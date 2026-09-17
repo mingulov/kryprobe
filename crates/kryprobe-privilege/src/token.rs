@@ -8,8 +8,11 @@
 
 pub mod mint;
 mod scm;
+pub mod smoke;
+mod spawn;
 
 pub use mint::{live_bpf_ids, mint_smoke_token};
+pub use smoke::run_smoke_roundtrip;
 
 use crate::bpfloader::{LoadedSpine, LoaderError, instantiate_with_token, parse_spine_object};
 use crate::fd::OwnedFd;
@@ -42,8 +45,21 @@ impl TokenAxes {
 #[derive(Debug)]
 pub enum TokenError {
     BadFd,
-    Parse { field: &'static str },
-    Denied { stage: &'static str, errno: i32 },
+    Parse {
+        field: &'static str,
+    },
+    Denied {
+        stage: &'static str,
+        errno: i32,
+    },
+    /// The smoke worker exited nonzero (never a skip).
+    WorkerExit {
+        code: i32,
+    },
+    /// BPF ids leaked across the roundtrip (`"maps"` or `"progs"`).
+    Leaked {
+        kind: &'static str,
+    },
 }
 
 impl fmt::Display for TokenError {
@@ -52,6 +68,8 @@ impl fmt::Display for TokenError {
             Self::BadFd => write!(f, "token fd out of range"),
             Self::Parse { field } => write!(f, "token fdinfo: bad {field}"),
             Self::Denied { stage, errno } => write!(f, "token {stage}: errno {errno}"),
+            Self::WorkerExit { code } => write!(f, "smoke worker exited {code}"),
+            Self::Leaked { kind } => write!(f, "smoke roundtrip leaked {kind}"),
         }
     }
 }

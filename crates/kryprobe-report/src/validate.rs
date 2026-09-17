@@ -41,6 +41,24 @@ pub enum ValidationFinding {
     },
 }
 
+impl std::fmt::Display for ValidationFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream(finding) => write!(f, "{finding}"),
+            Self::SchemaMismatch { line, found } => {
+                write!(
+                    f,
+                    "line {line}: schema is '{found}', want '{EVENT_SCHEMA_V0}'"
+                )
+            }
+            Self::SchemaDrift { expected, actual } => {
+                write!(f, "schema drift: disk {actual} != frozen {expected}")
+            }
+            Self::Unreadable { detail } => write!(f, "unreadable stream: {detail}"),
+        }
+    }
+}
+
 /// The frozen schema bytes compiled into this crate.
 const EMBEDDED_SCHEMA: &str = include_str!("../../../schemas/event-v0.schema.json");
 

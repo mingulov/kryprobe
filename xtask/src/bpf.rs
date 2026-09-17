@@ -109,14 +109,32 @@ pub(crate) fn test_bpf() -> i32 {
             return code;
         }
     }
-    for suite in ["bpf_pipeline", "token_plumbing"] {
+    let code = run_child(
+        "cargo",
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "kryprobe-cli",
+            "--bin",
+            "kryprobe",
+        ],
+    );
+    if code != 0 {
+        return code;
+    }
+    for (package, suite) in [
+        ("kryprobe-privilege", "bpf_pipeline"),
+        ("kryprobe-privilege", "token_plumbing"),
+        ("kryprobe-cli", "cli_bpf_e2e"),
+    ] {
         let code = run_child(
             "cargo",
             &[
                 "test",
                 "--locked",
                 "-p",
-                "kryprobe-privilege",
+                package,
                 "--test",
                 suite,
                 "--",

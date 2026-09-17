@@ -13,6 +13,7 @@ use kryprobe_core::{
 };
 use kryprobe_privilege::attach::{AttachError, attach_group};
 use kryprobe_privilege::bpfloader::{LoaderError, load_spine_object};
+use kryprobe_privilege::bpfselftest::{SpineEventView, view_spine_event};
 use kryprobe_privilege::drain::{DrainEvent, DrainThread};
 use kryprobe_privilege::elfread::goblin_parser;
 use kryprobe_privilege::mapops::{MapOpsError, map_lookup_percpu_sum, map_update};
@@ -98,24 +99,9 @@ fn or_skip<T, E: std::fmt::Display>(
     }
 }
 
-/// Field-wise SpineEvent read (no alignment assumptions on copies).
-struct EventView {
-    cookie: u64,
-    flags: u32,
-    seq: u64,
-    reserved_zero: bool,
-}
-
-fn view_event(bytes: &[u8]) -> EventView {
-    assert_eq!(bytes.len(), 64, "spine record must be 64 bytes");
-    let u64le = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
-    let u32le = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
-    EventView {
-        cookie: u64le(0),
-        flags: u32le(32),
-        seq: u64le(24),
-        reserved_zero: bytes[36..64].iter().all(|b| *b == 0),
-    }
+/// Lane-local parse: lib validates shape, lane asserts generation + flags.
+fn view_event(bytes: &[u8]) -> SpineEventView {
+    view_spine_event(bytes).expect("spine record must parse")
 }
 
 #[test]
@@ -271,7 +257,6 @@ fn privileged_roundtrip(loaded: &kryprobe_privilege::bpfloader::LoadedSpine) {
         let view = view_event(bytes);
         assert_eq!(view.cookie >> 32, u64::from(GENERATION), "stale gen leaked");
         assert_eq!(view.cookie & 0xffff_ffff, 0, "bad offset index");
-        assert!(view.reserved_zero, "reserved bytes must be zero");
         match view.flags {
             0 => entries += 1,
             1 => returns += 1,

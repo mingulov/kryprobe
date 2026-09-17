@@ -10,6 +10,7 @@
 
 pub mod attach;
 pub mod bpfloader;
+pub mod bpfselftest;
 pub mod drain;
 pub mod elfread;
 pub mod fd;
