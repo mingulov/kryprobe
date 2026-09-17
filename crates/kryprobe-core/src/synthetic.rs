@@ -8,7 +8,7 @@
 pub mod codec;
 pub mod run;
 
-pub use run::{OpSpec, ScriptOp, ScriptRun};
+pub use run::{OpSpec, ScriptOp, ScriptRun, canonical_script};
 
 use crate::backend::{
     Backend, BackendCapabilities, BackendPlan, BackendSummary, ConfigureContext, DecodeContext,

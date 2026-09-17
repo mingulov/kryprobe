@@ -17,38 +17,15 @@ use kryprobe_core::error::BackendError;
 use kryprobe_core::evidence::{
     CoverageSummary, DimensionCoverage, IntegritySummary, NativeResult, ValidityInterval,
 };
-use kryprobe_core::ids::{ObservationId, PlanGeneration, SessionId};
+use kryprobe_core::ids::{PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_core::session::{SessionController, SessionState};
-use kryprobe_core::synthetic::{OpSpec, ScriptOp, SyntheticBackend};
+use kryprobe_core::synthetic::{SyntheticBackend, canonical_script};
 use kryprobe_testkit::{assert_golden, check_stream};
 use std::path::PathBuf;
 
-fn script() -> Vec<ScriptOp> {
-    let sign = OpSpec {
-        class: OperationClass::Sign,
-        call: CallKind::Operation,
-    };
-    let size = OpSpec {
-        class: OperationClass::Encrypt,
-        call: CallKind::SizeQuery,
-    };
-    let fail = OpSpec {
-        class: OperationClass::Digest,
-        call: CallKind::Operation,
-    };
-    vec![
-        ScriptOp::Enter { op: sign },
-        ScriptOp::Return { op: sign, code: 0 },
-        ScriptOp::Enter { op: size },
-        ScriptOp::Return { op: size, code: 0 },
-        ScriptOp::Enter { op: fail },
-        ScriptOp::Return { op: fail, code: -1 },
-        ScriptOp::DropDetailed { count: 2 },
-        ScriptOp::SpawnChild {
-            parent: ObservationId::new(1),
-        },
-    ]
+fn script() -> Vec<kryprobe_core::synthetic::ScriptOp> {
+    canonical_script()
 }
 
 fn golden_path() -> PathBuf {

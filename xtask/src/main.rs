@@ -4,6 +4,7 @@
 //! Every child invocation is printed (`+ argv...`) before it runs, and the
 //! child exit code is propagated to the caller.
 
+mod bench;
 mod bpf;
 mod child;
 
@@ -24,6 +25,8 @@ commands:
   test bpf     build BPF object + fixture, run the BPF pipeline lane
   verify generated
                schema-freeze + fixture-validation report tests
+  bench [--json]
+               receipt suites: attach/drain/elf/e2e (exit 4 when denied)
 ";
 
 fn main() {
@@ -59,6 +62,12 @@ fn run(argv: &[String]) -> i32 {
     }
     if argv[1] == "verify" && argv.len() == 3 && argv[2] == "generated" {
         return run_child("cargo", &["test", "--locked", "-p", "kryprobe-report"]);
+    }
+    if argv[1] == "bench" && argv.len() == 2 {
+        return bench::bench(false);
+    }
+    if argv[1] == "bench" && argv.len() == 3 && argv[2] == "--json" {
+        return bench::bench(true);
     }
     eprint!("{USAGE}");
     2

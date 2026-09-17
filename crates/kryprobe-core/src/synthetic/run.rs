@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 mod steps;
 
-pub use steps::{OpSpec, ScriptOp};
+pub use steps::{OpSpec, ScriptOp, canonical_script};
 
 /// Deterministic outcome of one scripted run.
 #[derive(Debug, Clone, PartialEq, Eq)]
