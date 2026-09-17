@@ -85,6 +85,60 @@ fn mint_denied_unprivileged_case() {
 }
 
 // ---------------------------------------------------------------------------
+// spawn + worker gates (runs everywhere; binary-dependent parts skip)
+// ---------------------------------------------------------------------------
+
+/// Bad fds never reach exec: the outcome discriminates the drop path.
+/// Unprivileged the drop itself must fail closed (126); as root the
+/// drop succeeds and the bad image fails (127). Either way the parent
+/// observes an exit code, never a silent privileged child.
+#[test]
+#[cfg(target_os = "linux")]
+fn spawn_drop_fails_closed() {
+    use kryprobe_privilege::token::spawn_smoke_worker;
+    // SAFETY: idempotent getter.
+    let root = unsafe { libc::geteuid() } == 0;
+    let code = spawn_smoke_worker(-1, -1, -1).expect("spawn must report");
+    assert_eq!(code, if root { 127 } else { 126 }, "drop/exec outcome");
+}
+
+#[test]
+fn worker_direct_without_marker() {
+    let exe = worker_path();
+    if !exe.is_file() {
+        println!("SKIP: token_worker not built (run `cargo xtask test bpf`)");
+        return;
+    }
+    let status = std::process::Command::new(&exe)
+        .env_remove("KRYPROBE_SMOKE_WORKER")
+        .output()
+        .expect("spawn worker")
+        .status;
+    assert_eq!(status.code(), Some(2), "direct run must exit 2 (usage)");
+}
+
+#[test]
+fn worker_refuses_outer_root() {
+    // SAFETY: idempotent getters.
+    if unsafe { libc::geteuid() } != 0 {
+        println!("SKIP: outer-root proof needs euid == 0");
+        return;
+    }
+    let exe = worker_path();
+    if !exe.is_file() {
+        println!("SKIP: token_worker not built (run `cargo xtask test bpf`)");
+        return;
+    }
+    let status = std::process::Command::new(&exe)
+        .args(["--fd", "9", "--object-fd", "9"])
+        .env("KRYPROBE_SMOKE_WORKER", "1")
+        .output()
+        .expect("spawn worker")
+        .status;
+    assert_eq!(status.code(), Some(3), "outer root must exit 3");
+}
+
+// ---------------------------------------------------------------------------
 // root roundtrip smoke (gated; honest skip)
 // ---------------------------------------------------------------------------
 

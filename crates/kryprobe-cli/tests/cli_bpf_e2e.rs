@@ -17,7 +17,18 @@ fn selftest_bpf_clean_or_denied() {
         .expect("spawn");
     let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
     match output.status.code() {
-        Some(0) => assert!(stderr.contains("reconcile: clean"), "stderr: {stderr}"),
+        Some(0) => {
+            assert!(stderr.contains("reconcile: clean"), "stderr: {stderr}");
+            // The owned fixture exited 0: session_end must say so.
+            let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+            let end = stdout
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("jsonl"))
+                .find(|record| record["kind"] == "session_end")
+                .expect("session_end record");
+            assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
+            assert!(end["payload"]["child_signal"].is_null(), "stdout: {stdout}");
+        }
         Some(3) => assert!(stderr.contains("Denied{"), "stderr: {stderr}"),
         Some(code) => panic!("unexpected exit {code}: {stderr}"),
         None => panic!("killed by signal: {stderr}"),

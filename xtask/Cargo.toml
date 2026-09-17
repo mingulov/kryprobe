@@ -6,6 +6,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+goblin = "0.10"
 kryprobe-core = { path = "../crates/kryprobe-core" }
 kryprobe-privilege = { path = "../crates/kryprobe-privilege" }
 libc = "0.2"

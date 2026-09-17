@@ -132,3 +132,41 @@ pub fn map_lookup_percpu_sum(map: &OwnedFd, key: u32, stage: &str) -> Result<u64
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fd::OwnedFd;
+
+    /// Never a real fd: syscalls fail EBADF before use; close(-1) is a
+    /// harmless no-op on drop.
+    fn bad_fd() -> OwnedFd {
+        // SAFETY: never dereferenced; the bpf() call fails first.
+        unsafe { OwnedFd::from_raw_fd(-1) }
+    }
+
+    #[test]
+    fn bad_fd_update_reports_stage_and_errno() {
+        let fd = bad_fd();
+        let err = map_update(&fd, 0, 0, "unit/probe").unwrap_err();
+        assert!(
+            matches!(err, MapOpsError::UpdateFailed { ref stage, errno } if stage == "unit/probe" && errno == libc::EBADF),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn bad_fd_lookup_reports_stage_and_errno() {
+        let fd = bad_fd();
+        let err = map_lookup(&fd, 0, "unit/probe").unwrap_err();
+        assert!(
+            matches!(err, MapOpsError::LookupFailed { ref stage, errno } if stage == "unit/probe" && errno == libc::EBADF),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn online_cpus_is_sane() {
+        assert!(online_cpus() >= 1);
+    }
+}

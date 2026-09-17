@@ -149,6 +149,10 @@ pub struct BpfSelftestOutcome {
     pub dropped: u64,
     /// Userspace queue drops.
     pub queue_drops: u64,
+    /// Fixture process exit code (`None` when killed by signal).
+    pub exit_code: Option<i32>,
+    /// Fixture terminating signal (`None` when it exited).
+    pub signal: Option<i32>,
     /// Loss-ledger verdict.
     pub verdict: kryprobe_core::ReconcileVerdict,
 }
@@ -181,4 +185,47 @@ pub fn run_bpf_selftest(
         other => BpfSelftestError::Loader(other),
     })?;
     round::roundtrip(config, &loaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..8].copy_from_slice(&0x0000_0001_0000_0002u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&7u64.to_le_bytes());
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn view_splits_fields() {
+        let view = view_spine_event(&record()).unwrap();
+        assert_eq!(view.cookie, 0x0000_0001_0000_0002);
+        assert_eq!(view.seq, 7);
+        assert_eq!(view.flags, 1);
+    }
+
+    #[test]
+    fn view_rejects_ragged_lengths() {
+        for len in [0, 1, 63, 65, 128] {
+            assert!(
+                view_spine_event(&vec![0u8; len]).is_err(),
+                "length {len} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn view_rejects_dirty_reserved() {
+        for off in [36, 40, 63] {
+            let mut bytes = record();
+            bytes[off] = 1;
+            assert!(
+                view_spine_event(&bytes).is_err(),
+                "dirty reserved byte {off} must fail closed"
+            );
+        }
+    }
 }

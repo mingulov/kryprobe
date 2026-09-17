@@ -7,6 +7,7 @@
 //! ([`MapReloc`]) applied at instantiate time, when fds exist.
 
 mod maps;
+mod reach;
 mod reloc;
 
 use crate::bpfloader::{LoaderError, ParsedMap, ParsedProg};
@@ -155,11 +156,39 @@ pub fn parse_spine_object(bytes: &[u8]) -> Result<ParsedSpine, LoaderError> {
         &mut programs,
         &mut map_relocs,
     )?;
+    let text_funcs = text_func_symbols(&elf, text_idx);
+    for (prog, (_, main_len)) in programs.iter().zip(bases.iter()) {
+        let funcs: Vec<(String, usize)> = text_funcs
+            .iter()
+            .map(|(name, off)| (name.clone(), main_len + off / 8))
+            .collect();
+        reach::check_reachable(&prog.name, &prog.insns, &funcs)?;
+    }
     Ok(ParsedSpine {
         maps,
         programs,
         map_relocs,
     })
+}
+
+/// `.text` function symbols (name, byte offset) for reachability reports.
+fn text_func_symbols(elf: &goblin::elf::Elf, text_idx: usize) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for sym in elf.syms.iter() {
+        if sym.st_shndx != text_idx
+            || goblin::elf::sym::st_type(sym.st_info) != goblin::elf::sym::STT_FUNC
+        {
+            continue;
+        }
+        let name = elf
+            .strtab
+            .get_at(sym.st_name)
+            .unwrap_or_default()
+            .to_owned();
+        out.push((name, sym.st_value as usize));
+    }
+    out.sort_by_key(|(_, off)| *off);
+    out
 }
 
 /// Flatten one program stream back to bytes for `BPF_PROG_LOAD`.

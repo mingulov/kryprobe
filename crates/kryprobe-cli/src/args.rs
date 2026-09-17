@@ -117,3 +117,130 @@ fn parse_simple(
     }
     Ok(build(json))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        std::iter::once("kryprobe")
+            .chain(words.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn early_exits_win() {
+        assert_eq!(parse(&argv(&["--help"])), Err(ArgsError::Help));
+        assert_eq!(parse(&argv(&["--help", "doctor"])), Err(ArgsError::Help));
+        assert_eq!(parse(&argv(&["--version"])), Err(ArgsError::Version));
+    }
+
+    #[test]
+    fn missing_and_unknown_subcommands() {
+        assert!(matches!(parse(&argv(&[])), Err(ArgsError::Usage(_))));
+        assert!(matches!(
+            parse(&argv(&["frobnicate"])),
+            Err(ArgsError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn simple_commands_merge_json() {
+        assert_eq!(
+            parse(&argv(&["doctor"])).unwrap().command,
+            Command::Doctor { json: false }
+        );
+        assert_eq!(
+            parse(&argv(&["--json", "doctor"])).unwrap().command,
+            Command::Doctor { json: true }
+        );
+        assert_eq!(
+            parse(&argv(&["backends", "--json"])).unwrap().command,
+            Command::Backends { json: true }
+        );
+        assert!(matches!(
+            parse(&argv(&["doctor", "extra"])),
+            Err(ArgsError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn inspect_needs_pid() {
+        assert_eq!(
+            parse(&argv(&["inspect", "--pid", "1"])).unwrap().command,
+            Command::Inspect {
+                pid: 1,
+                json: false
+            }
+        );
+        for bad in [
+            vec!["inspect"],
+            vec!["inspect", "--pid"],
+            vec!["inspect", "--pid", "nope"],
+            vec!["inspect", "--pid", "1", "extra"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "args {bad:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn selftest_grammars() {
+        assert_eq!(
+            parse(&argv(&["selftest", "synthetic"])).unwrap().command,
+            Command::SelftestSynthetic { out: None }
+        );
+        assert!(matches!(
+            parse(&argv(&["selftest"])),
+            Err(ArgsError::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["selftest", "bpf", "--calls", "0"])),
+            Err(ArgsError::Usage(_))
+        ));
+        assert_eq!(
+            parse(&argv(&["selftest", "bpf"])).unwrap().command,
+            Command::SelftestBpf {
+                calls: 200,
+                out: None
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["selftest", "token-smoke"])).unwrap().command,
+            Command::SelftestToken
+        );
+        assert!(matches!(
+            parse(&argv(&["selftest", "token-smoke", "extra"])),
+            Err(ArgsError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn report_wants_exactly_one_file() {
+        assert!(matches!(
+            parse(&argv(&["report", "s.jsonl"])).unwrap().command,
+            Command::Report { .. }
+        ));
+        for bad in [vec!["report"], vec!["report", "a", "b"]] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "args {bad:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn stubs_accept_anything() {
+        for sub in ["plan", "observe", "run"] {
+            assert_eq!(
+                parse(&argv(&[sub, "--anything", "goes"])).unwrap().command,
+                Command::Stub {
+                    name: sub.to_owned()
+                }
+            );
+        }
+    }
+}

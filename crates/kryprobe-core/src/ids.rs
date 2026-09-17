@@ -105,3 +105,22 @@ define_id!(ObservationId, u64, "observation");
 define_id!(CorrelationId, u64, "correlation");
 define_id!(PlanGeneration, u32, "plan_generation");
 define_id!(ProcessGeneration, u64, "process_generation");
+
+/// Session-scoped observation ID issuer.
+///
+/// Backends must NOT mint IDs from private counters: two backends would
+/// issue colliding `observation:N` values into one session. The runtime
+/// owns one issuer per session and loans it through
+/// [`DecodeContext`](crate::backend::DecodeContext); every decoded
+/// observation takes the next value.
+#[derive(Debug, Default)]
+pub struct IdIssuer {
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl IdIssuer {
+    /// Issue the next session-scoped observation ID (1-based).
+    pub fn issue(&self) -> ObservationId {
+        ObservationId::new(self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+    }
+}

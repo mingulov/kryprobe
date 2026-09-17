@@ -17,7 +17,10 @@ use kryprobe_core::{DrainConfig, GenerationGuard, LinkGroup, LossLedger, Program
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 /// Test generation pinned into cookies + CONFIG.
 const GENERATION: u32 = 1;
@@ -117,8 +120,12 @@ fn drive(
         links.push(link);
     }
     let drain_config = DrainConfig {
-        max_events_per_iter: 128,
-        queue_depth: 1024,
+        // A full ring per wakeup (256 KiB / 72 B ≈ 3.6k records).
+        max_events_per_iter: 4096,
+        // Absorbs whole wakeup bursts (try_send never blocks, so a
+        // shallow queue would drop under burst production even with a
+        // concurrent receiver); production backends size their own.
+        queue_depth: 65536,
         poll_timeout_ms: 50,
     };
     let drain = DrainThread::spawn(&loaded.maps.events, RING_BYTES, &drain_config)
@@ -130,13 +137,27 @@ fn drive(
         .write_all(b"GO\n")
         .map_err(|err| BpfSelftestError::Fixture(err.to_string()))?;
     let done_secs = 30 + config.calls / 500;
-    let done = await_line(&lines, "DONE", Duration::from_secs(done_secs))?;
-    if !done.starts_with("DONE ") {
-        return Err(BpfSelftestError::BadEvent("DONE line malformed"));
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // DONE watcher owns the line pump: it waits for DONE, lets the ring
+    // settle, then releases the collector below. Records are collected
+    // CONCURRENTLY with the fixture run, so bursts larger than the
+    // queue survive; the flag is set on every path (including fixture
+    // errors) so the collector always terminates.
+    let settled = Arc::new(AtomicBool::new(false));
+    let settled_w = settled.clone();
+    let watcher = thread::spawn(move || {
+        let outcome: Result<(), BpfSelftestError> = (|| {
+            let done = await_line(&lines, "DONE", Duration::from_secs(done_secs))?;
+            if !done.starts_with("DONE ") {
+                return Err(BpfSelftestError::BadEvent("DONE line malformed"));
+            }
+            thread::sleep(Duration::from_secs(2));
+            Ok(())
+        })();
+        settled_w.store(true, Ordering::Release);
+        outcome
+    });
     let mut records: Vec<Vec<u8>> = Vec::new();
-    while Instant::now() < deadline {
+    while !settled.load(Ordering::Acquire) {
         match drain.receiver().recv_timeout(Duration::from_millis(100)) {
             Ok(DrainEvent::Record(bytes)) => records.push(bytes),
             Ok(DrainEvent::Barrier(_)) => {}
@@ -146,6 +167,9 @@ fn drive(
     while let Ok(DrainEvent::Record(bytes)) = drain.receiver().try_recv() {
         records.push(bytes);
     }
+    watcher
+        .join()
+        .map_err(|_| BpfSelftestError::Fixture("DONE watcher panicked".to_owned()))??;
     let stats: DrainStats = drain.stop();
     drop(links);
     let status = child
@@ -154,6 +178,8 @@ fn drive(
     if !status.success() {
         return Err(BpfSelftestError::FixtureExit(status.code().unwrap_or(-1)));
     }
+    use std::os::unix::process::ExitStatusExt as _;
+    let (exit_code, signal) = (status.code(), status.signal());
     let mut entries = 0u64;
     let mut returns = 0u64;
     for bytes in &records {
@@ -183,6 +209,8 @@ fn drive(
         ring,
         dropped,
         queue_drops: stats.queue_drops,
+        exit_code,
+        signal,
         verdict: ledger.reconcile(),
     })
 }

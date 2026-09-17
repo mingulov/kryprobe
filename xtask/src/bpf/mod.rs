@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! xtask BPF lanes: `build --bpf` and `test bpf` (T7 split).
 
+pub(crate) mod strip;
+
 use crate::channel_from_file;
 use crate::child::{run_child, run_child_in};
 use std::env;
@@ -72,15 +74,37 @@ pub(crate) fn build_bpf() -> i32 {
         );
         return 1;
     }
-    if let Err(err) = fs::copy(&built, &dest) {
-        eprintln!(
-            "xtask build --bpf: cannot copy {} to {}: {err}",
-            built.display(),
-            dest.display()
-        );
+    let bytes = match fs::read(&built) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("xtask build --bpf: cannot read {}: {err}", built.display());
+            return 1;
+        }
+    };
+    let stripped = match strip::strip_dead_text_funcs(&bytes) {
+        Ok((stripped, report)) => {
+            if report.removed.is_empty() {
+                println!("+ strip: no dead .text functions");
+            } else {
+                println!(
+                    "+ strip: removed {} ({} -> {} .text bytes)",
+                    report.removed.join(", "),
+                    report.text_before,
+                    report.text_after
+                );
+            }
+            stripped
+        }
+        Err(err) => {
+            eprintln!("xtask build --bpf: {err}");
+            return 1;
+        }
+    };
+    if let Err(err) = fs::write(&dest, &stripped) {
+        eprintln!("xtask build --bpf: cannot write {}: {err}", dest.display());
         return 1;
     }
-    println!("+ copied {} to {}", built.display(), dest.display());
+    println!("+ wrote {} (stripped)", dest.display());
     0
 }
 

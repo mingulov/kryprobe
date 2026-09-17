@@ -59,6 +59,10 @@ pub trait Backend: Send + Sync {
         plan: &BackendPlan,
     ) -> Result<(), BackendError>;
     /// Decode one raw event into a native observation.
+    ///
+    /// The observation ID comes from `ctx.id_issuer`: backends must
+    /// never mint IDs from private counters (two backends would
+    /// collide in one session).
     fn decode(
         &self,
         ctx: &DecodeContext<'_>,

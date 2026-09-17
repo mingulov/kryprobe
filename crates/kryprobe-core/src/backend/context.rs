@@ -8,7 +8,7 @@ use crate::budget::BudgetManager;
 use crate::capability::RuntimeCapabilities;
 use crate::enums::BackendId;
 use crate::evidence::{CoverageSummary, IntegritySummary};
-use crate::ids::{ObjectId, PlanGeneration, SessionId};
+use crate::ids::{IdIssuer, ObjectId, PlanGeneration, SessionId};
 use crate::plan::{CapabilityRequirements, OffsetProbe};
 use kryprobe_abi::RawEventHeader;
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,8 @@ pub struct DecodeContext<'a> {
     pub generation: PlanGeneration,
     /// Current integrity baseline for loss-aware decoding.
     pub integrity: &'a IntegritySummary,
+    /// Session-scoped observation ID issuer (no private counters).
+    pub id_issuer: &'a IdIssuer,
 }
 
 /// One raw BPF event: validated header plus backend-owned payload bytes.

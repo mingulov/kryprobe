@@ -2,9 +2,10 @@
 //! Root-side token minting over a private bpffs mount (T8).
 //!
 //! Follows the kernel selftests/bpf `token` flow: `fsopen("bpf")`,
-//! four `delegate_*` strings, `FSCONFIG_CMD_CREATE`, `fsmount`, then
-//! `BPF_TOKEN_CREATE` on the mount fd. Syscall numbers come from libc;
-//! the `linux/mount.h` command constants are spelled out (verified).
+//! four `delegate_*` strings, `FSCONFIG_CMD_CREATE`, `fsmount`,
+//! `openat` of the mount root, then `BPF_TOKEN_CREATE` on that
+//! directory fd. Syscall numbers come from libc; the `linux/mount.h`
+//! command constants are spelled out (verified).
 
 use super::{TokenAxes, TokenError, TokenHandle};
 use crate::fd::OwnedFd;
@@ -83,9 +84,19 @@ pub fn mint_smoke_token() -> Result<TokenHandle, TokenError> {
             0,
         )
     })?;
+    // `BPF_TOKEN_CREATE` wants a directory fd on the bpffs instance,
+    // not the mount fd itself (which it rejects with EBADF).
+    // SAFETY: "." is NUL-terminated; O_DIRECTORY pins a directory.
+    let dir = syscall_fd("open-mount-root", unsafe {
+        libc::openat(
+            mnt.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    } as c_long)?;
     let mut attr = TokenAttr {
         flags: 0,
-        bpffs_fd: mnt.as_raw_fd() as u32,
+        bpffs_fd: dir.as_raw_fd() as u32,
     };
     // SAFETY: `attr` is a live stack struct; size matches its type.
     let ret = unsafe {

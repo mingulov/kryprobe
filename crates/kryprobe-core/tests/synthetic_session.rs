@@ -17,7 +17,7 @@ use kryprobe_core::error::BackendError;
 use kryprobe_core::evidence::{
     CoverageSummary, DimensionCoverage, IntegritySummary, NativeResult, ValidityInterval,
 };
-use kryprobe_core::ids::{PlanGeneration, SessionId};
+use kryprobe_core::ids::{IdIssuer, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_core::session::{SessionController, SessionState};
 use kryprobe_core::synthetic::{SyntheticBackend, canonical_script};
@@ -218,10 +218,12 @@ fn synthetic_backend_implements_all_seven_trait_methods() {
     ));
 
     let integrity = IntegritySummary::default();
+    let issuer = IdIssuer::default();
     let ctx = DecodeContext {
         session,
         generation,
         integrity: &integrity,
+        id_issuer: &issuer,
     };
     let bytes = SyntheticBackend::encode_event(
         EvidencePhase::Entered,
@@ -289,6 +291,49 @@ fn synthetic_backend_implements_all_seven_trait_methods() {
     assert_eq!(summary.backend, BackendId::Synthetic);
     assert_eq!(summary.observations, 1);
     assert_eq!(summary.integrity, IntegritySummary::default());
+}
+
+#[test]
+fn decode_ids_are_unique_across_backends() {
+    // Two backends sharing one session issuer must never collide:
+    // private per-backend counters would both start at observation:1.
+    let session = SessionId::new(9);
+    let generation = PlanGeneration::new(1);
+    let integrity = IntegritySummary::default();
+    let issuer = IdIssuer::default();
+    let ctx = DecodeContext {
+        session,
+        generation,
+        integrity: &integrity,
+        id_issuer: &issuer,
+    };
+    let bytes = SyntheticBackend::encode_event(
+        EvidencePhase::Entered,
+        OperationClass::Encrypt,
+        CallKind::SizeQuery,
+        0,
+    );
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let backend = SyntheticBackend::new(script());
+        for _ in 0..3 {
+            let obs = backend
+                .decode(
+                    &ctx,
+                    RawEvent {
+                        header: sample_header(),
+                        payload: &bytes,
+                    },
+                )
+                .unwrap();
+            ids.push(obs.id);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 6, "decoded IDs must be session-unique");
+    assert_eq!(ids[0].to_string(), "observation:1");
+    assert_eq!(ids[5].to_string(), "observation:6");
 }
 
 #[test]

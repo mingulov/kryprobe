@@ -13,6 +13,7 @@ mod spawn;
 
 pub use mint::{live_bpf_ids, mint_smoke_token};
 pub use smoke::run_smoke_roundtrip;
+pub use spawn::spawn_smoke_worker;
 
 use crate::bpfloader::{LoadedSpine, LoaderError, instantiate_with_token, parse_spine_object};
 use crate::fd::OwnedFd;

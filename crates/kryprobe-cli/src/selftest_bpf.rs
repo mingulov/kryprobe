@@ -14,7 +14,12 @@ use kryprobe_report::{FinalBarrier, JsonlWriter, SessionEnd, SessionStart, Sessi
 use std::io::Write;
 use std::path::Path;
 
-fn emit_jsonl(calls: u64, verdict: SessionVerdict) -> String {
+fn emit_jsonl(
+    calls: u64,
+    verdict: SessionVerdict,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> String {
     let mut writer = JsonlWriter::new("session:bpf-selftest");
     // Backends unclaimable here (no crypto backend observed); the start
     // record carries an empty request list by design, never a guess.
@@ -31,8 +36,8 @@ fn emit_jsonl(calls: u64, verdict: SessionVerdict) -> String {
             verdict,
             final_barrier: FinalBarrier::Validated,
             unresolved_gap_ids: Vec::new(),
-            child_exit_code: None,
-            child_signal: None,
+            child_exit_code: exit_code,
+            child_signal: signal,
         })
         .expect("bpf end record");
     writer.into_string()
@@ -88,8 +93,18 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
             ("defect", SessionVerdict::Failed, 1)
         }
     };
-    let text = emit_jsonl(calls, verdict);
+    let text = emit_jsonl(calls, verdict, outcome.exit_code, outcome.signal);
     let _ = write!(stderr, "{}", kryprobe_report::render_summary(&text));
+    let _ = writeln!(
+        stderr,
+        "selftest bpf: entries={} returns={} received={} ring={} drop={} queue={}",
+        outcome.entries,
+        outcome.returns,
+        outcome.received,
+        outcome.ring,
+        outcome.dropped,
+        outcome.queue_drops
+    );
     let _ = writeln!(stderr, "reconcile: {marker}");
     match out {
         Some(path) => match std::fs::write(path, &text) {

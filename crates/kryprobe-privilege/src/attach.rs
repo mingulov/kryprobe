@@ -35,6 +35,7 @@ impl std::fmt::Display for AttachError {
 impl std::error::Error for AttachError {}
 
 /// RAII uprobe-multi link: drop closes (detaches) it.
+#[derive(Debug)]
 pub struct OwnedLink {
     _fd: OwnedFd,
 }

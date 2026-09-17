@@ -4,7 +4,7 @@
 //! Hidden entry contract: exact argv `[bin, --fd, SOCK, --object-fd, OBJ]`
 //! plus `KRYPROBE_SMOKE_WORKER=1` in the environment; direct execution
 //! without both exits 2. The parent drops to `nobody` before exec, so the
-//! worker refuses to run when its outer euid is 0 (exit 3).
+//! worker refuses to run when its outer euid or egid is 0 (exit 3).
 //!
 //! Flow: read object bytes → parse (exit 7 on fixture corruption) → join
 //! a user namespace (exit 6) → receive + verify the token (exit 5) →
@@ -45,8 +45,8 @@ fn main() {
 
     // SAFETY: idempotent getters.
     let (outer_uid, outer_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    if outer_uid == 0 {
-        eprintln!("token_worker: refusing to run as outer root");
+    if outer_uid == 0 || outer_gid == 0 {
+        eprintln!("token_worker: refusing to run with outer root uid/gid");
         std::process::exit(3);
     }
 

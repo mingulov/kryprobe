@@ -27,6 +27,9 @@ impl Worker {
         let mut stats = DrainStats::default();
         let mut consumer = self.area.consumer();
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+        // Reusable full-size view: each round refreshes only the pending
+        // window (see `snapshot_into`); the walk never reads stale bytes.
+        let mut snap = vec![0u8; 2 * (self.mask + 1) as usize];
         'run: while !self.stop.load(Ordering::Acquire) {
             // SAFETY: epoll fd live; events buffer valid for one entry.
             unsafe {
@@ -42,7 +45,7 @@ impl Worker {
             }
             let producer = self.area.producer();
             if producer != consumer {
-                let snap = self.area.snapshot();
+                self.area.snapshot_into(&mut snap, consumer, producer);
                 let out = frame::consume_range(&snap, self.mask, consumer, producer, self.budget);
                 consumer = out.consumer;
                 self.area.set_consumer(consumer);

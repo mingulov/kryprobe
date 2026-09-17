@@ -18,7 +18,7 @@ use crate::budget::BudgetKind;
 use crate::enums::{BackendId, CaptureMode};
 use crate::error::{BackendError, BudgetReason, UnsupportedReason};
 use crate::evidence::{IntegrityRef, NativeObservation, NativeResult};
-use crate::ids::ObservationId;
+
 use crate::plan::{CapabilityRequirements, OffsetProbe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -122,13 +122,16 @@ impl Backend for SyntheticBackend {
 
     fn decode(
         &self,
-        _ctx: &DecodeContext<'_>,
+        ctx: &DecodeContext<'_>,
         event: RawEvent<'_>,
     ) -> Result<NativeObservation, BackendError> {
         let (phase, class, call, code) = codec::decode_event(&event)?;
-        let id = self.decoded.fetch_add(1, Ordering::SeqCst) + 1;
+        // Identity comes from the session issuer (unique across
+        // backends); `decoded` stays a per-backend decode count.
+        let id = ctx.id_issuer.issue();
+        self.decoded.fetch_add(1, Ordering::SeqCst);
         Ok(NativeObservation {
-            id: ObservationId::new(id as u64),
+            id,
             backend: BackendId::Synthetic,
             target: None,
             object: None,

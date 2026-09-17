@@ -4,10 +4,11 @@
 //! Layout (libbpf protocol): consumer page `mmap(fd, 0)` holds the u64
 //! consumer position at offset 0; `mmap(fd, page)` of
 //! `page + 2 * max_entries` holds the u64 producer position at offset 0
-//! and the double-mapped data area after one page. Each iteration takes
-//! a volatile snapshot of the data area (the kernel mutates it
-//! concurrently; 512 KiB per wakeup is fine for the spine) and runs the
-//! pure [`frame`] walk over the copy.
+//! and the double-mapped data area after one page. Each iteration copies
+//! only the pending window into a reusable full-size view and runs the
+//! pure [`frame`] walk over it (pending bytes are stable: the kernel
+//! appends past `producer` and fails reservations on a full ring
+//! instead of wrapping over `consumer`).
 //!
 //! Alignment: ring offsets advance in multiples of 8 by construction
 //! (see `frame` tests); record bytes are copied out and parsed

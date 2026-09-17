@@ -76,7 +76,9 @@ fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
     let want_tgid = CONFIG.get(1).copied().unwrap_or(0) as u32;
     let id = bpf_get_current_pid_tgid();
     let tgid = (id >> 32) as u32;
-    if want_tgid != 0 && tgid != want_tgid {
+    // Fail closed: no TGID pinned (want == 0) matches nothing, since
+    // no real process has TGID 0. Callers always pin the target.
+    if tgid != want_tgid {
         bump(&LOSS, LOSS_DROP);
         return 0;
     }
@@ -85,15 +87,28 @@ fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
         bump(&LOSS, LOSS_RING);
         return 0;
     };
-    entry.write(SpineEvent {
-        cookie,
-        tgid,
-        tid: id as u32,
-        monotonic_ns: unsafe { bpf_ktime_get_ns() },
-        seq,
-        flags: if is_return { FLAG_RETURN } else { 0 },
-        reserved: [0; 28],
-    });
+    // Slot init through the entry deref: `MaybeUninit::write` takes the
+    // event by value, and the 28-byte zero tail of that aggregate copy
+    // fuses into a `memset` call (as does any repeat/loop/literal zero
+    // chain). The call pulls the whole compiler_builtins mem blob into
+    // `.text`; the uncalled siblings are unreachable and the kernel
+    // verifier rejects the program. Volatile stores are preserved
+    // exactly, so no builtin call can form.
+    let slot: &mut core::mem::MaybeUninit<SpineEvent> = &mut entry;
+    let ptr = slot.as_mut_ptr();
+    // SAFETY: the slot is exclusively ours until `submit`, and every
+    // field is written before the entry is committed.
+    unsafe {
+        core::ptr::addr_of_mut!((*ptr).cookie).write(cookie);
+        core::ptr::addr_of_mut!((*ptr).tgid).write(tgid);
+        core::ptr::addr_of_mut!((*ptr).tid).write(id as u32);
+        core::ptr::addr_of_mut!((*ptr).monotonic_ns).write(bpf_ktime_get_ns());
+        core::ptr::addr_of_mut!((*ptr).seq).write(seq);
+        core::ptr::addr_of_mut!((*ptr).flags).write(if is_return { FLAG_RETURN } else { 0 });
+        for i in 0..28 {
+            core::ptr::addr_of_mut!((*ptr).reserved[i]).write_volatile(0);
+        }
+    }
     entry.submit(0);
     0
 }
@@ -120,3 +135,4 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[link_section = "license"]
 #[used]
 static LICENSE: [u8; 4] = *b"GPL\0";
+

@@ -195,3 +195,24 @@ fn misaligned_record_rejected() {
         Err(LoaderError::MisalignedRecord { .. })
     ));
 }
+
+#[test]
+fn parse_hostile_inputs_fail_closed() {
+    // Empty, truncated, and non-ELF inputs: graceful errors, never panic.
+    assert!(parse_spine_object(&[]).is_err());
+    assert!(parse_spine_object(&[0x7f, b'E', b'L']).is_err());
+    assert!(parse_spine_object(&[b'X'; 64]).is_err());
+    // Minimal ELF header, no sections: missing .text, not a crash.
+    let mut hdr = vec![0u8; 64];
+    hdr[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    hdr[4] = 2;
+    hdr[5] = 1;
+    hdr[6] = 1;
+    hdr[18..20].copy_from_slice(&247u16.to_le_bytes());
+    hdr[52..54].copy_from_slice(&64u16.to_le_bytes());
+    let err = parse_spine_object(&hdr).unwrap_err();
+    assert!(
+        matches!(err, LoaderError::BadObject { .. }),
+        "hostile header must be BadObject, got {err}"
+    );
+}
