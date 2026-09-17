@@ -21,6 +21,8 @@ pub const BPF_PROG_TYPE_KPROBE: u32 = 2;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
+/// Required in map/prog flags when a token fd rides the attr.
+pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
 
 /// Raw `bpf(cmd, attr, size)`; returns the fd or -1 (see [`last_errno`]).
 ///

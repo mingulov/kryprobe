@@ -11,9 +11,11 @@
 //! map-fd fixups (osslscope loader-prepare pattern, reimplemented).
 
 pub mod instantiate;
+pub mod mapcreate;
 pub mod parse;
+pub mod progload;
 
-pub use instantiate::instantiate;
+pub use instantiate::{instantiate, instantiate_with_token};
 pub use parse::{BpfInsn, MapReloc, ParsedSpine, insns_to_bytes, parse_spine_object};
 
 use crate::elfread::{ElfBytes, MmapGuard};

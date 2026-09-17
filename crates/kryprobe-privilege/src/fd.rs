@@ -8,6 +8,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 
 /// Owns a raw file descriptor; closes it on drop.
+#[derive(Debug)]
 pub struct OwnedFd {
     fd: RawFd,
 }

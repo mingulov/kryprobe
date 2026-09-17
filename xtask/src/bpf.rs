@@ -93,33 +93,41 @@ pub(crate) fn test_bpf() -> i32 {
     if code != 0 {
         return code;
     }
-    let code = run_child(
-        "cargo",
-        &[
-            "build",
-            "--locked",
-            "-p",
-            "kryprobe-privilege",
-            "--bin",
-            "spine_fixture",
-        ],
-    );
-    if code != 0 {
-        return code;
+    for bin in ["spine_fixture", "token_worker"] {
+        let code = run_child(
+            "cargo",
+            &[
+                "build",
+                "--locked",
+                "-p",
+                "kryprobe-privilege",
+                "--bin",
+                bin,
+            ],
+        );
+        if code != 0 {
+            return code;
+        }
     }
-    run_child(
-        "cargo",
-        &[
-            "test",
-            "--locked",
-            "-p",
-            "kryprobe-privilege",
-            "--test",
-            "bpf_pipeline",
-            "--",
-            "--include-ignored",
-        ],
-    )
+    for suite in ["bpf_pipeline", "token_plumbing"] {
+        let code = run_child(
+            "cargo",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kryprobe-privilege",
+                "--test",
+                suite,
+                "--",
+                "--include-ignored",
+            ],
+        );
+        if code != 0 {
+            return code;
+        }
+    }
+    0
 }
 
 /// True when `rustup run <channel> rustc --version` succeeds.

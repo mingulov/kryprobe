@@ -18,6 +18,7 @@ pub mod local;
 pub mod mapops;
 pub mod probe;
 pub mod refused;
+pub mod token;
 
 pub use inspect::{InspectError, TargetSnapshot, inspect_pid};
 pub use kryprobe_core::ProgramId;

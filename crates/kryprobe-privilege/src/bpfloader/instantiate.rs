@@ -1,67 +1,44 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Syscall half of the raw loader: maps, fixups, program loads (T7c1).
 
+use super::mapcreate::map_create_raw;
 use super::parse::{BpfInsn, insns_to_bytes, pseudo_map_fd};
+use super::progload::prog_load_raw;
 use crate::bpfloader::{LoadedSpine, LoaderError, ParsedSpine, SpineMaps, SpineProgs};
 use crate::fd::OwnedFd;
-use crate::probe::bpf_sys::{
-    BPF_MAP_CREATE, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_TRACE_UPROBE_MULTI, MapAttr, bpf,
-    fd_or_errno,
-};
-use std::os::raw::c_void;
+use crate::probe::bpf_sys::fd_or_errno;
+use std::os::fd::RawFd;
 
-/// Verifier log verbosity (2 = verbose) and 1 MiB capture buffer.
-const LOG_LEVEL: u32 = 2;
+/// 1 MiB verifier-log capture buffer.
 const LOG_CAP: usize = 1 << 20;
 /// Bytes of verifier-log tail kept on load failure.
 const LOG_TAIL: usize = 2048;
 
-/// `BPF_PROG_LOAD` attr through `expected_attach_type` (72 bytes, UAPI order).
-#[repr(C)]
-struct ProgLoadAttr {
-    prog_type: u32,
-    insn_cnt: u32,
-    insns: u64,
-    license: u64,
-    log_level: u32,
-    log_size: u32,
-    log_buf: u64,
-    kern_version: u32,
-    prog_flags: u32,
-    prog_name: [u8; 16],
-    prog_ifindex: u32,
-    expected_attach_type: u32,
-}
-
-static LICENSE: &[u8; 4] = b"GPL\0";
-
 /// Create maps, apply map-fd fixups, load both programs. No BTF fd.
 pub fn instantiate(parsed: &ParsedSpine) -> Result<LoadedSpine, LoaderError> {
+    instantiate_with_token(parsed, None)
+}
+
+/// [`instantiate`] with an optional BPF token fd instead of privilege.
+/// `None` builds the short attrs; `Some` the token-extended attrs.
+pub fn instantiate_with_token(
+    parsed: &ParsedSpine,
+    token: Option<RawFd>,
+) -> Result<LoadedSpine, LoaderError> {
     let mut fds: Vec<(String, OwnedFd)> = Vec::with_capacity(parsed.maps.len());
     for map in &parsed.maps {
-        let mut attr = MapAttr {
-            map_type: map.dims.map_type,
-            key_size: map.dims.key_size,
-            value_size: map.dims.value_size,
-            max_entries: map.dims.max_entries,
-        };
-        // SAFETY: `attr` is a live stack struct; size matches its type.
-        let ret = unsafe {
-            bpf(
-                BPF_MAP_CREATE,
-                (&raw mut attr).cast::<c_void>(),
-                size_of::<MapAttr>() as u32,
-            )
-        };
-        match fd_or_errno(ret) {
-            Ok(fd) => fds.push((map.name.clone(), fd)),
-            Err(errno) => {
-                return Err(LoaderError::MapFailed {
-                    stage: map.name.clone(),
-                    errno,
-                });
-            }
-        }
+        let ret = map_create_raw(
+            map.dims.map_type,
+            map.dims.key_size,
+            map.dims.value_size,
+            map.dims.max_entries,
+            token,
+        );
+        let fd = fd_or_errno(ret).map_err(|errno| LoaderError::MapFailed {
+            stage: map.name.clone(),
+            errno,
+        })?;
+        fds.push((map.name.clone(), fd));
     }
     let fd_of = |name: &str| -> Result<i32, LoaderError> {
         fds.iter()
@@ -105,7 +82,7 @@ pub fn instantiate(parsed: &ParsedSpine) -> Result<LoadedSpine, LoaderError> {
     }
     let mut progs = Vec::with_capacity(2);
     for (prog, insns) in parsed.programs.iter().zip(streams.iter()) {
-        progs.push(load_program(&prog.name, insns)?);
+        progs.push(load_program(&prog.name, insns, token)?);
     }
     let mut take = |name: &str| -> Result<OwnedFd, LoaderError> {
         let pos =
@@ -135,15 +112,11 @@ pub fn instantiate(parsed: &ParsedSpine) -> Result<LoadedSpine, LoaderError> {
     })
 }
 
-fn prog_name16(name: &str) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    let bytes = name.as_bytes();
-    let len = bytes.len().min(15);
-    out[..len].copy_from_slice(&bytes[..len]);
-    out
-}
-
-fn load_program(name: &str, insns: &[BpfInsn]) -> Result<OwnedFd, LoaderError> {
+fn load_program(
+    name: &str,
+    insns: &[BpfInsn],
+    token: Option<RawFd>,
+) -> Result<OwnedFd, LoaderError> {
     if insns.is_empty() {
         return Err(LoaderError::BadObject {
             reason: format!("program '{name}' has no insns"),
@@ -151,28 +124,7 @@ fn load_program(name: &str, insns: &[BpfInsn]) -> Result<OwnedFd, LoaderError> {
     }
     let bytes = insns_to_bytes(insns);
     let mut log = vec![0u8; LOG_CAP];
-    let mut attr = ProgLoadAttr {
-        prog_type: BPF_PROG_TYPE_KPROBE,
-        insn_cnt: insns.len() as u32,
-        insns: bytes.as_ptr() as u64,
-        license: LICENSE.as_ptr() as u64,
-        log_level: LOG_LEVEL,
-        log_size: LOG_CAP as u32,
-        log_buf: log.as_mut_ptr() as u64,
-        kern_version: 0,
-        prog_flags: 0,
-        prog_name: prog_name16(name),
-        prog_ifindex: 0,
-        expected_attach_type: BPF_TRACE_UPROBE_MULTI,
-    };
-    // SAFETY: attr + pointees (insns, license, log) outlive the syscall.
-    let ret = unsafe {
-        bpf(
-            BPF_PROG_LOAD,
-            (&raw mut attr).cast::<c_void>(),
-            size_of::<ProgLoadAttr>() as u32,
-        )
-    };
+    let ret = prog_load_raw(name, &bytes, insns.len() as u32, &mut log, token);
     match fd_or_errno(ret) {
         Ok(fd) => Ok(fd),
         Err(errno) => Err(LoaderError::LoadFailed {
