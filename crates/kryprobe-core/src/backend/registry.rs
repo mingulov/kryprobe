@@ -58,6 +58,7 @@ impl Display for DuplicateBackend {
             BackendId::P11 => "p11",
             BackendId::OpenSsl => "openssl",
             BackendId::KCrypto => "kcrypto",
+            BackendId::Synthetic => "synthetic",
         };
         write!(f, "duplicate backend: {name}")
     }

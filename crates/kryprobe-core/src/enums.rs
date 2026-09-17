@@ -4,34 +4,11 @@
 //! Wire spellings are exactly the `schemas/event-v0.schema.json` enum
 //! strings. `EvidencePhase::Succeeded` is Rust-only and never serializes.
 
-use kryprobe_abi::{BACKEND_KCRYPTO, BACKEND_OPENSSL, BACKEND_P11};
 use serde::{Deserialize, Serialize};
 
-/// Backend producing an observation (CONTRACTS §2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum BackendId {
-    /// PKCS#11 backend (`p11` on the wire).
-    #[serde(rename = "p11")]
-    P11,
-    /// OpenSSL backend (`openssl` on the wire).
-    #[serde(rename = "openssl")]
-    OpenSsl,
-    /// Kernel-crypto backend (`kcrypto` on the wire).
-    #[serde(rename = "kcrypto")]
-    KCrypto,
-}
+mod backend_id;
 
-impl BackendId {
-    /// BPF wire discriminator from [`kryprobe_abi`].
-    #[must_use]
-    pub const fn wire_id(self) -> u16 {
-        match self {
-            Self::P11 => BACKEND_P11,
-            Self::OpenSsl => BACKEND_OPENSSL,
-            Self::KCrypto => BACKEND_KCRYPTO,
-        }
-    }
-}
+pub use backend_id::BackendId;
 
 /// Capture depth requested for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

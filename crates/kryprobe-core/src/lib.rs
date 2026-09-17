@@ -15,4 +15,5 @@ pub mod ids;
 pub mod object;
 pub mod plan;
 pub mod session;
+pub mod synthetic;
 pub mod target;
