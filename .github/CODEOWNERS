@@ -1,0 +1,21 @@
+# kryprobe product ownership. Paths relative to the product repo root.
+# Single owner until backend maintainers exist; every thin-spine shared
+# contract (manifests, ABI, schemas, decisions) has one writer.
+/Cargo.toml @mingulov
+/Cargo.lock @mingulov
+/rust-toolchain.toml @mingulov
+/mise.toml @mingulov
+/xtask/ @mingulov
+/crates/kryprobe-abi/ @mingulov
+/crates/kryprobe-core/ @mingulov
+/bpf/userspace/src/common/ @mingulov
+/schemas/ @mingulov
+/docs/decisions/ @mingulov
+
+# Backend ownership can expand when maintainers exist.
+/crates/kryprobe-backend-p11/ @mingulov
+/bpf/userspace/src/p11/ @mingulov
+/crates/kryprobe-backend-openssl/ @mingulov
+/bpf/userspace/src/openssl/ @mingulov
+/crates/kryprobe-backend-kcrypto/ @mingulov
+/bpf/kcrypto/ @mingulov
