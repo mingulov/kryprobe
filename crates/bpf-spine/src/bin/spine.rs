@@ -26,7 +26,7 @@ use kryprobe_abi::SpineEvent;
 const COUNT_ENTRIES: u32 = 64;
 /// `LOSS` slot: ringbuf reservation failures.
 const LOSS_RING: u32 = 0;
-/// `LOSS` slot: stale generation / bad index / TGID-guard drops.
+/// `LOSS` slot: disarmed / stale generation / bad index / TGID-guard drops.
 const LOSS_DROP: u32 = 1;
 /// `SpineEvent.flags` bit marking return-probe records.
 const FLAG_RETURN: u32 = 1;
@@ -61,6 +61,8 @@ fn bump(map: &PerCpuArray<u64>, idx: u32) -> u64 {
 
 fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
     if START.get(0).copied().unwrap_or(0) == 0 {
+        // Hit before arming: a real anomaly, accounted, never silent.
+        bump(&LOSS, LOSS_DROP);
         return 0;
     }
     // SAFETY: BPF helpers with the program ctx pointer.

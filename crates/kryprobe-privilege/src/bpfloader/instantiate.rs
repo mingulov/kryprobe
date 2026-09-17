@@ -183,14 +183,10 @@ fn load_program(name: &str, insns: &[BpfInsn]) -> Result<OwnedFd, LoaderError> {
     }
 }
 
-/// Verifier-log tail (up to the first NUL, last `LOG_TAIL` bytes).
+/// Verifier-log tail: bytes first (never panics on char boundaries).
 fn log_tail(log: &[u8]) -> String {
     let end = log.iter().position(|b| *b == 0).unwrap_or(log.len());
-    let text = String::from_utf8_lossy(&log[..end]);
-    let text = text.trim();
-    if text.len() > LOG_TAIL {
-        text[text.len() - LOG_TAIL..].to_owned()
-    } else {
-        text.to_owned()
-    }
+    let bytes = &log[..end];
+    let start = bytes.len().saturating_sub(LOG_TAIL);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_owned()
 }

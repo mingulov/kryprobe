@@ -96,8 +96,8 @@ impl DrainThread {
         // SAFETY: dup returned an open fd; the guard is its sole owner.
         let owned = unsafe { OwnedFd::from_raw_fd(dup) };
         let area = area::RingArea::map(&owned, max_entries)?;
-        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if epoll < 0 {
+        let raw_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if raw_epoll < 0 {
             return Err(DrainError::EpollFailed {
                 stage: "create".to_owned(),
                 errno: std::io::Error::last_os_error()
@@ -105,15 +105,22 @@ impl DrainThread {
                     .unwrap_or(libc::EIO),
             });
         }
+        // SAFETY: create returned an open fd; the guard is its sole owner.
+        let epoll = unsafe { OwnedFd::from_raw_fd(raw_epoll) };
         let mut event = libc::epoll_event {
             events: libc::EPOLLIN as u32,
             u64: 0,
         };
         // SAFETY: epoll fd + owned map fd are live; event is a valid pointer.
-        let ctl =
-            unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, owned.as_raw_fd(), &mut event) };
+        let ctl = unsafe {
+            libc::epoll_ctl(
+                epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                owned.as_raw_fd(),
+                &mut event,
+            )
+        };
         if ctl != 0 {
-            unsafe { libc::close(epoll) };
             return Err(DrainError::EpollFailed {
                 stage: "add".to_owned(),
                 errno: std::io::Error::last_os_error()
@@ -127,7 +134,7 @@ impl DrainThread {
         let worker = worker::Worker {
             _owned: owned,
             area,
-            epoll,
+            _epoll: epoll,
             tx,
             stop: stop.clone(),
             barrier: pending.clone(),
@@ -165,6 +172,8 @@ impl DrainThread {
 }
 
 impl Drop for DrainThread {
+    /// Backstop only: signals stop without joining, so counters are lost.
+    /// Prefer [`DrainThread::stop`], which joins and returns [`DrainStats`].
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
     }

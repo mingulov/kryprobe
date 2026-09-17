@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! xtask BPF lanes: `build --bpf` and `test bpf` (T7 split).
+
+use crate::channel_from_file;
+use crate::child::{run_child, run_child_in};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+/// Build the BPF spine object with the pinned nightly (T7b).
+pub(crate) fn build_bpf() -> i32 {
+    let root = match workspace_root() {
+        Some(root) => root,
+        None => {
+            eprintln!(
+                "xtask build --bpf: cannot find workspace root (no crates/bpf-spine above here)"
+            );
+            return 1;
+        }
+    };
+    let pin_file = root.join("crates/bpf-spine/rust-toolchain.toml");
+    let channel = match channel_from_file(&pin_file) {
+        Some(channel) => channel,
+        None => {
+            eprintln!(
+                "xtask build --bpf: cannot read pinned channel from {}",
+                pin_file.display()
+            );
+            return 1;
+        }
+    };
+    if !toolchain_present(&channel) {
+        eprintln!("xtask build --bpf: BPF toolchain '{channel}' is not installed");
+        eprintln!(
+            "install it with: rustup toolchain install {channel} -c rust-src --profile minimal"
+        );
+        return 1;
+    }
+    if Command::new("bpf-linker")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("xtask build --bpf: `bpf-linker` not found on PATH");
+        eprintln!("install it with: cargo install bpf-linker");
+        return 1;
+    }
+    let code = run_child_in(
+        &root.join("crates/bpf-spine"),
+        "rustup",
+        &[
+            "run",
+            channel.as_str(),
+            "cargo",
+            "build",
+            "--release",
+            "--bin",
+            "spine",
+        ],
+    );
+    if code != 0 {
+        return code;
+    }
+    let built = root.join("crates/bpf-spine/target/bpfel-unknown-none/release/spine");
+    let dest_dir = root.join("target/kryprobe-bpf");
+    let dest = dest_dir.join("spine.bpf.o");
+    if let Err(err) = fs::create_dir_all(&dest_dir) {
+        eprintln!(
+            "xtask build --bpf: cannot create {}: {err}",
+            dest_dir.display()
+        );
+        return 1;
+    }
+    if let Err(err) = fs::copy(&built, &dest) {
+        eprintln!(
+            "xtask build --bpf: cannot copy {} to {}: {err}",
+            built.display(),
+            dest.display()
+        );
+        return 1;
+    }
+    println!("+ copied {} to {}", built.display(), dest.display());
+    0
+}
+
+/// BPF lane: object (incremental) + fixture bin, then the pipeline tests.
+///
+/// Unprivileged runs pass through the loader's honest Denied path;
+/// privileged runs execute the full attach/drain/loss roundtrip.
+pub(crate) fn test_bpf() -> i32 {
+    let code = build_bpf();
+    if code != 0 {
+        return code;
+    }
+    let code = run_child(
+        "cargo",
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "kryprobe-privilege",
+            "--bin",
+            "spine_fixture",
+        ],
+    );
+    if code != 0 {
+        return code;
+    }
+    run_child(
+        "cargo",
+        &[
+            "test",
+            "--locked",
+            "-p",
+            "kryprobe-privilege",
+            "--test",
+            "bpf_pipeline",
+            "--",
+            "--include-ignored",
+        ],
+    )
+}
+
+/// True when `rustup run <channel> rustc --version` succeeds.
+fn toolchain_present(channel: &str) -> bool {
+    Command::new("rustup")
+        .args(["run", channel, "rustc", "--version"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Walk up to the directory containing `crates/bpf-spine/Cargo.toml`.
+fn workspace_root() -> Option<PathBuf> {
+    let mut dir = env::current_dir().ok()?;
+    loop {
+        if dir.join("crates/bpf-spine/Cargo.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}

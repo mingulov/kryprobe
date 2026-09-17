@@ -13,7 +13,7 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 pub(crate) struct Worker {
     pub(crate) _owned: OwnedFd,
     pub(crate) area: RingArea,
-    pub(crate) epoll: i32,
+    pub(crate) _epoll: OwnedFd,
     pub(crate) tx: SyncSender<DrainEvent>,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) barrier: Arc<AtomicU64>,
@@ -29,7 +29,14 @@ impl Worker {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
         'run: while !self.stop.load(Ordering::Acquire) {
             // SAFETY: epoll fd live; events buffer valid for one entry.
-            unsafe { libc::epoll_wait(self.epoll, events.as_mut_ptr(), 1, self.timeout_ms) };
+            unsafe {
+                libc::epoll_wait(
+                    self._epoll.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    1,
+                    self.timeout_ms,
+                )
+            };
             if self.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -57,7 +64,6 @@ impl Worker {
                 }
             }
         }
-        unsafe { libc::close(self.epoll) };
         stats
     }
 }

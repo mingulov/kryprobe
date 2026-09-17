@@ -11,11 +11,11 @@ use kryprobe_core::plan::TargetScope;
 use kryprobe_core::{
     DrainConfig, GenerationGuard, LinkGroup, LossLedger, ProgramId, ReconcileVerdict,
 };
-use kryprobe_privilege::attach::attach_group;
+use kryprobe_privilege::attach::{AttachError, attach_group};
 use kryprobe_privilege::bpfloader::{LoaderError, load_spine_object};
 use kryprobe_privilege::drain::{DrainEvent, DrainThread};
 use kryprobe_privilege::elfread::goblin_parser;
-use kryprobe_privilege::mapops::{map_lookup_percpu_sum, map_update};
+use kryprobe_privilege::mapops::{MapOpsError, map_lookup_percpu_sum, map_update};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -66,6 +66,12 @@ fn await_line(rx: &std::sync::mpsc::Receiver<String>, what: &str, timeout: Durat
         .unwrap_or_else(|_| panic!("timed out waiting for fixture {what}"))
 }
 
+/// Best-effort child cleanup on honest-skip paths.
+fn kill_quietly(child: &mut Child) {
+    child.kill().ok();
+    child.wait().ok();
+}
+
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -73,6 +79,23 @@ fn fixture_path() -> PathBuf {
         .join("target")
         .join("debug")
         .join("spine_fixture")
+}
+
+/// Honest-skip adapter: EPERM/EACCES at any privileged step passes the
+/// lane (partial caps); anything else fails loudly. Returns `None` to skip.
+fn or_skip<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    denied: impl Fn(&E) -> bool,
+    stage: &str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) if denied(&err) => {
+            eprintln!("pipeline: {stage} honestly denied ({err}); skipping");
+            None
+        }
+        Err(err) => panic!("pipeline: {stage} failed dishonestly: {err}"),
+    }
 }
 
 /// Field-wise SpineEvent read (no alignment assumptions on copies).
@@ -144,11 +167,24 @@ fn privileged_roundtrip(loaded: &kryprobe_privilege::bpfloader::LoadedSpine) {
     );
     let pid = child.id();
     let generation = PlanGeneration::new(GENERATION);
-    map_update(&loaded.maps.config, 0, u64::from(GENERATION), "config/gen")
-        .expect("CONFIG[0] update must succeed");
-    map_update(&loaded.maps.config, 1, u64::from(pid), "config/tgid")
-        .expect("CONFIG[1] update must succeed");
-    map_update(&loaded.maps.start, 0, 1, "start/arm").expect("START arm must succeed");
+    let map_denied = |err: &MapOpsError| {
+        matches!(
+            err,
+            MapOpsError::UpdateFailed { errno, .. }
+                if *errno == libc::EPERM || *errno == libc::EACCES
+        )
+    };
+    let updates = [
+        (&loaded.maps.config, 0, u64::from(GENERATION), "config/gen"),
+        (&loaded.maps.config, 1, u64::from(pid), "config/tgid"),
+        (&loaded.maps.start, 0, 1, "start/arm"),
+    ];
+    for (map, key, value, stage) in updates {
+        if or_skip(map_update(map, key, value, stage), map_denied, stage).is_none() {
+            kill_quietly(&mut child);
+            return;
+        }
+    }
     let meta = std::fs::symlink_metadata(&fixture).unwrap();
     let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
     let group = |entry: bool| LinkGroup {
@@ -165,22 +201,41 @@ fn privileged_roundtrip(loaded: &kryprobe_privilege::bpfloader::LoadedSpine) {
         generation,
     };
     let guard = GenerationGuard { generation };
-    let _entry_link = attach_group(
+    let link_denied = |err: &AttachError| {
+        matches!(
+            err,
+            AttachError::LinkFailed { errno, .. }
+                if *errno == libc::EPERM || *errno == libc::EACCES
+        )
+    };
+    let entry = attach_group(
         &group(true),
         &guard,
         &loaded.progs.entry,
         &fixture,
         &[offset],
-    )
-    .expect("entry attach must succeed");
-    let _ret_link = attach_group(
+    );
+    let _entry_link = match or_skip(entry, link_denied, "entry attach") {
+        Some(link) => link,
+        None => {
+            kill_quietly(&mut child);
+            return;
+        }
+    };
+    let ret = attach_group(
         &group(false),
         &guard,
         &loaded.progs.ret,
         &fixture,
         &[offset],
-    )
-    .expect("return attach must succeed");
+    );
+    let _ret_link = match or_skip(ret, link_denied, "return attach") {
+        Some(link) => link,
+        None => {
+            kill_quietly(&mut child);
+            return;
+        }
+    };
     let config = DrainConfig {
         max_events_per_iter: 128,
         queue_depth: 1024,

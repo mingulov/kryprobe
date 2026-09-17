@@ -55,12 +55,12 @@ fn parse_finds_both_programs() {
 fn parse_resolves_calls_and_plans_map_fixups() {
     let bytes = object_bytes();
     let parsed = parse_spine_object(&bytes).expect("real object must parse");
-    // 8 map references across .text (START×1 CONFIG×2 COUNT×1 EVENTS×1
-    // LOSS×3), applied to each of the 2 program streams.
-    assert_eq!(parsed.map_relocs.len(), 16);
+    // 9 map references across .text (START×1 CONFIG×2 COUNT×1 EVENTS×1
+    // LOSS×4 incl. the disarmed-drop bump), applied to each program stream.
+    assert_eq!(parsed.map_relocs.len(), 18);
     for prog in 0..2 {
         let per_prog = parsed.map_relocs.iter().filter(|r| r.prog == prog).count();
-        assert_eq!(per_prog, 8, "program {prog} fixup count drifted");
+        assert_eq!(per_prog, 9, "program {prog} fixup count drifted");
     }
     for reloc in &parsed.map_relocs {
         assert!(parsed.maps.iter().any(|m| m.name == reloc.map));

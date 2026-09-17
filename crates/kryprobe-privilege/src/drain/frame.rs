@@ -64,6 +64,12 @@ pub fn consume_range(
         }
         if hdr & DISCARD_BIT == 0 {
             let start = off + HDR_SZ;
+            // Defense in depth: framing math bounds this, but a corrupt
+            // consumer position must stop the walk, never panic it.
+            if start + len as usize > data.len() {
+                busy = true;
+                break;
+            }
             records.push(data[start..start + len as usize].to_vec());
         }
         consumer += total;
