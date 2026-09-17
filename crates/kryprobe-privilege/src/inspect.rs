@@ -9,6 +9,7 @@
 //! the p11scope `process.rs` / osslscope `pin.rs` patterns, reimplemented
 //! here (no code copied).
 
+use crate::fd::OwnedFd;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 
@@ -127,8 +128,8 @@ fn cap_eff(status: &str) -> String {
 /// notes only and never fail the snapshot.
 pub fn inspect_pid(pid: u32) -> Result<TargetSnapshot, InspectError> {
     // Raw syscall: this libc exposes SYS_pidfd_open but no pidfd_open wrapper.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) } as i32;
-    if pidfd < 0 {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) } as i32;
+    if raw < 0 {
         let code = std::io::Error::last_os_error().raw_os_error();
         match code {
             Some(c) if c == libc::ESRCH || c == libc::ENOENT || c == libc::EINVAL => {
@@ -141,9 +142,9 @@ pub fn inspect_pid(pid: u32) -> Result<TargetSnapshot, InspectError> {
             }
         }
     }
-    unsafe {
-        libc::close(pidfd);
-    }
+    // SAFETY: pidfd_open returned an open fd; this guard is its sole owner.
+    // Held to end of scope so the pid cannot be recycled mid-snapshot.
+    let _pin = unsafe { OwnedFd::from_raw_fd(raw) };
 
     let stat_path = format!("/proc/{pid}/stat");
     let stat = read_capped(&stat_path, "stat")?;

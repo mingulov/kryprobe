@@ -25,6 +25,8 @@ impl MmapGuard {
         if len == 0 {
             return Err(anyhow!("empty file {}", path.display()));
         }
+        // SAFETY: len > 0, fd is an open readable file, offset 0 is valid;
+        // MAP_FAILED is checked below before the pointer escapes.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -48,12 +50,15 @@ impl MmapGuard {
 
 impl ElfBytes for MmapGuard {
     fn bytes(&self) -> &[u8] {
+        // SAFETY: ptr/len describe the live read-only mapping (unmapped only
+        // in Drop, which takes &mut self and so cannot alias this borrow).
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 }
 
 impl Drop for MmapGuard {
     fn drop(&mut self) {
+        // SAFETY: exactly one munmap of the mapping created in `open`.
         unsafe {
             libc::munmap(self.ptr, self.len);
         }
