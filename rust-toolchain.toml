@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[toolchain]
+channel = "1.98.0"

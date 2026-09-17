@@ -1,0 +1,736 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kryprobe:design:event:v0",
+  "title": "KryProbe proposed event envelope v0",
+  "description": "KryProbe proposed initial event envelope v0 for p11, openssl, and kcrypto. Design artifact, not implemented protocol. Structural validation never establishes evidence truth; see docs/CONTRACTS.md.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "kryprobe.event/v0"
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+      "maxLength": 96
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+      "maxLength": 96
+    },
+    "monotonic_ns": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 24
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "kind",
+    "session_id",
+    "record_id",
+    "monotonic_ns",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "kind": {
+          "const": "session_start"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "target_selector": {
+              "type": "string",
+              "enum": [
+                "pid",
+                "tree",
+                "cgroup",
+                "owned_run"
+              ]
+            },
+            "capture_mode": {
+              "type": "string",
+              "enum": [
+                "inventory",
+                "profile",
+                "trace"
+              ]
+            },
+            "requested_backends": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "p11",
+                  "openssl",
+                  "kcrypto"
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "contract_version": {
+              "const": "v0-proposed"
+            },
+            "qualification_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            }
+          },
+          "required": [
+            "target_selector",
+            "capture_mode",
+            "requested_backends",
+            "contract_version",
+            "qualification_id"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "implementation_catalog"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "implementation_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "backend": {
+              "type": "string",
+              "enum": [
+                "p11",
+                "openssl",
+                "kcrypto"
+              ]
+            },
+            "object_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "profile_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "safe_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 96
+            },
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "exact_object_callback",
+                "exact_object_symbol",
+                "selected_only",
+                "unknown"
+              ]
+            },
+            "provenance_record_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                "maxLength": 96
+              },
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "implementation_id",
+            "backend",
+            "object_id",
+            "profile_id",
+            "safe_name",
+            "resolution",
+            "provenance_record_ids"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "operation_observation"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "observation_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "target_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                  "maxLength": 96
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "implementation_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                  "maxLength": 96
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "backend": {
+              "type": "string",
+              "enum": [
+                "p11",
+                "openssl",
+                "kcrypto"
+              ]
+            },
+            "boundary": {
+              "type": "string",
+              "enum": [
+                "api",
+                "provider_callback",
+                "module_callback",
+                "kernel_submission",
+                "kernel_completion",
+                "transport"
+              ]
+            },
+            "phase": {
+              "type": "string",
+              "enum": [
+                "discovered",
+                "selected",
+                "entered",
+                "returned",
+                "completed"
+              ]
+            },
+            "call_kind": {
+              "type": "string",
+              "enum": [
+                "operation",
+                "initialization",
+                "size_query",
+                "update",
+                "finalization",
+                "unknown"
+              ]
+            },
+            "operation_class": {
+              "type": "string",
+              "enum": [
+                "sign",
+                "verify",
+                "encrypt",
+                "decrypt",
+                "digest",
+                "mac",
+                "kdf",
+                "key_agreement",
+                "kem_encapsulate",
+                "kem_decapsulate",
+                "random",
+                "key_management",
+                "unknown"
+              ]
+            },
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "success",
+                "failure",
+                "pending",
+                "unknown",
+                "not_applicable"
+              ]
+            },
+            "native_namespace": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            },
+            "native_operation": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 96
+            },
+            "native_result": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 96
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "algorithm": {
+              "type": "object",
+              "properties": {
+                "safe_native_name": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 96
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "canonical_id": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 96
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "resolution": {
+                  "type": "string",
+                  "enum": [
+                    "exact",
+                    "family_only",
+                    "candidate_set",
+                    "unknown"
+                  ]
+                }
+              },
+              "required": [
+                "safe_native_name",
+                "canonical_id",
+                "resolution"
+              ],
+              "additionalProperties": false
+            },
+            "duration_ns": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$",
+                  "maxLength": 24
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "observation_id",
+            "target_id",
+            "implementation_id",
+            "backend",
+            "boundary",
+            "phase",
+            "call_kind",
+            "operation_class",
+            "outcome",
+            "native_namespace",
+            "native_operation",
+            "native_result",
+            "algorithm",
+            "duration_ns"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "coverage_gap"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "target_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                  "maxLength": 96
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "backend": {
+              "type": "string",
+              "enum": [
+                "p11",
+                "openssl",
+                "kcrypto"
+              ]
+            },
+            "dimension": {
+              "type": "string",
+              "enum": [
+                "target_enumeration",
+                "executable_discovery",
+                "attachment",
+                "semantic_resolution",
+                "attribution",
+                "aggregate_counts",
+                "event_transport",
+                "correlation",
+                "observation_continuity"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "pre_attach_interval",
+                "target_enumeration_exhausted",
+                "unreadable_target",
+                "mapping_unstable",
+                "loader_state_unknown",
+                "object_identity_ambiguous",
+                "unsupported_build",
+                "unsupported_abi",
+                "attachment_refused",
+                "callback_discovery_window",
+                "event_transport_loss",
+                "counter_map_exhausted",
+                "correlation_tainted",
+                "observer_interrupted",
+                "budget_exhausted",
+                "missing_final_barrier"
+              ]
+            },
+            "begin_ns": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 24
+            },
+            "end_ns": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$",
+                  "maxLength": 24
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "impact": {
+              "type": "string",
+              "enum": [
+                "partial",
+                "unsupported",
+                "refused",
+                "unknown"
+              ]
+            },
+            "omitted_count": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(0|[1-9][0-9]*)$",
+                  "maxLength": 24
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "target_id",
+            "backend",
+            "dimension",
+            "reason",
+            "begin_ns",
+            "end_ns",
+            "impact",
+            "omitted_count"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "aggregate_snapshot"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "target_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                  "maxLength": 96
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "backend": {
+              "type": "string",
+              "enum": [
+                "p11",
+                "openssl",
+                "kcrypto"
+              ]
+            },
+            "implementation_id": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                  "maxLength": 96
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "api_calls",
+                "callback_entries",
+                "size_queries",
+                "operation_attempts",
+                "successful_operations",
+                "logical_operations"
+              ]
+            },
+            "count": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 24
+            },
+            "count_integrity": {
+              "type": "string",
+              "enum": [
+                "qualified",
+                "lower_bound",
+                "estimated",
+                "unknown"
+              ]
+            },
+            "begin_ns": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 24
+            },
+            "end_ns": {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "maxLength": 24
+            },
+            "final": {
+              "type": "boolean"
+            },
+            "barrier_status": {
+              "type": "string",
+              "enum": [
+                "validated",
+                "not_final",
+                "missing"
+              ]
+            },
+            "event_integrity": {
+              "type": "string",
+              "enum": [
+                "qualified",
+                "partial",
+                "not_requested",
+                "unknown"
+              ]
+            }
+          },
+          "required": [
+            "target_id",
+            "backend",
+            "implementation_id",
+            "unit",
+            "count",
+            "count_integrity",
+            "begin_ns",
+            "end_ns",
+            "final",
+            "barrier_status",
+            "event_integrity"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "relationship"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "parent_observation_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "child_observation_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "relation": {
+              "type": "string",
+              "enum": [
+                "nested_within",
+                "delegated_to",
+                "implements",
+                "setup_for",
+                "same_context"
+              ]
+            },
+            "anchor": {
+              "type": "string",
+              "enum": [
+                "verified_synchronous_nesting",
+                "qualified_context_lifetime"
+              ]
+            },
+            "rule_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+              "maxLength": 96
+            },
+            "integrity": {
+              "type": "string",
+              "enum": [
+                "qualified",
+                "partial",
+                "unknown"
+              ]
+            }
+          },
+          "required": [
+            "parent_observation_id",
+            "child_observation_id",
+            "relation",
+            "anchor",
+            "rule_id",
+            "integrity"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "session_end"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "OBSERVED",
+                "PARTIAL",
+                "UNSUPPORTED",
+                "REFUSED",
+                "FAILED"
+              ]
+            },
+            "final_barrier": {
+              "type": "string",
+              "enum": [
+                "validated",
+                "missing"
+              ]
+            },
+            "unresolved_gap_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+                "maxLength": 96
+              },
+              "uniqueItems": true
+            },
+            "child_exit_code": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "child_signal": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 128
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "verdict",
+            "final_barrier",
+            "unresolved_gap_ids",
+            "child_exit_code",
+            "child_signal"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
