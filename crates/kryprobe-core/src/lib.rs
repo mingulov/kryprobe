@@ -14,6 +14,9 @@ pub mod evidence;
 pub mod ids;
 pub mod object;
 pub mod plan;
+pub mod program;
+
+pub use program::ProgramId;
 pub mod session;
 pub mod synthetic;
 pub mod target;
