@@ -10,6 +10,24 @@ fn own_binary() -> PathBuf {
     std::env::current_exe().unwrap()
 }
 
+#[unsafe(no_mangle)]
+#[inline(never)]
+fn oracle_static_probe() -> u64 {
+    0x5ca1_ab1e
+}
+
+#[test]
+fn static_symbol_resolves_in_own_binary() {
+    assert_eq!(oracle_static_probe(), 0x5ca1_ab1e);
+    let me = own_binary();
+    let bytes = std::fs::read(&me).unwrap();
+    let first = goblin_parser::static_symbol_file_offset(&bytes, "oracle_static_probe").unwrap();
+    let second = goblin_parser::static_symbol_file_offset(&bytes, "oracle_static_probe").unwrap();
+    assert_eq!(first, second, "static resolution must be stable");
+    let off = first.expect("own static symbol must resolve");
+    assert!(off > 0 && off < bytes.len() as u64);
+}
+
 fn system_libc() -> PathBuf {
     LIBC_CANDIDATES
         .iter()

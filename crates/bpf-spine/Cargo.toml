@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[package]
+name = "bpf-spine"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[workspace]
+
+[[bin]]
+name = "spine"
+path = "src/bin/spine.rs"
+
+[dependencies]
+aya-ebpf = "=0.2.1"
+kryprobe-abi = { path = "../kryprobe-abi" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -4,6 +4,8 @@
 //! Follows CONTRACTS §1–§2, §4, §14. Wire spellings come from
 //! `schemas/event-v0.schema.json`, which is authoritative over examples.
 
+pub mod attach;
+pub use attach::{DrainConfig, GenerationGuard, LinkGroup, LossLedger, ReconcileVerdict};
 pub mod authority;
 pub mod backend;
 pub mod budget;

@@ -4,8 +4,10 @@
 //! T6a seeds the enum with the self-probe used by the thin spine.
 //! T7 extends it with further program kinds.
 
+use serde::{Deserialize, Serialize};
+
 /// Identifies a privileged program attachable by kryprobe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProgramId {
     /// uprobe-multi self-probe used by the thin-spine spike (T6b).
     UprobeMultiSelfProbe,

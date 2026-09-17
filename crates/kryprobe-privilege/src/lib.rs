@@ -8,10 +8,14 @@
 //! Program identities live in [`kryprobe_core::ProgramId`]
 //! (re-exported here for convenience).
 
+pub mod attach;
+pub mod bpfloader;
+pub mod drain;
 pub mod elfread;
 pub mod fd;
 pub mod inspect;
 pub mod local;
+pub mod mapops;
 pub mod probe;
 pub mod refused;
 

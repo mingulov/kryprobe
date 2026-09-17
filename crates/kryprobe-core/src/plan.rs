@@ -22,7 +22,7 @@ pub struct OffsetProbe {
 }
 
 /// Target population a plan is allowed to attach to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetScope {
     /// A run owned (spawned) by KryProbe itself.
     OwnedRun,

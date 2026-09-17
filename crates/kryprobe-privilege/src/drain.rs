@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Ringbuf drain: mmap/epoll shell over the pure frame walk (T7c2).
+//!
+//! Layout (libbpf protocol): consumer page `mmap(fd, 0)` holds the u64
+//! consumer position at offset 0; `mmap(fd, page)` of
+//! `page + 2 * max_entries` holds the u64 producer position at offset 0
+//! and the double-mapped data area after one page. Each iteration takes
+//! a volatile snapshot of the data area (the kernel mutates it
+//! concurrently; 512 KiB per wakeup is fine for the spine) and runs the
+//! pure [`frame`] walk over the copy.
+//!
+//! Alignment: ring offsets advance in multiples of 8 by construction
+//! (see `frame` tests); record bytes are copied out and parsed
+//! field-wise, so no `split_header` alignment precondition applies here.
+
+mod area;
+pub mod frame;
+mod worker;
+
+use crate::fd::OwnedFd;
+use kryprobe_core::DrainConfig;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
+
+/// Drained stream item: record bytes or an injected barrier.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DrainEvent {
+    Record(Vec<u8>),
+    Barrier(u64),
+}
+
+/// End-of-drain counters for the loss ledger.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrainStats {
+    pub records: u64,
+    pub queue_drops: u64,
+}
+
+/// Drain failure: config, mapping, or epoll setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainError {
+    ConfigInvalid { reason: String },
+    MmapFailed { stage: String, errno: i32 },
+    EpollFailed { stage: String, errno: i32 },
+}
+
+impl std::fmt::Display for DrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConfigInvalid { reason } => write!(f, "invalid drain config: {reason}"),
+            Self::MmapFailed { stage, errno } => {
+                write!(f, "ringbuf mmap failed at {stage}: errno {errno}")
+            }
+            Self::EpollFailed { stage, errno } => {
+                write!(f, "epoll setup failed at {stage}: errno {errno}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DrainError {}
+
+/// Ringbuf drain thread: epoll-paced, budgeted, bounded queue.
+pub struct DrainThread {
+    join: Option<std::thread::JoinHandle<DrainStats>>,
+    rx: Receiver<DrainEvent>,
+    stop: Arc<AtomicBool>,
+    barrier: Arc<AtomicU64>,
+}
+
+impl DrainThread {
+    /// Spawn a drain over `map_fd` (dup'd). `max_entries` must be a power of two.
+    pub fn spawn(
+        map_fd: &OwnedFd,
+        max_entries: u32,
+        config: &DrainConfig,
+    ) -> Result<Self, DrainError> {
+        config.validate().map_err(|err| DrainError::ConfigInvalid {
+            reason: err.to_string(),
+        })?;
+        if !max_entries.is_power_of_two() {
+            return Err(DrainError::ConfigInvalid {
+                reason: format!("max_entries {max_entries} is not a power of two"),
+            });
+        }
+        let dup = unsafe { libc::dup(map_fd.as_raw_fd()) };
+        if dup < 0 {
+            return Err(DrainError::MmapFailed {
+                stage: "dup".to_owned(),
+                errno: std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            });
+        }
+        // SAFETY: dup returned an open fd; the guard is its sole owner.
+        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+        let area = area::RingArea::map(&owned, max_entries)?;
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll < 0 {
+            return Err(DrainError::EpollFailed {
+                stage: "create".to_owned(),
+                errno: std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            });
+        }
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 0,
+        };
+        // SAFETY: epoll fd + owned map fd are live; event is a valid pointer.
+        let ctl =
+            unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, owned.as_raw_fd(), &mut event) };
+        if ctl != 0 {
+            unsafe { libc::close(epoll) };
+            return Err(DrainError::EpollFailed {
+                stage: "add".to_owned(),
+                errno: std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            });
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(config.queue_depth as usize);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pending: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let worker = worker::Worker {
+            _owned: owned,
+            area,
+            epoll,
+            tx,
+            stop: stop.clone(),
+            barrier: pending.clone(),
+            budget: config.max_events_per_iter as usize,
+            timeout_ms: config.poll_timeout_ms as i32,
+            mask: u64::from(max_entries) - 1,
+        };
+        let join = std::thread::spawn(move || worker.run());
+        Ok(Self {
+            join: Some(join),
+            rx,
+            stop,
+            barrier: pending,
+        })
+    }
+
+    /// Borrow the event receiver.
+    pub fn receiver(&self) -> &Receiver<DrainEvent> {
+        &self.rx
+    }
+
+    /// Queue a userspace barrier marker into the event stream.
+    pub fn inject_barrier(&self, id: u64) {
+        self.barrier.store(id.max(1), Ordering::Release);
+    }
+
+    /// Signal stop, join the thread, return its counters.
+    pub fn stop(mut self) -> DrainStats {
+        self.stop.store(true, Ordering::Release);
+        match self.join.take() {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => DrainStats::default(),
+        }
+    }
+}
+
+impl Drop for DrainThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
