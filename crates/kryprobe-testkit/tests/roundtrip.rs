@@ -41,6 +41,16 @@ fn record(kind: &str, record_id: &str, mono: &str, payload: &str) -> String {
     )
 }
 
+/// A `session_end` record with a caller-supplied raw JSON `session_id` value
+/// (e.g. `"\"Test:session\""` or `"42"`); everything else is valid.
+fn record_with_session_id(session_id_json: &str) -> String {
+    format!(
+        "{{\"schema\":\"kryprobe.event/v0\",\"kind\":\"session_end\",\
+         \"session_id\":{session_id_json},\"record_id\":\"test:r\",\
+         \"monotonic_ns\":\"7\",\"payload\":{{\"verdict\":\"OBSERVED\"}}}}"
+    )
+}
+
 #[test]
 fn manual_clock_starts_at_given_value_and_advances_monotonically() {
     let mut clock = ManualClock::new(1_000_000);
@@ -81,10 +91,45 @@ fn golden_update_rewrites_and_still_fails() {
     unsafe {
         std::env::remove_var("KRYPROBE_UPDATE_GOLDENS");
     }
-    assert!(result.is_err(), "update mode must still fail the test");
+    let err = result.expect_err("update mode must still fail the test");
+    let message = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|text| (*text).to_string()))
+        .expect("panic payload is a string");
+    assert!(
+        message.contains("mismatch"),
+        "update panic must name the mismatch, got: {message}"
+    );
     assert_eq!(
         std::fs::read(&path).expect("read rewritten golden"),
         b"fresh-bytes"
+    );
+}
+
+#[test]
+fn golden_mismatch_without_update_mode_leaves_file_untouched() {
+    let path = scratch_dir("no-update").join("golden.bin");
+    std::fs::write(&path, b"stale-bytes").expect("write golden");
+    let _guard = lock_env();
+    // Force update mode off even if the outer environment enables it, so
+    // this negative control always exercises the no-rewrite path.
+    let saved = std::env::var("KRYPROBE_UPDATE_GOLDENS").ok();
+    // SAFETY: `ENV_LOCK` is held; see the update test.
+    unsafe {
+        std::env::remove_var("KRYPROBE_UPDATE_GOLDENS");
+    }
+    let result = std::panic::catch_unwind(|| assert_golden(&path, b"fresh-bytes"));
+    // SAFETY: same lock still held; the saved value (if any) is restored.
+    unsafe {
+        if let Some(value) = saved {
+            std::env::set_var("KRYPROBE_UPDATE_GOLDENS", value);
+        }
+    }
+    assert!(result.is_err(), "mismatch must still fail the test");
+    assert_eq!(
+        std::fs::read(&path).expect("read untouched golden"),
+        b"stale-bytes"
     );
 }
 
@@ -151,6 +196,91 @@ fn check_stream_reports_bad_shape() {
             value: "07".to_string(),
         }]
     );
+}
+
+#[test]
+fn check_stream_rejects_prefixed_id_with_uppercase_head() {
+    let text = record_with_session_id("\"Test:session\"");
+    assert_eq!(
+        check_stream(&text, SYNTH_KINDS),
+        vec![StreamFinding::BadShape {
+            line: 1,
+            key: "session_id".to_string(),
+            value: "Test:session".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn check_stream_rejects_prefixed_id_with_digit_head() {
+    let text = record_with_session_id("\"9test:session\"");
+    assert_eq!(
+        check_stream(&text, SYNTH_KINDS),
+        vec![StreamFinding::BadShape {
+            line: 1,
+            key: "session_id".to_string(),
+            value: "9test:session".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn check_stream_rejects_prefixed_id_without_colon() {
+    let text = record_with_session_id("\"testsession\"");
+    assert_eq!(
+        check_stream(&text, SYNTH_KINDS),
+        vec![StreamFinding::BadShape {
+            line: 1,
+            key: "session_id".to_string(),
+            value: "testsession".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn check_stream_rejects_prefixed_id_with_empty_tail() {
+    let text = record_with_session_id("\"test:\"");
+    assert_eq!(
+        check_stream(&text, SYNTH_KINDS),
+        vec![StreamFinding::BadShape {
+            line: 1,
+            key: "session_id".to_string(),
+            value: "test:".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn check_stream_rejects_non_string_session_id() {
+    let text = record_with_session_id("42");
+    assert_eq!(
+        check_stream(&text, SYNTH_KINDS),
+        vec![StreamFinding::BadShape {
+            line: 1,
+            key: "session_id".to_string(),
+            value: "42".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn check_stream_accepts_equal_monotonic_ns() {
+    let text = [
+        record(
+            "session_start",
+            "test:r1",
+            "100",
+            "{\"target_selector\":\"pid\",\"capture_mode\":\"trace\"}",
+        ),
+        record(
+            "session_end",
+            "test:r2",
+            "100",
+            "{\"verdict\":\"OBSERVED\"}",
+        ),
+    ]
+    .join("\n");
+    assert_eq!(check_stream(&text, SYNTH_KINDS), Vec::new());
 }
 
 #[test]
