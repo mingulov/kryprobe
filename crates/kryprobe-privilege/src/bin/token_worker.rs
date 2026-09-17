@@ -92,6 +92,7 @@ fn main() {
     match kryprobe_privilege::token::load_bytes_with_token(&bytes, &token) {
         Ok(_loaded) => {
             println!("TOKEN-LOAD-PASS");
+            println!("NOTE: token is not target confinement (Phase A scope-all)");
             std::process::exit(0);
         }
         Err(LoaderError::MapFailed { stage, errno }) => {
