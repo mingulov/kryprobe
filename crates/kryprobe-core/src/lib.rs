@@ -4,9 +4,13 @@
 //! Follows CONTRACTS §1–§2, §4, §14. Wire spellings come from
 //! `schemas/event-v0.schema.json`, which is authoritative over examples.
 
+pub mod authority;
+pub mod budget;
+pub mod capability;
 pub mod enums;
 pub mod error;
 pub mod ids;
 pub mod object;
 pub mod plan;
+pub mod session;
 pub mod target;
