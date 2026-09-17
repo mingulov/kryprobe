@@ -14,9 +14,11 @@ coverage. Keys, PINs, passwords, payload bytes, and arbitrary target
 memory are never retained. BPF backends never perform privileged
 operations directly; they produce plans consumed by authority code.
 
-Status: thin-spine milestone in progress. This tree currently holds the
-workspace bootstrap (contracts, runtime, CLI, and BPF spine land in
-later tasks). No backend code from other trees is imported here.
+Status: thin-spine milestone complete. This tree holds the frozen
+contracts and the executable skeleton (session/target/authority
+model, CLI, reporting, synthetic backend, BPF spine, token lane,
+bench receipts). No backend code from other trees is imported here;
+backend ports plug into the `Backend` trait without redesign.
 
 ## Backends
 
@@ -87,11 +89,12 @@ toolchain and prints the install command.
   automatically when missing. Crates use edition 2024.
 - Linux 6.12 or newer on x86-64. Capability probes are authoritative;
   kernel release alone never decides support.
-- BPF lane (spine object build, `selftest bpf`, token smoke): a
-  nightly toolchain newer than 1.98.0, `bpf-linker`, and `clang`.
-  Exact pins live in `docs/dependencies/pins.md` once the BPF lane
-  lands. Privileged rows need `cap_bpf`/`cap_perfmon` or root; without
-  them the probes report typed `Denied` rows instead of failing.
+- BPF lane (spine object build, `selftest bpf`, token smoke): the
+  pinned nightly toolchain and `bpf-linker` (no clang needed: there
+  are no C BPF sources). Exact pins live in
+  `docs/dependencies/pins.md`. Privileged rows need
+  `cap_bpf`/`cap_perfmon` or root; without them the probes report
+  typed `Denied` rows instead of failing.
 - The spine object loads without kernel BTF. Kernel-crypto observation
   will need target BTF when that backend is implemented.
 

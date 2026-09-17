@@ -39,3 +39,29 @@ llvm-readelf -S target/kryprobe-bpf/spine.bpf.o   # expect uprobe.multi, uretpro
 ## Fork rule
 
 Not fired: raw loader path, no vendoring. No `third-party/` content.
+
+## Build quirks (T12 root-cause notes)
+
+- Dead builtins: rustc exports `memcpy`/`memmove`/`memset` as link
+  roots and bpf-linker has no GC, so uncalled builtins land in
+  `.text` and the kernel verifier rejects the program. `build --bpf`
+  strips unreachable `.text` functions after the link
+  (`xtask/src/bpf/strip.rs`, 1808 → 1200 bytes); the loader
+  re-checks reachability at parse time and fails closed naming the
+  dead function. `--disable-memory-builtins` does not help (it only
+  stops bpf-linker from *injecting* missing builtins, not from
+  keeping linker-pulled ones), and `LTO` is blocked by build-std's
+  `-C embed-bitcode=no`.
+- `spine.rs` writes the ring slot field-by-field through the entry
+  deref: any 28-byte zero chain (repeat-expr, loop, literal list)
+  fuses back into a `memset` call, which would reintroduce a real
+  builtin reference. Volatile stores keep the tail call-free.
+- bpf-linker `0.10.4` hung once (7+ min CPU spin on a <1s link, same
+  input linked fine on retry): suspected flake in the bundled-LLVM
+  fallback under load, not yet reproduced deterministically.
+  `build --bpf` has no hang workaround; retry the build if it stalls.
+- The host kernel answers `EOPNOTSUPP` to `BPF_TOKEN_CREATE` on every
+  bpffs instance tried (private delegated mount and system bpffs,
+  all fd modes, `unprivileged_bpf_disabled` 2 and 0): the token lane
+  honestly reports `Denied{token-create}` (errno 95) here. Full
+  `TOKEN-LOAD-PASS` needs a kernel that supports token creation.
