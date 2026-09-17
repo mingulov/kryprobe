@@ -96,6 +96,9 @@ pub struct ProbePlan {
 
 impl ProbePlan {
     /// Structural validation: non-empty probes and a usable scope.
+    ///
+    /// Descriptor/cookie validity is owned by backends at attach time;
+    /// this check only guards plan shape (CONTRACTS §4 requires no more).
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(!self.offsets.is_empty(), "plan has no offset probes");
         if let TargetScope::Cgroup { path } = &self.target_scope {

@@ -142,3 +142,24 @@ const fn rank(status: CoverageStatus) -> u8 {
         CoverageStatus::Unknown => 4,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rank_order_is_pinned() {
+        // Load-bearing order for `overall()`: higher rank = weaker.
+        // Unsupported (definitive, bounded) outranks Partial (lossy).
+        let ordered = [
+            CoverageStatus::CompleteForDeclaredBoundary,
+            CoverageStatus::Unsupported,
+            CoverageStatus::Partial,
+            CoverageStatus::NotRun,
+            CoverageStatus::Unknown,
+        ];
+        for (i, status) in ordered.iter().enumerate() {
+            assert_eq!(rank(*status), i as u8, "rank of {status:?} moved");
+        }
+    }
+}
