@@ -1,0 +1,16 @@
+session session:demo: 7 records
+phase discovered: no discovered-phase operations observed during 0..6000ns; detailed_events: complete
+phase selected: no selected-phase operations observed during 0..6000ns; detailed_events: complete
+phase entered: 1 observations
+phase returned: 1 observations
+phase completed: no completed-phase operations observed during 0..6000ns; detailed_events: complete
+coverage:
+  target_population: complete; no gaps recorded during 0..6000ns
+  object_discovery: complete; no gaps recorded during 0..6000ns
+  attachment: partial; 1 gap during 0..50ns
+  aggregate_counts: complete; no gaps recorded during 0..6000ns
+  detailed_events: complete; no gaps recorded during 0..6000ns
+  attribution: complete; no gaps recorded during 0..6000ns
+  correlation: complete; no gaps recorded during 0..6000ns
+  completion: complete; no gaps recorded during 0..6000ns
+integrity: 1 snapshot; counts qualified; events qualified

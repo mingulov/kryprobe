@@ -52,6 +52,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kryprobe-report"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "kryprobe-core",
+ "kryprobe-testkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kryprobe-testkit"
 version = "0.0.0"
 dependencies = [

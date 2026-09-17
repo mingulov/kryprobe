@@ -22,6 +22,8 @@ commands:
   build --bpf  build the BPF spine object into target/kryprobe-bpf/
   test host    cargo test --locked --workspace
   test bpf     build BPF object + fixture, run the BPF pipeline lane
+  verify generated
+               schema-freeze + fixture-validation report tests
 ";
 
 fn main() {
@@ -54,6 +56,9 @@ fn run(argv: &[String]) -> i32 {
     }
     if argv[1] == "test" && argv.len() == 3 && argv[2] == "bpf" {
         return bpf::test_bpf();
+    }
+    if argv[1] == "verify" && argv.len() == 3 && argv[2] == "generated" {
+        return run_child("cargo", &["test", "--locked", "-p", "kryprobe-report"]);
     }
     eprint!("{USAGE}");
     2
