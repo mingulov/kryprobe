@@ -13,7 +13,7 @@ pub use context::{
     BackendPlan, BackendSummary, ConfigureContext, DecodeContext, DetectContext, DetectedInstance,
     FinalizeContext, PlanContext, RawEvent,
 };
-pub use driver::{BackendDriver, DriverError, DriverReport, SkippedBackend};
+pub use driver::{BackendDriver, DriverError, DriverReport, SharedFeedError, SkippedBackend};
 pub use registry::{BackendRegistry, DuplicateBackend};
 
 use crate::enums::{BackendId, CaptureMode};

@@ -12,7 +12,7 @@ pub mod relationship;
 
 pub use catalog::{ImplementationRecord, ImplementationResolution};
 pub use coverage::{CoverageSummary, DimensionCounter, DimensionCoverage};
-pub use integrity::IntegritySummary;
+pub use integrity::{IntegritySummary, SharedLosses};
 pub use observation::{
     BackendPayload, CorrelationRef, IntegrityRef, NativeObservation, NativeResult, SafeTextId,
 };

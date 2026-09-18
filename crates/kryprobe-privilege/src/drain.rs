@@ -20,6 +20,7 @@ mod worker;
 
 use crate::fd::OwnedFd;
 use kryprobe_core::DrainConfig;
+use kryprobe_core::evidence::SharedLosses;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -36,6 +37,20 @@ pub enum DrainEvent {
 pub struct DrainStats {
     pub records: u64,
     pub queue_drops: u64,
+}
+
+impl DrainStats {
+    /// Combine both shared-layer observation points into one
+    /// [`SharedLosses`](kryprobe_core::evidence::SharedLosses) for the
+    /// driver report's shared feed: the drain's own queue drops plus the
+    /// BPF-side ringbuf reservation count (`LOSS[0]`, read by the caller
+    /// from the `LOSS` map and passed in). Records delivered are not a
+    /// loss and stay out. The caller feeds the result once via
+    /// `DriverReport::feed_shared_losses`, after the drain stops.
+    #[must_use]
+    pub fn shared_losses(&self, ring_reservation_failures: u64) -> SharedLosses {
+        SharedLosses::new(ring_reservation_failures, self.queue_drops)
+    }
 }
 
 /// Drain failure: config, mapping, or epoll setup.
@@ -175,5 +190,26 @@ impl Drop for DrainThread {
     /// Prefer [`DrainThread::stop`], which joins and returns [`DrainStats`].
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DrainStats;
+    use kryprobe_core::evidence::SharedLosses;
+
+    #[test]
+    fn drain_stats_combine_with_ring_into_shared_losses() {
+        let stats = DrainStats {
+            records: 10,
+            queue_drops: 5,
+        };
+        // Records delivered are not a loss; the ring count rides in from
+        // the BPF LOSS[0] reader alongside the drain's queue drops.
+        assert_eq!(stats.shared_losses(3), SharedLosses::new(3, 5));
+        assert_eq!(
+            DrainStats::default().shared_losses(0),
+            SharedLosses::default()
+        );
     }
 }

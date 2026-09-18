@@ -36,7 +36,8 @@ use crate::capability::RuntimeCapabilities;
 use crate::enums::{BackendId, CaptureMode, CoverageStatus};
 use crate::error::BackendError;
 use crate::evidence::{
-    CoverageSummary, DimensionCoverage, IntegritySummary, NativeObservation, ValidityInterval,
+    CoverageSummary, DimensionCoverage, IntegritySummary, NativeObservation, SharedLosses,
+    ValidityInterval,
 };
 use crate::ids::{IdIssuer, PlanGeneration, SessionId};
 use crate::plan::PlanBudget;
@@ -271,17 +272,68 @@ pub struct DriverReport {
     /// the host cannot satisfy), in skip order. Each receipt counts the
     /// routed-but-undelivered events for that backend.
     pub skipped: Vec<SkippedBackend>,
+    /// Shared-layer losses fed once via [`DriverReport::feed_shared_losses`];
+    /// `None` until fed. Private so the feed is the sole writer and the
+    /// exactly-once rule cannot be bypassed by direct assignment.
+    shared_losses: Option<SharedLosses>,
 }
 
 impl DriverReport {
-    /// Session integrity rollup: the summaries' backend-scoped counters
-    /// totaled through [`IntegritySummary::rollup`] (the one rollup site).
-    /// Skipped backends contribute no summary; their dropped events are
-    /// receipted separately in [`DriverReport::skipped`] (see
+    /// Feed the session's shared-layer losses: ring/queue/drain counters
+    /// observed in privilege land, outside any backend. Call once per
+    /// report, after the drain stops and before reading session totals;
+    /// a second feed refuses with [`SharedFeedError::DuplicateFeed`] and
+    /// the first feed stands (no double accrual).
+    ///
+    /// The shared feed accrues once outside the per-backend sums: it never
+    /// touches [`DriverReport::summaries`], and skip-drop receipts stay
+    /// disjoint in [`DriverReport::skipped`] (see
     /// [`DriverReport::skipped_drops`]).
+    pub fn feed_shared_losses(&mut self, shared: SharedLosses) -> Result<(), SharedFeedError> {
+        if self.shared_losses.is_some() {
+            return Err(SharedFeedError::DuplicateFeed);
+        }
+        self.shared_losses = Some(shared);
+        Ok(())
+    }
+
+    /// Shared-layer losses fed so far, or `None` before the feed.
+    #[must_use]
+    pub fn shared_losses(&self) -> Option<SharedLosses> {
+        self.shared_losses
+    }
+
+    /// Session integrity rollup: the summaries' backend-scoped counters
+    /// totaled through [`IntegritySummary::rollup`] (the one rollup site),
+    /// plus the shared-layer feed accrued once outside the per-backend
+    /// sums. Skipped backends contribute no summary; their dropped events
+    /// are receipted separately in [`DriverReport::skipped`] (see
+    /// [`DriverReport::skipped_drops`]).
+    ///
+    /// Lenient on a missing feed (unfed counts as zero) for
+    /// harness/back-compat paths; production reconciliation must use
+    /// [`DriverReport::session_integrity_checked`], which fails closed.
     #[must_use]
     pub fn session_integrity(&self) -> IntegritySummary {
-        IntegritySummary::rollup(self.summaries.iter().map(|summary| &summary.integrity))
+        let per_backend =
+            IntegritySummary::rollup(self.summaries.iter().map(|summary| &summary.integrity));
+        match self.shared_losses {
+            Some(shared) => per_backend.saturating_add(IntegritySummary::from(shared)),
+            None => per_backend,
+        }
+    }
+
+    /// Session integrity rollup that fails closed on a missing shared
+    /// feed: [`SharedFeedError::MissingFeed`] before
+    /// [`DriverReport::feed_shared_losses`] runs, else the same total as
+    /// [`DriverReport::session_integrity`]. Consumers reconciling exact
+    /// vs received + drops must use this, so an unfed session total can
+    /// never pass as complete.
+    pub fn session_integrity_checked(&self) -> Result<IntegritySummary, SharedFeedError> {
+        if self.shared_losses.is_none() {
+            return Err(SharedFeedError::MissingFeed);
+        }
+        Ok(self.session_integrity())
     }
 
     /// Total events dropped on skipped backends this pass: the
@@ -341,6 +393,30 @@ impl Display for DriverError {
 }
 
 impl std::error::Error for DriverError {}
+
+/// Shared-feed failure: the drain→driver handoff ran zero times or twice.
+/// Both refuse fail-closed: a missing feed never reads as a complete
+/// total through [`DriverReport::session_integrity_checked`], and a
+/// duplicate feed never accrues (the first feed stands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedFeedError {
+    /// No shared feed yet; the checked session total refuses.
+    MissingFeed,
+    /// A second [`DriverReport::feed_shared_losses`] call; refused, the
+    /// first feed stands unmodified.
+    DuplicateFeed,
+}
+
+impl Display for SharedFeedError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFeed => write!(f, "shared losses not fed"),
+            Self::DuplicateFeed => write!(f, "shared losses already fed"),
+        }
+    }
+}
+
+impl std::error::Error for SharedFeedError {}
 
 /// Static backend name for diagnostics (mirrors the registry's spelling).
 fn backend_name(id: BackendId) -> &'static str {

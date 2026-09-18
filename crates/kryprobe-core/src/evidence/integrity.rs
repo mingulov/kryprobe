@@ -44,54 +44,168 @@ pub struct IntegritySummary {
 }
 
 impl IntegritySummary {
+    /// Field-wise saturating sum: the one counter-addition primitive.
+    /// Saturates at `u64::MAX` per counter (counters never wrap, never
+    /// panic); [`IntegritySummary::rollup`] folds through this.
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            ring_reservation_failures: self
+                .ring_reservation_failures
+                .saturating_add(other.ring_reservation_failures),
+            user_queue_drops: self.user_queue_drops.saturating_add(other.user_queue_drops),
+            state_insert_failures: self
+                .state_insert_failures
+                .saturating_add(other.state_insert_failures),
+            state_evictions: self.state_evictions.saturating_add(other.state_evictions),
+            unmatched_entries: self
+                .unmatched_entries
+                .saturating_add(other.unmatched_entries),
+            unmatched_returns: self
+                .unmatched_returns
+                .saturating_add(other.unmatched_returns),
+            correlation_overflows: self
+                .correlation_overflows
+                .saturating_add(other.correlation_overflows),
+            unknown_generation_events: self
+                .unknown_generation_events
+                .saturating_add(other.unknown_generation_events),
+            budget_omissions: self.budget_omissions.saturating_add(other.budget_omissions),
+        }
+    }
+
     /// Session rollup over per-backend counters: field-wise saturating sum.
     ///
     /// This is the one rollup site: the driver and all future consumers
     /// total per-backend summaries through this, never through ad-hoc
     /// folds. Saturates at `u64::MAX` per counter (counters never wrap);
     /// the empty rollup is zero (no backends, no observed loss).
+    /// Shared-layer losses are not per-backend sums: they accrue once
+    /// outside this, via [`SharedLosses`] fed to the driver report.
     #[must_use]
     pub fn rollup<'a, I>(summaries: I) -> Self
     where
         I: IntoIterator<Item = &'a IntegritySummary>,
     {
-        let mut total = Self::default();
-        for summary in summaries {
-            total.ring_reservation_failures = total
-                .ring_reservation_failures
-                .saturating_add(summary.ring_reservation_failures);
-            total.user_queue_drops = total
-                .user_queue_drops
-                .saturating_add(summary.user_queue_drops);
-            total.state_insert_failures = total
-                .state_insert_failures
-                .saturating_add(summary.state_insert_failures);
-            total.state_evictions = total
-                .state_evictions
-                .saturating_add(summary.state_evictions);
-            total.unmatched_entries = total
-                .unmatched_entries
-                .saturating_add(summary.unmatched_entries);
-            total.unmatched_returns = total
-                .unmatched_returns
-                .saturating_add(summary.unmatched_returns);
-            total.correlation_overflows = total
-                .correlation_overflows
-                .saturating_add(summary.correlation_overflows);
-            total.unknown_generation_events = total
-                .unknown_generation_events
-                .saturating_add(summary.unknown_generation_events);
-            total.budget_omissions = total
-                .budget_omissions
-                .saturating_add(summary.budget_omissions);
+        summaries
+            .into_iter()
+            .fold(Self::default(), |total, summary| {
+                total.saturating_add(*summary)
+            })
+    }
+}
+
+/// Shared-layer losses: ring/queue/drain counters observed in privilege
+/// land, outside any backend (BPF `LOSS[0]` ringbuf reservation failures
+/// plus the drain thread's userspace queue drops).
+///
+/// Ownership: the sole producer is the drain→driver path (privilege
+/// `drain::DrainStats` supplies both observation points in one value);
+/// the sole consumer is
+/// [`DriverReport::feed_shared_losses`](crate::backend::DriverReport::feed_shared_losses),
+/// which accrues it once outside the per-backend sums. The restricted
+/// shape is deliberate: the shared transport can observe only these two
+/// counters, so backend-scoped counters are inexpressible here and can
+/// never double-count through the shared path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SharedLosses {
+    /// Ringbuf reservation failures (BPF `LOSS[0]`).
+    pub ring_reservation_failures: u64,
+    /// Userspace queue drops (drain thread).
+    pub user_queue_drops: u64,
+}
+
+impl SharedLosses {
+    /// Shared losses observed outside any backend: BPF-side ring
+    /// reservation failures plus drain-side queue drops.
+    #[must_use]
+    pub const fn new(ring_reservation_failures: u64, user_queue_drops: u64) -> Self {
+        Self {
+            ring_reservation_failures,
+            user_queue_drops,
         }
-        total
+    }
+}
+
+impl From<SharedLosses> for IntegritySummary {
+    /// Map the shared counters onto the session shape; every
+    /// backend-scoped counter stays zero (the shared layer observes no
+    /// backend state, matching, correlation, or budget events).
+    fn from(shared: SharedLosses) -> Self {
+        Self {
+            ring_reservation_failures: shared.ring_reservation_failures,
+            user_queue_drops: shared.user_queue_drops,
+            ..Self::default()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::IntegritySummary;
+    use super::{IntegritySummary, SharedLosses};
+
+    #[test]
+    fn saturating_add_combines_disjoint_counters_exactly() {
+        let first = IntegritySummary {
+            ring_reservation_failures: 3,
+            unmatched_entries: 1,
+            ..IntegritySummary::default()
+        };
+        let second = IntegritySummary {
+            user_queue_drops: 7,
+            budget_omissions: 2,
+            ..IntegritySummary::default()
+        };
+        assert_eq!(
+            first.saturating_add(second),
+            IntegritySummary {
+                ring_reservation_failures: 3,
+                user_queue_drops: 7,
+                unmatched_entries: 1,
+                budget_omissions: 2,
+                ..IntegritySummary::default()
+            }
+        );
+    }
+
+    #[test]
+    fn saturating_add_saturates_per_counter() {
+        let high = IntegritySummary {
+            ring_reservation_failures: u64::MAX,
+            user_queue_drops: 40,
+            ..IntegritySummary::default()
+        };
+        let low = IntegritySummary {
+            ring_reservation_failures: 1,
+            user_queue_drops: 2,
+            ..IntegritySummary::default()
+        };
+        assert_eq!(
+            high.saturating_add(low),
+            IntegritySummary {
+                ring_reservation_failures: u64::MAX,
+                user_queue_drops: 42,
+                ..IntegritySummary::default()
+            }
+        );
+    }
+
+    #[test]
+    fn shared_losses_map_to_integrity_only_shared_counters() {
+        let shared = SharedLosses::new(11, 5);
+        assert_eq!(
+            IntegritySummary::from(shared),
+            IntegritySummary {
+                ring_reservation_failures: 11,
+                user_queue_drops: 5,
+                ..IntegritySummary::default()
+            }
+        );
+        assert_eq!(
+            IntegritySummary::from(SharedLosses::default()),
+            IntegritySummary::default()
+        );
+    }
 
     #[test]
     fn rollup_sums_disjoint_counters_exactly_once() {
