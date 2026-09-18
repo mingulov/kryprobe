@@ -46,7 +46,6 @@ dependencies = [
 name = "kryprobe-core"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "kryprobe-abi",
  "kryprobe-testkit",
  "serde",

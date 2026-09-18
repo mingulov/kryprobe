@@ -72,6 +72,14 @@ fn ids_reject_bad_shapes() {
     assert!(SessionId::from_str("session: 1").is_err());
     assert!(TargetId::from_str("target:18446744073709551616").is_err());
     assert!(PlanGeneration::from_str("plan_generation:4294967296").is_err());
+    // Non-canonical spellings fail closed: Display never emits leading
+    // zeros, so the parser rejects them (`0` itself stays valid).
+    assert!(SessionId::from_str("session:007").is_err());
+    assert!(SessionId::from_str("session:00").is_err());
+    assert!(TargetId::from_str("target:010").is_err());
+    assert!(PlanGeneration::from_str("plan_generation:01").is_err());
+    assert_eq!(SessionId::from_str("session:0"), Ok(SessionId::new(0)));
+    assert_eq!(TargetId::from_str("target:0"), Ok(TargetId::new(0)));
     assert!(ProcessGeneration::from_str("process_generation:xyz").is_err());
     assert!(serde_json::from_str::<ObjectId>("\"nope\"").is_err());
     assert!(serde_json::from_str::<ObservationId>("42").is_err());

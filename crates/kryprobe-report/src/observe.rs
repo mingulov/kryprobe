@@ -116,6 +116,10 @@ fn namespace_of(result: NativeResult) -> &'static str {
 
 impl JsonlWriter {
     /// Appends `operation_observation`; `Synthetic`/`Succeeded` fail closed.
+    /// The result variant is cross-checked too: a test-only `Synthetic`
+    /// result on a real backend (exactly what the driver test double
+    /// emits) refuses rather than stamping `synthetic` into
+    /// `native_namespace`.
     pub fn observation(
         &mut self,
         obs: &NativeObservation,
@@ -124,6 +128,9 @@ impl JsonlWriter {
         let Some(backend) = obs.backend.as_wire_str() else {
             return Err(ReportError::SyntheticBackend);
         };
+        if matches!(obs.native_result, NativeResult::Synthetic { .. }) {
+            return Err(ReportError::SyntheticResult);
+        }
         let Some(phase) = obs.phase.as_wire_str() else {
             return Err(ReportError::SucceededPhase);
         };
@@ -162,7 +169,7 @@ impl JsonlWriter {
                 },
                 duration_ns,
             },
-        );
+        )?;
         Ok(())
     }
 }

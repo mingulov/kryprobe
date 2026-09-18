@@ -17,9 +17,10 @@ use crate::backend::{
 use crate::budget::BudgetKind;
 use crate::enums::{BackendId, CaptureMode};
 use crate::error::{BackendError, BudgetReason, UnsupportedReason};
-use crate::evidence::{IntegrityRef, NativeObservation, NativeResult};
+use crate::evidence::{IntegrityRef, IntegritySummary, NativeObservation, NativeResult};
 
 use crate::plan::{CapabilityRequirements, OffsetProbe};
+use kryprobe_abi::{ABI_VERSION, BACKEND_SYNTHETIC, EVENT_OBSERVATION, RawEventHeader};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Static descriptor: synthetic backend asks for no host capabilities.
@@ -60,6 +61,35 @@ impl SyntheticBackend {
         code: i32,
     ) -> [u8; 8] {
         codec::encode_event(phase, class, call, code)
+    }
+
+    /// One synthetic observation event for harness/driver runs: owned
+    /// header plus payload bytes (callers borrow both into a [`RawEvent`]).
+    /// `total_len` covers exactly header + payload per CONTRACTS §3.
+    #[must_use]
+    pub fn harness_event(
+        phase: crate::enums::EvidencePhase,
+        class: crate::enums::OperationClass,
+        call: crate::enums::CallKind,
+        code: i32,
+        monotonic_ns: u64,
+    ) -> (RawEventHeader, [u8; 8]) {
+        let header = RawEventHeader {
+            abi_version: ABI_VERSION,
+            backend_id: BACKEND_SYNTHETIC,
+            event_kind: EVENT_OBSERVATION,
+            flags: 0,
+            total_len: 64,
+            cpu: 0,
+            session_cookie: 0,
+            monotonic_ns,
+            tgid: 0,
+            tid: 0,
+            process_generation: 0,
+            plan_generation: 1,
+            reserved: 0,
+        };
+        (header, Self::encode_event(phase, class, call, code))
     }
 }
 
@@ -128,7 +158,13 @@ impl Backend for SyntheticBackend {
         let (phase, class, call, code) = codec::decode_event(&event)?;
         // Identity comes from the session issuer (unique across
         // backends); `decoded` stays a per-backend decode count.
-        let id = ctx.id_issuer.issue();
+        // Exhaustion refuses typed: no duplicate ID is ever minted.
+        let id = ctx.id_issuer.issue().map_err(|exhausted| {
+            BackendError::Exhausted(BudgetReason::with_detail(
+                "observation_ids",
+                &exhausted.to_string(),
+            ))
+        })?;
         self.decoded.fetch_add(1, Ordering::SeqCst);
         Ok(NativeObservation {
             id,
@@ -150,11 +186,16 @@ impl Backend for SyntheticBackend {
         })
     }
 
-    fn finalize(&self, ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError> {
+    fn finalize(&self, _ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError> {
+        // Backend-observed counters only: this decode path has no loss
+        // events (corrupt input aborts fail-closed), so the scoped
+        // integrity is zero. The session baseline in `ctx` is assessment
+        // context, never echoed (echoing would double-count under the
+        // session rollup with two backends).
         Ok(BackendSummary {
             backend: BackendId::Synthetic,
             observations: self.decoded.load(Ordering::SeqCst) as u64,
-            integrity: *ctx.integrity,
+            integrity: IntegritySummary::default(),
         })
     }
 }

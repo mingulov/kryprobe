@@ -12,4 +12,4 @@ pub mod jsonl;
 
 pub use clock::ManualClock;
 pub use golden::{UPDATE_ENV_VAR, assert_golden};
-pub use jsonl::{StreamFinding, check_stream};
+pub use jsonl::{StreamChecker, StreamFinding, check_stream};

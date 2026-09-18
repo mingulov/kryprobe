@@ -81,7 +81,9 @@ fn prog_name16(name: &str) -> [u8; 16] {
 }
 
 /// Raw `BPF_PROG_LOAD`; `log` receives the verifier log. Returns fd or -1.
-pub fn prog_load_raw(
+///
+/// Crate-private: reached only via the load facet's instantiate path.
+pub(crate) fn prog_load_raw(
     name: &str,
     insn_bytes: &[u8],
     insn_cnt: u32,

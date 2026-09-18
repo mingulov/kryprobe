@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `inspect`: one process snapshot, human or JSON.
 
-use kryprobe_privilege::{InspectError, TargetSnapshot, inspect_pid};
+use kryprobe_core::authority::TargetInspectionAuthority;
+use kryprobe_privilege::{InspectError, LocalPrivilegedAuthority, TargetSnapshot};
 use std::io::Write;
 
 fn human(snapshot: &TargetSnapshot) -> String {
@@ -35,7 +36,7 @@ fn json(snapshot: &TargetSnapshot) -> serde_json::Value {
 
 /// Runs `inspect`: 0 on success, 1 when gone, 3 when denied a stage.
 pub fn run(pid: u32, json: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
-    match inspect_pid(pid) {
+    match LocalPrivilegedAuthority.inspect(pid) {
         Ok(snapshot) => {
             if json {
                 let _ = writeln!(stdout, "{}", self::json(&snapshot));

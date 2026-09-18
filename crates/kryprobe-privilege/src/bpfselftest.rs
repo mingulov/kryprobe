@@ -8,7 +8,11 @@
 
 mod round;
 
-use crate::bpfloader::{LoaderError, load_spine_object};
+use crate::bpfloader::LoaderError;
+use crate::elfread::{ElfBytes, MmapGuard};
+use crate::local::LocalPrivilegedAuthority;
+use kryprobe_core::ProgramId;
+use kryprobe_core::authority::BpfLoadAuthority;
 use std::path::PathBuf;
 
 /// Whole-pipeline failure: denied (exit 3) vs hard errors.
@@ -67,6 +71,25 @@ impl std::error::Error for BpfSelftestError {}
 /// True for honest capability denials (exit 3); anything else is an error.
 pub(crate) fn is_denied(errno: i32) -> bool {
     errno == libc::EPERM || errno == libc::EACCES
+}
+
+/// Maps a loader failure to the pipeline error (X16): allowlist denials
+/// and EPERM/EACCES syscall failures are honest [`BpfSelftestError::Denied`]
+/// (exit 3); corrupt objects and other failures stay hard errors.
+/// Shared with the decoy harness (same exit contract).
+pub(crate) fn loader_outcome(err: LoaderError) -> BpfSelftestError {
+    match err {
+        LoaderError::NotAllowed { .. } => BpfSelftestError::Denied {
+            stage: "allowlist".to_owned(),
+            errno: libc::EACCES,
+        },
+        LoaderError::MapFailed { stage, errno } | LoaderError::LoadFailed { stage, errno, .. }
+            if is_denied(errno) =>
+        {
+            BpfSelftestError::Denied { stage, errno }
+        }
+        other => BpfSelftestError::Loader(other),
+    }
 }
 
 /// Spawns a line pump: stdout lines flow to a channel for deadline reads.
@@ -147,6 +170,8 @@ pub struct BpfSelftestOutcome {
     pub ring: u64,
     /// BPF-side guard drops (LOSS[1]).
     pub dropped: u64,
+    /// Wide-CONFIG refusals (LOSS[2]); always 0 on the narrow path.
+    pub truncated: u64,
     /// Userspace queue drops.
     pub queue_drops: u64,
     /// Fixture process exit code (`None` when killed by signal).
@@ -176,14 +201,15 @@ pub fn run_bpf_selftest(
             path: config.fixture.clone(),
         });
     }
-    let loaded = load_spine_object(&config.object).map_err(|err| match err {
-        LoaderError::MapFailed { stage, errno } | LoaderError::LoadFailed { stage, errno, .. }
-            if is_denied(errno) =>
-        {
-            BpfSelftestError::Denied { stage, errno }
-        }
-        other => BpfSelftestError::Loader(other),
+    let guard = MmapGuard::open(&config.object).map_err(|err| {
+        BpfSelftestError::Loader(LoaderError::Io {
+            stage: "open",
+            detail: format!("{}: {err:#}", config.object.display()),
+        })
     })?;
+    let loaded = LocalPrivilegedAuthority
+        .load_program(ProgramId::UprobeMultiSelfProbe, guard.bytes())
+        .map_err(loader_outcome)?;
     round::roundtrip(config, &loaded)
 }
 
@@ -227,5 +253,55 @@ mod tests {
                 "dirty reserved byte {off} must fail closed"
             );
         }
+    }
+
+    /// X16: forbidden-program vs corrupt-object stay distinguishable —
+    /// allowlist denials map to `Denied` (exit 3), corrupt objects and
+    /// non-denial syscall failures stay hard `Loader` errors.
+    #[test]
+    fn loader_outcome_routes_denial_vs_corruption() {
+        match loader_outcome(LoaderError::NotAllowed {
+            id: ProgramId::UprobeMultiSelfProbe,
+        }) {
+            BpfSelftestError::Denied { stage, errno } => {
+                assert_eq!(stage, "allowlist");
+                assert_eq!(errno, libc::EACCES);
+            }
+            other => panic!("allowlist denial must map to Denied, got {other}"),
+        }
+        match loader_outcome(LoaderError::BadObject {
+            reason: "x".to_owned(),
+        }) {
+            BpfSelftestError::Loader(LoaderError::BadObject { .. }) => {}
+            other => panic!("corrupt object must stay Loader, got {other}"),
+        }
+        match loader_outcome(LoaderError::MapFailed {
+            stage: "s".to_owned(),
+            errno: libc::EPERM,
+        }) {
+            BpfSelftestError::Denied { stage, errno } => {
+                assert_eq!(stage, "s");
+                assert_eq!(errno, libc::EPERM);
+            }
+            other => panic!("EPERM must map to Denied, got {other}"),
+        }
+        assert!(
+            matches!(
+                loader_outcome(LoaderError::MapFailed {
+                    stage: "s".to_owned(),
+                    errno: libc::EINVAL,
+                }),
+                BpfSelftestError::Loader(_)
+            ),
+            "non-denial syscall failure must stay Loader"
+        );
+        assert!(
+            LoaderError::NotAllowed {
+                id: ProgramId::UprobeMultiSelfProbe,
+            }
+            .to_string()
+            .contains("allowlist"),
+            "denial Display must name the allowlist"
+        );
     }
 }

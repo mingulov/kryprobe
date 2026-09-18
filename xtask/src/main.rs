@@ -7,6 +7,7 @@
 mod bench;
 mod bpf;
 mod child;
+mod seam;
 
 use child::run_child;
 use std::env;
@@ -76,6 +77,9 @@ fn run(argv: &[String]) -> i32 {
 fn check() -> i32 {
     if let Some(code) = toolchain_failure() {
         return code;
+    }
+    if seam::check_seam() != 0 {
+        return 1;
     }
     let steps: &[&[&str]] = &[
         &["fmt", "--check"],

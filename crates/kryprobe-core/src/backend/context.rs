@@ -93,11 +93,18 @@ pub struct FinalizeContext<'a> {
     pub session: SessionId,
     /// Session coverage for the backend's final assessment.
     pub coverage: &'a CoverageSummary,
-    /// Session integrity for the backend's final assessment.
+    /// Session integrity baseline for the backend's final assessment:
+    /// read-only context, never echoed into the summary (echoing would
+    /// double-count under the session rollup with two backends).
     pub integrity: &'a IntegritySummary,
 }
 
 /// Per-backend end-of-session facts: counts plus integrity receipts.
+///
+/// Coverage stays session-owned (dimensions assess the session within its
+/// declared boundary, which no single backend can judge); integrity is
+/// backend-scoped here and totaled once by
+/// [`IntegritySummary::rollup`](crate::evidence::IntegritySummary::rollup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSummary {
     /// Backend reporting.
@@ -105,6 +112,7 @@ pub struct BackendSummary {
     /// Observations decoded by this backend (JSON string on the wire).
     #[serde(with = "crate::evidence::wire::u64_string")]
     pub observations: u64,
-    /// Integrity counters attributed to this backend.
+    /// Integrity counters observed by this backend only, never the
+    /// session echo.
     pub integrity: IntegritySummary,
 }

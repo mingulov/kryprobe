@@ -5,15 +5,19 @@ use super::{
     BpfSelftestConfig, BpfSelftestError, BpfSelftestOutcome, await_line, is_denied, kill_quietly,
     pump_lines, view_spine_event,
 };
-use crate::attach::{AttachError, attach_group};
+use crate::attach::AttachError;
 use crate::bpfloader::LoadedSpine;
 use crate::drain::{DrainEvent, DrainStats, DrainThread};
 use crate::elfread::goblin_parser;
+use crate::local::LocalPrivilegedAuthority;
 use crate::mapops::{MapOpsError, map_lookup_percpu_sum, map_update};
+use kryprobe_core::authority::AttachAuthority;
 use kryprobe_core::ids::PlanGeneration;
 use kryprobe_core::object::{ObjectRef, ObjectRole};
 use kryprobe_core::plan::TargetScope;
-use kryprobe_core::{DrainConfig, GenerationGuard, LinkGroup, LossLedger, ProgramId};
+use kryprobe_core::{
+    CookieAllocator, CookieRange, DrainConfig, GenerationGuard, LinkGroup, LossLedger, ProgramId,
+};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
@@ -86,18 +90,29 @@ fn drive(
     let meta = std::fs::symlink_metadata(&config.fixture)
         .map_err(|err| BpfSelftestError::Fixture(err.to_string()))?;
     let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-    let group = |entry: bool| LinkGroup {
-        object: ObjectRef {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            size: meta.size(),
-            mtime: mtime_ns,
-            role: ObjectRole::Executable,
-        },
-        program: ProgramId::UprobeMultiSelfProbe,
-        scope: TargetScope::Pid { pid },
-        entry,
-        generation,
+    // One allocator for the round's single generation: entry and return
+    // are concurrent groups, so they take disjoint indices (sharing index
+    // 0 would merge their COUNT slots).
+    let mut cookies = CookieAllocator::new(generation);
+    let alloc = |cookies: &mut CookieAllocator, stage: &'static str| {
+        cookies.allocate(1).map_err(|err| {
+            BpfSelftestError::Fixture(format!("{stage}: cookie allocation failed: {err}"))
+        })
+    };
+    let group = |entry: bool, range: CookieRange| {
+        LinkGroup::from_range(
+            ObjectRef {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                size: meta.size(),
+                mtime: mtime_ns,
+                role: ObjectRole::Executable,
+            },
+            ProgramId::UprobeMultiSelfProbe,
+            TargetScope::Pid { pid },
+            entry,
+            range,
+        )
     };
     let guard = GenerationGuard { generation };
     // Links stay bound until the drain below finishes (drop = detach).
@@ -106,8 +121,16 @@ fn drive(
         (&loaded.progs.entry, true, "entry attach"),
         (&loaded.progs.ret, false, "return attach"),
     ] {
-        let link = attach_group(&group(entry), &guard, prog, &config.fixture, &[offset]).map_err(
-            |err| match err {
+        let range = alloc(&mut cookies, stage)?;
+        let link = LocalPrivilegedAuthority
+            .attach_group(
+                &group(entry, range),
+                &guard,
+                prog,
+                &config.fixture,
+                &[offset],
+            )
+            .map_err(|err| match err {
                 AttachError::LinkFailed { errno, .. } if is_denied(errno) => {
                     BpfSelftestError::Denied {
                         stage: stage.to_owned(),
@@ -115,8 +138,7 @@ fn drive(
                     }
                 }
                 other => BpfSelftestError::Fixture(format!("attach failed: {other:?}")),
-            },
-        )?;
+            })?;
         links.push(link);
     }
     let drain_config = DrainConfig {
@@ -197,10 +219,12 @@ fn drive(
         .map_err(|err| map_denied("loss/ring", err))?;
     let dropped = map_lookup_percpu_sum(&loaded.maps.loss, 1, "loss/drop")
         .map_err(|err| map_denied("loss/drop", err))?;
+    let truncated = map_lookup_percpu_sum(&loaded.maps.loss, 2, "loss/trunc")
+        .map_err(|err| map_denied("loss/trunc", err))?;
     let ledger = LossLedger {
         exact: 2 * config.calls,
         received: records.len() as u64,
-        drops: ring + dropped,
+        drops: ring.saturating_add(dropped).saturating_add(truncated),
     };
     Ok(BpfSelftestOutcome {
         entries,
@@ -208,6 +232,7 @@ fn drive(
         received: records.len() as u64,
         ring,
         dropped,
+        truncated,
         queue_drops: stats.queue_drops,
         exit_code,
         signal,

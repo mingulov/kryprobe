@@ -101,13 +101,14 @@ impl Runner {
         Ok(id)
     }
 
-    /// Close one observation; size queries stop at returned, failures at
-    /// completed, successes add the completed+success rendering.
+    /// Close one observation; size queries stop at returned, every other
+    /// op adds exactly one completed record carrying the outcome.
+    /// Matching is LIFO: nested identical opens close inner-first.
     pub(super) fn return_op(&mut self, spec: OpSpec, code: i32) -> Result<(), BackendError> {
         let position = self
             .open
             .iter()
-            .position(|open| open.spec == spec)
+            .rposition(|open| open.spec == spec)
             .ok_or_else(|| defect("return without open enter"))?;
         let open = self.open.remove(position);
         let outcome = outcome_of(code);
@@ -130,16 +131,6 @@ impl Runner {
             outcome,
             code,
         )?;
-        if code == 0 {
-            self.emit_phase(
-                open.id,
-                open.opened_ns,
-                spec,
-                EvidencePhase::Completed,
-                "success",
-                code,
-            )?;
-        }
         Ok(())
     }
 

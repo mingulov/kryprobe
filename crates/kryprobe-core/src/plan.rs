@@ -7,7 +7,6 @@
 use crate::enums::BackendId;
 use crate::ids::PlanGeneration;
 use crate::object::ObjectRef;
-use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 
 /// One file-offset probe: where to attach and how to correlate events.
@@ -15,7 +14,10 @@ use serde::{Deserialize, Serialize};
 pub struct OffsetProbe {
     /// File offset of the probe point.
     pub file_offset: u64,
-    /// Cookie stamped on events from this probe.
+    /// Cookie stamped on events from this probe. Cookies live in the
+    /// allocator-owned namespace ([`CookieAllocator`](crate::attach::CookieAllocator));
+    /// until the plan→attach bridge mints them, backends propose values
+    /// and the attach runtime is the source of truth.
     pub cookie: u64,
     /// Backend callback descriptor this probe implements.
     pub descriptor_id: u32,
@@ -94,23 +96,71 @@ pub struct ProbePlan {
     pub budget: PlanBudget,
 }
 
+/// Structural plan rejection: empty probes or an empty cgroup path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanValidationError {
+    /// The plan carries no offset probes.
+    NoOffsetProbes,
+    /// A cgroup-scoped plan carries an empty path.
+    EmptyCgroupPath,
+}
+
+impl std::fmt::Display for PlanValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOffsetProbes => write!(f, "plan has no offset probes"),
+            Self::EmptyCgroupPath => write!(f, "cgroup scope has an empty path"),
+        }
+    }
+}
+
+impl std::error::Error for PlanValidationError {}
+
 impl ProbePlan {
     /// Structural validation: non-empty probes and a usable scope.
     ///
     /// Descriptor/cookie validity is owned by backends at attach time;
     /// this check only guards plan shape (CONTRACTS §4 requires no more).
-    pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(!self.offsets.is_empty(), "plan has no offset probes");
-        if let TargetScope::Cgroup { path } = &self.target_scope {
-            ensure!(!path.is_empty(), "cgroup scope has an empty path");
+    pub fn validate(&self) -> Result<(), PlanValidationError> {
+        if self.offsets.is_empty() {
+            return Err(PlanValidationError::NoOffsetProbes);
+        }
+        if let TargetScope::Cgroup { path } = &self.target_scope
+            && path.is_empty()
+        {
+            return Err(PlanValidationError::EmptyCgroupPath);
         }
         Ok(())
     }
 }
 
+/// Plan serialization defect: `ProbePlan` must stay serializable.
+/// Unreachable in practice (every field serializes); typed so callers
+/// match on a defect instead of an untyped `anyhow` (M6 bar).
+#[derive(Debug)]
+pub struct PlanSerializeError {
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for PlanSerializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "defect: ProbePlan must stay serializable: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PlanSerializeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Serialize helper used by the round-trip test and evidence writers.
-pub fn to_canonical_json(plan: &ProbePlan) -> anyhow::Result<String> {
-    serde_json::to_string(plan).context("defect: ProbePlan must stay serializable")
+pub fn to_canonical_json(plan: &ProbePlan) -> Result<String, PlanSerializeError> {
+    serde_json::to_string(plan).map_err(|source| PlanSerializeError { source })
 }
 
 #[cfg(test)]
@@ -189,11 +239,36 @@ mod tests {
     fn plan_validation_rejects_empty_probes_and_scope() {
         let mut plan = sample_plan();
         plan.offsets.clear();
-        assert!(plan.validate().is_err());
+        assert_eq!(plan.validate(), Err(PlanValidationError::NoOffsetProbes));
         let mut plan = sample_plan();
         plan.target_scope = TargetScope::Cgroup {
             path: String::new(),
         };
-        assert!(plan.validate().is_err());
+        assert_eq!(plan.validate(), Err(PlanValidationError::EmptyCgroupPath));
+    }
+
+    #[test]
+    fn serialize_error_is_typed_with_source() {
+        use serde::ser::Error as _;
+        let err = PlanSerializeError {
+            source: serde_json::Error::custom("boom"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "defect: ProbePlan must stay serializable: boom"
+        );
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn plan_validation_messages_stay_stable() {
+        assert_eq!(
+            PlanValidationError::NoOffsetProbes.to_string(),
+            "plan has no offset probes"
+        );
+        assert_eq!(
+            PlanValidationError::EmptyCgroupPath.to_string(),
+            "cgroup scope has an empty path"
+        );
     }
 }

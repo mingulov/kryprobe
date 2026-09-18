@@ -4,7 +4,7 @@
 //! Manual `cmsghdr` layout (no libc CMSG helpers): on 64-bit Linux the
 //! header is 16 bytes (`len:u64 level:i32 type:i32`), the fd sits at
 //! offset 16, `cmsg_len` is 20, and the control buffer is 24 bytes.
-//! The `size_of` assert guards the layout assumption at runtime.
+//! The `size_of` assert pins the layout assumption at compile time.
 
 use super::TokenError;
 use crate::fd::OwnedFd;
@@ -17,9 +17,11 @@ const CMSG_LEN: usize = 20;
 /// `CMSG_SPACE(sizeof(int))`: length rounded up to alignment.
 const CMSG_SPACE: usize = 24;
 
+/// Compile-time pin of the manual cmsg layout (64-bit Linux only).
+const _: () = assert!(size_of::<libc::cmsghdr>() == CMSG_HDRLEN, "cmsghdr layout");
+
 /// Sends one fd over `sock` with a single payload byte.
 pub(super) fn send_fd(sock: BorrowedFd<'_>, fd: RawFd) -> Result<(), TokenError> {
-    assert_eq!(size_of::<libc::cmsghdr>(), CMSG_HDRLEN, "cmsghdr layout");
     let mut cmsg = [0u8; CMSG_SPACE];
     cmsg[0..8].copy_from_slice(&CMSG_LEN.to_ne_bytes());
     cmsg[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
@@ -52,7 +54,6 @@ pub(super) fn send_fd(sock: BorrowedFd<'_>, fd: RawFd) -> Result<(), TokenError>
 
 /// Receives one fd; short reads and malformed cmsgs fail closed.
 pub(super) fn recv_fd(sock: BorrowedFd<'_>) -> Result<OwnedFd, TokenError> {
-    assert_eq!(size_of::<libc::cmsghdr>(), CMSG_HDRLEN, "cmsghdr layout");
     let closed = |stage: &'static str, errno: i32| TokenError::Denied { stage, errno };
     let mut cmsg = [0u8; CMSG_SPACE];
     let mut byte = [0u8; 1];
@@ -69,8 +70,11 @@ pub(super) fn recv_fd(sock: BorrowedFd<'_>) -> Result<OwnedFd, TokenError> {
         msg_controllen: CMSG_SPACE,
         msg_flags: 0,
     };
+    // `MSG_CMSG_CLOEXEC`: SCM_RIGHTS receipts (the token fd) are
+    // CLOEXEC at creation, so they can never leak through a later
+    // exec (spawn discipline); sending over them is unaffected.
     // SAFETY: msg borrows live iov/cmsg; kernel fills them synchronously.
-    let rc = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
+    let rc = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if rc < 0 {
         return Err(closed("scm-recv", crate::probe::bpf_sys::last_errno()));
     }
@@ -118,6 +122,10 @@ mod tests {
         send_fd(a, probe).expect("send fd");
         let got = recv_fd(b).expect("receive fd");
         assert!(got.as_raw_fd() >= 0 && got.as_raw_fd() != probe);
+        assert!(
+            crate::fd::cloexec_flag_set(got.as_raw_fd()),
+            "SCM_RIGHTS receipts must be CLOEXEC (spawn discipline)"
+        );
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `stat` is a live out-param; `got` is open.
         assert_eq!(unsafe { libc::fstat(got.as_raw_fd(), &mut stat) }, 0);

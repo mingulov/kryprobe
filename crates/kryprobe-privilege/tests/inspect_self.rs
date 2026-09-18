@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! inspect_pid on own pid matches /proc/self/exe; dead pid is TargetGone.
+//! Facet inspect on own pid matches /proc/self/exe; dead pid is TargetGone.
 
 use std::os::unix::fs::MetadataExt;
 
-use kryprobe_privilege::{InspectError, inspect_pid};
+use kryprobe_core::authority::TargetInspectionAuthority;
+use kryprobe_privilege::{InspectError, LocalPrivilegedAuthority};
 
 #[test]
 fn inspect_self_matches_proc_self_exe() {
     let pid = std::process::id();
-    let snap = match inspect_pid(pid) {
+    let snap = match LocalPrivilegedAuthority.inspect(pid) {
         Ok(snap) => snap,
-        Err(err) => panic!("inspect_pid(self) must succeed: {err}"),
+        Err(err) => panic!("facet inspect(self) must succeed: {err}"),
     };
     assert_eq!(snap.pid, pid);
     assert!(snap.starttime > 0, "starttime must be nonzero");
@@ -33,7 +34,10 @@ fn inspect_dead_pid_is_target_gone() {
     let pid = child.id();
     child.wait().expect("wait for true helper");
     assert!(
-        matches!(inspect_pid(pid), Err(InspectError::TargetGone)),
+        matches!(
+            LocalPrivilegedAuthority.inspect(pid),
+            Err(InspectError::TargetGone)
+        ),
         "reaped pid {pid} must be TargetGone"
     );
 }

@@ -68,6 +68,38 @@ fn counters_are_distinct() {
 }
 
 #[test]
+fn overflowing_charge_refuses_even_at_u64_max_limit() {
+    let budget = PlanBudget {
+        max_targets: u64::MAX,
+        max_objects: u64::MAX,
+        max_bytes: u64::MAX,
+        max_links: u64::MAX,
+        max_state_entries: u64::MAX,
+        max_queue: u64::MAX,
+        max_duration_ns: u64::MAX,
+    };
+    let mut mgr = BudgetManager::new(budget);
+    assert!(mgr.charge(BudgetKind::Targets, u64::MAX).is_ok());
+    assert_eq!(mgr.used(BudgetKind::Targets), u64::MAX);
+    // `used + 1` overflows: must refuse (fail closed), never
+    // saturate-pass against the `u64::MAX` ceiling.
+    let err = mgr
+        .charge(BudgetKind::Targets, 1)
+        .expect_err("overflow must refuse");
+    assert_eq!(err.limit, u64::MAX);
+    assert_eq!(err.used, u64::MAX);
+    assert_eq!(err.requested, 1);
+    assert_eq!(
+        mgr.used(BudgetKind::Targets),
+        u64::MAX,
+        "refused charge must not consume"
+    );
+    // A zero charge at the ceiling still passes: no overflow, nothing
+    // consumed.
+    assert!(mgr.charge(BudgetKind::Targets, 0).is_ok());
+}
+
+#[test]
 fn zero_charge_is_free_but_never_exceeds() {
     let mut mgr = BudgetManager::new(small_budget());
     assert!(mgr.charge(BudgetKind::Bytes, 0).is_ok());

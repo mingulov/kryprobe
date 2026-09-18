@@ -50,7 +50,10 @@ kryprobe plan|observe|run ...   # stub: exit 3, typed marker
   lane has no backend for.
 - `selftest token-smoke` mints a token over a private bpffs mount
   and runs the nobody worker (root-only; exit 3 otherwise, or when
-  the kernel answers `EOPNOTSUPP`/`EPERM`).
+  the kernel answers `EOPNOTSUPP`/`EPERM`). SERIAL LANE: run with no
+  concurrent BPF activity on the host — ambient teardown mid-lane is
+  tolerated (extras-only leak comparison), but any map/program loaded
+  by another process during the roundtrip reports `Leaked` honestly.
 - `report FILE` validates a JSONL stream against the frozen schema
   (exit 2 on corrupt input) and renders phase tables, coverage, and
   integrity.

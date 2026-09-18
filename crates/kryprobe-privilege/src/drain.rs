@@ -12,7 +12,7 @@
 //!
 //! Alignment: ring offsets advance in multiples of 8 by construction
 //! (see `frame` tests); record bytes are copied out and parsed
-//! field-wise, so no `split_header` alignment precondition applies here.
+//! field-wise, so `split_header`'s alignment check never applies here.
 
 mod area;
 pub mod frame;
@@ -85,17 +85,15 @@ impl DrainThread {
                 reason: format!("max_entries {max_entries} is not a power of two"),
             });
         }
-        let dup = unsafe { libc::dup(map_fd.as_raw_fd()) };
-        if dup < 0 {
-            return Err(DrainError::MmapFailed {
+        // CLOEXEC clone (T16 B11): a plain `dup` would clear the flag
+        // and leak this fd through any later exec (cf. `EPOLL_CLOEXEC`
+        // below and the discipline in `token::spawn`).
+        let owned = map_fd
+            .try_clone_cloexec()
+            .map_err(|err| DrainError::MmapFailed {
                 stage: "dup".to_owned(),
-                errno: std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO),
-            });
-        }
-        // SAFETY: dup returned an open fd; the guard is its sole owner.
-        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+                errno: err.raw_os_error().unwrap_or(libc::EIO),
+            })?;
         let area = area::RingArea::map(&owned, max_entries)?;
         let raw_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if raw_epoll < 0 {

@@ -10,13 +10,17 @@ pub mod mint;
 mod scm;
 pub mod smoke;
 mod spawn;
+mod userns;
 
-pub use mint::{live_bpf_ids, mint_smoke_token};
+pub use mint::{MintedToken, live_bpf_ids, mint_smoke_token};
 pub use smoke::run_smoke_roundtrip;
 pub use spawn::spawn_smoke_worker;
 
-use crate::bpfloader::{LoadedSpine, LoaderError, instantiate_with_token, parse_spine_object};
+use crate::bpfloader::{LoadedSpine, LoaderError};
 use crate::fd::OwnedFd;
+use crate::local::LocalPrivilegedAuthority;
+use kryprobe_core::ProgramId;
+use kryprobe_core::authority::BpfLoadAuthority;
 use std::fmt;
 use std::os::fd::{BorrowedFd, RawFd};
 
@@ -32,10 +36,12 @@ pub struct TokenAxes {
 impl TokenAxes {
     /// Exact axes the smoke lane delegates (Phase A gate: `map_create` +
     /// `prog_load`, array/percpu/ringbuf maps, kprobe progs, uprobe-multi).
+    /// Live-verified (T17): each delegate name sets exactly `1 << type`,
+    /// so maps is bits 2,6,27 (array, percpu_array, ringbuf).
     pub fn smoke_expected() -> Self {
         Self {
             cmds: 0x21,
-            maps: 0x8400044,
+            maps: 0x8000044,
             progs: 0x4,
             attachs: 0x1000000000000,
         }
@@ -61,6 +67,13 @@ pub enum TokenError {
     Leaked {
         kind: &'static str,
     },
+    /// BPF id scan aborted: host churned under the sweep (bound hit or
+    /// ids went non-monotonic). Never a skip and never clean — the lane
+    /// fails honestly instead of crying leak or false-clean.
+    ScanAborted {
+        stage: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for TokenError {
@@ -71,6 +84,9 @@ impl fmt::Display for TokenError {
             Self::Denied { stage, errno } => write!(f, "token {stage}: errno {errno}"),
             Self::WorkerExit { code } => write!(f, "smoke worker exited {code}"),
             Self::Leaked { kind } => write!(f, "smoke roundtrip leaked {kind}"),
+            Self::ScanAborted { stage, reason } => {
+                write!(f, "token {stage}: id scan aborted ({reason})")
+            }
         }
     }
 }
@@ -104,6 +120,29 @@ pub fn parse_token_fdinfo(text: &str) -> Result<TokenAxes, TokenError> {
         progs: field(text, "allowed_progs")?,
         attachs: field(text, "allowed_attachs")?,
     })
+}
+
+/// Parses the OUTER id of inner 0 from a `/proc/self/uid_map`-style
+/// map: the middle field of the `inner == 0` line (`inner outer
+/// count`). `None` when no line maps inner 0, or on ANY malformed
+/// line (fail closed: the worker refuses when it cannot prove a
+/// non-root outer identity).
+pub fn parse_id_map_outer(text: &str) -> Option<u32> {
+    let mut outer = None;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (inner, candidate, count) = (fields.next()?, fields.next()?, fields.next()?);
+        if fields.next().is_some() {
+            return None;
+        }
+        let inner = inner.parse::<u32>().ok()?;
+        count.parse::<u32>().ok()?;
+        let candidate = candidate.parse::<u32>().ok()?;
+        if inner == 0 && outer.is_none() {
+            outer = Some(candidate);
+        }
+    }
+    outer
 }
 
 /// Reads live delegation axes for `fd` from `/proc/self/fdinfo`.
@@ -163,8 +202,8 @@ impl TokenHandle {
     }
 }
 
-/// Loads the spine object using `token` instead of privilege: the shared
-/// [`instantiate_with_token`] path, not a second loader.
+/// Loads the spine object using `token` instead of privilege: the load
+/// facet's token path, not a second loader.
 pub fn load_with_token(
     object: &std::path::Path,
     token: &TokenHandle,
@@ -181,6 +220,60 @@ pub fn load_bytes_with_token(
     bytes: &[u8],
     token: &TokenHandle,
 ) -> Result<LoadedSpine, LoaderError> {
-    let parsed = parse_spine_object(bytes)?;
-    instantiate_with_token(&parsed, Some(token.as_raw_fd()))
+    LocalPrivilegedAuthority.load_program_with_token(ProgramId::UprobeMultiSelfProbe, bytes, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_id_map_outer;
+
+    /// Outer-id extraction: the mint ns (`0 65534 1`) and init ns
+    /// (`0 0 4294967295`) shapes, plus kernel column padding.
+    #[test]
+    fn id_map_outer_cases() {
+        assert_eq!(parse_id_map_outer("0 65534 1\n"), Some(65534));
+        assert_eq!(
+            parse_id_map_outer("         0      65534          1\n"),
+            Some(65534)
+        );
+        assert_eq!(parse_id_map_outer("0 0 4294967295\n"), Some(0));
+        assert_eq!(parse_id_map_outer("0 1000 1"), Some(1000));
+    }
+
+    /// Malformed maps fail closed (`None` → worker refuses).
+    #[test]
+    fn id_map_outer_rejects_garbage() {
+        for bad in [
+            "",
+            "\n",
+            "0 65534\n",
+            "0 65534 1 2\n",
+            "0 bogus 1\n",
+            "bogus 65534 1\n",
+            "0 65534 bogus\n",
+            "0 -1 1\n",
+            "0 4294967296 1\n",
+            // A garbage second line poisons the whole map, even when
+            // the first line is well-formed (strict: every line parsed).
+            "0 65534 1\nbogus\n",
+            "0 65534 1\n1 2\n",
+        ] {
+            assert_eq!(parse_id_map_outer(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    /// T18-review: multi-line maps match the `inner == 0` line, not
+    /// the first line; a map with no inner-0 line proves nothing.
+    #[test]
+    fn id_map_outer_matches_inner_zero_line() {
+        assert_eq!(
+            parse_id_map_outer("1 100000 1000\n0 65534 1\n"),
+            Some(65534)
+        );
+        assert_eq!(
+            parse_id_map_outer("0 65534 1\n1 100000 1000\n"),
+            Some(65534)
+        );
+        assert_eq!(parse_id_map_outer("1 100000 1000\n2 200000 1000\n"), None);
+    }
 }

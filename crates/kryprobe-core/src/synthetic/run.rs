@@ -125,14 +125,19 @@ impl Runner {
                 "duration_ns": self.clock.now().saturating_sub(opened_ns).to_string(),
             }),
         );
-        self.emitted_observations += 1;
+        self.emitted_observations = self.emitted_observations.saturating_add(1);
         Ok(())
     }
 
     /// Seal the run: unmatched entries plus exact aggregates.
+    /// Saturates like `BudgetManager`/`LossLedger`: a hostile
+    /// `DropDetailed` count must never panic (debug) or wrap (release).
     fn finish(mut self) -> ScriptRun {
-        self.integrity.unmatched_entries += self.open.len() as u64;
-        let aggregate_observations = self.emitted_observations + self.dropped;
+        self.integrity.unmatched_entries = self
+            .integrity
+            .unmatched_entries
+            .saturating_add(self.open.len() as u64);
+        let aggregate_observations = self.emitted_observations.saturating_add(self.dropped);
         ScriptRun {
             records: self.records,
             relationships: self.relationships,
@@ -155,8 +160,11 @@ impl crate::synthetic::SyntheticBackend {
                     runner.return_op(op, code)?;
                 }
                 ScriptOp::DropDetailed { count } => {
-                    runner.integrity.ring_reservation_failures += count;
-                    runner.dropped += count;
+                    runner.integrity.ring_reservation_failures = runner
+                        .integrity
+                        .ring_reservation_failures
+                        .saturating_add(count);
+                    runner.dropped = runner.dropped.saturating_add(count);
                 }
                 ScriptOp::SpawnChild { parent } => {
                     runner.spawn_child(parent)?;

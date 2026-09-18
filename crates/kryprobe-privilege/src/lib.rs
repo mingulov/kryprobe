@@ -11,8 +11,10 @@
 pub mod attach;
 pub mod bpfloader;
 pub mod bpfselftest;
+pub mod decoy;
 pub mod drain;
 pub mod elfread;
+pub mod fanout;
 pub mod fd;
 pub mod inspect;
 pub mod local;
@@ -21,7 +23,7 @@ pub mod probe;
 pub mod refused;
 pub mod token;
 
-pub use inspect::{InspectError, TargetSnapshot, inspect_pid};
+pub use inspect::{InspectError, TargetSnapshot};
 pub use kryprobe_core::ProgramId;
 pub use local::LocalPrivilegedAuthority;
 pub use probe::{ProbeMatrix, ProbeOutcome, run_probe_matrix};

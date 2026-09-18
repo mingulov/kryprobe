@@ -31,7 +31,7 @@ fn wire_id_consts_match_contracts() {
     assert_eq!(EVENT_BARRIER, 3);
 }
 
-/// 8-aligned scratch so `split_header` borrows hold its alignment precondition.
+/// 8-aligned scratch so `split_header` borrows pass its alignment check.
 #[repr(C, align(8))]
 struct AlignedBuf([u8; 256]);
 
@@ -147,6 +147,31 @@ fn split_header_unknown_version() {
         let err = kryprobe_abi::split_header(bytes).expect_err("bad version must fail");
         assert_eq!(err, AbiError::UnknownVersion { version: 0xFFFF });
     });
+}
+
+#[test]
+fn split_header_misaligned_buffer_is_rejected() {
+    // Valid record shifted one byte into 8-aligned storage: the bytes
+    // decode fine, but the address is misaligned. Must be a checked
+    // error, never UB (the old debug_assert compiled out in release).
+    let header = valid_header();
+    let hb = header_bytes(&header);
+    let mut buf = AlignedBuf([0u8; 256]);
+    buf.0[1..1 + hb.len()].copy_from_slice(&hb);
+    let bytes = &buf.0[1..1 + hb.len()];
+    assert_ne!(
+        bytes.as_ptr() as usize % 8,
+        0,
+        "test setup must misalign the buffer"
+    );
+    let err = kryprobe_abi::split_header(bytes).expect_err("misaligned buffer must fail");
+    assert_eq!(
+        err,
+        AbiError::Misaligned {
+            addr: bytes.as_ptr() as usize,
+            align: 8,
+        }
+    );
 }
 
 #[test]

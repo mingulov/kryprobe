@@ -88,13 +88,31 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
     let Some((sub, args)) = rest.split_first() else {
         return Err(usage("missing subcommand"));
     };
+    // Global `--json` is threaded through only where a command speaks
+    // it; anywhere else it is a usage error (exit 2), never silently
+    // discarded.
     let command = match sub.as_str() {
         "doctor" => parse_simple(args, json, "doctor", |json| Command::Doctor { json })?,
         "backends" => parse_simple(args, json, "backends", |json| Command::Backends { json })?,
         "inspect" => crate::args_sub::parse_inspect(args, json)?,
-        "selftest" => crate::args_sub::parse_selftest(args)?,
-        "report" => crate::args_sub::parse_report(args)?,
-        "plan" | "observe" | "run" => Command::Stub { name: sub.clone() },
+        "selftest" => {
+            if json {
+                return Err(usage("selftest: --json is not supported"));
+            }
+            crate::args_sub::parse_selftest(args)?
+        }
+        "report" => {
+            if json {
+                return Err(usage("report: --json is not supported"));
+            }
+            crate::args_sub::parse_report(args)?
+        }
+        "plan" | "observe" | "run" => {
+            if json {
+                return Err(usage(format!("{sub}: --json is not supported")));
+            }
+            Command::Stub { name: sub.clone() }
+        }
         other => return Err(usage(format!("unknown subcommand '{other}'"))),
     };
     Ok(Args { command })
@@ -230,6 +248,32 @@ mod tests {
                 "args {bad:?} must be a usage error"
             );
         }
+    }
+
+    #[test]
+    fn global_json_rejected_where_unsupported() {
+        for words in [
+            vec!["--json", "selftest", "synthetic"],
+            vec!["--json", "selftest", "bpf"],
+            vec!["--json", "selftest", "token-smoke"],
+            vec!["--json", "report", "s.jsonl"],
+            vec!["--json", "plan"],
+            vec!["--json", "observe"],
+            vec!["--json", "run"],
+        ] {
+            let err = parse(&argv(&words)).expect_err("global --json must not be silent");
+            assert!(
+                matches!(&err, ArgsError::Usage(reason) if reason.contains("--json")),
+                "args {words:?} gave {err:?}"
+            );
+        }
+        // Supported commands still merge the global flag.
+        assert_eq!(
+            parse(&argv(&["--json", "inspect", "--pid", "1"]))
+                .unwrap()
+                .command,
+            Command::Inspect { pid: 1, json: true }
+        );
     }
 
     #[test]

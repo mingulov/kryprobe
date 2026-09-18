@@ -104,18 +104,22 @@ impl BudgetManager {
 
     /// Consume `amount` of `kind`, or refuse with a typed omission.
     ///
-    /// A refused charge consumes nothing.
+    /// A refused charge consumes nothing. The add is checked, not
+    /// saturating: a saturating add would pass a `u64::MAX` limit once
+    /// `used` saturates, silently granting unbounded charges.
     pub fn charge(&mut self, kind: BudgetKind, amount: u64) -> Result<(), BudgetOmission> {
         let slot = index(kind);
-        let next = self.used[slot].saturating_add(amount);
-        if next > self.limits[slot] {
-            return Err(BudgetOmission {
-                kind,
-                limit: self.limits[slot],
-                used: self.used[slot],
-                requested: amount,
-            });
-        }
+        let next = match self.used[slot].checked_add(amount) {
+            Some(next) if next <= self.limits[slot] => next,
+            _ => {
+                return Err(BudgetOmission {
+                    kind,
+                    limit: self.limits[slot],
+                    used: self.used[slot],
+                    requested: amount,
+                });
+            }
+        };
         self.used[slot] = next;
         Ok(())
     }

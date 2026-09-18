@@ -149,6 +149,7 @@ pub(crate) fn test_bpf() -> i32 {
     }
     for (package, suite) in [
         ("kryprobe-privilege", "bpf_pipeline"),
+        ("kryprobe-privilege", "decoy_pid"),
         ("kryprobe-privilege", "token_plumbing"),
         ("kryprobe-cli", "cli_bpf_e2e"),
     ] {

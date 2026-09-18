@@ -121,7 +121,7 @@ impl JsonlWriter {
                 barrier_status: snap.barrier,
                 event_integrity,
             },
-        );
+        )?;
         Ok(())
     }
 }

@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `backends`: registry states plus capability gates.
 //!
-//! The registry carries the synthetic backend (leaked once: the registry
-//! API requires `&'static`); the other three rows are static thin-spine
-//! states shared with [`crate::cmd_doctor`].
+//! The registry owns the synthetic backend (no `Box::leak`); the `active`
+//! row is backed by a live end-to-end driver pass (detect → plan →
+//! configure → decode → finalize) over one synthetic event. A driver
+//! failure fails closed (stderr plus exit 1) instead of claiming `active`.
+//! The other three rows are static thin-spine states shared with
+//! [`crate::cmd_doctor`].
 
-use kryprobe_core::backend::{Backend, BackendRegistry};
+use kryprobe_core::backend::{BackendDriver, BackendRegistry, RawEvent};
+use kryprobe_core::capability::RuntimeCapabilities;
+use kryprobe_core::enums::{BackendId, CallKind, EvidencePhase, OperationClass};
 use kryprobe_core::synthetic::SyntheticBackend;
 use std::io::Write;
 
@@ -53,33 +58,76 @@ pub fn human_row(row: &BackendRow) -> String {
     }
 }
 
-/// Synthetic capability gates from a live registry (deterministic).
-fn synthetic_gates() -> [(&'static str, bool); 4] {
+/// Minimal host facts for the liveness proof: synthetic requires nothing,
+/// so all gates read false and the proof passes on any host.
+fn proof_runtime() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        kernel_release: String::from("synthetic"),
+        uprobe_multi: false,
+        cookies: false,
+        ringbuf: false,
+        btf_present: false,
+        userns: false,
+        yama_scope: 0,
+        caps: Vec::new(),
+    }
+}
+
+/// Synthetic capability gates from a live owned registry (deterministic).
+///
+/// Proves liveness first: one driver pass over one synthetic event must
+/// yield exactly one observation and one summary with no skips. Any driver
+/// failure (or partial result, a defect) is `Err` and the caller fails
+/// closed instead of printing the `active` row.
+fn live_synthetic_gates() -> Result<[(&'static str, bool); 4], String> {
     let mut registry = BackendRegistry::new();
-    let leaked: &'static dyn Backend = Box::leak(Box::new(SyntheticBackend::new(Vec::new())));
     // Fresh registry + unique id: registration is infallible by construction.
     registry
-        .register(leaked)
+        .register(Box::new(SyntheticBackend::new(Vec::new())))
         .expect("fresh registry accepts synthetic");
+    let mut driver = BackendDriver::harness();
+    let (header, payload) = SyntheticBackend::harness_event(
+        EvidencePhase::Entered,
+        OperationClass::Sign,
+        CallKind::Operation,
+        0,
+        1_000_000,
+    );
+    let events = [RawEvent {
+        header,
+        payload: &payload,
+    }];
+    let report = driver
+        .run(&registry, &proof_runtime(), &events)
+        .map_err(|err| err.to_string())?;
+    if report.observations.len() != 1 || report.summaries.len() != 1 || !report.skipped.is_empty() {
+        return Err(String::from(
+            "defect: synthetic liveness pass returned partial results",
+        ));
+    }
     let backend = registry
-        .discover_all()
-        .into_iter()
-        .find(|b| b.capabilities().name == "synthetic")
+        .get(BackendId::Synthetic)
         .expect("synthetic registered");
     let required = &backend.capabilities().required;
-    [
+    Ok([
         ("uprobe_multi", required.uprobe_multi),
         ("cookies", required.cookies),
         ("ringbuf", required.ringbuf),
         ("btf", required.btf),
-    ]
+    ])
 }
 
-/// Runs `backends`; always exit 0.
-pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
+/// Runs `backends`; exit 0, or 1 when the synthetic liveness proof fails.
+pub fn run(json: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    let gates = match live_synthetic_gates() {
+        Ok(gates) => gates,
+        Err(err) => {
+            let _ = writeln!(stderr, "backends: synthetic liveness proof failed: {err}");
+            return 1;
+        }
+    };
     let rows = backend_rows();
     if json {
-        let gates = synthetic_gates();
         let caps = serde_json::json!({
             "uprobe_multi": gates[0].1,
             "cookies": gates[1].1,
@@ -103,7 +151,7 @@ pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
     for row in &rows {
         let _ = writeln!(stdout, "{}", human_row(row));
         if row.id == "synthetic" {
-            let gates = synthetic_gates()
+            let gates = gates
                 .iter()
                 .map(|(name, value)| format!("{name}={value}"))
                 .collect::<Vec<_>>()
@@ -112,4 +160,34 @@ pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn liveness_proof_yields_all_false_synthetic_gates() {
+        let gates = live_synthetic_gates().expect("synthetic liveness proof runs clean");
+        assert_eq!(
+            gates,
+            [
+                ("uprobe_multi", false),
+                ("cookies", false),
+                ("ringbuf", false),
+                ("btf", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_exits_zero_with_requires_line() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run(false, &mut stdout, &mut stderr), 0);
+        let stdout = String::from_utf8(stdout).expect("stdout utf-8");
+        assert!(stdout.contains("synthetic: active (test-only)"), "{stdout}");
+        assert!(stdout.contains("requires:"), "{stdout}");
+        assert!(stderr.is_empty());
+    }
 }

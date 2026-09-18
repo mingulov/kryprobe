@@ -52,6 +52,8 @@ pub struct SpineEvent {
 pub enum AbiError {
     /// Fewer than `expected` header bytes present (`actual` seen).
     Truncated { expected: usize, actual: usize },
+    /// Buffer address `addr` is not `align`-byte aligned.
+    Misaligned { addr: usize, align: usize },
     /// `total_len` disagrees with the buffer: claims more bytes than present,
     /// or fewer than the header itself occupies.
     LengthMismatch { total_len: u32, buffer_len: usize },
@@ -67,6 +69,10 @@ impl fmt::Display for AbiError {
             AbiError::Truncated { expected, actual } => write!(
                 f,
                 "truncated event buffer: need {expected} header bytes, got {actual}"
+            ),
+            AbiError::Misaligned { addr, align } => write!(
+                f,
+                "event buffer at address {addr:#x} is not {align}-byte aligned"
             ),
             AbiError::LengthMismatch {
                 total_len,
@@ -93,12 +99,11 @@ impl core::error::Error for AbiError {}
 
 /// Splits `bytes` into its [`RawEventHeader`] borrow and backend payload.
 ///
-/// Checks, in order: the buffer holds a full header, the version is
-/// [`ABI_VERSION`], `total_len` covers exactly the buffer (neither short,
-/// impossible, nor trailing).
+/// Checks, in order: the buffer holds a full header, the address is
+/// 8-byte aligned, the version is [`ABI_VERSION`], `total_len` covers
+/// exactly the buffer (neither short, impossible, nor trailing).
 ///
-/// Callers must pass an 8-byte-aligned buffer, as produced by the BPF
-/// ringbuf path; every length/version failure is a returned [`AbiError`],
+/// Every failure — including misalignment — is a returned [`AbiError`],
 /// never a panic.
 pub fn split_header(bytes: &[u8]) -> Result<(&RawEventHeader, &[u8]), AbiError> {
     let header_len = size_of::<RawEventHeader>();
@@ -108,9 +113,13 @@ pub fn split_header(bytes: &[u8]) -> Result<(&RawEventHeader, &[u8]), AbiError> 
             actual: bytes.len(),
         });
     }
-    debug_assert_eq!(bytes.as_ptr() as usize % align_of::<RawEventHeader>(), 0);
-    // SAFETY: length checked above; 8-byte alignment is a documented
-    // caller precondition (BPF ringbuf records are 8-aligned).
+    let addr = bytes.as_ptr() as usize;
+    let align = align_of::<RawEventHeader>();
+    if !addr.is_multiple_of(align) {
+        return Err(AbiError::Misaligned { addr, align });
+    }
+    // SAFETY: length and alignment both checked above, so the header
+    // range is a valid aligned `RawEventHeader` borrow for `bytes`' lifetime.
     let header = unsafe { &*(bytes.as_ptr().cast::<RawEventHeader>()) };
     if header.abi_version != ABI_VERSION {
         return Err(AbiError::UnknownVersion {

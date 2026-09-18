@@ -38,6 +38,9 @@ impl TokenBrokerStub {
     }
 
     /// Mirrors the local attach op (SECURITY §3.2); always refuses (R-030).
+    ///
+    /// `Tree`/`Cgroup` plans refuse here too (same receipt): broker mode
+    /// never silently lacks fan-out policy (X15).
     pub fn attach_plan(&self, _plan: &ProbePlan) -> Result<(), BackendError> {
         Err(Self::refused())
     }

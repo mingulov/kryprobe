@@ -13,6 +13,17 @@ mod reloc;
 use crate::bpfloader::{LoaderError, ParsedMap, ParsedProg};
 use goblin::elf::Elf;
 
+/// 64-bit gate: the `u64 as usize` casts in this module (section
+/// ranges in [`section_bytes`], `.text` symbol values below) and in
+/// `reloc` (offsets/symbol indices, call-target bytes) are
+/// lossless-by-construction only where `usize` holds every `u64`.
+/// Unsupported 32-bit targets fail the build here, loudly, instead of
+/// silently truncating attacker-controlled ELF fields.
+const _: () = assert!(
+    size_of::<usize>() >= size_of::<u64>(),
+    "kryprobe-privilege requires a 64-bit target"
+);
+
 /// ELF machine id for eBPF.
 const EM_BPF: u16 = 247;
 /// `src_reg` nibble marking a map-fd `ld_imm64` (`BPF_PSEUDO_MAP_FD`).
@@ -69,6 +80,8 @@ pub(crate) fn bad(reason: String) -> LoaderError {
 }
 
 pub(crate) fn section_bytes(bytes: &[u8], off: u64, len: u64) -> Result<&[u8], LoaderError> {
+    // Lossless by the 64-bit gate above; the range check below still
+    // bounds both against the actual file.
     let (off, len) = (off as usize, len as usize);
     let end = off
         .checked_add(len)
@@ -185,6 +198,7 @@ fn text_func_symbols(elf: &goblin::elf::Elf, text_idx: usize) -> Vec<(String, us
             .get_at(sym.st_name)
             .unwrap_or_default()
             .to_owned();
+        // Lossless by the 64-bit gate above.
         out.push((name, sym.st_value as usize));
     }
     out.sort_by_key(|(_, off)| *off);
@@ -203,4 +217,17 @@ pub fn insns_to_bytes(insns: &[BpfInsn]) -> Vec<u8> {
 /// `BPF_PSEUDO_MAP_FD` marker for instantiate-time fixups.
 pub const fn pseudo_map_fd() -> u8 {
     PSEUDO_MAP_FD
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn usize_holds_every_u64() {
+        // The property the 64-bit gate above pins at compile time:
+        // every `u64 as usize` cast in this module and `reloc` is exact.
+        // (The gate itself refuses 32-bit builds; this test pins the
+        // intent on the host target.)
+        assert!(size_of::<usize>() >= size_of::<u64>());
+        assert_eq!(u64::MAX as usize as u64, u64::MAX);
+    }
 }

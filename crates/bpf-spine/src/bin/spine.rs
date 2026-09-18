@@ -3,8 +3,9 @@
 //!
 //! Cookie layout: `(generation << 32) | offset_index`. Programs drop (and
 //! account) disarmed runs, stale generations, out-of-range indices, and
-//! TGID mismatches; otherwise they bump `COUNT[idx]` and emit one
-//! [`SpineEvent`] per hit. Only aya-ebpf map/program types plus
+//! TGID mismatches; out-of-u32 CONFIG values are refused into their own
+//! `LOSS` bucket, never truncated; otherwise they bump `COUNT[idx]` and
+//! emit one [`SpineEvent`] per hit. Only aya-ebpf map/program types plus
 //! kryprobe-abi layouts are used here (no BPF-side loader logic).
 //!
 //! Micro-borrows: cookie-as-plan-index + in-BPF TGID guard (osslscope
@@ -28,6 +29,9 @@ const COUNT_ENTRIES: u32 = 64;
 const LOSS_RING: u32 = 0;
 /// `LOSS` slot: disarmed / stale generation / bad index / TGID-guard drops.
 const LOSS_DROP: u32 = 1;
+/// `LOSS` slot: CONFIG value wider than its u32 domain (osslscope
+/// `count.rs` borrow (a): counted, never silently truncated).
+const LOSS_TRUNC: u32 = 2;
 /// `SpineEvent.flags` bit marking return-probe records.
 const FLAG_RETURN: u32 = 1;
 
@@ -38,7 +42,7 @@ static START: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
 static COUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(COUNT_ENTRIES, 0);
 #[map]
-static LOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+static LOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(3, 0);
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(262_144, 0);
 
@@ -65,15 +69,23 @@ fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
         bump(&LOSS, LOSS_DROP);
         return 0;
     }
+    // Wide CONFIG values are a userspace bug: refuse them into their
+    // own bucket before any narrowing cast can silently truncate them.
+    let cfg_gen = CONFIG.get(0).copied().unwrap_or(0);
+    let cfg_tgid = CONFIG.get(1).copied().unwrap_or(0);
+    if cfg_gen > u32::MAX as u64 || cfg_tgid > u32::MAX as u64 {
+        bump(&LOSS, LOSS_TRUNC);
+        return 0;
+    }
     // SAFETY: BPF helpers with the program ctx pointer.
     let cookie = unsafe { bpf_get_attach_cookie(ctx) };
     let gen = (cookie >> 32) as u32;
     let idx = cookie as u32;
-    if gen != CONFIG.get(0).copied().unwrap_or(0) as u32 || idx >= COUNT_ENTRIES {
+    if gen != cfg_gen as u32 || idx >= COUNT_ENTRIES {
         bump(&LOSS, LOSS_DROP);
         return 0;
     }
-    let want_tgid = CONFIG.get(1).copied().unwrap_or(0) as u32;
+    let want_tgid = cfg_tgid as u32;
     let id = bpf_get_current_pid_tgid();
     let tgid = (id >> 32) as u32;
     // Fail closed: no TGID pinned (want == 0) matches nothing, since
@@ -82,6 +94,10 @@ fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
         bump(&LOSS, LOSS_DROP);
         return 0;
     }
+    // COUNT slots carry no timestamps yet. When per-CPU first/last
+    // stamps are added here, a fresh (count == 0) slot MUST stamp
+    // first-touch: an ever-zero first stamp poisons the userspace
+    // min-fold (osslscope `count.rs` borrow (c) constraint).
     let seq = bump(&COUNT, idx);
     let Some(mut entry) = EVENTS.reserve::<SpineEvent>(0) else {
         bump(&LOSS, LOSS_RING);
@@ -105,7 +121,11 @@ fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
         core::ptr::addr_of_mut!((*ptr).monotonic_ns).write(bpf_ktime_get_ns());
         core::ptr::addr_of_mut!((*ptr).seq).write(seq);
         core::ptr::addr_of_mut!((*ptr).flags).write(if is_return { FLAG_RETURN } else { 0 });
-        for i in 0..28 {
+        // Zero-tail bound derived from the field itself (`SpineEvent.reserved`,
+        // header.rs): a layout change moves the bound with it instead of
+        // rotting a literal. `len()` is the array length — a constant 28,
+        // not a read — so the volatile-store / no-builtin constraint above holds.
+        for i in 0..(*ptr).reserved.len() {
             core::ptr::addr_of_mut!((*ptr).reserved[i]).write_volatile(0);
         }
     }
@@ -127,7 +147,12 @@ pub fn spine_selftest_ret(ctx: RetProbeContext) -> u32 {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // panic = "abort": unreachable in verified code; aborts the program.
+    // NOTE: `panic = "abort"` does NOT make this unreachable — any panic
+    // still lands here first. This is dead code only because the crate is
+    // audited panic-free (no panic!/unwrap/expect/runtime-assert, no
+    // div/mod, sole index provably in-bounds; see the B5 row in
+    // tasks/queued/second-sweep-fulltext.md). Keep it that way: if a panic
+    // path is ever introduced, the `unreachable_unchecked` below is live UB.
     unsafe { core::hint::unreachable_unchecked() }
 }
 

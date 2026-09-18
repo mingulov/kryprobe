@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Raw BPF spine loader: pure parse + syscall instantiate (T7c1).
 //!
-//! [`load_spine_object`] reads the object through the T6 `elfread`
-//! winner, asserts the frozen [`SPINE_MAPS`] dims, creates the maps,
+//! The load facet (`BpfLoadAuthority::load_program*` on
+//! `LocalPrivilegedAuthority`) is the only entry: it asserts the frozen
+//! [`SPINE_MAPS`] dims via [`parse_spine_object`], creates the maps,
 //! applies relocations, and loads both programs with
 //! `expected_attach_type = UPROBE_MULTI` and no BTF. Every fallible BPF
-//! step reports stage + errno.
+//! step reports stage + errno. The syscall half (`instantiate`,
+//! `mapcreate`, `progload`) is crate-private.
 //!
 //! Micro-borrow: fail-closed raw loader incl. frozen dims + symbolic
 //! map-fd fixups (osslscope loader-prepare pattern, reimplemented).
 
-pub mod instantiate;
-pub mod mapcreate;
+pub(crate) mod instantiate;
+pub(crate) mod mapcreate;
 pub mod parse;
-pub mod progload;
+pub(crate) mod progload;
 
-pub use instantiate::{instantiate, instantiate_with_token};
 pub use parse::{BpfInsn, MapReloc, ParsedSpine, insns_to_bytes, parse_spine_object};
 
-use crate::elfread::{ElfBytes, MmapGuard};
 use crate::fd::OwnedFd;
-use std::path::Path;
+use kryprobe_core::ProgramId;
 
 /// Frozen dims of one spine map (ground truth: the built object).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 2,
+            max_entries: 3,
         },
     ),
 ];
@@ -105,6 +105,12 @@ pub enum LoaderError {
     BadObject {
         reason: String,
     },
+    /// Program id refused by the load-facet allowlist: a forbidden
+    /// program, NOT a corrupt object (X16). Callers map this to exit 3
+    /// / `Denied`, never to a corruption bucket.
+    NotAllowed {
+        id: ProgramId,
+    },
     DimMismatch {
         name: String,
     },
@@ -130,6 +136,9 @@ impl std::fmt::Display for LoaderError {
         match self {
             Self::Io { stage, detail } => write!(f, "loader I/O at {stage}: {detail}"),
             Self::BadObject { reason } => write!(f, "bad spine object: {reason}"),
+            Self::NotAllowed { id } => {
+                write!(f, "program {id:?} not in approved allowlist")
+            }
             Self::DimMismatch { name } => write!(f, "map '{name}' dims mismatch frozen SPINE_MAPS"),
             Self::UnsupportedMap { name } => write!(f, "object has unknown map '{name}'"),
             Self::MapFailed { stage, errno } => {
@@ -166,16 +175,6 @@ pub struct SpineProgs {
 pub struct LoadedSpine {
     pub maps: SpineMaps,
     pub progs: SpineProgs,
-}
-
-/// Read, parse, and instantiate the spine object at `path`.
-pub fn load_spine_object(path: &Path) -> Result<LoadedSpine, LoaderError> {
-    let guard = MmapGuard::open(path).map_err(|err| LoaderError::Io {
-        stage: "open",
-        detail: format!("{}: {err:#}", path.display()),
-    })?;
-    let parsed = parse_spine_object(guard.bytes())?;
-    instantiate(&parsed)
 }
 
 /// 8-alignment precondition for record buffers (abi `split_header` rule).

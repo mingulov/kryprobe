@@ -33,7 +33,9 @@ struct TokenMapAttr {
 const _: () = assert!(size_of::<TokenMapAttr>() == 80);
 
 /// Raw `BPF_MAP_CREATE`; returns the fd or -1 (see `last_errno`).
-pub fn map_create_raw(
+///
+/// Crate-private: reached only via the load facet's instantiate path.
+pub(crate) fn map_create_raw(
     map_type: u32,
     key_size: u32,
     value_size: u32,

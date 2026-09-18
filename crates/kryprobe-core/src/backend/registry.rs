@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Static backend registry: duplicate `BackendId` is `Err`, never a panic.
+//! Owned backend registry: duplicate `BackendId` is `Err`, never a panic.
+//!
+//! Ownership story (roadmap option (a)): the runtime owns every backend
+//! handle in a `Vec<Box<dyn Backend>>`, and the registry hands out borrowed
+//! `&dyn Backend` views tied to `&self`. Nothing here requires `'static`,
+//! so backends with borrowed configuration or test doubles register
+//! without `Box::leak`, and dropping the registry frees every backend.
+//! `Box<dyn Backend>` is `Send + Sync` because [`Backend`] requires both.
 
 use crate::backend::Backend;
 use crate::enums::BackendId;
 use std::fmt::{Display, Formatter};
 
-/// Registry of statically linked backends, keyed by [`BackendId`].
+/// Registry of backends, keyed by [`BackendId`]; owns every handle.
 #[derive(Default)]
 pub struct BackendRegistry {
-    backends: Vec<&'static dyn Backend>,
+    backends: Vec<Box<dyn Backend>>,
 }
 
 impl std::fmt::Debug for BackendRegistry {
@@ -27,9 +34,10 @@ impl BackendRegistry {
         Self::default()
     }
 
-    /// Register a statically linked backend. A duplicate [`BackendId`] is a
-    /// panic-free `Err` and leaves the registry unchanged.
-    pub fn register(&mut self, backend: &'static dyn Backend) -> Result<(), DuplicateBackend> {
+    /// Register an owned backend. A duplicate [`BackendId`] is a panic-free
+    /// `Err` that leaves the registry unchanged; the rejected handle is
+    /// dropped with the caller's `Err`, never leaked.
+    pub fn register(&mut self, backend: Box<dyn Backend>) -> Result<(), DuplicateBackend> {
         let id = backend.id();
         if self.backends.iter().any(|known| known.id() == id) {
             return Err(DuplicateBackend { backend: id });
@@ -38,10 +46,19 @@ impl BackendRegistry {
         Ok(())
     }
 
-    /// All registered backends, in registration order.
+    /// All registered backends, in registration order (borrowed views).
     #[must_use]
-    pub fn discover_all(&self) -> Vec<&'static dyn Backend> {
-        self.backends.clone()
+    pub fn discover_all(&self) -> Vec<&dyn Backend> {
+        self.backends.iter().map(AsRef::as_ref).collect()
+    }
+
+    /// One backend by id, when registered.
+    #[must_use]
+    pub fn get(&self, id: BackendId) -> Option<&dyn Backend> {
+        self.backends
+            .iter()
+            .find(|backend| backend.id() == id)
+            .map(AsRef::as_ref)
     }
 }
 

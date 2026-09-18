@@ -58,7 +58,7 @@ pub fn consume_range(
             break;
         }
         let total = HDR_SZ as u64 + ((len + 7) & !7);
-        if consumer + total > producer {
+        if consumer.saturating_add(total) > producer {
             busy = true;
             break;
         }
@@ -72,7 +72,9 @@ pub fn consume_range(
             }
             records.push(data[start..start + len as usize].to_vec());
         }
-        consumer += total;
+        // Saturating: the check above admits `consumer == u64::MAX - total + 1`
+        // when the producer sits at `u64::MAX`, where `+=` would wrap.
+        consumer = consumer.saturating_add(total);
     }
     Consumed {
         records,
@@ -188,5 +190,29 @@ mod tests {
         let out = consume_range(&area, 255, 0, end, 16);
         assert_eq!(out.records, vec![vec![42u8]]);
         assert_eq!(out.consumer, 16);
+    }
+
+    #[test]
+    fn near_max_consumer_stops_without_wrap() {
+        // Corrupt producer just below u64::MAX: `consumer + total` would
+        // wrap (and panic in debug); saturation must stop the walk instead.
+        let area = area(256);
+        let consumer = u64::MAX - 7;
+        let out = consume_range(&area, 255, consumer, u64::MAX - 3, 16);
+        assert!(out.records.is_empty());
+        assert_eq!(out.consumer, consumer);
+        assert!(out.busy);
+    }
+
+    #[test]
+    fn max_producer_near_max_consumer_saturates() {
+        // Producer pinned at u64::MAX: the record fits exactly, so the
+        // walk emits it and saturates the consumer onto the producer.
+        let area = area(256);
+        let consumer = u64::MAX - 7;
+        let out = consume_range(&area, 255, consumer, u64::MAX, 16);
+        assert_eq!(out.records, vec![Vec::<u8>::new()]);
+        assert_eq!(out.consumer, u64::MAX);
+        assert!(!out.busy);
     }
 }

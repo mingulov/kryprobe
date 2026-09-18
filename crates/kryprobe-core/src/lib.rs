@@ -5,7 +5,10 @@
 //! `schemas/event-v0.schema.json`, which is authoritative over examples.
 
 pub mod attach;
-pub use attach::{DrainConfig, GenerationGuard, LinkGroup, LossLedger, ReconcileVerdict};
+pub use attach::{
+    COUNT_SLOTS, CookieAllocator, CookieExhausted, CookieRange, DrainConfig, GenerationGuard,
+    LinkGroup, LossLedger, ReconcileVerdict, cookie_for,
+};
 pub mod authority;
 pub mod backend;
 pub mod budget;

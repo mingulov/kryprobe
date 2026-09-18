@@ -126,7 +126,10 @@ fn cap_eff(status: &str) -> String {
 /// [`InspectError::TargetGone`]; EACCES/EPERM map to
 /// [`InspectError::Denied`] naming the stage. Yama/CapEff are context
 /// notes only and never fail the snapshot.
-pub fn inspect_pid(pid: u32) -> Result<TargetSnapshot, InspectError> {
+///
+/// Crate-private: the only external entry is the inspection facet
+/// (`TargetInspectionAuthority::inspect` on `LocalPrivilegedAuthority`).
+pub(crate) fn inspect_pid(pid: u32) -> Result<TargetSnapshot, InspectError> {
     // Raw syscall: this libc exposes SYS_pidfd_open but no pidfd_open wrapper.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) } as i32;
     if raw < 0 {

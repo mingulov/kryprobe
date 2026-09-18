@@ -15,21 +15,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum ReportError {
     /// `BackendId::Synthetic` never serializes (schema has no spelling).
     SyntheticBackend,
+    /// `NativeResult::Synthetic` never serializes either: it is test-only
+    /// (the driver test double emits it), and stamping `synthetic` into a
+    /// real backend's `native_namespace` would launder harness output as
+    /// native evidence.
+    SyntheticResult,
     /// `EvidencePhase::Succeeded` is derived in Rust, never on the wire.
     SucceededPhase,
     /// `child_exit_code` must be 0–255 or null.
     ExitCodeOutOfRange(i32),
     /// `child_signal` must be 1–128 or null.
     SignalOutOfRange(i32),
+    /// A `kind` record failed to serialize (a harness defect: every
+    /// shipped payload serializes; only a future non-serializable
+    /// payload can trip this).
+    SerializeFailed {
+        /// Record kind that failed to serialize.
+        kind: &'static str,
+        /// The underlying serialization failure.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ReportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SyntheticBackend => write!(f, "synthetic backend has no wire spelling"),
+            Self::SyntheticResult => {
+                write!(f, "synthetic native result has no wire spelling")
+            }
             Self::SucceededPhase => write!(f, "succeeded phase never serializes"),
             Self::ExitCodeOutOfRange(code) => write!(f, "exit code {code} out of range 0-255"),
             Self::SignalOutOfRange(sig) => write!(f, "signal {sig} out of range 1-128"),
+            Self::SerializeFailed { kind, detail } => {
+                write!(f, "cannot serialize {kind} record: {detail}")
+            }
         }
     }
 }
@@ -83,7 +103,13 @@ impl JsonlWriter {
     }
 
     /// Appends one record; stamp advances the clock by [`STEP_NS`].
-    pub(crate) fn emit<P: Serialize>(&mut self, kind: &'static str, payload: P) {
+    /// Serialization failure is a typed [`ReportError`], never a panic:
+    /// a failed emit appends nothing, so the stream stays well-formed.
+    pub(crate) fn emit<P: Serialize>(
+        &mut self,
+        kind: &'static str,
+        payload: P,
+    ) -> Result<(), ReportError> {
         let record = Record {
             schema: EVENT_SCHEMA_V0,
             kind,
@@ -92,39 +118,55 @@ impl JsonlWriter {
             monotonic_ns: self.clock_ns.to_string(),
             payload,
         };
-        // Payloads are plain string-keyed structs; serialization is infallible.
-        self.out
-            .push_str(&serde_json::to_string(&record).expect("record serializes"));
+        let text = serde_json::to_string(&record).map_err(|err| ReportError::SerializeFailed {
+            kind,
+            detail: err.to_string(),
+        })?;
+        self.out.push_str(&text);
         self.out.push('\n');
         self.next_record += 1;
         self.clock_ns += STEP_NS;
+        Ok(())
     }
 
     /// Commits the stream atomically: temp file + fsync + rename + dir fsync.
     pub fn write_file_atomic(&self, path: &Path) -> anyhow::Result<()> {
-        use anyhow::Context;
-        use std::io::Write;
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let name = path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("atomic write needs a file name"))?;
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(
-            ".{}.{}.{}.tmp",
-            name.to_string_lossy(),
-            std::process::id(),
-            unique
-        ));
+        write_str_atomic(path, &self.out)
+    }
+}
+
+/// Atomically commits `text` to `path`: temp file + fsync + rename +
+/// dir fsync. The one commit site: [`JsonlWriter::write_file_atomic`]
+/// and the selftest `--out` paths share it, so no plain `fs::write`
+/// can leave a torn file behind.
+///
+/// A failed commit removes its temp file (best-effort): callers never
+/// inherit `.tmp` litter from an error path.
+pub fn write_str_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("atomic write needs a file name"))?;
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        unique
+    ));
+    let outcome: anyhow::Result<()> = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
             .with_context(|| format!("create temp {}", tmp.display()))?;
-        file.write_all(self.out.as_bytes())
+        file.write_all(text.as_bytes())
             .with_context(|| format!("write temp {}", tmp.display()))?;
         file.sync_all()
             .with_context(|| format!("fsync temp {}", tmp.display()))?;
@@ -135,5 +177,44 @@ impl JsonlWriter {
         dir.sync_all()
             .with_context(|| format!("fsync dir {}", parent.display()))?;
         Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A payload whose serialization always fails.
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("boom"))
+        }
+    }
+
+    #[test]
+    fn emit_returns_typed_error_instead_of_panicking() {
+        let mut writer = JsonlWriter::new("session:emit");
+        let err = writer
+            .emit("operation_observation", Unserializable)
+            .expect_err("unserializable payload must fail");
+        assert_eq!(
+            err,
+            ReportError::SerializeFailed {
+                kind: "operation_observation",
+                detail: "boom".to_owned(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot serialize operation_observation record: boom"
+        );
+        // The failed emit appended nothing: no torn record.
+        assert_eq!(writer.finish(), "");
     }
 }

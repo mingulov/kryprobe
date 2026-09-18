@@ -3,6 +3,7 @@
 //!
 //! Every ID renders as a `kind:value` string matching the envelope pattern
 //! `^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$`, and serializes to that same string.
+//! Parsing accepts canonical spellings only (no leading zeros).
 
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -37,6 +38,9 @@ impl Display for IdParseError {
 
 impl std::error::Error for IdParseError {}
 
+/// Define a `kind:value` ID type with [`IdParseError`] rejection, `Display`,
+/// `FromStr`, and string-form serde impls.
+#[macro_export]
 macro_rules! define_id {
     ($name:ident, $inner:ty, $kind:literal) => {
         /// Opaque session-scoped identifier; displays as `kind:value`.
@@ -72,7 +76,11 @@ macro_rules! define_id {
                     None => return Err(IdParseError::new($kind, text)),
                 };
                 let shaped = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
-                if !shaped {
+                // Canonical spelling only: `Display` never emits leading
+                // zeros, so the parser rejects them (fail closed; `0`
+                // itself stays valid).
+                let canonical = digits.len() == 1 || !digits.starts_with('0');
+                if !shaped || !canonical {
                     return Err(IdParseError::new($kind, text));
                 }
                 digits
@@ -118,9 +126,67 @@ pub struct IdIssuer {
     next: std::sync::atomic::AtomicU64,
 }
 
+/// Session observation-ID space exhausted: all 2^64 IDs issued.
+///
+/// Fail closed: the caller decodes nothing, so no duplicate ID can alias
+/// two observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdExhausted;
+
+impl Display for IdExhausted {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "observation id space exhausted: 2^64 ids issued")
+    }
+}
+
+impl std::error::Error for IdExhausted {}
+
 impl IdIssuer {
     /// Issue the next session-scoped observation ID (1-based).
-    pub fn issue(&self) -> ObservationId {
-        ObservationId::new(self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+    ///
+    /// Refuses with [`IdExhausted`] once `u64::MAX` is issued: the
+    /// counter never wraps (wrapping would alias new observations to
+    /// old IDs). Unreachable in practice — 2^64 issues — but fail-closed.
+    pub fn issue(&self) -> Result<ObservationId, IdExhausted> {
+        use std::sync::atomic::Ordering;
+        match self
+            .next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+        {
+            // Success implies `prev < u64::MAX`, so `prev + 1` cannot overflow.
+            Ok(prev) => Ok(ObservationId::new(prev + 1)),
+            // At `u64::MAX` nothing is stored: the counter stays refused,
+            // never wraps.
+            Err(_) => Err(IdExhausted),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn issue_counts_from_one() {
+        let issuer = IdIssuer::default();
+        assert_eq!(issuer.issue(), Ok(ObservationId::new(1)));
+        assert_eq!(issuer.issue(), Ok(ObservationId::new(2)));
+        assert_eq!(issuer.issue(), Ok(ObservationId::new(3)));
+    }
+
+    #[test]
+    fn issue_refuses_at_u64_max_without_wrapping() {
+        let issuer = IdIssuer {
+            next: AtomicU64::new(u64::MAX - 1),
+        };
+        assert_eq!(issuer.issue(), Ok(ObservationId::new(u64::MAX)));
+        assert_eq!(issuer.issue(), Err(IdExhausted));
+        // Stays refused: never wraps to 0 and re-issues old IDs.
+        assert_eq!(issuer.issue(), Err(IdExhausted));
+        assert_eq!(
+            IdExhausted.to_string(),
+            "observation id space exhausted: 2^64 ids issued"
+        );
     }
 }

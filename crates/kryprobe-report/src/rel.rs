@@ -49,7 +49,7 @@ impl JsonlWriter {
                 rule_id,
                 integrity,
             },
-        );
+        )?;
         Ok(())
     }
 }

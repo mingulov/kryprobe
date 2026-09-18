@@ -96,7 +96,7 @@ impl JsonlWriter {
                 contract_version: "v0-proposed",
                 qualification_id: &start.qualification_id,
             },
-        );
+        )?;
         Ok(())
     }
 
@@ -121,7 +121,7 @@ impl JsonlWriter {
                 child_exit_code: end.child_exit_code,
                 child_signal: end.child_signal,
             },
-        );
+        )?;
         Ok(())
     }
 }

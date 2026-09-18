@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! In-process privileged authority: all three facets, one honest stub.
+//! In-process privileged authority: all three facets, really fronted.
 //!
 //! `LocalPrivilegedAuthority` implements the three SECURITY §3 authority
-//! traits in-process. T6c wires inspection for real; program load and link
-//! creation stay honest `Unsupported` stubs until T7 (`bpfloader`/`attach`).
+//! traits in-process. Each trait method fronts its real path: object bytes
+//! parse + instantiate (§3.1, plain or token-delegated), scope-checked
+//! link creation (§3.2), and bounded target inspection (§3.3). The free
+//! functions behind these methods are crate-private; outside this crate
+//! the ONLY load/link/inspect entries are the facet methods.
+
+use std::path::Path;
 
 use kryprobe_core::ProgramId;
+use kryprobe_core::attach::{GenerationGuard, LinkGroup};
 use kryprobe_core::authority::{AttachAuthority, BpfLoadAuthority, TargetInspectionAuthority};
-use kryprobe_core::error::{BackendError, InputReason, UnsupportedReason};
-use kryprobe_core::plan::ProbePlan;
 
+use crate::attach::{AttachError, OwnedLink, attach_group};
+use crate::bpfloader::instantiate::{instantiate, instantiate_with_token};
+use crate::bpfloader::{LoadedSpine, LoaderError, parse_spine_object};
+use crate::fanout::{FanoutPlan, FanoutRefresh, refresh_with, resolve_with};
+use crate::fd::OwnedFd;
 use crate::inspect::{InspectError, TargetSnapshot, inspect_pid};
+use crate::token::TokenHandle;
 
 /// Approved program allowlist: exactly the T6 self-probe.
 static ALLOWLIST: &[ProgramId] = &[ProgramId::UprobeMultiSelfProbe];
@@ -19,51 +29,103 @@ static ALLOWLIST: &[ProgramId] = &[ProgramId::UprobeMultiSelfProbe];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LocalPrivilegedAuthority;
 
-impl BpfLoadAuthority for LocalPrivilegedAuthority {}
-impl AttachAuthority for LocalPrivilegedAuthority {}
-impl TargetInspectionAuthority for LocalPrivilegedAuthority {}
-
 impl LocalPrivilegedAuthority {
-    /// Approved programs (SECURITY §3.1): exactly `UprobeMultiSelfProbe`.
-    #[must_use]
-    pub fn allowed_programs() -> &'static [ProgramId] {
+    /// Resolve a `Tree`/`Cgroup` scope to admitted members (FU4 fan-out).
+    ///
+    /// Inherent (not a facet method) by design (X15, see `AttachAuthority`):
+    /// a composition helper over the inspect facet, not a fourth authority.
+    /// Each member admits through the inspection facet; the plan's
+    /// [`FanoutPlan::link_groups`] then flow through the unchanged Pid
+    /// attach path. `Pid`/`OwnedRun` reject honestly here.
+    pub fn resolve_scope(
+        &self,
+        scope: &kryprobe_core::plan::TargetScope,
+        max_targets: u64,
+    ) -> Result<FanoutPlan, AttachError> {
+        resolve_with(scope, max_targets, &|pid| {
+            <Self as TargetInspectionAuthority>::inspect(self, pid)
+        })
+    }
+
+    /// Follow-fork refresh: re-resolve the plan's scope and diff.
+    ///
+    /// A failed refresh leaves the caller's plan untouched.
+    pub fn refresh_fanout(
+        &self,
+        plan: &FanoutPlan,
+        max_targets: u64,
+    ) -> Result<(FanoutPlan, FanoutRefresh), AttachError> {
+        refresh_with(plan, max_targets, &|pid| {
+            <Self as TargetInspectionAuthority>::inspect(self, pid)
+        })
+    }
+
+    /// Fail-closed allowlist gate shared by both load entries.
+    /// Denials are typed [`LoaderError::NotAllowed`] (X16: forbidden
+    /// program, never `BadObject`), so callers can route them to exit
+    /// 3 / `Denied` instead of a corruption bucket.
+    fn check_allowlist(id: ProgramId) -> Result<(), LoaderError> {
+        if ALLOWLIST.contains(&id) {
+            Ok(())
+        } else {
+            Err(LoaderError::NotAllowed { id })
+        }
+    }
+}
+
+impl BpfLoadAuthority for LocalPrivilegedAuthority {
+    type Loaded = LoadedSpine;
+    type LoadError = LoaderError;
+    type Token = TokenHandle;
+
+    fn allowed_programs() -> &'static [ProgramId] {
         ALLOWLIST
     }
 
-    /// Load one approved program (SECURITY §3.1).
-    ///
-    /// Honest T6 stub: unknown ids are `Unsupported`, and even allowlisted
-    /// ids are `Unsupported` until T7 wires the real `bpfloader`.
-    pub fn load_program(&self, id: ProgramId) -> Result<(), BackendError> {
-        if !Self::allowed_programs().contains(&id) {
-            return Err(BackendError::Unsupported(UnsupportedReason::new(
-                "program id not in approved allowlist",
-            )));
-        }
-        Err(BackendError::Unsupported(UnsupportedReason::new(
-            "program load arrives with T7 bpfloader",
-        )))
+    /// Allowlist, then the real parse + instantiate path.
+    fn load_program(&self, id: ProgramId, bytes: &[u8]) -> Result<LoadedSpine, LoaderError> {
+        Self::check_allowlist(id)?;
+        let parsed = parse_spine_object(bytes)?;
+        instantiate(&parsed)
     }
 
-    /// Attach one validated plan (SECURITY §3.2, target-authorization boundary).
-    ///
-    /// Invalid plans are `CorruptInput`; valid plans are `Unsupported`
-    /// until T7 wires real link creation.
-    pub fn attach_plan(&self, plan: &ProbePlan) -> Result<(), BackendError> {
-        if let Err(err) = plan.validate() {
-            return Err(BackendError::CorruptInput(InputReason::with_detail(
-                "plan_validate",
-                &err.to_string(),
-            )));
-        }
-        Err(BackendError::Unsupported(UnsupportedReason::new(
-            "link creation arrives with T7 attach",
-        )))
+    /// Allowlist, then the real token-delegated instantiate path.
+    fn load_program_with_token(
+        &self,
+        id: ProgramId,
+        bytes: &[u8],
+        token: &TokenHandle,
+    ) -> Result<LoadedSpine, LoaderError> {
+        Self::check_allowlist(id)?;
+        let parsed = parse_spine_object(bytes)?;
+        instantiate_with_token(&parsed, Some(token.as_raw_fd()))
     }
+}
 
-    /// Inspect one process (SECURITY §3.3): delegates to `inspect_pid`,
-    /// the ONLY inspection path.
-    pub fn inspect(&self, pid: u32) -> Result<TargetSnapshot, InspectError> {
+impl AttachAuthority for LocalPrivilegedAuthority {
+    type Link = OwnedLink;
+    type AttachError = AttachError;
+    type ProgFd = OwnedFd;
+
+    /// Fronts the scope-checked, generation-guarded link path.
+    fn attach_group(
+        &self,
+        group: &LinkGroup,
+        guard: &GenerationGuard,
+        prog_fd: &OwnedFd,
+        object: &Path,
+        offsets: &[u64],
+    ) -> Result<OwnedLink, AttachError> {
+        attach_group(group, guard, prog_fd, object, offsets)
+    }
+}
+
+impl TargetInspectionAuthority for LocalPrivilegedAuthority {
+    type Snapshot = TargetSnapshot;
+    type InspectError = InspectError;
+
+    /// Fronts the bounded inspection path.
+    fn inspect(&self, pid: u32) -> Result<TargetSnapshot, InspectError> {
         inspect_pid(pid)
     }
 }

@@ -1,0 +1,60 @@
+{
+  "session_integrity": {
+    "budget_omissions": "2",
+    "correlation_overflows": "0",
+    "ring_reservation_failures": "3",
+    "state_evictions": "0",
+    "state_insert_failures": "0",
+    "unknown_generation_events": "0",
+    "unmatched_entries": "1",
+    "unmatched_returns": "0",
+    "user_queue_drops": "7"
+  },
+  "summaries": [
+    {
+      "backend": "Synthetic",
+      "integrity": {
+        "budget_omissions": "0",
+        "correlation_overflows": "0",
+        "ring_reservation_failures": "0",
+        "state_evictions": "0",
+        "state_insert_failures": "0",
+        "unknown_generation_events": "0",
+        "unmatched_entries": "0",
+        "unmatched_returns": "0",
+        "user_queue_drops": "0"
+      },
+      "observations": "1"
+    },
+    {
+      "backend": "P11",
+      "integrity": {
+        "budget_omissions": "0",
+        "correlation_overflows": "0",
+        "ring_reservation_failures": "3",
+        "state_evictions": "0",
+        "state_insert_failures": "0",
+        "unknown_generation_events": "0",
+        "unmatched_entries": "1",
+        "unmatched_returns": "0",
+        "user_queue_drops": "0"
+      },
+      "observations": "2"
+    },
+    {
+      "backend": "OpenSsl",
+      "integrity": {
+        "budget_omissions": "2",
+        "correlation_overflows": "0",
+        "ring_reservation_failures": "0",
+        "state_evictions": "0",
+        "state_insert_failures": "0",
+        "unknown_generation_events": "0",
+        "unmatched_entries": "0",
+        "unmatched_returns": "0",
+        "user_queue_drops": "7"
+      },
+      "observations": "1"
+    }
+  ]
+}

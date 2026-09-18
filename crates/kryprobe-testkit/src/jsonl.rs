@@ -82,15 +82,53 @@ const STRING_KEYS: &[&str] = &["schema", "kind", "session_id", "record_id", "mon
 /// prefixed-ID shape, per-kind required payload keys from `kinds`, and
 /// non-decreasing `monotonic_ns`. Blank lines are skipped.
 pub fn check_stream(text: &str, kinds: &[(&str, &[&str])]) -> Vec<StreamFinding> {
-    let mut findings = Vec::new();
-    let mut previous: Option<String> = None;
+    let mut checker = StreamChecker::new(kinds);
     for (index, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        check_record(line, index + 1, kinds, &mut previous, &mut findings);
+        checker.push_line(index + 1, line);
     }
-    findings
+    checker.finish()
+}
+
+/// Incremental [`check_stream`]: one `push_line` per physical line, then
+/// [`finish`](Self::finish). Holds only the previous clock plus findings,
+/// so readers stream million-line files with bounded working memory.
+pub struct StreamChecker<'a> {
+    kinds: &'a [(&'a str, &'a [&'a str])],
+    previous: Option<String>,
+    findings: Vec<StreamFinding>,
+}
+
+impl<'a> StreamChecker<'a> {
+    /// New checker over the per-kind required-payload-key table.
+    #[must_use]
+    pub fn new(kinds: &'a [(&'a str, &'a [&'a str])]) -> Self {
+        Self {
+            kinds,
+            previous: None,
+            findings: Vec::new(),
+        }
+    }
+
+    /// Checks physical line `line_no` (1-based); blank lines are skipped
+    /// exactly as in [`check_stream`].
+    pub fn push_line(&mut self, line_no: usize, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        check_record(
+            line,
+            line_no,
+            self.kinds,
+            &mut self.previous,
+            &mut self.findings,
+        );
+    }
+
+    /// Collected findings, in line order.
+    #[must_use]
+    pub fn finish(self) -> Vec<StreamFinding> {
+        self.findings
+    }
 }
 
 fn check_record(

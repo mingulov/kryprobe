@@ -20,70 +20,12 @@ pub use relationship::{
     RelationshipConfidence, RelationshipEvidence, RelationshipKind, RelationshipRecord,
 };
 
+use crate::ids::IdParseError;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-/// Opaque omission identity; displays as `omission:<n>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct OmissionId(u64);
-
-impl OmissionId {
-    /// Wrap a raw omission value.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Unwrap the raw omission value.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl Display for OmissionId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "omission:{}", self.0)
-    }
-}
-
-/// Rejection message for a malformed `omission:<int>` string.
-fn bad_id(text: &str) -> String {
-    format!("invalid id: expected `omission:<int>`, found `{text}`")
-}
-
-impl FromStr for OmissionId {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let digits = match text.strip_prefix("omission:") {
-            Some(digits) => digits,
-            None => return Err(bad_id(text)),
-        };
-        let shaped = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
-        if !shaped {
-            return Err(bad_id(text));
-        }
-        match digits.parse::<u64>() {
-            Ok(value) => Ok(Self(value)),
-            Err(_) => Err(bad_id(text)),
-        }
-    }
-}
-
-impl Serialize for OmissionId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for OmissionId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        text.parse().map_err(serde::de::Error::custom)
-    }
-}
+crate::define_id!(OmissionId, u64, "omission");
 
 /// Validity interval in monotonic nanoseconds (JSON strings on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,5 +77,20 @@ pub(crate) mod wire {
             text.map(|text| text.parse().map_err(serde::de::Error::custom))
                 .transpose()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OmissionId;
+    use crate::ids::IdParseError;
+
+    #[test]
+    fn omission_id_rejects_with_typed_error() {
+        let err: IdParseError = "target:7".parse::<OmissionId>().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid id: expected `omission:<int>`, found `target:7`"
+        );
     }
 }

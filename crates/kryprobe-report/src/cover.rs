@@ -97,7 +97,7 @@ impl JsonlWriter {
                 impact: &gap.impact,
                 omitted_count: gap.omitted_count.map(|n| n.to_string()),
             },
-        );
+        )?;
         Ok(())
     }
 }

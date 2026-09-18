@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Backend contract: host-side trait plus static registry.
+//! Backend contract: host-side trait plus owned registry and driver.
 //!
 //! The [`Backend`] trait is exactly ARCH §4.6. ARCH writes `Result` bare;
 //! the error type is [`BackendError`] per CONTRACTS §14 ("Backends return
 //! typed errors").
 
 pub mod context;
+pub mod driver;
 pub mod registry;
 
 pub use context::{
     BackendPlan, BackendSummary, ConfigureContext, DecodeContext, DetectContext, DetectedInstance,
     FinalizeContext, PlanContext, RawEvent,
 };
+pub use driver::{BackendDriver, DriverError, DriverReport, SkippedBackend};
 pub use registry::{BackendRegistry, DuplicateBackend};
 
 use crate::enums::{BackendId, CaptureMode};

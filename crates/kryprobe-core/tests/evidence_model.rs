@@ -165,3 +165,64 @@ fn omission_id_roundtrip() {
     assert!("omission:".parse::<OmissionId>().is_err());
     assert!("target:7".parse::<OmissionId>().is_err());
 }
+
+// ---------------------------------------------------------------------------
+// C13: wire-leniency contract pin (`evidence::wire`, shared by every ns/count
+// field). Input parses any decimal `u64` spelling; output is always
+// canonical (the frozen schema pattern `^(0|[1-9][0-9]*)$`).
+// ---------------------------------------------------------------------------
+
+/// The frozen-schema decimal pattern, hand-rolled (no regex dependency).
+fn is_canonical_decimal(text: &str) -> bool {
+    if text == "0" {
+        return true;
+    }
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) if ('1'..='9').contains(&first) => chars.all(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+#[test]
+fn wire_leniency_noncanonical_in_canonical_out() {
+    // Non-canonical spellings parse (deliberate leniency)...
+    let interval: ValidityInterval =
+        serde_json::from_str(r#"{"start_ns":"007","end_ns":"00042"}"#).unwrap();
+    assert_eq!(interval.start_ns, 7);
+    assert_eq!(interval.end_ns, Some(42));
+    // ...but output is always canonical (frozen-schema shape).
+    let text = serde_json::to_string(&interval).unwrap();
+    assert_eq!(text, r#"{"start_ns":"7","end_ns":"42"}"#);
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(is_canonical_decimal(value["start_ns"].as_str().unwrap()));
+    assert!(is_canonical_decimal(value["end_ns"].as_str().unwrap()));
+}
+
+#[test]
+fn wire_leniency_zero_and_max_spellings() {
+    let zero: ValidityInterval = serde_json::from_str(r#"{"start_ns":"00"}"#).unwrap();
+    assert_eq!((zero.start_ns, zero.end_ns), (0, None));
+    let text = serde_json::to_string(&zero).unwrap();
+    assert_eq!(text, r#"{"start_ns":"0","end_ns":null}"#);
+
+    let max: ValidityInterval =
+        serde_json::from_str(r#"{"start_ns":"00018446744073709551615"}"#).unwrap();
+    assert_eq!(max.start_ns, u64::MAX);
+    let text = serde_json::to_string(&max).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(is_canonical_decimal(value["start_ns"].as_str().unwrap()));
+}
+
+#[test]
+fn wire_leniency_rejects_non_decimal_spellings() {
+    // Leniency is decimal-only: garbage, signs, fractions, whitespace,
+    // and overflow still fail closed.
+    for bad in ["", "abc", "-1", "1.5", " 7", "7 ", "18446744073709551616"] {
+        let text = format!(r#"{{"start_ns":"{bad}"}}"#);
+        assert!(
+            serde_json::from_str::<ValidityInterval>(&text).is_err(),
+            "must reject {bad:?}"
+        );
+    }
+}

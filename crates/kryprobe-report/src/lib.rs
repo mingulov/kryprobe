@@ -16,11 +16,14 @@ pub mod writer;
 
 pub use cover::{CoverageGap, GapCtx};
 pub use observe::ObservationExtra;
-pub use render::render_summary;
+pub use render::{render_summary, render_summary_reader};
 pub use session::{FinalBarrier, SessionEnd, SessionStart, SessionVerdict};
 pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
-pub use validate::{ValidationFinding, schema_fnv1a_hex, validate_file, validate_str};
-pub use writer::{JsonlWriter, ReportError};
+pub use validate::{
+    ValidationFinding, schema_fnv1a_hex, validate_and_render_file, validate_and_render_reader,
+    validate_file, validate_reader, validate_str,
+};
+pub use writer::{JsonlWriter, ReportError, write_str_atomic};
 
 /// Frozen event-envelope schema const; every record must carry exactly this.
 pub const EVENT_SCHEMA_V0: &str = "kryprobe.event/v0";

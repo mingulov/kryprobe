@@ -12,7 +12,7 @@ use kryprobe_core::ids::{CorrelationId, ImplementationId, ObservationId, Session
 use kryprobe_report::{
     CoverageGap, FinalBarrier, JsonlWriter, ObservationExtra, ReportError, SessionEnd,
     SessionStart, SessionVerdict, SnapshotBarrier, SnapshotParams, SnapshotUnit, ValidationFinding,
-    render_summary, validate_file, validate_str,
+    render_summary, validate_file, validate_str, write_str_atomic,
 };
 use kryprobe_testkit::assert_golden;
 use std::path::PathBuf;
@@ -383,6 +383,33 @@ fn writer_rejects_synthetic_case() {
         )
         .unwrap_err();
     assert!(matches!(err, ReportError::SyntheticBackend));
+    // The driver test double's exact shape (P11 backend, Synthetic
+    // result) refuses too: test-only `synthetic` must never reach
+    // `native_namespace`.
+    let err = writer
+        .observation(
+            &observation(
+                2,
+                BackendId::P11,
+                EvidencePhase::Returned,
+                NativeResult::Synthetic { code: 0 },
+                Some(0),
+                Some(1),
+            ),
+            &ObservationExtra {
+                boundary: "api".to_owned(),
+                native_operation: "op".to_owned(),
+                algorithm_native: None,
+                algorithm_canonical: None,
+                algorithm_resolution: "unknown".to_owned(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err, ReportError::SyntheticResult);
+    assert_eq!(
+        err.to_string(),
+        "synthetic native result has no wire spelling"
+    );
 }
 
 #[test]
@@ -487,6 +514,29 @@ fn atomic_write_roundtrip_case() {
     second.write_file_atomic(&path).expect("rewrite");
     assert_eq!(std::fs::read_to_string(&path).expect("read back"), "");
     assert!(validate_file(&path).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn failed_atomic_commit_leaves_no_tmp_litter() {
+    let dir = std::env::temp_dir().join(format!("kryprobe-report-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    // Renaming a file onto a directory fails: the commit errors and must
+    // still remove its temp file (best-effort cleanup).
+    let target = dir.join("adir");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let err = write_str_atomic(&target, "torn?\n").expect_err("rename onto dir must fail");
+    assert!(
+        format!("{err:?}").contains("rename to"),
+        "unexpected error: {err:?}"
+    );
+    let litter: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(litter.is_empty(), "tmp litter: {litter:?}");
+    assert!(target.is_dir(), "target dir must survive");
     std::fs::remove_dir_all(&dir).ok();
 }
 

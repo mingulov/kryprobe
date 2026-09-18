@@ -10,7 +10,10 @@ use crate::cmd_selftest::{locate_bpf_object, sibling_binary};
 use kryprobe_core::ReconcileVerdict;
 use kryprobe_core::enums::{CaptureMode, TargetSelector};
 use kryprobe_privilege::bpfselftest::{BpfSelftestConfig, BpfSelftestError, run_bpf_selftest};
-use kryprobe_report::{FinalBarrier, JsonlWriter, SessionEnd, SessionStart, SessionVerdict};
+use kryprobe_report::{
+    FinalBarrier, JsonlWriter, ReportError, SessionEnd, SessionStart, SessionVerdict,
+    write_str_atomic,
+};
 use std::io::Write;
 use std::path::Path;
 
@@ -19,28 +22,24 @@ fn emit_jsonl(
     verdict: SessionVerdict,
     exit_code: Option<i32>,
     signal: Option<i32>,
-) -> String {
+) -> Result<String, ReportError> {
     let mut writer = JsonlWriter::new("session:bpf-selftest");
     // Backends unclaimable here (no crypto backend observed); the start
     // record carries an empty request list by design, never a guess.
-    writer
-        .session_start(&SessionStart {
-            target_selector: TargetSelector::OwnedRun,
-            capture_mode: CaptureMode::Trace,
-            requested_backends: Vec::new(),
-            qualification_id: format!("qualification:bpf-selftest-{calls}"),
-        })
-        .expect("bpf start record");
-    writer
-        .session_end(&SessionEnd {
-            verdict,
-            final_barrier: FinalBarrier::Validated,
-            unresolved_gap_ids: Vec::new(),
-            child_exit_code: exit_code,
-            child_signal: signal,
-        })
-        .expect("bpf end record");
-    writer.into_string()
+    writer.session_start(&SessionStart {
+        target_selector: TargetSelector::OwnedRun,
+        capture_mode: CaptureMode::Trace,
+        requested_backends: Vec::new(),
+        qualification_id: format!("qualification:bpf-selftest-{calls}"),
+    })?;
+    writer.session_end(&SessionEnd {
+        verdict,
+        final_barrier: FinalBarrier::Validated,
+        unresolved_gap_ids: Vec::new(),
+        child_exit_code: exit_code,
+        child_signal: signal,
+    })?;
+    Ok(writer.into_string())
 }
 
 /// Runs `selftest bpf`: 0 clean, 4 partial, 3 denied/missing, 1 failure.
@@ -84,8 +83,8 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
         (ReconcileVerdict::Partial { missing }, _) => {
             let _ = writeln!(
                 stderr,
-                "selftest bpf: partial ({missing} missing; ring={} drop={} queue={})",
-                outcome.ring, outcome.dropped, outcome.queue_drops
+                "selftest bpf: partial ({missing} missing; ring={} drop={} trunc={} queue={})",
+                outcome.ring, outcome.dropped, outcome.truncated, outcome.queue_drops
             );
             ("partial", SessionVerdict::Partial, 4)
         }
@@ -93,21 +92,28 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
             ("defect", SessionVerdict::Failed, 1)
         }
     };
-    let text = emit_jsonl(calls, verdict, outcome.exit_code, outcome.signal);
+    let text = match emit_jsonl(calls, verdict, outcome.exit_code, outcome.signal) {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = writeln!(stderr, "selftest bpf: cannot encode session jsonl: {err}");
+            return 1;
+        }
+    };
     let _ = write!(stderr, "{}", kryprobe_report::render_summary(&text));
     let _ = writeln!(
         stderr,
-        "selftest bpf: entries={} returns={} received={} ring={} drop={} queue={}",
+        "selftest bpf: entries={} returns={} received={} ring={} drop={} trunc={} queue={}",
         outcome.entries,
         outcome.returns,
         outcome.received,
         outcome.ring,
         outcome.dropped,
+        outcome.truncated,
         outcome.queue_drops
     );
     let _ = writeln!(stderr, "reconcile: {marker}");
     match out {
-        Some(path) => match std::fs::write(path, &text) {
+        Some(path) => match write_str_atomic(path, &text) {
             Ok(()) => {
                 let _ = writeln!(stderr, "wrote {}", path.display());
                 code
@@ -125,5 +131,37 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
             let _ = write!(stdout, "{text}");
             code
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emit_jsonl_rejects_out_of_range_exit_and_signal() {
+        assert_eq!(
+            emit_jsonl(2, SessionVerdict::Observed, Some(999), None),
+            Err(ReportError::ExitCodeOutOfRange(999))
+        );
+        assert_eq!(
+            emit_jsonl(2, SessionVerdict::Observed, Some(-1), None),
+            Err(ReportError::ExitCodeOutOfRange(-1))
+        );
+        assert_eq!(
+            emit_jsonl(2, SessionVerdict::Observed, None, Some(999)),
+            Err(ReportError::SignalOutOfRange(999))
+        );
+        assert_eq!(
+            emit_jsonl(2, SessionVerdict::Observed, None, Some(0)),
+            Err(ReportError::SignalOutOfRange(0))
+        );
+    }
+
+    #[test]
+    fn emit_jsonl_accepts_boundary_values() {
+        assert!(emit_jsonl(2, SessionVerdict::Observed, Some(0), Some(1)).is_ok());
+        assert!(emit_jsonl(2, SessionVerdict::Observed, Some(255), Some(128)).is_ok());
+        assert!(emit_jsonl(2, SessionVerdict::Observed, None, None).is_ok());
     }
 }

@@ -4,12 +4,14 @@
 use super::{
     SuiteResult, SuiteStatus, locate_bpf_object, locate_fixture, median_of, percentile_of,
 };
+use kryprobe_core::authority::{AttachAuthority, BpfLoadAuthority};
 use kryprobe_core::ids::PlanGeneration;
 use kryprobe_core::object::{ObjectRef, ObjectRole};
 use kryprobe_core::plan::TargetScope;
-use kryprobe_core::{GenerationGuard, LinkGroup, ProgramId};
-use kryprobe_privilege::attach::{AttachError, attach_group};
-use kryprobe_privilege::bpfloader::{LoaderError, SpineProgs, load_spine_object};
+use kryprobe_core::{CookieAllocator, CookieRange, GenerationGuard, LinkGroup, ProgramId};
+use kryprobe_privilege::LocalPrivilegedAuthority;
+use kryprobe_privilege::attach::AttachError;
+use kryprobe_privilege::bpfloader::{LoaderError, SpineProgs};
 use kryprobe_privilege::elfread::goblin_parser;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
@@ -72,31 +74,43 @@ fn iteration(
         let meta =
             std::fs::symlink_metadata(fixture).map_err(|err| format!("fixture-meta: {err}"))?;
         let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-        let group = |entry: bool| LinkGroup {
-            object: ObjectRef {
-                dev: meta.dev(),
-                ino: meta.ino(),
-                size: meta.size(),
-                mtime: mtime_ns,
-                role: ObjectRole::Executable,
-            },
-            program: ProgramId::UprobeMultiSelfProbe,
-            scope: TargetScope::Pid { pid: child.id() },
-            entry,
-            generation,
+        // One range shared by the alternating groups: only one link is
+        // live at a time (attach → drop per cycle), so sequential reuse
+        // cannot conflate slots.
+        let mut cookies = CookieAllocator::new(generation);
+        let range = cookies
+            .allocate(1)
+            .map_err(|err| format!("cookies: {err}"))?;
+        let group = |entry: bool, range: CookieRange| {
+            LinkGroup::from_range(
+                ObjectRef {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                    size: meta.size(),
+                    mtime: mtime_ns,
+                    role: ObjectRole::Executable,
+                },
+                ProgramId::UprobeMultiSelfProbe,
+                TargetScope::Pid { pid: child.id() },
+                entry,
+                range,
+            )
         };
-        let (ret_group, entry_group) = (group(false), group(true));
+        // One range shared by the alternating groups (only one link
+        // live at a time); `CookieRange` is `Copy`, the allocator stays
+        // the single issuance owner.
+        let (ret_group, entry_group) = (group(false, range), group(true, range));
         for i in 0..CYCLES {
             let entry = i % 2 == 0;
             let prog = if entry { &progs.entry } else { &progs.ret };
             let link_group = if entry { &entry_group } else { &ret_group };
             let start = Instant::now();
-            let link = attach_group(link_group, guard, prog, fixture, &[offset]).map_err(
-                |err| match err {
+            let link = LocalPrivilegedAuthority
+                .attach_group(link_group, guard, prog, fixture, &[offset])
+                .map_err(|err| match err {
                     AttachError::LinkFailed { stage, .. } => stage,
                     AttachError::Rejected { reason } => format!("rejected:{reason}"),
-                },
-            )?;
+                })?;
             drop(link);
             out.push(start.elapsed().as_secs_f64() * 1000.0);
         }
@@ -130,7 +144,19 @@ pub(crate) fn run() -> SuiteResult {
     let Some(fixture) = locate_fixture() else {
         return denied("attach", "missing-fixture");
     };
-    let loaded = match load_spine_object(&object) {
+    let object_bytes = match std::fs::read(&object) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let io = LoaderError::Io {
+                stage: "open",
+                detail: err.to_string(),
+            };
+            return denied("attach", format!("loader:{io:?}"));
+        }
+    };
+    let loaded = match LocalPrivilegedAuthority
+        .load_program(ProgramId::UprobeMultiSelfProbe, &object_bytes)
+    {
         Ok(loaded) => loaded,
         Err(LoaderError::MapFailed { stage, errno })
         | Err(LoaderError::LoadFailed { stage, errno, .. }) => {

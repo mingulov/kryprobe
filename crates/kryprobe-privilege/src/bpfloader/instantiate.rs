@@ -15,13 +15,18 @@ const LOG_CAP: usize = 1 << 20;
 const LOG_TAIL: usize = 2048;
 
 /// Create maps, apply map-fd fixups, load both programs. No BTF fd.
-pub fn instantiate(parsed: &ParsedSpine) -> Result<LoadedSpine, LoaderError> {
+///
+/// Crate-private: the only external entries are the load facet
+/// (`BpfLoadAuthority::load_program*` on `LocalPrivilegedAuthority`).
+pub(crate) fn instantiate(parsed: &ParsedSpine) -> Result<LoadedSpine, LoaderError> {
     instantiate_with_token(parsed, None)
 }
 
 /// [`instantiate`] with an optional BPF token fd instead of privilege.
 /// `None` builds the short attrs; `Some` the token-extended attrs.
-pub fn instantiate_with_token(
+///
+/// Crate-private: fronted by `BpfLoadAuthority::load_program_with_token`.
+pub(crate) fn instantiate_with_token(
     parsed: &ParsedSpine,
     token: Option<RawFd>,
 ) -> Result<LoadedSpine, LoaderError> {

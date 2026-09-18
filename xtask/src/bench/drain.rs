@@ -58,7 +58,11 @@ pub(crate) fn run() -> SuiteResult {
     }
     let median = median_of(&mut rates);
     let last = last.expect("five measured runs");
-    let loss = last.ring + last.dropped + last.queue_drops;
+    let loss = last
+        .ring
+        .saturating_add(last.dropped)
+        .saturating_add(last.truncated)
+        .saturating_add(last.queue_drops);
     SuiteResult {
         name: "drain",
         status: SuiteStatus::Ok {
