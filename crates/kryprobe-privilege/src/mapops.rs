@@ -155,17 +155,11 @@ fn possible_cpus_from_str(text: &str) -> Option<u32> {
     if total == 0 { None } else { Some(total) }
 }
 
-/// `sysconf` fallback for the possible-CPU count: `max(CONF, online)`.
-///
-/// Used only when `/sys/devices/system/cpu/possible` is unreadable or
-/// unparseable. Takes the maximum of the available signals so the buffer
-/// errs toward larger (safe direction), never smaller. Always ≥1 since
-/// `online_cpus()` is.
-fn fallback_possible_cpus() -> u32 {
+/// `_SC_NPROCESSORS_CONF` (≥1; `max(1)` fallback documented).
+fn conf_cpus() -> u32 {
     // SAFETY: sysconf takes no pointers; an error return folds into the max(1) fallback.
     let conf = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
-    let conf = if conf < 1 { 1 } else { conf as u32 };
-    conf.max(online_cpus())
+    if conf < 1 { 1 } else { conf as u32 }
 }
 
 /// Possible CPU count for percpu-map buffer sizing (≥1).
@@ -181,14 +175,28 @@ fn fallback_possible_cpus() -> u32 {
 /// The parsed value is clamped to `max(parsed, online)`: a
 /// parseable-but-stale sysfs file must never shrink the buffer below a
 /// trusted signal. Unreadable/unparseable input falls back to
-/// `fallback_possible_cpus` (safe/larger direction).
+/// `max(conf, online)` (safe/larger direction).
 pub fn possible_cpus() -> u32 {
-    if let Ok(text) = std::fs::read_to_string("/sys/devices/system/cpu/possible")
-        && let Some(n) = possible_cpus_from_str(&text)
+    let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").ok();
+    possible_cpus_from_topology(text.as_deref(), conf_cpus(), online_cpus())
+}
+
+/// [`possible_cpus`] over an injected CPU topology (test seam).
+///
+/// `possible_text` is the raw `/sys/devices/system/cpu/possible` content
+/// (`None` = unreadable file); `conf`/`online` are the two `sysconf`
+/// signals. The offline-CPU path (possible > online) is unproducible on
+/// an all-online host and offlining live CPUs is out of scope, so tests
+/// drive this seam with a synthetic possible≠online mismatch instead.
+/// [`possible_cpus`] is this function applied to the real host reads —
+/// no behavior change on the real path.
+fn possible_cpus_from_topology(possible_text: Option<&str>, conf: u32, online: u32) -> u32 {
+    if let Some(text) = possible_text
+        && let Some(parsed) = possible_cpus_from_str(text)
     {
-        return n.max(online_cpus());
+        return parsed.max(online);
     }
-    fallback_possible_cpus()
+    conf.max(online)
 }
 
 /// Look up one percpu element and sum all CPU lanes (saturating).
@@ -310,12 +318,56 @@ mod tests {
 
     #[test]
     fn possible_fallback_is_safe_direction() {
-        let fallback = fallback_possible_cpus();
-        assert!(fallback >= 1);
-        assert!(
-            fallback >= online_cpus(),
-            "fallback {fallback} < online {}",
-            online_cpus()
+        // Unreadable/unparseable possible set falls back to max(conf,
+        // online) — the safe (larger) direction on every input shape.
+        for (possible_text, conf, online) in [
+            (None, 8, 4),
+            (None, 2, 4),
+            (Some("garbage"), 8, 4),
+            (Some(""), 8, 4),
+            (Some("0-100000"), 8, 4),
+        ] {
+            let fallback = possible_cpus_from_topology(possible_text, conf, online);
+            assert_eq!(fallback, conf.max(online), "input {possible_text:?}");
+            assert!(fallback >= 1);
+        }
+    }
+
+    #[test]
+    fn offline_cpu_mismatch_sizes_by_possible() {
+        // Synthetic possible≠online mismatch: 8 possible lanes with only
+        // 4 online (half the CPUs offline) must still size 8 lanes — the
+        // kernel writes all possible lanes on percpu lookup regardless
+        // of which are online. Unproducible on an all-online host, so it
+        // runs through the injected-topology seam.
+        assert_eq!(
+            possible_cpus_from_topology(Some("0-7\n"), 8, 4),
+            8,
+            "offline CPUs must not shrink the percpu buffer"
+        );
+        assert_eq!(
+            possible_cpus_from_topology(Some("0-3,8-11"), 12, 4),
+            8,
+            "disjoint possible set still sizes by possible"
+        );
+    }
+
+    #[test]
+    fn stale_possible_never_shrinks_below_online() {
+        // A parseable-but-stale sysfs file (fewer lanes than are
+        // online) clamps up to the trusted online signal.
+        assert_eq!(possible_cpus_from_topology(Some("0-1\n"), 4, 4), 4);
+        assert_eq!(possible_cpus_from_topology(Some("0\n"), 16, 16), 16);
+    }
+
+    #[test]
+    fn seam_matches_real_path_on_host_topology() {
+        // The seam is a refactor, not a behavior change: applied to the
+        // real host reads it must equal `possible_cpus()`.
+        let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").ok();
+        assert_eq!(
+            possible_cpus_from_topology(text.as_deref(), conf_cpus(), online_cpus()),
+            possible_cpus()
         );
     }
 }
