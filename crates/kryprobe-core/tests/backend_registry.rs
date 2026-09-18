@@ -223,3 +223,12 @@ fn owned_registry_stays_send_sync() {
     assert_send_sync::<BackendRegistry>();
     assert_send_sync::<Box<dyn Backend>>();
 }
+
+#[test]
+fn registry_handles_are_static_owned_values() {
+    // Doc pin (registry module docs): handles are `'static`, so borrowed
+    // configuration cannot register — doubles register as owned values.
+    // Breaks if the registry ever takes `Box<dyn Backend + 'a>`.
+    fn assert_static<T: 'static>() {}
+    assert_static::<Box<dyn Backend>>();
+}

@@ -7,8 +7,9 @@
 
 use kryprobe_core::ids::SessionId;
 use kryprobe_core::synthetic::{SyntheticBackend, canonical_script};
-use kryprobe_report::validate::{ResolvedSchema, resolve_schema};
-use kryprobe_report::{render_summary, validate_str, write_str_atomic};
+use kryprobe_report::{
+    ResolvedSchema, render_summary, resolve_schema, validate_str, write_str_atomic,
+};
 use std::io::Write;
 use std::path::Path;
 
@@ -75,7 +76,7 @@ fn run_with_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kryprobe_report::validate::resolve_schema_at;
+    use kryprobe_report::resolve_schema_at;
 
     fn missing_schema_path() -> std::path::PathBuf {
         let missing = std::env::temp_dir()

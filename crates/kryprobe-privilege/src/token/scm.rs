@@ -126,6 +126,8 @@ mod tests {
             crate::fd::cloexec_flag_set(got.as_raw_fd()),
             "SCM_RIGHTS receipts must be CLOEXEC (spawn discipline)"
         );
+        // SAFETY: all-zero is a valid `stat` (plain integers, no
+        // padding invariants); overwritten by `fstat` below.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `stat` is a live out-param; `got` is open.
         assert_eq!(unsafe { libc::fstat(got.as_raw_fd(), &mut stat) }, 0);

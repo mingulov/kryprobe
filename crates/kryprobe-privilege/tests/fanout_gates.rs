@@ -89,7 +89,13 @@ fn owned_run_rejected() {
     let err = LocalPrivilegedAuthority
         .resolve_scope(&TargetScope::OwnedRun, u64::MAX)
         .unwrap_err();
-    assert!(matches!(err, AttachError::Rejected { .. }), "got {err}");
+    // Pins the T12 decline pointer: no session spawner exists (declined
+    // for want of a backend consumer), so fan-out stays Tree/Cgroup-only.
+    assert!(
+        matches!(err, AttachError::Rejected { ref reason } if reason.contains("declined")
+            && reason.contains("Tree/Cgroup")),
+        "got {err}"
+    );
 }
 
 #[test]

@@ -34,8 +34,8 @@ context notes, never as gates). Consequences:
 
 - `Pid` attaches directly via `attach_group`; it is not a fan-out
   scope and `resolve_scope` rejects it (use the link path).
-- `OwnedRun` rejects: it needs the session spawner (deferred
-  follow-up), not fan-out.
+- `OwnedRun` rejects: it has no session spawner (declined: no
+  backend consumer), so it is not a fan-out scope.
 - `Tree{root}`: root 0 rejects; a gone root rejects; a denied root
   rejects. Members are the root plus all descendants enumerated via
   `/proc/<pid>/task/*/children`.

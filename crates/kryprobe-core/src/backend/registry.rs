@@ -3,9 +3,10 @@
 //!
 //! Ownership story (roadmap option (a)): the runtime owns every backend
 //! handle in a `Vec<Box<dyn Backend>>`, and the registry hands out borrowed
-//! `&dyn Backend` views tied to `&self`. Nothing here requires `'static`,
-//! so backends with borrowed configuration or test doubles register
-//! without `Box::leak`, and dropping the registry frees every backend.
+//! `&dyn Backend` views tied to `&self`. Handles are `'static` (the
+//! `Box<dyn Backend>` default), so backends own their configuration and
+//! test doubles register as owned values; dropping the registry frees
+//! every backend.
 //! `Box<dyn Backend>` is `Send + Sync` because [`Backend`] requires both.
 
 use crate::backend::Backend;

@@ -50,9 +50,9 @@ const KIND_GO: u8 = b'G';
 const KIND_FS: u8 = b'S';
 /// Carries the mounted bpffs root dir fd.
 const KIND_DIR: u8 = b'D';
-/// Carries the token fd + the minter's userns inode (`u64` LE).
+/// Carries the token fd + the minter's userns inode (`u64`, native-endian).
 const KIND_TOKEN: u8 = b'K';
-/// Child failure: `errno` (`i32` LE) + stage id byte.
+/// Child failure: `errno` (`i32`, native-endian) + stage id byte.
 const KIND_ERROR: u8 = b'E';
 
 /// `KIND_TOKEN` payload length: kind + `u64` inode.
@@ -75,6 +75,7 @@ const _: () = assert!(size_of::<libc::cmsghdr>() == CMSG_HDRLEN, "cmsghdr layout
 /// One received datagram. Ownership: `fd` is an open, solely-owned fd
 /// iff `>= 0`; every consumer below either wraps it in an `OwnedFd`
 /// or closes it before returning, so no path leaks.
+#[derive(Debug)]
 struct Datagram {
     len: usize,
     fd: RawFd,
@@ -139,9 +140,54 @@ fn send_msg(sock: RawFd, payload: &[u8], fd: RawFd) -> Result<(), TokenError> {
     Ok(())
 }
 
+/// The cmsg header as `(cmsg_len, level, type)` (64-bit Linux layout).
+fn cmsg_header(cmsg: &[u8; CMSG_SPACE]) -> (usize, i32, i32) {
+    (
+        usize::from_ne_bytes([
+            cmsg[0], cmsg[1], cmsg[2], cmsg[3], cmsg[4], cmsg[5], cmsg[6], cmsg[7],
+        ]),
+        i32::from_ne_bytes([cmsg[8], cmsg[9], cmsg[10], cmsg[11]]),
+        i32::from_ne_bytes([cmsg[12], cmsg[13], cmsg[14], cmsg[15]]),
+    )
+}
+
+/// Closes every fd number a truncated datagram's control buffer
+/// reports. Only slots fully present in the RECEIVED bytes are touched
+/// (the claimed length only narrows: padding past it is never offered
+/// to `close`), and only when the header names `SCM_RIGHTS`. A mangled
+/// header has no trustworthy fd numbers to close; the kernel drops
+/// undelivered fds on control truncation anyway, so those need no close.
+/// Child-safe (`close` only).
+fn close_reported_fds(cmsg: &[u8; CMSG_SPACE], controllen: usize) {
+    if controllen < CMSG_LEN {
+        return;
+    }
+    let (len_field, level, kind) = cmsg_header(cmsg);
+    if level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
+        return;
+    }
+    // Received bytes bound the slots (the `min` keeps this panic-free
+    // even if the kernel ever reported more than the passed buffer);
+    // the claimed length narrows past padding (a one-fd cmsg arrives in
+    // 24 bytes but claims only one fd slot — the padding must never be
+    // closed, it decodes to stdin).
+    let avail = controllen.min(CMSG_SPACE).saturating_sub(CMSG_HDRLEN);
+    let claimed = len_field.saturating_sub(CMSG_HDRLEN);
+    let slots = avail.min(claimed) / 4;
+    for i in 0..slots {
+        let off = CMSG_HDRLEN + 4 * i;
+        let fd = i32::from_ne_bytes([cmsg[off], cmsg[off + 1], cmsg[off + 2], cmsg[off + 3]]);
+        close_stray(fd);
+    }
+}
+
 /// Receives one datagram. Stack buffers only; child-safe like
-/// [`send_msg`]. Truncated control data fails closed (the kernel
-/// drops undelivered fds on truncation: nothing to close here).
+/// [`send_msg`]. Truncation fails closed: `MSG_TRUNC` (payload larger
+/// than [`MAX_PAYLOAD`]) or `MSG_CTRUNC` (control larger than one fd)
+/// is a protocol violation, never a short datagram to accept. A
+/// truncated datagram can still carry installed fds (measured: the
+/// kernel installs every fd whose bytes fit), so reported slots are
+/// closed on the error path via [`close_reported_fds`], never leaked.
 fn recv_msg(sock: RawFd) -> Result<Datagram, TokenError> {
     let mut cmsg = [0u8; CMSG_SPACE];
     let mut bytes = [0u8; MAX_PAYLOAD];
@@ -169,7 +215,8 @@ fn recv_msg(sock: RawFd) -> Result<Datagram, TokenError> {
             errno: last_errno(),
         });
     }
-    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+    if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        close_reported_fds(&cmsg, msg.msg_controllen);
         return Err(TokenError::Denied {
             stage: "userns-trunc",
             errno: libc::EPROTO,
@@ -181,11 +228,7 @@ fn recv_msg(sock: RawFd) -> Result<Datagram, TokenError> {
     })?;
     let mut fd = -1;
     if msg.msg_controllen >= CMSG_LEN {
-        let len_field = usize::from_ne_bytes([
-            cmsg[0], cmsg[1], cmsg[2], cmsg[3], cmsg[4], cmsg[5], cmsg[6], cmsg[7],
-        ]);
-        let level = i32::from_ne_bytes([cmsg[8], cmsg[9], cmsg[10], cmsg[11]]);
-        let kind = i32::from_ne_bytes([cmsg[12], cmsg[13], cmsg[14], cmsg[15]]);
+        let (len_field, level, kind) = cmsg_header(&cmsg);
         if len_field != CMSG_LEN || level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
             return Err(TokenError::Denied {
                 stage: "userns-cmsg",
@@ -774,6 +817,153 @@ mod tests {
         send_msg(b.as_raw_fd(), &[KIND_GO], -1).expect("send plain");
         let dg = recv_msg(a.as_raw_fd()).expect("recv plain");
         expect_plain(&dg, KIND_GO, "test").expect("plain ok");
+    }
+
+    /// Counts `/proc/self/fd` entries pointing at `target`: a stray-fd
+    /// leak probe scoped to one unique file, so parallel tests' fd
+    /// churn cannot skew it (process-wide fd counts would flake).
+    fn fd_refs_to(target: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.path().read_link().ok())
+                    .filter(|link| link == target)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A uniquely-named scratch file whose fd refs the leak probe
+    /// counts. Tests remove it explicitly (best-effort) after use.
+    fn stray_probe_file(tag: &str) -> (std::path::PathBuf, std::fs::File) {
+        let path = std::env::temp_dir().join(format!(
+            "kryprobe-r3-stray-{}-{tag}.tmp",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("stray probe file");
+        (path, file)
+    }
+
+    /// An over-long payload (`MSG_TRUNC`) with an attached fd fails
+    /// closed (never a short datagram to accept) without leaking the
+    /// stray fd. Unprivileged.
+    #[test]
+    fn recv_truncated_payload_fails_closed_without_leak_case() {
+        let (a, b) = seqpacket_pair().expect("socketpair");
+        let (path, probe) = stray_probe_file("payload");
+        let probe_fd = std::os::fd::AsRawFd::as_raw_fd(&probe);
+        let before = fd_refs_to(&path);
+        assert_eq!(before, 1, "one held probe ref");
+        for _ in 0..16 {
+            let big = [0xA5u8; MAX_PAYLOAD + 8];
+            send_msg(a.as_raw_fd(), &big, probe_fd).expect("send oversized");
+            let err = recv_msg(b.as_raw_fd()).unwrap_err();
+            assert!(
+                matches!(err, TokenError::Denied { stage, errno }
+                    if stage == "userns-trunc" && errno == libc::EPROTO),
+                "truncated payload must fail closed, got {err}"
+            );
+        }
+        assert_eq!(
+            fd_refs_to(&path),
+            before,
+            "truncated recvs must not leak fds"
+        );
+        drop(probe);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Overflowing control data (`MSG_CTRUNC`: three fds against the
+    /// one-fd buffer) fails closed without leaking. Unprivileged.
+    #[test]
+    fn recv_truncated_control_fails_closed_without_leak_case() {
+        let (a, b) = seqpacket_pair().expect("socketpair");
+        let (path, f0) = stray_probe_file("control");
+        // Three opens of the same unique file: every stray copy the
+        // kernel installs is countable via the link target.
+        let f1 = f0.try_clone().expect("clone probe");
+        let f2 = f0.try_clone().expect("clone probe");
+        use std::os::fd::AsRawFd as _;
+        let probes = [f0.as_raw_fd(), f1.as_raw_fd(), f2.as_raw_fd()];
+        // Three fds need 32 control bytes against the 24-byte buffer.
+        let mut cmsg = [0u8; 32];
+        cmsg[0..8].copy_from_slice(&28usize.to_ne_bytes());
+        cmsg[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
+        cmsg[12..16].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
+        for (i, fd) in probes.iter().enumerate() {
+            cmsg[16 + 4 * i..20 + 4 * i].copy_from_slice(&fd.to_ne_bytes());
+        }
+        let byte = [KIND_GO];
+        let iov = libc::iovec {
+            iov_base: byte.as_ptr().cast_mut().cast(),
+            iov_len: 1,
+        };
+        let msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: std::ptr::addr_of!(iov).cast_mut(),
+            msg_iovlen: 1,
+            msg_control: cmsg.as_mut_ptr().cast(),
+            msg_controllen: cmsg.len(),
+            msg_flags: 0,
+        };
+        let before = fd_refs_to(&path);
+        assert_eq!(before, 3, "three held probe refs");
+        for _ in 0..16 {
+            // SAFETY: msg borrows live iov/cmsg; copied synchronously.
+            let rc = unsafe { libc::sendmsg(a.as_raw_fd(), &msg, 0) };
+            assert_eq!(rc, 1, "send 3-fd datagram");
+            let err = recv_msg(b.as_raw_fd()).unwrap_err();
+            assert!(
+                matches!(err, TokenError::Denied { stage, errno }
+                    if stage == "userns-trunc" && errno == libc::EPROTO),
+                "truncated control must fail closed, got {err}"
+            );
+        }
+        assert_eq!(
+            fd_refs_to(&path),
+            before,
+            "truncated recvs must not leak fds"
+        );
+        drop((f0, f1, f2));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `close_reported_fds` closes exactly the claimed slots with
+    /// bytes present: padding past the claimed length is never closed
+    /// (it decodes to fd 0 = stdin for a one-fd cmsg), while every
+    /// reported slot of a multi-fd cmsg is (the truncated-control test
+    /// above pins the two-slot kernel delivery end to end).
+    #[test]
+    fn close_reported_fds_narrows_to_claimed_slots_case() {
+        fn is_open(fd: RawFd) -> bool {
+            // SAFETY: `F_GETFD` only reads flags.
+            (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+        }
+        let (path, keep) = stray_probe_file("slots");
+        use std::os::fd::AsRawFd as _;
+        let keep_fd = keep.as_raw_fd();
+        // Slot fd: a second open of the probe file, closed by the helper.
+        let doomed = std::fs::File::open(&path).expect("reopen probe");
+        let doomed_fd = doomed.as_raw_fd();
+        // Ownership passes to the helper's close below.
+        std::mem::forget(doomed);
+        // One-fd header claiming one slot; padding encodes the LIVE
+        // canary: a padding-closing bug would kill `keep_fd`.
+        let mut cmsg = [0u8; CMSG_SPACE];
+        cmsg[0..8].copy_from_slice(&CMSG_LEN.to_ne_bytes());
+        cmsg[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
+        cmsg[12..16].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
+        cmsg[16..20].copy_from_slice(&doomed_fd.to_ne_bytes());
+        cmsg[20..24].copy_from_slice(&keep_fd.to_ne_bytes());
+        close_reported_fds(&cmsg, CMSG_SPACE);
+        // The slot close is pinned by the ref count below, not by
+        // probing `doomed_fd`: closed numbers recycle process-wide
+        // under parallel tests, so an `is_open` check there would flake.
+        assert!(is_open(keep_fd), "padding past the claim must never close");
+        assert_eq!(fd_refs_to(&path), 1, "exactly the canary survives");
+        drop(keep);
+        std::fs::remove_file(&path).ok();
     }
 
     /// The ns-join handle is CLOEXEC at creation (the worker must

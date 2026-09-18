@@ -14,6 +14,9 @@
 //! Failure policy (fail-closed): the first backend error aborts the run
 //! with the failing backend attributed ([`DriverError::Backend`]); partial
 //! observations are discarded with the `Err`, never returned as success.
+//! This abort policy is the driver/registry seam session attribution
+//! relies on: an aborted run files no summary, so the rollup sums only
+//! backends that completed — never partial observations.
 //! Capability gates are environmental, not defects: a backend whose static
 //! or plan requirements the host cannot satisfy is skipped with a
 //! [`SkippedBackend`] receipt in [`DriverReport::skipped`], so a skipped

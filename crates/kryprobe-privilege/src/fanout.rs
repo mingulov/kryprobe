@@ -304,9 +304,10 @@ fn admit_enumerated(
 
 /// Resolve a fan-out scope: enumerate, then admit each member.
 ///
-/// `Pid` attaches directly via the link path (no fan-out to resolve)
-/// and `OwnedRun` needs the deferred session spawner; both reject
-/// honestly here.
+/// `Pid` attaches directly via the link path (no fan-out to resolve),
+/// and `OwnedRun` has no session spawner (declined: no backend
+/// consumer — the selftest fixture's ad-hoc spawn is the only
+/// observed-target spawn); both reject honestly here.
 pub(crate) fn resolve_with(
     scope: &TargetScope,
     max_targets: u64,
@@ -322,7 +323,7 @@ pub(crate) fn resolve_with(
         }
         TargetScope::OwnedRun => {
             return Err(rejected(
-                "OwnedRun needs a session spawner (deferred); fan-out is for Tree/Cgroup"
+                "OwnedRun has no session spawner (declined: no backend consumer); fan-out is for Tree/Cgroup"
                     .to_owned(),
             ));
         }

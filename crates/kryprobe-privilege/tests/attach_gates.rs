@@ -212,9 +212,12 @@ fn nul_in_path_rejected() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn non_utf8_path_rejected_before_syscall() {
+    // No `cfg(unix)`: the crate already needs `std::os::unix`
+    // unconditionally (`attach.rs` production path), so this test
+    // builds everywhere the crate builds — the gate only risked a
+    // silent skip.
     // 0xFF is never valid UTF-8: must reject, not lossy-convert onto a
     // neighbouring path. Rejected (not LinkFailed/EBADF) proves no syscall.
     use std::ffi::OsString;

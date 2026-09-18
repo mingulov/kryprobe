@@ -24,6 +24,10 @@ const FSCONFIG_SET_STRING: c_long = 1;
 const FSCONFIG_CMD_CREATE: c_long = 6;
 /// `linux/mount.h`: close-on-exec mount fd.
 const FSMOUNT_CLOEXEC: c_long = 1;
+/// `linux/mount.h`: close-on-exec fs-context fd (the sole `fsopen`
+/// flag; unknown flags are `EINVAL`). Present since `fsopen` itself
+/// (5.1), so safe on every kernel this product supports (6.12+).
+const FSOPEN_CLOEXEC: c_long = 1;
 
 /// Smoke-lane delegation: trailing atoms use the kernel's lowercase
 /// enum-name suffixes (`map_create`, `array`, `kprobe`, `trace_uprobe_multi`).
@@ -45,9 +49,11 @@ fn syscall_fd(stage: &'static str, ret: c_long) -> Result<OwnedFd, TokenError> {
 /// Lives here (not in `super::userns`) so the raw entry point stays
 /// in the ADR-0002 allowlisted token mount flow.
 pub(crate) fn fsopen_bpf() -> Result<OwnedFd, TokenError> {
-    // SAFETY: fsopen("bpf", 0) takes no out-params.
+    // SAFETY: fsopen("bpf", FSOPEN_CLOEXEC) takes no out-params.
+    // CLOEXEC (spawn discipline): the sole caller is the post-fork
+    // mint child, which never execs — the flag only hardens.
     syscall_fd("fsopen", unsafe {
-        libc::syscall(libc::SYS_fsopen, c"bpf".as_ptr(), 0)
+        libc::syscall(libc::SYS_fsopen, c"bpf".as_ptr(), FSOPEN_CLOEXEC)
     })
 }
 
@@ -288,6 +294,71 @@ pub fn settle_bpf_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `FSOPEN_CLOEXEC` value this module passes is accepted by
+    /// the kernel and takes effect. Where `fsopen` succeeds the
+    /// CLOEXEC bit is asserted directly; where the host denies contexts
+    /// (this host denies even tmpfs unprivileged: measured EPERM), a
+    /// differential pins the value instead: a bogus flag must draw
+    /// `EINVAL` (proving flag validation runs before the denial), while
+    /// ours must not be `EINVAL`. A host that denies before validating
+    /// flags skips honestly (the value is then unverifiable here).
+    #[test]
+    fn fsopen_cloexec_flag_accepted_case() {
+        // SAFETY: fsopen takes no out-params; the fd is owned below
+        // on the success path only.
+        let ret = unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), FSOPEN_CLOEXEC) };
+        if ret >= 0 {
+            // SAFETY: freshly returned owned fd.
+            let fs = unsafe { OwnedFd::from_raw_fd(ret as RawFd) };
+            assert!(
+                crate::fd::cloexec_flag_set(fs.as_raw_fd()),
+                "FSOPEN_CLOEXEC must take effect"
+            );
+            return;
+        }
+        let errno = last_errno();
+        // SAFETY: bogus-flag probe; the fd is closed below on the
+        // unexpected success path.
+        let bogus = unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), 0x4000) };
+        if bogus >= 0 {
+            println!("SKIP: host accepts wider fsopen flags; differential inconclusive");
+            if let Ok(fd) = RawFd::try_from(bogus) {
+                // SAFETY: freshly returned owned fd; closed immediately.
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            return;
+        }
+        if last_errno() != libc::EINVAL {
+            println!("SKIP: host denies fsopen before validating flags");
+            return;
+        }
+        assert_ne!(
+            errno,
+            libc::EINVAL,
+            "kernel rejected FSOPEN_CLOEXEC (wrong constant?)"
+        );
+        println!("SKIP: fsopen denied (errno {errno}); flag value accepted (not EINVAL)");
+    }
+
+    /// The bpf fs context opens CLOEXEC (spawn discipline): the
+    /// child's copy must never survive an exec. Root-only (`fsopen`
+    /// of bpf denies unprivileged with EPERM: measured).
+    #[test]
+    fn fsopen_bpf_is_cloexec_case() {
+        // SAFETY: idempotent getter.
+        if unsafe { libc::geteuid() } != 0 {
+            println!("SKIP: bpf fsopen needs euid == 0");
+            return;
+        }
+        let fs = fsopen_bpf().expect("root fsopen");
+        assert!(
+            crate::fd::cloexec_flag_set(fs.as_raw_fd()),
+            "fs context fd must be CLOEXEC"
+        );
+    }
 
     /// A bad fs fd denies at the first `fsconfig` (unprivileged-safe:
     /// no mount is reachable from fd -1).
