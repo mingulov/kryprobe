@@ -11,4 +11,8 @@ use serde::{Deserialize, Serialize};
 pub enum ProgramId {
     /// uprobe-multi self-probe used by the thin-spine spike (T6b).
     UprobeMultiSelfProbe,
+    /// uprobe-multi probe for the p11 backend (first CONTRACTS §2
+    /// backend). Declared but NOT allowlisted: loads refuse until
+    /// its object and allowlist entry land.
+    UprobeMultiP11Probe,
 }

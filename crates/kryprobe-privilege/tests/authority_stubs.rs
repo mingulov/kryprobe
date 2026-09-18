@@ -119,6 +119,24 @@ fn load_rejects_garbage_bytes_through_facet() {
 }
 
 #[test]
+fn load_rejects_non_allowlisted_id_through_facet() {
+    // C3 (+ T5 "allowlist + rejection behavior"): the id-refusal arm
+    // pinned end-to-end. A declared-but-unapproved id refuses with
+    // typed NotAllowed however valid the bytes are (gate precedes parse).
+    let bytes = object_bytes();
+    let garbage: &[u8] = b"not an elf file at all....................";
+    for input in [bytes.as_slice(), garbage] {
+        match LocalPrivilegedAuthority.load_program(ProgramId::UprobeMultiP11Probe, input) {
+            Ok(_) => panic!("non-allowlisted id must not load"),
+            Err(LoaderError::NotAllowed { id }) => {
+                assert_eq!(id, ProgramId::UprobeMultiP11Probe);
+            }
+            Err(other) => panic!("non-allowlisted id must be NotAllowed, got {other}"),
+        }
+    }
+}
+
+#[test]
 fn attach_rejects_stale_generation_through_facet() {
     // SAFETY: never dereferenced; the gate rejects before any syscall.
     let bad_fd = unsafe { kryprobe_privilege::fd::OwnedFd::from_raw_fd(-1) };
