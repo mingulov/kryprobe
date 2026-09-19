@@ -136,6 +136,7 @@ impl Sensor {
             pf_kthread: PF_KTHREAD,
             aead_cryptlen_off: off.aead_cryptlen_off,
             ahash_nbytes_off: off.ahash_nbytes_off,
+            shash_base: off.shash_base,
             _pad: 0,
         };
         map_update_bytes(
@@ -692,7 +693,7 @@ fn kcfg_roundtrip_matches_resolver() {
     if !lane_ready("kcfg_roundtrip_matches_resolver") {
         return;
     }
-    // Load only (no attach, no traffic): the 40B KCFG row the loader
+    // Load only (no attach, no traffic): the 44B KCFG row the loader
     // path writes must read back byte-identical (pin + codec + dims).
     let bytes = kcrypto_bytes();
     let ids = resolve_btf_ids().expect("P0 symbols must resolve");
@@ -712,10 +713,11 @@ fn kcfg_roundtrip_matches_resolver() {
         pf_kthread: PF_KTHREAD,
         aead_cryptlen_off: off.aead_cryptlen_off,
         ahash_nbytes_off: off.ahash_nbytes_off,
+        shash_base: off.shash_base,
         _pad: 0,
     };
     let want = cfg.to_bytes();
-    assert_eq!(want.len(), 40, "KCFG wire is 40B (C2)");
+    assert_eq!(want.len(), 44, "KCFG wire is 44B (C2 + shash_base)");
     map_update_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
@@ -726,7 +728,7 @@ fn kcfg_roundtrip_matches_resolver() {
     let got = map_lookup_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
-        40,
+        44,
         "kcfg/roundtrip",
     )
     .expect("KCFG read");
@@ -743,7 +745,11 @@ fn c3_first_member_links_reverified() {
         println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
         return;
     }
-    assert_eq!(FIRST_MEMBER_LINKS.len(), 5, "five C3 links");
+    assert_eq!(
+        FIRST_MEMBER_LINKS.len(),
+        4,
+        "four C3 links (shash retired to resolution)"
+    );
     for (type_name, member) in FIRST_MEMBER_LINKS {
         let offset = resolve_member_offset(type_name, member)
             .unwrap_or_else(|err| panic!("C3 resolve {type_name}.{member}: {err}"));

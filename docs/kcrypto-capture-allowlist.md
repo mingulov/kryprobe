@@ -28,7 +28,7 @@ counts, return/error class, timestamps, PID/TGID/comm/cgroup metadata,
 and kernel/build metadata. Every field below cites the §9 category it
 falls under (plus the sharper kp2 section where one exists).
 
-## `KCFG`: loader-written config, not observations (40B `KConfig`)
+## `KCFG`: loader-written config, not observations (44B `KConfig`)
 
 Written once by `load_kcrypto_configured` from live-BTF resolution
 (`kconfig_from_offsets`); never touched by traffic. WHY: kernel/build
@@ -46,6 +46,7 @@ the BPF cannot chase request→tfm→algorithm.
 | `pf_kthread` | u32 | `PF_KTHREAD` (`linux/sched.h`) | kernel constant; doubles as the unconfigured gate (all-zero KCFG skips observations) |
 | `aead_cryptlen_off` | u32 | BTF `aead_request.cryptlen` | kernel layout metadata |
 | `ahash_nbytes_off` | u32 | BTF `ahash_request.nbytes` | kernel layout metadata |
+| `shash_base` | u32 | BTF `crypto_shash.base` | kernel layout metadata (replaces the retired C3 hardcoded-0 link: @0 on 7.0, @8 on 6.12) |
 | `_pad` | u32 | zero | reserved, always 0 |
 
 ## `KAGG` key: attribution head + identity (260B `KAgg`)

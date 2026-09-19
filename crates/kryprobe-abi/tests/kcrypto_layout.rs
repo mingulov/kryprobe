@@ -15,9 +15,10 @@ use kryprobe_abi::kcrypto_agg::{
 
 #[test]
 fn kconfig_size_align_and_offsets_pinned() {
-    // 10 x u32, no padding (40B per brief C2: the 6 P2/task offsets +
-    // pf_kthread + the AEAD/ahash length offsets + _pad as 10th word).
-    assert_eq!(std::mem::size_of::<KConfig>(), 40);
+    // 11 x u32, no padding (44B: the 6 P2/task offsets + pf_kthread
+    // + the AEAD/ahash length offsets + shash_base + _pad as 11th word;
+    // brief C2 + the K4-fix3 shash resolution).
+    assert_eq!(std::mem::size_of::<KConfig>(), 44);
     assert_eq!(std::mem::align_of::<KConfig>(), 4);
     assert_eq!(std::mem::offset_of!(KConfig, sk_req_base), 0);
     assert_eq!(std::mem::offset_of!(KConfig, async_tfm), 4);
@@ -28,7 +29,8 @@ fn kconfig_size_align_and_offsets_pinned() {
     assert_eq!(std::mem::offset_of!(KConfig, pf_kthread), 24);
     assert_eq!(std::mem::offset_of!(KConfig, aead_cryptlen_off), 28);
     assert_eq!(std::mem::offset_of!(KConfig, ahash_nbytes_off), 32);
-    assert_eq!(std::mem::offset_of!(KConfig, _pad), 36);
+    assert_eq!(std::mem::offset_of!(KConfig, shash_base), 36);
+    assert_eq!(std::mem::offset_of!(KConfig, _pad), 40);
 }
 
 #[test]

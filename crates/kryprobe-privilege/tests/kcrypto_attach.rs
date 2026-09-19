@@ -192,6 +192,7 @@ fn resolve_offsets_are_structural() {
         ("task_flags", off.task_flags),
         ("aead_cryptlen_off", off.aead_cryptlen_off),
         ("ahash_nbytes_off", off.ahash_nbytes_off),
+        ("shash_base", off.shash_base),
     ] {
         assert!(value < 4096, "{name}={value} out of range");
     }

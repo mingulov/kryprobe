@@ -2,11 +2,12 @@
 //! vmlinux BTF resolver: func ids + struct-member offsets, unprivileged.
 //!
 //! [`resolve_btf_ids`] finds the 9 P0 kcrypto attach symbols
-//! (`evidence/k0/P0-btf-ids.txt`) and [`resolve_offsets`] returns the 8
+//! (`evidence/k0/P0-btf-ids.txt`) and [`resolve_offsets`] returns the 9
 //! explicit-offset reads the BPF needs (K0 P2 chain + `task_struct.flags`
-//! for the kthread classifier + the C2 AEAD/ahash length reads — G6
-//! option (a): loader-side resolution, no CO-RE relocations) and asserts
-//! the C3 first-member links at 0. Both parse `/sys/kernel/btf/vmlinux` raw
+//! for the kthread classifier + the C2 AEAD/ahash length reads + the
+//! `crypto_shash.base` link (6.12 moved it to byte 8 — G6 option (a):
+//! loader-side resolution, no CO-RE relocations)) and asserts the C3
+//! first-member links at 0. Both parse `/sys/kernel/btf/vmlinux` raw
 //! (world-readable; no privilege, no bpftool subprocess) with a strict
 //! sequential walker: every truncation, unknown kind, or misaligned
 //! member offset is [`BtfError`], never a guess.
@@ -15,7 +16,7 @@
 //! (`Documentation/bpf/btf.rst`, UAPI `linux/btf.h`).
 //!
 //! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
-//! 8-offsets → 40B projection) and [`load_kcrypto_configured`] (the
+//! 9-offsets → 44B projection) and [`load_kcrypto_configured`] (the
 //! single resolve → load → write-KCFG → attach entry K2 calls).
 
 use crate::attach::OwnedLink;
@@ -134,6 +135,9 @@ pub struct CryptoOffsets {
     pub aead_cryptlen_off: u32,
     /// `ahash_request.nbytes` (C2: ahash bytes).
     pub ahash_nbytes_off: u32,
+    /// `crypto_shash.base` (shash tfm link; @0 on 7.0, @8 on 6.12 —
+    /// CONFIG-resolved so the reorder resolves instead of refusing).
+    pub shash_base: u32,
 }
 
 /// Resolve the 9 [`KCRYPTO_SYMBOLS`] to vmlinux BTF ids. Unprivileged.
@@ -146,12 +150,14 @@ pub fn resolve_btf_ids() -> Result<HashMap<String, u32>, BtfError> {
     resolve_btf_ids_from(&bytes)
 }
 
-/// Resolve the 8 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
+/// Resolve the 9 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
 ///
 /// Fail-closed on the C3 first-member links: the BPF hardcodes 0 for
-/// the five [`FIRST_MEMBER_LINKS`] below, so any nonzero live offset is
+/// the four [`FIRST_MEMBER_LINKS`] below, so any nonzero live offset is
 /// [`BtfError::FirstMemberMoved`] (a kernel struct reorder must refuse
-/// here, never mis-chase in BPF).
+/// here, never mis-chase in BPF). The retired fifth link
+/// (`crypto_shash.base`) is CONFIG-resolved instead (see [`CryptoOffsets::shash_base`]):
+/// a missing member still fails closed as [`BtfError::MissingMember`].
 pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
     let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| BtfError::Io {
         detail: format!("{VMLINUX_BTF}: {err}"),
@@ -159,8 +165,8 @@ pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
     resolve_offsets_from(&bytes)
 }
 
-/// Pure CONFIG projection (K1 Task 3): the 8 resolved offsets +
-/// [`PF_KTHREAD`] + zero pad → the 40B [`KConfig`] in C2 word order.
+/// Pure CONFIG projection (K1 Task 3): the 9 resolved offsets +
+/// [`PF_KTHREAD`] + zero pad → the 44B [`KConfig`] in C2 word order.
 /// Total (no failure mode: every input word is copied verbatim).
 #[must_use]
 pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
@@ -174,6 +180,7 @@ pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
         pf_kthread: PF_KTHREAD,
         aead_cryptlen_off: off.aead_cryptlen_off,
         ahash_nbytes_off: off.ahash_nbytes_off,
+        shash_base: off.shash_base,
         _pad: 0,
     }
 }
@@ -385,12 +392,13 @@ fn resolve_btf_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> 
 /// C3 first-member links: struct/member pairs the BPF reads at
 /// literal offset 0 (verified first members on the K1 host BTF; C
 /// guarantees no padding before the initial member, so only a struct
-/// reorder can move them — which fails closed below).
+/// reorder can move them — which fails closed below). The retired fifth
+/// link (`crypto_shash.base`, @8 on 6.12) is CONFIG-resolved instead
+/// ([`CryptoOffsets::shash_base`]).
 pub const FIRST_MEMBER_LINKS: &[(&str, &str)] = &[
     ("aead_request", "base"),
     ("ahash_request", "base"),
     ("shash_desc", "tfm"),
-    ("crypto_shash", "base"),
     ("skcipher_request", "cryptlen"),
 ];
 
@@ -405,6 +413,7 @@ fn resolve_offsets_from(bytes: &[u8]) -> Result<CryptoOffsets, BtfError> {
         task_flags: btf.member_offset("task_struct", "flags")?,
         aead_cryptlen_off: btf.member_offset("aead_request", "cryptlen")?,
         ahash_nbytes_off: btf.member_offset("ahash_request", "nbytes")?,
+        shash_base: btf.member_offset("crypto_shash", "base")?,
     };
     for (type_name, member) in FIRST_MEMBER_LINKS {
         let offset = btf.member_offset(type_name, member)?;
@@ -920,7 +929,7 @@ mod tests {
 
     #[test]
     fn misaligned_member_is_bad_btf() {
-        // `bbb` at 7 bits: not byte-aligned, must fail closed (our 8
+        // `bbb` at 7 bits: not byte-aligned, must fail closed (our 9
         // reads are all byte-aligned; a sub-byte offset is a wrong
         // assumption, never a guess).
         let mut bytes = fixture();
@@ -941,22 +950,33 @@ mod tests {
         assert_eq!(PF_KTHREAD, 0x0020_0000);
     }
 
-    /// Synthetic crypto image: the 8 [`CryptoOffsets`] structs plus the
-    /// 5 [`FIRST_MEMBER_LINKS`] members. `moved` relocates one
-    /// first-member link to byte 8 (fail-closed proof for C3).
+    /// Synthetic crypto image: the 9 [`CryptoOffsets`] structs plus the
+    /// 4 [`FIRST_MEMBER_LINKS`] members. `moved` relocates one member
+    /// to byte 8 (fail-closed proof for C3 links; resolution proof for
+    /// the CONFIG-resolved `crypto_shash.base`). `drop` omits one member
+    /// entirely (missing-member fail-closed proof).
     fn crypto_fixture(moved: Option<(&str, &str)>) -> Vec<u8> {
+        crypto_fixture_inner(moved, None)
+    }
+
+    fn crypto_fixture_inner(moved: Option<(&str, &str)>, drop: Option<(&str, &str)>) -> Vec<u8> {
         let mut b = BtfBuild::new();
         // [1] INT (shared member type).
         b.rec(0, KIND_INT, 0, false, 4);
         b.word(0x0100_0020);
         let mut named = |name: &str, members: &[(&str, u32)]| {
+            let kept: Vec<(&str, u32)> = members
+                .iter()
+                .copied()
+                .filter(|(member, _)| drop != Some((name, *member)))
+                .collect();
             let o_name = b.str(name);
-            b.rec(o_name, KIND_STRUCT, members.len() as u32, false, 256);
-            for (member, byte) in members {
-                let at = if moved == Some((name, *member)) {
+            b.rec(o_name, KIND_STRUCT, kept.len() as u32, false, 256);
+            for (member, byte) in kept {
+                let at = if moved == Some((name, member)) {
                     8
                 } else {
-                    *byte
+                    byte
                 };
                 let o_member = b.str(member);
                 b.member(o_member, 1, at * 8);
@@ -975,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_offsets_resolve_eight_exact() {
+    fn synthetic_offsets_resolve_nine_exact() {
         let bytes = crypto_fixture(None);
         let off = resolve_offsets_from(&bytes).expect("crypto fixture resolves");
         assert_eq!(
@@ -989,14 +1009,15 @@ mod tests {
                 task_flags: 44,
                 aead_cryptlen_off: 52,
                 ahash_nbytes_off: 48,
+                shash_base: 0,
             }
         );
     }
 
     #[test]
     fn kconfig_from_offsets_lays_out_c2_words() {
-        // Pure CONFIG projection (K1 Task 3): the 8 resolved offsets +
-        // PF_KTHREAD + zero pad → the 40B KCFG wire layout in C2 word
+        // Pure CONFIG projection (K1 Task 3): the 9 resolved offsets +
+        // PF_KTHREAD + zero pad → the 44B KCFG wire layout in C2 word
         // order (brief Step 1: KCFG bytes equal the resolved offsets).
         let off = CryptoOffsets {
             sk_req_base: 32,
@@ -1007,16 +1028,45 @@ mod tests {
             task_flags: 44,
             aead_cryptlen_off: 52,
             ahash_nbytes_off: 48,
+            shash_base: 8,
         };
         let cfg = kconfig_from_offsets(off);
-        let mut want = [0u8; 40];
-        for (i, word) in [32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 0]
+        let mut want = [0u8; 44];
+        for (i, word) in [32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 8, 0]
             .iter()
             .enumerate()
         {
             want[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         assert_eq!(cfg.to_bytes(), want);
+    }
+
+    #[test]
+    fn shash_base_at_8_resolves_not_refuses() {
+        // 6.12 layout (K4 task-4 refusal evidence, replicated 2x + BTF
+        // cross-proven): `crypto_shash.base` @ 8. The shash base link is
+        // CONFIG-resolved like the other offsets — resolution, not
+        // refusal — so this fixture must RESOLVE with `shash_base == 8`.
+        let bytes = crypto_fixture(Some(("crypto_shash", "base")));
+        let off = resolve_offsets_from(&bytes).expect("6.12 shash layout must resolve");
+        assert_eq!(off.shash_base, 8);
+    }
+
+    #[test]
+    fn shash_base_missing_member_fails_closed() {
+        // `crypto_shash` without `base`: resolution failure must still
+        // fail closed with `MissingMember` (same exit-4 honesty as the
+        // retired C3 refusal — a kernel that drops the member refuses
+        // here, never mis-chases in BPF).
+        let bytes = crypto_fixture_inner(None, Some(("crypto_shash", "base")));
+        let err = resolve_offsets_from(&bytes).expect_err("missing shash.base must fail");
+        assert_eq!(
+            err,
+            BtfError::MissingMember {
+                type_name: "crypto_shash".to_owned(),
+                member: "base".to_owned(),
+            }
+        );
     }
 
     #[test]

@@ -92,16 +92,17 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 
 /// Frozen kcrypto maps, in creation order. Asserted against the object.
 ///
-/// The exact Task-2 contract (`KConfig` 40B per C2, `KAgg` 260B, `VAgg`
-/// 120B — `planning/kryprobe-phaseK1-sensor-plan.md` Task 2); names
-/// dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
+/// The exact Task-2 contract (`KConfig` 44B per C2 + the K4-fix3
+/// `shash_base` word, `KAgg` 260B, `VAgg` 120B —
+/// `planning/kryprobe-phaseK1-sensor-plan.md` Task 2); names dot-free
+/// per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
         "KCFG",
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 40,
+            value_size: 44,
             max_entries: 1,
         },
     ),

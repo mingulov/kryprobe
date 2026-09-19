@@ -22,6 +22,7 @@ const KCONFIG_WANT: &[&str] = &[
     "pf_kthread",
     "aead_cryptlen_off",
     "ahash_nbytes_off",
+    "shash_base",
     "_pad",
 ];
 const KAGG_WANT: &[&str] = &["fam", "op", "res", "ctx", "alg", "drv"];

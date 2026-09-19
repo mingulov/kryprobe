@@ -94,7 +94,7 @@ pub const KIDN_DROPS: u64 = u64::MAX;
 // Structs (twinned in kcrypto.rs; sizes pinned by kcrypto_layout.rs)
 // ---------------------------------------------------------------------------
 
-/// `KCFG` value: the 8 loader-resolved offsets + kthread flag + pad (40B).
+/// `KCFG` value: the 9 loader-resolved offsets + kthread flag + pad (44B).
 ///
 /// Twin: `KConfig` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -118,6 +118,9 @@ pub struct KConfig {
     pub aead_cryptlen_off: u32,
     /// `ahash_request.nbytes` (bytes; the ahash length read).
     pub ahash_nbytes_off: u32,
+    /// `crypto_shash.base` (bytes; the shash tfm link — @0 on 7.0, @8
+    /// on 6.12; resolved, not hardcoded).
+    pub shash_base: u32,
     /// Reserved, zero.
     pub _pad: u32,
 }
@@ -138,13 +141,14 @@ impl KConfig {
         "pf_kthread",
         "aead_cryptlen_off",
         "ahash_nbytes_off",
+        "shash_base",
         "_pad",
     ];
 
     /// Little-endian wire bytes for the `KCFG` map update (x86-64 target).
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 40] {
-        let mut out = [0u8; 40];
+    pub fn to_bytes(&self) -> [u8; 44] {
+        let mut out = [0u8; 44];
         out[0..4].copy_from_slice(&self.sk_req_base.to_le_bytes());
         out[4..8].copy_from_slice(&self.async_tfm.to_le_bytes());
         out[8..12].copy_from_slice(&self.tfm_alg.to_le_bytes());
@@ -154,7 +158,8 @@ impl KConfig {
         out[24..28].copy_from_slice(&self.pf_kthread.to_le_bytes());
         out[28..32].copy_from_slice(&self.aead_cryptlen_off.to_le_bytes());
         out[32..36].copy_from_slice(&self.ahash_nbytes_off.to_le_bytes());
-        out[36..40].copy_from_slice(&self._pad.to_le_bytes());
+        out[36..40].copy_from_slice(&self.shash_base.to_le_bytes());
+        out[40..44].copy_from_slice(&self._pad.to_le_bytes());
         out
     }
 }

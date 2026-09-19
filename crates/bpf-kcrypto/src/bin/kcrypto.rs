@@ -112,7 +112,7 @@ const MAX_ERRNO: u64 = 4095;
 // Twinned structs (mirror: kryprobe-abi/src/kcrypto_agg.rs)
 // ---------------------------------------------------------------------------
 
-/// `KCFG` value: the 8 loader-resolved offsets + kthread flag + pad.
+/// `KCFG` value: the 9 loader-resolved offsets + kthread flag + pad.
 #[repr(C)]
 pub struct KConfig {
     pub sk_req_base: u32,
@@ -124,6 +124,7 @@ pub struct KConfig {
     pub pf_kthread: u32,
     pub aead_cryptlen_off: u32,
     pub ahash_nbytes_off: u32,
+    pub shash_base: u32,
     pub _pad: u32,
 }
 
@@ -172,7 +173,7 @@ pub struct KCtl {
 
 // SAME numbers as the ABI mirrors + loader KCRYPTO_MAPS (duplication
 // deliberate + cited: a dims drift must fail here AND at load).
-const _: () = assert!(size_of::<KConfig>() == 40);
+const _: () = assert!(size_of::<KConfig>() == 44);
 const _: () = assert!(size_of::<KAgg>() == 260);
 const _: () = assert!(size_of::<VAgg>() == 120);
 const _: () = assert!(size_of::<KCtl>() == 48);
@@ -302,10 +303,12 @@ fn chase_req(req: u64, base_off: u32, async_tfm: u32, tfm_alg: u32) -> u64 {
     read_u64(tfm.wrapping_add(tfm_alg as u64))
 }
 
-/// Chase `tfm -> __crt_alg` for direct-tfm args (destroy `arg1`; shash
-/// `tfm` read at `desc` + literal 0 — host-BTF-verified first members
-/// (`shash_desc.tfm` @ 0, `crypto_shash.base` @ 0, so the shash tfm
-/// pointer IS the `crypto_tfm` numerically — C3, loader-asserted). 0 =
+/// Chase `tfm -> __crt_alg` for direct-`crypto_tfm` args (destroy
+/// `arg1`; the shash sites add the KCFG `shash_base` to the
+/// `shash_desc.tfm` pointer first — `crypto_shash.base` is @ 0 on 7.0
+/// but @ 8 on 6.12, so the shash pointer is NOT the `crypto_tfm`
+/// numerically on every kernel; the offset is loader-resolved, and
+/// `shash_desc.tfm` @ 0 stays a C3 loader-asserted first member). 0 =
 /// skip.
 #[inline(always)]
 fn chase_tfm(tfm: u64, tfm_alg: u32) -> u64 {
@@ -603,6 +606,7 @@ struct Cfg {
     pf_kthread: u32,
     aead_cryptlen_off: u32,
     ahash_nbytes_off: u32,
+    shash_base: u32,
 }
 
 /// Load the `KCFG` row into stack scalars (`None` = skipped observation;
@@ -625,6 +629,7 @@ fn load_cfg() -> Option<Cfg> {
                 pf_kthread: cfg.pf_kthread,
                 aead_cryptlen_off: cfg.aead_cryptlen_off,
                 ahash_nbytes_off: cfg.ahash_nbytes_off,
+                shash_base: cfg.shash_base,
             })
         }
         None => None,
@@ -851,8 +856,10 @@ pub fn kcrypto_ahash(ctx: FExitContext) -> i32 {
     )
 }
 
-/// `crypto_shash_digest(desc, data, len, out)` exit: `tfm` @ 0 in the desc,
-/// `base` @ 0 in `crypto_shash` (first members — C3); `len` = `arg2`.
+/// `crypto_shash_digest(desc, data, len, out)` exit: `tfm` @ 0 in the desc
+/// (first member — C3); the `crypto_shash`→`crypto_tfm` step adds the
+/// KCFG `shash_base` (loader-resolved: @0 on 7.0, @8 on 6.12);
+/// `len` = `arg2`.
 #[fexit(function = "crypto_shash_digest")]
 pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
@@ -866,8 +873,11 @@ pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
         return 0;
     };
     let len: u64 = ctx.arg(2);
-    let tfm = read_u64(desc);
-    let alg = chase_tfm(tfm, cfg.tfm_alg);
+    let shash = read_u64(desc);
+    if shash == 0 {
+        return 0;
+    }
+    let alg = chase_tfm(shash.wrapping_add(cfg.shash_base as u64), cfg.tfm_alg);
     if alg == 0 {
         return 0;
     }
@@ -897,8 +907,11 @@ pub fn kcrypto_finup(ctx: FExitContext) -> i32 {
         return 0;
     };
     let len: u64 = ctx.arg(2);
-    let tfm = read_u64(desc);
-    let alg = chase_tfm(tfm, cfg.tfm_alg);
+    let shash = read_u64(desc);
+    if shash == 0 {
+        return 0;
+    }
+    let alg = chase_tfm(shash.wrapping_add(cfg.shash_base as u64), cfg.tfm_alg);
     if alg == 0 {
         return 0;
     }

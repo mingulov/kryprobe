@@ -2,10 +2,10 @@
 //! K1 Task 3: configured-entry proof + secret-canary tripwire.
 //!
 //! `kconfig_bytes_match_live_resolver` is the unprivileged half of
-//! brief Step 1 (resolve + KCFG bytes equal the 8 resolved offsets +
+//! brief Step 1 (resolve + KCFG bytes equal the 9 resolved offsets +
 //! pad per C2, from live BTF). `configured_entry_writes_kcfg_from_
 //! resolver` is the privileged half: `load_kcrypto_configured` writes
-//! the 40B KCFG row the live resolver dictates, attaches all 9 points,
+//! the 44B KCFG row the live resolver dictates, attaches all 9 points,
 //! and the row reads back byte-identical (from the map fd, then again
 //! after a real bpffs pin). `canary_kcrypto` plants `KPROBE-CANARY-*`
 //! markers in key, IV, and plaintext fixture buffers and byte-scans
@@ -223,7 +223,7 @@ fn dump_all_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
         &map_lookup_bytes(
             &sensor.loaded.maps.config,
             &0u32.to_le_bytes(),
-            40,
+            44,
             "canary/kcfg",
         )
         .expect("KCFG dump"),
@@ -283,7 +283,7 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 #[test]
 fn kconfig_bytes_match_live_resolver() {
     // Unprivileged (BTF read only): the KCFG bytes the configured
-    // entry writes equal the 8 live-resolved offsets + `PF_KTHREAD` +
+    // entry writes equal the 9 live-resolved offsets + `PF_KTHREAD` +
     // zero pad in C2 word order.
     if !btf_available() {
         println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
@@ -291,7 +291,7 @@ fn kconfig_bytes_match_live_resolver() {
     }
     let off = resolve_offsets().expect("offsets must resolve");
     let bytes = kconfig_from_offsets(off).to_bytes();
-    assert_eq!(bytes.len(), 40, "KCFG wire is 40B (C2)");
+    assert_eq!(bytes.len(), 44, "KCFG wire is 44B (C2 + shash_base)");
     let word =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
     assert_eq!(word(0), off.sk_req_base, "word 0: sk_req_base");
@@ -307,7 +307,8 @@ fn kconfig_bytes_match_live_resolver() {
     );
     assert_eq!(word(28), off.aead_cryptlen_off, "word 7: aead_cryptlen_off");
     assert_eq!(word(32), off.ahash_nbytes_off, "word 8: ahash_nbytes_off");
-    assert_eq!(word(36), 0, "word 9: zero pad");
+    assert_eq!(word(36), off.shash_base, "word 9: shash_base");
+    assert_eq!(word(40), 0, "word 10: zero pad");
 }
 
 /// Our bpffs pin dir (pid-suffixed: never collides, never shared).
@@ -362,7 +363,7 @@ fn configured_entry_writes_kcfg_from_resolver() {
     let got = map_lookup_bytes(
         &sensor.loaded.maps.config,
         &0u32.to_le_bytes(),
-        40,
+        44,
         "configured/kcfg",
     )
     .expect("KCFG read");
@@ -389,7 +390,7 @@ fn configured_entry_writes_kcfg_from_resolver() {
         let pinned = map_lookup_bytes(
             &sensor.loaded.maps.config,
             &0u32.to_le_bytes(),
-            40,
+            44,
             "configured/kcfg-pinned",
         )
         .expect("KCFG pinned read");
