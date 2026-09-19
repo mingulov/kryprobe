@@ -260,9 +260,10 @@ pub fn map_lookup_bytes(
     let mut value = vec![0u8; value_len.max(1)];
     value.truncate(value_len);
     // `truncate` to the requested length keeps capacity; an empty
-    // request still hands the kernel a live (1-byte) buffer — the
-    // lookup then fails honestly (`E2BIG`/length) instead of faulting
-    // on a dangling pointer.
+    // request still hands the kernel a live (1-byte) buffer — it only
+    // avoids faulting on misuse (all callers pass exact sizes; the
+    // lookup takes no userspace value length, so no `E2BIG` exists
+    // on this path — the kernel writes the full value size).
     let mut attr = ElemAttr {
         map_fd: map.as_raw_fd() as u32,
         _pad: 0,

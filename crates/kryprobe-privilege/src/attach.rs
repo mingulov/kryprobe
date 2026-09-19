@@ -67,7 +67,7 @@ impl OwnedLink {
 /// `COUNT[idx]`. The uprobe spine serves `Pid` scope (entry vs return
 /// selects `um_flags`); `System` is system-wide kernel probes (kcrypto
 /// fexit, kp2 §3), not a pid filter: it builds a tracing `LINK_CREATE`
-/// (type 25, `target_btf_id` 0, 64-byte attr per R1) and never touches
+/// (attach type 25, `target_btf_id` 0, 64-byte attr per R1) and never touches
 /// `object`/`offsets` (fexit attaches are whole-function; the scope
 /// carries no path, and non-empty inputs reject fail-closed).
 ///

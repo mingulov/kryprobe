@@ -15,7 +15,7 @@ struct carries a manually-maintained `FIELDS` list; the test
 against a hardcoded expectation AND against this doc (each field must
 appear backticked below). The privileged `canary_kcrypto` suite
 (`crates/kryprobe-privilege/tests/kcrypto_canary.rs`) byte-scans every
-map + ring dump for `KPROBE-CANARY` markers planted in key and
+map + ring dump for `KPROBE-CANARY` markers planted in key, IV, and
 plaintext fixture buffers. A new captured field moves all four —
 struct, `FIELDS`, this doc, canary reasoning — or fails the build.
 
@@ -143,7 +143,7 @@ scatterlist contents, arbitrary buffers, callback private data, or
 request/tfm/task pointers (kp2 §9 never-list + request pointers).
 Length scalars (`cryptlen`/`nbytes`/shash `len`) ARE captured — sizes,
 not contents (kp2 §9: scalar byte counts). The `canary_kcrypto`
-privileged test plants `KPROBE-CANARY-*` markers in key AND plaintext
+privileged test plants `KPROBE-CANARY-*` markers in key, IV, AND plaintext
 fixture buffers and byte-scans every `KAGG`/`KTOT`/`KIDN`/`KRING`/
 `KCFG` dump for zero occurrences: any allowlist drift that leaks
 buffer bytes fails the build.

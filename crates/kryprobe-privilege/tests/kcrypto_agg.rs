@@ -361,6 +361,8 @@ fn drain_ring(sensor: &Sensor) -> Vec<KCtl> {
 
 /// Sum rows matching `(fam, op, res, alg)` over all contexts (the P4
 /// find/sum: background + cross-test traffic lives in other rows).
+/// Rows match by NUL-terminated string: requested-name hashes are
+/// cross-run unstable (heap padding past NUL is hashed).
 fn sum_rows(rows: &[AggRow], fam: u8, op: u8, res: u8, alg: &str) -> VAgg {
     let mut out = VAgg::default();
     for row in rows

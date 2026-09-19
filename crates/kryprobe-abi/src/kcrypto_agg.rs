@@ -77,8 +77,9 @@ pub const KCTL_GENCHANGE: u8 = 2;
 /// carries no sequence number; reserve failures instead saturate the
 /// [`KIDN_DROPS`] counter so no loss is silent).
 pub const KCTL_GAP: u8 = 3;
-/// Ring kind: `KAGG` insert failed (map full), or `KIDN` insert failed on
-/// a new identity (gate full); totals preserved in `KTOT` either way.
+/// Ring kind: `KAGG` insert failed (map full), first per identity
+/// (KIDN-gated); a full `KIDN` stays silent per C9 — observe via
+/// `KTOT`-gap + `KIDN` dump; totals preserved.
 pub const KCTL_OVERFLOW: u8 = 4;
 /// Ring kind: periodic health. RESERVED, never emitted from BPF
 /// (userspace-synthesized; the fast path stays control-event-only).
@@ -381,7 +382,9 @@ pub fn kcrypto_ident_hash(fam: u8, op: u8, alg: &[u64; 16], drv: &[u64; 16]) -> 
 /// Counters and histogram lanes sum saturating; `first_ns` is the minimum
 /// over lanes with `calls > 0` (a zero-`calls` lane holds `first_ns == 0`
 /// and must not poison the min); `last_ns` is the maximum; both stamps
-/// are 0 when no lane observed anything.
+/// are 0 when no lane observed anything. BPF-full-path overflow needs
+/// 256+ distinct identities, so it is untestable live — the synthetic
+/// fold tests + no-overflow gates are the backstop.
 #[must_use]
 pub fn fold_vagg(lanes: &[VAgg]) -> VAgg {
     let mut out = VAgg::default();
