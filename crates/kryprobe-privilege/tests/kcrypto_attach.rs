@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! K1 Task 1: kcrypto loader-extension proof — parse shape, BTF
+//! resolution (unprivileged), and the privileged 9-point attach matrix.
+//!
+//! Pure tests (parse, pin gate, resolver) run everywhere, including
+//! `cargo xtask check`. The two `#[ignore]`d lane tests need root +
+//! objects (`cargo xtask test bpf`) and skip honestly otherwise
+//! (`token_plumbing` idiom). The attach matrix loads the skeleton
+//! object once per P0 point with that point's `attach_btf_id` (the id
+//! binds, not the section name) and asserts 9 live links through the
+//! loader's own handles plus procfs fd kinds (no bpftool oracle).
+
+use kryprobe_core::attach::{CookieAllocator, GenerationGuard, LinkGroup};
+use kryprobe_core::authority::AttachAuthority;
+use kryprobe_core::ids::PlanGeneration;
+use kryprobe_core::object::{ObjectRef, ObjectRole};
+use kryprobe_core::plan::TargetScope;
+use kryprobe_core::program::ProgramId;
+use kryprobe_privilege::LocalPrivilegedAuthority;
+use kryprobe_privilege::bpfloader::{
+    KCRYPTO_MAPS, LoaderError, PointStatus, check_pin_name, load_kcrypto, parse_kcrypto_object,
+    parse_spine_object, pin_fd,
+};
+use kryprobe_privilege::btf_resolve::{KCRYPTO_SYMBOLS, resolve_btf_ids, resolve_offsets};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// Workspace-relative path of the built kcrypto object.
+fn kcrypto_object_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("kryprobe-bpf")
+        .join("kcrypto.bpf.o")
+}
+
+/// Workspace-relative path of the built spine object.
+fn spine_object_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("kryprobe-bpf")
+        .join("spine.bpf.o")
+}
+
+fn kcrypto_bytes() -> Vec<u8> {
+    let path = kcrypto_object_path();
+    assert!(
+        path.is_file(),
+        "missing BPF kcrypto object at {} — run `cargo xtask build --bpf`",
+        path.display()
+    );
+    std::fs::read(&path).expect("test fixture must be readable")
+}
+
+fn spine_bytes() -> Vec<u8> {
+    let path = spine_object_path();
+    assert!(
+        path.is_file(),
+        "missing BPF spine object at {} — run `cargo xtask build --bpf`",
+        path.display()
+    );
+    std::fs::read(&path).expect("test fixture must be readable")
+}
+
+#[test]
+fn kcrypto_object_present() {
+    let path = kcrypto_object_path();
+    assert!(
+        path.is_file(),
+        "missing BPF kcrypto object at {} — run `cargo xtask build --bpf`",
+        path.display()
+    );
+}
+
+#[test]
+fn parse_reports_kcrypto_dims() {
+    let bytes = kcrypto_bytes();
+    let parsed = parse_kcrypto_object(&bytes).expect("real object must parse");
+    assert_eq!(parsed.maps.len(), KCRYPTO_MAPS.len(), "map count drifted");
+    for ((want_name, want_dims), got) in KCRYPTO_MAPS.iter().zip(parsed.maps.iter()) {
+        assert_eq!(got.name, *want_name);
+        assert_eq!(got.dims, *want_dims, "dims drifted for {want_name}");
+    }
+    assert_eq!(parsed.maps.len(), 5);
+}
+
+#[test]
+fn parse_finds_skeleton_program() {
+    let bytes = kcrypto_bytes();
+    let parsed = parse_kcrypto_object(&bytes).expect("real object must parse");
+    // Skeleton pins 1 program; Task 2 extends this lane to 9.
+    assert_eq!(parsed.programs.len(), 1);
+    let prog = &parsed.programs[0];
+    assert_eq!(prog.name, "kcrypto_skel");
+    assert!(
+        prog.section.starts_with("fentry/"),
+        "section must be fentry/*, got {}",
+        prog.section
+    );
+    assert!(!prog.insns.is_empty(), "skeleton has no insns");
+}
+
+#[test]
+fn rejects_garbage_as_kcrypto() {
+    assert!(matches!(
+        parse_kcrypto_object(b"not an elf file at all...................."),
+        Err(LoaderError::BadObject { .. })
+    ));
+    assert!(matches!(
+        parse_kcrypto_object(&[]),
+        Err(LoaderError::BadObject { .. })
+    ));
+}
+
+#[test]
+fn rejects_spine_object_as_kcrypto() {
+    // Shape mismatch, spine direction: no `fentry/` sections, so the
+    // error names the section allowlist.
+    let err = parse_kcrypto_object(&spine_bytes()).unwrap_err();
+    assert!(
+        matches!(err, LoaderError::BadObject { ref reason } if reason.contains("fentry/")),
+        "spine-as-kcrypto must name the allowlist, got {err}"
+    );
+}
+
+#[test]
+fn rejects_kcrypto_object_as_spine() {
+    // Shape mismatch, kcrypto direction: the spine dims assert fires.
+    let err = parse_spine_object(&kcrypto_bytes()).unwrap_err();
+    assert!(
+        matches!(err, LoaderError::BadObject { .. }),
+        "kcrypto-as-spine must be BadObject, got {err}"
+    );
+}
+
+#[test]
+fn rejects_dotted_pin_name() {
+    // R3, before any syscall (runs unprivileged).
+    for name in ["kcrypto.prog", "KCFG.0"] {
+        assert!(
+            matches!(check_pin_name(name), Err(LoaderError::BadPinName { .. })),
+            "{name} must be BadPinName"
+        );
+    }
+    assert!(check_pin_name("KCFG").is_ok());
+}
+
+/// Live BTF available (unprivileged read)? Honest-skip gate for the
+/// resolver tests on BTF-less hosts.
+fn btf_available() -> bool {
+    std::fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
+}
+
+#[test]
+fn resolve_btf_ids_finds_p0_symbols() {
+    if !btf_available() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let ids = resolve_btf_ids().expect("P0 symbols must resolve");
+    assert_eq!(ids.len(), KCRYPTO_SYMBOLS.len());
+    // Presence by NAME, never hardcoded ids (ids vary by kernel).
+    for name in KCRYPTO_SYMBOLS {
+        let id = ids.get(*name).unwrap_or_else(|| panic!("{name} missing"));
+        assert!(*id > 0, "{name} id must be nonzero");
+    }
+}
+
+#[test]
+fn resolve_offsets_are_structural() {
+    if !btf_available() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let off = resolve_offsets().expect("offsets must resolve");
+    // Structural only (exact values are host-coupled; the synthetic
+    // unit test in `btf_resolve` pins exactness).
+    for (name, value) in [
+        ("sk_req_base", off.sk_req_base),
+        ("async_tfm", off.async_tfm),
+        ("tfm_alg", off.tfm_alg),
+        ("alg_name", off.alg_name),
+        ("alg_drv", off.alg_drv),
+        ("task_flags", off.task_flags),
+    ] {
+        assert!(value < 4096, "{name}={value} out of range");
+    }
+    assert!(
+        off.alg_drv > off.alg_name,
+        "driver name sits past the name: {off:?}"
+    );
+}
+
+fn is_root() -> bool {
+    // SAFETY: idempotent getter.
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn object() -> ObjectRef {
+    ObjectRef {
+        dev: 0,
+        ino: 0,
+        size: 0,
+        mtime: 0,
+        role: ObjectRole::Executable,
+    }
+}
+
+fn group(scope: TargetScope) -> LinkGroup {
+    let mut alloc = CookieAllocator::new(PlanGeneration::new(1));
+    let range = alloc.allocate(1).expect("group range fits");
+    // The program label rides the group unchecked on the attach path;
+    // kcrypto carries the self-probe label until a dedicated
+    // `ProgramId` lands (K2).
+    LinkGroup::from_range(
+        object(),
+        ProgramId::UprobeMultiSelfProbe,
+        scope,
+        true,
+        range,
+    )
+}
+
+fn guard(generation: u32) -> GenerationGuard {
+    GenerationGuard {
+        generation: PlanGeneration::new(generation),
+    }
+}
+
+/// Skeleton's section suffix: the attach-id key for this lane (Task 2
+/// passes all 9 honestly-matched entries).
+fn skeleton_symbol(bytes: &[u8]) -> String {
+    let parsed = parse_kcrypto_object(bytes).expect("kcrypto object must parse");
+    assert_eq!(parsed.programs.len(), 1, "skeleton pins 1 program");
+    parsed.programs[0]
+        .section
+        .strip_prefix("fentry/")
+        .expect("skeleton section is fentry/*")
+        .to_owned()
+}
+
+/// Kernel-side fd liveness via fcntl (no bpftool oracle).
+fn assert_fcntl_alive(fd: i32, what: &str) {
+    // SAFETY: `F_GETFD` only reads flags of an open fd we hold.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(flags >= 0, "{what}: fd {fd} is not alive");
+}
+
+/// Procfs fd-kind check: `/proc/self/fd/N` must read as `kind`.
+/// (The kernel spells these inconsistently: `bpf_link` with an
+/// underscore, `bpf-prog`/`bpf-map` with hyphens — asserted as-is.)
+fn assert_procfs_kind(fd: i32, kind: &str, what: &str) {
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .unwrap_or_else(|err| panic!("{what}: cannot read fd link {fd}: {err}"));
+    assert_eq!(
+        target,
+        Path::new(kind),
+        "{what}: fd {fd} is not a {kind} (got {})",
+        target.display()
+    );
+}
+
+#[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
+fn attach_all_points() {
+    // SAFETY: idempotent getter.
+    if !is_root() {
+        println!("SKIP: kcrypto attach matrix requires root (euid != 0)");
+        return;
+    }
+    if !btf_available() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let bytes = kcrypto_bytes();
+    let symbol = skeleton_symbol(&bytes);
+    let ids = resolve_btf_ids().expect("P0 symbols must resolve");
+    // One load per P0 point, in P0 table order (deterministic, not
+    // HashMap order): the same bytes with that point's `attach_btf_id`.
+    let mut held = Vec::new();
+    let mut links = Vec::new();
+    for name in KCRYPTO_SYMBOLS.iter().copied() {
+        let id = ids.get(name).unwrap_or_else(|| panic!("{name} missing"));
+        let (loaded, statuses) = load_kcrypto(&bytes, &[(symbol.clone(), *id)], None)
+            .unwrap_or_else(|err| panic!("load for {name} (btf {id}) failed: {err}"));
+        assert_eq!(statuses.len(), 1);
+        assert!(
+            matches!(&statuses[0], PointStatus::Loaded { .. }),
+            "{name}: expected Loaded, got {:?}",
+            statuses[0]
+        );
+        assert_eq!(loaded.progs.len(), 1);
+        let link = LocalPrivilegedAuthority
+            .attach_group(
+                &group(TargetScope::System),
+                &guard(1),
+                &loaded.progs[0].1,
+                Path::new(""),
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("attach for {name} failed: {err}"));
+        held.push(loaded);
+        links.push((name, link));
+    }
+    assert_eq!(links.len(), 9, "the matrix is 9 points");
+    // 9 live links, self-consistent: distinct fds, each fcntl-alive
+    // and a kernel bpf-link; plus one prog + one map kind check.
+    let mut fds = HashSet::new();
+    for (name, link) in &links {
+        let fd = link.as_raw_fd();
+        assert!(fd >= 0, "{name}: link fd invalid");
+        assert!(fds.insert(fd), "duplicate link fd {fd}");
+        assert_fcntl_alive(fd, name);
+        assert_procfs_kind(fd, "anon_inode:bpf_link", name);
+    }
+    assert_procfs_kind(
+        held[0].progs[0].1.as_raw_fd(),
+        "anon_inode:bpf-prog",
+        "skeleton prog",
+    );
+    assert_procfs_kind(
+        held[0].maps.config.as_raw_fd(),
+        "anon_inode:bpf-map",
+        "KCFG map",
+    );
+    // Detach: RAII drop (links first, then progs/maps); assert clean.
+    drop(links);
+    drop(held);
+}
+
+/// Our bpffs pin dir (pid-suffixed: never collides, never shared).
+fn pin_dir() -> PathBuf {
+    PathBuf::from("/sys/fs/bpf").join(format!("k1t1probe-{}", std::process::id()))
+}
+
+/// Unlink guard: the pin file + dir vanish on all paths (RAII cleanup
+/// for the bpffs side, which pins escape by design).
+struct UnpinGuard {
+    file: PathBuf,
+    dir: PathBuf,
+}
+
+impl Drop for UnpinGuard {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.file).ok();
+        std::fs::remove_dir(&self.dir).ok();
+    }
+}
+
+#[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
+fn pin_roundtrip_proves_r2_and_cleanup() {
+    if !is_root() {
+        println!("SKIP: kcrypto pin roundtrip requires root (euid != 0)");
+        return;
+    }
+    if !btf_available() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let bytes = kcrypto_bytes();
+    let symbol = skeleton_symbol(&bytes);
+    let ids = resolve_btf_ids().expect("P0 symbols must resolve");
+    let first = KCRYPTO_SYMBOLS[0];
+    let (loaded, _) = load_kcrypto(&bytes, &[(symbol, ids[first])], None)
+        .unwrap_or_else(|err| panic!("load for pin roundtrip failed: {err}"));
+    // Dotted names reject typed even as root (no syscall attempted).
+    assert!(
+        matches!(
+            pin_fd(
+                &loaded.maps.config,
+                Path::new("/sys/fs/bpf"),
+                "kcrypto.prog"
+            ),
+            Err(LoaderError::BadPinName { .. })
+        ),
+        "dotted pin must be BadPinName"
+    );
+    let dir = pin_dir();
+    if let Err(err) = std::fs::create_dir(&dir) {
+        let errno = err.raw_os_error().unwrap_or(0);
+        if [libc::EPERM, libc::EACCES, libc::EROFS].contains(&errno) {
+            println!("SKIP: bpffs not writable (errno {errno})");
+            return;
+        }
+        panic!("cannot create pin dir {}: {err}", dir.display());
+    }
+    {
+        let _guard = UnpinGuard {
+            file: dir.join("KCFG"),
+            dir: dir.clone(),
+        };
+        // R2: the 20-byte pin attr lands the map; R3: the dot-free name.
+        pin_fd(&loaded.maps.config, &dir, "KCFG")
+            .unwrap_or_else(|err| panic!("pin KCFG failed: {err}"));
+        assert!(dir.join("KCFG").exists(), "pin file must exist after pin");
+    } // Guard drops: pin file + dir unlinked on all paths.
+    assert!(
+        !dir.exists(),
+        "pin dir must be gone after cleanup: {}",
+        dir.display()
+    );
+}

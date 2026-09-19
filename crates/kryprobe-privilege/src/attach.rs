@@ -3,7 +3,8 @@
 
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{
-    BPF_LINK_CREATE, BPF_TRACE_UPROBE_MULTI, LinkUprobeMulti, bpf, fd_or_errno,
+    BPF_LINK_CREATE, BPF_TRACE_FENTRY, BPF_TRACE_UPROBE_MULTI, LinkTracing, LinkUprobeMulti, bpf,
+    fd_or_errno,
 };
 use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
 use kryprobe_core::plan::TargetScope;
@@ -63,11 +64,12 @@ impl OwnedLink {
 ///
 /// Cookies are `(generation << 32) | (index_base + offset_index)` over the
 /// group's allocator-issued range, so concurrent groups never conflate
-/// `COUNT[idx]`. Only `Pid` scope is supported by the uprobe spine;
-/// entry vs return selects `um_flags`. `System` is system-wide kernel
-/// probes (kcrypto fentry, kp2 §3), not a pid filter: it rejects here
-/// with a pointer at the fentry path and never touches a cgroup path
-/// (the scope carries none).
+/// `COUNT[idx]`. The uprobe spine serves `Pid` scope (entry vs return
+/// selects `um_flags`); `System` is system-wide kernel probes (kcrypto
+/// fentry, kp2 §3), not a pid filter: it builds a tracing `LINK_CREATE`
+/// (type 24, `target_btf_id` 0, 64-byte attr per R1) and never touches
+/// `object`/`offsets` (fentry attaches are whole-function; the scope
+/// carries no path, and non-empty inputs reject fail-closed).
 ///
 /// Crate-private: the only external entry is the attach facet
 /// (`AttachAuthority::attach_group` on `LocalPrivilegedAuthority`).
@@ -87,15 +89,11 @@ pub(crate) fn attach_group(
             ),
         });
     }
+    if group.scope == TargetScope::System {
+        return attach_fentry(prog_fd, object, offsets);
+    }
     let pid = match group.scope {
         TargetScope::Pid { pid } => pid,
-        TargetScope::System => {
-            return Err(AttachError::Rejected {
-                reason:
-                    "System scope is system-wide (kcrypto fentry); spine supports Pid scope only"
-                        .to_owned(),
-            });
-        }
         _ => {
             return Err(AttachError::Rejected {
                 reason: "spine supports Pid scope only".to_owned(),
@@ -173,10 +171,88 @@ pub(crate) fn attach_group(
     }
 }
 
+/// Attach one fentry program system-wide (K1 Task 1; K0 G4).
+///
+/// Tracing `LINK_CREATE`: attach type 24 (`FENTRY`), `target_btf_id` 0
+/// (the kernel binds the load-time `attach_btf_id`), 64-byte attr (R1 —
+/// `evidence/k0/P1-attach-matrix.txt`). No cookie: kcrypto attribution
+/// is in-BPF. `object`/`offsets` must be empty (a confused caller
+/// passing uprobe coordinates to a whole-function attach rejects here,
+/// before any syscall).
+fn attach_fentry(
+    prog_fd: &OwnedFd,
+    object: &Path,
+    offsets: &[u64],
+) -> Result<OwnedLink, AttachError> {
+    // Both rejections name the fentry path and the Pid-scope owner of
+    // uprobe coordinates (keeps the `attach_gates` pins: Rejected +
+    // "System"/"fentry"/"Pid scope", before any object access).
+    if !offsets.is_empty() {
+        return Err(AttachError::Rejected {
+            reason: "System scope fentry attach takes no offsets (whole functions; only spine Pid scope takes offsets)".to_owned(),
+        });
+    }
+    if !object.as_os_str().is_empty() {
+        return Err(AttachError::Rejected {
+            reason:
+                "System scope fentry attach carries no object path (only spine Pid scope reads one)"
+                    .to_owned(),
+        });
+    }
+    let mut attr = LinkTracing {
+        prog_fd: prog_fd.as_raw_fd() as u32,
+        target_fd: 0,
+        attach_type: BPF_TRACE_FENTRY,
+        flags: 0,
+        target_btf_id: 0,
+        pad: 0,
+        cookie: 0,
+        tail: [0; 4],
+    };
+    // SAFETY: attr outlives the syscall; no pointees.
+    let ret = unsafe {
+        bpf(
+            BPF_LINK_CREATE,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<LinkTracing>() as u32,
+        )
+    };
+    match fd_or_errno(ret) {
+        Ok(fd) => Ok(OwnedLink { _fd: fd }),
+        Err(errno) => Err(AttachError::LinkFailed {
+            stage: "fentry_link".to_owned(),
+            errno,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::COUNT_SLOTS;
     use crate::bpfloader::SPINE_MAPS;
+
+    /// A borrowed-then-owned /dev/null fd: never a real prog fd, but the
+    /// rejection paths below return before any syscall reads it.
+    fn null_fd() -> super::OwnedFd {
+        // SAFETY: read-only probe fd, solely owned from here.
+        let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(raw >= 0, "open /dev/null");
+        // SAFETY: `raw` is open and solely owned from here.
+        unsafe { super::OwnedFd::from_raw_fd(raw) }
+    }
+
+    #[test]
+    fn system_rejects_uprobe_coordinates() {
+        // Offsets and object paths are meaningless for whole-function
+        // fentry attaches: both reject before any syscall (unprivileged).
+        let fd = null_fd();
+        let err = super::attach_fentry(&fd, std::path::Path::new(""), &[7])
+            .expect_err("non-empty offsets must reject");
+        assert!(matches!(err, super::AttachError::Rejected { .. }), "{err}");
+        let err = super::attach_fentry(&fd, std::path::Path::new("/bin/true"), &[])
+            .expect_err("non-empty object must reject");
+        assert!(matches!(err, super::AttachError::Rejected { .. }), "{err}");
+    }
 
     #[test]
     fn count_slots_match_frozen_spine_dims() {

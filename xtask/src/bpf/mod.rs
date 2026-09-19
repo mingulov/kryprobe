@@ -12,6 +12,30 @@ use std::process::Command;
 
 /// Build the BPF spine object with the pinned nightly (T7b).
 pub(crate) fn build_bpf() -> i32 {
+    build_bpf_inner(&[
+        ("bpf-spine", "spine", "spine.bpf.o", Strip::GcDeadFuncs),
+        (
+            "bpf-kcrypto",
+            "kcrypto",
+            "kcrypto.bpf.o",
+            Strip::DropUnreferencedText,
+        ),
+    ])
+}
+
+/// Which strip recipe applies to one BPF object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Strip {
+    /// Spine: GC dead `.text` functions, keep live ones.
+    GcDeadFuncs,
+    /// Kcrypto (R4): assert zero call relocs, drop `.text` entirely.
+    DropUnreferencedText,
+}
+
+/// Build each `(crate dir, bin, output, strip)` row with the pinned
+/// nightly + bpf-linker, then strip per row. Both BPF crates share the
+/// same pinned nightly (a skew fails the build loudly).
+fn build_bpf_inner(rows: &[(&str, &str, &str, Strip)]) -> i32 {
     let root = match workspace_root() {
         Some(root) => root,
         None => {
@@ -32,6 +56,26 @@ pub(crate) fn build_bpf() -> i32 {
             return 1;
         }
     };
+    for (dir, _, _, _) in rows {
+        let pin = root.join("crates").join(dir).join("rust-toolchain.toml");
+        match channel_from_file(&pin) {
+            Some(other) if other == channel => {}
+            Some(other) => {
+                eprintln!(
+                    "xtask build --bpf: BPF pin skew: {} pins {other}, want {channel}",
+                    pin.display()
+                );
+                return 1;
+            }
+            None => {
+                eprintln!(
+                    "xtask build --bpf: cannot read pinned channel from {}",
+                    pin.display()
+                );
+                return 1;
+            }
+        }
+    }
     if !toolchain_present(&channel) {
         eprintln!("xtask build --bpf: BPF toolchain '{channel}' is not installed");
         eprintln!(
@@ -48,25 +92,39 @@ pub(crate) fn build_bpf() -> i32 {
         eprintln!("install it with: cargo install bpf-linker");
         return 1;
     }
+    for (dir, bin, out, strip) in rows {
+        let code = build_one(&root, &channel, dir, bin, out, *strip);
+        if code != 0 {
+            return code;
+        }
+    }
+    0
+}
+
+/// Build + strip one BPF object row.
+fn build_one(
+    root: &std::path::Path,
+    channel: &str,
+    dir: &str,
+    bin: &str,
+    out: &str,
+    strip: Strip,
+) -> i32 {
     let code = run_child_in(
-        &root.join("crates/bpf-spine"),
+        &root.join("crates").join(dir),
         "rustup",
-        &[
-            "run",
-            channel.as_str(),
-            "cargo",
-            "build",
-            "--release",
-            "--bin",
-            "spine",
-        ],
+        &["run", channel, "cargo", "build", "--release", "--bin", bin],
     );
     if code != 0 {
         return code;
     }
-    let built = root.join("crates/bpf-spine/target/bpfel-unknown-none/release/spine");
+    let built = root
+        .join("crates")
+        .join(dir)
+        .join("target/bpfel-unknown-none/release")
+        .join(bin);
     let dest_dir = root.join("target/kryprobe-bpf");
-    let dest = dest_dir.join("spine.bpf.o");
+    let dest = dest_dir.join(out);
     if let Err(err) = fs::create_dir_all(&dest_dir) {
         eprintln!(
             "xtask build --bpf: cannot create {}: {err}",
@@ -81,13 +139,17 @@ pub(crate) fn build_bpf() -> i32 {
             return 1;
         }
     };
-    let stripped = match strip::strip_dead_text_funcs(&bytes) {
+    let stripped = match strip {
+        Strip::GcDeadFuncs => strip::strip_dead_text_funcs(&bytes),
+        Strip::DropUnreferencedText => strip::drop_unreferenced_text(&bytes),
+    };
+    let stripped = match stripped {
         Ok((stripped, report)) => {
             if report.removed.is_empty() {
-                println!("+ strip: no dead .text functions");
+                println!("+ strip [{out}]: no dead .text functions");
             } else {
                 println!(
-                    "+ strip: removed {} ({} -> {} .text bytes)",
+                    "+ strip [{out}]: removed {} ({} -> {} .text bytes)",
                     report.removed.join(", "),
                     report.text_before,
                     report.text_after
@@ -96,7 +158,7 @@ pub(crate) fn build_bpf() -> i32 {
             stripped
         }
         Err(err) => {
-            eprintln!("xtask build --bpf: {err}");
+            eprintln!("xtask build --bpf [{out}]: {err}");
             return 1;
         }
     };
@@ -151,6 +213,7 @@ pub(crate) fn test_bpf() -> i32 {
         ("kryprobe-privilege", "bpf_pipeline"),
         ("kryprobe-privilege", "decoy_pid"),
         ("kryprobe-privilege", "token_plumbing"),
+        ("kryprobe-privilege", "kcrypto_attach"),
         ("kryprobe-cli", "cli_bpf_e2e"),
     ] {
         let code = run_child(

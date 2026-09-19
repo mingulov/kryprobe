@@ -11,13 +11,23 @@
 //!
 //! Micro-borrow: fail-closed raw loader incl. frozen dims + symbolic
 //! map-fd fixups (osslscope loader-prepare pattern, reimplemented).
+//!
+//! K1 adds a second, independent load path for fentry/kcrypto objects
+//! ([`parse_kcrypto_object`], [`load_kcrypto`]): `fentry/*` sections,
+//! 1..=16 programs, optional `.text`, the frozen [`KCRYPTO_MAPS`] dims,
+//! `TRACING`/`FENTRY` loads with per-prog `attach_btf_id` (R1), and a
+//! dot-free pin gate (R3). The spine path above is byte-identical.
 
 pub(crate) mod instantiate;
 pub(crate) mod mapcreate;
 pub mod parse;
 pub(crate) mod progload;
 
-pub use parse::{BpfInsn, MapReloc, ParsedSpine, insns_to_bytes, parse_spine_object};
+pub use instantiate::{check_pin_name, load_kcrypto, pin_fd};
+pub use parse::{
+    BpfInsn, MapReloc, ParsedKcrypto, ParsedSpine, insns_to_bytes, parse_kcrypto_object,
+    parse_spine_object, valid_kcrypto_dims, valid_kcrypto_section,
+};
 
 use crate::fd::OwnedFd;
 use kryprobe_core::ProgramId;
@@ -80,6 +90,59 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
     ),
 ];
 
+/// Frozen kcrypto maps, in creation order. Asserted against the object.
+///
+/// The exact Task-2 contract (`KConfig` 32B, `KAgg` 260B, `VAgg` 120B —
+/// `planning/kryprobe-phaseK1-sensor-plan.md` Task 2); names dot-free per
+/// R3 (`evidence/k0/P1-attach-matrix.txt`).
+pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
+    (
+        "KCFG",
+        MapDims {
+            map_type: 2,
+            key_size: 4,
+            value_size: 32,
+            max_entries: 1,
+        },
+    ),
+    (
+        "KAGG",
+        MapDims {
+            map_type: 5,
+            key_size: 260,
+            value_size: 120,
+            max_entries: 256,
+        },
+    ),
+    (
+        "KTOT",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 120,
+            max_entries: 1,
+        },
+    ),
+    (
+        "KIDN",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 1,
+            max_entries: 256,
+        },
+    ),
+    (
+        "KRING",
+        MapDims {
+            map_type: 27,
+            key_size: 0,
+            value_size: 0,
+            max_entries: 1_048_576,
+        },
+    ),
+];
+
 /// One parsed map: name + dims as found in the object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMap {
@@ -129,6 +192,13 @@ pub enum LoaderError {
     MisalignedRecord {
         addr: usize,
     },
+    /// Pin name refused by the dot-free gate (R3): bpffs refuses dotted
+    /// names with EPERM, so the loader rejects them typed, before any
+    /// syscall. Empty names, `/`, and NUL fail here too (fail-closed
+    /// path hygiene, same variant).
+    BadPinName {
+        name: String,
+    },
 }
 
 impl std::fmt::Display for LoaderError {
@@ -149,6 +219,12 @@ impl std::fmt::Display for LoaderError {
             }
             Self::MisalignedRecord { addr } => {
                 write!(f, "record buffer {addr:#x} violates 8-alignment")
+            }
+            Self::BadPinName { name } => {
+                write!(
+                    f,
+                    "pin name '{name}' rejected: dot-free, slash-free, non-empty (R3)"
+                )
             }
         }
     }
@@ -175,6 +251,51 @@ pub struct SpineProgs {
 pub struct LoadedSpine {
     pub maps: SpineMaps,
     pub progs: SpineProgs,
+}
+
+/// Loaded kcrypto maps, one RAII fd per map (K1 Task 1).
+pub struct KcryptoMaps {
+    pub config: OwnedFd,
+    pub agg: OwnedFd,
+    pub total: OwnedFd,
+    pub ident: OwnedFd,
+    pub ring: OwnedFd,
+}
+
+/// Fully loaded kcrypto object: maps + per-program fds, all RAII-owned.
+///
+/// `progs` carries only the programs that loaded; the per-point outcomes
+/// (including `Missing`/`Unsupported`) ride the sibling [`PointStatus`]
+/// vector returned by [`load_kcrypto`].
+pub struct LoadedKcrypto {
+    pub maps: KcryptoMaps,
+    pub progs: Vec<(String, OwnedFd)>,
+}
+
+/// Per-point load outcome (K1 Task 1; the plan's Self-Review pre-authorizes
+/// this return extension: `load_kcrypto` takes attach ids and returns
+/// per-point outcomes). A missing point degrades its op, never fails the
+/// load: the load succeeds iff at least one program loads. Attach-level
+/// attached/unsupported/missing arrives with the attach wiring (Task 3/K2),
+/// which maps `Loaded` forward; `Missing`/`Unsupported` already degrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointStatus {
+    /// Program loaded with its `attach_btf_id`, ready to attach.
+    Loaded { name: String },
+    /// No `attach_btf_id` was supplied for this program; skipped.
+    Missing { name: String },
+    /// Load refused (verifier/capability); `detail` is a short reason.
+    Unsupported { name: String, detail: String },
+}
+
+impl PointStatus {
+    /// Program name this outcome belongs to.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Loaded { name } | Self::Missing { name } | Self::Unsupported { name, .. } => name,
+        }
+    }
 }
 
 /// 8-alignment precondition for record buffers (abi `split_header` rule).

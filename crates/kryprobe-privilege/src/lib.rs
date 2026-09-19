@@ -11,6 +11,7 @@
 pub mod attach;
 pub mod bpfloader;
 pub mod bpfselftest;
+pub mod btf_resolve;
 pub mod decoy;
 pub mod drain;
 pub mod elfread;

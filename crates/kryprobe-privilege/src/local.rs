@@ -6,7 +6,10 @@
 //! parse + instantiate (§3.1, plain or token-delegated), scope-checked
 //! link creation (§3.2), and bounded target inspection (§3.3). The free
 //! functions behind these methods are crate-private; outside this crate
-//! the ONLY load/link/inspect entries are the facet methods.
+//! the ONLY spine load/link/inspect entries are the facet methods. The
+//! kcrypto loader ([`crate::bpfloader::load_kcrypto`]) is the deliberate
+//! exception: a shape-authenticated free entry (no `ProgramId` claim to
+//! gate — see its docs); its syscalls still need privilege or a token.
 
 use std::path::Path;
 

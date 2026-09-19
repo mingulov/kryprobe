@@ -142,6 +142,110 @@ fn text_len(elf: &Elf, text_idx: usize) -> usize {
     elf.section_headers[text_idx].sh_size as usize
 }
 
+/// Drop the whole `.text` section after proving it unreferenced (R4).
+///
+/// K1 kcrypto recipe (`evidence/k0/P1-attach-matrix.txt` R4): the
+/// bpf-linker `.text` carries only dead compiler-builtins mem fns;
+/// proven unreferenced here (zero `R_BPF_64_32` call relocs in the
+/// whole object, no relocs of any kind against `.text` itself) and the
+/// section is then retired in place (header nulled: type + name
+/// cleared, so name scans see no `.text`). Any call reloc anywhere
+/// fails the build — a called `.text` needs the spine-style GC strip,
+/// not this drop. Missing `.text` is a no-op success.
+///
+/// Pure over bytes; errors are build failures, never guesses.
+pub(crate) fn drop_unreferenced_text(obj: &[u8]) -> Result<(Vec<u8>, StripReport), String> {
+    let elf = Elf::parse(obj).map_err(|e| err(format!("ELF parse: {e}")))?;
+    if elf.header.e_machine != EM_BPF {
+        return Err(err(format!(
+            "e_machine {} is not EM_BPF",
+            elf.header.e_machine
+        )));
+    }
+    let text_idx = match find_text(&elf) {
+        Ok(idx) => idx,
+        Err(_) => {
+            return Ok((
+                obj.to_vec(),
+                StripReport {
+                    removed: Vec::new(),
+                    text_before: 0,
+                    text_after: 0,
+                },
+            ));
+        }
+    };
+    let relocs = collect_relocs(&elf, obj)?;
+    let calls = relocs.iter().filter(|r| r.typ == R_BPF_64_32).count();
+    if calls > 0 {
+        return Err(err(format!(
+            "R4: object has {calls} call relocs; kcrypto objects must be call-free"
+        )));
+    }
+    let against_text = relocs.iter().filter(|r| r.target_sect == text_idx).count();
+    if against_text > 0 {
+        return Err(err(format!(
+            "R4: {against_text} relocs against .text; refusing to drop a referenced section"
+        )));
+    }
+    let mut out = obj.to_vec();
+    let shoff = elf.header.e_shoff as usize;
+    // Retire `.text` plus its (proven empty) reloc sections: type and
+    // name cleared, bytes left unreferenced. Unlike an
+    // llvm-objcopy removal the headers are not renumbered — equivalent
+    // for every ELF reader on this path (scans match by name/type).
+    let mut retire = vec![text_idx];
+    for (idx, sh) in elf.section_headers.iter().enumerate() {
+        if sh.sh_type == SHT_REL && sh.sh_info as usize == text_idx {
+            retire.push(idx);
+        }
+    }
+    for idx in &retire {
+        write_u32(&mut out, shdr_field(shoff, *idx, 0), 0)?;
+        write_u32(&mut out, shdr_field(shoff, *idx, 4), 0)?;
+    }
+    let report = StripReport {
+        removed: vec![".text".to_owned()],
+        text_before: text_len(&elf, text_idx),
+        text_after: 0,
+    };
+    verify_drop(&out)?;
+    Ok((out, report))
+}
+
+/// Structural re-check of the dropped object: no `.text` by name, no
+/// reloc section against a retired header, every entry in range.
+fn verify_drop(out: &[u8]) -> Result<(), String> {
+    let elf = Elf::parse(out).map_err(|e| err(format!("verify parse: {e}")))?;
+    for sh in elf.section_headers.iter() {
+        let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default();
+        if name == ".text" {
+            return Err(err("verify: .text survived the drop"));
+        }
+        if sh.sh_type != SHT_REL {
+            continue;
+        }
+        let target = sh.sh_info as usize;
+        if target >= elf.section_headers.len() {
+            return Err(err("verify: reloc section targets nothing"));
+        }
+        if elf.section_headers[target].sh_type == 0 {
+            return Err(err("verify: reloc section targets a retired section"));
+        }
+    }
+    let relocs = collect_relocs(&elf, out)?;
+    for reloc in &relocs {
+        if reloc.sym_idx >= elf.syms.len() {
+            return Err(err("verify: reloc symbol out of range"));
+        }
+        let (_, len) = section_file_range(&elf, reloc.target_sect)?;
+        if reloc.offset >= len {
+            return Err(err("verify: reloc offset out of range"));
+        }
+    }
+    Ok(())
+}
+
 fn collect_funcs(elf: &Elf, text_idx: usize, obj: &[u8]) -> Result<Vec<Func>, String> {
     let _ = obj;
     let len = text_len(elf, text_idx);
@@ -877,5 +981,98 @@ mod tests {
         let obj = fixture(LIVE_EXIT, 8, 0, 8, &[]);
         let err = strip_dead_text_funcs(&obj).unwrap_err();
         assert!(err.contains("shifted"), "unexpected: {err}");
+    }
+
+    /// Rewrite reloc entries of type `from` to `to` in one reloc
+    /// section; returns the patched count.
+    fn rewrite_reloc_types(obj: &mut [u8], sect: &str, from: u32, to: u32) -> usize {
+        let sites: Vec<usize> = {
+            let elf = Elf::parse(obj).unwrap();
+            let mut sites = Vec::new();
+            for sh in elf.section_headers.iter() {
+                if sh.sh_type != SHT_REL {
+                    continue;
+                }
+                if elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default() != sect {
+                    continue;
+                }
+                let (off, len) = (sh.sh_offset as usize, sh.sh_size as usize);
+                for e in 0..len / 16 {
+                    let info_at = off + e * 16 + 8;
+                    let info = u64::from_le_bytes(obj[info_at..info_at + 8].try_into().unwrap());
+                    if (info & 0xffff_ffff) as u32 == from {
+                        sites.push(info_at);
+                    }
+                }
+            }
+            sites
+        };
+        for at in &sites {
+            let info = u64::from_le_bytes(obj[*at..*at + 8].try_into().unwrap());
+            let patched = (info & !0xffff_ffff) | u64::from(to);
+            obj[*at..*at + 8].copy_from_slice(&patched.to_le_bytes());
+        }
+        sites.len()
+    }
+
+    #[test]
+    fn drop_retires_text_and_keeps_map_relocs() {
+        let mut obj = fixture(LIVE_EXIT, 0, 16, -1, &[]);
+        assert_eq!(
+            rewrite_reloc_types(&mut obj, ".rel.uprobe.multi", R_BPF_64_32, 1),
+            1
+        );
+        let (out, report) = drop_unreferenced_text(&obj).unwrap();
+        assert_eq!(report.removed, vec![".text".to_owned()]);
+        assert_eq!((report.text_before, report.text_after), (24, 0));
+        // No `.text` by name anymore; the map reloc survives untouched.
+        let elf = Elf::parse(&out).unwrap();
+        assert!(
+            elf.section_headers.iter().all(|sh| elf
+                .shdr_strtab
+                .get_at(sh.sh_name)
+                .unwrap_or_default()
+                != ".text")
+        );
+        let relocs = collect_relocs(&elf, &out).unwrap();
+        assert_eq!(relocs.len(), 1);
+        assert_eq!(relocs[0].typ, 1);
+        // Idempotent: a second drop is a no-op.
+        let (out2, report2) = drop_unreferenced_text(&out).unwrap();
+        assert!(report2.removed.is_empty());
+        assert_eq!(out2, out);
+    }
+
+    #[test]
+    fn drop_refuses_call_relocs() {
+        let obj = fixture(LIVE_EXIT, 0, 16, -1, &[]);
+        let err = drop_unreferenced_text(&obj).unwrap_err();
+        assert!(err.contains("call reloc"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn drop_refuses_relocs_against_text() {
+        let mut obj = fixture(LIVE_EXIT, 0, 16, -1, &[(0, 4, 1)]);
+        assert_eq!(
+            rewrite_reloc_types(&mut obj, ".rel.uprobe.multi", R_BPF_64_32, 1),
+            1
+        );
+        let err = drop_unreferenced_text(&obj).unwrap_err();
+        assert!(err.contains(".text"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn drop_without_text_is_noop() {
+        // Retire `.text` by hand (name + type cleared), then the drop
+        // must no-op on the missing section.
+        let mut obj = fixture(LIVE_EXIT, 0, 16, -1, &[]);
+        let text_hdr: usize = {
+            let elf = Elf::parse(&obj).unwrap();
+            (elf.header.e_shoff as usize) + 64
+        };
+        obj[text_hdr..text_hdr + 8].fill(0);
+        let (out, report) = drop_unreferenced_text(&obj).unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(out, obj);
     }
 }

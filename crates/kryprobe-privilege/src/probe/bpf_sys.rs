@@ -21,6 +21,12 @@ pub const BPF_PROG_TYPE_KPROBE: u32 = 2;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
+/// `BPF_OBJ_PIN` command id (R2: the attr must be exactly 20 bytes).
+pub const BPF_OBJ_PIN: u32 = 6;
+/// `BPF_PROG_TYPE_TRACING` program type id (fentry, K1).
+pub const BPF_PROG_TYPE_TRACING: u32 = 26;
+/// `BPF_TRACE_FENTRY` expected attach type id (K1).
+pub const BPF_TRACE_FENTRY: u32 = 24;
 /// Required in map/prog flags when a token fd rides the attr.
 pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
 
@@ -106,3 +112,22 @@ pub struct LinkUprobeMulti {
     pub pid: u32,
     pub pad: u32,
 }
+
+/// `BPF_LINK_CREATE` tracing-attach attr (64 bytes, UAPI order): the
+/// `target_btf_id` union variant + zero tail. `target_btf_id` is 0: the
+/// kernel attaches to the load-time `attach_btf_id` (R1 —
+/// `evidence/k0/P1-attach-matrix.txt`; explicit nonzero ids fail EINVAL
+/// on the K0 host, strace-verified).
+#[repr(C)]
+pub struct LinkTracing {
+    pub prog_fd: u32,
+    pub target_fd: u32,
+    pub attach_type: u32,
+    pub flags: u32,
+    pub target_btf_id: u32,
+    pub pad: u32,
+    pub cookie: u64,
+    pub tail: [u64; 4],
+}
+
+const _: () = assert!(size_of::<LinkTracing>() == 64);

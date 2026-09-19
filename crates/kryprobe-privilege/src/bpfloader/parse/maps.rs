@@ -2,7 +2,7 @@
 //! Map-def extraction + frozen-dim asserts (T7c1 split).
 
 use super::{bad, find_section};
-use crate::bpfloader::{LoaderError, MapDims, ParsedMap, SPINE_MAPS};
+use crate::bpfloader::{KCRYPTO_MAPS, LoaderError, MapDims, ParsedMap, SPINE_MAPS};
 use goblin::elf::Elf;
 
 /// Legacy `bpf_map_def` size: 7 × u32.
@@ -57,6 +57,51 @@ pub(crate) fn parse_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, Load
     }
     for (name, _) in &found {
         if !SPINE_MAPS.iter().any(|(want, _)| want == name) {
+            return Err(LoaderError::UnsupportedMap { name: name.clone() });
+        }
+    }
+    Ok(out)
+}
+
+/// Kcrypto twin of [`parse_maps`]: same legacy `maps` decode, dims
+/// asserted against [`KCRYPTO_MAPS`] instead of the spine names (K1
+/// Task 1; K0 G1). Deliberately a second function, not a parameter: the
+/// spine path stays byte-identical.
+pub(crate) fn parse_kcrypto_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, LoaderError> {
+    let (maps_idx, maps_bytes) = find_section(elf, bytes, "maps")?;
+    let mut found: Vec<(String, MapDims)> = Vec::new();
+    for sym in elf.syms.iter() {
+        if sym.st_shndx != maps_idx || sym.st_name == 0 {
+            continue;
+        }
+        let name = elf.strtab.get_at(sym.st_name).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let off = sym.st_value as usize;
+        let def = maps_bytes
+            .get(off..off.saturating_add(MAP_DEF_LEN))
+            .filter(|d| d.len() == MAP_DEF_LEN)
+            .ok_or_else(|| bad(format!("map '{name}' def outside maps section")))?;
+        found.push((name.to_owned(), parse_map_def(def)?));
+    }
+    let mut out = Vec::with_capacity(KCRYPTO_MAPS.len());
+    for (want_name, want_dims) in KCRYPTO_MAPS {
+        match found.iter().find(|(name, _)| name == want_name) {
+            Some((_, dims)) if dims == want_dims => out.push(ParsedMap {
+                name: (*want_name).to_owned(),
+                dims: *dims,
+            }),
+            Some(_) => {
+                return Err(LoaderError::DimMismatch {
+                    name: (*want_name).to_owned(),
+                });
+            }
+            None => return Err(bad(format!("missing map '{want_name}'"))),
+        }
+    }
+    for (name, _) in &found {
+        if !KCRYPTO_MAPS.iter().any(|(want, _)| want == name) {
             return Err(LoaderError::UnsupportedMap { name: name.clone() });
         }
     }

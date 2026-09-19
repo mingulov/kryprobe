@@ -21,7 +21,7 @@ usage: cargo xtask <command> [<lane>]
 commands:
   check        verify pinned toolchain, then fmt, clippy, host tests
   build        cargo build --locked --workspace
-  build --bpf  build the BPF spine object into target/kryprobe-bpf/
+  build --bpf  build the BPF spine + kcrypto objects into target/kryprobe-bpf/
   test host    cargo test --locked --workspace
   test bpf     build BPF object + fixture, run the BPF pipeline lane
   verify generated
