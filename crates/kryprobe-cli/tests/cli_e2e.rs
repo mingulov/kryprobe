@@ -76,10 +76,15 @@ fn backends_json_shape_case() {
         for gate in ["uprobe_multi", "cookies", "ringbuf", "btf"] {
             assert!(caps[gate].is_boolean(), "gate {gate}");
         }
+        // K2.3: the live kcrypto row mirrors synthetic's capabilities shape.
+        let kcrypto_caps = &backends[3]["capabilities"];
+        for gate in ["uprobe_multi", "cookies", "ringbuf", "btf"] {
+            assert!(kcrypto_caps[gate].is_boolean(), "kcrypto gate {gate}");
+        }
     }
 }
 
-const PROBE_NAMES: [&str; 14] = [
+const PROBE_NAMES: [&str; 17] = [
     "kernel_release",
     "bpf_syscall",
     "map_create",
@@ -94,7 +99,18 @@ const PROBE_NAMES: [&str; 14] = [
     "token_create_exists",
     "file_caps_gate",
     "uretprobe_seccomp_fork",
+    // K2.3: appended after the existing 14, never reordered.
+    "kcrypto_symbols",
+    "kcrypto_attach",
+    "lockdown",
 ];
+
+/// K2.3 verdict dimensions (brief-exact spellings).
+const VERDICT_DIMS: [&str; 5] = ["symbols", "caps", "btf", "attach", "object"];
+
+fn btf_available() -> bool {
+    std::fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
+}
 
 #[test]
 fn doctor_human_markers_case() {
@@ -111,9 +127,45 @@ fn doctor_human_markers_case() {
         "backend synthetic: active (test-only)",
         "backend p11: not installed",
         "backend openssl: not installed",
-        "backend kcrypto: unavailable (no backend; needs target BTF when implemented)",
     ] {
         assert!(stdout.contains(row), "missing row {row}");
+    }
+    // K2.3: live kcrypto row (BTF-gated; lane hosts have BTF).
+    if btf_available() {
+        assert!(
+            stdout.contains("backend kcrypto: available"),
+            "missing live kcrypto row"
+        );
+    } else {
+        assert!(
+            stdout.contains("backend kcrypto: unavailable ("),
+            "missing unavailable kcrypto row"
+        );
+    }
+    // K2.3: coverage profile + verdict trailer (verdict value varies by
+    // privilege, so the shape — not the value — is pinned here; exact
+    // ready/missing mappings ride the cmd_doctor unit truth table).
+    assert!(
+        stdout.contains("coverage-profile: kernel-crypto-v1"),
+        "missing coverage profile"
+    );
+    let verdict = stdout
+        .lines()
+        .find(|line| line.starts_with("verdict: "))
+        .expect("missing verdict line");
+    if verdict == "verdict: ready" {
+        // Exact ready render.
+    } else {
+        let pieces = verdict
+            .strip_prefix("verdict: degraded: ")
+            .expect("bad verdict render");
+        assert!(!pieces.is_empty(), "empty degraded pieces");
+        for piece in pieces.split(',') {
+            assert!(
+                VERDICT_DIMS.contains(&piece),
+                "bad verdict dimension {piece}"
+            );
+        }
     }
 }
 
@@ -123,7 +175,7 @@ fn doctor_json_shape_case() {
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("doctor json");
     let probes = json["probes"].as_array().expect("probes array");
-    assert_eq!(probes.len(), 14);
+    assert_eq!(probes.len(), 17);
     for (probe, want) in probes.iter().zip(PROBE_NAMES) {
         assert_eq!(probe["name"], want);
         let outcome = probe["outcome"].as_str().expect("outcome");
@@ -141,6 +193,27 @@ fn doctor_json_shape_case() {
         }
     }
     assert_eq!(json["backends"].as_array().expect("backends").len(), 4);
+    // K2.3: coverage profile + verdict (exact keys, brief-exact spellings).
+    assert_eq!(json["coverage_profile"], "kernel-crypto-v1");
+    let verdict = &json["verdict"];
+    let status = verdict["status"].as_str().expect("verdict status");
+    assert!(
+        ["ready", "degraded"].contains(&status),
+        "bad status {status}"
+    );
+    let missing = verdict["missing"].as_array().expect("verdict missing");
+    if status == "ready" {
+        assert!(missing.is_empty(), "ready with missing {missing:?}");
+    } else {
+        assert!(!missing.is_empty(), "degraded with empty missing");
+    }
+    for piece in missing {
+        let piece = piece.as_str().expect("missing piece str");
+        assert!(
+            VERDICT_DIMS.contains(&piece),
+            "bad verdict dimension {piece}"
+        );
+    }
 }
 
 #[test]
