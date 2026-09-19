@@ -632,6 +632,13 @@ impl Backend for KCryptoBackend {
     ) -> Result<(), BackendError> {
         // Idempotent by generation: same-generation re-calls are no-ops
         // (no reload, no re-charge) so K3 can call per watch tick.
+        // NOTE (accepted): the check and the stash are not atomic across
+        // the load — two threads configuring the SAME new generation
+        // concurrently could both load and both charge (the loser's
+        // sensor drops via RAII: no leak, no half-state). Unreachable in
+        // practice: the driver drives the lifecycle single-threaded and
+        // no concurrent caller exists; re-check under the lock before
+        // charging if that ever changes.
         {
             let state = self
                 .state
