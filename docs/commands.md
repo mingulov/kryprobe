@@ -34,6 +34,7 @@ kryprobe watch --system [--source S] [--duration N]
 kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S]
 kryprobe report FILE
 kryprobe check --system --policy FILE [--duration N] [--source S]
+kryprobe import FILE
 kryprobe plan|observe|run ...   # stub: exit 4, typed marker
 ```
 
@@ -79,6 +80,13 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   three. Workload selectors (`--pid`, `--tree`, `--cgroup`,
   `--cgroup-id`, `--unit`) and `--comm` filters are deferred past v0.1
   and rejected naming the deferral.
+- `import FILE` reads one osslscope report (`schema_version:
+  observed-crypto-v1[.minor]`) or p11scope profile (`schema:
+  p11scope/observed-profile/v3`) doc and emits one shell JSONL record
+  (`schema: kryprobe/shell/v1`) to stdout: mapped fields best-effort
+  plus `native` carrying the FULL original doc verbatim. Unprivileged;
+  exit 0 on success, 2 on unreadable/invalid input or an unknown schema
+  marker (naming the marker found), 1 on internal failure.
 
 ## Environment overrides
 

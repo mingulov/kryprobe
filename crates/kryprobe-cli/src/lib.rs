@@ -12,6 +12,7 @@ mod args_sub;
 pub mod cmd_backends;
 pub mod cmd_check;
 pub mod cmd_doctor;
+pub mod cmd_import;
 pub mod cmd_inspect;
 pub mod cmd_report;
 pub mod cmd_selftest;
@@ -66,6 +67,7 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             duration,
             policy,
         } => cmd_check::run(&source, duration, &policy, stdout, stderr),
+        Command::Import { file } => cmd_import::run(&file, stdout, stderr),
         Command::Stub { name } => cmd_stub::run(&name, stderr),
     }
 }

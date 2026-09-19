@@ -22,6 +22,7 @@ commands:
   report FILE                  validate + render a JSONL stream
   check --system --policy F [--duration N] [--source S]
                                system-wide policy check (exit 10 on violation)
+  import FILE                  import an osslscope/p11scope doc as shell JSONL
   plan|observe|run ...         unsupported in thin spine (exit 4)
 
 globals:
@@ -103,6 +104,12 @@ pub enum Command {
         /// Policy file (required: v0.1 has no default policy).
         policy: PathBuf,
     },
+    /// Import one osslscope report or p11scope profile doc as shell
+    /// JSONL (unpriv; exit 0 ok, 2 bad input/unknown marker, 1 internal).
+    Import {
+        /// Source doc file.
+        file: PathBuf,
+    },
     /// Thin-spine stub (`plan`/`observe`/`run`).
     Stub { name: String },
 }
@@ -166,6 +173,12 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
                 return Err(usage("check: --json is not supported"));
             }
             crate::args_sub::parse_check(args)?
+        }
+        "import" => {
+            if json {
+                return Err(usage("import: --json is not supported"));
+            }
+            crate::args_sub::parse_import(args)?
         }
         "plan" | "observe" | "run" => {
             if json {
@@ -512,6 +525,7 @@ mod tests {
             vec!["--json", "report", "--system"],
             vec!["--json", "watch", "--system"],
             vec!["--json", "check", "--system", "--policy", "p.yaml"],
+            vec!["--json", "import", "r.json"],
             vec!["--json", "plan"],
             vec!["--json", "observe"],
             vec!["--json", "run"],
@@ -528,6 +542,26 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Inspect { pid: 1, json: true }
+        );
+    }
+
+    #[test]
+    fn import_wants_exactly_one_file() {
+        assert_eq!(
+            parse(&argv(&["import", "r.json"])).unwrap().command,
+            Command::Import {
+                file: PathBuf::from("r.json"),
+            }
+        );
+        for bad in [vec!["import"], vec!["import", "a", "b"]] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "args {bad:?} must be a usage error"
+            );
+        }
+        assert!(
+            USAGE.contains("import FILE"),
+            "usage misses import:\n{USAGE}"
         );
     }
 

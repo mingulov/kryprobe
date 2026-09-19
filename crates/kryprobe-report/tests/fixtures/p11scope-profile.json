@@ -1,0 +1,50 @@
+{
+  "capture": {
+    "drain_interval_ms": 1000,
+    "end": "2026-09-17T05:19:56Z",
+    "kernel": "test-kernel",
+    "mode": "profile",
+    "modules": [],
+    "privacy_mode": "allowlisted",
+    "ring_bytes": 262144,
+    "start": "2026-09-17T05:19:50Z"
+  },
+  "cgroups": [],
+  "evidence": {
+    "attached_probes": 12,
+    "authority": "hash-pinned",
+    "completeness": "COMPLETE",
+    "event_loss": 0,
+    "slots": 2
+  },
+  "functions": [
+    {
+      "calls": 25,
+      "errors": 3,
+      "name": "C_OpenSession",
+      "pending_returns": 0
+    }
+  ],
+  "logins": {},
+  "mechanisms": [
+    {
+      "mechanism": 1,
+      "mechanism_hex": "0x0000000000000001",
+      "note": "test mechanism",
+      "params": null
+    }
+  ],
+  "schema": "p11scope/observed-profile/v3",
+  "sessions": {
+    "async_opened": 0,
+    "balance": 0,
+    "closed": 1,
+    "inherited": 0,
+    "opened": 1,
+    "peak_concurrent": 1
+  },
+  "templates": {
+    "note": "test note",
+    "operations": []
+  }
+}

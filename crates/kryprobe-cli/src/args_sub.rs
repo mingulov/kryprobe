@@ -264,6 +264,17 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     })
 }
 
+/// `import FILE`: losslessly import one osslscope report or p11scope
+/// profile doc as kryprobe shell JSONL (exactly one positional arg).
+pub fn parse_import(args: &[String]) -> Result<Command, ArgsError> {
+    if args.len() != 1 {
+        return Err(usage("import: want exactly one FILE"));
+    }
+    Ok(Command::Import {
+        file: PathBuf::from(&args[0]),
+    })
+}
+
 /// `check --system --policy F [--duration N] [--source S]`: system-wide
 /// policy check. `--policy` is required (v0.1 has no default policy).
 pub fn parse_check(args: &[String]) -> Result<Command, ArgsError> {

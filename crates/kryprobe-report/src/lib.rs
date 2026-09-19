@@ -5,6 +5,7 @@
 //! records; the validator checks streams structurally and pins the schema
 //! bytes; the renderer prints counts that always qualify zeros (R-024).
 
+pub mod adapters;
 pub mod cover;
 pub mod observe;
 pub mod rel;
