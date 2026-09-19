@@ -16,8 +16,9 @@
 //! `driver_e2e` already proves twin attach works. M1 dissolves
 //! structurally: ticks drain the session ring, and the once-only finalize
 //! drain drops only duplicates of decoded idents. The session sensor loads
-//! before `configure` (lane-observed: the second-attached twin records
-//! nothing, so the decoded sensor must attach first).
+//! before `configure` by convention: both twins record (K4 S8 run D shows
+//! both KAGG+KIDN 256/256 full), so order is not load-bearing — decode
+//! reads the session sensor only, `finalize` the backend's.
 //!
 //! Snapshots are non-consuming reads (only the KRING drain consumes), so
 //! agg/totals observations repeat per tick with cumulative counters —
@@ -489,10 +490,10 @@ pub fn run_live_capture_with_registry(
         .map_err(|err| backend_err("kcrypto plan", err))?;
     gate_check("plan", &plan.required, runtime)?;
     // Session-owned sensor for per-tick snapshots (twin of the backend's),
-    // loaded BEFORE `configure`: lane-observed, the second-attached of two
-    // twin sensors records nothing (links exist, maps stay empty — the K2
-    // e2e loads its snapshot twin first for the same reason), so the
-    // session sensor — the one whose rows decode — must attach first.
+    // loaded BEFORE `configure` by convention: both twins record (K4 S8
+    // run D shows both KAGG+KIDN 256/256 full), so order is not
+    // load-bearing — decode reads this sensor's rows only, and `finalize`
+    // assesses the backend's own sensor.
     let object_path = kryprobe_privilege::locate_kcrypto_object()
         .map_err(|err| LiveError::Unusable(format!("kcrypto object: {err}")))?;
     let object_bytes = std::fs::read(&object_path).map_err(|err| {
