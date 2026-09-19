@@ -285,25 +285,47 @@ pub struct BurstCounts {
     pub secs: u64,
 }
 
+/// Canary key (K1 Task 3): 16B AES key carrying the `KPROBE-CANARY`
+/// marker, so the privileged `canary_kcrypto` suite can byte-scan every
+/// map + ring dump for leaked key bytes (kp2 §9 never-list tripwire).
+pub const CANARY_KEY: &[u8; 16] = b"KPROBE-CANARY-K!";
+/// Canary IV (K1 Task 3): same tripwire for the IV bytes (the brief
+/// mandates key + plaintext; the IV rides the same marker free).
+pub const CANARY_IV: &[u8; 16] = b"KPROBE-CANARY-IV";
+/// Canary plaintext (K1 Task 3): 32B input carrying the marker.
+pub const CANARY_PT: &[u8; 32] = b"KPROBE-CANARY-PT-BUFFER-01234567";
+
 /// `skcipher` roundtrip: `ops` encrypts + `ops` decrypts of 32B (C
 /// `do_skcipher`: key 16B `0x42`, IV 16B `0x11`, pt 32B `0xaa`,
 /// `ecb`-prefix algs take a zero IV).
 pub fn skcipher_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureError> {
+    skcipher_roundtrip_with(alg, ops, &[0x42u8; 16], &[0x11u8; 16], &[0xaau8; 32])
+}
+
+/// Canary `skcipher` roundtrip (K1 Task 3): same choreography as
+/// [`skcipher_roundtrip`], but key, IV, and plaintext are the
+/// `KPROBE-CANARY-*` markers above.
+pub fn skcipher_canary_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureError> {
+    skcipher_roundtrip_with(alg, ops, CANARY_KEY, CANARY_IV, CANARY_PT)
+}
+
+/// [`skcipher_roundtrip`] over caller-supplied buffers (the exactness
+/// suite keeps the C's fixed bytes; the canary suite passes markers).
+fn skcipher_roundtrip_with(
+    alg: &str,
+    ops: u64,
+    key: &[u8; 16],
+    iv_full: &[u8; 16],
+    pt: &[u8; 32],
+) -> Result<CipherCounts, FixtureError> {
     let tfm = alg_bind("skcipher", alg)?;
-    let key = [0x42u8; 16];
-    let iv_full = [0x11u8; 16];
-    let iv: &[u8] = if alg.starts_with("ecb") {
-        &[]
-    } else {
-        &iv_full
-    };
-    let pt = [0xaau8; 32];
-    set_key(&tfm, &key)?;
+    let iv: &[u8] = if alg.starts_with("ecb") { &[] } else { iv_full };
+    set_key(&tfm, key)?;
     let op = op_socket(&tfm)?;
     let mut out = [0u8; 32];
     let mut enc = 0u64;
     while enc < ops {
-        send_op(&op, ALG_OP_ENCRYPT, iv, &pt)?;
+        send_op(&op, ALG_OP_ENCRYPT, iv, pt)?;
         read_exact(&op, &mut out, 32, "enc read")?;
         enc += 1;
     }

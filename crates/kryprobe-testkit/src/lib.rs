@@ -16,7 +16,7 @@ pub mod jsonl;
 
 pub use alg_fixture::{
     BurstCounts, CipherCounts, FixtureError, HashCounts, aead_decrypt_bad_tag, aead_roundtrip,
-    burst_encrypt, hash_digest, hash_digest_multi, skcipher_roundtrip,
+    burst_encrypt, hash_digest, hash_digest_multi, skcipher_canary_roundtrip, skcipher_roundtrip,
 };
 pub use clock::ManualClock;
 pub use golden::{UPDATE_ENV_VAR, assert_golden};

@@ -122,6 +122,24 @@ pub struct KConfig {
 }
 
 impl KConfig {
+    /// Manually-maintained field list (K1 Task 3 allowlist tripwire):
+    /// declaration order, pins `docs/kcrypto-capture-allowlist.md`
+    /// via `allowlist_field_set_matches_docs` (adding a field without
+    /// updating this list + the test + the doc fails the build —
+    /// deliberate friction, brief Step 2).
+    pub const FIELDS: &[&str] = &[
+        "sk_req_base",
+        "async_tfm",
+        "tfm_alg",
+        "alg_name",
+        "alg_drv",
+        "task_flags",
+        "pf_kthread",
+        "aead_cryptlen_off",
+        "ahash_nbytes_off",
+        "_pad",
+    ];
+
     /// Little-endian wire bytes for the `KCFG` map update (x86-64 target).
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 40] {
@@ -179,6 +197,12 @@ impl Clone for KAgg {
 impl Copy for KAgg {}
 
 impl KAgg {
+    /// Manually-maintained field list (K1 Task 3 allowlist tripwire):
+    /// declaration order, pins `docs/kcrypto-capture-allowlist.md`
+    /// via `allowlist_field_set_matches_docs` (deliberate friction —
+    /// see [`KConfig::FIELDS`]).
+    pub const FIELDS: &[&str] = &["fam", "op", "res", "ctx", "alg", "drv"];
+
     /// Sound unaligned field reads (packed: no direct borrows).
     #[must_use]
     pub fn fam(&self) -> u8 {
@@ -245,6 +269,16 @@ pub struct VAgg {
     pub lat: [u64; 8],
 }
 
+impl VAgg {
+    /// Manually-maintained field list (K1 Task 3 allowlist tripwire):
+    /// declaration order, pins `docs/kcrypto-capture-allowlist.md`
+    /// via `allowlist_field_set_matches_docs` (deliberate friction —
+    /// see [`KConfig::FIELDS`]).
+    pub const FIELDS: &[&str] = &[
+        "calls", "bytes", "ok", "errors", "queued", "first_ns", "last_ns", "lat",
+    ];
+}
+
 /// Ring control event (48B): references, never full identity.
 ///
 /// `key_hash` joins [`kcrypto_ident_hash`] over the `KAGG` row's `(fam,
@@ -273,6 +307,14 @@ pub struct KCtl {
     pub val2: u64,
     /// Reserved, zero.
     pub val3: u64,
+}
+
+impl KCtl {
+    /// Manually-maintained field list (K1 Task 3 allowlist tripwire):
+    /// declaration order, pins `docs/kcrypto-capture-allowlist.md`
+    /// via `allowlist_field_set_matches_docs` (deliberate friction —
+    /// see [`KConfig::FIELDS`]).
+    pub const FIELDS: &[&str] = &["kind", "_p", "key_hash", "val0", "val1", "val2", "val3"];
 }
 
 /// Pack a `KCtl.val0` attribution head: `fam | op<<8 | res<<16 | ctx<<24`

@@ -13,8 +13,25 @@
 //!
 //! Micro-borrow: none — direct decode against the BTF spec
 //! (`Documentation/bpf/btf.rst`, UAPI `linux/btf.h`).
+//!
+//! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
+//! 8-offsets → 40B projection) and [`load_kcrypto_configured`] (the
+//! single resolve → load → write-KCFG → attach entry K2 calls).
 
+use crate::attach::OwnedLink;
+use crate::bpfloader::{LoadedKcrypto, LoaderError, PointStatus, load_kcrypto};
+use crate::local::LocalPrivilegedAuthority;
+use crate::mapops::{MapOpsError, map_update_bytes};
+use kryprobe_abi::kcrypto_agg::KConfig;
+use kryprobe_core::attach::{CookieAllocator, GenerationGuard, LinkGroup};
+use kryprobe_core::authority::AttachAuthority;
+use kryprobe_core::ids::PlanGeneration;
+use kryprobe_core::object::{ObjectRef, ObjectRole};
+use kryprobe_core::plan::TargetScope;
+use kryprobe_core::program::ProgramId;
 use std::collections::HashMap;
+use std::os::fd::RawFd;
+use std::path::Path;
 
 /// vmlinux BTF image (world-readable on the K0 host and the 6.12 guest).
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
@@ -140,6 +157,206 @@ pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
         detail: format!("{VMLINUX_BTF}: {err}"),
     })?;
     resolve_offsets_from(&bytes)
+}
+
+/// Pure CONFIG projection (K1 Task 3): the 8 resolved offsets +
+/// [`PF_KTHREAD`] + zero pad → the 40B [`KConfig`] in C2 word order.
+/// Total (no failure mode: every input word is copied verbatim).
+#[must_use]
+pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
+    KConfig {
+        sk_req_base: off.sk_req_base,
+        async_tfm: off.async_tfm,
+        tfm_alg: off.tfm_alg,
+        alg_name: off.alg_name,
+        alg_drv: off.alg_drv,
+        task_flags: off.task_flags,
+        pf_kthread: PF_KTHREAD,
+        aead_cryptlen_off: off.aead_cryptlen_off,
+        ahash_nbytes_off: off.ahash_nbytes_off,
+        _pad: 0,
+    }
+}
+
+/// Per-point attach outcome for a loaded kcrypto program.
+///
+/// Maps [`PointStatus::Loaded`] forward to the attach-time export the
+/// Task-1 handoff promises `doctor`: `Missing`/`Unsupported` points
+/// already degrade at load and carry no attach outcome (`None` on
+/// [`ConfiguredPoint::attach`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachOutcome {
+    /// Tracing link created; the point observes system-wide.
+    Attached,
+    /// Load succeeded but the link failed; `detail` is the refusal.
+    Failed { detail: String },
+}
+
+/// One configured attach point: load outcome + (when loaded) attach outcome.
+///
+/// `load` is the [`load_kcrypto`] verdict, never swallowed: K2 routes
+/// `Missing`/`Unsupported` to its degraded-coverage export and
+/// `Loaded`+`Attached` to live points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredPoint {
+    /// Program name (carries the `fexit/<symbol>` section's program).
+    pub name: String,
+    /// Load outcome from [`load_kcrypto`].
+    pub load: PointStatus,
+    /// Attach outcome; `None` unless `load` is [`PointStatus::Loaded`].
+    pub attach: Option<AttachOutcome>,
+}
+
+/// A fully configured kcrypto sensor: resolved, loaded, KCFG-written,
+/// attached. RAII: drop detaches links, then closes progs/maps.
+pub struct ConfiguredKcrypto {
+    /// Loaded maps + programs (only the programs that loaded).
+    pub loaded: LoadedKcrypto,
+    /// Live tracing links (only the points that attached), load order.
+    pub links: Vec<(String, OwnedLink)>,
+}
+
+/// Configured bring-up failure: resolution, load, KCFG write, group
+/// minting, or a total attach failure. Per-point outcomes ride the
+/// [`ConfiguredError::NoPointAttached`] variant (diagnosable, never
+/// swallowed); every other stage fails before any point exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfiguredError {
+    Resolve(BtfError),
+    Load(LoaderError),
+    Configure(MapOpsError),
+    AttachSetup { detail: String },
+    NoPointAttached { points: Vec<ConfiguredPoint> },
+}
+
+impl std::fmt::Display for ConfiguredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolve(err) => write!(f, "kcrypto resolve: {err}"),
+            Self::Load(err) => write!(f, "kcrypto load: {err}"),
+            Self::Configure(err) => write!(f, "kcrypto KCFG write: {err}"),
+            Self::AttachSetup { detail } => {
+                write!(f, "kcrypto attach setup: {detail}")
+            }
+            Self::NoPointAttached { points } => {
+                write!(
+                    f,
+                    "kcrypto attach: no point attached ({} points)",
+                    points.len()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfiguredError {}
+
+/// Zero-identity object for system-wide groups (the fexit path never
+/// reads it; same shape as the suite scaffolding).
+fn system_object() -> ObjectRef {
+    ObjectRef {
+        dev: 0,
+        ino: 0,
+        size: 0,
+        mtime: 0,
+        role: ObjectRole::Executable,
+    }
+}
+
+/// Single configured entry for K2: resolve BTF ids + offsets → load →
+/// write KCFG → attach every loaded point system-wide.
+///
+/// Physical order is resolve → load → write → attach (the KCFG write
+/// needs the loaded map fd, so it cannot precede the load): KCFG lands
+/// BEFORE any attach, so no observation runs unconfigured (the BPF
+/// `pf_kthread` gate would skip it anyway).
+///
+/// `token` reuses the [`load_kcrypto`] convention (`None` loads with
+/// privilege, `Some` with a borrowed BPF token fd); the attach step
+/// always needs privilege (the tracing link carries no token field).
+/// Per-point outcomes surface in the returned [`ConfiguredPoint`]s in
+/// parsed-program order (load verdict + attach verdict each).
+///
+/// Each link rides its own allocator-issued [`LinkGroup`] (generation
+/// 1, single-shot bring-up issuance — the fexit attach ignores cookies
+/// and only generation-guards, so group and guard share issuance and
+/// never go stale) through the attach facet
+/// (`AttachAuthority::attach_group` on [`LocalPrivilegedAuthority`]).
+/// The program label rides `UprobeMultiSelfProbe` until a dedicated
+/// `ProgramId` lands (K2's call; the attach path ignores it).
+///
+/// Succeeds iff at least one point attaches (the load rule, mapped
+/// forward); a total attach failure drops everything (RAII) and
+/// returns the per-point outcomes in the error.
+pub fn load_kcrypto_configured(
+    object_bytes: &[u8],
+    token: Option<RawFd>,
+) -> Result<(ConfiguredKcrypto, Vec<ConfiguredPoint>), ConfiguredError> {
+    let ids = resolve_btf_ids().map_err(ConfiguredError::Resolve)?;
+    let off = resolve_offsets().map_err(ConfiguredError::Resolve)?;
+    let entries: Vec<(String, u32)> = KCRYPTO_SYMBOLS
+        .iter()
+        .map(|name| ((*name).to_owned(), ids[*name]))
+        .collect();
+    let (loaded, statuses) =
+        load_kcrypto(object_bytes, &entries, token).map_err(ConfiguredError::Load)?;
+    let cfg = kconfig_from_offsets(off);
+    map_update_bytes(
+        &loaded.maps.config,
+        &0u32.to_le_bytes(),
+        &cfg.to_bytes(),
+        "kcrypto_configured/kcfg",
+    )
+    .map_err(ConfiguredError::Configure)?;
+    let authority = LocalPrivilegedAuthority;
+    let mut alloc = CookieAllocator::new(PlanGeneration::new(1));
+    let guard = GenerationGuard {
+        generation: PlanGeneration::new(1),
+    };
+    let mut links: Vec<(String, OwnedLink)> = Vec::with_capacity(loaded.progs.len());
+    let mut outcomes: Vec<(String, AttachOutcome)> = Vec::with_capacity(loaded.progs.len());
+    for (name, prog) in &loaded.progs {
+        let range = alloc
+            .allocate(1)
+            .map_err(|exhausted| ConfiguredError::AttachSetup {
+                detail: format!("cookie range for {name}: {exhausted}"),
+            })?;
+        let group = LinkGroup::from_range(
+            system_object(),
+            ProgramId::UprobeMultiSelfProbe,
+            TargetScope::System,
+            true,
+            range,
+        );
+        match authority.attach_group(&group, &guard, prog, Path::new(""), &[]) {
+            Ok(link) => {
+                links.push((name.clone(), link));
+                outcomes.push((name.clone(), AttachOutcome::Attached));
+            }
+            Err(err) => outcomes.push((
+                name.clone(),
+                AttachOutcome::Failed {
+                    detail: err.to_string(),
+                },
+            )),
+        }
+    }
+    let mut points = Vec::with_capacity(statuses.len());
+    for status in &statuses {
+        let attach = outcomes
+            .iter()
+            .find(|(name, _)| name == status.name())
+            .map(|(_, outcome)| outcome.clone());
+        points.push(ConfiguredPoint {
+            name: status.name().to_owned(),
+            load: status.clone(),
+            attach,
+        });
+    }
+    if links.is_empty() {
+        return Err(ConfiguredError::NoPointAttached { points });
+    }
+    Ok((ConfiguredKcrypto { loaded, links }, points))
 }
 
 /// Resolve one struct-member byte offset from live vmlinux BTF.
@@ -774,6 +991,32 @@ mod tests {
                 ahash_nbytes_off: 48,
             }
         );
+    }
+
+    #[test]
+    fn kconfig_from_offsets_lays_out_c2_words() {
+        // Pure CONFIG projection (K1 Task 3): the 8 resolved offsets +
+        // PF_KTHREAD + zero pad → the 40B KCFG wire layout in C2 word
+        // order (brief Step 1: KCFG bytes equal the resolved offsets).
+        let off = CryptoOffsets {
+            sk_req_base: 32,
+            async_tfm: 32,
+            tfm_alg: 32,
+            alg_name: 60,
+            alg_drv: 188,
+            task_flags: 44,
+            aead_cryptlen_off: 52,
+            ahash_nbytes_off: 48,
+        };
+        let cfg = kconfig_from_offsets(off);
+        let mut want = [0u8; 40];
+        for (i, word) in [32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 0]
+            .iter()
+            .enumerate()
+        {
+            want[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(cfg.to_bytes(), want);
     }
 
     #[test]

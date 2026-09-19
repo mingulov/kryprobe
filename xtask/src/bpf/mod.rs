@@ -215,6 +215,7 @@ pub(crate) fn test_bpf() -> i32 {
         ("kryprobe-privilege", "token_plumbing"),
         ("kryprobe-privilege", "kcrypto_attach"),
         ("kryprobe-privilege", "kcrypto_agg"),
+        ("kryprobe-privilege", "kcrypto_canary"),
         ("kryprobe-cli", "cli_bpf_e2e"),
     ] {
         let code = run_child(
