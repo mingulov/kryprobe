@@ -484,8 +484,11 @@ fn overflow_path(key_hash: u64, head: u64, lens: u64, now: u64) {
 
 /// Record one attributed observation: build the key (volatile-zeroed,
 /// then filled), update `KTOT` always, update-or-insert `KAGG` (overflow
-/// path on map-full), then the first-seen `KIDN` gate + `IDENT` event
-/// (`OVERFLOW` when the gate itself is full — C5/C6).
+/// path on map-full), then the first-seen `KIDN` gate + `IDENT` event.
+/// A full `KIDN` stays SILENT by design (C9): a per-observation `OVERFLOW`
+/// here would flood the ring (kp2 S7: rare control events only).
+/// Observable instead via the `KTOT`-vs-sum gap (K2 publishes as
+/// `attribution_overflow`) + the `KIDN` dump showing full; totals preserved.
 ///
 /// `cra_src` = 128B name source (`cra_name`, or the requested alloc
 /// name); `drv_src` = `cra_driver_name` source, or 0 on the alloc path
