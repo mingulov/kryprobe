@@ -18,13 +18,9 @@ use kryprobe_privilege::mapops::MapOpsError;
 use kryprobe_privilege::probe::{ProbeOutcome, ProbeRow, cap_names};
 use kryprobe_privilege::run_probe_matrix;
 use std::io::Write;
-use std::path::PathBuf;
 
 /// Coverage profile string (brief-exact).
 pub const COVERAGE_PROFILE: &str = "kernel-crypto-v1";
-
-/// Dev-object fallback for the attach probe (CWD-relative, per brief).
-const DEV_OBJECT: &str = "./target/kryprobe-bpf/kcrypto.bpf.o";
 
 fn human_outcome(outcome: &ProbeOutcome) -> String {
     match outcome {
@@ -79,40 +75,11 @@ fn is_privileged(caps: &[String]) -> bool {
         .any(|cap| cap == "CAP_BPF" || cap == "CAP_SYS_ADMIN")
 }
 
-/// Object candidates in try order: `KRYPROBE_BPF_DIR` (a file, or a dir
-/// containing `kcrypto.bpf.o`) first, then the CWD-relative dev object.
-/// Pure over the env value (unit-testable without env mutation).
-fn object_candidates(env: Option<&str>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(value) = env {
-        let candidate = PathBuf::from(value);
-        if candidate.is_file() {
-            out.push(candidate);
-        } else {
-            out.push(candidate.join("kcrypto.bpf.o"));
-        }
-    }
-    out.push(PathBuf::from(DEV_OBJECT));
-    out
-}
-
-/// First readable candidate; `Err` is the exact skip reason with every
-/// tried path + fs error (env misses ordered before the dev miss).
+/// First readable candidate via the consolidated privilege locator;
+/// `Err` is the exact skip reason it reports.
 fn kcrypto_object_bytes() -> Result<Vec<u8>, String> {
-    let env = std::env::var("KRYPROBE_BPF_DIR").ok();
-    let mut misses = Vec::new();
-    for candidate in object_candidates(env.as_deref()) {
-        match std::fs::read(&candidate) {
-            Ok(bytes) => return Ok(bytes),
-            Err(err) => misses.push(format!("{}: {err}", candidate.display())),
-        }
-    }
-    Err(format!(
-        "object missing (tried KRYPROBE_BPF_DIR={}, {}: {})",
-        env.as_deref().unwrap_or("(unset)"),
-        DEV_OBJECT,
-        misses.join("; ")
-    ))
+    let path = kryprobe_privilege::locate_kcrypto_object().map_err(|err| err.to_string())?;
+    std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// One configured point as `name=word` (Task-2 `point_word` vocabulary).
@@ -356,6 +323,7 @@ pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn verdict_truth_table_pins_ready_and_missing_set() {
@@ -423,24 +391,33 @@ mod tests {
     }
 
     #[test]
-    fn locator_miss_ordering_env_before_dev() {
-        // Unset env: only the dev object is tried.
-        assert_eq!(object_candidates(None), [PathBuf::from(DEV_OBJECT)]);
-        // Missing dir: dir-joined candidate first, dev second.
+    fn locator_tier_order_env_exe_dev() {
+        use kryprobe_privilege::kcrypto_backend::kcrypto_object_candidates;
+        let dev = PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o");
+        let exe = PathBuf::from("/exe/dir");
+        let bundled = PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o");
+        // Unset env: exe-bundled first, dev last.
+        assert_eq!(
+            kcrypto_object_candidates(None, Some(exe.as_path())),
+            [bundled.clone(), dev.clone()]
+        );
+        // Missing dir: dir-joined candidate first, then exe, then dev.
         let dir = std::env::temp_dir().join("kryprobe-doctor-locator-absent");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            object_candidates(Some(dir.to_str().expect("utf-8 tmp"))),
-            [dir.join("kcrypto.bpf.o"), PathBuf::from(DEV_OBJECT),]
+            kcrypto_object_candidates(Some(dir.to_str().expect("utf-8 tmp")), Some(exe.as_path())),
+            [dir.join("kcrypto.bpf.o"), bundled.clone(), dev.clone()]
         );
         // A real file is tried as-is (not dir-joined).
         let file = std::env::temp_dir().join("kryprobe-doctor-locator-file.o");
         std::fs::write(&file, b"object").expect("write tmp file");
         assert_eq!(
-            object_candidates(Some(file.to_str().expect("utf-8 tmp"))),
-            [file.clone(), PathBuf::from(DEV_OBJECT)]
+            kcrypto_object_candidates(Some(file.to_str().expect("utf-8 tmp")), Some(exe.as_path())),
+            [file.clone(), bundled.clone(), dev.clone()]
         );
         std::fs::remove_file(&file).ok();
+        // Unknown exe dir: tier 2 skipped, never fabricated.
+        assert_eq!(kcrypto_object_candidates(None, None), [dev]);
     }
 
     #[test]

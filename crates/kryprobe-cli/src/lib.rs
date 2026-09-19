@@ -13,6 +13,7 @@ pub mod cmd_inspect;
 pub mod cmd_report;
 pub mod cmd_selftest;
 pub mod cmd_stub;
+pub mod live;
 pub mod selftest_bpf;
 pub mod selftest_synth;
 pub mod selftest_token;

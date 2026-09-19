@@ -27,6 +27,7 @@ pub mod refused;
 pub mod token;
 
 pub use inspect::{InspectError, TargetSnapshot};
+pub use kcrypto_backend::{LocateMiss, ObjectLocateError, locate_kcrypto_object};
 pub use kryprobe_core::ProgramId;
 pub use local::LocalPrivilegedAuthority;
 pub use probe::{ProbeMatrix, ProbeOutcome, run_probe_matrix};

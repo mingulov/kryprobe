@@ -28,7 +28,7 @@
 //! [`load_kcrypto_configured`], finalize reuses [`snapshot_rows`] +
 //! [`map_lookup_bytes`], decode is pure.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -217,26 +217,108 @@ fn configured_error_to_backend(err: ConfiguredError) -> BackendError {
     }
 }
 
-/// Locate the kcrypto BPF object: `KRYPROBE_BPF_DIR` (a file, or a dir
-/// containing `kcrypto.bpf.o`) wins, else the workspace dev object baked at
-/// compile time. Missing/unreadable is `Unsupported` (environmental — the
-/// backend cannot attach, honestly reported, never a defect).
-fn kcrypto_object_bytes() -> Result<Vec<u8>, BackendError> {
-    const DEV_OBJECT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/kryprobe-bpf/kcrypto.bpf.o"
-    );
-    let path = match std::env::var("KRYPROBE_BPF_DIR") {
-        Ok(value) => {
-            let candidate = PathBuf::from(value);
-            if candidate.is_file() {
-                candidate
-            } else {
-                candidate.join("kcrypto.bpf.o")
-            }
+/// kcrypto object file name (tier-1 dir join + tier-2 bundled path).
+const OBJECT_FILE_NAME: &str = "kcrypto.bpf.o";
+
+/// Dev-object fallback, CWD-relative (tier 3; the K2 doctor spelling, kept
+/// verbatim so dev runs from the workspace root keep working).
+const DEV_OBJECT: &str = "target/kryprobe-bpf/kcrypto.bpf.o";
+
+/// One tried candidate plus its exact fs error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocateMiss {
+    /// Candidate path tried.
+    pub candidate: PathBuf,
+    /// Exact `fs::read` error text for this candidate.
+    pub error: String,
+}
+
+/// Total locator miss: every candidate tried in order with exact fs errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectLocateError {
+    /// Probed `KRYPROBE_BPF_DIR` value (`None` when unset).
+    pub env_dir: Option<String>,
+    /// Tried candidates in try order, each with its exact fs error.
+    pub misses: Vec<LocateMiss>,
+}
+
+impl std::fmt::Display for ObjectLocateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let misses = self
+            .misses
+            .iter()
+            .map(|miss| format!("{}: {}", miss.candidate.display(), miss.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            f,
+            "object missing (tried KRYPROBE_BPF_DIR={}, {})",
+            self.env_dir.as_deref().unwrap_or("(unset)"),
+            misses
+        )
+    }
+}
+
+impl std::error::Error for ObjectLocateError {}
+
+/// Object candidates in D2 try order, pure over the inputs (unit-testable
+/// without env mutation): `KRYPROBE_BPF_DIR` (a file tried as-is, else a
+/// dir joined with `kcrypto.bpf.o`) → executable-dir
+/// `kryprobe-bpf/kcrypto.bpf.o` (bundled; skipped when the exe dir is
+/// unknown, never fabricated) → the CWD-relative dev object.
+#[must_use]
+pub fn kcrypto_object_candidates(env: Option<&str>, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(value) = env {
+        let candidate = PathBuf::from(value);
+        if candidate.is_file() {
+            out.push(candidate);
+        } else {
+            out.push(candidate.join(OBJECT_FILE_NAME));
         }
-        Err(_) => PathBuf::from(DEV_OBJECT),
-    };
+    }
+    if let Some(dir) = exe_dir {
+        out.push(dir.join("kryprobe-bpf").join(OBJECT_FILE_NAME));
+    }
+    out.push(PathBuf::from(DEV_OBJECT));
+    out
+}
+
+/// D2 consolidated locator (replaces both K2 copies): first readable
+/// candidate wins; a total miss reports every tried path + fs error in
+/// try order (the K2 doctor wrapper vocabulary is preserved).
+pub fn locate_kcrypto_object() -> Result<PathBuf, ObjectLocateError> {
+    let env = std::env::var("KRYPROBE_BPF_DIR").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let mut misses = Vec::new();
+    for candidate in kcrypto_object_candidates(env.as_deref(), exe_dir.as_deref()) {
+        match std::fs::read(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(err) => misses.push(LocateMiss {
+                candidate,
+                error: err.to_string(),
+            }),
+        }
+    }
+    Err(ObjectLocateError {
+        env_dir: env,
+        misses,
+    })
+}
+
+/// Read the kcrypto BPF object via the consolidated locator.
+/// Missing/unreadable is `Unsupported` (environmental — the backend cannot
+/// attach, honestly reported, never a defect). The reason name is the K2
+/// spelling (stable surface).
+fn kcrypto_object_bytes() -> Result<Vec<u8>, BackendError> {
+    let path = locate_kcrypto_object().map_err(|err| {
+        BackendError::Unsupported(UnsupportedReason::with_detail(
+            "kcrypto_object_unreadable",
+            &err.to_string(),
+        ))
+    })?;
     std::fs::read(&path).map_err(|err| {
         BackendError::Unsupported(UnsupportedReason::with_detail(
             "kcrypto_object_unreadable",
@@ -909,6 +991,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn locator_miss_message_keeps_k2_vocabulary() {
+        let err = ObjectLocateError {
+            env_dir: Some("/nope".to_owned()),
+            misses: vec![
+                LocateMiss {
+                    candidate: PathBuf::from("/nope/kcrypto.bpf.o"),
+                    error: "No such file or directory (os error 2)".to_owned(),
+                },
+                LocateMiss {
+                    candidate: PathBuf::from("/exe/kryprobe-bpf/kcrypto.bpf.o"),
+                    error: "No such file or directory (os error 2)".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            err.to_string(),
+            "object missing (tried KRYPROBE_BPF_DIR=/nope, \
+             /nope/kcrypto.bpf.o: No such file or directory (os error 2); \
+             /exe/kryprobe-bpf/kcrypto.bpf.o: No such file or directory (os error 2))"
+        );
+        let unset = ObjectLocateError {
+            env_dir: None,
+            misses: vec![LocateMiss {
+                candidate: PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
+                error: "No such file or directory (os error 2)".to_owned(),
+            }],
+        };
+        assert!(
+            unset
+                .to_string()
+                .starts_with("object missing (tried KRYPROBE_BPF_DIR=(unset), ")
+        );
+    }
+
+    #[test]
+    fn locator_candidates_cover_env_file_dir_and_unset() {
+        // Real file tried as-is; missing path dir-joined; exe tier joins
+        // the bundled subpath; dev tier always last.
+        let file = std::env::temp_dir().join("kryprobe-k3-1-backend-cand.o");
+        std::fs::write(&file, b"object").expect("write tmp file");
+        let exe = PathBuf::from("/exe/dir");
+        assert_eq!(
+            kcrypto_object_candidates(file.to_str(), Some(exe.as_path())),
+            vec![
+                file.clone(),
+                PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o"),
+                PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
+            ]
+        );
+        std::fs::remove_file(&file).ok();
+        let missing = PathBuf::from("/tmp/kryprobe-k3-1-backend-absent-9f2");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(
+            kcrypto_object_candidates(missing.to_str(), None),
+            vec![
+                missing.join("kcrypto.bpf.o"),
+                PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
+            ]
+        );
     }
 
     #[test]
