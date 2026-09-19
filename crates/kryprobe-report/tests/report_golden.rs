@@ -196,7 +196,38 @@ fn pack_fixture_validates_clean_case() {
 fn schema_freeze_case() {
     // The frozen schema bytes are pinned: any edit must update this pin
     // deliberately (see `cargo xtask verify generated`).
-    assert_eq!(kryprobe_report::schema_fnv1a_hex(), "47d26ce34743e923");
+    assert_eq!(kryprobe_report::schema_fnv1a_hex(), "497094a00e27a588");
+}
+
+#[test]
+fn system_selector_session_start_validates_clean_case() {
+    // The select-all scope spells `system` in session_start and the
+    // report path accepts it: writer emits it, validation stays clean.
+    let mut writer = JsonlWriter::new("session:system");
+    writer
+        .session_start(&SessionStart {
+            target_selector: TargetSelector::System,
+            capture_mode: CaptureMode::Profile,
+            requested_backends: vec![BackendId::KCrypto],
+            qualification_id: "qualification:system".to_owned(),
+        })
+        .expect("start");
+    writer
+        .session_end(&SessionEnd {
+            verdict: SessionVerdict::Observed,
+            final_barrier: FinalBarrier::Validated,
+            unresolved_gap_ids: vec![],
+            child_exit_code: None,
+            child_signal: None,
+        })
+        .expect("end");
+    let stream = writer.finish().to_owned();
+    assert!(
+        stream.contains("\"target_selector\":\"system\""),
+        "{stream}"
+    );
+    let schema = include_bytes!("../../../schemas/event-v0.schema.json");
+    assert!(validate_str(&stream, schema).is_empty());
 }
 
 #[test]

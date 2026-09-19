@@ -305,9 +305,11 @@ fn admit_enumerated(
 /// Resolve a fan-out scope: enumerate, then admit each member.
 ///
 /// `Pid` attaches directly via the link path (no fan-out to resolve),
-/// and `OwnedRun` has no session spawner (declined: no backend
-/// consumer — the selftest fixture's ad-hoc spawn is the only
-/// observed-target spawn); both reject honestly here.
+/// `System` is system-wide kernel probes with nothing to enumerate
+/// (kp2 §3: skips fan-out), and `OwnedRun` has no session spawner
+/// (declined: no backend consumer — the selftest fixture's ad-hoc
+/// spawn is the only observed-target spawn); all three reject honestly
+/// here.
 pub(crate) fn resolve_with(
     scope: &TargetScope,
     max_targets: u64,
@@ -319,6 +321,12 @@ pub(crate) fn resolve_with(
         TargetScope::Pid { .. } => {
             return Err(rejected(
                 "Pid scope attaches directly; fan-out is for Tree/Cgroup".to_owned(),
+            ));
+        }
+        TargetScope::System => {
+            return Err(rejected(
+                "System scope is system-wide (no members to enumerate); fan-out is for Tree/Cgroup"
+                    .to_owned(),
             ));
         }
         TargetScope::OwnedRun => {

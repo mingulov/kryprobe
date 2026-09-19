@@ -56,7 +56,8 @@
                 "pid",
                 "tree",
                 "cgroup",
-                "owned_run"
+                "owned_run",
+                "system"
               ]
             },
             "capture_mode": {

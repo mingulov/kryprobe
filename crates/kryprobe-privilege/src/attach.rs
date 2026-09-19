@@ -63,8 +63,11 @@ impl OwnedLink {
 ///
 /// Cookies are `(generation << 32) | (index_base + offset_index)` over the
 /// group's allocator-issued range, so concurrent groups never conflate
-/// `COUNT[idx]`. Only `Pid` scope is supported by the spine; entry vs
-/// return selects `um_flags`.
+/// `COUNT[idx]`. Only `Pid` scope is supported by the uprobe spine;
+/// entry vs return selects `um_flags`. `System` is system-wide kernel
+/// probes (kcrypto fentry, kp2 §3), not a pid filter: it rejects here
+/// with a pointer at the fentry path and never touches a cgroup path
+/// (the scope carries none).
 ///
 /// Crate-private: the only external entry is the attach facet
 /// (`AttachAuthority::attach_group` on `LocalPrivilegedAuthority`).
@@ -86,6 +89,13 @@ pub(crate) fn attach_group(
     }
     let pid = match group.scope {
         TargetScope::Pid { pid } => pid,
+        TargetScope::System => {
+            return Err(AttachError::Rejected {
+                reason:
+                    "System scope is system-wide (kcrypto fentry); spine supports Pid scope only"
+                        .to_owned(),
+            });
+        }
         _ => {
             return Err(AttachError::Rejected {
                 reason: "spine supports Pid scope only".to_owned(),

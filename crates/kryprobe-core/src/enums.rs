@@ -37,6 +37,13 @@ pub enum TargetSelector {
     /// A cgroup subtree.
     #[serde(rename = "cgroup")]
     Cgroup,
+    /// The whole machine: system-wide kernel probes with no per-process
+    /// filter (kp2 §3). Select-all: fork/exec, new containers, and module
+    /// loads need no new probes. Report-time context (pid, comm, cgroup
+    /// id) still attributes each observation; the selector itself carries
+    /// no filter.
+    #[serde(rename = "system")]
+    System,
 }
 
 /// Evidence ladder phase (CONTRACTS §7).
@@ -172,4 +179,22 @@ pub enum OperationClass {
     KeyManagement,
     #[serde(rename = "unknown")]
     Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetSelector;
+
+    #[test]
+    fn system_selector_wire_spelling_is_system() {
+        // Select-all scope spells `system` on the wire (frozen schema
+        // `target_selector` enum); round-trips exactly.
+        assert!(matches!(
+            serde_json::to_string(&TargetSelector::System).as_deref(),
+            Ok("\"system\"")
+        ));
+        let back: TargetSelector =
+            serde_json::from_str("\"system\"").expect("system must deserialize");
+        assert_eq!(back, TargetSelector::System);
+    }
 }

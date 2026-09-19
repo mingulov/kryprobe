@@ -9,7 +9,9 @@ path. This document is the policy; the mechanism is
 `LocalPrivilegedAuthority::resolve_scope` / `refresh_fanout`.
 Generation semantics (fork/exec/reuse) follow ADR-0003; this policy
 covers admission only. The single-link entry (`attach_group`) still
-rejects non-Pid scopes: fan-out plans must be resolved first.
+rejects non-Pid scopes: fan-out plans must be resolved first, and
+`System` (system-wide kernel probes) needs the kcrypto fentry path,
+not a pid link.
 
 ## Who may observe
 
@@ -34,6 +36,9 @@ context notes, never as gates). Consequences:
 
 - `Pid` attaches directly via `attach_group`; it is not a fan-out
   scope and `resolve_scope` rejects it (use the link path).
+- `System` skips fan-out: system-wide kernel probes have no members
+  to enumerate and carry no cgroup path, so `resolve_scope` and
+  `refresh_fanout` refuse as non-fan-out scopes (kp2 §3).
 - `OwnedRun` rejects: it has no session spawner (declined: no
   backend consumer), so it is not a fan-out scope.
 - `Tree{root}`: root 0 rejects; a gone root rejects; a denied root

@@ -36,7 +36,9 @@ impl LocalPrivilegedAuthority {
     /// a composition helper over the inspect facet, not a fourth authority.
     /// Each member admits through the inspection facet; the plan's
     /// [`FanoutPlan::link_groups`] then flow through the unchanged Pid
-    /// attach path. `Pid`/`OwnedRun` reject honestly here.
+    /// attach path. `Pid`/`System`/`OwnedRun` reject honestly here:
+    /// `System` is system-wide kernel probes with nothing to enumerate
+    /// (kp2 §3: skips fan-out).
     pub fn resolve_scope(
         &self,
         scope: &kryprobe_core::plan::TargetScope,
