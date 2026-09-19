@@ -62,6 +62,7 @@ dependencies = [
  "kryprobe-core",
  "kryprobe-testkit",
  "libc",
+ "serde_json",
 ]
 
 [[package]]

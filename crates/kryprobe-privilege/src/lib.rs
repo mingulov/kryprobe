@@ -18,6 +18,7 @@ pub mod elfread;
 pub mod fanout;
 pub mod fd;
 pub mod inspect;
+pub mod kcrypto_backend;
 pub mod kcrypto_snapshot;
 pub mod local;
 pub mod mapops;

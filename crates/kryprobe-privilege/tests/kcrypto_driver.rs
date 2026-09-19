@@ -17,9 +17,9 @@
 //! (under the lane every test runs as root, and `configure` attaches).
 
 use kryprobe_abi::kcrypto_agg::{
-    KCTL_IDENT, KCTL_OVERFLOW, KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS,
-    KOP_ALLOC, KOP_DEC, KOP_DESTROY, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK,
-    KRES_QUEUED, KRES_UNOBSERVED, KCTX_KTHREAD, KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, VAgg,
+    KCTL_IDENT, KCTL_OVERFLOW, KCTX_KTHREAD, KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KFAM_AEAD,
+    KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC, KOP_DESTROY,
+    KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED, VAgg,
     kcrypto_ident_hash, kctl_from_bytes, kctl_pack_head, kctl_pack_lens,
 };
 use kryprobe_core::backend::{
@@ -37,9 +37,7 @@ use kryprobe_core::evidence::{
 use kryprobe_core::ids::{IdIssuer, ObservationId, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_privilege::btf_resolve::{KCRYPTO_SYMBOLS, load_kcrypto_configured};
-use kryprobe_privilege::kcrypto_backend::{
-    KCRYPTO_CAPABILITIES, KCryptoBackend, register_kcrypto,
-};
+use kryprobe_privilege::kcrypto_backend::{KCRYPTO_CAPABILITIES, KCryptoBackend, register_kcrypto};
 use kryprobe_privilege::kcrypto_snapshot::{
     IdentBytes, ParsedRow, RowBytes, SnapshotRows, TotalsBytes, parse_snapshot_row,
     raw_event_for_agg, raw_event_for_ident, raw_event_for_totals, snapshot_rows,
@@ -121,7 +119,9 @@ fn ident_payload_for(kind: u8, key_hash: u64, fam: u8, op: u8, res: u8, ctx: u8)
     out.extend_from_slice(&[0u8; 7]); // _p[3] + pad to key_hash@8
     out.extend_from_slice(&key_hash.to_le_bytes());
     out.extend_from_slice(&kctl_pack_head(fam, op, res, ctx).to_le_bytes());
-    out.extend_from_slice(&kctl_pack_lens(TEST_ALG.len() as u32, TEST_DRV.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &kctl_pack_lens(TEST_ALG.len() as u32, TEST_DRV.len() as u32).to_le_bytes(),
+    );
     out.extend_from_slice(&150u64.to_le_bytes()); // val2: first-seen ns
     out.extend_from_slice(&0u64.to_le_bytes()); // val3: reserved
     out
@@ -269,7 +269,7 @@ fn expected_call_phase(op: u8, res: u8, inventory: bool) -> (CallKind, EvidenceP
 fn expected_status(res: u8) -> i32 {
     match res {
         KRES_OK => 0,
-        KRES_ERR => -5, // -EIO canonical
+        KRES_ERR => -5,      // -EIO canonical
         KRES_QUEUED => -115, // -EINPROGRESS canonical
         _ => 0,
     }
@@ -340,7 +340,7 @@ fn capabilities_require_btf_only() {
     );
     let backend = KCryptoBackend::new();
     assert_eq!(backend.id(), BackendId::KCrypto);
-    assert_eq!(backend.capabilities().required.btf, true);
+    assert!(backend.capabilities().required.btf);
 }
 
 fn btf_available() -> bool {
@@ -350,12 +350,16 @@ fn btf_available() -> bool {
 #[test]
 fn register_kcrypto_detects_system_instance() {
     if !btf_available() {
-        println!("SKIP: register_kcrypto_detects_system_instance requires BTF (lane hosts have it)");
+        println!(
+            "SKIP: register_kcrypto_detects_system_instance requires BTF (lane hosts have it)"
+        );
         return;
     }
     let mut registry = BackendRegistry::new();
     register_kcrypto(&mut registry).expect("first registration ok");
-    let backend = registry.get(BackendId::KCrypto).expect("kcrypto registered");
+    let backend = registry
+        .get(BackendId::KCrypto)
+        .expect("kcrypto registered");
     let runtime = runtime_with_btf(true);
     let ctx = DetectContext {
         session: SessionId::new(1),
@@ -399,18 +403,13 @@ fn plan_proposes_nine_ordinal_probes() {
         kryprobe_core::enums::CaptureMode::Profile,
         kryprobe_core::enums::CaptureMode::Trace,
     ] {
-        let plan = backend
-            .plan(&plan_ctx, &instance, mode)
-            .expect("plan ok");
+        let plan = backend.plan(&plan_ctx, &instance, mode).expect("plan ok");
         assert_eq!(plan.backend, BackendId::KCrypto);
         assert_eq!(plan.probes.len(), 9, "D3: 9 probes in {mode:?} mode");
         for (i, probe) in plan.probes.iter().enumerate() {
             assert_eq!(probe.file_offset, 0, "D3: kernel symbol, no file");
             assert_eq!(probe.cookie, 0, "D3: fexit ignores cookies");
-            assert_eq!(
-                probe.descriptor_id, i as u32,
-                "D3: KCRYPTO_SYMBOLS ordinal"
-            );
+            assert_eq!(probe.descriptor_id, i as u32, "D3: KCRYPTO_SYMBOLS ordinal");
         }
         assert_eq!(
             plan.required, KCRYPTO_CAPABILITIES.required,
@@ -447,7 +446,10 @@ fn decode_spot_cases_pin_d8_tables() {
 
     // (AEAD,DEC,ERR,KTHREAD): canonical -EIO failure.
     let obs = decode_agg(KFAM_AEAD, KOP_DEC, KRES_ERR, KCTX_KTHREAD);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Operation, EvidencePhase::Completed));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Operation, EvidencePhase::Completed)
+    );
     assert_eq!(obs.native_result, NativeResult::KCrypto { status: -5 });
     assert_eq!(outcome_of_obs(&obs), "failure");
     assert_eq!(
@@ -455,18 +457,27 @@ fn decode_spot_cases_pin_d8_tables() {
         Some("crypto_aead_decrypt")
     );
     assert_eq!(obs.backend_payload["context"], "kthread");
-    assert_eq!(obs.backend_payload["status_canonical"].as_bool(), Some(true));
+    assert_eq!(
+        obs.backend_payload["status_canonical"].as_bool(),
+        Some(true)
+    );
 
     // (SK,ENC,QUEUED,SOFTIRQ): canonical -EINPROGRESS pending.
     let obs = decode_agg(KFAM_SK, KOP_ENC, KRES_QUEUED, KCTX_SOFTIRQ);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Operation, EvidencePhase::Entered));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Operation, EvidencePhase::Entered)
+    );
     assert_eq!(obs.native_result, NativeResult::KCrypto { status: -115 });
     assert_eq!(outcome_of_obs(&obs), "pending");
     assert_eq!(obs.backend_payload["context"], "softirq");
 
     // (SHASH,FINUP,OK,UNKNOWN): finalization call kind.
     let obs = decode_agg(KFAM_SHASH, KOP_FINUP, KRES_OK, KCTX_UNKNOWN);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Finalization, EvidencePhase::Completed));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Finalization, EvidencePhase::Completed)
+    );
     assert_eq!(
         obs.native_name.as_ref().map(|n| n.as_str()),
         Some("crypto_shash_finup")
@@ -476,7 +487,10 @@ fn decode_spot_cases_pin_d8_tables() {
 
     // (ANY,ALLOC,OK,PROC): inventory-only (D8).
     let obs = decode_agg(KFAM_ANY, KOP_ALLOC, KRES_OK, KCTX_PROC);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Initialization, EvidencePhase::Selected));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Initialization, EvidencePhase::Selected)
+    );
     assert_eq!(outcome_of_obs(&obs), "not_applicable");
     assert_eq!(
         obs.native_name.as_ref().map(|n| n.as_str()),
@@ -487,7 +501,10 @@ fn decode_spot_cases_pin_d8_tables() {
     // (ANY,ENC,OK,PROC): defensive ANY+exec (BPF never emits) — same
     // inventory treatment, never crash, never silent.
     let obs = decode_agg(KFAM_ANY, KOP_ENC, KRES_OK, KCTX_PROC);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Operation, EvidencePhase::Selected));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Operation, EvidencePhase::Selected)
+    );
     assert_eq!(outcome_of_obs(&obs), "not_applicable");
     assert_eq!(obs.native_name, None, "unknown family: no symbol to name");
     assert_eq!(obs.backend_payload["execution"], "unsupported");
@@ -506,7 +523,10 @@ fn decode_spot_cases_pin_d8_tables() {
 
     // Impossible-live combo (SK,DIGEST): normal op/res mapping, no symbol.
     let obs = decode_agg(KFAM_SK, KOP_DIGEST, KRES_OK, KCTX_PROC);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Operation, EvidencePhase::Completed));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Operation, EvidencePhase::Completed)
+    );
     assert_eq!(obs.native_name, None);
     assert!(obs.backend_payload.get("execution").is_none());
 }
@@ -516,13 +536,25 @@ fn decode_spot_cases_pin_d8_tables() {
 #[test]
 fn decode_cartesian_480_pins_full_contract() {
     let fams = [KFAM_ANY, KFAM_SK, KFAM_AEAD, KFAM_AHASH, KFAM_SHASH];
-    let ops = [KOP_ALLOC, KOP_DESTROY, KOP_ENC, KOP_DEC, KOP_DIGEST, KOP_FINUP];
+    let ops = [
+        KOP_ALLOC,
+        KOP_DESTROY,
+        KOP_ENC,
+        KOP_DEC,
+        KOP_DIGEST,
+        KOP_FINUP,
+    ];
     let ress = [KRES_OK, KRES_ERR, KRES_QUEUED, KRES_UNOBSERVED];
     let ctxs = [KCTX_PROC, KCTX_KTHREAD, KCTX_SOFTIRQ, KCTX_UNKNOWN];
     let backend = KCryptoBackend::new();
     let issuer = IdIssuer::default();
     let integrity = IntegritySummary::default();
-    let ctx = decode_ctx(SessionId::new(1), PlanGeneration::new(1), &integrity, &issuer);
+    let ctx = decode_ctx(
+        SessionId::new(1),
+        PlanGeneration::new(1),
+        &integrity,
+        &issuer,
+    );
     let mut count = 0u32;
     for fam in fams {
         for op in ops {
@@ -534,7 +566,11 @@ fn decode_cartesian_480_pins_full_contract() {
                     let inventory = fam == KFAM_ANY;
                     let (call, phase) = expected_call_phase(op, res, inventory);
                     let status = expected_status(res);
-                    assert_eq!(obs.backend, BackendId::KCrypto, "combo {fam}/{op}/{res}/{ct}");
+                    assert_eq!(
+                        obs.backend,
+                        BackendId::KCrypto,
+                        "combo {fam}/{op}/{res}/{ct}"
+                    );
                     assert_eq!(obs.call_kind, call, "combo {fam}/{op}/{res}/{ct}: call");
                     assert_eq!(obs.phase, phase, "combo {fam}/{op}/{res}/{ct}: phase");
                     assert_eq!(
@@ -575,9 +611,15 @@ fn decode_cartesian_480_pins_full_contract() {
                     assert_eq!(obs.backend_payload["driver"], TEST_DRV);
                     assert_eq!(obs.backend_payload["counts"]["calls"].as_u64(), Some(7));
                     assert_eq!(obs.backend_payload["bytes"].as_u64(), Some(224));
-                    assert_eq!(obs.backend_payload["window"]["first_ns"].as_u64(), Some(100));
+                    assert_eq!(
+                        obs.backend_payload["window"]["first_ns"].as_u64(),
+                        Some(100)
+                    );
                     assert_eq!(obs.backend_payload["window"]["last_ns"].as_u64(), Some(200));
-                    assert_eq!(obs.backend_payload["status_canonical"].as_bool(), Some(true));
+                    assert_eq!(
+                        obs.backend_payload["status_canonical"].as_bool(),
+                        Some(true)
+                    );
                     // UNOBSERVED rows carry the payload note; others must not.
                     assert_eq!(
                         obs.backend_payload.get("result_note").is_some(),
@@ -598,7 +640,9 @@ fn decode_cartesian_480_pins_full_contract() {
         coverage: &coverage,
         integrity: &integrity,
     };
-    let summary = backend.finalize(&fin_ctx).expect("unconfigured finalize ok");
+    let summary = backend
+        .finalize(&fin_ctx)
+        .expect("unconfigured finalize ok");
     assert_eq!(summary.observations, 480, "finalize echoes decoded");
 }
 
@@ -608,10 +652,16 @@ fn canonical_codes_pin_eio_einprogress() {
     assert_eq!(-libc_einprogress(), -115, "EINPROGRESS pins 115 (Linux)");
     let err = decode_agg(KFAM_SK, KOP_ENC, KRES_ERR, KCTX_PROC);
     assert_eq!(err.native_result, NativeResult::KCrypto { status: -5 });
-    assert_eq!(err.backend_payload["status_canonical"].as_bool(), Some(true));
+    assert_eq!(
+        err.backend_payload["status_canonical"].as_bool(),
+        Some(true)
+    );
     let queued = decode_agg(KFAM_SK, KOP_ENC, KRES_QUEUED, KCTX_PROC);
     assert_eq!(queued.native_result, NativeResult::KCrypto { status: -115 });
-    assert_eq!(queued.backend_payload["status_canonical"].as_bool(), Some(true));
+    assert_eq!(
+        queued.backend_payload["status_canonical"].as_bool(),
+        Some(true)
+    );
     // The flag rides every row: the sensor counts classes, never codes (D9).
     let ok = decode_agg(KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC);
     assert_eq!(ok.backend_payload["status_canonical"].as_bool(), Some(true));
@@ -631,11 +681,17 @@ fn destroy_unobserved_arms_mapped_but_unreachable() {
     // DESTROY -> (unknown, Returned): mapped per D8, unreachable because
     // destroy rows never materialize (K1-proven void path).
     let obs = decode_agg(KFAM_ANY, KOP_DESTROY, KRES_OK, KCTX_PROC);
-    assert_eq!(obs.native_name.as_ref().map(|n| n.as_str()), Some("crypto_destroy_tfm"));
+    assert_eq!(
+        obs.native_name.as_ref().map(|n| n.as_str()),
+        Some("crypto_destroy_tfm")
+    );
     // ANY-fam inventory override still applies (Selected, not Returned).
     assert_eq!(obs.phase, EvidencePhase::Selected);
     let obs = decode_agg(KFAM_SK, KOP_DESTROY, KRES_OK, KCTX_PROC);
-    assert_eq!((obs.call_kind, obs.phase), (CallKind::Unknown, EvidencePhase::Returned));
+    assert_eq!(
+        (obs.call_kind, obs.phase),
+        (CallKind::Unknown, EvidencePhase::Returned)
+    );
     // UNOBSERVED -> status 0 + payload note (unreachable: only the void
     // destroy path carries it, and that path emits no rows).
     let obs = decode_agg(KFAM_SK, KOP_DESTROY, KRES_UNOBSERVED, KCTX_PROC);
@@ -654,7 +710,12 @@ fn decode_rejects_corrupt_without_counting() {
     let backend = KCryptoBackend::new();
     let issuer = IdIssuer::default();
     let integrity = IntegritySummary::default();
-    let ctx = decode_ctx(SessionId::new(1), PlanGeneration::new(1), &integrity, &issuer);
+    let ctx = decode_ctx(
+        SessionId::new(1),
+        PlanGeneration::new(1),
+        &integrity,
+        &issuer,
+    );
     let row = RowBytes::new(agg_payload_for(KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC)).expect("row");
     let good = raw_event_for_agg(&row);
     // Corrupt the version byte through a borrowed bad payload.
@@ -664,7 +725,9 @@ fn decode_rejects_corrupt_without_counting() {
         header: good.header,
         payload: &bad,
     };
-    let err = backend.decode(&ctx, bad_event).expect_err("bad version refuses");
+    let err = backend
+        .decode(&ctx, bad_event)
+        .expect_err("bad version refuses");
     assert!(
         matches!(err, BackendError::CorruptInput(_)),
         "parse errors pass through, got {err:?}"
@@ -691,7 +754,12 @@ fn totals_row_decodes_to_completed_aggregate() {
     let event = raw_event_for_totals(&totals);
     let issuer = IdIssuer::default();
     let integrity = IntegritySummary::default();
-    let ctx = decode_ctx(SessionId::new(1), PlanGeneration::new(1), &integrity, &issuer);
+    let ctx = decode_ctx(
+        SessionId::new(1),
+        PlanGeneration::new(1),
+        &integrity,
+        &issuer,
+    );
     let obs = backend.decode(&ctx, event).expect("totals decodes");
     assert_eq!(obs.backend, BackendId::KCrypto);
     assert_eq!(obs.phase, EvidencePhase::Completed);
@@ -704,9 +772,15 @@ fn totals_row_decodes_to_completed_aggregate() {
     assert_eq!(obs.backend_payload["counts"]["calls"].as_u64(), Some(7));
     assert_eq!(obs.backend_payload["counts"]["ok"].as_u64(), Some(7));
     assert_eq!(obs.backend_payload["bytes"].as_u64(), Some(224));
-    assert_eq!(obs.backend_payload["window"]["first_ns"].as_u64(), Some(100));
+    assert_eq!(
+        obs.backend_payload["window"]["first_ns"].as_u64(),
+        Some(100)
+    );
     assert_eq!(obs.backend_payload["window"]["last_ns"].as_u64(), Some(200));
-    assert_eq!(obs.backend_payload["status_canonical"].as_bool(), Some(true));
+    assert_eq!(
+        obs.backend_payload["status_canonical"].as_bool(),
+        Some(true)
+    );
     assert_eq!(obs.started_ns, Some(100));
     assert_eq!(obs.ended_ns, Some(200));
 }
@@ -716,12 +790,18 @@ fn ident_rows_decode_to_discovered_markers() {
     let backend = KCryptoBackend::new();
     let issuer = IdIssuer::default();
     let integrity = IntegritySummary::default();
-    let ctx = decode_ctx(SessionId::new(1), PlanGeneration::new(1), &integrity, &issuer);
+    let ctx = decode_ctx(
+        SessionId::new(1),
+        PlanGeneration::new(1),
+        &integrity,
+        &issuer,
+    );
     for (kind, kind_str) in [(KCTL_IDENT, "ident"), (KCTL_OVERFLOW, "overflow")] {
         let hash = 0x0102_0304_0506_0708u64;
-        let ident =
-            IdentBytes::new(ident_payload_for(kind, hash, KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC))
-                .expect("ident");
+        let ident = IdentBytes::new(ident_payload_for(
+            kind, hash, KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC,
+        ))
+        .expect("ident");
         // The KCtl body parses (Task-1 codec shape).
         let kctl = kctl_from_bytes(&ident.0[2..]).expect("KCtl body");
         assert_eq!(kctl.kind, kind);
@@ -765,10 +845,17 @@ fn finalize_unconfigured_counts_without_integrity() {
     let backend = KCryptoBackend::new();
     let issuer = IdIssuer::default();
     let integrity = IntegritySummary::default();
-    let ctx = decode_ctx(SessionId::new(1), PlanGeneration::new(1), &integrity, &issuer);
+    let ctx = decode_ctx(
+        SessionId::new(1),
+        PlanGeneration::new(1),
+        &integrity,
+        &issuer,
+    );
     for (op, res) in [(KOP_ENC, KRES_OK), (KOP_DEC, KRES_ERR)] {
         let row = RowBytes::new(agg_payload_for(KFAM_SK, op, res, KCTX_PROC)).expect("row");
-        backend.decode(&ctx, raw_event_for_agg(&row)).expect("decode");
+        backend
+            .decode(&ctx, raw_event_for_agg(&row))
+            .expect("decode");
     }
     let coverage = coverage_all(CoverageStatus::Partial);
     // A nonzero ctx baseline must never echo (synthetic pattern).
@@ -784,7 +871,11 @@ fn finalize_unconfigured_counts_without_integrity() {
     let summary = backend.finalize(&fin_ctx).expect("finalize");
     assert_eq!(summary.backend, BackendId::KCrypto);
     assert_eq!(summary.observations, 2);
-    assert_eq!(summary.integrity, IntegritySummary::default(), "never echo ctx");
+    assert_eq!(
+        summary.integrity,
+        IntegritySummary::default(),
+        "never echo ctx"
+    );
 }
 
 #[test]
@@ -808,7 +899,10 @@ fn driver_run_over_handfed_rows_green_unpriv() {
     let report = driver
         .run(&registry, &runtime_with_btf(false), &events)
         .expect("gated run is Ok");
-    assert!(report.observations.is_empty(), "skipped backend decodes nothing");
+    assert!(
+        report.observations.is_empty(),
+        "skipped backend decodes nothing"
+    );
     assert!(report.plans.is_empty());
     assert!(report.summaries.is_empty());
     assert_eq!(report.skipped.len(), 1);
@@ -843,12 +937,18 @@ fn configure_fails_honestly_without_privilege() {
         probes: vec![],
         required: KCRYPTO_CAPABILITIES.required,
     };
-    let err = backend.configure(&mut ctx, &plan).expect_err("unpriv configure fails");
+    let err = backend
+        .configure(&mut ctx, &plan)
+        .expect_err("unpriv configure fails");
     assert!(
         matches!(err, BackendError::Denied(_) | BackendError::Unsupported(_)),
         "honest typed failure, got {err:?}"
     );
-    assert_eq!(budget.used(BudgetKind::Links), 0, "failed configure charges nothing");
+    assert_eq!(
+        budget.used(BudgetKind::Links),
+        0,
+        "failed configure charges nothing"
+    );
     assert_eq!(budget.used(BudgetKind::StateEntries), 0);
 }
 
@@ -896,7 +996,9 @@ fn lane_ready(name: &str) -> bool {
 static SUITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn suite_guard() -> std::sync::MutexGuard<'static, ()> {
-    SUITE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    SUITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Sum decoded agg-observation counts matching (family, op, result, alg).
@@ -978,8 +1080,8 @@ fn driver_e2e_matches_fixture_truth() {
         );
     }
     let bytes = kcrypto_bytes();
-    let (sensor, _points) =
-        load_kcrypto_configured(&bytes, None).unwrap_or_else(|err| panic!("bring-up failed: {err}"));
+    let (sensor, _points) = load_kcrypto_configured(&bytes, None)
+        .unwrap_or_else(|err| panic!("bring-up failed: {err}"));
     // Task-1 P4 traffic, identical counts (lane-exclusive, fresh sensor).
     let sk = alg_fixture::skcipher_roundtrip("cbc(aes)", 20).expect("skcipher traffic");
     assert_eq!((sk.enc, sk.dec), (20, 20));
@@ -996,8 +1098,7 @@ fn driver_e2e_matches_fixture_truth() {
     // blobs outlive the run; events borrow them (D6).
     let snap: SnapshotRows = snapshot_rows(&sensor).expect("snapshot_rows");
     assert!(!snap.rows.is_empty(), "snapshot must carry agg rows");
-    let mut events: Vec<RawEvent<'_>> =
-        snap.rows.iter().map(raw_event_for_agg).collect();
+    let mut events: Vec<RawEvent<'_>> = snap.rows.iter().map(raw_event_for_agg).collect();
     if let Some(totals) = snap.totals.as_ref() {
         events.push(raw_event_for_totals(totals));
     }
@@ -1040,22 +1141,53 @@ fn driver_e2e_matches_fixture_truth() {
 
     // Fixture truth through DECODED observations (payload counts, P4):
     // skcipher roundtrip.
-    assert_eq!(sum_obs(observations, "skcipher", "encrypt", "ok", "cbc(aes)"), (20, 20 * 32, 20, 0, 0));
-    assert_eq!(sum_obs(observations, "skcipher", "decrypt", "ok", "cbc(aes)"), (20, 20 * 32, 20, 0, 0));
-    assert_eq!(sum_obs(observations, "any", "alloc", "ok", "cbc(aes)").0, 1, "one bind alloc");
+    assert_eq!(
+        sum_obs(observations, "skcipher", "encrypt", "ok", "cbc(aes)"),
+        (20, 20 * 32, 20, 0, 0)
+    );
+    assert_eq!(
+        sum_obs(observations, "skcipher", "decrypt", "ok", "cbc(aes)"),
+        (20, 20 * 32, 20, 0, 0)
+    );
+    assert_eq!(
+        sum_obs(observations, "any", "alloc", "ok", "cbc(aes)").0,
+        1,
+        "one bind alloc"
+    );
     // Hash: one ahash + one shash observation per single-shot op (64B
     // each), two finups per multi digest.
-    assert_eq!(sum_obs(observations, "ahash", "digest", "ok", "sha512"), (8, 8 * 64, 8, 0, 0));
-    assert_eq!(sum_obs(observations, "shash", "digest", "ok", "sha512"), (8, 8 * 64, 8, 0, 0));
-    assert_eq!(sum_obs(observations, "shash", "finup", "ok", "sha512"), (8, 4 * 32, 8, 0, 0));
+    assert_eq!(
+        sum_obs(observations, "ahash", "digest", "ok", "sha512"),
+        (8, 8 * 64, 8, 0, 0)
+    );
+    assert_eq!(
+        sum_obs(observations, "shash", "digest", "ok", "sha512"),
+        (8, 8 * 64, 8, 0, 0)
+    );
+    assert_eq!(
+        sum_obs(observations, "shash", "finup", "ok", "sha512"),
+        (8, 4 * 32, 8, 0, 0)
+    );
     // AEAD: 10 clean + bad-tag setup enc + failed dec.
-    assert_eq!(sum_obs(observations, "aead", "encrypt", "ok", "gcm(aes)"), (11, 11 * 32, 11, 0, 0));
-    assert_eq!(sum_obs(observations, "aead", "decrypt", "ok", "gcm(aes)"), (10, 10 * 48, 10, 0, 0));
-    assert_eq!(sum_obs(observations, "aead", "decrypt", "error", "gcm(aes)"), (1, 48, 0, 1, 0));
+    assert_eq!(
+        sum_obs(observations, "aead", "encrypt", "ok", "gcm(aes)"),
+        (11, 11 * 32, 11, 0, 0)
+    );
+    assert_eq!(
+        sum_obs(observations, "aead", "decrypt", "ok", "gcm(aes)"),
+        (10, 10 * 48, 10, 0, 0)
+    );
+    assert_eq!(
+        sum_obs(observations, "aead", "decrypt", "error", "gcm(aes)"),
+        (1, 48, 0, 1, 0)
+    );
 
     // Per-row shape: symbol set for known pairs, conservation, sane
     // windows, canonical flag, inventory marking on ANY rows only.
-    for obs in observations.iter().filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("agg"))) {
+    for obs in observations
+        .iter()
+        .filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("agg")))
+    {
         let counts = &obs.backend_payload["counts"];
         let (calls, ok, errors, queued) = (
             counts["calls"].as_u64().expect("calls"),
@@ -1065,11 +1197,18 @@ fn driver_e2e_matches_fixture_truth() {
         );
         assert_eq!(ok + errors + queued, calls, "conservation per row");
         let (first, last) = (
-            obs.backend_payload["window"]["first_ns"].as_u64().expect("first"),
-            obs.backend_payload["window"]["last_ns"].as_u64().expect("last"),
+            obs.backend_payload["window"]["first_ns"]
+                .as_u64()
+                .expect("first"),
+            obs.backend_payload["window"]["last_ns"]
+                .as_u64()
+                .expect("last"),
         );
         assert!(first <= last && last > 0, "sane window");
-        assert_eq!(obs.backend_payload["status_canonical"].as_bool(), Some(true));
+        assert_eq!(
+            obs.backend_payload["status_canonical"].as_bool(),
+            Some(true)
+        );
         assert_eq!(obs.started_ns, Some(first));
         assert_eq!(obs.ended_ns, Some(last));
         let is_any = obs.backend_payload.get("family") == Some(&serde_json::json!("any"));
@@ -1095,19 +1234,43 @@ fn driver_e2e_matches_fixture_truth() {
         .collect();
     assert_eq!(totals_obs.len(), 1, "exactly one totals observation");
     let tot = decode_snapshot_totals_via_parse(&snap);
-    assert_eq!(totals_obs[0].backend_payload["counts"]["calls"].as_u64(), Some(tot.calls));
-    assert_eq!(totals_obs[0].backend_payload["bytes"].as_u64(), Some(tot.bytes));
-    assert_eq!(totals_obs[0].backend_payload["counts"]["ok"].as_u64(), Some(tot.ok));
-    assert_eq!(totals_obs[0].backend_payload["counts"]["errors"].as_u64(), Some(tot.errors));
-    assert_eq!(totals_obs[0].backend_payload["counts"]["queued"].as_u64(), Some(tot.queued));
+    assert_eq!(
+        totals_obs[0].backend_payload["counts"]["calls"].as_u64(),
+        Some(tot.calls)
+    );
+    assert_eq!(
+        totals_obs[0].backend_payload["bytes"].as_u64(),
+        Some(tot.bytes)
+    );
+    assert_eq!(
+        totals_obs[0].backend_payload["counts"]["ok"].as_u64(),
+        Some(tot.ok)
+    );
+    assert_eq!(
+        totals_obs[0].backend_payload["counts"]["errors"].as_u64(),
+        Some(tot.errors)
+    );
+    assert_eq!(
+        totals_obs[0].backend_payload["counts"]["queued"].as_u64(),
+        Some(tot.queued)
+    );
     // KTOT == sum(agg observations): healthy conservation end to end.
     let mut sum = (0u64, 0u64, 0u64, 0u64, 0u64);
-    for obs in observations.iter().filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("agg"))) {
-        sum.0 += obs.backend_payload["counts"]["calls"].as_u64().expect("calls");
+    for obs in observations
+        .iter()
+        .filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("agg")))
+    {
+        sum.0 += obs.backend_payload["counts"]["calls"]
+            .as_u64()
+            .expect("calls");
         sum.1 += obs.backend_payload["bytes"].as_u64().expect("bytes");
         sum.2 += obs.backend_payload["counts"]["ok"].as_u64().expect("ok");
-        sum.3 += obs.backend_payload["counts"]["errors"].as_u64().expect("errors");
-        sum.4 += obs.backend_payload["counts"]["queued"].as_u64().expect("queued");
+        sum.3 += obs.backend_payload["counts"]["errors"]
+            .as_u64()
+            .expect("errors");
+        sum.4 += obs.backend_payload["counts"]["queued"]
+            .as_u64()
+            .expect("queued");
     }
     assert_eq!((tot.calls, tot.bytes, tot.ok, tot.errors, tot.queued), sum);
 
@@ -1118,7 +1281,9 @@ fn driver_e2e_matches_fixture_truth() {
         .collect();
     assert!(!ident_obs.is_empty(), "snapshot must carry IDENTs");
     for obs in &ident_obs {
-        let key_hash = obs.backend_payload["key_hash"].as_u64().expect("key_hash u64");
+        let key_hash = obs.backend_payload["key_hash"]
+            .as_u64()
+            .expect("key_hash u64");
         let fam = fam_num(obs.backend_payload["family"].as_str().expect("family"));
         let op = op_num(obs.backend_payload["op"].as_str().expect("op"));
         let joined: Vec<&NativeObservation> = observations
@@ -1130,26 +1295,46 @@ fn driver_e2e_matches_fixture_truth() {
                 kcrypto_ident_hash(fam, op, &alg, &drv) == key_hash
             })
             .collect();
-        assert!(!joined.is_empty(), "IDENT {key_hash:016x} joins a decoded row");
-        let first_seen = obs.backend_payload["first_seen_ns"].as_u64().expect("first_seen");
+        assert!(
+            !joined.is_empty(),
+            "IDENT {key_hash:016x} joins a decoded row"
+        );
+        let first_seen = obs.backend_payload["first_seen_ns"]
+            .as_u64()
+            .expect("first_seen");
         let first = joined
             .iter()
-            .map(|o| o.backend_payload["window"]["first_ns"].as_u64().expect("first"))
+            .map(|o| {
+                o.backend_payload["window"]["first_ns"]
+                    .as_u64()
+                    .expect("first")
+            })
             .min()
             .expect("joined");
         let last = joined
             .iter()
-            .map(|o| o.backend_payload["window"]["last_ns"].as_u64().expect("last"))
+            .map(|o| {
+                o.backend_payload["window"]["last_ns"]
+                    .as_u64()
+                    .expect("last")
+            })
             .max()
             .expect("joined");
-        assert!(first <= first_seen && first_seen <= last, "IDENT inside gate window");
+        assert!(
+            first <= first_seen && first_seen <= last,
+            "IDENT inside gate window"
+        );
     }
 
     // Finalize: observations == decoded; healthy integrity (drops 0, gap 0).
     let summary = &report.summaries[0];
     assert_eq!(summary.backend, BackendId::KCrypto);
     assert_eq!(summary.observations, observations.len() as u64);
-    assert_eq!(summary.integrity, IntegritySummary::default(), "healthy lane: zero losses");
+    assert_eq!(
+        summary.integrity,
+        IntegritySummary::default(),
+        "healthy lane: zero losses"
+    );
     let drops = map_lookup_bytes(
         &sensor.loaded.maps.ident,
         &KIDN_DROPS.to_le_bytes(),
@@ -1196,7 +1381,11 @@ fn driver_e2e_matches_fixture_truth() {
         .configure(&mut ctx, &report.plans[0])
         .expect("new-generation re-configure reloads");
     assert_eq!(budget.used(BudgetKind::Links), 9, "Links += attached_n");
-    assert_eq!(budget.used(BudgetKind::StateEntries), 5, "StateEntries += maps");
+    assert_eq!(
+        budget.used(BudgetKind::StateEntries),
+        5,
+        "StateEntries += maps"
+    );
 }
 
 /// Independent totals oracle: the Task-1 fallible entry over the snapshot

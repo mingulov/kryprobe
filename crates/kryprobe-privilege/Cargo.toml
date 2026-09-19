@@ -11,6 +11,7 @@ kryprobe-abi = { path = "../kryprobe-abi" }
 anyhow = "1"
 libc = "0.2"
 goblin = "0.10"
+serde_json = "1"
 
 [dev-dependencies]
 kryprobe-testkit = { path = "../kryprobe-testkit" }
