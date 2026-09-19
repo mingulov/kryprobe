@@ -46,7 +46,16 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             selftest_bpf::run(calls, out.as_deref(), stdout, stderr)
         }
         Command::SelftestToken => selftest_token::run(stdout, stderr),
+        Command::Watch { .. } => {
+            cmd_stub::run_uninstalled("watch --system", "the kcrypto backend", stderr)
+        }
         Command::Report { file } => cmd_report::run(&file, stdout, stderr),
+        Command::ReportLive { .. } => {
+            cmd_stub::run_uninstalled("report --system", "the kcrypto backend", stderr)
+        }
+        Command::Check { .. } => {
+            cmd_stub::run_uninstalled("check --system", "the kcrypto backend", stderr)
+        }
         Command::Stub { name } => cmd_stub::run(&name, stderr),
     }
 }

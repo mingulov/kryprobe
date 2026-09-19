@@ -28,7 +28,10 @@ kryprobe inspect --pid N [--json]
 kryprobe selftest synthetic [--out FILE]
 kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
+kryprobe watch --system [--source S] [--duration N]
+kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S]
 kryprobe report FILE
+kryprobe check --system --policy FILE [--duration N] [--source S]
 kryprobe plan|observe|run ...   # stub: exit 3, typed marker
 ```
 
@@ -57,6 +60,19 @@ kryprobe plan|observe|run ...   # stub: exit 3, typed marker
 - `report FILE` validates a JSONL stream against the frozen schema
   (exit 2 on corrupt input) and renders phase tables, coverage, and
   integrity.
+- `watch --system`, `report --system`, and `check --system` are the
+  system-wide kcrypto commands (kp2 §2–§3): `--system` select-all is
+  the only v0.1 scope, so fork/exec, new containers, and module loads
+  need no new probes. `--duration` is a window in seconds (`>= 1`);
+  `--source` accepts only `kernel-crypto` (other sources arrive with
+  their backends); live `report` renders `--format human` (default) or
+  `json` to stdout or `--out`; `check` requires `--policy` (no default
+  policy). Workload selectors (`--pid`, `--tree`, `--cgroup`,
+  `--cgroup-id`, `--unit`) and `--comm` filters are deferred past v0.1
+  and rejected naming the deferral. All three parse fully and exit 3
+  until the kcrypto backend lands; `check` reserves exit 10 for a
+  confirmed policy violation (policy engine follow-up), never exited
+  by the stub.
 
 ## Environment overrides
 

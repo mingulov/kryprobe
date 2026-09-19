@@ -43,6 +43,12 @@ pub enum TargetScope {
         /// Cgroup filesystem path.
         path: String,
     },
+    /// The whole machine: system-wide kernel probes (kcrypto fentry),
+    /// no pid/tree/cgroup filter. Skips fan-out (nothing to enumerate);
+    /// carries no path by construction, so attachment never reads one.
+    /// Report-time context still attributes each observation (pid, comm,
+    /// cgroup id); the scope itself selects all (kp2 §3).
+    System,
 }
 
 /// Budget ceilings carried by a plan; enforced per counter at runtime.
@@ -233,6 +239,21 @@ mod tests {
             serde_json::to_string(&CallKind::SizeQuery).as_deref(),
             Ok("\"size_query\"")
         ));
+    }
+
+    #[test]
+    fn system_scope_validates_and_roundtrips_without_path() {
+        // Select-all: a System plan carries no pid, root, or cgroup path
+        // (unit variant: a path is inexpressible), validates, and keeps
+        // its spelling across the canonical JSON round-trip.
+        let mut plan = sample_plan();
+        plan.target_scope = TargetScope::System;
+        assert!(plan.validate().is_ok());
+        let text = to_canonical_json(&plan).expect("plan must serialize");
+        let back: ProbePlan = serde_json::from_str(&text).expect("plan must deserialize");
+        assert_eq!(back, plan);
+        assert_eq!(back.target_scope, TargetScope::System);
+        assert!(text.contains("\"System\""), "{text}");
     }
 
     #[test]

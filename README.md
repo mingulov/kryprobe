@@ -42,7 +42,10 @@ kryprobe inspect --pid N [--json]
 kryprobe selftest synthetic [--out FILE]
 kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
+kryprobe watch --system [--source S] [--duration N]
+kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S]
 kryprobe report FILE
+kryprobe check --system --policy FILE [--duration N] [--source S]
 kryprobe plan|observe|run ...   # honest stub: exits 3, see below
 ```
 
@@ -58,6 +61,11 @@ and integrity.
 
 `plan`, `observe`, and `run` parse their arguments and exit 3 with a
 typed `unsupported-in-thin-spine` marker; they never pretend success.
+
+`watch --system`, `report --system`, and `check --system` are the
+system-wide kcrypto commands: `--system` select-all is the only v0.1
+scope. They parse fully and exit 3 until the kcrypto backend lands
+(see `docs/commands.md`).
 
 ## Exit codes
 

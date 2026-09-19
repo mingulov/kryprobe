@@ -85,6 +85,35 @@ fn pid_scope_rejected_as_not_fanout() {
 }
 
 #[test]
+fn system_scope_skips_fanout() {
+    // System-wide kernel probes have no members to enumerate (kp2 §3):
+    // resolve and refresh both refuse as non-fan-out scopes without
+    // touching any cgroup path (the scope carries none).
+    let err = LocalPrivilegedAuthority
+        .resolve_scope(&TargetScope::System, u64::MAX)
+        .unwrap_err();
+    assert!(
+        matches!(err, AttachError::Rejected { ref reason } if reason.contains("System")
+            && reason.contains("fan-out")
+            && reason.contains("Tree/Cgroup")),
+        "got {err}"
+    );
+    let plan = FanoutPlan {
+        scope: TargetScope::System,
+        members: Vec::new(),
+        exited_during_resolve: 0,
+    };
+    let err = LocalPrivilegedAuthority
+        .refresh_fanout(&plan, u64::MAX)
+        .unwrap_err();
+    assert!(
+        matches!(err, AttachError::Rejected { ref reason } if reason.contains("System")
+            && reason.contains("fan-out")),
+        "got {err}"
+    );
+}
+
+#[test]
 fn owned_run_rejected() {
     let err = LocalPrivilegedAuthority
         .resolve_scope(&TargetScope::OwnedRun, u64::MAX)

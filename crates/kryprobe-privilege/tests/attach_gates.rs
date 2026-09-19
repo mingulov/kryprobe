@@ -90,6 +90,7 @@ fn non_pid_scopes_rejected_before_object_access() {
             path: "/sys/fs/cgroup".to_owned(),
         },
         TargetScope::OwnedRun,
+        TargetScope::System,
     ] {
         let err = LocalPrivilegedAuthority
             .attach_group(
@@ -105,6 +106,29 @@ fn non_pid_scopes_rejected_before_object_access() {
             "got {err}"
         );
     }
+}
+
+#[test]
+fn system_scope_rejected_as_fentry_without_path_access() {
+    // System-wide (kcrypto fentry) is not a pid filter: the uprobe spine
+    // rejects it naming the fentry path, before touching any object or
+    // cgroup path (the scope carries no path; the bad object + bad fd
+    // prove no access ran — Rejected, not LinkFailed).
+    let err = LocalPrivilegedAuthority
+        .attach_group(
+            &group(TargetScope::System),
+            &guard(1),
+            &bad_prog_fd(),
+            &PathBuf::from("/nonexistent-kryprobe-object"),
+            &[0x1000],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, AttachError::Rejected { ref reason } if reason.contains("System")
+            && reason.contains("fentry")
+            && reason.contains("Pid scope")),
+        "got {err}"
+    );
 }
 
 #[test]
