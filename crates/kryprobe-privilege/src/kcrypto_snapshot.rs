@@ -533,6 +533,25 @@ fn collect_until_barrier(
 /// call — no persistent thread in v0.1): a barrier checkpoint bounds the
 /// "since last call" window (fresh thread per call, so no stale
 /// consumer). Drain stats are discarded (see the module docs).
+///
+/// Tail-race warning (ACCEPTED v0.1 limitation, not a Task 2 TODO —
+/// Task 2 scope holds: no persistent drain): records pushed in the
+/// microsecond window between the post-barrier tail sweep (see
+/// `collect_until_barrier`) and `stop()` are consumed from the ring
+/// but undelivered — lost, not re-readable on a later call.
+///
+/// Scope: quiescent-ring runs are unaffected; only sustained
+/// new-identity/overflow traffic landing in that microsecond window is
+/// at risk. Counts/bytes/totals are unaffected — `KAGG` rows still
+/// decode with full identity in-row; only first-seen `EVENT` timing /
+/// `OVERFLOW` signals are at risk.
+///
+/// Caller rule: treat unjoined hashes (ident never seen for a row) as
+/// unknown (`coverage_gap`/`unknown`) — never misattribute, crash, or
+/// silently drop.
+///
+/// Post-v0.1 improvement note: a persistent drain (no per-call
+/// spawn/stop) would close this window.
 fn drain_idents(sensor: &ConfiguredKcrypto) -> Result<(Vec<IdentBytes>, u64), MapOpsError> {
     let drain = DrainThread::spawn(&sensor.loaded.maps.ring, KRING_MAX_ENTRIES, &DRAIN_BUDGET)
         .map_err(drain_setup_error)?;
