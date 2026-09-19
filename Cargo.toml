@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [workspace]
 resolver = "2"
-members = ["xtask", "crates/kryprobe-abi", "crates/kryprobe-testkit", "crates/kryprobe-core", "crates/kryprobe-privilege", "crates/kryprobe-report", "crates/kryprobe-cli"]
+members = ["xtask", "crates/kryprobe-abi", "crates/kryprobe-testkit", "crates/kryprobe-core", "crates/kryprobe-privilege", "crates/kryprobe-report", "crates/kryprobe-policy", "crates/kryprobe-cli"]
 # crates/bpf-spine and crates/bpf-kcrypto are excluded: the bpf-target
 # `no_std` bins never enter the host build (osslscope precedent: BPF
 # objects built separately with the pinned nightly + bpf-linker lane,

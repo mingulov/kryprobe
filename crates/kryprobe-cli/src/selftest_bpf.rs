@@ -4,7 +4,7 @@
 //! The JSONL carries session start/end only: per-event observations and
 //! backend-attributed snapshots would claim coverage the kprobe lane has
 //! no backend for. Loss surfaces through the verdict (`PARTIAL`), the
-//! stderr reconcile marker, and exit 4 (partial) — never silently.
+//! stderr reconcile marker, and exit 3 (partial) — never silently.
 
 use crate::cmd_selftest::{locate_bpf_object, sibling_binary};
 use kryprobe_core::ReconcileVerdict;
@@ -42,18 +42,18 @@ fn emit_jsonl(
     Ok(writer.into_string())
 }
 
-/// Runs `selftest bpf`: 0 clean, 4 partial, 3 denied/missing, 1 failure.
+/// Runs `selftest bpf`: 0 clean, 3 partial, 4 denied/missing, 1 failure.
 pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     let Some(object) = locate_bpf_object() else {
         let _ = writeln!(
             stderr,
             "selftest bpf: missing object (run `cargo xtask build --bpf`)"
         );
-        return 3;
+        return 4;
     };
     let Some(fixture) = sibling_binary("spine_fixture", "KRYPROBE_FIXTURE") else {
         let _ = writeln!(stderr, "selftest bpf: missing spine_fixture sibling");
-        return 3;
+        return 4;
     };
     let outcome = match run_bpf_selftest(&BpfSelftestConfig {
         calls,
@@ -66,11 +66,11 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
                 stderr,
                 "selftest bpf: Denied{{{stage}}} (errno {errno}); needs privilege"
             );
-            return 3;
+            return 4;
         }
         Err(BpfSelftestError::MissingArtifact { what, path }) => {
             let _ = writeln!(stderr, "selftest bpf: missing {what} at {}", path.display());
-            return 3;
+            return 4;
         }
         Err(err) => {
             let _ = writeln!(stderr, "selftest bpf: {err}");
@@ -86,7 +86,7 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
                 "selftest bpf: partial ({missing} missing; ring={} drop={} trunc={} queue={})",
                 outcome.ring, outcome.dropped, outcome.truncated, outcome.queue_drops
             );
-            ("partial", SessionVerdict::Partial, 4)
+            ("partial", SessionVerdict::Partial, 3)
         }
         (ReconcileVerdict::Clean, false) | (ReconcileVerdict::Defect { .. }, _) => {
             ("defect", SessionVerdict::Failed, 1)

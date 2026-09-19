@@ -16,21 +16,21 @@ commands:
                                BPF pipeline against spine_fixture
   selftest token-smoke         root token roundtrip (needs root)
   watch --system [--source S] [--duration N]
-                               continuous system-wide observe (kcrypto stub: exit 3)
+                               continuous system-wide observe (live kcrypto)
   report --system [--duration N] [--format human|json] [--out F] [--source S]
-                               bounded system-wide capture + render (stub: exit 3)
+                               bounded system-wide capture + render (live kcrypto)
   report FILE                  validate + render a JSONL stream
   check --system --policy F [--duration N] [--source S]
-                               system-wide policy check (stub: exit 3)
-  plan|observe|run ...         unsupported in thin spine (exit 3)
+                               system-wide policy check (exit 10 on violation)
+  plan|observe|run ...         unsupported in thin spine (exit 4)
 
 globals:
   --help                       print this usage (exit 0)
   --version                    print version (exit 0)
   --json                       JSON output (commands that support it)
 
-exit codes: 0 ok; 1 runtime failure; 2 usage/invalid input;
-  3 unsupported/degraded; 4 ran-but-partial.
+exit codes: 0 clean/ok; 1 internal failure; 2 usage/invalid input;
+  3 inconclusive/PARTIAL; 4 environment-unusable; 10 policy violation.
 ";
 
 /// Early exits plus usage errors (exit 2; reason + [`USAGE`]).
@@ -69,9 +69,9 @@ pub enum Command {
     SelftestBpf { calls: u64, out: Option<PathBuf> },
     /// Root token roundtrip.
     SelftestToken,
-    /// Continuous system-wide observe (`--system` select-all; kcrypto
-    /// stub until the backend lands). `duration` is an optional window
-    /// in seconds; `None` observes until interrupted.
+    /// Continuous system-wide observe (`--system` select-all; live
+    /// kcrypto capture). `duration` is an optional window in seconds;
+    /// `None` observes until interrupted.
     Watch {
         /// Accepted `--source` spelling (only `kernel-crypto` in v0.1).
         source: String,
@@ -80,9 +80,9 @@ pub enum Command {
     },
     /// Validate + render a stream.
     Report { file: PathBuf },
-    /// Bounded system-wide capture + render (kcrypto stub until the
-    /// backend lands). `duration` is an optional window in seconds;
-    /// `None` takes the command default when capture lands.
+    /// Bounded system-wide capture + render (live kcrypto capture).
+    /// `duration` is an optional window in seconds; `None` takes the
+    /// 60s command default.
     ReportLive {
         /// Accepted `--source` spelling (only `kernel-crypto` in v0.1).
         source: String,
@@ -93,8 +93,8 @@ pub enum Command {
         /// Output file, or stdout when `None`.
         out: Option<PathBuf>,
     },
-    /// System-wide policy check (kcrypto stub until the backend and
-    /// policy engine land; exit 10 on confirmed violation then).
+    /// System-wide policy check (live kcrypto capture evaluated
+    /// against the policy; exit 10 on confirmed violation).
     Check {
         /// Accepted `--source` spelling (only `kernel-crypto` in v0.1).
         source: String,

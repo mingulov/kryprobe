@@ -355,7 +355,7 @@ fn report_invalid_case() {
 fn stub_commands_case() {
     for sub in ["plan", "observe", "run"] {
         let output = run(&[sub, "--anything", "goes"]);
-        assert_eq!(output.status.code(), Some(3), "sub {sub}");
+        assert_eq!(output.status.code(), Some(4), "sub {sub}");
         assert!(
             stderr_of(&output).contains("unsupported-in-thin-spine"),
             "sub {sub}: {}",
@@ -1109,6 +1109,278 @@ fn report_live_proves_json_case() {
     );
     let file_doc: serde_json::Value = serde_json::from_slice(&via_file).expect("file json parses");
     assert_eq!(file_doc["verdict"]["status"], "complete");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// K3 Task 3: `check` exit matrix (0/1/2/3/4/10). Binary legs run unpriv
+// (policy parses before capture; forced object-miss proves 4); the
+// hand-fed legs (10/0/3/1 mapping) ride `cmd_check` unit tests; live
+// 10/0 are lane-locked + leased (ignored).
+// ---------------------------------------------------------------------------
+
+/// k3-3 scratch dir (policy files live here).
+fn check_scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kryprobe-k3-3-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+fn write_policy(dir: &std::path::Path, text: &str) -> PathBuf {
+    let file = dir.join("policy.yaml");
+    std::fs::write(&file, text).expect("write policy");
+    file
+}
+
+/// Valid policy whose deny rule matches nothing observable.
+fn clean_policy_text() -> &'static str {
+    "version: 1\nrules:\n  - id: no-such-alg\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: no-such-alg-zzz\n    decision: deny\n"
+}
+
+#[test]
+fn check_unusable_exit4_case() {
+    // Valid policy + all three locator tiers missing: policy parses,
+    // capture is unusable — exit 4 without privilege (watch idiom).
+    let tier2 = kryprobe()
+        .parent()
+        .expect("exe parent")
+        .join("kryprobe-bpf")
+        .join("kcrypto.bpf.o");
+    if tier2.is_file() {
+        println!("SKIP: exe-bundled object present (tier 2 would hit)");
+        return;
+    }
+    let dir = check_scratch("check-4");
+    let policy = write_policy(&dir, clean_policy_text());
+    let absent = dir.join("absent.o");
+    let output = run_with(
+        &[("KRYPROBE_BPF_DIR", absent.to_str().expect("utf-8 tmp"))],
+        &dir,
+        &[
+            "check",
+            "--system",
+            "--duration",
+            "1",
+            "--policy",
+            policy.to_str().expect("utf-8 tmp"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("check:"), "stderr: {stderr}");
+    assert!(stderr.contains("object missing"), "stderr: {stderr}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_bad_policy_exit2_case() {
+    // Policy parses before capture: bad policy exits 2 even when the
+    // lane is unusable (no privilege needed, fully deterministic).
+    let dir = check_scratch("check-2");
+    for (text, what) in [
+        (
+            "version: 1\nrules:\n  - id: r\n    source: kernel-crypto\n    match:\n      algorithm: md5\n      bogus: x\n    decision: deny\n",
+            "unknown match key",
+        ),
+        ("version: 2\nrules: []\n", "unknown version"),
+        ("version: [1\n", "malformed yaml"),
+    ] {
+        let policy = write_policy(&dir, text);
+        let output = run(&[
+            "check",
+            "--system",
+            "--duration",
+            "1",
+            "--policy",
+            policy.to_str().expect("utf-8 tmp"),
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{what}: stderr: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("check:"),
+            "{what}: {}",
+            stderr_of(&output)
+        );
+    }
+    // Unreadable policy path is a usage error too, never a panic.
+    let output = run(&[
+        "check",
+        "--system",
+        "--policy",
+        dir.join("no-such-policy.yaml").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_bad_args_exit2_case() {
+    let dir = check_scratch("check-args");
+    let policy = write_policy(&dir, clean_policy_text());
+    let policy_arg = policy.to_str().expect("utf-8 tmp").to_owned();
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["check"],
+        vec!["check", "--system"],
+        vec!["check", "--policy", &policy_arg],
+        vec![
+            "check",
+            "--system",
+            "--source",
+            "openssl",
+            "--policy",
+            &policy_arg,
+        ],
+        vec![
+            "check",
+            "--system",
+            "--duration",
+            "0",
+            "--policy",
+            &policy_arg,
+        ],
+    ];
+    for args in &cases {
+        let output = run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "args {args:?}: stderr: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("usage:"),
+            "args {args:?}: {}",
+            stderr_of(&output)
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// md5 presence in `/proc/crypto` (the exit-10 positive control needs
+/// a drivable md5 path; absent → honest skip, never a fake 10).
+fn md5_available() -> bool {
+    std::fs::read_to_string("/proc/crypto")
+        .map(|text| text.contains("md5"))
+        .unwrap_or(false)
+}
+
+/// md5 positive-control traffic, gated on both session sensors fully
+/// attached (the `spawn_traffic` 18-link idiom).
+fn spawn_md5_traffic() -> std::thread::JoinHandle<()> {
+    std::thread::spawn(|| {
+        let start = std::time::Instant::now();
+        loop {
+            if link_count_or_none().is_some_and(|n| n >= 18) {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "sensors attach within 60s (links: {:?})",
+                link_count_or_none()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let md5 = kryprobe_testkit::alg_fixture::hash_digest("md5", 20).expect("md5 control");
+        assert_eq!((md5.digests, md5.digest_len), (20, 16), "md5 control");
+    })
+}
+
+#[test]
+#[ignore = "BPF lane: run under sudo with the lane lock + lease"]
+fn check_live_violation_exit10_case() {
+    let _guard = lane_guard();
+    if !lane_ready("check_live_violation_exit10_case") {
+        return;
+    }
+    if !md5_available() {
+        println!("SKIP: check_live_violation_exit10_case requires md5 in /proc/crypto");
+        return;
+    }
+    let dir = check_scratch("live-10");
+    let policy = write_policy(
+        &dir,
+        "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: \"*md5*\"\n    decision: deny\n",
+    );
+    let traffic = spawn_md5_traffic();
+    let output = Command::new(kryprobe())
+        .args([
+            "check",
+            "--system",
+            "--duration",
+            "2",
+            "--policy",
+            policy.to_str().expect("utf-8 tmp"),
+        ])
+        .env("KRYPROBE_BPF_DIR", kcrypto_object_path())
+        .output()
+        .expect("spawn kryprobe check");
+    traffic.join().expect("traffic joins");
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "live md5 + deny rule exits 10; stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("VIOLATION"), "stdout: {stdout}");
+    assert!(stdout.contains("no-kernel-md5"), "stdout: {stdout}");
+    // kp2 §13 row 12: the detail names algorithm/driver/context/evidence.
+    let stderr = stderr_of(&output);
+    for marker in ["algorithm=", "driver=", "context=", "evidence="] {
+        assert!(stderr.contains(marker), "missing {marker}: {stderr}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[ignore = "BPF lane: run under sudo with the lane lock + lease"]
+fn check_live_clean_exit0_case() {
+    let _guard = lane_guard();
+    if !lane_ready("check_live_clean_exit0_case") {
+        return;
+    }
+    let dir = check_scratch("live-0");
+    let policy = write_policy(&dir, clean_policy_text());
+    let traffic = spawn_traffic();
+    let output = Command::new(kryprobe())
+        .args([
+            "check",
+            "--system",
+            "--duration",
+            "2",
+            "--policy",
+            policy.to_str().expect("utf-8 tmp"),
+        ])
+        .env("KRYPROBE_BPF_DIR", kcrypto_object_path())
+        .output()
+        .expect("spawn kryprobe check");
+    traffic.join().expect("traffic joins");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "healthy lane + clean policy exits 0; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("CLEAN"),
+        "stdout: {}",
+        stdout_of(&output)
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

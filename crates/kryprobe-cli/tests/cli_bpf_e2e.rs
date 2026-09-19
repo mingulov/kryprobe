@@ -29,7 +29,7 @@ fn selftest_bpf_clean_or_denied() {
             assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
             assert!(end["payload"]["child_signal"].is_null(), "stdout: {stdout}");
         }
-        Some(3) => assert!(stderr.contains("Denied{"), "stderr: {stderr}"),
+        Some(4) => assert!(stderr.contains("Denied{"), "stderr: {stderr}"),
         Some(code) => panic!("unexpected exit {code}: {stderr}"),
         None => panic!("killed by signal: {stderr}"),
     }
@@ -47,7 +47,7 @@ fn selftest_token_smoke_needs_root() {
         .args(["selftest", "token-smoke"])
         .output()
         .expect("spawn");
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(4));
     let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
     assert!(stderr.contains("needs root"), "stderr: {stderr}");
 }

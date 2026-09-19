@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 kryprobe-abi = { path = "../kryprobe-abi" }
 kryprobe-core = { path = "../kryprobe-core" }
+kryprobe-policy = { path = "../kryprobe-policy" }
 kryprobe-privilege = { path = "../kryprobe-privilege" }
 kryprobe-report = { path = "../kryprobe-report" }
 kryprobe-testkit = { path = "../kryprobe-testkit" }

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! kryprobe CLI: the outermost ring (T10).
 //!
-//! Exit codes: 0 success; 1 runtime/internal failure; 2 usage or invalid
-//! input; 3 unsupported/degraded environment (stubs, needs-root, BPF
-//! denied, missing artifacts); 4 ran-but-partial (BPF losses receipted).
+//! Exit codes (kp2 family): 0 clean/success; 1 internal failure; 2
+//! usage or invalid input; 3 inconclusive/PARTIAL (ran, coverage
+//! gaps receipted); 4 environment-unusable (denied, missing
+//! artifacts, uninstalled backends); 10 confirmed policy violation
+//! (`check` only).
 
 pub mod args;
 mod args_sub;
 pub mod cmd_backends;
+pub mod cmd_check;
 pub mod cmd_doctor;
 pub mod cmd_inspect;
 pub mod cmd_report;
@@ -58,9 +61,11 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             format,
             out,
         } => cmd_report::run_report_live(&source, duration, format, out.as_deref(), stdout, stderr),
-        Command::Check { .. } => {
-            cmd_stub::run_uninstalled("check --system", "the kcrypto backend", stderr)
-        }
+        Command::Check {
+            source,
+            duration,
+            policy,
+        } => cmd_check::run(&source, duration, &policy, stdout, stderr),
         Command::Stub { name } => cmd_stub::run(&name, stderr),
     }
 }

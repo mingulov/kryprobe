@@ -2,9 +2,11 @@
 # Command reference
 
 `cargo xtask` is the only supported orchestration entry point; `kryprobe`
-is the product CLI. Exit codes: 0 ok, 1 internal defect, 2
-usage/invalid input, 3 refused/unsupported/denied, 4 partial (gaps
-noted, never silent).
+is the product CLI. Exit codes (kp2 family): 0 clean/ok, 1 internal
+defect, 2 usage/invalid input, 3 inconclusive/PARTIAL (ran, gaps
+noted, never silent), 4 environment-unusable (denied, missing
+artifacts, uninstalled backends), 10 confirmed policy violation
+(`check` only).
 
 ## `cargo xtask` lanes
 
@@ -32,7 +34,7 @@ kryprobe watch --system [--source S] [--duration N]
 kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S]
 kryprobe report FILE
 kryprobe check --system --policy FILE [--duration N] [--source S]
-kryprobe plan|observe|run ...   # stub: exit 3, typed marker
+kryprobe plan|observe|run ...   # stub: exit 4, typed marker
 ```
 
 - `doctor` prints the capability probe matrix (`Pass`/`Denied`/
@@ -46,13 +48,13 @@ kryprobe plan|observe|run ...   # stub: exit 3, typed marker
   renders a summary to stderr.
 - `selftest bpf` runs load → attach → drain → reconcile against the
   fixture (default 200 calls): exit 0 prints `reconcile: clean` plus
-  `entries=/returns=/received=/ring=/drop=/queue=` counts; exit 4
-  prints `reconcile: partial`; exit 3 prints `Denied{stage}`.
+  `entries=/returns=/received=/ring=/drop=/queue=` counts; exit 3
+  prints `reconcile: partial`; exit 4 prints `Denied{stage}`.
   The JSONL carries session start/end only (with the fixture exit
   code); per-event observations would claim backend coverage the
   lane has no backend for.
 - `selftest token-smoke` mints a token over a private bpffs mount
-  and runs the nobody worker (root-only; exit 3 otherwise, or when
+  and runs the nobody worker (root-only; exit 4 otherwise, or when
   the kernel answers `EOPNOTSUPP`/`EPERM`). SERIAL LANE: run with no
   concurrent BPF activity on the host — ambient teardown mid-lane is
   tolerated (extras-only leak comparison), but any map/program loaded
@@ -63,16 +65,20 @@ kryprobe plan|observe|run ...   # stub: exit 3, typed marker
 - `watch --system`, `report --system`, and `check --system` are the
   system-wide kcrypto commands (kp2 §2–§3): `--system` select-all is
   the only v0.1 scope, so fork/exec, new containers, and module loads
-  need no new probes. `--duration` is a window in seconds (`>= 1`);
-  `--source` accepts only `kernel-crypto` (other sources arrive with
-  their backends); live `report` renders `--format human` (default) or
-  `json` to stdout or `--out`; `check` requires `--policy` (no default
-  policy). Workload selectors (`--pid`, `--tree`, `--cgroup`,
+  need no new probes. `--duration` is a window in seconds (`>= 1`,
+  60s default for `report`/`check`); `--source` accepts only
+  `kernel-crypto` (other sources arrive with their backends); live
+  `report` renders `--format human` (default) or `json` to stdout or
+  `--out` (exit 0 complete, 3 partial); `watch` renders the same
+  tables and exits 0 on any completed capture. `check` requires
+  `--policy` (no default policy; bad policy is exit 2, parsed before
+  capture) and evaluates one capture against the explicit-rules
+  policy: exit 10 prints `VIOLATION rule=…` plus stderr detail naming
+  algorithm/driver/context/evidence, exit 0 prints `CLEAN`, exit 3
+  prints `INCONCLUSIVE missing=…`. Unusable lanes exit 4 in all
+  three. Workload selectors (`--pid`, `--tree`, `--cgroup`,
   `--cgroup-id`, `--unit`) and `--comm` filters are deferred past v0.1
-  and rejected naming the deferral. All three parse fully and exit 3
-  until the kcrypto backend lands; `check` reserves exit 10 for a
-  confirmed policy violation (policy engine follow-up), never exited
-  by the stub.
+  and rejected naming the deferral.
 
 ## Environment overrides
 
@@ -86,7 +92,7 @@ kryprobe plan|observe|run ...   # stub: exit 3, typed marker
 
 ```sh
 sudo ./target/debug/kryprobe selftest bpf --calls 20000  # expect exit 0, reconcile: clean
-sudo ./target/debug/kryprobe selftest token-smoke        # exit 0 (pass) or 3 (Denied, kernel-dependent)
+sudo ./target/debug/kryprobe selftest token-smoke        # exit 0 (pass) or 4 (Denied, kernel-dependent)
 ```
 
 `cargo xtask test bpf` runs unprivileged with honest-denial asserts;
