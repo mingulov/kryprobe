@@ -387,6 +387,39 @@ fn kcrypto_object_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kryprobe-bpf/kcrypto.bpf.o")
 }
 
+/// A `bpftool link show` block header: `<id>:` followed by the link
+/// kind, e.g. `15125: tracing  prog 18393` (K4 evidence
+/// `evidence/k4-1/s1-mon.d/link-*.txt`).
+fn is_link_header(line: &str) -> bool {
+    let mut parts = line.splitn(2, ':');
+    matches!(parts.next(), Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_some()
+}
+
+/// Count TRUE `trace_fexit` links in `bpftool link show` output.
+///
+/// Each link is a block (a `<id>:` header plus continuation lines); only
+/// blocks carrying `attach_type trace_fexit` count. Foreign links
+/// (`raw_tracepoint`/`perf_event`, 1–2 lines each) and transient
+/// `Error: ...` lines are ignored, and empty output yields 0. Counting
+/// raw lines instead passes the gate mid-ramp (3 lines per tracing
+/// link), which flaked exactness assertions — see K4 T1 root cause.
+fn count_trace_fexit_links(output: &str) -> usize {
+    let mut count = 0;
+    let mut in_block = false;
+    let mut block_has_fexit = false;
+    for line in output.lines() {
+        if is_link_header(line) {
+            in_block = true;
+            block_has_fexit = false;
+        } else if in_block && !block_has_fexit && line.contains("attach_type trace_fexit") {
+            block_has_fexit = true;
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Tracing-link count via bpftool (lane-only helper; the test runs as
 /// root so no sudo indirection is needed). `None` when bpftool itself
 /// errors (transient during attach storms — the caller retries; the
@@ -404,13 +437,63 @@ fn link_count_or_none() -> Option<usize> {
     if !output.status.success() {
         return None;
     }
-    Some(
-        String::from_utf8(output.stdout)
-            .ok()?
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
-    )
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(count_trace_fexit_links(&text))
+}
+
+#[test]
+fn link_parser_empty_case() {
+    // `link-0.txt`: zero bytes before attach.
+    assert_eq!(count_trace_fexit_links(""), 0);
+    assert_eq!(count_trace_fexit_links("\n"), 0);
+}
+
+#[test]
+fn link_parser_midramp_with_error_case() {
+    // Verbatim `s1-mon.d/link-21.txt` (modulo trailing spaces): 3
+    // tracing links plus a transient per-id error line → 3, not 10.
+    let sample = "15125: tracing  prog 18393\n\
+        \tprog_type tracing  attach_type trace_fexit\n\
+        \ttarget_obj_id 1  target_btf_id 105300\n\
+        15126: tracing  prog 18394\n\
+        \tprog_type tracing  attach_type trace_fexit\n\
+        \ttarget_obj_id 1  target_btf_id 105301\n\
+        15127: tracing  prog 18395\n\
+        \tprog_type tracing  attach_type trace_fexit\n\
+        \ttarget_obj_id 1  target_btf_id 105317\n\
+        Error: can't get link by id (15128): Resource temporarily unavailable\n";
+    assert_eq!(count_trace_fexit_links(sample), 3);
+}
+
+#[test]
+fn link_parser_foreign_only_case() {
+    // Verbatim shapes from `s3-late-module-load.txt` (1-line
+    // raw_tracepoint/perf_event) and `s4-two-implementations.txt`
+    // (2-line perf_event + uprobe/uretprobe continuation): no fexit → 0.
+    let sample = "15407: raw_tracepoint  prog 18717\n\
+        15408: raw_tracepoint  prog 18718\n\
+        15410: perf_event  prog 18716\n\
+        15826: perf_event  prog 18715\n\
+        \tuprobe /proc/self/fd/18+0x27a60\n\
+        15827: perf_event  prog 18715\n\
+        \turetprobe /proc/self/fd/58+0x315f0  cookie 413\n";
+    assert_eq!(count_trace_fexit_links(sample), 0);
+}
+
+#[test]
+fn link_parser_full_session_case() {
+    // One fully attached session holds 18 trace_fexit links (K4 graded
+    // gates: "stable at 18 true links"); the `n >= 18` gate below pins
+    // that unit. Foreign links interleaved must not inflate the count.
+    let mut sample = String::from("15407: raw_tracepoint  prog 18717\n");
+    for id in 15125..15125 + 18 {
+        sample.push_str(&format!(
+            "{id}: tracing  prog {}\n\tprog_type tracing  attach_type trace_fexit\n\ttarget_obj_id 1  target_btf_id 105300\n",
+            18393 + (id - 15125)
+        ));
+    }
+    sample.push_str("15826: perf_event  prog 18715\n\tuprobe /proc/self/fd/18+0x27a60\n");
+    assert_eq!(count_trace_fexit_links(&sample), 18);
 }
 
 fn lane_runtime() -> kryprobe_core::capability::RuntimeCapabilities {
@@ -531,10 +614,10 @@ fn live_capture_proves_session() {
     );
     set_bpf_dir(object_path.as_os_str());
 
-    // Mid-session traffic burst (positive control): gated on both
-    // sensors fully attached (9+9 tracing links) — deterministic, no
-    // sleep-guessing against BPF load times — and done well before the
-    // window closes.
+    // Mid-session traffic burst (positive control): gated on the
+    // session sensor fully attached (18 true `trace_fexit` links — one
+    // session per K4 graded gates) — deterministic, no sleep-guessing
+    // against BPF load times — and done well before the window closes.
     let traffic = std::thread::spawn(|| {
         let start = std::time::Instant::now();
         loop {
