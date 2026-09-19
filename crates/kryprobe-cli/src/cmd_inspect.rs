@@ -34,7 +34,7 @@ fn json(snapshot: &TargetSnapshot) -> serde_json::Value {
     })
 }
 
-/// Runs `inspect`: 0 on success, 1 when gone, 3 when denied a stage.
+/// Runs `inspect`: 0 on success, 1 when gone, 4 when denied a stage.
 pub fn run(pid: u32, json: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     match LocalPrivilegedAuthority.inspect(pid) {
         Ok(snapshot) => {
@@ -51,7 +51,7 @@ pub fn run(pid: u32, json: bool, stdout: &mut dyn Write, stderr: &mut dyn Write)
         }
         Err(InspectError::Denied { stage }) => {
             let _ = writeln!(stderr, "inspect: Denied{{{stage}}} (needs capability)");
-            3
+            4
         }
     }
 }

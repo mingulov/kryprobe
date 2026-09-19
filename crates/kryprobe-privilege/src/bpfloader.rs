@@ -169,7 +169,7 @@ pub enum LoaderError {
         reason: String,
     },
     /// Program id refused by the load-facet allowlist: a forbidden
-    /// program, NOT a corrupt object (X16). Callers map this to exit 3
+    /// program, NOT a corrupt object (X16). Callers map this to exit 4
     /// / `Denied`, never to a corruption bucket.
     NotAllowed {
         id: ProgramId,

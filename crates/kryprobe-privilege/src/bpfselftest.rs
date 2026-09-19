@@ -4,7 +4,7 @@
 //! Load → spawn fixture → attach entry/return → drain → reconcile. The T7
 //! lane test keeps its own detailed asserts; `kryprobe selftest bpf` runs
 //! this path. Denials (EPERM/EACCES) surface as [`BpfSelftestError::Denied`]
-//! for honest-degraded exit 3; everything else is a hard error.
+//! for environment-unusable exit 4; everything else is a hard error.
 
 mod round;
 
@@ -15,7 +15,7 @@ use kryprobe_core::ProgramId;
 use kryprobe_core::authority::BpfLoadAuthority;
 use std::path::PathBuf;
 
-/// Whole-pipeline failure: denied (exit 3) vs hard errors.
+/// Whole-pipeline failure: denied (exit 4) vs hard errors.
 #[derive(Debug)]
 pub enum BpfSelftestError {
     /// Required artifact (object or fixture) is missing.
@@ -68,14 +68,14 @@ impl std::fmt::Display for BpfSelftestError {
 
 impl std::error::Error for BpfSelftestError {}
 
-/// True for honest capability denials (exit 3); anything else is an error.
+/// True for honest capability denials (exit 4); anything else is an error.
 pub(crate) fn is_denied(errno: i32) -> bool {
     errno == libc::EPERM || errno == libc::EACCES
 }
 
 /// Maps a loader failure to the pipeline error (X16): allowlist denials
 /// and EPERM/EACCES syscall failures are honest [`BpfSelftestError::Denied`]
-/// (exit 3); corrupt objects and other failures stay hard errors.
+/// (exit 4); corrupt objects and other failures stay hard errors.
 /// Shared with the decoy harness (same exit contract).
 pub(crate) fn loader_outcome(err: LoaderError) -> BpfSelftestError {
     match err {
@@ -256,7 +256,7 @@ mod tests {
     }
 
     /// X16: forbidden-program vs corrupt-object stay distinguishable —
-    /// allowlist denials map to `Denied` (exit 3), corrupt objects and
+    /// allowlist denials map to `Denied` (exit 4), corrupt objects and
     /// non-denial syscall failures stay hard `Loader` errors.
     #[test]
     fn loader_outcome_routes_denial_vs_corruption() {
