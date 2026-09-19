@@ -35,6 +35,35 @@ const SYS_ALLOW: &[&str] = &[
 /// `libc::name(` calls allowed outside `crates/kryprobe-privilege/`.
 const CALL_ALLOW: &[&str] = &["geteuid", "getegid", "getpid", "getppid"];
 
+/// Per-file Rule-B exceptions: (workspace-relative file, extra allowed
+/// `libc::name(` calls). The K1 Task-2 `AF_ALG` fixture performs
+/// unprivileged socket I/O only — any uid may `socket`/`bind`/`send`/
+/// `recv` on `AF_ALG`; no capability, no BPF, no mount/pidfd/netlink —
+/// so the seam's privilege-containment intent is preserved. Scoped to
+/// the one justified file (K1 Task-2 brief mandates the testkit
+/// placement); anything else there still trips.
+const FILE_CALL_ALLOW: &[(&str, &[&str])] = &[(
+    "crates/kryprobe-testkit/src/alg_fixture.rs",
+    &[
+        "accept",
+        "bind",
+        "clock_gettime",
+        "close",
+        "read",
+        "send",
+        "sendmsg",
+        "setsockopt",
+        "socket",
+    ],
+)];
+
+/// True when `name` is allowed in `rel` by the per-file exceptions.
+fn file_allows(rel: &str, name: &str) -> bool {
+    FILE_CALL_ALLOW
+        .iter()
+        .any(|(file, names)| *file == rel && names.contains(&name))
+}
+
 /// Privilege crate prefix (workspace-relative, `/` separators).
 const PRIV_PREFIX: &str = "crates/kryprobe-privilege/";
 
@@ -245,7 +274,7 @@ fn violations_in_source(rel: &str, text: &str) -> Vec<Violation> {
         }
         if !in_privilege {
             for name in calls {
-                if name != "syscall" && !CALL_ALLOW.contains(&name) {
+                if name != "syscall" && !CALL_ALLOW.contains(&name) && !file_allows(rel, name) {
                     out.push(Violation {
                         file: rel.to_owned(),
                         line: index + 1,
@@ -442,6 +471,37 @@ mod tests {
             violations_in_source("crates/kryprobe-core/src/x.rs", text).len(),
             1
         );
+    }
+
+    #[test]
+    fn rule_b_file_exception_allows_fixture_socket_calls() {
+        let rel = "crates/kryprobe-testkit/src/alg_fixture.rs";
+        let text = "unsafe { libc::socket(0, 0, 0) }; unsafe { libc::bind(0, 0, 0) };\n\
+             unsafe { libc::setsockopt(0, 0, 0, 0, 0) }; unsafe { libc::accept(0, 0, 0) };\n\
+             unsafe { libc::sendmsg(0, 0, 0) }; unsafe { libc::send(0, 0, 0, 0) };\n\
+             unsafe { libc::read(0, 0, 0) }; unsafe { libc::close(0) };\n\
+             unsafe { libc::clock_gettime(0, 0) };\n";
+        assert!(violations_in_source(rel, text).is_empty());
+    }
+
+    #[test]
+    fn rule_b_file_exception_is_file_scoped() {
+        // The same calls in any other file still trip (one per line).
+        let text = "unsafe { libc::socket(0, 0, 0) }; unsafe { libc::bind(0, 0, 0) };\n";
+        let found = violations_in_source("crates/kryprobe-core/src/x.rs", text);
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|v| v.rule == 'B'));
+    }
+
+    #[test]
+    fn rule_b_file_exception_does_not_allow_other_calls() {
+        // The fixture file gets no blanket pass: anything outside its
+        // socket-I/O set still trips.
+        let rel = "crates/kryprobe-testkit/src/alg_fixture.rs";
+        let text = "unsafe { libc::fork() };\nunsafe { libc::epoll_create1(0) };\n";
+        let found = violations_in_source(rel, text);
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|v| v.rule == 'B'));
     }
 
     #[test]

@@ -2,10 +2,11 @@
 //! vmlinux BTF resolver: func ids + struct-member offsets, unprivileged.
 //!
 //! [`resolve_btf_ids`] finds the 9 P0 kcrypto attach symbols
-//! (`evidence/k0/P0-btf-ids.txt`) and [`resolve_offsets`] returns the 6
+//! (`evidence/k0/P0-btf-ids.txt`) and [`resolve_offsets`] returns the 8
 //! explicit-offset reads the BPF needs (K0 P2 chain + `task_struct.flags`
-//! for the kthread classifier — G6 option (a): loader-side resolution,
-//! no CO-RE relocations). Both parse `/sys/kernel/btf/vmlinux` raw
+//! for the kthread classifier + the C2 AEAD/ahash length reads — G6
+//! option (a): loader-side resolution, no CO-RE relocations) and asserts
+//! the C3 first-member links at 0. Both parse `/sys/kernel/btf/vmlinux` raw
 //! (world-readable; no privilege, no bpftool subprocess) with a strict
 //! sequential walker: every truncation, unknown kind, or misaligned
 //! member offset is [`BtfError`], never a guess.
@@ -41,14 +42,31 @@ pub const KCRYPTO_SYMBOLS: &[&str] = &[
     "crypto_shash_finup",
 ];
 
-/// BTF resolution failure: I/O, malformed image, or a missing record.
+/// BTF resolution failure: I/O, malformed image, a missing record,
+/// or a moved first-member link (C3 — the BPF hardcodes 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BtfError {
-    Io { detail: String },
-    BadBtf { reason: String },
-    MissingFunc { name: String },
-    MissingType { name: String },
-    MissingMember { type_name: String, member: String },
+    Io {
+        detail: String,
+    },
+    BadBtf {
+        reason: String,
+    },
+    MissingFunc {
+        name: String,
+    },
+    MissingType {
+        name: String,
+    },
+    MissingMember {
+        type_name: String,
+        member: String,
+    },
+    FirstMemberMoved {
+        type_name: String,
+        member: String,
+        offset: u32,
+    },
 }
 
 impl std::fmt::Display for BtfError {
@@ -61,6 +79,16 @@ impl std::fmt::Display for BtfError {
             Self::MissingMember { type_name, member } => {
                 write!(f, "BTF struct '{type_name}' has no member '{member}'")
             }
+            Self::FirstMemberMoved {
+                type_name,
+                member,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "BTF struct '{type_name}' member '{member}' moved to byte {offset} (BPF hardcodes 0)"
+                )
+            }
         }
     }
 }
@@ -69,7 +97,8 @@ impl std::error::Error for BtfError {}
 
 /// Explicit-offset reads for the kcrypto BPF (all u32 byte offsets):
 /// the K0 P2 identity chain plus `task_struct.flags` (kthread via
-/// [`PF_KTHREAD`]). Enter the BPF via the CONFIG map (G6 option (a)).
+/// [`PF_KTHREAD`]) plus the AEAD/ahash length reads (C2). Enter the BPF
+/// via the CONFIG map (G6 option (a)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CryptoOffsets {
     /// `skcipher_request.base`.
@@ -84,6 +113,10 @@ pub struct CryptoOffsets {
     pub alg_drv: u32,
     /// `task_struct.flags`.
     pub task_flags: u32,
+    /// `aead_request.cryptlen` (C2: AEAD bytes).
+    pub aead_cryptlen_off: u32,
+    /// `ahash_request.nbytes` (C2: ahash bytes).
+    pub ahash_nbytes_off: u32,
 }
 
 /// Resolve the 9 [`KCRYPTO_SYMBOLS`] to vmlinux BTF ids. Unprivileged.
@@ -96,12 +129,28 @@ pub fn resolve_btf_ids() -> Result<HashMap<String, u32>, BtfError> {
     resolve_btf_ids_from(&bytes)
 }
 
-/// Resolve the 6 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
+/// Resolve the 8 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
+///
+/// Fail-closed on the C3 first-member links: the BPF hardcodes 0 for
+/// the five [`FIRST_MEMBER_LINKS`] below, so any nonzero live offset is
+/// [`BtfError::FirstMemberMoved`] (a kernel struct reorder must refuse
+/// here, never mis-chase in BPF).
 pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
     let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| BtfError::Io {
         detail: format!("{VMLINUX_BTF}: {err}"),
     })?;
     resolve_offsets_from(&bytes)
+}
+
+/// Resolve one struct-member byte offset from live vmlinux BTF.
+/// Unprivileged. The exactness suite's C3 re-verification rides this
+/// (same walker, same fail-closed errors — no second implementation).
+pub fn resolve_member_offset(type_name: &str, member: &str) -> Result<u32, BtfError> {
+    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| BtfError::Io {
+        detail: format!("{VMLINUX_BTF}: {err}"),
+    })?;
+    let btf = Btf::parse(&bytes)?;
+    btf.member_offset(type_name, member)
 }
 
 fn resolve_btf_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> {
@@ -116,16 +165,41 @@ fn resolve_btf_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> 
     Ok(out)
 }
 
+/// C3 first-member links: struct/member pairs the BPF reads at
+/// literal offset 0 (verified first members on the K1 host BTF; C
+/// guarantees no padding before the initial member, so only a struct
+/// reorder can move them — which fails closed below).
+pub const FIRST_MEMBER_LINKS: &[(&str, &str)] = &[
+    ("aead_request", "base"),
+    ("ahash_request", "base"),
+    ("shash_desc", "tfm"),
+    ("crypto_shash", "base"),
+    ("skcipher_request", "cryptlen"),
+];
+
 fn resolve_offsets_from(bytes: &[u8]) -> Result<CryptoOffsets, BtfError> {
     let btf = Btf::parse(bytes)?;
-    Ok(CryptoOffsets {
+    let out = CryptoOffsets {
         sk_req_base: btf.member_offset("skcipher_request", "base")?,
         async_tfm: btf.member_offset("crypto_async_request", "tfm")?,
         tfm_alg: btf.member_offset("crypto_tfm", "__crt_alg")?,
         alg_name: btf.member_offset("crypto_alg", "cra_name")?,
         alg_drv: btf.member_offset("crypto_alg", "cra_driver_name")?,
         task_flags: btf.member_offset("task_struct", "flags")?,
-    })
+        aead_cryptlen_off: btf.member_offset("aead_request", "cryptlen")?,
+        ahash_nbytes_off: btf.member_offset("ahash_request", "nbytes")?,
+    };
+    for (type_name, member) in FIRST_MEMBER_LINKS {
+        let offset = btf.member_offset(type_name, member)?;
+        if offset != 0 {
+            return Err(BtfError::FirstMemberMoved {
+                type_name: (*type_name).to_owned(),
+                member: (*member).to_owned(),
+                offset,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Raw BTF header length minimum (magic + version/flags + 5 u32s).
@@ -629,7 +703,7 @@ mod tests {
 
     #[test]
     fn misaligned_member_is_bad_btf() {
-        // `bbb` at 7 bits: not byte-aligned, must fail closed (our 6
+        // `bbb` at 7 bits: not byte-aligned, must fail closed (our 8
         // reads are all byte-aligned; a sub-byte offset is a wrong
         // assumption, never a guess).
         let mut bytes = fixture();
@@ -648,5 +722,77 @@ mod tests {
         // The value is verified against the installed kernel headers
         // (see the const docs); this pins it against accidental edits.
         assert_eq!(PF_KTHREAD, 0x0020_0000);
+    }
+
+    /// Synthetic crypto image: the 8 [`CryptoOffsets`] structs plus the
+    /// 5 [`FIRST_MEMBER_LINKS`] members. `moved` relocates one
+    /// first-member link to byte 8 (fail-closed proof for C3).
+    fn crypto_fixture(moved: Option<(&str, &str)>) -> Vec<u8> {
+        let mut b = BtfBuild::new();
+        // [1] INT (shared member type).
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        let mut named = |name: &str, members: &[(&str, u32)]| {
+            let o_name = b.str(name);
+            b.rec(o_name, KIND_STRUCT, members.len() as u32, false, 256);
+            for (member, byte) in members {
+                let at = if moved == Some((name, *member)) {
+                    8
+                } else {
+                    *byte
+                };
+                let o_member = b.str(member);
+                b.member(o_member, 1, at * 8);
+            }
+        };
+        named("skcipher_request", &[("cryptlen", 0), ("base", 32)]);
+        named("crypto_async_request", &[("tfm", 32)]);
+        named("crypto_tfm", &[("__crt_alg", 32)]);
+        named("crypto_alg", &[("cra_name", 60), ("cra_driver_name", 188)]);
+        named("task_struct", &[("flags", 44)]);
+        named("aead_request", &[("base", 0), ("cryptlen", 52)]);
+        named("ahash_request", &[("base", 0), ("nbytes", 48)]);
+        named("shash_desc", &[("tfm", 0)]);
+        named("crypto_shash", &[("base", 0)]);
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_offsets_resolve_eight_exact() {
+        let bytes = crypto_fixture(None);
+        let off = resolve_offsets_from(&bytes).expect("crypto fixture resolves");
+        assert_eq!(
+            off,
+            CryptoOffsets {
+                sk_req_base: 32,
+                async_tfm: 32,
+                tfm_alg: 32,
+                alg_name: 60,
+                alg_drv: 188,
+                task_flags: 44,
+                aead_cryptlen_off: 52,
+                ahash_nbytes_off: 48,
+            }
+        );
+    }
+
+    #[test]
+    fn moved_first_member_fails_closed() {
+        // Every C3 link, moved to byte 8 in turn: each must be
+        // FirstMemberMoved naming the exact struct/member/offset (never
+        // a silently-resolved offset set).
+        for (type_name, member) in FIRST_MEMBER_LINKS {
+            let bytes = crypto_fixture(Some((type_name, member)));
+            let err = resolve_offsets_from(&bytes).expect_err("moved link must fail");
+            assert_eq!(
+                err,
+                BtfError::FirstMemberMoved {
+                    type_name: (*type_name).to_owned(),
+                    member: (*member).to_owned(),
+                    offset: 8,
+                },
+                "link {type_name}.{member}"
+            );
+        }
     }
 }

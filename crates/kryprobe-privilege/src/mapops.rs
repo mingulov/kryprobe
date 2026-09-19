@@ -7,6 +7,8 @@ use std::os::raw::c_void;
 
 const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;
+/// `BPF_MAP_GET_NEXT_KEY` command id (UAPI `linux/bpf.h` `bpf_cmd`).
+const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 
 /// `BPF_MAP_*_ELEM` attr: map_fd, key, value, flags (32 bytes, UAPI order).
 #[repr(C)]
@@ -16,6 +18,16 @@ struct ElemAttr {
     key: u64,
     value: u64,
     flags: u64,
+}
+
+/// `BPF_MAP_GET_NEXT_KEY` attr: map_fd, key, next_key (24 bytes, UAPI
+/// order). A null `key` starts the iteration; `ENOENT` ends it.
+#[repr(C)]
+struct NextKeyAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    next_key: u64,
 }
 
 /// Map element failure: stage + errno, never a panic.
@@ -199,6 +211,126 @@ fn possible_cpus_from_topology(possible_text: Option<&str>, conf: u32, online: u
     conf.max(online)
 }
 
+/// Update one element with raw key/value bytes (`BPF_ANY`, K1 Task 2:
+/// kcrypto `KCFG` init + dump-test setup).
+pub fn map_update_bytes(
+    map: &OwnedFd,
+    key: &[u8],
+    value: &[u8],
+    stage: &str,
+) -> Result<(), MapOpsError> {
+    let mut attr = ElemAttr {
+        map_fd: map.as_raw_fd() as u32,
+        _pad: 0,
+        key: key.as_ptr() as u64,
+        value: value.as_ptr() as u64,
+        flags: 0,
+    };
+    // SAFETY: attr + key/value pointees outlive the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_MAP_UPDATE_ELEM,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<ElemAttr>() as u32,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(MapOpsError::UpdateFailed {
+            stage: stage.to_owned(),
+            errno: last_errno(),
+        })
+    }
+}
+
+/// Look up one element with raw key bytes into exactly `value_len`
+/// bytes (K1 Task 2: kcrypto map dumps).
+///
+/// The caller must pass the map's exact value size (percpu maps:
+/// `value_size * possible_cpus()` — the kernel writes all possible
+/// lanes; an undersized buffer is a kernel heap overwrite, same trust
+/// model as [`map_lookup_percpu_sum`]).
+pub fn map_lookup_bytes(
+    map: &OwnedFd,
+    key: &[u8],
+    value_len: usize,
+    stage: &str,
+) -> Result<Vec<u8>, MapOpsError> {
+    let mut value = vec![0u8; value_len.max(1)];
+    value.truncate(value_len);
+    // `truncate` to the requested length keeps capacity; an empty
+    // request still hands the kernel a live (1-byte) buffer — the
+    // lookup then fails honestly (`E2BIG`/length) instead of faulting
+    // on a dangling pointer.
+    let mut attr = ElemAttr {
+        map_fd: map.as_raw_fd() as u32,
+        _pad: 0,
+        key: key.as_ptr() as u64,
+        value: value.as_mut_ptr() as u64,
+        flags: 0,
+    };
+    // SAFETY: attr + key/value pointees outlive the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_MAP_LOOKUP_ELEM,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<ElemAttr>() as u32,
+        )
+    };
+    if ret == 0 {
+        value.resize(value_len, 0);
+        Ok(value)
+    } else {
+        Err(MapOpsError::LookupFailed {
+            stage: stage.to_owned(),
+            errno: last_errno(),
+        })
+    }
+}
+
+/// Iterate keys: `None` starts at the first key, `Some(prev)` steps.
+/// `Ok(None)` is end-of-iteration (`ENOENT`); any other errno is
+/// [`MapOpsError::LookupFailed`]. `key_len` must be the map's exact key
+/// size (K1 Task 2: `KAGG`/`KIDN` dumps).
+pub fn map_get_next_key(
+    map: &OwnedFd,
+    key: Option<&[u8]>,
+    key_len: usize,
+    stage: &str,
+) -> Result<Option<Vec<u8>>, MapOpsError> {
+    let mut next = vec![0u8; key_len.max(1)];
+    next.truncate(key_len);
+    let mut attr = NextKeyAttr {
+        map_fd: map.as_raw_fd() as u32,
+        _pad: 0,
+        key: key.map(|k| k.as_ptr() as u64).unwrap_or(0),
+        next_key: next.as_mut_ptr() as u64,
+    };
+    // SAFETY: attr + key/next pointees outlive the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_MAP_GET_NEXT_KEY,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<NextKeyAttr>() as u32,
+        )
+    };
+    if ret == 0 {
+        next.resize(key_len, 0);
+        Ok(Some(next))
+    } else {
+        let errno = last_errno();
+        if errno == libc::ENOENT {
+            Ok(None)
+        } else {
+            Err(MapOpsError::LookupFailed {
+                stage: stage.to_owned(),
+                errno,
+            })
+        }
+    }
+}
+
 /// Look up one percpu element and sum all CPU lanes (saturating).
 ///
 /// Buffer is sized by [`possible_cpus`], not [`online_cpus`]: the kernel
@@ -259,6 +391,29 @@ mod tests {
         let err = map_lookup(&fd, 0, "unit/probe").unwrap_err();
         assert!(
             matches!(err, MapOpsError::LookupFailed { ref stage, errno } if stage == "unit/probe" && errno == libc::EBADF),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn bad_fd_byte_ops_report_stage_and_errno() {
+        // The K1 Task-2 byte primitives fail honestly (EBADF before any
+        // length check) on a bad fd; GET_NEXT_KEY maps only ENOENT to
+        // end-of-iteration, never other errnos.
+        let fd = bad_fd();
+        let err = map_update_bytes(&fd, &[0u8; 4], &[0u8; 8], "unit/update").unwrap_err();
+        assert!(
+            matches!(err, MapOpsError::UpdateFailed { ref stage, errno } if stage == "unit/update" && errno == libc::EBADF),
+            "got {err}"
+        );
+        let err = map_lookup_bytes(&fd, &[0u8; 4], 8, "unit/lookup").unwrap_err();
+        assert!(
+            matches!(err, MapOpsError::LookupFailed { ref stage, errno } if stage == "unit/lookup" && errno == libc::EBADF),
+            "got {err}"
+        );
+        let err = map_get_next_key(&fd, None, 4, "unit/next").unwrap_err();
+        assert!(
+            matches!(err, MapOpsError::LookupFailed { ref stage, errno } if stage == "unit/next" && errno == libc::EBADF),
             "got {err}"
         );
     }

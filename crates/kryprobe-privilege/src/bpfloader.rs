@@ -12,10 +12,10 @@
 //! Micro-borrow: fail-closed raw loader incl. frozen dims + symbolic
 //! map-fd fixups (osslscope loader-prepare pattern, reimplemented).
 //!
-//! K1 adds a second, independent load path for fentry/kcrypto objects
-//! ([`parse_kcrypto_object`], [`load_kcrypto`]): `fentry/*` sections,
+//! K1 adds a second, independent load path for fexit/kcrypto objects
+//! ([`parse_kcrypto_object`], [`load_kcrypto`]): `fexit/*` sections,
 //! 1..=16 programs, optional `.text`, the frozen [`KCRYPTO_MAPS`] dims,
-//! `TRACING`/`FENTRY` loads with per-prog `attach_btf_id` (R1), and a
+//! `TRACING`/`FEXIT` loads with per-prog `attach_btf_id` (R1), and a
 //! dot-free pin gate (R3). The spine path above is byte-identical.
 
 pub(crate) mod instantiate;
@@ -92,16 +92,16 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 
 /// Frozen kcrypto maps, in creation order. Asserted against the object.
 ///
-/// The exact Task-2 contract (`KConfig` 32B, `KAgg` 260B, `VAgg` 120B —
-/// `planning/kryprobe-phaseK1-sensor-plan.md` Task 2); names dot-free per
-/// R3 (`evidence/k0/P1-attach-matrix.txt`).
+/// The exact Task-2 contract (`KConfig` 40B per C2, `KAgg` 260B, `VAgg`
+/// 120B — `planning/kryprobe-phaseK1-sensor-plan.md` Task 2); names
+/// dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
         "KCFG",
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 32,
+            value_size: 40,
             max_entries: 1,
         },
     ),

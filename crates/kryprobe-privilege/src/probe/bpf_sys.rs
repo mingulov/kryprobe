@@ -23,10 +23,11 @@ pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
 /// `BPF_OBJ_PIN` command id (R2: the attr must be exactly 20 bytes).
 pub const BPF_OBJ_PIN: u32 = 6;
-/// `BPF_PROG_TYPE_TRACING` program type id (fentry, K1).
+/// `BPF_PROG_TYPE_TRACING` program type id (fexit, K1 Task 2; the
+/// Task-1 fentry shape migrated to exit-edge tracing per ruling C1).
 pub const BPF_PROG_TYPE_TRACING: u32 = 26;
-/// `BPF_TRACE_FENTRY` expected attach type id (K1).
-pub const BPF_TRACE_FENTRY: u32 = 24;
+/// `BPF_TRACE_FEXIT` expected attach type id (K1 Task 2, C1).
+pub const BPF_TRACE_FEXIT: u32 = 25;
 /// Required in map/prog flags when a token fd rides the attr.
 pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
 

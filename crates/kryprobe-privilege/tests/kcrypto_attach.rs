@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! K1 Task 1: kcrypto loader-extension proof — parse shape, BTF
-//! resolution (unprivileged), and the privileged 9-point attach matrix.
+//! K1 Task 2: kcrypto sensor proof — parse shape, BTF resolution
+//! (unprivileged), and the privileged 9-point attach matrix.
 //!
 //! Pure tests (parse, pin gate, resolver) run everywhere, including
 //! `cargo xtask check`. The two `#[ignore]`d lane tests need root +
 //! objects (`cargo xtask test bpf`) and skip honestly otherwise
-//! (`token_plumbing` idiom). The attach matrix loads the skeleton
-//! object once per P0 point with that point's `attach_btf_id` (the id
-//! binds, not the section name) and asserts 9 live links through the
+//! (`token_plumbing` idiom). The attach matrix loads the true 9-prog
+//! fexit object ONCE with all 9 `attach_btf_id`s (each program binds
+//! its own section suffix) and asserts 9 live links through the
 //! loader's own handles plus procfs fd kinds (no bpftool oracle).
 
 use kryprobe_core::attach::{CookieAllocator, GenerationGuard, LinkGroup};
@@ -88,19 +88,24 @@ fn parse_reports_kcrypto_dims() {
 }
 
 #[test]
-fn parse_finds_skeleton_program() {
+fn parse_finds_nine_fexit_programs() {
     let bytes = kcrypto_bytes();
     let parsed = parse_kcrypto_object(&bytes).expect("real object must parse");
-    // Skeleton pins 1 program; Task 2 extends this lane to 9.
-    assert_eq!(parsed.programs.len(), 1);
-    let prog = &parsed.programs[0];
-    assert_eq!(prog.name, "kcrypto_skel");
-    assert!(
-        prog.section.starts_with("fentry/"),
-        "section must be fentry/*, got {}",
-        prog.section
-    );
-    assert!(!prog.insns.is_empty(), "skeleton has no insns");
+    // The Task-2 sensor: 9 fexit programs, one per P0 symbol.
+    assert_eq!(parsed.programs.len(), 9);
+    let mut suffixes: Vec<&str> = Vec::with_capacity(9);
+    for prog in &parsed.programs {
+        let suffix = prog.section.strip_prefix("fexit/").unwrap_or_else(|| {
+            panic!("section must be fexit/*, got {}", prog.section);
+        });
+        assert!(!prog.name.is_empty(), "program name must be set");
+        assert!(!prog.insns.is_empty(), "{} has no insns", prog.name);
+        suffixes.push(suffix);
+    }
+    suffixes.sort_unstable();
+    let mut want: Vec<&str> = KCRYPTO_SYMBOLS.to_vec();
+    want.sort_unstable();
+    assert_eq!(suffixes, want, "fexit sections must cover the 9 P0 symbols");
 }
 
 #[test]
@@ -117,11 +122,11 @@ fn rejects_garbage_as_kcrypto() {
 
 #[test]
 fn rejects_spine_object_as_kcrypto() {
-    // Shape mismatch, spine direction: no `fentry/` sections, so the
+    // Shape mismatch, spine direction: no `fexit/` sections, so the
     // error names the section allowlist.
     let err = parse_kcrypto_object(&spine_bytes()).unwrap_err();
     assert!(
-        matches!(err, LoaderError::BadObject { ref reason } if reason.contains("fentry/")),
+        matches!(err, LoaderError::BadObject { ref reason } if reason.contains("fexit/")),
         "spine-as-kcrypto must name the allowlist, got {err}"
     );
 }
@@ -185,6 +190,8 @@ fn resolve_offsets_are_structural() {
         ("alg_name", off.alg_name),
         ("alg_drv", off.alg_drv),
         ("task_flags", off.task_flags),
+        ("aead_cryptlen_off", off.aead_cryptlen_off),
+        ("ahash_nbytes_off", off.ahash_nbytes_off),
     ] {
         assert!(value < 4096, "{name}={value} out of range");
     }
@@ -230,16 +237,18 @@ fn guard(generation: u32) -> GenerationGuard {
     }
 }
 
-/// Skeleton's section suffix: the attach-id key for this lane (Task 2
-/// passes all 9 honestly-matched entries).
-fn skeleton_symbol(bytes: &[u8]) -> String {
-    let parsed = parse_kcrypto_object(bytes).expect("kcrypto object must parse");
-    assert_eq!(parsed.programs.len(), 1, "skeleton pins 1 program");
-    parsed.programs[0]
-        .section
-        .strip_prefix("fentry/")
-        .expect("skeleton section is fentry/*")
-        .to_owned()
+/// All 9 attach ids, keyed by section suffix (the honest `load_kcrypto`
+/// shape: every program binds its own symbol's BTF id).
+fn all_attach_ids(ids: &std::collections::HashMap<String, u32>) -> Vec<(String, u32)> {
+    KCRYPTO_SYMBOLS
+        .iter()
+        .map(|name| {
+            let id = ids
+                .get(*name)
+                .unwrap_or_else(|| panic!("{name} missing from resolver output"));
+            ((*name).to_owned(), *id)
+        })
+        .collect()
 }
 
 /// Kernel-side fd liveness via fcntl (no bpftool oracle).
@@ -276,34 +285,32 @@ fn attach_all_points() {
         return;
     }
     let bytes = kcrypto_bytes();
-    let symbol = skeleton_symbol(&bytes);
     let ids = resolve_btf_ids().expect("P0 symbols must resolve");
-    // One load per P0 point, in P0 table order (deterministic, not
-    // HashMap order): the same bytes with that point's `attach_btf_id`.
-    let mut held = Vec::new();
-    let mut links = Vec::new();
-    for name in KCRYPTO_SYMBOLS.iter().copied() {
-        let id = ids.get(name).unwrap_or_else(|| panic!("{name} missing"));
-        let (loaded, statuses) = load_kcrypto(&bytes, &[(symbol.clone(), *id)], None)
-            .unwrap_or_else(|err| panic!("load for {name} (btf {id}) failed: {err}"));
-        assert_eq!(statuses.len(), 1);
+    // ONE load of the true 9-prog object with all 9 attach ids; every
+    // program binds its own section suffix.
+    let (loaded, statuses) = load_kcrypto(&bytes, &all_attach_ids(&ids), None)
+        .unwrap_or_else(|err| panic!("9-prog load failed: {err}"));
+    assert_eq!(statuses.len(), 9);
+    for status in &statuses {
         assert!(
-            matches!(&statuses[0], PointStatus::Loaded { .. }),
-            "{name}: expected Loaded, got {:?}",
-            statuses[0]
+            matches!(status, PointStatus::Loaded { .. }),
+            "expected Loaded, got {status:?}"
         );
-        assert_eq!(loaded.progs.len(), 1);
+    }
+    assert_eq!(loaded.progs.len(), 9);
+    // Attach all 9, in load order (deterministic, not HashMap order).
+    let mut links = Vec::new();
+    for (name, prog) in &loaded.progs {
         let link = LocalPrivilegedAuthority
             .attach_group(
                 &group(TargetScope::System),
                 &guard(1),
-                &loaded.progs[0].1,
+                prog,
                 Path::new(""),
                 &[],
             )
             .unwrap_or_else(|err| panic!("attach for {name} failed: {err}"));
-        held.push(loaded);
-        links.push((name, link));
+        links.push((name.clone(), link));
     }
     assert_eq!(links.len(), 9, "the matrix is 9 points");
     // 9 live links, self-consistent: distinct fds, each fcntl-alive
@@ -317,18 +324,18 @@ fn attach_all_points() {
         assert_procfs_kind(fd, "anon_inode:bpf_link", name);
     }
     assert_procfs_kind(
-        held[0].progs[0].1.as_raw_fd(),
+        loaded.progs[0].1.as_raw_fd(),
         "anon_inode:bpf-prog",
-        "skeleton prog",
+        "first kcrypto prog",
     );
     assert_procfs_kind(
-        held[0].maps.config.as_raw_fd(),
+        loaded.maps.config.as_raw_fd(),
         "anon_inode:bpf-map",
         "KCFG map",
     );
     // Detach: RAII drop (links first, then progs/maps); assert clean.
     drop(links);
-    drop(held);
+    drop(loaded);
 }
 
 /// Our bpffs pin dir (pid-suffixed: never collides, never shared).
@@ -362,10 +369,8 @@ fn pin_roundtrip_proves_r2_and_cleanup() {
         return;
     }
     let bytes = kcrypto_bytes();
-    let symbol = skeleton_symbol(&bytes);
     let ids = resolve_btf_ids().expect("P0 symbols must resolve");
-    let first = KCRYPTO_SYMBOLS[0];
-    let (loaded, _) = load_kcrypto(&bytes, &[(symbol, ids[first])], None)
+    let (loaded, _) = load_kcrypto(&bytes, &all_attach_ids(&ids), None)
         .unwrap_or_else(|err| panic!("load for pin roundtrip failed: {err}"));
     // Dotted names reject typed even as root (no syscall attempted).
     assert!(

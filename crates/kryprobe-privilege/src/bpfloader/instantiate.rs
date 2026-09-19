@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Syscall half of the raw loader: maps, fixups, program loads (T7c1).
 //!
-//! K1 adds [`load_kcrypto`] (fentry objects: [`ParsedKcrypto`](super::parse::ParsedKcrypto),
+//! K1 adds [`load_kcrypto`] (fexit objects: [`ParsedKcrypto`](super::parse::ParsedKcrypto),
 //! per-prog `attach_btf_id`, per-point outcomes) plus the dot-free pin
 //! gate ([`check_pin_name`]) and [`pin_fd`] (R2/R3).
 
 use super::mapcreate::map_create_raw;
 use super::parse::{BpfInsn, insns_to_bytes, parse_kcrypto_object, pseudo_map_fd};
-use super::progload::{prog_load_fentry_raw, prog_load_raw};
+use super::progload::{prog_load_fexit_raw, prog_load_raw};
 use crate::bpfloader::{
     KcryptoMaps, LoadedKcrypto, LoadedSpine, LoaderError, ParsedSpine, PointStatus, SpineMaps,
     SpineProgs,
@@ -129,11 +129,11 @@ pub(crate) fn instantiate_with_token(
 }
 
 /// Load a kcrypto object through the real loader: parse, create the
-/// five frozen maps, apply map-fd fixups, load each `fentry/` program
+/// five frozen maps, apply map-fd fixups, load each `fexit/` program
 /// with its `attach_btf_id` (R1 — `evidence/k0/P1-attach-matrix.txt`).
 ///
 /// `attach_ids` maps kernel symbol names (the section suffix after
-/// `fentry/`, as returned by `btf_resolve::resolve_btf_ids`) to vmlinux
+/// `fexit/`, as returned by `btf_resolve::resolve_btf_ids`) to vmlinux
 /// BTF ids. `token` is an optional borrowed BPF token fd (`None` loads
 /// with privilege, like the spine path).
 ///
@@ -145,7 +145,7 @@ pub(crate) fn instantiate_with_token(
 /// (the first error is preserved, or `BadObject` when every point is
 /// `Missing`).
 ///
-/// Shape-authenticated entry (no `ProgramId` allowlist): the `fentry/`
+/// Shape-authenticated entry (no `ProgramId` allowlist): the `fexit/`
 /// sections + frozen [`KCRYPTO_MAPS`](crate::bpfloader::KCRYPTO_MAPS)
 /// dims fully determine the loaded behavior, so there is no trusted-id
 /// claim to spoof; the syscalls still need privilege or a token.
@@ -209,14 +209,14 @@ pub fn load_kcrypto(
     let mut statuses: Vec<PointStatus> = Vec::with_capacity(parsed.programs.len());
     let mut first_err: Option<LoaderError> = None;
     for (prog, insns) in parsed.programs.iter().zip(streams.iter()) {
-        let symbol = prog.section.strip_prefix("fentry/").unwrap_or_default();
+        let symbol = prog.section.strip_prefix("fexit/").unwrap_or_default();
         let Some((_, id)) = attach_ids.iter().find(|(name, _)| name == symbol) else {
             statuses.push(PointStatus::Missing {
                 name: prog.name.clone(),
             });
             continue;
         };
-        match load_fentry_program(&prog.name, insns, *id, token) {
+        match load_fexit_program(&prog.name, insns, *id, token) {
             Ok(fd) => {
                 statuses.push(PointStatus::Loaded {
                     name: prog.name.clone(),
@@ -277,7 +277,7 @@ fn short_detail(err: &LoaderError) -> String {
     }
 }
 
-fn load_fentry_program(
+fn load_fexit_program(
     name: &str,
     insns: &[BpfInsn],
     attach_btf_id: u32,
@@ -290,7 +290,7 @@ fn load_fentry_program(
     }
     let bytes = insns_to_bytes(insns);
     let mut log = vec![0u8; LOG_CAP];
-    let ret = prog_load_fentry_raw(
+    let ret = prog_load_fexit_raw(
         name,
         &bytes,
         insns.len() as u32,

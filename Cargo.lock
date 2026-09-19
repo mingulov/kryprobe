@@ -60,6 +60,7 @@ dependencies = [
  "goblin",
  "kryprobe-abi",
  "kryprobe-core",
+ "kryprobe-testkit",
  "libc",
 ]
 
@@ -79,6 +80,7 @@ name = "kryprobe-testkit"
 version = "0.0.0"
 dependencies = [
  "kryprobe-abi",
+ "libc",
  "serde_json",
 ]
 

@@ -5,11 +5,12 @@
 //! attr with `BPF_F_TOKEN_FD` in `prog_flags` (required by UAPI when a
 //! token fd is provided). Attr sizes are compile-time asserted.
 //!
-//! K1 adds [`prog_load_fentry_raw`]: `TRACING` + expected `FENTRY` +
-//! per-prog `attach_btf_id` (R1 — `evidence/k0/P1-attach-matrix.txt`).
+//! K1 adds [`prog_load_fexit_raw`]: `TRACING` + expected `FEXIT` +
+//! per-prog `attach_btf_id` (R1 — `evidence/k0/P1-attach-matrix.txt`; the
+//! Task-1 fentry shape migrated to exit-edge tracing per ruling C1).
 
 use crate::probe::bpf_sys::{
-    BPF_F_TOKEN_FD, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING, BPF_TRACE_FENTRY,
+    BPF_F_TOKEN_FD, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING, BPF_TRACE_FEXIT,
     BPF_TRACE_UPROBE_MULTI, bpf,
 };
 use std::os::fd::RawFd;
@@ -17,6 +18,19 @@ use std::os::raw::{c_long, c_void};
 
 /// Verifier log verbosity (2 = verbose).
 const LOG_LEVEL: u32 = 2;
+
+/// Verifier log verbosity for kcrypto loads (1 = errors + stats).
+///
+/// The 9 kcrypto programs are loop-bearing (~600 insns each: key
+/// zero/hash/name-scan loops), and their level-2 verbose log exceeds
+/// ANY reasonable buffer (measured: overflows even 64MiB) — at which
+/// point the kernel fails the load with `ENOSPC` instead of truncating
+/// (the verbose log must be complete to be useful). Level 1 keeps the
+/// error + verdict lines the `LoadFailed` tail needs while bounding the
+/// volume to ~100 bytes on success
+/// (`evidence/k1-2/step3-enospc-rootcause.txt`). The loop-free spine
+/// keeps level 2 (frozen behavior).
+const KCRYPTO_LOG_LEVEL: u32 = 1;
 
 /// `BPF_PROG_LOAD` attr through `expected_attach_type` (72 bytes, UAPI order).
 #[repr(C)]
@@ -74,11 +88,11 @@ const TOKEN_PROG_ATTR_LEN: u32 = 148;
 const _: () = assert!(size_of::<ProgLoadAttr>() == 72);
 const _: () = assert!(size_of::<TokenProgAttr>() == 152);
 
-/// `BPF_PROG_LOAD` attr for fentry through the attach union (116 bytes,
+/// `BPF_PROG_LOAD` attr for fexit through the attach union (116 bytes,
 /// UAPI order): the K0-proven non-token shape (`attach_btf_id` at load,
 /// no prog BTF — `evidence/k0/P1-attach-matrix.txt` R1).
 #[repr(C)]
-struct FentryProgAttr {
+struct FexitProgAttr {
     prog_type: u32,
     insn_cnt: u32,
     insns: u64,
@@ -102,11 +116,11 @@ struct FentryProgAttr {
     attach_union: u32,
 }
 
-/// Bytes handed to the kernel for the fentry prog attr: the 116-byte
+/// Bytes handed to the kernel for the fexit prog attr: the 116-byte
 /// UAPI prefix, not the 4-byte alignment tail `repr(C)` appends.
-const FENTRY_PROG_ATTR_LEN: u32 = 116;
+const FEXIT_PROG_ATTR_LEN: u32 = 116;
 
-const _: () = assert!(size_of::<FentryProgAttr>() == 120);
+const _: () = assert!(size_of::<FexitProgAttr>() == 120);
 
 static LICENSE: &[u8; 4] = b"GPL\0";
 
@@ -189,15 +203,15 @@ pub(crate) fn prog_load_raw(
     }
 }
 
-/// Raw `BPF_PROG_LOAD` for one fentry program; `log` receives the
+/// Raw `BPF_PROG_LOAD` for one fexit program; `log` receives the
 /// verifier log. Returns fd or -1.
 ///
-/// `TRACING(26)` + expected `FENTRY(24)` + per-prog `attach_btf_id` at
+/// `TRACING(26)` + expected `FEXIT(25)` + per-prog `attach_btf_id` at
 /// load (R1); `token: None` builds the 116-byte attr, `Some(fd)` the
 /// token-extended attr. No prog BTF (K0 P1 attaches without it).
 ///
 /// Crate-private: reached only via [`load_kcrypto`](super::instantiate::load_kcrypto).
-pub(crate) fn prog_load_fentry_raw(
+pub(crate) fn prog_load_fexit_raw(
     name: &str,
     insn_bytes: &[u8],
     insn_cnt: u32,
@@ -213,14 +227,14 @@ pub(crate) fn prog_load_fentry_raw(
                 insn_cnt,
                 insns: insn_bytes.as_ptr() as u64,
                 license: LICENSE.as_ptr() as u64,
-                log_level: LOG_LEVEL,
+                log_level: KCRYPTO_LOG_LEVEL,
                 log_size: log.len() as u32,
                 log_buf: log.as_mut_ptr() as u64,
                 kern_version: 0,
                 prog_flags: BPF_F_TOKEN_FD,
                 prog_name: prog_name16(name),
                 prog_ifindex: 0,
-                expected_attach_type: BPF_TRACE_FENTRY,
+                expected_attach_type: BPF_TRACE_FEXIT,
                 prog_btf_fd: 0,
                 func_info_rec_size: 0,
                 func_info: 0,
@@ -243,19 +257,19 @@ pub(crate) fn prog_load_fentry_raw(
                 TOKEN_PROG_ATTR_LEN,
             )
         } else {
-            let mut attr = FentryProgAttr {
+            let mut attr = FexitProgAttr {
                 prog_type: BPF_PROG_TYPE_TRACING,
                 insn_cnt,
                 insns: insn_bytes.as_ptr() as u64,
                 license: LICENSE.as_ptr() as u64,
-                log_level: LOG_LEVEL,
+                log_level: KCRYPTO_LOG_LEVEL,
                 log_size: log.len() as u32,
                 log_buf: log.as_mut_ptr() as u64,
                 kern_version: 0,
                 prog_flags: 0,
                 prog_name: prog_name16(name),
                 prog_ifindex: 0,
-                expected_attach_type: BPF_TRACE_FENTRY,
+                expected_attach_type: BPF_TRACE_FEXIT,
                 prog_btf_fd: 0,
                 func_info_rec_size: 0,
                 func_info: 0,
@@ -269,7 +283,7 @@ pub(crate) fn prog_load_fentry_raw(
             bpf(
                 BPF_PROG_LOAD,
                 (&raw mut attr).cast::<c_void>(),
-                FENTRY_PROG_ATTR_LEN,
+                FEXIT_PROG_ATTR_LEN,
             )
         }
     }

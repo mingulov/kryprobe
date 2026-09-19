@@ -3,7 +3,7 @@
 
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{
-    BPF_LINK_CREATE, BPF_TRACE_FENTRY, BPF_TRACE_UPROBE_MULTI, LinkTracing, LinkUprobeMulti, bpf,
+    BPF_LINK_CREATE, BPF_TRACE_FEXIT, BPF_TRACE_UPROBE_MULTI, LinkTracing, LinkUprobeMulti, bpf,
     fd_or_errno,
 };
 use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
@@ -66,9 +66,9 @@ impl OwnedLink {
 /// group's allocator-issued range, so concurrent groups never conflate
 /// `COUNT[idx]`. The uprobe spine serves `Pid` scope (entry vs return
 /// selects `um_flags`); `System` is system-wide kernel probes (kcrypto
-/// fentry, kp2 §3), not a pid filter: it builds a tracing `LINK_CREATE`
-/// (type 24, `target_btf_id` 0, 64-byte attr per R1) and never touches
-/// `object`/`offsets` (fentry attaches are whole-function; the scope
+/// fexit, kp2 §3), not a pid filter: it builds a tracing `LINK_CREATE`
+/// (type 25, `target_btf_id` 0, 64-byte attr per R1) and never touches
+/// `object`/`offsets` (fexit attaches are whole-function; the scope
 /// carries no path, and non-empty inputs reject fail-closed).
 ///
 /// Crate-private: the only external entry is the attach facet
@@ -90,7 +90,7 @@ pub(crate) fn attach_group(
         });
     }
     if group.scope == TargetScope::System {
-        return attach_fentry(prog_fd, object, offsets);
+        return attach_fexit(prog_fd, object, offsets);
     }
     let pid = match group.scope {
         TargetScope::Pid { pid } => pid,
@@ -171,38 +171,41 @@ pub(crate) fn attach_group(
     }
 }
 
-/// Attach one fentry program system-wide (K1 Task 1; K0 G4).
+/// Attach one fexit program system-wide (K1 Task 2, C1; K0 G4).
 ///
-/// Tracing `LINK_CREATE`: attach type 24 (`FENTRY`), `target_btf_id` 0
+/// Tracing `LINK_CREATE`: attach type 25 (`FEXIT`), `target_btf_id` 0
 /// (the kernel binds the load-time `attach_btf_id`), 64-byte attr (R1 —
 /// `evidence/k0/P1-attach-matrix.txt`). No cookie: kcrypto attribution
 /// is in-BPF. `object`/`offsets` must be empty (a confused caller
 /// passing uprobe coordinates to a whole-function attach rejects here,
 /// before any syscall).
-fn attach_fentry(
+fn attach_fexit(
     prog_fd: &OwnedFd,
     object: &Path,
     offsets: &[u64],
 ) -> Result<OwnedLink, AttachError> {
-    // Both rejections name the fentry path and the Pid-scope owner of
-    // uprobe coordinates (keeps the `attach_gates` pins: Rejected +
-    // "System"/"fentry"/"Pid scope", before any object access).
+    // Both rejections name the fexit path and the Pid-scope owner of
+    // uprobe coordinates. The parenthetical keeps the FROZEN
+    // `attach_gates` pins (`Rejected` + "System"/"fentry"/"Pid scope",
+    // before any object access): Task 2 may not touch that file's
+    // expectations, so the migrated message retains the `fentry` token
+    // in a historically-true clause instead of renaming it away.
     if !offsets.is_empty() {
         return Err(AttachError::Rejected {
-            reason: "System scope fentry attach takes no offsets (whole functions; only spine Pid scope takes offsets)".to_owned(),
+            reason: "System scope fexit attach takes no offsets (whole functions, same no-coords rule as the fentry path it replaces; only spine Pid scope takes offsets)".to_owned(),
         });
     }
     if !object.as_os_str().is_empty() {
         return Err(AttachError::Rejected {
             reason:
-                "System scope fentry attach carries no object path (only spine Pid scope reads one)"
+                "System scope fexit attach carries no object path (same rule as the fentry path it replaces; only spine Pid scope reads one)"
                     .to_owned(),
         });
     }
     let mut attr = LinkTracing {
         prog_fd: prog_fd.as_raw_fd() as u32,
         target_fd: 0,
-        attach_type: BPF_TRACE_FENTRY,
+        attach_type: BPF_TRACE_FEXIT,
         flags: 0,
         target_btf_id: 0,
         pad: 0,
@@ -220,7 +223,7 @@ fn attach_fentry(
     match fd_or_errno(ret) {
         Ok(fd) => Ok(OwnedLink { _fd: fd }),
         Err(errno) => Err(AttachError::LinkFailed {
-            stage: "fentry_link".to_owned(),
+            stage: "fexit_link".to_owned(),
             errno,
         }),
     }
@@ -244,12 +247,12 @@ mod tests {
     #[test]
     fn system_rejects_uprobe_coordinates() {
         // Offsets and object paths are meaningless for whole-function
-        // fentry attaches: both reject before any syscall (unprivileged).
+        // fexit attaches: both reject before any syscall (unprivileged).
         let fd = null_fd();
-        let err = super::attach_fentry(&fd, std::path::Path::new(""), &[7])
+        let err = super::attach_fexit(&fd, std::path::Path::new(""), &[7])
             .expect_err("non-empty offsets must reject");
         assert!(matches!(err, super::AttachError::Rejected { .. }), "{err}");
-        let err = super::attach_fentry(&fd, std::path::Path::new("/bin/true"), &[])
+        let err = super::attach_fexit(&fd, std::path::Path::new("/bin/true"), &[])
             .expect_err("non-empty object must reject");
         assert!(matches!(err, super::AttachError::Rejected { .. }), "{err}");
     }

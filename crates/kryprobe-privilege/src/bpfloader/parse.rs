@@ -6,9 +6,10 @@
 //! resolves call relocs. Map-fd fixups stay a plan
 //! ([`MapReloc`]) applied at instantiate time, when fds exist.
 //!
-//! K1 adds [`parse_kcrypto_object`]: same machinery, fentry shape — the
-//! section allowlist is the `fentry/` prefix, 1..=16 programs, `.text`
-//! optional (stripped objects lack it per R4), dims asserted against
+//! K1 adds [`parse_kcrypto_object`]: same machinery, fexit shape — the
+//! section allowlist is the `fexit/` prefix (Task-1 fentry migrated per
+//! ruling C1), 1..=16 programs, `.text` optional (stripped objects lack
+//! it per R4), dims asserted against
 //! [`KCRYPTO_MAPS`](crate::bpfloader::KCRYPTO_MAPS).
 
 mod maps;
@@ -90,10 +91,11 @@ pub struct ParsedKcrypto {
 }
 
 /// Section-name allowlist for kcrypto objects: the section name must
-/// start with `fentry/` (K1 Task 1; K0 G1).
+/// start with `fexit/` (K1 Task 2, C1; the Task-1 `fentry/` shape is
+/// rejected — K0 G1 re-proven for the exit edge).
 #[must_use]
 pub fn valid_kcrypto_section(name: &str) -> bool {
-    name.starts_with("fentry/")
+    name.starts_with("fexit/")
 }
 
 /// Dims gate for kcrypto objects: exactly [`KCRYPTO_MAPS`], no missing
@@ -220,14 +222,14 @@ pub fn parse_spine_object(bytes: &[u8]) -> Result<ParsedSpine, LoaderError> {
 const KCRYPTO_PROG_MAX: usize = 16;
 
 /// Parse a kcrypto object: license, KCRYPTO dims, one insn stream per
-/// `fentry/*` section (main section ++ `.text` when present), relocs
+/// `fexit/*` section (main section ++ `.text` when present), relocs
 /// applied, reachability gated. No syscalls.
 ///
-/// `.text` is optional: R4-stripped fentry objects lack it
+/// `.text` is optional: R4-stripped fexit objects lack it
 /// (`evidence/k0/P1-attach-matrix.txt` R4); when present it must decode
 /// and every stream is gated exactly like the spine path. Program names
 /// come from the first function symbol in each section; the attach id
-/// lookup keys on the section suffix after `fentry/` (see `load_kcrypto`).
+/// lookup keys on the section suffix after `fexit/` (see `load_kcrypto`).
 pub fn parse_kcrypto_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError> {
     let elf = Elf::parse(bytes).map_err(|err| bad(format!("ELF parse: {err}")))?;
     if elf.header.e_machine != EM_BPF {
@@ -240,7 +242,7 @@ pub fn parse_kcrypto_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError> 
     if !license.starts_with(b"GPL") {
         return Err(bad("license section is not GPL".to_owned()));
     }
-    // Section shape first: a non-fentry object (e.g. the spine) names
+    // Section shape first: a non-fexit object (e.g. the spine) names
     // the allowlist instead of tripping the dims assert further down.
     let mut sections: Vec<(usize, String)> = Vec::new();
     for (idx, sh) in elf.section_headers.iter().enumerate() {
@@ -251,7 +253,7 @@ pub fn parse_kcrypto_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError> 
     }
     if sections.is_empty() || sections.len() > KCRYPTO_PROG_MAX {
         return Err(bad(format!(
-            "want 1..=16 programs in `fentry/*` sections, found {}",
+            "want 1..=16 programs in `fexit/*` sections, found {}",
             sections.len()
         )));
     }
@@ -270,7 +272,7 @@ pub fn parse_kcrypto_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError> 
     let mut programs: Vec<ParsedProg> = Vec::with_capacity(sections.len());
     let mut bases: Vec<(usize, usize)> = Vec::new();
     for (sec_idx, sec_name) in &sections {
-        let symbol = sec_name.strip_prefix("fentry/").unwrap_or_default();
+        let symbol = sec_name.strip_prefix("fexit/").unwrap_or_default();
         if symbol.is_empty() {
             return Err(bad(format!(
                 "section '{sec_name}' has an empty target symbol"
@@ -381,16 +383,19 @@ mod tests {
     // `parse_kcrypto_object` rides with them.
 
     #[test]
-    fn kcrypto_section_allowlist_is_fentry_prefix() {
+    fn kcrypto_section_allowlist_is_fexit_prefix() {
         use super::valid_kcrypto_section;
-        assert!(valid_kcrypto_section("fentry/crypto_alloc_tfm_node"));
-        assert!(valid_kcrypto_section("fentry/x"));
+        assert!(valid_kcrypto_section("fexit/crypto_alloc_tfm_node"));
+        assert!(valid_kcrypto_section("fexit/x"));
         assert!(!valid_kcrypto_section("uprobe.multi"));
         assert!(!valid_kcrypto_section("uretprobe.multi"));
-        assert!(!valid_kcrypto_section("fentry"));
+        assert!(!valid_kcrypto_section("fexit"));
         assert!(!valid_kcrypto_section(""));
         assert!(!valid_kcrypto_section("maps"));
         assert!(!valid_kcrypto_section(".text"));
+        // The Task-1 fentry shape no longer parses (C1 migration).
+        assert!(!valid_kcrypto_section("fentry/crypto_alloc_tfm_node"));
+        assert!(!valid_kcrypto_section("fentry/x"));
     }
 
     #[test]
