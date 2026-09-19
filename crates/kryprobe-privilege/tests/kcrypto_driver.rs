@@ -1027,14 +1027,73 @@ fn sum_obs(
     out
 }
 
-fn words_for_name(name: &str) -> [u64; 16] {
-    let mut bytes = [0u8; 128];
-    bytes[..name.len()].copy_from_slice(name.as_bytes());
-    let mut words = [0u64; 16];
-    for (i, w) in words.iter_mut().enumerate() {
-        *w = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8B word"));
+fn words_to_bytes(words: &[u64; 16]) -> [u8; 128] {
+    let mut out = [0u8; 128];
+    for (i, w) in words.iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
     }
-    words
+    out
+}
+
+fn cstr(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// One oracle-decoded snapshot agg row (Task-1 `SnapRow` shape).
+struct OracleRow {
+    fam: u8,
+    op: u8,
+    res: u8,
+    ctx: u8,
+    alg: String,
+    drv: String,
+    alg_words: [u64; 16],
+    drv_words: [u64; 16],
+    val: VAgg,
+}
+
+/// `KCtl.val0` unpack (inverse of `kctl_pack_head`).
+fn unpack_head(val0: u64) -> (u8, u8, u8, u8) {
+    (
+        (val0 & 0xff) as u8,
+        ((val0 >> 8) & 0xff) as u8,
+        ((val0 >> 16) & 0xff) as u8,
+        ((val0 >> 24) & 0xff) as u8,
+    )
+}
+
+fn family_spelling(fam: u8) -> &'static str {
+    match fam {
+        KFAM_ANY => "any",
+        KFAM_SK => "skcipher",
+        KFAM_AEAD => "aead",
+        KFAM_AHASH => "ahash",
+        KFAM_SHASH => "shash",
+        _ => "unknown",
+    }
+}
+
+fn op_spelling(op: u8) -> &'static str {
+    match op {
+        KOP_ALLOC => "alloc",
+        KOP_DESTROY => "destroy",
+        KOP_ENC => "encrypt",
+        KOP_DEC => "decrypt",
+        KOP_DIGEST => "digest",
+        KOP_FINUP => "finup",
+        _ => "unknown",
+    }
+}
+
+fn result_spelling(res: u8) -> &'static str {
+    match res {
+        KRES_OK => "ok",
+        KRES_ERR => "error",
+        KRES_QUEUED => "queued",
+        KRES_UNOBSERVED => "unobserved",
+        _ => "unknown",
+    }
 }
 
 fn fam_num(family: &str) -> u8 {
@@ -1280,50 +1339,137 @@ fn driver_e2e_matches_fixture_truth() {
         .filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("ident")))
         .collect();
     assert!(!ident_obs.is_empty(), "snapshot must carry IDENTs");
-    for obs in &ident_obs {
-        let key_hash = obs.backend_payload["key_hash"]
-            .as_u64()
-            .expect("key_hash u64");
-        let fam = fam_num(obs.backend_payload["family"].as_str().expect("family"));
-        let op = op_num(obs.backend_payload["op"].as_str().expect("op"));
-        let joined: Vec<&NativeObservation> = observations
+    assert_eq!(snap.overflow_identities, 0, "healthy drain has no OVERFLOW");
+    // Oracle: raw snapshot parses (Task-1 idiom). The hash join runs on
+    // raw words — NOT on decoded strings: kernel name tails past the NUL
+    // are not guaranteed zero (live-observed on alloc-path requested
+    // names), so NUL-truncated strings cannot re-encode the hashed words.
+    let oracle_idents: Vec<kryprobe_abi::kcrypto_agg::KCtl> = snap
+        .idents
+        .iter()
+        .map(
+            |ident| match parse_snapshot_row(&ident.0).expect("ident parses") {
+                ParsedRow::Ident { kctl } => kctl,
+                _ => panic!("ident bytes decoded off-kind"),
+            },
+        )
+        .collect();
+    // Decode exactness, order-independent (multiset) and in feed order:
+    // every ident byte the snapshot drained, the backend decoded exactly.
+    assert_eq!(
+        ident_obs.len(),
+        oracle_idents.len(),
+        "no ident lost or added"
+    );
+    let mut obs_hashes: Vec<u64> = ident_obs
+        .iter()
+        .map(|o| o.backend_payload["key_hash"].as_u64().expect("key_hash"))
+        .collect();
+    let mut oracle_hashes: Vec<u64> = oracle_idents.iter().map(|c| c.key_hash).collect();
+    obs_hashes.sort_unstable();
+    oracle_hashes.sort_unstable();
+    assert_eq!(obs_hashes, oracle_hashes, "ident hash multiset exact");
+    for (obs, kctl) in ident_obs.iter().zip(oracle_idents.iter()) {
+        assert_eq!(
+            obs.backend_payload["key_hash"].as_u64(),
+            Some(kctl.key_hash)
+        );
+        let (fam, op, res, ctx) = unpack_head(kctl.val0);
+        assert_eq!(
+            obs.backend_payload["family"].as_str(),
+            Some(family_spelling(fam))
+        );
+        assert_eq!(obs.backend_payload["op"].as_str(), Some(op_spelling(op)));
+        assert_eq!(
+            obs.backend_payload["result"].as_str(),
+            Some(result_spelling(res))
+        );
+        assert_eq!(
+            obs.backend_payload["context"].as_str(),
+            Some(expected_context(ctx))
+        );
+        let (alg_len, drv_len) = kryprobe_abi::kcrypto_agg::kctl_unpack_lens(kctl.val1);
+        assert_eq!(
+            obs.backend_payload["name_lens"]["alg"].as_u64(),
+            Some(u64::from(alg_len))
+        );
+        assert_eq!(
+            obs.backend_payload["name_lens"]["drv"].as_u64(),
+            Some(u64::from(drv_len))
+        );
+        assert_eq!(
+            obs.backend_payload["first_seen_ns"].as_u64(),
+            Some(kctl.val2)
+        );
+    }
+    // Hash join on oracle data (C5): every IDENT joins a snapshot row by
+    // hash with consistent head/lengths/window; decoded windows match the
+    // oracle rows index-for-index (rows feed first, in order).
+    let oracle_rows: Vec<OracleRow> = snap
+        .rows
+        .iter()
+        .map(
+            |row| match parse_snapshot_row(&row.0).expect("row parses") {
+                ParsedRow::Agg { kagg, vagg } => OracleRow {
+                    fam: kagg.fam(),
+                    op: kagg.op(),
+                    res: kagg.res(),
+                    ctx: kagg.ctx(),
+                    alg: cstr(&words_to_bytes(&kagg.alg())),
+                    drv: cstr(&words_to_bytes(&kagg.drv())),
+                    alg_words: kagg.alg(),
+                    drv_words: kagg.drv(),
+                    val: vagg,
+                },
+                _ => panic!("row bytes decoded off-kind"),
+            },
+        )
+        .collect();
+    let agg_obs: Vec<&NativeObservation> = observations
+        .iter()
+        .filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("agg")))
+        .collect();
+    assert_eq!(agg_obs.len(), oracle_rows.len());
+    for (obs, oracle) in agg_obs.iter().zip(oracle_rows.iter()) {
+        assert_eq!(
+            obs.backend_payload["algorithm"].as_str(),
+            Some(oracle.alg.as_str())
+        );
+        assert_eq!(
+            obs.backend_payload["driver"].as_str(),
+            Some(oracle.drv.as_str())
+        );
+    }
+    for kctl in oracle_idents.iter().filter(|c| c.kind == KCTL_IDENT) {
+        let gated: Vec<&OracleRow> = oracle_rows
             .iter()
-            .filter(|o| o.backend_payload.get("row") == Some(&serde_json::json!("agg")))
-            .filter(|o| {
-                let alg = words_for_name(o.backend_payload["algorithm"].as_str().expect("alg"));
-                let drv = words_for_name(o.backend_payload["driver"].as_str().expect("drv"));
-                kcrypto_ident_hash(fam, op, &alg, &drv) == key_hash
+            .filter(|r| {
+                kcrypto_ident_hash(r.fam, r.op, &r.alg_words, &r.drv_words) == kctl.key_hash
             })
             .collect();
         assert!(
-            !joined.is_empty(),
-            "IDENT {key_hash:016x} joins a decoded row"
+            !gated.is_empty(),
+            "IDENT {:016x} joins no snapshot row",
+            kctl.key_hash
         );
-        let first_seen = obs.backend_payload["first_seen_ns"]
-            .as_u64()
-            .expect("first_seen");
-        let first = joined
+        let heads: Vec<u64> = gated
             .iter()
-            .map(|o| {
-                o.backend_payload["window"]["first_ns"]
-                    .as_u64()
-                    .expect("first")
-            })
-            .min()
-            .expect("joined");
-        let last = joined
-            .iter()
-            .map(|o| {
-                o.backend_payload["window"]["last_ns"]
-                    .as_u64()
-                    .expect("last")
-            })
-            .max()
-            .expect("joined");
+            .map(|r| kctl_pack_head(r.fam, r.op, r.res, r.ctx))
+            .collect();
         assert!(
-            first <= first_seen && first_seen <= last,
-            "IDENT inside gate window"
+            heads.contains(&kctl.val0),
+            "IDENT head {:#x} matches no row of gate {:016x}",
+            kctl.val0,
+            kctl.key_hash
         );
+        let first = gated.iter().map(|r| r.val.first_ns).min().expect("gated");
+        let last = gated.iter().map(|r| r.val.last_ns).max().expect("gated");
+        assert!(
+            first <= kctl.val2 && kctl.val2 <= last,
+            "IDENT ns {} outside gate window [{first}, {last}]",
+            kctl.val2
+        );
+        assert_eq!(kctl.val3, 0, "IDENT val3 must be reserved zero");
     }
 
     // Finalize: observations == decoded; healthy integrity (drops 0, gap 0).
