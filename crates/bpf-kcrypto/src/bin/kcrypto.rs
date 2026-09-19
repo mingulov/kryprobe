@@ -458,8 +458,10 @@ fn emit_ctl(kind: u8, key_hash: u64, head: u64, lens: u64, now: u64) {
 /// identity in `KIDN` (saturating) and emit one `OVERFLOW` event on the
 /// first overflow per identity (ring volume stays identity-bounded).
 /// A concurrent inserter winning the race just moves the count (benign);
-/// a full `KIDN` stays silent (observable via the `KTOT`-vs-sum gap +
-/// the `KIDN` dump, totals still preserved).
+/// a full `KIDN` stays SILENT by design (C9): a per-observation `OVERFLOW`
+/// here would flood the ring (kp2 S7: rare control events only).
+/// Observable instead via the `KTOT`-vs-sum gap (K2 publishes as
+/// `attribution_overflow`) + the `KIDN` dump showing full; totals preserved.
 #[inline(always)]
 fn overflow_path(key_hash: u64, head: u64, lens: u64, now: u64) {
     if let Some(slot) = KIDN.get_ptr_mut(&key_hash) {
@@ -570,8 +572,12 @@ fn observe(
     }
     // First-seen gate: exactly one `IDENT` per identity (the `is_ok`
     // resolves the concurrent-inserter race). A full `KIDN` (insert
-    // failed AND the key is still absent — not a lost race) emits
-    // `OVERFLOW` instead; the `KAGG` row still carries the full identity.
+    // failed AND the key is still absent — not a lost race) stays SILENT
+    // by design (C9): the 257th+ distinct identity gets no ring event,
+    // because a per-observation `OVERFLOW` here would flood the ring
+    // (kp2 S7: rare control events only). Observable via the
+    // `KTOT`-vs-sum gap (K2 `attribution_overflow`) + the `KIDN` dump
+    // showing full; the `KAGG` row still carries the full identity.
     if KIDN.get_ptr(&hash).is_none() {
         let zero: u8 = 0;
         if KIDN.insert(&hash, &zero, BPF_NOEXIST).is_ok() {
