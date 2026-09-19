@@ -51,6 +51,16 @@ fn help_case() {
 fn backends_golden_case() {
     let output = run(&["backends"]);
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    if !btf_available() {
+        // BTF-absent hosts render `kcrypto: unavailable (...)`; the golden
+        // pins the BTF-present `available` render, so skip the golden here
+        // (BTF-adaptive, like the doctor markers below).
+        assert!(
+            stdout_of(&output).contains("kcrypto: unavailable ("),
+            "missing unavailable kcrypto row"
+        );
+        return;
+    }
     assert_golden(&golden_path("backends.txt"), &output.stdout);
 }
 
@@ -108,8 +118,25 @@ const PROBE_NAMES: [&str; 17] = [
 /// K2.3 verdict dimensions (brief-exact spellings).
 const VERDICT_DIMS: [&str; 5] = ["symbols", "caps", "btf", "attach", "object"];
 
+fn btf_available_at(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok()
+}
+
 fn btf_available() -> bool {
-    std::fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
+    btf_available_at(std::path::Path::new("/sys/kernel/btf/vmlinux"))
+}
+
+#[test]
+fn btf_gate_predicate_case() {
+    // The golden gate is pure path-existence: a missing path maps to
+    // BTF-absent (skip), an existing file maps to present (compare).
+    assert!(!btf_available_at(std::path::Path::new(
+        "/nonexistent-dir/kryprobe-btf-probe"
+    )));
+    let probe = std::env::temp_dir().join(format!("kryprobe-btf-{}", std::process::id()));
+    std::fs::write(&probe, b"vmlinux").expect("write btf probe");
+    assert!(btf_available_at(&probe));
+    std::fs::remove_file(&probe).ok();
 }
 
 #[test]
