@@ -28,6 +28,8 @@
 //! skipped backend are dropped undecoded; the receipt counts them
 //! (`dropped_events`, totaled by [`DriverReport::skipped_drops`]) so
 //! skip-drops stay visible to integrity accounting alongside the rollup.
+//!
+//! Shared-layer losses enter once via [`DriverReport::feed_shared_losses`] (exactly-once: second feed is `SharedFeedError::DuplicateFeed`), outside the per-backend sums.
 
 use crate::attach::{CookieAllocator, CookieExhausted, CookieRange};
 use crate::backend::{

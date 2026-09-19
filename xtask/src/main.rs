@@ -157,21 +157,77 @@ fn pinned_channel() -> Option<String> {
 
 pub(crate) fn channel_from_file(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
+    channel_from_text(&text)
+}
+
+fn channel_from_text(text: &str) -> Option<String> {
     for line in text.lines() {
         let rest = match line.trim().strip_prefix("channel") {
             Some(rest) => rest,
             None => continue,
         };
-        if !rest.trim_start().starts_with('=') {
-            continue;
-        }
-        let mut parts = line.split('"');
-        let _before = parts.next()?;
-        let channel = parts.next()?;
+        let after_eq = match rest.trim_start().strip_prefix('=') {
+            Some(after_eq) => after_eq,
+            None => continue,
+        };
+        // One matching quote pair after `=`: `"..."` or `'...'`; anything
+        // else (unquoted, empty, unclosed) is not a channel.
+        let value = after_eq.trim_start();
+        let quote = match value.as_bytes().first() {
+            Some(b'"') => '"',
+            Some(b'\'') => '\'',
+            _ => continue,
+        };
+        let end = match value[1..].find(quote) {
+            Some(end) => end,
+            None => continue,
+        };
+        let channel = &value[1..1 + end];
         if channel.is_empty() {
             continue;
         }
         return Some(channel.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_from_file;
+
+    fn read_case(name: &str, body: &str) -> Option<String> {
+        let path = std::env::temp_dir().join(format!(
+            "kryprobe-xtask-channel-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, body).expect("write temp toolchain case");
+        let got = channel_from_file(&path);
+        std::fs::remove_file(&path).ok();
+        got
+    }
+
+    #[test]
+    fn channel_single_quoted_parses() {
+        assert_eq!(
+            read_case("single", "channel = 'nightly-2026-09-16'\n").as_deref(),
+            Some("nightly-2026-09-16")
+        );
+    }
+
+    #[test]
+    fn channel_double_quoted_parses() {
+        assert_eq!(
+            read_case("double", "[toolchain]\nchannel = \"1.88\"\n").as_deref(),
+            Some("1.88")
+        );
+    }
+
+    #[test]
+    fn channel_unquoted_and_garbage_is_none() {
+        assert_eq!(read_case("unquoted", "channel = 1.88\n"), None);
+        assert_eq!(read_case("empty", "channel = \"\"\n"), None);
+        assert_eq!(read_case("unclosed", "channel = \"1.88\n"), None);
+        assert_eq!(read_case("garbage", "[toolchain]\nfoo = 1\n"), None);
+        assert_eq!(read_case("missing", "[other]\nchannelx = \"1\"\n"), None);
+    }
 }

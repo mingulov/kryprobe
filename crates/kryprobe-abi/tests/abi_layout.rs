@@ -20,6 +20,34 @@ fn spine_event_size_and_align_are_frozen() {
 }
 
 #[test]
+fn spine_event_field_offsets_pinned() {
+    assert_eq!(std::mem::offset_of!(SpineEvent, cookie), 0);
+    assert_eq!(std::mem::offset_of!(SpineEvent, tgid), 8);
+    assert_eq!(std::mem::offset_of!(SpineEvent, tid), 12);
+    assert_eq!(std::mem::offset_of!(SpineEvent, monotonic_ns), 16);
+    assert_eq!(std::mem::offset_of!(SpineEvent, seq), 24);
+    assert_eq!(std::mem::offset_of!(SpineEvent, flags), 32);
+    assert_eq!(std::mem::offset_of!(SpineEvent, reserved), 36);
+}
+
+#[test]
+fn raw_header_field_offsets_pinned() {
+    assert_eq!(std::mem::offset_of!(RawEventHeader, abi_version), 0);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, backend_id), 2);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, event_kind), 4);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, flags), 6);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, total_len), 8);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, cpu), 12);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, session_cookie), 16);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, monotonic_ns), 24);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, tgid), 32);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, tid), 36);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, process_generation), 40);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, plan_generation), 48);
+    assert_eq!(std::mem::offset_of!(RawEventHeader, reserved), 52);
+}
+
+#[test]
 fn wire_id_consts_match_contracts() {
     assert_eq!(ABI_VERSION, 0);
     assert_eq!(BACKEND_P11, 1);

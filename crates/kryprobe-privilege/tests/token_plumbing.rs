@@ -237,6 +237,55 @@ fn smoke() {
     run_roundtrip();
 }
 
+/// Token-path allowlist denial (X16): an unlisted program id is refused
+/// with typed `LoaderError::NotAllowed` before the object bytes parse,
+/// so empty bytes plus a real minted token suffice — no BPF load is
+/// attempted. Root + 6.9 + fixtures; incapable
+/// hosts skip via the euid/kernel gates or mint `Denied`.
+#[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
+fn token_path_allowlist_denies_unlisted_object() {
+    use kryprobe_core::authority::BpfLoadAuthority;
+    use kryprobe_privilege::LocalPrivilegedAuthority;
+    use kryprobe_privilege::ProgramId;
+    use kryprobe_privilege::bpfloader::LoaderError;
+    use kryprobe_privilege::token::{TokenError, mint_smoke_token};
+    // SAFETY: idempotent getter.
+    if unsafe { libc::geteuid() } != 0 {
+        println!("SKIP: token-path allowlist proof needs euid == 0");
+        return;
+    }
+    let raw = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let release = kryprobe_privilege::probe::parse_kernel_release(raw.trim()).unwrap_or((0, 0));
+    if release < (6, 9) {
+        println!("SKIP: token delegation needs kernel 6.9+, have {release:?}");
+        return;
+    }
+    let minted = match mint_smoke_token() {
+        Ok(minted) => minted,
+        Err(TokenError::Denied { errno, .. })
+            if [libc::EPERM, libc::EACCES, libc::EOPNOTSUPP].contains(&errno) =>
+        {
+            println!("SKIP: kernel denied split-flow mint (errno {errno})");
+            return;
+        }
+        Err(err) => panic!("mint failed dishonestly: {err}"),
+    };
+    let err = match LocalPrivilegedAuthority.load_program_with_token(
+        ProgramId::UprobeMultiP11Probe,
+        &[],
+        minted.handle(),
+    ) {
+        // `LoadedSpine` is not `Debug`, so no `expect_err` here.
+        Ok(_) => panic!("unlisted program id must be denied on the token path"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, LoaderError::NotAllowed { id } if id == ProgramId::UprobeMultiP11Probe),
+        "token-path denial must be typed NotAllowed, got {err}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn run_roundtrip() {
     use kryprobe_privilege::token::{TokenError, run_smoke_roundtrip};
