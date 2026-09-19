@@ -1,0 +1,5 @@
+FAMILY OP ALGORITHM DRIVER CALLS BYTES OK QUEUED ERRORS
+aead decrypt gcm(aes) aesni 7 448 5 0 2
+skcipher encrypt cbc(aes) aesni 25 2500 25 0 0
+TOTAL - - - 32 2948 30 0 2
+COMPLETE

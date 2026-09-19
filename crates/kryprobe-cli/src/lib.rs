@@ -13,6 +13,7 @@ pub mod cmd_inspect;
 pub mod cmd_report;
 pub mod cmd_selftest;
 pub mod cmd_stub;
+pub mod cmd_watch;
 pub mod live;
 pub mod selftest_bpf;
 pub mod selftest_synth;
@@ -47,13 +48,16 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             selftest_bpf::run(calls, out.as_deref(), stdout, stderr)
         }
         Command::SelftestToken => selftest_token::run(stdout, stderr),
-        Command::Watch { .. } => {
-            cmd_stub::run_uninstalled("watch --system", "the kcrypto backend", stderr)
+        Command::Watch { source, duration } => {
+            cmd_watch::run_watch(&source, duration, stdout, stderr)
         }
         Command::Report { file } => cmd_report::run(&file, stdout, stderr),
-        Command::ReportLive { .. } => {
-            cmd_stub::run_uninstalled("report --system", "the kcrypto backend", stderr)
-        }
+        Command::ReportLive {
+            source,
+            duration,
+            format,
+            out,
+        } => cmd_report::run_report_live(&source, duration, format, out.as_deref(), stdout, stderr),
         Command::Check { .. } => {
             cmd_stub::run_uninstalled("check --system", "the kcrypto backend", stderr)
         }
