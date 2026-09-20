@@ -14,32 +14,30 @@ use kryprobe_core::evidence::payload_keys as K;
 use kryprobe_core::ids::{IdIssuer, PlanGeneration, SessionId};
 
 fn agg_row(calls: u64) -> kryprobe_privilege::kcrypto_snapshot::RowBytes {
-    let mut out = Vec::with_capacity(382);
-    out.push(0x01);
-    out.push(1);
-    out.extend_from_slice(&[KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC]);
-    out.extend_from_slice(b"cbc(aes)");
-    out.push(0);
-    out.extend_from_slice(&[0u8; 260 - 4 - 9]);
-    out.extend_from_slice(&calls.to_le_bytes());
-    out.extend_from_slice(&[0u8; 120 - 8]);
+    // 3A-M-T7: canonical builder (fills preserved from the old local copy).
+    let out =
+        kryprobe_testkit::kcrypto_rows::agg_row_bytes(kryprobe_testkit::kcrypto_rows::AggSpec {
+            family: KFAM_SK,
+            op: KOP_ENC,
+            result: KRES_OK,
+            ctx: KCTX_PROC,
+            name: b"cbc(aes)",
+            calls,
+            bytes: 0,
+            ok: 0,
+        });
     kryprobe_privilege::kcrypto_snapshot::RowBytes::new(out).expect("hand row")
 }
 
 fn totals_row(calls: u64) -> kryprobe_privilege::kcrypto_snapshot::TotalsBytes {
-    let mut out = Vec::with_capacity(122);
-    out.push(0x01);
-    out.push(2);
-    out.extend_from_slice(&calls.to_le_bytes());
-    out.extend_from_slice(&[0u8; 120 - 8]);
+    // 3A-M-T7: canonical builder (fills preserved from the old local copy).
+    let out = kryprobe_testkit::kcrypto_rows::totals_row_bytes(calls, 0, 0);
     kryprobe_privilege::kcrypto_snapshot::TotalsBytes::new(out).expect("hand totals")
 }
 
 fn ident_row() -> kryprobe_privilege::kcrypto_snapshot::IdentBytes {
-    let mut out = Vec::with_capacity(50);
-    out.push(0x01);
-    out.push(3);
-    out.extend_from_slice(&[0u8; 48]);
+    // 3A-M-T7: canonical builder.
+    let out = kryprobe_testkit::kcrypto_rows::ident_row_bytes();
     kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(out).expect("hand ident")
 }
 

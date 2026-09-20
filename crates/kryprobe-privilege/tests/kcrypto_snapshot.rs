@@ -1001,3 +1001,93 @@ fn assert_snapshot_fold_matches_raw_maps(sensor: &ConfiguredKcrypto, rows: &[Sna
         "oracle KTOT fold == snapshot totals"
     );
 }
+
+#[test]
+#[ignore = "BPF lane: run under sudo with the lane lock"]
+fn captured_row_matches_canonical_layout() {
+    // 3A-H-T4: the canonical hand-rolled vectors are validated
+    // against live sensor bytes — length, version/kind, name
+    // termination, and counter offsets must agree, or the suites
+    // decode a fiction.
+    let _guard = suite_guard();
+    if !lane_ready("captured_row_matches_canonical_layout") {
+        return;
+    }
+    let bytes = kcrypto_bytes();
+    let (sensor, _points) = load_kcrypto_configured(&bytes, None)
+        .unwrap_or_else(|err| panic!("configured bring-up failed: {err}"));
+    let counts = alg_fixture::skcipher_roundtrip("ecb(aes)", 5).expect("capture traffic");
+    assert_eq!((counts.enc, counts.dec), (5, 5));
+    let snap = snapshot_rows(&sensor).expect("snapshot_rows");
+    let enc = snap
+        .rows
+        .iter()
+        .find(|row| {
+            row.0[2] == KFAM_SK
+                && row.0[3] == KOP_ENC
+                && row.0[4] == KRES_OK
+                && cstr(&row.0[6..262]) == "ecb(aes)"
+        })
+        .expect("captured ecb(aes) enc row");
+    assert_eq!(enc.0.len(), kryprobe_testkit::kcrypto_rows::AGG_LEN);
+    assert_eq!(enc.0[0], SNAPSHOT_VERSION);
+    assert_eq!(enc.0[1], ROW_KIND_AGG);
+    assert!(
+        enc.0[6..262].contains(&0),
+        "captured name NUL-terminates in-field"
+    );
+    let calls = u64::from_le_bytes(enc.0[262..270].try_into().expect("calls field"));
+    assert!(calls >= 5, "enc calls cover the fixture traffic");
+    let totals = snap.totals.expect("KTOT row present");
+    assert_eq!(totals.0.len(), kryprobe_testkit::kcrypto_rows::TOTALS_LEN);
+    assert_eq!(totals.0[0], SNAPSHOT_VERSION);
+    assert_eq!(totals.0[1], ROW_KIND_TOTALS);
+}
+
+#[test]
+#[ignore = "BPF lane: run under sudo with the lane lock"]
+fn drain_start_stop_cycle_leaks_nothing() {
+    // M-T4: a full spawn → barrier → snapshot → stop cycle joins its
+    // worker (one spawn accounted) and leaves no epoll instance or fd
+    // behind. Lane-exclusive, so exact deltas are meaningful.
+    let _guard = suite_guard();
+    if !lane_ready("drain_start_stop_cycle_leaks_nothing") {
+        return;
+    }
+    fn live_fds(prefix: &str) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fd dir reads")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                std::fs::read_link(entry.path())
+                    .is_ok_and(|target| target.to_string_lossy().starts_with(prefix))
+            })
+            .count()
+    }
+    let bytes = kcrypto_bytes();
+    let (sensor, _points) = load_kcrypto_configured(&bytes, None)
+        .unwrap_or_else(|err| panic!("configured bring-up failed: {err}"));
+    let spawns_before = drain_spawns();
+    let epoll_before = live_fds("anon_inode:[eventpoll]");
+    let fds_before = std::fs::read_dir("/proc/self/fd")
+        .expect("fd dir reads")
+        .count();
+    let drain = session_drain(&sensor).expect("session drain spawns");
+    drain.inject_barrier(7);
+    let counts = alg_fixture::skcipher_roundtrip("ecb(aes)", 3).expect("cycle traffic");
+    assert_eq!((counts.enc, counts.dec), (3, 3));
+    let snap = snapshot_rows_with_drain(&sensor, &drain, 1).expect("cycle snapshot");
+    assert!(!snap.idents.is_empty(), "cycle observes traffic idents");
+    let stats = drain.stop();
+    assert_eq!(drain_spawns() - spawns_before, 1, "one spawn accounted");
+    assert_eq!(
+        live_fds("anon_inode:[eventpoll]"),
+        epoll_before,
+        "no epoll leaked"
+    );
+    let fds_after = std::fs::read_dir("/proc/self/fd")
+        .expect("fd dir reads")
+        .count();
+    assert_eq!(fds_after, fds_before, "no fd leaked");
+    assert_eq!(stats.queue_drops, 0, "healthy cycle drops nothing");
+}

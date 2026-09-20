@@ -11,6 +11,7 @@
 
 pub mod alg_fixture;
 pub mod golden;
+pub mod kcrypto_rows;
 
 pub use alg_fixture::{
     BurstCounts, CipherCounts, FixtureError, HashCounts, aead_decrypt_bad_tag, aead_roundtrip,

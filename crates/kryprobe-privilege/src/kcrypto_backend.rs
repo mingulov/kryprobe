@@ -2019,33 +2019,44 @@ mod tests {
         assert_eq!(name_from_words(&[0x6161_6161_6161_6161u64; 16]).len(), 128);
     }
 
-    /// Hand 382B agg row with `calls` observations.
+    /// Hand 382B agg row with `calls` observations (3A-M-T7: the
+    /// canonical builder; fills preserved from the old local copy).
     fn hand_agg(calls: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(382);
-        out.push(0x01);
-        out.push(1);
-        out.extend_from_slice(&[KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC]);
-        out.extend_from_slice(b"cbc(aes)\0");
-        out.extend_from_slice(&vec![0u8; 260 - 4 - 9]);
-        out.extend_from_slice(&calls.to_le_bytes());
-        out.extend_from_slice(&0u64.to_le_bytes()); // bytes
-        out.extend_from_slice(&calls.to_le_bytes()); // ok
-        out.extend_from_slice(&[0u8; 120 - 24]);
-        assert_eq!(out.len(), 382);
-        out
+        kryprobe_testkit::kcrypto_rows::agg_row_bytes(kryprobe_testkit::kcrypto_rows::AggSpec {
+            family: KFAM_SK,
+            op: KOP_ENC,
+            result: KRES_OK,
+            ctx: KCTX_PROC,
+            name: b"cbc(aes)",
+            calls,
+            bytes: 0,
+            ok: calls,
+        })
     }
 
-    /// Hand 122B totals row with `calls` observations.
+    /// Hand 122B totals row with `calls` observations (3A-M-T7:
+    /// canonical builder; fills preserved from the old local copy).
     fn hand_totals(calls: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(122);
-        out.push(0x01);
-        out.push(2);
-        out.extend_from_slice(&calls.to_le_bytes());
-        out.extend_from_slice(&640u64.to_le_bytes()); // bytes
-        out.extend_from_slice(&calls.to_le_bytes()); // ok
-        out.extend_from_slice(&[0u8; 120 - 24]);
-        assert_eq!(out.len(), 122);
-        out
+        kryprobe_testkit::kcrypto_rows::totals_row_bytes(calls, 640, calls)
+    }
+
+    /// Cross-crate consistency (3A-M-T7): the canonical testkit
+    /// builders mirror the wire consts — drift fails here, not as a
+    /// mysterious decode rejection in a consumer suite.
+    #[test]
+    fn canonical_row_layout_matches_wire_consts() {
+        use crate::kcrypto_snapshot::{
+            IDENT_BYTES_LEN, ROW_BYTES_LEN, ROW_KIND_AGG, ROW_KIND_IDENT, ROW_KIND_TOTALS,
+            SNAPSHOT_VERSION, TOTALS_BYTES_LEN,
+        };
+        use kryprobe_testkit::kcrypto_rows as canonical;
+        assert_eq!(canonical::VERSION, SNAPSHOT_VERSION);
+        assert_eq!(canonical::KIND_AGG, ROW_KIND_AGG);
+        assert_eq!(canonical::KIND_TOTALS, ROW_KIND_TOTALS);
+        assert_eq!(canonical::KIND_IDENT, ROW_KIND_IDENT);
+        assert_eq!(canonical::AGG_LEN, ROW_BYTES_LEN);
+        assert_eq!(canonical::TOTALS_LEN, TOTALS_BYTES_LEN);
+        assert_eq!(canonical::IDENT_LEN, IDENT_BYTES_LEN);
     }
 
     fn hand_snapshot(agg_calls: &[u64], tot_calls: Option<u64>) -> SnapshotRows {

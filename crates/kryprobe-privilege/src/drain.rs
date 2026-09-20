@@ -207,8 +207,53 @@ impl Drop for DrainThread {
 
 #[cfg(test)]
 mod tests {
-    use super::DrainStats;
+    use super::{DrainStats, DrainThread, drain_spawns};
+    use crate::fd::OwnedFd;
+    use kryprobe_core::DrainConfig;
     use kryprobe_core::evidence::SharedLosses;
+
+    /// Live epoll fds in this process (drain-specific leak signal —
+    /// no other unprivileged lib test creates epoll instances, so an
+    /// exact delta is meaningful where a raw fd count would be noise).
+    fn epoll_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("fd dir reads")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                std::fs::read_link(entry.path())
+                    .is_ok_and(|target| target.to_string_lossy() == "anon_inode:[eventpoll]")
+            })
+            .count()
+    }
+
+    #[test]
+    fn failed_spawn_leaks_no_thread_no_epoll() {
+        // M-T4: spawn over a non-map fd fails closed at mmap with no
+        // worker thread (spawn counter holds) and no epoll instance
+        // left behind, over repeated failures.
+        let config = DrainConfig {
+            max_events_per_iter: 64,
+            queue_depth: 16,
+            poll_timeout_ms: 10,
+        };
+        let spawns_before = drain_spawns();
+        let epoll_before = epoll_fds();
+        for _ in 0..32 {
+            // SAFETY: fresh `open` fd, owned by the wrapper from here.
+            let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(raw >= 0, "null opens");
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            let Err(err) = DrainThread::spawn(&owned, 4096, &config) else {
+                panic!("non-map fd must reject");
+            };
+            assert!(
+                matches!(err, super::DrainError::MmapFailed { .. }),
+                "fails at mmap, got {err:?}"
+            );
+        }
+        assert_eq!(drain_spawns(), spawns_before, "no worker spawned");
+        assert_eq!(epoll_fds(), epoll_before, "no epoll leaked");
+    }
 
     #[test]
     fn drain_stats_combine_with_ring_into_shared_losses() {

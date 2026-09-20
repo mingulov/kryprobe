@@ -1062,37 +1062,30 @@ impl kryprobe_core::backend::Backend for SuccessBackend {
 }
 
 fn script_agg_as(calls: u64, name8: &[u8; 8]) -> kryprobe_privilege::kcrypto_snapshot::RowBytes {
-    let mut out = Vec::with_capacity(382);
-    out.push(0x01);
-    out.push(1);
-    out.extend_from_slice(&[
-        kryprobe_abi::kcrypto_agg::KFAM_SK,
-        kryprobe_abi::kcrypto_agg::KOP_ENC,
-        kryprobe_abi::kcrypto_agg::KRES_OK,
-        kryprobe_abi::kcrypto_agg::KCTX_PROC,
-    ]);
-    out.extend_from_slice(name8);
-    out.push(0);
-    out.extend_from_slice(&[0u8; 260 - 4 - 9]);
-    out.extend_from_slice(&calls.to_le_bytes());
-    out.extend_from_slice(&[0u8; 120 - 8]);
+    // 3A-M-T7: canonical builder (fills preserved from the old local copy).
+    let out =
+        kryprobe_testkit::kcrypto_rows::agg_row_bytes(kryprobe_testkit::kcrypto_rows::AggSpec {
+            family: kryprobe_abi::kcrypto_agg::KFAM_SK,
+            op: kryprobe_abi::kcrypto_agg::KOP_ENC,
+            result: kryprobe_abi::kcrypto_agg::KRES_OK,
+            ctx: kryprobe_abi::kcrypto_agg::KCTX_PROC,
+            name: name8.as_slice(),
+            calls,
+            bytes: 0,
+            ok: 0,
+        });
     kryprobe_privilege::kcrypto_snapshot::RowBytes::new(out).expect("hand row")
 }
 
 fn script_totals(calls: u64) -> kryprobe_privilege::kcrypto_snapshot::TotalsBytes {
-    let mut out = Vec::with_capacity(122);
-    out.push(0x01);
-    out.push(2);
-    out.extend_from_slice(&calls.to_le_bytes());
-    out.extend_from_slice(&[0u8; 120 - 8]);
+    // 3A-M-T7: canonical builder (fills preserved from the old local copy).
+    let out = kryprobe_testkit::kcrypto_rows::totals_row_bytes(calls, 0, 0);
     kryprobe_privilege::kcrypto_snapshot::TotalsBytes::new(out).expect("hand totals")
 }
 
 fn script_ident() -> kryprobe_privilege::kcrypto_snapshot::IdentBytes {
-    let mut out = Vec::with_capacity(50);
-    out.push(0x01);
-    out.push(3);
-    out.extend_from_slice(&[0u8; 48]);
+    // 3A-M-T7: canonical builder.
+    let out = kryprobe_testkit::kcrypto_rows::ident_row_bytes();
     kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(out).expect("hand ident")
 }
 
@@ -1208,6 +1201,123 @@ fn live_success_path_scripted_sensor_three_ticks() {
     assert_eq!(outcome.coverage.completion.counters.len(), 1);
     // Exactly-once feed + finalize: Ok outcome proves the shared feed
     // ran once (double-feed errors) and finalize filed its summary.
+    assert!(
+        backend.finalized.load(std::sync::atomic::Ordering::Relaxed),
+        "finalize ran once"
+    );
+    assert!(
+        sensor.finished.load(std::sync::atomic::Ordering::Relaxed),
+        "sensor finish ran once"
+    );
+}
+
+/// M-T4: sensor serving unbounded identical ticks — the session
+/// ends only when the shared stop flag fires, so a stop-ignoring
+/// driver would hang this test instead of passing it.
+struct MidStopSensor {
+    tick: kryprobe_privilege::kcrypto_snapshot::SnapshotRows,
+    ticks: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl kryprobe_cli::live::SessionSensor for MidStopSensor {
+    fn snapshot_tick(
+        &mut self,
+        _barrier_id: u64,
+        _stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<kryprobe_privilege::kcrypto_snapshot::SnapshotRows, kryprobe_cli::live::LiveError>
+    {
+        self.ticks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.tick.clone())
+    }
+
+    fn kallsyms_text(&mut self) -> String {
+        String::new()
+    }
+
+    fn snapshot_who(
+        &mut self,
+    ) -> Result<
+        (Vec<kryprobe_privilege::kcrypto_backend::WhoSnapshot>, u64),
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok((Vec::new(), 0))
+    }
+
+    fn drop_sites(&mut self) -> Result<[u64; 8], kryprobe_cli::live::LiveError> {
+        Ok([0; 8])
+    }
+
+    fn finish(&mut self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn live_stop_mid_run_tears_down_cleanly() {
+    // M-T4: a second thread sets the shared stop flag after the 3rd
+    // tick starts; the driver must end the session (Ok, Finalized,
+    // exactly-once finalize + sensor finish), not hang or error.
+    let _suite = suite_guard();
+    let mut controller = attached_controller();
+    let tick = kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![script_agg_as(10, b"cbc(aes)")],
+        totals: Some(script_totals(10)),
+        idents: vec![script_ident()],
+        overflow_identities: 0,
+        drops: 0,
+        monotonic_ns: 100,
+    };
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut sensor = MidStopSensor {
+        tick,
+        ticks: ticks.clone(),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = SuccessBackend {
+        decodes: std::sync::atomic::AtomicU64::new(0),
+        finalized: std::sync::atomic::AtomicBool::new(false),
+        table: kryprobe_privilege::kallsyms::SymTable::parse(""),
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(3600),
+        tick_ms: 1,
+        token: None,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while ticks.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                std::thread::yield_now();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        kryprobe_cli::live::drive_session(
+            &cfg,
+            &backend,
+            &mut sensor,
+            &stop,
+            9,
+            kryprobe_core::ids::SessionId::new(1),
+            kryprobe_core::ids::PlanGeneration::new(1),
+            &kryprobe_core::ids::IdIssuer::default(),
+            None,
+            &mut controller,
+        )
+    })
+    .expect("stopped session drives green");
+    let served = sensor.ticks.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        (3..=6).contains(&served),
+        "stop lands mid-run, promptly ({served} ticks)"
+    );
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
     assert!(
         backend.finalized.load(std::sync::atomic::Ordering::Relaxed),
         "finalize ran once"
