@@ -30,11 +30,13 @@ kryprobe inspect --pid N [--json]
 kryprobe selftest synthetic [--out FILE]
 kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
-kryprobe watch --system [--source S] [--duration N]
-kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S]
+kryprobe watch --system [--source S] [--duration N] [--token PATH]
+kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S] [--token PATH]
 kryprobe report FILE
-kryprobe check --system --policy FILE [--duration N] [--source S]
+kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH]
 kryprobe import FILE
+kryprobe token mint [--bin PATH] [--receipt PATH] [--force]
+kryprobe token status [--bin PATH]
 kryprobe plan|observe|run ...   # stub: exit 4, typed marker
 ```
 
@@ -87,14 +89,49 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   plus `native` carrying the FULL original doc verbatim. Unprivileged;
   exit 0 on success, 2 on unreadable/invalid input or an unknown schema
   marker (naming the marker found), 1 on internal failure.
+- `token mint` is the root one-shot file-cap grant (the spec §3.3
+  `setcap` fallback): it writes a `security.capability` xattr
+  granting `cap_bpf,cap_perfmon+ep` on `--bin` (default: the running
+  binary, resolved; symlink targets are refused) plus a JSON receipt
+  to stdout or `--receipt`. Exit 0 on success; exit 4 without root;
+  exit 2 on a bad `--bin` path, on a target that is not the running
+  kryprobe binary without `--force`, or on receipt-overwrite without
+  `--force`. See `docs/deployment.md` for the deploy runbook
+  (install → `mint` → verify, re-mint after every binary swap).
+- `token status` reports file caps + token-pin usability for `--bin`
+  (default: the running binary). Never privileged; exit 0 always
+  (findings ride the output, not the exit code).
+- `watch`/`report --system`/`check --system` accept `--token PATH`
+  to point BPF token-FD delegation at an explicit bpffs pin (see the
+  env table: `--token` beats `KRYPROBE_TOKEN` beats default-pin
+  discovery).
 
 ## Environment overrides
 
 | Variable | Used by | Meaning |
 |----------|---------|---------|
-| `KRYPROBE_BPF_OBJ` | `selftest bpf`, benches | Spine object path (default: `target/kryprobe-bpf/spine.bpf.o`). |
-| `KRYPROBE_FIXTURE` | `selftest bpf`, benches | `spine_fixture` binary path. |
-| `KRYPROBE_TOKEN_WORKER` | lane tests | `token_worker` binary path. |
+| `KRYPROBE_BPF_DIR` | kcrypto object locator | Dir (or file, tried as-is) joined with `kcrypto.bpf.o`; tier 1 of the D2 try order. Ignored when elevated. |
+| `KRYPROBE_BPF_OBJ` | `selftest bpf`, benches | Spine object path (default: `target/kryprobe-bpf/spine.bpf.o`). Ignored when elevated. |
+| `KRYPROBE_FIXTURE` | `selftest bpf`, benches | `spine_fixture` binary path (dev-only override). Ignored when elevated — an elevated selftest never executes an env-steered helper. |
+| `KRYPROBE_TOKEN_WORKER` | lane tests | `token_worker` binary path (dev-only override, same elevated rule). |
+| `KRYPROBE_TOKEN` | `watch`/`report`/`check`, `token status` | BPF token bpffs pin path (a path, not a credential): `--token` > env > default-pin discovery. |
+| `KRYPROBE_SMOKE_WORKER` | `token_worker` | Internal spawn marker (`=1` only; set by the spawner, not operators). |
+| `KRYPROBE_UPDATE_GOLDENS` | testkit golden tests | When `=1`, a golden mismatch rewrites the file instead of failing (tests only, never product). |
+| `KRYPROBE_PIN_DIGESTS` | `kryprobe-privilege` build | Comma-separated sha256 pins for release BPF objects (build-time; see below). |
+
+Object-locator try order (D2): `KRYPROBE_BPF_DIR` (or file as-is) →
+exe-relative `kryprobe-bpf/kcrypto.bpf.o` (the bundled/install tier)
+→ CWD-relative `target/kryprobe-bpf/kcrypto.bpf.o` (dev tier).
+Security note: env and CWD tiers exist for unprivileged dev/test
+only. An elevated process (euid 0 or effective `CAP_BPF`/
+`CAP_SYS_ADMIN`, i.e. any file-cap deployment) loads only the
+exe-bundled tier — so a hand-rolled deploy fails closed (exit 4,
+`kcrypto_object_unreadable`) instead of loading a stray object — and
+release builds additionally refuse any object whose sha256 is not in
+the `KRYPROBE_PIN_DIGESTS` build-time pin set. `doctor` prints the
+resolved object path (`kcrypto_object` row) so the effective
+configuration is inspectable. The normative trusted path is
+`docs/deployment.md`.
 
 ## Privileged runs
 

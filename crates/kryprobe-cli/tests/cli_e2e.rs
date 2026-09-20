@@ -94,7 +94,7 @@ fn backends_json_shape_case() {
     }
 }
 
-const PROBE_NAMES: [&str; 18] = [
+const PROBE_NAMES: [&str; 19] = [
     "kernel_release",
     "bpf_syscall",
     "map_create",
@@ -111,6 +111,9 @@ const PROBE_NAMES: [&str; 18] = [
     "uretprobe_seccomp_fork",
     // K2.3: appended after the existing 14, never reordered.
     "kcrypto_symbols",
+    // Review-remain (4B-H6.3): resolved object path, ahead of the
+    // attach probe that consumes it.
+    "kcrypto_object",
     "kcrypto_attach",
     "lockdown",
     // K5: delegation probe, appended last, never reordered.
@@ -204,7 +207,7 @@ fn doctor_json_shape_case() {
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("doctor json");
     let probes = json["probes"].as_array().expect("probes array");
-    assert_eq!(probes.len(), 18);
+    assert_eq!(probes.len(), 19);
     for (probe, want) in probes.iter().zip(PROBE_NAMES) {
         assert_eq!(probe["name"], want);
         let outcome = probe["outcome"].as_str().expect("outcome");
@@ -212,6 +215,14 @@ fn doctor_json_shape_case() {
             ["pass", "denied", "skipped"].contains(&outcome),
             "bad outcome {outcome}"
         );
+        // 4B-H6.3: a passing object row names the resolved artifact.
+        if want == "kcrypto_object" && outcome == "pass" {
+            let detail = probe["detail"].as_str().expect("object detail");
+            assert!(
+                detail.ends_with("kcrypto.bpf.o"),
+                "object detail names artifact: {detail}"
+            );
+        }
         // Volatile by shape: a passing release row names a dotted version.
         if want == "kernel_release" && outcome == "pass" {
             let detail = probe["detail"].as_str().expect("release detail");

@@ -106,17 +106,22 @@ fn dump_kagg_rows(sensor: &ConfiguredKcrypto) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(
-            &sensor.loaded.maps.agg,
-            key.as_deref(),
-            260,
-            "canary/kagg-iter",
-        )
+        // SAFETY: KAGG key is KAgg, exactly 260B.
+        let next = unsafe {
+            map_get_next_key(
+                &sensor.loaded.maps.agg,
+                key.as_deref(),
+                260,
+                "canary/kagg-iter",
+            )
+        }
         .expect("KAGG iteration");
         let Some(k) = next else { break };
         assert_eq!(k.len(), 260, "KAGG key size drifted");
-        let raw = map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "canary/kagg-val")
-            .expect("KAGG lookup");
+        // SAFETY: KAGG value is VAgg, 120B × possible_cpus.
+        let raw =
+            unsafe { map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "canary/kagg-val") }
+                .expect("KAGG lookup");
         let mut lanes = Vec::with_capacity(ncpu);
         for c in 0..ncpu {
             lanes.push(vagg_from_bytes(&raw[c * 120..(c + 1) * 120]).expect("VAgg lane"));
@@ -220,54 +225,70 @@ fn drain_ring_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
 fn dump_all_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
     let ncpu = possible_cpus() as usize;
     let mut out = Vec::new();
+    // SAFETY: KCFG wire is exactly 76B.
     out.extend_from_slice(
-        &map_lookup_bytes(
-            &sensor.loaded.maps.config,
-            &0u32.to_le_bytes(),
-            76,
-            "canary/kcfg",
-        )
+        &unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.config,
+                &0u32.to_le_bytes(),
+                76,
+                "canary/kcfg",
+            )
+        }
         .expect("KCFG dump"),
     );
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(
-            &sensor.loaded.maps.agg,
-            key.as_deref(),
-            260,
-            "canary/kagg-keys",
-        )
+        // SAFETY: KAGG key is KAgg, exactly 260B.
+        let next = unsafe {
+            map_get_next_key(
+                &sensor.loaded.maps.agg,
+                key.as_deref(),
+                260,
+                "canary/kagg-keys",
+            )
+        }
         .expect("KAGG iteration");
         let Some(k) = next else { break };
         out.extend_from_slice(&k);
         out.extend_from_slice(
-            &map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "canary/kagg-vals")
-                .expect("KAGG lookup"),
+            // SAFETY: KAGG value is VAgg, 120B × possible_cpus.
+            &unsafe {
+                map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "canary/kagg-vals")
+            }
+            .expect("KAGG lookup"),
         );
         key = Some(k);
     }
+    // SAFETY: KTOT value is VAgg, 120B × possible_cpus.
     out.extend_from_slice(
-        &map_lookup_bytes(
-            &sensor.loaded.maps.total,
-            &0u32.to_le_bytes(),
-            120 * ncpu,
-            "canary/ktot",
-        )
+        &unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.total,
+                &0u32.to_le_bytes(),
+                120 * ncpu,
+                "canary/ktot",
+            )
+        }
         .expect("KTOT dump"),
     );
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(
-            &sensor.loaded.maps.ident,
-            key.as_deref(),
-            8,
-            "canary/kidn-keys",
-        )
+        // SAFETY: KIDN key is u64, exactly 8B.
+        let next = unsafe {
+            map_get_next_key(
+                &sensor.loaded.maps.ident,
+                key.as_deref(),
+                8,
+                "canary/kidn-keys",
+            )
+        }
         .expect("KIDN iteration");
         let Some(k) = next else { break };
         out.extend_from_slice(&k);
         out.extend_from_slice(
-            &map_lookup_bytes(&sensor.loaded.maps.ident, &k, 1, "canary/kidn-vals")
+            // SAFETY: KIDN value is u8; value_len 1 is exact.
+            &unsafe { map_lookup_bytes(&sensor.loaded.maps.ident, &k, 1, "canary/kidn-vals") }
                 .expect("KIDN lookup"),
         );
         key = Some(k);
@@ -382,12 +403,15 @@ fn configured_entry_writes_kcfg_from_resolver() {
         resolve_kcrypto_offsets().expect("K5 offsets resolve fail-soft"),
     )
     .to_bytes();
-    let got = map_lookup_bytes(
-        &sensor.loaded.maps.config,
-        &0u32.to_le_bytes(),
-        76,
-        "configured/kcfg",
-    )
+    // SAFETY: KCFG wire is exactly 76B.
+    let got = unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.config,
+            &0u32.to_le_bytes(),
+            76,
+            "configured/kcfg",
+        )
+    }
     .expect("KCFG read");
     assert_eq!(got, want, "KCFG must equal the resolver's bytes");
     // From the pinned map too (bpffs-writability skips only this step:
@@ -409,12 +433,15 @@ fn configured_entry_writes_kcfg_from_resolver() {
         pin_fd(&sensor.loaded.maps.config, &dir, "KCFG")
             .unwrap_or_else(|err| panic!("pin KCFG failed: {err}"));
         assert!(dir.join("KCFG").exists(), "pin file must exist after pin");
-        let pinned = map_lookup_bytes(
-            &sensor.loaded.maps.config,
-            &0u32.to_le_bytes(),
-            76,
-            "configured/kcfg-pinned",
-        )
+        // SAFETY: KCFG wire is exactly 76B.
+        let pinned = unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.config,
+                &0u32.to_le_bytes(),
+                76,
+                "configured/kcfg-pinned",
+            )
+        }
         .expect("KCFG pinned read");
         assert_eq!(pinned, want, "pinned KCFG must equal the resolver's bytes");
     }

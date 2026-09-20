@@ -279,12 +279,15 @@ fn notrun_coverage() -> CoverageSummary {
 /// Session sensor `KIDN[KIDN_DROPS]` read (the K2 `finalize_drops` idiom:
 /// absent key reads healthy-zero; any other map failure is loud).
 fn session_drops(sensor: &ConfiguredKcrypto) -> Result<u8, LiveError> {
-    match map_lookup_bytes(
-        &sensor.loaded.maps.ident,
-        &KIDN_DROPS.to_le_bytes(),
-        1,
-        "live/kidn-drops",
-    ) {
+    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
+    match unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.ident,
+            &KIDN_DROPS.to_le_bytes(),
+            1,
+            "live/kidn-drops",
+        )
+    } {
         Ok(value) => Ok(value.first().copied().unwrap_or(0)),
         Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
         Err(err) => Err(LiveError::Internal(format!("live kidn-drops read: {err}"))),
@@ -524,11 +527,8 @@ pub fn run_live_capture_with_registry(
     // run D shows both KAGG+KIDN 256/256 full), so order is not
     // load-bearing — decode reads this sensor's rows only, and `finalize`
     // assesses the backend's own sensor.
-    let object_path = kryprobe_privilege::locate_kcrypto_object()
+    let (_object_path, object_bytes) = kryprobe_privilege::locate_kcrypto_object_bytes()
         .map_err(|err| LiveError::Unusable(format!("kcrypto object: {err}")))?;
-    let object_bytes = std::fs::read(&object_path).map_err(|err| {
-        LiveError::Unusable(format!("kcrypto object {}: {err}", object_path.display()))
-    })?;
     // K5 bring-up authority: the first usable token in discovery order
     // (`--token` > `KRYPROBE_TOKEN` > default pin), held across the
     // session-twin load below. No usable token and no process caps is

@@ -340,14 +340,22 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
     let mut rows = Vec::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(
-            &sensor.loaded.maps.agg,
-            key.as_deref(),
-            260,
-            "snapshot/kagg-iter",
-        )?;
+        // SAFETY: KAGG key is KAgg, exactly 260B (bpf-kcrypto map def).
+        let next = unsafe {
+            map_get_next_key(
+                &sensor.loaded.maps.agg,
+                key.as_deref(),
+                260,
+                "snapshot/kagg-iter",
+            )
+        }?;
         let Some(k) = next else { break };
-        let raw = map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "snapshot/kagg-val")?;
+        // SAFETY: KAGG is PerCpuHashMap<KAgg, VAgg>; VAgg is 120B
+        // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus, and the
+        // kernel writes all possible lanes.
+        let raw = unsafe {
+            map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "snapshot/kagg-val")
+        }?;
         let mut lanes = Vec::with_capacity(ncpu);
         for c in 0..ncpu {
             let lane = raw
@@ -378,12 +386,16 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
 /// fails the snapshot).
 fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsError> {
     let ncpu = possible_cpus() as usize;
-    let raw = match map_lookup_bytes(
-        &sensor.loaded.maps.total,
-        &0u32.to_le_bytes(),
-        120 * ncpu,
-        "snapshot/ktot",
-    ) {
+    // SAFETY: KTOT is PerCpuArray<VAgg>; VAgg is 120B
+    // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus.
+    let raw = match unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.total,
+            &0u32.to_le_bytes(),
+            120 * ncpu,
+            "snapshot/ktot",
+        )
+    } {
         Ok(raw) => raw,
         Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
             return Ok(None);
@@ -416,12 +428,15 @@ fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsEr
 /// Absent key = healthy zero; any other errno fails the snapshot (a
 /// broken `KIDN` read must be loud, never a silent zero).
 fn read_kidn_drops(sensor: &ConfiguredKcrypto) -> Result<(), MapOpsError> {
-    match map_lookup_bytes(
-        &sensor.loaded.maps.ident,
-        &KIDN_DROPS.to_le_bytes(),
-        1,
-        "snapshot/kidn-drops",
-    ) {
+    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
+    match unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.ident,
+            &KIDN_DROPS.to_le_bytes(),
+            1,
+            "snapshot/kidn-drops",
+        )
+    } {
         Ok(_) => Ok(()),
         Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(()),
         Err(err) => Err(err),

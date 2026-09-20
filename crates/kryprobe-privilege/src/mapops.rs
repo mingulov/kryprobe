@@ -247,11 +247,14 @@ pub fn map_update_bytes(
 /// Look up one element with raw key bytes into exactly `value_len`
 /// bytes (K1 Task 2: kcrypto map dumps).
 ///
+/// # Safety
+///
 /// The caller must pass the map's exact value size (percpu maps:
 /// `value_size * possible_cpus()` — the kernel writes all possible
-/// lanes; an undersized buffer is a kernel heap overwrite, same trust
-/// model as [`map_lookup_percpu_sum`]).
-pub fn map_lookup_bytes(
+/// lanes). An undersized buffer is a kernel heap overwrite (L-SEC-02);
+/// every call site documents its size provenance. Same trust model as
+/// [`map_lookup_percpu_sum`].
+pub unsafe fn map_lookup_bytes(
     map: &OwnedFd,
     key: &[u8],
     value_len: usize,
@@ -292,9 +295,13 @@ pub fn map_lookup_bytes(
 
 /// Iterate keys: `None` starts at the first key, `Some(prev)` steps.
 /// `Ok(None)` is end-of-iteration (`ENOENT`); any other errno is
-/// [`MapOpsError::LookupFailed`]. `key_len` must be the map's exact key
-/// size (K1 Task 2: `KAGG`/`KIDN` dumps).
-pub fn map_get_next_key(
+/// [`MapOpsError::LookupFailed`].
+///
+/// # Safety
+///
+/// `key_len` must be the map's exact key size (same L-SEC-02 rationale
+/// as [`map_lookup_bytes`]: the kernel writes `key_len` bytes).
+pub unsafe fn map_get_next_key(
     map: &OwnedFd,
     key: Option<&[u8]>,
     key_len: usize,
@@ -407,12 +414,18 @@ mod tests {
             matches!(err, MapOpsError::UpdateFailed { ref stage, errno } if stage == "unit/update" && errno == libc::EBADF),
             "got {err}"
         );
-        let err = map_lookup_bytes(&fd, &[0u8; 4], 8, "unit/lookup").unwrap_err();
+        // SAFETY: bad fd fails EBADF before any kernel write; the
+        // length is never trusted on the error path (M-T5: the sizing
+        // contract is probed by compilation — every production caller
+        // documents exact-size provenance — plus this fail-safe read).
+        let err = unsafe { map_lookup_bytes(&fd, &[0u8; 4], 8, "unit/lookup") }.unwrap_err();
         assert!(
             matches!(err, MapOpsError::LookupFailed { ref stage, errno } if stage == "unit/lookup" && errno == libc::EBADF),
             "got {err}"
         );
-        let err = map_get_next_key(&fd, None, 4, "unit/next").unwrap_err();
+        // SAFETY: bad fd fails EBADF before any kernel write (same
+        // M-T5 rationale as the lookup above).
+        let err = unsafe { map_get_next_key(&fd, None, 4, "unit/next") }.unwrap_err();
         assert!(
             matches!(err, MapOpsError::LookupFailed { ref stage, errno } if stage == "unit/next" && errno == libc::EBADF),
             "got {err}"

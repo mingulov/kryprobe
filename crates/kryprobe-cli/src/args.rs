@@ -74,13 +74,15 @@ pub enum Command {
     /// Root token roundtrip.
     SelftestToken,
     /// Root one-shot file-cap grant (`token mint`): `--bin` target
-    /// (default: current exe), `--receipt` copy, `--force` overwrite.
+    /// (default: current exe), `--receipt` copy, `--force` overwrite
+    /// plus foreign-binary override.
     TokenMint {
         /// Binary to grant caps on (`None` selects the current exe).
         bin: Option<PathBuf>,
         /// Receipt copy destination (`None` prints stdout only).
         receipt: Option<PathBuf>,
-        /// Overwrite an existing receipt.
+        /// Overwrite an existing receipt; also allows a target that
+        /// is not the running kryprobe binary.
         force: bool,
     },
     /// File caps + token-pin usability (`token status`, unprivileged).

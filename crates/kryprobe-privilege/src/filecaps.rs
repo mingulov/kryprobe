@@ -23,21 +23,39 @@ fn last_errno() -> i32 {
 }
 
 /// Writes the `security.capability` xattr (create-or-replace). A `NUL`
-/// byte in the path fails with `EINVAL` before any syscall.
+/// byte in the path fails with `EINVAL` before any syscall. Opens
+/// `O_NOFOLLOW` and writes via the fd (L-SEC-03): a symlink target
+/// fails `ELOOP` instead of writing through the link, with no
+/// path-swap TOCTOU between open and write.
 pub fn set_capability_xattr(target: &Path, value: &[u8]) -> Result<(), i32> {
     let c_path = CString::new(target.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
     let c_name = CString::new(XATTR_NAME).expect("static name has no NUL");
-    // SAFETY: pointers borrow live `CString`/slice bytes for the call.
-    let ret = unsafe {
-        libc::setxattr(
+    // SAFETY: path borrow is live for the call.
+    let fd = unsafe {
+        libc::open(
             c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: fd is open (checked above); the value borrow is live.
+    let ret = unsafe {
+        libc::fsetxattr(
+            fd,
             c_name.as_ptr(),
             value.as_ptr().cast::<std::os::raw::c_void>(),
             value.len(),
             0,
         )
     };
-    if ret == 0 { Ok(()) } else { Err(last_errno()) }
+    let errno = last_errno();
+    // SAFETY: fd came from the `open` above; single close.
+    unsafe {
+        libc::close(fd);
+    }
+    if ret == 0 { Ok(()) } else { Err(errno) }
 }
 
 /// Reads one `security.capability` value: size probe, then the read.
@@ -91,6 +109,22 @@ mod tests {
             get_capability_xattr(Path::new("/nonexistent-k5-filecaps-zzz")),
             Err(libc::ENOENT)
         );
+    }
+
+    #[test]
+    fn symlink_target_refused_without_following() {
+        // L-SEC-03: setxattr follows symlinks — the seam must open
+        // O_NOFOLLOW and fail ELOOP instead of writing through a link.
+        let dir =
+            std::env::temp_dir().join(format!("kryprobe-k5-filecaps-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("real");
+        std::fs::write(&target, b"real").expect("write fixture");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert_eq!(set_capability_xattr(&link, &[0u8; 20]), Err(libc::ELOOP));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

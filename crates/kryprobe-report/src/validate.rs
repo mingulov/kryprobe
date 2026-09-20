@@ -14,7 +14,7 @@ use self::kinds::KIND_TABLE;
 use crate::EVENT_SCHEMA_V0;
 use kryprobe_testkit::{StreamChecker, StreamFinding};
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// One validation defect; empty means the stream validates clean.
@@ -292,18 +292,70 @@ fn validate_and_render_file_with_schema(
     }
 }
 
+/// Maximum single line accepted by the streaming readers (M-SEC-02):
+/// unbounded lines are a local memory-exhaustion vector.
+pub const MAX_VALIDATE_LINE_BYTES: usize = 1 << 20;
+
+/// Outcome of one bounded line read.
+pub(crate) enum CappedLine {
+    /// A line (newline/`\r\n` stripped, UTF-8 checked).
+    Line(String),
+    /// Clean EOF (no bytes).
+    Eof,
+    /// I/O error, invalid UTF-8, or overlong line (fail-closed detail).
+    Unreadable(String),
+}
+
+/// Bounded `lines()`: at most `MAX_VALIDATE_LINE_BYTES + 2` bytes are
+/// ever buffered per line (content cap plus the newline probe), so a
+/// hostile overlong line refuses instead of OOMing (M-SEC-02).
+/// Otherwise identical to `BufRead::lines` (`\n`/`\r\n` stripped).
+pub(crate) fn next_line_capped(reader: &mut impl BufRead) -> CappedLine {
+    let mut buf = Vec::new();
+    match reader
+        .by_ref()
+        .take(MAX_VALIDATE_LINE_BYTES as u64 + 2)
+        .read_until(b'\n', &mut buf)
+    {
+        Ok(0) => return CappedLine::Eof,
+        Ok(_) => (),
+        Err(err) => return CappedLine::Unreadable(err.to_string()),
+    }
+    if buf.ends_with(b"\n") {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+    }
+    if buf.len() > MAX_VALIDATE_LINE_BYTES {
+        return CappedLine::Unreadable(format!(
+            "line too large (over {MAX_VALIDATE_LINE_BYTES} bytes)"
+        ));
+    }
+    match String::from_utf8(buf) {
+        Ok(line) => CappedLine::Line(line),
+        Err(err) => CappedLine::Unreadable(err.to_string()),
+    }
+}
+
 /// Streaming [`validate_str`]: same findings, O(1) records in memory.
 /// Stops fail-closed with [`ValidationFinding::Unreadable`] on any I/O
-/// error (including invalid UTF-8).
-pub fn validate_reader(reader: impl BufRead, schema_disk_bytes: &[u8]) -> Vec<ValidationFinding> {
+/// error (including invalid UTF-8) or overlong line.
+pub fn validate_reader(
+    mut reader: impl BufRead,
+    schema_disk_bytes: &[u8],
+) -> Vec<ValidationFinding> {
     let mut validator = LineValidator::new();
-    for (index, line) in reader.lines().enumerate() {
-        match line {
-            Ok(line) => validator.push_line(index + 1, &line),
-            Err(err) => {
-                return vec![ValidationFinding::Unreadable {
-                    detail: err.to_string(),
-                }];
+    let mut index = 0usize;
+    loop {
+        match next_line_capped(&mut reader) {
+            CappedLine::Line(line) => {
+                index += 1;
+                validator.push_line(index, &line);
+            }
+            CappedLine::Eof => break,
+            CappedLine::Unreadable(detail) => {
+                return vec![ValidationFinding::Unreadable { detail }];
             }
         }
     }
@@ -317,24 +369,22 @@ pub fn validate_reader(reader: impl BufRead, schema_disk_bytes: &[u8]) -> Vec<Va
 /// Stops fail-closed with [`ValidationFinding::Unreadable`] and no
 /// summary on any I/O error (including invalid UTF-8).
 pub fn validate_and_render_reader(
-    reader: impl BufRead,
+    mut reader: impl BufRead,
     schema_disk_bytes: &[u8],
 ) -> (Vec<ValidationFinding>, Option<String>) {
     let mut validator = LineValidator::new();
     let mut summary = crate::render::Summary::default();
-    for (index, line) in reader.lines().enumerate() {
-        match line {
-            Ok(line) => {
-                validator.push_line(index + 1, &line);
+    let mut index = 0usize;
+    loop {
+        match next_line_capped(&mut reader) {
+            CappedLine::Line(line) => {
+                index += 1;
+                validator.push_line(index, &line);
                 summary.push_line(&line);
             }
-            Err(err) => {
-                return (
-                    vec![ValidationFinding::Unreadable {
-                        detail: err.to_string(),
-                    }],
-                    None,
-                );
+            CappedLine::Eof => break,
+            CappedLine::Unreadable(detail) => {
+                return (vec![ValidationFinding::Unreadable { detail }], None);
             }
         }
     }

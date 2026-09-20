@@ -9,11 +9,36 @@
 
 use kryprobe_report::JsonlWriter;
 use kryprobe_report::adapters::{self, ImportError};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Session id stamped on the one-record import stream.
 const IMPORT_SESSION: &str = "session:import";
+
+/// Maximum import file accepted (M-SEC-02): unbounded reads are a
+/// local memory-exhaustion vector.
+const MAX_IMPORT_BYTES: usize = 4 << 20;
+
+/// Reads an import file with a hard cap (the token-worker `take(+1)`
+/// probe idiom): over-cap refuses with a size error, never parses.
+fn read_import_capped(file: &Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .and_then(|f| {
+            f.take(MAX_IMPORT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| ())
+        })
+        .map_err(|err| format!("import: cannot read {}: {err}", file.display()))?;
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "import: {} too large ({} bytes, max {MAX_IMPORT_BYTES})",
+            file.display(),
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
 
 /// Rejects an import defect on stderr (exit 2): unreadable bytes,
 /// invalid JSON, or an unknown marker — always naming what was found.
@@ -25,10 +50,10 @@ fn reject(err: &ImportError, stderr: &mut dyn Write) -> i32 {
 /// Runs `import`: parse → detect → adapt → one envelope record
 /// (kind `import_shell`) to stdout.
 pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
-    let bytes = match std::fs::read(file) {
+    let bytes = match read_import_capped(file) {
         Ok(bytes) => bytes,
-        Err(err) => {
-            let _ = writeln!(stderr, "import: cannot read {}: {err}", file.display());
+        Err(detail) => {
+            let _ = writeln!(stderr, "{detail}");
             return 2;
         }
     };
@@ -100,6 +125,24 @@ mod tests {
         // Lossless at the CLI boundary too: `native` is the input doc.
         let original: serde_json::Value = serde_json::from_str(P11_MIN).expect("input parses");
         assert_eq!(shell["native"], original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_run_oversize_exit_2_names_limit() {
+        // M-SEC-02: unbounded import reads are a local
+        // memory-exhaustion vector — over 4 MiB refuses with a size
+        // error, never parses.
+        let dir = scratch_dir("oversize");
+        let file = dir.join("huge.json");
+        let big = "x".repeat(4 * 1024 * 1024 + 1);
+        std::fs::write(&file, &big).expect("write input");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run(&file, &mut stdout, &mut stderr), 2);
+        assert!(stdout.is_empty());
+        let detail = String::from_utf8(stderr).expect("utf-8");
+        assert!(detail.contains("too large"), "size error, got: {detail}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

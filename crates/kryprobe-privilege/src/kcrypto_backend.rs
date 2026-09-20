@@ -63,6 +63,7 @@ use kryprobe_core::evidence::{
 use kryprobe_core::ids::{ObservationId, PlanGeneration};
 use kryprobe_core::plan::{CapabilityRequirements, OffsetProbe};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::bpfloader::PointStatus;
 use crate::btf_resolve::{
@@ -230,6 +231,10 @@ fn configured_error_to_backend(err: ConfiguredError) -> BackendError {
     }
 }
 
+// Pinned release-object digests (H-SEC-01), baked by build.rs from
+// `KRYPROBE_PIN_DIGESTS`; empty in dev builds (pin check skipped).
+include!(concat!(env!("OUT_DIR"), "/pinned_digests.rs"));
+
 /// kcrypto object file name (tier-1 dir join + tier-2 bundled path).
 const OBJECT_FILE_NAME: &str = "kcrypto.bpf.o";
 
@@ -279,10 +284,17 @@ impl std::error::Error for ObjectLocateError {}
 /// dir joined with `kcrypto.bpf.o`) → executable-dir
 /// `kryprobe-bpf/kcrypto.bpf.o` (bundled; skipped when the exe dir is
 /// unknown, never fabricated) → the CWD-relative dev object.
+///
+/// When `elevated`, env and CWD tiers are refused (H-SEC-01): only the
+/// exe-bundled tier is returned, possibly nothing.
 #[must_use]
-pub fn kcrypto_object_candidates(env: Option<&str>, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+pub fn kcrypto_object_candidates(
+    env: Option<&str>,
+    exe_dir: Option<&Path>,
+    elevated: bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(value) = env {
+    if !elevated && let Some(value) = env {
         let candidate = PathBuf::from(value);
         if candidate.is_file() {
             out.push(candidate);
@@ -293,27 +305,78 @@ pub fn kcrypto_object_candidates(env: Option<&str>, exe_dir: Option<&Path>) -> V
     if let Some(dir) = exe_dir {
         out.push(dir.join("kryprobe-bpf").join(OBJECT_FILE_NAME));
     }
-    out.push(PathBuf::from(DEV_OBJECT));
+    if !elevated {
+        out.push(PathBuf::from(DEV_OBJECT));
+    }
     out
 }
 
-/// D2 consolidated locator (replaces both K2 copies): first readable
-/// candidate wins; a total miss reports every tried path + fs error in
-/// try order (the K2 doctor wrapper vocabulary is preserved).
-pub fn locate_kcrypto_object() -> Result<PathBuf, ObjectLocateError> {
+/// Lowercase hex sha256 of object bytes (H-SEC-01 pin check).
+fn object_digest_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    hex
+}
+
+/// Pin check (H-SEC-01): empty pins (dev build) skip verification;
+/// otherwise the object sha256 must be pinned. Pure over inputs for
+/// unit tests; production passes [`PINNED_DIGESTS`].
+fn verify_object_pinned(bytes: &[u8], pins: &[&str]) -> Result<(), String> {
+    if pins.is_empty() {
+        return Ok(());
+    }
+    let digest = object_digest_hex(bytes);
+    if pins.iter().any(|pin| *pin == digest) {
+        Ok(())
+    } else {
+        Err(format!(
+            "untrusted object (sha256 {digest} not in pinned release digests)"
+        ))
+    }
+}
+
+/// D2 consolidated locator, single-read form (replaces the probe/use
+/// double-read, L-SEC-06): first readable AND pin-trusted candidate
+/// wins; bytes return with the path so callers never re-open.
+/// Untrusted (pin mismatch) candidates are misses, not errors.
+pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateError> {
+    let elevated = crate::elevate::process_is_elevated();
     let env = std::env::var("KRYPROBE_BPF_DIR").ok();
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let env_tier = if elevated { None } else { env.as_deref() };
     let mut misses = Vec::new();
-    for candidate in kcrypto_object_candidates(env.as_deref(), exe_dir.as_deref()) {
-        match std::fs::read(&candidate) {
-            Ok(_) => return Ok(candidate),
-            Err(err) => misses.push(LocateMiss {
+    for candidate in kcrypto_object_candidates(env_tier, exe_dir.as_deref(), elevated) {
+        let bytes = match std::fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                misses.push(LocateMiss {
+                    candidate,
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        if let Err(detail) = verify_object_pinned(&bytes, PINNED_DIGESTS) {
+            misses.push(LocateMiss {
                 candidate,
-                error: err.to_string(),
-            }),
+                error: detail,
+            });
+            continue;
         }
+        return Ok((candidate, bytes));
+    }
+    if elevated {
+        misses.push(LocateMiss {
+            candidate: PathBuf::from("(refused: env/CWD tiers disabled when elevated)"),
+            error: "refused".to_owned(),
+        });
     }
     Err(ObjectLocateError {
         env_dir: env,
@@ -326,18 +389,13 @@ pub fn locate_kcrypto_object() -> Result<PathBuf, ObjectLocateError> {
 /// attach, honestly reported, never a defect). The reason name is the K2
 /// spelling (stable surface).
 fn kcrypto_object_bytes() -> Result<Vec<u8>, BackendError> {
-    let path = locate_kcrypto_object().map_err(|err| {
+    let (_path, bytes) = locate_kcrypto_object_bytes().map_err(|err| {
         BackendError::Unsupported(UnsupportedReason::with_detail(
             "kcrypto_object_unreadable",
             &err.to_string(),
         ))
     })?;
-    std::fs::read(&path).map_err(|err| {
-        BackendError::Unsupported(UnsupportedReason::with_detail(
-            "kcrypto_object_unreadable",
-            &format!("{}: {err}", path.display()),
-        ))
-    })
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -436,12 +494,16 @@ pub fn snapshot_drops(sensor: &ConfiguredKcrypto) -> Result<[u64; 8], SnapshotEr
     let ncpu = possible_cpus() as usize;
     let mut out = [0u64; 8];
     for (site, slot) in out.iter_mut().enumerate() {
-        let raw = map_lookup_bytes(
-            &sensor.loaded.maps.drops,
-            &(site as u32).to_le_bytes(),
-            8 * ncpu,
-            "snapshot/drops",
-        )?;
+        // SAFETY: KDROPS is PerCpuArray<u64> (bpf-kcrypto map def);
+        // 8B × possible_cpus matches the kernel's write.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.drops,
+                &(site as u32).to_le_bytes(),
+                8 * ncpu,
+                "snapshot/drops",
+            )
+        }?;
         *slot = fold_drop_lanes(&raw, ncpu).ok_or_else(|| MapOpsError::LookupFailed {
             stage: "snapshot/drops-lane".to_owned(),
             errno: libc::EBADMSG,
@@ -522,18 +584,24 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
     let mut out = Vec::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(
-            &maps.loaded.maps.who,
-            key.as_deref(),
-            16,
-            "snapshot/who-iter",
-        )?;
+        // SAFETY: KWHO key is KWhoKey, exactly 16B (bpf-kcrypto map def).
+        let next = unsafe {
+            map_get_next_key(
+                &maps.loaded.maps.who,
+                key.as_deref(),
+                16,
+                "snapshot/who-iter",
+            )
+        }?;
         let Some(k) = next else { break };
         let who_key = kwho_key_from_bytes(&k).ok_or_else(|| MapOpsError::LookupFailed {
             stage: "snapshot/who-key".to_owned(),
             errno: libc::EBADMSG,
         })?;
-        let raw = map_lookup_bytes(&maps.loaded.maps.who, &k, 80 * ncpu, "snapshot/who-val")?;
+        // SAFETY: KWHO is PerCpuHashMap<KWhoKey, VWho>; VWho is 80B
+        // (vwho_from_bytes); ncpu is possible_cpus.
+        let raw =
+            unsafe { map_lookup_bytes(&maps.loaded.maps.who, &k, 80 * ncpu, "snapshot/who-val") }?;
         let mut lanes = Vec::with_capacity(ncpu);
         for c in 0..ncpu {
             let lane = raw
@@ -547,12 +615,16 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
         }
         let val = fold_vwho(&lanes);
         let stack_ips = if val.stack >= 0 {
-            match map_lookup_bytes(
-                &maps.loaded.maps.stack,
-                &(val.stack as u32).to_le_bytes(),
-                1016,
-                "snapshot/who-stack",
-            ) {
+            // SAFETY: KSTACK is an aya StackTrace map: the kernel stack
+            // value is 127 × u64 = 1016B, always.
+            match unsafe {
+                map_lookup_bytes(
+                    &maps.loaded.maps.stack,
+                    &(val.stack as u32).to_le_bytes(),
+                    1016,
+                    "snapshot/who-stack",
+                )
+            } {
                 Ok(raw) => stack_ips_from_bytes(&raw),
                 Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Vec::new(),
                 Err(err) => return Err(err.into()),
@@ -560,12 +632,15 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
         } else {
             Vec::new()
         };
-        let first_errno = match map_lookup_bytes(
-            &maps.loaded.maps.err,
-            &who_key.kh.to_le_bytes(),
-            4,
-            "snapshot/who-err",
-        ) {
+        // SAFETY: KERR is HashMap<u64, i32>; value_len 4 is exact.
+        let first_errno = match unsafe {
+            map_lookup_bytes(
+                &maps.loaded.maps.err,
+                &who_key.kh.to_le_bytes(),
+                4,
+                "snapshot/who-err",
+            )
+        } {
             Ok(raw) => {
                 let word: [u8; 4] = raw.try_into().map_err(|_| MapOpsError::LookupFailed {
                     stage: "snapshot/who-err".to_owned(),
@@ -576,12 +651,16 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
             Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
             Err(err) => return Err(err.into()),
         };
-        let params = match map_lookup_bytes(
-            &maps.loaded.maps.params,
-            &who_key.kh.to_le_bytes(),
-            16,
-            "snapshot/who-params",
-        ) {
+        // SAFETY: KPARAMS is HashMap<u64, VParams>; VParams is 16B
+        // (vparams_from_bytes).
+        let params = match unsafe {
+            map_lookup_bytes(
+                &maps.loaded.maps.params,
+                &who_key.kh.to_le_bytes(),
+                16,
+                "snapshot/who-params",
+            )
+        } {
             Ok(raw) => Some(
                 vparams_from_bytes(&raw).ok_or_else(|| MapOpsError::LookupFailed {
                     stage: "snapshot/who-params".to_owned(),
@@ -600,12 +679,15 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
         });
         key = Some(k);
     }
-    let drops = match map_lookup_bytes(
-        &maps.loaded.maps.ident,
-        &KWHO_DROPS.to_le_bytes(),
-        1,
-        "snapshot/who-drops",
-    ) {
+    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
+    let drops = match unsafe {
+        map_lookup_bytes(
+            &maps.loaded.maps.ident,
+            &KWHO_DROPS.to_le_bytes(),
+            1,
+            "snapshot/who-drops",
+        )
+    } {
         Ok(value) => u64::from(value.first().copied().unwrap_or(0)),
         Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => 0,
         Err(err) => return Err(err.into()),
@@ -974,12 +1056,15 @@ pub fn observation_for_who(
 /// (the Task-1 idiom); any other map failure is a defect marker (a broken
 /// post-attach read must be loud, never a silent zero).
 fn finalize_drops(sensor: &ConfiguredKcrypto) -> Result<u8, BackendError> {
-    match map_lookup_bytes(
-        &sensor.loaded.maps.ident,
-        &KIDN_DROPS.to_le_bytes(),
-        1,
-        "kcrypto_backend/finalize-drops",
-    ) {
+    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
+    match unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.ident,
+            &KIDN_DROPS.to_le_bytes(),
+            1,
+            "kcrypto_backend/finalize-drops",
+        )
+    } {
         Ok(value) => Ok(value.first().copied().unwrap_or(0)),
         Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
         Err(err) => Err(BackendError::Internal(InternalError::with_detail(
@@ -1498,7 +1583,7 @@ mod tests {
         std::fs::write(&file, b"object").expect("write tmp file");
         let exe = PathBuf::from("/exe/dir");
         assert_eq!(
-            kcrypto_object_candidates(file.to_str(), Some(exe.as_path())),
+            kcrypto_object_candidates(file.to_str(), Some(exe.as_path()), false),
             vec![
                 file.clone(),
                 PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o"),
@@ -1509,12 +1594,46 @@ mod tests {
         let missing = PathBuf::from("/tmp/kryprobe-k3-1-backend-absent-9f2");
         let _ = std::fs::remove_dir_all(&missing);
         assert_eq!(
-            kcrypto_object_candidates(missing.to_str(), None),
+            kcrypto_object_candidates(missing.to_str(), None, false),
             vec![
                 missing.join("kcrypto.bpf.o"),
                 PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
             ]
         );
+    }
+
+    #[test]
+    fn locator_candidates_elevated_drops_env_and_dev_tiers() {
+        // H-SEC-01: elevated processes (root/file caps) never steer on
+        // env or CWD — exe-bundled tier only.
+        let file = std::env::temp_dir().join("kryprobe-k3-1-backend-cand-elev.o");
+        std::fs::write(&file, b"object").expect("write tmp file");
+        let exe = PathBuf::from("/exe/dir");
+        assert_eq!(
+            kcrypto_object_candidates(file.to_str(), Some(exe.as_path()), true),
+            vec![PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o")]
+        );
+        std::fs::remove_file(&file).ok();
+        // Elevated + unknown exe dir: no tiers at all (never fabricated).
+        assert!(kcrypto_object_candidates(Some("/tmp/x"), None, true).is_empty());
+    }
+
+    #[test]
+    fn verify_object_pin_rules() {
+        // Hex encoding pins the standard sha256("abc") vector.
+        assert_eq!(
+            object_digest_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Empty pins (dev build): verification skipped.
+        assert!(verify_object_pinned(b"anything", &[]).is_ok());
+        // Pinned digest matches.
+        let digest = object_digest_hex(b"release-object");
+        assert!(verify_object_pinned(b"release-object", &[digest.as_str()]).is_ok());
+        // Mismatch fails loud with the failure named.
+        let err = verify_object_pinned(b"tampered-object", &[digest.as_str()])
+            .expect_err("tampered bytes must not verify");
+        assert!(err.contains("untrusted object"), "names the failure: {err}");
     }
 
     #[test]

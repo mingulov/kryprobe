@@ -138,14 +138,31 @@ impl std::error::Error for PolicyError {}
 /// Parses one rule YAML doc (K5 Task 5 surface for single-rule
 /// checks; full policy docs use [`parse_policy`]). Same rejections:
 /// malformed YAML or unknown keys fail.
+/// Maximum policy/rule text accepted (M-SEC-02): unbounded YAML text
+/// is a local memory-exhaustion vector — reject, never parse.
+const MAX_POLICY_BYTES: usize = 64 * 1024;
+
+/// Rejects oversize text before parsing (M-SEC-02).
+fn check_len(text: &str, what: &str) -> Result<(), PolicyError> {
+    if text.len() > MAX_POLICY_BYTES {
+        return Err(PolicyError::new(format!(
+            "{what} too large ({} bytes, max {MAX_POLICY_BYTES})",
+            text.len()
+        )));
+    }
+    Ok(())
+}
+
 pub fn parse_rule(text: &str) -> Result<Rule, PolicyError> {
-    serde_yaml::from_str(text).map_err(|err| PolicyError::new(format!("invalid rule: {err}")))
+    check_len(text, "rule")?;
+    serde_saphyr::from_str(text).map_err(|err| PolicyError::new(format!("invalid rule: {err}")))
 }
 
 /// Parses policy YAML: exact shape, unknown keys rejected, only
 /// `version: 1` accepted.
 pub fn parse_policy(text: &str) -> Result<Policy, PolicyError> {
-    let policy: Policy = serde_yaml::from_str(text)
+    check_len(text, "policy")?;
+    let policy: Policy = serde_saphyr::from_str(text)
         .map_err(|err| PolicyError::new(format!("invalid policy: {err}")))?;
     if policy.version != 1 {
         return Err(PolicyError::new(format!(

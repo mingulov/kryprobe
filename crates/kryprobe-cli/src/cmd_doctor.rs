@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `doctor`: the 18-row probe matrix plus backend rows plus the kcrypto
+//! `doctor`: the 19-row probe matrix plus backend rows plus the kcrypto
 //! coverage profile + ready/degraded verdict.
 //!
-//! The 4 K2.3/K5 rows extend [`run_probe_matrix`]'s 14 in fixed order
+//! The 5 K2.3/K5/review rows extend [`run_probe_matrix`]'s 14 in fixed order
 //! (appended after, never reordered) as a library consumer: symbols via
 //! [`resolve_btf_ids`], attach via a real [`load_kcrypto_configured`]
 //! load+attach+RAII drop, lockdown via a file parse, `token_delegated`
@@ -102,11 +102,27 @@ fn token_delegated_row_at(pin_path: &std::path::Path, caps: &[String]) -> ProbeR
     }
 }
 
-/// First readable candidate via the consolidated privilege locator;
+/// Resolved kcrypto object row (4B-H6.3): the effective artifact
+/// path is inspectable, so a poisoned env/CWD shows up in `doctor`
+/// output. Informational, never blocks the verdict.
+fn kcrypto_object_row() -> ProbeRow {
+    let outcome = match kryprobe_privilege::locate_kcrypto_object_bytes() {
+        Ok((path, _)) => ProbeOutcome::pass(path.display().to_string()),
+        Err(err) => ProbeOutcome::skipped(err.to_string()),
+    };
+    ProbeRow {
+        name: "kcrypto_object",
+        outcome,
+    }
+}
+
+/// First readable candidate via the consolidated privilege locator
+/// (single read — bytes return with the path, never a re-open);
 /// `Err` is the exact skip reason it reports.
 fn kcrypto_object_bytes() -> Result<Vec<u8>, String> {
-    let path = kryprobe_privilege::locate_kcrypto_object().map_err(|err| err.to_string())?;
-    std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))
+    let (_path, bytes) =
+        kryprobe_privilege::locate_kcrypto_object_bytes().map_err(|err| err.to_string())?;
+    Ok(bytes)
 }
 
 /// One configured point as `name=word` (Task-2 `point_word` vocabulary).
@@ -292,6 +308,7 @@ pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
         .find(|row| row.name == "btf_present")
         .is_some_and(|row| matches!(row.outcome, ProbeOutcome::Pass { .. }));
     matrix.rows.push(symbols_row);
+    matrix.rows.push(kcrypto_object_row());
     matrix.rows.push(attach.row);
     matrix.rows.push(lockdown);
     matrix.rows.push(token_delegated_row_at(
@@ -429,26 +446,34 @@ mod tests {
         let bundled = PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o");
         // Unset env: exe-bundled first, dev last.
         assert_eq!(
-            kcrypto_object_candidates(None, Some(exe.as_path())),
+            kcrypto_object_candidates(None, Some(exe.as_path()), false),
             [bundled.clone(), dev.clone()]
         );
         // Missing dir: dir-joined candidate first, then exe, then dev.
         let dir = std::env::temp_dir().join("kryprobe-doctor-locator-absent");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            kcrypto_object_candidates(Some(dir.to_str().expect("utf-8 tmp")), Some(exe.as_path())),
+            kcrypto_object_candidates(
+                Some(dir.to_str().expect("utf-8 tmp")),
+                Some(exe.as_path()),
+                false
+            ),
             [dir.join("kcrypto.bpf.o"), bundled.clone(), dev.clone()]
         );
         // A real file is tried as-is (not dir-joined).
         let file = std::env::temp_dir().join("kryprobe-doctor-locator-file.o");
         std::fs::write(&file, b"object").expect("write tmp file");
         assert_eq!(
-            kcrypto_object_candidates(Some(file.to_str().expect("utf-8 tmp")), Some(exe.as_path())),
+            kcrypto_object_candidates(
+                Some(file.to_str().expect("utf-8 tmp")),
+                Some(exe.as_path()),
+                false
+            ),
             [file.clone(), bundled.clone(), dev.clone()]
         );
         std::fs::remove_file(&file).ok();
         // Unknown exe dir: tier 2 skipped, never fabricated.
-        assert_eq!(kcrypto_object_candidates(None, None), [dev]);
+        assert_eq!(kcrypto_object_candidates(None, None, false), [dev]);
     }
 
     #[test]

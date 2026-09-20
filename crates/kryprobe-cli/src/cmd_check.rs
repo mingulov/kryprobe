@@ -10,7 +10,7 @@
 
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
 use kryprobe_policy::{Policy, PolicyVerdict, evaluate, parse_policy};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Default live window when `--duration` is absent (report idiom).
@@ -18,13 +18,44 @@ const DEFAULT_CHECK_SECS: u64 = 60;
 
 /// Rendered cell: missing or empty renders `unknown` (C10 — never
 /// fabricated).
-fn show(cell: &str) -> &str {
-    if cell.is_empty() { "unknown" } else { cell }
+fn show(cell: &str) -> String {
+    if cell.is_empty() {
+        String::from("unknown")
+    } else {
+        kryprobe_report::sanitize_cell(cell)
+    }
 }
 
 /// Live window: explicit `--duration` or the 60s default.
 fn check_window_secs(duration: Option<u64>) -> u64 {
     duration.unwrap_or(DEFAULT_CHECK_SECS)
+}
+
+/// Maximum policy file accepted (M-SEC-02): unbounded reads are a
+/// local memory-exhaustion vector (the policy crate caps again at
+/// parse; both agree on 64 KiB).
+const MAX_POLICY_FILE_BYTES: usize = 64 * 1024;
+
+/// Reads a policy file with a hard cap (the token-worker `take(+1)`
+/// probe idiom): over-cap refuses with a size error, never parses.
+fn read_policy_capped(policy: &Path) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(policy)
+        .and_then(|f| {
+            f.take(MAX_POLICY_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| ())
+        })
+        .map_err(|err| format!("check: cannot read policy {}: {err}", policy.display()))?;
+    if bytes.len() > MAX_POLICY_FILE_BYTES {
+        return Err(format!(
+            "check: policy {} too large ({} bytes, max {MAX_POLICY_FILE_BYTES})",
+            policy.display(),
+            bytes.len()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| format!("check: cannot read policy {}: {err}", policy.display()))
 }
 
 /// Finishes a capture against a parsed policy: the verdict line to
@@ -107,14 +138,10 @@ pub fn run(
     // Ctrl-C keeps the default disposition and terminates the process:
     // no verdict, no finalize (Task 1 installs no SIGINT handler —
     // std-only). Graceful-shutdown-on-SIGINT is future work.
-    let text = match std::fs::read_to_string(policy) {
+    let text = match read_policy_capped(policy) {
         Ok(text) => text,
-        Err(err) => {
-            let _ = writeln!(
-                stderr,
-                "check: cannot read policy {}: {err}",
-                policy.display()
-            );
+        Err(detail) => {
+            let _ = writeln!(stderr, "{detail}");
             return 2;
         }
     };
@@ -182,6 +209,21 @@ mod tests {
             ],
             healthy_coverage(3),
         )
+    }
+
+    #[test]
+    fn policy_read_refuses_oversize() {
+        // M-SEC-02: unbounded policy reads are a local
+        // memory-exhaustion vector — over 64 KiB refuses with a size
+        // error, never parses.
+        let dir = std::env::temp_dir().join(format!("kryprobe-k4-oversize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let file = dir.join("huge.yaml");
+        std::fs::write(&file, "x".repeat(64 * 1024 + 1)).expect("write input");
+        let err = read_policy_capped(&file).expect_err("oversize refused");
+        assert!(err.contains("too large"), "size error, got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

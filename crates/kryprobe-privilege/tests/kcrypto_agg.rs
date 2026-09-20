@@ -220,11 +220,14 @@ fn dump_kagg(sensor: &Sensor) -> Vec<AggRow> {
     let mut rows = Vec::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(&sensor.loaded.maps.agg, key.as_deref(), 260, "kagg/iter")
-            .expect("KAGG iteration");
+        // SAFETY: KAGG key is KAgg, exactly 260B.
+        let next =
+            unsafe { map_get_next_key(&sensor.loaded.maps.agg, key.as_deref(), 260, "kagg/iter") }
+                .expect("KAGG iteration");
         let Some(k) = next else { break };
         assert_eq!(k.len(), 260, "KAGG key size drifted");
-        let raw = map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "kagg/val")
+        // SAFETY: KAGG value is VAgg, 120B × possible_cpus.
+        let raw = unsafe { map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "kagg/val") }
             .expect("KAGG lookup");
         let mut lanes = Vec::with_capacity(ncpu);
         for c in 0..ncpu {
@@ -252,12 +255,15 @@ fn dump_kagg(sensor: &Sensor) -> Vec<AggRow> {
 /// Fold the single `KTOT` row.
 fn dump_ktot(sensor: &Sensor) -> VAgg {
     let ncpu = possible_cpus() as usize;
-    let raw = map_lookup_bytes(
-        &sensor.loaded.maps.total,
-        &0u32.to_le_bytes(),
-        120 * ncpu,
-        "ktot/val",
-    )
+    // SAFETY: KTOT value is VAgg, 120B × possible_cpus.
+    let raw = unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.total,
+            &0u32.to_le_bytes(),
+            120 * ncpu,
+            "ktot/val",
+        )
+    }
     .expect("KTOT lookup");
     let mut lanes = Vec::with_capacity(ncpu);
     for c in 0..ncpu {
@@ -271,18 +277,23 @@ fn dump_kidn(sensor: &Sensor) -> (usize, u8) {
     let mut count = 0;
     let mut key: Option<Vec<u8>> = None;
     loop {
-        let next = map_get_next_key(&sensor.loaded.maps.ident, key.as_deref(), 8, "kidn/iter")
-            .expect("KIDN iteration");
+        // SAFETY: KIDN key is u64, exactly 8B.
+        let next =
+            unsafe { map_get_next_key(&sensor.loaded.maps.ident, key.as_deref(), 8, "kidn/iter") }
+                .expect("KIDN iteration");
         let Some(k) = next else { break };
         count += 1;
         key = Some(k);
     }
-    let drops = map_lookup_bytes(
-        &sensor.loaded.maps.ident,
-        &KIDN_DROPS.to_le_bytes(),
-        1,
-        "kidn/drops",
-    )
+    // SAFETY: KIDN value is u8; value_len 1 is exact.
+    let drops = unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.ident,
+            &KIDN_DROPS.to_le_bytes(),
+            1,
+            "kidn/drops",
+        )
+    }
     .map(|v| v[0])
     .unwrap_or(0);
     (count, drops)
@@ -751,12 +762,15 @@ fn kcfg_roundtrip_matches_resolver() {
         "kcfg/roundtrip",
     )
     .expect("KCFG write");
-    let got = map_lookup_bytes(
-        &loaded.maps.config,
-        &0u32.to_le_bytes(),
-        76,
-        "kcfg/roundtrip",
-    )
+    // SAFETY: KCFG wire is exactly 76B (asserted above).
+    let got = unsafe {
+        map_lookup_bytes(
+            &loaded.maps.config,
+            &0u32.to_le_bytes(),
+            76,
+            "kcfg/roundtrip",
+        )
+    }
     .expect("KCFG read");
     assert_eq!(got, want, "KCFG must roundtrip byte-identical");
 }

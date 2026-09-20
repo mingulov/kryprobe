@@ -17,13 +17,13 @@ pub mod writer;
 
 pub use cover::{CoverageGap, GapCtx};
 pub use observe::ObservationExtra;
-pub use render::{render_summary, render_summary_reader};
+pub use render::{render_summary, render_summary_reader, sanitize_cell};
 pub use session::{FinalBarrier, SessionEnd, SessionStart, SessionVerdict};
 pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
 pub use validate::{
-    ResolvedSchema, ValidationFinding, resolve_schema, resolve_schema_at, schema_fnv1a_hex,
-    validate_and_render_file, validate_and_render_reader, validate_file, validate_reader,
-    validate_str,
+    MAX_VALIDATE_LINE_BYTES, ResolvedSchema, ValidationFinding, resolve_schema, resolve_schema_at,
+    schema_fnv1a_hex, validate_and_render_file, validate_and_render_reader, validate_file,
+    validate_reader, validate_str,
 };
 pub use writer::{JsonlWriter, ReportError, write_str_atomic};
 

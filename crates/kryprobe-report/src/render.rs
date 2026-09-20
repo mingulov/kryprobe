@@ -11,6 +11,7 @@
 
 mod table;
 
+use crate::validate::{CappedLine, next_line_capped};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::BufRead;
@@ -266,10 +267,33 @@ pub fn render_summary(stream: &str) -> String {
 
 /// Streaming [`render_summary`]: same bytes, O(1) records in memory.
 /// Stops fail-closed with the I/O error (including invalid UTF-8).
-pub fn render_summary_reader(reader: impl BufRead) -> std::io::Result<String> {
+/// Sanitizes one human-table cell (L-SEC-01): kernel-sourced strings
+/// (`comm`, algorithm/driver/family names) can carry control bytes
+/// (`PR_SET_NAME`, hostile modules) that inject terminal escapes or
+/// split table rows — every control char renders as `?`. Unicode
+/// printing characters pass through; JSON output is unaffected
+/// (`serde_json` escapes by construction).
+#[must_use]
+pub fn sanitize_cell(cell: &str) -> String {
+    if cell.chars().any(char::is_control) {
+        cell.chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    } else {
+        cell.to_owned()
+    }
+}
+
+pub fn render_summary_reader(mut reader: impl BufRead) -> std::io::Result<String> {
     let mut summary = Summary::default();
-    for line in reader.lines() {
-        summary.push_line(&line?);
+    loop {
+        match next_line_capped(&mut reader) {
+            CappedLine::Line(line) => summary.push_line(&line),
+            CappedLine::Eof => break,
+            CappedLine::Unreadable(detail) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, detail));
+            }
+        }
     }
     Ok(summary.finish())
 }

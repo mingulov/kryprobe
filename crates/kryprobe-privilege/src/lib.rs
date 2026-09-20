@@ -14,6 +14,7 @@ pub mod bpfselftest;
 pub mod btf_resolve;
 pub mod decoy;
 pub mod drain;
+pub mod elevate;
 pub mod elfread;
 pub mod fanout;
 pub mod fd;
@@ -29,7 +30,7 @@ pub mod refused;
 pub mod token;
 
 pub use inspect::{InspectError, TargetSnapshot};
-pub use kcrypto_backend::{LocateMiss, ObjectLocateError, locate_kcrypto_object};
+pub use kcrypto_backend::{LocateMiss, ObjectLocateError, locate_kcrypto_object_bytes};
 pub use kryprobe_core::ProgramId;
 pub use local::LocalPrivilegedAuthority;
 pub use probe::{ProbeMatrix, ProbeOutcome, run_probe_matrix};

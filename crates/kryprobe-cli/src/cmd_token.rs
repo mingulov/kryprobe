@@ -437,18 +437,41 @@ pub fn no_mechanism_reason(explicit: Option<&Path>) -> String {
 }
 
 /// Mint target: `--bin` or the current exe (`/proc/self/exe` via
-/// [`std::env::current_exe`]).
+/// [`std::env::current_exe`]), always canonicalized (L-SEC-03):
+/// symlinks resolve to the real binary (never the link), and
+/// nonexistent paths are invalid input.
 fn mint_target(bin: Option<&Path>) -> Result<PathBuf, String> {
     match bin {
-        Some(path) => Ok(path.to_owned()),
-        None => std::env::current_exe().map_err(|err| format!("cannot resolve current exe: {err}")),
+        Some(path) => std::fs::canonicalize(path)
+            .map_err(|err| format!("invalid --bin {}: {err}", path.display())),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::canonicalize(exe).ok())
+            .ok_or_else(|| "cannot resolve current exe".to_owned()),
+    }
+}
+
+/// Mint identity gate (L-SEC-03): granting file caps to anything but
+/// the running kryprobe binary needs explicit `--force`. Pure over
+/// canonical paths for unit tests; unresolvable self fails closed.
+fn check_mint_identity(target: &Path, current: Option<&Path>, force: bool) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    match current {
+        Some(current) if current == target => Ok(()),
+        _ => Err(format!(
+            "refusing to grant caps to {} (not the running kryprobe binary; pass --force to override)",
+            target.display()
+        )),
     }
 }
 
 /// Runs `token mint`: root one-shot file-cap grant + receipt.
 /// Exit 0 prints the receipt JSON to stdout (one object, nothing
 /// else); hints ride stderr. Refusals: exit 4 without root, exit 2 on
-/// receipt-overwrite without `--force` or a bad `--bin` path.
+/// a bad `--bin` path, a foreign-binary target without `--force`, or
+/// receipt-overwrite without `--force`.
 pub fn run_mint(
     bin: Option<&Path>,
     receipt: Option<&Path>,
@@ -456,22 +479,38 @@ pub fn run_mint(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let target = match mint_target(bin) {
-        Ok(target) => target,
-        Err(reason) => {
-            let _ = writeln!(stderr, "token mint: {reason}");
-            return 1;
-        }
-    };
+    // Root gate FIRST (baseline precedence): every unprivileged
+    // invocation refuses exit 4 naming root, before any input
+    // validation. The target resolves for the message only.
+    let target = mint_target(bin);
     // SAFETY: idempotent getter.
     if unsafe { libc::geteuid() } != 0 {
+        let what = match &target {
+            Ok(target) => target.display().to_string(),
+            Err(_) => bin
+                .map(|bin| bin.display().to_string())
+                .unwrap_or_else(|| String::from("current exe")),
+        };
         let _ = writeln!(
             stderr,
             "token mint: needs root (euid != 0); run once as root to grant \
-             cap_bpf,cap_perfmon on {}",
-            target.display()
+             cap_bpf,cap_perfmon on {what}"
         );
         return 4;
+    }
+    let target = match target {
+        Ok(target) => target,
+        Err(reason) => {
+            let _ = writeln!(stderr, "token mint: {reason}");
+            return 2;
+        }
+    };
+    let current = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::canonicalize(exe).ok());
+    if let Err(reason) = check_mint_identity(&target, current.as_deref(), force) {
+        let _ = writeln!(stderr, "token mint: {reason}");
+        return 2;
     }
     if let Some(path) = receipt
         && !force
@@ -625,4 +664,53 @@ pub fn run_status(bin: Option<&Path>, stdout: &mut dyn Write) -> i32 {
     };
     let _ = writeln!(stdout, "{pin}");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kryprobe-k5-token-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn mint_target_canonicalizes_bin() {
+        // L-SEC-03: --bin resolves through symlinks (never the link
+        // itself); nonexistent paths are invalid input.
+        let exe = std::env::current_exe().expect("current exe");
+        let canonical = std::fs::canonicalize(&exe).expect("canonical exe");
+        assert_eq!(mint_target(None).expect("self resolves"), canonical);
+        let dir = scratch_dir("canon");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink");
+        assert_eq!(mint_target(Some(&link)).expect("link resolves"), canonical);
+        assert!(
+            mint_target(Some(Path::new("/nonexistent-k5-token-zzz"))).is_err(),
+            "nonexistent --bin is invalid"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mint_identity_requires_force_for_foreign_binary() {
+        // L-SEC-03/H-T1: granting caps to anything but the running
+        // kryprobe binary needs explicit --force.
+        let this = PathBuf::from("/usr/local/bin/kryprobe");
+        let other = PathBuf::from("/tmp/evil-helper");
+        assert!(check_mint_identity(&this, Some(&this), false).is_ok());
+        let err = check_mint_identity(&other, Some(&this), false)
+            .expect_err("foreign binary needs --force");
+        assert!(err.contains("--force"), "names the override: {err}");
+        assert!(check_mint_identity(&other, Some(&this), true).is_ok());
+        assert!(
+            check_mint_identity(&other, None, false).is_err(),
+            "unresolvable self fails closed without --force"
+        );
+        assert!(check_mint_identity(&other, None, true).is_ok());
+    }
 }

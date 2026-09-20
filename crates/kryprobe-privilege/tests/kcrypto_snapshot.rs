@@ -549,12 +549,15 @@ fn twin_peek_ring(sensor: &ConfiguredKcrypto) -> Vec<Vec<u8>> {
 /// independent oracle for the drops wiring (the snapshotter reads the
 /// same key internally).
 fn twin_read_drops(sensor: &ConfiguredKcrypto) -> u8 {
-    map_lookup_bytes(
-        &sensor.loaded.maps.ident,
-        &KIDN_DROPS.to_le_bytes(),
-        1,
-        "snapshot-twin/kidn-drops",
-    )
+    // SAFETY: KIDN value is u8; value_len 1 is exact.
+    unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.ident,
+            &KIDN_DROPS.to_le_bytes(),
+            1,
+            "snapshot-twin/kidn-drops",
+        )
+    }
     .map(|v| v[0])
     .unwrap_or(0)
 }
@@ -914,20 +917,26 @@ fn assert_snapshot_fold_matches_raw_maps(sensor: &ConfiguredKcrypto, rows: &[Sna
     let mut key: Option<Vec<u8>> = None;
     let mut raw_rows = 0;
     loop {
-        let next = map_get_next_key(
-            &sensor.loaded.maps.agg,
-            key.as_deref(),
-            260,
-            "snapshot-twin/kagg-iter",
-        )
+        // SAFETY: KAGG key is KAgg, exactly 260B.
+        let next = unsafe {
+            map_get_next_key(
+                &sensor.loaded.maps.agg,
+                key.as_deref(),
+                260,
+                "snapshot-twin/kagg-iter",
+            )
+        }
         .expect("KAGG iteration");
         let Some(k) = next else { break };
-        let raw = map_lookup_bytes(
-            &sensor.loaded.maps.agg,
-            &k,
-            120 * ncpu,
-            "snapshot-twin/kagg-val",
-        )
+        // SAFETY: KAGG value is VAgg, 120B × possible_cpus.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.agg,
+                &k,
+                120 * ncpu,
+                "snapshot-twin/kagg-val",
+            )
+        }
         .expect("KAGG lookup");
         let mut lanes = Vec::with_capacity(ncpu);
         for c in 0..ncpu {
@@ -971,12 +980,15 @@ fn assert_snapshot_fold_matches_raw_maps(sensor: &ConfiguredKcrypto, rows: &[Sna
         key = Some(k);
     }
     assert_eq!(raw_rows, rows.len(), "oracle sees every snapshot row");
-    let raw = map_lookup_bytes(
-        &sensor.loaded.maps.total,
-        &0u32.to_le_bytes(),
-        120 * ncpu,
-        "snapshot-twin/ktot",
-    )
+    // SAFETY: KTOT value is VAgg, 120B × possible_cpus.
+    let raw = unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.total,
+            &0u32.to_le_bytes(),
+            120 * ncpu,
+            "snapshot-twin/ktot",
+        )
+    }
     .expect("KTOT lookup");
     let mut lanes = Vec::with_capacity(ncpu);
     for c in 0..ncpu {

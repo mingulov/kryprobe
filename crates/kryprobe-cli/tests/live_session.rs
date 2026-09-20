@@ -55,8 +55,10 @@ fn locator_env_file_wins_live() {
     let file = dir.join("custom.o");
     std::fs::write(&file, b"fake-object").expect("write tmp object");
     set_bpf_dir(file.as_os_str());
-    let found = kryprobe_privilege::locate_kcrypto_object().expect("env file locates");
+    let (found, bytes) =
+        kryprobe_privilege::locate_kcrypto_object_bytes().expect("env file locates");
     assert_eq!(found, file, "tier 1: env file tried as-is");
+    assert_eq!(bytes, b"fake-object", "single read returns the bytes");
     match prior {
         Some(value) => set_bpf_dir(&value),
         None => remove_bpf_dir(),
@@ -72,8 +74,10 @@ fn locator_env_dir_joins_live() {
     let object = dir.join("kcrypto.bpf.o");
     std::fs::write(&object, b"fake-object").expect("write tmp object");
     set_bpf_dir(dir.as_os_str());
-    let found = kryprobe_privilege::locate_kcrypto_object().expect("env dir locates");
+    let (found, bytes) =
+        kryprobe_privilege::locate_kcrypto_object_bytes().expect("env dir locates");
     assert_eq!(found, object, "tier 1: env dir joined with kcrypto.bpf.o");
+    assert_eq!(bytes, b"fake-object", "single read returns the bytes");
     match prior {
         Some(value) => set_bpf_dir(&value),
         None => remove_bpf_dir(),
@@ -95,8 +99,8 @@ fn locator_miss_or_dev_fallback_pins_order() {
     let tier1 = absent.join("kcrypto.bpf.o");
     let tier2 = exe_tier_candidate();
     let tier3 = PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o");
-    match kryprobe_privilege::locate_kcrypto_object() {
-        Ok(path) => assert_eq!(
+    match kryprobe_privilege::locate_kcrypto_object_bytes() {
+        Ok((path, _)) => assert_eq!(
             path, tier3,
             "only the dev fallback may rescue an env+exe miss (tiers 1-2 missed)"
         ),
@@ -864,7 +868,7 @@ fn locator_candidates_pin_three_tier_order() {
     std::fs::write(&file, b"x").expect("candidate probe file");
     let exe = PathBuf::from("/exe/dir");
     assert_eq!(
-        kcrypto_object_candidates(file.to_str(), Some(exe.as_path())),
+        kcrypto_object_candidates(file.to_str(), Some(exe.as_path()), false),
         vec![
             file.clone(),
             PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o"),
@@ -875,7 +879,7 @@ fn locator_candidates_pin_three_tier_order() {
     // Env dir joined; unknown exe dir skips tier 2 (never fabricated).
     let dir = PathBuf::from("/tmp/kryprobe-k3-1-cand-dir");
     assert_eq!(
-        kcrypto_object_candidates(dir.to_str(), None),
+        kcrypto_object_candidates(dir.to_str(), None, false),
         vec![
             dir.join("kcrypto.bpf.o"),
             PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
@@ -883,7 +887,7 @@ fn locator_candidates_pin_three_tier_order() {
     );
     // Unset env: exe tier first, dev last.
     assert_eq!(
-        kcrypto_object_candidates(None, Some(exe.as_path())),
+        kcrypto_object_candidates(None, Some(exe.as_path()), false),
         vec![
             PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o"),
             PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),

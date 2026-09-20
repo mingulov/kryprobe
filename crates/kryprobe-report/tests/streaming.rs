@@ -2,8 +2,9 @@
 //! T13: streaming render/validate are byte-identical to the batch pass.
 
 use kryprobe_report::{
-    ValidationFinding, render_summary, render_summary_reader, validate_and_render_file,
-    validate_and_render_reader, validate_file, validate_reader, validate_str,
+    MAX_VALIDATE_LINE_BYTES, ValidationFinding, render_summary, render_summary_reader,
+    validate_and_render_file, validate_and_render_reader, validate_file, validate_reader,
+    validate_str,
 };
 use std::io::BufReader;
 
@@ -305,9 +306,31 @@ fn streaming_validate_rejects_invalid_utf8_closed() {
 }
 
 #[test]
+fn streaming_validate_rejects_overlong_line_closed() {
+    // M-SEC-02: an unbounded line is a local memory-exhaustion vector.
+    let mut big = vec![b'x'; MAX_VALIDATE_LINE_BYTES + 1];
+    big.push(b'\n');
+    let findings = validate_reader(BufReader::new(&big[..]), schema_bytes());
+    assert!(
+        matches!(findings.as_slice(), [ValidationFinding::Unreadable { .. }]),
+        "overlong line must fail closed, got {findings:?}"
+    );
+}
+
+#[test]
 fn streaming_render_rejects_invalid_utf8() {
     let result = render_summary_reader(BufReader::new(&b"{\xff\n"[..]));
     assert!(result.is_err(), "invalid UTF-8 must error, got {result:?}");
+}
+
+#[test]
+fn streaming_render_rejects_overlong_line() {
+    // Same root as validate (M-SEC-02): the render loop shares the
+    // bounded line reader.
+    let mut big = vec![b'x'; MAX_VALIDATE_LINE_BYTES + 1];
+    big.push(b'\n');
+    let result = render_summary_reader(BufReader::new(&big[..]));
+    assert!(result.is_err(), "overlong line must error");
 }
 
 fn fixture_path() -> std::path::PathBuf {

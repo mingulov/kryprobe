@@ -61,8 +61,12 @@ fn raw<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
 
 /// Rendered cell: missing or empty renders `unknown` (C10 — zeros and
 /// unknowns render as unknown, never fabricated).
-fn show(cell: &str) -> &str {
-    if cell.is_empty() { "unknown" } else { cell }
+fn show(cell: &str) -> String {
+    if cell.is_empty() {
+        String::from("unknown")
+    } else {
+        kryprobe_report::sanitize_cell(cell)
+    }
 }
 
 /// One `counts` sub-counter (0 when the shape is absent — real decodes
@@ -838,6 +842,38 @@ mod tests {
             text.contains("skcipher encrypt unknown unknown 3 30 3 0 0\n"),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn hostile_cells_render_sanitized() {
+        // L-SEC-01/M-T3: kernel-sourced strings (`comm`, names) can
+        // carry control bytes (`PR_SET_NAME`, hostile modules) — tables
+        // must neutralize them (no escapes, no row splits).
+        let who = who_obs(1, 0xc1, 4242, "py\x1b[2Jth\non3", 1000, 7);
+        let agg = agg_obs(
+            2,
+            "skcipher",
+            "encrypt",
+            "ok",
+            "cbc\x07(aes)",
+            "aesni",
+            "process",
+            3,
+            30,
+            3,
+            0,
+            0,
+        );
+        let text = render_watch_tables(&outcome_with(vec![who, agg], healthy_coverage(2)));
+        assert!(!text.contains('\x1b'), "no escapes: {text:?}");
+        assert!(text.contains("py?[2Jth?on3"), "sanitized comm: {text:?}");
+        assert!(text.contains("cbc?(aes)"), "sanitized algorithm: {text:?}");
+        for fragment in text.split('\n') {
+            assert!(
+                !fragment.chars().any(|c| c.is_control()),
+                "no control chars in row: {fragment:?}"
+            );
+        }
     }
 
     #[test]

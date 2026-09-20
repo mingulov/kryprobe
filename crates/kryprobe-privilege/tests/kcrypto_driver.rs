@@ -1481,12 +1481,15 @@ fn driver_e2e_matches_fixture_truth() {
         IntegritySummary::default(),
         "healthy lane: zero losses"
     );
-    let drops = map_lookup_bytes(
-        &sensor.loaded.maps.ident,
-        &KIDN_DROPS.to_le_bytes(),
-        1,
-        "driver-twin/kidn-drops",
-    )
+    // SAFETY: KIDN value is u8; value_len 1 is exact.
+    let drops = unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.ident,
+            &KIDN_DROPS.to_le_bytes(),
+            1,
+            "driver-twin/kidn-drops",
+        )
+    }
     .map(|v| v[0])
     .unwrap_or(0);
     assert_eq!(drops, 0, "ring-reserve drops pin zero (independent read)");

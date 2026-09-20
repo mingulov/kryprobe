@@ -902,3 +902,15 @@ fn driver_not_only_rule_vs_keyless_obs_is_inconclusive() {
         "driver_not-only deny vs keyless obs must not be Violation"
     );
 }
+
+#[test]
+fn oversize_policy_rejected_before_parse() {
+    // M-SEC-02/M-T1: unbounded policy text is a local memory-exhaustion
+    // vector — reject over 64 KiB with a size error, never parse.
+    let big = "x".repeat(64 * 1024 + 1);
+    let err = parse_policy(&big).expect_err("oversize policy must be rejected");
+    assert!(
+        err.to_string().contains("too large"),
+        "size error, got: {err}"
+    );
+}
