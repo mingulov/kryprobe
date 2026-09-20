@@ -1,0 +1,6 @@
+ffffffff81000000 T _stext
+ffffffff81001000 T hash_sendmsg
+ffffffff81001500 t hash_sendmsg_helper
+ffffffff81002000 T _etext
+ffffffff81003000 R __start_rodata
+ffffffff81004000 T crypto_alloc_tfm_node
