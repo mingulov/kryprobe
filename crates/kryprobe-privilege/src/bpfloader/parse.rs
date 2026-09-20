@@ -409,7 +409,8 @@ mod tests {
                 dims: *dims,
             })
             .collect();
-        assert_eq!(good.len(), 5);
+        // 5 K1 maps + 4 K5 attribution maps.
+        assert_eq!(good.len(), 9);
         assert!(valid_kcrypto_dims(&good));
         // Spine shape is NOT kcrypto shape (discrimination).
         let spineish = vec![ParsedMap {
@@ -427,7 +428,7 @@ mod tests {
         wrong[0].dims.max_entries += 1;
         assert!(!valid_kcrypto_dims(&wrong));
         // Missing map / extra map.
-        assert!(!valid_kcrypto_dims(&good[..4]));
+        assert!(!valid_kcrypto_dims(&good[..8]));
         let mut extra = good.clone();
         extra.push(ParsedMap {
             name: "ZZZ".to_owned(),

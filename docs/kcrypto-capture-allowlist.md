@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# kcrypto capture allowlist (K1 sensor v0.1)
+# kcrypto capture allowlist (K1 sensor v0.1 + K5 attribution)
 
 Closed list of everything the kcrypto fexit sensor stores in
-`KCFG`/`KAGG`/`KTOT`/`KIDN`/`KRING`. Anything not on this list is not
-captured; the [NEVER](#never-list) section names the categories the
-sensor must never read. Field order and sizes twin
+`KCFG`/`KAGG`/`KTOT`/`KIDN`/`KRING` (K1) plus
+`KWHO`/`KSTACK`/`KERR`/`KPARAMS` (K5 attribution). Anything not on
+this list is not captured; the [NEVER](#never-list) section names the
+categories the sensor must never read. Field order and sizes twin
 `crates/bpf-kcrypto/src/bin/kcrypto.rs` (BPF owns the originals) and
 `crates/kryprobe-abi/src/kcrypto_agg.rs` (userspace mirrors).
 
@@ -28,7 +29,7 @@ counts, return/error class, timestamps, PID/TGID/comm/cgroup metadata,
 and kernel/build metadata. Every field below cites the §9 category it
 falls under (plus the sharper kp2 section where one exists).
 
-## `KCFG`: loader-written config, not observations (44B `KConfig`)
+## `KCFG`: loader-written config, not observations (76B `KConfig`)
 
 Written once by `load_kcrypto_configured` from live-BTF resolution
 (`kconfig_from_offsets`); never touched by traffic. WHY: kernel/build
@@ -48,6 +49,16 @@ the BPF cannot chase request→tfm→algorithm.
 | `ahash_nbytes_off` | u32 | BTF `ahash_request.nbytes` | kernel layout metadata |
 | `shash_base` | u32 | BTF `crypto_shash.base` | kernel layout metadata (replaces the retired C3 hardcoded-0 link: @0 on 7.0, @8 on 6.12) |
 | `_pad` | u32 | zero | reserved, always 0 |
+| `task_real_parent` | u32 | BTF `task_struct.real_parent` (K5) | kernel layout metadata |
+| `task_tgid` | u32 | BTF `task_struct.tgid` (K5) | kernel layout metadata |
+| `task_comm` | u32 | BTF `task_struct.comm` (K5) | kernel layout metadata |
+| `cra_blocksize` | u32 | BTF `crypto_alg.cra_blocksize` (K5) | kernel layout metadata |
+| `cra_ivsize` | u32 | BTF per-family ivsize member (K5) | kernel layout metadata |
+| `cra_min_keysize` | u32 | BTF per-family min-keysize member (K5) | kernel layout metadata |
+| `cra_max_keysize` | u32 | BTF per-family max-keysize member (K5) | kernel layout metadata |
+| `parent_ok` | u8 | nonzero iff the parent offsets resolved (K5) | resolution flag, not an observation |
+| `params_ok` | u8 | nonzero iff the params offsets resolved (K5) | resolution flag, not an observation |
+| `_pad2` | 2B | zero | reserved, always 0 |
 
 ## `KAGG` key: attribution head + identity (260B `KAgg`)
 
@@ -119,7 +130,75 @@ joins by hash; the ring carries no names by construction.
 | `val2` | u64 | first-seen `ktime` ns | timestamps (kp2 §9) |
 | `val3` | u64 | zero | reserved, always 0 |
 
-## Attribution: `ctx` classifier, no raw IDs
+## `KWHO` key: row hash + thread group (16B `KWhoKey`, K5)
+
+Per-CPU hash, 2048 entries. One row per (`kh`, `tgid`).
+
+| Field | Bytes | Source | WHY (kp2 §9) |
+|---|---|---|---|
+| `kh` | u64 | FNV-1a over the full `KAgg` row (`fam`/`op`/`res`/`ctx` + `alg`/`drv` words) | name-free join key (same discipline as `KIDN`) |
+| `tgid` | u32 | `bpf_get_current_pid_tgid` high 32 | PID/TGID metadata (kp2 §9; raw identity is owner-approved for K5, superseding the v0.1 no-raw-IDs hardening below) |
+| `_pad` | u32 | zero | padding, always 0 |
+
+## `KWHO` value: caller identity + tallies (80B `VWho`, K5)
+
+First-seen fields are written once at insert; the hit path updates
+only `calls`, `last_ns`, `tid`, `comm` (last-writer).
+
+| Field | Bytes | Source | WHY (kp2 §9) |
+|---|---|---|---|
+| `comm` | 16B | `bpf_get_current_comm` (last-writer) | comm metadata (kp2 §9) |
+| `tid` | u32 | `bpf_get_current_pid_tgid` low 32 (last-writer) | PID/TGID metadata (kp2 §9) |
+| `uid` | u32 | `bpf_get_current_uid_gid` low 32 | caller identity metadata (kp2 §9) |
+| `cgroup` | u64 | `bpf_get_current_cgroup_id` | cgroup metadata (kp2 §9) |
+| `ppid` | u32 | parent `tgid` via `task_struct.real_parent` chase (iff `parent_ok`, else 0) | PID/TGID metadata (kp2 §9) |
+| `pcomm` | 16B | parent `comm` via the same chase (iff `parent_ok`, else zeros) | comm metadata (kp2 §9) |
+| `stack` | i32 | `bpf_get_stackid` first-seen id (negative = helper errno, no row) | kernel-stack reference (kp2 §9 kernel metadata; IPs, never contents) |
+| `calls` | u64 | observations attributed to this row | return/error class tallies (kp2 §9) |
+| `first_ns` | u64 | first seen-edge `ktime` per lane | timestamps (kp2 §9) |
+| `last_ns` | u64 | last seen-edge `ktime` per lane | timestamps (kp2 §9) |
+
+## `KSTACK`: kernel stacks by id (K5)
+
+`BPF_MAP_TYPE_STACK_TRACE`, 1024 entries: key u32 stack id → value
+127 × u64 kernel IPs. Written implicitly by `bpf_get_stackid`
+(first-seen per key only, never per event). Symbolized userspace-side
+against `/proc/kallsyms` (best-effort; unreadable → raw IPs kept).
+
+## `KERR`: first nonzero return per `kh` (K5)
+
+Plain hash `u64 → i32`, 256 entries, insert-if-absent only: the raw
+`i32` return of the first nonzero-return event for that `kh` (alloc
+path: the decoded negative errno of an `ERR_PTR`; void destroy never
+records). Return/error class (kp2 §9; kp2 §5).
+
+## `KPARAMS`: per-`kh` crypto parameters (16B `VParams`, K5)
+
+Plain hash `u64 → VParams`, 256 entries, insert-if-absent only,
+written iff `params_ok` and the `crypto_alg` address is known (failed
+allocs have no `alg`: no row, and userspace omits the keys — never
+zero-filled). Per-family BTF member reads, fail-soft zeros on probe
+faults.
+
+| Field | Bytes | Source | WHY (kp2 §9) |
+|---|---|---|---|
+| `blocksize` | u32 | `cra_blocksize` | kernel/build metadata (algorithm properties, not material) |
+| `ivsize` | u32 | per-family ivsize member (0-legit: ECB has no IV) | kernel/build metadata (a size, never IV bytes) |
+| `min_keysize` | u32 | per-family min-keysize member | kernel/build metadata (a bound, never key bytes) |
+| `max_keysize` | u32 | per-family max-keysize member | kernel/build metadata (a bound, never key bytes) |
+
+Reserved key `KWHO_DROPS` (`u64::MAX - 1`) in `KIDN`:
+`KWHO`/`KERR`/`KPARAMS` insert-failure counter, saturating (kp2 §8:
+attribution loss surfaces here instead of vanishing; separate from
+`KIDN_DROPS` so ring loss and attribution loss stay distinguishable).
+
+## Attribution: `ctx` classifier, no raw IDs (v0.1; K5 supersedes)
+
+K5 (this doc's `KWHO`/`KSTACK`/`KERR`/`KPARAMS` sections above)
+supersedes the v0.1 hardening by owner decision: raw tgid/tid, comm,
+uid, cgroup id, parent, and kernel-stack references are captured (all
+inside the kp2 §9 "PID/TGID/comm/cgroup metadata" allowance — the
+v0.1 sensor deliberately captured a subset).
 
 The v0.1 sensor captures NO PID, TGID, comm, or cgroup id — only the
 `ctx` classifier (`PROC` / `KTHREAD` / `UNKNOWN`) derived from the
@@ -147,4 +226,9 @@ not contents (kp2 §9: scalar byte counts). The `canary_kcrypto`
 privileged test plants `KPROBE-CANARY-*` markers in key, IV, AND plaintext
 fixture buffers and byte-scans every `KAGG`/`KTOT`/`KIDN`/`KRING`/
 `KCFG` dump for zero occurrences: any allowlist drift that leaks
-buffer bytes fails the build.
+buffer bytes fails the build. Canary reasoning for the K5 maps (the
+fourth move of a new captured field): `KWHO`/`KSTACK`/`KERR`/
+`KPARAMS` hold task/crypto metadata only (IDs, comms, stack IPs,
+errno, sizes/bounds) — no read in the who-path touches a request
+buffer, key, or IV, so no new scan surface is required; extending the
+byte-scan to the who-map dumps is optional hardening for later.

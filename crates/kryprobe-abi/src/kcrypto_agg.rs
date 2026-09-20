@@ -90,13 +90,22 @@ pub const KCTL_HEALTH: u8 = 5;
 /// corrupt (the value only ever saturates upward).
 pub const KIDN_DROPS: u64 = u64::MAX;
 
+/// Reserved `KIDN` key: K5 attribution-insert-failure counter
+/// (`KWHO`/`KERR`/`KPARAMS` insert failed while the key stayed absent —
+/// saturating `u8`, surfaced as `who_drops`). Separate from
+/// [`KIDN_DROPS`] so ring loss and attribution loss stay distinguishable.
+pub const KWHO_DROPS: u64 = u64::MAX - 1;
+
 // ---------------------------------------------------------------------------
 // Structs (twinned in kcrypto.rs; sizes pinned by kcrypto_layout.rs)
 // ---------------------------------------------------------------------------
 
-/// `KCFG` value: the 9 loader-resolved offsets + kthread flag + pad (44B).
+/// `KCFG` value: the 9 loader-resolved offsets + kthread flag + pad
+/// (44B, K1) + the 7 K5 attribution offsets + `parent_ok`/`params_ok`
+/// flags + pad (76B total).
 ///
-/// Twin: `KConfig` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
+/// Append-only: the K1 field offsets are unchanged. Twin: `KConfig` in
+/// `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct KConfig {
@@ -123,6 +132,29 @@ pub struct KConfig {
     pub shash_base: u32,
     /// Reserved, zero.
     pub _pad: u32,
+    /// `task_struct.real_parent` (bytes; K5 parent chase).
+    pub task_real_parent: u32,
+    /// `task_struct.tgid` (bytes; K5 parent chase).
+    pub task_tgid: u32,
+    /// `task_struct.comm` (bytes; K5 parent chase).
+    pub task_comm: u32,
+    /// `crypto_alg.cra_blocksize` (bytes; K5 crypto params).
+    pub cra_blocksize: u32,
+    /// Per-family ivsize member offset (bytes; K5 crypto params — the
+    /// union member exists only for some families, hence fail-soft).
+    pub cra_ivsize: u32,
+    /// Per-family min-keysize member offset (bytes; K5 crypto params).
+    pub cra_min_keysize: u32,
+    /// Per-family max-keysize member offset (bytes; K5 crypto params).
+    pub cra_max_keysize: u32,
+    /// Nonzero iff the parent offsets resolved (BPF gates the parent
+    /// chase on this; userspace omits parent keys when false).
+    pub parent_ok: u8,
+    /// Nonzero iff the params offsets resolved (BPF gates the params
+    /// chase on this; userspace omits params keys when false).
+    pub params_ok: u8,
+    /// Reserved, zero.
+    pub _pad2: [u8; 2],
 }
 
 impl KConfig {
@@ -143,12 +175,22 @@ impl KConfig {
         "ahash_nbytes_off",
         "shash_base",
         "_pad",
+        "task_real_parent",
+        "task_tgid",
+        "task_comm",
+        "cra_blocksize",
+        "cra_ivsize",
+        "cra_min_keysize",
+        "cra_max_keysize",
+        "parent_ok",
+        "params_ok",
+        "_pad2",
     ];
 
     /// Little-endian wire bytes for the `KCFG` map update (x86-64 target).
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 44] {
-        let mut out = [0u8; 44];
+    pub fn to_bytes(&self) -> [u8; 76] {
+        let mut out = [0u8; 76];
         out[0..4].copy_from_slice(&self.sk_req_base.to_le_bytes());
         out[4..8].copy_from_slice(&self.async_tfm.to_le_bytes());
         out[8..12].copy_from_slice(&self.tfm_alg.to_le_bytes());
@@ -160,6 +202,16 @@ impl KConfig {
         out[32..36].copy_from_slice(&self.ahash_nbytes_off.to_le_bytes());
         out[36..40].copy_from_slice(&self.shash_base.to_le_bytes());
         out[40..44].copy_from_slice(&self._pad.to_le_bytes());
+        out[44..48].copy_from_slice(&self.task_real_parent.to_le_bytes());
+        out[48..52].copy_from_slice(&self.task_tgid.to_le_bytes());
+        out[52..56].copy_from_slice(&self.task_comm.to_le_bytes());
+        out[56..60].copy_from_slice(&self.cra_blocksize.to_le_bytes());
+        out[60..64].copy_from_slice(&self.cra_ivsize.to_le_bytes());
+        out[64..68].copy_from_slice(&self.cra_min_keysize.to_le_bytes());
+        out[68..72].copy_from_slice(&self.cra_max_keysize.to_le_bytes());
+        out[72] = self.parent_ok;
+        out[73] = self.params_ok;
+        out[74..76].copy_from_slice(&self._pad2);
         out
     }
 }
@@ -323,6 +375,111 @@ impl KCtl {
     pub const FIELDS: &[&str] = &["kind", "_p", "key_hash", "val0", "val1", "val2", "val3"];
 }
 
+// ---------------------------------------------------------------------------
+// K5 attribution (twinned in kcrypto.rs; sizes pinned by kcrypto_layout.rs)
+// ---------------------------------------------------------------------------
+
+/// `KWHO` key: row hash + thread-group id (16B).
+///
+/// `kh` is [`kh_of`] over the full `KAgg` key (fam/op/res/ctx +
+/// alg/drv words); `tgid` scopes the caller identity to one thread
+/// group (per-tgid rows, not per-tid — `tid` rides the value as a
+/// last-writer hint).
+///
+/// Twin: `KWhoKey` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct KWhoKey {
+    /// [`kh_of`] of the `KAGG` row this identity belongs to.
+    pub kh: u64,
+    /// Thread-group id of the calling thread group.
+    pub tgid: u32,
+    /// Padding, zero.
+    pub _pad: u32,
+}
+
+impl KWhoKey {
+    /// Manually-maintained field list (allowlist tripwire, declaration
+    /// order — see [`KConfig::FIELDS`]).
+    pub const FIELDS: &[&str] = &["kh", "tgid", "_pad"];
+}
+
+/// `KWHO` value: caller identity + call tallies (80B).
+///
+/// First-seen fields (`comm` initial, `uid`, `cgroup`, `ppid`, `pcomm`,
+/// `stack`) are written once at insert; the hit path updates only
+/// `calls`, `last_ns`, and the last-writer `tid`/`comm`. Per-CPU lanes
+/// (like [`VAgg`]): the insert broadcasts the identity with `calls == 0`
+/// to every lane and the inserting CPU's lane is updated in place, so
+/// idle lanes hold `calls == 0` and must be skipped by the
+/// `first_ns`-min fold (same contract as [`fold_vagg`]).
+///
+/// Twin: `VWho` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct VWho {
+    /// Calling thread `comm` (`TASK_COMM_LEN`, NUL-padded; last-writer).
+    pub comm: [u8; 16],
+    /// Calling thread id (last-writer; the key carries the tgid).
+    pub tid: u32,
+    /// Calling uid (low 32 of `bpf_get_current_uid_gid`).
+    pub uid: u32,
+    /// Calling cgroup id (`bpf_get_current_cgroup_id`).
+    pub cgroup: u64,
+    /// Parent thread-group id (0 when `parent_ok` is false or the chase
+    /// failed).
+    pub ppid: u32,
+    /// Parent `comm` (zeros when `parent_ok` is false or the chase
+    /// failed).
+    pub pcomm: [u8; 16],
+    /// `KSTACK` id (`bpf_get_stackid`, first-seen only); negative is the
+    /// raw helper errno (no `KSTACK` row).
+    pub stack: i32,
+    /// Observations attributed to this row (per lane; sum over lanes).
+    pub calls: u64,
+    /// First-observation time per lane (min-folded over busy lanes; 0
+    /// when `calls` is 0).
+    pub first_ns: u64,
+    /// Last-observation time per lane (max-folded).
+    pub last_ns: u64,
+}
+
+impl VWho {
+    /// Manually-maintained field list (allowlist tripwire, declaration
+    /// order — see [`KConfig::FIELDS`]).
+    pub const FIELDS: &[&str] = &[
+        "comm", "tid", "uid", "cgroup", "ppid", "pcomm", "stack", "calls", "first_ns", "last_ns",
+    ];
+}
+
+/// `KPARAMS` value: per-`kh` crypto parameters (16B).
+///
+/// Keyed by [`kh_of`] (insert-if-absent): the parameters describe the
+/// `crypto_alg`, which is fixed per (alg, drv) identity. A missing row
+/// means "unknown" (params chase skipped or `alg == 0`, e.g. a failed
+/// alloc); userspace omits the params keys then, and whenever
+/// `params_ok` is false — never zero-filled in output.
+///
+/// Twin: `VParams` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct VParams {
+    /// `cra_blocksize`.
+    pub blocksize: u32,
+    /// Per-family ivsize member (0-legit: e.g. ECB has no IV).
+    pub ivsize: u32,
+    /// Per-family min-keysize member.
+    pub min_keysize: u32,
+    /// Per-family max-keysize member.
+    pub max_keysize: u32,
+}
+
+impl VParams {
+    /// Manually-maintained field list (allowlist tripwire, declaration
+    /// order — see [`KConfig::FIELDS`]).
+    pub const FIELDS: &[&str] = &["blocksize", "ivsize", "min_keysize", "max_keysize"];
+}
+
 /// Pack a `KCtl.val0` attribution head: `fam | op<<8 | res<<16 | ctx<<24`
 /// (userspace helper; the BPF inlines the same shifts).
 #[must_use]
@@ -368,6 +525,39 @@ pub fn kcrypto_ident_hash(fam: u8, op: u8, alg: &[u64; 16], drv: &[u64; 16]) -> 
     };
     mix(fam);
     mix(op);
+    for words in [alg, drv] {
+        for word in words {
+            for byte in word.to_le_bytes() {
+                mix(byte);
+            }
+        }
+    }
+    hash
+}
+
+/// Row hash: `KWHO`/`KERR`/`KPARAMS` key (`kh`).
+///
+/// FNV-1a over, in order: `fam`, `op`, `res`, `ctx`, the 128 `alg`
+/// bytes, the 128 `drv` bytes (words in little-endian byte order).
+/// Unlike [`kcrypto_ident_hash`] (identity-scoped: `fam`/`op` only),
+/// `kh` covers the FULL `KAgg` row: each (result, context) row of an
+/// identity hashes distinctly, so who-rows join agg rows exactly.
+///
+/// Twin: `kh_of` in `crates/bpf-kcrypto/src/bin/kcrypto.rs` (same
+/// bytes; the BPF twin reads them through byte pointers because `KAgg`
+/// is packed — same twin-shape adaptation as
+/// [`kcrypto_ident_hash`]/`ident_hash`).
+#[must_use]
+pub fn kh_of(fam: u8, op: u8, res: u8, ctx: u8, alg: &[u64; 16], drv: &[u64; 16]) -> u64 {
+    let mut hash = FNV_BASIS;
+    let mut mix = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    mix(fam);
+    mix(op);
+    mix(res);
+    mix(ctx);
     for words in [alg, drv] {
         for word in words {
             for byte in word.to_le_bytes() {
@@ -497,6 +687,71 @@ pub fn kctl_from_bytes(bytes: &[u8]) -> Option<KCtl> {
     })
 }
 
+/// Decode one `u32` field; `None` on a short buffer.
+fn lane_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes
+        .get(at..at + 4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+}
+
+/// Decode one `i32` field; `None` on a short buffer.
+fn lane_i32(bytes: &[u8], at: usize) -> Option<i32> {
+    bytes
+        .get(at..at + 4)
+        .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+}
+
+/// Decode a `KWhoKey` map key from exactly 16 bytes (`None` otherwise).
+#[must_use]
+pub fn kwho_key_from_bytes(bytes: &[u8]) -> Option<KWhoKey> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    Some(KWhoKey {
+        kh: lane_word(bytes, 0)?,
+        tgid: lane_u32(bytes, 8)?,
+        _pad: lane_u32(bytes, 12)?,
+    })
+}
+
+/// Decode a `VWho` map value from exactly 80 bytes (`None` otherwise).
+#[must_use]
+pub fn vwho_from_bytes(bytes: &[u8]) -> Option<VWho> {
+    if bytes.len() != 80 {
+        return None;
+    }
+    let mut comm = [0u8; 16];
+    comm.copy_from_slice(bytes.get(0..16)?);
+    let mut pcomm = [0u8; 16];
+    pcomm.copy_from_slice(bytes.get(36..52)?);
+    Some(VWho {
+        comm,
+        tid: lane_u32(bytes, 16)?,
+        uid: lane_u32(bytes, 20)?,
+        cgroup: lane_word(bytes, 24)?,
+        ppid: lane_u32(bytes, 32)?,
+        pcomm,
+        stack: lane_i32(bytes, 52)?,
+        calls: lane_word(bytes, 56)?,
+        first_ns: lane_word(bytes, 64)?,
+        last_ns: lane_word(bytes, 72)?,
+    })
+}
+
+/// Decode a `VParams` map value from exactly 16 bytes (`None` otherwise).
+#[must_use]
+pub fn vparams_from_bytes(bytes: &[u8]) -> Option<VParams> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    Some(VParams {
+        blocksize: lane_u32(bytes, 0)?,
+        ivsize: lane_u32(bytes, 4)?,
+        min_keysize: lane_u32(bytes, 8)?,
+        max_keysize: lane_u32(bytes, 12)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +878,111 @@ mod tests {
         let ctl = kctl_from_bytes(&ctl_bytes).expect("48B decodes");
         assert_eq!(ctl.kind, KCTL_IDENT);
         assert!(kctl_from_bytes(&ctl_bytes[..47]).is_none());
+    }
+
+    #[test]
+    fn kh_covers_full_row_with_golden() {
+        // Goldens: FNV-1a over (fam, op, res, ctx, alg LE bytes, drv LE
+        // bytes) computed by hand from the FNV spec (independent python
+        // check, not compiler output) for alg="cbc(aes)"+pad, drv=zeros.
+        let mut alg = [0u64; 16];
+        alg[0] = u64::from_le_bytes(*b"cbc(aes)");
+        let drv = [0u64; 16];
+        assert_eq!(
+            kh_of(KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC, &alg, &drv),
+            0x8e83_4f55_dbe2_59a5
+        );
+        // res/ctx move the hash (row-scoped, unlike the identity hash).
+        assert_eq!(
+            kh_of(KFAM_SK, KOP_ENC, KRES_ERR, KCTX_PROC, &alg, &drv),
+            0xd420_b807_aa39_0150
+        );
+        assert_eq!(
+            kh_of(KFAM_SHASH, KOP_DIGEST, KRES_OK, KCTX_KTHREAD, &alg, &drv),
+            0x00ea_318f_c071_25a5
+        );
+    }
+
+    #[test]
+    fn who_codecs_roundtrip_and_reject_short() {
+        let mut key_bytes = [0u8; 16];
+        key_bytes[0..8].copy_from_slice(&0x8e83_4f55_dbe2_59a5u64.to_le_bytes());
+        key_bytes[8..12].copy_from_slice(&4242u32.to_le_bytes());
+        let key = kwho_key_from_bytes(&key_bytes).expect("16B decodes");
+        assert_eq!(key.kh, 0x8e83_4f55_dbe2_59a5);
+        assert_eq!(key.tgid, 4242);
+        assert!(kwho_key_from_bytes(&key_bytes[..15]).is_none());
+        assert!(kwho_key_from_bytes(&[0u8; 17]).is_none());
+
+        let mut who_bytes = [0u8; 80];
+        who_bytes[0..7].copy_from_slice(b"python3");
+        who_bytes[16..20].copy_from_slice(&4243u32.to_le_bytes());
+        who_bytes[20..24].copy_from_slice(&1000u32.to_le_bytes());
+        who_bytes[24..32].copy_from_slice(&0x9cu64.to_le_bytes());
+        who_bytes[32..36].copy_from_slice(&12u32.to_le_bytes());
+        who_bytes[36..41].copy_from_slice(b"bash\0");
+        who_bytes[52..56].copy_from_slice(&(-115i32).to_le_bytes());
+        who_bytes[56..64].copy_from_slice(&7u64.to_le_bytes());
+        who_bytes[64..72].copy_from_slice(&111u64.to_le_bytes());
+        who_bytes[72..80].copy_from_slice(&222u64.to_le_bytes());
+        let who = vwho_from_bytes(&who_bytes).expect("80B decodes");
+        assert_eq!(&who.comm[..7], b"python3");
+        assert_eq!(who.tid, 4243);
+        assert_eq!(who.uid, 1000);
+        assert_eq!(who.cgroup, 0x9c);
+        assert_eq!(who.ppid, 12);
+        assert_eq!(&who.pcomm[..4], b"bash");
+        assert_eq!(who.stack, -115);
+        assert_eq!(who.calls, 7);
+        assert_eq!(who.first_ns, 111);
+        assert_eq!(who.last_ns, 222);
+        assert!(vwho_from_bytes(&who_bytes[..79]).is_none());
+        assert!(vwho_from_bytes(&[0u8; 81]).is_none());
+
+        let mut params_bytes = [0u8; 16];
+        params_bytes[0..4].copy_from_slice(&16u32.to_le_bytes());
+        params_bytes[4..8].copy_from_slice(&16u32.to_le_bytes());
+        params_bytes[8..12].copy_from_slice(&16u32.to_le_bytes());
+        params_bytes[12..16].copy_from_slice(&32u32.to_le_bytes());
+        let params = vparams_from_bytes(&params_bytes).expect("16B decodes");
+        assert_eq!(params.blocksize, 16);
+        assert_eq!(params.ivsize, 16);
+        assert_eq!(params.min_keysize, 16);
+        assert_eq!(params.max_keysize, 32);
+        assert!(vparams_from_bytes(&params_bytes[..15]).is_none());
+    }
+
+    #[test]
+    fn kconfig_wire_is_76_with_k5_tail() {
+        // K1 head bytes unchanged (append-only extension); the K5 tail
+        // carries the new offsets + flags.
+        let cfg = KConfig {
+            sk_req_base: 32,
+            task_real_parent: 1232,
+            task_tgid: 1240,
+            task_comm: 1808,
+            cra_blocksize: 64,
+            cra_ivsize: 0,
+            cra_min_keysize: 72,
+            cra_max_keysize: 76,
+            parent_ok: 1,
+            params_ok: 0,
+            ..KConfig::default()
+        };
+        let wire = cfg.to_bytes();
+        assert_eq!(wire.len(), 76);
+        assert_eq!(u32::from_le_bytes([wire[0], wire[1], wire[2], wire[3]]), 32);
+        assert_eq!(
+            u32::from_le_bytes([wire[44], wire[45], wire[46], wire[47]]),
+            1232
+        );
+        assert_eq!(
+            u32::from_le_bytes([wire[68], wire[69], wire[70], wire[71]]),
+            76
+        );
+        assert_eq!(wire[72], 1);
+        assert_eq!(wire[73], 0);
+        assert_eq!(&wire[74..76], &[0, 0]);
     }
 
     #[test]

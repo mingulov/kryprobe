@@ -16,8 +16,9 @@
 //! (`Documentation/bpf/btf.rst`, UAPI `linux/btf.h`).
 //!
 //! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
-//! 9-offsets → 44B projection) and [`load_kcrypto_configured`] (the
-//! single resolve → load → write-KCFG → attach entry K2 calls).
+//! 9-offsets → 76B projection, K1 44B head + zeroed K5 tail) and
+//! [`load_kcrypto_configured`] (the single resolve → load → write-KCFG
+//! → attach entry K2 calls).
 
 use crate::attach::OwnedLink;
 use crate::bpfloader::{LoadedKcrypto, LoaderError, PointStatus, load_kcrypto};
@@ -166,7 +167,9 @@ pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
 }
 
 /// Pure CONFIG projection (K1 Task 3): the 9 resolved offsets +
-/// [`PF_KTHREAD`] + zero pad → the 44B [`KConfig`] in C2 word order.
+/// [`PF_KTHREAD`] + zero pad → the 76B [`KConfig`] in C2 word order
+/// (K5 appends the attribution tail, zeroed here: Task 3 resolves the
+/// parent/params offsets + flags and fills them).
 /// Total (no failure mode: every input word is copied verbatim).
 #[must_use]
 pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
@@ -182,6 +185,19 @@ pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
         ahash_nbytes_off: off.ahash_nbytes_off,
         shash_base: off.shash_base,
         _pad: 0,
+        // K5 attribution tail: zeros until Task 3 wires resolution
+        // (`parent_ok == 0` / `params_ok == 0` = chases disabled,
+        // fail-soft by construction).
+        task_real_parent: 0,
+        task_tgid: 0,
+        task_comm: 0,
+        cra_blocksize: 0,
+        cra_ivsize: 0,
+        cra_min_keysize: 0,
+        cra_max_keysize: 0,
+        parent_ok: 0,
+        params_ok: 0,
+        _pad2: [0, 0],
     }
 }
 
@@ -1017,8 +1033,9 @@ mod tests {
     #[test]
     fn kconfig_from_offsets_lays_out_c2_words() {
         // Pure CONFIG projection (K1 Task 3): the 9 resolved offsets +
-        // PF_KTHREAD + zero pad → the 44B KCFG wire layout in C2 word
-        // order (brief Step 1: KCFG bytes equal the resolved offsets).
+        // PF_KTHREAD + zero pad → the 76B KCFG wire layout in C2 word
+        // order (brief Step 1: KCFG bytes equal the resolved offsets;
+        // K5 appends a zeroed attribution tail until Task 3 wires it).
         let off = CryptoOffsets {
             sk_req_base: 32,
             async_tfm: 32,
@@ -1031,13 +1048,15 @@ mod tests {
             shash_base: 8,
         };
         let cfg = kconfig_from_offsets(off);
-        let mut want = [0u8; 44];
+        let mut want = [0u8; 76];
         for (i, word) in [32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 8, 0]
             .iter()
             .enumerate()
         {
             want[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
+        // K5 tail: 7 zero offsets + zero flags + zero pad.
+        assert_eq!(want[44..], [0u8; 32]);
         assert_eq!(cfg.to_bytes(), want);
     }
 

@@ -5,7 +5,7 @@
 //! brief Step 1 (resolve + KCFG bytes equal the 9 resolved offsets +
 //! pad per C2, from live BTF). `configured_entry_writes_kcfg_from_
 //! resolver` is the privileged half: `load_kcrypto_configured` writes
-//! the 44B KCFG row the live resolver dictates, attaches all 9 points,
+//! the 76B KCFG row the live resolver dictates, attaches all 9 points,
 //! and the row reads back byte-identical (from the map fd, then again
 //! after a real bpffs pin). `canary_kcrypto` plants `KPROBE-CANARY-*`
 //! markers in key, IV, and plaintext fixture buffers and byte-scans
@@ -223,7 +223,7 @@ fn dump_all_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
         &map_lookup_bytes(
             &sensor.loaded.maps.config,
             &0u32.to_le_bytes(),
-            44,
+            76,
             "canary/kcfg",
         )
         .expect("KCFG dump"),
@@ -291,7 +291,11 @@ fn kconfig_bytes_match_live_resolver() {
     }
     let off = resolve_offsets().expect("offsets must resolve");
     let bytes = kconfig_from_offsets(off).to_bytes();
-    assert_eq!(bytes.len(), 44, "KCFG wire is 44B (C2 + shash_base)");
+    assert_eq!(
+        bytes.len(),
+        76,
+        "KCFG wire is 76B (C2 + shash_base + K5 tail)"
+    );
     let word =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
     assert_eq!(word(0), off.sk_req_base, "word 0: sk_req_base");
@@ -363,7 +367,7 @@ fn configured_entry_writes_kcfg_from_resolver() {
     let got = map_lookup_bytes(
         &sensor.loaded.maps.config,
         &0u32.to_le_bytes(),
-        44,
+        76,
         "configured/kcfg",
     )
     .expect("KCFG read");
@@ -390,7 +394,7 @@ fn configured_entry_writes_kcfg_from_resolver() {
         let pinned = map_lookup_bytes(
             &sensor.loaded.maps.config,
             &0u32.to_le_bytes(),
-            44,
+            76,
             "configured/kcfg-pinned",
         )
         .expect("KCFG pinned read");

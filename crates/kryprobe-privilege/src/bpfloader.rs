@@ -92,17 +92,19 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 
 /// Frozen kcrypto maps, in creation order. Asserted against the object.
 ///
-/// The exact Task-2 contract (`KConfig` 44B per C2 + the K4-fix3
-/// `shash_base` word, `KAgg` 260B, `VAgg` 120B —
-/// `planning/kryprobe-phaseK1-sensor-plan.md` Task 2); names dot-free
-/// per R3 (`evidence/k0/P1-attach-matrix.txt`).
+/// The exact Task-2 contract (`KConfig` 76B per C2 + the K4-fix3
+/// `shash_base` word + the K5 attribution tail, `KAgg` 260B, `VAgg`
+/// 120B — `planning/kryprobe-phaseK1-sensor-plan.md` Task 2) plus the
+/// four K5 attribution maps (`KWHO`/`KSTACK`/`KERR`/`KPARAMS` —
+/// `planning/kryprobe-phaseK5-attribution-token-design.md` §2.1);
+/// names dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
         "KCFG",
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 44,
+            value_size: 76,
             max_entries: 1,
         },
     ),
@@ -140,6 +142,42 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             key_size: 0,
             value_size: 0,
             max_entries: 1_048_576,
+        },
+    ),
+    (
+        "KWHO",
+        MapDims {
+            map_type: 5,
+            key_size: 16,
+            value_size: 80,
+            max_entries: 2048,
+        },
+    ),
+    (
+        "KSTACK",
+        MapDims {
+            map_type: 7,
+            key_size: 4,
+            value_size: 1016,
+            max_entries: 1024,
+        },
+    ),
+    (
+        "KERR",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 4,
+            max_entries: 256,
+        },
+    ),
+    (
+        "KPARAMS",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 16,
+            max_entries: 256,
         },
     ),
 ];

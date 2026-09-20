@@ -138,6 +138,17 @@ impl Sensor {
             ahash_nbytes_off: off.ahash_nbytes_off,
             shash_base: off.shash_base,
             _pad: 0,
+            // K5 attribution tail, zeroed (Task 3 wires resolution).
+            task_real_parent: 0,
+            task_tgid: 0,
+            task_comm: 0,
+            cra_blocksize: 0,
+            cra_ivsize: 0,
+            cra_min_keysize: 0,
+            cra_max_keysize: 0,
+            parent_ok: 0,
+            params_ok: 0,
+            _pad2: [0, 0],
         };
         map_update_bytes(
             &loaded.maps.config,
@@ -693,7 +704,7 @@ fn kcfg_roundtrip_matches_resolver() {
     if !lane_ready("kcfg_roundtrip_matches_resolver") {
         return;
     }
-    // Load only (no attach, no traffic): the 44B KCFG row the loader
+    // Load only (no attach, no traffic): the 76B KCFG row the loader
     // path writes must read back byte-identical (pin + codec + dims).
     let bytes = kcrypto_bytes();
     let ids = resolve_btf_ids().expect("P0 symbols must resolve");
@@ -715,9 +726,24 @@ fn kcfg_roundtrip_matches_resolver() {
         ahash_nbytes_off: off.ahash_nbytes_off,
         shash_base: off.shash_base,
         _pad: 0,
+        // K5 attribution tail, zeroed (Task 3 wires resolution).
+        task_real_parent: 0,
+        task_tgid: 0,
+        task_comm: 0,
+        cra_blocksize: 0,
+        cra_ivsize: 0,
+        cra_min_keysize: 0,
+        cra_max_keysize: 0,
+        parent_ok: 0,
+        params_ok: 0,
+        _pad2: [0, 0],
     };
     let want = cfg.to_bytes();
-    assert_eq!(want.len(), 44, "KCFG wire is 44B (C2 + shash_base)");
+    assert_eq!(
+        want.len(),
+        76,
+        "KCFG wire is 76B (C2 + shash_base + K5 tail)"
+    );
     map_update_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
@@ -728,7 +754,7 @@ fn kcfg_roundtrip_matches_resolver() {
     let got = map_lookup_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
-        44,
+        76,
         "kcfg/roundtrip",
     )
     .expect("KCFG read");

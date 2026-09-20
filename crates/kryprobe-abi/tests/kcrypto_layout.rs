@@ -10,15 +10,18 @@ use kryprobe_abi::kcrypto_agg::{
     KAgg, KCTL_GAP, KCTL_GENCHANGE, KCTL_HEALTH, KCTL_IDENT, KCTL_OVERFLOW, KCTX_KTHREAD,
     KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KConfig, KCtl, KFAM_AEAD, KFAM_AHASH, KFAM_ANY,
     KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC, KOP_DESTROY, KOP_DIGEST, KOP_ENC,
-    KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED, VAgg,
+    KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED, KWHO_DROPS, KWhoKey, VAgg, VParams,
+    VWho,
 };
 
 #[test]
 fn kconfig_size_align_and_offsets_pinned() {
-    // 11 x u32, no padding (44B: the 6 P2/task offsets + pf_kthread
-    // + the AEAD/ahash length offsets + shash_base + _pad as 11th word;
-    // brief C2 + the K4-fix3 shash resolution).
-    assert_eq!(std::mem::size_of::<KConfig>(), 44);
+    // 11 x u32 (44B K1 head: the 6 P2/task offsets + pf_kthread + the
+    // AEAD/ahash length offsets + shash_base + _pad as 11th word; brief
+    // C2 + the K4-fix3 shash resolution) + 7 x u32 K5 offsets + 2 flag
+    // bytes + 2 pad bytes = 76B. Append-only: every K1 offset below is
+    // unchanged.
+    assert_eq!(std::mem::size_of::<KConfig>(), 76);
     assert_eq!(std::mem::align_of::<KConfig>(), 4);
     assert_eq!(std::mem::offset_of!(KConfig, sk_req_base), 0);
     assert_eq!(std::mem::offset_of!(KConfig, async_tfm), 4);
@@ -31,6 +34,16 @@ fn kconfig_size_align_and_offsets_pinned() {
     assert_eq!(std::mem::offset_of!(KConfig, ahash_nbytes_off), 32);
     assert_eq!(std::mem::offset_of!(KConfig, shash_base), 36);
     assert_eq!(std::mem::offset_of!(KConfig, _pad), 40);
+    assert_eq!(std::mem::offset_of!(KConfig, task_real_parent), 44);
+    assert_eq!(std::mem::offset_of!(KConfig, task_tgid), 48);
+    assert_eq!(std::mem::offset_of!(KConfig, task_comm), 52);
+    assert_eq!(std::mem::offset_of!(KConfig, cra_blocksize), 56);
+    assert_eq!(std::mem::offset_of!(KConfig, cra_ivsize), 60);
+    assert_eq!(std::mem::offset_of!(KConfig, cra_min_keysize), 64);
+    assert_eq!(std::mem::offset_of!(KConfig, cra_max_keysize), 68);
+    assert_eq!(std::mem::offset_of!(KConfig, parent_ok), 72);
+    assert_eq!(std::mem::offset_of!(KConfig, params_ok), 73);
+    assert_eq!(std::mem::offset_of!(KConfig, _pad2), 74);
 }
 
 #[test]
@@ -76,6 +89,45 @@ fn kctl_size_align_and_offsets_pinned() {
     assert_eq!(std::mem::offset_of!(KCtl, val1), 24);
     assert_eq!(std::mem::offset_of!(KCtl, val2), 32);
     assert_eq!(std::mem::offset_of!(KCtl, val3), 40);
+}
+
+#[test]
+fn k5_who_mirror_sizes() {
+    assert_eq!(std::mem::size_of::<KWhoKey>(), 16);
+    assert_eq!(std::mem::size_of::<VWho>(), 80);
+    assert_eq!(std::mem::offset_of!(VWho, cgroup), 24);
+    assert_eq!(std::mem::offset_of!(VWho, stack), 52);
+    // Full hand-computed layout (brief verbatim field order):
+    // comm[16] @0, tid @16, uid @20, cgroup @24, ppid @32, pcomm[16]
+    // @36, stack @52, calls @56, first_ns @64, last_ns @72.
+    assert_eq!(std::mem::align_of::<KWhoKey>(), 8);
+    assert_eq!(std::mem::align_of::<VWho>(), 8);
+    assert_eq!(std::mem::offset_of!(KWhoKey, kh), 0);
+    assert_eq!(std::mem::offset_of!(KWhoKey, tgid), 8);
+    assert_eq!(std::mem::offset_of!(KWhoKey, _pad), 12);
+    assert_eq!(std::mem::offset_of!(VWho, comm), 0);
+    assert_eq!(std::mem::offset_of!(VWho, tid), 16);
+    assert_eq!(std::mem::offset_of!(VWho, uid), 20);
+    assert_eq!(std::mem::offset_of!(VWho, ppid), 32);
+    assert_eq!(std::mem::offset_of!(VWho, pcomm), 36);
+    assert_eq!(std::mem::offset_of!(VWho, calls), 56);
+    assert_eq!(std::mem::offset_of!(VWho, first_ns), 64);
+    assert_eq!(std::mem::offset_of!(VWho, last_ns), 72);
+}
+
+#[test]
+fn k5_params_mirror_sizes() {
+    // 4 x u32, no padding (16B per-kh crypto params).
+    assert_eq!(std::mem::size_of::<VParams>(), 16);
+    assert_eq!(std::mem::align_of::<VParams>(), 4);
+    assert_eq!(std::mem::offset_of!(VParams, blocksize), 0);
+    assert_eq!(std::mem::offset_of!(VParams, ivsize), 4);
+    assert_eq!(std::mem::offset_of!(VParams, min_keysize), 8);
+    assert_eq!(std::mem::offset_of!(VParams, max_keysize), 12);
+    // Attribution drops ride their own reserved KIDN key, distinct
+    // from the ring-reserve counter.
+    assert_eq!(KWHO_DROPS, u64::MAX - 1);
+    assert_ne!(KWHO_DROPS, KIDN_DROPS);
 }
 
 #[test]
