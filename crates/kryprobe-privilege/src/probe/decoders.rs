@@ -16,7 +16,7 @@ pub fn parse_kernel_release(text: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-const CAP_TABLE: [&str; 40] = [
+const CAP_TABLE: [&str; 41] = [
     "CAP_CHOWN",
     "CAP_DAC_OVERRIDE",
     "CAP_DAC_READ_SEARCH",
@@ -28,6 +28,7 @@ const CAP_TABLE: [&str; 40] = [
     "CAP_SETPCAP",
     "CAP_LINUX_IMMUTABLE",
     "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
     "CAP_NET_ADMIN",
     "CAP_NET_RAW",
     "CAP_IPC_LOCK",
@@ -111,10 +112,18 @@ mod tests {
     fn cap_bits_table() {
         assert!(cap_names(0).is_empty());
         assert_eq!(cap_names(1), ["CAP_CHOWN"]);
-        assert_eq!(cap_names(1 << 38), ["CAP_BPF"]);
-        assert_eq!(cap_names(1 << 18), ["CAP_SYS_PTRACE"]);
-        assert_eq!(cap_names((1 << 37) | (1 << 38)), ["CAP_PERFMON", "CAP_BPF"]);
-        assert_eq!(cap_names(1 << 39).len(), 1);
+        // UAPI order (`linux/capability.h` + `capsh --decode`): 11 is
+        // BROADCAST (the table used to omit it, shifting 11–39 by one).
+        assert_eq!(cap_names(1 << 11), ["CAP_NET_BROADCAST"]);
+        assert_eq!(cap_names(1 << 12), ["CAP_NET_ADMIN"]);
+        assert_eq!(cap_names(1 << 18), ["CAP_SYS_CHROOT"]);
+        assert_eq!(cap_names(1 << 19), ["CAP_SYS_PTRACE"]);
+        assert_eq!(cap_names(1 << 36), ["CAP_BLOCK_SUSPEND"]);
+        assert_eq!(cap_names(1 << 37), ["CAP_AUDIT_READ"]);
+        assert_eq!(cap_names(1 << 38), ["CAP_PERFMON"]);
+        assert_eq!(cap_names(1 << 39), ["CAP_BPF"]);
+        assert_eq!(cap_names(1 << 40), ["CAP_CHECKPOINT_RESTORE"]);
+        assert_eq!(cap_names((1 << 38) | (1 << 39)), ["CAP_PERFMON", "CAP_BPF"]);
         assert!(cap_names(1 << 63).is_empty());
     }
 

@@ -87,8 +87,11 @@ pub const KCRYPTO_CAPABILITIES: BackendCapabilities = BackendCapabilities {
 };
 
 /// kcrypto BPF maps held per configured sensor: `KAGG`, `KTOT`, `KIDN`,
-/// `KRING`, `KCFG` (the `StateEntries` charge on first configure).
-const KCRYPTO_MAP_COUNT: u64 = 5;
+/// `KRING`, `KCFG` (K1 five) + `KWHO`/`KSTACK`/`KERR`/`KPARAMS` (K5
+/// attribution four) + `KDROPS` (fix-wave pre-`KTOT` site counters) —
+/// the `StateEntries` charge on first configure (the message contract
+/// is maps-count, so the charge tracks the loaded map count).
+const KCRYPTO_MAP_COUNT: u64 = 10;
 
 /// Payload note on `UNOBSERVED` rows (unreachable-by-construction: only the
 /// void destroy path carries this class, and it emits no rows).
@@ -384,6 +387,67 @@ impl From<MapOpsError> for SnapshotError {
     fn from(err: MapOpsError) -> Self {
         Self::Map(err)
     }
+}
+
+/// `KDROPS` site names by index (fix wave, G-C1): the BPF/userspace
+/// order contract — index order pins exactly (see
+/// `kdrop_site_names_pin_eight`). Sites 0–4 are unexpected loss;
+/// `destroy_skip` is C7-expected (always skips, separately keyed);
+/// spares are reserved (BPF never writes them).
+pub const KDROP_SITES: [&str; 8] = [
+    "cfg_fail",
+    "fret_fail",
+    "arg_null",
+    "chase_fail",
+    "name_fail",
+    "destroy_skip",
+    "spare_6",
+    "spare_7",
+];
+
+/// `KDROPS` index of the destroy C7-expected skip (surfaced, but
+/// excluded from loss verdicts — sites below this index are the
+/// unexpected-loss set).
+pub const KDROP_DESTROY: usize = 5;
+
+/// Fold one `KDROPS` percpu read (`ncpu` LE `u64` lanes) into a site
+/// total. `None` on a short read (a broken post-attach read must be
+/// loud, never a silent partial sum). Saturating (never wraps —
+/// magnitude honesty at scale).
+#[must_use]
+pub fn fold_drop_lanes(raw: &[u8], ncpu: usize) -> Option<u64> {
+    if raw.len() < 8 * ncpu {
+        return None;
+    }
+    let mut total = 0u64;
+    for c in 0..ncpu {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&raw[c * 8..(c + 1) * 8]);
+        total = total.saturating_add(u64::from_le_bytes(word));
+    }
+    Some(total)
+}
+
+/// Snapshot the `KDROPS` pre-`KTOT` drop sites of a configured sensor:
+/// one percpu lookup + fold per site, in [`KDROP_SITES`] order.
+/// Structural failures fail the whole snapshot (the [`snapshot_who`]
+/// discipline: loud, never a silent zero).
+pub fn snapshot_drops(sensor: &ConfiguredKcrypto) -> Result<[u64; 8], SnapshotError> {
+    let ncpu = possible_cpus() as usize;
+    let mut out = [0u64; 8];
+    for (site, slot) in out.iter_mut().enumerate() {
+        let raw = map_lookup_bytes(
+            &sensor.loaded.maps.drops,
+            &(site as u32).to_le_bytes(),
+            8 * ncpu,
+            "snapshot/drops",
+        )?;
+        *slot = fold_drop_lanes(&raw, ncpu).ok_or_else(|| MapOpsError::LookupFailed {
+            stage: "snapshot/drops-lane".to_owned(),
+            errno: libc::EBADMSG,
+        })?;
+    }
+    Ok(out)
 }
 
 /// Fold per-CPU `VWho` lanes into one total (the [`fold_vagg`](kryprobe_abi::kcrypto_agg::fold_vagg)
@@ -1560,5 +1624,45 @@ mod tests {
         let obs = backend.decode(&ctx, event).expect("totals decodes");
         assert_eq!(obs.backend_payload["counts"]["calls"].as_u64(), Some(40));
         assert_eq!(obs.backend_payload["bytes"].as_u64(), Some(640));
+    }
+
+    #[test]
+    fn kdrop_site_names_pin_eight() {
+        // Fix wave (G-C1): the KDROPS site order is a BPF/userspace
+        // contract — index order pins exactly (destroy is separately
+        // keyed: it always skips via C7, never a loss signal).
+        assert_eq!(
+            KDROP_SITES,
+            [
+                "cfg_fail",
+                "fret_fail",
+                "arg_null",
+                "chase_fail",
+                "name_fail",
+                "destroy_skip",
+                "spare_6",
+                "spare_7",
+            ]
+        );
+        assert_eq!(KDROP_DESTROY, 5);
+        assert_eq!(KDROP_SITES[KDROP_DESTROY], "destroy_skip");
+    }
+
+    #[test]
+    fn kdrop_fold_sums_percpu_lanes_saturating() {
+        // Synthetic 3-CPU lanes: exact sum, short read refuses, overflow
+        // saturates (never wraps — magnitude honesty at scale).
+        let lanes: Vec<u8> = [10u64, 20, 30]
+            .iter()
+            .flat_map(|lane| lane.to_le_bytes())
+            .collect();
+        assert_eq!(fold_drop_lanes(&lanes, 3), Some(60));
+        assert_eq!(fold_drop_lanes(&lanes, 4), None);
+        assert_eq!(fold_drop_lanes(&lanes[..16], 3), None);
+        let lanes: Vec<u8> = [u64::MAX, 1]
+            .iter()
+            .flat_map(|lane| lane.to_le_bytes())
+            .collect();
+        assert_eq!(fold_drop_lanes(&lanes, 2), Some(u64::MAX));
     }
 }

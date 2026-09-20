@@ -104,6 +104,22 @@ const KIDN_DROPS: u64 = u64::MAX;
 /// saturating `u8`, surfaced as `who_drops`).
 const KWHO_DROPS: u64 = u64::MAX - 1;
 
+/// `KDROPS` sites: pre-`KTOT` skip accounting (fix wave, G-C1). Every
+/// `return 0` before the `KTOT` update bumps one site (exact per-CPU
+/// `u64` — no saturation, no races); userspace folds lanes and
+/// surfaces per-site coverage counters. Order is a BPF/userspace
+/// contract (`KDROP_SITES` pins it).
+const KDROPS_CFG: u32 = 0;
+const KDROPS_FRET: u32 = 1;
+const KDROPS_ARGNULL: u32 = 2;
+const KDROPS_CHASE: u32 = 3;
+const KDROPS_NAME: u32 = 4;
+/// Destroy chase-skip, separately keyed: it ALWAYS skips (C7 — the tfm
+/// is zeroed at the exit edge), so it is C7-expected, never a loss
+/// signal. Excluded from loss verdicts, still counted (never silent).
+const KDROPS_DESTROY: u32 = 5;
+// Sites 6–7 are spare, reserved (BPF never writes them).
+
 /// `BPF_NOEXIST` (`enum bpf_map_update_elem_flags`, UAPI `linux/bpf.h`).
 const BPF_NOEXIST: u64 = 1;
 
@@ -262,6 +278,8 @@ static KSTACK: StackTrace = StackTrace::with_max_entries(1024, 0);
 static KERR: HashMap<u64, i32> = HashMap::with_max_entries(256, 0);
 #[map]
 static KPARAMS: HashMap<u64, VParams> = HashMap::with_max_entries(256, 0);
+#[map]
+static KDROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers (all #[inline(always)]: R4 call-free)
@@ -491,6 +509,13 @@ fn vagg_zero_slot(slot: *mut VAgg) {
 /// Identity hash over `(fam, op, alg bytes, drv bytes)` (twinned FNV-1a:
 /// same inputs, same byte order as the ABI mirror). `res`/`ctx` are
 /// excluded so one gate covers all rows of an identity.
+///
+/// Hashes the canonical key (fix wave, G-I1): the rewrite lands
+/// BEFORE the hashes, so post-NUL bytes are zero here and the plain
+/// full-width hash equals the ABI twins' canonical stream on every
+/// input. (Rewrite-before-hash is safe only because the scan above
+/// yields one range state — with 129 exact-len paths it forks through
+/// these loops and blows the 1M budget, observed E2BIG.)
 #[inline(always)]
 fn ident_hash(key: &KAgg) -> u64 {
     let raw = (key as *const KAgg).cast::<u8>();
@@ -535,15 +560,42 @@ fn kh_of(key: &KAgg) -> u64 {
     hash
 }
 
-/// NUL-scan one 128B name (bounded `strnlen`): the C5 `val1` input.
+/// NUL-scan one 128B name (bounded `strnlen`, the C5 `val1` input)
+/// AND NUL-canonicalize it in place, single pass (fix wave, G-I1):
+/// zero every byte at/after the first NUL so the `KAGG` map key — and
+/// the hashes over it — are canonical (kernel heap padding past the
+/// NUL used to split logical identities into phantom keys, burning
+/// the 256-entry map). Returns the first-NUL index (128 when the name
+/// has no NUL). One 128-iteration pass (the scan and the rewrite
+/// fused): fewer hot-path instructions means a smaller preemption
+/// window means fewer `bpf_prog_active` guard-skips (G-C1 root cause —
+/// every skip is an event whose program never runs, uncountable
+/// in-product, so the window is minimized, not merely bounded).
+/// Branchless prefix latch — NO early exit: a `break` produces 129
+/// exact-len paths that multiply every downstream loop past the
+/// verifier's 1M-insn budget (observed E2BIG); this yields one range
+/// state instead (the `byte != 0` diamonds rejoin within each
+/// iteration). The keep-mask is `black_box`'d: LLVM otherwise proves
+/// the `{0, 0xFF}` range and rewrites the byte-select as branches,
+/// defeating verifier state-merging (observed E2BIG); opaque, it
+/// emits one straight-line AND. Register scalars only — no new stack
+/// slots (the 512B frame binds).
 #[inline(always)]
-fn name_len(base: *const u8) -> u32 {
+fn canon_len(name: *mut u8) -> u32 {
     let mut len = 0u32;
-    while len < 128 {
-        if unsafe { *base.add(len as usize) } == 0 {
-            break;
+    let mut nz = 1u32;
+    let mut i = 0u32;
+    while i < 128 {
+        let byte = unsafe { *name.add(i as usize) };
+        nz &= u32::from(byte != 0);
+        len += nz;
+        // `nz` (post-update) is 1 iff byte `i` is still inside the
+        // leading-nonzero prefix — it already encodes keep/drop.
+        let keep = core::hint::black_box((nz * 0xFF) as u8);
+        unsafe {
+            *name.add(i as usize) = byte & keep;
         }
-        len += 1;
+        i += 1;
     }
     len
 }
@@ -613,6 +665,20 @@ fn overflow_path(key_hash: u64, head: u64, lens: u64, now: u64) {
     if KIDN.insert(&key_hash, &one, BPF_NOEXIST).is_ok() {
         emit_ctl(KCTL_OVERFLOW, key_hash, head, lens, now);
     } else if let Some(slot) = KIDN.get_ptr_mut(&key_hash) {
+        unsafe {
+            *slot = (*slot).saturating_add(1);
+        }
+    }
+}
+
+/// Pre-`KTOT` skip accounting: bump this CPU's lane for `site`
+/// (exact `u64` per-CPU — no saturation, no races; userspace folds
+/// lanes). A missing slot (live-impossible on a `PerCpuArray`) is
+/// ignored: the observation is already skipped, and a counter for the
+/// counter would recurse.
+#[inline(always)]
+fn drop_inc(site: u32) {
+    if let Some(slot) = KDROPS.get_ptr_mut(site) {
         unsafe {
             *slot = (*slot).saturating_add(1);
         }
@@ -876,9 +942,11 @@ fn observe(
         i += 1;
     }
     if !read_name(cra_src, unsafe { base.add(4) }) {
+        drop_inc(KDROPS_NAME);
         return 0;
     }
     if drv_src != 0 && !read_name(drv_src, unsafe { base.add(132) }) {
+        drop_inc(KDROPS_NAME);
         return 0;
     }
     let ctx_class = classify_ctx(cfg.task_flags, cfg.pf_kthread);
@@ -888,18 +956,29 @@ fn observe(
         *base.add(2) = res;
         *base.add(3) = ctx_class;
     }
+    // G-I1: single-pass scan + rewrite BEFORE the hashes (the scan
+    // yields one range state, so the rewritten bytes stay single-state
+    // through them — see `ident_hash`). The alloc path's drv bytes are
+    // pre-zeroed, so its length is 0 without a wasted scan. Runs before
+    // the `key_ref` borrow below (no shared borrow live across the
+    // mutation).
+    let alg_len = canon_len(unsafe { base.add(4) });
+    let drv_len = if drv_src != 0 {
+        canon_len(unsafe { base.add(132) })
+    } else {
+        0
+    };
     // Borrow the slot directly (no `assume_init` copy: a second 260B
     // key on the 512B frame overflows it).
     //
     // SAFETY: all 260 bytes initialized above (zeroed, then filled head
-    // + names; the alloc path's drv bytes stay zero by construction).
+    // + names, now canonical; the alloc path's drv bytes stay zero by
+    // construction).
     let key_ref: &KAgg = unsafe { &*slot.as_ptr() };
     let hash = ident_hash(key_ref);
     let kh = kh_of(key_ref);
     let head =
         (fam as u64) | ((op as u64) << 8) | ((res as u64) << 16) | ((ctx_class as u64) << 24);
-    let alg_len = name_len(unsafe { base.add(4) });
-    let drv_len = name_len(unsafe { base.add(132) });
     let lens = (alg_len as u64) | ((drv_len as u64) << 32);
     // SAFETY: helper with no pointer arguments.
     let now = unsafe { bpf_ktime_get_ns() };
@@ -1017,13 +1096,16 @@ fn load_cfg() -> Option<Cfg> {
 #[fexit(function = "crypto_alloc_tfm_node")]
 pub fn kcrypto_alloc(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let name: u64 = ctx.arg(0);
     if name == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let res = classify_alloc_ptr(ret);
@@ -1058,11 +1140,14 @@ pub fn kcrypto_alloc(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_destroy_tfm")]
 pub fn kcrypto_destroy(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let tfm: u64 = ctx.arg(1);
     let alg = chase_tfm(tfm, cfg.tfm_alg);
     if alg == 0 {
+        // Separately keyed (C7-expected — never a loss signal).
+        drop_inc(KDROPS_DESTROY);
         return 0;
     }
     // Void return: no errno to record (kerr 0); the chased alg feeds
@@ -1088,18 +1173,22 @@ pub fn kcrypto_destroy(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_skcipher_encrypt")]
 pub fn kcrypto_skenc(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req) as u64;
     let alg = chase_req(req, cfg.sk_req_base, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(
@@ -1120,18 +1209,22 @@ pub fn kcrypto_skenc(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_skcipher_decrypt")]
 pub fn kcrypto_skdec(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req) as u64;
     let alg = chase_req(req, cfg.sk_req_base, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(
@@ -1153,18 +1246,22 @@ pub fn kcrypto_skdec(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_aead_encrypt")]
 pub fn kcrypto_aeadenc(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req.wrapping_add(cfg.aead_cryptlen_off as u64)) as u64;
     let alg = chase_req(req, 0, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(
@@ -1186,18 +1283,22 @@ pub fn kcrypto_aeadenc(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_aead_decrypt")]
 pub fn kcrypto_aeaddec(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req.wrapping_add(cfg.aead_cryptlen_off as u64)) as u64;
     let alg = chase_req(req, 0, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(
@@ -1219,18 +1320,22 @@ pub fn kcrypto_aeaddec(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_ahash_digest")]
 pub fn kcrypto_ahash(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req.wrapping_add(cfg.ahash_nbytes_off as u64)) as u64;
     let alg = chase_req(req, 0, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(
@@ -1254,22 +1359,27 @@ pub fn kcrypto_ahash(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_shash_digest")]
 pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let desc: u64 = ctx.arg(0);
     if desc == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let len: u64 = ctx.arg(2);
     let shash = read_u64(desc);
     if shash == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     let alg = chase_tfm(shash.wrapping_add(cfg.shash_base as u64), cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(
@@ -1290,22 +1400,27 @@ pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
 #[fexit(function = "crypto_shash_finup")]
 pub fn kcrypto_finup(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
+        drop_inc(KDROPS_CFG);
         return 0;
     };
     let desc: u64 = ctx.arg(0);
     if desc == 0 {
+        drop_inc(KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
+        drop_inc(KDROPS_FRET);
         return 0;
     };
     let len: u64 = ctx.arg(2);
     let shash = read_u64(desc);
     if shash == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     let alg = chase_tfm(shash.wrapping_add(cfg.shash_base as u64), cfg.tfm_alg);
     if alg == 0 {
+        drop_inc(KDROPS_CHASE);
         return 0;
     }
     observe(

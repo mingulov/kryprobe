@@ -509,6 +509,33 @@ const FNV_BASIS: u64 = 14695981039346656037;
 /// FNV-1a 64 prime.
 const FNV_PRIME: u64 = 1099511628211;
 
+/// Zero the bytes at/after the first NUL in one 128B name (fix wave,
+/// G-I1): the userspace twins hash canonical streams, byte-identical
+/// to the BPF length-aware twins on every input (BPF mixes `byte &
+/// keep` per index with `keep = 0` past the NUL; this zeroes the same
+/// bytes, then the plain hash runs over the same stream).
+fn canon_words(words: &[u64; 16]) -> [u64; 16] {
+    let mut bytes = [0u8; 128];
+    for (w, word) in words.iter().enumerate() {
+        bytes[w * 8..(w + 1) * 8].copy_from_slice(&word.to_le_bytes());
+    }
+    let mut len = 128usize;
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == 0 {
+            len = i;
+            break;
+        }
+    }
+    bytes[len..].fill(0);
+    let mut out = [0u64; 16];
+    for (w, word) in out.iter_mut().enumerate() {
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&bytes[w * 8..(w + 1) * 8]);
+        *word = u64::from_le_bytes(slot);
+    }
+    out
+}
+
 /// Identity hash: `KIDN` key and `KCtl.key_hash`.
 ///
 /// FNV-1a over, in order: `fam`, `op`, the 128 `alg` bytes, the 128 `drv`
@@ -516,6 +543,10 @@ const FNV_PRIME: u64 = 1099511628211;
 /// several `KAGG` rows (distinct result/context) share one identity gate,
 /// so first-seen fires once per `(fam, op, alg, drv)` (brief's `KIDN`
 /// contract; C5's "over KAgg key" names these identity fields).
+///
+/// Names hash canonical (fix wave, G-I1): bytes past the first NUL mix
+/// as zero, so heap padding never splits an identity. Zero-padded
+/// inputs hash exactly as before (goldens hold).
 #[must_use]
 pub fn kcrypto_ident_hash(fam: u8, op: u8, alg: &[u64; 16], drv: &[u64; 16]) -> u64 {
     let mut hash = FNV_BASIS;
@@ -525,7 +556,7 @@ pub fn kcrypto_ident_hash(fam: u8, op: u8, alg: &[u64; 16], drv: &[u64; 16]) -> 
     };
     mix(fam);
     mix(op);
-    for words in [alg, drv] {
+    for words in [&canon_words(alg), &canon_words(drv)] {
         for word in words {
             for byte in word.to_le_bytes() {
                 mix(byte);
@@ -547,6 +578,10 @@ pub fn kcrypto_ident_hash(fam: u8, op: u8, alg: &[u64; 16], drv: &[u64; 16]) -> 
 /// bytes; the BPF twin reads them through byte pointers because `KAgg`
 /// is packed — same twin-shape adaptation as
 /// [`kcrypto_ident_hash`]/`ident_hash`).
+///
+/// Names hash canonical (fix wave, G-I1): bytes past the first NUL mix
+/// as zero, so heap padding never splits an identity. Zero-padded
+/// inputs hash exactly as before (goldens hold).
 #[must_use]
 pub fn kh_of(fam: u8, op: u8, res: u8, ctx: u8, alg: &[u64; 16], drv: &[u64; 16]) -> u64 {
     let mut hash = FNV_BASIS;
@@ -558,7 +593,7 @@ pub fn kh_of(fam: u8, op: u8, res: u8, ctx: u8, alg: &[u64; 16], drv: &[u64; 16]
     mix(op);
     mix(res);
     mix(ctx);
-    for words in [alg, drv] {
+    for words in [&canon_words(alg), &canon_words(drv)] {
         for word in words {
             for byte in word.to_le_bytes() {
                 mix(byte);
@@ -878,6 +913,35 @@ mod tests {
         let ctl = kctl_from_bytes(&ctl_bytes).expect("48B decodes");
         assert_eq!(ctl.kind, KCTL_IDENT);
         assert!(kctl_from_bytes(&ctl_bytes[..47]).is_none());
+    }
+
+    #[test]
+    fn twins_ignore_post_nul_padding() {
+        // Fix wave (G-I1): heap garbage past the NUL must not move the
+        // hashes — padded and garbage-suffixed names hash identically.
+        let mut clean = [0u64; 16];
+        clean[0] = u64::from_le_bytes(*b"sha256\0\0");
+        let mut dirty = clean;
+        dirty[1] = 0xDEAD_BEEF_DEAD_BEEF;
+        dirty[15] = 0x0102_0304_0506_0708;
+        let drv = [0u64; 16];
+        assert_eq!(
+            kcrypto_ident_hash(KFAM_ANY, KOP_ALLOC, &dirty, &drv),
+            kcrypto_ident_hash(KFAM_ANY, KOP_ALLOC, &clean, &drv)
+        );
+        assert_eq!(
+            kh_of(KFAM_ANY, KOP_ALLOC, KRES_OK, KCTX_PROC, &dirty, &drv),
+            kh_of(KFAM_ANY, KOP_ALLOC, KRES_OK, KCTX_PROC, &clean, &drv)
+        );
+        // A full 128B name with no NUL hashes the full width (no
+        // truncation): flipping the last byte still moves the hash.
+        let full = [0x4141_4141_4141_4141u64; 16];
+        let mut full2 = full;
+        full2[15] ^= 1;
+        assert_ne!(
+            kh_of(KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC, &full, &drv),
+            kh_of(KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC, &full2, &drv)
+        );
     }
 
     #[test]

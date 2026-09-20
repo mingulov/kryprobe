@@ -7,7 +7,7 @@
 //! Test 4 refuses pre-load, never attaches, and runs everywhere: as root
 //! it drops to `nobody` via `setpriv`, unprivileged it runs directly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -16,6 +16,14 @@ use std::time::{Duration, Instant};
 
 /// Traffic generator (hash-only mode default; proven lane fixture).
 const GEN: &str = "/tmp/kcrypto_gen.py";
+
+/// Decoded agg identity: family/op/result/algorithm/driver/context.
+type DecodedIdentity = (String, String, String, String, String, String);
+
+/// Test-2 golden maps: latest calls per (identity, `key_hash`) +
+/// distinct hashes per alloc identity (split-key robustness, G-I1).
+type DigestAgg = BTreeMap<(DecodedIdentity, u64), u64>;
+type AllocKh = BTreeMap<DecodedIdentity, BTreeSet<u64>>;
 
 /// Fully attached live session: 9 fexit symbols x 2 twins (K4 graded
 /// gate, mirrored from `live_session.rs`).
@@ -439,7 +447,11 @@ fn setcap_roundtrip_unpriv() {
             &object_dir,
         ),
     );
-    let guard = gate_attach_and_settle(TEST, guard);
+    let mut guard = gate_attach_and_settle(TEST, guard);
+    // Nobody attestation (fix wave, G-M1): prove the watch leg runs as
+    // nobody — `/proc/<child>/status` read pre-wait (the child must
+    // still be alive).
+    attest_nobody(TEST, guard.child());
     hash_traffic(TEST);
     let output = guard.release().wait_with_output().expect("watch output");
     let stdout = String::from_utf8(output.stdout).expect("watch stdout utf-8");
@@ -450,6 +462,39 @@ fn setcap_roundtrip_unpriv() {
     assert!(total > 0, "TOTAL calls > 0, got {total}");
 
     dir.remove_and_check(TEST);
+}
+
+/// Nobody attestation (fix wave, G-M1): `/proc/<child>/status` read
+/// pre-wait — prints + pins `Uid: 65534` (all four) and the effective
+/// set carrying the minted `cap_bpf`+`cap_perfmon` (bits 39+38).
+fn attest_nobody(test: &str, child: &mut Child) {
+    let pid = child.id();
+    let status =
+        std::fs::read_to_string(format!("/proc/{pid}/status")).expect("child status reads");
+    let uid = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .expect("Uid line present");
+    let capeff = status
+        .lines()
+        .find(|line| line.starts_with("CapEff:"))
+        .expect("CapEff line present");
+    println!("{test}: nobody leg pid={pid} | {uid} | {capeff}");
+    assert_eq!(
+        uid.split_whitespace().skip(1).collect::<Vec<_>>(),
+        ["65534", "65534", "65534", "65534"],
+        "{test}: watch leg runs as nobody"
+    );
+    let hex = capeff
+        .split_whitespace()
+        .nth(1)
+        .expect("CapEff hex present");
+    let bits = u64::from_str_radix(hex, 16).expect("CapEff hex parses");
+    assert_eq!(
+        bits & ((1 << 38) | (1 << 39)),
+        (1 << 38) | (1 << 39),
+        "{test}: CapEff carries the minted cap_perfmon+cap_bpf"
+    );
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -591,8 +636,11 @@ fn attribution_golden_python() {
     let observations = doc["observations"].as_array().expect("observations array");
 
     let mut python_who: BTreeMap<(u64, u64), u64> = BTreeMap::new();
-    let mut digest_agg: BTreeMap<(String, String, String, String, String, String), u64> =
-        BTreeMap::new();
+    // Split-key robustness (fix wave, G-I1): max per
+    // (decoded-identity, `key_hash`), then sum — the old
+    // max-per-decoded-identity idiom undercounts phantom splits.
+    let mut digest_agg: DigestAgg = BTreeMap::new();
+    let mut alloc_kh: AllocKh = BTreeMap::new();
     let mut totals_latest: u64 = 0;
     for obs in observations {
         let payload = &obs["backend_payload"];
@@ -616,6 +664,27 @@ fn attribution_golden_python() {
                     Some("ahash") | Some("shash")
                 ) && payload.get("op").and_then(serde_json::Value::as_str) == Some("digest") =>
             {
+                let identity = (
+                    str_cell(payload, "family"),
+                    str_cell(payload, "op"),
+                    str_cell(payload, "result"),
+                    str_cell(payload, "algorithm"),
+                    str_cell(payload, "driver"),
+                    str_cell(payload, "context"),
+                );
+                let key = (
+                    identity,
+                    payload["key_hash"].as_u64().expect("agg key_hash"),
+                );
+                let calls = payload["counts"]["calls"].as_u64().expect("agg calls");
+                digest_agg
+                    .entry(key)
+                    .and_modify(|latest| *latest = (*latest).max(calls))
+                    .or_insert(calls);
+            }
+            Some("agg")
+                if payload.get("op").and_then(serde_json::Value::as_str) == Some("alloc") =>
+            {
                 let key = (
                     str_cell(payload, "family"),
                     str_cell(payload, "op"),
@@ -624,11 +693,8 @@ fn attribution_golden_python() {
                     str_cell(payload, "driver"),
                     str_cell(payload, "context"),
                 );
-                let calls = payload["counts"]["calls"].as_u64().expect("agg calls");
-                digest_agg
-                    .entry(key)
-                    .and_modify(|latest| *latest = (*latest).max(calls))
-                    .or_insert(calls);
+                let kh = payload["key_hash"].as_u64().expect("alloc key_hash");
+                alloc_kh.entry(key).or_default().insert(kh);
             }
             Some("totals") => {
                 let calls = payload["counts"]["calls"].as_u64().expect("totals calls");
@@ -655,6 +721,17 @@ fn attribution_golden_python() {
         kryprobe_digest, oracle_count,
         "{TEST}: EXACT oracle equality (kryprobe filtered agg == bpftrace @c); totals_latest={totals_latest}"
     );
+    // Single-kh-per-alloc-identity pin (fix wave, G-I1): post-NUL
+    // canonicalization makes this deterministic (pre-fix it was
+    // probabilistic — L4 alloc showed 8 key_hashes × 500).
+    for (identity, hashes) in &alloc_kh {
+        println!("{TEST}: alloc {identity:?} key_hashes={hashes:?}");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "{TEST}: one key_hash per alloc identity, got {hashes:?} for {identity:?}"
+        );
+    }
 }
 
 fn str_cell(payload: &serde_json::Value, key: &str) -> String {

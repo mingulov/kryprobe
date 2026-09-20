@@ -96,7 +96,8 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 /// `shash_base` word + the K5 attribution tail, `KAgg` 260B, `VAgg`
 /// 120B — `planning/kryprobe-phaseK1-sensor-plan.md` Task 2) plus the
 /// four K5 attribution maps (`KWHO`/`KSTACK`/`KERR`/`KPARAMS` —
-/// `planning/kryprobe-phaseK5-attribution-token-design.md` §2.1);
+/// `planning/kryprobe-phaseK5-attribution-token-design.md` §2.1) plus
+/// the fix-wave `KDROPS` pre-`KTOT` site counters (G-C1);
 /// names dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
@@ -178,6 +179,15 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             key_size: 8,
             value_size: 16,
             max_entries: 256,
+        },
+    ),
+    (
+        "KDROPS",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 8,
         },
     ),
 ];
@@ -310,6 +320,8 @@ pub struct KcryptoMaps {
     pub err: OwnedFd,
     /// `KPARAMS` (crypto params per row hash, 256 entries).
     pub params: OwnedFd,
+    /// `KDROPS` (pre-`KTOT` skip sites, 8 per-CPU u64 counters).
+    pub drops: OwnedFd,
 }
 
 /// Fully loaded kcrypto object: maps + per-program fds, all RAII-owned.

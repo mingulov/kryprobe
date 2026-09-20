@@ -69,7 +69,9 @@ use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredError, ConfiguredKcrypto, KCRYPTO_SYMBOLS, load_kcrypto_configured,
 };
 use kryprobe_privilege::kallsyms::read_kallsyms;
-use kryprobe_privilege::kcrypto_backend::{observation_for_who, register_kcrypto, snapshot_who};
+use kryprobe_privilege::kcrypto_backend::{
+    KDROP_DESTROY, KDROP_SITES, observation_for_who, register_kcrypto, snapshot_drops, snapshot_who,
+};
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_for_agg, raw_event_for_ident,
     raw_event_for_totals, shared_losses_from_snapshot, snapshot_rows,
@@ -331,6 +333,7 @@ struct SessionMeasurements {
     ktot_gap: Option<u64>,
     ring_drops: u64,
     overflow_identities: u64,
+    drops: [u64; 8],
     observations_decoded: u64,
     interval: ValidityInterval,
 }
@@ -360,9 +363,20 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     attachment
         .counters
         .push(counter("probes_expected", m.expected_points as u64));
-    // Aggregate counts: the twin gap (absent totals → uncovered, not zero).
+    // Aggregate counts: the twin gap + the pre-KTOT skip sites (absent
+    // totals → uncovered, not zero). Every KDROPS site rides as a
+    // counter (always present — never silent); unexpected sites flip
+    // the dimension (measured loss), destroy stays Complete (C7-known).
+    let mut unexpected_drops = 0u64;
+    for (site, count) in m.drops.iter().enumerate() {
+        if site < KDROP_DESTROY {
+            unexpected_drops = unexpected_drops.saturating_add(*count);
+        }
+    }
     let mut aggregate_counts = match (m.totals_present, m.ktot_gap) {
-        (true, Some(0)) => dim(CoverageStatus::CompleteForDeclaredBoundary),
+        (true, Some(0)) if unexpected_drops == 0 => {
+            dim(CoverageStatus::CompleteForDeclaredBoundary)
+        }
         (true, Some(_)) => dim(CoverageStatus::Partial),
         _ => dim(CoverageStatus::Unknown),
     };
@@ -371,6 +385,11 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
         _ => aggregate_counts
             .counters
             .push(counter("uncovered:ktot_baseline_missing", 1)),
+    }
+    for (site, name) in KDROP_SITES.iter().enumerate() {
+        aggregate_counts
+            .counters
+            .push(counter(&format!("predrop_{name}"), m.drops[site]));
     }
     // Detailed events: measured ring drops + accumulated overflow.
     let mut detailed_events = dim(if m.ring_drops == 0 && m.overflow_identities == 0 {
@@ -640,6 +659,8 @@ pub fn run_live_capture_with_registry(
         .session_integrity_checked()
         .map_err(|err| LiveError::Internal(format!("live session integrity: {err}")))?;
     let gap = ktot_gap(&closing)?;
+    let kdrop_sites = snapshot_drops(&sensor)
+        .map_err(|err| LiveError::Internal(format!("live snapshot drops: {err}")))?;
     let coverage = session_coverage(&SessionMeasurements {
         attached_points,
         expected_points: KCRYPTO_SYMBOLS.len(),
@@ -647,6 +668,7 @@ pub fn run_live_capture_with_registry(
         ktot_gap: gap,
         ring_drops: u64::from(drops),
         overflow_identities,
+        drops: kdrop_sites,
         observations_decoded: report.observations.len() as u64,
         interval: ValidityInterval {
             start_ns: first_wall,
@@ -806,6 +828,7 @@ mod tests {
             ktot_gap: Some(0),
             ring_drops: 0,
             overflow_identities: 0,
+            drops: [0; 8],
             observations_decoded: 12,
             interval: ValidityInterval {
                 start_ns: 100,
@@ -937,6 +960,53 @@ mod tests {
             Some(10)
         );
         assert_eq!(ktot_gap(&hand_snapshot(&[10], None)).expect("gap"), None);
+    }
+
+    #[test]
+    fn coverage_predrop_counters_ride_aggregate_counts() {
+        // Fix wave (G-C1): all 8 KDROPS sites surface as counters on
+        // aggregate_counts (always present — a missing counter would be
+        // silent), in KDROP_SITES order.
+        let mut m = measurements();
+        m.drops = [1, 0, 0, 7, 0, 3, 0, 0];
+        let counters = session_coverage(&m).aggregate_counts.counters;
+        let site_counters: Vec<(&str, u64)> = counters
+            .iter()
+            .filter(|c| c.name.starts_with("predrop_"))
+            .map(|c| (c.name.as_str(), c.value))
+            .collect();
+        assert_eq!(
+            site_counters,
+            vec![
+                ("predrop_cfg_fail", 1),
+                ("predrop_fret_fail", 0),
+                ("predrop_arg_null", 0),
+                ("predrop_chase_fail", 7),
+                ("predrop_name_fail", 0),
+                ("predrop_destroy_skip", 3),
+                ("predrop_spare_6", 0),
+                ("predrop_spare_7", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn coverage_unexpected_predrop_flips_aggregate_counts() {
+        // Any unexpected pre-KTOT site (0–4) is measured loss → Partial.
+        let mut m = measurements();
+        m.drops[3] = 7;
+        let coverage = session_coverage(&m);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.weaker_dimensions(), vec!["aggregate_counts"]);
+        // Destroy-only skips stay Complete (C7-expected, separately keyed).
+        let mut m = measurements();
+        m.drops[KDROP_DESTROY] = 50;
+        let coverage = session_coverage(&m);
+        assert_eq!(
+            coverage.aggregate_counts.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
+        assert!(coverage.weaker_dimensions().is_empty());
     }
 
     #[test]

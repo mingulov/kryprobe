@@ -764,6 +764,8 @@ fn k5_token_candidates_order() {
 fn k5_no_mechanism_reason_names_mint() {
     use kryprobe_cli::cmd_token::no_mechanism_reason;
     use std::path::PathBuf;
+    // Reads KRYPROBE_TOKEN: serialize with the env writer (K5_ENV_LOCK).
+    let _guard = k5_env_guard();
     let bare = no_mechanism_reason(None);
     assert!(
         bare.contains(

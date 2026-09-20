@@ -3,7 +3,8 @@
 
 Closed list of everything the kcrypto fexit sensor stores in
 `KCFG`/`KAGG`/`KTOT`/`KIDN`/`KRING` (K1) plus
-`KWHO`/`KSTACK`/`KERR`/`KPARAMS` (K5 attribution). Anything not on
+`KWHO`/`KSTACK`/`KERR`/`KPARAMS` (K5 attribution) plus `KDROPS`
+(fix-wave pre-`KTOT` site counters). Anything not on
 this list is not captured; the [NEVER](#never-list) section names the
 categories the sensor must never read. Field order and sizes twin
 `crates/bpf-kcrypto/src/bin/kcrypto.rs` (BPF owns the originals) and
@@ -108,9 +109,12 @@ Per-CPU lanes, userspace-folded (`fold_vagg`: saturating sums, min
   (kp2 §7: rare control events only). Observable via the
   `KTOT`-vs-`ΣKAGG` gap (K2 publishes as `attribution_overflow`) + the
   `KIDN` dump showing full; totals preserved.
-- Alloc rows' requested-name hashes are cross-run UNSTABLE (heap
-  padding past the NUL is hashed); within-run joins hold, and the
-  suite matches alloc rows by decoded string, never by hash.
+- Alloc rows' requested-name hashes are cross-run STABLE (the K5
+  fix wave NUL-canonicalizes both names in `observe()` before hashing:
+  bytes past the first NUL are zeroed, so heap padding no longer
+  splits logical identities into phantom keys). Joins hold within and
+  across runs; the suite still matches alloc rows by decoded string
+  where display equality is the question.
 
 ## `KRING`: control events, name-free (48B `KCtl`)
 
@@ -191,6 +195,35 @@ Reserved key `KWHO_DROPS` (`u64::MAX - 1`) in `KIDN`:
 `KWHO`/`KERR`/`KPARAMS` insert-failure counter, saturating (kp2 §8:
 attribution loss surfaces here instead of vanishing; separate from
 `KIDN_DROPS` so ring loss and attribution loss stay distinguishable).
+
+## `KDROPS`: pre-`KTOT` skip sites (8 per-CPU u64, fix wave)
+
+Per-CPU array, 8 entries: one exact `u64` counter per pre-`KTOT` skip
+site (`cfg_fail` / `fret_fail` / `arg_null` / `chase_fail` /
+`name_fail` / `destroy_skip` / two spares, reserved). Every BPF
+`return 0` before the `KTOT` update bumps its site; userspace folds
+lanes and surfaces per-site coverage counters. Scalar skip counts
+only — no identities, no names (kp2 §8 capture integrity, kp2 §9
+scalar counts). The destroy site always counts (C7: the tfm is zeroed
+at the exit edge); it is separately keyed and excluded from loss
+verdicts, still counted (never silent).
+
+## Known-uncountable remainder: fexit guard-skips (fix wave, G-C1)
+
+`KDROPS` proves every in-program skip path reads zero — yet dual-
+observer (bpftrace oracle) comparisons show a small load-coupled
+shortfall (≤0.2% at flood scale under load, 0 when quiet/idle).
+Root cause, proven by experiment: the kernel's per-CPU
+`bpf_prog_active` recursion guard silently skips a same-program fexit
+re-entry when the outer task is preempted mid-program and the middle
+task's same-symbol fexit re-enters on that CPU. The skipped program
+never executes, and the kernel counts nothing — no in-product
+counter CAN exist for these (pre-existing since K1; RT-pinned
+traffic shows delta-0 under identical load, confirming preemption as
+the driver). The loss is therefore attributed externally (oracle
+differential, measured ceiling) rather than silently absorbed: every
+countable path is zero by `KDROPS`, and the remainder is bounded,
+characterized, and disclosed here — never unexamined.
 
 ## Attribution: `ctx` classifier, no raw IDs (v0.1; K5 supersedes)
 

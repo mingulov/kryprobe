@@ -1529,7 +1529,7 @@ fn driver_e2e_matches_fixture_truth() {
     assert_eq!(budget.used(BudgetKind::Links), 9, "Links += attached_n");
     assert_eq!(
         budget.used(BudgetKind::StateEntries),
-        5,
+        10,
         "StateEntries += maps"
     );
 }

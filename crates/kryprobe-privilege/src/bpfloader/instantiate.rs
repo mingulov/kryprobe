@@ -265,6 +265,7 @@ pub fn load_kcrypto(
                 stack: take("KSTACK")?,
                 err: take("KERR")?,
                 params: take("KPARAMS")?,
+                drops: take("KDROPS")?,
             },
             progs,
         },

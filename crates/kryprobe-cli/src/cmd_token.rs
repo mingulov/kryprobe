@@ -124,13 +124,11 @@ fn permitted_list(words: &[u32]) -> Vec<u32> {
 /// 39 = `BPF`, 40 = `CHECKPOINT_RESTORE`).
 ///
 /// This deliberately does NOT reuse
-/// [`kryprobe_privilege::probe::cap_names`]: that table omits
+/// [`kryprobe_privilege::probe::cap_names`]: that table used to omit
 /// `CAP_NET_BROADCAST`, shifting every name from index 11 on by one
-/// (its bit-38 renders `CAP_BPF`, really `PERFMON`; bit-39 renders
-/// `CAP_CHECKPOINT_RESTORE`, really `BPF`; real 40 is unrepresentable
-/// — see the Task 5 report finding). The shared table is outside this
-/// task's contract to change (its pins + the `cap_state` probe own
-/// that decision); this surface decodes from the verified order.
+/// (fixed by the K5 wave — the shared table now decodes the same
+/// verified order; dedup of the two tables is parked as
+/// non-load-bearing, so this surface keeps its own copy).
 const CAP_NAMES: [&str; 41] = [
     "CAP_CHOWN",
     "CAP_DAC_OVERRIDE",
