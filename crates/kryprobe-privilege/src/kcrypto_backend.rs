@@ -32,7 +32,7 @@
 //! walks `KWHO`/`KSTACK`/`KERR`/`KPARAMS` (map access reuses
 //! [`crate::mapops`], like [`snapshot_rows`]) into [`WhoSnapshot`]s.
 //! K5 Task 4 decodes those into `row="who"` observations
-//! ([`observation_for_who`], pure over the snapshot + kallsyms text),
+//! ([`observation_for_who`], pure over the snapshot + parsed table),
 //! adds `key_hash`/`lat` to agg payloads, and merges `who_drops` into
 //! finalize integrity.
 
@@ -69,7 +69,7 @@ use crate::btf_resolve::{
     AttachOutcome, BtfError, ConfiguredError, ConfiguredKcrypto, ConfiguredPoint, KCRYPTO_SYMBOLS,
     load_kcrypto_configured, resolve_btf_ids,
 };
-use crate::kallsyms::symbolize;
+use crate::kallsyms::{SymTable, symbolize_with};
 use crate::kcrypto_snapshot::{ParsedRow, SnapshotRows, parse_snapshot_row, snapshot_rows};
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, possible_cpus};
 
@@ -898,7 +898,7 @@ fn render_first_errno(first_errno: Option<i32>) -> Option<i32> {
 /// `kh`, straight from the `KWHO` key — joins the agg `key_hash`),
 /// identity (`tgid`/`tid`/`comm`/`uid`/`cgroup`), parent
 /// (`ppid`/`pcomm`), `stack` (`{id, frames: [{ip, sym|null}]}`,
-/// symbolized through `kallsyms` text), tallies
+/// symbolized through a shared [`SymTable`](crate::kallsyms::SymTable)), tallies
 /// (`calls`/`first_ns`/`last_ns`), crypto params
 /// (`blocksize`/`ivsize`/`min_keysize`/`max_keysize`), `first_errno`.
 ///
@@ -912,7 +912,7 @@ fn render_first_errno(first_errno: Option<i32>) -> Option<i32> {
 pub fn observation_for_who(
     who: &WhoSnapshot,
     id: ObservationId,
-    kallsyms: &str,
+    table: &SymTable,
 ) -> NativeObservation {
     let parent_resolved = who.val.ppid != 0 || who.val.pcomm != [0u8; 16];
     let mut payload = json!({
@@ -925,7 +925,7 @@ pub fn observation_for_who(
         "cgroup": who.val.cgroup,
         "stack": {
             "id": who.val.stack,
-            "frames": symbolize(&who.stack_ips, kallsyms).into_iter().map(|frame| {
+            "frames": symbolize_with(&who.stack_ips, table).into_iter().map(|frame| {
                 json!({"ip": frame.ip, "sym": frame.sym})
             }).collect::<Vec<_>>(),
         },

@@ -77,6 +77,17 @@ impl std::fmt::Display for DrainError {
 
 impl std::error::Error for DrainError {}
 
+/// Lifetime `DrainThread` spawns in this process (observability + lane
+/// tests: one session drain serves any number of windows with a single
+/// spawn; per-call drains spawn per snapshot).
+static SPAWNS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of successful [`DrainThread::spawn`] calls so far in this process.
+#[must_use]
+pub fn drain_spawns() -> u64 {
+    SPAWNS.load(Ordering::Relaxed)
+}
+
 /// Ringbuf drain thread: epoll-paced, budgeted, bounded queue.
 pub struct DrainThread {
     join: Option<std::thread::JoinHandle<DrainStats>>,
@@ -157,6 +168,7 @@ impl DrainThread {
             mask: u64::from(max_entries) - 1,
         };
         let join = std::thread::spawn(move || worker.run());
+        SPAWNS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             join: Some(join),
             rx,

@@ -19,9 +19,11 @@
 //! the row (`VAgg.last_ns` for agg/totals, `KCtl.val2` first-seen ns
 //! for idents).
 //!
-//! v0.1 limits (documented, Task 2 owns the steady state): the ring
-//! drains through a short-lived [`DrainThread`] spawned and stopped per
-//! call (no persistent thread); the `KIDN_DROPS` read is validated but
+//! v0.1 limits (documented, Task 2 owns the steady state): live ticks
+//! share one session drain ([`session_drain`] +
+//! [`snapshot_rows_with_drain`], one barrier window per tick); the
+//! one-shot [`snapshot_rows`] wrapper (spawn/stop per call) is retained
+//! for single snapshots such as `finalize`. The `KIDN_DROPS` read is validated but
 //! not retained ([`SnapshotRows`] carries no drops field — callers pass
 //! their own [`map_lookup_bytes`] read to
 //! [`shared_losses_from_snapshot`]); drain queue stats are discarded
@@ -529,16 +531,50 @@ fn collect_until_barrier(
     }
 }
 
-/// Drain `KRING` through a short-lived [`DrainThread`] (spawn/stop per
-/// call — no persistent thread in v0.1): a barrier checkpoint bounds the
-/// "since last call" window (fresh thread per call, so no stale
-/// consumer). Drain stats are discarded (see the module docs).
+/// Spawn the session `KRING` drain: one spawn per session, shared by
+/// every tick through [`snapshot_rows_with_drain`] (2B-C1 — a per-tick
+/// spawn/stop pays thread + ~2MB mmap + epoll + up to 10ms quantum on
+/// every tick, making sub-100ms cadence unachievable). Stop it once,
+/// after the closing tick, via [`DrainThread::stop`].
+pub fn session_drain(sensor: &ConfiguredKcrypto) -> Result<DrainThread, MapOpsError> {
+    DrainThread::spawn(&sensor.loaded.maps.ring, KRING_MAX_ENTRIES, &DRAIN_BUDGET)
+        .map_err(drain_setup_error)
+}
+
+/// Drain one barrier window through a session drain: inject `barrier`,
+/// collect records up to it, sweep the in-channel tail.
 ///
-/// Tail-race warning (ACCEPTED v0.1 limitation, not a Task 2 TODO —
-/// Task 2 scope holds: no persistent drain): records pushed in the
-/// microsecond window between the post-barrier tail sweep (see
-/// `collect_until_barrier`) and `stop()` are consumed from the ring
-/// but undelivered — lost, not re-readable on a later call.
+/// Window-attribution note: records the worker pushes after emitting
+/// the barrier but before the sweep observe no newer barrier yet, so
+/// the sweep attributes them to this window (up to one tick early).
+/// Every record is still consumed exactly once — no loss, no
+/// duplication — and the per-call tail-race loss below cannot occur
+/// while the drain stays open.
+fn drain_idents_with(
+    drain: &DrainThread,
+    barrier: u64,
+) -> Result<(Vec<IdentBytes>, u64), MapOpsError> {
+    // The worker emits the barrier after the backlog it observed, so
+    // records collected before the barrier are exactly this window.
+    drain.inject_barrier(barrier);
+    let mut idents = Vec::new();
+    let mut overflow_identities = 0;
+    collect_until_barrier(drain, &mut idents, &mut overflow_identities)?;
+    Ok((idents, overflow_identities))
+}
+
+/// Drain `KRING` through a short-lived [`DrainThread`] (spawn/stop per
+/// call): one-shot wrapper retained for single snapshots such as
+/// `finalize`. Live ticks share a [`session_drain`] instead (2B-C1).
+/// Drain stats are discarded (see the module docs).
+///
+/// Tail-race warning (ACCEPTED v0.1 limitation of the one-shot path
+/// only): records pushed in the microsecond window between the
+/// post-barrier tail sweep (see `collect_until_barrier`) and `stop()`
+/// are consumed from the ring but undelivered — lost, not re-readable
+/// on a later call. The session path cannot hit this window (the drain
+/// stays open across ticks); only session-end records arriving after
+/// the closing window are at risk.
 ///
 /// Scope: quiescent-ring runs are unaffected; only sustained
 /// new-identity/overflow traffic landing in that microsecond window is
@@ -549,27 +585,48 @@ fn collect_until_barrier(
 /// Caller rule: treat unjoined hashes (ident never seen for a row) as
 /// unknown (`coverage_gap`/`unknown`) — never misattribute, crash, or
 /// silently drop.
-///
-/// Post-v0.1 improvement note: a persistent drain (no per-call
-/// spawn/stop) would close this window.
 fn drain_idents(sensor: &ConfiguredKcrypto) -> Result<(Vec<IdentBytes>, u64), MapOpsError> {
-    let drain = DrainThread::spawn(&sensor.loaded.maps.ring, KRING_MAX_ENTRIES, &DRAIN_BUDGET)
-        .map_err(drain_setup_error)?;
-    // The worker emits the barrier after the backlog it observed, so
-    // records collected before the barrier are exactly this window.
-    drain.inject_barrier(1);
-    let mut idents = Vec::new();
-    let mut overflow_identities = 0;
-    let result = collect_until_barrier(&drain, &mut idents, &mut overflow_identities);
+    let drain = session_drain(sensor)?;
+    let result = drain_idents_with(&drain, 1);
     // Always joined (even on collect failure) so the thread never escapes.
     let _stats = drain.stop();
-    result?;
-    Ok((idents, overflow_identities))
+    result
+}
+
+/// Snapshot every kcrypto map through a session drain: same walk as
+/// [`snapshot_rows`], but the `KRING` window runs on the shared
+/// [`DrainThread`] instead of a per-call spawn/stop (2B-C1).
+///
+/// `barrier` identifies this window on the drain: nonzero, distinct
+/// per call within the drain's life (a tick counter satisfies this;
+/// the id rides the `Barrier` event for debuggability — collection
+/// consumes exactly one barrier per call, so sequential windows never
+/// coalesce).
+pub fn snapshot_rows_with_drain(
+    sensor: &ConfiguredKcrypto,
+    drain: &DrainThread,
+    barrier: u64,
+) -> Result<SnapshotRows, MapOpsError> {
+    let monotonic_ns = monotonic_now()?;
+    let rows = walk_kagg(sensor)?;
+    let totals = read_ktot(sensor)?;
+    read_kidn_drops(sensor)?;
+    let (idents, overflow_identities) = drain_idents_with(drain, barrier)?;
+    Ok(SnapshotRows {
+        rows,
+        totals,
+        idents,
+        overflow_identities,
+        monotonic_ns,
+    })
 }
 
 /// Snapshot every kcrypto map of a configured sensor: `KAGG` full walk +
 /// percpu fold, `KTOT`, the `KIDN_DROPS` validation read, and a `KRING`
 /// drain. Map order for rows, ring order for idents.
+///
+/// One-shot form (spawn/stop per call): retained for single snapshots
+/// such as `finalize`. Live ticks use [`snapshot_rows_with_drain`].
 pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsError> {
     let monotonic_ns = monotonic_now()?;
     let rows = walk_kagg(sensor)?;

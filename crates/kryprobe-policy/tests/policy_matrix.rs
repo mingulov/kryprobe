@@ -847,3 +847,58 @@ fn violation_stands_when_other_dims_partial() {
         "violation stands over partial coverage"
     );
 }
+
+#[test]
+fn missing_keys_never_yield_clean() {
+    // H-SEC-02: a deny rule over keys no observation carries is
+    // unevaluable — with complete coverage the verdict must be
+    // Inconclusive (never Clean: absence of evidence is not evidence
+    // of absence).
+    let observations = vec![obs(
+        1,
+        BackendId::KCrypto,
+        EvidencePhase::Completed,
+        serde_json::json!({"row": "agg"}), // no algorithm/driver keys
+    )];
+    let text = policy_yaml(&deny_rule(
+        "r",
+        "kernel-crypto",
+        "      algorithm: md5\n",
+        "deny",
+    ));
+    let policy = parse_policy(&text).expect("parses");
+    assert!(
+        matches!(
+            evaluate(&policy, &observations, &complete_coverage()),
+            PolicyVerdict::Inconclusive { .. }
+        ),
+        "unevaluable deny rules must not be Clean"
+    );
+}
+
+#[test]
+fn driver_not_only_rule_vs_keyless_obs_is_inconclusive() {
+    // H-SEC-02 flip side: a `driver_not`-only deny matches keyless
+    // observations (glob vs "" misses, exclusion passes) — Violation
+    // on empty data. Must be Inconclusive instead.
+    let observations = vec![obs(
+        1,
+        BackendId::KCrypto,
+        EvidencePhase::Completed,
+        serde_json::json!({"row": "agg"}),
+    )];
+    let text = policy_yaml(&deny_rule(
+        "r",
+        "kernel-crypto",
+        "      driver_not: \"*-aesni\"\n",
+        "deny",
+    ));
+    let policy = parse_policy(&text).expect("parses");
+    assert!(
+        matches!(
+            evaluate(&policy, &observations, &complete_coverage()),
+            PolicyVerdict::Inconclusive { .. }
+        ),
+        "driver_not-only deny vs keyless obs must not be Violation"
+    );
+}

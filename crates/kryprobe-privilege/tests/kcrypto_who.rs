@@ -13,7 +13,7 @@ use kryprobe_core::backend::{Backend, DecodeContext};
 use kryprobe_core::enums::EvidencePhase;
 use kryprobe_core::evidence::{IntegritySummary, NativeObservation};
 use kryprobe_core::ids::{IdIssuer, ObservationId, PlanGeneration, SessionId};
-use kryprobe_privilege::kallsyms::{read_kallsyms, symbolize};
+use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms, symbolize, symbolize_with};
 use kryprobe_privilege::kcrypto_backend::{KCryptoBackend, WhoSnapshot, observation_for_who};
 use kryprobe_privilege::kcrypto_snapshot::{RowBytes, raw_event_for_agg};
 use serde_json::Value;
@@ -86,6 +86,42 @@ fn k5_read_kallsyms_never_fails() {
     assert_eq!(out[0].ip, 0xffffffff81001500);
 }
 
+#[test]
+fn sym_table_parse_once_shared_across_rows() {
+    // 2B-C2: one parse per tick, shared across all who rows. Decoding two
+    // rows against the same table must match, with the parse explicit and
+    // singular at the call site (the tick used to re-parse + re-sort the
+    // whole map for every who row).
+    let table = SymTable::parse(TINY_MAP);
+    let snap = who_snapshot(true, true);
+    let first = observation_for_who(&snap, ObservationId::new(7), &table);
+    let second = observation_for_who(&snap, ObservationId::new(8), &table);
+    assert_eq!(first.backend_payload, second.backend_payload);
+    let frames = first
+        .backend_payload
+        .get("stack")
+        .and_then(|s| s.get("frames"))
+        .and_then(Value::as_array)
+        .expect("frames array");
+    assert_eq!(
+        frames[0].get("sym").and_then(Value::as_str),
+        Some("hash_sendmsg")
+    );
+}
+
+#[test]
+fn symbolize_with_matches_symbolize() {
+    // Refactor guard: the shared-table path must equal the legacy
+    // per-call parse path on every input shape.
+    let cases: [&[u64]; 3] = [&[0xffffffff81001500], &[0x10], &[]];
+    for text in [TINY_MAP, FIXTURE, "garbage\n", ""] {
+        let table = SymTable::parse(text);
+        for ips in cases {
+            assert_eq!(symbolize_with(ips, &table), symbolize(ips, text));
+        }
+    }
+}
+
 /// Hand-built `WhoSnapshot` with comm `python3`; the ok-flags shape the
 /// DATA exactly as the BPF does when the chase is skipped: `parent_ok=false`
 /// leaves `ppid`/`pcomm` zero, `params_ok=false` leaves `params` absent.
@@ -128,10 +164,11 @@ fn who_snapshot(parent_ok: bool, params_ok: bool) -> WhoSnapshot {
 /// Decode the hand-built fixture (both ok-flags false: parent zeroed,
 /// params absent).
 fn decode_who_fixture(parent_ok: bool, params_ok: bool) -> NativeObservation {
+    let table = SymTable::parse(TINY_MAP);
     observation_for_who(
         &who_snapshot(parent_ok, params_ok),
         ObservationId::new(1),
-        TINY_MAP,
+        &table,
     )
 }
 
@@ -147,7 +184,8 @@ fn k5_who_row_omits_unresolved() {
 fn k5_who_row_exact_keys_when_resolved() {
     let mut snap = who_snapshot(true, true);
     snap.first_errno = Some(-5);
-    let obs = observation_for_who(&snap, ObservationId::new(2), TINY_MAP);
+    let table = SymTable::parse(TINY_MAP);
+    let obs = observation_for_who(&snap, ObservationId::new(2), &table);
     assert_eq!(obs.phase, EvidencePhase::Discovered);
     let p = &obs.backend_payload;
     assert_eq!(p.get("row").and_then(Value::as_str), Some("who"));
@@ -265,7 +303,8 @@ fn k5_who_row_first_errno_rule() {
     ] {
         let mut snap = who_snapshot(false, false);
         snap.first_errno = input;
-        let obs = observation_for_who(&snap, ObservationId::new(3), TINY_MAP);
+        let table = SymTable::parse(TINY_MAP);
+        let obs = observation_for_who(&snap, ObservationId::new(3), &table);
         assert_eq!(
             obs.backend_payload
                 .get("first_errno")
@@ -283,7 +322,8 @@ fn k5_who_row_negative_stack_id_renders_empty_frames() {
     let mut snap = who_snapshot(false, false);
     snap.val.stack = -14;
     snap.stack_ips = Vec::new();
-    let obs = observation_for_who(&snap, ObservationId::new(5), TINY_MAP);
+    let table = SymTable::parse(TINY_MAP);
+    let obs = observation_for_who(&snap, ObservationId::new(5), &table);
     let stack = obs.backend_payload.get("stack").expect("stack block");
     assert_eq!(stack.get("id").and_then(Value::as_i64), Some(-14));
     assert_eq!(
@@ -295,7 +335,8 @@ fn k5_who_row_negative_stack_id_renders_empty_frames() {
 #[test]
 fn k5_who_row_frames_null_when_unresolvable() {
     let snap = who_snapshot(false, false);
-    let obs = observation_for_who(&snap, ObservationId::new(4), "garbage\n");
+    let table = SymTable::parse("garbage\n");
+    let obs = observation_for_who(&snap, ObservationId::new(4), &table);
     let frames = obs
         .backend_payload
         .get("stack")

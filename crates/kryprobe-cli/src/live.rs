@@ -68,13 +68,13 @@ use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredError, ConfiguredKcrypto, KCRYPTO_SYMBOLS, load_kcrypto_configured,
 };
-use kryprobe_privilege::kallsyms::read_kallsyms;
+use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms};
 use kryprobe_privilege::kcrypto_backend::{
     KDROP_DESTROY, KDROP_SITES, observation_for_who, register_kcrypto, snapshot_drops, snapshot_who,
 };
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_for_agg, raw_event_for_ident,
-    raw_event_for_totals, shared_losses_from_snapshot, snapshot_rows,
+    raw_event_for_totals, session_drain, shared_losses_from_snapshot, snapshot_rows_with_drain,
 };
 use kryprobe_privilege::mapops::{MapOpsError, map_lookup_bytes};
 use std::os::fd::AsRawFd;
@@ -567,6 +567,12 @@ pub fn run_live_capture_with_registry(
     if cfg.duration_secs.is_none() {
         let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop));
     }
+    // Session KRING drain (2B-C1): one spawn for all ticks — a per-tick
+    // spawn/stop would pay thread + ~2MB mmap + epoll + up to 10ms
+    // quantum on every tick. Stopped once after the closing tick below;
+    // drain stats stay discarded (see the snapshot docs).
+    let drain = session_drain(&sensor)
+        .map_err(|err| LiveError::Internal(format!("live session drain: {err}")))?;
     // Tick loop: snapshot → raw events in row order → decode each (first
     // error aborts `Internal`). Always at least the opening tick, even
     // for a zero-second window; the tick at/after the deadline is the
@@ -581,8 +587,10 @@ pub fn run_live_capture_with_registry(
     let mut overflow_identities = 0u64;
     let mut first_wall = 0u64;
     let mut first_tick = true;
+    let mut barrier_id = 0u64;
     let closing: SnapshotRows = loop {
-        let snap = snapshot_rows(&sensor)
+        barrier_id += 1;
+        let snap = snapshot_rows_with_drain(&sensor, &drain, barrier_id)
             .map_err(|err| LiveError::Internal(format!("live snapshot: {err}")))?;
         // Coverage interval walls come from the snapshots themselves
         // (measured `CLOCK_MONOTONIC`, no separate clock read).
@@ -615,21 +623,23 @@ pub fn run_live_capture_with_registry(
             observations.push(observation);
         }
         // K5 attribution: who rows decode from the session sensor's
-        // who maps on the same tick. Kallsyms is read ONCE per tick
-        // (a file read — per-row would be wasteful; per-session would
-        // go stale across module load/unload) and shared across all
-        // rows; ids draw from the session issuer so who rows sequence
-        // with the tick's other rows. Per-tick who drops are NOT fed
-        // here — `finalize` merges them (Task 4), and the shared feed
-        // only speaks ring/queue counters.
+        // who maps on the same tick. Kallsyms is read AND parsed ONCE
+        // per tick (per-row parse+sort re-sorts ~1e5 entries per row,
+        // 2B-C2; per-session would go stale across module load/unload)
+        // and the table is shared across all rows; ids draw from the
+        // session issuer so who rows sequence with the tick's other
+        // rows. Per-tick who drops are NOT fed here — `finalize`
+        // merges them (Task 4), and the shared feed only speaks
+        // ring/queue counters.
         let kallsyms = read_kallsyms();
+        let table = SymTable::parse(&kallsyms);
         let (whos, _who_drops) = snapshot_who(&sensor)
             .map_err(|err| LiveError::Internal(format!("live snapshot who: {err}")))?;
         for who in &whos {
             let id = issuer
                 .issue()
                 .map_err(|_| LiveError::Internal("live who id exhausted".to_owned()))?;
-            observations.push(observation_for_who(who, id, &kallsyms));
+            observations.push(observation_for_who(who, id, &table));
         }
         overflow_identities = overflow_identities.saturating_add(snap.overflow_identities);
         let stopped =
@@ -639,6 +649,9 @@ pub fn run_live_capture_with_registry(
         }
         sleep_tick(tick_ms, &stop);
     };
+    // Session drain stops once, after the closing tick: later snapshots
+    // (finalize) run their own one-shot drains.
+    let _drain_stats = drain.stop();
     // Finalize ONCE, then the shared feed ONCE.
     let notrun = notrun_coverage();
     let summary = backend

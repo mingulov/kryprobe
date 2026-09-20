@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Evaluation: deny/report rules over one capture into a 3-state
 //! verdict (D7 — violation / clean-with-coverage / inconclusive).
+//!
+//! Fail-closed rule (H-SEC-02): a deny rule is evaluated only against
+//! observations carrying every key it constrains; a deny rule with
+//! in-source observations but none fully specified makes the capture
+//! `Inconclusive` (dimension `evidence-shape`), never `Clean`. A rule
+//! with no in-source observations at all is inapplicable, not
+//! unevaluable.
 
 use crate::glob;
 use crate::rule::{Decision, Policy, Rule, Stage};
@@ -30,8 +37,10 @@ pub enum PolicyVerdict {
     },
     /// No deny matched and rule-dimension coverage is COMPLETE.
     Clean,
-    /// No deny matched but coverage has gaps on rule dimensions:
-    /// absence of a finding is not evidence of absence.
+    /// No deny matched but the capture cannot prove absence:
+    /// coverage has gaps on rule dimensions, or a deny rule's
+    /// constrained keys are absent from every in-source observation
+    /// (`evidence-shape` dimension, H-SEC-02).
     Inconclusive {
         /// Weaker coverage dimensions in core order.
         missing_dims: Vec<String>,
@@ -139,10 +148,91 @@ fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
     true
 }
 
+/// Whether a deny rule is evaluable against an observation: the
+/// source must agree and every constrained evidence key must be
+/// present and correctly typed in the payload.
+///
+/// A missing key is not a non-match — it means the evidence cannot
+/// answer the rule (producer skew, shape drift, carrier rows).
+/// Matching against absent keys fails open toward `Clean` for exact
+/// patterns (glob vs `""` misses) and fabricates `Violation`s for
+/// exclusions (`driver_not` vs `""` passes), so both directions fail
+/// closed here (H-SEC-02): matches count only on fully-specified
+/// observations, and a deny rule with no fully-specified in-source
+/// observation makes the capture `Inconclusive` instead of `Clean`.
+///
+/// Out of scope by design: `stage` (row/phase gating is matching
+/// semantics, D3) and `module` over kernel-crypto (explicit backend
+/// gate that never matches v0.1 data, D4 — other backends must carry
+/// the key).
+fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
+    if rule.source != source_name(obs.backend) {
+        return false;
+    }
+    let spec = &rule.match_spec;
+    let payload = &obs.backend_payload;
+    for (pattern, key) in [
+        (&spec.algorithm, "algorithm"),
+        (&spec.driver, "driver"),
+        (&spec.family, "family"),
+        (&spec.operation, "op"),
+        (&spec.result, "result"),
+        (&spec.context, "context"),
+        (&spec.comm, "comm"),
+    ] {
+        if pattern.is_some()
+            && payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return false;
+        }
+    }
+    // `driver_not` constrains the driver key too: without a driver to
+    // exclude on, the rule cannot be evaluated.
+    if spec.driver_not.is_some()
+        && payload
+            .get("driver")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    if spec.module.is_some()
+        && obs.backend != BackendId::KCrypto
+        && payload
+            .get("module")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    // `uid` is an exact u32: presence + numeric type is specifiedness;
+    // the value comparison itself stays in `rule_matches`.
+    if spec.uid.is_some()
+        && payload
+            .get("uid")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return false;
+    }
+    true
+}
+
 /// Evaluates a policy over one capture: the first matching `deny`
 /// rule (policy order) is a violation; `report` matches never
 /// violate; with no deny match the coverage contract decides
 /// Clean (COMPLETE) vs Inconclusive (gaps on rule dimensions).
+///
+/// Fail-closed (H-SEC-02): matches count only on fully-specified
+/// observations, and a deny rule that has in-source observations but
+/// no fully-specified one makes the capture `Inconclusive` (with an
+/// `evidence-shape` dimension) instead of `Clean` — absence of
+/// evidence is not evidence of absence. A deny rule with no
+/// in-source observations at all is inapplicable and contributes
+/// nothing.
 #[must_use]
 pub fn evaluate(
     policy: &Policy,
@@ -153,8 +243,10 @@ pub fn evaluate(
         if rule.decision != Decision::Deny {
             continue;
         }
-        let matched: Vec<&NativeObservation> =
-            obs.iter().filter(|obs| rule_matches(rule, obs)).collect();
+        let matched: Vec<&NativeObservation> = obs
+            .iter()
+            .filter(|obs| rule_matches(rule, obs) && rule_specified(rule, obs))
+            .collect();
         if matched.is_empty() {
             continue;
         }
@@ -168,15 +260,35 @@ pub fn evaluate(
             evidence: matched.into_iter().cloned().collect(),
         };
     }
-    if coverage.overall() == CoverageStatus::CompleteForDeclaredBoundary {
+    let unevaluable = policy.rules.iter().any(|rule| {
+        if rule.decision != Decision::Deny {
+            return false;
+        }
+        // Inapplicable (no in-source observations) is not unevaluable:
+        // only a rule that should have been answerable, but finds no
+        // fully-specified observation, fails closed.
+        let mut any_in_source = false;
+        for ob in obs {
+            if rule.source == source_name(ob.backend) {
+                any_in_source = true;
+                if rule_specified(rule, ob) {
+                    return false;
+                }
+            }
+        }
+        any_in_source
+    });
+    if !unevaluable && coverage.overall() == CoverageStatus::CompleteForDeclaredBoundary {
         PolicyVerdict::Clean
     } else {
-        PolicyVerdict::Inconclusive {
-            missing_dims: coverage
-                .weaker_dimensions()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+        let mut missing_dims: Vec<String> = coverage
+            .weaker_dimensions()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if unevaluable {
+            missing_dims.push("evidence-shape".to_owned());
         }
+        PolicyVerdict::Inconclusive { missing_dims }
     }
 }

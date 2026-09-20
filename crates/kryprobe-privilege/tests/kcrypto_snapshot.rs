@@ -31,11 +31,12 @@ use kryprobe_core::backend::RawEvent;
 use kryprobe_core::error::BackendError;
 use kryprobe_core::evidence::SharedLosses;
 use kryprobe_privilege::btf_resolve::{ConfiguredKcrypto, load_kcrypto_configured};
+use kryprobe_privilege::drain::drain_spawns;
 use kryprobe_privilege::kcrypto_snapshot::{
     IDENT_BYTES_LEN, IdentBytes, ParsedRow, ROW_BYTES_LEN, ROW_KIND_AGG, ROW_KIND_IDENT,
     ROW_KIND_TOTALS, RowBytes, SNAPSHOT_VERSION, SnapshotRows, TOTALS_BYTES_LEN, TotalsBytes,
     parse_snapshot_row, raw_event_for_agg, raw_event_for_ident, raw_event_for_totals,
-    shared_losses_from_snapshot, snapshot_rows,
+    session_drain, shared_losses_from_snapshot, snapshot_rows, snapshot_rows_with_drain,
 };
 use kryprobe_privilege::mapops::{map_lookup_bytes, possible_cpus};
 use kryprobe_testkit::alg_fixture;
@@ -697,6 +698,42 @@ fn compat_ring_matches_canary_twin() {
         SharedLosses::new(0, 0),
         "healthy shared losses pin zero"
     );
+}
+
+#[test]
+#[ignore = "BPF lane: run under sudo with the lane lock"]
+fn session_drain_serves_many_windows_with_one_spawn() {
+    // 2B-C1: one session drain serves every tick window — no per-tick
+    // spawn/stop (thread + ~2MB mmap + epoll + 10ms quantum per tick).
+    // Deterministic tripwire: the process spawn count must not grow
+    // across windows.
+    let _guard = suite_guard();
+    if !lane_ready("session_drain_serves_many_windows_with_one_spawn") {
+        return;
+    }
+    let bytes = kcrypto_bytes();
+    let (sensor, _points) = load_kcrypto_configured(&bytes, None)
+        .unwrap_or_else(|err| panic!("configured bring-up failed: {err}"));
+    let before = drain_spawns();
+    let drain = session_drain(&sensor).expect("session drain spawns");
+    assert_eq!(
+        drain_spawns() - before,
+        1,
+        "one spawn for the session drain"
+    );
+    let mut last_wall = 0u64;
+    let mut seen_idents = 0usize;
+    for window in 1..=3u64 {
+        let counts = alg_fixture::skcipher_roundtrip("ecb(aes)", 3).expect("window traffic");
+        assert_eq!((counts.enc, counts.dec), (3, 3));
+        let snap = snapshot_rows_with_drain(&sensor, &drain, window).expect("window snapshot");
+        assert!(snap.monotonic_ns >= last_wall, "window walls nondecreasing");
+        last_wall = snap.monotonic_ns;
+        seen_idents += snap.idents.len();
+    }
+    assert_eq!(drain_spawns() - before, 1, "no per-window respawn (2B-C1)");
+    assert!(seen_idents > 0, "windows must observe traffic idents");
+    let _stats = drain.stop();
 }
 
 #[test]
