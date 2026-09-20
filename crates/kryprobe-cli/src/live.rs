@@ -63,6 +63,7 @@ use kryprobe_core::evidence::{
 };
 use kryprobe_core::ids::{IdIssuer, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
+use kryprobe_core::session::{SessionController, SessionState};
 use kryprobe_privilege::btf_resolve::{ConfiguredKcrypto, KCRYPTO_SYMBOLS};
 use kryprobe_privilege::drain::DrainThread;
 use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms};
@@ -136,6 +137,10 @@ pub struct LiveOutcome {
     pub coverage: CoverageSummary,
     /// Reconciled session integrity (rollup + the once-only shared feed).
     pub integrity: IntegritySummary,
+    /// Terminal ARCH §4.1 machine state (1B-H4): `Finalized` on every
+    /// `Ok` return — the machine's observable proof it governed this
+    /// session end to end.
+    pub terminal_state: SessionState,
 }
 
 /// Live failure: unusable environment (→ exit 4) or internal defect
@@ -172,36 +177,15 @@ impl LiveError {
     }
 }
 
-/// Required capabilities the runtime does not satisfy, in
-/// [`CapabilityRequirements`] field order.
-fn missing_gates(
-    required: &CapabilityRequirements,
-    runtime: &RuntimeCapabilities,
-) -> Vec<&'static str> {
-    let mut missing = Vec::new();
-    if required.uprobe_multi && !runtime.uprobe_multi {
-        missing.push("uprobe_multi");
-    }
-    if required.cookies && !runtime.cookies {
-        missing.push("cookies");
-    }
-    if required.ringbuf && !runtime.ringbuf {
-        missing.push("ringbuf");
-    }
-    if required.btf && !runtime.btf_present {
-        missing.push("btf");
-    }
-    missing
-}
-
 /// Gate check: every required capability must have probed present, else
-/// `Unusable` naming each missing gate.
+/// `Unusable` naming each missing gate (1B-H1: the gate vocabulary is
+/// core's [`RuntimeCapabilities::missing_gates`] — no CLI copy).
 fn gate_check(
     stage: &str,
     required: &CapabilityRequirements,
     runtime: &RuntimeCapabilities,
 ) -> Result<(), LiveError> {
-    let missing = missing_gates(required, runtime);
+    let missing = runtime.missing_gates(required);
     if missing.is_empty() {
         Ok(())
     } else {
@@ -212,53 +196,15 @@ fn gate_check(
     }
 }
 
-/// Backend errors to live errors: environmental (`Unsupported`/`Denied`)
-/// stay `Unusable`; everything else is a defect marker (`Internal`).
+/// Backend errors to live errors (1B-M2): every world condition —
+/// refused/unsupported bring-up, budget exhaustion, target
+/// instability, fired safety rules, ambiguous identity, corrupt input
+/// — stays `Unusable` (exit 4: retry/fix env). Only
+/// `BackendError::Internal` is a kryprobe defect (`Internal`, exit 1).
 fn backend_err(stage: &str, err: BackendError) -> LiveError {
     match err {
-        BackendError::Unsupported(_) | BackendError::Denied(_) => {
-            LiveError::Unusable(format!("{stage}: {err}"))
-        }
-        _ => LiveError::Internal(format!("{stage}: {err}")),
-    }
-}
-
-/// Wide-open session budget (the `BackendDriver::harness` ceilings: the
-/// live session gates on privilege/BTF, not on budgets).
-fn open_budget() -> PlanBudget {
-    PlanBudget {
-        max_targets: u64::MAX,
-        max_objects: u64::MAX,
-        max_bytes: u64::MAX,
-        max_links: u64::MAX,
-        max_state_entries: u64::MAX,
-        max_queue: u64::MAX,
-        max_duration_ns: u64::MAX,
-    }
-}
-
-/// All-`NotRun` coverage for the finalize context (the K2 backend ignores
-/// its context — it assesses its own sensor; session coverage is
-/// assembled here afterwards).
-fn notrun_coverage() -> CoverageSummary {
-    let dimension = || {
-        DimensionCoverage::new(
-            CoverageStatus::NotRun,
-            ValidityInterval {
-                start_ns: 0,
-                end_ns: None,
-            },
-        )
-    };
-    CoverageSummary {
-        target_population: dimension(),
-        object_discovery: dimension(),
-        attachment: dimension(),
-        aggregate_counts: dimension(),
-        detailed_events: dimension(),
-        attribution: dimension(),
-        correlation: dimension(),
-        completion: dimension(),
+        BackendError::Internal(_) => LiveError::Internal(format!("{stage}: {err}")),
+        _ => LiveError::Unusable(format!("{stage}: {err}")),
     }
 }
 
@@ -532,15 +478,18 @@ fn upsert_latest(
     }
 }
 
-/// Tick driver over a caller-supplied sensor (P0-4): the tick loop
-/// (snapshot → parse each row once → decode each → who attribution
-/// with latest-per-key accumulation), then finalize ONCE and the
-/// shared feed ONCE, then coverage from the session measurements.
-/// NEVER finalizes per tick (D1/M1).
+/// Governed tick driver over a caller-supplied sensor (P0-4 +
+/// 1B-H4): the ARCH §4.1 machine walks `Attaching -> Observing ->
+/// Quiescing -> Draining -> Finalized` on the success path; any
+/// failure after `Observing` parks it in `FailedPartial` (best-effort
+/// — the original error always wins, fail-closed preserved).
 ///
-/// `concrete` stages the closing-tick counts for the finalize fast
-/// path (M5): production passes the shared backend, scripted tests
-/// pass `None` (their fake finalizes need no staging).
+/// Callers bring the controller to `Attaching` first (production via
+/// `run_live_session` bring-up); a refused entry hop is a loud
+/// `Internal`, never a silent skip. `concrete` stages the
+/// closing-tick counts for the finalize fast path (M5): production
+/// passes the shared backend, scripted tests pass `None` (their fake
+/// finalizes need no staging).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_session(
     cfg: &LiveConfig,
@@ -552,6 +501,55 @@ pub fn drive_session(
     generation: PlanGeneration,
     issuer: &IdIssuer,
     concrete: Option<&KCryptoBackend>,
+    controller: &mut SessionController,
+) -> Result<LiveOutcome, LiveError> {
+    hop(controller, SessionState::Observing, "session start")?;
+    match drive_session_inner(
+        cfg,
+        backend,
+        sensor,
+        stop,
+        attached_points,
+        session,
+        generation,
+        issuer,
+        concrete,
+        controller,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            let _ = controller.transition(SessionState::FailedPartial);
+            Err(err)
+        }
+    }
+}
+
+/// One governed session hop (1B-H4): a refused hop is a loud
+/// `Internal` naming the stage — phase reorderings fail here, not
+/// silently.
+fn hop(controller: &mut SessionController, to: SessionState, stage: &str) -> Result<(), LiveError> {
+    controller
+        .transition(to)
+        .map_err(|err| LiveError::Internal(format!("live session machine refused {stage}: {err}")))
+}
+
+/// Tick driver over a caller-supplied sensor (P0-4): the tick loop
+/// (snapshot → parse each row once → decode each → who attribution
+/// with latest-per-key accumulation), then finalize ONCE and the
+/// shared feed ONCE, then coverage from the session measurements.
+/// NEVER finalizes per tick (D1/M1).
+#[allow(clippy::too_many_arguments)]
+fn drive_session_inner(
+    cfg: &LiveConfig,
+    backend: &dyn Backend,
+    sensor: &mut dyn SessionSensor,
+    stop: &AtomicBool,
+    attached_points: usize,
+    session: SessionId,
+    generation: PlanGeneration,
+    issuer: &IdIssuer,
+    concrete: Option<&KCryptoBackend>,
+    controller: &mut SessionController,
 ) -> Result<LiveOutcome, LiveError> {
     let baseline = IntegritySummary::default();
     // Tick loop: snapshot → raw events in row order → decode each
@@ -681,6 +679,8 @@ pub fn drive_session(
         }
         sleep_tick(tick_ms, stop);
     };
+    // Observing -> Quiescing: the loop stopped taking new work.
+    hop(controller, SessionState::Quiescing, "session quiesce")?;
     // Session drain stops once, after the closing tick: later snapshots
     // (finalize) run their own one-shot drains.
     sensor.finish();
@@ -698,8 +698,12 @@ pub fn drive_session(
             drops: closing.drops,
         });
     }
+    // Quiescing -> Draining: queued events become evidence now.
+    hop(controller, SessionState::Draining, "session drain")?;
     // Finalize ONCE, then the shared feed ONCE.
-    let notrun = notrun_coverage();
+    // All-`NotRun` baseline is core's (1B-H1): the backend ignores its
+    // context — it assesses its own sensor.
+    let notrun = CoverageSummary::not_run();
     let summary = backend
         .finalize(&FinalizeContext {
             session,
@@ -741,11 +745,13 @@ pub fn drive_session(
         .summaries
         .pop()
         .ok_or_else(|| LiveError::Internal("live session filed no summary".to_owned()))?;
+    hop(controller, SessionState::Finalized, "session finalize")?;
     Ok(LiveOutcome {
         observations: report.observations,
         summary,
         coverage,
         integrity,
+        terminal_state: controller.state(),
     })
 }
 
@@ -778,11 +784,33 @@ pub fn run_live_capture_with_registry(
 /// plus the concrete sensor handle (H1(b)). Production passes `Some`
 /// (one sensor for ticks and finalize); the fake-registry test path
 /// passes `None` and stops at `configure` before any sensor access.
+///
+/// 1B-H4: the orchestrator owns the ARCH §4.1 machine for bring-up
+/// (`Created -> Qualified -> Discovering -> Attaching`) and hands it
+/// to `drive_session` for the governed tail. A started session that
+/// fails parks in `FailedPartial`; a refused session (bad source,
+/// missing backend, failed gate) never started and stays `Created` —
+/// refusal is not partial.
 fn run_live_session(
     cfg: &LiveConfig,
     runtime: &RuntimeCapabilities,
     registry: &BackendRegistry,
     concrete: Option<&KCryptoBackend>,
+) -> Result<LiveOutcome, LiveError> {
+    let mut controller = SessionController::new();
+    let outcome = run_live_session_inner(cfg, runtime, registry, concrete, &mut controller);
+    if outcome.is_err() && controller.state() != SessionState::Created {
+        let _ = controller.transition(SessionState::FailedPartial);
+    }
+    outcome
+}
+
+fn run_live_session_inner(
+    cfg: &LiveConfig,
+    runtime: &RuntimeCapabilities,
+    registry: &BackendRegistry,
+    concrete: Option<&KCryptoBackend>,
+    controller: &mut SessionController,
 ) -> Result<LiveOutcome, LiveError> {
     if cfg.source != LIVE_SOURCE {
         return Err(LiveError::Unusable(format!(
@@ -794,12 +822,18 @@ fn run_live_session(
         .get(BackendId::KCrypto)
         .ok_or_else(|| LiveError::Unusable("kcrypto backend not registered".to_owned()))?;
     gate_check("session", &backend.capabilities().required, runtime)?;
+    // Created -> Qualified: capabilities probed present.
+    hop(controller, SessionState::Qualified, "session qualify")?;
     // Harness-style session state (fresh ids, open budgets; the
     // driver owns the zero integrity baseline).
     let session = SessionId::new(1);
     let generation = PlanGeneration::new(1);
-    let mut budget = BudgetManager::new(open_budget());
+    // Wide-open session budget is core's (1B-H1): the session gates
+    // on privilege/BTF, not on budgets.
+    let mut budget = BudgetManager::new(PlanBudget::open());
     let issuer = IdIssuer::default();
+    // Qualified -> Discovering: targets and objects resolve now.
+    hop(controller, SessionState::Discovering, "session discover")?;
     let instances = backend
         .detect(&DetectContext { session, runtime })
         .map_err(|err| backend_err("kcrypto detect", err))?;
@@ -828,15 +862,18 @@ fn run_live_session(
     // refused AFTER the object resolves (a missing object is its own
     // exit-4 with its own name) but BEFORE `configure` loads anything
     // (a doomed unprivileged run must not start the load either).
-    let token = crate::cmd_token::usable_token(cfg.token.as_deref());
-    if token.is_none() && !crate::cmd_token::process_has_bpf_caps() {
-        return Err(LiveError::Unusable(crate::cmd_token::no_mechanism_reason(
+    let token = crate::token::usable_token(cfg.token.as_deref());
+    if token.is_none() && !crate::runtime_facts::process_has_bpf_caps() {
+        return Err(LiveError::Unusable(crate::token::no_mechanism_reason(
             cfg.token.as_deref(),
         )));
     }
     if let Some(concrete) = concrete {
         concrete.stage_session_inputs(object_bytes, token);
     }
+    // Discovering -> Attaching: the plan is validated and inputs are
+    // staged; `configure` loads and attaches the single sensor.
+    hop(controller, SessionState::Attaching, "session attach")?;
     backend
         .configure(
             &mut ConfigureContext {
@@ -883,6 +920,7 @@ fn run_live_session(
         generation,
         &issuer,
         Some(concrete),
+        controller,
     )
 }
 
@@ -903,36 +941,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn missing_gates_names_each_gap_in_field_order() {
-        let all = CapabilityRequirements {
-            uprobe_multi: true,
-            cookies: true,
-            ringbuf: true,
-            btf: true,
-        };
-        let none = RuntimeCapabilities {
-            kernel_release: "test".to_owned(),
-            uprobe_multi: false,
-            cookies: false,
-            ringbuf: false,
-            btf_present: false,
-            userns: false,
-            yama_scope: 0,
-            caps: Vec::new(),
-        };
-        assert_eq!(
-            missing_gates(&all, &none),
-            vec!["uprobe_multi", "cookies", "ringbuf", "btf"]
-        );
-        assert!(missing_gates(&all, &runtime_with(true)).is_empty());
-        let need_btf = CapabilityRequirements {
-            btf: true,
-            ..CapabilityRequirements::default()
-        };
-        assert_eq!(missing_gates(&need_btf, &runtime_with(false)), vec!["btf"]);
-        assert!(missing_gates(&need_btf, &runtime_with(true)).is_empty());
-    }
+    // (The gate-vocabulary test moved to core with `missing_gates`
+    // itself — 1B-H1/1B-L2; `gate_check` below still pins the CLI's
+    // error attribution over the shared vocabulary.)
 
     #[test]
     fn gate_check_error_names_gates() {
@@ -956,10 +967,21 @@ mod tests {
             AmbiguityReason, BackendError, BudgetReason, DeniedReason, InputReason, InternalError,
             SafetyReason, UnstableReason, UnsupportedReason,
         };
-        // Environmental stages stay `Unusable`, naming stage + reason.
+        // World conditions stay `Unusable` (exit 4: retry/fix env),
+        // naming stage + reason. Only a kryprobe defect is `Internal`
+        // (exit 1). 1B-M2: budget exhaustion, target instability, and
+        // corrupt input are environmental/usage — not defects — and
+        // neither is a fired safety rule (`Unsafe`, a protection like
+        // `Denied`) nor an unclear identity (`Ambiguous`, a data
+        // condition).
         for err in [
             BackendError::Unsupported(UnsupportedReason::with_detail("r", "d")),
             BackendError::Denied(DeniedReason::with_detail("r", "d")),
+            BackendError::Unstable(UnstableReason::with_detail("r", "d")),
+            BackendError::Exhausted(BudgetReason::with_detail("r", "d")),
+            BackendError::Unsafe(SafetyReason::with_detail("r", "d")),
+            BackendError::Ambiguous(AmbiguityReason::with_detail("r", "d")),
+            BackendError::CorruptInput(InputReason::with_detail("r", "d")),
         ] {
             match backend_err("kcrypto configure", err) {
                 LiveError::Unusable(reason) => {
@@ -968,20 +990,16 @@ mod tests {
                 other => panic!("expected Unusable, got {other:?}"),
             }
         }
-        // Every other variant is a defect marker (`Internal`).
-        for err in [
-            BackendError::Unstable(UnstableReason::with_detail("r", "d")),
-            BackendError::Exhausted(BudgetReason::with_detail("r", "d")),
-            BackendError::Unsafe(SafetyReason::with_detail("r", "d")),
-            BackendError::Ambiguous(AmbiguityReason::with_detail("r", "d")),
-            BackendError::CorruptInput(InputReason::with_detail("r", "d")),
-            BackendError::Internal(InternalError::with_detail("r", "d")),
-        ] {
-            assert!(
-                matches!(backend_err("kcrypto plan", err), LiveError::Internal(_)),
-                "defect variants map Internal"
-            );
-        }
+        assert!(
+            matches!(
+                backend_err(
+                    "kcrypto plan",
+                    BackendError::Internal(InternalError::with_detail("r", "d"))
+                ),
+                LiveError::Internal(_)
+            ),
+            "only Internal maps Internal"
+        );
     }
 
     fn measurements() -> SessionMeasurements {

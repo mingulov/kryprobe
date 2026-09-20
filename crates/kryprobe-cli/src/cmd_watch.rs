@@ -6,360 +6,15 @@
 //! rows with cumulative counters, so the table keeps the latest
 //! observation per full row key and sums across result classes and
 //! contexts. `report --system` (human) renders these same tables via
-//! [`render_watch_tables`]; only the exit code differs (watch exits 0 on
-//! any completed capture, report exits 0/3 on the verdict).
+//! [`render_watch_tables`](kryprobe_report::live_render::render_watch_tables);
+//! only the exit code differs (watch exits 0 on any completed capture,
+//! report exits 0/3 on the verdict). The tables themselves live in
+//! `kryprobe-report` (1B-H2/1B-M8); this module is dispatch + runtime
+//! facts + test fixtures.
 
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
-use kryprobe_core::capability::RuntimeCapabilities;
-use kryprobe_core::enums::CoverageStatus;
-use kryprobe_core::evidence::{CoverageSummary, NativeObservation};
-use kryprobe_privilege::probe::{
-    ProbeOutcome, attach_cookies, btf_present, ringbuf_create, uprobe_multi_link_self,
-    userns_create,
-};
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
-
-/// Exact table header (brief-exact column set).
-const HEADER: &str = "FAMILY OP ALGORITHM DRIVER CALLS BYTES OK QUEUED ERRORS";
-
-/// WHO block column header (spec §2.3: `KH TGID COMM UID CALLS`).
-pub const WHO_HEADER: &str = "KH TGID COMM UID CALLS";
-
-/// Max WHO rows rendered; the rest collapse into the `+N more` trailer.
-pub const WHO_MAX_ROWS: usize = 32;
-
-/// Accumulated counters for one rendered row.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Acc {
-    calls: u64,
-    bytes: u64,
-    ok: u64,
-    queued: u64,
-    errors: u64,
-}
-
-impl Acc {
-    /// Field-wise saturating sum (counters never wrap, never panic).
-    fn add(&mut self, other: Acc) {
-        self.calls = self.calls.saturating_add(other.calls);
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.ok = self.ok.saturating_add(other.ok);
-        self.queued = self.queued.saturating_add(other.queued);
-        self.errors = self.errors.saturating_add(other.errors);
-    }
-}
-
-/// Raw payload string (empty when missing or not a string).
-fn raw<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
-    payload
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-}
-
-/// Rendered cell: missing or empty renders `unknown` (C10 — zeros and
-/// unknowns render as unknown, never fabricated).
-fn show(cell: &str) -> String {
-    if cell.is_empty() {
-        String::from("unknown")
-    } else {
-        kryprobe_report::sanitize_cell(cell)
-    }
-}
-
-/// One `counts` sub-counter (0 when the shape is absent — real decodes
-/// always carry it; only hand-fed shapes can miss it).
-fn count(payload: &serde_json::Value, key: &str) -> u64 {
-    payload
-        .get("counts")
-        .and_then(|counts| counts.get(key))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-}
-
-fn acc_of(obs: &NativeObservation) -> Acc {
-    let payload = &obs.backend_payload;
-    Acc {
-        calls: count(payload, "calls"),
-        bytes: payload
-            .get("bytes")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        ok: count(payload, "ok"),
-        queued: count(payload, "queued"),
-        errors: count(payload, "errors"),
-    }
-}
-
-/// Full row key: the KAGG identity the payload mirrors
-/// (family, op, result, algorithm, driver, context).
-fn row_key(obs: &NativeObservation) -> (&str, &str, &str, &str, &str, &str) {
-    let payload = &obs.backend_payload;
-    (
-        raw(payload, "family"),
-        raw(payload, "op"),
-        raw(payload, "result"),
-        raw(payload, "algorithm"),
-        raw(payload, "driver"),
-        raw(payload, "context"),
-    )
-}
-
-/// kp2 §8 trailer dimensions in kp2 order: `attach` (attachment,
-/// object_discovery), `operation` (target_population — the observed op
-/// surface), `capture-integrity` (aggregate_counts, detailed_events),
-/// `completion` (completion — the closed window attests temporal
-/// coverage, so `temporal` is never emitted alone), `attribution`
-/// (attribution), `correlation` (passthrough — no kp2 §8 counterpart).
-/// Empty ⟺ every dimension complete (interval end with the contract held
-/// is COMPLETE, never PARTIAL).
-#[must_use]
-pub fn trailer_dims(coverage: &CoverageSummary) -> Vec<&'static str> {
-    let weak = |status: CoverageStatus| status != CoverageStatus::CompleteForDeclaredBoundary;
-    let mut dims = Vec::new();
-    if weak(coverage.attachment.status) || weak(coverage.object_discovery.status) {
-        dims.push("attach");
-    }
-    if weak(coverage.target_population.status) {
-        dims.push("operation");
-    }
-    if weak(coverage.aggregate_counts.status) || weak(coverage.detailed_events.status) {
-        dims.push("capture-integrity");
-    }
-    if weak(coverage.completion.status) {
-        dims.push("completion");
-    }
-    if weak(coverage.attribution.status) {
-        dims.push("attribution");
-    }
-    if weak(coverage.correlation.status) {
-        dims.push("correlation");
-    }
-    dims
-}
-
-/// One who-row `calls` tally (0 when the shape is absent — real
-/// decodes always carry it; only hand-fed shapes can miss it).
-fn who_calls(obs: &NativeObservation) -> u64 {
-    obs.backend_payload
-        .get("calls")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-}
-
-/// Who-row dedup key: (key_hash, tgid), 0 when absent (real decodes
-/// always carry both; only hand-fed shapes can miss them).
-fn who_key(obs: &NativeObservation) -> (u64, u64) {
-    let payload = &obs.backend_payload;
-    (
-        payload
-            .get("key_hash")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        payload
-            .get("tgid")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-    )
-}
-
-/// Projected who row (M4): every JSON walk for the row happens once,
-/// at projection time — dedup/sort/render below never touch JSON.
-#[derive(Debug, Clone, Copy)]
-struct WhoProj<'a> {
-    kh: u64,
-    tgid: Option<u64>,
-    comm: &'a str,
-    uid: Option<u64>,
-    calls: u64,
-}
-
-/// Projects one who observation (same defaults as the direct
-/// readers: 0 key parts, `None` cells, 0 calls when absent).
-fn project_who(obs: &NativeObservation) -> WhoProj<'_> {
-    let payload = &obs.backend_payload;
-    let (kh, _) = who_key(obs);
-    WhoProj {
-        kh,
-        tgid: payload.get("tgid").and_then(serde_json::Value::as_u64),
-        comm: raw(payload, "comm"),
-        uid: payload.get("uid").and_then(serde_json::Value::as_u64),
-        calls: who_calls(obs),
-    }
-}
-
-/// Renders the K5 attribution block over `obs`: only `row="who"`
-/// observations feed it; latest wins per (key_hash, tgid) (cumulative
-/// per-tick snapshots, the agg-table idiom); rows sort by calls desc
-/// (ties by (kh, tgid) asc, deterministic); the top 32 render as
-/// `KH TGID COMM UID CALLS` (`KH` is 16-digit lowercase hex) and the
-/// rest collapse into a `+N more` trailer. Empty renders `WHO: none`.
-#[must_use]
-pub fn render_who_block(obs: &[NativeObservation]) -> String {
-    // M4: one projection pass (each row's JSON walks once), then
-    // plain-struct dedup/sort/render — no per-comparison walks.
-    let mut latest: BTreeMap<(u64, u64), WhoProj<'_>> = BTreeMap::new();
-    for ob in obs {
-        if ob
-            .backend_payload
-            .get("row")
-            .and_then(serde_json::Value::as_str)
-            != Some("who")
-        {
-            continue;
-        }
-        let proj = project_who(ob);
-        latest.insert((proj.kh, proj.tgid.unwrap_or(0)), proj);
-    }
-    if latest.is_empty() {
-        return String::from("WHO: none\n");
-    }
-    let mut rows: Vec<WhoProj<'_>> = latest.into_values().collect();
-    rows.sort_by(|a, b| {
-        // Tie-break matches `who_key` exactly (absent tgid sorts as
-        // 0, NOT as `None`-first).
-        b.calls
-            .cmp(&a.calls)
-            .then_with(|| (a.kh, a.tgid.unwrap_or(0)).cmp(&(b.kh, b.tgid.unwrap_or(0))))
-    });
-    let mut text = String::from(WHO_HEADER);
-    text.push('\n');
-    for row in rows.iter().take(WHO_MAX_ROWS) {
-        text.push_str(&format!(
-            "{kh:016x} {tgid} {comm} {uid} {calls}\n",
-            kh = row.kh,
-            tgid = row
-                .tgid
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| String::from("unknown")),
-            comm = show(row.comm),
-            uid = row
-                .uid
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| String::from("unknown")),
-            calls = row.calls
-        ));
-    }
-    if rows.len() > WHO_MAX_ROWS {
-        text.push_str(&format!("+{} more\n", rows.len() - WHO_MAX_ROWS));
-    }
-    text
-}
-
-/// Renders one outcome: header + one row per
-/// (family, op, algorithm, driver) + `TOTAL` + the WHO attribution
-/// block + the `COMPLETE` / `PARTIAL: <dims>` trailer. Latest wins
-/// per full row key (cumulative snapshots), then classes/contexts
-/// sum; idents never render as rows;
-/// `TOTAL` comes from the latest totals carrier (column sums when totals
-/// are absent — the coverage trailer separately attests the gap).
-#[must_use]
-pub fn render_watch_tables(outcome: &LiveOutcome) -> String {
-    // M4: one projection pass builds the agg latest-map AND the
-    // totals slot (last totals in vec order wins — the `rev().find`
-    // idiom, without the second iteration).
-    let mut latest: BTreeMap<(&str, &str, &str, &str, &str, &str), Acc> = BTreeMap::new();
-    let mut totals_slot: Option<Acc> = None;
-    for obs in &outcome.observations {
-        let kind = obs
-            .backend_payload
-            .get("row")
-            .and_then(serde_json::Value::as_str);
-        if kind == Some("agg") {
-            latest.insert(row_key(obs), acc_of(obs));
-        } else if kind == Some("totals") {
-            totals_slot = Some(acc_of(obs));
-        }
-    }
-    let mut rows: BTreeMap<(&str, &str, &str, &str), Acc> = BTreeMap::new();
-    for ((family, op, _, algorithm, driver, _), acc) in latest {
-        rows.entry((family, op, algorithm, driver))
-            .or_default()
-            .add(acc);
-    }
-    let mut text = String::from(HEADER);
-    text.push('\n');
-    for ((family, op, algorithm, driver), acc) in &rows {
-        text.push_str(&format!(
-            "{} {} {} {} {} {} {} {} {}\n",
-            show(family),
-            show(op),
-            show(algorithm),
-            show(driver),
-            acc.calls,
-            acc.bytes,
-            acc.ok,
-            acc.queued,
-            acc.errors
-        ));
-    }
-    let totals = totals_slot.unwrap_or_else(|| {
-        rows.values().fold(Acc::default(), |mut total, acc| {
-            total.add(*acc);
-            total
-        })
-    });
-    text.push_str(&format!(
-        "TOTAL - - - {} {} {} {} {}\n",
-        totals.calls, totals.bytes, totals.ok, totals.queued, totals.errors
-    ));
-    text.push_str(&render_who_block(&outcome.observations));
-    let dims = trailer_dims(&outcome.coverage);
-    if dims.is_empty() {
-        text.push_str("COMPLETE\n");
-    } else {
-        text.push_str(&format!("PARTIAL: {}\n", dims.join(",")));
-    }
-    text
-}
-
-/// Kernel release context (`/proc` read; `unknown` when unreadable —
-/// informational only, never a gate).
-fn os_release() -> String {
-    let text = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_default();
-    if text.is_empty() {
-        String::from("unknown")
-    } else {
-        text
-    }
-}
-
-/// Yama scope context (informational only, never a gate; 0 when
-/// unreadable — mirrors the fail-soft context reads).
-fn yama_scope() -> u32 {
-    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// Effective caps from CapEff (the shared `cmd_token` reader — one
-/// CapEff parse for the crate).
-fn effective_caps() -> Vec<String> {
-    crate::cmd_token::effective_cap_names()
-}
-
-/// Live host facts for the session gate: gate bools from the committed
-/// privilege probes (`Pass` ⟺ present — probe details are human verdicts,
-/// never parsed back), context from direct `/proc` reads. std-only
-/// (ADR-0002 Rule B: no `libc::` in the CLI crate).
-pub(crate) fn live_runtime() -> RuntimeCapabilities {
-    let pass = |outcome: ProbeOutcome| matches!(outcome, ProbeOutcome::Pass { .. });
-    RuntimeCapabilities {
-        kernel_release: os_release(),
-        uprobe_multi: pass(uprobe_multi_link_self()),
-        cookies: pass(attach_cookies()),
-        ringbuf: pass(ringbuf_create()),
-        btf_present: pass(btf_present()),
-        userns: pass(userns_create()),
-        yama_scope: yama_scope(),
-        caps: effective_caps(),
-    }
-}
 
 /// Finishes a capture: tables to stdout (exit 0) or the named failure to
 /// stderr (`Unusable` → 4, `Internal` → 1 via [`LiveError::exit_code`]).
@@ -370,7 +25,14 @@ fn finish_watch(
 ) -> i32 {
     match result {
         Ok(outcome) => {
-            let _ = write!(stdout, "{}", render_watch_tables(&outcome));
+            let _ = write!(
+                stdout,
+                "{}",
+                kryprobe_report::live_render::render_watch_tables(
+                    &outcome.observations,
+                    &outcome.coverage
+                )
+            );
             0
         }
         Err(err) => {
@@ -398,7 +60,11 @@ pub fn run_watch(
         tick_ms: DEFAULT_TICK_MS,
         token: token.map(Path::to_owned),
     };
-    finish_watch(run_live_capture(&cfg, &live_runtime()), stdout, stderr)
+    finish_watch(
+        run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
+        stdout,
+        stderr,
+    )
 }
 
 /// Hand-fed `LiveOutcome` fixtures shared by this crate's unit tests
@@ -665,6 +331,7 @@ pub(crate) mod fixtures {
             },
             coverage,
             integrity: IntegritySummary::default(),
+            terminal_state: kryprobe_core::session::SessionState::Finalized,
         }
     }
 
@@ -722,6 +389,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use kryprobe_report::live_render::render_watch_tables;
     use kryprobe_testkit::assert_golden;
     use std::path::PathBuf;
 
@@ -731,12 +399,14 @@ mod tests {
             .join(name)
     }
 
+    /// Renders a hand-fed outcome through the report tables (1B-H2).
+    fn render(fixture: &crate::live::LiveOutcome) -> String {
+        render_watch_tables(&fixture.observations, &fixture.coverage)
+    }
+
     #[test]
     fn watch_golden_pins_complete_render() {
-        assert_golden(
-            &golden("watch.txt"),
-            render_watch_tables(&watch_fixture()).as_bytes(),
-        );
+        assert_golden(&golden("watch.txt"), render(&watch_fixture()).as_bytes());
     }
 
     #[test]
@@ -745,67 +415,8 @@ mod tests {
         // PARTIAL trailer over the gapped fixture.
         assert_golden(
             &golden("report_partial.txt"),
-            render_watch_tables(&partial_fixture()).as_bytes(),
+            render(&partial_fixture()).as_bytes(),
         );
-    }
-
-    #[test]
-    fn trailer_names_each_gap_in_kp2_order() {
-        // Each dimension alone maps to its kp2 §8 token.
-        let cases = [
-            ("target_population", "operation"),
-            ("object_discovery", "attach"),
-            ("attachment", "attach"),
-            ("aggregate_counts", "capture-integrity"),
-            ("detailed_events", "capture-integrity"),
-            ("attribution", "attribution"),
-            ("correlation", "correlation"),
-            ("completion", "completion"),
-        ];
-        for (field, token) in cases {
-            let mut coverage = healthy_coverage(1);
-            let dim = match field {
-                "target_population" => &mut coverage.target_population,
-                "object_discovery" => &mut coverage.object_discovery,
-                "attachment" => &mut coverage.attachment,
-                "aggregate_counts" => &mut coverage.aggregate_counts,
-                "detailed_events" => &mut coverage.detailed_events,
-                "attribution" => &mut coverage.attribution,
-                "correlation" => &mut coverage.correlation,
-                "completion" => &mut coverage.completion,
-                _ => unreachable!("pinned field list"),
-            };
-            dim.status = CoverageStatus::Partial;
-            assert_eq!(trailer_dims(&coverage), vec![token], "field {field}");
-        }
-        // Every non-complete status weakens (Unsupported/NotRun/Unknown
-        // are gaps too, never COMPLETE).
-        for status in [
-            CoverageStatus::Partial,
-            CoverageStatus::Unsupported,
-            CoverageStatus::NotRun,
-            CoverageStatus::Unknown,
-        ] {
-            let mut coverage = healthy_coverage(1);
-            coverage.attachment.status = status;
-            assert_eq!(
-                trailer_dims(&coverage),
-                vec!["attach"],
-                "status {status:?} weakens"
-            );
-        }
-        // Multi-gap order is the kp2 §8 order, deduped.
-        let mut coverage = healthy_coverage(1);
-        coverage.completion.status = CoverageStatus::Partial;
-        coverage.attachment.status = CoverageStatus::Partial;
-        coverage.aggregate_counts.status = CoverageStatus::Partial;
-        coverage.correlation.status = CoverageStatus::Unknown;
-        assert_eq!(
-            trailer_dims(&coverage),
-            vec!["attach", "capture-integrity", "completion", "correlation"]
-        );
-        // Contract held (incl. interval end) is COMPLETE.
-        assert!(trailer_dims(&healthy_coverage(1)).is_empty());
     }
 
     #[test]
@@ -821,7 +432,7 @@ mod tests {
             ),
             totals_obs(3, 25, 250, 25, 0, 0),
         ];
-        let text = render_watch_tables(&outcome_with(observations, healthy_coverage(3)));
+        let text = render(&outcome_with(observations, healthy_coverage(3)));
         assert!(
             text.contains("skcipher encrypt cbc(aes) aesni 25 250 25 0 0\n"),
             "{text:?}"
@@ -840,7 +451,7 @@ mod tests {
                 2, "aead", "decrypt", "ok", "gcm(aes)", "aesni", "process", 5, 50, 5, 0, 0,
             ),
         ];
-        let text = render_watch_tables(&outcome_with(observations, healthy_coverage(2)));
+        let text = render(&outcome_with(observations, healthy_coverage(2)));
         assert!(text.contains("TOTAL - - - 15 150 15 0 0\n"), "{text:?}");
     }
 
@@ -855,7 +466,7 @@ mod tests {
             .as_object_mut()
             .expect("payload object")
             .remove("driver");
-        let text = render_watch_tables(&outcome_with(vec![obs], healthy_coverage(1)));
+        let text = render(&outcome_with(vec![obs], healthy_coverage(1)));
         assert!(
             text.contains("skcipher encrypt unknown unknown 3 30 3 0 0\n"),
             "{text:?}"
@@ -882,7 +493,7 @@ mod tests {
             0,
             0,
         );
-        let text = render_watch_tables(&outcome_with(vec![who, agg], healthy_coverage(2)));
+        let text = render(&outcome_with(vec![who, agg], healthy_coverage(2)));
         assert!(!text.contains('\x1b'), "no escapes: {text:?}");
         assert!(text.contains("py?[2Jth?on3"), "sanitized comm: {text:?}");
         assert!(text.contains("cbc?(aes)"), "sanitized algorithm: {text:?}");
@@ -934,12 +545,5 @@ mod tests {
             String::from_utf8(stderr).expect("utf-8").contains("boom"),
             "internal reason surfaces"
         );
-    }
-
-    #[test]
-    fn live_runtime_reports_without_privilege() {
-        // Shape smoke: always runs, release never empty.
-        let runtime = live_runtime();
-        assert!(!runtime.kernel_release.is_empty());
     }
 }

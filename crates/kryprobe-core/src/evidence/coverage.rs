@@ -58,6 +58,76 @@ impl DimensionCoverage {
     }
 }
 
+/// Canonical session-coverage dimension (1B-M3): the one enum behind
+/// the struct fields, the core spellings, and the kp2 trailer tokens —
+/// adding a dimension extends this enum and the compiler points at
+/// every projection. (The report renderer's 9 schema dims are a
+/// separate frozen contract — the event-v0 `coverage_gap` enum, pinned
+/// to the schema file by `coverage_dims.rs` — not these.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoverageDimension {
+    /// Population the session claims to observe.
+    TargetPopulation,
+    /// Discovery of executable objects.
+    ObjectDiscovery,
+    /// Probe attachment to discovered objects.
+    Attachment,
+    /// Exactness of aggregate counters.
+    AggregateCounts,
+    /// Completeness of detailed per-operation events.
+    DetailedEvents,
+    /// Attribution of events to targets/objects/implementations.
+    Attribution,
+    /// Cross-backend correlation coverage.
+    Correlation,
+    /// Observation of operation completion.
+    Completion,
+}
+
+impl CoverageDimension {
+    /// All dimensions in struct order.
+    pub const ALL: [Self; 8] = [
+        Self::TargetPopulation,
+        Self::ObjectDiscovery,
+        Self::Attachment,
+        Self::AggregateCounts,
+        Self::DetailedEvents,
+        Self::Attribution,
+        Self::Correlation,
+        Self::Completion,
+    ];
+
+    /// Core spelling (matches the `CoverageSummary` field name).
+    #[must_use]
+    pub const fn as_core_str(self) -> &'static str {
+        match self {
+            Self::TargetPopulation => "target_population",
+            Self::ObjectDiscovery => "object_discovery",
+            Self::Attachment => "attachment",
+            Self::AggregateCounts => "aggregate_counts",
+            Self::DetailedEvents => "detailed_events",
+            Self::Attribution => "attribution",
+            Self::Correlation => "correlation",
+            Self::Completion => "completion",
+        }
+    }
+
+    /// kp2 §8 trailer token (merged pairs share one token:
+    /// `attachment`+`object_discovery` → `attach`,
+    /// `aggregate_counts`+`detailed_events` → `capture-integrity`).
+    #[must_use]
+    pub const fn as_kp2_str(self) -> &'static str {
+        match self {
+            Self::TargetPopulation => "operation",
+            Self::ObjectDiscovery | Self::Attachment => "attach",
+            Self::AggregateCounts | Self::DetailedEvents => "capture-integrity",
+            Self::Attribution => "attribution",
+            Self::Correlation => "correlation",
+            Self::Completion => "completion",
+        }
+    }
+}
+
 /// Eight-dimension session coverage (CONTRACTS §8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageSummary {
@@ -80,6 +150,32 @@ pub struct CoverageSummary {
 }
 
 impl CoverageSummary {
+    /// All-[`CoverageStatus::NotRun`] baseline at the zero wall (no
+    /// end, no counters — 1B-H1/1B-L2: the one not-run baseline for
+    /// the driver harness and the live finalize context).
+    #[must_use]
+    pub fn not_run() -> Self {
+        let dimension = || {
+            DimensionCoverage::new(
+                CoverageStatus::NotRun,
+                ValidityInterval {
+                    start_ns: 0,
+                    end_ns: None,
+                },
+            )
+        };
+        Self {
+            target_population: dimension(),
+            object_discovery: dimension(),
+            attachment: dimension(),
+            aggregate_counts: dimension(),
+            detailed_events: dimension(),
+            attribution: dimension(),
+            correlation: dimension(),
+            completion: dimension(),
+        }
+    }
+
     /// Weakest-link summary: the worst dimension status wins. Only an
     /// all-complete session reports `CompleteForDeclaredBoundary`.
     #[must_use]
@@ -96,38 +192,35 @@ impl CoverageSummary {
         )
     }
 
+    /// The dimension's coverage record.
+    #[must_use]
+    pub const fn dimension(&self, dim: CoverageDimension) -> &DimensionCoverage {
+        match dim {
+            CoverageDimension::TargetPopulation => &self.target_population,
+            CoverageDimension::ObjectDiscovery => &self.object_discovery,
+            CoverageDimension::Attachment => &self.attachment,
+            CoverageDimension::AggregateCounts => &self.aggregate_counts,
+            CoverageDimension::DetailedEvents => &self.detailed_events,
+            CoverageDimension::Attribution => &self.attribution,
+            CoverageDimension::Correlation => &self.correlation,
+            CoverageDimension::Completion => &self.completion,
+        }
+    }
+
     /// Names of every non-complete dimension, in struct order.
     #[must_use]
     pub fn weaker_dimensions(&self) -> Vec<&'static str> {
-        const NAMES: [&str; 8] = [
-            "target_population",
-            "object_discovery",
-            "attachment",
-            "aggregate_counts",
-            "detailed_events",
-            "attribution",
-            "correlation",
-            "completion",
-        ];
-        self.statuses()
+        CoverageDimension::ALL
             .iter()
-            .zip(NAMES)
-            .filter(|(status, _)| **status != CoverageStatus::CompleteForDeclaredBoundary)
-            .map(|(_, name)| name)
+            .filter(|dim| {
+                self.dimension(**dim).status != CoverageStatus::CompleteForDeclaredBoundary
+            })
+            .map(|dim| dim.as_core_str())
             .collect()
     }
 
     fn statuses(&self) -> [CoverageStatus; 8] {
-        [
-            self.target_population.status,
-            self.object_discovery.status,
-            self.attachment.status,
-            self.aggregate_counts.status,
-            self.detailed_events.status,
-            self.attribution.status,
-            self.correlation.status,
-            self.completion.status,
-        ]
+        CoverageDimension::ALL.map(|dim| self.dimension(dim).status)
     }
 }
 
@@ -146,6 +239,71 @@ const fn rank(status: CoverageStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_run_coverage_is_all_not_run_at_zero() {
+        // 1B-H1/1B-L2: the one all-`NotRun` baseline (driver harness +
+        // live finalize context) — zero wall, no end, no counters.
+        let coverage = CoverageSummary::not_run();
+        for status in coverage.statuses() {
+            assert_eq!(status, CoverageStatus::NotRun);
+        }
+        assert_eq!(coverage.target_population.interval.start_ns, 0);
+        assert_eq!(coverage.target_population.interval.end_ns, None);
+        assert!(coverage.target_population.counters.is_empty());
+    }
+
+    #[test]
+    fn dimension_enum_projects_both_spellings() {
+        // 1B-M3: one canonical dimension enum — core spellings match
+        // the struct fields in order, kp2 spellings match the trailer
+        // contract (shared tokens for the merged pairs).
+        let core: Vec<&str> = CoverageDimension::ALL
+            .iter()
+            .map(|dim| dim.as_core_str())
+            .collect();
+        assert_eq!(
+            core,
+            vec![
+                "target_population",
+                "object_discovery",
+                "attachment",
+                "aggregate_counts",
+                "detailed_events",
+                "attribution",
+                "correlation",
+                "completion",
+            ]
+        );
+        let kp2: Vec<&str> = CoverageDimension::ALL
+            .iter()
+            .map(|dim| dim.as_kp2_str())
+            .collect();
+        assert_eq!(
+            kp2,
+            vec![
+                "operation",
+                "attach",
+                "attach",
+                "capture-integrity",
+                "capture-integrity",
+                "attribution",
+                "correlation",
+                "completion",
+            ]
+        );
+        // The accessor reads the struct field the spelling names.
+        let mut coverage = CoverageSummary::not_run();
+        coverage.attachment.status = CoverageStatus::Partial;
+        assert_eq!(
+            coverage.dimension(CoverageDimension::Attachment).status,
+            CoverageStatus::Partial
+        );
+        assert_eq!(
+            coverage.dimension(CoverageDimension::Completion).status,
+            CoverageStatus::NotRun
+        );
+    }
 
     #[test]
     fn rank_order_is_pinned() {

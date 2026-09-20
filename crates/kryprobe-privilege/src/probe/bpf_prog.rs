@@ -154,6 +154,11 @@ pub fn attach_cookies() -> ProbeOutcome {
         ProbeOutcome::Skipped { reason } => ProbeOutcome::skipped(format!(
             "uprobe_multi unresolved, cookies unknown: {reason}"
         )),
+        // Unreachable today (`uprobe_multi_link_self` never fails) —
+        // passed through with context if it ever does.
+        ProbeOutcome::Failed { detail } => ProbeOutcome::failed(format!(
+            "uprobe_multi unresolved, cookies unknown: {detail}"
+        )),
     }
 }
 

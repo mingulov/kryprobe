@@ -249,7 +249,7 @@ fn tamper_clock_case() {
     assert!(
         findings.iter().any(|f| matches!(
             f,
-            ValidationFinding::Stream(kryprobe_testkit::StreamFinding::ClockWentBackwards { .. })
+            ValidationFinding::Stream(kryprobe_report::StreamFinding::ClockWentBackwards { .. })
         )),
         "clock tamper must flag, got {findings:?}"
     );
@@ -263,7 +263,7 @@ fn tamper_key_case() {
     assert!(
         findings.iter().any(|f| matches!(
             f,
-            ValidationFinding::Stream(kryprobe_testkit::StreamFinding::MissingKey { .. })
+            ValidationFinding::Stream(kryprobe_report::StreamFinding::MissingKey { .. })
         )),
         "dropped key must flag, got {findings:?}"
     );

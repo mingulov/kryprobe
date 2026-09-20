@@ -183,6 +183,7 @@ name = "kryprobe-core"
 version = "0.0.0"
 dependencies = [
  "kryprobe-abi",
+ "kryprobe-report",
  "kryprobe-testkit",
  "serde",
  "serde_json",
@@ -229,7 +230,6 @@ version = "0.0.0"
 dependencies = [
  "kryprobe-abi",
  "libc",
- "serde_json",
 ]
 
 [[package]]

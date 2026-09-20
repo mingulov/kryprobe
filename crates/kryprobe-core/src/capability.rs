@@ -41,6 +41,28 @@ impl RuntimeCapabilities {
             && (!required.ringbuf || self.ringbuf)
             && (!required.btf || self.btf_present)
     }
+
+    /// Names of the required capabilities that did NOT probe present,
+    /// in [`CapabilityRequirements`] field order (1B-H1/1B-L2: one
+    /// gate vocabulary shared by `satisfies` and error attribution —
+    /// empty exactly when `satisfies`).
+    #[must_use]
+    pub fn missing_gates(&self, required: &CapabilityRequirements) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if required.uprobe_multi && !self.uprobe_multi {
+            missing.push("uprobe_multi");
+        }
+        if required.cookies && !self.cookies {
+            missing.push("cookies");
+        }
+        if required.ringbuf && !self.ringbuf {
+            missing.push("ringbuf");
+        }
+        if required.btf && !self.btf_present {
+            missing.push("btf");
+        }
+        missing
+    }
 }
 
 /// Capability requirements attributed to one backend.
@@ -92,6 +114,79 @@ mod tests {
             ..CapabilityRequirements::default()
         };
         assert!(!runtime.satisfies(&need_btf));
+    }
+
+    #[test]
+    fn missing_gates_names_each_gap_in_field_order() {
+        // 1B-H1/1B-L2: the CLI's `missing_gates` copy moved here — one
+        // gate vocabulary for `satisfies` and error attribution.
+        let all = CapabilityRequirements {
+            uprobe_multi: true,
+            cookies: true,
+            ringbuf: true,
+            btf: true,
+        };
+        let none = RuntimeCapabilities {
+            kernel_release: "test".to_owned(),
+            uprobe_multi: false,
+            cookies: false,
+            ringbuf: false,
+            btf_present: false,
+            userns: false,
+            yama_scope: 0,
+            caps: Vec::new(),
+        };
+        assert_eq!(
+            none.missing_gates(&all),
+            vec!["uprobe_multi", "cookies", "ringbuf", "btf"]
+        );
+    }
+
+    #[test]
+    fn missing_gates_agrees_with_satisfies_exhaustively() {
+        // All 16 required masks × all 16 runtime masks: `satisfies`
+        // is exactly `missing_gates().is_empty()`, and every missing
+        // name is a required-but-absent flag.
+        for required_mask in 0..16u8 {
+            let required = CapabilityRequirements {
+                uprobe_multi: required_mask & 1 != 0,
+                cookies: required_mask & 2 != 0,
+                ringbuf: required_mask & 4 != 0,
+                btf: required_mask & 8 != 0,
+            };
+            for runtime_mask in 0..16u8 {
+                let runtime = RuntimeCapabilities {
+                    kernel_release: String::new(),
+                    uprobe_multi: runtime_mask & 1 != 0,
+                    cookies: runtime_mask & 2 != 0,
+                    ringbuf: runtime_mask & 4 != 0,
+                    btf_present: runtime_mask & 8 != 0,
+                    userns: false,
+                    yama_scope: 0,
+                    caps: Vec::new(),
+                };
+                let missing = runtime.missing_gates(&required);
+                assert_eq!(
+                    runtime.satisfies(&required),
+                    missing.is_empty(),
+                    "masks {required_mask:04b}/{runtime_mask:04b}"
+                );
+                for name in &missing {
+                    let flag = match *name {
+                        "uprobe_multi" => (required.uprobe_multi, runtime.uprobe_multi),
+                        "cookies" => (required.cookies, runtime.cookies),
+                        "ringbuf" => (required.ringbuf, runtime.ringbuf),
+                        "btf" => (required.btf, runtime.btf_present),
+                        other => panic!("unknown gate name {other}"),
+                    };
+                    assert_eq!(
+                        flag,
+                        (true, false),
+                        "masks {required_mask:04b}/{runtime_mask:04b}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -159,7 +159,7 @@ fn who_fixture(n: u64) -> Vec<NativeObservation> {
 
 #[test]
 fn k5_who_block_renders_top32() {
-    let text = kryprobe_cli::cmd_watch::render_who_block(&who_fixture(40));
+    let text = kryprobe_report::live_render::render_who_block(&who_fixture(40));
     assert_eq!(text.lines().count(), 1 + 32 + 1); // header + rows + "+N more"
     assert!(text.contains("+8 more"));
 }
@@ -167,14 +167,14 @@ fn k5_who_block_renders_top32() {
 #[test]
 fn k5_who_block_empty_renders_none() {
     assert_eq!(
-        kryprobe_cli::cmd_watch::render_who_block(&[]),
+        kryprobe_report::live_render::render_who_block(&[]),
         "WHO: none\n"
     );
     // Non-who rows do not feed the block either.
     let mut agg = who_obs(1, "x", 0, 1, 1, 1);
     agg.backend_payload["row"] = serde_json::json!("agg");
     assert_eq!(
-        kryprobe_cli::cmd_watch::render_who_block(&[agg]),
+        kryprobe_report::live_render::render_who_block(&[agg]),
         "WHO: none\n"
     );
 }
@@ -188,7 +188,7 @@ fn k5_who_block_sorts_calls_desc_latest_wins() {
         who_obs(2, "small", 1000, 200, 0xbbbb, 3),
         who_obs(3, "new", 1000, 100, 0xaaaa, 7),
     ];
-    let text = kryprobe_cli::cmd_watch::render_who_block(&rows);
+    let text = kryprobe_report::live_render::render_who_block(&rows);
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], "KH TGID COMM UID CALLS");
     assert_eq!(lines.len(), 3, "header + 2 rows, no trailer:\n{text}");
@@ -213,7 +213,7 @@ fn k5_cap_xattr_golden() {
     // yields exactly this `security.capability` value on this host, and
     // writing these bytes back round-trips through `getcap` (see the
     // Task 5 report for the exact commands).
-    let got = kryprobe_cli::cmd_token::encode_capability_xattr(&[38, 39]);
+    let got = kryprobe_cli::token::encode_capability_xattr(&[38, 39]);
     assert_eq!(
         got,
         [
@@ -230,7 +230,7 @@ fn k5_cap_xattr_golden() {
 fn k5_cap_xattr_low_cap_matches_ping() {
     // Second empirical pin: `/usr/bin/ping` (`cap_net_raw=ep`, cap 13)
     // reads back exactly these bytes on this host.
-    let got = kryprobe_cli::cmd_token::encode_capability_xattr(&[13]);
+    let got = kryprobe_cli::token::encode_capability_xattr(&[13]);
     assert_eq!(
         got,
         [
@@ -239,7 +239,7 @@ fn k5_cap_xattr_low_cap_matches_ping() {
         ]
     );
     // Empty set: magic only, no permitted bits.
-    let got = kryprobe_cli::cmd_token::encode_capability_xattr(&[]);
+    let got = kryprobe_cli::token::encode_capability_xattr(&[]);
     assert_eq!(&got[..4], &[0x01, 0x00, 0x00, 0x02]);
     assert!(got[4..].iter().all(|b| *b == 0));
 }
@@ -495,7 +495,7 @@ fn k5_doctor_json_includes_token_delegated() {
 #[test]
 fn k5_doctor_token_delegated_matrix() {
     use kryprobe_cli::cmd_doctor::token_delegated_outcome;
-    use kryprobe_cli::cmd_token::PinState;
+    use kryprobe_cli::token::PinState;
     use kryprobe_privilege::ProbeOutcome;
     let bpf_caps = vec!["CAP_BPF".to_owned()];
     // Usable pin passes even without caps.
@@ -508,13 +508,22 @@ fn k5_doctor_token_delegated_matrix() {
         token_delegated_outcome(&PinState::Absent, &bpf_caps),
         ProbeOutcome::Pass { .. }
     ));
-    // Present-but-unusable pin without caps is denied (names why).
-    let denied_stage =
-        match token_delegated_outcome(&PinState::PresentUnusable("errno 22".to_owned()), &[]) {
-            ProbeOutcome::Denied { stage, .. } => stage,
-            _ => panic!("expected denied"),
-        };
-    assert!(denied_stage.contains("errno 22"), "{denied_stage}");
+    // Present-but-unusable pin without caps is denied (names why,
+    // with the REAL retrieval errno — 1B-M7, never fabricated).
+    let denied = token_delegated_outcome(
+        &PinState::PresentUnusable {
+            reason: "Invalid argument (os error 22)".to_owned(),
+            errno: 22,
+        },
+        &[],
+    );
+    match denied {
+        ProbeOutcome::Denied { stage, errno } => {
+            assert!(stage.contains("os error 22"), "{stage}");
+            assert_eq!(errno, 22);
+        }
+        _ => panic!("expected denied"),
+    }
     // Neither mechanism is a skip, never a denial.
     assert!(matches!(
         token_delegated_outcome(&PinState::Absent, &[]),
@@ -577,7 +586,7 @@ fn k5_token_status_missing_bin_reports_unreadable() {
 
 #[test]
 fn k5_cap_xattr_decode_roundtrip() {
-    use kryprobe_cli::cmd_token::{decode_capability_xattr, encode_capability_xattr};
+    use kryprobe_cli::token::{decode_capability_xattr, encode_capability_xattr};
     // Encode/decode round-trip, effective flag preserved.
     assert_eq!(
         decode_capability_xattr(&encode_capability_xattr(&[38, 39])),
@@ -606,7 +615,7 @@ fn k5_cap_display_name_pins_verified_positions() {
     // Header-verified positions (`capsh --decode` cross-checked): the
     // broadcast/admin/perfmon/bpf/restore slots that neighbor tables
     // misplace, plus the numeric fallback past the table.
-    use kryprobe_cli::cmd_token::cap_display_name;
+    use kryprobe_cli::runtime_facts::cap_display_name;
     assert_eq!(cap_display_name(11), "cap_net_broadcast");
     assert_eq!(cap_display_name(13), "cap_net_raw");
     assert_eq!(cap_display_name(21), "cap_sys_admin");
@@ -720,7 +729,7 @@ fn k5_token_mint_roundtrip_as_root() {
 #[test]
 fn k5_receipt_json_shape() {
     let doc: serde_json::Value =
-        serde_json::from_str(&kryprobe_cli::cmd_token::mint_receipt_json("b", "k", "t"))
+        serde_json::from_str(&kryprobe_cli::token::mint_receipt_json("b", "k", "t"))
             .expect("receipt parses");
     assert_eq!(doc["mechanism"], "setcap");
     assert_eq!(doc["binary"], "b");
@@ -732,10 +741,10 @@ fn k5_receipt_json_shape() {
 
 #[test]
 fn k5_format_unix_utc_pins_shape() {
-    use kryprobe_cli::cmd_token::format_unix_utc;
+    use kryprobe_cli::token::format_unix_utc;
     assert_eq!(format_unix_utc(0), "1970-01-01T00:00:00Z");
     assert_eq!(format_unix_utc(2_147_483_647), "2038-01-19T03:14:07Z");
-    let now = kryprobe_cli::cmd_token::utc_now_string();
+    let now = kryprobe_cli::token::utc_now_string();
     assert_eq!(now.len(), 20, "RFC3339 UTC shape: {now}");
     assert!(now.ends_with('Z') && now.starts_with("20"), "{now}");
 }
@@ -746,7 +755,7 @@ fn k5_format_unix_utc_pins_shape() {
 
 #[test]
 fn k5_token_candidates_order() {
-    use kryprobe_cli::cmd_token::token_candidates;
+    use kryprobe_cli::token::token_candidates;
     use std::path::PathBuf;
     let pin = PathBuf::from("/sys/fs/bpf/kryprobe/token");
     assert_eq!(
@@ -762,7 +771,7 @@ fn k5_token_candidates_order() {
 
 #[test]
 fn k5_no_mechanism_reason_names_mint() {
-    use kryprobe_cli::cmd_token::no_mechanism_reason;
+    use kryprobe_cli::token::no_mechanism_reason;
     use std::path::PathBuf;
     // Reads KRYPROBE_TOKEN: serialize with the env writer (K5_ENV_LOCK).
     let _guard = k5_env_guard();

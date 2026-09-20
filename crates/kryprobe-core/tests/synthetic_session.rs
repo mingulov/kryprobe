@@ -21,7 +21,8 @@ use kryprobe_core::ids::{IdIssuer, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_core::session::{SessionController, SessionState};
 use kryprobe_core::synthetic::{OpSpec, ScriptOp, SyntheticBackend, canonical_script};
-use kryprobe_testkit::{assert_golden, check_stream};
+use kryprobe_report::check_stream;
+use kryprobe_testkit::assert_golden;
 use std::path::PathBuf;
 
 fn script() -> Vec<kryprobe_core::synthetic::ScriptOp> {

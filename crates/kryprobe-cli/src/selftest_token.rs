@@ -7,13 +7,14 @@
 //! and leaks are exit 1 (never silent, never skips).
 
 use crate::cmd_selftest::{locate_bpf_object, sibling_binary};
+use kryprobe_privilege::host as priv_host;
 use kryprobe_privilege::token::{TokenError, run_smoke_roundtrip};
 use std::io::Write;
 
 /// Runs `selftest token-smoke`.
 pub fn run(stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
-    // SAFETY: idempotent getter.
-    if unsafe { libc::geteuid() } != 0 {
+    // Root gate via the privilege boundary (1B-M7: no `libc::` here).
+    if !priv_host::euid_is_root() {
         let _ = writeln!(stderr, "selftest token-smoke: needs root (euid != 0)");
         return 4;
     }
@@ -42,9 +43,8 @@ pub fn run(stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
             let _ = writeln!(stdout, "token-smoke: pass");
             0
         }
-        Err(TokenError::Denied { errno, .. })
-            if [libc::EPERM, libc::EACCES, libc::EOPNOTSUPP].contains(&errno) =>
-        {
+        // Refusal classification lives behind the boundary (1B-M7).
+        Err(TokenError::Denied { errno, .. }) if priv_host::errno_is_refused(errno) => {
             let _ = writeln!(
                 stderr,
                 "selftest token-smoke: kernel denied mint (errno {errno})"

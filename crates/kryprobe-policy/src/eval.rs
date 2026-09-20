@@ -12,6 +12,7 @@
 use crate::glob;
 use crate::rule::{Decision, Policy, Rule, Stage};
 use kryprobe_core::enums::{BackendId, CoverageStatus, EvidencePhase};
+use kryprobe_core::evidence::payload_keys as K;
 use kryprobe_core::evidence::{CoverageSummary, NativeObservation};
 use kryprobe_core::ids::ObservationId;
 
@@ -59,6 +60,22 @@ fn source_name(backend: BackendId) -> &'static str {
     }
 }
 
+/// Every payload key policy reads (1B-H3: keep in sync with
+/// `rule_matches`/`rule_specified`/finding detail below — the
+/// `payload_contract` test proves the producer emits all of these).
+pub const POLICY_READ_KEYS: &[&str] = &[
+    K::ROW,
+    K::ALGORITHM,
+    K::DRIVER,
+    K::FAMILY,
+    K::OP,
+    K::RESULT,
+    K::CONTEXT,
+    K::MODULE,
+    K::COMM,
+    K::UID,
+];
+
 /// Raw payload string (empty when missing or not a string — a glob
 /// that must not match simply won't).
 fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
@@ -72,7 +89,7 @@ fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
 /// are carriers/markers and never match (even though totals carry
 /// `Completed`).
 fn stage_matches(stage: Stage, obs: &NativeObservation) -> bool {
-    if payload_str(&obs.backend_payload, "row") != "agg" {
+    if payload_str(&obs.backend_payload, K::ROW) != "agg" {
         return false;
     }
     match stage {
@@ -91,7 +108,7 @@ fn module_matches(pattern: &str, obs: &NativeObservation) -> bool {
     if obs.backend == BackendId::KCrypto {
         return false;
     }
-    glob::matches(pattern, payload_str(&obs.backend_payload, "module"))
+    glob::matches(pattern, payload_str(&obs.backend_payload, K::MODULE))
 }
 
 /// A rule matches an observation only if the source agrees and ALL
@@ -109,12 +126,12 @@ fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
     }
     // (`operation` reads the payload `op` spelling.)
     for (pattern, key) in [
-        (&spec.algorithm, "algorithm"),
-        (&spec.driver, "driver"),
-        (&spec.family, "family"),
-        (&spec.operation, "op"),
-        (&spec.result, "result"),
-        (&spec.context, "context"),
+        (&spec.algorithm, K::ALGORITHM),
+        (&spec.driver, K::DRIVER),
+        (&spec.family, K::FAMILY),
+        (&spec.operation, K::OP),
+        (&spec.result, K::RESULT),
+        (&spec.context, K::CONTEXT),
     ] {
         if let Some(pattern) = pattern
             && !glob::matches(pattern, payload_str(payload, key))
@@ -123,7 +140,7 @@ fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
         }
     }
     if let Some(pattern) = &spec.driver_not
-        && glob::matches(pattern, payload_str(payload, "driver"))
+        && glob::matches(pattern, payload_str(payload, K::DRIVER))
     {
         return false;
     }
@@ -137,12 +154,12 @@ fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
     // exact u32 over the payload `uid` number (missing or non-numeric
     // never matches).
     if let Some(pattern) = &spec.comm
-        && !glob::matches(pattern, payload_str(payload, "comm"))
+        && !glob::matches(pattern, payload_str(payload, K::COMM))
     {
         return false;
     }
     if let Some(uid) = spec.uid
-        && payload.get("uid").and_then(serde_json::Value::as_u64) != Some(u64::from(uid))
+        && payload.get(K::UID).and_then(serde_json::Value::as_u64) != Some(u64::from(uid))
     {
         return false;
     }
@@ -173,13 +190,13 @@ fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
     let spec = &rule.match_spec;
     let payload = &obs.backend_payload;
     for (pattern, key) in [
-        (&spec.algorithm, "algorithm"),
-        (&spec.driver, "driver"),
-        (&spec.family, "family"),
-        (&spec.operation, "op"),
-        (&spec.result, "result"),
-        (&spec.context, "context"),
-        (&spec.comm, "comm"),
+        (&spec.algorithm, K::ALGORITHM),
+        (&spec.driver, K::DRIVER),
+        (&spec.family, K::FAMILY),
+        (&spec.operation, K::OP),
+        (&spec.result, K::RESULT),
+        (&spec.context, K::CONTEXT),
+        (&spec.comm, K::COMM),
     ] {
         if pattern.is_some()
             && payload
@@ -194,7 +211,7 @@ fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
     // exclude on, the rule cannot be evaluated.
     if spec.driver_not.is_some()
         && payload
-            .get("driver")
+            .get(K::DRIVER)
             .and_then(serde_json::Value::as_str)
             .is_none()
     {
@@ -203,7 +220,7 @@ fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
     if spec.module.is_some()
         && obs.backend != BackendId::KCrypto
         && payload
-            .get("module")
+            .get(K::MODULE)
             .and_then(serde_json::Value::as_str)
             .is_none()
     {
@@ -213,7 +230,7 @@ fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
     // the value comparison itself stays in `rule_matches`.
     if spec.uid.is_some()
         && payload
-            .get("uid")
+            .get(K::UID)
             .and_then(serde_json::Value::as_u64)
             .is_none()
     {
@@ -271,9 +288,9 @@ pub fn evaluate<'a>(
         return PolicyVerdict::Violation {
             rule: rule.id.clone(),
             obs_ids: matched.iter().map(|obs| obs.id).collect(),
-            algorithm: payload_str(&first.backend_payload, "algorithm").to_owned(),
-            driver: payload_str(&first.backend_payload, "driver").to_owned(),
-            context: payload_str(&first.backend_payload, "context").to_owned(),
+            algorithm: payload_str(&first.backend_payload, K::ALGORITHM).to_owned(),
+            driver: payload_str(&first.backend_payload, K::DRIVER).to_owned(),
+            context: payload_str(&first.backend_payload, K::CONTEXT).to_owned(),
             evidence: matched,
         };
     }

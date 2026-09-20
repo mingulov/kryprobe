@@ -10,13 +10,12 @@
 //! are informational and never block the verdict.
 
 use crate::cmd_backends::{backend_rows, human_row};
-use crate::cmd_token::{DEFAULT_TOKEN_PIN, PinState, probe_pin};
-use kryprobe_privilege::bpfloader::{LoaderError, PointStatus};
+use crate::token::{DEFAULT_TOKEN_PIN, PinState, probe_pin};
+use kryprobe_privilege::bpfloader::PointStatus;
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredError, ConfiguredPoint, KCRYPTO_SYMBOLS, load_kcrypto_configured,
     resolve_btf_ids,
 };
-use kryprobe_privilege::mapops::MapOpsError;
 use kryprobe_privilege::probe::{ProbeOutcome, ProbeRow};
 use kryprobe_privilege::run_probe_matrix;
 use std::io::Write;
@@ -29,6 +28,9 @@ fn human_outcome(outcome: &ProbeOutcome) -> String {
         ProbeOutcome::Pass { detail } => format!("pass: {detail}"),
         ProbeOutcome::Denied { stage, errno } => format!("denied: {stage} (errno {errno})"),
         ProbeOutcome::Skipped { reason } => format!("skipped: {reason}"),
+        // 1B-M7: attempted-but-incomplete with no kernel errno — the
+        // detail names counts, never a fabricated errno.
+        ProbeOutcome::Failed { detail } => format!("failed: {detail}"),
     }
 }
 
@@ -40,6 +42,9 @@ fn json_outcome(outcome: &ProbeOutcome) -> serde_json::Value {
         }
         ProbeOutcome::Skipped { reason } => {
             serde_json::json!({"outcome": "skipped", "reason": reason})
+        }
+        ProbeOutcome::Failed { detail } => {
+            serde_json::json!({"outcome": "failed", "detail": detail})
         }
     }
 }
@@ -57,15 +62,9 @@ fn kcrypto_symbols_row() -> ProbeRow {
     }
 }
 
-/// Effective caps from CapEff (the shared `cmd_token` reader — one
-/// CapEff parse for the crate; fail-closed as before).
-fn effective_caps() -> Vec<String> {
-    crate::cmd_token::effective_cap_names()
-}
-
 /// Attach privilege: tracing links need CAP_BPF (or CAP_SYS_ADMIN).
 fn is_privileged(caps: &[String]) -> bool {
-    crate::cmd_token::caps_allow_bpf_bringup(caps)
+    crate::runtime_facts::caps_allow_bpf_bringup(caps)
 }
 
 /// K5 delegation probe over its inputs (pin state + effective caps):
@@ -79,13 +78,15 @@ pub fn token_delegated_outcome(pin: &PinState, caps: &[String]) -> ProbeOutcome 
     if matches!(pin, PinState::Usable) {
         return ProbeOutcome::pass(format!("token pin {DEFAULT_TOKEN_PIN} usable"));
     }
-    if crate::cmd_token::caps_have_bpf(caps) {
+    if crate::runtime_facts::caps_have_bpf(caps) {
         return ProbeOutcome::pass("effective CAP_BPF (setcap grant or privilege)".to_owned());
     }
     match pin {
-        PinState::PresentUnusable(reason) => ProbeOutcome::denied(
+        // 1B-M7: the REAL retrieval errno rides the pin state — the
+        // fabricated EIO is gone.
+        PinState::PresentUnusable { reason, errno } => ProbeOutcome::denied(
             format!("token pin {DEFAULT_TOKEN_PIN} unusable: {reason}"),
-            libc::EIO,
+            *errno,
         ),
         PinState::Usable | PinState::Absent => ProbeOutcome::skipped(format!(
             "no token pin at {DEFAULT_TOKEN_PIN}; no effective CAP_BPF"
@@ -146,28 +147,22 @@ fn attach_stage(points: &[ConfiguredPoint], attached: usize) -> String {
     format!("attach {attached}/{}: {words}", KCRYPTO_SYMBOLS.len())
 }
 
-/// Kernel errno when the bring-up error carries one, else EIO (generic
-/// I/O failure — the `bpf_sys::last_errno` fallback precedent).
-fn configured_errno(err: &ConfiguredError) -> i32 {
-    match err {
-        ConfiguredError::Load(LoaderError::MapFailed { errno, .. })
-        | ConfiguredError::Load(LoaderError::LoadFailed { errno, .. }) => *errno,
-        ConfiguredError::Configure(MapOpsError::LookupFailed { errno, .. })
-        | ConfiguredError::Configure(MapOpsError::UpdateFailed { errno, .. }) => *errno,
-        _ => libc::EIO,
-    }
-}
-
 fn attach_denied(err: &ConfiguredError) -> ProbeOutcome {
     match err {
+        // 1B-M7: zero attached points is counted, not a syscall
+        // failure — `Failed` carries counts, no invented errno.
         ConfiguredError::NoPointAttached { points } => {
             let attached = points
                 .iter()
                 .filter(|point| matches!(point.attach, Some(AttachOutcome::Attached)))
                 .count();
-            ProbeOutcome::denied(attach_stage(points, attached), libc::EIO)
+            ProbeOutcome::failed(attach_stage(points, attached))
         }
-        other => ProbeOutcome::denied(format!("attach: {other}"), configured_errno(other)),
+        other => ProbeOutcome::denied(
+            format!("attach: {other}"),
+            // Errno plumbing lives behind the boundary (1B-M7).
+            other.bringup_errno(),
+        ),
     }
 }
 
@@ -221,7 +216,9 @@ fn kcrypto_attach_probe(caps: &[String]) -> AttachProbe {
             if attached == KCRYPTO_SYMBOLS.len() {
                 ProbeOutcome::pass(format!("{attached}/{} attached", KCRYPTO_SYMBOLS.len()))
             } else {
-                ProbeOutcome::denied(attach_stage(&points, attached), libc::EIO)
+                // 1B-M7: partial attach is counted — `Failed`, never a
+                // fabricated errno.
+                ProbeOutcome::failed(attach_stage(&points, attached))
             }
         }
         Err(err) => attach_denied(&err),
@@ -296,7 +293,7 @@ fn coverage_verdict(
 /// Runs `doctor`; always exit 0 (degraded rows are data, not failure).
 pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
     let mut matrix = run_probe_matrix();
-    let caps = effective_caps();
+    let caps = crate::runtime_facts::effective_cap_names();
     let privileged = is_privileged(&caps);
     let symbols_row = kcrypto_symbols_row();
     let symbols_ok = matches!(symbols_row.outcome, ProbeOutcome::Pass { .. });
@@ -372,6 +369,24 @@ pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn failed_outcome_renders_without_errno() {
+        // 1B-M7: `Failed` carries counts/detail, never an errno — both
+        // renderers spell it without inventing one.
+        let failed = ProbeOutcome::failed("attach 7/9: aead_decrypt=loaded+unattached");
+        assert_eq!(
+            human_outcome(&failed),
+            "failed: attach 7/9: aead_decrypt=loaded+unattached"
+        );
+        assert_eq!(
+            json_outcome(&failed),
+            serde_json::json!({
+                "outcome": "failed",
+                "detail": "attach 7/9: aead_decrypt=loaded+unattached",
+            })
+        );
+    }
 
     #[test]
     fn verdict_truth_table_pins_ready_and_missing_set() {

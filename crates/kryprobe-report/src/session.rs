@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Session envelope records: `session_start` / `session_end`.
 
+use crate::CONTRACT_VERSION_V0;
 use crate::writer::{JsonlWriter, ReportError};
 use kryprobe_core::enums::{BackendId, CaptureMode, TargetSelector};
 use serde::Serialize;
@@ -31,7 +32,8 @@ pub enum FinalBarrier {
     Missing,
 }
 
-/// `session_start` payload; `contract_version` is always `v0-proposed`.
+/// `session_start` payload; `contract_version` is always
+/// [`CONTRACT_VERSION_V0`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
     /// Population selector used to start the session.
@@ -93,7 +95,7 @@ impl JsonlWriter {
                 target_selector: start.target_selector,
                 capture_mode: start.capture_mode,
                 requested_backends: &start.requested_backends,
-                contract_version: "v0-proposed",
+                contract_version: CONTRACT_VERSION_V0,
                 qualification_id: &start.qualification_id,
             },
         )?;

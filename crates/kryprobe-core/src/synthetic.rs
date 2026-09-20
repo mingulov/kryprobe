@@ -5,10 +5,12 @@
 //! runtime, reporting, and CLI are testable with byte-exact goldens. All
 //! JSONL output uses schema-spelled values only.
 
+pub mod clock;
 pub mod codec;
 pub mod run;
 
-pub use run::{OpSpec, ScriptOp, ScriptRun, canonical_script};
+pub use clock::ManualClock;
+pub use run::{OpSpec, STEP_NS, ScriptOp, ScriptRun, canonical_script};
 
 use crate::backend::{
     Backend, BackendCapabilities, BackendPlan, BackendSummary, ConfigureContext, DecodeContext,

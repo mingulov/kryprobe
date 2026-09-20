@@ -460,6 +460,25 @@ impl std::fmt::Display for ConfiguredError {
 
 impl std::error::Error for ConfiguredError {}
 
+impl ConfiguredError {
+    /// Kernel errno when the bring-up error carries one, else `EIO`
+    /// (generic I/O failure — the `bpf_sys::last_errno` fallback
+    /// precedent). Moved here from the CLI (1B-M7): errno plumbing
+    /// over privilege error types lives behind the boundary.
+    #[must_use]
+    pub fn bringup_errno(&self) -> i32 {
+        match self {
+            Self::Load(
+                LoaderError::MapFailed { errno, .. } | LoaderError::LoadFailed { errno, .. },
+            )
+            | Self::Configure(
+                MapOpsError::LookupFailed { errno, .. } | MapOpsError::UpdateFailed { errno, .. },
+            ) => *errno,
+            _ => libc::EIO,
+        }
+    }
+}
+
 /// Zero-identity object for system-wide groups (the fexit path never
 /// reads it; same shape as the suite scaffolding).
 fn system_object() -> ObjectRef {
@@ -1005,6 +1024,45 @@ fn aux_len(kind: u8, vlen: u32) -> Result<usize, BtfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bringup_errno_prefers_carried_errno_else_eio() {
+        // 1B-M7: errno plumbing lives here — carried errnos surface,
+        // errno-less stages fall back to EIO (documented precedent).
+        let carried = [
+            ConfiguredError::Load(LoaderError::MapFailed {
+                stage: "m".to_owned(),
+                errno: 13,
+            }),
+            ConfiguredError::Load(LoaderError::LoadFailed {
+                stage: "l".to_owned(),
+                errno: 22,
+                log: String::new(),
+            }),
+            ConfiguredError::Configure(MapOpsError::LookupFailed {
+                stage: "k".to_owned(),
+                errno: 2,
+            }),
+            ConfiguredError::Configure(MapOpsError::UpdateFailed {
+                stage: "u".to_owned(),
+                errno: 28,
+            }),
+        ];
+        assert_eq!(
+            carried
+                .iter()
+                .map(ConfiguredError::bringup_errno)
+                .collect::<Vec<_>>(),
+            vec![13, 22, 2, 28]
+        );
+        assert_eq!(
+            ConfiguredError::AttachSetup {
+                detail: "d".to_owned()
+            }
+            .bringup_errno(),
+            libc::EIO
+        );
+    }
 
     /// Minimal synthetic BTF image builder (header + types + strtab).
     struct BtfBuild {

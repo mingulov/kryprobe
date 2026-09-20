@@ -58,7 +58,7 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 /// piece-assembled form.
 #[must_use]
 pub fn render_report_json(outcome: &LiveOutcome) -> String {
-    let missing = crate::cmd_watch::trailer_dims(&outcome.coverage);
+    let missing = kryprobe_report::live_render::trailer_dims(&outcome.coverage);
     let status = if missing.is_empty() {
         "complete"
     } else {
@@ -88,9 +88,11 @@ fn report_window_secs(duration: Option<u64>) -> u64 {
     duration.unwrap_or(DEFAULT_REPORT_SECS)
 }
 
-/// Finishes a live capture: human tables or the JSON doc to `--out`
-/// (atomic) or stdout; 0 when the coverage contract held, 3 on gaps,
-/// 4/1 on [`LiveError`] via [`LiveError::exit_code`].
+/// Finishes a live capture: human tables, the JSON doc, or the
+/// validated event-v0 JSONL stream to `--out` (atomic) or stdout; 0
+/// when the coverage contract held, 3 on gaps, 4/1 on [`LiveError`]
+/// via [`LiveError::exit_code`], 1 when the JSONL export refuses a
+/// non-wire-spellable row.
 fn finish_report_live(
     result: Result<LiveOutcome, LiveError>,
     format: ReportFormat,
@@ -105,14 +107,29 @@ fn finish_report_live(
             return err.exit_code();
         }
     };
-    let code = if crate::cmd_watch::trailer_dims(&outcome.coverage).is_empty() {
+    let code = if kryprobe_report::live_render::trailer_dims(&outcome.coverage).is_empty() {
         0
     } else {
         3
     };
     let text = match format {
-        ReportFormat::Human => crate::cmd_watch::render_watch_tables(&outcome),
+        ReportFormat::Human => kryprobe_report::live_render::render_watch_tables(
+            &outcome.observations,
+            &outcome.coverage,
+        ),
         ReportFormat::Json => render_report_json(&outcome),
+        ReportFormat::Jsonl => {
+            match kryprobe_report::live_render::render_live_jsonl(
+                &outcome.observations,
+                &outcome.coverage,
+            ) {
+                Ok(text) => text,
+                Err(err) => {
+                    let _ = writeln!(stderr, "report: cannot export JSONL: {err}");
+                    return 1;
+                }
+            }
+        }
     };
     match out {
         Some(path) => match write_str_atomic(path, &text) {
@@ -153,7 +170,7 @@ pub fn run_report_live(
         token: token.map(Path::to_owned),
     };
     finish_report_live(
-        run_live_capture(&cfg, &crate::cmd_watch::live_runtime()),
+        run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
         format,
         out,
         stdout,
@@ -332,7 +349,11 @@ mod tests {
         assert!(stdout.is_empty(), "file mode prints no stdout");
         assert_eq!(
             std::fs::read(&human).expect("read human out file"),
-            crate::cmd_watch::render_watch_tables(&json_fixture()).as_bytes()
+            kryprobe_report::live_render::render_watch_tables(
+                &json_fixture().observations,
+                &json_fixture().coverage,
+            )
+            .as_bytes()
         );
         // Unwritable destination fails closed (exit 1, nothing on stdout).
         let missing = dir.join("no-such-dir").join("report.json");
@@ -353,5 +374,28 @@ mod tests {
                 .contains("cannot write")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finish_jsonl_emits_validated_stream() {
+        const KINDS: &[(&str, &[&str])] = &[
+            ("session_start", &["target_selector", "capture_mode"]),
+            ("operation_observation", &["observation_id", "backend"]),
+            ("session_end", &["verdict"]),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(json_fixture()),
+            ReportFormat::Jsonl,
+            None,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).expect("utf-8");
+        assert_eq!(kryprobe_report::check_stream(&text, KINDS), Vec::new());
+        assert!(text.contains("\"session_start\""));
+        assert!(text.contains("\"session_end\""));
     }
 }

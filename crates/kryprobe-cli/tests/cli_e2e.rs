@@ -729,6 +729,7 @@ fn outcome_with(
         },
         coverage,
         integrity: IntegritySummary::default(),
+        terminal_state: kryprobe_core::session::SessionState::Finalized,
     }
 }
 
@@ -778,7 +779,10 @@ fn json_fixture() -> kryprobe_cli::live::LiveOutcome {
 
 #[test]
 fn watch_tables_handfed_markers_case() {
-    let text = kryprobe_cli::cmd_watch::render_watch_tables(&watch_fixture());
+    let text = kryprobe_report::live_render::render_watch_tables(
+        &watch_fixture().observations,
+        &watch_fixture().coverage,
+    );
     assert!(
         text.starts_with("FAMILY OP ALGORITHM DRIVER CALLS BYTES OK QUEUED ERRORS\n"),
         "exact header: {text:?}"
@@ -803,7 +807,10 @@ fn watch_tables_handfed_markers_case() {
 #[test]
 fn report_human_partial_handfed_markers_case() {
     // Report human renders the same tables as watch, plus the verdict.
-    let text = kryprobe_cli::cmd_watch::render_watch_tables(&partial_fixture());
+    let text = kryprobe_report::live_render::render_watch_tables(
+        &partial_fixture().observations,
+        &partial_fixture().coverage,
+    );
     assert!(
         text.contains("skcipher encrypt cbc(aes) aesni 3 300 3 0 0\n"),
         "table row: {text:?}"

@@ -251,9 +251,10 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
                 format = match value {
                     "human" => ReportFormat::Human,
                     "json" => ReportFormat::Json,
+                    "jsonl" => ReportFormat::Jsonl,
                     _ => {
                         return Err(usage(format!(
-                            "report: unsupported --format '{value}' (human|json)"
+                            "report: unsupported --format '{value}' (human|json|jsonl)"
                         )));
                     }
                 };

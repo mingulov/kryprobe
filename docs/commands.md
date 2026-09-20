@@ -31,7 +31,7 @@ kryprobe selftest synthetic [--out FILE]
 kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
 kryprobe watch --system [--source S] [--duration N] [--token PATH]
-kryprobe report --system [--duration N] [--format human|json] [--out FILE] [--source S] [--token PATH]
+kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH]
 kryprobe report FILE
 kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH]
 kryprobe import FILE
@@ -71,8 +71,10 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   need no new probes. `--duration` is a window in seconds (`>= 1`,
   60s default for `report`/`check`); `--source` accepts only
   `kernel-crypto` (other sources arrive with their backends); live
-  `report` renders `--format human` (default) or `json` to stdout or
-  `--out` (exit 0 complete, 3 partial); `watch` renders the same
+  `report` renders `--format human` (default), `json`, or `jsonl`
+  (validated event-v0 JSONL: session envelope records, same
+  coverage verdict as the human trailer) to stdout or `--out`
+  (exit 0 complete, 3 partial); `watch` renders the same
   tables and exits 0 on any completed capture. `check` requires
   `--policy` (no default policy; bad policy is exit 2, parsed before
   capture) and evaluates one capture against the explicit-rules

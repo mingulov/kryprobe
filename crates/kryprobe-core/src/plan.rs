@@ -70,6 +70,24 @@ pub struct PlanBudget {
     pub max_duration_ns: u64,
 }
 
+impl PlanBudget {
+    /// Wide-open budget: every ceiling at `u64::MAX` (1B-H1/1B-L2 —
+    /// the one open budget for sessions that gate on privilege/BTF,
+    /// not on budgets: driver harness and live session alike).
+    #[must_use]
+    pub const fn open() -> Self {
+        Self {
+            max_targets: u64::MAX,
+            max_objects: u64::MAX,
+            max_bytes: u64::MAX,
+            max_links: u64::MAX,
+            max_state_entries: u64::MAX,
+            max_queue: u64::MAX,
+            max_duration_ns: u64::MAX,
+        }
+    }
+}
+
 /// Runtime capabilities a plan requires before attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct CapabilityRequirements {
@@ -174,6 +192,24 @@ mod tests {
     use super::*;
     use crate::enums::{CallKind, OperationClass};
     use crate::object::ObjectRole;
+
+    #[test]
+    fn open_budget_has_no_ceiling() {
+        // 1B-H1/1B-L2: the one wide-open budget (driver harness + live
+        // session both gate on privilege/BTF, not on budgets).
+        let budget = PlanBudget::open();
+        for ceiling in [
+            budget.max_targets,
+            budget.max_objects,
+            budget.max_bytes,
+            budget.max_links,
+            budget.max_state_entries,
+            budget.max_queue,
+            budget.max_duration_ns,
+        ] {
+            assert_eq!(ceiling, u64::MAX);
+        }
+    }
 
     fn sample_plan() -> ProbePlan {
         ProbePlan {

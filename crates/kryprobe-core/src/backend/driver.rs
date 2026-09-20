@@ -38,12 +38,9 @@ use crate::backend::{
 };
 use crate::budget::BudgetManager;
 use crate::capability::RuntimeCapabilities;
-use crate::enums::{BackendId, CaptureMode, CoverageStatus};
+use crate::enums::{BackendId, CaptureMode};
 use crate::error::BackendError;
-use crate::evidence::{
-    CoverageSummary, DimensionCoverage, IntegritySummary, NativeObservation, SharedLosses,
-    ValidityInterval,
-};
+use crate::evidence::{CoverageSummary, IntegritySummary, NativeObservation, SharedLosses};
 use crate::ids::{IdIssuer, PlanGeneration, SessionId};
 use crate::plan::PlanBudget;
 use std::fmt::{Display, Formatter};
@@ -97,44 +94,19 @@ impl BackendDriver {
 
     /// Deterministic minimal session state for harnesses and liveness
     /// proofs: session 1, [`CaptureMode::Trace`], generation 1, wide-open
-    /// budgets, all-[`CoverageStatus::NotRun`] coverage. Production callers
-    /// use [`BackendDriver::new`] with real session state.
+    /// budgets, all-[`NotRun`](crate::enums::CoverageStatus::NotRun)
+    /// coverage. Production callers use [`BackendDriver::new`] with real
+    /// session state.
     #[must_use]
     pub fn harness() -> Self {
-        let budget = PlanBudget {
-            max_targets: u64::MAX,
-            max_objects: u64::MAX,
-            max_bytes: u64::MAX,
-            max_links: u64::MAX,
-            max_state_entries: u64::MAX,
-            max_queue: u64::MAX,
-            max_duration_ns: u64::MAX,
-        };
-        let dimension = || {
-            DimensionCoverage::new(
-                CoverageStatus::NotRun,
-                ValidityInterval {
-                    start_ns: 0,
-                    end_ns: None,
-                },
-            )
-        };
-        let coverage = CoverageSummary {
-            target_population: dimension(),
-            object_discovery: dimension(),
-            attachment: dimension(),
-            aggregate_counts: dimension(),
-            detailed_events: dimension(),
-            attribution: dimension(),
-            correlation: dimension(),
-            completion: dimension(),
-        };
+        // 1B-H1: the shared open budget / not-run baseline (same
+        // literals the live session uses — one definition now).
         Self::new(
             SessionId::new(1),
             CaptureMode::Trace,
             PlanGeneration::new(1),
-            budget,
-            coverage,
+            PlanBudget::open(),
+            CoverageSummary::not_run(),
         )
     }
 

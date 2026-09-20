@@ -4,6 +4,9 @@
 //! No backend knowledge lives here: callers pass the per-kind required
 //! payload keys as `&[(&str, &[&str])]`. Kinds absent from that table get
 //! envelope, shape, and clock checks only.
+//!
+//! Moved here from testkit (1B-M4): stream validation is production
+//! (the validator runs it on every import/report), not a test utility.
 
 use std::fmt;
 

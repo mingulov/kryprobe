@@ -15,7 +15,11 @@ kryprobe-core = { path = "../kryprobe-core" }
 kryprobe-policy = { path = "../kryprobe-policy" }
 kryprobe-privilege = { path = "../kryprobe-privilege" }
 kryprobe-report = { path = "../kryprobe-report" }
-kryprobe-testkit = { path = "../kryprobe-testkit" }
 anyhow = "1"
-libc = "0.2"
 serde_json = "1"
+
+[dev-dependencies]
+kryprobe-testkit = { path = "../kryprobe-testkit" }
+# 1B-M7: tests still gate on euid/errno constants; production code must
+# never touch libc (ADR-0002 Rule B — absence here enforces it).
+libc = "0.2"

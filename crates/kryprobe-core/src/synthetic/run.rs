@@ -10,7 +10,7 @@ use crate::enums::EvidencePhase;
 use crate::error::{BackendError, InternalError};
 use crate::evidence::{IntegritySummary, NativeResult, RelationshipRecord};
 use crate::ids::{ObservationId, SessionId};
-use kryprobe_testkit::ManualClock;
+use crate::synthetic::ManualClock;
 use serde_json::{Value, json};
 
 mod steps;
@@ -44,7 +44,10 @@ impl ScriptRun {
 }
 
 /// Clock step per emitted record, in monotonic nanoseconds.
-const STEP_NS: u64 = 1_000;
+///
+/// Single source of truth shared with `kryprobe-report`'s JSONL writer so
+/// scripted sessions and live session JSONL advance stamps identically.
+pub const STEP_NS: u64 = 1_000;
 
 /// Open observation tracked while its Enter lacks a Return.
 struct OpenOp {

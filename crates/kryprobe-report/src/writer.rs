@@ -6,6 +6,7 @@
 //! order (`schema` first, like the pack example), not sorted keys.
 
 use crate::EVENT_SCHEMA_V0;
+use kryprobe_core::synthetic::STEP_NS;
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,9 +56,6 @@ impl std::fmt::Display for ReportError {
 }
 
 impl std::error::Error for ReportError {}
-
-/// Clock step per emitted record, in monotonic nanoseconds.
-const STEP_NS: u64 = 1_000;
 
 /// Envelope keys in pack order (struct order, not sorted).
 #[derive(Serialize)]

@@ -25,9 +25,21 @@ pub const KERNEL_FLOOR: (u32, u32) = (6, 12);
 
 /// Honest outcome of one probe row.
 pub enum ProbeOutcome {
-    Pass { detail: String },
-    Denied { stage: String, errno: i32 },
-    Skipped { reason: String },
+    Pass {
+        detail: String,
+    },
+    Denied {
+        stage: String,
+        errno: i32,
+    },
+    Skipped {
+        reason: String,
+    },
+    /// Attempted but incomplete with no kernel errno (1B-M7: partial
+    /// attach counts, never a fabricated errno).
+    Failed {
+        detail: String,
+    },
 }
 
 impl ProbeOutcome {
@@ -41,6 +53,13 @@ impl ProbeOutcome {
         let stage = stage.into();
         assert!(!stage.is_empty(), "denied stage must be non-empty");
         Self::Denied { stage, errno }
+    }
+
+    /// Failed without a kernel errno (the detail names counts/points).
+    pub fn failed(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        assert!(!detail.is_empty(), "failed detail must be non-empty");
+        Self::Failed { detail }
     }
 
     pub fn skipped(reason: impl Into<String>) -> Self {

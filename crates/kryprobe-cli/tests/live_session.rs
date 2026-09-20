@@ -895,6 +895,18 @@ fn locator_candidates_pin_three_tier_order() {
     );
 }
 
+/// 1B-H4: a controller walked through bring-up to `Attaching` — the
+/// state `drive_session` requires on entry (production reaches it via
+/// gate → detect → plan → configure in `run_live_session`).
+fn attached_controller() -> kryprobe_core::session::SessionController {
+    use kryprobe_core::session::SessionState as S;
+    let mut controller = kryprobe_core::session::SessionController::new();
+    for state in [S::Qualified, S::Discovering, S::Attaching] {
+        controller.transition(state).expect("bring-up hop legal");
+    }
+    controller
+}
+
 /// P0-4 (3A-C-T2): scripted sensor serving canned ticks through the
 /// `SessionSensor` seam — the live success path without privilege.
 struct ScriptedSensor {
@@ -1094,6 +1106,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
     // table once at construction, and that parse must not land in a
     // concurrent test's count window.
     let _suite = suite_guard();
+    let mut controller = attached_controller();
     let tick = |wall: u64| kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
         rows: vec![
             script_agg_as(10, b"cbc(aes)"),
@@ -1145,6 +1158,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
         None,
+        &mut controller,
     )
     .expect("scripted session drives green");
     // Row counts: latest-per-key (2 agg + totals + who) + every
@@ -1170,6 +1184,15 @@ fn live_success_path_scripted_sensor_three_ticks() {
         kryprobe_privilege::kallsyms::parse_calls() - parses_before,
         3,
         "one real parse per tick across 3 who rows per tick (C2)"
+    );
+    // 1B-H4: the governed session ends Finalized, observably.
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+    assert_eq!(
+        controller.state(),
+        kryprobe_core::session::SessionState::Finalized
     );
     // Drops accounting: scripted session drops ride the coverage.
     let ring = outcome
@@ -1202,6 +1225,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
     // 5x5=25. Memory is O(keys + idents), never O(ticks x rows).
     // H-T3(1): guard before construction (see the 3-tick test).
     let _suite = suite_guard();
+    let mut controller = attached_controller();
     let tick = |wall: u64| kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
         rows: vec![
             script_agg_as(10, b"cbc(aes)"),
@@ -1250,6 +1274,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
         None,
+        &mut controller,
     )
     .expect("scripted session drives green");
     assert_eq!(
@@ -1278,6 +1303,10 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         5,
         "one real parse per tick across 3 who rows per tick (C2)"
     );
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
 }
 
 #[test]
@@ -1287,6 +1316,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
     // never decodes half a row.
     // H-T3(1): guard before construction (see the 3-tick test).
     let _suite = suite_guard();
+    let mut controller = attached_controller();
     let mut bad = vec![0u8; 382];
     bad[0] = 0x01;
     bad[1] = 9; // no such row kind
@@ -1337,6 +1367,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
         None,
+        &mut controller,
     )
     .expect_err("corrupt row must fail the session");
     let msg = format!("{err:?}");
@@ -1353,5 +1384,148 @@ fn live_corrupt_snapshot_row_fails_closed() {
         kryprobe_privilege::kallsyms::parse_calls() - parses_before,
         0,
         "corrupt tick parses no kallsyms table"
+    );
+    // 1B-H4: the failure parks the machine in FailedPartial (the
+    // session still fails closed — the escape records, not recovers).
+    assert_eq!(
+        controller.state(),
+        kryprobe_core::session::SessionState::FailedPartial
+    );
+}
+
+/// 3A-M-T6: fake backend whose decode fails — drives the live session
+/// into the `FailedPartial` escape without privilege.
+struct FailingBackend;
+
+impl kryprobe_core::backend::Backend for FailingBackend {
+    fn id(&self) -> kryprobe_core::enums::BackendId {
+        kryprobe_core::enums::BackendId::KCrypto
+    }
+
+    fn capabilities(&self) -> &'static kryprobe_core::backend::BackendCapabilities {
+        &FAKE_OPEN_CAPS
+    }
+
+    fn detect(
+        &self,
+        _ctx: &kryprobe_core::backend::DetectContext<'_>,
+    ) -> Result<Vec<kryprobe_core::backend::DetectedInstance>, kryprobe_core::error::BackendError>
+    {
+        Ok(vec![kryprobe_core::backend::DetectedInstance {
+            backend: kryprobe_core::enums::BackendId::KCrypto,
+            object: None,
+            detail: "failing fake".to_owned(),
+        }])
+    }
+
+    fn plan(
+        &self,
+        _ctx: &kryprobe_core::backend::PlanContext<'_>,
+        _instance: &kryprobe_core::backend::DetectedInstance,
+        _mode: kryprobe_core::enums::CaptureMode,
+    ) -> Result<kryprobe_core::backend::BackendPlan, kryprobe_core::error::BackendError> {
+        Ok(kryprobe_core::backend::BackendPlan {
+            backend: kryprobe_core::enums::BackendId::KCrypto,
+            probes: Vec::new(),
+            required: FAKE_OPEN_CAPS.required,
+        })
+    }
+
+    fn configure(
+        &self,
+        _ctx: &mut kryprobe_core::backend::ConfigureContext<'_>,
+        _plan: &kryprobe_core::backend::BackendPlan,
+    ) -> Result<(), kryprobe_core::error::BackendError> {
+        Ok(())
+    }
+
+    fn decode(
+        &self,
+        _ctx: &kryprobe_core::backend::DecodeContext<'_>,
+        _event: kryprobe_core::backend::RawEvent<'_>,
+    ) -> Result<kryprobe_core::evidence::NativeObservation, kryprobe_core::error::BackendError>
+    {
+        Err(kryprobe_core::error::BackendError::Internal(
+            kryprobe_core::error::InternalError::new("scripted_decode_failed"),
+        ))
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &kryprobe_core::backend::FinalizeContext<'_>,
+    ) -> Result<kryprobe_core::backend::BackendSummary, kryprobe_core::error::BackendError> {
+        Ok(kryprobe_core::backend::BackendSummary {
+            backend: kryprobe_core::enums::BackendId::KCrypto,
+            observations: 0,
+            integrity: kryprobe_core::evidence::IntegritySummary::default(),
+        })
+    }
+}
+
+#[test]
+fn live_backend_failure_runs_failed_partial_recovery() {
+    // 3A-M-T6 (1B-H4): a backend decode failure fails the session AND
+    // parks the machine in `FailedPartial`; the recovery edge
+    // `FailedPartial -> Finalized` stays legal (a future consumer may
+    // still finalize partial results — today the escape only records).
+    let _suite = suite_guard();
+    let mut controller = attached_controller();
+    let tick = kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![script_agg_as(10, b"cbc(aes)")],
+        totals: None,
+        idents: Vec::new(),
+        overflow_identities: 0,
+        drops: 0,
+        monotonic_ns: 100,
+    };
+    let mut sensor = ScriptedSensor {
+        script: vec![tick],
+        who: kryprobe_privilege::kcrypto_backend::WhoSnapshot {
+            key: Default::default(),
+            val: Default::default(),
+            stack_ips: Vec::new(),
+            first_errno: None,
+            params: None,
+        },
+        drop_sites: [0; 8],
+        barriers: std::sync::Mutex::new(Vec::new()),
+        tables: std::sync::atomic::AtomicU64::new(0),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = FailingBackend;
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let err = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+        &mut controller,
+    )
+    .expect_err("failing decode must fail the session");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("live decode agg"),
+        "names the failing stage: {msg}"
+    );
+    assert_eq!(
+        controller.state(),
+        kryprobe_core::session::SessionState::FailedPartial
+    );
+    assert!(
+        controller
+            .transition(kryprobe_core::session::SessionState::Finalized)
+            .is_ok(),
+        "FailedPartial -> Finalized recovery edge stays legal"
     );
 }

@@ -30,3 +30,20 @@ impl ManualClock {
         self.now
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_at_given_value_and_advances_monotonically() {
+        // Moved with the clock from testkit (1B-M4): the scripted
+        // session's time source pins its start/advance contract here.
+        let mut clock = ManualClock::new(1_000_000);
+        assert_eq!(clock.now(), 1_000_000);
+        assert_eq!(clock.advance(500), 1_000_500);
+        assert_eq!(clock.now(), 1_000_500);
+        assert_eq!(clock.advance(0), 1_000_500);
+        assert!(clock.now() >= 1_000_500);
+    }
+}

@@ -19,10 +19,14 @@ pub use spawn::spawn_smoke_worker;
 use crate::bpfloader::{LoadedSpine, LoaderError};
 use crate::fd::OwnedFd;
 use crate::local::LocalPrivilegedAuthority;
+use crate::probe::bpf_sys;
 use kryprobe_core::ProgramId;
 use kryprobe_core::authority::BpfLoadAuthority;
+use std::ffi::CString;
 use std::fmt;
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 /// Delegation axes from `allowed_*` fdinfo lines (all `0x`-hex `u64`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,9 +227,59 @@ pub fn load_bytes_with_token(
     LocalPrivilegedAuthority.load_program_with_token(ProgramId::UprobeMultiSelfProbe, bytes, token)
 }
 
+/// `BPF_OBJ_GET` command id (pinned-token retrieval; the attr is the
+/// 16-byte `{pathname, bpf_fd, file_flags}` prefix of `union bpf_attr`).
+const BPF_OBJ_GET: u32 = 7;
+
+/// `BPF_OBJ_GET` attr: `{pathname, bpf_fd, file_flags}` (16 bytes).
+#[repr(C)]
+struct ObjGetAttr {
+    pathname: u64,
+    bpf_fd: u32,
+    file_flags: u32,
+}
+
+/// Retrieves the pinned BPF object at `path` via `BPF_OBJ_GET`
+/// (plain `open()` cannot reach bpffs objects — only the `bpf()`
+/// syscall can). `Ok` holds the live fd; `Err` is the kernel errno
+/// (`NUL` in the path maps to `EINVAL`, never a panic).
+///
+/// Moved here from the CLI (1B-M7): the `bpf()` call and its errno
+/// live behind the privilege boundary; callers render the errno.
+pub fn obj_get(path: &Path) -> Result<std::fs::File, i32> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+    let mut attr = ObjGetAttr {
+        pathname: c_path.as_ptr() as u64,
+        bpf_fd: 0,
+        file_flags: 0,
+    };
+    // SAFETY: `attr` is 16 live bytes for the syscall; the kernel
+    // copies the attr struct in and out (the `bpf()` contract).
+    let ret = unsafe {
+        bpf_sys::bpf(
+            BPF_OBJ_GET,
+            (&raw mut attr).cast::<std::os::raw::c_void>(),
+            16,
+        )
+    };
+    if ret < 0 {
+        return Err(bpf_sys::last_errno());
+    }
+    // SAFETY: the kernel handed us a live fd; we own it from here.
+    Ok(unsafe { std::fs::File::from_raw_fd(ret as i32) })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::obj_get;
     use super::parse_id_map_outer;
+
+    #[test]
+    fn obj_get_nul_path_is_inval_without_syscall() {
+        // 1B-M7: NUL never reaches the kernel — unprivileged check.
+        let bad = std::path::Path::new("/sys/fs/bpf/\0/x");
+        assert_eq!(obj_get(bad).expect_err("NUL path refuses"), libc::EINVAL);
+    }
 
     /// Outer-id extraction: the mint ns (`0 65534 1`) and init ns
     /// (`0 0 4294967295`) shapes, plus kernel column padding.

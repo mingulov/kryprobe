@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Stream validation: structural checks + schema const + schema freeze.
 //!
-//! Testkit [`check_stream`](kryprobe_testkit::check_stream) checks envelope
-//! presence only (T4 ruling); this module additionally requires every
+//! [`check_stream`](crate::check_stream) checks envelope presence only
+//! (T4 ruling); this module additionally requires every
 //! record's `schema` to equal [`EVENT_SCHEMA_V0`](crate::EVENT_SCHEMA_V0)
 //! and, when the dev-tree schema file is present, that it hash identically
 //! to the compiled-in copy, else [`ValidationFinding::SchemaDrift`]. An
@@ -12,7 +12,7 @@ mod kinds;
 
 use self::kinds::KIND_TABLE;
 use crate::EVENT_SCHEMA_V0;
-use kryprobe_testkit::{StreamChecker, StreamFinding};
+use crate::checker::{StreamChecker, StreamFinding};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -20,7 +20,7 @@ use std::path::Path;
 /// One validation defect; empty means the stream validates clean.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationFinding {
-    /// Structural defect from testkit checks.
+    /// Structural defect from the stream checks.
     Stream(StreamFinding),
     /// Record `schema` is present but not the frozen const.
     SchemaMismatch {

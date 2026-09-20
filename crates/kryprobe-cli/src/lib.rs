@@ -20,9 +20,12 @@ pub mod cmd_stub;
 pub mod cmd_token;
 pub mod cmd_watch;
 pub mod live;
+pub mod runtime_facts;
 pub mod selftest_bpf;
 pub mod selftest_synth;
 pub mod selftest_token;
+pub mod token;
+pub mod verdict;
 
 use args::{ArgsError, Command, USAGE};
 use std::io::Write;

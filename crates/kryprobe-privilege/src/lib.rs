@@ -19,6 +19,7 @@ pub mod elfread;
 pub mod fanout;
 pub mod fd;
 pub mod filecaps;
+pub mod host;
 pub mod inspect;
 pub mod kallsyms;
 pub mod kcrypto_backend;

@@ -30,6 +30,7 @@ fn probe_degrades_honestly() {
             ProbeOutcome::Pass { detail } => assert!(!detail.is_empty(), "{want}: empty detail"),
             ProbeOutcome::Denied { stage, .. } => assert!(!stage.is_empty(), "{want}: empty stage"),
             ProbeOutcome::Skipped { reason } => assert!(!reason.is_empty(), "{want}: empty reason"),
+            ProbeOutcome::Failed { detail } => assert!(!detail.is_empty(), "{want}: empty detail"),
         }
     }
     let release = &matrix.rows[0];

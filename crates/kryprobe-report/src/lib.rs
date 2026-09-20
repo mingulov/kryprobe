@@ -6,7 +6,9 @@
 //! bytes; the renderer prints counts that always qualify zeros (R-024).
 
 pub mod adapters;
+pub mod checker;
 pub mod cover;
+pub mod live_render;
 pub mod observe;
 pub mod rel;
 pub mod render;
@@ -15,6 +17,7 @@ pub mod snapshot;
 pub mod validate;
 pub mod writer;
 
+pub use checker::{StreamChecker, StreamFinding, check_stream};
 pub use cover::{CoverageGap, GapCtx};
 pub use observe::ObservationExtra;
 pub use render::{render_summary, render_summary_reader, sanitize_cell};
@@ -29,3 +32,8 @@ pub use writer::{JsonlWriter, ReportError, write_str_atomic};
 
 /// Frozen event-envelope schema const; every record must carry exactly this.
 pub const EVENT_SCHEMA_V0: &str = "kryprobe.event/v0";
+
+/// Frozen contract version carried in `session_start` payloads (1B-M5:
+/// one shared const, not a literal per emitter; see `docs/versioning.md`
+/// for what each version marker versions and the reader-tolerance rules).
+pub const CONTRACT_VERSION_V0: &str = "v0-proposed";

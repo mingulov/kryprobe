@@ -7,6 +7,11 @@ use super::Summary;
 /// in schema order (`schemas/event-v0.schema.json`). Shared vocabulary —
 /// every schema-valid gap renders as its own row (see
 /// `tests/coverage_dims.rs`); only non-schema spellings footnote.
+///
+/// 1B-M3: this is deliberately NOT the core `CoverageDimension` enum —
+/// the schema gap enum versions the event-v0 wire contract while the
+/// core enum versions session coverage; each is pinned to its own
+/// authority instead of merged.
 pub(super) const SCHEMA_DIMS: [&str; 9] = [
     "target_enumeration",
     "executable_discovery",

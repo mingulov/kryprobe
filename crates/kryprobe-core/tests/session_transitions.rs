@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Session machine tests: legal path + full 9x9 transition table.
+//!
+//! Production wiring (1B-H4): the live session walks this machine in
+//! `kryprobe-cli/src/live.rs` (`run_live_session` bring-up +
+//! `drive_session` tail); `FailedPartial` recovery is covered by
+//! `live_backend_failure_runs_failed_partial_recovery` there.
 
 use kryprobe_core::session::{SessionController, SessionError, SessionState};
 

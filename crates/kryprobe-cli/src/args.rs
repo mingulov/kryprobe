@@ -20,7 +20,7 @@ commands:
   token status [--bin PATH]     file caps + token-pin usability (never privileged)
   watch --system [--source S] [--duration N] [--token PATH]
                                continuous system-wide observe (live kcrypto)
-  report --system [--duration N] [--format human|json] [--out F] [--source S] [--token PATH]
+  report --system [--duration N] [--format human|json|jsonl] [--out F] [--source S] [--token PATH]
                                bounded system-wide capture + render (live kcrypto)
   report FILE                  validate + render a JSONL stream
   check --system --policy F [--duration N] [--source S] [--token PATH]
@@ -56,6 +56,8 @@ pub enum ReportFormat {
     Human,
     /// Machine-readable JSON.
     Json,
+    /// Validated event-v0 JSONL stream (session envelope records).
+    Jsonl,
 }
 
 /// Parsed command with merged `--json`.
@@ -439,6 +441,18 @@ mod tests {
                 duration: Some(60),
                 format: ReportFormat::Json,
                 out: Some(PathBuf::from("o.json")),
+                token: None,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["report", "--system", "--format", "jsonl"]))
+                .unwrap()
+                .command,
+            Command::ReportLive {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                format: ReportFormat::Jsonl,
+                out: None,
                 token: None,
             }
         );

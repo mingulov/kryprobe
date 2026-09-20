@@ -8,10 +8,11 @@ pub mod catalog;
 pub mod coverage;
 pub mod integrity;
 pub mod observation;
+pub mod payload_keys;
 pub mod relationship;
 
 pub use catalog::{ImplementationRecord, ImplementationResolution};
-pub use coverage::{CoverageSummary, DimensionCounter, DimensionCoverage};
+pub use coverage::{CoverageDimension, CoverageSummary, DimensionCounter, DimensionCoverage};
 pub use integrity::{IntegritySummary, SharedLosses};
 pub use observation::{
     BackendPayload, CorrelationRef, IntegrityRef, NativeObservation, NativeResult, SafeTextId,

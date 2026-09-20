@@ -9,22 +9,12 @@
 //! context/evidence, kp2 §13 row 12) and gap dims go to stderr.
 
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
-use kryprobe_policy::{Policy, PolicyVerdict, evaluate, parse_policy};
+use kryprobe_policy::{Policy, evaluate, parse_policy};
 use std::io::{Read, Write};
 use std::path::Path;
 
 /// Default live window when `--duration` is absent (report idiom).
 const DEFAULT_CHECK_SECS: u64 = 60;
-
-/// Rendered cell: missing or empty renders `unknown` (C10 — never
-/// fabricated).
-fn show(cell: &str) -> String {
-    if cell.is_empty() {
-        String::from("unknown")
-    } else {
-        kryprobe_report::sanitize_cell(cell)
-    }
-}
 
 /// Live window: explicit `--duration` or the 60s default.
 fn check_window_secs(duration: Option<u64>) -> u64 {
@@ -60,7 +50,8 @@ fn read_policy_capped(policy: &Path) -> Result<String, String> {
 
 /// Finishes a capture against a parsed policy: the verdict line to
 /// stdout, detail to stderr; 10/0/3 on the verdict, 4/1 on
-/// [`LiveError`] via [`LiveError::exit_code`].
+/// [`LiveError`] via [`LiveError::exit_code`]. The verdict mapping
+/// itself lives in [`crate::verdict`] (1B-M8).
 fn finish_check(
     result: Result<LiveOutcome, LiveError>,
     policy: &Policy,
@@ -74,55 +65,13 @@ fn finish_check(
             return err.exit_code();
         }
     };
-    match evaluate(policy, &outcome.observations, &outcome.coverage) {
-        PolicyVerdict::Violation {
-            rule,
-            obs_ids,
-            algorithm,
-            driver,
-            context,
-            evidence,
-        } => {
-            let _ = writeln!(
-                stdout,
-                "VIOLATION rule={rule} observations={}",
-                obs_ids.len()
-            );
-            let ids = obs_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let _ = writeln!(
-                stderr,
-                "check: violation rule='{rule}' matched={} algorithm='{}' driver='{}' context='{}' evidence=obs[{ids}]",
-                obs_ids.len(),
-                show(&algorithm),
-                show(&driver),
-                show(&context),
-            );
-            // First matched observation verbatim: the lossless evidence
-            // behind the summary (names/counts only — C10 holds).
-            if let Some(first) = evidence.first() {
-                let rendered = serde_json::to_string(first).expect("live evidence serializes");
-                let _ = writeln!(stderr, "check: evidence: {rendered}");
-            }
-            10
-        }
-        PolicyVerdict::Clean => {
-            let _ = writeln!(stdout, "CLEAN");
-            0
-        }
-        PolicyVerdict::Inconclusive { .. } => {
-            // kp2 §8 tokens via the shared trailer (same dims as the
-            // report PARTIAL trailer — one gap vocabulary).
-            let dims = crate::cmd_watch::trailer_dims(&outcome.coverage);
-            let dims = dims.join(",");
-            let _ = writeln!(stdout, "INCONCLUSIVE missing={dims}");
-            let _ = writeln!(stderr, "check: inconclusive: coverage gaps on {dims}");
-            3
-        }
-    }
+    let rendered = crate::verdict::render_check_verdict(
+        evaluate(policy, &outcome.observations, &outcome.coverage),
+        &outcome.coverage,
+    );
+    let _ = write!(stdout, "{}", rendered.stdout);
+    let _ = write!(stderr, "{}", rendered.stderr);
+    rendered.code
 }
 
 /// Runs `check --system`: parse the policy (exit 2 on any rejection),
@@ -159,7 +108,7 @@ pub fn run(
         token: token.map(Path::to_owned),
     };
     finish_check(
-        run_live_capture(&cfg, &crate::cmd_watch::live_runtime()),
+        run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
         &policy,
         stdout,
         stderr,
