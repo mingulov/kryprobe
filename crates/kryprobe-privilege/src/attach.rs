@@ -10,6 +10,7 @@ use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
 use kryprobe_core::plan::TargetScope;
 use kryprobe_core::{GenerationGuard, LinkGroup};
 use std::ffi::CString;
+use std::os::fd::RawFd;
 use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -171,14 +172,39 @@ pub(crate) fn attach_group(
     }
 }
 
+/// Tracing `LINK_CREATE` attr constructor (K5 Task 3 extraction):
+/// attach type 25 (`FEXIT`), `target_btf_id` 0 (the kernel binds the
+/// load-time `attach_btf_id`), 64-byte attr (R1 —
+/// `evidence/k0/P1-attach-matrix.txt`). No cookie: kcrypto attribution
+/// is in-BPF.
+///
+/// Deliberately token-free: UAPI provides NO token field for
+/// `BPF_LINK_CREATE` (verified against the installed `linux/bpf.h`: the
+/// struct ends at the attach union), and K5 Task 1 proved the kernel
+/// demands no `link_create` delegation
+/// (`DELEGATE_CMDS=map_create:prog_load`). A token-loaded program
+/// remembers its token, and the kernel authorizes the fexit link
+/// against it — so this constructor takes no token, and the `Some` and
+/// `None` loader paths emit byte-identical link attrs by construction.
+/// [`attach_fexit`] calls this verbatim; the unit test pins the shape.
+pub(crate) fn fexit_link_attr(prog_fd: RawFd) -> LinkTracing {
+    LinkTracing {
+        prog_fd: prog_fd as u32,
+        target_fd: 0,
+        attach_type: BPF_TRACE_FEXIT,
+        flags: 0,
+        target_btf_id: 0,
+        pad: 0,
+        cookie: 0,
+        tail: [0; 4],
+    }
+}
+
 /// Attach one fexit program system-wide (K1 Task 2, C1; K0 G4).
 ///
-/// Tracing `LINK_CREATE`: attach type 25 (`FEXIT`), `target_btf_id` 0
-/// (the kernel binds the load-time `attach_btf_id`), 64-byte attr (R1 —
-/// `evidence/k0/P1-attach-matrix.txt`). No cookie: kcrypto attribution
-/// is in-BPF. `object`/`offsets` must be empty (a confused caller
-/// passing uprobe coordinates to a whole-function attach rejects here,
-/// before any syscall).
+/// Tracing `LINK_CREATE` via [`fexit_link_attr`]. `object`/`offsets`
+/// must be empty (a confused caller passing uprobe coordinates to a
+/// whole-function attach rejects here, before any syscall).
 fn attach_fexit(
     prog_fd: &OwnedFd,
     object: &Path,
@@ -202,16 +228,7 @@ fn attach_fexit(
                     .to_owned(),
         });
     }
-    let mut attr = LinkTracing {
-        prog_fd: prog_fd.as_raw_fd() as u32,
-        target_fd: 0,
-        attach_type: BPF_TRACE_FEXIT,
-        flags: 0,
-        target_btf_id: 0,
-        pad: 0,
-        cookie: 0,
-        tail: [0; 4],
-    };
+    let mut attr = fexit_link_attr(prog_fd.as_raw_fd());
     // SAFETY: attr outlives the syscall; no pointees.
     let ret = unsafe {
         bpf(
@@ -255,6 +272,23 @@ mod tests {
         let err = super::attach_fexit(&fd, std::path::Path::new("/bin/true"), &[])
             .expect_err("non-empty object must reject");
         assert!(matches!(err, super::AttachError::Rejected { .. }), "{err}");
+    }
+
+    #[test]
+    fn fexit_link_attr_is_token_free_64_bytes() {
+        // The link attr carries NO token field (UAPI has none; Task 1
+        // proved no `link_create` delegation): the constructor takes no
+        // token, so token and privileged paths emit identical bytes by
+        // construction. Pins the R1 shape (FEXIT, load-time id bind).
+        let attr = super::fexit_link_attr(99);
+        assert_eq!(attr.prog_fd, 99);
+        assert_eq!(attr.target_fd, 0);
+        assert_eq!(attr.attach_type, super::BPF_TRACE_FEXIT);
+        assert_eq!(attr.flags, 0);
+        assert_eq!(attr.target_btf_id, 0);
+        assert_eq!(attr.cookie, 0);
+        assert_eq!(attr.tail, [0; 4]);
+        assert_eq!(size_of::<super::LinkTracing>(), 64);
     }
 
     #[test]

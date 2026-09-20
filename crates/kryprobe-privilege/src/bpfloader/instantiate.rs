@@ -134,8 +134,10 @@ pub(crate) fn instantiate_with_token(
 ///
 /// `attach_ids` maps kernel symbol names (the section suffix after
 /// `fexit/`, as returned by `btf_resolve::resolve_btf_ids`) to vmlinux
-/// BTF ids. `token` is an optional borrowed BPF token fd (`None` loads
-/// with privilege, like the spine path).
+/// BTF ids. `token_fd` is an optional borrowed BPF token fd (`None`
+/// loads with privilege, like the spine path; `Some` threads the token
+/// to map create + prog load — link create carries no token field and
+/// authorizes via the token-loaded program).
 ///
 /// Per-point outcomes (attach independence): a program without a
 /// supplied id is [`PointStatus::Missing`], a refused load is
@@ -152,7 +154,7 @@ pub(crate) fn instantiate_with_token(
 pub fn load_kcrypto(
     bytes: &[u8],
     attach_ids: &[(String, u32)],
-    token: Option<RawFd>,
+    token_fd: Option<RawFd>,
 ) -> Result<(LoadedKcrypto, Vec<PointStatus>), LoaderError> {
     let parsed = parse_kcrypto_object(bytes)?;
     let mut fds: Vec<(String, OwnedFd)> = Vec::with_capacity(parsed.maps.len());
@@ -162,7 +164,7 @@ pub fn load_kcrypto(
             map.dims.key_size,
             map.dims.value_size,
             map.dims.max_entries,
-            token,
+            token_fd,
         );
         let fd = fd_or_errno(ret).map_err(|errno| LoaderError::MapFailed {
             stage: map.name.clone(),
@@ -216,7 +218,7 @@ pub fn load_kcrypto(
             });
             continue;
         };
-        match load_fexit_program(&prog.name, insns, *id, token) {
+        match load_fexit_program(&prog.name, insns, *id, token_fd) {
             Ok(fd) => {
                 statuses.push(PointStatus::Loaded {
                     name: prog.name.clone(),
@@ -259,6 +261,10 @@ pub fn load_kcrypto(
                 total: take("KTOT")?,
                 ident: take("KIDN")?,
                 ring: take("KRING")?,
+                who: take("KWHO")?,
+                stack: take("KSTACK")?,
+                err: take("KERR")?,
+                params: take("KPARAMS")?,
             },
             progs,
         },
@@ -281,7 +287,7 @@ fn load_fexit_program(
     name: &str,
     insns: &[BpfInsn],
     attach_btf_id: u32,
-    token: Option<RawFd>,
+    token_fd: Option<RawFd>,
 ) -> Result<OwnedFd, LoaderError> {
     if insns.is_empty() {
         return Err(LoaderError::BadObject {
@@ -296,7 +302,7 @@ fn load_fexit_program(
         insns.len() as u32,
         attach_btf_id,
         &mut log,
-        token,
+        token_fd,
     );
     match fd_or_errno(ret) {
         Ok(fd) => Ok(fd),

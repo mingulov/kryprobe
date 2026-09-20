@@ -292,13 +292,24 @@ pub struct LoadedSpine {
     pub progs: SpineProgs,
 }
 
-/// Loaded kcrypto maps, one RAII fd per map (K1 Task 1).
+/// Loaded kcrypto maps, one RAII fd per map (K1 Task 1 five + K5
+/// Task 3 attribution four — [`snapshot_who`](crate::kcrypto_backend::snapshot_who)
+/// reads the tail; dropping them here would close userspace's only
+/// handles while the programs still reference the maps).
 pub struct KcryptoMaps {
     pub config: OwnedFd,
     pub agg: OwnedFd,
     pub total: OwnedFd,
     pub ident: OwnedFd,
     pub ring: OwnedFd,
+    /// `KWHO` (per-cpu caller identity, 2048 entries).
+    pub who: OwnedFd,
+    /// `KSTACK` (kernel stack traces, 1024 entries).
+    pub stack: OwnedFd,
+    /// `KERR` (first errno per row hash, 256 entries).
+    pub err: OwnedFd,
+    /// `KPARAMS` (crypto params per row hash, 256 entries).
+    pub params: OwnedFd,
 }
 
 /// Fully loaded kcrypto object: maps + per-program fds, all RAII-owned.

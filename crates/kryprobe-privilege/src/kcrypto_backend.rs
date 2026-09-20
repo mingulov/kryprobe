@@ -27,6 +27,11 @@
 //! No new privileged syscall sites: loading reuses
 //! [`load_kcrypto_configured`], finalize reuses [`snapshot_rows`] +
 //! [`map_lookup_bytes`], decode is pure.
+//!
+//! K5 Task 3 adds the snapshot side of attribution: [`snapshot_who`]
+//! walks `KWHO`/`KSTACK`/`KERR`/`KPARAMS` (map access reuses
+//! [`crate::mapops`], like [`snapshot_rows`]) into [`WhoSnapshot`]s;
+//! who-row decode is Task 4.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -36,7 +41,8 @@ use kryprobe_abi::kcrypto_agg::{
     KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCTX_KTHREAD, KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KCtl,
     KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC,
     KOP_DESTROY, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED,
-    VAgg, kctl_unpack_lens,
+    KWHO_DROPS, KWhoKey, VAgg, VParams, VWho, kctl_unpack_lens, kwho_key_from_bytes,
+    vparams_from_bytes, vwho_from_bytes,
 };
 use kryprobe_core::backend::{
     Backend, BackendCapabilities, BackendPlan, BackendRegistry, BackendSummary, ConfigureContext,
@@ -61,7 +67,7 @@ use crate::btf_resolve::{
     load_kcrypto_configured, resolve_btf_ids,
 };
 use crate::kcrypto_snapshot::{ParsedRow, SnapshotRows, parse_snapshot_row, snapshot_rows};
-use crate::mapops::{MapOpsError, map_lookup_bytes};
+use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, possible_cpus};
 
 /// Static descriptor: the kcrypto backend gates on BTF only (D2 — ringbuf
 /// is universal past the floor, `uprobe_multi`/`cookies` are N/A to fexit).
@@ -325,6 +331,217 @@ fn kcrypto_object_bytes() -> Result<Vec<u8>, BackendError> {
             &format!("{}: {err}", path.display()),
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// K5 attribution snapshot (Task 3; who-row DECODE is Task 4).
+// ---------------------------------------------------------------------------
+
+/// One snapshotted caller-identity row: the folded `KWHO` value plus its
+/// joins (`KSTACK` frames, first errno, crypto params). Task 4 decodes
+/// these into `row="who"` observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhoSnapshot {
+    /// The `KWHO` key (row hash + tgid).
+    pub key: KWhoKey,
+    /// The percpu-folded `KWHO` value (calls summed, stamps min/maxed,
+    /// identity from the most-recent-writer lane).
+    pub val: VWho,
+    /// Kernel stack IPs for `val.stack` (truncated at the first zero;
+    /// empty when `stack` is negative or the `KSTACK` row is absent).
+    pub stack_ips: Vec<u64>,
+    /// First nonzero return for `key.kh` (`None` when `KERR` has no row).
+    pub first_errno: Option<i32>,
+    /// Crypto params for `key.kh` (`None` when `KPARAMS` has no row —
+    /// params chase skipped or `alg == 0`).
+    pub params: Option<VParams>,
+}
+
+/// Attribution-snapshot failure: an underlying map walk/read failure
+/// (stage + errno preserved). Per-row join misses degrade instead (empty
+/// `stack_ips`, `None` errno/params — the snapshot caller rule: unjoined
+/// is unknown, never misattributed, never fatal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    Map(MapOpsError),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Map(err) => write!(f, "who snapshot: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+impl From<MapOpsError> for SnapshotError {
+    fn from(err: MapOpsError) -> Self {
+        Self::Map(err)
+    }
+}
+
+/// Fold per-CPU `VWho` lanes into one total (the [`fold_vagg`](kryprobe_abi::kcrypto_agg::fold_vagg)
+/// contract for who rows): `calls` sums saturating; `first_ns` is the
+/// minimum over lanes with `calls > 0` (idle lanes hold insert-time
+/// stamps with `calls == 0` and must not poison the min — the BPF
+/// broadcasts the insert value to every lane, then updates only the
+/// inserting CPU's lane); `last_ns` is the maximum; both stamps are 0
+/// when no lane observed anything. Identity fields come from the
+/// most-recent-writer lane (greatest `last_ns`, first on ties):
+/// `tid`/`comm` are last-writer per lane, the rest are insert-identical
+/// across lanes. Total over any lane slice (empty folds to zero).
+fn fold_vwho(lanes: &[VWho]) -> VWho {
+    let mut out = VWho::default();
+    let mut first = u64::MAX;
+    let mut any = false;
+    let mut best = 0usize;
+    for (i, lane) in lanes.iter().enumerate() {
+        out.calls = out.calls.saturating_add(lane.calls);
+        if lane.calls > 0 {
+            any = true;
+            first = first.min(lane.first_ns);
+        }
+        if lane.last_ns > out.last_ns {
+            out.last_ns = lane.last_ns;
+            best = i;
+        }
+    }
+    out.first_ns = if any { first } else { 0 };
+    if let Some(winner) = lanes.get(best) {
+        out.comm = winner.comm;
+        out.tid = winner.tid;
+        out.uid = winner.uid;
+        out.cgroup = winner.cgroup;
+        out.ppid = winner.ppid;
+        out.pcomm = winner.pcomm;
+        out.stack = winner.stack;
+    }
+    out
+}
+
+/// Decode one `KSTACK` value (1016B = 127 LE u64 frames, zero-padded)
+/// into the frame prefix: truncated at the FIRST zero (frames fill
+/// contiguously from index 0, and 0 is never a valid kernel IP).
+fn stack_ips_from_bytes(bytes: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for i in 0..bytes.len() / 8 {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+        let ip = u64::from_le_bytes(word);
+        if ip == 0 {
+            break;
+        }
+        out.push(ip);
+    }
+    out
+}
+
+/// Snapshot the K5 attribution maps of a configured sensor: full `KWHO`
+/// walk (key iteration + percpu fold) with per-row `KSTACK`/`KERR`/
+/// `KPARAMS` joins, plus the `KWHO_DROPS` insert-loss count. Map order.
+///
+/// Join-miss discipline (fail-soft, never fatal): a negative `stack`
+/// (raw helper errno — no `KSTACK` row) or an absent `KSTACK` row yields
+/// empty `stack_ips`; an absent `KERR`/`KPARAMS` row yields `None`.
+/// Structural failures (walk errors, short reads, undecodable lanes)
+/// fail the whole snapshot as [`SnapshotError::Map`] (a broken
+/// post-attach read must be loud, never a silent zero).
+pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
+    let ncpu = possible_cpus() as usize;
+    let mut out = Vec::new();
+    let mut key: Option<Vec<u8>> = None;
+    loop {
+        let next = map_get_next_key(
+            &maps.loaded.maps.who,
+            key.as_deref(),
+            16,
+            "snapshot/who-iter",
+        )?;
+        let Some(k) = next else { break };
+        let who_key = kwho_key_from_bytes(&k).ok_or_else(|| MapOpsError::LookupFailed {
+            stage: "snapshot/who-key".to_owned(),
+            errno: libc::EBADMSG,
+        })?;
+        let raw = map_lookup_bytes(&maps.loaded.maps.who, &k, 80 * ncpu, "snapshot/who-val")?;
+        let mut lanes = Vec::with_capacity(ncpu);
+        for c in 0..ncpu {
+            let lane = raw
+                .get(c * 80..(c + 1) * 80)
+                .and_then(vwho_from_bytes)
+                .ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "snapshot/who-lane".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+            lanes.push(lane);
+        }
+        let val = fold_vwho(&lanes);
+        let stack_ips = if val.stack >= 0 {
+            match map_lookup_bytes(
+                &maps.loaded.maps.stack,
+                &(val.stack as u32).to_le_bytes(),
+                1016,
+                "snapshot/who-stack",
+            ) {
+                Ok(raw) => stack_ips_from_bytes(&raw),
+                Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Vec::new(),
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            Vec::new()
+        };
+        let first_errno = match map_lookup_bytes(
+            &maps.loaded.maps.err,
+            &who_key.kh.to_le_bytes(),
+            4,
+            "snapshot/who-err",
+        ) {
+            Ok(raw) => {
+                let word: [u8; 4] = raw.try_into().map_err(|_| MapOpsError::LookupFailed {
+                    stage: "snapshot/who-err".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+                Some(i32::from_le_bytes(word))
+            }
+            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
+            Err(err) => return Err(err.into()),
+        };
+        let params = match map_lookup_bytes(
+            &maps.loaded.maps.params,
+            &who_key.kh.to_le_bytes(),
+            16,
+            "snapshot/who-params",
+        ) {
+            Ok(raw) => Some(
+                vparams_from_bytes(&raw).ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "snapshot/who-params".to_owned(),
+                    errno: libc::EBADMSG,
+                })?,
+            ),
+            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
+            Err(err) => return Err(err.into()),
+        };
+        out.push(WhoSnapshot {
+            key: who_key,
+            val,
+            stack_ips,
+            first_errno,
+            params,
+        });
+        key = Some(k);
+    }
+    let drops = match map_lookup_bytes(
+        &maps.loaded.maps.ident,
+        &KWHO_DROPS.to_le_bytes(),
+        1,
+        "snapshot/who-drops",
+    ) {
+        Ok(value) => u64::from(value.first().copied().unwrap_or(0)),
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => 0,
+        Err(err) => return Err(err.into()),
+    };
+    Ok((out, drops))
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1192,74 @@ mod tests {
         assert_eq!(symbol_for(KFAM_SK, KOP_DIGEST), None);
         assert_eq!(symbol_for(KFAM_ANY, KOP_ENC), None);
         assert_eq!(symbol_for(KFAM_AEAD, KOP_FINUP), None);
+    }
+
+    fn vwho_lane(comm0: u8, tid: u32, stack: i32, calls: u64, first_ns: u64, last_ns: u64) -> VWho {
+        let mut comm = [0u8; 16];
+        comm[0] = comm0;
+        VWho {
+            comm,
+            tid,
+            uid: 1000,
+            cgroup: 7,
+            ppid: 1,
+            pcomm: [b'p'; 16],
+            stack,
+            calls,
+            first_ns,
+            last_ns,
+        }
+    }
+
+    #[test]
+    fn fold_vwho_sums_calls_and_folds_stamps() {
+        // 3 lanes: one idle (insert-time stamps, calls 0 — must not
+        // poison the first-min), two busy. calls sums; first is the min
+        // over BUSY lanes; last is the max; identity rides the
+        // most-recent-writer lane (greatest last_ns).
+        let lanes = [
+            vwho_lane(b'a', 11, 5, 0, 100, 100), // idle inserter copy
+            vwho_lane(b'b', 12, 5, 3, 100, 300),
+            vwho_lane(b'c', 13, 5, 7, 100, 200),
+        ];
+        let folded = fold_vwho(&lanes);
+        assert_eq!(folded.calls, 10);
+        assert_eq!(folded.first_ns, 100);
+        assert_eq!(folded.last_ns, 300);
+        assert_eq!(folded.comm[0], b'b', "identity from the last_ns=300 lane");
+        assert_eq!(folded.tid, 12);
+        assert_eq!(folded.uid, 1000);
+        assert_eq!(folded.stack, 5);
+    }
+
+    #[test]
+    fn fold_vwho_all_idle_folds_to_zero_stamps() {
+        // No busy lane: stamps are 0 (never the insert-time min), calls 0.
+        let lanes = [vwho_lane(b'a', 11, 5, 0, 100, 100)];
+        let folded = fold_vwho(&lanes);
+        assert_eq!(folded.calls, 0);
+        assert_eq!(folded.first_ns, 0);
+        assert_eq!(folded.last_ns, 100);
+        assert_eq!((folded.tid, folded.uid), (11, 1000));
+        // Empty lane slice (defensive: callers pass >= 1): all zero.
+        let folded = fold_vwho(&[]);
+        assert_eq!(folded.calls, 0);
+        assert_eq!((folded.first_ns, folded.last_ns), (0, 0));
+    }
+
+    #[test]
+    fn stack_ips_truncate_at_first_zero() {
+        // 127-frame KSTACK value shape: frames, then zero padding.
+        let mut bytes = [0u8; 1016];
+        for (i, ip) in [0xfff1u64, 0xfff2, 0xfff3].iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&ip.to_le_bytes());
+        }
+        assert_eq!(
+            stack_ips_from_bytes(&bytes),
+            vec![0xfff1u64, 0xfff2, 0xfff3]
+        );
+        assert!(stack_ips_from_bytes(&[0u8; 1016]).is_empty());
+        assert!(stack_ips_from_bytes(&[]).is_empty());
     }
 
     #[test]

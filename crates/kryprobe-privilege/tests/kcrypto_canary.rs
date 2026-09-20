@@ -3,7 +3,8 @@
 //!
 //! `kconfig_bytes_match_live_resolver` is the unprivileged half of
 //! brief Step 1 (resolve + KCFG bytes equal the 9 resolved offsets +
-//! pad per C2, from live BTF). `configured_entry_writes_kcfg_from_
+//! pad per C2 plus the K5 attribution tail, from live BTF).
+//! `configured_entry_writes_kcfg_from_
 //! resolver` is the privileged half: `load_kcrypto_configured` writes
 //! the 76B KCFG row the live resolver dictates, attaches all 9 points,
 //! and the row reads back byte-identical (from the map fd, then again
@@ -25,7 +26,7 @@ use kryprobe_abi::kcrypto_agg::{
 use kryprobe_privilege::bpfloader::{PointStatus, pin_fd};
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredKcrypto, kconfig_from_offsets, load_kcrypto_configured,
-    resolve_offsets,
+    resolve_kcrypto_offsets, resolve_offsets,
 };
 use kryprobe_privilege::mapops::{map_get_next_key, map_lookup_bytes, possible_cpus};
 use kryprobe_testkit::alg_fixture;
@@ -284,13 +285,15 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 fn kconfig_bytes_match_live_resolver() {
     // Unprivileged (BTF read only): the KCFG bytes the configured
     // entry writes equal the 9 live-resolved offsets + `PF_KTHREAD` +
-    // zero pad in C2 word order.
+    // zero pad in C2 word order, plus the 7 K5 attribution offsets +
+    // flags verbatim in the tail.
     if !btf_available() {
         println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
         return;
     }
     let off = resolve_offsets().expect("offsets must resolve");
-    let bytes = kconfig_from_offsets(off).to_bytes();
+    let k5 = resolve_kcrypto_offsets().expect("K5 offsets resolve fail-soft");
+    let bytes = kconfig_from_offsets(off, k5).to_bytes();
     assert_eq!(
         bytes.len(),
         76,
@@ -313,6 +316,17 @@ fn kconfig_bytes_match_live_resolver() {
     assert_eq!(word(32), off.ahash_nbytes_off, "word 8: ahash_nbytes_off");
     assert_eq!(word(36), off.shash_base, "word 9: shash_base");
     assert_eq!(word(40), 0, "word 10: zero pad");
+    // K5 tail (K5 Task 3): offsets verbatim + flags as 0/1 + zero pad.
+    assert_eq!(word(44), k5.task_real_parent, "word 11: task_real_parent");
+    assert_eq!(word(48), k5.task_tgid, "word 12: task_tgid");
+    assert_eq!(word(52), k5.task_comm, "word 13: task_comm");
+    assert_eq!(word(56), k5.cra_blocksize, "word 14: cra_blocksize");
+    assert_eq!(word(60), k5.cra_ivsize, "word 15: cra_ivsize");
+    assert_eq!(word(64), k5.cra_min_keysize, "word 16: cra_min_keysize");
+    assert_eq!(word(68), k5.cra_max_keysize, "word 17: cra_max_keysize");
+    assert_eq!(bytes[72], u8::from(k5.parent_ok), "parent_ok flag");
+    assert_eq!(bytes[73], u8::from(k5.params_ok), "params_ok flag");
+    assert_eq!(&bytes[74..76], &[0, 0], "tail zero pad");
 }
 
 /// Our bpffs pin dir (pid-suffixed: never collides, never shared).
@@ -363,7 +377,11 @@ fn configured_entry_writes_kcfg_from_resolver() {
     assert_eq!(sensor.links.len(), 9, "9 live links");
     assert_eq!(sensor.loaded.progs.len(), 9, "9 loaded programs");
     // The KCFG row reads back byte-identical to the resolver's bytes.
-    let want = kconfig_from_offsets(resolve_offsets().expect("offsets must resolve")).to_bytes();
+    let want = kconfig_from_offsets(
+        resolve_offsets().expect("offsets must resolve"),
+        resolve_kcrypto_offsets().expect("K5 offsets resolve fail-soft"),
+    )
+    .to_bytes();
     let got = map_lookup_bytes(
         &sensor.loaded.maps.config,
         &0u32.to_le_bytes(),

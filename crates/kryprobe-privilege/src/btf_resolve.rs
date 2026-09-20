@@ -16,9 +16,10 @@
 //! (`Documentation/bpf/btf.rst`, UAPI `linux/btf.h`).
 //!
 //! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
-//! 9-offsets → 76B projection, K1 44B head + zeroed K5 tail) and
+//! 9-offsets + K5 attribution offsets → 76B projection) and
 //! [`load_kcrypto_configured`] (the single resolve → load → write-KCFG
-//! → attach entry K2 calls).
+//! → attach entry K2 calls). K5 Task 3 adds [`resolve_kcrypto_offsets`]
+//! (fail-soft parent/params offsets + flags for the KCFG tail).
 
 use crate::attach::OwnedLink;
 use crate::bpfloader::{LoadedKcrypto, LoaderError, PointStatus, load_kcrypto};
@@ -114,6 +115,68 @@ impl std::fmt::Display for BtfError {
 
 impl std::error::Error for BtfError {}
 
+/// K5 attribution offsets: the 7 BPF parent/params chase offsets
+/// (all u32 byte offsets) plus the two fail-soft gate flags.
+///
+/// Group-atomic by contract: `parent_ok` is true iff ALL three parent
+/// members resolve (else all three offsets are 0); `params_ok` is true
+/// iff ALL four params members resolve (else all four are 0). The BPF
+/// gates each chase on its flag, and userspace omits the gated keys
+/// when the flag is false — never zero-filled in output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KcryptoOffsets {
+    /// `task_struct.real_parent` (bytes; K5 parent chase).
+    pub task_real_parent: u32,
+    /// `task_struct.tgid` (bytes; K5 parent chase).
+    pub task_tgid: u32,
+    /// `task_struct.comm` (bytes; K5 parent chase).
+    pub task_comm: u32,
+    /// `crypto_alg.cra_blocksize` (bytes; K5 crypto params).
+    pub cra_blocksize: u32,
+    /// `crypto_alg.cra_ivsize` (bytes; K5 crypto params).
+    pub cra_ivsize: u32,
+    /// `crypto_alg.cra_min_keysize` (bytes; K5 crypto params).
+    pub cra_min_keysize: u32,
+    /// `crypto_alg.cra_max_keysize` (bytes; K5 crypto params).
+    pub cra_max_keysize: u32,
+    /// True iff all three parent offsets resolved.
+    pub parent_ok: bool,
+    /// True iff all four params offsets resolved.
+    pub params_ok: bool,
+}
+
+/// K5 attribution-offset resolution failure: the BTF image itself is
+/// unreadable or malformed. Unresolvable MEMBERS never surface here —
+/// they yield `*_ok=false` + zeros inside [`KcryptoOffsets`] (fail-soft).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    Io { detail: String },
+    BadBtf { reason: String },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { detail } => write!(f, "BTF I/O: {detail}"),
+            Self::BadBtf { reason } => write!(f, "malformed BTF: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// Lossless promotion into the configured bring-up error (both variants
+/// carry their text across; the fail-soft member cases never construct
+/// a [`ResolveError`], so no information is dropped here).
+impl From<ResolveError> for BtfError {
+    fn from(err: ResolveError) -> Self {
+        match err {
+            ResolveError::Io { detail } => Self::Io { detail },
+            ResolveError::BadBtf { reason } => Self::BadBtf { reason },
+        }
+    }
+}
+
 /// Explicit-offset reads for the kcrypto BPF (all u32 byte offsets):
 /// the K0 P2 identity chain plus `task_struct.flags` (kthread via
 /// [`PF_KTHREAD`]) plus the AEAD/ahash length reads (C2). Enter the BPF
@@ -166,13 +229,84 @@ pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
     resolve_offsets_from(&bytes)
 }
 
-/// Pure CONFIG projection (K1 Task 3): the 9 resolved offsets +
-/// [`PF_KTHREAD`] + zero pad → the 76B [`KConfig`] in C2 word order
-/// (K5 appends the attribution tail, zeroed here: Task 3 resolves the
-/// parent/params offsets + flags and fills them).
+/// Resolve the 7 K5 attribution offsets from vmlinux BTF. Unprivileged.
+///
+/// Fail-soft per group (never `Err` for members): each unresolvable
+/// member zeroes its whole group (`parent_ok`/`params_ok` false + group
+/// zeros). Hard [`ResolveError`] only when BTF itself is unreadable
+/// (I/O) or malformed (parse) — the image both callers and the BPF
+/// chase trust must be intact, or nothing resolves.
+///
+/// Params members resolve as DIRECT `crypto_alg` members (the BPF adds
+/// these offsets to the chased `__crt_alg` pointer with no family
+/// knowledge). On this kernel only `cra_blocksize` exists there: the
+/// iv/keysize members live in the per-family containers at NEGATIVE,
+/// family-DIFFERING offsets from the embedded `base` (bpftool-proven on
+/// 7.0: skcipher min/max/iv 20/16/12 bytes BEFORE base, aead iv 12
+/// bytes before base with no key members, hashes with neither) — so
+/// no single base-relative
+/// offset set could serve all families, and `params_ok=false` (with the
+/// whole params group zeroed) is the CORRECT verdict here, not a gap:
+/// emitting family-wrong params would be mislabeled garbage.
+pub fn resolve_kcrypto_offsets() -> Result<KcryptoOffsets, ResolveError> {
+    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| ResolveError::Io {
+        detail: format!("{VMLINUX_BTF}: {err}"),
+    })?;
+    resolve_kcrypto_offsets_from(&bytes)
+}
+
+/// [`resolve_kcrypto_offsets`] over an injected BTF image (test seam).
+fn resolve_kcrypto_offsets_from(bytes: &[u8]) -> Result<KcryptoOffsets, ResolveError> {
+    let btf = Btf::parse(bytes).map_err(|err| match err {
+        BtfError::BadBtf { reason } => ResolveError::BadBtf { reason },
+        // Defensive: the parser only emits `BadBtf` today; any other
+        // shape still means "BTF unusable", with its text preserved.
+        other => ResolveError::BadBtf {
+            reason: other.to_string(),
+        },
+    })?;
+    // Any member error (missing type/member, or a misaligned offset the
+    // BPF could not use) is "unresolvable" → group fail-soft, never Err.
+    let parent = (
+        btf.member_offset("task_struct", "real_parent").ok(),
+        btf.member_offset("task_struct", "tgid").ok(),
+        btf.member_offset("task_struct", "comm").ok(),
+    );
+    let params = (
+        btf.member_offset("crypto_alg", "cra_blocksize").ok(),
+        btf.member_offset("crypto_alg", "cra_ivsize").ok(),
+        btf.member_offset("crypto_alg", "cra_min_keysize").ok(),
+        btf.member_offset("crypto_alg", "cra_max_keysize").ok(),
+    );
+    let (parent_ok, (task_real_parent, task_tgid, task_comm)) = match parent {
+        (Some(rp), Some(tgid), Some(comm)) => (true, (rp, tgid, comm)),
+        _ => (false, (0, 0, 0)),
+    };
+    let (params_ok, (cra_blocksize, cra_ivsize, cra_min_keysize, cra_max_keysize)) = match params {
+        (Some(bs), Some(iv), Some(min), Some(max)) => (true, (bs, iv, min, max)),
+        _ => (false, (0, 0, 0, 0)),
+    };
+    Ok(KcryptoOffsets {
+        task_real_parent,
+        task_tgid,
+        task_comm,
+        cra_blocksize,
+        cra_ivsize,
+        cra_min_keysize,
+        cra_max_keysize,
+        parent_ok,
+        params_ok,
+    })
+}
+
+/// Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail): the 9
+/// resolved offsets + [`PF_KTHREAD`] + zero pad → the 76B [`KConfig`]
+/// in C2 word order, with the 7 K5 attribution offsets + flags
+/// (`parent_ok`/`params_ok` nonzero iff the group resolved — a false
+/// flag pairs with group zeros by [`resolve_kcrypto_offsets`]).
 /// Total (no failure mode: every input word is copied verbatim).
 #[must_use]
-pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
+pub fn kconfig_from_offsets(off: CryptoOffsets, k5: KcryptoOffsets) -> KConfig {
     KConfig {
         sk_req_base: off.sk_req_base,
         async_tfm: off.async_tfm,
@@ -185,18 +319,15 @@ pub fn kconfig_from_offsets(off: CryptoOffsets) -> KConfig {
         ahash_nbytes_off: off.ahash_nbytes_off,
         shash_base: off.shash_base,
         _pad: 0,
-        // K5 attribution tail: zeros until Task 3 wires resolution
-        // (`parent_ok == 0` / `params_ok == 0` = chases disabled,
-        // fail-soft by construction).
-        task_real_parent: 0,
-        task_tgid: 0,
-        task_comm: 0,
-        cra_blocksize: 0,
-        cra_ivsize: 0,
-        cra_min_keysize: 0,
-        cra_max_keysize: 0,
-        parent_ok: 0,
-        params_ok: 0,
+        task_real_parent: k5.task_real_parent,
+        task_tgid: k5.task_tgid,
+        task_comm: k5.task_comm,
+        cra_blocksize: k5.cra_blocksize,
+        cra_ivsize: k5.cra_ivsize,
+        cra_min_keysize: k5.cra_min_keysize,
+        cra_max_keysize: k5.cra_max_keysize,
+        parent_ok: u8::from(k5.parent_ok),
+        params_ok: u8::from(k5.params_ok),
         _pad2: [0, 0],
     }
 }
@@ -286,17 +417,24 @@ fn system_object() -> ObjectRef {
     }
 }
 
-/// Single configured entry for K2: resolve BTF ids + offsets → load →
-/// write KCFG → attach every loaded point system-wide.
+/// Single configured entry for K2: resolve BTF ids + offsets (+ K5
+/// attribution offsets, fail-soft) → load → write KCFG → attach every
+/// loaded point system-wide.
 ///
 /// Physical order is resolve → load → write → attach (the KCFG write
 /// needs the loaded map fd, so it cannot precede the load): KCFG lands
 /// BEFORE any attach, so no observation runs unconfigured (the BPF
 /// `pf_kthread` gate would skip it anyway).
 ///
-/// `token` reuses the [`load_kcrypto`] convention (`None` loads with
-/// privilege, `Some` with a borrowed BPF token fd); the attach step
-/// always needs privilege (the tracing link carries no token field).
+/// `token_fd` reuses the [`load_kcrypto`] convention (`None` loads with
+/// privilege, `Some` with a borrowed BPF token fd — threaded to map
+/// create + prog load; `None` preserves today's behavior byte-for-byte).
+/// The attach step carries no token field of its own (UAPI provides
+/// none, and Task 1 proved the kernel demands no `link_create`
+/// delegation: `DELEGATE_CMDS=map_create:prog_load`): a token-loaded
+/// program remembers its token, and the kernel authorizes the fexit
+/// link against it — so `Some` attaches work unprivileged against the
+/// token-loaded progs, while `None` needs privilege as before.
 /// Per-point outcomes surface in the returned [`ConfiguredPoint`]s in
 /// parsed-program order (load verdict + attach verdict each).
 ///
@@ -313,17 +451,21 @@ fn system_object() -> ObjectRef {
 /// returns the per-point outcomes in the error.
 pub fn load_kcrypto_configured(
     object_bytes: &[u8],
-    token: Option<RawFd>,
+    token_fd: Option<RawFd>,
 ) -> Result<(ConfiguredKcrypto, Vec<ConfiguredPoint>), ConfiguredError> {
     let ids = resolve_btf_ids().map_err(ConfiguredError::Resolve)?;
     let off = resolve_offsets().map_err(ConfiguredError::Resolve)?;
+    // Fail-soft member cases ride INSIDE `k5` (flags + zeros); only a
+    // BTF image that vanished mid-bring-up fails here (fail-closed: the
+    // two resolutions above already trusted that same image).
+    let k5 = resolve_kcrypto_offsets().map_err(|err| ConfiguredError::Resolve(err.into()))?;
     let entries: Vec<(String, u32)> = KCRYPTO_SYMBOLS
         .iter()
         .map(|name| ((*name).to_owned(), ids[*name]))
         .collect();
     let (loaded, statuses) =
-        load_kcrypto(object_bytes, &entries, token).map_err(ConfiguredError::Load)?;
-    let cfg = kconfig_from_offsets(off);
+        load_kcrypto(object_bytes, &entries, token_fd).map_err(ConfiguredError::Load)?;
+    let cfg = kconfig_from_offsets(off, k5);
     map_update_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
@@ -673,8 +815,13 @@ impl<'a> Btf<'a> {
     }
 
     /// Member search under struct/union `id`: `Ok(None)` when absent
-    /// here (callers keep looking outward); misaligned offsets are
-    /// `BadBtf` (fail-closed: our reads are all byte-aligned).
+    /// here (callers keep looking outward). Alignment/bitfield checks
+    /// apply ONLY to the sought member and to anonymous members on the
+    /// descent path (fail-closed: our reads are all byte-aligned, and a
+    /// bitfield has no byte offset to read): non-sought members —
+    /// including bitfields elsewhere in the struct (K5: `task_struct`
+    /// carries bitfields before `real_parent`/`tgid`/`comm`) — are
+    /// skipped, never fatal.
     fn member_at(
         &self,
         id: u32,
@@ -695,23 +842,35 @@ impl<'a> Btf<'a> {
             let name_off = read_u32(self.bytes, at, "member name_off")?;
             let mtype = read_u32(self.bytes, at + 4, "member type")?;
             let raw = read_u32(self.bytes, at + 8, "member offset")?;
+            // Corrupt string refs still fail closed (a skipped name
+            // could hide the record we want and misreport it as
+            // missing) — but a name that simply is not ours skips.
+            let wanted = name_off != 0 && self.str_at(name_off)? == member.as_bytes();
+            let descend = name_off == 0 && mtype != 0;
+            if !wanted && !descend {
+                continue;
+            }
             // Bit offset: low 24 bits when the kind flag marks
             // bitfield packing, the whole word otherwise (BTF spec).
+            // A nonzero high byte under the kind flag marks a BITFIELD
+            // (width in bits): it has no byte offset, so a sought (or
+            // descended) bitfield fails closed like a misalignment.
             let bits = if rec.kind_flag {
                 raw & 0x00ff_ffff
             } else {
                 raw
             };
-            if !bits.is_multiple_of(8) {
+            let bitfield = rec.kind_flag && raw >> 24 != 0;
+            if bitfield || !bits.is_multiple_of(8) {
                 return Err(bad(format!(
                     "member at {at:#x} is not byte-aligned ({bits} bits)"
                 )));
             }
             let base = bits / 8;
-            if name_off != 0 && self.str_at(name_off)? == member.as_bytes() {
+            if wanted {
                 return Ok(Some(base));
             }
-            if name_off == 0 && mtype != 0 {
+            if descend {
                 // Anonymous member: descend into struct/union shapes
                 // (through const/typedef wrappers), offsets add.
                 let mut inner = Some(mtype);
@@ -947,7 +1106,9 @@ mod tests {
     fn misaligned_member_is_bad_btf() {
         // `bbb` at 7 bits: not byte-aligned, must fail closed (our 9
         // reads are all byte-aligned; a sub-byte offset is a wrong
-        // assumption, never a guess).
+        // assumption, never a guess). The ALIGNED sibling still
+        // resolves: checks apply to the sought member only (K5:
+        // `task_struct` bitfields must not break the parent chase).
         let mut bytes = fixture();
         // [3] aux starts at 24 (hdr) + 12 ([1]) + 12 ([2]) + 12 ([3] hdr).
         let m1_off_at = 24 + 12 + 12 + 12 + 12 + 8;
@@ -955,6 +1116,46 @@ mod tests {
         let btf = Btf::parse(&bytes).expect("shape still parses");
         assert!(matches!(
             btf.member_offset("tstruct", "bbb"),
+            Err(BtfError::BadBtf { .. })
+        ));
+        assert_eq!(btf.member_offset("tstruct", "aaa").unwrap(), 0);
+    }
+
+    /// Kind-flagged struct with a leading 1-bit field: `bf1` (width 1,
+    /// bit 0) then `good` (width 0, bit 64 = byte 8).
+    fn bitfield_fixture() -> Vec<u8> {
+        let mut b = BtfBuild::new();
+        let o_mixed = b.str("mixed");
+        let o_bf1 = b.str("bf1");
+        let o_good = b.str("good");
+        // [1] INT (shared member type).
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        // [2] STRUCT mixed { bf1: 1-bit field, good @ byte 8 }.
+        b.rec(o_mixed, KIND_STRUCT, 2, true, 16);
+        b.member(o_bf1, 1, 1 << 24);
+        b.member(o_good, 1, 64);
+        b.finish()
+    }
+
+    #[test]
+    fn sought_member_past_bitfield_resolves() {
+        // The K5 `task_struct` shape: a bitfield BEFORE the sought
+        // member skips (never fatal), and the sought member resolves.
+        let bytes = bitfield_fixture();
+        let btf = Btf::parse(&bytes).expect("fixture must parse");
+        assert_eq!(btf.member_offset("mixed", "good").unwrap(), 8);
+    }
+
+    #[test]
+    fn sought_bitfield_fails_closed() {
+        // A bitfield has no byte offset to read: seeking one fails
+        // closed (BTF spec: nonzero width in the high byte under the
+        // kind flag), never a guessed byte read.
+        let bytes = bitfield_fixture();
+        let btf = Btf::parse(&bytes).expect("fixture must parse");
+        assert!(matches!(
+            btf.member_offset("mixed", "bf1"),
             Err(BtfError::BadBtf { .. })
         ));
     }
@@ -1032,10 +1233,11 @@ mod tests {
 
     #[test]
     fn kconfig_from_offsets_lays_out_c2_words() {
-        // Pure CONFIG projection (K1 Task 3): the 9 resolved offsets +
-        // PF_KTHREAD + zero pad → the 76B KCFG wire layout in C2 word
-        // order (brief Step 1: KCFG bytes equal the resolved offsets;
-        // K5 appends a zeroed attribution tail until Task 3 wires it).
+        // Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail): the 9
+        // resolved offsets + PF_KTHREAD + zero pad → the 76B KCFG wire
+        // layout in C2 word order, with the K5 attribution offsets +
+        // flags verbatim in the tail (a false flag pairs with group
+        // zeros — here the params group is off, so its words are 0).
         let off = CryptoOffsets {
             sk_req_base: 32,
             async_tfm: 32,
@@ -1047,17 +1249,139 @@ mod tests {
             ahash_nbytes_off: 48,
             shash_base: 8,
         };
-        let cfg = kconfig_from_offsets(off);
+        let k5 = KcryptoOffsets {
+            task_real_parent: 1432,
+            task_tgid: 1424,
+            task_comm: 1648,
+            cra_blocksize: 0,
+            cra_ivsize: 0,
+            cra_min_keysize: 0,
+            cra_max_keysize: 0,
+            parent_ok: true,
+            params_ok: false,
+        };
+        let cfg = kconfig_from_offsets(off, k5);
         let mut want = [0u8; 76];
-        for (i, word) in [32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 8, 0]
-            .iter()
-            .enumerate()
+        for (i, word) in [
+            32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 8, 0, 1432, 1424, 1648, 0, 0, 0, 0,
+        ]
+        .iter()
+        .enumerate()
         {
             want[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
-        // K5 tail: 7 zero offsets + zero flags + zero pad.
-        assert_eq!(want[44..], [0u8; 32]);
+        want[72] = 1;
+        want[73] = 0;
         assert_eq!(cfg.to_bytes(), want);
+    }
+
+    /// Synthetic K5 image: `task_struct` with the 3 parent members +
+    /// `crypto_alg` with the 4 params members. `drop` omits one member
+    /// entirely (group fail-soft proof).
+    fn k5_fixture(drop: Option<(&str, &str)>) -> Vec<u8> {
+        let mut b = BtfBuild::new();
+        // [1] INT (shared member type).
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        let mut named = |name: &str, members: &[(&str, u32)]| {
+            let kept: Vec<(&str, u32)> = members
+                .iter()
+                .copied()
+                .filter(|(member, _)| drop != Some((name, *member)))
+                .collect();
+            let o_name = b.str(name);
+            b.rec(o_name, KIND_STRUCT, kept.len() as u32, false, 4096);
+            for (member, byte) in kept {
+                let o_member = b.str(member);
+                b.member(o_member, 1, byte * 8);
+            }
+        };
+        named(
+            "task_struct",
+            &[("real_parent", 1432), ("tgid", 1424), ("comm", 1648)],
+        );
+        named(
+            "crypto_alg",
+            &[
+                ("cra_blocksize", 36),
+                ("cra_ivsize", 400),
+                ("cra_min_keysize", 404),
+                ("cra_max_keysize", 408),
+            ],
+        );
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_k5_offsets_resolve_exact() {
+        let bytes = k5_fixture(None);
+        let off = resolve_kcrypto_offsets_from(&bytes).expect("K5 fixture resolves");
+        assert_eq!(
+            off,
+            KcryptoOffsets {
+                task_real_parent: 1432,
+                task_tgid: 1424,
+                task_comm: 1648,
+                cra_blocksize: 36,
+                cra_ivsize: 400,
+                cra_min_keysize: 404,
+                cra_max_keysize: 408,
+                parent_ok: true,
+                params_ok: true,
+            }
+        );
+    }
+
+    #[test]
+    fn synthetic_k5_missing_member_fails_soft_per_group() {
+        // One missing parent member zeroes the PARENT group only (flags
+        // + offsets); the params group still resolves fully.
+        let bytes = k5_fixture(Some(("task_struct", "tgid")));
+        let off = resolve_kcrypto_offsets_from(&bytes).expect("fail-soft never errs");
+        assert!(!off.parent_ok);
+        assert_eq!(
+            (off.task_real_parent, off.task_tgid, off.task_comm),
+            (0, 0, 0)
+        );
+        assert!(off.params_ok);
+        assert_eq!(
+            (
+                off.cra_blocksize,
+                off.cra_ivsize,
+                off.cra_min_keysize,
+                off.cra_max_keysize
+            ),
+            (36, 400, 404, 408)
+        );
+        // One missing params member zeroes the PARAMS group only (even
+        // though `cra_blocksize` itself resolves — group-atomic).
+        let bytes = k5_fixture(Some(("crypto_alg", "cra_ivsize")));
+        let off = resolve_kcrypto_offsets_from(&bytes).expect("fail-soft never errs");
+        assert!(off.parent_ok);
+        assert_eq!(
+            (off.task_real_parent, off.task_tgid, off.task_comm),
+            (1432, 1424, 1648)
+        );
+        assert!(!off.params_ok);
+        assert_eq!(
+            (
+                off.cra_blocksize,
+                off.cra_ivsize,
+                off.cra_min_keysize,
+                off.cra_max_keysize
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn synthetic_k5_malformed_btf_is_hard_err() {
+        // Unreadable IMAGE (not members): truncated bytes fail hard as
+        // `BadBtf` (fail-closed: nothing resolves off a broken image).
+        let bytes = k5_fixture(None);
+        let err = resolve_kcrypto_offsets_from(&bytes[..bytes.len() / 2])
+            .expect_err("truncated image must fail");
+        assert!(matches!(err, ResolveError::BadBtf { .. }), "got {err}");
     }
 
     #[test]
