@@ -131,6 +131,7 @@ pub fn run_report_live(
     duration: Option<u64>,
     format: ReportFormat,
     out: Option<&Path>,
+    token: Option<&Path>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -141,6 +142,7 @@ pub fn run_report_live(
         source: source.to_owned(),
         duration_secs: Some(report_window_secs(duration)),
         tick_ms: DEFAULT_TICK_MS,
+        token: token.map(Path::to_owned),
     };
     finish_report_live(
         run_live_capture(&cfg, &crate::cmd_watch::live_runtime()),

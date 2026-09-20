@@ -94,7 +94,7 @@ fn backends_json_shape_case() {
     }
 }
 
-const PROBE_NAMES: [&str; 17] = [
+const PROBE_NAMES: [&str; 18] = [
     "kernel_release",
     "bpf_syscall",
     "map_create",
@@ -113,6 +113,8 @@ const PROBE_NAMES: [&str; 17] = [
     "kcrypto_symbols",
     "kcrypto_attach",
     "lockdown",
+    // K5: delegation probe, appended last, never reordered.
+    "token_delegated",
 ];
 
 /// K2.3 verdict dimensions (brief-exact spellings).
@@ -202,7 +204,7 @@ fn doctor_json_shape_case() {
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("doctor json");
     let probes = json["probes"].as_array().expect("probes array");
-    assert_eq!(probes.len(), 17);
+    assert_eq!(probes.len(), 18);
     for (probe, want) in probes.iter().zip(PROBE_NAMES) {
         assert_eq!(probe["name"], want);
         let outcome = probe["outcome"].as_str().expect("outcome");
@@ -241,6 +243,31 @@ fn doctor_json_shape_case() {
             "bad verdict dimension {piece}"
         );
     }
+}
+
+#[test]
+fn token_status_case() {
+    // K5: read-only, unprivileged, exit 0 on any box; the built binary
+    // carries no file caps and no pin exists here.
+    let output = run(&["token", "status"]);
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("caps: none not-effective"),
+        "caps line: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("pin: absent unreadable"),
+        "pin line: {stdout:?}"
+    );
+    // Missing target reports with a reason, still exit 0.
+    let output = run(&["token", "status", "--bin", "/nonexistent-k5-zzz"]);
+    assert!(output.status.success());
+    assert!(stdout_of(&output).contains("caps: unreadable ("));
+    // Mint grammar errors are usage errors (exit 2), never panics.
+    let output = run(&["token"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_of(&output).contains("usage:"));
 }
 
 #[test]

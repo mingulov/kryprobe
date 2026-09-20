@@ -86,6 +86,13 @@ pub struct MatchSpec {
     /// Context kind (`process`/`kthread`/`softirq`/…).
     #[serde(default)]
     pub context: Option<String>,
+    /// Process comm glob (K5: D5 `*`/`?`; matches who-row `comm`).
+    #[serde(default)]
+    pub comm: Option<String>,
+    /// Exact uid match (K5: a YAML u32; anything else is a policy
+    /// parse error, exit 2 at the CLI).
+    #[serde(default)]
+    pub uid: Option<u32>,
 }
 
 impl MatchSpec {
@@ -102,6 +109,8 @@ impl MatchSpec {
             && self.operation.is_none()
             && self.result.is_none()
             && self.context.is_none()
+            && self.comm.is_none()
+            && self.uid.is_none()
     }
 }
 
@@ -125,6 +134,13 @@ impl std::fmt::Display for PolicyError {
 }
 
 impl std::error::Error for PolicyError {}
+
+/// Parses one rule YAML doc (K5 Task 5 surface for single-rule
+/// checks; full policy docs use [`parse_policy`]). Same rejections:
+/// malformed YAML or unknown keys fail.
+pub fn parse_rule(text: &str) -> Result<Rule, PolicyError> {
+    serde_yaml::from_str(text).map_err(|err| PolicyError::new(format!("invalid rule: {err}")))
+}
 
 /// Parses policy YAML: exact shape, unknown keys rejected, only
 /// `version: 1` accepted.
@@ -154,6 +170,32 @@ mod tests {
             }
             .is_empty()
         );
+        // K5 keys constrain too.
+        assert!(
+            !MatchSpec {
+                comm: Some("py*".to_owned()),
+                ..MatchSpec::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !MatchSpec {
+                uid: Some(1000),
+                ..MatchSpec::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_rule_pins_single_rule_shape() {
+        let rule = parse_rule(
+            "id: x\nsource: kernel-crypto\nmatch: {uid: 1000, comm: 'py*'}\ndecision: deny\n",
+        )
+        .expect("rule parses");
+        assert_eq!(rule.match_spec.uid, Some(1000));
+        assert_eq!(rule.match_spec.comm.as_deref(), Some("py*"));
+        assert!(parse_rule("id: x\nmatch: {bogus: 1}\n").is_err());
     }
 
     #[test]

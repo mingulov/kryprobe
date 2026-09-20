@@ -3,8 +3,11 @@
 //! driven per-tick against a session-owned sensor.
 //!
 //! Flow (D1): registry + [`register_kcrypto`] → gate check → `detect` →
-//! `plan` (Trace) → `configure` once → tick loop (`snapshot_rows` → raw
-//! events in row order → `decode` each with a session [`IdIssuer`]) →
+//! `plan` (Trace) → K5 token/caps pre-flight → `configure` once → tick
+//! loop (`snapshot_rows` → raw events in row order → `decode` each
+//! with a session [`IdIssuer`], then `snapshot_who` → who rows via
+//! [`observation_for_who`](kryprobe_privilege::kcrypto_backend::observation_for_who)
+//! with once-per-tick kallsyms) →
 //! `finalize` ONCE → [`DriverReport::feed_shared_losses`] ONCE from
 //! measured drop counters only.
 //!
@@ -65,12 +68,15 @@ use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredError, ConfiguredKcrypto, KCRYPTO_SYMBOLS, load_kcrypto_configured,
 };
-use kryprobe_privilege::kcrypto_backend::register_kcrypto;
+use kryprobe_privilege::kallsyms::read_kallsyms;
+use kryprobe_privilege::kcrypto_backend::{observation_for_who, register_kcrypto, snapshot_who};
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_for_agg, raw_event_for_ident,
     raw_event_for_totals, shared_losses_from_snapshot, snapshot_rows,
 };
 use kryprobe_privilege::mapops::{MapOpsError, map_lookup_bytes};
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -87,7 +93,7 @@ pub const DEFAULT_TICK_MS: u64 = 1000;
 /// closed-stdin stops a session promptly.
 const STOP_POLL_MS: u64 = 50;
 
-/// Live capture configuration (brief-exact shape).
+/// Live capture configuration (brief-exact shape + the K5 token path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConfig {
     /// Capture source; only [`LIVE_SOURCE`] is supported.
@@ -100,15 +106,20 @@ pub struct LiveConfig {
     pub duration_secs: Option<u64>,
     /// Tick cadence in milliseconds.
     pub tick_ms: u64,
+    /// Explicit BPF token path (K5: first in the `--token` >
+    /// `KRYPROBE_TOKEN` > default-pin discovery order; `None` consults
+    /// env + default only).
+    pub token: Option<PathBuf>,
 }
 
 impl Default for LiveConfig {
-    /// `kernel-crypto`, unbounded, 1000ms ticks.
+    /// `kernel-crypto`, unbounded, 1000ms ticks, no explicit token.
     fn default() -> Self {
         Self {
             source: LIVE_SOURCE.to_owned(),
             duration_secs: None,
             tick_ms: DEFAULT_TICK_MS,
+            token: None,
         }
     }
 }
@@ -499,7 +510,23 @@ pub fn run_live_capture_with_registry(
     let object_bytes = std::fs::read(&object_path).map_err(|err| {
         LiveError::Unusable(format!("kcrypto object {}: {err}", object_path.display()))
     })?;
-    let (sensor, points) = load_kcrypto_configured(&object_bytes, None).map_err(configured_err)?;
+    // K5 bring-up authority: the first usable token in discovery order
+    // (`--token` > `KRYPROBE_TOKEN` > default pin), held across the
+    // session-twin load below. No usable token and no process caps is
+    // the honest exit-4 naming `token mint` — refused AFTER the object
+    // resolves (a missing object is its own exit-4 with its own name)
+    // but BEFORE either twin loads (the backend twin in `configure`
+    // loads with privilege via the frozen trait, so a doomed
+    // unprivileged run must not start it either).
+    let token = crate::cmd_token::usable_token(cfg.token.as_deref());
+    if token.is_none() && !crate::cmd_token::process_has_bpf_caps() {
+        return Err(LiveError::Unusable(crate::cmd_token::no_mechanism_reason(
+            cfg.token.as_deref(),
+        )));
+    }
+    let token_fd = token.as_ref().map(|file| file.as_raw_fd());
+    let (sensor, points) =
+        load_kcrypto_configured(&object_bytes, token_fd).map_err(configured_err)?;
     backend
         .configure(
             &mut ConfigureContext {
@@ -567,6 +594,23 @@ pub fn run_live_capture_with_registry(
                 .decode(&decode_ctx, raw_event_for_ident(ident))
                 .map_err(|err| LiveError::Internal(format!("live decode ident: {err}")))?;
             observations.push(observation);
+        }
+        // K5 attribution: who rows decode from the session sensor's
+        // who maps on the same tick. Kallsyms is read ONCE per tick
+        // (a file read — per-row would be wasteful; per-session would
+        // go stale across module load/unload) and shared across all
+        // rows; ids draw from the session issuer so who rows sequence
+        // with the tick's other rows. Per-tick who drops are NOT fed
+        // here — `finalize` merges them (Task 4), and the shared feed
+        // only speaks ring/queue counters.
+        let kallsyms = read_kallsyms();
+        let (whos, _who_drops) = snapshot_who(&sensor)
+            .map_err(|err| LiveError::Internal(format!("live snapshot who: {err}")))?;
+        for who in &whos {
+            let id = issuer
+                .issue()
+                .map_err(|_| LiveError::Internal("live who id exhausted".to_owned()))?;
+            observations.push(observation_for_who(who, id, &kallsyms));
         }
         overflow_identities = overflow_identities.saturating_add(snap.overflow_identities);
         let stopped =

@@ -143,6 +143,7 @@ fn live_gate_fail_names_gate() {
         source: "kernel-crypto".to_owned(),
         duration_secs: Some(0),
         tick_ms: 1000,
+        token: None,
     };
     let runtime = kryprobe_core::capability::RuntimeCapabilities {
         kernel_release: "test".to_owned(),
@@ -252,6 +253,7 @@ fn open_session() -> (
             source: "kernel-crypto".to_owned(),
             duration_secs: Some(0),
             tick_ms: 1000,
+            token: None,
         },
         kryprobe_core::capability::RuntimeCapabilities {
             kernel_release: "test".to_owned(),
@@ -648,6 +650,7 @@ fn live_capture_proves_session() {
         source: "kernel-crypto".to_owned(),
         duration_secs: Some(8),
         tick_ms: 1000,
+        token: None,
     };
     let outcome = kryprobe_cli::live::run_live_capture(&cfg, &lane_runtime())
         .unwrap_or_else(|err| panic!("live capture failed: {err}"));
@@ -825,6 +828,7 @@ fn live_capture_proves_session() {
         source: "kernel-crypto".to_owned(),
         duration_secs: Some(0),
         tick_ms: 1000,
+        token: None,
     };
     let outcome0 = kryprobe_cli::live::run_live_capture(&cfg0, &lane_runtime())
         .unwrap_or_else(|err| panic!("zero-window capture failed: {err}"));

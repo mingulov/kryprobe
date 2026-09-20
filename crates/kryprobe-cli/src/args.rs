@@ -15,12 +15,15 @@ commands:
   selftest bpf [--calls N] [--out F]
                                BPF pipeline against spine_fixture
   selftest token-smoke         root token roundtrip (needs root)
-  watch --system [--source S] [--duration N]
+  token mint [--bin PATH] [--receipt PATH] [--force]
+                               root one-shot file-cap grant + receipt (setcap)
+  token status [--bin PATH]     file caps + token-pin usability (never privileged)
+  watch --system [--source S] [--duration N] [--token PATH]
                                continuous system-wide observe (live kcrypto)
-  report --system [--duration N] [--format human|json] [--out F] [--source S]
+  report --system [--duration N] [--format human|json] [--out F] [--source S] [--token PATH]
                                bounded system-wide capture + render (live kcrypto)
   report FILE                  validate + render a JSONL stream
-  check --system --policy F [--duration N] [--source S]
+  check --system --policy F [--duration N] [--source S] [--token PATH]
                                system-wide policy check (exit 10 on violation)
   import FILE                  import an osslscope/p11scope doc as shell JSONL
   plan|observe|run ...         unsupported in thin spine (exit 4)
@@ -70,6 +73,21 @@ pub enum Command {
     SelftestBpf { calls: u64, out: Option<PathBuf> },
     /// Root token roundtrip.
     SelftestToken,
+    /// Root one-shot file-cap grant (`token mint`): `--bin` target
+    /// (default: current exe), `--receipt` copy, `--force` overwrite.
+    TokenMint {
+        /// Binary to grant caps on (`None` selects the current exe).
+        bin: Option<PathBuf>,
+        /// Receipt copy destination (`None` prints stdout only).
+        receipt: Option<PathBuf>,
+        /// Overwrite an existing receipt.
+        force: bool,
+    },
+    /// File caps + token-pin usability (`token status`, unprivileged).
+    TokenStatus {
+        /// Binary to inspect (`None` selects the current exe).
+        bin: Option<PathBuf>,
+    },
     /// Continuous system-wide observe (`--system` select-all; live
     /// kcrypto capture). `duration` is an optional window in seconds;
     /// `None` observes until interrupted.
@@ -78,6 +96,8 @@ pub enum Command {
         source: String,
         /// Optional capture window in seconds.
         duration: Option<u64>,
+        /// Explicit BPF token path (overrides env + default pin).
+        token: Option<PathBuf>,
     },
     /// Validate + render a stream.
     Report { file: PathBuf },
@@ -93,6 +113,8 @@ pub enum Command {
         format: ReportFormat,
         /// Output file, or stdout when `None`.
         out: Option<PathBuf>,
+        /// Explicit BPF token path (overrides env + default pin).
+        token: Option<PathBuf>,
     },
     /// System-wide policy check (live kcrypto capture evaluated
     /// against the policy; exit 10 on confirmed violation).
@@ -103,6 +125,8 @@ pub enum Command {
         duration: Option<u64>,
         /// Policy file (required: v0.1 has no default policy).
         policy: PathBuf,
+        /// Explicit BPF token path (overrides env + default pin).
+        token: Option<PathBuf>,
     },
     /// Import one osslscope report or p11scope profile doc as shell
     /// JSONL (unpriv; exit 0 ok, 2 bad input/unknown marker, 1 internal).
@@ -179,6 +203,12 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
                 return Err(usage("import: --json is not supported"));
             }
             crate::args_sub::parse_import(args)?
+        }
+        "token" => {
+            if json {
+                return Err(usage("token: --json is not supported"));
+            }
+            crate::args_sub::parse_token(args)?
         }
         "plan" | "observe" | "run" => {
             if json {
@@ -332,6 +362,7 @@ mod tests {
             Command::Watch {
                 source: "kernel-crypto".to_owned(),
                 duration: None,
+                token: None,
             }
         );
         assert_eq!(
@@ -341,6 +372,7 @@ mod tests {
             Command::Watch {
                 source: "kernel-crypto".to_owned(),
                 duration: Some(60),
+                token: None,
             }
         );
         assert_eq!(
@@ -350,6 +382,7 @@ mod tests {
             Command::Watch {
                 source: "kernel-crypto".to_owned(),
                 duration: None,
+                token: None,
             }
         );
         for bad in [
@@ -383,6 +416,7 @@ mod tests {
                 duration: None,
                 format: ReportFormat::Human,
                 out: None,
+                token: None,
             }
         );
         assert_eq!(
@@ -403,6 +437,7 @@ mod tests {
                 duration: Some(60),
                 format: ReportFormat::Json,
                 out: Some(PathBuf::from("o.json")),
+                token: None,
             }
         );
         for bad in [
@@ -430,6 +465,7 @@ mod tests {
                 source: "kernel-crypto".to_owned(),
                 duration: None,
                 policy: PathBuf::from("p.yaml"),
+                token: None,
             }
         );
         assert_eq!(
@@ -447,6 +483,7 @@ mod tests {
                 source: "kernel-crypto".to_owned(),
                 duration: Some(60),
                 policy: PathBuf::from("p.yaml"),
+                token: None,
             }
         );
         for bad in [
@@ -510,6 +547,7 @@ mod tests {
             "check --system --policy",
             "--source",
             "--duration",
+            "--token",
         ] {
             assert!(USAGE.contains(needle), "usage misses {needle:?}:\n{USAGE}");
         }
@@ -573,6 +611,121 @@ mod tests {
                 Command::Stub {
                     name: sub.to_owned()
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn k5_token_grammars() {
+        // Bare verbs with all-defaults.
+        assert_eq!(
+            parse(&argv(&["token", "mint"])).unwrap().command,
+            Command::TokenMint {
+                bin: None,
+                receipt: None,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["token", "status"])).unwrap().command,
+            Command::TokenStatus { bin: None }
+        );
+        // Full mint spelling.
+        assert_eq!(
+            parse(&argv(&[
+                "token",
+                "mint",
+                "--bin",
+                "k",
+                "--receipt",
+                "r.json",
+                "--force",
+            ]))
+            .unwrap()
+            .command,
+            Command::TokenMint {
+                bin: Some(PathBuf::from("k")),
+                receipt: Some(PathBuf::from("r.json")),
+                force: true,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["token", "status", "--bin", "k"]))
+                .unwrap()
+                .command,
+            Command::TokenStatus {
+                bin: Some(PathBuf::from("k")),
+            }
+        );
+        for bad in [
+            vec!["token"],
+            vec!["token", "frobnicate"],
+            vec!["token", "mint", "--bin"],
+            vec!["token", "mint", "--receipt"],
+            vec!["token", "mint", "extra"],
+            vec!["token", "mint", "--pin", "p"],
+            vec!["token", "status", "--receipt", "r"],
+            vec!["token", "status", "extra"],
+            vec!["--json", "token", "mint"],
+            vec!["--json", "token", "status"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "args {bad:?} must be a usage error"
+            );
+        }
+        assert!(
+            USAGE.contains("token mint") && USAGE.contains("token status"),
+            "usage lists token mint|status:\n{USAGE}"
+        );
+    }
+
+    #[test]
+    fn k5_live_commands_accept_token_path() {
+        assert_eq!(
+            parse(&argv(&["watch", "--system", "--token", "t"]))
+                .unwrap()
+                .command,
+            Command::Watch {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                token: Some(PathBuf::from("t")),
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["report", "--system", "--token", "t"]))
+                .unwrap()
+                .command,
+            Command::ReportLive {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                format: ReportFormat::Human,
+                out: None,
+                token: Some(PathBuf::from("t")),
+            }
+        );
+        assert_eq!(
+            parse(&argv(&[
+                "check", "--system", "--policy", "p.yaml", "--token", "t",
+            ]))
+            .unwrap()
+            .command,
+            Command::Check {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                policy: PathBuf::from("p.yaml"),
+                token: Some(PathBuf::from("t")),
+            }
+        );
+        for bad in [
+            vec!["watch", "--system", "--token"],
+            vec!["report", "--system", "--token"],
+            vec!["check", "--system", "--policy", "p.yaml", "--token"],
+            vec!["report", "s.jsonl", "--token", "t"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "args {bad:?} must be a usage error"
             );
         }
     }

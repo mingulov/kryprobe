@@ -277,6 +277,22 @@ fn k5_who_row_first_errno_rule() {
 }
 
 #[test]
+fn k5_who_row_negative_stack_id_renders_empty_frames() {
+    // Task 4 review M1: a negative `stack` (raw helper errno) has no
+    // KSTACK row, so `frames` is empty and `id` echoes the errno.
+    let mut snap = who_snapshot(false, false);
+    snap.val.stack = -14;
+    snap.stack_ips = Vec::new();
+    let obs = observation_for_who(&snap, ObservationId::new(5), TINY_MAP);
+    let stack = obs.backend_payload.get("stack").expect("stack block");
+    assert_eq!(stack.get("id").and_then(Value::as_i64), Some(-14));
+    assert_eq!(
+        stack.get("frames").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+}
+
+#[test]
 fn k5_who_row_frames_null_when_unresolvable() {
     let snap = who_snapshot(false, false);
     let obs = observation_for_who(&snap, ObservationId::new(4), "garbage\n");

@@ -122,6 +122,20 @@ fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
     {
         return false;
     }
+    // K5 attribution keys: `comm` is a D5 glob over the payload `comm`
+    // (missing reads as `""`, like every other glob key); `uid` is an
+    // exact u32 over the payload `uid` number (missing or non-numeric
+    // never matches).
+    if let Some(pattern) = &spec.comm
+        && !glob::matches(pattern, payload_str(payload, "comm"))
+    {
+        return false;
+    }
+    if let Some(uid) = spec.uid
+        && payload.get("uid").and_then(serde_json::Value::as_u64) != Some(u64::from(uid))
+    {
+        return false;
+    }
     true
 }
 

@@ -14,14 +14,21 @@ use kryprobe_core::capability::RuntimeCapabilities;
 use kryprobe_core::enums::CoverageStatus;
 use kryprobe_core::evidence::{CoverageSummary, NativeObservation};
 use kryprobe_privilege::probe::{
-    ProbeOutcome, attach_cookies, btf_present, cap_names, ringbuf_create, uprobe_multi_link_self,
+    ProbeOutcome, attach_cookies, btf_present, ringbuf_create, uprobe_multi_link_self,
     userns_create,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 
 /// Exact table header (brief-exact column set).
 const HEADER: &str = "FAMILY OP ALGORITHM DRIVER CALLS BYTES OK QUEUED ERRORS";
+
+/// WHO block column header (spec §2.3: `KH TGID COMM UID CALLS`).
+pub const WHO_HEADER: &str = "KH TGID COMM UID CALLS";
+
+/// Max WHO rows rendered; the rest collapse into the `+N more` trailer.
+pub const WHO_MAX_ROWS: usize = 32;
 
 /// Accumulated counters for one rendered row.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -129,10 +136,94 @@ pub fn trailer_dims(coverage: &CoverageSummary) -> Vec<&'static str> {
     dims
 }
 
+/// One who-row `calls` tally (0 when the shape is absent — real
+/// decodes always carry it; only hand-fed shapes can miss it).
+fn who_calls(obs: &NativeObservation) -> u64 {
+    obs.backend_payload
+        .get("calls")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Who-row dedup key: (key_hash, tgid), 0 when absent (real decodes
+/// always carry both; only hand-fed shapes can miss them).
+fn who_key(obs: &NativeObservation) -> (u64, u64) {
+    let payload = &obs.backend_payload;
+    (
+        payload
+            .get("key_hash")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        payload
+            .get("tgid")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    )
+}
+
+/// One who-row identity cell: the payload u64, or `unknown` when
+/// absent (C10 — never fabricated).
+fn who_cell(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| String::from("unknown"))
+}
+
+/// Renders the K5 attribution block over `obs`: only `row="who"`
+/// observations feed it; latest wins per (key_hash, tgid) (cumulative
+/// per-tick snapshots, the agg-table idiom); rows sort by calls desc
+/// (ties by (kh, tgid) asc, deterministic); the top 32 render as
+/// `KH TGID COMM UID CALLS` (`KH` is 16-digit lowercase hex) and the
+/// rest collapse into a `+N more` trailer. Empty renders `WHO: none`.
+#[must_use]
+pub fn render_who_block(obs: &[NativeObservation]) -> String {
+    let mut latest: BTreeMap<(u64, u64), &NativeObservation> = BTreeMap::new();
+    for ob in obs {
+        if ob
+            .backend_payload
+            .get("row")
+            .and_then(serde_json::Value::as_str)
+            != Some("who")
+        {
+            continue;
+        }
+        latest.insert(who_key(ob), ob);
+    }
+    if latest.is_empty() {
+        return String::from("WHO: none\n");
+    }
+    let mut rows: Vec<&NativeObservation> = latest.into_values().collect();
+    rows.sort_by(|a, b| {
+        who_calls(b)
+            .cmp(&who_calls(a))
+            .then_with(|| who_key(a).cmp(&who_key(b)))
+    });
+    let mut text = String::from(WHO_HEADER);
+    text.push('\n');
+    for ob in rows.iter().take(WHO_MAX_ROWS) {
+        let payload = &ob.backend_payload;
+        let (kh, _) = who_key(ob);
+        text.push_str(&format!(
+            "{kh:016x} {} {} {} {}\n",
+            who_cell(payload, "tgid"),
+            show(raw(payload, "comm")),
+            who_cell(payload, "uid"),
+            who_calls(ob)
+        ));
+    }
+    if rows.len() > WHO_MAX_ROWS {
+        text.push_str(&format!("+{} more\n", rows.len() - WHO_MAX_ROWS));
+    }
+    text
+}
+
 /// Renders one outcome: header + one row per
-/// (family, op, algorithm, driver) + `TOTAL` + the `COMPLETE` /
-/// `PARTIAL: <dims>` trailer. Latest wins per full row key (cumulative
-/// snapshots), then classes/contexts sum; idents never render as rows;
+/// (family, op, algorithm, driver) + `TOTAL` + the WHO attribution
+/// block + the `COMPLETE` / `PARTIAL: <dims>` trailer. Latest wins
+/// per full row key (cumulative snapshots), then classes/contexts
+/// sum; idents never render as rows;
 /// `TOTAL` comes from the latest totals carrier (column sums when totals
 /// are absent — the coverage trailer separately attests the gap).
 #[must_use]
@@ -192,6 +283,7 @@ pub fn render_watch_tables(outcome: &LiveOutcome) -> String {
         "TOTAL - - - {} {} {} {} {}\n",
         totals.calls, totals.bytes, totals.ok, totals.queued, totals.errors
     ));
+    text.push_str(&render_who_block(&outcome.observations));
     let dims = trailer_dims(&outcome.coverage);
     if dims.is_empty() {
         text.push_str("COMPLETE\n");
@@ -223,18 +315,10 @@ fn yama_scope() -> u32 {
         .unwrap_or(0)
 }
 
-/// Effective caps from CapEff (mirrors the `cmd_doctor` helper, which is
-/// outside this task's file budget so it cannot be shared).
+/// Effective caps from CapEff (the shared `cmd_token` reader — one
+/// CapEff parse for the crate).
 fn effective_caps() -> Vec<String> {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in status.lines() {
-        if let Some(hex) = line.strip_prefix("CapEff:")
-            && let Ok(bits) = u64::from_str_radix(hex.trim(), 16)
-        {
-            return cap_names(bits);
-        }
-    }
-    Vec::new()
+    crate::cmd_token::effective_cap_names()
 }
 
 /// Live host facts for the session gate: gate bools from the committed
@@ -279,6 +363,7 @@ fn finish_watch(
 pub fn run_watch(
     source: &str,
     duration: Option<u64>,
+    token: Option<&Path>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -289,6 +374,7 @@ pub fn run_watch(
         source: source.to_owned(),
         duration_secs: duration,
         tick_ms: DEFAULT_TICK_MS,
+        token: token.map(Path::to_owned),
     };
     finish_watch(run_live_capture(&cfg, &live_runtime()), stdout, stderr)
 }
@@ -426,6 +512,55 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// One `row="who"` observation in the Task 4 resolved shape
+    /// (parent + params + one symbolized frame + first_errno).
+    pub(crate) fn who_obs(
+        id: u64,
+        kh: u64,
+        tgid: u64,
+        comm: &str,
+        uid: u64,
+        calls: u64,
+    ) -> NativeObservation {
+        NativeObservation {
+            id: ObservationId::new(id),
+            backend: BackendId::KCrypto,
+            target: None,
+            object: None,
+            implementation: None,
+            phase: EvidencePhase::Discovered,
+            call_kind: CallKind::Unknown,
+            operation_class: OperationClass::Unknown,
+            native_name: None,
+            native_code: None,
+            native_result: NativeResult::KCrypto { status: 0 },
+            started_ns: Some(100),
+            ended_ns: Some(200),
+            correlation: None,
+            integrity: IntegrityRef::new(0),
+            backend_payload: serde_json::json!({
+                "row": "who",
+                "key_hash": kh,
+                "tgid": tgid,
+                "tid": tgid + 1,
+                "comm": comm,
+                "uid": uid,
+                "cgroup": 156,
+                "ppid": 12,
+                "pcomm": "bash",
+                "stack": {"id": 3, "frames": [{"ip": 0xffffffff81001500u64, "sym": "hash_sendmsg"}]},
+                "calls": calls,
+                "first_ns": 100,
+                "last_ns": 200,
+                "blocksize": 16,
+                "ivsize": 16,
+                "min_keysize": 16,
+                "max_keysize": 32,
+                "first_errno": -5,
+            }),
+        }
+    }
+
     fn dim(status: CoverageStatus, counters: Vec<(&str, u64)>) -> DimensionCoverage {
         let mut dim = DimensionCoverage::new(
             status,
@@ -532,8 +667,10 @@ pub(crate) mod fixtures {
             ),
             totals_obs(7, 32, 2948, 30, 2, 0),
             ident_obs(8),
+            who_obs(9, 0xc1, 4242, "python3", 1000, 7),
+            who_obs(10, 0xc2, 12, "bash", 0, 3),
         ];
-        outcome_with(observations, healthy_coverage(8))
+        outcome_with(observations, healthy_coverage(10))
     }
 
     /// Single-tick gapped session (mirrors `tests/goldens/report_partial.txt`).
@@ -549,10 +686,13 @@ pub(crate) mod fixtures {
 
     /// Minimal healthy session (mirrors `tests/goldens/report_live.json`).
     pub(crate) fn json_fixture() -> crate::live::LiveOutcome {
-        let observations = vec![agg_obs(
-            1, "skcipher", "encrypt", "ok", "cbc(aes)", "aesni", "process", 3, 300, 3, 0, 0,
-        )];
-        outcome_with(observations, healthy_coverage(1))
+        let observations = vec![
+            agg_obs(
+                1, "skcipher", "encrypt", "ok", "cbc(aes)", "aesni", "process", 3, 300, 3, 0, 0,
+            ),
+            who_obs(2, 0xc1, 4242, "python3", 1000, 7),
+        ];
+        outcome_with(observations, healthy_coverage(2))
     }
 }
 

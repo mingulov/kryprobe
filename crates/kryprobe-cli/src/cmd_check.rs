@@ -100,6 +100,7 @@ pub fn run(
     source: &str,
     duration: Option<u64>,
     policy: &Path,
+    token: Option<&Path>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -128,6 +129,7 @@ pub fn run(
         source: source.to_owned(),
         duration_secs: Some(check_window_secs(duration)),
         tick_ms: DEFAULT_TICK_MS,
+        token: token.map(Path::to_owned),
     };
     finish_check(
         run_live_capture(&cfg, &crate::cmd_watch::live_runtime()),

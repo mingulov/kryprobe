@@ -171,12 +171,14 @@ fn parse_duration(value: &str, what: &str) -> Result<u64, ArgsError> {
     Ok(seconds)
 }
 
-/// `watch --system [--source S] [--duration N]`: continuous system-wide
-/// observe. `--system` is required (select-all is the only v0.1 scope).
+/// `watch --system [--source S] [--duration N] [--token PATH]`:
+/// continuous system-wide observe. `--system` is required (select-all
+/// is the only v0.1 scope).
 pub fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
     let mut duration = None;
+    let mut token = None;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -194,6 +196,11 @@ pub fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
                 duration = Some(parse_duration(value, "watch")?);
                 rest = next;
             }
+            "--token" => {
+                let (value, next) = take_value(tail, "--token", "watch")?;
+                token = Some(PathBuf::from(value));
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("watch", other)),
             other => return Err(usage(format!("watch: unexpected '{other}'"))),
         }
@@ -201,17 +208,22 @@ pub fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     if !system {
         return Err(usage("watch: missing --system (system scope only in v0.1)"));
     }
-    Ok(Command::Watch { source, duration })
+    Ok(Command::Watch {
+        source,
+        duration,
+        token,
+    })
 }
 
 /// `report --system [--duration N] [--format human|json] [--out F]
-/// [--source S]`: bounded system-wide capture + render.
+/// [--source S] [--token PATH]`: bounded system-wide capture + render.
 fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
     let mut duration = None;
     let mut format = ReportFormat::Human;
     let mut out = None;
+    let mut token = None;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -222,6 +234,11 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
             "--source" => {
                 let (value, next) = take_value(tail, "--source", "report")?;
                 source = parse_source(value, "report")?;
+                rest = next;
+            }
+            "--token" => {
+                let (value, next) = take_value(tail, "--token", "report")?;
+                token = Some(PathBuf::from(value));
                 rest = next;
             }
             "--duration" => {
@@ -261,6 +278,7 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
         duration,
         format,
         out,
+        token,
     })
 }
 
@@ -275,13 +293,15 @@ pub fn parse_import(args: &[String]) -> Result<Command, ArgsError> {
     })
 }
 
-/// `check --system --policy F [--duration N] [--source S]`: system-wide
-/// policy check. `--policy` is required (v0.1 has no default policy).
+/// `check --system --policy F [--duration N] [--source S] [--token PATH]`:
+/// system-wide policy check. `--policy` is required (v0.1 has no
+/// default policy).
 pub fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
     let mut duration = None;
     let mut policy = None;
+    let mut token = None;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -304,6 +324,11 @@ pub fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
                 policy = Some(PathBuf::from(value));
                 rest = next;
             }
+            "--token" => {
+                let (value, next) = take_value(tail, "--token", "check")?;
+                token = Some(PathBuf::from(value));
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("check", other)),
             other => return Err(usage(format!("check: unexpected '{other}'"))),
         }
@@ -318,5 +343,66 @@ pub fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
         source,
         duration,
         policy,
+        token,
     })
+}
+
+/// `token mint [--bin PATH] [--receipt PATH] [--force]` /
+/// `token status [--bin PATH]` (K5: mint-once delegation surface).
+/// No `--pin` spelling exists in the setcap branch (unknown flags are
+/// usage errors, never silently ignored).
+pub fn parse_token(args: &[String]) -> Result<Command, ArgsError> {
+    let Some((verb, rest)) = args.split_first() else {
+        return Err(usage("token: missing verb (mint|status)"));
+    };
+    match verb.as_str() {
+        "mint" => {
+            let mut bin = None;
+            let mut receipt = None;
+            let mut force = false;
+            let mut rest = rest;
+            while let Some((arg, tail)) = rest.split_first() {
+                match arg.as_str() {
+                    "--bin" => {
+                        let (value, next) = take_value(tail, "--bin", "token mint")?;
+                        bin = Some(PathBuf::from(value));
+                        rest = next;
+                    }
+                    "--receipt" => {
+                        let (value, next) = take_value(tail, "--receipt", "token mint")?;
+                        receipt = Some(PathBuf::from(value));
+                        rest = next;
+                    }
+                    "--force" => {
+                        force = true;
+                        rest = tail;
+                    }
+                    other => return Err(usage(format!("token mint: unexpected '{other}'"))),
+                }
+            }
+            Ok(Command::TokenMint {
+                bin,
+                receipt,
+                force,
+            })
+        }
+        "status" => {
+            let mut bin = None;
+            let mut rest = rest;
+            while let Some((arg, tail)) = rest.split_first() {
+                match arg.as_str() {
+                    "--bin" => {
+                        let (value, next) = take_value(tail, "--bin", "token status")?;
+                        bin = Some(PathBuf::from(value));
+                        rest = next;
+                    }
+                    other => return Err(usage(format!("token status: unexpected '{other}'"))),
+                }
+            }
+            Ok(Command::TokenStatus { bin })
+        }
+        other => Err(usage(format!(
+            "token: unknown verb '{other}' (mint|status)"
+        ))),
+    }
 }

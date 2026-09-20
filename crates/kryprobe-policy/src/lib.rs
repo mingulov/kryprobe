@@ -10,4 +10,4 @@ pub mod glob;
 pub mod rule;
 
 pub use eval::{PolicyVerdict, evaluate};
-pub use rule::{Decision, MatchSpec, Policy, PolicyError, Rule, Stage, parse_policy};
+pub use rule::{Decision, MatchSpec, Policy, PolicyError, Rule, Stage, parse_policy, parse_rule};

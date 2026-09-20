@@ -17,6 +17,7 @@ pub mod cmd_inspect;
 pub mod cmd_report;
 pub mod cmd_selftest;
 pub mod cmd_stub;
+pub mod cmd_token;
 pub mod cmd_watch;
 pub mod live;
 pub mod selftest_bpf;
@@ -52,21 +53,39 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             selftest_bpf::run(calls, out.as_deref(), stdout, stderr)
         }
         Command::SelftestToken => selftest_token::run(stdout, stderr),
-        Command::Watch { source, duration } => {
-            cmd_watch::run_watch(&source, duration, stdout, stderr)
-        }
+        Command::TokenMint {
+            bin,
+            receipt,
+            force,
+        } => cmd_token::run_mint(bin.as_deref(), receipt.as_deref(), force, stdout, stderr),
+        Command::TokenStatus { bin } => cmd_token::run_status(bin.as_deref(), stdout),
+        Command::Watch {
+            source,
+            duration,
+            token,
+        } => cmd_watch::run_watch(&source, duration, token.as_deref(), stdout, stderr),
         Command::Report { file } => cmd_report::run(&file, stdout, stderr),
         Command::ReportLive {
             source,
             duration,
             format,
             out,
-        } => cmd_report::run_report_live(&source, duration, format, out.as_deref(), stdout, stderr),
+            token,
+        } => cmd_report::run_report_live(
+            &source,
+            duration,
+            format,
+            out.as_deref(),
+            token.as_deref(),
+            stdout,
+            stderr,
+        ),
         Command::Check {
             source,
             duration,
             policy,
-        } => cmd_check::run(&source, duration, &policy, stdout, stderr),
+            token,
+        } => cmd_check::run(&source, duration, &policy, token.as_deref(), stdout, stderr),
         Command::Import { file } => cmd_import::run(&file, stdout, stderr),
         Command::Stub { name } => cmd_stub::run(&name, stderr),
     }

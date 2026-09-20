@@ -1,21 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `doctor`: the 17-row probe matrix plus backend rows plus the kcrypto
+//! `doctor`: the 18-row probe matrix plus backend rows plus the kcrypto
 //! coverage profile + ready/degraded verdict.
 //!
-//! The 3 kcrypto rows extend [`run_probe_matrix`]'s 14 in fixed order
+//! The 4 K2.3/K5 rows extend [`run_probe_matrix`]'s 14 in fixed order
 //! (appended after, never reordered) as a library consumer: symbols via
 //! [`resolve_btf_ids`], attach via a real [`load_kcrypto_configured`]
-//! load+attach+RAII drop, lockdown via a file parse. Lockdown is
-//! informational and never blocks the verdict.
+//! load+attach+RAII drop, lockdown via a file parse, `token_delegated`
+//! via the default-pin probe + CapEff. Lockdown and `token_delegated`
+//! are informational and never block the verdict.
 
 use crate::cmd_backends::{backend_rows, human_row};
+use crate::cmd_token::{DEFAULT_TOKEN_PIN, PinState, probe_pin};
 use kryprobe_privilege::bpfloader::{LoaderError, PointStatus};
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredError, ConfiguredPoint, KCRYPTO_SYMBOLS, load_kcrypto_configured,
     resolve_btf_ids,
 };
 use kryprobe_privilege::mapops::MapOpsError;
-use kryprobe_privilege::probe::{ProbeOutcome, ProbeRow, cap_names};
+use kryprobe_privilege::probe::{ProbeOutcome, ProbeRow};
 use kryprobe_privilege::run_probe_matrix;
 use std::io::Write;
 
@@ -55,24 +57,49 @@ fn kcrypto_symbols_row() -> ProbeRow {
     }
 }
 
-/// Effective caps from CapEff; unreadable/unparseable → empty (fail-closed:
-/// treated as unprivileged, never as privileged).
+/// Effective caps from CapEff (the shared `cmd_token` reader — one
+/// CapEff parse for the crate; fail-closed as before).
 fn effective_caps() -> Vec<String> {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in status.lines() {
-        if let Some(hex) = line.strip_prefix("CapEff:")
-            && let Ok(bits) = u64::from_str_radix(hex.trim(), 16)
-        {
-            return cap_names(bits);
-        }
-    }
-    Vec::new()
+    crate::cmd_token::effective_cap_names()
 }
 
 /// Attach privilege: tracing links need CAP_BPF (or CAP_SYS_ADMIN).
 fn is_privileged(caps: &[String]) -> bool {
-    caps.iter()
-        .any(|cap| cap == "CAP_BPF" || cap == "CAP_SYS_ADMIN")
+    crate::cmd_token::caps_allow_bpf_bringup(caps)
+}
+
+/// K5 delegation probe over its inputs (pin state + effective caps):
+/// `pass` when a usable token pin exists OR the process holds
+/// effective `CAP_BPF` (the ruling's literal condition — file caps
+/// granted by `token mint` always include it); `denied` when a pin
+/// exists but retrieves corrupt (reason carried); `skipped` when
+/// neither mechanism is present. Never feeds the coverage verdict.
+#[must_use]
+pub fn token_delegated_outcome(pin: &PinState, caps: &[String]) -> ProbeOutcome {
+    if matches!(pin, PinState::Usable) {
+        return ProbeOutcome::pass(format!("token pin {DEFAULT_TOKEN_PIN} usable"));
+    }
+    if crate::cmd_token::caps_have_bpf(caps) {
+        return ProbeOutcome::pass("effective CAP_BPF (setcap grant or privilege)".to_owned());
+    }
+    match pin {
+        PinState::PresentUnusable(reason) => ProbeOutcome::denied(
+            format!("token pin {DEFAULT_TOKEN_PIN} unusable: {reason}"),
+            libc::EIO,
+        ),
+        PinState::Usable | PinState::Absent => ProbeOutcome::skipped(format!(
+            "no token pin at {DEFAULT_TOKEN_PIN}; no effective CAP_BPF"
+        )),
+    }
+}
+
+/// `token_delegated` row over one pin path (the hermetic seam: tests
+/// feed fixture paths; production passes the default pin).
+fn token_delegated_row_at(pin_path: &std::path::Path, caps: &[String]) -> ProbeRow {
+    ProbeRow {
+        name: "token_delegated",
+        outcome: token_delegated_outcome(&probe_pin(pin_path), caps),
+    }
 }
 
 /// First readable candidate via the consolidated privilege locator;
@@ -267,6 +294,10 @@ pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
     matrix.rows.push(symbols_row);
     matrix.rows.push(attach.row);
     matrix.rows.push(lockdown);
+    matrix.rows.push(token_delegated_row_at(
+        std::path::Path::new(DEFAULT_TOKEN_PIN),
+        &caps,
+    ));
     let (status, missing) = coverage_verdict(
         symbols_ok,
         btf_ok,
@@ -455,5 +486,43 @@ mod tests {
             }
             other => panic!("expected empty-caps skip, got {}", human_outcome(other)),
         }
+    }
+
+    #[test]
+    fn token_delegated_row_probes_fixture_pin() {
+        // Hermetic over fixture paths (no default-pin touch): a missing
+        // path skips, a regular file denies (never a BPF object — the
+        // kernel refuses retrieval on every host, with or without bpf()).
+        let dir = std::env::temp_dir().join(format!("kryprobe-k5-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let missing = dir.join("absent");
+        let row = token_delegated_row_at(&missing, &[]);
+        assert_eq!(row.name, "token_delegated");
+        assert!(
+            matches!(row.outcome, ProbeOutcome::Skipped { .. }),
+            "absent pin skips: {}",
+            human_outcome(&row.outcome)
+        );
+        let file = dir.join("regular");
+        std::fs::write(&file, b"not a token").expect("write fixture");
+        let row = token_delegated_row_at(&file, &[]);
+        assert!(
+            matches!(row.outcome, ProbeOutcome::Denied { .. }),
+            "regular file denies: {}",
+            human_outcome(&row.outcome)
+        );
+        // Caps rescue either shape (the pass arm is pin-independent).
+        let caps = vec!["CAP_BPF".to_owned()];
+        for path in [&missing, &file] {
+            let row = token_delegated_row_at(path, &caps);
+            assert!(
+                matches!(row.outcome, ProbeOutcome::Pass { .. }),
+                "caps pass over {}: {}",
+                path.display(),
+                human_outcome(&row.outcome)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
