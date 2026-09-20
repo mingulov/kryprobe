@@ -100,3 +100,44 @@ fn bench_json_case() {
         );
     }
 }
+
+/// H-T3(3): loose upper bounds on the unprivileged suites so a
+/// pathological regression trips CI, not humans. Bounds sit ~100×
+/// above observed medians (e2e ~0.2ms, elf cells ≤20ms on the
+/// reference host) — a hang or algorithmic blowup fails; ordinary
+/// machine variance never does. Denied suites skip (nothing measured).
+#[test]
+fn bench_unprivileged_upper_bounds_case() {
+    const E2E_MEDIAN_MS_MAX: f64 = 50.0;
+    const ELF_CELL_MS_MAX: f64 = 2000.0;
+    let output = bench_output(&["--json"]);
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("bench json");
+    let suites = json["suites"].as_array().expect("suites array");
+    for suite in suites {
+        let name = suite["name"].as_str().expect("name");
+        if suite["status"] != "ok" {
+            continue;
+        }
+        let detail = &suite["detail"];
+        if name == "e2e" {
+            let median = detail["median_ms"].as_f64().expect("e2e median_ms");
+            assert!(
+                median < E2E_MEDIAN_MS_MAX,
+                "e2e median {median}ms exceeds {E2E_MEDIAN_MS_MAX}ms"
+            );
+        } else if name == "elf" {
+            let fixtures = detail["fixtures"].as_object().expect("elf fixtures");
+            assert!(!fixtures.is_empty(), "elf ok needs a fixture");
+            for (fixture, medians) in fixtures {
+                for median in medians.as_array().expect("cell medians") {
+                    let ms = median.as_f64().expect("cell ms");
+                    assert!(
+                        ms < ELF_CELL_MS_MAX,
+                        "elf {fixture} cell {ms}ms exceeds {ELF_CELL_MS_MAX}ms"
+                    );
+                }
+            }
+        }
+    }
+}

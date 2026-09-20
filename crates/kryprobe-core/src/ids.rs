@@ -149,9 +149,11 @@ impl IdIssuer {
     /// old IDs). Unreachable in practice — 2^64 issues — but fail-closed.
     pub fn issue(&self) -> Result<ObservationId, IdExhausted> {
         use std::sync::atomic::Ordering;
+        // L5: uniqueness needs RMW atomicity (inherent), not a global
+        // order — `AcqRel` publishes the increment to other issuers.
         match self
             .next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
         {
             // Success implies `prev < u64::MAX`, so `prev + 1` cannot overflow.
             Ok(prev) => Ok(ObservationId::new(prev + 1)),

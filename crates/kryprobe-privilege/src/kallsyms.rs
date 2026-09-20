@@ -40,6 +40,21 @@ pub struct SymTable<'a> {
     entries: Vec<(u64, &'a str)>,
 }
 
+/// Lifetime count of [`SymTable::parse`] calls in this process.
+///
+/// Observability hook for H-T3(1): a live session must parse exactly
+/// one table per tick no matter how many who rows the tick carries,
+/// and tests assert that by diffing this counter across a driven
+/// session. One `Relaxed` increment per parse — noise next to an
+/// O(K log K) parse+sort of ~10^5 entries.
+static PARSE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lifetime [`SymTable::parse`] calls in this process (H-T3(1) hook).
+#[must_use]
+pub fn parse_calls() -> u64 {
+    PARSE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl<'a> SymTable<'a> {
     /// Parse `kallsyms` text (`addr type name` lines) into a sorted table.
     ///
@@ -48,6 +63,7 @@ impl<'a> SymTable<'a> {
     /// become floors.
     #[must_use]
     pub fn parse(kallsyms: &'a str) -> Self {
+        PARSE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut entries: Vec<(u64, &str)> = Vec::new();
         for line in kallsyms.lines() {
             let mut fields = line.split_whitespace();

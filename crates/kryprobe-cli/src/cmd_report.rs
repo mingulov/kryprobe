@@ -52,8 +52,10 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 /// Renders one outcome as a single JSON doc plus a trailing newline:
 /// brief-exact keys in brief order (`observations`, `coverage`,
 /// `integrity`, `verdict`), with the `doctor`-shaped verdict
-/// `{status, missing}`. Assembled from serialized pieces (a `json!` map
-/// would sort the keys) so no new dependency is needed.
+/// `{status, missing}`. Serialized straight into one growing buffer
+/// (M7: a `json!` map would sort the keys, and four `to_string`s plus
+/// `format!` would peak at ~2× the doc size); byte-identical to the
+/// piece-assembled form.
 #[must_use]
 pub fn render_report_json(outcome: &LiveOutcome) -> String {
     let missing = crate::cmd_watch::trailer_dims(&outcome.coverage);
@@ -64,15 +66,21 @@ pub fn render_report_json(outcome: &LiveOutcome) -> String {
     };
     // Live kcrypto rows always serialize (real decodes never emit the
     // synthetic backend/result or the `Succeeded` phase); a failure is a
-    // caller defect and fails loud, never a partial doc.
-    let observations =
-        serde_json::to_string(&outcome.observations).expect("live observations serialize");
-    let coverage = serde_json::to_string(&outcome.coverage).expect("live coverage serializes");
-    let integrity = serde_json::to_string(&outcome.integrity).expect("live integrity serializes");
-    let missing = serde_json::to_string(&missing).expect("verdict dims serialize");
-    format!(
-        "{{\"observations\":{observations},\"coverage\":{coverage},\"integrity\":{integrity},\"verdict\":{{\"status\":\"{status}\",\"missing\":{missing}}}}}\n"
-    )
+    // caller defect and fails loud, never a partial doc. `Vec` writes
+    // never fail, so the `expect`s below are unreachable in practice.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"{\"observations\":");
+    serde_json::to_writer(&mut buf, &outcome.observations).expect("live observations serialize");
+    buf.extend_from_slice(b",\"coverage\":");
+    serde_json::to_writer(&mut buf, &outcome.coverage).expect("live coverage serializes");
+    buf.extend_from_slice(b",\"integrity\":");
+    serde_json::to_writer(&mut buf, &outcome.integrity).expect("live integrity serializes");
+    buf.extend_from_slice(b",\"verdict\":{\"status\":\"");
+    buf.extend_from_slice(status.as_bytes());
+    buf.extend_from_slice(b"\",\"missing\":");
+    serde_json::to_writer(&mut buf, &missing).expect("verdict dims serialize");
+    buf.extend_from_slice(b"}}\n");
+    String::from_utf8(buf).expect("report JSON is UTF-8")
 }
 
 /// Live window: explicit `--duration` or the 60s default.

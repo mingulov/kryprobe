@@ -204,14 +204,31 @@ pub struct CryptoOffsets {
     pub shash_base: u32,
 }
 
+/// Process-lifetime vmlinux BTF image (H1(a)): the sysfs image is
+/// boot-pinned (content-stable per boot; a reread mid-session could
+/// only observe the same bytes), so one read serves every resolver in
+/// the process. Failures are NOT cached (read-then-store: only a
+/// successful read is stored) — a BTF that appears late still
+/// resolves late. Two racing first readers may both read; one image
+/// wins and both observe identical bytes.
+static VMLINUX_BTF_BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Shared BTF image bytes; the detail string keeps the exact
+/// historical `{VMLINUX_BTF}: {err}` shape for all error channels.
+fn vmlinux_btf_bytes() -> Result<&'static [u8], String> {
+    if let Some(cached) = VMLINUX_BTF_BYTES.get() {
+        return Ok(cached);
+    }
+    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| format!("{VMLINUX_BTF}: {err}"))?;
+    Ok(VMLINUX_BTF_BYTES.get_or_init(|| bytes))
+}
+
 /// Resolve the 9 [`KCRYPTO_SYMBOLS`] to vmlinux BTF ids. Unprivileged.
 /// Every symbol must resolve; the first missing one fails the whole
 /// call (fail-closed: a half map would silently drop attach points).
 pub fn resolve_btf_ids() -> Result<HashMap<String, u32>, BtfError> {
-    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| BtfError::Io {
-        detail: format!("{VMLINUX_BTF}: {err}"),
-    })?;
-    resolve_btf_ids_from(&bytes)
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    resolve_btf_ids_from(bytes)
 }
 
 /// Resolve the 9 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
@@ -223,10 +240,8 @@ pub fn resolve_btf_ids() -> Result<HashMap<String, u32>, BtfError> {
 /// (`crypto_shash.base`) is CONFIG-resolved instead (see [`CryptoOffsets::shash_base`]):
 /// a missing member still fails closed as [`BtfError::MissingMember`].
 pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
-    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| BtfError::Io {
-        detail: format!("{VMLINUX_BTF}: {err}"),
-    })?;
-    resolve_offsets_from(&bytes)
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    resolve_offsets_from(bytes)
 }
 
 /// Resolve the 7 K5 attribution offsets from vmlinux BTF. Unprivileged.
@@ -249,10 +264,25 @@ pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
 /// whole params group zeroed) is the CORRECT verdict here, not a gap:
 /// emitting family-wrong params would be mislabeled garbage.
 pub fn resolve_kcrypto_offsets() -> Result<KcryptoOffsets, ResolveError> {
-    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| ResolveError::Io {
-        detail: format!("{VMLINUX_BTF}: {err}"),
-    })?;
-    resolve_kcrypto_offsets_from(&bytes)
+    let bytes = vmlinux_btf_bytes().map_err(|detail| ResolveError::Io { detail })?;
+    resolve_kcrypto_offsets_from(bytes)
+}
+
+/// All three bringup resolutions over one BTF image with ONE parse
+/// (H1(a)): func ids + crypto offsets (fail-closed) + K5 groups
+/// (fail-soft inside the struct, never `Err`). Only the parse and the
+/// two fail-closed resolutions can fail, as [`BtfError`].
+fn resolve_kcrypto_bringup_from(
+    bytes: &[u8],
+) -> Result<(HashMap<String, u32>, CryptoOffsets, KcryptoOffsets), BtfError> {
+    let btf = Btf::parse(bytes)?;
+    let ids = btf_ids_from_btf(&btf)?;
+    let off = offsets_from_btf(&btf)?;
+    // Fail-soft member cases ride INSIDE `k5` (flags + zeros); only a
+    // BTF image that vanished mid-bring-up fails here (fail-closed: the
+    // two resolutions above already trusted that same image).
+    let k5 = kcrypto_offsets_from_btf(&btf);
+    Ok((ids, off, k5))
 }
 
 /// [`resolve_kcrypto_offsets`] over an injected BTF image (test seam).
@@ -265,6 +295,14 @@ fn resolve_kcrypto_offsets_from(bytes: &[u8]) -> Result<KcryptoOffsets, ResolveE
             reason: other.to_string(),
         },
     })?;
+    Ok(kcrypto_offsets_from_btf(&btf))
+}
+
+/// K5 group resolution over an already-parsed image (H1(a) combo
+/// core). Infallible by design: any member error (missing
+/// type/member, or a misaligned offset the BPF could not use) is
+/// "unresolvable" → group fail-soft, never Err.
+fn kcrypto_offsets_from_btf(btf: &Btf) -> KcryptoOffsets {
     // Any member error (missing type/member, or a misaligned offset the
     // BPF could not use) is "unresolvable" → group fail-soft, never Err.
     let parent = (
@@ -286,7 +324,7 @@ fn resolve_kcrypto_offsets_from(bytes: &[u8]) -> Result<KcryptoOffsets, ResolveE
         (Some(bs), Some(iv), Some(min), Some(max)) => (true, (bs, iv, min, max)),
         _ => (false, (0, 0, 0, 0)),
     };
-    Ok(KcryptoOffsets {
+    KcryptoOffsets {
         task_real_parent,
         task_tgid,
         task_comm,
@@ -296,7 +334,7 @@ fn resolve_kcrypto_offsets_from(bytes: &[u8]) -> Result<KcryptoOffsets, ResolveE
         cra_max_keysize,
         parent_ok,
         params_ok,
-    })
+    }
 }
 
 /// Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail): the 9
@@ -368,6 +406,23 @@ pub struct ConfiguredKcrypto {
     pub loaded: LoadedKcrypto,
     /// Live tracing links (only the points that attached), load order.
     pub links: Vec<(String, OwnedLink)>,
+}
+
+impl ConfiguredKcrypto {
+    /// Duplicates the sensor handle (H1(b)): the clone snapshots the
+    /// SAME kernel sensor (dup'd fds — no second attach, no double
+    /// probe stream, no double map memory). Only used to hand the
+    /// live tick loop its own handle onto the backend's sensor.
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        let mut links = Vec::with_capacity(self.links.len());
+        for (name, link) in &self.links {
+            links.push((name.clone(), link.try_clone()?));
+        }
+        Ok(Self {
+            loaded: self.loaded.try_clone()?,
+            links,
+        })
+    }
 }
 
 /// Configured bring-up failure: resolution, load, KCFG write, group
@@ -453,12 +508,12 @@ pub fn load_kcrypto_configured(
     object_bytes: &[u8],
     token_fd: Option<RawFd>,
 ) -> Result<(ConfiguredKcrypto, Vec<ConfiguredPoint>), ConfiguredError> {
-    let ids = resolve_btf_ids().map_err(ConfiguredError::Resolve)?;
-    let off = resolve_offsets().map_err(ConfiguredError::Resolve)?;
-    // Fail-soft member cases ride INSIDE `k5` (flags + zeros); only a
-    // BTF image that vanished mid-bring-up fails here (fail-closed: the
-    // two resolutions above already trusted that same image).
-    let k5 = resolve_kcrypto_offsets().map_err(|err| ConfiguredError::Resolve(err.into()))?;
+    // H1(a): one shared image read (cached) + ONE parse serves all
+    // three resolutions (was: 3 reads + 3 parses per load, 7 per
+    // session with detect).
+    let bytes =
+        vmlinux_btf_bytes().map_err(|detail| ConfiguredError::Resolve(BtfError::Io { detail }))?;
+    let (ids, off, k5) = resolve_kcrypto_bringup_from(bytes).map_err(ConfiguredError::Resolve)?;
     let entries: Vec<(String, u32)> = KCRYPTO_SYMBOLS
         .iter()
         .map(|name| ((*name).to_owned(), ids[*name]))
@@ -528,15 +583,20 @@ pub fn load_kcrypto_configured(
 /// Unprivileged. The exactness suite's C3 re-verification rides this
 /// (same walker, same fail-closed errors — no second implementation).
 pub fn resolve_member_offset(type_name: &str, member: &str) -> Result<u32, BtfError> {
-    let bytes = std::fs::read(VMLINUX_BTF).map_err(|err| BtfError::Io {
-        detail: format!("{VMLINUX_BTF}: {err}"),
-    })?;
-    let btf = Btf::parse(&bytes)?;
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    let btf = Btf::parse(bytes)?;
     btf.member_offset(type_name, member)
 }
 
 fn resolve_btf_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> {
     let btf = Btf::parse(bytes)?;
+    btf_ids_from_btf(&btf)
+}
+
+/// Func-id resolution over an already-parsed image (H1(a): the
+/// bringup combo parses once and shares the `Btf` across all three
+/// resolutions instead of parsing per resolver).
+fn btf_ids_from_btf(btf: &Btf) -> Result<HashMap<String, u32>, BtfError> {
     let mut out = HashMap::with_capacity(KCRYPTO_SYMBOLS.len());
     for name in KCRYPTO_SYMBOLS {
         let id = btf.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
@@ -562,6 +622,11 @@ pub const FIRST_MEMBER_LINKS: &[(&str, &str)] = &[
 
 fn resolve_offsets_from(bytes: &[u8]) -> Result<CryptoOffsets, BtfError> {
     let btf = Btf::parse(bytes)?;
+    offsets_from_btf(&btf)
+}
+
+/// Offset resolution over an already-parsed image (H1(a) combo core).
+fn offsets_from_btf(btf: &Btf) -> Result<CryptoOffsets, BtfError> {
     let out = CryptoOffsets {
         sk_req_base: btf.member_offset("skcipher_request", "base")?,
         async_tfm: btf.member_offset("crypto_async_request", "tfm")?,
@@ -1430,5 +1495,89 @@ mod tests {
                 "link {type_name}.{member}"
             );
         }
+    }
+
+    /// Bringup fixture: the crypto structs (with K5 members merged in)
+    /// plus all 9 [`KCRYPTO_SYMBOLS`] as FUNCs sharing one FUNC_PROTO.
+    fn bringup_fixture() -> Vec<u8> {
+        let mut b = BtfBuild::new();
+        // [1] INT (shared member type), [2] FUNC_PROTO (shared).
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_FUNC_PROTO, 0, false, 1);
+        // [3..11] the 9 FUNCs in symbol order.
+        for name in KCRYPTO_SYMBOLS {
+            let o_name = b.str(name);
+            b.rec(o_name, KIND_FUNC, 1, false, 2);
+        }
+        let mut named = |name: &str, members: &[(&str, u32)]| {
+            let o_name = b.str(name);
+            b.rec(o_name, KIND_STRUCT, members.len() as u32, false, 4096);
+            for (member, byte) in members {
+                let o_member = b.str(member);
+                b.member(o_member, 1, byte * 8);
+            }
+        };
+        named("skcipher_request", &[("cryptlen", 0), ("base", 32)]);
+        named("crypto_async_request", &[("tfm", 32)]);
+        named("crypto_tfm", &[("__crt_alg", 32)]);
+        named(
+            "crypto_alg",
+            &[
+                ("cra_name", 60),
+                ("cra_driver_name", 188),
+                ("cra_blocksize", 36),
+                ("cra_ivsize", 400),
+                ("cra_min_keysize", 404),
+                ("cra_max_keysize", 408),
+            ],
+        );
+        named(
+            "task_struct",
+            &[
+                ("flags", 44),
+                ("real_parent", 1432),
+                ("tgid", 1424),
+                ("comm", 1648),
+            ],
+        );
+        named("aead_request", &[("base", 0), ("cryptlen", 52)]);
+        named("ahash_request", &[("base", 0), ("nbytes", 48)]);
+        named("shash_desc", &[("tfm", 0)]);
+        named("crypto_shash", &[("base", 0)]);
+        b.finish()
+    }
+
+    #[test]
+    fn bringup_combo_matches_split_resolvers() {
+        // H1(a): one parse serves all three bringup resolutions —
+        // identical results to the three separate resolvers.
+        let bytes = bringup_fixture();
+        let (ids, off, k5) = resolve_kcrypto_bringup_from(&bytes).expect("combo resolves");
+        assert_eq!(ids, resolve_btf_ids_from(&bytes).expect("ids resolve"));
+        assert_eq!(off, resolve_offsets_from(&bytes).expect("offsets resolve"));
+        assert_eq!(
+            k5,
+            resolve_kcrypto_offsets_from(&bytes).expect("k5 resolves")
+        );
+        // Spot values pin the combo to the fixture (not just to the
+        // split path): func ids in declaration order, crypto + k5.
+        assert_eq!(ids["crypto_alloc_tfm_node"], 3);
+        assert_eq!(ids["crypto_shash_finup"], 11);
+        assert_eq!(
+            off,
+            CryptoOffsets {
+                sk_req_base: 32,
+                async_tfm: 32,
+                tfm_alg: 32,
+                alg_name: 60,
+                alg_drv: 188,
+                task_flags: 44,
+                aead_cryptlen_off: 52,
+                ahash_nbytes_off: 48,
+                shash_base: 0,
+            }
+        );
+        assert!(k5.parent_ok && k5.params_ok);
     }
 }

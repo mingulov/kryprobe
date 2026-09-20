@@ -132,6 +132,10 @@ pub struct SnapshotRows {
     pub idents: Vec<IdentBytes>,
     /// `OVERFLOW`-kind records in this drain (healthy: 0).
     pub overflow_identities: u64,
+    /// `KIDN[KIDN_DROPS]` at snapshot time (M3: retained, not
+    /// discarded — the feed and finalize reuse the closing snapshot's
+    /// value instead of re-reading the key at session end).
+    pub drops: u8,
     /// Snapshot wall (`CLOCK_MONOTONIC`, taken before the walk).
     pub monotonic_ns: u64,
 }
@@ -285,6 +289,18 @@ pub fn raw_event_for_ident(ident: &IdentBytes) -> RawEvent<'_> {
     }
 }
 
+/// Wrap row bytes into a borrowed [`RawEvent`] with a caller-supplied
+/// stamp (H3): the tick loop parses each row once and reuses the
+/// parsed stamp instead of re-slicing the payload for the header.
+/// Same header shape as the `raw_event_for_*` constructors — only the
+/// stamp source differs (parsed, not re-parsed).
+pub fn raw_event_stamped(payload: &[u8], monotonic_ns: u64) -> RawEvent<'_> {
+    RawEvent {
+        header: snapshot_header(payload.len(), monotonic_ns),
+        payload,
+    }
+}
+
 /// Build the shared loss feed from a snapshot plus the caller's own
 /// `KIDN[KIDN_DROPS]` read (v0.1: the short-lived drain keeps no queue
 /// accounting, so the queue pins 0 — K3 feeds the result once).
@@ -338,6 +354,9 @@ fn vagg_to_bytes(vagg: &VAgg) -> [u8; 120] {
 fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
     let ncpu = possible_cpus() as usize;
     let mut rows = Vec::new();
+    // M8: one lane buffer per walk, cleared per row (not one alloc
+    // per row per tick).
+    let mut lanes: Vec<VAgg> = Vec::with_capacity(ncpu);
     let mut key: Option<Vec<u8>> = None;
     loop {
         // SAFETY: KAGG key is KAgg, exactly 260B (bpf-kcrypto map def).
@@ -356,7 +375,7 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
         let raw = unsafe {
             map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "snapshot/kagg-val")
         }?;
-        let mut lanes = Vec::with_capacity(ncpu);
+        lanes.clear();
         for c in 0..ncpu {
             let lane = raw
                 .get(c * 120..(c + 1) * 120)
@@ -421,13 +440,11 @@ fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsEr
     Ok(Some(TotalsBytes(bytes)))
 }
 
-/// Read `KIDN[KIDN_DROPS]` (the ring-reserve counter) for later integrity
-/// wiring. v0.1 validates-but-discards: [`SnapshotRows`] carries no
-/// drops field, so callers needing the value read the key via
-/// [`map_lookup_bytes`] and pass it to [`shared_losses_from_snapshot`].
-/// Absent key = healthy zero; any other errno fails the snapshot (a
-/// broken `KIDN` read must be loud, never a silent zero).
-fn read_kidn_drops(sensor: &ConfiguredKcrypto) -> Result<(), MapOpsError> {
+/// Read `KIDN[KIDN_DROPS]` (the ring-reserve counter) into
+/// [`SnapshotRows::drops`]. Absent key = healthy zero; any other errno
+/// fails the snapshot (a broken `KIDN` read must be loud, never a
+/// silent zero).
+fn read_kidn_drops(sensor: &ConfiguredKcrypto) -> Result<u8, MapOpsError> {
     // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
     match unsafe {
         map_lookup_bytes(
@@ -437,8 +454,8 @@ fn read_kidn_drops(sensor: &ConfiguredKcrypto) -> Result<(), MapOpsError> {
             "snapshot/kidn-drops",
         )
     } {
-        Ok(_) => Ok(()),
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(()),
+        Ok(value) => Ok(value.first().copied().unwrap_or(0)),
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
         Err(err) => Err(err),
     }
 }
@@ -625,13 +642,14 @@ pub fn snapshot_rows_with_drain(
     let monotonic_ns = monotonic_now()?;
     let rows = walk_kagg(sensor)?;
     let totals = read_ktot(sensor)?;
-    read_kidn_drops(sensor)?;
+    let drops = read_kidn_drops(sensor)?;
     let (idents, overflow_identities) = drain_idents_with(drain, barrier)?;
     Ok(SnapshotRows {
         rows,
         totals,
         idents,
         overflow_identities,
+        drops,
         monotonic_ns,
     })
 }
@@ -646,13 +664,14 @@ pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsE
     let monotonic_ns = monotonic_now()?;
     let rows = walk_kagg(sensor)?;
     let totals = read_ktot(sensor)?;
-    read_kidn_drops(sensor)?;
+    let drops = read_kidn_drops(sensor)?;
     let (idents, overflow_identities) = drain_idents(sensor)?;
     Ok(SnapshotRows {
         rows,
         totals,
         idents,
         overflow_identities,
+        drops,
         monotonic_ns,
     })
 }
@@ -692,5 +711,29 @@ mod tests {
         let second = monotonic_now().expect("clock reads");
         assert!(first > 0, "CLOCK_MONOTONIC is nonzero");
         assert!(second >= first, "CLOCK_MONOTONIC never goes backwards");
+    }
+
+    #[test]
+    fn stamped_event_matches_parsed_stamp_header() {
+        // H3: the stamped constructor carries the same header the
+        // parsing constructor derives — only the stamp source differs.
+        let vagg = VAgg {
+            calls: 7,
+            bytes: 224,
+            ok: 6,
+            errors: 1,
+            queued: 0,
+            first_ns: 100,
+            last_ns: 200,
+            lat: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let mut bytes = vec![SNAPSHOT_VERSION, ROW_KIND_TOTALS];
+        bytes.extend_from_slice(&vagg_to_bytes(&vagg));
+        let totals = TotalsBytes::new(bytes).expect("hand totals");
+        let parsed = raw_event_for_totals(&totals);
+        let stamped = raw_event_stamped(&totals.0, 200);
+        assert_eq!(stamped.header, parsed.header, "same header shape");
+        assert_eq!(stamped.header.monotonic_ns, 200);
+        assert_eq!(stamped.payload, parsed.payload);
     }
 }

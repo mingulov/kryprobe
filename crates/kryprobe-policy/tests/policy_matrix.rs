@@ -294,7 +294,7 @@ fn yaml_empty_rules_and_empty_match_accepted() {
 // Match dimensions (D3/D4/D5)
 // ---------------------------------------------------------------------------
 
-fn eval_deny(matches: &str, observations: &[NativeObservation]) -> PolicyVerdict {
+fn eval_deny<'a>(matches: &str, observations: &'a [NativeObservation]) -> PolicyVerdict<'a> {
     let text = policy_yaml(&deny_rule("r", "kernel-crypto", matches, "deny"));
     let policy = parse_policy(&text).expect("rule parses");
     evaluate(&policy, observations, &complete_coverage())

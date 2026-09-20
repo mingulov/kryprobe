@@ -165,14 +165,29 @@ fn who_key(obs: &NativeObservation) -> (u64, u64) {
     )
 }
 
-/// One who-row identity cell: the payload u64, or `unknown` when
-/// absent (C10 — never fabricated).
-fn who_cell(payload: &serde_json::Value, key: &str) -> String {
-    payload
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| String::from("unknown"))
+/// Projected who row (M4): every JSON walk for the row happens once,
+/// at projection time — dedup/sort/render below never touch JSON.
+#[derive(Debug, Clone, Copy)]
+struct WhoProj<'a> {
+    kh: u64,
+    tgid: Option<u64>,
+    comm: &'a str,
+    uid: Option<u64>,
+    calls: u64,
+}
+
+/// Projects one who observation (same defaults as the direct
+/// readers: 0 key parts, `None` cells, 0 calls when absent).
+fn project_who(obs: &NativeObservation) -> WhoProj<'_> {
+    let payload = &obs.backend_payload;
+    let (kh, _) = who_key(obs);
+    WhoProj {
+        kh,
+        tgid: payload.get("tgid").and_then(serde_json::Value::as_u64),
+        comm: raw(payload, "comm"),
+        uid: payload.get("uid").and_then(serde_json::Value::as_u64),
+        calls: who_calls(obs),
+    }
 }
 
 /// Renders the K5 attribution block over `obs`: only `row="who"`
@@ -183,7 +198,9 @@ fn who_cell(payload: &serde_json::Value, key: &str) -> String {
 /// rest collapse into a `+N more` trailer. Empty renders `WHO: none`.
 #[must_use]
 pub fn render_who_block(obs: &[NativeObservation]) -> String {
-    let mut latest: BTreeMap<(u64, u64), &NativeObservation> = BTreeMap::new();
+    // M4: one projection pass (each row's JSON walks once), then
+    // plain-struct dedup/sort/render — no per-comparison walks.
+    let mut latest: BTreeMap<(u64, u64), WhoProj<'_>> = BTreeMap::new();
     for ob in obs {
         if ob
             .backend_payload
@@ -193,28 +210,36 @@ pub fn render_who_block(obs: &[NativeObservation]) -> String {
         {
             continue;
         }
-        latest.insert(who_key(ob), ob);
+        let proj = project_who(ob);
+        latest.insert((proj.kh, proj.tgid.unwrap_or(0)), proj);
     }
     if latest.is_empty() {
         return String::from("WHO: none\n");
     }
-    let mut rows: Vec<&NativeObservation> = latest.into_values().collect();
+    let mut rows: Vec<WhoProj<'_>> = latest.into_values().collect();
     rows.sort_by(|a, b| {
-        who_calls(b)
-            .cmp(&who_calls(a))
-            .then_with(|| who_key(a).cmp(&who_key(b)))
+        // Tie-break matches `who_key` exactly (absent tgid sorts as
+        // 0, NOT as `None`-first).
+        b.calls
+            .cmp(&a.calls)
+            .then_with(|| (a.kh, a.tgid.unwrap_or(0)).cmp(&(b.kh, b.tgid.unwrap_or(0))))
     });
     let mut text = String::from(WHO_HEADER);
     text.push('\n');
-    for ob in rows.iter().take(WHO_MAX_ROWS) {
-        let payload = &ob.backend_payload;
-        let (kh, _) = who_key(ob);
+    for row in rows.iter().take(WHO_MAX_ROWS) {
         text.push_str(&format!(
-            "{kh:016x} {} {} {} {}\n",
-            who_cell(payload, "tgid"),
-            show(raw(payload, "comm")),
-            who_cell(payload, "uid"),
-            who_calls(ob)
+            "{kh:016x} {tgid} {comm} {uid} {calls}\n",
+            kh = row.kh,
+            tgid = row
+                .tgid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("unknown")),
+            comm = show(row.comm),
+            uid = row
+                .uid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("unknown")),
+            calls = row.calls
         ));
     }
     if rows.len() > WHO_MAX_ROWS {
@@ -232,17 +257,21 @@ pub fn render_who_block(obs: &[NativeObservation]) -> String {
 /// are absent — the coverage trailer separately attests the gap).
 #[must_use]
 pub fn render_watch_tables(outcome: &LiveOutcome) -> String {
+    // M4: one projection pass builds the agg latest-map AND the
+    // totals slot (last totals in vec order wins — the `rev().find`
+    // idiom, without the second iteration).
     let mut latest: BTreeMap<(&str, &str, &str, &str, &str, &str), Acc> = BTreeMap::new();
+    let mut totals_slot: Option<Acc> = None;
     for obs in &outcome.observations {
-        if obs
+        let kind = obs
             .backend_payload
             .get("row")
-            .and_then(serde_json::Value::as_str)
-            != Some("agg")
-        {
-            continue;
+            .and_then(serde_json::Value::as_str);
+        if kind == Some("agg") {
+            latest.insert(row_key(obs), acc_of(obs));
+        } else if kind == Some("totals") {
+            totals_slot = Some(acc_of(obs));
         }
-        latest.insert(row_key(obs), acc_of(obs));
     }
     let mut rows: BTreeMap<(&str, &str, &str, &str), Acc> = BTreeMap::new();
     for ((family, op, _, algorithm, driver, _), acc) in latest {
@@ -266,23 +295,12 @@ pub fn render_watch_tables(outcome: &LiveOutcome) -> String {
             acc.errors
         ));
     }
-    let totals = outcome
-        .observations
-        .iter()
-        .rev()
-        .find(|obs| {
-            obs.backend_payload
-                .get("row")
-                .and_then(serde_json::Value::as_str)
-                == Some("totals")
+    let totals = totals_slot.unwrap_or_else(|| {
+        rows.values().fold(Acc::default(), |mut total, acc| {
+            total.add(*acc);
+            total
         })
-        .map(acc_of)
-        .unwrap_or_else(|| {
-            rows.values().fold(Acc::default(), |mut total, acc| {
-                total.add(*acc);
-                total
-            })
-        });
+    });
     text.push_str(&format!(
         "TOTAL - - - {} {} {} {} {}\n",
         totals.calls, totals.bytes, totals.ok, totals.queued, totals.errors

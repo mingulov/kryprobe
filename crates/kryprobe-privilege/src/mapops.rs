@@ -188,7 +188,22 @@ fn conf_cpus() -> u32 {
 /// parseable-but-stale sysfs file must never shrink the buffer below a
 /// trusted signal. Unreadable/unparseable input falls back to
 /// `max(conf, online)` (safe/larger direction).
+///
+/// Cached process-wide (M1): every snapshot path calls this per tick
+/// (4+ sysfs reads per tick for a value that changes only on CPU
+/// hotplug). Hotplug staleness is accepted and fail-loud: a CPU added
+/// mid-process grows the kernel's lane count past the cached value
+/// (undersized buffers), which is exactly why every consumer treats
+/// short reads as loud errors (`EBADMSG`, never a silent partial
+/// fold) — a hotplug event fails the tick visibly instead of
+/// corrupting memory. Hotplug-remove only oversizes (harmless).
 pub fn possible_cpus() -> u32 {
+    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(possible_cpus_uncached)
+}
+
+/// Uncached [`possible_cpus`] read (one sysfs read + two `sysconf`s).
+fn possible_cpus_uncached() -> u32 {
     let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").ok();
     possible_cpus_from_topology(text.as_deref(), conf_cpus(), online_cpus())
 }
@@ -435,6 +450,16 @@ mod tests {
     #[test]
     fn online_cpus_is_sane() {
         assert!(online_cpus() >= 1);
+    }
+
+    #[test]
+    fn possible_cpus_cached_matches_live_read() {
+        // M1: the cached value is exactly the live read (stable
+        // across calls — one sysfs read per process, not per tick).
+        let live = possible_cpus_uncached();
+        assert!(live >= 1);
+        assert_eq!(possible_cpus(), live);
+        assert_eq!(possible_cpus(), live);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use kryprobe_core::ids::ObservationId;
 
 /// 3-state policy verdict (kp2 §8/`check`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyVerdict {
+pub enum PolicyVerdict<'a> {
     /// A `deny` rule matched: the finding stands even when other
     /// coverage is partial (kp2 §8 — a real observation is evidence).
     Violation {
@@ -32,8 +32,9 @@ pub enum PolicyVerdict {
         driver: String,
         /// Representative context (see [`PolicyVerdict::Violation::algorithm`]).
         context: String,
-        /// The matched observations themselves (full evidence).
-        evidence: Vec<NativeObservation>,
+        /// The matched observations themselves (borrowed, M6: no
+        /// deep clone of the matched set — the capture owns them).
+        evidence: Vec<&'a NativeObservation>,
     },
     /// No deny matched and rule-dimension coverage is COMPLETE.
     Clean,
@@ -234,17 +235,33 @@ fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
 /// in-source observations at all is inapplicable and contributes
 /// nothing.
 #[must_use]
-pub fn evaluate(
+pub fn evaluate<'a>(
     policy: &Policy,
-    obs: &[NativeObservation],
+    obs: &'a [NativeObservation],
     coverage: &CoverageSummary,
-) -> PolicyVerdict {
+) -> PolicyVerdict<'a> {
+    // M6: partition by source once — every rule scans only its own
+    // source slice (no per-(rule, obs) source check over foreign
+    // observations).
+    let mut by_source: std::collections::HashMap<&str, Vec<&'a NativeObservation>> =
+        std::collections::HashMap::new();
+    for ob in obs {
+        by_source
+            .entry(source_name(ob.backend))
+            .or_default()
+            .push(ob);
+    }
     for rule in &policy.rules {
         if rule.decision != Decision::Deny {
             continue;
         }
-        let matched: Vec<&NativeObservation> = obs
+        let in_source: &[&NativeObservation] = by_source
+            .get(rule.source.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let matched: Vec<&NativeObservation> = in_source
             .iter()
+            .copied()
             .filter(|obs| rule_matches(rule, obs) && rule_specified(rule, obs))
             .collect();
         if matched.is_empty() {
@@ -257,7 +274,7 @@ pub fn evaluate(
             algorithm: payload_str(&first.backend_payload, "algorithm").to_owned(),
             driver: payload_str(&first.backend_payload, "driver").to_owned(),
             context: payload_str(&first.backend_payload, "context").to_owned(),
-            evidence: matched.into_iter().cloned().collect(),
+            evidence: matched,
         };
     }
     let unevaluable = policy.rules.iter().any(|rule| {
@@ -267,16 +284,18 @@ pub fn evaluate(
         // Inapplicable (no in-source observations) is not unevaluable:
         // only a rule that should have been answerable, but finds no
         // fully-specified observation, fails closed.
-        let mut any_in_source = false;
-        for ob in obs {
-            if rule.source == source_name(ob.backend) {
-                any_in_source = true;
-                if rule_specified(rule, ob) {
-                    return false;
-                }
+        let in_source: &[&NativeObservation] = by_source
+            .get(rule.source.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut any_specified = false;
+        for ob in in_source {
+            if rule_specified(rule, ob) {
+                any_specified = true;
+                break;
             }
         }
-        any_in_source
+        !in_source.is_empty() && !any_specified
     });
     if !unevaluable && coverage.overall() == CoverageStatus::CompleteForDeclaredBoundary {
         PolicyVerdict::Clean

@@ -378,6 +378,7 @@ fn shared_losses_ctor_wires_ring_drops_with_zero_queue() {
         totals: Some(TotalsBytes::new(totals_payload()).expect("totals")),
         idents: vec![IdentBytes::new(ident_payload()).expect("ident")],
         overflow_identities: 0,
+        drops: 0,
         monotonic_ns: 999,
     };
     for drops in [0u8, 1, 255] {

@@ -1077,28 +1077,28 @@ fn link_parser_foreign_only_case() {
 
 #[test]
 fn link_parser_full_session_case() {
-    // One fully attached session holds 18 trace_fexit links (K4 graded
-    // gates: "stable at 18 true links"); the `n >= 18` gates below pin
+    // One fully attached session holds 9 trace_fexit links (single sensor,
+    // H1(b); was 18 across the session + backend twins); the `n >= 9` gates below pin
     // that unit. Foreign links interleaved must not inflate the count.
     let mut sample = String::from("15407: raw_tracepoint  prog 18717\n");
-    for id in 15125..15125 + 18 {
+    for id in 15125..15125 + 9 {
         sample.push_str(&format!(
             "{id}: tracing  prog {}\n\tprog_type tracing  attach_type trace_fexit\n\ttarget_obj_id 1  target_btf_id 105300\n",
             18393 + (id - 15125)
         ));
     }
     sample.push_str("15826: perf_event  prog 18715\n\tuprobe /proc/self/fd/18+0x27a60\n");
-    assert_eq!(count_trace_fexit_links(&sample), 18);
+    assert_eq!(count_trace_fexit_links(&sample), 9);
 }
 
 /// Positive-control traffic, gated on the session sensor fully
-/// attached (18 true `trace_fexit` links — one session per K4 graded
-/// gates) — deterministic, no sleep-guessing.
+/// attached (9 true `trace_fexit` links, single sensor — one session
+/// per K4 graded gates) — deterministic, no sleep-guessing.
 fn spawn_traffic() -> std::thread::JoinHandle<()> {
     std::thread::spawn(|| {
         let start = std::time::Instant::now();
         loop {
-            if link_count_or_none().is_some_and(|n| n >= 18) {
+            if link_count_or_none().is_some_and(|n| n >= 9) {
                 break;
             }
             assert!(
@@ -1402,12 +1402,12 @@ fn md5_available() -> bool {
 }
 
 /// md5 positive-control traffic, gated on the session sensor fully
-/// attached (the `spawn_traffic` 18-true-link idiom).
+/// attached (the `spawn_traffic` 9-true-link idiom).
 fn spawn_md5_traffic() -> std::thread::JoinHandle<()> {
     std::thread::spawn(|| {
         let start = std::time::Instant::now();
         loop {
-            if link_count_or_none().is_some_and(|n| n >= 18) {
+            if link_count_or_none().is_some_and(|n| n >= 9) {
                 break;
             }
             assert!(

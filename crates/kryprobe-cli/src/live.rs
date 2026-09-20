@@ -2,32 +2,30 @@
 //! Live kcrypto capture session (K3 Task 1): the frozen-trait lifecycle
 //! driven per-tick against a session-owned sensor.
 //!
-//! Flow (D1): registry + [`register_kcrypto`] → gate check → `detect` →
-//! `plan` (Trace) → K5 token/caps pre-flight → `configure` once → tick
-//! loop (`snapshot_rows` → raw events in row order → `decode` each
+//! Flow (D1): shared registry + [`register_kcrypto_shared`] → gate
+//! check → `detect` → `plan` (Trace) → K5 token/caps pre-flight →
+//! stage bytes + token → `configure` once (loads the single sensor) →
+//! tick loop (`snapshot_rows` → raw events in row order → `decode` each
 //! with a session [`IdIssuer`], then `snapshot_who` → who rows via
 //! [`observation_for_who`](kryprobe_privilege::kcrypto_backend::observation_for_who)
-//! with once-per-tick kallsyms) →
-//! `finalize` ONCE → [`DriverReport::feed_shared_losses`] ONCE from
+//! with once-per-tick kallsyms) → `finalize` ONCE → [`DriverReport::feed_shared_losses`] ONCE from
 //! measured drop counters only.
 //!
-//! Twin sensors (M1 resolution): per-tick snapshots run against a
-//! session-owned sensor loaded here via [`load_kcrypto_configured`], while
-//! the backend's `configure` owns its own sensor for the end-of-session
-//! `finalize` assessment. The backend's sensor handle is private and this
-//! task's file budget forbids new privilege accessors; the K2
-//! `driver_e2e` already proves twin attach works. M1 dissolves
-//! structurally: ticks drain the session ring, and the once-only finalize
-//! drain drops only duplicates of decoded idents. The session sensor loads
-//! before `configure` by convention: both twins record (K4 S8 run D shows
-//! both KAGG+KIDN 256/256 full), so order is not load-bearing — decode
-//! reads the session sensor only, `finalize` the backend's.
+//! Single sensor (H1(b); was: session twin + backend twin): per-tick
+//! snapshots run against the backend's own sensor via a dup'd handle
+//! ([`KCryptoBackend::session_sensor`](kryprobe_privilege::kcrypto_backend::KCryptoBackend::session_sensor)
+//! — same kernel objects, one attach, one probe stream, one set of
+//! maps), and `finalize` assesses that same sensor. Ticks drain the
+//! session ring through the shared handle, and the once-only finalize
+//! drain drops only duplicates of decoded idents.
 //!
 //! Snapshots are non-consuming reads (only the KRING drain consumes), so
-//! agg/totals observations repeat per tick with cumulative counters —
-//! consumers render the latest per row key — while idents are disjoint
-//! across ticks. Nothing is deduped: `summary.observations` always equals
-//! `observations.len()` (`finalize == decoded`).
+//! agg/totals/who rows repeat per tick with cumulative counters — the
+//! driver accumulates latest-per-row-key (H2: memory is O(keys +
+//! idents), never O(ticks × rows)) while idents, disjoint across
+//! ticks, are all kept. `summary.observations` counts `decode` calls
+//! (fresh decodes every tick for latest counters);
+//! `observations.len()` counts latest-per-key + idents.
 //!
 //! The shared feed carries the session sensor's measured `KIDN_DROPS`
 //! read (the K2 `finalize_drops` idiom, including ENOENT→0), disjoint
@@ -50,10 +48,10 @@
 //! deadline, unbounded runs stop on closed stdin; SIGINT keeps the
 //! default disposition and terminates (documented approach, no handler).
 
-use kryprobe_abi::kcrypto_agg::KIDN_DROPS;
+use kryprobe_abi::kcrypto_agg::kh_of;
 use kryprobe_core::backend::{
-    BackendRegistry, BackendSummary, ConfigureContext, DecodeContext, DetectContext, DriverReport,
-    FinalizeContext, PlanContext,
+    Backend, BackendRegistry, BackendSummary, ConfigureContext, DecodeContext, DetectContext,
+    DriverReport, FinalizeContext, PlanContext,
 };
 use kryprobe_core::budget::BudgetManager;
 use kryprobe_core::capability::RuntimeCapabilities;
@@ -65,19 +63,19 @@ use kryprobe_core::evidence::{
 };
 use kryprobe_core::ids::{IdIssuer, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
-use kryprobe_privilege::btf_resolve::{
-    AttachOutcome, ConfiguredError, ConfiguredKcrypto, KCRYPTO_SYMBOLS, load_kcrypto_configured,
-};
+use kryprobe_privilege::btf_resolve::{ConfiguredKcrypto, KCRYPTO_SYMBOLS};
+use kryprobe_privilege::drain::DrainThread;
 use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms};
 use kryprobe_privilege::kcrypto_backend::{
-    KDROP_DESTROY, KDROP_SITES, observation_for_who, register_kcrypto, snapshot_drops, snapshot_who,
+    ClosingCounts, KCryptoBackend, KDROP_DESTROY, KDROP_SITES, WhoCache, WhoSnapshot,
+    observation_for_who, register_kcrypto_shared, snapshot_drops, snapshot_who_cached,
 };
 use kryprobe_privilege::kcrypto_snapshot::{
-    ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_for_agg, raw_event_for_ident,
-    raw_event_for_totals, session_drain, shared_losses_from_snapshot, snapshot_rows_with_drain,
+    ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
+    shared_losses_from_snapshot, snapshot_rows_with_drain,
 };
-use kryprobe_privilege::mapops::{MapOpsError, map_lookup_bytes};
-use std::os::fd::AsRawFd;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -225,18 +223,6 @@ fn backend_err(stage: &str, err: BackendError) -> LiveError {
     }
 }
 
-/// Twin bring-up errors to live errors (the D5 map in live terms: only a
-/// post-load map-write failure is `Internal`; resolution/load/attach
-/// failures are environmental).
-fn configured_err(err: ConfiguredError) -> LiveError {
-    match err {
-        ConfiguredError::Configure(_) => {
-            LiveError::Internal(format!("live session sensor configure: {err}"))
-        }
-        _ => LiveError::Unusable(format!("live session sensor: {err}")),
-    }
-}
-
 /// Wide-open session budget (the `BackendDriver::harness` ceilings: the
 /// live session gates on privilege/BTF, not on budgets).
 fn open_budget() -> PlanBudget {
@@ -276,55 +262,17 @@ fn notrun_coverage() -> CoverageSummary {
     }
 }
 
-/// Session sensor `KIDN[KIDN_DROPS]` read (the K2 `finalize_drops` idiom:
-/// absent key reads healthy-zero; any other map failure is loud).
-fn session_drops(sensor: &ConfiguredKcrypto) -> Result<u8, LiveError> {
-    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
-    match unsafe {
-        map_lookup_bytes(
-            &sensor.loaded.maps.ident,
-            &KIDN_DROPS.to_le_bytes(),
-            1,
-            "live/kidn-drops",
+/// KTOT gap from call counts: `KTOT − ΣKAGG` calls (saturating).
+/// `None` when totals are absent (no baseline — the caller leaves the
+/// dimension uncovered, never claims zero).
+fn ktot_gap_from_calls(agg_calls: &[u64], totals_calls: Option<u64>) -> Option<u64> {
+    totals_calls.map(|totals| {
+        totals.saturating_sub(
+            agg_calls
+                .iter()
+                .fold(0u64, |sum, calls| sum.saturating_add(*calls)),
         )
-    } {
-        Ok(value) => Ok(value.first().copied().unwrap_or(0)),
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
-        Err(err) => Err(LiveError::Internal(format!("live kidn-drops read: {err}"))),
-    }
-}
-
-/// Twin KTOT gap from the closing snapshot: `KTOT − ΣKAGG` calls
-/// (saturating). `None` when totals are absent (no baseline — the caller
-/// leaves the dimension uncovered, never claims zero). A reparse failure
-/// or a surprise row kind is `Internal` (rows came from our own snapshot;
-/// failing to re-read them is a defect — the K2 `integrity_for_snapshot`
-/// arms).
-fn ktot_gap(snap: &SnapshotRows) -> Result<Option<u64>, LiveError> {
-    let reparse =
-        |err: BackendError| LiveError::Internal(format!("live gap recompute: row reparse: {err}"));
-    let Some(totals) = &snap.totals else {
-        return Ok(None);
-    };
-    let mut agg_calls = 0u64;
-    for row in &snap.rows {
-        match parse_snapshot_row(&row.0).map_err(reparse)? {
-            ParsedRow::Agg { vagg, .. } => {
-                agg_calls = agg_calls.saturating_add(vagg.calls);
-            }
-            _ => {
-                return Err(LiveError::Internal(
-                    "live gap recompute: unexpected row kind".to_owned(),
-                ));
-            }
-        }
-    }
-    match parse_snapshot_row(&totals.0).map_err(reparse)? {
-        ParsedRow::Totals { vagg } => Ok(Some(vagg.calls.saturating_sub(agg_calls))),
-        _ => Err(LiveError::Internal(
-            "live gap recompute: unexpected totals kind".to_owned(),
-        )),
-    }
+    })
 }
 
 /// Session measurements feeding the coverage assembly (all observed live,
@@ -470,128 +418,167 @@ fn sleep_tick(tick_ms: u64, stop: &AtomicBool) {
     }
 }
 
-/// Live kcrypto capture: registry + `register_kcrypto`, then the
-/// injectable session below. See the module docs for the flow.
-pub fn run_live_capture(
-    cfg: &LiveConfig,
-    runtime: &RuntimeCapabilities,
-) -> Result<LiveOutcome, LiveError> {
-    let mut registry = BackendRegistry::new();
-    register_kcrypto(&mut registry)
-        .map_err(|err| LiveError::Internal(format!("kcrypto registration: {err}")))?;
-    run_live_capture_with_registry(cfg, runtime, &registry)
+/// Session sensor seam (P0-4 / 3A-C-T2): everything the tick driver
+/// reads from the live sensor. Production serves [`RealSensor`]
+/// (session-owned sensor + session drain); tests serve scripted ticks
+/// with no privilege. `snapshot_tick` receives the shared stop flag
+/// so a script can end the session after its Nth tick; the
+/// production impl ignores it (deadline/stdin still stop the loop).
+pub trait SessionSensor {
+    /// One snapshot pass (`barrier_id` counts 1, 2, … per session).
+    fn snapshot_tick(
+        &mut self,
+        barrier_id: u64,
+        stop: &AtomicBool,
+    ) -> Result<SnapshotRows, LiveError>;
+    /// Raw kallsyms text for this tick's who rows (read once per
+    /// tick, 2B-C2 — the counting seam for H-T3; the driver parses it
+    /// once via [`SymTable::parse`] with the text kept alive locally).
+    fn kallsyms_text(&mut self) -> String;
+    /// Who attribution rows for this tick (drops merge at finalize).
+    fn snapshot_who(&mut self) -> Result<(Vec<WhoSnapshot>, u64), LiveError>;
+    /// The 8 `KDROPS` pre-KTOT skip sites.
+    fn drop_sites(&mut self) -> Result<[u64; 8], LiveError>;
+    /// End-of-session teardown (runs once, after the closing tick).
+    fn finish(&mut self);
 }
 
-/// Live capture over a caller-supplied registry (the injection seam:
-/// production passes a registry with the real kcrypto backend; tests
-/// pass scripted fakes that stop before any attach).
-pub fn run_live_capture_with_registry(
+/// Production sensor: the session-owned sensor plus its session
+/// drain (2B-C1: one spawn for all ticks) plus the cross-tick
+/// who-join cache (H4: quiescent rows skip their joins).
+pub struct RealSensor<'a> {
+    sensor: &'a ConfiguredKcrypto,
+    drain: Option<DrainThread>,
+    who_cache: WhoCache,
+}
+
+impl<'a> RealSensor<'a> {
+    /// Opens the session drain; drain stats stay discarded (see the
+    /// snapshot docs).
+    pub fn new(sensor: &'a ConfiguredKcrypto) -> Result<Self, LiveError> {
+        let drain = session_drain(sensor)
+            .map_err(|err| LiveError::Internal(format!("live session drain: {err}")))?;
+        Ok(Self {
+            sensor,
+            drain: Some(drain),
+            who_cache: WhoCache::new(),
+        })
+    }
+}
+
+impl SessionSensor for RealSensor<'_> {
+    fn snapshot_tick(
+        &mut self,
+        barrier_id: u64,
+        _stop: &AtomicBool,
+    ) -> Result<SnapshotRows, LiveError> {
+        let drain = self
+            .drain
+            .as_ref()
+            .ok_or_else(|| LiveError::Internal("live snapshot after finish".to_owned()))?;
+        snapshot_rows_with_drain(self.sensor, drain, barrier_id)
+            .map_err(|err| LiveError::Internal(format!("live snapshot: {err}")))
+    }
+
+    fn kallsyms_text(&mut self) -> String {
+        read_kallsyms()
+    }
+
+    fn snapshot_who(&mut self) -> Result<(Vec<WhoSnapshot>, u64), LiveError> {
+        snapshot_who_cached(self.sensor, &mut self.who_cache)
+            .map_err(|err| LiveError::Internal(format!("live snapshot who: {err}")))
+    }
+
+    fn drop_sites(&mut self) -> Result<[u64; 8], LiveError> {
+        snapshot_drops(self.sensor)
+            .map_err(|err| LiveError::Internal(format!("live snapshot drops: {err}")))
+    }
+
+    fn finish(&mut self) {
+        if let Some(drain) = self.drain.take() {
+            let _drain_stats = drain.stop();
+        }
+    }
+}
+
+/// Latest-per-key identity (H2): mirrors the render's downstream
+/// keys exactly — agg `(family, op, result, algorithm, driver,
+/// context)` collapses to the shared `kh_of` identity hash (it covers
+/// all six render fields); who matches `(key_hash, tgid)`; totals is
+/// a singleton. Idents are disjoint across ticks and bypass the map
+/// (every ident is kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ObsKey {
+    Agg(u64),
+    Totals,
+    Who(u64, u32),
+}
+
+/// Latest-wins insert at first-seen position (H2): repeats overwrite
+/// in place (cumulative counters supersede), new keys append in tick
+/// order. Memory is O(keys + idents), never O(ticks × rows).
+fn upsert_latest(
+    index: &mut HashMap<ObsKey, usize>,
+    observations: &mut Vec<NativeObservation>,
+    key: ObsKey,
+    observation: NativeObservation,
+) {
+    match index.entry(key) {
+        Entry::Occupied(slot) => observations[*slot.get()] = observation,
+        Entry::Vacant(slot) => {
+            slot.insert(observations.len());
+            observations.push(observation);
+        }
+    }
+}
+
+/// Tick driver over a caller-supplied sensor (P0-4): the tick loop
+/// (snapshot → parse each row once → decode each → who attribution
+/// with latest-per-key accumulation), then finalize ONCE and the
+/// shared feed ONCE, then coverage from the session measurements.
+/// NEVER finalizes per tick (D1/M1).
+///
+/// `concrete` stages the closing-tick counts for the finalize fast
+/// path (M5): production passes the shared backend, scripted tests
+/// pass `None` (their fake finalizes need no staging).
+#[allow(clippy::too_many_arguments)]
+pub fn drive_session(
     cfg: &LiveConfig,
-    runtime: &RuntimeCapabilities,
-    registry: &BackendRegistry,
+    backend: &dyn Backend,
+    sensor: &mut dyn SessionSensor,
+    stop: &AtomicBool,
+    attached_points: usize,
+    session: SessionId,
+    generation: PlanGeneration,
+    issuer: &IdIssuer,
+    concrete: Option<&KCryptoBackend>,
 ) -> Result<LiveOutcome, LiveError> {
-    if cfg.source != LIVE_SOURCE {
-        return Err(LiveError::Unusable(format!(
-            "unsupported live source '{}': only '{}' is captured live",
-            cfg.source, LIVE_SOURCE
-        )));
-    }
-    let backend = registry
-        .get(BackendId::KCrypto)
-        .ok_or_else(|| LiveError::Unusable("kcrypto backend not registered".to_owned()))?;
-    gate_check("session", &backend.capabilities().required, runtime)?;
-    // Harness-style session state (fresh ids, open budgets, zero baseline).
-    let session = SessionId::new(1);
-    let generation = PlanGeneration::new(1);
-    let mut budget = BudgetManager::new(open_budget());
     let baseline = IntegritySummary::default();
-    let issuer = IdIssuer::default();
-    let instances = backend
-        .detect(&DetectContext { session, runtime })
-        .map_err(|err| backend_err("kcrypto detect", err))?;
-    let Some(instance) = instances.into_iter().next() else {
-        return Err(LiveError::Unusable(
-            "kcrypto detect found no instances".to_owned(),
-        ));
-    };
-    let plan = backend
-        .plan(
-            &PlanContext { session, runtime },
-            &instance,
-            CaptureMode::Trace,
-        )
-        .map_err(|err| backend_err("kcrypto plan", err))?;
-    gate_check("plan", &plan.required, runtime)?;
-    // Session-owned sensor for per-tick snapshots (twin of the backend's),
-    // loaded BEFORE `configure` by convention: both twins record (K4 S8
-    // run D shows both KAGG+KIDN 256/256 full), so order is not
-    // load-bearing — decode reads this sensor's rows only, and `finalize`
-    // assesses the backend's own sensor.
-    let (_object_path, object_bytes) = kryprobe_privilege::locate_kcrypto_object_bytes()
-        .map_err(|err| LiveError::Unusable(format!("kcrypto object: {err}")))?;
-    // K5 bring-up authority: the first usable token in discovery order
-    // (`--token` > `KRYPROBE_TOKEN` > default pin), held across the
-    // session-twin load below. No usable token and no process caps is
-    // the honest exit-4 naming `token mint` — refused AFTER the object
-    // resolves (a missing object is its own exit-4 with its own name)
-    // but BEFORE either twin loads (the backend twin in `configure`
-    // loads with privilege via the frozen trait, so a doomed
-    // unprivileged run must not start it either).
-    let token = crate::cmd_token::usable_token(cfg.token.as_deref());
-    if token.is_none() && !crate::cmd_token::process_has_bpf_caps() {
-        return Err(LiveError::Unusable(crate::cmd_token::no_mechanism_reason(
-            cfg.token.as_deref(),
-        )));
-    }
-    let token_fd = token.as_ref().map(|file| file.as_raw_fd());
-    let (sensor, points) =
-        load_kcrypto_configured(&object_bytes, token_fd).map_err(configured_err)?;
-    backend
-        .configure(
-            &mut ConfigureContext {
-                session,
-                generation,
-                budget: &mut budget,
-            },
-            &plan,
-        )
-        .map_err(|err| backend_err("kcrypto configure", err))?;
-    let attached_points = points
-        .iter()
-        .filter(|point| point.attach == Some(AttachOutcome::Attached))
-        .count();
-    // Stop machinery: a session-local flag; the stdin watcher feeds it
-    // for unbounded runs (SIGINT keeps the default disposition — see the
-    // `duration_secs` docs).
-    let stop = Arc::new(AtomicBool::new(false));
-    if cfg.duration_secs.is_none() {
-        let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop));
-    }
-    // Session KRING drain (2B-C1): one spawn for all ticks — a per-tick
-    // spawn/stop would pay thread + ~2MB mmap + epoll + up to 10ms
-    // quantum on every tick. Stopped once after the closing tick below;
-    // drain stats stay discarded (see the snapshot docs).
-    let drain = session_drain(&sensor)
-        .map_err(|err| LiveError::Internal(format!("live session drain: {err}")))?;
-    // Tick loop: snapshot → raw events in row order → decode each (first
-    // error aborts `Internal`). Always at least the opening tick, even
-    // for a zero-second window; the tick at/after the deadline is the
-    // closing snapshot. NEVER finalize per tick (D1/M1).
+    // Tick loop: snapshot → raw events in row order → decode each
+    // (first error aborts `Internal`). Always at least the opening
+    // tick, even for a zero-second window; the tick at/after the
+    // deadline is the closing snapshot.
     // Sub-ms ticks are meaningless against snapshot cost; floor at 1ms.
     let tick_ms = cfg.tick_ms.max(1);
     let start_wall = Instant::now();
     let deadline = cfg
         .duration_secs
         .map(|secs| start_wall + Duration::from_secs(secs));
-    let mut observations = Vec::new();
+    let mut observations: Vec<NativeObservation> = Vec::new();
+    let mut latest: HashMap<ObsKey, usize> = HashMap::new();
     let mut overflow_identities = 0u64;
     let mut first_wall = 0u64;
     let mut first_tick = true;
     let mut barrier_id = 0u64;
+    // Closing tick's parsed call counts (H3): each tick overwrites, so
+    // the gap recompute after the loop never re-parses the closing
+    // snapshot's rows. Deferred init: the loop always ticks at least
+    // once, so both are assigned before any `break`.
+    let mut closing_agg_calls: Vec<u64>;
+    let mut closing_totals_calls: Option<u64>;
     let closing: SnapshotRows = loop {
         barrier_id += 1;
-        let snap = snapshot_rows_with_drain(&sensor, &drain, barrier_id)
-            .map_err(|err| LiveError::Internal(format!("live snapshot: {err}")))?;
+        let snap = sensor.snapshot_tick(barrier_id, stop)?;
         // Coverage interval walls come from the snapshots themselves
         // (measured `CLOCK_MONOTONIC`, no separate clock read).
         if first_tick {
@@ -602,24 +589,63 @@ pub fn run_live_capture_with_registry(
             session,
             generation,
             integrity: &baseline,
-            id_issuer: &issuer,
+            id_issuer: issuer,
         };
+        // Each row parses ONCE (H3): the parsed form yields the dedup
+        // key, the header stamp, and the gap call counts. `decode`
+        // re-parses internally (frozen-trait residual: `decode` takes
+        // row bytes, not rows — the header pre-parse and the gap
+        // re-parse are the parses this loop eliminates).
+        let mut tick_agg_calls = Vec::with_capacity(snap.rows.len());
+        let mut tick_totals_calls = None;
         for row in &snap.rows {
+            let parsed = parse_snapshot_row(&row.0)
+                .map_err(|err| LiveError::Internal(format!("live parse agg: {err}")))?;
+            let ParsedRow::Agg { kagg, vagg } = parsed else {
+                return Err(LiveError::Internal(
+                    "live parse agg: unexpected row kind".to_owned(),
+                ));
+            };
+            tick_agg_calls.push(vagg.calls);
+            let key = ObsKey::Agg(kh_of(
+                kagg.fam(),
+                kagg.op(),
+                kagg.res(),
+                kagg.ctx(),
+                &kagg.alg(),
+                &kagg.drv(),
+            ));
             let observation = backend
-                .decode(&decode_ctx, raw_event_for_agg(row))
+                .decode(&decode_ctx, raw_event_stamped(&row.0, vagg.last_ns))
                 .map_err(|err| LiveError::Internal(format!("live decode agg: {err}")))?;
-            observations.push(observation);
+            upsert_latest(&mut latest, &mut observations, key, observation);
         }
         if let Some(totals) = &snap.totals {
+            let parsed = parse_snapshot_row(&totals.0)
+                .map_err(|err| LiveError::Internal(format!("live parse totals: {err}")))?;
+            let ParsedRow::Totals { vagg } = parsed else {
+                return Err(LiveError::Internal(
+                    "live parse totals: unexpected row kind".to_owned(),
+                ));
+            };
+            tick_totals_calls = Some(vagg.calls);
             let observation = backend
-                .decode(&decode_ctx, raw_event_for_totals(totals))
+                .decode(&decode_ctx, raw_event_stamped(&totals.0, vagg.last_ns))
                 .map_err(|err| LiveError::Internal(format!("live decode totals: {err}")))?;
-            observations.push(observation);
+            upsert_latest(&mut latest, &mut observations, ObsKey::Totals, observation);
         }
         for ident in &snap.idents {
+            let parsed = parse_snapshot_row(&ident.0)
+                .map_err(|err| LiveError::Internal(format!("live parse ident: {err}")))?;
+            let ParsedRow::Ident { kctl } = parsed else {
+                return Err(LiveError::Internal(
+                    "live parse ident: unexpected row kind".to_owned(),
+                ));
+            };
             let observation = backend
-                .decode(&decode_ctx, raw_event_for_ident(ident))
+                .decode(&decode_ctx, raw_event_stamped(&ident.0, kctl.val2))
                 .map_err(|err| LiveError::Internal(format!("live decode ident: {err}")))?;
+            // Idents are disjoint across ticks: every one is kept.
             observations.push(observation);
         }
         // K5 attribution: who rows decode from the session sensor's
@@ -631,27 +657,47 @@ pub fn run_live_capture_with_registry(
         // rows. Per-tick who drops are NOT fed here — `finalize`
         // merges them (Task 4), and the shared feed only speaks
         // ring/queue counters.
-        let kallsyms = read_kallsyms();
+        let (whos, _who_drops) = sensor.snapshot_who()?;
+        let kallsyms = sensor.kallsyms_text();
         let table = SymTable::parse(&kallsyms);
-        let (whos, _who_drops) = snapshot_who(&sensor)
-            .map_err(|err| LiveError::Internal(format!("live snapshot who: {err}")))?;
         for who in &whos {
             let id = issuer
                 .issue()
                 .map_err(|_| LiveError::Internal("live who id exhausted".to_owned()))?;
-            observations.push(observation_for_who(who, id, &table));
+            upsert_latest(
+                &mut latest,
+                &mut observations,
+                ObsKey::Who(who.key.kh, who.key.tgid),
+                observation_for_who(who, id, &table),
+            );
         }
+        closing_agg_calls = tick_agg_calls;
+        closing_totals_calls = tick_totals_calls;
         overflow_identities = overflow_identities.saturating_add(snap.overflow_identities);
         let stopped =
             stop.load(Ordering::Relaxed) || deadline.is_some_and(|end| Instant::now() >= end);
         if stopped {
             break snap;
         }
-        sleep_tick(tick_ms, &stop);
+        sleep_tick(tick_ms, stop);
     };
     // Session drain stops once, after the closing tick: later snapshots
     // (finalize) run their own one-shot drains.
-    let _drain_stats = drain.stop();
+    sensor.finish();
+    // Stage closing counts for the finalize fast path (M5): the
+    // same parsed counts the coverage gap uses below, so finalize
+    // and coverage agree by construction.
+    if let Some(concrete) = concrete {
+        let agg_calls = closing_agg_calls
+            .iter()
+            .fold(0u64, |sum, calls| sum.saturating_add(*calls));
+        concrete.stage_closing_counts(ClosingCounts {
+            generation,
+            agg_calls,
+            totals_calls: closing_totals_calls,
+            drops: closing.drops,
+        });
+    }
     // Finalize ONCE, then the shared feed ONCE.
     let notrun = notrun_coverage();
     let summary = backend
@@ -661,7 +707,11 @@ pub fn run_live_capture_with_registry(
             integrity: &baseline,
         })
         .map_err(|err| LiveError::Internal(format!("live finalize: {err}")))?;
-    let drops = session_drops(&sensor)?;
+    // Feed drops come from the closing snapshot's retained read (M3):
+    // no end-of-session re-read of the key (a drop landing between the
+    // closing snapshot and the feed is unattributed — a microseconds
+    // window, versus a guaranteed extra syscall before).
+    let drops = closing.drops;
     let mut report = DriverReport::default();
     report.observations = observations;
     report.summaries.push(summary);
@@ -671,9 +721,8 @@ pub fn run_live_capture_with_registry(
     let integrity = report
         .session_integrity_checked()
         .map_err(|err| LiveError::Internal(format!("live session integrity: {err}")))?;
-    let gap = ktot_gap(&closing)?;
-    let kdrop_sites = snapshot_drops(&sensor)
-        .map_err(|err| LiveError::Internal(format!("live snapshot drops: {err}")))?;
+    let gap = ktot_gap_from_calls(&closing_agg_calls, closing_totals_calls);
+    let kdrop_sites = sensor.drop_sites()?;
     let coverage = session_coverage(&SessionMeasurements {
         attached_points,
         expected_points: KCRYPTO_SYMBOLS.len(),
@@ -700,10 +749,146 @@ pub fn run_live_capture_with_registry(
     })
 }
 
+/// Live kcrypto capture: shared registry + the concrete backend
+/// handle, then the injectable session below. See the module docs for
+/// the flow.
+pub fn run_live_capture(
+    cfg: &LiveConfig,
+    runtime: &RuntimeCapabilities,
+) -> Result<LiveOutcome, LiveError> {
+    let mut registry = BackendRegistry::new();
+    let shared = register_kcrypto_shared(&mut registry)
+        .map_err(|err| LiveError::Internal(format!("kcrypto registration: {err}")))?;
+    run_live_session(cfg, runtime, &registry, Some(shared.backend()))
+}
+
+/// Live capture over a caller-supplied registry (the injection seam:
+/// tests pass scripted fakes that stop before any attach — no
+/// concrete backend, so a session that reaches the sensor errors
+/// typed instead of loading).
+pub fn run_live_capture_with_registry(
+    cfg: &LiveConfig,
+    runtime: &RuntimeCapabilities,
+    registry: &BackendRegistry,
+) -> Result<LiveOutcome, LiveError> {
+    run_live_session(cfg, runtime, registry, None)
+}
+
+/// Shared orchestrator: frozen-trait lifecycle through `registry`
+/// plus the concrete sensor handle (H1(b)). Production passes `Some`
+/// (one sensor for ticks and finalize); the fake-registry test path
+/// passes `None` and stops at `configure` before any sensor access.
+fn run_live_session(
+    cfg: &LiveConfig,
+    runtime: &RuntimeCapabilities,
+    registry: &BackendRegistry,
+    concrete: Option<&KCryptoBackend>,
+) -> Result<LiveOutcome, LiveError> {
+    if cfg.source != LIVE_SOURCE {
+        return Err(LiveError::Unusable(format!(
+            "unsupported live source '{}': only '{}' is captured live",
+            cfg.source, LIVE_SOURCE
+        )));
+    }
+    let backend = registry
+        .get(BackendId::KCrypto)
+        .ok_or_else(|| LiveError::Unusable("kcrypto backend not registered".to_owned()))?;
+    gate_check("session", &backend.capabilities().required, runtime)?;
+    // Harness-style session state (fresh ids, open budgets; the
+    // driver owns the zero integrity baseline).
+    let session = SessionId::new(1);
+    let generation = PlanGeneration::new(1);
+    let mut budget = BudgetManager::new(open_budget());
+    let issuer = IdIssuer::default();
+    let instances = backend
+        .detect(&DetectContext { session, runtime })
+        .map_err(|err| backend_err("kcrypto detect", err))?;
+    let Some(instance) = instances.into_iter().next() else {
+        return Err(LiveError::Unusable(
+            "kcrypto detect found no instances".to_owned(),
+        ));
+    };
+    let plan = backend
+        .plan(
+            &PlanContext { session, runtime },
+            &instance,
+            CaptureMode::Trace,
+        )
+        .map_err(|err| backend_err("kcrypto plan", err))?;
+    gate_check("plan", &plan.required, runtime)?;
+    // Object bytes resolve once here (H1(b)/M2): staged into the
+    // backend below so `configure` loads the single sensor from them
+    // instead of locating + reading a second time.
+    let (_object_path, object_bytes) = kryprobe_privilege::locate_kcrypto_object_bytes()
+        .map_err(|err| LiveError::Unusable(format!("kcrypto object: {err}")))?;
+    // K5 bring-up authority: the first usable token in discovery order
+    // (`--token` > `KRYPROBE_TOKEN` > default pin), staged into the
+    // backend so the single sensor loads through it. No usable token
+    // and no process caps is the honest exit-4 naming `token mint` —
+    // refused AFTER the object resolves (a missing object is its own
+    // exit-4 with its own name) but BEFORE `configure` loads anything
+    // (a doomed unprivileged run must not start the load either).
+    let token = crate::cmd_token::usable_token(cfg.token.as_deref());
+    if token.is_none() && !crate::cmd_token::process_has_bpf_caps() {
+        return Err(LiveError::Unusable(crate::cmd_token::no_mechanism_reason(
+            cfg.token.as_deref(),
+        )));
+    }
+    if let Some(concrete) = concrete {
+        concrete.stage_session_inputs(object_bytes, token);
+    }
+    backend
+        .configure(
+            &mut ConfigureContext {
+                session,
+                generation,
+                budget: &mut budget,
+            },
+            &plan,
+        )
+        .map_err(|err| backend_err("kcrypto configure", err))?;
+    // Single sensor (H1(b), was: session twin + backend twin): the
+    // tick loop snapshots the backend's own sensor via a dup'd handle
+    // (same kernel objects — one attach, one probe stream, one set of
+    // maps), and `finalize` assesses that same sensor. Attached points
+    // count the live links (links exist only for attached points).
+    let Some(concrete) = concrete else {
+        return Err(LiveError::Internal(
+            "live session needs a concrete kcrypto backend".to_owned(),
+        ));
+    };
+    let sensor = concrete
+        .session_sensor()
+        .map_err(|err| LiveError::Internal(format!("kcrypto session sensor: {err}")))?;
+    let attached_points = sensor.links.len();
+    // Stop machinery: a session-local flag; the stdin watcher feeds it
+    // for unbounded runs (SIGINT keeps the default disposition — see the
+    // `duration_secs` docs).
+    let stop = Arc::new(AtomicBool::new(false));
+    if cfg.duration_secs.is_none() {
+        let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop));
+    }
+    // Session KRING drain (2B-C1): one spawn for all ticks — a per-tick
+    // spawn/stop would pay thread + ~2MB mmap + epoll + up to 10ms
+    // quantum on every tick. The drain lives in the production sensor;
+    // the driver stops it once after the closing tick.
+    let mut production = RealSensor::new(&sensor)?;
+    drive_session(
+        cfg,
+        backend,
+        &mut production,
+        &stop,
+        attached_points,
+        session,
+        generation,
+        &issuer,
+        Some(concrete),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kryprobe_privilege::kcrypto_snapshot::{RowBytes, TotalsBytes};
 
     fn runtime_with(btf: bool) -> RuntimeCapabilities {
         RuntimeCapabilities {
@@ -799,40 +984,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn twin_bringup_map_marks_only_post_load_failure_internal() {
-        use kryprobe_privilege::bpfloader::LoaderError;
-        use kryprobe_privilege::btf_resolve::BtfError;
-        use kryprobe_privilege::mapops::MapOpsError;
-        // Resolution/load/attach failures are environmental (`Unusable`).
-        for err in [
-            ConfiguredError::Resolve(BtfError::MissingFunc {
-                name: "f".to_owned(),
-            }),
-            ConfiguredError::Load(LoaderError::BadObject {
-                reason: "x".to_owned(),
-            }),
-            ConfiguredError::AttachSetup {
-                detail: "x".to_owned(),
-            },
-            ConfiguredError::NoPointAttached { points: vec![] },
-        ] {
-            assert!(
-                matches!(configured_err(err), LiveError::Unusable(_)),
-                "bring-up failures map Unusable"
-            );
-        }
-        // Post-load map-write failure is the defect marker (`Internal`).
-        let err = ConfiguredError::Configure(MapOpsError::UpdateFailed {
-            stage: "kcfg".to_owned(),
-            errno: 5,
-        });
-        assert!(
-            matches!(configured_err(err), LiveError::Internal(_)),
-            "post-load failure maps Internal"
-        );
-    }
-
     fn measurements() -> SessionMeasurements {
         SessionMeasurements {
             attached_points: 9,
@@ -922,57 +1073,41 @@ mod tests {
         );
     }
 
-    /// Hand 382B agg row with `calls` (mirrors the K2 hand-row layout).
-    fn hand_agg(calls: u64) -> RowBytes {
-        let mut out = Vec::with_capacity(382);
-        out.push(0x01);
-        out.push(1);
-        out.extend_from_slice(&[
-            kryprobe_abi::kcrypto_agg::KFAM_SK,
-            kryprobe_abi::kcrypto_agg::KOP_ENC,
-            kryprobe_abi::kcrypto_agg::KRES_OK,
-            kryprobe_abi::kcrypto_agg::KCTX_PROC,
-        ]);
-        out.extend_from_slice(b"cbc(aes)\0");
-        out.extend_from_slice(&[0u8; 260 - 4 - 9]);
-        out.extend_from_slice(&calls.to_le_bytes());
-        out.extend_from_slice(&[0u8; 120 - 8]);
-        assert_eq!(out.len(), 382);
-        RowBytes::new(out).expect("hand row")
-    }
-
-    /// Hand 122B totals row with `calls`.
-    fn hand_totals(calls: u64) -> TotalsBytes {
-        let mut out = Vec::with_capacity(122);
-        out.push(0x01);
-        out.push(2);
-        out.extend_from_slice(&calls.to_le_bytes());
-        out.extend_from_slice(&[0u8; 120 - 8]);
-        assert_eq!(out.len(), 122);
-        TotalsBytes::new(out).expect("hand totals")
-    }
-
-    fn hand_snapshot(agg_calls: &[u64], tot_calls: Option<u64>) -> SnapshotRows {
-        SnapshotRows {
-            rows: agg_calls.iter().map(|c| hand_agg(*c)).collect(),
-            totals: tot_calls.map(hand_totals),
-            idents: Vec::new(),
-            overflow_identities: 0,
-            monotonic_ns: 7,
-        }
+    #[test]
+    fn upsert_latest_overwrites_in_place_at_first_seen_position() {
+        // H2: repeats overwrite (latest counters win) without moving
+        // the first-seen slot; new keys append in tick order.
+        let issuer = IdIssuer::default();
+        let table = SymTable::parse("");
+        let who = WhoSnapshot {
+            key: Default::default(),
+            val: Default::default(),
+            stack_ips: Vec::new(),
+            first_errno: None,
+            params: None,
+        };
+        let obs = || observation_for_who(&who, issuer.issue().expect("id"), &table);
+        let (a1, b1, a2) = (obs(), obs(), obs());
+        let mut index = HashMap::new();
+        let mut out = Vec::new();
+        upsert_latest(&mut index, &mut out, ObsKey::Agg(7), a1);
+        upsert_latest(&mut index, &mut out, ObsKey::Totals, b1.clone());
+        upsert_latest(&mut index, &mut out, ObsKey::Agg(7), a2.clone());
+        assert_eq!(out.len(), 2, "repeat reuses its slot");
+        assert_eq!(out[0], a2, "latest wins at the first-seen position");
+        assert_eq!(out[1], b1, "unrelated key untouched");
     }
 
     #[test]
     fn gap_recompute_conserves_and_detects_pressure() {
-        assert_eq!(
-            ktot_gap(&hand_snapshot(&[10, 20], Some(30))).expect("gap"),
-            Some(0)
-        );
-        assert_eq!(
-            ktot_gap(&hand_snapshot(&[10, 20], Some(40))).expect("gap"),
-            Some(10)
-        );
-        assert_eq!(ktot_gap(&hand_snapshot(&[10], None)).expect("gap"), None);
+        // Gap math over the tick loop's parsed call counts (H3: the
+        // closing snapshot's rows are never re-parsed for the gap).
+        assert_eq!(ktot_gap_from_calls(&[10, 20], Some(30)), Some(0));
+        assert_eq!(ktot_gap_from_calls(&[10, 20], Some(40)), Some(10));
+        assert_eq!(ktot_gap_from_calls(&[10], None), None);
+        // Saturation, never wrap.
+        assert_eq!(ktot_gap_from_calls(&[u64::MAX, 1], Some(5)), Some(0));
+        assert_eq!(ktot_gap_from_calls(&[], Some(7)), Some(7));
     }
 
     #[test]

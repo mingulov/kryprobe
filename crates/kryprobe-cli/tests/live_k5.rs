@@ -25,9 +25,9 @@ type DecodedIdentity = (String, String, String, String, String, String);
 type DigestAgg = BTreeMap<(DecodedIdentity, u64), u64>;
 type AllocKh = BTreeMap<DecodedIdentity, BTreeSet<u64>>;
 
-/// Fully attached live session: 9 fexit symbols x 2 twins (K4 graded
-/// gate, mirrored from `live_session.rs`).
-const ATTACHED_LINKS: usize = 18;
+/// Fully attached live session: 9 fexit symbols on the single sensor
+/// (H1(b); was x 2 twins). K4 graded gate, mirrored from `live_session.rs`.
+const ATTACHED_LINKS: usize = 9;
 
 /// Built CLI under test (cargo builds the binary for integration tests).
 fn kryprobe() -> PathBuf {
@@ -203,7 +203,7 @@ fn gate_attach_only(test: &'static str, guard: ChildGuard) -> ChildGuard {
 }
 
 fn gate_wait(test: &'static str, mut guard: ChildGuard) -> ChildGuard {
-    // Generous ceiling: verifier + BTF resolve + 18 links run ~9s on a
+    // Generous ceiling: verifier + BTF resolve + 9 links run ~9s on a
     // quiet host but past 60s under heavy load (observed at loadavg
     // ~20); the child-liveness check keeps a real failure fast.
     const GATE_SECS: u64 = 180;

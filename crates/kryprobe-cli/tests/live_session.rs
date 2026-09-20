@@ -488,18 +488,18 @@ fn link_parser_foreign_only_case() {
 
 #[test]
 fn link_parser_full_session_case() {
-    // One fully attached session holds 18 trace_fexit links (K4 graded
-    // gates: "stable at 18 true links"); the `n >= 18` gate below pins
+    // One fully attached session holds 9 trace_fexit links (single sensor,
+    // H1(b); was 18 across the twins); the `n >= 9` gate below pins
     // that unit. Foreign links interleaved must not inflate the count.
     let mut sample = String::from("15407: raw_tracepoint  prog 18717\n");
-    for id in 15125..15125 + 18 {
+    for id in 15125..15125 + 9 {
         sample.push_str(&format!(
             "{id}: tracing  prog {}\n\tprog_type tracing  attach_type trace_fexit\n\ttarget_obj_id 1  target_btf_id 105300\n",
             18393 + (id - 15125)
         ));
     }
     sample.push_str("15826: perf_event  prog 18715\n\tuprobe /proc/self/fd/18+0x27a60\n");
-    assert_eq!(count_trace_fexit_links(&sample), 18);
+    assert_eq!(count_trace_fexit_links(&sample), 9);
 }
 
 fn lane_runtime() -> kryprobe_core::capability::RuntimeCapabilities {
@@ -621,13 +621,13 @@ fn live_capture_proves_session() {
     set_bpf_dir(object_path.as_os_str());
 
     // Mid-session traffic burst (positive control): gated on the
-    // session sensor fully attached (18 true `trace_fexit` links — one
+    // session sensor fully attached (9 true `trace_fexit` links — one
     // session per K4 graded gates) — deterministic, no sleep-guessing
     // against BPF load times — and done well before the window closes.
     let traffic = std::thread::spawn(|| {
         let start = std::time::Instant::now();
         loop {
-            if link_count_or_none().is_some_and(|n| n >= 18) {
+            if link_count_or_none().is_some_and(|n| n >= 9) {
                 break;
             }
             assert!(
@@ -892,5 +892,466 @@ fn locator_candidates_pin_three_tier_order() {
             PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o"),
             PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
         ]
+    );
+}
+
+/// P0-4 (3A-C-T2): scripted sensor serving canned ticks through the
+/// `SessionSensor` seam — the live success path without privilege.
+struct ScriptedSensor {
+    script: Vec<kryprobe_privilege::kcrypto_snapshot::SnapshotRows>,
+    who: kryprobe_privilege::kcrypto_backend::WhoSnapshot,
+    drop_sites: [u64; 8],
+    barriers: std::sync::Mutex<Vec<u64>>,
+    tables: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl kryprobe_cli::live::SessionSensor for ScriptedSensor {
+    fn snapshot_tick(
+        &mut self,
+        barrier_id: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<kryprobe_privilege::kcrypto_snapshot::SnapshotRows, kryprobe_cli::live::LiveError>
+    {
+        self.barriers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(barrier_id);
+        let idx = (barrier_id - 1) as usize;
+        if idx + 1 >= self.script.len() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(self.script[idx.min(self.script.len() - 1)].clone())
+    }
+
+    fn kallsyms_text(&mut self) -> String {
+        self.tables
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        String::new()
+    }
+
+    fn snapshot_who(
+        &mut self,
+    ) -> Result<
+        (Vec<kryprobe_privilege::kcrypto_backend::WhoSnapshot>, u64),
+        kryprobe_cli::live::LiveError,
+    > {
+        // Three same-key rows per tick: latest-per-key still dedups to
+        // one who observation, but a per-row kallsyms parse (2B-C2)
+        // would cost 3 parses per tick instead of 1 — the H-T3(1)
+        // parse-count leg below discriminates exactly that.
+        Ok((
+            vec![self.who.clone(), self.who.clone(), self.who.clone()],
+            0,
+        ))
+    }
+
+    fn drop_sites(&mut self) -> Result<[u64; 8], kryprobe_cli::live::LiveError> {
+        Ok(self.drop_sites)
+    }
+
+    fn finish(&mut self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Success-path fake backend: scripted detect/plan/configure, counting
+/// decode over production `observation_for_who`, scripted finalize.
+struct SuccessBackend {
+    decodes: std::sync::atomic::AtomicU64,
+    finalized: std::sync::atomic::AtomicBool,
+    /// Parsed ONCE at construction (empty fixture text): decode must
+    /// not parse per call, or the H-T3(1) parse-count leg below would
+    /// count fake-backend parses alongside tick parses.
+    table: kryprobe_privilege::kallsyms::SymTable<'static>,
+}
+
+impl kryprobe_core::backend::Backend for SuccessBackend {
+    fn id(&self) -> kryprobe_core::enums::BackendId {
+        kryprobe_core::enums::BackendId::KCrypto
+    }
+
+    fn capabilities(&self) -> &'static kryprobe_core::backend::BackendCapabilities {
+        &FAKE_OPEN_CAPS
+    }
+
+    fn detect(
+        &self,
+        _ctx: &kryprobe_core::backend::DetectContext<'_>,
+    ) -> Result<Vec<kryprobe_core::backend::DetectedInstance>, kryprobe_core::error::BackendError>
+    {
+        Ok(vec![kryprobe_core::backend::DetectedInstance {
+            backend: kryprobe_core::enums::BackendId::KCrypto,
+            object: None,
+            detail: "success fake".to_owned(),
+        }])
+    }
+
+    fn plan(
+        &self,
+        _ctx: &kryprobe_core::backend::PlanContext<'_>,
+        _instance: &kryprobe_core::backend::DetectedInstance,
+        _mode: kryprobe_core::enums::CaptureMode,
+    ) -> Result<kryprobe_core::backend::BackendPlan, kryprobe_core::error::BackendError> {
+        Ok(kryprobe_core::backend::BackendPlan {
+            backend: kryprobe_core::enums::BackendId::KCrypto,
+            probes: Vec::new(),
+            required: FAKE_OPEN_CAPS.required,
+        })
+    }
+
+    fn configure(
+        &self,
+        _ctx: &mut kryprobe_core::backend::ConfigureContext<'_>,
+        _plan: &kryprobe_core::backend::BackendPlan,
+    ) -> Result<(), kryprobe_core::error::BackendError> {
+        Ok(())
+    }
+
+    fn decode(
+        &self,
+        ctx: &kryprobe_core::backend::DecodeContext<'_>,
+        _event: kryprobe_core::backend::RawEvent<'_>,
+    ) -> Result<kryprobe_core::evidence::NativeObservation, kryprobe_core::error::BackendError>
+    {
+        let id = ctx.id_issuer.issue().map_err(|_| {
+            kryprobe_core::error::BackendError::Internal(kryprobe_core::error::InternalError::new(
+                "scripted_id_exhausted",
+            ))
+        })?;
+        self.decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(kryprobe_privilege::kcrypto_backend::observation_for_who(
+            &kryprobe_privilege::kcrypto_backend::WhoSnapshot {
+                key: Default::default(),
+                val: Default::default(),
+                stack_ips: Vec::new(),
+                first_errno: None,
+                params: None,
+            },
+            id,
+            &self.table,
+        ))
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &kryprobe_core::backend::FinalizeContext<'_>,
+    ) -> Result<kryprobe_core::backend::BackendSummary, kryprobe_core::error::BackendError> {
+        self.finalized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(kryprobe_core::backend::BackendSummary {
+            backend: kryprobe_core::enums::BackendId::KCrypto,
+            observations: self.decodes.load(std::sync::atomic::Ordering::Relaxed),
+            integrity: kryprobe_core::evidence::IntegritySummary::default(),
+        })
+    }
+}
+
+fn script_agg_as(calls: u64, name8: &[u8; 8]) -> kryprobe_privilege::kcrypto_snapshot::RowBytes {
+    let mut out = Vec::with_capacity(382);
+    out.push(0x01);
+    out.push(1);
+    out.extend_from_slice(&[
+        kryprobe_abi::kcrypto_agg::KFAM_SK,
+        kryprobe_abi::kcrypto_agg::KOP_ENC,
+        kryprobe_abi::kcrypto_agg::KRES_OK,
+        kryprobe_abi::kcrypto_agg::KCTX_PROC,
+    ]);
+    out.extend_from_slice(name8);
+    out.push(0);
+    out.extend_from_slice(&[0u8; 260 - 4 - 9]);
+    out.extend_from_slice(&calls.to_le_bytes());
+    out.extend_from_slice(&[0u8; 120 - 8]);
+    kryprobe_privilege::kcrypto_snapshot::RowBytes::new(out).expect("hand row")
+}
+
+fn script_totals(calls: u64) -> kryprobe_privilege::kcrypto_snapshot::TotalsBytes {
+    let mut out = Vec::with_capacity(122);
+    out.push(0x01);
+    out.push(2);
+    out.extend_from_slice(&calls.to_le_bytes());
+    out.extend_from_slice(&[0u8; 120 - 8]);
+    kryprobe_privilege::kcrypto_snapshot::TotalsBytes::new(out).expect("hand totals")
+}
+
+fn script_ident() -> kryprobe_privilege::kcrypto_snapshot::IdentBytes {
+    let mut out = Vec::with_capacity(50);
+    out.push(0x01);
+    out.push(3);
+    out.extend_from_slice(&[0u8; 48]);
+    kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(out).expect("hand ident")
+}
+
+#[test]
+fn live_success_path_scripted_sensor_three_ticks() {
+    // P0-4: N ticks → decode → coverage → finalize, unprivileged.
+    // 3 ticks × (2 distinct agg + totals + ident + who), latest-per-key:
+    // 2 agg + totals + who + 3 idents = 7 observations; decode serves
+    // agg/totals/ident every tick (12 calls).
+    // H-T3(1): guard BEFORE construction — the fake backend parses its
+    // table once at construction, and that parse must not land in a
+    // concurrent test's count window.
+    let _suite = suite_guard();
+    let tick = |wall: u64| kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![
+            script_agg_as(10, b"cbc(aes)"),
+            script_agg_as(20, b"gcm(aes)"),
+        ],
+        totals: Some(script_totals(30)),
+        idents: vec![script_ident()],
+        overflow_identities: 0,
+        drops: 7,
+        monotonic_ns: wall,
+    };
+    let sensor = ScriptedSensor {
+        script: vec![tick(100), tick(200), tick(300)],
+        who: kryprobe_privilege::kcrypto_backend::WhoSnapshot {
+            key: Default::default(),
+            val: Default::default(),
+            stack_ips: Vec::new(),
+            first_errno: None,
+            params: None,
+        },
+        drop_sites: [0; 8],
+        barriers: std::sync::Mutex::new(Vec::new()),
+        tables: std::sync::atomic::AtomicU64::new(0),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = SuccessBackend {
+        decodes: std::sync::atomic::AtomicU64::new(0),
+        finalized: std::sync::atomic::AtomicBool::new(false),
+        table: kryprobe_privilege::kallsyms::SymTable::parse(""),
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = sensor;
+    // The delta below counts REAL `SymTable::parse` calls — 1 per
+    // tick, not 1 per who row (guard held since test start).
+    let parses_before = kryprobe_privilege::kallsyms::parse_calls();
+    let outcome = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+    )
+    .expect("scripted session drives green");
+    // Row counts: latest-per-key (2 agg + totals + who) + every
+    // disjoint ident (3).
+    assert_eq!(outcome.observations.len(), 7, "4 keys + 3 idents");
+    assert_eq!(
+        backend.decodes.load(std::sync::atomic::Ordering::Relaxed),
+        12,
+        "decode serves agg+totals+ident (who bypasses decode)"
+    );
+    // Barrier cadence: exactly 3 ticks, sequential ids from 1.
+    assert_eq!(
+        sensor
+            .barriers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone(),
+        vec![1, 2, 3]
+    );
+    // Kallsyms seam: one table per tick (C2 counting leg, H-T3).
+    assert_eq!(sensor.tables.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert_eq!(
+        kryprobe_privilege::kallsyms::parse_calls() - parses_before,
+        3,
+        "one real parse per tick across 3 who rows per tick (C2)"
+    );
+    // Drops accounting: scripted session drops ride the coverage.
+    let ring = outcome
+        .coverage
+        .detailed_events
+        .counters
+        .iter()
+        .find(|c| c.name == "ring_drops")
+        .expect("ring_drops counter")
+        .value;
+    assert_eq!(ring, 7);
+    // Interval walls come from the snapshots (first → closing).
+    assert_eq!(outcome.coverage.completion.counters.len(), 1);
+    // Exactly-once feed + finalize: Ok outcome proves the shared feed
+    // ran once (double-feed errors) and finalize filed its summary.
+    assert!(
+        backend.finalized.load(std::sync::atomic::Ordering::Relaxed),
+        "finalize ran once"
+    );
+    assert!(
+        sensor.finished.load(std::sync::atomic::Ordering::Relaxed),
+        "sensor finish ran once"
+    );
+}
+
+#[test]
+fn live_observations_bounded_by_row_keys_not_ticks() {
+    // H2/H-T3(2): 5 identical ticks accumulate latest-per-key (2 agg +
+    // totals + who = 4) plus every disjoint ident (5) — 9 total, not
+    // 5x5=25. Memory is O(keys + idents), never O(ticks x rows).
+    // H-T3(1): guard before construction (see the 3-tick test).
+    let _suite = suite_guard();
+    let tick = |wall: u64| kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![
+            script_agg_as(10, b"cbc(aes)"),
+            script_agg_as(20, b"gcm(aes)"),
+        ],
+        totals: Some(script_totals(30)),
+        idents: vec![script_ident()],
+        overflow_identities: 0,
+        drops: 7,
+        monotonic_ns: wall,
+    };
+    let mut sensor = ScriptedSensor {
+        script: vec![tick(100), tick(200), tick(300), tick(400), tick(500)],
+        who: kryprobe_privilege::kcrypto_backend::WhoSnapshot {
+            key: Default::default(),
+            val: Default::default(),
+            stack_ips: Vec::new(),
+            first_errno: None,
+            params: None,
+        },
+        drop_sites: [0; 8],
+        barriers: std::sync::Mutex::new(Vec::new()),
+        tables: std::sync::atomic::AtomicU64::new(0),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = SuccessBackend {
+        decodes: std::sync::atomic::AtomicU64::new(0),
+        finalized: std::sync::atomic::AtomicBool::new(false),
+        table: kryprobe_privilege::kallsyms::SymTable::parse(""),
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let parses_before = kryprobe_privilege::kallsyms::parse_calls();
+    let outcome = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+    )
+    .expect("scripted session drives green");
+    assert_eq!(
+        sensor
+            .barriers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len(),
+        5,
+        "all 5 ticks ran"
+    );
+    assert_eq!(
+        outcome.observations.len(),
+        9,
+        "latest-per-key (4) + all idents (5), not 25"
+    );
+    // Decode still runs per row per tick (latest counters need fresh
+    // decodes); only accumulation is bounded.
+    assert_eq!(
+        backend.decodes.load(std::sync::atomic::Ordering::Relaxed),
+        20,
+        "5 ticks x (2 agg + totals + ident)"
+    );
+    assert_eq!(
+        kryprobe_privilege::kallsyms::parse_calls() - parses_before,
+        5,
+        "one real parse per tick across 3 who rows per tick (C2)"
+    );
+}
+
+#[test]
+fn live_corrupt_snapshot_row_fails_closed() {
+    // H3: the in-loop single parse is also the corruption gate — a
+    // garbage row fails the tick typed (`Internal`), never panics and
+    // never decodes half a row.
+    // H-T3(1): guard before construction (see the 3-tick test).
+    let _suite = suite_guard();
+    let mut bad = vec![0u8; 382];
+    bad[0] = 0x01;
+    bad[1] = 9; // no such row kind
+    let tick = kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![kryprobe_privilege::kcrypto_snapshot::RowBytes::new(bad).expect("382B")],
+        totals: None,
+        idents: Vec::new(),
+        overflow_identities: 0,
+        drops: 0,
+        monotonic_ns: 100,
+    };
+    let mut sensor = ScriptedSensor {
+        script: vec![tick],
+        who: kryprobe_privilege::kcrypto_backend::WhoSnapshot {
+            key: Default::default(),
+            val: Default::default(),
+            stack_ips: Vec::new(),
+            first_errno: None,
+            params: None,
+        },
+        drop_sites: [0; 8],
+        barriers: std::sync::Mutex::new(Vec::new()),
+        tables: std::sync::atomic::AtomicU64::new(0),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = SuccessBackend {
+        decodes: std::sync::atomic::AtomicU64::new(0),
+        finalized: std::sync::atomic::AtomicBool::new(false),
+        table: kryprobe_privilege::kallsyms::SymTable::parse(""),
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    // The corrupt row fails before the who/kallsyms stage — the
+    // session must parse zero tables, not one-per-row-then-fail.
+    let parses_before = kryprobe_privilege::kallsyms::parse_calls();
+    let err = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+    )
+    .expect_err("corrupt row must fail the session");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("live parse agg"),
+        "names the failing stage: {msg}"
+    );
+    assert_eq!(
+        backend.decodes.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "nothing decodes past a corrupt row"
+    );
+    assert_eq!(
+        kryprobe_privilege::kallsyms::parse_calls() - parses_before,
+        0,
+        "corrupt tick parses no kallsyms table"
     );
 }

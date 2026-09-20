@@ -36,16 +36,19 @@
 //! adds `key_hash`/`lat` to agg payloads, and merges `who_drops` into
 //! finalize integrity.
 
+use std::collections::HashMap;
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kryprobe_abi::kcrypto_agg::{
     KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCTX_KTHREAD, KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KCtl,
-    KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC,
-    KOP_DESTROY, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED,
-    KWHO_DROPS, KWhoKey, VAgg, VParams, VWho, kctl_unpack_lens, kh_of, kwho_key_from_bytes,
-    vparams_from_bytes, vwho_from_bytes,
+    KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KOP_ALLOC, KOP_DEC, KOP_DESTROY,
+    KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED, KWHO_DROPS,
+    KWhoKey, VAgg, VParams, VWho, kctl_unpack_lens, kh_of, kwho_key_from_bytes, vparams_from_bytes,
+    vwho_from_bytes,
 };
 use kryprobe_core::backend::{
     Backend, BackendCapabilities, BackendPlan, BackendRegistry, BackendSummary, ConfigureContext,
@@ -103,29 +106,220 @@ const UNOBSERVED_NOTE: &str = "unobserved: void return carries no result class (
 /// is fd-backed, no interior aliasing).
 pub struct KCryptoBackend {
     state: Mutex<Option<(PlanGeneration, ConfiguredKcrypto)>>,
+    staged: Mutex<StagedBringup>,
     decoded: AtomicUsize,
+}
+
+/// One-shot bringup inputs staged by the live session (H1(b)/M2): the
+/// already-read object bytes (no third locator read) plus the held
+/// token file (token-only delegation loads through it). Drained
+/// exactly once by the `configure` that loads; empty unless staged.
+#[derive(Default)]
+struct StagedBringup {
+    object: Option<Vec<u8>>,
+    token: Option<File>,
+    closing: Option<ClosingCounts>,
+}
+
+/// Closing-tick counts staged by the live driver (M5): the finalize
+/// fast path computes integrity from these plus one fresh
+/// `KWHO_DROPS` read — no snapshot walk, no who walk. Generation-
+/// tagged so stale counts can never serve another session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosingCounts {
+    /// Session generation the counts belong to.
+    pub generation: PlanGeneration,
+    /// ΣKAGG calls over the closing tick (saturating).
+    pub agg_calls: u64,
+    /// KTOT calls (`None` when the closing tick had no totals).
+    pub totals_calls: Option<u64>,
+    /// Retained `KIDN_DROPS` from the closing snapshot.
+    pub drops: u8,
 }
 
 impl std::fmt::Debug for KCryptoBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // L5: `Relaxed` counter read; `try_lock` (never blocks — a
+        // `Debug` that deadlocks while its own mutex is held would be
+        // a debugging nightmare).
         f.debug_struct("KCryptoBackend")
-            .field("decoded", &self.decoded.load(Ordering::SeqCst))
+            .field("decoded", &self.decoded.load(Ordering::Relaxed))
             .field(
                 "configured",
-                &self.state.lock().map(|s| s.is_some()).unwrap_or(false),
+                &self.state.try_lock().map(|s| s.is_some()).unwrap_or(false),
             )
             .finish()
     }
 }
 
 impl KCryptoBackend {
-    /// Unconfigured backend: no sensor, zero decoded.
+    /// Unconfigured backend: no sensor, zero decoded, nothing staged.
     #[must_use]
     pub fn new() -> Self {
         Self {
             state: Mutex::new(None),
+            staged: Mutex::new(StagedBringup::default()),
             decoded: AtomicUsize::new(0),
         }
+    }
+
+    /// Stages one-shot bringup inputs for the next loading `configure`
+    /// (H1(b)/M2): live passes its already-read object bytes plus the
+    /// held token file, so `configure` neither re-reads the object
+    /// (M2's third read) nor loads privilege-only (token-only
+    /// delegation works: the single sensor loads through the token).
+    /// Overwrites any previous staging; drained exactly once.
+    pub fn stage_session_inputs(&self, object: Vec<u8>, token: Option<File>) {
+        let mut staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        staged.object = Some(object);
+        staged.token = token;
+    }
+
+    /// Drains staged inputs (empty unless staged since the last drain).
+    /// Leaves `closing` in place: it belongs to a later lifecycle
+    /// stage (staged after the tick loop, consumed by `finalize`).
+    fn take_staged_inputs(&self) -> StagedBringup {
+        let mut staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        StagedBringup {
+            object: staged.object.take(),
+            token: staged.token.take(),
+            closing: staged.closing,
+        }
+    }
+
+    /// Stages closing-tick counts for the finalize fast path (M5).
+    /// Overwrites any previous staging.
+    pub fn stage_closing_counts(&self, closing: ClosingCounts) {
+        self.staged
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .closing = Some(closing);
+    }
+
+    /// Takes staged closing counts iff they belong to `generation`.
+    /// A foreign generation discards them (stale counts never serve
+    /// another session); a hit drains once.
+    fn take_closing_for(&self, generation: PlanGeneration) -> Option<ClosingCounts> {
+        let mut staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match staged.closing {
+            Some(closing) if closing.generation == generation => {
+                staged.closing = None;
+                Some(closing)
+            }
+            _ => {
+                staged.closing = None;
+                None
+            }
+        }
+    }
+
+    /// Hands the live tick loop its own handle onto the configured
+    /// sensor (H1(b)): dup'd fds onto the SAME kernel sensor — one
+    /// attach, one probe stream, one set of maps shared by ticks and
+    /// finalize. Typed error before `configure` (never a handle to
+    /// nothing); fd exhaustion surfaces as `Exhausted`, never a
+    /// half-dup'd sensor.
+    pub fn session_sensor(&self) -> Result<ConfiguredKcrypto, BackendError> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some((_, sensor)) = guard.as_ref() else {
+            return Err(BackendError::Internal(InternalError::new(
+                "kcrypto_sensor_unconfigured",
+            )));
+        };
+        sensor.try_clone().map_err(|err| {
+            BackendError::Exhausted(BudgetReason::with_detail(
+                "kcrypto_sensor_clone",
+                &err.to_string(),
+            ))
+        })
+    }
+}
+
+/// Shared ownership for the live session (H1(b)): live holds one
+/// clone for the sensor accessor while the registry owns another for
+/// the frozen-trait lifecycle — both name the SAME backend state, so
+/// ticks and finalize share one sensor with no trait change. A local
+/// wrapper (not a bare `Arc`) because the orphan rule forbids
+/// implementing the foreign [`Backend`] trait for `Arc` directly.
+#[derive(Debug, Clone)]
+pub struct SharedKcryptoBackend {
+    inner: std::sync::Arc<KCryptoBackend>,
+}
+
+impl SharedKcryptoBackend {
+    /// Wraps a fresh unconfigured backend.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(KCryptoBackend::new()),
+        }
+    }
+
+    /// Borrows the shared concrete backend (staging + sensor handle).
+    #[must_use]
+    pub fn backend(&self) -> &KCryptoBackend {
+        &self.inner
+    }
+}
+
+impl Default for SharedKcryptoBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Backend for SharedKcryptoBackend {
+    fn id(&self) -> BackendId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &'static BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn detect(&self, ctx: &DetectContext<'_>) -> Result<Vec<DetectedInstance>, BackendError> {
+        self.inner.detect(ctx)
+    }
+
+    fn plan(
+        &self,
+        ctx: &PlanContext<'_>,
+        instance: &DetectedInstance,
+        mode: CaptureMode,
+    ) -> Result<BackendPlan, BackendError> {
+        self.inner.plan(ctx, instance, mode)
+    }
+
+    fn configure(
+        &self,
+        ctx: &mut ConfigureContext<'_>,
+        plan: &BackendPlan,
+    ) -> Result<(), BackendError> {
+        self.inner.configure(ctx, plan)
+    }
+
+    fn decode(
+        &self,
+        ctx: &DecodeContext<'_>,
+        event: RawEvent<'_>,
+    ) -> Result<NativeObservation, BackendError> {
+        self.inner.decode(ctx, event)
+    }
+
+    fn finalize(&self, ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError> {
+        self.inner.finalize(ctx)
     }
 }
 
@@ -138,6 +332,17 @@ impl Default for KCryptoBackend {
 /// Single registration helper (the CLI imports this; never redefines it).
 pub fn register_kcrypto(registry: &mut BackendRegistry) -> Result<(), DuplicateBackend> {
     registry.register(Box::new(KCryptoBackend::new()))
+}
+
+/// Shared registration (H1(b)): registers the backend AND returns a
+/// live-held clone onto the same state, so ticks and finalize share
+/// one sensor. The CLI live session imports this; never redefines it.
+pub fn register_kcrypto_shared(
+    registry: &mut BackendRegistry,
+) -> Result<SharedKcryptoBackend, DuplicateBackend> {
+    let shared = SharedKcryptoBackend::new();
+    registry.register(Box::new(shared.clone()))?;
+    Ok(shared)
 }
 
 /// Charge one budget kind, mapping refusal to a typed exhaustion error
@@ -569,6 +774,87 @@ fn stack_ips_from_bytes(bytes: &[u8]) -> Vec<u64> {
     out
 }
 
+/// Read the `KIDN[KWHO_DROPS]` per-row identity drop counter (M5:
+/// the finalize fast path's only map read). Absent key reads
+/// healthy-zero; any other errno fails loud (same rule as the
+/// `snapshot_who` tail this was extracted from).
+fn read_kwho_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotError> {
+    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
+    match unsafe {
+        map_lookup_bytes(
+            &maps.loaded.maps.ident,
+            &KWHO_DROPS.to_le_bytes(),
+            1,
+            "snapshot/who-drops",
+        )
+    } {
+        Ok(value) => Ok(u64::from(value.first().copied().unwrap_or(0))),
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Joined attribution for one who row: the three map joins
+/// (`KSTACK`/`KERR`/`KPARAMS`) factored out so quiescent rows reuse
+/// them from [`WhoCache`] instead of re-reading the maps (H4).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WhoJoins {
+    /// Kernel stack IPs for the row's stack id.
+    pub stack_ips: Vec<u64>,
+    /// First nonzero return for the row hash.
+    pub first_errno: Option<i32>,
+    /// Crypto params for the row hash.
+    pub params: Option<VParams>,
+}
+
+/// Cross-tick who-join cache (H4): one entry per live `(kh, tgid)`
+/// key, each pinned to the `(last_ns, stack)` it was joined at. A
+/// hit reuses the joins (skips 3 map reads); any advance rejoins. The
+/// entry count is bounded by the live `KWHO` key set (≤2048 map
+/// entries); dead keys linger until the session ends (bounded, small:
+/// ~100B per entry worst case).
+///
+/// Correctness: a hit requires the folded `last_ns` (max lane write
+/// time) AND the stack id to be unchanged. Any new who-event for the
+/// key advances `last_ns` (folded max), and all three joins derive
+/// from the same events — so a hit implies an unchanged map entry
+/// (tgid-recycle safe: recycled tgids with new activity advance the
+/// stamp; quiescent keys keep valid joins).
+#[derive(Debug, Default)]
+pub struct WhoCache {
+    entries: HashMap<(u64, u32), (u64, i32, WhoJoins)>,
+}
+
+impl WhoCache {
+    /// Empty cache (cold: every row rejoins once).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Cached joins for a row stamped `(last_ns, stack)` (`None` =
+    /// rejoin: cold key, advanced stamp, or changed stack id).
+    #[must_use]
+    pub fn lookup(&self, kh: u64, tgid: u32, last_ns: u64, stack: i32) -> Option<WhoJoins> {
+        match self.entries.get(&(kh, tgid)) {
+            Some((cached_ns, cached_stack, joins))
+                if *cached_ns == last_ns && *cached_stack == stack =>
+            {
+                Some(joins.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Stores joins for a row stamped `(last_ns, stack)` (overwrites
+    /// any previous entry for the key).
+    pub fn store(&mut self, kh: u64, tgid: u32, last_ns: u64, stack: i32, joins: WhoJoins) {
+        self.entries.insert((kh, tgid), (last_ns, stack, joins));
+    }
+}
+
 /// Snapshot the K5 attribution maps of a configured sensor: full `KWHO`
 /// walk (key iteration + percpu fold) with per-row `KSTACK`/`KERR`/
 /// `KPARAMS` joins, plus the `KWHO_DROPS` insert-loss count. Map order.
@@ -576,12 +862,98 @@ fn stack_ips_from_bytes(bytes: &[u8]) -> Vec<u64> {
 /// Join-miss discipline (fail-soft, never fatal): a negative `stack`
 /// (raw helper errno — no `KSTACK` row) or an absent `KSTACK` row yields
 /// empty `stack_ips`; an absent `KERR`/`KPARAMS` row yields `None`.
+/// `KSTACK` join for one stack id: kernel stack IPs, truncated at
+/// the first zero; empty when the id is negative or the row is
+/// absent. Other map errors fail loud.
+fn join_stack(maps: &ConfiguredKcrypto, stack: i32) -> Result<Vec<u64>, SnapshotError> {
+    if stack < 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: KSTACK is an aya StackTrace map: the kernel stack
+    // value is 127 × u64 = 1016B, always.
+    match unsafe {
+        map_lookup_bytes(
+            &maps.loaded.maps.stack,
+            &(stack as u32).to_le_bytes(),
+            1016,
+            "snapshot/who-stack",
+        )
+    } {
+        Ok(raw) => Ok(stack_ips_from_bytes(&raw)),
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(Vec::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// `KERR` + `KPARAMS` joins for one row hash: first errno + crypto
+/// params (`None` each when the row is absent). Other map errors, or
+/// a present-but-undecodable value, fail loud.
+fn join_err_params(
+    maps: &ConfiguredKcrypto,
+    kh: u64,
+) -> Result<(Option<i32>, Option<VParams>), SnapshotError> {
+    // SAFETY: KERR is HashMap<u64, i32>; value_len 4 is exact.
+    let first_errno = match unsafe {
+        map_lookup_bytes(
+            &maps.loaded.maps.err,
+            &kh.to_le_bytes(),
+            4,
+            "snapshot/who-err",
+        )
+    } {
+        Ok(raw) => {
+            let word: [u8; 4] = raw.try_into().map_err(|_| MapOpsError::LookupFailed {
+                stage: "snapshot/who-err".to_owned(),
+                errno: libc::EBADMSG,
+            })?;
+            Some(i32::from_le_bytes(word))
+        }
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
+        Err(err) => return Err(err.into()),
+    };
+    // SAFETY: KPARAMS is HashMap<u64, VParams>; VParams is 16B
+    // (vparams_from_bytes).
+    let params = match unsafe {
+        map_lookup_bytes(
+            &maps.loaded.maps.params,
+            &kh.to_le_bytes(),
+            16,
+            "snapshot/who-params",
+        )
+    } {
+        Ok(raw) => Some(
+            vparams_from_bytes(&raw).ok_or_else(|| MapOpsError::LookupFailed {
+                stage: "snapshot/who-params".to_owned(),
+                errno: libc::EBADMSG,
+            })?,
+        ),
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
+        Err(err) => return Err(err.into()),
+    };
+    Ok((first_errno, params))
+}
+
 /// Structural failures (walk errors, short reads, undecodable lanes)
 /// fail the whole snapshot as [`SnapshotError::Map`] (a broken
 /// post-attach read must be loud, never a silent zero).
 pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
+    snapshot_who_cached(maps, &mut WhoCache::new())
+}
+
+/// [`snapshot_who`] with a caller-held join cache (H4): quiescent
+/// rows skip all three joins; changed rows join through the
+/// within-tick `kh` dedup (same crypto identity across tgids looks
+/// up `KERR`/`KPARAMS` once per tick, not once per row). The lane
+/// buffer is hoisted out of the row loop (M8: one alloc per snapshot,
+/// not per row).
+pub fn snapshot_who_cached(
+    maps: &ConfiguredKcrypto,
+    cache: &mut WhoCache,
+) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
     let ncpu = possible_cpus() as usize;
     let mut out = Vec::new();
+    let mut lanes: Vec<VWho> = Vec::with_capacity(ncpu);
+    let mut tick_err: HashMap<u64, (Option<i32>, Option<VParams>)> = HashMap::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
         // SAFETY: KWHO key is KWhoKey, exactly 16B (bpf-kcrypto map def).
@@ -602,7 +974,7 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
         // (vwho_from_bytes); ncpu is possible_cpus.
         let raw =
             unsafe { map_lookup_bytes(&maps.loaded.maps.who, &k, 80 * ncpu, "snapshot/who-val") }?;
-        let mut lanes = Vec::with_capacity(ncpu);
+        lanes.clear();
         for c in 0..ncpu {
             let lane = raw
                 .get(c * 80..(c + 1) * 80)
@@ -614,84 +986,46 @@ pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64),
             lanes.push(lane);
         }
         let val = fold_vwho(&lanes);
-        let stack_ips = if val.stack >= 0 {
-            // SAFETY: KSTACK is an aya StackTrace map: the kernel stack
-            // value is 127 × u64 = 1016B, always.
-            match unsafe {
-                map_lookup_bytes(
-                    &maps.loaded.maps.stack,
-                    &(val.stack as u32).to_le_bytes(),
-                    1016,
-                    "snapshot/who-stack",
-                )
-            } {
-                Ok(raw) => stack_ips_from_bytes(&raw),
-                Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Vec::new(),
-                Err(err) => return Err(err.into()),
+        let joins = match cache.lookup(who_key.kh, who_key.tgid, val.last_ns, val.stack) {
+            Some(joins) => joins,
+            None => {
+                let stack_ips = join_stack(maps, val.stack)?;
+                // `KERR`/`KPARAMS` key on `kh` alone: rows sharing one
+                // crypto identity across tgids share these joins
+                // within the tick.
+                let (first_errno, params) = match tick_err.get(&who_key.kh) {
+                    Some(cached) => *cached,
+                    None => {
+                        let joined = join_err_params(maps, who_key.kh)?;
+                        tick_err.insert(who_key.kh, joined);
+                        joined
+                    }
+                };
+                let joins = WhoJoins {
+                    stack_ips,
+                    first_errno,
+                    params,
+                };
+                cache.store(
+                    who_key.kh,
+                    who_key.tgid,
+                    val.last_ns,
+                    val.stack,
+                    joins.clone(),
+                );
+                joins
             }
-        } else {
-            Vec::new()
-        };
-        // SAFETY: KERR is HashMap<u64, i32>; value_len 4 is exact.
-        let first_errno = match unsafe {
-            map_lookup_bytes(
-                &maps.loaded.maps.err,
-                &who_key.kh.to_le_bytes(),
-                4,
-                "snapshot/who-err",
-            )
-        } {
-            Ok(raw) => {
-                let word: [u8; 4] = raw.try_into().map_err(|_| MapOpsError::LookupFailed {
-                    stage: "snapshot/who-err".to_owned(),
-                    errno: libc::EBADMSG,
-                })?;
-                Some(i32::from_le_bytes(word))
-            }
-            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
-            Err(err) => return Err(err.into()),
-        };
-        // SAFETY: KPARAMS is HashMap<u64, VParams>; VParams is 16B
-        // (vparams_from_bytes).
-        let params = match unsafe {
-            map_lookup_bytes(
-                &maps.loaded.maps.params,
-                &who_key.kh.to_le_bytes(),
-                16,
-                "snapshot/who-params",
-            )
-        } {
-            Ok(raw) => Some(
-                vparams_from_bytes(&raw).ok_or_else(|| MapOpsError::LookupFailed {
-                    stage: "snapshot/who-params".to_owned(),
-                    errno: libc::EBADMSG,
-                })?,
-            ),
-            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => None,
-            Err(err) => return Err(err.into()),
         };
         out.push(WhoSnapshot {
             key: who_key,
             val,
-            stack_ips,
-            first_errno,
-            params,
+            stack_ips: joins.stack_ips,
+            first_errno: joins.first_errno,
+            params: joins.params,
         });
         key = Some(k);
     }
-    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
-    let drops = match unsafe {
-        map_lookup_bytes(
-            &maps.loaded.maps.ident,
-            &KWHO_DROPS.to_le_bytes(),
-            1,
-            "snapshot/who-drops",
-        )
-    } {
-        Ok(value) => u64::from(value.first().copied().unwrap_or(0)),
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => 0,
-        Err(err) => return Err(err.into()),
-    };
+    let drops = read_kwho_drops(maps)?;
     Ok((out, drops))
 }
 
@@ -1052,28 +1386,6 @@ pub fn observation_for_who(
 // D10 integrity mapping (exact).
 // ---------------------------------------------------------------------------
 
-/// `KIDN[KIDN_DROPS]` ring-reserve counter: absent key reads healthy-zero
-/// (the Task-1 idiom); any other map failure is a defect marker (a broken
-/// post-attach read must be loud, never a silent zero).
-fn finalize_drops(sensor: &ConfiguredKcrypto) -> Result<u8, BackendError> {
-    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
-    match unsafe {
-        map_lookup_bytes(
-            &sensor.loaded.maps.ident,
-            &KIDN_DROPS.to_le_bytes(),
-            1,
-            "kcrypto_backend/finalize-drops",
-        )
-    } {
-        Ok(value) => Ok(value.first().copied().unwrap_or(0)),
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
-        Err(err) => Err(BackendError::Internal(InternalError::with_detail(
-            "kcrypto_finalize_read",
-            &err.to_string(),
-        ))),
-    }
-}
-
 /// D10 over snapshot data: `ring_reservation_failures ← drops`,
 /// `state_insert_failures ← KTOT − ΣKAGG` calls gap `+ who_drops`
 /// (saturating; the KAGG/KIDN-full volume plus the KWHO-family
@@ -1104,11 +1416,11 @@ fn integrity_for_snapshot(
             }
         }
     }
-    let gap = match &snap.totals {
+    let totals_calls = match &snap.totals {
         // Array map: live-impossible; with no baseline, claim no gap.
-        None => 0,
+        None => None,
         Some(totals) => match parse_snapshot_row(&totals.0).map_err(reparse)? {
-            ParsedRow::Totals { vagg } => vagg.calls.saturating_sub(agg_calls),
+            ParsedRow::Totals { vagg } => Some(vagg.calls),
             _ => {
                 return Err(BackendError::Internal(InternalError::new(
                     "kcrypto_finalize_row_kind",
@@ -1116,6 +1428,21 @@ fn integrity_for_snapshot(
             }
         },
     };
+    integrity_for_counts(agg_calls, totals_calls, drops, who_drops)
+}
+
+/// D10 over call counts (M5 core): `ring_reservation_failures ←
+/// drops`, `state_insert_failures ← KTOT − ΣKAGG calls gap `+`
+/// who_drops` (saturating). No baseline (missing totals) claims no
+/// gap. Infallible in practice (`Result` keeps the wrapper's error
+/// channel shape).
+fn integrity_for_counts(
+    agg_calls: u64,
+    totals_calls: Option<u64>,
+    drops: u8,
+    who_drops: u64,
+) -> Result<IntegritySummary, BackendError> {
+    let gap = totals_calls.map_or(0, |totals| totals.saturating_sub(agg_calls));
     Ok(IntegritySummary {
         ring_reservation_failures: u64::from(drops),
         state_insert_failures: gap.saturating_add(who_drops),
@@ -1182,13 +1509,6 @@ impl Backend for KCryptoBackend {
     ) -> Result<(), BackendError> {
         // Idempotent by generation: same-generation re-calls are no-ops
         // (no reload, no re-charge) so K3 can call per watch tick.
-        // NOTE (accepted): the check and the stash are not atomic across
-        // the load — two threads configuring the SAME new generation
-        // concurrently could both load and both charge (the loser's
-        // sensor drops via RAII: no leak, no half-state). Unreachable in
-        // practice: the driver drives the lifecycle single-threaded and
-        // no concurrent caller exists; re-check under the lock before
-        // charging if that ever changes.
         {
             let state = self
                 .state
@@ -1200,19 +1520,43 @@ impl Backend for KCryptoBackend {
                 return Ok(());
             }
         }
-        // First call (or a new generation): direct-privileged bring-up.
-        let bytes = kcrypto_object_bytes()?;
+        // First call (or a new generation): staged inputs win when
+        // the live session staged them (H1(b)/M2 — the already-read
+        // bytes skip the locator re-read; the staged token loads
+        // token-only delegations), else the historical direct path:
+        // locate + privileged load. `staged` stays alive across the
+        // load so the borrowed token fd cannot close mid-bring-up.
+        let staged = self.take_staged_inputs();
+        let bytes = match staged.object {
+            Some(bytes) => bytes,
+            None => kcrypto_object_bytes()?,
+        };
+        let token_fd = staged.token.as_ref().map(File::as_raw_fd);
         let (sensor, _points) =
-            load_kcrypto_configured(&bytes, None).map_err(configured_error_to_backend)?;
+            load_kcrypto_configured(&bytes, token_fd).map_err(configured_error_to_backend)?;
         // Charge only after the load succeeds (a failed configure charges
         // nothing); the sensor stashes only after the charges land, so a
         // refused charge drops the fresh sensor and keeps prior state.
-        charge(ctx, BudgetKind::Links, sensor.links.len() as u64)?;
-        charge(ctx, BudgetKind::StateEntries, KCRYPTO_MAP_COUNT)?;
-        *self
+        // L6: the re-check + charges + stash run under one held lock —
+        // a concurrent configure of the same generation that stashed
+        // while this load ran turns this call into a no-op (the loser
+        // drops its fresh sensor via RAII and charges nothing: no
+        // double-load-survives, no double-charge). The slow load stays
+        // outside the lock; the critical section is two in-memory
+        // budget charges plus the stash (no lock ordering: the budget
+        // is caller-owned `&mut`, never a mutex).
+        let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some((ctx.generation, sensor));
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some((generation, _)) = state.as_ref()
+            && *generation == ctx.generation
+        {
+            return Ok(());
+        }
+        charge(ctx, BudgetKind::Links, sensor.links.len() as u64)?;
+        charge(ctx, BudgetKind::StateEntries, KCRYPTO_MAP_COUNT)?;
+        *state = Some((ctx.generation, sensor));
         Ok(())
     }
 
@@ -1235,17 +1579,18 @@ impl Backend for KCryptoBackend {
             ParsedRow::Totals { vagg } => observation_for_totals(&vagg, id),
             ParsedRow::Ident { kctl } => observation_for_ident(&kctl, id),
         };
-        self.decoded.fetch_add(1, Ordering::SeqCst);
+        // L5: pure counter — `Relaxed` suffices (no data rides it).
+        self.decoded.fetch_add(1, Ordering::Relaxed);
         Ok(observation)
     }
 
     fn finalize(&self, _ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError> {
-        let observations = self.decoded.load(Ordering::SeqCst) as u64;
+        let observations = self.decoded.load(Ordering::Relaxed) as u64;
         let guard = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let Some((_, sensor)) = guard.as_ref() else {
+        let Some((generation, sensor)) = guard.as_ref() else {
             // Pre-configure: no sensor to assess — counts echo, integrity
             // pins zero (documented; never echo the ctx baseline).
             return Ok(BackendSummary {
@@ -1254,6 +1599,30 @@ impl Backend for KCryptoBackend {
                 integrity: IntegritySummary::default(),
             });
         };
+        // Staged fast path (M5): the live driver staged closing-tick
+        // counts, so integrity computes from those plus one fresh
+        // `KWHO_DROPS` read — no snapshot walk, no who walk. The gap
+        // agrees with the session coverage by construction (same
+        // closing counts). Unstaged callers (driver tests, direct
+        // use) fall through to the historical full assessment.
+        if let Some(closing) = self.take_closing_for(*generation) {
+            let who_drops = read_kwho_drops(sensor).map_err(|err| {
+                BackendError::Internal(InternalError::with_detail(
+                    "kcrypto_finalize_read",
+                    &format!("who drops: {err}"),
+                ))
+            })?;
+            return Ok(BackendSummary {
+                backend: BackendId::KCrypto,
+                observations,
+                integrity: integrity_for_counts(
+                    closing.agg_calls,
+                    closing.totals_calls,
+                    closing.drops,
+                    who_drops,
+                )?,
+            });
+        }
         // End-of-session assessment over a fresh snapshot (the ring drain
         // lands here too — the session is over, nothing else consumes it).
         let snap = snapshot_rows(sensor).map_err(|err| {
@@ -1262,7 +1631,9 @@ impl Backend for KCryptoBackend {
                 &format!("snapshot: {err}"),
             ))
         })?;
-        let drops = finalize_drops(sensor)?;
+        // Retained read (M3): the fresh snapshot already carries
+        // `KIDN_DROPS` — no second lookup of the key.
+        let drops = snap.drops;
         // K5: attribution-insert loss joins the state-insert counter (the
         // who rows themselves decode per-tick in Task 5; finalize only
         // needs the loss count).
@@ -1688,6 +2059,7 @@ mod tests {
             }),
             idents: vec![],
             overflow_identities: 0,
+            drops: 0,
             monotonic_ns: 7,
         }
     }
@@ -1768,6 +2140,102 @@ mod tests {
     }
 
     #[test]
+    fn integrity_for_counts_matches_snapshot_wrapper() {
+        // M5: the staged fast path computes integrity from closing
+        // counts — identical to the parse-then-compute wrapper.
+        let snap = hand_snapshot(&[10, 20], Some(30));
+        let via_snapshot = integrity_for_snapshot(&snap, 3, 5).expect("wrapper computes");
+        let via_counts = integrity_for_counts(30, Some(30), 3, 5).expect("core computes");
+        assert_eq!(via_counts, via_snapshot);
+        assert_eq!(via_counts.ring_reservation_failures, 3);
+        assert_eq!(via_counts.state_insert_failures, 5, "gap 0 + who 5");
+        // Gap leg: totals beyond Σagg accrue as insert failures.
+        let gapped = integrity_for_counts(30, Some(40), 0, 1).expect("gap");
+        assert_eq!(gapped.state_insert_failures, 11, "gap 10 + who 1");
+        // Missing totals: no baseline, no gap claim.
+        let nobase = integrity_for_counts(30, None, 0, 2).expect("no baseline");
+        assert_eq!(nobase.state_insert_failures, 2);
+    }
+
+    #[test]
+    fn staged_closing_counts_match_generation_only() {
+        // M5: staged closing counts serve only the generation they
+        // were staged for; a foreign generation discards them (stale
+        // counts never poison another session's integrity).
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(4);
+        backend.stage_closing_counts(ClosingCounts {
+            generation,
+            agg_calls: 30,
+            totals_calls: Some(30),
+            drops: 3,
+        });
+        assert!(
+            backend.take_closing_for(PlanGeneration::new(5)).is_none(),
+            "foreign generation discards"
+        );
+        assert!(
+            backend.take_closing_for(generation).is_none(),
+            "discarded staging is gone for good"
+        );
+        backend.stage_closing_counts(ClosingCounts {
+            generation,
+            agg_calls: 30,
+            totals_calls: Some(30),
+            drops: 3,
+        });
+        let hit = backend
+            .take_closing_for(generation)
+            .expect("matching generation hits");
+        assert_eq!(
+            (hit.agg_calls, hit.totals_calls, hit.drops),
+            (30, Some(30), 3)
+        );
+        assert!(
+            backend.take_closing_for(generation).is_none(),
+            "closing staging drains once"
+        );
+    }
+
+    #[test]
+    fn who_cache_hit_skips_rejoin_on_quiescent_row() {
+        // H4: quiescent rows (same last_ns + stack id) reuse joins;
+        // any advance or any new key rejoins. tgid-recycle safe: new
+        // activity always advances last_ns (folded max), so a hit
+        // implies an unchanged map entry.
+        let mut cache = WhoCache::new();
+        let joins = WhoJoins {
+            stack_ips: vec![0xfff0, 0xfff1],
+            first_errno: Some(-2),
+            params: Some(VParams::default()),
+        };
+        assert_eq!(cache.lookup(7, 42, 100, 3), None, "cold miss");
+        cache.store(7, 42, 100, 3, joins.clone());
+        assert_eq!(
+            cache.lookup(7, 42, 100, 3),
+            Some(joins.clone()),
+            "quiescent hit"
+        );
+        assert_eq!(
+            cache.lookup(7, 42, 101, 3),
+            None,
+            "advanced last_ns rejoins"
+        );
+        assert_eq!(
+            cache.lookup(7, 42, 100, 4),
+            None,
+            "changed stack id rejoins"
+        );
+        assert_eq!(cache.lookup(7, 43, 100, 3), None, "other tgid misses");
+        assert_eq!(cache.lookup(8, 42, 100, 3), None, "other kh misses");
+        // Restoring advances the entry (no unbounded growth: one
+        // entry per live key; dead keys evaporate on process exit...
+        // see the struct docs for the session bound).
+        cache.store(7, 42, 101, 3, joins.clone());
+        assert_eq!(cache.lookup(7, 42, 101, 3), Some(joins));
+    }
+
+    #[test]
     fn kdrop_fold_sums_percpu_lanes_saturating() {
         // Synthetic 3-CPU lanes: exact sum, short read refuses, overflow
         // saturates (never wraps — magnitude honesty at scale).
@@ -1783,5 +2251,43 @@ mod tests {
             .flat_map(|lane| lane.to_le_bytes())
             .collect();
         assert_eq!(fold_drop_lanes(&lanes, 2), Some(u64::MAX));
+    }
+
+    #[test]
+    fn session_sensor_before_configure_is_typed_error() {
+        // H1(b): the tick sensor comes from the configured backend —
+        // before configure there is no sensor, typed (never a panic
+        // or a silent empty handle).
+        let backend = KCryptoBackend::new();
+        let err = match backend.session_sensor() {
+            Ok(_) => panic!("unconfigured backend has no sensor"),
+            Err(err) => err,
+        };
+        match err {
+            BackendError::Internal(reason) => {
+                assert_eq!(reason.reason, "kcrypto_sensor_unconfigured")
+            }
+            other => panic!("expected Internal(unconfigured), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staged_inputs_roundtrip_and_drain_once() {
+        // H1(b)/M2: live stages its already-read object bytes + token
+        // file; configure drains them exactly once (second drain is
+        // empty — no stale reuse across generations).
+        let backend = KCryptoBackend::new();
+        let probe =
+            std::env::temp_dir().join(format!("kryprobe-k3-merge-stage-{}", std::process::id()));
+        std::fs::write(&probe, b"token").expect("write probe");
+        let file = std::fs::File::open(&probe).expect("open probe");
+        backend.stage_session_inputs(vec![0x7f, b'E', b'L', b'F'], Some(file));
+        let first = backend.take_staged_inputs();
+        assert_eq!(first.object, Some(vec![0x7f, b'E', b'L', b'F']));
+        assert!(first.token.is_some(), "staged token drains");
+        let second = backend.take_staged_inputs();
+        assert_eq!(second.object, None, "bytes drain once");
+        assert!(second.token.is_none(), "token drains once");
+        std::fs::remove_file(&probe).ok();
     }
 }
