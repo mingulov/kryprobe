@@ -779,9 +779,14 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
                 stack_map,
                 BPF_F_FAST_STACK_CMP,
             ) as i32);
+            // Zero tallies + stamps: the percpu insert broadcasts this
+            // value to every lane, so idle lanes must hold calls == 0
+            // with zero stamps (the KAGG `vagg_zero_slot` precedent);
+            // the re-lookup below stamps the inserting lane via
+            // `update_who_slot` (first_ns = last_ns = now, calls = 1).
             core::ptr::addr_of_mut!((*base).calls).write_volatile(0);
-            core::ptr::addr_of_mut!((*base).first_ns).write(now);
-            core::ptr::addr_of_mut!((*base).last_ns).write(now);
+            core::ptr::addr_of_mut!((*base).first_ns).write_volatile(0);
+            core::ptr::addr_of_mut!((*base).last_ns).write_volatile(0);
         }
         // SAFETY: fully initialized above.
         let who_ref: &VWho = unsafe { &*base };
