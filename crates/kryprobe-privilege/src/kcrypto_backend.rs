@@ -384,14 +384,15 @@ impl From<MapOpsError> for SnapshotError {
 
 /// Fold per-CPU `VWho` lanes into one total (the [`fold_vagg`](kryprobe_abi::kcrypto_agg::fold_vagg)
 /// contract for who rows): `calls` sums saturating; `first_ns` is the
-/// minimum over lanes with `calls > 0` (idle lanes hold insert-time
-/// stamps with `calls == 0` and must not poison the min — the BPF
-/// broadcasts the insert value to every lane, then updates only the
-/// inserting CPU's lane); `last_ns` is the maximum; both stamps are 0
-/// when no lane observed anything. Identity fields come from the
-/// most-recent-writer lane (greatest `last_ns`, first on ties):
-/// `tid`/`comm` are last-writer per lane, the rest are insert-identical
-/// across lanes. Total over any lane slice (empty folds to zero).
+/// minimum over lanes with `calls > 0` (idle lanes hold `calls == 0`
+/// with zero stamps — the BPF broadcasts a zero tallies+stamps insert
+/// to every lane, then the re-lookup stamps only the inserting CPU's
+/// lane — and must not poison the min); `last_ns` is the maximum; both
+/// stamps are 0 when no lane observed anything. Identity fields come
+/// from the most-recent-writer lane (greatest `last_ns`, first on
+/// ties): `tid`/`comm` are last-writer per lane, the rest are
+/// insert-identical across lanes. Total over any lane slice (empty
+/// folds to zero).
 fn fold_vwho(lanes: &[VWho]) -> VWho {
     let mut out = VWho::default();
     let mut first = u64::MAX;
@@ -1213,12 +1214,14 @@ mod tests {
 
     #[test]
     fn fold_vwho_sums_calls_and_folds_stamps() {
-        // 3 lanes: one idle (insert-time stamps, calls 0 — must not
-        // poison the first-min), two busy. calls sums; first is the min
-        // over BUSY lanes; last is the max; identity rides the
+        // 3 lanes: one idle (calls 0 — must not poison the first-min
+        // even with nonzero stamps; live idle lanes are zero-stamped
+        // since the Task-2 I-1 fix, so this pins the exclusion rule
+        // beyond the current BPF shape), two busy. calls sums; first is
+        // the min over BUSY lanes; last is the max; identity rides the
         // most-recent-writer lane (greatest last_ns).
         let lanes = [
-            vwho_lane(b'a', 11, 5, 0, 100, 100), // idle inserter copy
+            vwho_lane(b'a', 11, 5, 0, 100, 100), // idle lane
             vwho_lane(b'b', 12, 5, 3, 100, 300),
             vwho_lane(b'c', 13, 5, 7, 100, 200),
         ];
