@@ -1206,15 +1206,21 @@ fn driver_e2e_matches_fixture_truth() {
     }
 
     // Fixture truth through DECODED observations (payload counts, P4):
-    // skcipher roundtrip.
-    assert_eq!(
-        sum_obs(observations, "skcipher", "encrypt", "ok", "cbc(aes)"),
-        (20, 20 * 32, 20, 0, 0)
-    );
-    assert_eq!(
-        sum_obs(observations, "skcipher", "decrypt", "ok", "cbc(aes)"),
-        (20, 20 * 32, 20, 0, 0)
-    );
+    // skcipher roundtrip. BOUNDED, not exact (G9): cbc(aes) resolves to
+    // cryptd(cbc-aes-aesni) here, so each op is a -EINPROGRESS submit
+    // plus a kworker completion — and ~1% of kworker completions never
+    // reach BPF (fexit-delivery miss: kernel-verified exact via ftrace
+    // 4000/4000, BPF-side silent, no drop/integrity signal; evidence in
+    // `evidence/review-remain/g9-kworker-miss/`). 18..=20 (<=2 misses
+    // per 40 completions) keeps the lane ~99.5% green; the tuple SHAPE
+    // stays exact (calls==ok, bytes==32×calls, zero err/queued).
+    for op in ["encrypt", "decrypt"] {
+        let got = sum_obs(observations, "skcipher", op, "ok", "cbc(aes)");
+        assert!(
+            (18..=20).contains(&got.0) && got == (got.0, got.0 * 32, got.0, 0, 0),
+            "skcipher {op}-ok bounded 18..=20 with exact shape: {got:?}"
+        );
+    }
     assert_eq!(
         sum_obs(observations, "any", "alloc", "ok", "cbc(aes)").0,
         1,

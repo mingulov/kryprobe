@@ -365,14 +365,26 @@ fn setcap_roundtrip_unpriv() {
     let copy = dir.path().join("kryprobe-setcap");
     std::fs::copy(kryprobe(), &copy).expect("copy binary");
     chmod_755(&copy);
+    // Exe-tier staging (G9): the minted child is elevated (file caps),
+    // so it refuses env/CWD tiers and loads ONLY from
+    // `<exe-dir>/kryprobe-bpf/` — stage the worktree object beside the
+    // copy (world-readable: the nobody child must read it despite a
+    // strict root umask).
+    let exe_bpf = dir.path().join("kryprobe-bpf");
+    std::fs::create_dir_all(&exe_bpf).expect("exe-tier dir");
+    let staged = exe_bpf.join("kcrypto.bpf.o");
+    std::fs::copy(&object, &staged).expect("stage exe-tier object");
+    chmod_755(&staged);
     let receipt = dir.path().join("receipt.json");
 
-    // Mint as root.
+    // Mint as root. `--force`: the copy is hermetic but not the
+    // running binary, so L-SEC-03/H-T1 needs explicit consent.
     let output = Command::new(kryprobe())
         .args(["token", "mint", "--bin"])
         .arg(&copy)
         .args(["--receipt"])
         .arg(&receipt)
+        .arg("--force")
         .output()
         .expect("spawn mint");
     let mint_out = String::from_utf8(output.stdout).expect("mint stdout utf-8");

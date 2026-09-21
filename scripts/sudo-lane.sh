@@ -46,6 +46,11 @@ step() {
 
 step "host build" "cargo xtask build"
 step "BPF objects" "cargo xtask build --bpf"
+# G9: elevated runs only trust the exe tier (`<exe-dir>/kryprobe-bpf/`;
+# env/CWD tiers are refused when elevated). Stage the just-built
+# object where both consumer shapes look: beside the kryprobe binary
+# (spawned children) and beside the test binaries (in-process suites).
+step "stage exe-tier objects" "mkdir -p target/debug/kryprobe-bpf target/debug/deps/kryprobe-bpf && cp target/kryprobe-bpf/kcrypto.bpf.o target/debug/kryprobe-bpf/kcrypto.bpf.o && cp target/kryprobe-bpf/kcrypto.bpf.o target/debug/deps/kryprobe-bpf/kcrypto.bpf.o"
 step "BPF lane (unprivileged asserts)" "cargo xtask test bpf"
 step "selftest bpf" "$SUDO ./target/debug/kryprobe selftest bpf --calls $CALLS"
 step "selftest token-smoke" "$SUDO ./target/debug/kryprobe selftest token-smoke"

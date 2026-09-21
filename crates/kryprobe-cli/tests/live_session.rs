@@ -99,9 +99,15 @@ fn locator_miss_or_dev_fallback_pins_order() {
     let tier2 = exe_tier_candidate();
     let tier3 = PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o");
     match kryprobe_privilege::locate_kcrypto_object_bytes() {
-        Ok((path, _)) => assert_eq!(
-            path, tier3,
-            "only the dev fallback may rescue an env+exe miss (tiers 1-2 missed)"
+        // Either later tier may rescue the env miss (G9: the lane stages
+        // the exe tier, so tier 2 hits on lane-run trees; tier 3 hits on
+        // trees with a prebuilt dev object). The miss of tier 1 + the
+        // try order stay pinned by the Err arm and the pure-candidates
+        // unit test.
+        Ok((path, _)) => assert!(
+            path == tier2 || path == tier3,
+            "a later tier rescues the env miss (tier 1 missed): {}",
+            path.display()
         ),
         Err(err) => {
             assert_eq!(err.env_dir.as_deref(), absent.to_str());
@@ -612,7 +618,9 @@ fn live_capture_proves_session() {
     let _env = env_guard();
     let prior = std::env::var_os("KRYPROBE_BPF_DIR");
     // Both the backend's `configure` and the session sensor resolve the
-    // object through the consolidated locator; the env tier is exact.
+    // object through the consolidated locator; elevated runs refuse the
+    // env tier, so the lane-staged exe tier serves (the env set below is
+    // belt-and-braces for manual non-lane runs).
     let object_path = kcrypto_object_path();
     assert!(
         object_path.is_file(),
@@ -668,66 +676,55 @@ fn live_capture_proves_session() {
     assert_eq!(multi.digests, 4, "hashmulti control");
     assert_eq!((aead.enc, aead.dec), (10, 10), "aead control");
 
-    // Observations decode; ids sequence from 1 in decode order.
+    // Observations decode; ids are unique and positive. (G9: NOT
+    // 1..N — G2 latest-per-key eviction consumes issuer ids for rows
+    // that later ticks overwrite, so survivors are a sparse
+    // subsequence; H2 pins latest-wins at first-seen slots.)
     assert!(!outcome.observations.is_empty(), "session decodes rows");
-    for (i, obs) in outcome.observations.iter().enumerate() {
-        assert_eq!(obs.id.get(), i as u64 + 1, "ids sequence from 1");
+    let mut seen = std::collections::HashSet::new();
+    for obs in &outcome.observations {
+        assert!(obs.id.get() > 0, "positive ids");
+        assert!(seen.insert(obs.id.get()), "ids unique across session");
         assert_eq!(obs.backend, kryprobe_core::enums::BackendId::KCrypto);
     }
-    // Finalize == decoded (nothing deduped, nothing lost).
-    assert_eq!(
+    // Finalize counts decodes, observations carry latest-per-key survivors
+    // (documented in live.rs): strictly more decodes than survivors —
+    // the totals key repeats every tick, so eviction always engages.
+    assert!(
+        outcome.summary.observations > outcome.observations.len() as u64,
+        "finalize(decodes) > emitted(survivors): {} vs {}",
         outcome.summary.observations,
-        outcome.observations.len() as u64,
-        "finalize==decoded"
+        outcome.observations.len()
     );
     assert_eq!(
         outcome.summary.backend,
         kryprobe_core::enums::BackendId::KCrypto
     );
 
-    // Tick count: one totals row per tick (9 ticks ran, closing included).
+    // Latest-wins: one totals row (single Totals key across all ticks, last
+    // tick wins). Cross-tick conservation sums are meaningless post-eviction,
+    // so the totals row asserts presence plus traffic flow instead.
     let totals: Vec<_> = outcome
         .observations
         .iter()
         .filter(|o| row_kind(o) == "totals")
         .collect();
-    assert_eq!(totals.len(), 9, "one totals row per tick");
-
-    // Totals conserved: per-tick KTOT == Σagg sums to global equality
-    // (ambient-proof: summation preserves the per-tick conservation).
-    let tot_calls: u64 = totals
-        .iter()
-        .map(|o| {
-            o.backend_payload["counts"]["calls"]
-                .as_u64()
-                .expect("calls")
-        })
-        .sum();
-    let agg_calls: u64 = outcome
-        .observations
-        .iter()
-        .filter(|o| row_kind(o) == "agg")
-        .map(|o| {
-            o.backend_payload["counts"]["calls"]
-                .as_u64()
-                .expect("calls")
-        })
-        .sum();
-    assert_eq!(tot_calls, agg_calls, "KTOT == Σagg across all ticks");
-    let tot_bytes: u64 = totals
-        .iter()
-        .map(|o| o.backend_payload["bytes"].as_u64().expect("bytes"))
-        .sum();
-    let agg_bytes: u64 = outcome
-        .observations
-        .iter()
-        .filter(|o| row_kind(o) == "agg")
-        .map(|o| o.backend_payload["bytes"].as_u64().expect("bytes"))
-        .sum();
-    assert_eq!(tot_bytes, agg_bytes, "bytes conserved too");
+    assert_eq!(totals.len(), 1, "latest-wins: exactly one totals row");
+    assert!(
+        totals[0].backend_payload["counts"]["calls"]
+            .as_u64()
+            .expect("calls")
+            >= 1,
+        "KTOT observed traffic"
+    );
 
     // Fixture truth present (lower bounds: ambient traffic may add rows,
     // never remove the driven ones).
+    // skcipher bounds are 18, not 20 (G9 kworker-miss finding: cbc(aes)
+    // is cryptd-async here and ~1% of kworker completions never reach
+    // BPF — see the driver test comment + evidence/review-remain/
+    // g9-kworker-miss/). Sync families below stay at full fixture
+    // counts (no kworker leg, exact every run).
     assert!(
         sum_obs(
             &outcome.observations,
@@ -735,7 +732,7 @@ fn live_capture_proves_session() {
             "encrypt",
             "ok",
             "cbc(aes)"
-        ) >= 20,
+        ) >= 18,
         "skcipher encrypt rows decode; breakdown: {}",
         breakdown(&outcome.observations)
     );
@@ -746,7 +743,7 @@ fn live_capture_proves_session() {
             "decrypt",
             "ok",
             "cbc(aes)"
-        ) >= 20,
+        ) >= 18,
         "skcipher decrypt rows decode"
     );
     assert!(

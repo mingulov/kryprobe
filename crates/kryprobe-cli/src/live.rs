@@ -161,8 +161,9 @@ impl Default for LiveConfig {
 /// Live capture outcome (brief-exact shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveOutcome {
-    /// Decoded observations, tick after tick in row order (agg rows, then
-    /// totals, then idents per tick; ids sequence from 1).
+    /// Latest-per-row-key survivors (agg/totals/who upsert, idents
+    /// appended disjoint per tick): ids unique-positive but sparse —
+    /// evicted ticks leave gaps, never renumbering.
     pub observations: Vec<NativeObservation>,
     /// The backend's once-only end-of-session facts.
     pub summary: BackendSummary,

@@ -485,6 +485,10 @@ fn canary_kcrypto() {
     assert_eq!((counts.enc, counts.dec), (20, 20));
     // Positive control: the sensor SAW the canary ops (an unconfigured
     // sensor would pass the absence scan trivially — this blocks that).
+    // BOUNDED 18..=20 (G9 kworker-miss finding: cbc(aes) is
+    // cryptd-async here and ~1% of kworker completions never reach BPF
+    // — see the kcrypto_driver comment + evidence/review-remain/
+    // g9-kworker-miss/).
     let rows = dump_kagg_rows(&sensor);
     for (op, what) in [(KOP_ENC, "enc"), (KOP_DEC, "dec")] {
         let mut calls = 0u64;
@@ -494,7 +498,10 @@ fn canary_kcrypto() {
         {
             calls = calls.saturating_add(row.val.calls);
         }
-        assert_eq!(calls, 20, "canary {what} calls observed");
+        assert!(
+            (18..=20).contains(&calls),
+            "canary {what} calls bounded 18..=20: {calls}"
+        );
     }
     // The ring dump path is live (alloc IDENT at minimum).
     let ring = drain_ring_bytes(&sensor);
