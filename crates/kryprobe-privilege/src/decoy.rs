@@ -65,6 +65,7 @@ fn lock_cell() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// TGID cell inputs: target + decoy call counts plus artifact paths.
+#[derive(Debug)]
 pub struct DecoyConfig {
     /// Target fixture calls (2 clean records per call).
     pub target_calls: u64,
@@ -77,6 +78,7 @@ pub struct DecoyConfig {
 }
 
 /// Stale-generation cell inputs: call count plus artifact paths.
+#[derive(Debug)]
 pub struct StaleGenConfig {
     /// Fixture calls (2 guard drops per call, zero records).
     pub calls: u64,
@@ -88,6 +90,7 @@ pub struct StaleGenConfig {
 
 /// Everything a cell observes: drained records, COUNT slots, all three
 /// LOSS buckets, queue drops, and both processes' exits.
+#[derive(Debug)]
 pub struct DecoyOutcome {
     /// Target fixture pid (pinned into CONFIG[1]).
     pub target_pid: u32,

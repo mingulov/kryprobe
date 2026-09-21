@@ -427,6 +427,7 @@ pub struct ConfiguredPoint {
 
 /// A fully configured kcrypto sensor: resolved, loaded, KCFG-written,
 /// attached. RAII: drop detaches links, then closes progs/maps.
+#[derive(Debug)]
 pub struct ConfiguredKcrypto {
     /// Loaded maps + programs (only the programs that loaded).
     pub loaded: LoadedKcrypto,
@@ -935,6 +936,31 @@ impl<'a> Btf<'a> {
             .ok_or_else(|| bad(format!("dangling type id {id}")))
     }
 
+    /// Chase typedef/const wrappers to the first struct/union
+    /// target (1A-M9: extracted so `member_at` reads at one level).
+    /// `Ok(None)` when the chain ends anywhere else (cycle, id 0,
+    /// non-aggregate); corrupt type ids still fail closed.
+    fn anon_target(&self, mtype: u32) -> Result<Option<u32>, BtfError> {
+        let mut inner = Some(mtype);
+        let mut seen = [0u32; DESCENT_CAP + 1];
+        for d in 0..=DESCENT_CAP {
+            let Some(tid) = inner else { return Ok(None) };
+            if tid == 0 || seen[..d].contains(&tid) {
+                return Ok(None);
+            }
+            seen[d] = tid;
+            let trec = self.rec(tid)?;
+            match trec.kind {
+                KIND_STRUCT | KIND_UNION => return Ok(Some(tid)),
+                KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT => {
+                    inner = Some(trec.size_or_type);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     /// Member search under struct/union `id`: `Ok(None)` when absent
     /// here (callers keep looking outward). Alignment/bitfield checks
     /// apply ONLY to the sought member and to anonymous members on the
@@ -994,29 +1020,12 @@ impl<'a> Btf<'a> {
             if descend {
                 // Anonymous member: descend into struct/union shapes
                 // (through const/typedef wrappers), offsets add.
-                let mut inner = Some(mtype);
-                let mut seen = [0u32; DESCENT_CAP + 1];
-                for d in 0..=DESCENT_CAP {
-                    let Some(tid) = inner else { break };
-                    if tid == 0 || seen[..d].contains(&tid) {
-                        break;
-                    }
-                    seen[d] = tid;
-                    let trec = self.rec(tid)?;
-                    match trec.kind {
-                        KIND_STRUCT | KIND_UNION => {
-                            if let Some(off) = self.member_at(tid, member, depth + 1, path)? {
-                                return Ok(Some(base.checked_add(off).ok_or_else(|| {
-                                    bad("anonymous member offset overflows".to_owned())
-                                })?));
-                            }
-                            break;
-                        }
-                        KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT => {
-                            inner = Some(trec.size_or_type);
-                        }
-                        _ => break,
-                    }
+                if let Some(tid) = self.anon_target(mtype)?
+                    && let Some(off) = self.member_at(tid, member, depth + 1, path)?
+                {
+                    return Ok(Some(base.checked_add(off).ok_or_else(|| {
+                        bad("anonymous member offset overflows".to_owned())
+                    })?));
                 }
             }
         }

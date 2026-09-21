@@ -106,6 +106,7 @@ struct Record<'a, P: Serialize> {
 /// ];
 /// assert_eq!(check_stream(&text, kinds), Vec::new());
 /// ```
+#[derive(Debug)]
 pub struct JsonlWriter {
     session: String,
     next_record: u64,

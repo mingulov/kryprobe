@@ -11,3 +11,6 @@ kryprobe-core = { path = "../crates/kryprobe-core" }
 kryprobe-privilege = { path = "../crates/kryprobe-privilege" }
 libc = "0.2"
 serde_json = "1"
+
+[lints]
+workspace = true

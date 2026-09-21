@@ -109,6 +109,7 @@ pub fn drain_spawns() -> u64 {
 }
 
 /// Ringbuf drain thread: epoll-paced, budgeted, bounded queue.
+#[derive(Debug)]
 pub struct DrainThread {
     join: Option<std::thread::JoinHandle<DrainStats>>,
     rx: Receiver<DrainEvent>,

@@ -56,31 +56,36 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 /// (M7: a `json!` map would sort the keys, and four `to_string`s plus
 /// `format!` would peak at ~2× the doc size); byte-identical to the
 /// piece-assembled form.
-#[must_use]
-pub fn render_report_json(outcome: &LiveOutcome) -> String {
+///
+/// 1A-M4: serialization failure is a defect `Err` (the caller exits
+/// 1), never a panic — a future unserializable graph shape must not
+/// turn a clean report (exit 0) into exit 101. Unreachable today
+/// (the graph holds no floats or exotic map keys and `Vec` writes
+/// never fail); the branches exist so the contract holds tomorrow.
+pub fn render_report_json(outcome: &LiveOutcome) -> Result<String, String> {
     let missing = kryprobe_report::live_render::trailer_dims(&outcome.coverage);
     let status = if !outcome.interrupted && missing.is_empty() {
         "complete"
     } else {
         "partial"
     };
-    // Live kcrypto rows always serialize (real decodes never emit the
-    // synthetic backend/result or the `Succeeded` phase); a failure is a
-    // caller defect and fails loud, never a partial doc. `Vec` writes
-    // never fail, so the `expect`s below are unreachable in practice.
     let mut buf = Vec::new();
     buf.extend_from_slice(b"{\"observations\":");
-    serde_json::to_writer(&mut buf, &outcome.observations).expect("live observations serialize");
+    serde_json::to_writer(&mut buf, &outcome.observations)
+        .map_err(|err| format!("defect: observations do not serialize: {err}"))?;
     buf.extend_from_slice(b",\"coverage\":");
-    serde_json::to_writer(&mut buf, &outcome.coverage).expect("live coverage serializes");
+    serde_json::to_writer(&mut buf, &outcome.coverage)
+        .map_err(|err| format!("defect: coverage does not serialize: {err}"))?;
     buf.extend_from_slice(b",\"integrity\":");
-    serde_json::to_writer(&mut buf, &outcome.integrity).expect("live integrity serializes");
+    serde_json::to_writer(&mut buf, &outcome.integrity)
+        .map_err(|err| format!("defect: integrity does not serialize: {err}"))?;
     buf.extend_from_slice(b",\"verdict\":{\"status\":\"");
     buf.extend_from_slice(status.as_bytes());
     buf.extend_from_slice(b"\",\"missing\":");
-    serde_json::to_writer(&mut buf, &missing).expect("verdict dims serialize");
+    serde_json::to_writer(&mut buf, &missing)
+        .map_err(|err| format!("defect: verdict dims do not serialize: {err}"))?;
     buf.extend_from_slice(b"}}\n");
-    String::from_utf8(buf).expect("report JSON is UTF-8")
+    String::from_utf8(buf).map_err(|err| format!("defect: report JSON is not UTF-8: {err}"))
 }
 
 /// Live window: explicit `--duration` or the 60s default.
@@ -124,7 +129,13 @@ fn finish_report_live(
             &outcome.observations,
             &outcome.coverage,
         ),
-        ReportFormat::Json => render_report_json(&outcome),
+        ReportFormat::Json => match render_report_json(&outcome) {
+            Ok(text) => text,
+            Err(err) => {
+                let _ = writeln!(stderr, "report: cannot render JSON: {err}");
+                return 1;
+            }
+        },
         ReportFormat::Jsonl => {
             match kryprobe_report::live_render::render_live_jsonl(
                 &outcome.observations,
@@ -205,13 +216,36 @@ mod tests {
     fn json_golden_pins_doc() {
         assert_golden(
             &golden("report_live.json"),
-            render_report_json(&json_fixture()).as_bytes(),
+            render_report_json(&json_fixture())
+                .expect("fixture renders")
+                .as_bytes(),
         );
     }
 
     #[test]
+    fn json_hostile_payload_renders_without_panic() {
+        // 1A-M4/3A-L-T2: hostile-but-valid payloads render through
+        // the Result shapes (the Err branches exist so a future
+        // unserializable graph shape degrades to exit 1, never a
+        // panic-shaped exit 101).
+        let mut outcome = json_fixture();
+        let first = outcome
+            .observations
+            .first_mut()
+            .expect("fixture carries an observation");
+        first.backend_payload = serde_json::json!({
+            "deep": {"a": [1, {"b": "x".repeat(4096)}]},
+            "many": (0..512).map(|i| format!("k{i}")).collect::<Vec<_>>(),
+        });
+        let text = render_report_json(&outcome).expect("hostile payload renders");
+        let doc: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("hostile json parses");
+        assert_eq!(doc["verdict"]["status"], "complete");
+    }
+
+    #[test]
     fn json_keys_exact_and_verdict_tracks_gaps() {
-        let text = render_report_json(&json_fixture());
+        let text = render_report_json(&json_fixture()).expect("fixture renders");
         let doc: serde_json::Value =
             serde_json::from_str(text.trim_end()).expect("report json parses");
         let mut keys: Vec<&str> = doc
@@ -226,7 +260,7 @@ mod tests {
         assert_eq!(doc["verdict"]["status"], "complete");
         assert_eq!(doc["verdict"]["missing"], serde_json::json!([]));
 
-        let partial = render_report_json(&partial_fixture());
+        let partial = render_report_json(&partial_fixture()).expect("fixture renders");
         let doc: serde_json::Value =
             serde_json::from_str(partial.trim_end()).expect("partial json parses");
         assert_eq!(doc["verdict"]["status"], "partial");
@@ -342,7 +376,9 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(&file).expect("read out file"),
-            render_report_json(&json_fixture()).as_bytes()
+            render_report_json(&json_fixture())
+                .expect("fixture renders")
+                .as_bytes()
         );
         // Human honors `--out` through the same branch.
         let human = dir.join("report.txt");
@@ -406,7 +442,9 @@ mod tests {
             );
         }
         assert!(
-            render_report_json(&outcome).contains("\"status\":\"partial\""),
+            render_report_json(&outcome)
+                .expect("fixture renders")
+                .contains("\"status\":\"partial\""),
             "JSON status flips to partial"
         );
         let mut stdout = Vec::new();

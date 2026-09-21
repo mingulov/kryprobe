@@ -8,6 +8,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 /// RAII read-only `mmap` of a file.
+#[derive(Debug)]
 pub struct MmapGuard {
     ptr: *mut libc::c_void,
     len: usize,

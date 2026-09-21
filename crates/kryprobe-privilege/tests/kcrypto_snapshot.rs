@@ -135,11 +135,11 @@ fn typed_ctors_accept_exact_lengths() {
     assert_eq!(totals_payload().len(), 122);
     assert_eq!(ident_payload().len(), 50);
     let row = RowBytes::new(agg_payload()).expect("382B row accepts");
-    assert_eq!(row.0.len(), 382);
+    assert_eq!(row.as_bytes().len(), 382);
     let totals = TotalsBytes::new(totals_payload()).expect("122B totals accepts");
-    assert_eq!(totals.0.len(), 122);
+    assert_eq!(totals.as_bytes().len(), 122);
     let ident = IdentBytes::new(ident_payload()).expect("50B ident accepts");
-    assert_eq!(ident.0.len(), 50);
+    assert_eq!(ident.as_bytes().len(), 50);
 }
 
 #[test]
@@ -340,31 +340,31 @@ fn assert_d7_header(event: &RawEvent<'_>, payload_len: usize, monotonic_ns: u64,
 fn raw_event_headers_pass_split_header() {
     let row = RowBytes::new(agg_payload()).expect("row");
     let event = raw_event_for_agg(&row);
-    assert_eq!(event.payload, &row.0[..], "agg payload borrows the row");
+    assert_eq!(event.payload, row.as_bytes(), "agg payload borrows the row");
     assert!(
-        std::ptr::eq(event.payload.as_ptr(), row.0.as_ptr()),
+        std::ptr::eq(event.payload.as_ptr(), row.as_bytes().as_ptr()),
         "agg payload is a borrow, not a copy"
     );
     assert_d7_header(&event, 382, 200, "agg");
-    assert_header_roundtrips(&event, &row.0, "agg");
+    assert_header_roundtrips(&event, row.as_bytes(), "agg");
 
     let totals = TotalsBytes::new(totals_payload()).expect("totals");
     let event = raw_event_for_totals(&totals);
     assert!(
-        std::ptr::eq(event.payload.as_ptr(), totals.0.as_ptr()),
+        std::ptr::eq(event.payload.as_ptr(), totals.as_bytes().as_ptr()),
         "totals payload is a borrow, not a copy"
     );
     assert_d7_header(&event, 122, 200, "totals");
-    assert_header_roundtrips(&event, &totals.0, "totals");
+    assert_header_roundtrips(&event, totals.as_bytes(), "totals");
 
     let ident = IdentBytes::new(ident_payload()).expect("ident");
     let event = raw_event_for_ident(&ident);
     assert!(
-        std::ptr::eq(event.payload.as_ptr(), ident.0.as_ptr()),
+        std::ptr::eq(event.payload.as_ptr(), ident.as_bytes().as_ptr()),
         "ident payload is a borrow, not a copy"
     );
     assert_d7_header(&event, 50, 12345, "ident");
-    assert_header_roundtrips(&event, &ident.0, "ident");
+    assert_header_roundtrips(&event, ident.as_bytes(), "ident");
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +583,7 @@ fn decode_snapshot_rows(snap: &SnapshotRows) -> Vec<SnapRow> {
     snap.rows
         .iter()
         .map(
-            |row| match parse_snapshot_row(&row.0).expect("snapshot row parses") {
+            |row| match parse_snapshot_row(row.as_bytes()).expect("snapshot row parses") {
                 ParsedRow::Agg { kagg, vagg } => {
                     let alg_words = kagg.alg();
                     let drv_words = kagg.drv();
@@ -609,7 +609,7 @@ fn decode_snapshot_rows(snap: &SnapshotRows) -> Vec<SnapRow> {
 /// Decode the snapshot totals row via the fallible entry.
 fn decode_snapshot_totals(snap: &SnapshotRows) -> VAgg {
     let totals = snap.totals.as_ref().expect("KTOT row present");
-    match parse_snapshot_row(&totals.0).expect("totals row parses") {
+    match parse_snapshot_row(totals.as_bytes()).expect("totals row parses") {
         ParsedRow::Totals { vagg } => vagg,
         ParsedRow::Agg { .. } => panic!("snapshot totals row decoded as Agg"),
         ParsedRow::Ident { .. } => panic!("snapshot totals row decoded as Ident"),
@@ -621,7 +621,7 @@ fn decode_snapshot_idents(snap: &SnapshotRows) -> Vec<KCtl> {
     snap.idents
         .iter()
         .map(
-            |ident| match parse_snapshot_row(&ident.0).expect("ident parses") {
+            |ident| match parse_snapshot_row(ident.as_bytes()).expect("ident parses") {
                 ParsedRow::Ident { kctl } => kctl,
                 ParsedRow::Agg { .. } => panic!("snapshot ident decoded as Agg"),
                 ParsedRow::Totals { .. } => panic!("snapshot ident decoded as Totals"),
@@ -677,7 +677,11 @@ fn compat_ring_matches_canary_twin() {
         twin.len()
     );
     for (ident, rec) in snap.idents.iter().zip(twin.iter()) {
-        assert_eq!(&ident.0[2..], &rec[..], "ident body == twin record bytes");
+        assert_eq!(
+            &ident.as_bytes()[2..],
+            &rec[..],
+            "ident body == twin record bytes"
+        );
     }
     // Overflow accounting agrees with the twin's kinds.
     let twin_overflow = twin
@@ -1023,25 +1027,31 @@ fn captured_row_matches_canonical_layout() {
         .rows
         .iter()
         .find(|row| {
-            row.0[2] == KFAM_SK
-                && row.0[3] == KOP_ENC
-                && row.0[4] == KRES_OK
-                && cstr(&row.0[6..262]) == "ecb(aes)"
+            row.as_bytes()[2] == KFAM_SK
+                && row.as_bytes()[3] == KOP_ENC
+                && row.as_bytes()[4] == KRES_OK
+                && cstr(&row.as_bytes()[6..262]) == "ecb(aes)"
         })
         .expect("captured ecb(aes) enc row");
-    assert_eq!(enc.0.len(), kryprobe_testkit::kcrypto_rows::AGG_LEN);
-    assert_eq!(enc.0[0], SNAPSHOT_VERSION);
-    assert_eq!(enc.0[1], ROW_KIND_AGG);
+    assert_eq!(
+        enc.as_bytes().len(),
+        kryprobe_testkit::kcrypto_rows::AGG_LEN
+    );
+    assert_eq!(enc.as_bytes()[0], SNAPSHOT_VERSION);
+    assert_eq!(enc.as_bytes()[1], ROW_KIND_AGG);
     assert!(
-        enc.0[6..262].contains(&0),
+        enc.as_bytes()[6..262].contains(&0),
         "captured name NUL-terminates in-field"
     );
-    let calls = u64::from_le_bytes(enc.0[262..270].try_into().expect("calls field"));
+    let calls = u64::from_le_bytes(enc.as_bytes()[262..270].try_into().expect("calls field"));
     assert!(calls >= 5, "enc calls cover the fixture traffic");
     let totals = snap.totals.expect("KTOT row present");
-    assert_eq!(totals.0.len(), kryprobe_testkit::kcrypto_rows::TOTALS_LEN);
-    assert_eq!(totals.0[0], SNAPSHOT_VERSION);
-    assert_eq!(totals.0[1], ROW_KIND_TOTALS);
+    assert_eq!(
+        totals.as_bytes().len(),
+        kryprobe_testkit::kcrypto_rows::TOTALS_LEN
+    );
+    assert_eq!(totals.as_bytes()[0], SNAPSHOT_VERSION);
+    assert_eq!(totals.as_bytes()[1], ROW_KIND_TOTALS);
 }
 
 #[test]

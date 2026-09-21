@@ -122,6 +122,7 @@ pub(crate) fn kill_quietly(child: &mut std::process::Child) {
 }
 
 /// Field-wise 64-byte spine record view (no alignment assumptions).
+#[derive(Debug)]
 pub struct SpineEventView {
     /// Cookie: generation in the high 32 bits.
     pub cookie: u64,
@@ -149,6 +150,7 @@ pub fn view_spine_event(bytes: &[u8]) -> Result<SpineEventView, BpfSelftestError
 }
 
 /// Pipeline inputs: call count plus artifact paths.
+#[derive(Debug)]
 pub struct BpfSelftestConfig {
     /// Fixture call count (2 records per call).
     pub calls: u64,
@@ -159,6 +161,7 @@ pub struct BpfSelftestConfig {
 }
 
 /// Pipeline outcome: counts, loss receipts, and the reconcile verdict.
+#[derive(Debug)]
 pub struct BpfSelftestOutcome {
     /// Entry records drained.
     pub entries: u64,

@@ -23,8 +23,9 @@ deviations in the lane evidence.
 
 - Host `rustc 1.98.0` (pinned `rust-toolchain.toml`; `xtask check`
   fails loud on skew).
-- BPF `nightly-2026-09-16` + `rust-src` (both BPF crates pin it;
-  `build --bpf` fails loud on skew).
+- BPF `nightly-2026-09-16` + `rust-src` + `rustfmt` + `clippy`
+  (both BPF crates pin it; `build --bpf` fails loud on skew and
+  runs fmt + clippy gates per BPF crate before building).
 - `bpf-linker 0.10.4` exactly (`build --bpf` gates the version).
 - Inspection: `llvm-readelf`/`llvm-strip` (verified set: Ubuntu
   LLVM 21.1.8; record local versions in evidence).

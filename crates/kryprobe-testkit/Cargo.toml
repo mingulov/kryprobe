@@ -10,3 +10,6 @@ libc = "0.2"
 
 [dev-dependencies]
 kryprobe-abi = { path = "../kryprobe-abi" }
+
+[lints]
+workspace = true

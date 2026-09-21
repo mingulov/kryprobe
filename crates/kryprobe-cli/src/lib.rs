@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#![warn(missing_docs)]
 //! kryprobe CLI: the outermost ring (T10).
 //!
 //! Exit codes (kp2 family): 0 clean/success; 1 internal failure; 2

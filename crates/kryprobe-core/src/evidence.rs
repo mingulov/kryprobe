@@ -45,23 +45,28 @@ pub struct ValidityInterval {
 pub(crate) mod wire {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub mod u64_string {
+    pub(crate) mod u64_string {
         use super::*;
 
-        pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        pub(crate) fn serialize<S: Serializer>(
+            value: &u64,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
             serializer.serialize_str(&value.to_string())
         }
 
-        pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<u64, D::Error> {
             let text = String::deserialize(deserializer)?;
             text.parse().map_err(serde::de::Error::custom)
         }
     }
 
-    pub mod opt_u64_string {
+    pub(crate) mod opt_u64_string {
         use super::*;
 
-        pub fn serialize<S: Serializer>(
+        pub(crate) fn serialize<S: Serializer>(
             value: &Option<u64>,
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
@@ -71,7 +76,7 @@ pub(crate) mod wire {
             }
         }
 
-        pub fn deserialize<'de, D: Deserializer<'de>>(
+        pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<u64>, D::Error> {
             let text: Option<String> = Option::deserialize(deserializer)?;

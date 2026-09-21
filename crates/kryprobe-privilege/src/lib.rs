@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#![warn(missing_docs)]
 //! kryprobe-privilege: privileged helpers (ELF readers/parsers in T6a).
 //!
 //! This crate hosts operations that need elevated privilege or raw

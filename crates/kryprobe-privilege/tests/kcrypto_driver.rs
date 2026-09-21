@@ -803,7 +803,7 @@ fn ident_rows_decode_to_discovered_markers() {
         ))
         .expect("ident");
         // The KCtl body parses (Task-1 codec shape).
-        let kctl = kctl_from_bytes(&ident.0[2..]).expect("KCtl body");
+        let kctl = kctl_from_bytes(&ident.as_bytes()[2..]).expect("KCtl body");
         assert_eq!(kctl.kind, kind);
         let event = raw_event_for_ident(&ident);
         let obs = backend.decode(&ctx, event).expect("ident decodes");
@@ -1348,7 +1348,7 @@ fn driver_e2e_matches_fixture_truth() {
         .idents
         .iter()
         .map(
-            |ident| match parse_snapshot_row(&ident.0).expect("ident parses") {
+            |ident| match parse_snapshot_row(ident.as_bytes()).expect("ident parses") {
                 ParsedRow::Ident { kctl } => kctl,
                 _ => panic!("ident bytes decoded off-kind"),
             },
@@ -1409,7 +1409,7 @@ fn driver_e2e_matches_fixture_truth() {
         .rows
         .iter()
         .map(
-            |row| match parse_snapshot_row(&row.0).expect("row parses") {
+            |row| match parse_snapshot_row(row.as_bytes()).expect("row parses") {
                 ParsedRow::Agg { kagg, vagg } => OracleRow {
                     fam: kagg.fam(),
                     op: kagg.op(),
@@ -1541,7 +1541,7 @@ fn driver_e2e_matches_fixture_truth() {
 /// totals bytes (same bytes the driver decoded — guards the totals path).
 fn decode_snapshot_totals_via_parse(snap: &SnapshotRows) -> VAgg {
     let totals = snap.totals.as_ref().expect("KTOT row present");
-    match parse_snapshot_row(&totals.0).expect("totals parses") {
+    match parse_snapshot_row(totals.as_bytes()).expect("totals parses") {
         ParsedRow::Totals { vagg } => vagg,
         _ => panic!("totals bytes decoded off-kind"),
     }

@@ -311,6 +311,7 @@ impl std::fmt::Display for LoaderError {
 impl std::error::Error for LoaderError {}
 
 /// Loaded spine maps, one RAII fd per map.
+#[derive(Debug)]
 pub struct SpineMaps {
     /// CONFIG map handle.
     pub config: OwnedFd,
@@ -325,6 +326,7 @@ pub struct SpineMaps {
 }
 
 /// Loaded spine programs: entry + return.
+#[derive(Debug)]
 pub struct SpineProgs {
     /// Entry probe program handle.
     pub entry: OwnedFd,
@@ -333,6 +335,7 @@ pub struct SpineProgs {
 }
 
 /// Fully loaded spine: maps + programs, all RAII-owned.
+#[derive(Debug)]
 pub struct LoadedSpine {
     /// Loaded spine maps.
     pub maps: SpineMaps,
@@ -344,6 +347,7 @@ pub struct LoadedSpine {
 /// Task 3 attribution four — [`snapshot_who`](crate::kcrypto_backend::snapshot_who)
 /// reads the tail; dropping them here would close userspace's only
 /// handles while the programs still reference the maps).
+#[derive(Debug)]
 pub struct KcryptoMaps {
     /// `KCFG` (resolved BTF ids + offsets).
     pub config: OwnedFd,
@@ -372,6 +376,7 @@ pub struct KcryptoMaps {
 /// `progs` carries only the programs that loaded; the per-point outcomes
 /// (including `Missing`/`Unsupported`) ride the sibling [`PointStatus`]
 /// vector returned by [`load_kcrypto`].
+#[derive(Debug)]
 pub struct LoadedKcrypto {
     /// Loaded kcrypto maps.
     pub maps: KcryptoMaps,

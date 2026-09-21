@@ -23,3 +23,6 @@ kryprobe-testkit = { path = "../kryprobe-testkit" }
 # 1B-M7: tests still gate on euid/errno constants; production code must
 # never touch libc (ADR-0002 Rule B — absence here enforces it).
 libc = "0.2"
+
+[lints]
+workspace = true

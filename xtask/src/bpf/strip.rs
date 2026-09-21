@@ -363,6 +363,9 @@ fn call_target(elf: &Elf, obj: &[u8], text_idx: usize, reloc: &Reloc) -> Result<
         )));
     }
     let (off, len) = section_file_range(elf, reloc.target_sect)?;
+    // 1A-M1/L-SEC-05: section headers are untrusted — a corrupt
+    // sh_offset past EOF must error here, never panic on obj[at].
+    check_range(obj, off, len, "reloc target section")?;
     if reloc.offset.checked_add(8).is_none_or(|end| end > len) {
         return Err(err(format!(
             "call reloc at {:#x} runs past its section",
@@ -506,7 +509,6 @@ fn remap(kept: &[(usize, usize, usize)], old: usize) -> Option<usize> {
 /// `docs/dependencies/pins.md` ("Build quirks": dead builtins, the
 /// 28-byte zero-chain `memset` fusion hazard, why `--disable-memory-builtins`
 /// and LTO do not help).
-#[allow(clippy::too_many_arguments)]
 fn rewrite(
     obj: &[u8],
     elf: &Elf,
@@ -516,7 +518,39 @@ fn rewrite(
     relocs: &[Reloc],
     live: &[bool],
 ) -> Result<Vec<u8>, String> {
-    // Kept ranges in address order; new offsets pack from zero.
+    let inputs = Rewrite {
+        obj,
+        elf,
+        text_idx,
+        symtab_idx,
+        funcs,
+        relocs,
+        live,
+    };
+    let (kept, cursor) = plan_kept(funcs, live);
+    check_entry_calls(&inputs, &kept)?;
+    let mut out = obj.to_vec();
+    compact_text(&inputs, &kept, cursor, &mut out)?;
+    let map = rewrite_symtab(&inputs, &kept, &mut out)?;
+    rewrite_relocs(&inputs, &kept, &map, &mut out)?;
+    Ok(out)
+}
+
+/// `rewrite` inputs, bundled (1A-M6: the 7-param signature outgrew
+/// itself; the phases below take this instead).
+struct Rewrite<'a> {
+    obj: &'a [u8],
+    elf: &'a Elf<'a>,
+    text_idx: usize,
+    symtab_idx: usize,
+    funcs: &'a [Func],
+    relocs: &'a [Reloc],
+    live: &'a [bool],
+}
+
+/// Kept ranges in address order; new offsets pack from zero.
+/// Returns the ranges plus the packed `.text` length.
+fn plan_kept(funcs: &[Func], live: &[bool]) -> (Vec<(usize, usize, usize)>, usize) {
     let mut kept: Vec<(usize, usize, usize)> = Vec::new();
     let mut cursor = 0;
     for func in funcs {
@@ -525,17 +559,22 @@ fn rewrite(
             cursor += func.size;
         }
     }
-    // Entry calls carry a raw byte addend against the `.text` section
-    // symbol, so a shifted root would silently retarget: refuse loudly.
-    // Intra-text calls resolve through function symbols, whose values
-    // are rewritten below, and therefore survive any shift.
-    for reloc in relocs {
+    (kept, cursor)
+}
+
+/// Entry calls carry a raw byte addend against the `.text` section
+/// symbol, so a shifted root would silently retarget: refuse loudly.
+/// Intra-text calls resolve through function symbols, whose values
+/// are rewritten below, and therefore survive any shift.
+fn check_entry_calls(inputs: &Rewrite, kept: &[(usize, usize, usize)]) -> Result<(), String> {
+    for reloc in inputs.relocs {
         if reloc.typ != R_BPF_64_32 {
             continue;
         }
-        let dest = call_target(elf, obj, text_idx, reloc)?;
-        let Some(new) = remap(&kept, dest) else {
-            let name = funcs
+        let dest = call_target(inputs.elf, inputs.obj, inputs.text_idx, reloc)?;
+        let Some(new) = remap(kept, dest) else {
+            let name = inputs
+                .funcs
                 .iter()
                 .find(|f| dest >= f.value && dest < f.value + f.size);
             match name {
@@ -543,42 +582,73 @@ fn rewrite(
                 None => return Err(err(format!("call targets {dest:#x} (no function there)"))),
             }
         };
-        if reloc.target_sect != text_idx && new != dest {
+        if reloc.target_sect != inputs.text_idx && new != dest {
             return Err(err(format!(
                 "entry call target {dest:#x} shifted to {new:#x}"
             )));
         }
     }
-    let mut out = obj.to_vec();
-    let shoff = elf.header.e_shoff as usize;
-    // Compact `.text` in ascending order (ranges only move down) and
-    // zero the slack so no stale bytes survive past the new end.
-    let (text_off, text_old) = section_file_range(elf, text_idx)?;
-    check_range(obj, text_off, text_old, ".text")?;
-    for (start, end, new) in &kept {
+    Ok(())
+}
+
+/// Compact `.text` in ascending order (ranges only move down) and
+/// zero the slack so no stale bytes survive past the new end.
+fn compact_text(
+    inputs: &Rewrite,
+    kept: &[(usize, usize, usize)],
+    cursor: usize,
+    out: &mut [u8],
+) -> Result<(), String> {
+    let shoff = inputs.elf.header.e_shoff as usize;
+    let (text_off, text_old) = section_file_range(inputs.elf, inputs.text_idx)?;
+    check_range(inputs.obj, text_off, text_old, ".text")?;
+    for (start, end, new) in kept {
         out.copy_within(text_off + start..text_off + end, text_off + new);
     }
     out[text_off + cursor..text_off + text_old].fill(0);
-    write_u64(&mut out, shdr_field(shoff, text_idx, 32), cursor as u64)?;
-    // Rewrite kept function values, then compact the symtab.
-    let sym_sh = &elf.section_headers[symtab_idx];
+    write_u64(
+        &mut *out,
+        shdr_field(shoff, inputs.text_idx, 32),
+        cursor as u64,
+    )?;
+    Ok(())
+}
+
+/// Rewrite kept function values, then compact the symtab. Returns
+/// the old→new symbol map for the reloc phase.
+fn rewrite_symtab(
+    inputs: &Rewrite,
+    kept: &[(usize, usize, usize)],
+    out: &mut [u8],
+) -> Result<Vec<Option<usize>>, String> {
+    let shoff = inputs.elf.header.e_shoff as usize;
+    let symtab_idx = inputs.symtab_idx;
+    let sym_sh = &inputs.elf.section_headers[symtab_idx];
     if sym_sh.sh_entsize != 24 {
         return Err(err("symtab entry size is not 24"));
     }
-    let (sym_off, sym_len) = section_file_range(elf, symtab_idx)?;
-    check_range(obj, sym_off, sym_len, "symtab")?;
+    let (sym_off, sym_len) = section_file_range(inputs.elf, symtab_idx)?;
+    check_range(inputs.obj, sym_off, sym_len, "symtab")?;
     if !sym_len.is_multiple_of(24) {
         return Err(err("symtab length is not a multiple of 24"));
     }
     let sym_count = sym_len / 24;
-    for func in funcs {
-        if live[func.sym_idx] {
-            let new = remap(&kept, func.value).expect("live function remaps");
-            write_u64(&mut out, sym_off + func.sym_idx * 24 + 8, new as u64)?;
+    for func in inputs.funcs {
+        if inputs.live[func.sym_idx] {
+            // 1A-M6: true by construction of `kept`, but a missing
+            // remap is an error, never a panic.
+            let new = remap(kept, func.value)
+                .ok_or_else(|| err(format!("live function '{}' has no remap", func.name)))?;
+            write_u64(&mut *out, sym_off + func.sym_idx * 24 + 8, new as u64)?;
         }
     }
     let dead_sym: Vec<bool> = (0..sym_count)
-        .map(|i| funcs.iter().any(|f| f.sym_idx == i && !live[f.sym_idx]))
+        .map(|i| {
+            inputs
+                .funcs
+                .iter()
+                .any(|f| f.sym_idx == i && !inputs.live[f.sym_idx])
+        })
         .collect();
     let mut map: Vec<Option<usize>> = vec![None; sym_count];
     let mut next = 0;
@@ -595,14 +665,15 @@ fn rewrite(
         }
     }
     write_u64(
-        &mut out,
+        &mut *out,
         shdr_field(shoff, symtab_idx, 32),
         (next * 24) as u64,
     )?;
     let mut first_global = next;
     for (new, old) in map.iter().enumerate() {
         let Some(old) = old else { continue };
-        let sym = elf
+        let sym = inputs
+            .elf
             .syms
             .get(*old)
             .ok_or_else(|| err("symtab index out of range"))?;
@@ -612,35 +683,50 @@ fn rewrite(
         }
     }
     write_u32(
-        &mut out,
+        &mut *out,
         shdr_field(shoff, symtab_idx, 44),
         first_global as u32,
     )?;
-    // Decide every reloc entry: kept (with new symbol + offset) or
-    // dropped with its dead function. A call from live code into
-    // dropped code is a hard error; the loader would resolve it
-    // through the rewritten (missing) symbol.
-    struct Kept {
-        rel_sect: usize,
-        offset: usize,
-        sym: usize,
-        typ: u32,
-    }
-    let mut kept_entries: Vec<Kept> = Vec::with_capacity(relocs.len());
-    for reloc in relocs {
-        let rel_sh = &elf.section_headers[reloc.rel_sect];
+    Ok(map)
+}
+
+/// One reloc entry that survives the strip (new symbol + offset).
+struct KeptEntry {
+    rel_sect: usize,
+    offset: usize,
+    sym: usize,
+    typ: u32,
+}
+
+/// Decide every reloc entry: kept (with new symbol + offset) or
+/// dropped with its dead function. A call from live code into
+/// dropped code is a hard error; the loader would resolve it
+/// through the rewritten (missing) symbol. Then compact each reloc
+/// section in place and shrink it (sections that lost every entry
+/// get a zeroed size).
+fn rewrite_relocs(
+    inputs: &Rewrite,
+    kept: &[(usize, usize, usize)],
+    map: &[Option<usize>],
+    out: &mut [u8],
+) -> Result<(), String> {
+    let shoff = inputs.elf.header.e_shoff as usize;
+    let text_idx = inputs.text_idx;
+    let mut kept_entries: Vec<KeptEntry> = Vec::with_capacity(inputs.relocs.len());
+    for reloc in inputs.relocs {
+        let rel_sh = &inputs.elf.section_headers[reloc.rel_sect];
         if rel_sh.sh_entsize != 16 {
             return Err(err("reloc entry size is not 16"));
         }
         let mut drop = false;
         let mut offset = reloc.offset;
         if reloc.target_sect == text_idx {
-            match remap(&kept, offset) {
+            match remap(kept, offset) {
                 Some(new) => {
                     if reloc.typ != R_BPF_64_32 {
                         // Map fixups patch an 8-byte `ld_imm64` pair:
                         // both halves must survive inside kept code.
-                        let end_ok = remap(&kept, offset + 8) == Some(new + 8);
+                        let end_ok = remap(kept, offset + 8) == Some(new + 8);
                         if !end_ok {
                             return Err(err(format!(
                                 "reloc pair straddles stripped code at {offset:#x}"
@@ -650,7 +736,8 @@ fn rewrite(
                     offset = new;
                 }
                 None => {
-                    if reloc.typ == R_BPF_64_32 && caller_is_live(funcs, live, offset) {
+                    if reloc.typ == R_BPF_64_32 && caller_is_live(inputs.funcs, inputs.live, offset)
+                    {
                         return Err(err(format!("call to stripped code at {offset:#x}")));
                     }
                     drop = true;
@@ -661,37 +748,37 @@ fn rewrite(
             continue;
         }
         let new_sym = map.get(reloc.sym_idx).copied().flatten().ok_or_else(|| {
-            let name = elf
+            let name = inputs
+                .elf
                 .syms
                 .get(reloc.sym_idx)
-                .map(|s| sym_name(elf, s.st_name))
+                .map(|s| sym_name(inputs.elf, s.st_name))
                 .unwrap_or_else(|| "?".to_owned());
             err(format!("reloc references removed symbol '{name}'"))
         })?;
-        kept_entries.push(Kept {
+        kept_entries.push(KeptEntry {
             rel_sect: reloc.rel_sect,
             offset,
             sym: new_sym,
             typ: reloc.typ,
         });
     }
-    // Compact each reloc section in place and shrink it.
     let mut sections: Vec<usize> = kept_entries.iter().map(|k| k.rel_sect).collect();
     sections.sort_unstable();
     sections.dedup();
     for rel_sect in sections {
-        let (rel_off, _) = section_file_range(elf, rel_sect)?;
+        let (rel_off, _) = section_file_range(inputs.elf, rel_sect)?;
         check_range(
-            obj,
+            inputs.obj,
             rel_off,
-            reloc_section_len(elf, rel_sect),
+            reloc_section_len(inputs.elf, rel_sect),
             "reloc section",
         )?;
         let mut at = rel_off;
         for kept in kept_entries.iter().filter(|k| k.rel_sect == rel_sect) {
             let r_info = ((kept.sym as u64) << 32) | u64::from(kept.typ);
-            write_u64(&mut out, at, kept.offset as u64)?;
-            write_u64(&mut out, at + 8, r_info)?;
+            write_u64(&mut *out, at, kept.offset as u64)?;
+            write_u64(&mut *out, at + 8, r_info)?;
             at += 16;
         }
         let kept_count = kept_entries
@@ -699,19 +786,17 @@ fn rewrite(
             .filter(|k| k.rel_sect == rel_sect)
             .count();
         write_u64(
-            &mut out,
+            &mut *out,
             shdr_field(shoff, rel_sect, 32),
             (kept_count * 16) as u64,
         )?;
     }
-    // Sections that lost every entry are absent from `sections`: find
-    // them and zero their size.
-    for reloc in relocs {
+    for reloc in inputs.relocs {
         if !kept_entries.iter().any(|k| k.rel_sect == reloc.rel_sect) {
-            write_u64(&mut out, shdr_field(shoff, reloc.rel_sect, 32), 0)?;
+            write_u64(&mut *out, shdr_field(shoff, reloc.rel_sect, 32), 0)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// True when the `.text` offset sits inside a live function.
@@ -1066,6 +1151,50 @@ mod tests {
         );
         let err = drop_unreferenced_text(&obj).unwrap_err();
         assert!(err.contains(".text"), "unexpected: {err}");
+    }
+
+    /// Overwrite a section header's `sh_offset` (1A-M1/M-T2
+    /// hostile-fixture helper): `idx` is the section index.
+    fn corrupt_sh_offset(obj: &mut [u8], idx: usize, off: u64) {
+        let elf = Elf::parse(obj).unwrap();
+        let hdr = (elf.header.e_shoff as usize) + idx * 64;
+        obj[hdr + 24..hdr + 32].copy_from_slice(&off.to_le_bytes());
+    }
+
+    #[test]
+    fn call_target_reloc_section_past_eof_errors() {
+        // 1A-M1/L-SEC-05: a corrupt sh_offset past EOF must error,
+        // never panic on obj[at]. Sym 3 is `live` (shndx .text).
+        let mut obj = fixture(LIVE_EXIT, 0, 16, -1, &[]);
+        corrupt_sh_offset(&mut obj, 2, 0xffff_ffff);
+        let elf = Elf::parse(&obj).unwrap();
+        let reloc = Reloc {
+            rel_sect: 7,
+            target_sect: 2,
+            offset: 0,
+            sym_idx: 3,
+            typ: 1,
+        };
+        let err = call_target(&elf, &obj, 1, &reloc).unwrap_err();
+        assert!(err.contains("outside file"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn strip_corrupt_text_offset_errors_never_panics() {
+        // M-T2: hostile bytes through the top-level entry — Err,
+        // never a panic.
+        let mut obj = fixture(LIVE_EXIT, 0, 16, -1, &[]);
+        corrupt_sh_offset(&mut obj, 1, 0xffff_ffff);
+        let err = strip_dead_text_funcs(&obj).unwrap_err();
+        assert!(err.starts_with("strip: "), "unexpected: {err}");
+    }
+
+    #[test]
+    fn strip_truncated_fixture_errors_never_panics() {
+        // M-T2: a file cut in half — Err, never a panic.
+        let obj = fixture(LIVE_EXIT, 0, 16, -1, &[]);
+        let err = strip_dead_text_funcs(&obj[..obj.len() / 2]).unwrap_err();
+        assert!(err.starts_with("strip: "), "unexpected: {err}");
     }
 
     #[test]

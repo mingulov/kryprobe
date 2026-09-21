@@ -842,7 +842,7 @@ fn report_human_partial_handfed_markers_case() {
 
 #[test]
 fn report_json_handfed_shape_case() {
-    let text = kryprobe_cli::cmd_report::render_report_json(&json_fixture());
+    let text = kryprobe_cli::cmd_report::render_report_json(&json_fixture()).expect("renders");
     assert!(text.ends_with('\n'), "one doc plus newline: {text:?}");
     let doc: serde_json::Value = serde_json::from_str(text.trim_end()).expect("report json parses");
     let mut keys: Vec<&str> = doc

@@ -229,6 +229,7 @@ impl KConfig {
 /// Twin: `KAgg` in `crates/bpf-kcrypto/src/bin/kcrypto.rs` (same packed
 /// shape; the BPF touches it through byte pointers only).
 #[repr(C, packed)]
+#[derive(Debug)]
 pub struct KAgg {
     /// Algorithm family ([`KFAM_ANY`]..).
     pub fam: u8,

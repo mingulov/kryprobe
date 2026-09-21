@@ -95,6 +95,7 @@ pub fn check_stream(text: &str, kinds: &[(&str, &[&str])]) -> Vec<StreamFinding>
 /// Incremental [`check_stream`]: one `push_line` per physical line, then
 /// [`finish`](Self::finish). Holds only the previous clock plus findings,
 /// so readers stream million-line files with bounded working memory.
+#[derive(Debug)]
 pub struct StreamChecker<'a> {
     kinds: &'a [(&'a str, &'a [&'a str])],
     previous: Option<String>,

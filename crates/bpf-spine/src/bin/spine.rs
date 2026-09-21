@@ -160,4 +160,3 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[link_section = "license"]
 #[used]
 static LICENSE: [u8; 4] = *b"GPL\0";
-

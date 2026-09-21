@@ -49,7 +49,7 @@ fn main() {
     std::fs::write(
         out.join("pinned_digests.rs"),
         format!(
-            "/// Baked release-object sha256 pins (empty in dev builds: pin check skipped).\npub const PINNED_DIGESTS: &[&str] = &[{list}];\n"
+            "/// Baked release-object sha256 pins (empty in dev builds: pin check skipped).\npub(crate) const PINNED_DIGESTS: &[&str] = &[{list}];\n"
         ),
     )
     .expect("write pinned digests");

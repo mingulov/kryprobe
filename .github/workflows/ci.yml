@@ -42,7 +42,7 @@ jobs:
         with:
           toolchain: "1.98.0"
       - name: BPF nightly
-        run: rustup toolchain install nightly-2026-09-16 -c rust-src --profile minimal
+        run: rustup toolchain install nightly-2026-09-16 -c rust-src -c rustfmt -c clippy --profile minimal
       - name: pinned linker
         run: cargo install bpf-linker --version 0.10.4 --locked
       - uses: Swatinem/rust-cache@v2

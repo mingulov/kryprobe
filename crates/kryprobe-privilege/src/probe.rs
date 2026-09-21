@@ -24,6 +24,7 @@ pub use host_rows::{
 pub const KERNEL_FLOOR: (u32, u32) = (6, 12);
 
 /// Honest outcome of one probe row.
+#[derive(Debug)]
 pub enum ProbeOutcome {
     /// Probe passed.
     Pass {
@@ -81,6 +82,7 @@ impl ProbeOutcome {
 }
 
 /// One named row of the probe matrix.
+#[derive(Debug)]
 pub struct ProbeRow {
     /// Probe name (canonical `doctor` order).
     pub name: &'static str,
@@ -89,6 +91,7 @@ pub struct ProbeRow {
 }
 
 /// The 14-row matrix, in canonical `doctor` order.
+#[derive(Debug)]
 pub struct ProbeMatrix {
     /// The 14 probe rows in canonical order.
     pub rows: Vec<ProbeRow>,

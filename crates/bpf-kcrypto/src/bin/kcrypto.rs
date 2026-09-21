@@ -610,13 +610,13 @@ fn canon_len(name: *mut u8) -> u32 {
 fn emit_ctl(kind: u8, key_hash: u64, head: u64, lens: u64, now: u64) {
     let Some(mut entry) = KRING.reserve::<KCtl>(0) else {
         let drops = KIDN_DROPS;
-        if let Some(slot) = KIDN.get_ptr_mut(&drops) {
+        if let Some(slot) = KIDN.get_ptr_mut(drops) {
             unsafe {
                 *slot = (*slot).saturating_add(1);
             }
         } else {
             let one: u8 = 1;
-            let _ = KIDN.insert(&drops, &one, BPF_NOEXIST);
+            let _ = KIDN.insert(drops, one, BPF_NOEXIST);
         }
         return;
     };
@@ -653,7 +653,7 @@ fn emit_ctl(kind: u8, key_hash: u64, head: u64, lens: u64, now: u64) {
 /// `attribution_overflow`) + the `KIDN` dump showing full; totals preserved.
 #[inline(always)]
 fn overflow_path(key_hash: u64, head: u64, lens: u64, now: u64) {
-    if let Some(slot) = KIDN.get_ptr_mut(&key_hash) {
+    if let Some(slot) = KIDN.get_ptr_mut(key_hash) {
         // Benign race: concurrent CPUs may lose an increment on this
         // shared (non-per-CPU) diagnostic counter; magnitude hint only.
         unsafe {
@@ -662,9 +662,9 @@ fn overflow_path(key_hash: u64, head: u64, lens: u64, now: u64) {
         return;
     }
     let one: u8 = 1;
-    if KIDN.insert(&key_hash, &one, BPF_NOEXIST).is_ok() {
+    if KIDN.insert(key_hash, one, BPF_NOEXIST).is_ok() {
         emit_ctl(KCTL_OVERFLOW, key_hash, head, lens, now);
-    } else if let Some(slot) = KIDN.get_ptr_mut(&key_hash) {
+    } else if let Some(slot) = KIDN.get_ptr_mut(key_hash) {
         unsafe {
             *slot = (*slot).saturating_add(1);
         }
@@ -691,13 +691,13 @@ fn drop_inc(site: u32) {
 #[inline(always)]
 fn who_drops_inc() {
     let drops = KWHO_DROPS;
-    if let Some(slot) = KIDN.get_ptr_mut(&drops) {
+    if let Some(slot) = KIDN.get_ptr_mut(drops) {
         unsafe {
             *slot = (*slot).saturating_add(1);
         }
     } else {
         let one: u8 = 1;
-        let _ = KIDN.insert(&drops, &one, BPF_NOEXIST);
+        let _ = KIDN.insert(drops, one, BPF_NOEXIST);
     }
 }
 
@@ -732,6 +732,174 @@ unsafe fn update_who_slot(slot: *mut VWho, tid: u32, comm: &[u8; 16], now: u64) 
     }
 }
 
+/// Parent chase on who-miss (1A-M8): `ppid`/`pcomm` iff
+/// `parent_ok`, fail-soft zeros otherwise (`pcomm`/`ppid` are
+/// pre-zeroed by the caller, so no zero chain fuses into memset).
+///
+/// # Safety
+///
+/// `base` must be a writable `VWho` slot.
+#[inline(always)]
+unsafe fn chase_parent(base: *mut VWho) {
+    // K5 tail of KCFG (miss-only lookup: keeps the per-event
+    // `Cfg` at 40B and no borrow live across the populate).
+    // `None` (unreadable map — essentially never) degrades to
+    // flags-off: identity without parent, never a skip.
+    if let Some(row) = KCFG.get(0) {
+        if row.parent_ok != 0 {
+            // SAFETY: helper with no pointer arguments.
+            let task = bpf_get_current_task();
+            if task != 0 {
+                let parent = read_u64(task.wrapping_add(row.task_real_parent as u64));
+                if parent != 0 {
+                    unsafe {
+                        core::ptr::addr_of_mut!((*base).ppid)
+                            .write(read_u32(parent.wrapping_add(row.task_tgid as u64)));
+                        let psrc = parent.wrapping_add(row.task_comm as u64);
+                        let pdst = core::ptr::addr_of_mut!((*base).pcomm).cast::<u8>();
+                        let _ = read_comm(psrc, pdst);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Who-miss upsert (1A-M8): populate the identity value at `base`
+/// (comm/tid/uid/cgroup, parent chase, stack id, zero tallies) and
+/// insert with `calls == 0` (the percpu insert broadcasts to every
+/// lane; the re-lookup below updates this CPU's lane in place — the
+/// KAGG insert-zero precedent, so idle lanes stay zero and the fold
+/// stays exact).
+///
+/// # Safety
+///
+/// `base` must span a writable `VWho` (the scratch head); `wkey` and
+/// `comm` must be live across the call.
+#[inline(always)]
+unsafe fn who_upsert(
+    base: *mut VWho,
+    ctx: &FExitContext,
+    wkey: &KWhoKey,
+    tid: u32,
+    comm: &[u8; 16],
+    now: u64,
+) {
+    // SAFETY: every field written below before any read/insert
+    // (`scratch` contract: `VWho` @ 0 spans 80 bytes).
+    unsafe {
+        let mut dst = core::ptr::addr_of_mut!((*base).comm).cast::<u8>();
+        let mut src = comm as *const [u8; 16] as *const u8;
+        let mut i = 0u32;
+        while i < 16 {
+            dst.write(*src);
+            dst = dst.add(1);
+            src = src.add(1);
+            i += 1;
+        }
+        core::ptr::addr_of_mut!((*base).tid).write(tid);
+        // SAFETY: helpers with no pointer arguments (results used
+        // inline: no temporary survives to the frame).
+        core::ptr::addr_of_mut!((*base).uid).write(bpf_get_current_uid_gid() as u32);
+        core::ptr::addr_of_mut!((*base).cgroup).write(bpf_get_current_cgroup_id());
+        // Parent chase iff `parent_ok`, fail-soft zeros (`pcomm`
+        // pre-zeroed: volatile, so no zero chain fuses into memset;
+        // `ppid` likewise, overwritten on chase success).
+        let mut pcomm = core::ptr::addr_of_mut!((*base).pcomm).cast::<u8>();
+        let mut j = 0u32;
+        while j < 16 {
+            pcomm.write_volatile(0);
+            pcomm = pcomm.add(1);
+            j += 1;
+        }
+        core::ptr::addr_of_mut!((*base).ppid).write_volatile(0);
+        chase_parent(base);
+        // Stack id, first-seen only: the raw helper return (id, or
+        // the negative errno when the helper refuses — no row).
+        // The `&KSTACK` address is the same map-reference pattern
+        // aya's own map methods emit (an `R_BPF_64_64` reloc the
+        // raw loader patches by symbol name); `ctx.as_ptr()` feeds
+        // the `ARG_PTR_TO_CTX` slot (kernel-stack collection needs
+        // no regs from it).
+        let stack_map = &KSTACK as *const StackTrace as *mut _;
+        // SAFETY: (fexit ctx, stack-trace map, kernel-stack flags).
+        core::ptr::addr_of_mut!((*base).stack).write(bpf_get_stackid(
+            ctx.as_ptr(),
+            stack_map,
+            BPF_F_FAST_STACK_CMP,
+        ) as i32);
+        // Zero tallies + stamps: the percpu insert broadcasts this
+        // value to every lane, so idle lanes must hold calls == 0
+        // with zero stamps (the KAGG `vagg_zero_slot` precedent);
+        // the re-lookup below stamps the inserting lane via
+        // `update_who_slot` (first_ns = last_ns = now, calls = 1).
+        core::ptr::addr_of_mut!((*base).calls).write_volatile(0);
+        core::ptr::addr_of_mut!((*base).first_ns).write_volatile(0);
+        core::ptr::addr_of_mut!((*base).last_ns).write_volatile(0);
+    }
+    // SAFETY: fully initialized above.
+    let who_ref: &VWho = unsafe { &*base };
+    let _ = KWHO.insert(wkey, who_ref, BPF_NOEXIST);
+    match KWHO.get_ptr_mut(wkey) {
+        Some(filled) => unsafe {
+            update_who_slot(filled, tid, comm, now);
+        },
+        None => {
+            who_drops_inc();
+        }
+    }
+}
+
+/// Per-kh crypto params, insert-if-absent (1A-M8): static per alg;
+/// no row when `alg == 0` (e.g. a failed alloc — userspace omits
+/// the keys then, never zero-fills). Reuses the scratch head: the
+/// who value is already copied into the map above.
+///
+/// # Safety
+///
+/// `scratch` @ 0 must span 80 writable bytes; the who init value
+/// there must be dead (copied into the map by the insert).
+#[inline(always)]
+unsafe fn record_params(scratch: *mut u8, kh: u64, alg: u64) {
+    if alg != 0 {
+        if let Some(row) = KCFG.get(0) {
+            if row.params_ok != 0 && KPARAMS.get_ptr(kh).is_none() {
+                // SAFETY: `scratch` @ 0 spans 80 bytes; the who init
+                // value above is dead (copied into the map by the
+                // insert).
+                unsafe {
+                    let pslot = scratch as *mut VParams;
+                    core::ptr::addr_of_mut!((*pslot).blocksize)
+                        .write(read_u32(alg.wrapping_add(row.cra_blocksize as u64)));
+                    core::ptr::addr_of_mut!((*pslot).ivsize)
+                        .write(read_u32(alg.wrapping_add(row.cra_ivsize as u64)));
+                    core::ptr::addr_of_mut!((*pslot).min_keysize)
+                        .write(read_u32(alg.wrapping_add(row.cra_min_keysize as u64)));
+                    core::ptr::addr_of_mut!((*pslot).max_keysize)
+                        .write(read_u32(alg.wrapping_add(row.cra_max_keysize as u64)));
+                    // SAFETY: fully initialized above.
+                    let params_ref: &VParams = &*pslot;
+                    let _ = KPARAMS.insert(kh, params_ref, BPF_NOEXIST);
+                }
+                if KPARAMS.get_ptr(kh).is_none() {
+                    who_drops_inc();
+                }
+            }
+        }
+    }
+}
+
+/// First nonzero return per kh, insert-if-absent only (1A-M8).
+#[inline(always)]
+fn record_kerr(kh: u64, kerr: i32) {
+    if kerr != 0 && KERR.get_ptr(kh).is_none() {
+        let _ = KERR.insert(kh, kerr, BPF_NOEXIST);
+        if KERR.get_ptr(kh).is_none() {
+            who_drops_inc();
+        }
+    }
+}
+
 /// Record one caller-attribution observation (row hash `kh`,
 /// precomputed): per-(`kh`, `tgid`) first-seen identity insert or hit
 /// update, plus the per-`kh` first-errno (`KERR`) + crypto-params
@@ -754,7 +922,6 @@ unsafe fn update_who_slot(slot: *mut VWho, tid: u32, comm: &[u8; 16], now: u64) 
 ///
 /// `scratch` must span 120 exclusive stack bytes, 8-aligned.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratch: *mut u8) {
     // SAFETY: helper with no pointer arguments.
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -778,131 +945,22 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
             update_who_slot(found, tid, comm, now);
         }
     } else {
-        // Miss: populate the identity + insert with `calls == 0` (the
-        // percpu insert broadcasts to every lane; the re-lookup below
-        // updates this CPU's lane in place — the KAGG insert-zero
-        // precedent, so idle lanes stay zero and the fold stays exact).
+        // Miss: populate the identity + insert (`who_upsert`), then
+        // the per-alg params row; the who value is already copied
+        // into the map when the scratch head is reused.
         let base = scratch as *mut VWho;
-        // SAFETY: every field written below before any read/insert
-        // (`scratch` contract: `VWho` @ 0 spans 80 bytes).
+        // SAFETY: `base` is the scratch head (a writable `VWho`);
+        // `wkey`/`comm` carves are live across the call.
         unsafe {
-            let mut dst = core::ptr::addr_of_mut!((*base).comm).cast::<u8>();
-            let mut src = comm as *const [u8; 16] as *const u8;
-            let mut i = 0u32;
-            while i < 16 {
-                dst.write(*src);
-                dst = dst.add(1);
-                src = src.add(1);
-                i += 1;
-            }
-            core::ptr::addr_of_mut!((*base).tid).write(tid);
-            // SAFETY: helpers with no pointer arguments (results used
-            // inline: no temporary survives to the frame).
-            core::ptr::addr_of_mut!((*base).uid).write(bpf_get_current_uid_gid() as u32);
-            core::ptr::addr_of_mut!((*base).cgroup).write(bpf_get_current_cgroup_id());
-            // Parent chase iff `parent_ok`, fail-soft zeros (`pcomm`
-            // pre-zeroed: volatile, so no zero chain fuses into memset;
-            // `ppid` likewise, overwritten on chase success).
-            let mut pcomm = core::ptr::addr_of_mut!((*base).pcomm).cast::<u8>();
-            let mut j = 0u32;
-            while j < 16 {
-                pcomm.write_volatile(0);
-                pcomm = pcomm.add(1);
-                j += 1;
-            }
-            core::ptr::addr_of_mut!((*base).ppid).write_volatile(0);
-            // K5 tail of KCFG (miss-only lookup: keeps the per-event
-            // `Cfg` at 40B and no borrow live across the populate).
-            // `None` (unreadable map — essentially never) degrades to
-            // flags-off: identity without parent, never a skip.
-            if let Some(row) = KCFG.get(0) {
-                if row.parent_ok != 0 {
-                    // SAFETY: helper with no pointer arguments.
-                    let task = bpf_get_current_task();
-                    if task != 0 {
-                        let parent = read_u64(task.wrapping_add(row.task_real_parent as u64));
-                        if parent != 0 {
-                            core::ptr::addr_of_mut!((*base).ppid)
-                                .write(read_u32(parent.wrapping_add(row.task_tgid as u64)));
-                            let psrc = parent.wrapping_add(row.task_comm as u64);
-                            let pdst = core::ptr::addr_of_mut!((*base).pcomm).cast::<u8>();
-                            let _ = read_comm(psrc, pdst);
-                        }
-                    }
-                }
-            }
-            // Stack id, first-seen only: the raw helper return (id, or
-            // the negative errno when the helper refuses — no row).
-            // The `&KSTACK` address is the same map-reference pattern
-            // aya's own map methods emit (an `R_BPF_64_64` reloc the
-            // raw loader patches by symbol name); `ctx.as_ptr()` feeds
-            // the `ARG_PTR_TO_CTX` slot (kernel-stack collection needs
-            // no regs from it).
-            let stack_map = &KSTACK as *const StackTrace as *mut _;
-            // SAFETY: (fexit ctx, stack-trace map, kernel-stack flags).
-            core::ptr::addr_of_mut!((*base).stack).write(bpf_get_stackid(
-                ctx.as_ptr(),
-                stack_map,
-                BPF_F_FAST_STACK_CMP,
-            ) as i32);
-            // Zero tallies + stamps: the percpu insert broadcasts this
-            // value to every lane, so idle lanes must hold calls == 0
-            // with zero stamps (the KAGG `vagg_zero_slot` precedent);
-            // the re-lookup below stamps the inserting lane via
-            // `update_who_slot` (first_ns = last_ns = now, calls = 1).
-            core::ptr::addr_of_mut!((*base).calls).write_volatile(0);
-            core::ptr::addr_of_mut!((*base).first_ns).write_volatile(0);
-            core::ptr::addr_of_mut!((*base).last_ns).write_volatile(0);
+            who_upsert(base, ctx, wkey, tid, comm, now);
         }
-        // SAFETY: fully initialized above.
-        let who_ref: &VWho = unsafe { &*base };
-        let _ = KWHO.insert(wkey, who_ref, BPF_NOEXIST);
-        match KWHO.get_ptr_mut(wkey) {
-            Some(filled) => unsafe {
-                update_who_slot(filled, tid, comm, now);
-            },
-            None => {
-                who_drops_inc();
-            }
-        }
-        // Per-kh crypto params, insert-if-absent (static per alg; no row
-        // when `alg == 0`, e.g. a failed alloc — userspace omits the
-        // keys then, never zero-fills). Reuses the scratch head: the
-        // who value is already copied into the map above.
-        if alg != 0 {
-            if let Some(row) = KCFG.get(0) {
-                if row.params_ok != 0 && KPARAMS.get_ptr(&kh).is_none() {
-                    // SAFETY: `scratch` @ 0 spans 80 bytes; the who init
-                    // value above is dead (copied into the map by the
-                    // insert).
-                    unsafe {
-                        let pslot = scratch as *mut VParams;
-                        core::ptr::addr_of_mut!((*pslot).blocksize)
-                            .write(read_u32(alg.wrapping_add(row.cra_blocksize as u64)));
-                        core::ptr::addr_of_mut!((*pslot).ivsize)
-                            .write(read_u32(alg.wrapping_add(row.cra_ivsize as u64)));
-                        core::ptr::addr_of_mut!((*pslot).min_keysize)
-                            .write(read_u32(alg.wrapping_add(row.cra_min_keysize as u64)));
-                        core::ptr::addr_of_mut!((*pslot).max_keysize)
-                            .write(read_u32(alg.wrapping_add(row.cra_max_keysize as u64)));
-                        // SAFETY: fully initialized above.
-                        let params_ref: &VParams = &*pslot;
-                        let _ = KPARAMS.insert(&kh, params_ref, BPF_NOEXIST);
-                    }
-                    if KPARAMS.get_ptr(&kh).is_none() {
-                        who_drops_inc();
-                    }
-                }
-            }
+        // SAFETY: scratch @ 0 spans 80 bytes; the who init value is
+        // dead (copied into the map by the insert above).
+        unsafe {
+            record_params(scratch, kh, alg);
         }
     }
-    // First nonzero return per kh, insert-if-absent only.
-    if kerr != 0 && KERR.get_ptr(&kh).is_none() {
-        let _ = KERR.insert(&kh, &kerr, BPF_NOEXIST);
-        if KERR.get_ptr(&kh).is_none() {
-            who_drops_inc();
-        }
-    }
+    record_kerr(kh, kerr);
 }
 
 /// Record one attributed observation: build the key (volatile-zeroed,
@@ -1027,11 +1085,11 @@ fn observe(
     // (kp2 S7: rare control events only). Observable via the
     // `KTOT`-vs-sum gap (K2 `attribution_overflow`) + the `KIDN` dump
     // showing full; the `KAGG` row still carries the full identity.
-    if KIDN.get_ptr(&hash).is_none() {
+    if KIDN.get_ptr(hash).is_none() {
         let zero: u8 = 0;
-        if KIDN.insert(&hash, &zero, BPF_NOEXIST).is_ok() {
+        if KIDN.insert(hash, zero, BPF_NOEXIST).is_ok() {
             emit_ctl(KCTL_IDENT, hash, head, lens, now);
-        } else if KIDN.get_ptr(&hash).is_none() {
+        } else if KIDN.get_ptr(hash).is_none() {
             overflow_path(hash, head, lens, now);
         }
     }

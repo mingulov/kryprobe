@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#![warn(missing_docs)]
 //! kryprobe-report: JSONL writer, validator, and summary renderer (T9).
 //!
 //! The writer maps core evidence types onto the frozen `event-v0` wire

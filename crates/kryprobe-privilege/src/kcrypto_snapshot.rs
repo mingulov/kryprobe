@@ -71,51 +71,86 @@ pub const TOTALS_BYTES_LEN: usize = 122;
 /// Ident row bytes: ver + kind + `KCtl` (48).
 pub const IDENT_BYTES_LEN: usize = 50;
 
-/// One `KAGG` snapshot row: exactly 382 bytes (D7).
+/// Shared exact-length check (1A-M5): the three row newtypes are
+/// thin wrappers over this, so the invariant lives in one place.
+fn check_len(bytes: &[u8], expect: usize, reason: &'static str) -> Result<(), BackendError> {
+    if bytes.len() != expect {
+        return Err(BackendError::CorruptInput(InputReason::new(reason)));
+    }
+    Ok(())
+}
+
+/// One `KAGG` snapshot row: exactly 382 bytes (D7). The field is
+/// private (1A-M5) — callers read through [`RowBytes::as_bytes`],
+/// so post-construction mutation cannot compile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowBytes(pub Vec<u8>);
+pub struct RowBytes(Vec<u8>);
 
 impl RowBytes {
     /// Wrap exact-length bytes; anything else is [`BackendError::CorruptInput`].
     pub fn new(bytes: Vec<u8>) -> Result<Self, BackendError> {
-        if bytes.len() != ROW_BYTES_LEN {
-            return Err(BackendError::CorruptInput(InputReason::new(
-                "snapshot_row_len",
-            )));
-        }
+        check_len(&bytes, ROW_BYTES_LEN, "snapshot_row_len")?;
         Ok(Self(bytes))
+    }
+
+    /// Read-only view of the row bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for RowBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
 /// One `KTOT` snapshot row: exactly 122 bytes (D7).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TotalsBytes(pub Vec<u8>);
+pub struct TotalsBytes(Vec<u8>);
 
 impl TotalsBytes {
     /// Wrap exact-length bytes; anything else is [`BackendError::CorruptInput`].
     pub fn new(bytes: Vec<u8>) -> Result<Self, BackendError> {
-        if bytes.len() != TOTALS_BYTES_LEN {
-            return Err(BackendError::CorruptInput(InputReason::new(
-                "snapshot_totals_len",
-            )));
-        }
+        check_len(&bytes, TOTALS_BYTES_LEN, "snapshot_totals_len")?;
         Ok(Self(bytes))
+    }
+
+    /// Read-only view of the row bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for TotalsBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
 /// One `KRING` snapshot record: exactly 50 bytes (D7).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentBytes(pub Vec<u8>);
+pub struct IdentBytes(Vec<u8>);
 
 impl IdentBytes {
     /// Wrap exact-length bytes; anything else is [`BackendError::CorruptInput`].
     pub fn new(bytes: Vec<u8>) -> Result<Self, BackendError> {
-        if bytes.len() != IDENT_BYTES_LEN {
-            return Err(BackendError::CorruptInput(InputReason::new(
-                "snapshot_ident_len",
-            )));
-        }
+        check_len(&bytes, IDENT_BYTES_LEN, "snapshot_ident_len")?;
         Ok(Self(bytes))
+    }
+
+    /// Read-only view of the record bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for IdentBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
@@ -714,6 +749,32 @@ mod tests {
             vagg_from_bytes(&vagg_to_bytes(&VAgg::default())).expect("zero roundtrip"),
             VAgg::default()
         );
+    }
+
+    #[test]
+    fn fixed_bytes_reject_wrong_len() {
+        // 1A-M5: each newtype enforces its exact length (pins the
+        // shared check through the refactor).
+        for (len, ok) in [(ROW_BYTES_LEN - 1, false), (ROW_BYTES_LEN, true)] {
+            assert_eq!(RowBytes::new(vec![0u8; len]).is_ok(), ok, "row {len}");
+        }
+        for (len, ok) in [(TOTALS_BYTES_LEN + 1, false), (TOTALS_BYTES_LEN, true)] {
+            assert_eq!(TotalsBytes::new(vec![0u8; len]).is_ok(), ok, "totals {len}");
+        }
+        for (len, ok) in [(0, false), (IDENT_BYTES_LEN, true)] {
+            assert_eq!(IdentBytes::new(vec![0u8; len]).is_ok(), ok, "ident {len}");
+        }
+    }
+
+    #[test]
+    fn fixed_bytes_expose_read_only_view() {
+        // 1A-M5: callers read through as_bytes/AsRef — the field is
+        // private, so post-construction mutation cannot compile.
+        let row = RowBytes::new(vec![7u8; ROW_BYTES_LEN]).expect("hand row");
+        assert_eq!(row.as_bytes().len(), ROW_BYTES_LEN);
+        assert_eq!(row.as_bytes()[0], 7);
+        let as_ref: &[u8] = row.as_ref();
+        assert_eq!(as_ref.len(), ROW_BYTES_LEN);
     }
 
     #[test]

@@ -7,3 +7,20 @@ members = ["xtask", "crates/kryprobe-abi", "crates/kryprobe-testkit", "crates/kr
 # objects built separately with the pinned nightly + bpf-linker lane,
 # see docs/dependencies/pins.md in T7).
 exclude = ["crates/bpf-spine", "crates/bpf-kcrypto"]
+
+# Shared lint table (BP-M3): every member inherits via `[lints]
+# workspace = true`. The gate runs clippy with `-D warnings`, so
+# `warn` here denies in CI. Deliberately NOT included: `pedantic`
+# (861 hits — adopt piecemeal, not wholesale), `unwrap_used` /
+# `expect_used` (~273 mostly-test hits), `unsafe_code` (legitimate
+# wire/FFI unsafe in abi/testkit/privilege; the privilege seam is
+# enforced by `xtask check`'s seam gate instead), `mod_module_files`
+# (forbids the `kcrypto_backend/mod.rs` layout 1A-M10 prescribes).
+[workspace.lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+bare_trait_objects = "warn"
+
+[workspace.lints.clippy]
+useless_conversion = "warn"

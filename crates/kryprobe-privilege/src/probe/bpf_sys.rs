@@ -76,6 +76,7 @@ pub fn denied_or_skipped(stage: &str, errno: i32) -> ProbeOutcome {
 
 /// `BPF_MAP_CREATE` attr, UAPI field order.
 #[repr(C)]
+#[derive(Debug)]
 pub struct MapAttr {
     /// Map type id.
     pub map_type: u32,
@@ -89,7 +90,7 @@ pub struct MapAttr {
 
 /// One 8-byte BPF instruction, UAPI layout.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Insn {
     /// Opcode.
     pub code: u8,
@@ -103,6 +104,7 @@ pub struct Insn {
 
 /// `BPF_PROG_LOAD` attr prefix, UAPI field order.
 #[repr(C)]
+#[derive(Debug)]
 pub struct ProgAttr {
     /// Program type id.
     pub prog_type: u32,
@@ -118,6 +120,7 @@ pub struct ProgAttr {
 
 /// `BPF_TOKEN_CREATE` attr, UAPI field order.
 #[repr(C)]
+#[derive(Debug)]
 pub struct TokenAttr {
     /// Creation flags.
     pub flags: u32,
@@ -127,6 +130,7 @@ pub struct TokenAttr {
 
 /// `BPF_LINK_CREATE uprobe_multi` attr, UAPI field order.
 #[repr(C)]
+#[derive(Debug)]
 pub struct LinkUprobeMulti {
     /// Program fd to link.
     pub prog_fd: u32,
@@ -160,6 +164,7 @@ pub struct LinkUprobeMulti {
 /// `evidence/k0/P1-attach-matrix.txt`; explicit nonzero ids fail EINVAL
 /// on the K0 host, strace-verified).
 #[repr(C)]
+#[derive(Debug)]
 pub struct LinkTracing {
     /// Program fd to link.
     pub prog_fd: u32,

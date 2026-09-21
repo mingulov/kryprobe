@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#![warn(missing_docs)]
 //! kryprobe-abi: shared BPF/userspace wire IDs and event header.
 //!
 //! Follows CONTRACTS §1–§3. This crate is `no_std` (core-only) so BPF

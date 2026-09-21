@@ -11,6 +11,7 @@ use kryprobe_core::evidence::CoverageSummary;
 use kryprobe_policy::PolicyVerdict;
 
 /// Rendered verdict: stdout line, stderr detail, exit code.
+#[derive(Debug)]
 pub struct CheckRender {
     /// Verdict line for stdout.
     pub stdout: String,
@@ -48,9 +49,17 @@ pub fn render_check_verdict(verdict: PolicyVerdict<'_>, coverage: &CoverageSumma
             );
             // First matched observation verbatim: the lossless evidence
             // behind the summary (names/counts only — C10 holds).
+            // 1A-M4: a future unserializable shape degrades to a
+            // stderr note — the VIOLATION line and exit 10 survive.
             if let Some(first) = evidence.first() {
-                let rendered = serde_json::to_string(first).expect("live evidence serializes");
-                stderr.push_str(&format!("check: evidence: {rendered}\n"));
+                match serde_json::to_string(first) {
+                    Ok(rendered) => {
+                        stderr.push_str(&format!("check: evidence: {rendered}\n"));
+                    }
+                    Err(err) => {
+                        stderr.push_str(&format!("check: evidence: <unserializable: {err}>\n"));
+                    }
+                }
             }
             CheckRender {
                 stdout,

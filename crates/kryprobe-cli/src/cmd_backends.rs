@@ -23,6 +23,7 @@ use kryprobe_privilege::probe::btf_present;
 use std::io::Write;
 
 /// One backend state row.
+#[derive(Debug)]
 pub struct BackendRow {
     /// Backend id (`synthetic`, `p11`, `openssl`, `kcrypto`).
     pub id: &'static str,
@@ -34,6 +35,7 @@ pub struct BackendRow {
 }
 
 /// Live kcrypto facts from one unprivileged detect+plan pass (D12).
+#[derive(Debug)]
 pub struct LiveKcrypto {
     /// Row state: `available`, `degraded`, or `unavailable`.
     pub state: &'static str,
@@ -166,11 +168,13 @@ fn failing_gates(
 /// the caller fails closed like the synthetic proof.
 pub fn live_kcrypto_gates() -> Result<LiveKcrypto, String> {
     let mut registry = BackendRegistry::new();
-    // Fresh registry + unique id: registration is infallible by construction.
-    register_kcrypto(&mut registry).expect("fresh registry accepts kcrypto");
+    // Fresh registry + unique id: registration succeeds today, but a
+    // future tightening degrades to Err (1A-M3), never a panic.
+    // 1A-M3: a future register tightening must degrade to Err, never panic.
+    register_kcrypto(&mut registry).map_err(|err| err.to_string())?;
     let backend = registry
         .get(BackendId::KCrypto)
-        .expect("kcrypto registered");
+        .ok_or_else(|| String::from("defect: kcrypto missing after register"))?;
     let runtime = gate_runtime();
     let session = SessionId::new(1);
     let detect_ctx = DetectContext {
@@ -297,10 +301,11 @@ pub fn run(json: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 /// closed instead of printing the `active` row.
 fn live_synthetic_gates() -> Result<[(&'static str, bool); 4], String> {
     let mut registry = BackendRegistry::new();
-    // Fresh registry + unique id: registration is infallible by construction.
+    // Fresh registry + unique id: registration succeeds today, but a
+    // future tightening degrades to Err (1A-M3), never a panic.
     registry
         .register(Box::new(SyntheticBackend::new(Vec::new())))
-        .expect("fresh registry accepts synthetic");
+        .map_err(|err| err.to_string())?;
     let mut driver = BackendDriver::harness();
     let (header, payload) = SyntheticBackend::harness_event(
         EvidencePhase::Entered,
@@ -323,7 +328,7 @@ fn live_synthetic_gates() -> Result<[(&'static str, bool); 4], String> {
     }
     let backend = registry
         .get(BackendId::Synthetic)
-        .expect("synthetic registered");
+        .ok_or_else(|| String::from("defect: synthetic missing after register"))?;
     let required = &backend.capabilities().required;
     Ok([
         ("uprobe_multi", required.uprobe_multi),

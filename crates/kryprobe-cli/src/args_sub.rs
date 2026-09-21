@@ -13,7 +13,7 @@ const DEFAULT_CALLS: u64 = 200;
 const KERNEL_CRYPTO_SOURCE: &str = "kernel-crypto";
 
 /// Parses `inspect --pid N [--json]` (requires exactly one pid).
-pub fn parse_inspect(args: &[String], json: bool) -> Result<Command, ArgsError> {
+pub(crate) fn parse_inspect(args: &[String], json: bool) -> Result<Command, ArgsError> {
     let mut pid: Option<u32> = None;
     let mut json = json;
     let mut rest = args;
@@ -40,7 +40,7 @@ pub fn parse_inspect(args: &[String], json: bool) -> Result<Command, ArgsError> 
 }
 
 /// Parses `selftest synthetic|bpf|token-smoke` plus each lane's flags.
-pub fn parse_selftest(args: &[String]) -> Result<Command, ArgsError> {
+pub(crate) fn parse_selftest(args: &[String]) -> Result<Command, ArgsError> {
     let Some((target, rest)) = args.split_first() else {
         return Err(usage("selftest: missing target"));
     };
@@ -107,7 +107,7 @@ fn parse_out_only(args: &[String], what: &str) -> Result<Option<PathBuf>, ArgsEr
 }
 
 /// Parses `report FILE` (stream mode) or `report --system …` (live mode).
-pub fn parse_report(args: &[String]) -> Result<Command, ArgsError> {
+pub(crate) fn parse_report(args: &[String]) -> Result<Command, ArgsError> {
     // Two modes: `report FILE` validates + renders a stream (unchanged),
     // while any `--flag` selects the live system-wide capture grammar
     // (kp2 §2), which requires `--system`.
@@ -177,7 +177,7 @@ fn parse_duration(value: &str, what: &str) -> Result<u64, ArgsError> {
 /// `watch --system [--source S] [--duration N] [--token PATH]`:
 /// continuous system-wide observe. `--system` is required (select-all
 /// is the only v0.1 scope).
-pub fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
+pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
     let mut duration = None;
@@ -288,7 +288,7 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
 
 /// `import FILE`: losslessly import one osslscope report or p11scope
 /// profile doc as kryprobe shell JSONL (exactly one positional arg).
-pub fn parse_import(args: &[String]) -> Result<Command, ArgsError> {
+pub(crate) fn parse_import(args: &[String]) -> Result<Command, ArgsError> {
     if args.len() != 1 {
         return Err(usage("import: want exactly one FILE"));
     }
@@ -300,7 +300,7 @@ pub fn parse_import(args: &[String]) -> Result<Command, ArgsError> {
 /// `check --system --policy F [--duration N] [--source S] [--token PATH]`:
 /// system-wide policy check. `--policy` is required (v0.1 has no
 /// default policy).
-pub fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
+pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
     let mut duration = None;
@@ -355,7 +355,7 @@ pub fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
 /// `token status [--bin PATH]` (K5: mint-once delegation surface).
 /// No `--pin` spelling exists in the setcap branch (unknown flags are
 /// usage errors, never silently ignored).
-pub fn parse_token(args: &[String]) -> Result<Command, ArgsError> {
+pub(crate) fn parse_token(args: &[String]) -> Result<Command, ArgsError> {
     let Some((verb, rest)) = args.split_first() else {
         return Err(usage("token: missing verb (mint|status)"));
     };

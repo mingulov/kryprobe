@@ -33,6 +33,22 @@ fn linker_version_ok(text: &str) -> bool {
     matches!(words.next(), Some("bpf-linker")) && words.next() == Some(PINNED_BPF_LINKER)
 }
 
+/// Sync key for one BPF lockfile (BP-M2): the lock text minus the
+/// root `[[package]]` stanza (the crate's own name/version, which
+/// differs by design). Pure over text for tests.
+fn lockfile_sync_key(text: &str) -> String {
+    let mut kept = Vec::new();
+    for stanza in text.split("[[package]]") {
+        let root = stanza
+            .lines()
+            .any(|line| line == "name = \"bpf-spine\"" || line == "name = \"bpf-kcrypto\"");
+        if !root {
+            kept.push(stanza);
+        }
+    }
+    kept.join("[[package]]")
+}
+
 /// Which strip recipe applies to one BPF object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Strip {
@@ -86,12 +102,45 @@ fn build_bpf_inner(rows: &[(&str, &str, &str, Strip)]) -> i32 {
             }
         }
     }
+    // BP-M2: the twin lockfiles must agree modulo the root stanza —
+    // drift means the two objects resolved different closures.
+    let spine_lock = fs::read_to_string(root.join("crates/bpf-spine/Cargo.lock"));
+    let kcrypto_lock = fs::read_to_string(root.join("crates/bpf-kcrypto/Cargo.lock"));
+    match (&spine_lock, &kcrypto_lock) {
+        (Ok(a), Ok(b)) if lockfile_sync_key(a) == lockfile_sync_key(b) => {}
+        (Ok(_), Ok(_)) => {
+            eprintln!(
+                "xtask build --bpf: BPF lockfile skew: crates/bpf-spine/Cargo.lock and \
+                 crates/bpf-kcrypto/Cargo.lock disagree past the root stanza"
+            );
+            return 1;
+        }
+        _ => {
+            eprintln!("xtask build --bpf: cannot read both BPF Cargo.lock files");
+            return 1;
+        }
+    }
     if !toolchain_present(&channel) {
         eprintln!("xtask build --bpf: BPF toolchain '{channel}' is not installed");
         eprintln!(
-            "install it with: rustup toolchain install {channel} -c rust-src --profile minimal"
+            "install it with: rustup toolchain install {channel} -c rust-src -c rustfmt -c clippy --profile minimal"
         );
         return 1;
+    }
+    for component in ["rustfmt", "clippy"] {
+        // BP-M1: the lint gates need these components on the pinned nightly.
+        let probe = if component == "rustfmt" {
+            "fmt"
+        } else {
+            "clippy"
+        };
+        if !rustup_probe(&channel, &["cargo", probe, "--version"]) {
+            eprintln!(
+                "xtask build --bpf: BPF toolchain '{channel}' lacks the {component} component"
+            );
+            eprintln!("install it with: rustup component add --toolchain {channel} {component}");
+            return 1;
+        }
     }
     match Command::new("bpf-linker").arg("--version").output() {
         Ok(out) if linker_version_ok(&String::from_utf8_lossy(&out.stdout)) => {}
@@ -111,10 +160,46 @@ fn build_bpf_inner(rows: &[(&str, &str, &str, Strip)]) -> i32 {
             return 1;
         }
     }
+    let code = lint_bpf(&root, &channel, rows);
+    if code != 0 {
+        return code;
+    }
     for (dir, bin, out, strip) in rows {
         let code = build_one(&root, &channel, dir, bin, out, *strip);
         if code != 0 {
             return code;
+        }
+    }
+    0
+}
+
+/// Lint budget (BP-M1): fmt is instant; clippy cold-compiles under
+/// nightly — 600s bounds a pathological hang, loudly (no retry: a
+/// lint failure is a verdict, not a flake).
+const LINT_TIMEOUT_SECS: u64 = 600;
+
+/// fmt + clippy per BPF crate under the pinned nightly (BP-M1). No
+/// `--all-targets`: the crates are bin-only `no_std` (test targets
+/// cannot build there — `can't find crate for test`).
+fn lint_bpf(root: &std::path::Path, channel: &str, rows: &[(&str, &str, &str, Strip)]) -> i32 {
+    for (dir, _, _, _) in rows {
+        let workdir = root.join("crates").join(dir);
+        for argv in [
+            &["run", channel, "cargo", "fmt", "--check"][..],
+            &[
+                "run", channel, "cargo", "clippy", "--locked", "--", "-D", "warnings",
+            ][..],
+        ] {
+            match run_child_in_timeout(&workdir, "rustup", argv, LINT_TIMEOUT_SECS) {
+                Some(0) => {}
+                Some(code) => return code,
+                None => {
+                    eprintln!(
+                        "xtask build --bpf: [{dir}] lint step timed out after {LINT_TIMEOUT_SECS}s"
+                    );
+                    return 1;
+                }
+            }
         }
     }
     0
@@ -134,7 +219,17 @@ fn build_one(
     strip: Strip,
 ) -> i32 {
     let workdir = root.join("crates").join(dir);
-    let argv: &[&str] = &["run", channel, "cargo", "build", "--release", "--bin", bin];
+    // BP-M2: the committed lockfiles are authoritative, like every host lane.
+    let argv: &[&str] = &[
+        "run",
+        channel,
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "--bin",
+        bin,
+    ];
     // 4B-L2: timeout → loud retry-once → fail. The retry stays
     // visible so flakes stay counted, never silent.
     let code = match run_child_in_timeout(&workdir, "rustup", argv, BUILD_TIMEOUT_SECS) {
@@ -273,13 +368,20 @@ pub(crate) fn test_bpf() -> i32 {
     0
 }
 
-/// True when `rustup run <channel> rustc --version` succeeds.
-fn toolchain_present(channel: &str) -> bool {
+/// True when `rustup run <channel> <args...>` succeeds.
+fn rustup_probe(channel: &str, args: &[&str]) -> bool {
+    let mut full = vec!["run", channel];
+    full.extend_from_slice(args);
     Command::new("rustup")
-        .args(["run", channel, "rustc", "--version"])
+        .args(full)
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// True when `rustup run <channel> rustc --version` succeeds.
+fn toolchain_present(channel: &str) -> bool {
+    rustup_probe(channel, &["rustc", "--version"])
 }
 
 /// Walk up to the directory containing `crates/bpf-spine/Cargo.toml`.
@@ -298,6 +400,17 @@ fn workspace_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lockfile_sync_ignores_root_stanza() {
+        // BP-M2: the twin lockfiles must agree modulo the root
+        // package stanza (the crate name differs by design).
+        let spine = "version = 4\n\n[[package]]\nname = \"bpf-spine\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"aya-ebpf\"\nversion = \"0.2.1\"\n";
+        let kcrypto = spine.replace("bpf-spine", "bpf-kcrypto");
+        assert_eq!(lockfile_sync_key(spine), lockfile_sync_key(&kcrypto));
+        let drifted = spine.replace("0.2.1", "0.2.2");
+        assert_ne!(lockfile_sync_key(spine), lockfile_sync_key(&drifted));
+    }
 
     #[test]
     fn linker_version_gate() {

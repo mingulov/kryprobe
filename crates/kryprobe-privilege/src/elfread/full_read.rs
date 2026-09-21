@@ -6,6 +6,7 @@ use anyhow::Context;
 use std::path::Path;
 
 /// Owning buffered copy of a file's bytes.
+#[derive(Debug)]
 pub struct FullRead {
     data: Vec<u8>,
 }

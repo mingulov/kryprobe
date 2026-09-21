@@ -364,10 +364,13 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
 /// the reader so tests feed a cursor; production passes `stdin()`. The
 /// handle is detached (never joined — a blocked stdin read has no
 /// timeout; process exit reaps it).
+///
+/// 1A-M2: spawn failure (thread limit, memory pressure) is a genuine
+/// OS error, so it returns `LiveError::Internal` — never a panic.
 fn spawn_stdin_watcher<R: std::io::Read + Send + 'static>(
     reader: R,
     stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+) -> Result<std::thread::JoinHandle<()>, LiveError> {
     std::thread::Builder::new()
         .name("kryprobe-stdin-watch".to_owned())
         .spawn(move || {
@@ -387,7 +390,7 @@ fn spawn_stdin_watcher<R: std::io::Read + Send + 'static>(
                 }
             }
         })
-        .expect("live stdin watcher spawns")
+        .map_err(|err| LiveError::Internal(format!("live stdin watcher spawn: {err}")))
 }
 
 /// Sleep one tick in stop-poll slices (early-out on the stop flag
@@ -429,6 +432,7 @@ pub trait SessionSensor {
 /// Production sensor: the session-owned sensor plus its session
 /// drain (2B-C1: one spawn for all ticks) plus the cross-tick
 /// who-join cache (H4: quiescent rows skip their joins).
+#[derive(Debug)]
 pub struct RealSensor<'a> {
     sensor: &'a ConfiguredKcrypto,
     drain: Option<DrainThread>,
@@ -640,7 +644,7 @@ fn drive_session_inner(
         let mut tick_agg_calls = Vec::with_capacity(snap.rows.len());
         let mut tick_totals_calls = None;
         for row in &snap.rows {
-            let parsed = parse_snapshot_row(&row.0)
+            let parsed = parse_snapshot_row(row.as_bytes())
                 .map_err(|err| LiveError::Internal(format!("live parse agg: {err}")))?;
             let ParsedRow::Agg { kagg, vagg } = parsed else {
                 return Err(LiveError::Internal(
@@ -657,12 +661,12 @@ fn drive_session_inner(
                 &kagg.drv(),
             ));
             let observation = backend
-                .decode(&decode_ctx, raw_event_stamped(&row.0, vagg.last_ns))
+                .decode(&decode_ctx, raw_event_stamped(row.as_bytes(), vagg.last_ns))
                 .map_err(|err| LiveError::Internal(format!("live decode agg: {err}")))?;
             upsert_latest(&mut latest, &mut observations, key, observation);
         }
         if let Some(totals) = &snap.totals {
-            let parsed = parse_snapshot_row(&totals.0)
+            let parsed = parse_snapshot_row(totals.as_bytes())
                 .map_err(|err| LiveError::Internal(format!("live parse totals: {err}")))?;
             let ParsedRow::Totals { vagg } = parsed else {
                 return Err(LiveError::Internal(
@@ -671,12 +675,15 @@ fn drive_session_inner(
             };
             tick_totals_calls = Some(vagg.calls);
             let observation = backend
-                .decode(&decode_ctx, raw_event_stamped(&totals.0, vagg.last_ns))
+                .decode(
+                    &decode_ctx,
+                    raw_event_stamped(totals.as_bytes(), vagg.last_ns),
+                )
                 .map_err(|err| LiveError::Internal(format!("live decode totals: {err}")))?;
             upsert_latest(&mut latest, &mut observations, ObsKey::Totals, observation);
         }
         for ident in &snap.idents {
-            let parsed = parse_snapshot_row(&ident.0)
+            let parsed = parse_snapshot_row(ident.as_bytes())
                 .map_err(|err| LiveError::Internal(format!("live parse ident: {err}")))?;
             let ParsedRow::Ident { kctl } = parsed else {
                 return Err(LiveError::Internal(
@@ -684,7 +691,7 @@ fn drive_session_inner(
                 ));
             };
             let observation = backend
-                .decode(&decode_ctx, raw_event_stamped(&ident.0, kctl.val2))
+                .decode(&decode_ctx, raw_event_stamped(ident.as_bytes(), kctl.val2))
                 .map_err(|err| LiveError::Internal(format!("live decode ident: {err}")))?;
             // Idents are disjoint across ticks: every one is kept.
             observations.push(observation);
@@ -973,7 +980,7 @@ fn run_live_session_inner(
         .map_err(|err| LiveError::Internal(format!("live SIGINT handler: {err}")))?;
     let stop = Arc::new(AtomicBool::new(false));
     if cfg.duration_secs.is_none() {
-        let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop));
+        let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop))?;
     }
     // Session KRING drain (2B-C1): one spawn for all ticks — a per-tick
     // spawn/stop would pay thread + ~2MB mmap + epoll + up to 10ms
@@ -1278,12 +1285,14 @@ mod tests {
     fn stdin_watcher_stops_on_eof_only() {
         use std::io::Cursor;
         let eof_stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_stdin_watcher(Cursor::new(Vec::new()), Arc::clone(&eof_stop));
+        let handle =
+            spawn_stdin_watcher(Cursor::new(Vec::new()), Arc::clone(&eof_stop)).expect("spawns");
         handle.join().expect("watcher joins");
         assert!(eof_stop.load(Ordering::Relaxed), "EOF stops");
         // Input bytes do not stop; EOF after input does.
         let input_stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_stdin_watcher(Cursor::new(b"hello".to_vec()), Arc::clone(&input_stop));
+        let handle = spawn_stdin_watcher(Cursor::new(b"hello".to_vec()), Arc::clone(&input_stop))
+            .expect("spawns");
         handle.join().expect("watcher joins");
         assert!(input_stop.load(Ordering::Relaxed), "EOF-after-input stops");
     }

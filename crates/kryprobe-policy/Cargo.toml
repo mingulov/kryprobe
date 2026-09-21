@@ -10,3 +10,6 @@ kryprobe-core = { path = "../kryprobe-core" }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "1.3.0"
 serde_json = "1"
+
+[lints]
+workspace = true

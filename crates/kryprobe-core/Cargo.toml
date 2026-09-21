@@ -13,3 +13,6 @@ serde_json = "1"
 [dev-dependencies]
 kryprobe-report = { path = "../kryprobe-report" }
 kryprobe-testkit = { path = "../kryprobe-testkit" }
+
+[lints]
+workspace = true
