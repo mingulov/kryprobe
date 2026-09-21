@@ -66,25 +66,40 @@ pub const KCRYPTO_SYMBOLS: &[&str] = &[
 /// or a moved first-member link (C3 — the BPF hardcodes 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BtfError {
+    /// BTF image I/O failure.
     Io {
+        /// Failure detail.
         detail: String,
     },
+    /// BTF image is malformed.
     BadBtf {
+        /// Rejection reason.
         reason: String,
     },
+    /// Function record absent from BTF.
     MissingFunc {
+        /// Missing function name.
         name: String,
     },
+    /// Type record absent from BTF.
     MissingType {
+        /// Missing type name.
         name: String,
     },
+    /// Struct member absent from its type.
     MissingMember {
+        /// Containing type name.
         type_name: String,
+        /// Missing member name.
         member: String,
     },
+    /// First-member link moved off offset 0 (the BPF hardcodes 0).
     FirstMemberMoved {
+        /// Containing type name.
         type_name: String,
+        /// Moved member name.
         member: String,
+        /// Observed nonzero offset.
         offset: u32,
     },
 }
@@ -150,8 +165,16 @@ pub struct KcryptoOffsets {
 /// they yield `*_ok=false` + zeros inside [`KcryptoOffsets`] (fail-soft).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
-    Io { detail: String },
-    BadBtf { reason: String },
+    /// BTF image I/O failure.
+    Io {
+        /// Failure detail.
+        detail: String,
+    },
+    /// BTF image is malformed.
+    BadBtf {
+        /// Rejection reason.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -381,7 +404,10 @@ pub enum AttachOutcome {
     /// Tracing link created; the point observes system-wide.
     Attached,
     /// Load succeeded but the link failed; `detail` is the refusal.
-    Failed { detail: String },
+    Failed {
+        /// Link refusal detail.
+        detail: String,
+    },
 }
 
 /// One configured attach point: load outcome + (when loaded) attach outcome.
@@ -431,11 +457,22 @@ impl ConfiguredKcrypto {
 /// swallowed); every other stage fails before any point exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfiguredError {
+    /// BTF resolution failed.
     Resolve(BtfError),
+    /// Object load failed.
     Load(LoaderError),
+    /// KCFG write failed.
     Configure(MapOpsError),
-    AttachSetup { detail: String },
-    NoPointAttached { points: Vec<ConfiguredPoint> },
+    /// Attach-group setup failed before any point existed.
+    AttachSetup {
+        /// Failure detail.
+        detail: String,
+    },
+    /// No point attached; per-point outcomes ride along.
+    NoPointAttached {
+        /// Per-point load/attach outcomes (diagnosable).
+        points: Vec<ConfiguredPoint>,
+    },
 }
 
 impl std::fmt::Display for ConfiguredError {

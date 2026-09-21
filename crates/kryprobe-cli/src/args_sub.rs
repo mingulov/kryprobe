@@ -12,6 +12,7 @@ const DEFAULT_CALLS: u64 = 200;
 /// their backends).
 const KERNEL_CRYPTO_SOURCE: &str = "kernel-crypto";
 
+/// Parses `inspect --pid N [--json]` (requires exactly one pid).
 pub fn parse_inspect(args: &[String], json: bool) -> Result<Command, ArgsError> {
     let mut pid: Option<u32> = None;
     let mut json = json;
@@ -38,6 +39,7 @@ pub fn parse_inspect(args: &[String], json: bool) -> Result<Command, ArgsError> 
     Ok(Command::Inspect { pid, json })
 }
 
+/// Parses `selftest synthetic|bpf|token-smoke` plus each lane's flags.
 pub fn parse_selftest(args: &[String]) -> Result<Command, ArgsError> {
     let Some((target, rest)) = args.split_first() else {
         return Err(usage("selftest: missing target"));
@@ -104,6 +106,7 @@ fn parse_out_only(args: &[String], what: &str) -> Result<Option<PathBuf>, ArgsEr
     Ok(out)
 }
 
+/// Parses `report FILE` (stream mode) or `report --system …` (live mode).
 pub fn parse_report(args: &[String]) -> Result<Command, ArgsError> {
     // Two modes: `report FILE` validates + renders a stream (unchanged),
     // while any `--flag` selects the live system-wide capture grammar

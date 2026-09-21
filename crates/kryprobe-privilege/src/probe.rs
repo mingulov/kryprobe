@@ -25,30 +25,40 @@ pub const KERNEL_FLOOR: (u32, u32) = (6, 12);
 
 /// Honest outcome of one probe row.
 pub enum ProbeOutcome {
+    /// Probe passed.
     Pass {
+        /// Pass detail (never empty).
         detail: String,
     },
+    /// Probe denied by capability/permission.
     Denied {
+        /// Denied stage (never empty).
         stage: String,
+        /// Kernel errno.
         errno: i32,
     },
+    /// Probe skipped (not attempted).
     Skipped {
+        /// Skip reason (never empty).
         reason: String,
     },
     /// Attempted but incomplete with no kernel errno (1B-M7: partial
     /// attach counts, never a fabricated errno).
     Failed {
+        /// Failure detail naming counts/points (never empty).
         detail: String,
     },
 }
 
 impl ProbeOutcome {
+    /// Passing outcome (panics on empty detail).
     pub fn pass(detail: impl Into<String>) -> Self {
         let detail = detail.into();
         assert!(!detail.is_empty(), "pass detail must be non-empty");
         Self::Pass { detail }
     }
 
+    /// Denied outcome (panics on empty stage).
     pub fn denied(stage: impl Into<String>, errno: i32) -> Self {
         let stage = stage.into();
         assert!(!stage.is_empty(), "denied stage must be non-empty");
@@ -62,6 +72,7 @@ impl ProbeOutcome {
         Self::Failed { detail }
     }
 
+    /// Skipped outcome (panics on empty reason).
     pub fn skipped(reason: impl Into<String>) -> Self {
         let reason = reason.into();
         assert!(!reason.is_empty(), "skipped reason must be non-empty");
@@ -71,12 +82,15 @@ impl ProbeOutcome {
 
 /// One named row of the probe matrix.
 pub struct ProbeRow {
+    /// Probe name (canonical `doctor` order).
     pub name: &'static str,
+    /// Honest probe outcome.
     pub outcome: ProbeOutcome,
 }
 
 /// The 14-row matrix, in canonical `doctor` order.
 pub struct ProbeMatrix {
+    /// The 14 probe rows in canonical order.
     pub rows: Vec<ProbeRow>,
 }
 

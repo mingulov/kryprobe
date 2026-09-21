@@ -35,9 +35,13 @@ use kryprobe_core::ProgramId;
 /// Frozen dims of one spine map (ground truth: the built object).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapDims {
+    /// BPF map type id.
     pub map_type: u32,
+    /// Key size in bytes.
     pub key_size: u32,
+    /// Value size in bytes.
     pub value_size: u32,
+    /// Maximum entries.
     pub max_entries: u32,
 }
 
@@ -195,50 +199,74 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
 /// One parsed map: name + dims as found in the object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMap {
+    /// Map name as found in the object.
     pub name: String,
+    /// Dims as found in the object.
     pub dims: MapDims,
 }
 
 /// One parsed program: insn stream with calls resolved, map fds pending.
 #[derive(Debug, Clone)]
 pub struct ParsedProg {
+    /// Program name.
     pub name: String,
+    /// ELF section the program came from.
     pub section: String,
+    /// Instruction stream with calls resolved.
     pub insns: Vec<BpfInsn>,
 }
 
 /// Raw loader failure: stage + detail, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoaderError {
+    /// Object I/O failure.
     Io {
+        /// Loader stage that failed.
         stage: &'static str,
+        /// Failure detail.
         detail: String,
     },
+    /// Object failed structural validation.
     BadObject {
+        /// Rejection reason.
         reason: String,
     },
     /// Program id refused by the load-facet allowlist: a forbidden
     /// program, NOT a corrupt object (X16). Callers map this to exit 4
     /// / `Denied`, never to a corruption bucket.
     NotAllowed {
+        /// Refused program id.
         id: ProgramId,
     },
+    /// Map dims disagree with the frozen ground truth.
     DimMismatch {
+        /// Offending map name.
         name: String,
     },
+    /// Map type the raw loader does not support.
     UnsupportedMap {
+        /// Offending map name.
         name: String,
     },
+    /// Map creation failed.
     MapFailed {
+        /// Loader stage that failed.
         stage: String,
+        /// Kernel errno.
         errno: i32,
     },
+    /// Program load failed.
     LoadFailed {
+        /// Loader stage that failed.
         stage: String,
+        /// Kernel errno.
         errno: i32,
+        /// Verifier log tail.
         log: String,
     },
+    /// Record buffer violates the 8-alignment precondition.
     MisalignedRecord {
+        /// Offending buffer address.
         addr: usize,
     },
     /// Pin name refused by the dot-free gate (R3): bpffs refuses dotted
@@ -246,6 +274,7 @@ pub enum LoaderError {
     /// syscall. Empty names, `/`, and NUL fail here too (fail-closed
     /// path hygiene, same variant).
     BadPinName {
+        /// Refused pin name.
         name: String,
     },
 }
@@ -283,22 +312,31 @@ impl std::error::Error for LoaderError {}
 
 /// Loaded spine maps, one RAII fd per map.
 pub struct SpineMaps {
+    /// CONFIG map handle.
     pub config: OwnedFd,
+    /// START map handle.
     pub start: OwnedFd,
+    /// COUNT map handle.
     pub count: OwnedFd,
+    /// EVENTS map handle.
     pub events: OwnedFd,
+    /// LOSS map handle.
     pub loss: OwnedFd,
 }
 
 /// Loaded spine programs: entry + return.
 pub struct SpineProgs {
+    /// Entry probe program handle.
     pub entry: OwnedFd,
+    /// Return probe program handle.
     pub ret: OwnedFd,
 }
 
 /// Fully loaded spine: maps + programs, all RAII-owned.
 pub struct LoadedSpine {
+    /// Loaded spine maps.
     pub maps: SpineMaps,
+    /// Loaded spine programs.
     pub progs: SpineProgs,
 }
 
@@ -307,10 +345,15 @@ pub struct LoadedSpine {
 /// reads the tail; dropping them here would close userspace's only
 /// handles while the programs still reference the maps).
 pub struct KcryptoMaps {
+    /// `KCFG` (resolved BTF ids + offsets).
     pub config: OwnedFd,
+    /// `KAGG` (percpu aggregate counters).
     pub agg: OwnedFd,
+    /// `KTOT` (global totals).
     pub total: OwnedFd,
+    /// `KIDN` (ident/drop counters).
     pub ident: OwnedFd,
+    /// `KRING` (ident record ring).
     pub ring: OwnedFd,
     /// `KWHO` (per-cpu caller identity, 2048 entries).
     pub who: OwnedFd,
@@ -330,7 +373,9 @@ pub struct KcryptoMaps {
 /// (including `Missing`/`Unsupported`) ride the sibling [`PointStatus`]
 /// vector returned by [`load_kcrypto`].
 pub struct LoadedKcrypto {
+    /// Loaded kcrypto maps.
     pub maps: KcryptoMaps,
+    /// Loaded programs as (name, handle) pairs.
     pub progs: Vec<(String, OwnedFd)>,
 }
 
@@ -376,11 +421,22 @@ impl LoadedKcrypto {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointStatus {
     /// Program loaded with its `attach_btf_id`, ready to attach.
-    Loaded { name: String },
+    Loaded {
+        /// Program name.
+        name: String,
+    },
     /// No `attach_btf_id` was supplied for this program; skipped.
-    Missing { name: String },
+    Missing {
+        /// Program name.
+        name: String,
+    },
     /// Load refused (verifier/capability); `detail` is a short reason.
-    Unsupported { name: String, detail: String },
+    Unsupported {
+        /// Program name.
+        name: String,
+        /// Short refusal reason.
+        detail: String,
+    },
 }
 
 impl PointStatus {

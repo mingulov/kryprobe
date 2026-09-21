@@ -153,30 +153,43 @@ pub enum CoverageStatus {
 /// Cryptographic operation class; exactly the 13 frozen-schema variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OperationClass {
+    /// Signature generation.
     #[serde(rename = "sign")]
     Sign,
+    /// Signature verification.
     #[serde(rename = "verify")]
     Verify,
+    /// Symmetric/asymmetric encryption.
     #[serde(rename = "encrypt")]
     Encrypt,
+    /// Symmetric/asymmetric decryption.
     #[serde(rename = "decrypt")]
     Decrypt,
+    /// Hash digest computation.
     #[serde(rename = "digest")]
     Digest,
+    /// Message authentication code.
     #[serde(rename = "mac")]
     Mac,
+    /// Key derivation.
     #[serde(rename = "kdf")]
     Kdf,
+    /// Key agreement (e.g. ECDH).
     #[serde(rename = "key_agreement")]
     KeyAgreement,
+    /// KEM encapsulation.
     #[serde(rename = "kem_encapsulate")]
     KemEncapsulate,
+    /// KEM decapsulation.
     #[serde(rename = "kem_decapsulate")]
     KemDecapsulate,
+    /// Random number generation.
     #[serde(rename = "random")]
     Random,
+    /// Key generation, import, or destruction.
     #[serde(rename = "key_management")]
     KeyManagement,
+    /// Operation class could not be determined.
     #[serde(rename = "unknown")]
     Unknown,
 }

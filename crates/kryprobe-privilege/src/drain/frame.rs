@@ -16,7 +16,9 @@ pub const LEN_MASK: u32 = !(BUSY_BIT | DISCARD_BIT);
 /// One walk's output: kept payloads + advanced consumer position.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Consumed {
+    /// Kept record payloads.
     pub records: Vec<Vec<u8>>,
+    /// Advanced consumer position.
     pub consumer: u64,
     /// Stopped on a busy/torn record: more may arrive later.
     pub busy: bool,

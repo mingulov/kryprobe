@@ -83,6 +83,18 @@ per-task tracing links, and ringbuf. The authoritative gate is the
 runtime probe matrix (`doctor`), not the release string — deploy on
 what `doctor` passes, not on what `uname` prints.
 
+## Supervision and cgroup notes
+
+v0.1 has no systemd unit, no daemon mode, and no cgroup integration:
+`watch`/`report`/`check` are foreground batch commands, and workload
+selectors (`--pid`, `--tree`, `--cgroup`, `--unit`) are deferred
+past v0.1 and rejected when passed. Supervise kryprobe like any
+batch job (a timer or a supervised one-shot); it needs no
+cgroup placement of its own. BPF links and maps live exactly as long
+as the kryprobe process — killing it detaches everything, so there
+is no stale-pin cleanup beyond the operator-owned bpffs token pin
+(`token status` shows whether that pin is usable).
+
 ## Elevated-mode hygiene
 
 - Never run elevated with a poisoned environment: `KRYPROBE_BPF_DIR`,

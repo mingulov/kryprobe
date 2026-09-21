@@ -3,9 +3,60 @@
 
 `kryprobe check --system --policy FILE` evaluates one capture
 against an explicit-rules YAML policy (`version: 1` + `rules`;
-unknown keys rejected). The full shape reference (MatchSpec key
-table, glob dialect, worked example) lands with the completed guide;
-this section normatively pins the verdict semantics.
+unknown keys rejected — exit 2 at the CLI, never silently
+ignored). There is no default policy: `check` requires `--policy`.
+
+## Example
+
+```yaml
+version: 1
+rules:
+  - id: no-kernel-md5
+    source: kernel-crypto
+    match:
+      stage: executed
+      algorithm: md5
+    decision: deny
+  - id: watch-external-drivers
+    source: kernel-crypto
+    match:
+      driver_not: "*-generic"
+    decision: deny
+```
+
+Rules evaluate in order; the first matching `deny` wins and the
+verdict names its `id`. `source` scopes the rule to a capture
+source (`kernel-crypto` in v0.1 — any other spelling parses but
+never matches kcrypto data). `decision: report` never raises a
+violation (v0.1 records nothing; the verdict only distinguishes
+deny-vs-report).
+
+## Match keys
+
+`match` is a conjunction: every present key must hold, absent keys
+are wildcards, `{}` matches everything in the rule's source.
+
+| Key | Matches |
+|-----|---------|
+| `stage` | `selected` (transform/selection observed) or `executed` (real execution: agg row Entered/Returned/Completed) |
+| `algorithm` | Kernel algorithm name, exact or glob (`md5`, `cbc(*)`) |
+| `driver` | Kernel driver name, exact or glob |
+| `driver_not` | Matches when the `driver` glob does NOT match |
+| `module` | Kernel module — **never matches kcrypto v0.1 data** (D4); import-shaped observations match their payload module |
+| `family` | Crypto family (`skcipher`, `aead`, `ahash`, `shash`, …) |
+| `operation` | Operation (`alloc`, `encrypt`, `decrypt`, `digest`, `finup`, …) — reads the payload `op` spelling |
+| `result` | Immediate result class (`ok`, `error`, `queued`, …) |
+| `context` | Context kind (`process`, `kthread`, `softirq`, …) |
+| `comm` | Process comm glob (matches who-row `comm`) |
+| `uid` | Exact uid (a YAML u32 — anything else is a policy parse error, exit 2) |
+
+## Glob dialect
+
+String keys are D5 globs: `*` spans any run (including empty),
+`?` spans exactly one byte; everything else is literal —
+brackets, backslashes, and braces never carry meaning. Matching
+is byte-wise over the whole value. A missing payload key reads
+as `""`, so a glob never matches absent data by accident.
 
 ## Verdicts
 

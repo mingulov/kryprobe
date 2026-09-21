@@ -12,8 +12,11 @@ use kryprobe_policy::PolicyVerdict;
 
 /// Rendered verdict: stdout line, stderr detail, exit code.
 pub struct CheckRender {
+    /// Verdict line for stdout.
     pub stdout: String,
+    /// Evidence detail for stderr (empty for clean).
     pub stderr: String,
+    /// Process exit code (10/0/3).
     pub code: i32,
 }
 

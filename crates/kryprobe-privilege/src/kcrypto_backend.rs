@@ -633,6 +633,7 @@ pub struct WhoSnapshot {
 /// is unknown, never misattributed, never fatal).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
+    /// Underlying map walk/read failure.
     Map(MapOpsError),
 }
 

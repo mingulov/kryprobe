@@ -5,6 +5,43 @@ All notable user-facing changes to the KryProbe thin spine. The
 `kryprobe.event/v0` session schema is frozen and never appears here;
 any schema change requires an ADR plus a version bump.
 
+## Unreleased — kcrypto backend (K5)
+
+Live kernel-crypto observation on top of the thin spine: the BPF
+sensor, system-wide watch/report/check, policy verdicts, token
+bring-up, and third-party import. Exit codes were renumbered — see
+the migration note below.
+
+### Added
+
+- kcrypto BPF sensor (9 fexit points, percpu aggregates, ident ring)
+  plus the configured loader (BTF resolution, offsets snapshot,
+  token-fd delegation).
+- Live capture session: `watch --system`, `report --system`
+  (human/json/validated-JSONL), `check --system` with the YAML
+  policy engine (`VIOLATION`/`CLEAN`/`INCONCLUSIVE` verdicts).
+- Who attribution: per-identity rows with kallsyms symbolization
+  and the K5 surface (`token mint|status`, doctor matrix rows).
+- `import`: osslscope/p11scope docs become shell JSONL records.
+- Deployment runbook (`docs/deployment.md`), policy guide
+  (`docs/policy.md`), versioning policy (`docs/versioning.md`).
+
+### Changed — exit-code migration
+
+- The kp2 family is now 0 clean/ok, 1 internal failure, 2
+  usage/invalid input, 3 inconclusive/PARTIAL, 4
+  environment-unusable, 10 policy violation. Previously 3 meant
+  refused/unsupported/denied and 4 meant partial: **every consumer
+  script keyed on 3/4 must swap those two branches and add exit 10**.
+  Stubs (`plan`/`observe`/`run`) and inspect denials moved from 3
+  to 4 with the family.
+
+### Fixed
+
+- Per-tick drain respawns replaced by one session drain; kallsyms
+  parses once per tick (not per row); fail-open policy verdicts
+  closed (unevaluable rules yield `INCONCLUSIVE`, never `Clean`).
+
 ## Unreleased — thin-spine milestone
 
 Executable skeleton: frozen contracts plus a working runtime spine

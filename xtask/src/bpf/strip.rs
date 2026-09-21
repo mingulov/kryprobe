@@ -499,6 +499,13 @@ fn remap(kept: &[(usize, usize, usize)], old: usize) -> Option<usize> {
     None
 }
 
+/// Reachability-GC rewrite: emit a new object whose `.text` packs only
+/// the `live` functions from zero, remapping intra-text calls through
+/// rewritten symbol values and refusing entry calls that would
+/// silently retarget against the section symbol. Design rationale in
+/// `docs/dependencies/pins.md` ("Build quirks": dead builtins, the
+/// 28-byte zero-chain `memset` fusion hazard, why `--disable-memory-builtins`
+/// and LTO do not help).
 #[allow(clippy::too_many_arguments)]
 fn rewrite(
     obj: &[u8],

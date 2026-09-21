@@ -64,15 +64,34 @@ pub enum ReportFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Probe matrix + backend rows.
-    Doctor { json: bool },
+    Doctor {
+        /// Render JSON instead of human tables.
+        json: bool,
+    },
     /// Backend registry + states.
-    Backends { json: bool },
+    Backends {
+        /// Render JSON instead of human rows.
+        json: bool,
+    },
     /// Snapshot one process.
-    Inspect { pid: u32, json: bool },
+    Inspect {
+        /// Target process id.
+        pid: u32,
+        /// Render JSON instead of human rows.
+        json: bool,
+    },
     /// Deterministic scripted session (`--out` or stdout).
-    SelftestSynthetic { out: Option<PathBuf> },
+    SelftestSynthetic {
+        /// Output file, or stdout when `None`.
+        out: Option<PathBuf>,
+    },
     /// BPF pipeline selftest.
-    SelftestBpf { calls: u64, out: Option<PathBuf> },
+    SelftestBpf {
+        /// Fixture call count.
+        calls: u64,
+        /// Output file, or stdout when `None`.
+        out: Option<PathBuf>,
+    },
     /// Root token roundtrip.
     SelftestToken,
     /// Root one-shot file-cap grant (`token mint`): `--bin` target
@@ -104,7 +123,10 @@ pub enum Command {
         token: Option<PathBuf>,
     },
     /// Validate + render a stream.
-    Report { file: PathBuf },
+    Report {
+        /// Stream file to validate and render.
+        file: PathBuf,
+    },
     /// Bounded system-wide capture + render (live kcrypto capture).
     /// `duration` is an optional window in seconds; `None` takes the
     /// 60s command default.
@@ -139,7 +161,10 @@ pub enum Command {
         file: PathBuf,
     },
     /// Thin-spine stub (`plan`/`observe`/`run`).
-    Stub { name: String },
+    Stub {
+        /// Stub subcommand name (echoed in the refusal).
+        name: String,
+    },
 }
 
 /// Parsed argv: exactly one command.

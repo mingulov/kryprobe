@@ -284,6 +284,7 @@ pub fn sanitize_cell(cell: &str) -> String {
     }
 }
 
+/// Renders a summary from a buffered stream reader (single pass).
 pub fn render_summary_reader(mut reader: impl BufRead) -> std::io::Result<String> {
     let mut summary = Summary::default();
     loop {

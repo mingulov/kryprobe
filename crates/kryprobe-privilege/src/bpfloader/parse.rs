@@ -38,9 +38,13 @@ const PSEUDO_MAP_FD: u8 = 1;
 /// One decoded 8-byte BPF instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BpfInsn {
+    /// Opcode.
     pub code: u8,
+    /// Packed dst (low nibble) / src (high nibble) registers.
     pub dst_src: u8,
+    /// Signed jump/data offset.
     pub off: i16,
+    /// Immediate constant.
     pub imm: i32,
 }
 
@@ -68,16 +72,22 @@ impl BpfInsn {
 /// One planned map-fd fixup: `prog`'s `ld_imm64` at `insn_idx` takes `map`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapReloc {
+    /// Program index the fixup applies to.
     pub prog: usize,
+    /// Instruction index of the `ld_imm64`.
     pub insn_idx: usize,
+    /// Map name whose fd the instruction takes.
     pub map: String,
 }
 
 /// Fully parsed object: dims, insn streams (calls resolved), fixup plan.
 #[derive(Debug, Clone)]
 pub struct ParsedSpine {
+    /// Parsed maps.
     pub maps: Vec<ParsedMap>,
+    /// Parsed programs.
     pub programs: Vec<ParsedProg>,
+    /// Planned map-fd fixups.
     pub map_relocs: Vec<MapReloc>,
 }
 
@@ -85,8 +95,11 @@ pub struct ParsedSpine {
 /// fixup plan (K1 Task 1; K0 G1 — `evidence/k0/VERDICT.md`).
 #[derive(Debug, Clone)]
 pub struct ParsedKcrypto {
+    /// Parsed maps.
     pub maps: Vec<ParsedMap>,
+    /// Parsed programs.
     pub programs: Vec<ParsedProg>,
+    /// Planned map-fd fixups.
     pub map_relocs: Vec<MapReloc>,
 }
 

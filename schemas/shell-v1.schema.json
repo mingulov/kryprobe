@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kryprobe:design:shell:v1",
+  "title": "KryProbe import shell record v1",
+  "description": "One `import` output record: best-effort mapped fields plus the FULL original third-party doc verbatim under `native`. Documentary contract — `report FILE` accepts these structurally as `import_shell` records; the checker does not evaluate this schema.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "kryprobe/shell/v1"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["osslscope", "p11scope"],
+      "description": "Which sibling tool's doc was imported."
+    },
+    "scope": {
+      "description": "Best-effort scope (`target` / `capture` verbatim, else null)."
+    },
+    "context": {
+      "description": "Best-effort status (`completeness` string, else null)."
+    },
+    "operation": {
+      "description": "Best-effort operation (`report`/`check`, `capture.mode`)."
+    },
+    "implementation": {
+      "description": "Best-effort implementation summary."
+    },
+    "metrics": {
+      "description": "Best-effort counters."
+    },
+    "window": {
+      "description": "Best-effort window."
+    },
+    "evidence": {
+      "description": "Best-effort evidence summary."
+    },
+    "native": {
+      "description": "FULL original parsed doc, verbatim. Always present; never elided."
+    }
+  },
+  "required": [
+    "schema",
+    "source",
+    "scope",
+    "context",
+    "operation",
+    "implementation",
+    "metrics",
+    "window",
+    "evidence",
+    "native"
+  ],
+  "additionalProperties": false
+}

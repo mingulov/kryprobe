@@ -23,8 +23,18 @@ pub(crate) const UPROBE_MULTI_RETURN: u32 = 1 << 0;
 /// Link-group attach failure: rejection or syscall errno.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachError {
-    Rejected { reason: String },
-    LinkFailed { stage: String, errno: i32 },
+    /// Admission rejected the scope.
+    Rejected {
+        /// Rejection reason.
+        reason: String,
+    },
+    /// Link creation syscall failed.
+    LinkFailed {
+        /// Attach stage that failed.
+        stage: String,
+        /// Kernel errno.
+        errno: i32,
+    },
 }
 
 impl std::fmt::Display for AttachError {

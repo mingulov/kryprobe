@@ -69,6 +69,43 @@ struct Record<'a, P: Serialize> {
 }
 
 /// Deterministic JSONL session writer.
+///
+/// # Example
+///
+/// A start/end envelope round-trips through the stream checker clean.
+///
+/// ```
+/// use kryprobe_core::enums::{BackendId, CaptureMode, TargetSelector};
+/// use kryprobe_report::{
+///     FinalBarrier, JsonlWriter, SessionEnd, SessionStart, SessionVerdict, check_stream,
+/// };
+///
+/// let mut writer = JsonlWriter::new("session:demo");
+/// writer
+///     .session_start(&SessionStart {
+///         target_selector: TargetSelector::System,
+///         capture_mode: CaptureMode::Trace,
+///         requested_backends: vec![BackendId::KCrypto],
+///         qualification_id: "qualification:demo".to_owned(),
+///     })
+///     .expect("start emits");
+/// writer
+///     .session_end(&SessionEnd {
+///         verdict: SessionVerdict::Observed,
+///         final_barrier: FinalBarrier::Validated,
+///         unresolved_gap_ids: Vec::new(),
+///         child_exit_code: None,
+///         child_signal: None,
+///     })
+///     .expect("end emits");
+/// let text = writer.into_string();
+/// assert_eq!(text.lines().count(), 2);
+/// let kinds: &[(&str, &[&str])] = &[
+///     ("session_start", &["target_selector"]),
+///     ("session_end", &["verdict"]),
+/// ];
+/// assert_eq!(check_stream(&text, kinds), Vec::new());
+/// ```
 pub struct JsonlWriter {
     session: String,
     next_record: u64,

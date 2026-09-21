@@ -19,7 +19,7 @@ const USAGE: &str = "\
 usage: cargo xtask <command> [<lane>]
 
 commands:
-  check        verify pinned toolchain, then fmt, clippy, host tests
+  check        verify pinned toolchain, then fmt, clippy, doc, host tests
   build        cargo build --locked --workspace
   build --bpf  build the BPF spine + kcrypto objects into target/kryprobe-bpf/
   test host    cargo test --locked --workspace
@@ -92,6 +92,7 @@ fn check() -> i32 {
             "-D",
             "warnings",
         ],
+        &["doc", "--locked", "--workspace", "--no-deps"],
         &["test", "--locked", "--workspace"],
     ];
     for step in steps {

@@ -40,6 +40,87 @@ pub struct BackendCapabilities {
 /// coverage/integrity facts. It never creates links, never inspects
 /// arbitrary targets, never mutates another backend's state, and never
 /// claims global session completeness.
+///
+/// # Example
+///
+/// A minimal backend: static identity, no instances, empty plans.
+///
+/// ```
+/// use kryprobe_core::backend::{
+///     Backend, BackendCapabilities, BackendPlan, BackendSummary, ConfigureContext, DecodeContext,
+///     DetectContext, DetectedInstance, FinalizeContext, PlanContext, RawEvent,
+/// };
+/// use kryprobe_core::enums::{BackendId, CaptureMode};
+/// use kryprobe_core::error::{BackendError, InputReason};
+/// use kryprobe_core::evidence::{IntegritySummary, NativeObservation};
+/// use kryprobe_core::plan::CapabilityRequirements;
+///
+/// struct NullBackend;
+///
+/// static CAPS: BackendCapabilities = BackendCapabilities {
+///     backend: BackendId::Synthetic,
+///     name: "null",
+///     required: CapabilityRequirements {
+///         uprobe_multi: false,
+///         cookies: false,
+///         ringbuf: false,
+///         btf: false,
+///     },
+/// };
+///
+/// impl Backend for NullBackend {
+///     fn id(&self) -> BackendId {
+///         BackendId::Synthetic
+///     }
+///     fn capabilities(&self) -> &'static BackendCapabilities {
+///         &CAPS
+///     }
+///     fn detect(
+///         &self,
+///         _ctx: &DetectContext<'_>,
+///     ) -> Result<Vec<DetectedInstance>, BackendError> {
+///         Ok(Vec::new())
+///     }
+///     fn plan(
+///         &self,
+///         _ctx: &PlanContext<'_>,
+///         instance: &DetectedInstance,
+///         _mode: CaptureMode,
+///     ) -> Result<BackendPlan, BackendError> {
+///         Ok(BackendPlan {
+///             backend: instance.backend,
+///             probes: Vec::new(),
+///             required: CapabilityRequirements::default(),
+///         })
+///     }
+///     fn configure(
+///         &self,
+///         _ctx: &mut ConfigureContext<'_>,
+///         _plan: &BackendPlan,
+///     ) -> Result<(), BackendError> {
+///         Ok(())
+///     }
+///     fn decode(
+///         &self,
+///         _ctx: &DecodeContext<'_>,
+///         _event: RawEvent<'_>,
+///     ) -> Result<NativeObservation, BackendError> {
+///         Err(BackendError::CorruptInput(InputReason::new("null backend")))
+///     }
+///     fn finalize(
+///         &self,
+///         _ctx: &FinalizeContext<'_>,
+///     ) -> Result<BackendSummary, BackendError> {
+///         Ok(BackendSummary {
+///             backend: BackendId::Synthetic,
+///             observations: 0,
+///             integrity: IntegritySummary::default(),
+///         })
+///     }
+/// }
+///
+/// assert_eq!(NullBackend.id(), BackendId::Synthetic);
+/// ```
 pub trait Backend: Send + Sync {
     /// Backend identity; the registry key.
     fn id(&self) -> BackendId;

@@ -11,8 +11,11 @@ use std::fmt::{Display, Formatter};
 /// One raw multi-attach link group: (object, program, scope, entry/return, generation).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LinkGroup {
+    /// Loaded object the link attaches from.
     pub object: ObjectRef,
+    /// Program within the object.
     pub program: ProgramId,
+    /// Population the link observes.
     pub scope: TargetScope,
     /// True for entry probes, false for return probes.
     pub entry: bool,
@@ -149,6 +152,20 @@ impl CookieAllocator {
 
     /// Issue a disjoint range of `len` indices, or refuse. Empty and
     /// over-size requests are `Err` and consume nothing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use kryprobe_core::attach::CookieAllocator;
+    /// use kryprobe_core::ids::PlanGeneration;
+    ///
+    /// let mut alloc = CookieAllocator::new(PlanGeneration::new(1));
+    /// let first = alloc.allocate(4).expect("4 slots free");
+    /// let second = alloc.allocate(4).expect("4 more free");
+    /// assert_ne!(first.base(), second.base());
+    /// assert_eq!(alloc.used(), 8);
+    /// assert!(alloc.allocate(0).is_err(), "empty requests refuse");
+    /// ```
     pub fn allocate(&mut self, len: usize) -> Result<CookieRange, CookieExhausted> {
         let remaining = self.remaining();
         match u32::try_from(len) {
@@ -243,10 +260,13 @@ impl std::error::Error for CookieExhausted {}
 /// Pins the generation of in-flight work; older generations are stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GenerationGuard {
+    /// Generation this guard pins (stale when the plan moves on).
     pub generation: PlanGeneration,
 }
 
 impl GenerationGuard {
+    /// True when the plan moved past the pinned generation.
+    #[must_use]
     pub fn is_stale(&self, current: PlanGeneration) -> bool {
         self.generation != current
     }
@@ -255,8 +275,11 @@ impl GenerationGuard {
 /// Userspace drain-thread budgets; all three must be nonzero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DrainConfig {
+    /// Events drained per epoll iteration (bounds one wakeup's work).
     pub max_events_per_iter: u64,
+    /// Bounded drain queue depth (backpressure, never unbounded).
     pub queue_depth: u64,
+    /// Epoll wait timeout in milliseconds.
     pub poll_timeout_ms: u64,
 }
 
@@ -292,6 +315,7 @@ impl Display for DrainConfigError {
 impl std::error::Error for DrainConfigError {}
 
 impl DrainConfig {
+    /// Rejects zero budgets and unrepresentable poll timeouts.
     pub fn validate(&self) -> Result<(), DrainConfigError> {
         if self.max_events_per_iter == 0 {
             return Err(DrainConfigError::ZeroMaxEventsPerIter);
@@ -313,22 +337,31 @@ impl DrainConfig {
 
 /// Loss accounting: exact ground truth vs received + drops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Ground-truth vs observed event accounting for one drain window.
 pub struct LossLedger {
+    /// Exact kernel-side count (the oracle).
     pub exact: u64,
+    /// Events the drain delivered.
     pub received: u64,
+    /// Ring-reserve drops observed on this window.
     pub drops: u64,
 }
 
+/// Reconciliation outcome: clean, partial, or over-accounted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReconcileVerdict {
+    /// Delivered plus drops equal ground truth exactly.
     Clean,
+    /// Under-delivered: `missing` events unaccounted for.
     Partial {
+        /// Ground truth minus (received plus drops).
         missing: u64,
     },
     /// Over-accounted: more observed than ground truth. `excess` clamps
     /// to `u64::MAX` when hostile counters overflow `u64` — the verdict
     /// stays `Defect`, only the magnitude saturates.
     Defect {
+        /// Observed minus ground truth (saturates at `u64::MAX`).
         excess: u64,
     },
 }

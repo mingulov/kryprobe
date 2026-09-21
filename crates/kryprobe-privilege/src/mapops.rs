@@ -33,8 +33,20 @@ struct NextKeyAttr {
 /// Map element failure: stage + errno, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapOpsError {
-    LookupFailed { stage: String, errno: i32 },
-    UpdateFailed { stage: String, errno: i32 },
+    /// Element lookup failed.
+    LookupFailed {
+        /// Lookup stage that failed.
+        stage: String,
+        /// Kernel errno.
+        errno: i32,
+    },
+    /// Element update failed.
+    UpdateFailed {
+        /// Update stage that failed.
+        stage: String,
+        /// Kernel errno.
+        errno: i32,
+    },
 }
 
 impl std::fmt::Display for MapOpsError {

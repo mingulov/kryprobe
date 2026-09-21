@@ -129,6 +129,27 @@ mod tests {
     }
 
     #[test]
+    fn shell_schema_matches_shell_keys() {
+        // 3B-M7: `schemas/shell-v1.schema.json` requires exactly the
+        // emitted shell keys — schema and emitter cannot drift.
+        let schema = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/shell-v1.schema.json");
+        let text = std::fs::read_to_string(&schema).expect("shell schema reads");
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("schema parses");
+        let mut required: Vec<&str> = doc["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .map(|key| key.as_str().expect("string key"))
+            .collect();
+        required.sort_unstable();
+        let mut want = SHELL_KEYS.to_vec();
+        want.sort_unstable();
+        assert_eq!(required, want);
+        assert_eq!(doc["properties"]["schema"]["const"], SHELL_SCHEMA_V1);
+    }
+
+    #[test]
     fn import_run_oversize_exit_2_names_limit() {
         // M-SEC-02: unbounded import reads are a local
         // memory-exhaustion vector — over 4 MiB refuses with a size

@@ -90,7 +90,12 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   (`schema: kryprobe/shell/v1`) to stdout: mapped fields best-effort
   plus `native` carrying the FULL original doc verbatim. Unprivileged;
   exit 0 on success, 2 on unreadable/invalid input or an unknown schema
-  marker (naming the marker found), 1 on internal failure.
+  marker (naming the marker found), 1 on internal failure. Shell
+  shape (`schemas/shell-v1.schema.json`): `schema` (always
+  `kryprobe/shell/v1`), `source` (`osslscope`|`p11scope`), then
+  best-effort `scope`, `context`, `operation`, `implementation`,
+  `metrics`, `window`, `evidence`, and `native` (the full original
+  doc, always present).
 - `token mint` is the root one-shot file-cap grant (the spec §3.3
   `setcap` fallback): it writes a `security.capability` xattr
   granting `cap_bpf,cap_perfmon+ep` on `--bin` (default: the running

@@ -28,14 +28,18 @@ use std::sync::mpsc::Receiver;
 /// Drained stream item: record bytes or an injected barrier.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DrainEvent {
+    /// One drained ring record's bytes.
     Record(Vec<u8>),
+    /// Userspace-injected barrier marker id.
     Barrier(u64),
 }
 
 /// End-of-drain counters for the loss ledger.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DrainStats {
+    /// Records delivered.
     pub records: u64,
+    /// Records dropped on a full drain queue.
     pub queue_drops: u64,
 }
 
@@ -56,9 +60,25 @@ impl DrainStats {
 /// Drain failure: config, mapping, or epoll setup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrainError {
-    ConfigInvalid { reason: String },
-    MmapFailed { stage: String, errno: i32 },
-    EpollFailed { stage: String, errno: i32 },
+    /// Drain configuration rejected.
+    ConfigInvalid {
+        /// Rejection reason.
+        reason: String,
+    },
+    /// Ringbuf mapping failed.
+    MmapFailed {
+        /// Setup stage that failed.
+        stage: String,
+        /// Kernel errno.
+        errno: i32,
+    },
+    /// Epoll setup failed.
+    EpollFailed {
+        /// Setup stage that failed.
+        stage: String,
+        /// Kernel errno.
+        errno: i32,
+    },
 }
 
 impl std::fmt::Display for DrainError {

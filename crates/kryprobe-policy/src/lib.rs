@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#![warn(missing_docs)]
 //! Explicit-rules policy engine over `NativeObservation` (K3 Task 3).
 //!
 //! Policies are YAML (`version: 1` + `rules`) with unknown-key rejection;

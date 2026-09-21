@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#![warn(missing_docs)]
 //! kryprobe-core: stable identities, enums, errors, and probe plans.
 //!
 //! Follows CONTRACTS §1–§2, §4, §14. Wire spellings come from

@@ -190,7 +190,12 @@ pub enum PinState {
     /// `BPF_OBJ_GET` succeeds on the path.
     Usable,
     /// The path exists but retrieval fails (1B-M7: the real errno).
-    PresentUnusable { reason: String, errno: i32 },
+    PresentUnusable {
+        /// Kernel refusal reason.
+        reason: String,
+        /// Real kernel errno (never fabricated).
+        errno: i32,
+    },
     /// No path stat (missing, or an unreadable parent like mode-700 bpffs).
     Absent,
 }

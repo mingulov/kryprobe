@@ -153,6 +153,7 @@ fn check_len(text: &str, what: &str) -> Result<(), PolicyError> {
     Ok(())
 }
 
+/// Parses one rule fragment: exact shape, unknown keys rejected.
 pub fn parse_rule(text: &str) -> Result<Rule, PolicyError> {
     check_len(text, "rule")?;
     serde_saphyr::from_str(text).map_err(|err| PolicyError::new(format!("invalid rule: {err}")))
@@ -160,6 +161,47 @@ pub fn parse_rule(text: &str) -> Result<Rule, PolicyError> {
 
 /// Parses policy YAML: exact shape, unknown keys rejected, only
 /// `version: 1` accepted.
+///
+/// # Example
+///
+/// Parse the guide's worked example, then evaluate it over an empty
+/// capture with complete coverage: no in-source observations makes
+/// the rule inapplicable, so the verdict is `Clean`.
+///
+/// ```
+/// use kryprobe_core::enums::CoverageStatus;
+/// use kryprobe_core::evidence::{
+///     CoverageSummary, DimensionCoverage, ValidityInterval,
+/// };
+/// use kryprobe_policy::{PolicyVerdict, evaluate, parse_policy};
+///
+/// let policy = parse_policy(
+///     "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: md5\n    decision: deny\n",
+/// )
+/// .expect("example parses");
+/// assert_eq!(policy.rules.len(), 1);
+/// let dim = DimensionCoverage::new(
+///     CoverageStatus::CompleteForDeclaredBoundary,
+///     ValidityInterval {
+///         start_ns: 0,
+///         end_ns: Some(1),
+///     },
+/// );
+/// let coverage = CoverageSummary {
+///     target_population: dim.clone(),
+///     object_discovery: dim.clone(),
+///     attachment: dim.clone(),
+///     aggregate_counts: dim.clone(),
+///     detailed_events: dim.clone(),
+///     attribution: dim.clone(),
+///     correlation: dim.clone(),
+///     completion: dim,
+/// };
+/// assert!(matches!(
+///     evaluate(&policy, &[], &coverage),
+///     PolicyVerdict::Clean
+/// ));
+/// ```
 pub fn parse_policy(text: &str) -> Result<Policy, PolicyError> {
     check_len(text, "policy")?;
     let policy: Policy = serde_saphyr::from_str(text)

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#![warn(missing_docs)]
 //! kryprobe-testkit: dev-only fixtures and golden helpers.
 //!
 //! 1B-M4: production code must never depend on this crate — the manual

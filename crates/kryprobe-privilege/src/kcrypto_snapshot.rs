@@ -147,11 +147,22 @@ pub struct SnapshotRows {
 #[derive(Clone, Copy)]
 pub enum ParsedRow {
     /// Aggregate row: attribution key + folded counters.
-    Agg { kagg: KAgg, vagg: VAgg },
+    Agg {
+        /// Attribution key.
+        kagg: KAgg,
+        /// Folded counters.
+        vagg: VAgg,
+    },
     /// Totals row: folded counters.
-    Totals { vagg: VAgg },
+    Totals {
+        /// Folded counters.
+        vagg: VAgg,
+    },
     /// Ring identity record.
-    Ident { kctl: KCtl },
+    Ident {
+        /// Identity control record.
+        kctl: KCtl,
+    },
 }
 
 // Manual: `KAgg` is packed without `Debug`, so the fields print through

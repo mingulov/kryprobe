@@ -31,9 +31,13 @@ use std::path::Path;
 /// Delegation axes from `allowed_*` fdinfo lines (all `0x`-hex `u64`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenAxes {
+    /// Allowed `bpf()` command bits.
     pub cmds: u64,
+    /// Allowed map-type bits.
     pub maps: u64,
+    /// Allowed program-type bits.
     pub progs: u64,
+    /// Allowed attach-type bits.
     pub attachs: u64,
 }
 
@@ -55,27 +59,37 @@ impl TokenAxes {
 /// Fail-closed token errors: every variant carries stage or errno detail.
 #[derive(Debug)]
 pub enum TokenError {
+    /// Token fd is unusable.
     BadFd,
+    /// Fdinfo delegation line failed to parse.
     Parse {
+        /// Offending field name.
         field: &'static str,
     },
+    /// Token operation denied.
     Denied {
+        /// Denied stage.
         stage: &'static str,
+        /// Kernel errno.
         errno: i32,
     },
     /// The smoke worker exited nonzero (never a skip).
     WorkerExit {
+        /// Worker exit code.
         code: i32,
     },
     /// BPF ids leaked across the roundtrip (`"maps"` or `"progs"`).
     Leaked {
+        /// Leaked id kind.
         kind: &'static str,
     },
     /// BPF id scan aborted: host churned under the sweep (bound hit or
     /// ids went non-monotonic). Never a skip and never clean — the lane
     /// fails honestly instead of crying leak or false-clean.
     ScanAborted {
+        /// Aborted scan stage.
         stage: &'static str,
+        /// Abort reason.
         reason: &'static str,
     },
 }

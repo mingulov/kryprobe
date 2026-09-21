@@ -33,16 +33,29 @@ fn cmsg_align(len: usize) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixtureError {
     /// Syscall failed: stage + errno (mirrors the C `FAIL <stage>` lines).
-    Syscall { stage: &'static str, errno: i32 },
+    Syscall {
+        /// Fixture stage that failed.
+        stage: &'static str,
+        /// Kernel errno.
+        errno: i32,
+    },
     /// A read returned an unexpected length (counts would lie, so fail).
     ShortRead {
+        /// Fixture stage that short-read.
         stage: &'static str,
+        /// Bytes expected.
         want: usize,
+        /// Bytes (or error) returned.
         got: isize,
     },
     /// An op that must fail succeeded (bad-tag decrypt accepted: the
     /// errors-bucket proof is void, so fail instead of misattributing).
-    UnexpectedOk { stage: &'static str, got: isize },
+    UnexpectedOk {
+        /// Fixture stage that unexpectedly succeeded.
+        stage: &'static str,
+        /// Bytes returned.
+        got: isize,
+    },
 }
 
 impl std::fmt::Display for FixtureError {

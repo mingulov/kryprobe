@@ -904,6 +904,20 @@ fn driver_not_only_rule_vs_keyless_obs_is_inconclusive() {
 }
 
 #[test]
+fn doc_example_parses_exact() {
+    // 3B-M2: the `docs/policy.md` worked example parses — the guide
+    // cannot drift from the engine.
+    let doc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/policy.md");
+    let text = std::fs::read_to_string(&doc).expect("policy guide reads");
+    let start = text.find("```yaml").expect("yaml block opens") + "```yaml".len();
+    let end = text[start..].find("```").expect("yaml block closes") + start;
+    let policy = parse_policy(text[start..end].trim()).expect("doc example parses");
+    assert_eq!(policy.version, 1);
+    let ids: Vec<&str> = policy.rules.iter().map(|rule| rule.id.as_str()).collect();
+    assert_eq!(ids, ["no-kernel-md5", "watch-external-drivers"]);
+}
+
+#[test]
 fn oversize_policy_rejected_before_parse() {
     // M-SEC-02/M-T1: unbounded policy text is a local memory-exhaustion
     // vector — reject over 64 KiB with a size error, never parse.

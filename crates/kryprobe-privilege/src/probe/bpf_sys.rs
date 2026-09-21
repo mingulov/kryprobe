@@ -13,13 +13,21 @@ use crate::fd::OwnedFd;
 use crate::probe::ProbeOutcome;
 use std::os::raw::{c_long, c_void};
 
+/// `BPF_MAP_CREATE` command id.
 pub const BPF_MAP_CREATE: u32 = 0;
+/// `BPF_PROG_LOAD` command id.
 pub const BPF_PROG_LOAD: u32 = 5;
+/// `BPF_LINK_CREATE` command id.
 pub const BPF_LINK_CREATE: u32 = 28;
+/// `BPF_TOKEN_CREATE` command id.
 pub const BPF_TOKEN_CREATE: u32 = 36;
+/// `BPF_PROG_TYPE_KPROBE` program type id.
 pub const BPF_PROG_TYPE_KPROBE: u32 = 2;
+/// `BPF_MAP_TYPE_ARRAY` map type id.
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+/// `BPF_MAP_TYPE_RINGBUF` map type id.
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
+/// `BPF_TRACE_UPROBE_MULTI` expected attach type id.
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
 /// `BPF_OBJ_PIN` command id (R2: the attr must be exactly 20 bytes).
 pub const BPF_OBJ_PIN: u32 = 6;
@@ -66,51 +74,83 @@ pub fn denied_or_skipped(stage: &str, errno: i32) -> ProbeOutcome {
     }
 }
 
+/// `BPF_MAP_CREATE` attr, UAPI field order.
 #[repr(C)]
 pub struct MapAttr {
+    /// Map type id.
     pub map_type: u32,
+    /// Key size in bytes.
     pub key_size: u32,
+    /// Value size in bytes.
     pub value_size: u32,
+    /// Maximum entries.
     pub max_entries: u32,
 }
 
+/// One 8-byte BPF instruction, UAPI layout.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Insn {
+    /// Opcode.
     pub code: u8,
+    /// Packed dst (low nibble) / src (high nibble) registers.
     pub dst_src: u8,
+    /// Signed jump/data offset.
     pub off: i16,
+    /// Immediate constant.
     pub imm: i32,
 }
 
+/// `BPF_PROG_LOAD` attr prefix, UAPI field order.
 #[repr(C)]
 pub struct ProgAttr {
+    /// Program type id.
     pub prog_type: u32,
+    /// Instruction count.
     pub insn_cnt: u32,
+    /// Userspace pointer to the instruction stream.
     pub insns: u64,
+    /// Userspace pointer to the NUL-terminated license string.
     pub license: u64,
+    /// Zero tail (log buffer, kern version, attach ids, …).
     pub rest: [u64; 20],
 }
 
+/// `BPF_TOKEN_CREATE` attr, UAPI field order.
 #[repr(C)]
 pub struct TokenAttr {
+    /// Creation flags.
     pub flags: u32,
+    /// Bpffs mount fd the token delegates.
     pub bpffs_fd: u32,
 }
 
+/// `BPF_LINK_CREATE uprobe_multi` attr, UAPI field order.
 #[repr(C)]
 pub struct LinkUprobeMulti {
+    /// Program fd to link.
     pub prog_fd: u32,
+    /// Target fd (unused for uprobe_multi, zero).
     pub target: u32,
+    /// Expected attach type (`BPF_TRACE_UPROBE_MULTI`).
     pub attach_type: u32,
+    /// Link creation flags.
     pub link_flags: u32,
+    /// Userspace pointer to the target path string.
     pub path: u64,
+    /// Userspace pointer to the offsets array.
     pub offsets: u64,
+    /// Userspace pointer to the ref-counter offsets array.
     pub ref_ctr_offsets: u64,
+    /// Userspace pointer to the cookies array.
     pub cookies: u64,
+    /// Offset/cookie array length.
     pub cnt: u32,
+    /// Uprobe-multi flags.
     pub um_flags: u32,
+    /// Target pid filter (0 for all).
     pub pid: u32,
+    /// Padding, must be zero.
     pub pad: u32,
 }
 
@@ -121,13 +161,21 @@ pub struct LinkUprobeMulti {
 /// on the K0 host, strace-verified).
 #[repr(C)]
 pub struct LinkTracing {
+    /// Program fd to link.
     pub prog_fd: u32,
+    /// Target object fd.
     pub target_fd: u32,
+    /// Expected attach type (`BPF_TRACE_FEXIT`).
     pub attach_type: u32,
+    /// Link creation flags.
     pub flags: u32,
+    /// Target BTF id (0: use the load-time `attach_btf_id`).
     pub target_btf_id: u32,
+    /// Padding, must be zero.
     pub pad: u32,
+    /// Attach cookie.
     pub cookie: u64,
+    /// Zero tail.
     pub tail: [u64; 4],
 }
 
