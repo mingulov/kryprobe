@@ -18,8 +18,8 @@ use crate::probe::bpf_sys::{
     BPF_F_TOKEN_FD, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING, BPF_TRACE_FEXIT,
     BPF_TRACE_UPROBE_MULTI, bpf,
 };
+use core::ffi::{c_long, c_void};
 use std::os::fd::RawFd;
-use std::os::raw::{c_long, c_void};
 
 /// Verifier log verbosity (2 = verbose).
 const LOG_LEVEL: u32 = 2;

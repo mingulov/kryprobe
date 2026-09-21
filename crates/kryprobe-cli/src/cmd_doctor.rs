@@ -571,8 +571,10 @@ mod tests {
             [bundled.clone(), dev.clone()]
         );
         // Missing dir: dir-joined candidate first, then exe, then dev.
-        let dir = std::env::temp_dir().join("kryprobe-doctor-locator-absent");
-        let _ = std::fs::remove_dir_all(&dir);
+        // (Absent child of a guard dir — never created, RAII-cleaned.)
+        let locator_scratch =
+            kryprobe_testkit::TempDir::named("doctor-locator").expect("scratch dir");
+        let dir = locator_scratch.path().join("absent");
         assert_eq!(
             kcrypto_object_candidates(
                 Some(dir.to_str().expect("utf-8 tmp")),
@@ -582,7 +584,7 @@ mod tests {
             [dir.join("kcrypto.bpf.o"), bundled.clone(), dev.clone()]
         );
         // A real file is tried as-is (not dir-joined).
-        let file = std::env::temp_dir().join("kryprobe-doctor-locator-file.o");
+        let file = locator_scratch.path().join("file.o");
         std::fs::write(&file, b"object").expect("write tmp file");
         assert_eq!(
             kcrypto_object_candidates(
@@ -592,7 +594,6 @@ mod tests {
             ),
             [file.clone(), bundled.clone(), dev.clone()]
         );
-        std::fs::remove_file(&file).ok();
         // Unknown exe dir: tier 2 skipped, never fabricated.
         assert_eq!(kcrypto_object_candidates(None, None, false), [dev]);
     }
@@ -639,9 +640,8 @@ mod tests {
         // Hermetic over fixture paths (no default-pin touch): a missing
         // path skips, a regular file denies (never a BPF object — the
         // kernel refuses retrieval on every host, with or without bpf()).
-        let dir = std::env::temp_dir().join(format!("kryprobe-k5-pin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let pin_scratch = kryprobe_testkit::TempDir::named("k5-pin").expect("scratch dir");
+        let dir = pin_scratch.path();
         let missing = dir.join("absent");
         let row = token_delegated_row_at(&missing, &[]);
         assert_eq!(row.name, "token_delegated");
@@ -669,6 +669,5 @@ mod tests {
                 human_outcome(&row.outcome)
             );
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

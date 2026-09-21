@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [package]
 name = "kryprobe-cli"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "kryprobe"
@@ -15,7 +16,6 @@ kryprobe-core = { path = "../kryprobe-core" }
 kryprobe-policy = { path = "../kryprobe-policy" }
 kryprobe-privilege = { path = "../kryprobe-privilege" }
 kryprobe-report = { path = "../kryprobe-report" }
-anyhow = "1"
 serde_json = "1"
 
 [dev-dependencies]

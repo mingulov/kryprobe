@@ -74,31 +74,14 @@ fn suite_guard() -> std::sync::MutexGuard<'static, ()> {
 
 /// Unique scratch dir per test (no shared state). Removed on drop —
 /// a gate failure must not leave temp copies behind either.
-struct ScratchGuard(PathBuf);
-
-fn scratch(name: &str) -> ScratchGuard {
-    let dir = std::env::temp_dir().join(format!("kryprobe-k5-t6-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    ScratchGuard(dir)
+fn scratch(name: &str) -> kryprobe_testkit::TempDir {
+    kryprobe_testkit::TempDir::named(&format!("k5-t6-{name}")).expect("scratch dir")
 }
 
-impl ScratchGuard {
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-
-    /// Remove now (success path) and prove it is gone.
-    fn remove_and_check(&self, test: &str) {
-        std::fs::remove_dir_all(&self.0).ok();
-        assert!(!self.0.exists(), "{test}: scratch removed");
-    }
-}
-
-impl Drop for ScratchGuard {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).ok();
-    }
+/// Remove now (success path) and prove it is gone.
+fn remove_and_check(dir: &std::path::Path, test: &str) {
+    std::fs::remove_dir_all(dir).ok();
+    assert!(!dir.exists(), "{test}: scratch removed");
 }
 
 /// Owns a live child; SIGKILLs + reaps on drop unless released. Lane
@@ -461,7 +444,7 @@ fn setcap_roundtrip_unpriv() {
     let total = parse_total_calls(&stdout).expect("TOTAL line parses");
     assert!(total > 0, "TOTAL calls > 0, got {total}");
 
-    dir.remove_and_check(TEST);
+    remove_and_check(dir.path(), TEST);
 }
 
 /// Nobody attestation (fix wave, G-M1): `/proc/<child>/status` read
@@ -929,5 +912,5 @@ fn no_mechanism_honest() {
     assert_eq!(output.status.code(), Some(4), "no mechanism exits 4");
     assert!(stderr.contains("token mint"), "stderr names `token mint`");
 
-    dir.remove_and_check(TEST);
+    remove_and_check(dir.path(), TEST);
 }

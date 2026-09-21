@@ -77,12 +77,9 @@ pub const POLICY_READ_KEYS: &[&str] = &[
 ];
 
 /// Raw payload string (empty when missing or not a string — a glob
-/// that must not match simply won't).
+/// that must not match simply won't). Shared lookup lives in core.
 fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
-    payload
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
+    kryprobe_core::evidence::payload_str_opt(payload, key).unwrap_or("")
 }
 
 /// Stage match (D3): only agg rows carry a stage — totals/ident rows

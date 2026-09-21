@@ -45,7 +45,7 @@ pub fn set_capability_xattr(target: &Path, value: &[u8]) -> Result<(), i32> {
         libc::fsetxattr(
             fd,
             c_name.as_ptr(),
-            value.as_ptr().cast::<std::os::raw::c_void>(),
+            value.as_ptr().cast::<core::ffi::c_void>(),
             value.len(),
             0,
         )
@@ -69,7 +69,7 @@ pub fn get_capability_xattr(target: &Path) -> Result<Vec<u8>, i32> {
         libc::getxattr(
             c_path.as_ptr(),
             c_name.as_ptr(),
-            std::ptr::null_mut::<std::os::raw::c_void>(),
+            std::ptr::null_mut::<core::ffi::c_void>(),
             0,
         )
     };
@@ -81,7 +81,7 @@ pub fn get_capability_xattr(target: &Path) -> Result<Vec<u8>, i32> {
         libc::getxattr(
             c_path.as_ptr(),
             c_name.as_ptr(),
-            buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
+            buf.as_mut_ptr().cast::<core::ffi::c_void>(),
             buf.len(),
         )
     };
@@ -115,26 +115,20 @@ mod tests {
     fn symlink_target_refused_without_following() {
         // L-SEC-03: setxattr follows symlinks — the seam must open
         // O_NOFOLLOW and fail ELOOP instead of writing through a link.
-        let dir =
-            std::env::temp_dir().join(format!("kryprobe-k5-filecaps-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let scratch = kryprobe_testkit::TempDir::named("k5-filecaps-link").expect("scratch dir");
+        let dir = scratch.path();
         let target = dir.join("real");
         std::fs::write(&target, b"real").expect("write fixture");
         let link = dir.join("link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         assert_eq!(set_capability_xattr(&link, &[0u8; 20]), Err(libc::ELOOP));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn file_without_xattr_reports_enodata() {
-        let dir = std::env::temp_dir().join(format!("kryprobe-k5-filecaps-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let file = dir.join("plain");
+        let scratch = kryprobe_testkit::TempDir::named("k5-filecaps").expect("scratch dir");
+        let file = scratch.path().join("plain");
         std::fs::write(&file, b"no xattr here").expect("write fixture");
         assert_eq!(get_capability_xattr(&file), Err(libc::ENODATA));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

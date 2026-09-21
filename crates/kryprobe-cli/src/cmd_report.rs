@@ -57,6 +57,12 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 /// `format!` would peak at ~2× the doc size); byte-identical to the
 /// piece-assembled form.
 ///
+/// 1A-L15: the hand-placed braces stay by design — a `preserve_order`
+/// `Map` would need the same 2× peak the streaming form avoids. The
+/// `report_live.json` byte-exact golden plus the parse/key-order
+/// tests fail on any unbalanced edit, so the braces are pinned
+/// without a serializer.
+///
 /// 1A-M4: serialization failure is a defect `Err` (the caller exits
 /// 1), never a panic — a future unserializable graph shape must not
 /// turn a clean report (exit 0) into exit 101. Unreachable today
@@ -355,10 +361,8 @@ mod tests {
 
     #[test]
     fn finish_out_writes_atomically_and_reports_failure() {
-        let dir = std::env::temp_dir().join(format!("kryprobe-k3-2-out-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let file = dir.join("report.json");
+        let scratch = kryprobe_testkit::TempDir::named("k3-2-out").expect("scratch dir");
+        let file = scratch.path().join("report.json");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = finish_report_live(
@@ -381,7 +385,7 @@ mod tests {
                 .as_bytes()
         );
         // Human honors `--out` through the same branch.
-        let human = dir.join("report.txt");
+        let human = scratch.path().join("report.txt");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = finish_report_live(
@@ -402,7 +406,7 @@ mod tests {
             .as_bytes()
         );
         // Unwritable destination fails closed (exit 1, nothing on stdout).
-        let missing = dir.join("no-such-dir").join("report.json");
+        let missing = scratch.path().join("no-such-dir").join("report.json");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = finish_report_live(
@@ -419,7 +423,6 @@ mod tests {
                 .expect("utf-8")
                 .contains("cannot write")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

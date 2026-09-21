@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
 [package]
 name = "bpf-spine"
+# Own `[workspace]` below: cannot inherit from the parent workspace
+# (BP-L4). `version` must equal `[workspace.package]` version
+# (enforced by `xtask check`'s manifest gate). No `rust-version`:
+# this crate builds only under the pinned nightly (rust-toolchain.toml).
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+# Intentional GPL-2.0-only (not the host GPL-3.0-or-later):
+# kernel-loadable objects need GPL-2.0 license compatibility.
 license = "GPL-2.0-only"
 
 [workspace]

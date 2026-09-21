@@ -6,12 +6,12 @@ use crate::probe::bpf_sys::{
     BPF_LINK_CREATE, BPF_TRACE_FEXIT, BPF_TRACE_UPROBE_MULTI, LinkTracing, LinkUprobeMulti, bpf,
     fd_or_errno,
 };
+use core::ffi::c_void;
 use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
 use kryprobe_core::plan::TargetScope;
 use kryprobe_core::{GenerationGuard, LinkGroup};
 use std::ffi::CString;
 use std::os::fd::RawFd;
-use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 

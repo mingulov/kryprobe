@@ -263,12 +263,8 @@ pub fn run_status(bin: Option<&Path>, stdout: &mut dyn Write) -> i32 {
 mod tests {
     use super::*;
 
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("kryprobe-k5-token-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch_dir(tag: &str) -> kryprobe_testkit::TempDir {
+        kryprobe_testkit::TempDir::named(&format!("k5-token-{tag}")).expect("scratch dir")
     }
 
     #[test]
@@ -278,15 +274,14 @@ mod tests {
         let exe = std::env::current_exe().expect("current exe");
         let canonical = std::fs::canonicalize(&exe).expect("canonical exe");
         assert_eq!(mint_target(None).expect("self resolves"), canonical);
-        let dir = scratch_dir("canon");
-        let link = dir.join("link");
+        let scratch = scratch_dir("canon");
+        let link = scratch.path().join("link");
         std::os::unix::fs::symlink(&exe, &link).expect("symlink");
         assert_eq!(mint_target(Some(&link)).expect("link resolves"), canonical);
         assert!(
             mint_target(Some(Path::new("/nonexistent-k5-token-zzz"))).is_err(),
             "nonexistent --bin is invalid"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

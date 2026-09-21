@@ -21,11 +21,10 @@ fn enoent_text() -> String {
     std::io::Error::from_raw_os_error(libc::ENOENT).to_string()
 }
 
-/// Unique scratch dir per test (no shared state; removed on success).
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kryprobe-k3-1-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+/// Unique scratch dir per test (no shared state; removed on drop,
+/// including on failure).
+fn scratch(name: &str) -> kryprobe_testkit::TempDir {
+    kryprobe_testkit::TempDir::named(&format!("k3-1-{name}")).expect("scratch dir")
 }
 
 fn set_bpf_dir(value: &std::ffi::OsStr) {
@@ -51,7 +50,8 @@ fn exe_tier_candidate() -> PathBuf {
 fn locator_env_file_wins_live() {
     let _guard = env_guard();
     let prior = std::env::var_os("KRYPROBE_BPF_DIR");
-    let dir = scratch("locator-file");
+    let scratch = scratch("locator-file");
+    let dir = scratch.path();
     let file = dir.join("custom.o");
     std::fs::write(&file, b"fake-object").expect("write tmp object");
     set_bpf_dir(file.as_os_str());
@@ -63,14 +63,14 @@ fn locator_env_file_wins_live() {
         Some(value) => set_bpf_dir(&value),
         None => remove_bpf_dir(),
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn locator_env_dir_joins_live() {
     let _guard = env_guard();
     let prior = std::env::var_os("KRYPROBE_BPF_DIR");
-    let dir = scratch("locator-dir");
+    let scratch = scratch("locator-dir");
+    let dir = scratch.path();
     let object = dir.join("kcrypto.bpf.o");
     std::fs::write(&object, b"fake-object").expect("write tmp object");
     set_bpf_dir(dir.as_os_str());
@@ -82,7 +82,6 @@ fn locator_env_dir_joins_live() {
         Some(value) => set_bpf_dir(&value),
         None => remove_bpf_dir(),
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -92,9 +91,9 @@ fn locator_miss_or_dev_fallback_pins_order() {
     // Absent env path: tier 1 must miss; tiers 2 (exe-dir) and 3 (CWD dev)
     // then decide the outcome. The dev tier may legitimately hit on trees
     // with a prebuilt object, so both arms assert exact order evidence.
-    let absent = std::env::temp_dir().join(format!("kryprobe-k3-1-absent-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&absent);
-    let _ = std::fs::remove_file(&absent);
+    // Absent child of a guard dir (never created).
+    let absent_scratch = scratch("absent");
+    let absent = absent_scratch.path().join("absent");
     set_bpf_dir(absent.as_os_str());
     let tier1 = absent.join("kcrypto.bpf.o");
     let tier2 = exe_tier_candidate();
@@ -868,7 +867,8 @@ fn live_capture_proves_session() {
 fn locator_candidates_pin_three_tier_order() {
     use kryprobe_privilege::kcrypto_backend::kcrypto_object_candidates;
     // Env file tried as-is, then exe tier, then dev tier.
-    let file = std::env::temp_dir().join("kryprobe-k3-1-cand.o");
+    let cand_scratch = scratch("cand");
+    let file = cand_scratch.path().join("cand.o");
     std::fs::write(&file, b"x").expect("candidate probe file");
     let exe = PathBuf::from("/exe/dir");
     assert_eq!(
@@ -879,9 +879,8 @@ fn locator_candidates_pin_three_tier_order() {
             PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
         ]
     );
-    std::fs::remove_file(&file).ok();
     // Env dir joined; unknown exe dir skips tier 2 (never fabricated).
-    let dir = PathBuf::from("/tmp/kryprobe-k3-1-cand-dir");
+    let dir = cand_scratch.path().join("cand-dir");
     assert_eq!(
         kcrypto_object_candidates(dir.to_str(), None, false),
         vec![

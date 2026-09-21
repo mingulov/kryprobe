@@ -8,7 +8,7 @@ use super::bpf_sys::{
 use super::decoders::parse_kernel_release;
 use crate::fd::OwnedFd;
 use crate::probe::{KERNEL_FLOOR, ProbeOutcome};
-use std::os::raw::c_void;
+use core::ffi::c_void;
 
 /// Pure compare of the running kernel against the 6.12 floor.
 pub fn kernel_release() -> ProbeOutcome {

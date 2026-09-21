@@ -900,14 +900,18 @@ fn driver_run_over_handfed_rows_green_unpriv() {
         .run(&registry, &runtime_with_btf(false), &events)
         .expect("gated run is Ok");
     assert!(
-        report.observations.is_empty(),
+        report.observations().is_empty(),
         "skipped backend decodes nothing"
     );
-    assert!(report.plans.is_empty());
-    assert!(report.summaries.is_empty());
-    assert_eq!(report.skipped.len(), 1);
-    assert_eq!(report.skipped[0].backend, BackendId::KCrypto);
-    assert_eq!(report.skipped[0].dropped_events, 3, "skip drops receipted");
+    assert!(report.plans().is_empty());
+    assert!(report.summaries().is_empty());
+    assert_eq!(report.skipped().len(), 1);
+    assert_eq!(report.skipped()[0].backend, BackendId::KCrypto);
+    assert_eq!(
+        report.skipped()[0].dropped_events,
+        3,
+        "skip drops receipted"
+    );
     assert_eq!(report.skipped_drops(), 3);
 }
 
@@ -1180,11 +1184,14 @@ fn driver_e2e_matches_fixture_truth() {
     let report = driver
         .run(&registry, &runtime, &events)
         .unwrap_or_else(|err| panic!("driver run failed: {err}"));
-    assert!(report.skipped.is_empty(), "no skips on a healthy lane host");
-    assert_eq!(report.plans.len(), 1, "one plan for one instance");
-    assert_eq!(report.plans[0].probes.len(), 9);
-    assert_eq!(report.summaries.len(), 1);
-    let observations = &report.observations;
+    assert!(
+        report.skipped().is_empty(),
+        "no skips on a healthy lane host"
+    );
+    assert_eq!(report.plans().len(), 1, "one plan for one instance");
+    assert_eq!(report.plans()[0].probes.len(), 9);
+    assert_eq!(report.summaries().len(), 1);
+    let observations = &report.observations();
     assert_eq!(
         observations.len(),
         events.len(),
@@ -1473,7 +1480,7 @@ fn driver_e2e_matches_fixture_truth() {
     }
 
     // Finalize: observations == decoded; healthy integrity (drops 0, gap 0).
-    let summary = &report.summaries[0];
+    let summary = &report.summaries()[0];
     assert_eq!(summary.backend, BackendId::KCrypto);
     assert_eq!(summary.observations, observations.len() as u64);
     assert_eq!(
@@ -1516,7 +1523,7 @@ fn driver_e2e_matches_fixture_truth() {
         budget: &mut budget,
     };
     backend
-        .configure(&mut ctx, &report.plans[0])
+        .configure(&mut ctx, &report.plans()[0])
         .expect("same-generation re-configure is a no-op");
     assert_eq!(budget.used(BudgetKind::Links), 0, "no-op charges nothing");
     assert_eq!(budget.used(BudgetKind::StateEntries), 0);
@@ -1527,7 +1534,7 @@ fn driver_e2e_matches_fixture_truth() {
         budget: &mut budget,
     };
     backend
-        .configure(&mut ctx, &report.plans[0])
+        .configure(&mut ctx, &report.plans()[0])
         .expect("new-generation re-configure reloads");
     assert_eq!(budget.used(BudgetKind::Links), 9, "Links += attached_n");
     assert_eq!(

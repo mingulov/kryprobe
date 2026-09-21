@@ -944,7 +944,8 @@ mod tests {
     fn locator_candidates_cover_env_file_dir_and_unset() {
         // Real file tried as-is; missing path dir-joined; exe tier joins
         // the bundled subpath; dev tier always last.
-        let file = std::env::temp_dir().join("kryprobe-k3-1-backend-cand.o");
+        let scratch = kryprobe_testkit::TempDir::named("k3-1-backend-cand").expect("scratch");
+        let file = scratch.path().join("cand.o");
         std::fs::write(&file, b"object").expect("write tmp file");
         let exe = PathBuf::from("/exe/dir");
         assert_eq!(
@@ -955,9 +956,8 @@ mod tests {
                 PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
             ]
         );
-        std::fs::remove_file(&file).ok();
-        let missing = PathBuf::from("/tmp/kryprobe-k3-1-backend-absent-9f2");
-        let _ = std::fs::remove_dir_all(&missing);
+        // Absent child of the same guard (never created).
+        let missing = scratch.path().join("absent");
         assert_eq!(
             kcrypto_object_candidates(missing.to_str(), None, false),
             vec![
@@ -971,14 +971,14 @@ mod tests {
     fn locator_candidates_elevated_drops_env_and_dev_tiers() {
         // H-SEC-01: elevated processes (root/file caps) never steer on
         // env or CWD — exe-bundled tier only.
-        let file = std::env::temp_dir().join("kryprobe-k3-1-backend-cand-elev.o");
+        let scratch = kryprobe_testkit::TempDir::named("k3-1-backend-cand-elev").expect("scratch");
+        let file = scratch.path().join("cand.o");
         std::fs::write(&file, b"object").expect("write tmp file");
         let exe = PathBuf::from("/exe/dir");
         assert_eq!(
             kcrypto_object_candidates(file.to_str(), Some(exe.as_path()), true),
             vec![PathBuf::from("/exe/dir/kryprobe-bpf/kcrypto.bpf.o")]
         );
-        std::fs::remove_file(&file).ok();
         // Elevated + unknown exe dir: no tiers at all (never fabricated).
         assert!(kcrypto_object_candidates(Some("/tmp/x"), None, true).is_empty());
     }
@@ -1299,8 +1299,8 @@ mod tests {
         // file; configure drains them exactly once (second drain is
         // empty — no stale reuse across generations).
         let backend = KCryptoBackend::new();
-        let probe =
-            std::env::temp_dir().join(format!("kryprobe-k3-merge-stage-{}", std::process::id()));
+        let scratch = kryprobe_testkit::TempDir::named("k3-merge-stage").expect("scratch");
+        let probe = scratch.path().join("probe");
         std::fs::write(&probe, b"token").expect("write probe");
         let file = std::fs::File::open(&probe).expect("open probe");
         backend.stage_session_inputs(vec![0x7f, b'E', b'L', b'F'], Some(file));
@@ -1310,6 +1310,5 @@ mod tests {
         let second = backend.take_staged_inputs();
         assert_eq!(second.object, None, "bytes drain once");
         assert!(second.token.is_none(), "token drains once");
-        std::fs::remove_file(&probe).ok();
     }
 }

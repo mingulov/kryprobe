@@ -523,9 +523,8 @@ fn coverage_from_dimension_cases() {
 
 #[test]
 fn atomic_write_roundtrip_case() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-report-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("out.jsonl");
+    let scratch = kryprobe_testkit::TempDir::named("report").expect("temp dir");
+    let path = scratch.path().join("out.jsonl");
     let mut writer = JsonlWriter::new("session:file");
     writer
         .session_start(&SessionStart {
@@ -545,13 +544,12 @@ fn atomic_write_roundtrip_case() {
     second.write_file_atomic(&path).expect("rewrite");
     assert_eq!(std::fs::read_to_string(&path).expect("read back"), "");
     assert!(validate_file(&path).is_empty());
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn failed_atomic_commit_leaves_no_tmp_litter() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-report-fail-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let scratch = kryprobe_testkit::TempDir::named("report-fail").expect("temp dir");
+    let dir = scratch.path();
     // Renaming a file onto a directory fails: the commit errors and must
     // still remove its temp file (best-effort cleanup).
     let target = dir.join("adir");
@@ -561,14 +559,13 @@ fn failed_atomic_commit_leaves_no_tmp_litter() {
         format!("{err:?}").contains("rename to"),
         "unexpected error: {err:?}"
     );
-    let litter: Vec<_> = std::fs::read_dir(&dir)
+    let litter: Vec<_> = std::fs::read_dir(dir)
         .expect("read dir")
         .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
         .filter(|name| name.to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(litter.is_empty(), "tmp litter: {litter:?}");
     assert!(target.is_dir(), "target dir must survive");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

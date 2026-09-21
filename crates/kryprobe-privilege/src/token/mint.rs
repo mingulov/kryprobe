@@ -15,8 +15,8 @@
 use super::{TokenAxes, TokenError, TokenHandle};
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{bpf, fd_or_errno, last_errno};
+use core::ffi::{c_long, c_void};
 use std::os::fd::RawFd;
-use std::os::raw::{c_long, c_void};
 
 /// `linux/mount.h`: set a string mount parameter.
 const FSCONFIG_SET_STRING: c_long = 1;

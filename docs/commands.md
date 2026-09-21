@@ -88,6 +88,14 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   `--cgroup-id`, `--unit`) and `--comm` filters are deferred past v0.1
   and rejected naming the deferral.
 
+- Truncated stdout (1A-L11): Rust ignores SIGPIPE, so `kryprobe
+  report … | head -1` hits EPIPE mid-stream. Every command's stdout
+  runs through one guard: a failed write/flush turns an otherwise-0
+  exit into exit 1 with a `kryprobe: stdout write failed (…)` stderr
+  note. This covers human tables and JSON/machine output alike —
+  truncated evidence never exits 0. Nonzero commands keep their own
+  code (still nonzero, still honest).
+
 - Live sessions and SIGINT (4B-M5): Ctrl-C never kills a capture
   mid-flight. The session finalizes, renders the partial window it
   captured, and exits 3 (`check` still exits 10 when the verdict

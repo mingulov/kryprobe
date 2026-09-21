@@ -173,14 +173,11 @@ mod tests {
         // M-SEC-02: unbounded policy reads are a local
         // memory-exhaustion vector — over 64 KiB refuses with a size
         // error, never parses.
-        let dir = std::env::temp_dir().join(format!("kryprobe-k4-oversize-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let file = dir.join("huge.yaml");
+        let scratch = kryprobe_testkit::TempDir::named("k4-oversize").expect("scratch dir");
+        let file = scratch.path().join("huge.yaml");
         std::fs::write(&file, "x".repeat(64 * 1024 + 1)).expect("write input");
         let err = read_policy_capped(&file).expect_err("oversize refused");
         assert!(err.contains("too large"), "size error, got: {err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

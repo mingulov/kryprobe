@@ -132,9 +132,12 @@ pub fn spawn_smoke_worker(
     ns_fd: RawFd,
 ) -> Result<i32, TokenError> {
     // All allocation happens parent-side, before fork.
-    let argv0 = CString::new(format!("/proc/self/fd/{exe_fd}")).expect("argv0 cstr");
-    let arg_sock = CString::new(sock_fd.to_string()).expect("sock cstr");
-    let arg_obj = CString::new(obj_fd.to_string()).expect("obj cstr");
+    // 1A-L1: fd numbers cannot contain NUL, so these never fail —
+    // but the error type is `Result`, not panic-shaped (same
+    // `BadFd` mapping as the sibling `userns.rs` CString sites).
+    let argv0 = CString::new(format!("/proc/self/fd/{exe_fd}")).map_err(|_| TokenError::BadFd)?;
+    let arg_sock = CString::new(sock_fd.to_string()).map_err(|_| TokenError::BadFd)?;
+    let arg_obj = CString::new(obj_fd.to_string()).map_err(|_| TokenError::BadFd)?;
     let argv = [
         argv0.as_c_str(),
         c"--fd",

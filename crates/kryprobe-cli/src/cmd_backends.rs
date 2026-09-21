@@ -90,6 +90,19 @@ fn backend_rows_with(live: &LiveKcrypto) -> [BackendRow; 4] {
     ]
 }
 
+/// Gates line shared by the synthetic/kcrypto arms (1A-L3): the two
+/// blocks differed only in which gates slice they formatted.
+fn requires_row(gates: &[(&str, bool)]) -> String {
+    format!(
+        "  requires: {}",
+        gates
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 /// Human row: `id: state` plus an optional `(note)` qualifier.
 pub fn human_row(row: &BackendRow) -> String {
     match &row.note {
@@ -273,21 +286,10 @@ pub fn run(json: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     for row in &rows {
         let _ = writeln!(stdout, "{}", human_row(row));
         if row.id == "synthetic" {
-            let gates = gates
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let _ = writeln!(stdout, "  requires: {gates}");
+            let _ = writeln!(stdout, "{}", requires_row(&gates));
         }
         if row.id == "kcrypto" {
-            let gates = live
-                .gates
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let _ = writeln!(stdout, "  requires: {gates}");
+            let _ = writeln!(stdout, "{}", requires_row(&live.gates));
         }
     }
     0
@@ -321,7 +323,10 @@ fn live_synthetic_gates() -> Result<[(&'static str, bool); 4], String> {
     let report = driver
         .run(&registry, &proof_runtime(), &events)
         .map_err(|err| err.to_string())?;
-    if report.observations.len() != 1 || report.summaries.len() != 1 || !report.skipped.is_empty() {
+    if report.observations().len() != 1
+        || report.summaries().len() != 1
+        || !report.skipped().is_empty()
+    {
         return Err(String::from(
             "defect: synthetic liveness pass returned partial results",
         ));

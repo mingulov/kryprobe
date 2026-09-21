@@ -294,11 +294,10 @@ fn k5_preflight_env(
 ) -> (
     Option<std::ffi::OsString>,
     Option<std::ffi::OsString>,
-    std::path::PathBuf,
+    kryprobe_testkit::TempDir,
 ) {
-    let dir = std::env::temp_dir().join(format!("kryprobe-k5-preflight-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = kryprobe_testkit::TempDir::named("k5-preflight").expect("scratch dir");
+    let dir = scratch.path();
     std::fs::write(dir.join("garbage.o"), b"k5-garbage-object").expect("write garbage object");
     let bpf_prior = std::env::var_os("KRYPROBE_BPF_DIR");
     // SAFETY: held under K5_ENV_LOCK; restored before the guard drops.
@@ -309,7 +308,7 @@ fn k5_preflight_env(
         Some(value) => unsafe { std::env::set_var("KRYPROBE_TOKEN", value) },
         None => unsafe { std::env::remove_var("KRYPROBE_TOKEN") },
     }
-    (bpf_prior, token_prior, dir)
+    (bpf_prior, token_prior, scratch)
 }
 
 fn k5_restore_env(
@@ -428,7 +427,7 @@ fn k5_live_no_mechanism_names_mint() {
         return;
     }
     let _guard = k5_env_guard();
-    let (bpf_prior, token_prior, dir) = k5_preflight_env(None);
+    let (bpf_prior, token_prior, scratch) = k5_preflight_env(None);
     let cfg = kryprobe_cli::live::LiveConfig {
         source: "kernel-crypto".to_owned(),
         duration_secs: Some(0),
@@ -442,7 +441,7 @@ fn k5_live_no_mechanism_names_mint() {
         &k5_registry(),
     )
     .expect_err("unpriv + no token must refuse");
-    k5_restore_env(bpf_prior, token_prior, &dir);
+    k5_restore_env(bpf_prior, token_prior, scratch.path());
     match err {
         kryprobe_cli::live::LiveError::Unusable(reason) => {
             assert!(
@@ -649,9 +648,8 @@ fn k5_token_mint_roundtrip_as_root() {
         println!("SKIP: k5_token_mint_roundtrip_as_root needs root");
         return;
     }
-    let dir = std::env::temp_dir().join(format!("kryprobe-k5-mint-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let scratch = kryprobe_testkit::TempDir::named("k5-mint").expect("scratch dir");
+    let dir = scratch.path();
     let bin = dir.join("mint-copy");
     std::fs::copy("/bin/true", &bin).expect("copy scratch binary");
     let receipt = dir.join("receipt.json");
@@ -724,7 +722,6 @@ fn k5_token_mint_roundtrip_as_root() {
         missing.to_str().expect("utf-8"),
     ]);
     assert_eq!(code, 2);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -800,7 +797,7 @@ fn k5_live_explicit_token_named_when_unusable() {
         return;
     }
     let _guard = k5_env_guard();
-    let (bpf_prior, token_prior, dir) = k5_preflight_env(None);
+    let (bpf_prior, token_prior, scratch) = k5_preflight_env(None);
     let cfg = kryprobe_cli::live::LiveConfig {
         source: "kernel-crypto".to_owned(),
         duration_secs: Some(0),
@@ -814,7 +811,7 @@ fn k5_live_explicit_token_named_when_unusable() {
         &k5_registry(),
     )
     .expect_err("unusable explicit token must refuse");
-    k5_restore_env(bpf_prior, token_prior, &dir);
+    k5_restore_env(bpf_prior, token_prior, scratch.path());
     match err {
         kryprobe_cli::live::LiveError::Unusable(reason) => {
             assert!(reason.contains("kryprobe token mint"), "{reason}");
@@ -831,7 +828,7 @@ fn k5_live_env_token_consulted() {
         return;
     }
     let _guard = k5_env_guard();
-    let (bpf_prior, token_prior, dir) = k5_preflight_env(Some("/nonexistent-k5-env-token"));
+    let (bpf_prior, token_prior, scratch) = k5_preflight_env(Some("/nonexistent-k5-env-token"));
     let cfg = kryprobe_cli::live::LiveConfig {
         source: "kernel-crypto".to_owned(),
         duration_secs: Some(0),
@@ -845,7 +842,7 @@ fn k5_live_env_token_consulted() {
         &k5_registry(),
     )
     .expect_err("unusable env token must refuse");
-    k5_restore_env(bpf_prior, token_prior, &dir);
+    k5_restore_env(bpf_prior, token_prior, scratch.path());
     match err {
         kryprobe_cli::live::LiveError::Unusable(reason) => {
             assert!(reason.contains("kryprobe token mint"), "{reason}");

@@ -150,6 +150,8 @@ impl BackendDriver {
         report: &mut DriverReport,
     ) -> Result<(), DriverError> {
         let id = backend.id();
+        // 1A-L8: one attribution closure, not five copies.
+        let wrap = |error| DriverError::Backend { backend: id, error };
         if !runtime.satisfies(&backend.capabilities().required) {
             report.skip(id, events);
             return Ok(());
@@ -158,9 +160,7 @@ impl BackendDriver {
             session: self.session,
             runtime,
         };
-        let instances = backend
-            .detect(&detect_ctx)
-            .map_err(|error| DriverError::Backend { backend: id, error })?;
+        let instances = backend.detect(&detect_ctx).map_err(&wrap)?;
         let mut plans = Vec::with_capacity(instances.len());
         for instance in &instances {
             let plan_ctx = PlanContext {
@@ -169,7 +169,7 @@ impl BackendDriver {
             };
             let plan = backend
                 .plan(&plan_ctx, instance, self.mode)
-                .map_err(|error| DriverError::Backend { backend: id, error })?;
+                .map_err(&wrap)?;
             plans.push(plan);
         }
         // Atomic plan gate: one failing instance skips the whole backend
@@ -185,9 +185,7 @@ impl BackendDriver {
                 generation: self.generation,
                 budget: &mut self.budget,
             };
-            backend
-                .configure(&mut configure_ctx, plan)
-                .map_err(|error| DriverError::Backend { backend: id, error })?;
+            backend.configure(&mut configure_ctx, plan).map_err(&wrap)?;
             report.plans.push(plan.clone());
         }
         for event in events
@@ -200,9 +198,7 @@ impl BackendDriver {
                 integrity: &self.integrity,
                 id_issuer: &self.id_issuer,
             };
-            let observation = backend
-                .decode(&decode_ctx, *event)
-                .map_err(|error| DriverError::Backend { backend: id, error })?;
+            let observation = backend.decode(&decode_ctx, *event).map_err(&wrap)?;
             report.observations.push(observation);
         }
         let finalize_ctx = FinalizeContext {
@@ -210,9 +206,7 @@ impl BackendDriver {
             coverage: &self.coverage,
             integrity: &self.integrity,
         };
-        let summary = backend
-            .finalize(&finalize_ctx)
-            .map_err(|error| DriverError::Backend { backend: id, error })?;
+        let summary = backend.finalize(&finalize_ctx).map_err(&wrap)?;
         report.summaries.push(summary);
         Ok(())
     }
@@ -236,19 +230,25 @@ pub struct SkippedBackend {
 }
 
 /// Outcome of one [`BackendDriver::run`] pass.
+///
+/// 1B-L4: every collection is private with read-only slice readers
+/// and named append/take transitions below — no wholesale field
+/// assignment, so hand-assembly outside the driver cannot bypass the
+/// report's invariants (drive-ordered plans/summaries, registration-
+/// ordered observations, exactly-once shared feed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DriverReport {
     /// Decoded observations: backends in registration order, each backend's
     /// events in input order.
-    pub observations: Vec<NativeObservation>,
+    observations: Vec<NativeObservation>,
     /// Accepted plans, in drive order (the runtime attaches from these).
-    pub plans: Vec<BackendPlan>,
+    plans: Vec<BackendPlan>,
     /// Per-backend end-of-session facts, in drive order.
-    pub summaries: Vec<BackendSummary>,
+    summaries: Vec<BackendSummary>,
     /// Backends skipped on capability gates (static or plan requirements
     /// the host cannot satisfy), in skip order. Each receipt counts the
     /// routed-but-undelivered events for that backend.
-    pub skipped: Vec<SkippedBackend>,
+    skipped: Vec<SkippedBackend>,
     /// Shared-layer losses fed once via [`DriverReport::feed_shared_losses`];
     /// `None` until fed. Private so the feed is the sole writer and the
     /// exactly-once rule cannot be bypassed by direct assignment.
@@ -278,6 +278,51 @@ impl DriverReport {
     #[must_use]
     pub fn shared_losses(&self) -> Option<SharedLosses> {
         self.shared_losses
+    }
+
+    /// Decoded observations, in report order.
+    #[must_use]
+    pub fn observations(&self) -> &[NativeObservation] {
+        &self.observations
+    }
+
+    /// Accepted plans, in drive order.
+    #[must_use]
+    pub fn plans(&self) -> &[BackendPlan] {
+        &self.plans
+    }
+
+    /// Per-backend end-of-session facts, in drive order.
+    #[must_use]
+    pub fn summaries(&self) -> &[BackendSummary] {
+        &self.summaries
+    }
+
+    /// Capability-gate skips, in skip order.
+    #[must_use]
+    pub fn skipped(&self) -> &[SkippedBackend] {
+        &self.skipped
+    }
+
+    /// Append decoded observations (report order is the caller's
+    /// responsibility: backends in registration order, each backend's
+    /// events in input order).
+    pub fn extend_observations(
+        &mut self,
+        observations: impl IntoIterator<Item = NativeObservation>,
+    ) {
+        self.observations.extend(observations);
+    }
+
+    /// File one backend's end-of-session summary, in drive order.
+    pub fn push_summary(&mut self, summary: BackendSummary) {
+        self.summaries.push(summary);
+    }
+
+    /// Move all observations out, leaving the report empty (the live
+    /// path's handoff into its outcome struct).
+    pub fn take_observations(&mut self) -> Vec<NativeObservation> {
+        std::mem::take(&mut self.observations)
     }
 
     /// Session integrity rollup: the summaries' backend-scoped counters

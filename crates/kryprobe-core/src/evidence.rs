@@ -16,6 +16,7 @@ pub use coverage::{CoverageDimension, CoverageSummary, DimensionCounter, Dimensi
 pub use integrity::{IntegritySummary, SharedLosses};
 pub use observation::{
     BackendPayload, CorrelationRef, IntegrityRef, NativeObservation, NativeResult, SafeTextId,
+    payload_str_opt,
 };
 pub use relationship::{
     RelationshipConfidence, RelationshipEvidence, RelationshipKind, RelationshipRecord,

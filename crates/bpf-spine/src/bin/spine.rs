@@ -15,11 +15,11 @@
 #![no_main]
 
 use aya_ebpf::{
+    EbpfContext,
     helpers::{bpf_get_attach_cookie, bpf_get_current_pid_tgid, bpf_ktime_get_ns},
     macros::{map, uprobe, uretprobe},
     maps::{Array, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext},
-    EbpfContext,
 };
 use kryprobe_abi::SpineEvent;
 
@@ -79,9 +79,9 @@ fn emit(ctx: *mut core::ffi::c_void, is_return: bool) -> u32 {
     }
     // SAFETY: BPF helpers with the program ctx pointer.
     let cookie = unsafe { bpf_get_attach_cookie(ctx) };
-    let gen = (cookie >> 32) as u32;
+    let cookie_gen = (cookie >> 32) as u32;
     let idx = cookie as u32;
-    if gen != cfg_gen as u32 || idx >= COUNT_ENTRIES {
+    if cookie_gen != cfg_gen as u32 || idx >= COUNT_ENTRIES {
         bump(&LOSS, LOSS_DROP);
         return 0;
     }
@@ -157,6 +157,6 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 /// Kernel license marker: this object is GPL-2.0-only BPF.
-#[link_section = "license"]
+#[unsafe(link_section = "license")]
 #[used]
 static LICENSE: [u8; 4] = *b"GPL\0";

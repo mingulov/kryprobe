@@ -421,12 +421,10 @@ mod tests {
     #[test]
     fn differing_schema_file_still_flags_drift() {
         // The best-effort check must survive: a present-but-edited copy flags.
-        let dir = std::env::temp_dir().join(format!("kryprobe-drift-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let decoy = dir.join("event-v0.schema.json");
+        let scratch = kryprobe_testkit::TempDir::named("drift").expect("temp dir");
+        let decoy = scratch.path().join("event-v0.schema.json");
         std::fs::write(&decoy, b"{\"edited\": true}").expect("decoy schema");
         let findings = validate_file_with_schema(&fixture_path(), &decoy);
-        std::fs::remove_dir_all(&dir).ok();
         assert!(
             findings
                 .iter()

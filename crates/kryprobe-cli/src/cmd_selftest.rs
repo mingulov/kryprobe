@@ -98,17 +98,14 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("kryprobe-selftest-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch(tag: &str) -> kryprobe_testkit::TempDir {
+        kryprobe_testkit::TempDir::named(&format!("selftest-{tag}")).expect("scratch dir")
     }
 
     #[test]
     fn bpf_object_candidates_honor_tiers_unelevated() {
-        let dir = scratch("cand");
+        let scratch = scratch("cand");
+        let dir = scratch.path();
         let env_file = dir.join("custom-spine.o");
         std::fs::write(&env_file, b"obj").expect("write env file");
         let exedir = dir.join("exe");
@@ -129,14 +126,14 @@ mod tests {
             found.first(),
             Some(&exedir.join("../kryprobe-bpf/spine.bpf.o"))
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn bpf_object_candidates_elevated_drops_env_tier() {
         // H-SEC-01 scenario 3: elevated selftest never loads an
         // env-steered object.
-        let dir = scratch("cand-elev");
+        let scratch = scratch("cand-elev");
+        let dir = scratch.path();
         let env_file = dir.join("custom-spine.o");
         std::fs::write(&env_file, b"obj").expect("write env file");
         let exedir = dir.join("exe");
@@ -146,13 +143,13 @@ mod tests {
             !found.contains(&env_file),
             "elevated must not honor KRYPROBE_BPF_OBJ: {found:?}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn sibling_candidates_elevated_drops_env_tier() {
         // L-SEC-04: elevated selftest never executes an env-steered helper.
-        let dir = scratch("sib-elev");
+        let scratch = scratch("sib-elev");
+        let dir = scratch.path();
         let env_file = dir.join("evil-helper");
         std::fs::write(&env_file, b"x").expect("write env file");
         let found = sibling_candidates(
@@ -173,6 +170,5 @@ mod tests {
             false,
         );
         assert_eq!(found.first(), Some(&env_file));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

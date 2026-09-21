@@ -3,7 +3,7 @@
 
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{bpf, last_errno};
-use std::os::raw::c_void;
+use core::ffi::c_void;
 
 const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;

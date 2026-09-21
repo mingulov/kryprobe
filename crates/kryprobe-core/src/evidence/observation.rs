@@ -74,6 +74,15 @@ impl IntegrityRef {
 /// Backend-owned extra facts; small, secret-free JSON (`Null` when empty).
 pub type BackendPayload = serde_json::Value;
 
+/// Shared payload-string lookup (1A-L5): `Some` for present strings
+/// (including `""`), `None` for missing or non-string values.
+/// Policy matches on the `&str` flavor (`.unwrap_or("")`), render
+/// owns the `Option<String>` flavor (`.map(str::to_owned)`).
+#[must_use]
+pub fn payload_str_opt<'a>(payload: &'a BackendPayload, key: &str) -> Option<&'a str> {
+    payload.get(key).and_then(serde_json::Value::as_str)
+}
+
 /// Domain-native result value; success is derived, never stored here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NativeResult {
@@ -136,4 +145,20 @@ pub struct NativeObservation {
     pub integrity: IntegrityRef,
     /// Backend-owned extra facts.
     pub backend_payload: BackendPayload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_str_opt_distinguishes_missing_and_empty() {
+        // 1A-L5: the shared lookup — Some("") for present-empty,
+        // None for missing or non-string.
+        let payload = serde_json::json!({"a": "x", "e": "", "n": 1});
+        assert_eq!(payload_str_opt(&payload, "a"), Some("x"));
+        assert_eq!(payload_str_opt(&payload, "e"), Some(""));
+        assert_eq!(payload_str_opt(&payload, "n"), None);
+        assert_eq!(payload_str_opt(&payload, "missing"), None);
+    }
 }

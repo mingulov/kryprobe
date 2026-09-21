@@ -8,6 +8,16 @@ members = ["xtask", "crates/kryprobe-abi", "crates/kryprobe-testkit", "crates/kr
 # see docs/dependencies/pins.md in T7).
 exclude = ["crates/bpf-spine", "crates/bpf-kcrypto"]
 
+# Shared package metadata (BP-L4): every member inherits via
+# `<key>.workspace = true` (enforced by `xtask check`'s manifest
+# gate). The BPF crates are workspace-excluded and keep explicit
+# fields instead (see their manifests).
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.98"
+
 # Shared lint table (BP-M3): every member inherits via `[lints]
 # workspace = true`. The gate runs clippy with `-D warnings`, so
 # `warn` here denies in CI. Deliberately NOT included: `pedantic`

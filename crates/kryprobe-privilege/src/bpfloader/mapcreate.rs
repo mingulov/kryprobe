@@ -11,8 +11,8 @@
 //! syscall — the flag/fd/size assertions below run unprivileged).
 
 use crate::probe::bpf_sys::{BPF_F_TOKEN_FD, BPF_MAP_CREATE, MapAttr, bpf};
+use core::ffi::{c_long, c_void};
 use std::os::fd::RawFd;
-use std::os::raw::{c_long, c_void};
 
 /// Token-extended map attr through `map_token_fd` (80 bytes, UAPI order).
 #[repr(C)]

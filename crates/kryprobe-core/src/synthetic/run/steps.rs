@@ -80,11 +80,13 @@ pub enum ScriptOp {
     },
 }
 
-impl Runner {
+impl Runner<'_> {
     /// Open one observation through discovered/selected/entered.
     pub(super) fn enter(&mut self, spec: OpSpec) -> Result<ObservationId, BackendError> {
-        let id = ObservationId::new(self.next_observation);
-        self.next_observation += 1;
+        let id = self
+            .issuer
+            .issue()
+            .map_err(|_| defect("observation id space exhausted"))?;
         let opened_ns = self.clock.now();
         for phase in [
             EvidencePhase::Discovered,

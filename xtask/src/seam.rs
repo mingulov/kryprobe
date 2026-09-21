@@ -220,7 +220,13 @@ fn scrubbed(text: &str) -> String {
         }
         i += 1;
     }
-    String::from_utf8(out).expect("scrubber only writes spaces")
+    match String::from_utf8(out) {
+        Ok(clean) => clean,
+        // 1A-L1: unreachable (blanking writes spaces over whole
+        // chars only) — but a corrupt future must fail CLOSED: scan
+        // unscrubbed so the gate flags more, never less.
+        Err(_) => text.to_owned(),
+    }
 }
 
 /// `libc::name(` call names on one comment-stripped line, in order.
@@ -307,15 +313,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 /// Walk up to the workspace root (holds `crates/kryprobe-privilege/`).
 fn workspace_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join("crates/kryprobe-privilege").is_dir() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    crate::root::climb_to("crates/kryprobe-privilege")
 }
 
 /// Scan the tree; nonempty means the gate fails.

@@ -167,7 +167,6 @@ version = "0.1.0"
 name = "kryprobe-cli"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "kryprobe-abi",
  "kryprobe-core",
  "kryprobe-policy",
@@ -467,6 +466,7 @@ dependencies = [
  "goblin",
  "kryprobe-core",
  "kryprobe-privilege",
+ "kryprobe-testkit",
  "libc",
  "serde_json",
 ]

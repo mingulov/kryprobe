@@ -65,6 +65,24 @@ per-tick kallsyms (parsed once per tick, 2B-C2) with a cross-tick
 join cache. Render reads typed payload keys (`payload_keys`);
 policy evaluates the same observations against YAML rules.
 
+## Vocabulary split: `session` / `snapshot` (1B-L5)
+
+The same words name unrelated concepts per crate — deliberate, but
+documented here so edits land in the right crate:
+
+- `core::session`: the capture state machine (`SessionController`,
+  open/run/close transitions). A *session* here is a lifecycle.
+- `report::session`: the JSONL envelope records (`session_start` /
+  `session_end`). A *session* here is a pair of wire records.
+- `report::snapshot`: the wire `aggregate_snapshot` record (rendered
+  aggregates qualified by integrity receipts).
+- `privilege::kcrypto_snapshot`: BPF map reads (`SnapshotRows` —
+  the raw per-tick rows decoded from the kcrypto maps).
+
+Rule of thumb: *lifecycle* → core, *wire records* → report, *map
+reads* → privilege. Renaming was considered and rejected: each name
+is correct inside its crate, and the split above is the map.
+
 ## Trust boundaries
 
 - Kernel entries: privilege only (ADR-0002, seam-gated).

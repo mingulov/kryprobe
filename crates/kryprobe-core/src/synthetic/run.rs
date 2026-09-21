@@ -9,7 +9,7 @@
 use crate::enums::EvidencePhase;
 use crate::error::{BackendError, InternalError};
 use crate::evidence::{IntegritySummary, NativeResult, RelationshipRecord};
-use crate::ids::{ObservationId, SessionId};
+use crate::ids::{IdIssuer, ObservationId, SessionId};
 use crate::synthetic::ManualClock;
 use serde_json::{Value, json};
 
@@ -57,10 +57,15 @@ struct OpenOp {
 }
 
 /// Per-record render state threaded through the script.
-struct Runner {
+struct Runner<'a> {
     session: SessionId,
     clock: ManualClock,
-    next_observation: u64,
+    /// 1B-L1: observations mint from the session issuer, never a
+    /// private counter (two minters would collide `observation:N`).
+    issuer: &'a IdIssuer,
+    /// Relationship IDs stay runner-local: the synthetic runner is
+    /// the only `CorrelationId` minter, so this counter cannot
+    /// collide across backends the way observation IDs could.
     next_relationship: u64,
     open: Vec<OpenOp>,
     records: Vec<Value>,
@@ -70,12 +75,12 @@ struct Runner {
     emitted_observations: u64,
 }
 
-impl Runner {
-    fn new(session: SessionId) -> Self {
+impl<'a> Runner<'a> {
+    fn new(session: SessionId, issuer: &'a IdIssuer) -> Self {
         Self {
             session,
             clock: ManualClock::new(1_000_000),
-            next_observation: 1,
+            issuer,
             next_relationship: 1,
             open: Vec::new(),
             records: Vec::new(),
@@ -152,8 +157,12 @@ impl Runner {
 
 impl crate::synthetic::SyntheticBackend {
     /// Replay the script for one session, deterministically.
-    pub fn run_script(&self, session: SessionId) -> Result<ScriptRun, BackendError> {
-        let mut runner = Runner::new(session);
+    pub fn run_script(
+        &self,
+        session: SessionId,
+        issuer: &IdIssuer,
+    ) -> Result<ScriptRun, BackendError> {
+        let mut runner = Runner::new(session, issuer);
         for op in &self.script {
             match *op {
                 ScriptOp::Enter { op } => {

@@ -52,7 +52,7 @@
 use kryprobe_abi::kcrypto_agg::kh_of;
 use kryprobe_core::backend::{
     Backend, BackendRegistry, BackendSummary, ConfigureContext, DecodeContext, DetectContext,
-    DriverReport, FinalizeContext, PlanContext,
+    DriverReport, FinalizeContext, PlanContext, RawEvent,
 };
 use kryprobe_core::budget::BudgetManager;
 use kryprobe_core::capability::RuntimeCapabilities;
@@ -242,6 +242,20 @@ fn backend_err(stage: &str, err: BackendError) -> LiveError {
         BackendError::Internal(_) => LiveError::Internal(format!("{stage}: {err}")),
         _ => LiveError::Unusable(format!("{stage}: {err}")),
     }
+}
+
+/// 1A-L9: one decode→map tail for the tick row blocks (agg, totals,
+/// ident). Each block keeps its own parse, stamp, and key handling —
+/// only the shared `decode` + `Internal` wrap folds here.
+fn decode_tick_row(
+    backend: &dyn Backend,
+    decode_ctx: &DecodeContext,
+    event: RawEvent<'_>,
+    what: &str,
+) -> Result<NativeObservation, LiveError> {
+    backend
+        .decode(decode_ctx, event)
+        .map_err(|err| LiveError::Internal(format!("live decode {what}: {err}")))
 }
 
 /// KTOT gap from call counts: `KTOT − ΣKAGG` calls (saturating).
@@ -660,9 +674,12 @@ fn drive_session_inner(
                 &kagg.alg(),
                 &kagg.drv(),
             ));
-            let observation = backend
-                .decode(&decode_ctx, raw_event_stamped(row.as_bytes(), vagg.last_ns))
-                .map_err(|err| LiveError::Internal(format!("live decode agg: {err}")))?;
+            let observation = decode_tick_row(
+                backend,
+                &decode_ctx,
+                raw_event_stamped(row.as_bytes(), vagg.last_ns),
+                "agg",
+            )?;
             upsert_latest(&mut latest, &mut observations, key, observation);
         }
         if let Some(totals) = &snap.totals {
@@ -674,12 +691,12 @@ fn drive_session_inner(
                 ));
             };
             tick_totals_calls = Some(vagg.calls);
-            let observation = backend
-                .decode(
-                    &decode_ctx,
-                    raw_event_stamped(totals.as_bytes(), vagg.last_ns),
-                )
-                .map_err(|err| LiveError::Internal(format!("live decode totals: {err}")))?;
+            let observation = decode_tick_row(
+                backend,
+                &decode_ctx,
+                raw_event_stamped(totals.as_bytes(), vagg.last_ns),
+                "totals",
+            )?;
             upsert_latest(&mut latest, &mut observations, ObsKey::Totals, observation);
         }
         for ident in &snap.idents {
@@ -690,9 +707,12 @@ fn drive_session_inner(
                     "live parse ident: unexpected row kind".to_owned(),
                 ));
             };
-            let observation = backend
-                .decode(&decode_ctx, raw_event_stamped(ident.as_bytes(), kctl.val2))
-                .map_err(|err| LiveError::Internal(format!("live decode ident: {err}")))?;
+            let observation = decode_tick_row(
+                backend,
+                &decode_ctx,
+                raw_event_stamped(ident.as_bytes(), kctl.val2),
+                "ident",
+            )?;
             // Idents are disjoint across ticks: every one is kept.
             observations.push(observation);
         }
@@ -776,8 +796,9 @@ fn drive_session_inner(
     // window, versus a guaranteed extra syscall before).
     let drops = closing.drops;
     let mut report = DriverReport::default();
-    report.observations = observations;
-    report.summaries.push(summary);
+    // 1B-L4: checked transitions only — no field assignment.
+    report.extend_observations(observations);
+    report.push_summary(summary);
     report
         .feed_shared_losses(shared_losses_from_snapshot(&closing, drops))
         .map_err(|err| LiveError::Internal(format!("live shared feed: {err}")))?;
@@ -794,19 +815,15 @@ fn drive_session_inner(
         ring_drops: u64::from(drops),
         overflow_identities,
         drops: kdrop_sites,
-        observations_decoded: report.observations.len() as u64,
+        observations_decoded: report.observations().len() as u64,
         interval: ValidityInterval {
             start_ns: first_wall,
             end_ns: Some(closing.monotonic_ns),
         },
     });
-    let summary = report
-        .summaries
-        .pop()
-        .ok_or_else(|| LiveError::Internal("live session filed no summary".to_owned()))?;
     hop(controller, SessionState::Finalized, "session finalize")?;
     Ok(LiveOutcome {
-        observations: report.observations,
+        observations: report.take_observations(),
         summary,
         coverage,
         integrity,

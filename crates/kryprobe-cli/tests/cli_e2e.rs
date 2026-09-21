@@ -138,10 +138,10 @@ fn btf_gate_predicate_case() {
     assert!(!btf_available_at(std::path::Path::new(
         "/nonexistent-dir/kryprobe-btf-probe"
     )));
-    let probe = std::env::temp_dir().join(format!("kryprobe-btf-{}", std::process::id()));
+    let btf_scratch = kryprobe_testkit::TempDir::named("btf").expect("scratch dir");
+    let probe = btf_scratch.path().join("vmlinux");
     std::fs::write(&probe, b"vmlinux").expect("write btf probe");
     assert!(btf_available_at(&probe));
-    std::fs::remove_file(&probe).ok();
 }
 
 #[test]
@@ -348,35 +348,31 @@ fn selftest_synthetic_twice_identical_case() {
 
 #[test]
 fn selftest_synthetic_out_case() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file = dir.join("synth.jsonl");
+    let scratch = kryprobe_testkit::TempDir::named("cli").expect("temp dir");
+    let file = scratch.path().join("synth.jsonl");
     let output = run(&["selftest", "synthetic", "--out", file.to_str().unwrap()]);
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     assert!(output.stdout.is_empty(), "file mode prints no stdout");
     let via_file = std::fs::read(&file).expect("read out file");
     let via_stdout = run(&["selftest", "synthetic"]);
     assert_eq!(via_file, via_stdout.stdout);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn report_on_selftest_output_case() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-cli-r{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file = dir.join("synth.jsonl");
+    let scratch = kryprobe_testkit::TempDir::named("cli-r").expect("temp dir");
+    let file = scratch.path().join("synth.jsonl");
     let synth = run(&["selftest", "synthetic", "--out", file.to_str().unwrap()]);
     assert!(synth.status.success());
     let output = run(&["report", file.to_str().unwrap()]);
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     assert!(stdout_of(&output).contains("phase "));
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn report_invalid_case() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-cli-i{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let scratch = kryprobe_testkit::TempDir::named("cli-i").expect("temp dir");
+    let dir = scratch.path();
     let file = dir.join("bad.jsonl");
     std::fs::write(&file, "not json\n{\"schema\":\"kryprobe.event/v0\"}\n").expect("write bad");
     let output = run(&["report", file.to_str().unwrap()]);
@@ -386,7 +382,6 @@ fn report_invalid_case() {
     assert_eq!(output.status.code(), Some(2));
     let output = run(&["report"]);
     assert_eq!(output.status.code(), Some(2));
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -875,11 +870,8 @@ fn run_with(env: &[(&str, &str)], cwd: &std::path::Path, args: &[&str]) -> std::
 }
 
 /// Empty scratch dir (locators miss tier 3 here).
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kryprobe-k3-2-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+fn scratch(name: &str) -> kryprobe_testkit::TempDir {
+    kryprobe_testkit::TempDir::named(&format!("k3-2-{name}")).expect("scratch dir")
 }
 
 #[test]
@@ -896,11 +888,12 @@ fn watch_unusable_exit4_case() {
         println!("SKIP: exe-bundled object present (tier 2 would hit)");
         return;
     }
-    let dir = scratch("watch-4");
+    let scratch = scratch("watch-4");
+    let dir = scratch.path();
     let absent = dir.join("absent.o");
     let output = run_with(
         &[("KRYPROBE_BPF_DIR", absent.to_str().expect("utf-8 tmp"))],
-        &dir,
+        dir,
         &["watch", "--system", "--duration", "1"],
     );
     assert_eq!(
@@ -912,7 +905,6 @@ fn watch_unusable_exit4_case() {
     let stderr = stderr_of(&output);
     assert!(stderr.contains("watch:"), "stderr: {stderr}");
     assert!(stderr.contains("object missing"), "stderr: {stderr}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -926,11 +918,12 @@ fn report_unusable_exit4_case() {
         println!("SKIP: exe-bundled object present (tier 2 would hit)");
         return;
     }
-    let dir = scratch("report-4");
+    let scratch = scratch("report-4");
+    let dir = scratch.path();
     let absent = dir.join("absent.o");
     let output = run_with(
         &[("KRYPROBE_BPF_DIR", absent.to_str().expect("utf-8 tmp"))],
-        &dir,
+        dir,
         &["report", "--system", "--duration", "1"],
     );
     assert_eq!(
@@ -942,7 +935,6 @@ fn report_unusable_exit4_case() {
     let stderr = stderr_of(&output);
     assert!(stderr.contains("report:"), "stderr: {stderr}");
     assert!(stderr.contains("object missing"), "stderr: {stderr}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -1225,7 +1217,8 @@ fn report_live_proves_json_case() {
         "bytes conserved"
     );
     // `--out` writes the same bytes the stdout form prints.
-    let dir = scratch("report-out");
+    let scratch = scratch("report-out");
+    let dir = scratch.path();
     let file = dir.join("report.json");
     let traffic = spawn_traffic();
     let output = Command::new(kryprobe())
@@ -1257,7 +1250,6 @@ fn report_live_proves_json_case() {
     );
     let file_doc: serde_json::Value = serde_json::from_slice(&via_file).expect("file json parses");
     assert_eq!(file_doc["verdict"]["status"], "complete");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,11 +1260,8 @@ fn report_live_proves_json_case() {
 // ---------------------------------------------------------------------------
 
 /// k3-3 scratch dir (policy files live here).
-fn check_scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kryprobe-k3-3-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+fn check_scratch(name: &str) -> kryprobe_testkit::TempDir {
+    kryprobe_testkit::TempDir::named(&format!("k3-3-{name}")).expect("scratch dir")
 }
 
 fn write_policy(dir: &std::path::Path, text: &str) -> PathBuf {
@@ -1299,12 +1288,13 @@ fn check_unusable_exit4_case() {
         println!("SKIP: exe-bundled object present (tier 2 would hit)");
         return;
     }
-    let dir = check_scratch("check-4");
-    let policy = write_policy(&dir, clean_policy_text());
+    let scratch = check_scratch("check-4");
+    let dir = scratch.path();
+    let policy = write_policy(dir, clean_policy_text());
     let absent = dir.join("absent.o");
     let output = run_with(
         &[("KRYPROBE_BPF_DIR", absent.to_str().expect("utf-8 tmp"))],
-        &dir,
+        dir,
         &[
             "check",
             "--system",
@@ -1323,14 +1313,14 @@ fn check_unusable_exit4_case() {
     let stderr = stderr_of(&output);
     assert!(stderr.contains("check:"), "stderr: {stderr}");
     assert!(stderr.contains("object missing"), "stderr: {stderr}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn check_bad_policy_exit2_case() {
     // Policy parses before capture: bad policy exits 2 even when the
     // lane is unusable (no privilege needed, fully deterministic).
-    let dir = check_scratch("check-2");
+    let scratch = check_scratch("check-2");
+    let dir = scratch.path();
     for (text, what) in [
         (
             "version: 1\nrules:\n  - id: r\n    source: kernel-crypto\n    match:\n      algorithm: md5\n      bogus: x\n    decision: deny\n",
@@ -1339,7 +1329,7 @@ fn check_bad_policy_exit2_case() {
         ("version: 2\nrules: []\n", "unknown version"),
         ("version: [1\n", "malformed yaml"),
     ] {
-        let policy = write_policy(&dir, text);
+        let policy = write_policy(dir, text);
         let output = run(&[
             "check",
             "--system",
@@ -1373,13 +1363,13 @@ fn check_bad_policy_exit2_case() {
         "stderr: {}",
         stderr_of(&output)
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn check_bad_args_exit2_case() {
-    let dir = check_scratch("check-args");
-    let policy = write_policy(&dir, clean_policy_text());
+    let scratch = check_scratch("check-args");
+    let dir = scratch.path();
+    let policy = write_policy(dir, clean_policy_text());
     let policy_arg = policy.to_str().expect("utf-8 tmp").to_owned();
     let cases: Vec<Vec<&str>> = vec![
         vec!["check"],
@@ -1416,7 +1406,6 @@ fn check_bad_args_exit2_case() {
             stderr_of(&output)
         );
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// md5 presence in `/proc/crypto` (the exit-10 positive control needs
@@ -1459,9 +1448,10 @@ fn check_live_violation_exit10_case() {
         println!("SKIP: check_live_violation_exit10_case requires md5 in /proc/crypto");
         return;
     }
-    let dir = check_scratch("live-10");
+    let scratch = check_scratch("live-10");
+    let dir = scratch.path();
     let policy = write_policy(
-        &dir,
+        dir,
         "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: \"*md5*\"\n    decision: deny\n",
     );
     let traffic = spawn_md5_traffic();
@@ -1492,7 +1482,6 @@ fn check_live_violation_exit10_case() {
     for marker in ["algorithm=", "driver=", "context=", "evidence="] {
         assert!(stderr.contains(marker), "missing {marker}: {stderr}");
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -1502,8 +1491,9 @@ fn check_live_clean_exit0_case() {
     if !lane_ready("check_live_clean_exit0_case") {
         return;
     }
-    let dir = check_scratch("live-0");
-    let policy = write_policy(&dir, clean_policy_text());
+    let scratch = check_scratch("live-0");
+    let dir = scratch.path();
+    let policy = write_policy(dir, clean_policy_text());
     let traffic = spawn_traffic();
     let output = Command::new(kryprobe())
         .args([
@@ -1529,7 +1519,6 @@ fn check_live_clean_exit0_case() {
         "stdout: {}",
         stdout_of(&output)
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

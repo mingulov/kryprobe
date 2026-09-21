@@ -28,6 +28,20 @@ fn rejected(reason: String) -> AttachError {
     AttachError::Rejected { reason }
 }
 
+/// Walk I/O triage (1A-L7): a present path yields `Some`, a
+/// `NotFound` (exit/rmdir race) yields `None` for the caller to skip
+/// or root-reject, and any other failure rejects with context.
+fn gone_ok<T>(
+    result: std::io::Result<T>,
+    ctx: impl FnOnce(std::io::Error) -> String,
+) -> Result<Option<T>, AttachError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(rejected(ctx(err))),
+    }
+}
+
 /// One admitted fan-out member: pid pinned to its starttime identity
 /// (ADR-0003: identity is (pid, start-time), never numeric pid alone).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,49 +115,36 @@ fn enumerate_tree(root: u32) -> Result<Vec<u32>, AttachError> {
     if root == 0 {
         return Err(rejected("tree root 0 is not a process".to_owned()));
     }
-    match std::fs::read_dir(format!("/proc/{root}/task")) {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(rejected(format!("tree root gone: pid {root}")));
-        }
-        Err(err) => {
-            return Err(rejected(format!(
-                "cannot enumerate tree under pid {root}: {err}"
-            )));
-        }
+    if gone_ok(std::fs::read_dir(format!("/proc/{root}/task")), |err| {
+        format!("cannot enumerate tree under pid {root}: {err}")
+    })?
+    .is_none()
+    {
+        return Err(rejected(format!("tree root gone: pid {root}")));
     }
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     let mut queue: Vec<u32> = vec![root];
     seen.insert(root);
     while let Some(pid) = queue.pop() {
-        let task_dir = match std::fs::read_dir(format!("/proc/{pid}/task")) {
-            Ok(dir) => dir,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(rejected(format!(
-                    "cannot enumerate tasks of pid {pid}: {err}"
-                )));
-            }
+        let Some(task_dir) = gone_ok(std::fs::read_dir(format!("/proc/{pid}/task")), |err| {
+            format!("cannot enumerate tasks of pid {pid}: {err}")
+        })?
+        else {
+            continue;
         };
         for task in task_dir {
-            let task = match task {
-                Ok(entry) => entry,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(rejected(format!(
-                        "cannot enumerate tasks of pid {pid}: {err}"
-                    )));
-                }
+            let Some(task) = gone_ok(task, |err| {
+                format!("cannot enumerate tasks of pid {pid}: {err}")
+            })?
+            else {
+                continue;
             };
             let children_path = task.path().join("children");
-            let text = match std::fs::read_to_string(&children_path) {
-                Ok(text) => text,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(rejected(format!(
-                        "cannot read children of pid {pid}: {err}"
-                    )));
-                }
+            let Some(text) = gone_ok(std::fs::read_to_string(&children_path), |err| {
+                format!("cannot read children of pid {pid}: {err}")
+            })?
+            else {
+                continue;
             };
             for child in parse_pids(&text, &format!("children of pid {pid}"))? {
                 if seen.insert(child) {
@@ -169,84 +170,60 @@ fn enumerate_cgroup(path: &str) -> Result<Vec<u32>, AttachError> {
         return Err(rejected("cgroup path is not NUL-safe".to_owned()));
     }
     let root = std::path::PathBuf::from(path);
-    match std::fs::symlink_metadata(&root) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Err(rejected(format!("cgroup path is not a directory: {path}"))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(rejected(format!("cgroup path gone: {path}")));
+    match gone_ok(std::fs::symlink_metadata(&root), |err| {
+        format!("cannot read cgroup path {path}: {err}")
+    })? {
+        Some(meta) if meta.is_dir() => {}
+        Some(_) => {
+            return Err(rejected(format!("cgroup path is not a directory: {path}")));
         }
-        Err(err) => return Err(rejected(format!("cannot read cgroup path {path}: {err}"))),
+        None => return Err(rejected(format!("cgroup path gone: {path}"))),
     }
     let mut members: BTreeSet<u32> = BTreeSet::new();
     let mut visited: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut stack: Vec<std::path::PathBuf> = vec![root];
     let mut at_root = true;
     while let Some(dir) = stack.pop() {
-        let meta = match std::fs::symlink_metadata(&dir) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(rejected(format!(
-                    "cannot read cgroup dir {}: {err}",
-                    dir.display()
-                )));
-            }
+        let Some(meta) = gone_ok(std::fs::symlink_metadata(&dir), |err| {
+            format!("cannot read cgroup dir {}: {err}", dir.display())
+        })?
+        else {
+            continue;
         };
         if !meta.is_dir() || !visited.insert((meta.dev(), meta.ino())) {
             continue;
         }
-        match std::fs::read_to_string(dir.join("cgroup.procs")) {
-            Ok(text) => {
-                for pid in parse_pids(&text, &format!("{} cgroup.procs", dir.display()))? {
-                    members.insert(pid);
-                }
+        if let Some(text) = gone_ok(std::fs::read_to_string(dir.join("cgroup.procs")), |err| {
+            format!("cannot read {} cgroup.procs: {err}", dir.display())
+        })? {
+            for pid in parse_pids(&text, &format!("{} cgroup.procs", dir.display()))? {
+                members.insert(pid);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if at_root {
-                    return Err(rejected(format!(
-                        "not a cgroup (no cgroup.procs): {}",
-                        dir.display()
-                    )));
-                }
-            }
-            Err(err) => {
-                return Err(rejected(format!(
-                    "cannot read {} cgroup.procs: {err}",
-                    dir.display()
-                )));
-            }
+        } else if at_root {
+            return Err(rejected(format!(
+                "not a cgroup (no cgroup.procs): {}",
+                dir.display()
+            )));
         }
         at_root = false;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(rejected(format!(
-                    "cannot list cgroup dir {}: {err}",
-                    dir.display()
-                )));
-            }
+        let Some(entries) = gone_ok(std::fs::read_dir(&dir), |err| {
+            format!("cannot list cgroup dir {}: {err}", dir.display())
+        })?
+        else {
+            continue;
         };
         for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(rejected(format!(
-                        "cannot list cgroup dir {}: {err}",
-                        dir.display()
-                    )));
-                }
+            let Some(entry) = gone_ok(entry, |err| {
+                format!("cannot list cgroup dir {}: {err}", dir.display())
+            })?
+            else {
+                continue;
             };
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    return Err(rejected(format!(
-                        "cannot list cgroup dir {}: {err}",
-                        dir.display()
-                    )));
-                }
+            let Some(kind) = gone_ok(entry.file_type(), |err| {
+                format!("cannot list cgroup dir {}: {err}", dir.display())
+            })?
+            else {
+                continue;
             };
             if kind.is_dir() {
                 stack.push(entry.path());
@@ -561,6 +538,22 @@ mod tests {
         assert!(matches!(
             parse_pids("12 nope", "test"),
             Err(AttachError::Rejected { .. })
+        ));
+    }
+
+    /// 1A-L7: the walk triage — present yields `Some`, exit-races
+    /// (`NotFound`) yield `None`, anything else rejects with context.
+    #[test]
+    fn gone_ok_triages_walk_io() {
+        let ok: std::io::Result<u32> = Ok(7);
+        assert_eq!(gone_ok(ok, |_| String::new()).unwrap(), Some(7));
+        let gone: std::io::Result<u32> = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(gone_ok(gone, |_| String::new()).unwrap(), None);
+        let denied: std::io::Result<u32> =
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(matches!(
+            gone_ok(denied, |err| format!("ctx: {err}")),
+            Err(AttachError::Rejected { reason }) if reason.starts_with("ctx: "),
         ));
     }
 }

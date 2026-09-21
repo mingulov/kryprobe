@@ -269,13 +269,7 @@ pub fn obj_get(path: &Path) -> Result<std::fs::File, i32> {
     };
     // SAFETY: `attr` is 16 live bytes for the syscall; the kernel
     // copies the attr struct in and out (the `bpf()` contract).
-    let ret = unsafe {
-        bpf_sys::bpf(
-            BPF_OBJ_GET,
-            (&raw mut attr).cast::<std::os::raw::c_void>(),
-            16,
-        )
-    };
+    let ret = unsafe { bpf_sys::bpf(BPF_OBJ_GET, (&raw mut attr).cast::<core::ffi::c_void>(), 16) };
     if ret < 0 {
         return Err(bpf_sys::last_errno());
     }

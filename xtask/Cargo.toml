@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [package]
 name = "xtask"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 goblin = "0.10"
@@ -11,6 +12,9 @@ kryprobe-core = { path = "../crates/kryprobe-core" }
 kryprobe-privilege = { path = "../crates/kryprobe-privilege" }
 libc = "0.2"
 serde_json = "1"
+
+[dev-dependencies]
+kryprobe-testkit = { path = "../crates/kryprobe-testkit" }
 
 [lints]
 workspace = true

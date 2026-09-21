@@ -111,18 +111,40 @@ fn acc_of(obs: &NativeObservation) -> Acc {
     }
 }
 
-/// Full row key: the KAGG identity the payload mirrors
-/// (family, op, result, algorithm, driver, context).
-fn row_key(obs: &NativeObservation) -> (&str, &str, &str, &str, &str, &str) {
+/// Full row key (1A-L14): the KAGG identity the payload mirrors.
+/// Field order IS the `BTreeMap` order (family, op, result,
+/// algorithm, driver, context) — the derived `Ord` compares top to
+/// bottom exactly like the old 6-tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RowKey<'a> {
+    family: &'a str,
+    op: &'a str,
+    result: &'a str,
+    algorithm: &'a str,
+    driver: &'a str,
+    context: &'a str,
+}
+
+/// Table class key: the row key minus result/context (the GROUP BY
+/// of the rendered table). Same field-order rule as [`RowKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClassKey<'a> {
+    family: &'a str,
+    op: &'a str,
+    algorithm: &'a str,
+    driver: &'a str,
+}
+
+fn row_key(obs: &NativeObservation) -> RowKey<'_> {
     let payload = &obs.backend_payload;
-    (
-        raw(payload, K::FAMILY),
-        raw(payload, K::OP),
-        raw(payload, K::RESULT),
-        raw(payload, K::ALGORITHM),
-        raw(payload, K::DRIVER),
-        raw(payload, K::CONTEXT),
-    )
+    RowKey {
+        family: raw(payload, K::FAMILY),
+        op: raw(payload, K::OP),
+        result: raw(payload, K::RESULT),
+        algorithm: raw(payload, K::ALGORITHM),
+        driver: raw(payload, K::DRIVER),
+        context: raw(payload, K::CONTEXT),
+    }
 }
 
 /// kp2 §8 trailer order over the canonical dimensions (1B-M3):
@@ -174,20 +196,37 @@ fn who_calls(obs: &NativeObservation) -> u64 {
         .unwrap_or(0)
 }
 
-/// Who-row dedup key: (key_hash, tgid), 0 when absent (real decodes
-/// always carry both; only hand-fed shapes can miss them).
-fn who_key(obs: &NativeObservation) -> (u64, u64) {
+/// Who-row dedup key (1A-L14): (key_hash, tgid), 0 when absent
+/// (real decodes always carry both; only hand-fed shapes can miss
+/// them). Derived order matches the old pair order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct WhoKey {
+    kh: u64,
+    tgid: u64,
+}
+
+impl WhoKey {
+    /// Absent tgid sorts as 0, NOT as `None`-first.
+    fn of(kh: u64, tgid: Option<u64>) -> Self {
+        WhoKey {
+            kh,
+            tgid: tgid.unwrap_or(0),
+        }
+    }
+}
+
+fn who_key(obs: &NativeObservation) -> WhoKey {
     let payload = &obs.backend_payload;
-    (
-        payload
+    WhoKey {
+        kh: payload
             .get(K::KEY_HASH)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        payload
+        tgid: payload
             .get(K::TGID)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-    )
+    }
 }
 
 /// Projected who row (M4): every JSON walk for the row happens once,
@@ -205,7 +244,7 @@ struct WhoProj<'a> {
 /// readers: 0 key parts, `None` cells, 0 calls when absent).
 fn project_who(obs: &NativeObservation) -> WhoProj<'_> {
     let payload = &obs.backend_payload;
-    let (kh, _) = who_key(obs);
+    let kh = who_key(obs).kh;
     WhoProj {
         kh,
         tgid: payload.get(K::TGID).and_then(serde_json::Value::as_u64),
@@ -225,7 +264,7 @@ fn project_who(obs: &NativeObservation) -> WhoProj<'_> {
 pub fn render_who_block(obs: &[NativeObservation]) -> String {
     // M4: one projection pass (each row's JSON walks once), then
     // plain-struct dedup/sort/render — no per-comparison walks.
-    let mut latest: BTreeMap<(u64, u64), WhoProj<'_>> = BTreeMap::new();
+    let mut latest: BTreeMap<WhoKey, WhoProj<'_>> = BTreeMap::new();
     for ob in obs {
         if ob
             .backend_payload
@@ -236,7 +275,7 @@ pub fn render_who_block(obs: &[NativeObservation]) -> String {
             continue;
         }
         let proj = project_who(ob);
-        latest.insert((proj.kh, proj.tgid.unwrap_or(0)), proj);
+        latest.insert(WhoKey::of(proj.kh, proj.tgid), proj);
     }
     if latest.is_empty() {
         return String::from("WHO: none\n");
@@ -247,7 +286,7 @@ pub fn render_who_block(obs: &[NativeObservation]) -> String {
         // 0, NOT as `None`-first).
         b.calls
             .cmp(&a.calls)
-            .then_with(|| (a.kh, a.tgid.unwrap_or(0)).cmp(&(b.kh, b.tgid.unwrap_or(0))))
+            .then_with(|| WhoKey::of(a.kh, a.tgid).cmp(&WhoKey::of(b.kh, b.tgid)))
     });
     let mut text = String::from(WHO_HEADER);
     text.push('\n');
@@ -288,7 +327,7 @@ pub fn render_watch_tables(
     // M4: one projection pass builds the agg latest-map AND the
     // totals slot (last totals in vec order wins — the `rev().find`
     // idiom, without the second iteration).
-    let mut latest: BTreeMap<(&str, &str, &str, &str, &str, &str), Acc> = BTreeMap::new();
+    let mut latest: BTreeMap<RowKey<'_>, Acc> = BTreeMap::new();
     let mut totals_slot: Option<Acc> = None;
     for obs in observations {
         let kind = obs
@@ -301,21 +340,26 @@ pub fn render_watch_tables(
             totals_slot = Some(acc_of(obs));
         }
     }
-    let mut rows: BTreeMap<(&str, &str, &str, &str), Acc> = BTreeMap::new();
-    for ((family, op, _, algorithm, driver, _), acc) in latest {
-        rows.entry((family, op, algorithm, driver))
-            .or_default()
-            .add(acc);
+    let mut rows: BTreeMap<ClassKey<'_>, Acc> = BTreeMap::new();
+    for (key, acc) in latest {
+        rows.entry(ClassKey {
+            family: key.family,
+            op: key.op,
+            algorithm: key.algorithm,
+            driver: key.driver,
+        })
+        .or_default()
+        .add(acc);
     }
     let mut text = String::from(HEADER);
     text.push('\n');
-    for ((family, op, algorithm, driver), acc) in &rows {
+    for (key, acc) in &rows {
         text.push_str(&format!(
             "{} {} {} {} {} {} {} {} {}\n",
-            show(family),
-            show(op),
-            show(algorithm),
-            show(driver),
+            show(key.family),
+            show(key.op),
+            show(key.algorithm),
+            show(key.driver),
             acc.calls,
             acc.bytes,
             acc.ok,
@@ -413,4 +457,38 @@ pub fn render_live_jsonl(
         child_signal: None,
     })?;
     Ok(writer.into_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1A-L14: derived field order must match the old tuple order —
+    /// `result` sorts before `algorithm` (tuple positions 3 < 4),
+    /// `kh` before `tgid`.
+    #[test]
+    fn key_order_matches_tuple_order() {
+        let base = RowKey {
+            family: "f",
+            op: "o",
+            result: "r",
+            algorithm: "a",
+            driver: "d",
+            context: "c",
+        };
+        let earlier_result = RowKey {
+            result: "0",
+            algorithm: "zzz",
+            ..base
+        };
+        assert!(earlier_result < base);
+        let earlier_family = RowKey {
+            family: "0",
+            ..base
+        };
+        assert!(earlier_family < earlier_result);
+        assert_eq!(base, base);
+        assert!(WhoKey { kh: 1, tgid: 9 } < WhoKey { kh: 2, tgid: 0 });
+        assert!(WhoKey { kh: 1, tgid: 1 } < WhoKey { kh: 1, tgid: 2 });
+    }
 }

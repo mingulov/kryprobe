@@ -7,12 +7,14 @@
 mod bench;
 mod bpf;
 mod child;
+mod manifest;
+mod root;
 mod seam;
 
 use child::run_child;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 const USAGE: &str = "\
@@ -84,6 +86,9 @@ fn check() -> i32 {
         return code;
     }
     if seam::check_seam() != 0 {
+        return 1;
+    }
+    if manifest::check_manifests() != 0 {
         return 1;
     }
     let steps: &[&[&str]] = &[
@@ -171,16 +176,8 @@ fn toolchain_failure() -> Option<i32> {
 
 /// Read the pinned `channel` by walking up from the current directory.
 fn pinned_channel() -> Option<String> {
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        let candidate: PathBuf = dir.join("rust-toolchain.toml");
-        if candidate.is_file() {
-            return channel_from_file(&candidate);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    let dir = root::climb_to("rust-toolchain.toml")?;
+    channel_from_file(&dir.join("rust-toolchain.toml"))
 }
 
 pub(crate) fn channel_from_file(path: &Path) -> Option<String> {
@@ -224,14 +221,11 @@ mod tests {
     use super::channel_from_file;
 
     fn read_case(name: &str, body: &str) -> Option<String> {
-        let path = std::env::temp_dir().join(format!(
-            "kryprobe-xtask-channel-test-{}-{name}",
-            std::process::id()
-        ));
+        let scratch = kryprobe_testkit::TempDir::named(&format!("xtask-channel-{name}"))
+            .expect("scratch dir");
+        let path = scratch.path().join("rust-toolchain.toml");
         std::fs::write(&path, body).expect("write temp toolchain case");
-        let got = channel_from_file(&path);
-        std::fs::remove_file(&path).ok();
-        got
+        channel_from_file(&path)
     }
 
     #[test]

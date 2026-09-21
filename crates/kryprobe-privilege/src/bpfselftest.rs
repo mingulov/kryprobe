@@ -140,12 +140,26 @@ pub fn view_spine_event(bytes: &[u8]) -> Result<SpineEventView, BpfSelftestError
     if !bytes[36..64].iter().all(|b| *b == 0) {
         return Err(BpfSelftestError::BadEvent("reserved bytes must be zero"));
     }
-    let u64le = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().expect("u64 width"));
-    let u32le = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().expect("u32 width"));
+    // 1A-L1: the 64-byte check above makes these statically exact,
+    // but a short future must fail closed (`BadEvent`), never panic.
+    let u64le = |o: usize| -> Result<u64, BpfSelftestError> {
+        bytes
+            .get(o..o.saturating_add(8))
+            .and_then(|w| w.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or(BpfSelftestError::BadEvent("short record"))
+    };
+    let u32le = |o: usize| -> Result<u32, BpfSelftestError> {
+        bytes
+            .get(o..o.saturating_add(4))
+            .and_then(|w| w.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or(BpfSelftestError::BadEvent("short record"))
+    };
     Ok(SpineEventView {
-        cookie: u64le(0),
-        flags: u32le(32),
-        seq: u64le(24),
+        cookie: u64le(0)?,
+        flags: u32le(32)?,
+        seq: u64le(24)?,
     })
 }
 

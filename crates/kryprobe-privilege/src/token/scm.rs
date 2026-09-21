@@ -53,6 +53,18 @@ pub(super) fn send_fd(sock: BorrowedFd<'_>, fd: RawFd) -> Result<(), TokenError>
 }
 
 /// Receives one fd; short reads and malformed cmsgs fail closed.
+/// Fixed-width cmsg decode (1A-L1): the widths are statically
+/// exact on the real path, so failure is unreachable — but a
+/// corrupt-`cmsg` future must fail closed (EPROTO), never panic.
+fn cmsg_int<const N: usize>(cmsg: &[u8], offset: usize) -> Result<[u8; N], TokenError> {
+    cmsg.get(offset..offset.saturating_add(N))
+        .and_then(|w| w.try_into().ok())
+        .ok_or(TokenError::Denied {
+            stage: "scm-cmsg",
+            errno: libc::EPROTO,
+        })
+}
+
 pub(super) fn recv_fd(sock: BorrowedFd<'_>) -> Result<OwnedFd, TokenError> {
     let closed = |stage: &'static str, errno: i32| TokenError::Denied { stage, errno };
     let mut cmsg = [0u8; CMSG_SPACE];
@@ -81,13 +93,13 @@ pub(super) fn recv_fd(sock: BorrowedFd<'_>) -> Result<OwnedFd, TokenError> {
     if rc != 1 || msg.msg_controllen < CMSG_LEN {
         return Err(closed("scm-short", libc::EPROTO));
     }
-    let len = usize::from_ne_bytes(cmsg[0..8].try_into().expect("len width"));
-    let level = i32::from_ne_bytes(cmsg[8..12].try_into().expect("level width"));
-    let kind = i32::from_ne_bytes(cmsg[12..16].try_into().expect("type width"));
+    let len = usize::from_ne_bytes(cmsg_int(&cmsg, 0)?);
+    let level = i32::from_ne_bytes(cmsg_int(&cmsg, 8)?);
+    let kind = i32::from_ne_bytes(cmsg_int(&cmsg, 12)?);
     if len != CMSG_LEN || level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
         return Err(closed("scm-cmsg", libc::EPROTO));
     }
-    let fd = i32::from_ne_bytes(cmsg[16..20].try_into().expect("fd width"));
+    let fd = i32::from_ne_bytes(cmsg_int(&cmsg, 16)?);
     if fd < 0 {
         return Err(closed("scm-fd", libc::EPROTO));
     }
@@ -97,8 +109,20 @@ pub(super) fn recv_fd(sock: BorrowedFd<'_>) -> Result<OwnedFd, TokenError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_fd, send_fd};
+    use super::{cmsg_int, recv_fd, send_fd};
     use std::os::fd::BorrowedFd;
+
+    /// 1A-L1: short/truncated control slices fail closed (EPROTO),
+    /// never panic — the widths are statically exact on the real path.
+    #[test]
+    fn cmsg_int_rejects_short_slice() {
+        assert!(matches!(
+            cmsg_int::<4>(&[0u8; 2], 0),
+            Err(super::TokenError::Denied { errno, .. })
+                if errno == libc::EPROTO
+        ));
+        assert_eq!(cmsg_int::<4>(&[1u8, 2, 3, 4], 0).unwrap(), [1, 2, 3, 4]);
+    }
 
     /// The manual cmsg layout must roundtrip a real fd (runs unprivileged).
     #[test]

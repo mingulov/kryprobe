@@ -275,7 +275,7 @@ fn golden_path() -> PathBuf {
 
 fn attribution_json(report: &DriverReport) -> serde_json::Value {
     let summaries: Vec<serde_json::Value> = report
-        .summaries
+        .summaries()
         .iter()
         .map(|summary| {
             json!({
@@ -321,9 +321,13 @@ fn synthetic_finalize_does_not_echo_session_integrity() {
 #[test]
 fn driver_run_scopes_integrity_per_backend_without_double_count() {
     let report = attributed_run();
-    assert!(report.skipped.is_empty());
-    assert_eq!(report.observations.len(), 4);
-    let observed: Vec<BackendId> = report.observations.iter().map(|obs| obs.backend).collect();
+    assert!(report.skipped().is_empty());
+    assert_eq!(report.observations().len(), 4);
+    let observed: Vec<BackendId> = report
+        .observations()
+        .iter()
+        .map(|obs| obs.backend)
+        .collect();
     assert_eq!(
         observed,
         vec![
@@ -333,26 +337,26 @@ fn driver_run_scopes_integrity_per_backend_without_double_count() {
             BackendId::OpenSsl
         ]
     );
-    assert_eq!(report.summaries.len(), 3);
+    assert_eq!(report.summaries().len(), 3);
     // Each summary carries only its own backend's losses (synthetic
     // observed none; the stubs report disjoint scripted counters).
-    assert_eq!(report.summaries[0].backend, BackendId::Synthetic);
-    assert_eq!(report.summaries[0].observations, 1);
-    assert_eq!(report.summaries[0].integrity, IntegritySummary::default());
-    assert_eq!(report.summaries[1].backend, BackendId::P11);
-    assert_eq!(report.summaries[1].observations, 2);
+    assert_eq!(report.summaries()[0].backend, BackendId::Synthetic);
+    assert_eq!(report.summaries()[0].observations, 1);
+    assert_eq!(report.summaries()[0].integrity, IntegritySummary::default());
+    assert_eq!(report.summaries()[1].backend, BackendId::P11);
+    assert_eq!(report.summaries()[1].observations, 2);
     assert_eq!(
-        report.summaries[1].integrity,
+        report.summaries()[1].integrity,
         IntegritySummary {
             ring_reservation_failures: 3,
             unmatched_entries: 1,
             ..IntegritySummary::default()
         }
     );
-    assert_eq!(report.summaries[2].backend, BackendId::OpenSsl);
-    assert_eq!(report.summaries[2].observations, 1);
+    assert_eq!(report.summaries()[2].backend, BackendId::OpenSsl);
+    assert_eq!(report.summaries()[2].observations, 1);
     assert_eq!(
-        report.summaries[2].integrity,
+        report.summaries()[2].integrity,
         IntegritySummary {
             user_queue_drops: 7,
             budget_omissions: 2,
@@ -369,7 +373,7 @@ fn driver_run_scopes_integrity_per_backend_without_double_count() {
     };
     assert_eq!(report.session_integrity(), rolled);
     assert_eq!(
-        IntegritySummary::rollup(report.summaries.iter().map(|summary| &summary.integrity)),
+        IntegritySummary::rollup(report.summaries().iter().map(|summary| &summary.integrity)),
         rolled
     );
 }
@@ -382,4 +386,20 @@ fn attribution_channel_matches_golden() {
         serde_json::to_string_pretty(&attribution_json(&report)).expect("golden serializes")
     );
     assert_golden(&golden_path(), text.as_bytes());
+}
+
+/// 1B-L4: reports assemble through checked transitions only — the
+/// extend/take/push path round-trips a driven report intact.
+#[test]
+fn builder_transitions_roundtrip_driven_report() {
+    let mut report = attributed_run();
+    let mut rebuilt = DriverReport::default();
+    rebuilt.extend_observations(report.take_observations());
+    assert!(report.observations().is_empty());
+    assert_eq!(rebuilt.observations().len(), 4);
+    for summary in report.summaries().to_vec() {
+        rebuilt.push_summary(summary);
+    }
+    assert_eq!(rebuilt.summaries().len(), 3);
+    assert_eq!(rebuilt.summaries()[0].backend, BackendId::Synthetic);
 }

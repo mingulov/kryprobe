@@ -19,6 +19,7 @@ use crate::mapops::{MapOpsError, map_lookup_percpu_sum, map_update};
 use crate::probe::bpf_sys::{
     BPF_LINK_CREATE, BPF_TRACE_UPROBE_MULTI, LinkUprobeMulti, bpf, fd_or_errno,
 };
+use core::ffi::c_void;
 use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
 use kryprobe_core::authority::{AttachAuthority, BpfLoadAuthority};
 use kryprobe_core::ids::PlanGeneration;
@@ -29,7 +30,6 @@ use kryprobe_core::{
 };
 use std::ffi::CString;
 use std::io::Write;
-use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};

@@ -14,9 +14,9 @@ use crate::bpfloader::{
 };
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{BPF_OBJ_PIN, bpf, fd_or_errno, last_errno};
+use core::ffi::{c_long, c_void};
 use std::ffi::CString;
 use std::os::fd::RawFd;
-use std::os::raw::{c_long, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 

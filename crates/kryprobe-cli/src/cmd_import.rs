@@ -84,16 +84,14 @@ mod tests {
     const P11_MIN: &str =
         r#"{"schema":"p11scope/observed-profile/v3","capture":{"mode":"profile"}}"#;
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kryprobe-k3-4-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    fn scratch_dir(tag: &str) -> kryprobe_testkit::TempDir {
+        kryprobe_testkit::TempDir::named(&format!("k3-4-{tag}")).expect("scratch dir")
     }
 
     #[test]
     fn import_run_emits_shell_exit_0() {
-        let dir = scratch_dir("ok");
+        let scratch = scratch_dir("ok");
+        let dir = scratch.path();
         let file = dir.join("profile.json");
         std::fs::write(&file, P11_MIN).expect("write input");
         let mut stdout = Vec::new();
@@ -125,7 +123,6 @@ mod tests {
         // Lossless at the CLI boundary too: `native` is the input doc.
         let original: serde_json::Value = serde_json::from_str(P11_MIN).expect("input parses");
         assert_eq!(shell["native"], original);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -154,7 +151,8 @@ mod tests {
         // M-SEC-02: unbounded import reads are a local
         // memory-exhaustion vector — over 4 MiB refuses with a size
         // error, never parses.
-        let dir = scratch_dir("oversize");
+        let scratch = scratch_dir("oversize");
+        let dir = scratch.path();
         let file = dir.join("huge.json");
         let big = "x".repeat(4 * 1024 * 1024 + 1);
         std::fs::write(&file, &big).expect("write input");
@@ -164,12 +162,12 @@ mod tests {
         assert!(stdout.is_empty());
         let detail = String::from_utf8(stderr).expect("utf-8");
         assert!(detail.contains("too large"), "size error, got: {detail}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn import_run_unknown_marker_exit_2_names_it() {
-        let dir = scratch_dir("marker");
+        let scratch = scratch_dir("marker");
+        let dir = scratch.path();
         let file = dir.join("weird.json");
         std::fs::write(&file, r#"{"schema":"p11scope/observed-profile/v9"}"#).expect("write");
         let mut stdout = Vec::new();
@@ -181,7 +179,6 @@ mod tests {
             detail.contains("p11scope/observed-profile/v9"),
             "names the marker: {detail}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -190,8 +187,10 @@ mod tests {
         // invalid input (exit 2), never silent and never 0.
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let missing =
-            std::env::temp_dir().join(format!("kryprobe-k3-4-absent-{}.json", std::process::id()));
+        // Absent path inside a guard dir (never created): hermetic
+        // and RAII-cleaned like the rest.
+        let absent_scratch = scratch_dir("absent");
+        let missing = absent_scratch.path().join("absent.json");
         assert_eq!(run(&missing, &mut stdout, &mut stderr), 2);
         assert!(stdout.is_empty());
         assert!(
@@ -201,7 +200,8 @@ mod tests {
             "missing file names itself"
         );
 
-        let dir = scratch_dir("bad");
+        let scratch = scratch_dir("bad");
+        let dir = scratch.path();
         for (name, body) in [("broken.json", "not json"), ("array.json", "[1]")] {
             let file = dir.join(name);
             std::fs::write(&file, body).expect("write");
@@ -211,7 +211,6 @@ mod tests {
             assert!(stdout.is_empty());
             assert!(!stderr.is_empty(), "{name} explains itself");
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A writer that always fails (exit-1 probe for the stdout leg).
@@ -229,7 +228,8 @@ mod tests {
 
     #[test]
     fn import_run_stdout_failure_exit_1() {
-        let dir = scratch_dir("stdout");
+        let scratch = scratch_dir("stdout");
+        let dir = scratch.path();
         let file = dir.join("profile.json");
         std::fs::write(&file, P11_MIN).expect("write input");
         let mut stderr = Vec::new();
@@ -239,6 +239,5 @@ mod tests {
                 .expect("utf-8")
                 .contains("cannot write stdout")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

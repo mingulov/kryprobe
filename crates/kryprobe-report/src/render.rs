@@ -221,38 +221,29 @@ impl Summary {
 }
 
 pub(crate) fn payload_str(payload: &Value, key: &str) -> Option<String> {
-    payload.get(key).and_then(Value::as_str).map(str::to_owned)
+    kryprobe_core::evidence::payload_str_opt(payload, key).map(str::to_owned)
+}
+
+/// Table-driven rank (1A-L5): position in the table, or the table
+/// length for unknown spellings (they rank worst so they surface).
+fn rank(word: &str, table: &[&str]) -> u8 {
+    table
+        .iter()
+        .position(|entry| *entry == word)
+        .map_or(table.len() as u8, |pos| pos as u8)
 }
 
 /// Severity rank: unknown spellings rank worst so they surface.
 pub(crate) fn impact_rank(impact: &str) -> u8 {
-    match impact {
-        "partial" => 0,
-        "unsupported" => 1,
-        "refused" => 2,
-        "unknown" => 3,
-        _ => 4,
-    }
+    rank(impact, &["partial", "unsupported", "refused", "unknown"])
 }
 
 fn count_rank(word: &str) -> u8 {
-    match word {
-        "qualified" => 0,
-        "lower_bound" => 1,
-        "estimated" => 2,
-        "unknown" => 3,
-        _ => 4,
-    }
+    rank(word, &["qualified", "lower_bound", "estimated", "unknown"])
 }
 
 fn event_rank(word: &str) -> u8 {
-    match word {
-        "qualified" => 0,
-        "partial" => 1,
-        "not_requested" => 2,
-        "unknown" => 3,
-        _ => 4,
-    }
+    rank(word, &["qualified", "partial", "not_requested", "unknown"])
 }
 
 /// Renders per-phase counts, the coverage table, and the integrity line.

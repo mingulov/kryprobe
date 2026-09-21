@@ -7,7 +7,7 @@ use kryprobe_core::evidence::{
     CoverageSummary, DimensionCoverage, IntegrityRef, NativeObservation, NativeResult,
     ValidityInterval,
 };
-use kryprobe_core::ids::{ImplementationId, ObservationId, SessionId, TargetId};
+use kryprobe_core::ids::{IdIssuer, ImplementationId, ObservationId, SessionId, TargetId};
 use kryprobe_core::synthetic::{STEP_NS, SyntheticBackend, canonical_script};
 use kryprobe_report::live_render::{LIVE_QUALIFICATION_ID, LIVE_SESSION_ID, render_live_jsonl};
 use kryprobe_report::{ReportError, check_stream};
@@ -146,7 +146,10 @@ fn live_jsonl_stamps_advance_by_shared_step() {
 #[test]
 fn canonical_script_stamps_advance_by_shared_step() {
     let backend = SyntheticBackend::new(canonical_script());
-    let run = backend.run_script(SessionId::new(1)).expect("script runs");
+    let issuer = IdIssuer::default();
+    let run = backend
+        .run_script(SessionId::new(1), &issuer)
+        .expect("script runs");
     let stamps = stamps(&run.to_jsonl());
     assert!(stamps.len() > 2, "script emits several records");
     for pair in stamps.windows(2) {

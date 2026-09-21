@@ -11,7 +11,7 @@
 
 use crate::fd::OwnedFd;
 use crate::probe::ProbeOutcome;
-use std::os::raw::{c_long, c_void};
+use core::ffi::{c_long, c_void};
 
 /// `BPF_MAP_CREATE` command id.
 pub const BPF_MAP_CREATE: u32 = 0;

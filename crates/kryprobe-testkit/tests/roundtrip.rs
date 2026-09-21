@@ -2,7 +2,7 @@
 //! Round-trip tests: goldens and ABI event bytes (the clock and JSONL
 //! checks moved to their production crates with the code, 1B-M4).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kryprobe_testkit::assert_golden;
 
@@ -20,15 +20,14 @@ fn locked_assert_golden(path: &Path, actual: &[u8]) {
     assert_golden(path, actual);
 }
 
-fn scratch_dir(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kryprobe-testkit-{}-{test}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+fn scratch_dir(test: &str) -> kryprobe_testkit::TempDir {
+    kryprobe_testkit::TempDir::named(&format!("testkit-{test}")).expect("create scratch dir")
 }
 
 #[test]
 fn golden_match_passes_on_identical_bytes() {
-    let path = scratch_dir("match").join("golden.bin");
+    let scratch = scratch_dir("match");
+    let path = scratch.path().join("golden.bin");
     std::fs::write(&path, b"exact-bytes").expect("write golden");
     locked_assert_golden(&path, b"exact-bytes");
 }
@@ -36,14 +35,16 @@ fn golden_match_passes_on_identical_bytes() {
 #[test]
 #[should_panic(expected = "mismatch")]
 fn golden_mismatch_fails() {
-    let path = scratch_dir("mismatch").join("golden.bin");
+    let scratch = scratch_dir("mismatch");
+    let path = scratch.path().join("golden.bin");
     std::fs::write(&path, b"expected-bytes").expect("write golden");
     locked_assert_golden(&path, b"different-bytes");
 }
 
 #[test]
 fn golden_update_rewrites_and_still_fails() {
-    let path = scratch_dir("update").join("golden.bin");
+    let scratch = scratch_dir("update");
+    let path = scratch.path().join("golden.bin");
     std::fs::write(&path, b"stale-bytes").expect("write golden");
     let _guard = lock_env();
     // SAFETY: `ENV_LOCK` is held, and every other environment access in this
@@ -74,7 +75,8 @@ fn golden_update_rewrites_and_still_fails() {
 
 #[test]
 fn golden_mismatch_without_update_mode_leaves_file_untouched() {
-    let path = scratch_dir("no-update").join("golden.bin");
+    let scratch = scratch_dir("no-update");
+    let path = scratch.path().join("golden.bin");
     std::fs::write(&path, b"stale-bytes").expect("write golden");
     let _guard = lock_env();
     // Force update mode off even if the outer environment enables it, so
@@ -115,7 +117,8 @@ fn abi_event_bytes_split_and_match_golden() {
     let (_header, body) = split_header(&scratch.0[..total]).expect("valid header splits");
     assert_eq!(body, payload);
 
-    let path = scratch_dir("abi").join("event.bin");
+    let scratch = scratch_dir("abi");
+    let path = scratch.path().join("event.bin");
     std::fs::write(&path, payload).expect("write golden");
     locked_assert_golden(&path, body);
 }

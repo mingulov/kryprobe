@@ -5,7 +5,7 @@
 //! validates the JSONL structurally, renders the summary to stderr, and
 //! emits JSONL to stdout (or `--out`). Two runs are byte-identical.
 
-use kryprobe_core::ids::SessionId;
+use kryprobe_core::ids::{IdIssuer, SessionId};
 use kryprobe_core::synthetic::{SyntheticBackend, canonical_script};
 use kryprobe_report::{
     ResolvedSchema, render_summary, resolve_schema, validate_str, write_str_atomic,
@@ -27,7 +27,8 @@ fn run_with_schema(
     resolved: &ResolvedSchema,
 ) -> i32 {
     let backend = SyntheticBackend::new(canonical_script());
-    let run = match backend.run_script(SessionId::new(1)) {
+    let issuer = IdIssuer::default();
+    let run = match backend.run_script(SessionId::new(1), &issuer) {
         Ok(run) => run,
         Err(err) => {
             let _ = writeln!(stderr, "selftest synthetic: backend failed: {err:?}");
@@ -109,22 +110,20 @@ mod tests {
         let code = run_with_schema(None, &mut stdout, &mut stderr, &resolved);
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
         // `--out` commits the identical bytes atomically.
-        let dir = std::env::temp_dir().join(format!("kryprobe-synth-out-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("synth.jsonl");
+        let scratch = kryprobe_testkit::TempDir::named("synth-out").expect("temp dir");
+        let path = scratch.path().join("synth.jsonl");
         let mut file_stdout = Vec::new();
         let mut file_stderr = Vec::new();
         let code = run_with_schema(Some(&path), &mut file_stdout, &mut file_stderr, &resolved);
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&file_stderr));
         assert_eq!(std::fs::read(&path).expect("read back"), stdout);
         assert!(file_stdout.is_empty(), "file run writes no stdout");
-        let litter: Vec<_> = std::fs::read_dir(&dir)
+        let litter: Vec<_> = std::fs::read_dir(scratch.path())
             .expect("read dir")
             .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
             .filter(|name| name.to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(litter.is_empty(), "tmp litter: {litter:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

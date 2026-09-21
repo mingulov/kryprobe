@@ -206,45 +206,31 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
         "backends" => parse_simple(args, json, "backends", |json| Command::Backends { json })?,
         "inspect" => crate::args_sub::parse_inspect(args, json)?,
         "selftest" => {
-            if json {
-                return Err(usage("selftest: --json is not supported"));
-            }
+            reject_json("selftest", json)?;
             crate::args_sub::parse_selftest(args)?
         }
         "report" => {
-            if json {
-                return Err(usage("report: --json is not supported"));
-            }
+            reject_json("report", json)?;
             crate::args_sub::parse_report(args)?
         }
         "watch" => {
-            if json {
-                return Err(usage("watch: --json is not supported"));
-            }
+            reject_json("watch", json)?;
             crate::args_sub::parse_watch(args)?
         }
         "check" => {
-            if json {
-                return Err(usage("check: --json is not supported"));
-            }
+            reject_json("check", json)?;
             crate::args_sub::parse_check(args)?
         }
         "import" => {
-            if json {
-                return Err(usage("import: --json is not supported"));
-            }
+            reject_json("import", json)?;
             crate::args_sub::parse_import(args)?
         }
         "token" => {
-            if json {
-                return Err(usage("token: --json is not supported"));
-            }
+            reject_json("token", json)?;
             crate::args_sub::parse_token(args)?
         }
         "plan" | "observe" | "run" => {
-            if json {
-                return Err(usage(format!("{sub}: --json is not supported")));
-            }
+            reject_json(sub, json)?;
             Command::Stub { name: sub.clone() }
         }
         other => return Err(usage(format!("unknown subcommand '{other}'"))),
@@ -253,6 +239,15 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
 }
 
 /// `doctor`/`backends`: bare or `--json`, nothing else.
+/// Reject global `--json` for subcommands that do not speak it
+/// (1A-L6: one guard helper, not seven inline copies).
+fn reject_json(sub: &str, json: bool) -> Result<(), ArgsError> {
+    if json {
+        return Err(usage(format!("{sub}: --json is not supported")));
+    }
+    Ok(())
+}
+
 /// `doctor`: bare, `--json`, `--versions` (each at most once,
 /// any order); anything else is a usage error.
 fn parse_doctor(args: &[String], json: bool) -> Result<Command, ArgsError> {

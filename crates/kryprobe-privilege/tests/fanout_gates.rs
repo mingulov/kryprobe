@@ -160,7 +160,8 @@ fn cgroup_missing_path_rejected() {
 fn cgroup_fixture_allowed_with_exit_receipt() {
     // Synthetic cgroup tree: self (admitted) + a never-lived pid
     // (exit receipt) + a nested empty child (recursion proof).
-    let dir = std::env::temp_dir().join(format!("kryprobe-fanout-{}", self_pid()));
+    let scratch = kryprobe_testkit::TempDir::named("fanout").expect("scratch dir");
+    let dir = scratch.path();
     let child = dir.join("nested");
     std::fs::create_dir_all(&child).expect("fixture dirs");
     std::fs::write(
@@ -175,7 +176,6 @@ fn cgroup_fixture_allowed_with_exit_receipt() {
         },
         u64::MAX,
     );
-    std::fs::remove_dir_all(&dir).ok();
     let plan: FanoutPlan = plan.expect("fixture cgroup must resolve");
     assert_eq!(
         plan.members.iter().map(|m| m.pid).collect::<Vec<_>>(),
@@ -188,15 +188,14 @@ fn cgroup_fixture_allowed_with_exit_receipt() {
 #[test]
 fn cgroup_plain_dir_rejected() {
     // A directory without cgroup.procs is not a cgroup.
-    let dir = std::env::temp_dir().join(format!("kryprobe-fanout-plain-{}", self_pid()));
-    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let scratch = kryprobe_testkit::TempDir::named("fanout-plain").expect("scratch dir");
+    let dir = scratch.path();
     let err = LocalPrivilegedAuthority.resolve_scope(
         &TargetScope::Cgroup {
             path: dir.to_string_lossy().into_owned(),
         },
         u64::MAX,
     );
-    std::fs::remove_dir_all(&dir).ok();
     assert!(
         matches!(err, Err(AttachError::Rejected { .. })),
         "got {err:?}"

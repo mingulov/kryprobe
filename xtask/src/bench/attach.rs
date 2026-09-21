@@ -60,7 +60,13 @@ fn iteration(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("fixture-spawn: {err}"))?;
-    let lines = pump_lines(child.stdout.take().expect("piped stdout"));
+    // 1A-L1: stdio is piped by the spawn above, so `take` never
+    // fails — but the error type is `Result`, not panic-shaped.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "piped stdout".to_owned())?;
+    let lines = pump_lines(stdout);
     let mut out = Vec::with_capacity(CYCLES);
     let run = (|| -> Result<(), String> {
         if lines
@@ -117,7 +123,7 @@ fn iteration(
         child
             .stdin
             .as_mut()
-            .expect("piped stdin")
+            .ok_or_else(|| "piped stdin".to_owned())?
             .write_all(b"GO\n")
             .map_err(|err| format!("fixture-go: {err}"))?;
         if lines

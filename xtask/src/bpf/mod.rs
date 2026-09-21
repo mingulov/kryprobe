@@ -5,7 +5,6 @@ pub(crate) mod strip;
 
 use crate::channel_from_file;
 use crate::child::{run_child, run_child_in_timeout};
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -386,15 +385,7 @@ fn toolchain_present(channel: &str) -> bool {
 
 /// Walk up to the directory containing `crates/bpf-spine/Cargo.toml`.
 fn workspace_root() -> Option<PathBuf> {
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        if dir.join("crates/bpf-spine/Cargo.toml").is_file() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    crate::root::climb_to("crates/bpf-spine/Cargo.toml")
 }
 
 #[cfg(test)]

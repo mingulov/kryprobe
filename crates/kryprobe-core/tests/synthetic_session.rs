@@ -61,7 +61,9 @@ fn scripted_session_runs_to_finalized_with_golden_jsonl() {
     ] {
         session.transition(state).unwrap();
     }
-    let run = backend.run_script(SessionId::new(7)).unwrap();
+    let run = backend
+        .run_script(SessionId::new(7), &IdIssuer::default())
+        .unwrap();
     for state in [
         SessionState::Quiescing,
         SessionState::Draining,
@@ -176,7 +178,9 @@ fn nested_identical_return_closes_inner_first() {
         ScriptOp::Enter { op: sign },
         ScriptOp::Return { op: sign, code: 0 },
     ]);
-    let run = backend.run_script(SessionId::new(11)).unwrap();
+    let run = backend
+        .run_script(SessionId::new(11), &IdIssuer::default())
+        .unwrap();
     let records = records(&run.to_jsonl());
     let returned: Vec<_> = records
         .iter()
@@ -456,7 +460,9 @@ fn hostile_drop_counts_saturate_instead_of_panicking_or_wrapping() {
         ScriptOp::DropDetailed { count: u64::MAX },
         ScriptOp::DropDetailed { count: 1 },
     ]);
-    let run = backend.run_script(SessionId::new(1)).expect("script runs");
+    let run = backend
+        .run_script(SessionId::new(1), &IdIssuer::default())
+        .expect("script runs");
     assert_eq!(run.aggregate_observations, u64::MAX);
     assert_eq!(run.integrity.ring_reservation_failures, u64::MAX);
     // Emitted observations still add into the saturated aggregate
@@ -469,7 +475,34 @@ fn hostile_drop_counts_saturate_instead_of_panicking_or_wrapping() {
         ScriptOp::Enter { op: sign },
         ScriptOp::DropDetailed { count: u64::MAX },
     ]);
-    let run = backend.run_script(SessionId::new(1)).expect("script runs");
+    let run = backend
+        .run_script(SessionId::new(1), &IdIssuer::default())
+        .expect("script runs");
     assert_eq!(run.aggregate_observations, u64::MAX);
     assert_eq!(run.integrity.ring_reservation_failures, u64::MAX);
+}
+
+/// 1B-L1: the script mints observation IDs from the passed issuer
+/// (no private counter) — pre-issued values shift the run's IDs.
+#[test]
+fn run_script_mints_from_passed_issuer() {
+    let issuer = IdIssuer::default();
+    assert_eq!(issuer.issue().unwrap().to_string(), "observation:1");
+    assert_eq!(issuer.issue().unwrap().to_string(), "observation:2");
+    let sign = OpSpec {
+        class: OperationClass::Sign,
+        call: CallKind::Operation,
+    };
+    let backend = SyntheticBackend::new(vec![
+        ScriptOp::Enter { op: sign },
+        ScriptOp::Return { op: sign, code: 0 },
+    ]);
+    let run = backend
+        .run_script(SessionId::new(1), &issuer)
+        .expect("script runs");
+    let parsed = records(&run.to_jsonl());
+    assert!(!parsed.is_empty());
+    for record in &parsed {
+        assert_eq!(record["payload"]["observation_id"], "observation:3");
+    }
 }

@@ -199,8 +199,8 @@ fn streaming_validate_matches_batch_on_drift() {
 
 #[test]
 fn validate_file_matches_batch_on_corpus() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-t13-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let scratch = kryprobe_testkit::TempDir::named("t13").expect("temp dir");
+    let dir = scratch.path();
     for (name, text) in [
         (
             "writer.jsonl",
@@ -217,7 +217,6 @@ fn validate_file_matches_batch_on_corpus() {
             "file: {name}"
         );
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// T16 X1: the merged single pass feeds both consumers identically to
@@ -267,8 +266,8 @@ fn merged_pass_rejects_invalid_utf8_closed() {
 
 #[test]
 fn merged_file_matches_two_pass_on_corpus() {
-    let dir = std::env::temp_dir().join(format!("kryprobe-t16x1-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let scratch = kryprobe_testkit::TempDir::named("t16x1").expect("temp dir");
+    let dir = scratch.path();
     for (name, text) in [
         (
             "writer.jsonl",
@@ -293,7 +292,6 @@ fn merged_file_matches_two_pass_on_corpus() {
         "missing file must fail closed, got {findings:?}"
     );
     assert!(summary.is_none(), "failed pass yields no summary");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

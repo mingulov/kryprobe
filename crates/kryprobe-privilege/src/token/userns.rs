@@ -38,9 +38,9 @@ use super::TokenError;
 use super::mint::instantiate_bpffs;
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{BPF_TOKEN_CREATE, TokenAttr, bpf, last_errno};
+use core::ffi::{c_char, c_void};
 use std::ffi::CString;
 use std::os::fd::RawFd;
-use std::os::raw::{c_char, c_void};
 
 /// Child unshared + mapped-handshake pending: "ready for id maps".
 const KIND_READY: u8 = b'R';
@@ -54,6 +54,18 @@ const KIND_DIR: u8 = b'D';
 const KIND_TOKEN: u8 = b'K';
 /// Child failure: `errno` (`i32`, native-endian) + stage id byte.
 const KIND_ERROR: u8 = b'E';
+
+/// `KIND_ERROR` stage ids. These ride in the error message's stage
+/// slot (byte 5), NOT the kind slot (byte 0), so their overlap with
+/// the `KIND_*` byte values is intentional, not a collision.
+const STAGE_UNSHARE: u8 = b'U';
+const STAGE_HANDSHAKE: u8 = b'G';
+const STAGE_DROP: u8 = b'P';
+const STAGE_FSOPEN: u8 = b'F';
+const STAGE_SEND_FS: u8 = b'S';
+const STAGE_RECV_DIR: u8 = b'D';
+const STAGE_NS_READ: u8 = b'N';
+const STAGE_TOKEN: u8 = b'T';
 
 /// `KIND_TOKEN` payload length: kind + `u64` inode.
 const TOKEN_MSG_LEN: usize = 9;
@@ -87,14 +99,14 @@ struct Datagram {
 /// honest-denial mapping (EOPNOTSUPP/EPERM/EACCES) is unchanged.
 fn child_stage_name(id: u8) -> &'static str {
     match id {
-        b'U' => "userns-unshare",
-        b'G' => "userns-handshake",
-        b'P' => "userns-drop",
-        b'F' => "userns-fsopen",
-        b'S' => "userns-send-fs",
-        b'D' => "userns-recv-dir",
-        b'N' => "userns-ns-read",
-        b'T' => "token-create",
+        STAGE_UNSHARE => "userns-unshare",
+        STAGE_HANDSHAKE => "userns-handshake",
+        STAGE_DROP => "userns-drop",
+        STAGE_FSOPEN => "userns-fsopen",
+        STAGE_SEND_FS => "userns-send-fs",
+        STAGE_RECV_DIR => "userns-recv-dir",
+        STAGE_NS_READ => "userns-ns-read",
+        STAGE_TOKEN => "token-create",
         b'K' => "userns-send-token",
         _ => "userns-child",
     }
@@ -340,6 +352,15 @@ fn send_err(sock: RawFd, errno: i32, stage: u8) {
     let _ = send_msg(sock, &msg, -1);
 }
 
+/// Child failure path: report `errno` + `STAGE_*` to the parent,
+/// then exit 1. Diverging (`-> !`) so an error site can never emit
+/// a report without exiting (or exit without reporting). Child-safe.
+fn fail(sock: RawFd, stage: u8, errno: i32) -> ! {
+    send_err(sock, errno, stage);
+    // SAFETY: terminal child exit; no cleanup runs.
+    unsafe { libc::_exit(1) }
+}
+
 /// The mint child: unshares, fsopens, and mints. Runs post-fork with
 /// NO exec, so (like `spawn.rs`'s child) it calls ONLY
 /// async-signal-safe functions — raw syscalls, stack buffers, `_exit`
@@ -351,9 +372,7 @@ fn child_main(sock: RawFd) -> ! {
     // anywhere, so no mount table is touched either way).
     // SAFETY: unshare takes flags only.
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-        send_err(sock, last_errno(), b'U');
-        // SAFETY: terminal child exit; no cleanup runs.
-        unsafe { libc::_exit(1) };
+        fail(sock, STAGE_UNSHARE, last_errno());
     }
     // Ready: the parent now writes our id maps, then sends `G`. We
     // must not fsopen before the maps exist (unmapped ids own nothing).
@@ -365,9 +384,7 @@ fn child_main(sock: RawFd) -> ! {
         .map(|dg| expect_plain(&dg, KIND_GO, "userns-handshake").is_ok())
         .unwrap_or(false);
     if !go_ok {
-        send_err(sock, libc::EPROTO, b'G');
-        // SAFETY: terminal child exit; no cleanup runs.
-        unsafe { libc::_exit(1) };
+        fail(sock, STAGE_HANDSHAKE, libc::EPROTO);
     }
     // Drop to in-ns root (= outer NOBODY under the parent's
     // "0 65534 1" maps): the minter keeps ns privilege for the mint
@@ -377,30 +394,22 @@ fn child_main(sock: RawFd) -> ! {
     // SAFETY: setgid/setuid take ids only; no syscalls intervene
     // before the errno below is captured.
     if unsafe { libc::setgid(0) } != 0 || unsafe { libc::setuid(0) } != 0 {
-        send_err(sock, last_errno(), b'P');
-        // SAFETY: terminal child exit; no cleanup runs.
-        unsafe { libc::_exit(1) };
+        fail(sock, STAGE_DROP, last_errno());
     }
     // `fsopen` HERE, in the new userns: this pins superblock ownership
     // to the mint ns. An init-ns fsopen would EPERM the mint below.
     let fs = match super::mint::fsopen_bpf() {
         Ok(fs) => fs,
         Err(TokenError::Denied { errno, .. }) => {
-            send_err(sock, errno, b'F');
-            // SAFETY: terminal child exit; no cleanup runs.
-            unsafe { libc::_exit(1) };
+            fail(sock, STAGE_FSOPEN, errno);
         }
         Err(_) => {
-            send_err(sock, libc::EPROTO, b'F');
-            // SAFETY: terminal child exit; no cleanup runs.
-            unsafe { libc::_exit(1) };
+            fail(sock, STAGE_FSOPEN, libc::EPROTO);
         }
     };
     if send_msg(sock, &[KIND_FS], fs.as_raw_fd()).is_err() {
         drop(fs);
-        send_err(sock, libc::EPROTO, b'S');
-        // SAFETY: terminal child exit; no cleanup runs.
-        unsafe { libc::_exit(1) };
+        fail(sock, STAGE_SEND_FS, libc::EPROTO);
     }
     // The parent holds its own copy now; close before minting.
     drop(fs);
@@ -409,14 +418,10 @@ fn child_main(sock: RawFd) -> ! {
         Ok(dg) if dg.len == 1 && dg.bytes[0] == KIND_DIR && dg.fd >= 0 => dg.fd,
         Ok(dg) => {
             close_stray(dg.fd);
-            send_err(sock, libc::EPROTO, b'D');
-            // SAFETY: terminal child exit; no cleanup runs.
-            unsafe { libc::_exit(1) };
+            fail(sock, STAGE_RECV_DIR, libc::EPROTO);
         }
         Err(_) => {
-            send_err(sock, libc::EPROTO, b'D');
-            // SAFETY: terminal child exit; no cleanup runs.
-            unsafe { libc::_exit(1) };
+            fail(sock, STAGE_RECV_DIR, libc::EPROTO);
         }
     };
     // Observe our userns inode immediately before the mint: the parent
@@ -435,9 +440,7 @@ fn child_main(sock: RawFd) -> ! {
     let Some(ino) = ino else {
         // SAFETY: `dir` is open and owned here.
         unsafe { libc::close(dir) };
-        send_err(sock, libc::EPROTO, b'N');
-        // SAFETY: terminal child exit; no cleanup runs.
-        unsafe { libc::_exit(1) };
+        fail(sock, STAGE_NS_READ, libc::EPROTO);
     };
     let mut attr = TokenAttr {
         flags: 0,
@@ -461,9 +464,7 @@ fn child_main(sock: RawFd) -> ! {
     // Syscall fds fit `RawFd` by construction; anything else fails closed.
     let token = RawFd::try_from(ret).unwrap_or(-1);
     if token < 0 {
-        send_err(sock, ret_errno, b'T');
-        // SAFETY: terminal child exit; no cleanup runs.
-        unsafe { libc::_exit(1) };
+        fail(sock, STAGE_TOKEN, ret_errno);
     }
     let mut msg = [0u8; TOKEN_MSG_LEN];
     msg[0] = KIND_TOKEN;
@@ -770,6 +771,27 @@ mod tests {
         assert_eq!(child_stage_name(b'?'), "userns-child");
     }
 
+    /// The `STAGE_*` consts must keep their historic wire bytes: the
+    /// parent decodes the stage slot with the same consts, so a drift
+    /// would be self-consistent inside one binary yet break any
+    /// cross-version reader of the error message.
+    #[test]
+    fn stage_consts_match_wire_bytes() {
+        assert_eq!(
+            (
+                STAGE_UNSHARE,
+                STAGE_HANDSHAKE,
+                STAGE_DROP,
+                STAGE_FSOPEN,
+                STAGE_SEND_FS,
+                STAGE_RECV_DIR,
+                STAGE_NS_READ,
+                STAGE_TOKEN,
+            ),
+            (b'U', b'G', b'P', b'F', b'S', b'D', b'N', b'T'),
+        );
+    }
+
     /// Payload + fd roundtrip over the seqpacket pair (unprivileged).
     #[test]
     fn msg_roundtrip_unprivileged_case() {
@@ -834,14 +856,15 @@ mod tests {
     }
 
     /// A uniquely-named scratch file whose fd refs the leak probe
-    /// counts. Tests remove it explicitly (best-effort) after use.
-    fn stray_probe_file(tag: &str) -> (std::path::PathBuf, std::fs::File) {
-        let path = std::env::temp_dir().join(format!(
-            "kryprobe-r3-stray-{}-{tag}.tmp",
-            std::process::id()
-        ));
+    /// counts. The guard owns cleanup (RAII, including on failure).
+    fn stray_probe_file(
+        tag: &str,
+    ) -> (kryprobe_testkit::TempDir, std::path::PathBuf, std::fs::File) {
+        let scratch =
+            kryprobe_testkit::TempDir::named(&format!("r3-stray-{tag}")).expect("stray probe dir");
+        let path = scratch.path().join("probe.tmp");
         let file = std::fs::File::create(&path).expect("stray probe file");
-        (path, file)
+        (scratch, path, file)
     }
 
     /// An over-long payload (`MSG_TRUNC`) with an attached fd fails
@@ -850,7 +873,7 @@ mod tests {
     #[test]
     fn recv_truncated_payload_fails_closed_without_leak_case() {
         let (a, b) = seqpacket_pair().expect("socketpair");
-        let (path, probe) = stray_probe_file("payload");
+        let (_scratch, path, probe) = stray_probe_file("payload");
         let probe_fd = std::os::fd::AsRawFd::as_raw_fd(&probe);
         let before = fd_refs_to(&path);
         assert_eq!(before, 1, "one held probe ref");
@@ -870,7 +893,6 @@ mod tests {
             "truncated recvs must not leak fds"
         );
         drop(probe);
-        std::fs::remove_file(&path).ok();
     }
 
     /// Overflowing control data (`MSG_CTRUNC`: three fds against the
@@ -878,7 +900,7 @@ mod tests {
     #[test]
     fn recv_truncated_control_fails_closed_without_leak_case() {
         let (a, b) = seqpacket_pair().expect("socketpair");
-        let (path, f0) = stray_probe_file("control");
+        let (_scratch, path, f0) = stray_probe_file("control");
         // Three opens of the same unique file: every stray copy the
         // kernel installs is countable via the link target.
         let f1 = f0.try_clone().expect("clone probe");
@@ -926,7 +948,6 @@ mod tests {
             "truncated recvs must not leak fds"
         );
         drop((f0, f1, f2));
-        std::fs::remove_file(&path).ok();
     }
 
     /// `close_reported_fds` closes exactly the claimed slots with
@@ -940,7 +961,7 @@ mod tests {
             // SAFETY: `F_GETFD` only reads flags.
             (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
         }
-        let (path, keep) = stray_probe_file("slots");
+        let (_scratch, path, keep) = stray_probe_file("slots");
         use std::os::fd::AsRawFd as _;
         let keep_fd = keep.as_raw_fd();
         // Slot fd: a second open of the probe file, closed by the helper.
@@ -963,7 +984,6 @@ mod tests {
         assert!(is_open(keep_fd), "padding past the claim must never close");
         assert_eq!(fd_refs_to(&path), 1, "exactly the canary survives");
         drop(keep);
-        std::fs::remove_file(&path).ok();
     }
 
     /// The ns-join handle is CLOEXEC at creation (the worker must

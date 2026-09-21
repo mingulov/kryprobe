@@ -51,11 +51,11 @@ fn synthetic_run() -> DriverReport {
 #[test]
 fn shared_losses_accrue_exactly_once_in_session_total() {
     let mut report = synthetic_run();
-    assert!(report.skipped.is_empty());
+    assert!(report.skipped().is_empty());
     assert_eq!(report.skipped_drops(), 0);
-    assert_eq!(report.summaries.len(), 1);
+    assert_eq!(report.summaries().len(), 1);
     assert_eq!(
-        report.summaries[0].integrity,
+        report.summaries()[0].integrity,
         IntegritySummary::default(),
         "synthetic path observes no backend-local losses"
     );
@@ -77,8 +77,8 @@ fn shared_losses_accrue_exactly_once_in_session_total() {
     assert_eq!(report.session_integrity(), want);
     // The feed accrues outside the per-backend sums: backend summaries
     // are untouched, and skip-drop receipts stay disjoint (still zero).
-    assert_eq!(report.summaries[0].integrity, IntegritySummary::default());
-    assert!(report.skipped.is_empty());
+    assert_eq!(report.summaries()[0].integrity, IntegritySummary::default());
+    assert!(report.skipped().is_empty());
     assert_eq!(report.skipped_drops(), 0);
 }
 

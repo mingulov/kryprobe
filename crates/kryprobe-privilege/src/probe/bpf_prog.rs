@@ -8,8 +8,8 @@ use super::bpf_sys::{
 use crate::elfread::{ElfBytes, MmapGuard, symbol_file_offset};
 use crate::fd::OwnedFd;
 use crate::probe::ProbeOutcome;
+use core::ffi::c_void;
 use std::ffi::CString;
-use std::os::raw::c_void;
 
 fn load_minimal(attach_type: u32) -> Result<OwnedFd, i32> {
     // mov r0, 0; exit

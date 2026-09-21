@@ -12,9 +12,11 @@
 pub mod alg_fixture;
 pub mod golden;
 pub mod kcrypto_rows;
+pub mod tempdir;
 
 pub use alg_fixture::{
     BurstCounts, CipherCounts, FixtureError, HashCounts, aead_decrypt_bad_tag, aead_roundtrip,
     burst_encrypt, hash_digest, hash_digest_multi, skcipher_canary_roundtrip, skcipher_roundtrip,
 };
 pub use golden::{UPDATE_ENV_VAR, assert_golden};
+pub use tempdir::TempDir;

@@ -50,6 +50,7 @@
 #![no_main]
 
 use aya_ebpf::{
+    EbpfContext as _,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_get_current_uid_gid, bpf_get_func_ret, bpf_get_stackid, bpf_ktime_get_ns,
@@ -58,7 +59,6 @@ use aya_ebpf::{
     macros::{fexit, map},
     maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, RingBuf, StackTrace},
     programs::FExitContext,
-    EbpfContext as _,
 };
 // Raw `bpf_get_current_comm` (the safe wrapper's `Result<[u8; 16]>`
 // copies do not fit the 512B frame; `current_comm` below keeps one
@@ -360,11 +360,7 @@ fn func_ret(ctx: &FExitContext) -> Option<u64> {
     // SAFETY: helper with (ctx, out-pointer); `ret_val` is a live stack slot.
     let err = unsafe { bpf_get_func_ret(ctx.as_ptr(), &raw mut ret_val) };
     let err = core::hint::black_box(err);
-    if err == 0 {
-        Some(ret_val)
-    } else {
-        None
-    }
+    if err == 0 { Some(ret_val) } else { None }
 }
 
 /// Classify an `int`-returning crypto call: 0 → ok; `-EINPROGRESS`/
@@ -745,20 +741,20 @@ unsafe fn chase_parent(base: *mut VWho) {
     // `Cfg` at 40B and no borrow live across the populate).
     // `None` (unreadable map — essentially never) degrades to
     // flags-off: identity without parent, never a skip.
-    if let Some(row) = KCFG.get(0) {
-        if row.parent_ok != 0 {
-            // SAFETY: helper with no pointer arguments.
-            let task = bpf_get_current_task();
-            if task != 0 {
-                let parent = read_u64(task.wrapping_add(row.task_real_parent as u64));
-                if parent != 0 {
-                    unsafe {
-                        core::ptr::addr_of_mut!((*base).ppid)
-                            .write(read_u32(parent.wrapping_add(row.task_tgid as u64)));
-                        let psrc = parent.wrapping_add(row.task_comm as u64);
-                        let pdst = core::ptr::addr_of_mut!((*base).pcomm).cast::<u8>();
-                        let _ = read_comm(psrc, pdst);
-                    }
+    if let Some(row) = KCFG.get(0)
+        && row.parent_ok != 0
+    {
+        // SAFETY: helper with no pointer arguments.
+        let task = unsafe { bpf_get_current_task() };
+        if task != 0 {
+            let parent = read_u64(task.wrapping_add(row.task_real_parent as u64));
+            if parent != 0 {
+                unsafe {
+                    core::ptr::addr_of_mut!((*base).ppid)
+                        .write(read_u32(parent.wrapping_add(row.task_tgid as u64)));
+                    let psrc = parent.wrapping_add(row.task_comm as u64);
+                    let pdst = core::ptr::addr_of_mut!((*base).pcomm).cast::<u8>();
+                    let _ = read_comm(psrc, pdst);
                 }
             }
         }
@@ -861,30 +857,30 @@ unsafe fn who_upsert(
 /// there must be dead (copied into the map by the insert).
 #[inline(always)]
 unsafe fn record_params(scratch: *mut u8, kh: u64, alg: u64) {
-    if alg != 0 {
-        if let Some(row) = KCFG.get(0) {
-            if row.params_ok != 0 && KPARAMS.get_ptr(kh).is_none() {
-                // SAFETY: `scratch` @ 0 spans 80 bytes; the who init
-                // value above is dead (copied into the map by the
-                // insert).
-                unsafe {
-                    let pslot = scratch as *mut VParams;
-                    core::ptr::addr_of_mut!((*pslot).blocksize)
-                        .write(read_u32(alg.wrapping_add(row.cra_blocksize as u64)));
-                    core::ptr::addr_of_mut!((*pslot).ivsize)
-                        .write(read_u32(alg.wrapping_add(row.cra_ivsize as u64)));
-                    core::ptr::addr_of_mut!((*pslot).min_keysize)
-                        .write(read_u32(alg.wrapping_add(row.cra_min_keysize as u64)));
-                    core::ptr::addr_of_mut!((*pslot).max_keysize)
-                        .write(read_u32(alg.wrapping_add(row.cra_max_keysize as u64)));
-                    // SAFETY: fully initialized above.
-                    let params_ref: &VParams = &*pslot;
-                    let _ = KPARAMS.insert(kh, params_ref, BPF_NOEXIST);
-                }
-                if KPARAMS.get_ptr(kh).is_none() {
-                    who_drops_inc();
-                }
-            }
+    if alg != 0
+        && let Some(row) = KCFG.get(0)
+        && row.params_ok != 0
+        && KPARAMS.get_ptr(kh).is_none()
+    {
+        // SAFETY: `scratch` @ 0 spans 80 bytes; the who init
+        // value above is dead (copied into the map by the
+        // insert).
+        unsafe {
+            let pslot = scratch as *mut VParams;
+            core::ptr::addr_of_mut!((*pslot).blocksize)
+                .write(read_u32(alg.wrapping_add(row.cra_blocksize as u64)));
+            core::ptr::addr_of_mut!((*pslot).ivsize)
+                .write(read_u32(alg.wrapping_add(row.cra_ivsize as u64)));
+            core::ptr::addr_of_mut!((*pslot).min_keysize)
+                .write(read_u32(alg.wrapping_add(row.cra_min_keysize as u64)));
+            core::ptr::addr_of_mut!((*pslot).max_keysize)
+                .write(read_u32(alg.wrapping_add(row.cra_max_keysize as u64)));
+            // SAFETY: fully initialized above.
+            let params_ref: &VParams = &*pslot;
+            let _ = KPARAMS.insert(kh, params_ref, BPF_NOEXIST);
+        }
+        if KPARAMS.get_ptr(kh).is_none() {
+            who_drops_inc();
         }
     }
 }
@@ -1505,6 +1501,6 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 /// Kernel license marker: this object is GPL-2.0-only BPF.
-#[link_section = "license"]
+#[unsafe(link_section = "license")]
 #[used]
 static LICENSE: [u8; 4] = *b"GPL\0";

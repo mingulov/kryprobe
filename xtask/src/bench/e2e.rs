@@ -2,7 +2,7 @@
 //! E2e suite: canonical synthetic script wall time (20 iterations).
 
 use super::{SuiteResult, SuiteStatus, median_of};
-use kryprobe_core::ids::SessionId;
+use kryprobe_core::ids::{IdIssuer, SessionId};
 use kryprobe_core::synthetic::{SyntheticBackend, canonical_script};
 use std::time::Instant;
 
@@ -15,7 +15,12 @@ pub(crate) fn run() -> SuiteResult {
     let mut samples = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         let start = Instant::now();
-        if backend.run_script(SessionId::new(1)).is_err() {
+        // Fresh issuer per sample: each run mints `observation:1..`
+        // (1B-L1), so samples stay mutually comparable.
+        if backend
+            .run_script(SessionId::new(1), &IdIssuer::default())
+            .is_err()
+        {
             return SuiteResult {
                 name: "e2e",
                 status: SuiteStatus::Denied {

@@ -5,7 +5,7 @@ use super::{
     BpfSelftestConfig, BpfSelftestError, BpfSelftestOutcome, await_line, is_denied, kill_quietly,
     pump_lines, view_spine_event,
 };
-use crate::attach::AttachError;
+use crate::attach::{AttachError, OwnedLink};
 use crate::bpfloader::LoadedSpine;
 use crate::drain::{DrainEvent, DrainStats, DrainThread};
 use crate::elfread::goblin_parser;
@@ -68,18 +68,8 @@ pub(super) fn roundtrip(
     outcome
 }
 
-fn drive(
-    config: &BpfSelftestConfig,
-    loaded: &LoadedSpine,
-    offset: u64,
-    child: &mut Child,
-) -> Result<BpfSelftestOutcome, BpfSelftestError> {
-    let lines = pump_lines(child.stdout.take().expect("piped stdout"));
-    if await_line(&lines, "READY", Duration::from_secs(10))? != "READY" {
-        return Err(BpfSelftestError::BadEvent("READY line malformed"));
-    }
-    let pid = child.id();
-    let generation = PlanGeneration::new(GENERATION);
+/// Arm the fixture maps: generation + tgid into CONFIG, START set.
+fn arm_maps(loaded: &LoadedSpine, pid: u32) -> Result<(), BpfSelftestError> {
     for (map, key, value, stage) in [
         (&loaded.maps.config, 0, u64::from(GENERATION), "config/gen"),
         (&loaded.maps.config, 1, u64::from(pid), "config/tgid"),
@@ -87,12 +77,24 @@ fn drive(
     ] {
         map_update(map, key, value, stage).map_err(|err| map_denied(stage, err))?;
     }
-    let meta = std::fs::symlink_metadata(&config.fixture)
+    Ok(())
+}
+
+/// Attach entry + return probes as concurrent groups with disjoint
+/// cookie indices (sharing index 0 would merge their COUNT slots).
+/// Returned links stay bound until the caller drops them (drop =
+/// detach) after the drain finishes.
+fn attach_entry_ret(
+    loaded: &LoadedSpine,
+    fixture: &std::path::Path,
+    offset: u64,
+    pid: u32,
+    generation: PlanGeneration,
+) -> Result<Vec<OwnedLink>, BpfSelftestError> {
+    let meta = std::fs::symlink_metadata(fixture)
         .map_err(|err| BpfSelftestError::Fixture(err.to_string()))?;
     let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-    // One allocator for the round's single generation: entry and return
-    // are concurrent groups, so they take disjoint indices (sharing index
-    // 0 would merge their COUNT slots).
+    // One allocator for the round's single generation.
     let mut cookies = CookieAllocator::new(generation);
     let alloc = |cookies: &mut CookieAllocator, stage: &'static str| {
         cookies.allocate(1).map_err(|err| {
@@ -115,7 +117,6 @@ fn drive(
         )
     };
     let guard = GenerationGuard { generation };
-    // Links stay bound until the drain below finishes (drop = detach).
     let mut links = Vec::new();
     for (prog, entry, stage) in [
         (&loaded.progs.entry, true, "entry attach"),
@@ -123,13 +124,7 @@ fn drive(
     ] {
         let range = alloc(&mut cookies, stage)?;
         let link = LocalPrivilegedAuthority
-            .attach_group(
-                &group(entry, range),
-                &guard,
-                prog,
-                &config.fixture,
-                &[offset],
-            )
+            .attach_group(&group(entry, range), &guard, prog, fixture, &[offset])
             .map_err(|err| match err {
                 AttachError::LinkFailed { errno, .. } if is_denied(errno) => {
                     BpfSelftestError::Denied {
@@ -141,29 +136,28 @@ fn drive(
             })?;
         links.push(link);
     }
-    let drain_config = DrainConfig {
-        // A full ring per wakeup (256 KiB / 72 B ≈ 3.6k records).
-        max_events_per_iter: 4096,
-        // Absorbs whole wakeup bursts (try_send never blocks, so a
-        // shallow queue would drop under burst production even with a
-        // concurrent receiver); production backends size their own.
-        queue_depth: 65536,
-        poll_timeout_ms: 50,
-    };
-    let drain = DrainThread::spawn(&loaded.maps.events, RING_BYTES, &drain_config)
-        .map_err(|err| BpfSelftestError::Drain(format!("{err:?}")))?;
+    Ok(links)
+}
+
+/// GO the fixture, then drain records until the DONE watcher settles
+/// the ring (plus a final non-blocking sweep). Records collect
+/// CONCURRENTLY with the fixture run, so bursts larger than the
+/// queue survive; the flag is set on every path (including fixture
+/// errors) so the collector always terminates.
+fn drain_until_settled(
+    child: &mut Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    drain: DrainThread,
+    done_secs: u64,
+) -> Result<(Vec<Vec<u8>>, DrainStats), BpfSelftestError> {
     child
         .stdin
         .as_mut()
-        .expect("piped stdin")
+        .ok_or_else(|| BpfSelftestError::Fixture("piped stdin".to_owned()))?
         .write_all(b"GO\n")
         .map_err(|err| BpfSelftestError::Fixture(err.to_string()))?;
-    let done_secs = 30 + config.calls / 500;
     // DONE watcher owns the line pump: it waits for DONE, lets the ring
-    // settle, then releases the collector below. Records are collected
-    // CONCURRENTLY with the fixture run, so bursts larger than the
-    // queue survive; the flag is set on every path (including fixture
-    // errors) so the collector always terminates.
+    // settle, then releases the collector below.
     let settled = Arc::new(AtomicBool::new(false));
     let settled_w = settled.clone();
     let watcher = thread::spawn(move || {
@@ -192,19 +186,22 @@ fn drive(
     watcher
         .join()
         .map_err(|_| BpfSelftestError::Fixture("DONE watcher panicked".to_owned()))??;
-    let stats: DrainStats = drain.stop();
-    drop(links);
-    let status = child
-        .wait()
-        .map_err(|err| BpfSelftestError::Fixture(err.to_string()))?;
-    if !status.success() {
-        return Err(BpfSelftestError::FixtureExit(status.code().unwrap_or(-1)));
-    }
-    use std::os::unix::process::ExitStatusExt as _;
-    let (exit_code, signal) = (status.code(), status.signal());
+    Ok((records, drain.stop()))
+}
+
+/// Tally drained records into the outcome: generation + flag checks,
+/// entry/return counts, BPF loss counters, and the reconcile ledger.
+fn tally(
+    loaded: &LoadedSpine,
+    calls: u64,
+    records: &[Vec<u8>],
+    stats: DrainStats,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> Result<BpfSelftestOutcome, BpfSelftestError> {
     let mut entries = 0u64;
     let mut returns = 0u64;
-    for bytes in &records {
+    for bytes in records {
         let view = view_spine_event(bytes)?;
         if view.cookie >> 32 != u64::from(GENERATION) {
             return Err(BpfSelftestError::BadEvent("stale generation leaked"));
@@ -222,7 +219,7 @@ fn drive(
     let truncated = map_lookup_percpu_sum(&loaded.maps.loss, 2, "loss/trunc")
         .map_err(|err| map_denied("loss/trunc", err))?;
     let ledger = LossLedger {
-        exact: 2 * config.calls,
+        exact: 2 * calls,
         received: records.len() as u64,
         drops: ring.saturating_add(dropped).saturating_add(truncated),
     };
@@ -238,4 +235,55 @@ fn drive(
         signal,
         verdict: ledger.reconcile(),
     })
+}
+
+fn drive(
+    config: &BpfSelftestConfig,
+    loaded: &LoadedSpine,
+    offset: u64,
+    child: &mut Child,
+) -> Result<BpfSelftestOutcome, BpfSelftestError> {
+    // 1A-L1: stdio is piped by the spawn above, so `take` never
+    // fails — but the error type is `Result`, not panic-shaped.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BpfSelftestError::Fixture("piped stdout".to_owned()))?;
+    let lines = pump_lines(stdout);
+    if await_line(&lines, "READY", Duration::from_secs(10))? != "READY" {
+        return Err(BpfSelftestError::BadEvent("READY line malformed"));
+    }
+    let pid = child.id();
+    let generation = PlanGeneration::new(GENERATION);
+    arm_maps(loaded, pid)?;
+    let links = attach_entry_ret(loaded, &config.fixture, offset, pid, generation)?;
+    let drain_config = DrainConfig {
+        // A full ring per wakeup (256 KiB / 72 B ≈ 3.6k records).
+        max_events_per_iter: 4096,
+        // Absorbs whole wakeup bursts (try_send never blocks, so a
+        // shallow queue would drop under burst production even with a
+        // concurrent receiver); production backends size their own.
+        queue_depth: 65536,
+        poll_timeout_ms: 50,
+    };
+    let drain = DrainThread::spawn(&loaded.maps.events, RING_BYTES, &drain_config)
+        .map_err(|err| BpfSelftestError::Drain(format!("{err:?}")))?;
+    let done_secs = 30 + config.calls / 500;
+    let (records, stats) = drain_until_settled(child, lines, drain, done_secs)?;
+    drop(links);
+    let status = child
+        .wait()
+        .map_err(|err| BpfSelftestError::Fixture(err.to_string()))?;
+    if !status.success() {
+        return Err(BpfSelftestError::FixtureExit(status.code().unwrap_or(-1)));
+    }
+    use std::os::unix::process::ExitStatusExt as _;
+    tally(
+        loaded,
+        config.calls,
+        &records,
+        stats,
+        status.code(),
+        status.signal(),
+    )
 }
