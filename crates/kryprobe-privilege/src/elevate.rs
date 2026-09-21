@@ -25,17 +25,32 @@ pub fn elevated_with(euid: u32, capeff: u64) -> bool {
 
 /// Live elevation check over the current process.
 ///
-/// Fail-open on unreadable/unparseable `/proc/self/status` (the
-/// `cmd_token::effective_cap_names` convention): hiding self-status
-/// from the process itself already implies deeper compromise, and
-/// euid 0 short-circuits before any read.
+/// Fail-CLOSED on unreadable/unparseable `/proc/self/status` (G10:
+/// fail-open let a mount-namespace without `/proc` convince a file-cap
+/// process it was unprivileged, re-enabling env/CWD artifact tiers —
+/// no compromise needed, just `unshare -m`). euid 0 short-circuits
+/// before any read. [`elevated_with_status`] is the pure form for tests.
 #[must_use]
 pub fn process_is_elevated() -> bool {
     // SAFETY: trivial getter.
-    if unsafe { libc::geteuid() } == 0 {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
         return true;
     }
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    elevated_with_status(
+        euid,
+        &std::fs::read_to_string("/proc/self/status").unwrap_or_default(),
+    )
+}
+
+/// Pure elevation check over an euid + status text (unit-tested):
+/// euid 0 is elevated; otherwise a parseable `CapEff` decides, and a
+/// missing/unparseable `CapEff` line fails closed (elevated).
+#[must_use]
+pub fn elevated_with_status(euid: u32, status: &str) -> bool {
+    if euid == 0 {
+        return true;
+    }
     for line in status.lines() {
         if let Some(hex) = line.strip_prefix("CapEff:")
             && let Ok(bits) = u64::from_str_radix(hex.trim(), 16)
@@ -43,7 +58,7 @@ pub fn process_is_elevated() -> bool {
             return has_elevating_caps(bits);
         }
     }
-    false
+    true
 }
 
 #[cfg(test)]
@@ -68,5 +83,25 @@ mod tests {
     #[test]
     fn self_check_does_not_panic() {
         let _ = super::process_is_elevated();
+    }
+
+    #[test]
+    fn status_parse_fails_closed() {
+        use super::elevated_with_status;
+        // Parseable CapEff decides.
+        assert!(elevated_with_status(
+            1000,
+            "Name:\tx\nCapEff:\t0000008000000000\n"
+        ));
+        assert!(!elevated_with_status(
+            1000,
+            "Name:\tx\nCapEff:\t0000000000000000\n"
+        ));
+        // Missing/unparseable CapEff fails closed (G10 mount-ns bypass).
+        assert!(elevated_with_status(1000, ""));
+        assert!(elevated_with_status(1000, "Name:\tx\n"));
+        assert!(elevated_with_status(1000, "CapEff:\tnot-hex\n"));
+        // Root is elevated regardless of status text.
+        assert!(elevated_with_status(0, ""));
     }
 }
