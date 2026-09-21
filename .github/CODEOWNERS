@@ -1,21 +1,41 @@
-# kryprobe product ownership. Paths relative to the product repo root.
-# Single owner until backend maintainers exist; every thin-spine shared
-# contract (manifests, ABI, schemas, decisions) has one writer.
+# kryprobe product ownership (4B-M7: rewritten against the real tree).
+# Paths relative to the product repo root. Single owner until backend
+# maintainers exist; every thin-spine shared contract (manifests, ABI,
+# schemas, decisions) has one writer.
+
+# Workspace roots: manifests, lockfile, toolchain, supply-chain policy.
 /Cargo.toml @mingulov
 /Cargo.lock @mingulov
 /rust-toolchain.toml @mingulov
-/mise.toml @mingulov
+/deny.toml @mingulov
+/audit.toml @mingulov
+
+# Orchestration + lanes.
 /xtask/ @mingulov
+/scripts/ @mingulov
+/.github/ @mingulov
+
+# BPF crates (pinned nightly) + lane notes.
+/crates/bpf-spine/ @mingulov
+/crates/bpf-kcrypto/ @mingulov
+/bpf/ @mingulov
+
+# Host crates.
 /crates/kryprobe-abi/ @mingulov
 /crates/kryprobe-core/ @mingulov
-/bpf/userspace/src/common/ @mingulov
+/crates/kryprobe-cli/ @mingulov
+/crates/kryprobe-policy/ @mingulov
+/crates/kryprobe-privilege/ @mingulov
+/crates/kryprobe-report/ @mingulov
+/crates/kryprobe-testkit/ @mingulov
+
+# Shared contracts + docs + install.
 /schemas/ @mingulov
-/docs/decisions/ @mingulov
+/tests/ @mingulov
+/docs/ @mingulov
+/packaging/ @mingulov
+/CHANGELOG.md @mingulov
+/README.md @mingulov
+/AGENTS.md @mingulov
 
 # Backend ownership can expand when maintainers exist.
-/crates/kryprobe-backend-p11/ @mingulov
-/bpf/userspace/src/p11/ @mingulov
-/crates/kryprobe-backend-openssl/ @mingulov
-/bpf/userspace/src/openssl/ @mingulov
-/crates/kryprobe-backend-kcrypto/ @mingulov
-/bpf/kcrypto/ @mingulov

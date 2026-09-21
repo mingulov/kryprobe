@@ -438,11 +438,29 @@ fn parser_globals_case() {
     assert!(parsed(&["kryprobe", "--help"]).is_err());
     assert!(parsed(&["kryprobe", "--version"]).is_err());
     let args = parsed(&["kryprobe", "--json", "doctor"]).expect("global json");
-    assert!(matches!(args.command, CliCommand::Doctor { json: true }));
+    assert!(matches!(
+        args.command,
+        CliCommand::Doctor {
+            json: true,
+            versions: false
+        }
+    ));
     let args = parsed(&["kryprobe", "doctor", "--json"]).expect("command json");
-    assert!(matches!(args.command, CliCommand::Doctor { json: true }));
+    assert!(matches!(
+        args.command,
+        CliCommand::Doctor {
+            json: true,
+            versions: false
+        }
+    ));
     let args = parsed(&["kryprobe", "doctor"]).expect("plain doctor");
-    assert!(matches!(args.command, CliCommand::Doctor { json: false }));
+    assert!(matches!(
+        args.command,
+        CliCommand::Doctor {
+            json: false,
+            versions: false
+        }
+    ));
 }
 
 #[test]
@@ -730,6 +748,7 @@ fn outcome_with(
         coverage,
         integrity: IntegritySummary::default(),
         terminal_state: kryprobe_core::session::SessionState::Finalized,
+        interrupted: false,
     }
 }
 

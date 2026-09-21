@@ -4,7 +4,7 @@
 pub(crate) mod strip;
 
 use crate::channel_from_file;
-use crate::child::{run_child, run_child_in};
+use crate::child::{run_child, run_child_in_timeout};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -21,6 +21,16 @@ pub(crate) fn build_bpf() -> i32 {
             Strip::DropUnreferencedText,
         ),
     ])
+}
+
+/// Pinned linker (4B-M6): same fail-loud style as the nightly skew
+/// gate — the strip recipes are sensitive to linker output shape.
+const PINNED_BPF_LINKER: &str = "0.10.4";
+
+/// True when `bpf-linker --version` output is exactly the pin.
+fn linker_version_ok(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    matches!(words.next(), Some("bpf-linker")) && words.next() == Some(PINNED_BPF_LINKER)
 }
 
 /// Which strip recipe applies to one BPF object.
@@ -83,14 +93,23 @@ fn build_bpf_inner(rows: &[(&str, &str, &str, Strip)]) -> i32 {
         );
         return 1;
     }
-    if Command::new("bpf-linker")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("xtask build --bpf: `bpf-linker` not found on PATH");
-        eprintln!("install it with: cargo install bpf-linker");
-        return 1;
+    match Command::new("bpf-linker").arg("--version").output() {
+        Ok(out) if linker_version_ok(&String::from_utf8_lossy(&out.stdout)) => {}
+        Ok(out) => {
+            eprintln!(
+                "xtask build --bpf: bpf-linker skew: want {PINNED_BPF_LINKER}, got {:?} (docs/dependencies/pins.md)",
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+            return 1;
+        }
+        Err(_) => {
+            eprintln!("xtask build --bpf: `bpf-linker` not found on PATH");
+            eprintln!("install it with: cargo install bpf-linker@{PINNED_BPF_LINKER}");
+            return 1;
+        }
     }
     for (dir, bin, out, strip) in rows {
         let code = build_one(&root, &channel, dir, bin, out, *strip);
@@ -101,6 +120,10 @@ fn build_bpf_inner(rows: &[(&str, &str, &str, Strip)]) -> i32 {
     0
 }
 
+/// BPF object build budget (4B-L2): the linker hang flake spins for
+/// 7+ minutes on a <1s link — 120s bounds it with a loud retry.
+const BUILD_TIMEOUT_SECS: u64 = 120;
+
 /// Build + strip one BPF object row.
 fn build_one(
     root: &std::path::Path,
@@ -110,11 +133,23 @@ fn build_one(
     out: &str,
     strip: Strip,
 ) -> i32 {
-    let code = run_child_in(
-        &root.join("crates").join(dir),
-        "rustup",
-        &["run", channel, "cargo", "build", "--release", "--bin", bin],
-    );
+    let workdir = root.join("crates").join(dir);
+    let argv: &[&str] = &["run", channel, "cargo", "build", "--release", "--bin", bin];
+    // 4B-L2: timeout → loud retry-once → fail. The retry stays
+    // visible so flakes stay counted, never silent.
+    let code = match run_child_in_timeout(&workdir, "rustup", argv, BUILD_TIMEOUT_SECS) {
+        Some(code) => code,
+        None => {
+            eprintln!("xtask build --bpf: [{out}] build timed out once; retrying once");
+            match run_child_in_timeout(&workdir, "rustup", argv, BUILD_TIMEOUT_SECS) {
+                Some(code) => code,
+                None => {
+                    eprintln!("xtask build --bpf: [{out}] build timed out twice; failing");
+                    return 1;
+                }
+            }
+        }
+    };
     if code != 0 {
         return code;
     }
@@ -257,5 +292,21 @@ fn workspace_root() -> Option<PathBuf> {
         if !dir.pop() {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linker_version_gate() {
+        // 4B-M6: exact pin match only — a drifted linker changes
+        // emitted objects the strip recipes are sensitive to.
+        assert!(linker_version_ok("bpf-linker 0.10.4\n"));
+        assert!(!linker_version_ok("bpf-linker 0.10.5\n"));
+        assert!(!linker_version_ok("bpf-linker 0.10.4-rc1\n"));
+        assert!(!linker_version_ok(""));
+        assert!(!linker_version_ok("not-a-linker 0.10.4\n"));
     }
 }

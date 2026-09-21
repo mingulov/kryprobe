@@ -132,9 +132,12 @@ toolchain and prints the install command.
 `docs/commands.md` is the command reference; `AGENTS.md` holds the
 agent workflow rules. Human contributors need three procedures:
 
-- Gate: `cargo xtask check` (pinned toolchain, fmt, clippy, host
-  tests) must pass before review. Behavior changes land with tests;
-  output-shape changes update the goldens below.
+- Gate: `cargo xtask check` (pinned toolchain, fmt, clippy, doc,
+  host tests) is the required pre-merge gate — run it, not bare
+  `cargo test` (which skips the seam gate, the pins, and `--locked`).
+  CI enforces the same gate plus the BPF lane and supply scans.
+  Behavior changes land with tests; output-shape changes update the
+  goldens below.
 - Privileged lanes: `cargo xtask test bpf` builds the BPF objects
   and runs the runnable privileged suites (honest `Denied` without
   caps). The sudo lanes (`#[ignore]`d tests naming \"the lane lock\"

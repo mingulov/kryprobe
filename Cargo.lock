@@ -161,11 +161,11 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kryprobe-abi"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "kryprobe-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "kryprobe-abi",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "kryprobe-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "kryprobe-abi",
  "kryprobe-report",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "kryprobe-policy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "kryprobe-core",
  "serde",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "kryprobe-privilege"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "goblin",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "kryprobe-report"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "kryprobe-core",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "kryprobe-testkit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "kryprobe-abi",
  "libc",
@@ -462,7 +462,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "goblin",
  "kryprobe-core",

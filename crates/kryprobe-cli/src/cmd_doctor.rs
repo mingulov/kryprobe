@@ -126,6 +126,75 @@ fn kcrypto_object_bytes() -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Spine object candidates (G6 M1): the exe-bundled deploy tier,
+/// then the dev-layout sibling (`target/kryprobe-bpf/` next to
+/// `target/debug/`). Pure over the exe dir for tests.
+fn spine_object_candidates(exe_dir: &std::path::Path) -> [std::path::PathBuf; 2] {
+    [
+        exe_dir.join("kryprobe-bpf/spine.bpf.o"),
+        exe_dir.join("../kryprobe-bpf/spine.bpf.o"),
+    ]
+}
+
+/// Best-effort spine object identity (G6 M1): first readable
+/// candidate plus its sha256. `None` is environmental (thin spine
+/// loads no spine object; dev shells may not have built one).
+fn spine_object_identity() -> Option<(String, String)> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))?;
+    for candidate in spine_object_candidates(&exe_dir) {
+        if let Ok(bytes) = std::fs::read(&candidate) {
+            let digest = kryprobe_privilege::sha256_hex(&bytes);
+            return Some((candidate.display().to_string(), digest));
+        }
+    }
+    None
+}
+
+/// Artifact versions object (G6 M1): binary plus both BPF objects
+/// plus the pin-enforcement bit. Pure over inputs for tests.
+fn versions_value(
+    binary: &str,
+    kcrypto: Option<(String, String)>,
+    spine: Option<(String, String)>,
+    pins_enforced: bool,
+) -> serde_json::Value {
+    let object = |identity: Option<(String, String)>| match identity {
+        Some((path, sha256)) => serde_json::json!({"path": path, "sha256": sha256}),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "binary": binary,
+        "kcrypto": object(kcrypto),
+        "spine": object(spine),
+        "pins_enforced": pins_enforced,
+    })
+}
+
+/// Runs `doctor --versions` (G6 M1); always exit 0 (absent objects
+/// are data, not failure).
+fn run_versions(json: bool, stdout: &mut dyn Write) -> i32 {
+    let binary = env!("CARGO_PKG_VERSION");
+    let kcrypto = kryprobe_privilege::locate_kcrypto_object_identity()
+        .map(|(path, digest)| (path.display().to_string(), digest));
+    let spine = spine_object_identity();
+    let pins = kryprobe_privilege::pins_enforced();
+    if json {
+        let _ = writeln!(stdout, "{}", versions_value(binary, kcrypto, spine, pins));
+        return 0;
+    }
+    let word = |identity: &Option<(String, String)>| match identity {
+        Some((path, digest)) => format!("{path} (sha256 {digest})"),
+        None => "absent".to_owned(),
+    };
+    let _ = writeln!(stdout, "binary: {binary}");
+    let _ = writeln!(stdout, "kcrypto: {}", word(&kcrypto));
+    let _ = writeln!(stdout, "spine: {}", word(&spine));
+    let _ = writeln!(stdout, "pins_enforced: {pins}");
+    0
+}
+
 /// One configured point as `name=word` (Task-2 `point_word` vocabulary).
 fn point_word(point: &ConfiguredPoint) -> String {
     let load = match &point.load {
@@ -291,7 +360,10 @@ fn coverage_verdict(
 }
 
 /// Runs `doctor`; always exit 0 (degraded rows are data, not failure).
-pub fn run(json: bool, stdout: &mut dyn Write) -> i32 {
+pub fn run(json: bool, versions: bool, stdout: &mut dyn Write) -> i32 {
+    if versions {
+        return run_versions(json, stdout);
+    }
     let mut matrix = run_probe_matrix();
     let caps = crate::runtime_facts::effective_cap_names();
     let privileged = is_privileged(&caps);
@@ -386,6 +458,40 @@ mod tests {
                 "detail": "attach 7/9: aead_decrypt=loaded+unattached",
             })
         );
+    }
+
+    #[test]
+    fn spine_candidates_prefer_bundled_then_dev_layout() {
+        let exe = PathBuf::from("/prefix/bin");
+        assert_eq!(
+            spine_object_candidates(&exe),
+            [
+                PathBuf::from("/prefix/bin/kryprobe-bpf/spine.bpf.o"),
+                PathBuf::from("/prefix/bin/../kryprobe-bpf/spine.bpf.o"),
+            ]
+        );
+    }
+
+    #[test]
+    fn versions_value_pins_shape() {
+        let value = versions_value(
+            "0.1.0",
+            Some(("kcrypto.bpf.o".to_owned(), "aa".to_owned())),
+            None,
+            true,
+        );
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "binary": "0.1.0",
+                "kcrypto": {"path": "kcrypto.bpf.o", "sha256": "aa"},
+                "spine": null,
+                "pins_enforced": true,
+            })
+        );
+        let absent = versions_value("0.1.0", None, None, false);
+        assert_eq!(absent["kcrypto"], serde_json::Value::Null);
+        assert_eq!(absent["pins_enforced"], serde_json::json!(false));
     }
 
     #[test]

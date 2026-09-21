@@ -26,6 +26,8 @@ commands:
   test bpf     build BPF object + fixture, run the BPF pipeline lane
   verify generated
                schema-freeze + fixture-validation report tests
+  verify supply
+               cargo-deny + cargo audit (exit 4 when scanners absent)
   bench [--json]
                receipt suites: attach/drain/elf/e2e (exit 4 when denied)
 ";
@@ -63,6 +65,9 @@ fn run(argv: &[String]) -> i32 {
     }
     if argv[1] == "verify" && argv.len() == 3 && argv[2] == "generated" {
         return run_child("cargo", &["test", "--locked", "-p", "kryprobe-report"]);
+    }
+    if argv[1] == "verify" && argv.len() == 3 && argv[2] == "supply" {
+        return verify_supply();
     }
     if argv[1] == "bench" && argv.len() == 2 {
         return bench::bench(false);
@@ -102,6 +107,28 @@ fn check() -> i32 {
         }
     }
     0
+}
+
+/// Supply-chain lane (4B-H3): `cargo deny` (licenses + bans +
+/// advisories per `deny.toml`) then `cargo audit` (RUSTSEC per
+/// `audit.toml`). Both need their scanners installed and (for fresh
+/// advisories) network — absent scanners exit 4 with the install
+/// line, never a silent pass. CI runs this on every push/PR plus a
+/// nightly schedule.
+fn verify_supply() -> i32 {
+    for tool in ["cargo-deny", "cargo-audit"] {
+        let probe = Command::new(tool).arg("--version").output();
+        if probe.is_err() {
+            eprintln!("xtask verify supply: `{tool}` not installed (supply scan unavailable)");
+            eprintln!("install it with: cargo install {tool} --locked");
+            return 4;
+        }
+    }
+    let deny = run_child("cargo", &["deny", "--locked", "check"]);
+    if deny != 0 {
+        return deny;
+    }
+    run_child("cargo", &["audit", "--deny", "warnings"])
 }
 
 /// Fail fast when the active `rustc` is not the pinned toolchain.

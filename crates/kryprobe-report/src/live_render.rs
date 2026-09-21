@@ -365,10 +365,13 @@ pub const LIVE_QUALIFICATION_ID: &str = "live";
 /// sessions (test-only `Synthetic` results refuse, never stamp).
 /// Native op/algorithm names come from the payload (`op` /
 /// `algorithm` keys); shapes without them (totals, who) report
-/// `unknown` rather than inventing names.
+/// `unknown` rather than inventing names. `interrupted` (4B-M5: a
+/// SIGINT-cut window) forces `PARTIAL` even when every measured
+/// dimension held.
 pub fn render_live_jsonl(
     observations: &[NativeObservation],
     coverage: &CoverageSummary,
+    interrupted: bool,
 ) -> Result<String, ReportError> {
     let mut writer = JsonlWriter::new(LIVE_SESSION_ID);
     writer.session_start(&SessionStart {
@@ -397,7 +400,7 @@ pub fn render_live_jsonl(
             },
         )?;
     }
-    let verdict = if trailer_dims(coverage).is_empty() {
+    let verdict = if !interrupted && trailer_dims(coverage).is_empty() {
         SessionVerdict::Observed
     } else {
         SessionVerdict::Partial

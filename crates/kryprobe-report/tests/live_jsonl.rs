@@ -114,7 +114,7 @@ fn live_jsonl_renders_validated_stream() {
         // report `unknown`, never invent names.
         kcrypto_obs(2, None, None, NativeResult::KCrypto { status: 0 }),
     ];
-    let text = render_live_jsonl(&observations, &healthy_coverage()).expect("renders");
+    let text = render_live_jsonl(&observations, &healthy_coverage(), false).expect("renders");
     assert_eq!(check_stream(&text, LIVE_KINDS), Vec::new());
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "start + 2 obs + end");
@@ -135,7 +135,7 @@ fn live_jsonl_stamps_advance_by_shared_step() {
         None,
         NativeResult::KCrypto { status: 0 },
     )];
-    let text = render_live_jsonl(&observations, &healthy_coverage()).expect("renders");
+    let text = render_live_jsonl(&observations, &healthy_coverage(), false).expect("renders");
     let stamps = stamps(&text);
     assert_eq!(stamps.len(), 3);
     for pair in stamps.windows(2) {
@@ -163,8 +163,22 @@ fn live_jsonl_rejects_synthetic_result() {
         NativeResult::Synthetic { code: 0 },
     )];
     assert_eq!(
-        render_live_jsonl(&observations, &healthy_coverage()),
+        render_live_jsonl(&observations, &healthy_coverage(), false),
         Err(ReportError::SyntheticResult)
+    );
+}
+
+#[test]
+fn live_jsonl_marks_partial_verdict_when_interrupted() {
+    // 4B-M5: a SIGINT-cut window forces PARTIAL even when every
+    // measured dimension held.
+    let text = render_live_jsonl(&[], &healthy_coverage(), true).expect("renders");
+    assert_eq!(check_stream(&text, LIVE_KINDS), Vec::new());
+    assert!(
+        text.lines()
+            .last()
+            .expect("end line")
+            .contains("\"PARTIAL\"")
     );
 }
 
@@ -172,7 +186,7 @@ fn live_jsonl_rejects_synthetic_result() {
 fn live_jsonl_marks_partial_verdict_on_gap() {
     let mut coverage = healthy_coverage();
     coverage.attachment.status = CoverageStatus::Partial;
-    let text = render_live_jsonl(&[], &coverage).expect("renders");
+    let text = render_live_jsonl(&[], &coverage, false).expect("renders");
     assert_eq!(check_stream(&text, LIVE_KINDS), Vec::new());
     assert!(
         text.lines()

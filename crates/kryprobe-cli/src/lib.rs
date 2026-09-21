@@ -49,7 +49,7 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
         }
     };
     match command {
-        Command::Doctor { json } => cmd_doctor::run(json, stdout),
+        Command::Doctor { json, versions } => cmd_doctor::run(json, versions, stdout),
         Command::Backends { json } => cmd_backends::run(json, stdout, stderr),
         Command::Inspect { pid, json } => cmd_inspect::run(pid, json, stdout, stderr),
         Command::SelftestSynthetic { out } => selftest_synth::run(out.as_deref(), stdout, stderr),

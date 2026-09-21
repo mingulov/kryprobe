@@ -19,7 +19,13 @@ the kcrypto row verified against `kcrypto.bpf.o` in-tree.
   `crates/bpf-spine/Cargo.toml` and
   `crates/bpf-kcrypto/Cargo.toml`; crates.io latest in the 0.2 line).
 - clang: not required (no C BPF sources; bpf-linker is prebuilt).
-  Inspection uses the system `llvm-readelf`/`llvm-strip`.
+  Inspection uses the system `llvm-readelf`/`llvm-strip`, verified
+  set Ubuntu LLVM 21.1.8 (4B-M6: inspection-only — record the local
+  versions when re-verifying sections, but they gate nothing).
+- Build hang guard (4B-L2): each BPF object build gets 120s, then
+  one loud retry, then failure (`BUILD_TIMEOUT_SECS` in
+  `xtask/src/bpf/mod.rs`) — the recorded 7-minute linker spin can
+  never stick a lane silently.
 
 Both BPF crates carry their own committed `Cargo.lock` (they build
 outside the host workspace): bump either only with the same dated

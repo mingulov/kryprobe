@@ -44,9 +44,10 @@
 //! COMPLETE; any measured loss flips its dimension to `Partial`.
 //!
 //! Sessions are process-exclusive (sensors are system-wide; the BPF lane
-//! lock serializes). Stopping is std-only: bounded runs stop at the
-//! deadline, unbounded runs stop on closed stdin; SIGINT keeps the
-//! default disposition and terminates (documented approach, no handler).
+//! lock serializes). Bounded runs stop at the deadline, unbounded runs
+//! stop on closed stdin; SIGINT is caught (4B-M5: a flag recorder, no
+//! libc in the CLI) — the tick loop observes it, finalizes, renders
+//! the partial window, and exits 3 instead of dying mid-capture.
 
 use kryprobe_abi::kcrypto_agg::kh_of;
 use kryprobe_core::backend::{
@@ -66,6 +67,7 @@ use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_core::session::{SessionController, SessionState};
 use kryprobe_privilege::btf_resolve::{ConfiguredKcrypto, KCRYPTO_SYMBOLS};
 use kryprobe_privilege::drain::DrainThread;
+use kryprobe_privilege::host::SIGINT_SEEN;
 use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms};
 use kryprobe_privilege::kcrypto_backend::{
     ClosingCounts, KCryptoBackend, KDROP_DESTROY, KDROP_SITES, WhoCache, WhoSnapshot,
@@ -94,15 +96,40 @@ pub const DEFAULT_TICK_MS: u64 = 1000;
 /// closed-stdin stops a session promptly.
 const STOP_POLL_MS: u64 = 50;
 
+/// Per-tick progress hook (4B-M5): `(tick_1_based, rows, drops)`.
+/// Production prints a stderr liveness line; tests pass `None`.
+/// Stderr progress is human-only/unstable (4B-M4): never script on it.
+pub type TickProgress = dyn Fn(u64, u64, u64);
+
+/// JSON-mode audit line for the privileged object load (4B-M4): the
+/// staged object path plus its sha256. Pure over inputs for tests;
+/// the shape is documented in `docs/json.md`.
+fn audit_object_line(path: &str, sha256: &str) -> String {
+    serde_json::json!({"audit": "object-load", "path": path, "sha256": sha256}).to_string()
+}
+
+/// JSON-mode audit line for the attach outcome (4B-M4): attached vs
+/// expected probe points. Pure over inputs for tests.
+fn audit_attach_line(attached: usize, expected: usize) -> String {
+    serde_json::json!({"audit": "attach", "attached": attached, "expected": expected}).to_string()
+}
+
+/// Emits one audit line to stderr in JSON mode, silent otherwise
+/// (4B-M4: stderr stays human-only outside JSON mode).
+fn emit_audit(json_audit: bool, line: &str) {
+    if json_audit {
+        eprintln!("{line}");
+    }
+}
+
 /// Live capture configuration (brief-exact shape + the K5 token path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConfig {
     /// Capture source; only [`LIVE_SOURCE`] is supported.
     pub source: String,
-    /// Window length; `None` runs until SIGINT or closed stdin. Stopping
-    /// is std-only (the brief's documented approach): no SIGINT handler
-    /// is installed, so SIGINT terminates via the default disposition
-    /// (sensors drop via RAII); closed stdin stops gracefully through a
+    /// Window length; `None` runs until SIGINT or closed stdin. SIGINT
+    /// is caught (4B-M5): the session finalizes, renders the partial
+    /// window, and exits 3. Closed stdin stops gracefully through a
     /// watcher thread sharing the session stop flag.
     pub duration_secs: Option<u64>,
     /// Tick cadence in milliseconds.
@@ -111,16 +138,22 @@ pub struct LiveConfig {
     /// `KRYPROBE_TOKEN` > default-pin discovery order; `None` consults
     /// env + default only).
     pub token: Option<PathBuf>,
+    /// JSON-mode audit trail (4B-M4): one structured stderr line per
+    /// privileged operation (object load, attach). Human mode stays
+    /// silent (stderr is human-only/unstable there).
+    pub json_audit: bool,
 }
 
 impl Default for LiveConfig {
-    /// `kernel-crypto`, unbounded, 1000ms ticks, no explicit token.
+    /// `kernel-crypto`, unbounded, 1000ms ticks, no explicit token,
+    /// no audit trail.
     fn default() -> Self {
         Self {
             source: LIVE_SOURCE.to_owned(),
             duration_secs: None,
             tick_ms: DEFAULT_TICK_MS,
             token: None,
+            json_audit: false,
         }
     }
 }
@@ -141,6 +174,9 @@ pub struct LiveOutcome {
     /// `Ok` return — the machine's observable proof it governed this
     /// session end to end.
     pub terminal_state: SessionState,
+    /// SIGINT ended the window early (4B-M5): the outcome is final
+    /// evidence for a cut-short window — callers render and exit 3.
+    pub interrupted: bool,
 }
 
 /// Live failure: unusable environment (→ exit 4) or internal defect
@@ -354,10 +390,11 @@ fn spawn_stdin_watcher<R: std::io::Read + Send + 'static>(
         .expect("live stdin watcher spawns")
 }
 
-/// Sleep one tick in stop-poll slices (early-out on the stop flag).
+/// Sleep one tick in stop-poll slices (early-out on the stop flag
+/// or a recorded SIGINT).
 fn sleep_tick(tick_ms: u64, stop: &AtomicBool) {
     let mut remaining = tick_ms;
-    while remaining > 0 && !stop.load(Ordering::Relaxed) {
+    while remaining > 0 && !stop.load(Ordering::Relaxed) && !SIGINT_SEEN.load(Ordering::Relaxed) {
         let slice = remaining.min(STOP_POLL_MS);
         std::thread::sleep(Duration::from_millis(slice));
         remaining = remaining.saturating_sub(slice);
@@ -502,6 +539,7 @@ pub fn drive_session(
     issuer: &IdIssuer,
     concrete: Option<&KCryptoBackend>,
     controller: &mut SessionController,
+    progress: Option<&TickProgress>,
 ) -> Result<LiveOutcome, LiveError> {
     hop(controller, SessionState::Observing, "session start")?;
     match drive_session_inner(
@@ -515,6 +553,7 @@ pub fn drive_session(
         issuer,
         concrete,
         controller,
+        progress,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
@@ -550,6 +589,7 @@ fn drive_session_inner(
     issuer: &IdIssuer,
     concrete: Option<&KCryptoBackend>,
     controller: &mut SessionController,
+    progress: Option<&TickProgress>,
 ) -> Result<LiveOutcome, LiveError> {
     let baseline = IntegritySummary::default();
     // Tick loop: snapshot → raw events in row order → decode each
@@ -574,6 +614,9 @@ fn drive_session_inner(
     // once, so both are assigned before any `break`.
     let mut closing_agg_calls: Vec<u64>;
     let mut closing_totals_calls: Option<u64>;
+    // 4B-M5: latched when the loop observes a recorded SIGINT — the
+    // session finalizes normally and the outcome carries `interrupted`.
+    let mut interrupted = false;
     let closing: SnapshotRows = loop {
         barrier_id += 1;
         let snap = sensor.snapshot_tick(barrier_id, stop)?;
@@ -672,8 +715,17 @@ fn drive_session_inner(
         closing_agg_calls = tick_agg_calls;
         closing_totals_calls = tick_totals_calls;
         overflow_identities = overflow_identities.saturating_add(snap.overflow_identities);
-        let stopped =
-            stop.load(Ordering::Relaxed) || deadline.is_some_and(|end| Instant::now() >= end);
+        interrupted |= SIGINT_SEEN.load(Ordering::Relaxed);
+        if let Some(report) = progress {
+            report(
+                barrier_id,
+                (snap.rows.len() + snap.idents.len()) as u64,
+                u64::from(snap.drops),
+            );
+        }
+        let stopped = stop.load(Ordering::Relaxed)
+            || interrupted
+            || deadline.is_some_and(|end| Instant::now() >= end);
         if stopped {
             break snap;
         }
@@ -752,6 +804,7 @@ fn drive_session_inner(
         coverage,
         integrity,
         terminal_state: controller.state(),
+        interrupted,
     })
 }
 
@@ -853,8 +906,18 @@ fn run_live_session_inner(
     // Object bytes resolve once here (H1(b)/M2): staged into the
     // backend below so `configure` loads the single sensor from them
     // instead of locating + reading a second time.
-    let (_object_path, object_bytes) = kryprobe_privilege::locate_kcrypto_object_bytes()
+    let (object_path, object_bytes) = kryprobe_privilege::locate_kcrypto_object_bytes()
         .map_err(|err| LiveError::Unusable(format!("kcrypto object: {err}")))?;
+    // 4B-M4: the object load is a privileged operation — in JSON mode
+    // it leaves one structured stderr line (path + sha256). The hash
+    // runs only when the line will print.
+    if cfg.json_audit {
+        let digest = kryprobe_privilege::sha256_hex(&object_bytes);
+        emit_audit(
+            true,
+            &audit_object_line(&object_path.display().to_string(), &digest),
+        );
+    }
     // K5 bring-up authority: the first usable token in discovery order
     // (`--token` > `KRYPROBE_TOKEN` > default pin), staged into the
     // backend so the single sensor loads through it. No usable token
@@ -898,9 +961,16 @@ fn run_live_session_inner(
         .session_sensor()
         .map_err(|err| LiveError::Internal(format!("kcrypto session sensor: {err}")))?;
     let attached_points = sensor.links.len();
+    // 4B-M4: the attach outcome is the second audit line.
+    emit_audit(
+        cfg.json_audit,
+        &audit_attach_line(attached_points, KCRYPTO_SYMBOLS.len()),
+    );
     // Stop machinery: a session-local flag; the stdin watcher feeds it
-    // for unbounded runs (SIGINT keeps the default disposition — see the
-    // `duration_secs` docs).
+    // for unbounded runs, and the SIGINT recorder (4B-M5) ends any run
+    // with finalize + partial render + exit 3 instead of dying.
+    kryprobe_privilege::host::install_sigint_flag()
+        .map_err(|err| LiveError::Internal(format!("live SIGINT handler: {err}")))?;
     let stop = Arc::new(AtomicBool::new(false));
     if cfg.duration_secs.is_none() {
         let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop));
@@ -910,6 +980,10 @@ fn run_live_session_inner(
     // quantum on every tick. The drain lives in the production sensor;
     // the driver stops it once after the closing tick.
     let mut production = RealSensor::new(&sensor)?;
+    // 4B-M5 liveness line (stderr, human-only/unstable — never script on it).
+    let progress = |tick: u64, rows: u64, drops: u64| {
+        eprintln!("kryprobe: progress tick={tick} rows={rows} drops={drops}");
+    };
     drive_session(
         cfg,
         backend,
@@ -921,6 +995,7 @@ fn run_live_session_inner(
         &issuer,
         Some(concrete),
         controller,
+        Some(&progress),
     )
 }
 
@@ -944,6 +1019,30 @@ mod tests {
     // (The gate-vocabulary test moved to core with `missing_gates`
     // itself — 1B-H1/1B-L2; `gate_check` below still pins the CLI's
     // error attribution over the shared vocabulary.)
+
+    #[test]
+    fn audit_lines_pin_json_shapes() {
+        // 4B-M4: one structured stderr line per privileged operation
+        // in JSON mode — object load carries path + sha256, attach
+        // carries the attached/expected counts.
+        let object: serde_json::Value =
+            serde_json::from_str(&audit_object_line("/prefix/kcrypto.bpf.o", "aa"))
+                .expect("object line parses");
+        assert_eq!(
+            object,
+            serde_json::json!({
+                "audit": "object-load",
+                "path": "/prefix/kcrypto.bpf.o",
+                "sha256": "aa",
+            })
+        );
+        let attach: serde_json::Value =
+            serde_json::from_str(&audit_attach_line(9, 9)).expect("attach line parses");
+        assert_eq!(
+            attach,
+            serde_json::json!({"audit": "attach", "attached": 9, "expected": 9})
+        );
+    }
 
     #[test]
     fn gate_check_error_names_gates() {

@@ -24,7 +24,7 @@ artifacts, uninstalled backends), 10 confirmed policy violation
 
 ```
 kryprobe --version
-kryprobe doctor [--json]
+kryprobe doctor [--json] [--versions]
 kryprobe backends [--json]
 kryprobe inspect --pid N [--json]
 kryprobe selftest synthetic [--out FILE]
@@ -42,6 +42,9 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
 
 - `doctor` prints the capability probe matrix (`Pass`/`Denied`/
   `Skipped`, every denial naming stage + errno) plus backend rows.
+  `doctor --versions [--json]` prints artifact versions instead:
+  binary + kcrypto/spine object paths + sha256 + the
+  `pins_enforced` bit (see `docs/json.md`).
 - `backends` lists the registry (`synthetic` active test-only;
   `p11`/`openssl` not installed; `kcrypto` unavailable).
 - `inspect` snapshots one process (bounded maps/exe/ELF reads;
@@ -84,6 +87,21 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   three. Workload selectors (`--pid`, `--tree`, `--cgroup`,
   `--cgroup-id`, `--unit`) and `--comm` filters are deferred past v0.1
   and rejected naming the deferral.
+
+- Live sessions and SIGINT (4B-M5): Ctrl-C never kills a capture
+  mid-flight. The session finalizes, renders the partial window it
+  captured, and exits 3 (`check` still exits 10 when the verdict
+  fired on the cut-short window). Every tick also prints one
+  stderr progress line (`kryprobe: progress tick=N rows=M
+  drops=K`) — human-only, unstable, never script on it.
+- Session bounds (4B-M5): observations accumulate in memory for
+  the whole window (agg rows dedup by key, but idents keep every
+  tick), so memory grows with ticks × rows — roughly 1KB per kept
+  observation. Prefer bounded `--duration` (minutes, not days; the
+  60s default is sized for triage, and hour-long windows stay under
+  ~100MB on quiet hosts but grow with crypto activity). Unbounded
+  `watch` is for attended use with closed-stdin/SIGINT stops. A
+  streaming sink that removes the bound is tracked as 2B-H2.
 - `import FILE` reads one osslscope report (`schema_version:
   observed-crypto-v1[.minor]`) or p11scope profile (`schema:
   p11scope/observed-profile/v3`) doc and emits one shell JSONL record
@@ -125,6 +143,7 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
 | `KRYPROBE_SMOKE_WORKER` | `token_worker` | Internal spawn marker (`=1` only; set by the spawner, not operators). |
 | `KRYPROBE_UPDATE_GOLDENS` | testkit golden tests | When `=1`, a golden mismatch rewrites the file instead of failing (tests only, never product). |
 | `KRYPROBE_PIN_DIGESTS` | `kryprobe-privilege` build | Comma-separated sha256 pins for release BPF objects (build-time; see below). |
+| `KRYPROBE_REQUIRE_PINS` | `kryprobe-privilege` build | When `=1`, an empty `KRYPROBE_PIN_DIGESTS` fails the build instead of baking a silently unpinned binary (release packaging sets this). |
 
 Object-locator try order (D2): `KRYPROBE_BPF_DIR` (or file as-is) →
 exe-relative `kryprobe-bpf/kcrypto.bpf.o` (the bundled/install tier)
@@ -134,19 +153,36 @@ only. An elevated process (euid 0 or effective `CAP_BPF`/
 `CAP_SYS_ADMIN`, i.e. any file-cap deployment) loads only the
 exe-bundled tier — so a hand-rolled deploy fails closed (exit 4,
 `kcrypto_object_unreadable`) instead of loading a stray object — and
-release builds additionally refuse any object whose sha256 is not in
-the `KRYPROBE_PIN_DIGESTS` build-time pin set. `doctor` prints the
-resolved object path (`kcrypto_object` row) so the effective
-configuration is inspectable. The normative trusted path is
-`docs/deployment.md`.
+pinned builds (non-empty `KRYPROBE_PIN_DIGESTS` baked at compile
+time) additionally refuse any object whose sha256 is not in the pin
+set. Unpinned builds skip the check with a once-per-process stderr
+warning and report `pins_enforced: false` in `doctor --versions`;
+release packaging must set `KRYPROBE_REQUIRE_PINS=1` so a missing
+pin set fails the build instead of shipping unpinned. `doctor`
+prints the resolved object path (`kcrypto_object` row) so the
+effective configuration is inspectable. The normative trusted path
+is `docs/deployment.md`.
 
 ## Privileged runs
+
+One command (4B-H2): `scripts/sudo-lane.sh` runs the full
+privileged lane under the BPF lane lock — builds, `cargo xtask
+test bpf` (unprivileged honest-denial asserts), the sudo
+selftests, and every `#[ignore]`d suite binary under sudo. It
+needs root or passwordless sudo, else it exits 4 (`NOT_RUN`).
+
+```sh
+scripts/sudo-lane.sh
+```
+
+The equivalent manual steps (what the script runs):
 
 ```sh
 sudo ./target/debug/kryprobe selftest bpf --calls 20000  # expect exit 0, reconcile: clean
 sudo ./target/debug/kryprobe selftest token-smoke        # exit 0 (pass) or 4 (Denied, kernel-dependent)
 ```
 
-`cargo xtask test bpf` runs unprivileged with honest-denial asserts;
-for the strict privileged asserts, run the built suite binaries
-under `sudo` (see the thin-spine evidence receipts).
+plus each workspace test binary's `--ignored` set under sudo
+(see the thin-spine evidence receipts). Until the self-hosted
+privileged runner exists, schedule the script by hand and record
+unavailable lanes `NOT_RUN` per `AGENTS.md`.

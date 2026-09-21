@@ -71,7 +71,15 @@ fn finish_check(
     );
     let _ = write!(stdout, "{}", rendered.stdout);
     let _ = write!(stderr, "{}", rendered.stderr);
-    rendered.code
+    // 4B-M5: an interrupted window is partial evidence — exit 3 —
+    // unless the verdict already fired (10 wins: a violation on a
+    // cut-short window is still a violation).
+    if outcome.interrupted && rendered.code == 0 {
+        let _ = writeln!(stderr, "check: interrupted by SIGINT — partial window");
+        3
+    } else {
+        rendered.code
+    }
 }
 
 /// Runs `check --system`: parse the policy (exit 2 on any rejection),
@@ -84,9 +92,8 @@ pub fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    // Ctrl-C keeps the default disposition and terminates the process:
-    // no verdict, no finalize (Task 1 installs no SIGINT handler —
-    // std-only). Graceful-shutdown-on-SIGINT is future work.
+    // 4B-M5: SIGINT finalizes and evaluates the partial window (exit 3
+    // unless the verdict fired), with a per-tick stderr progress line.
     let text = match read_policy_capped(policy) {
         Ok(text) => text,
         Err(detail) => {
@@ -106,6 +113,7 @@ pub fn run(
         duration_secs: Some(check_window_secs(duration)),
         tick_ms: DEFAULT_TICK_MS,
         token: token.map(Path::to_owned),
+        json_audit: false,
     };
     finish_check(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
@@ -257,6 +265,30 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = finish_check(Ok(outcome), &deny_md5(), &mut stdout, &mut stderr);
+        assert_eq!(code, 10);
+    }
+
+    #[test]
+    fn check_finish_interrupted_clean_becomes_3_violation_stands() {
+        // 4B-M5: an interrupted clean verdict degrades to 3, but a
+        // violation on a cut-short window is still a violation (10).
+        let mut clean = md5_outcome();
+        clean.interrupted = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check(Ok(clean), &clean_policy(), &mut stdout, &mut stderr);
+        assert_eq!(code, 3);
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("interrupted by SIGINT")
+        );
+
+        let mut violated = md5_outcome();
+        violated.interrupted = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check(Ok(violated), &deny_md5(), &mut stdout, &mut stderr);
         assert_eq!(code, 10);
     }
 

@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# 4B-H1: the merge gate, automated. `cargo xtask check` (not bare
+# cargo) is the required pre-merge gate — this workflow runs it on
+# every push/PR, plus the unprivileged BPF lane and supply-chain
+# scans. The privileged sudo suites still need a self-hosted runner
+# with BPF caps (4B-H2, tracked gap) — until then they run via
+# `scripts/sudo-lane.sh` with the lane lock, scheduled by hand.
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly supply-chain watch: advisories can land any day.
+    - cron: "17 3 * * *"
+
+jobs:
+  check:
+    name: host gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: merge gate
+        run: cargo xtask check
+      - name: pin strict gate (fail-closed proof)
+        # No pins are baked in CI: with KRYPROBE_REQUIRE_PINS=1 the
+        # privilege build must refuse an unpinned binary. `!` inverts:
+        # the step passes exactly when the build fails closed.
+        run: "! KRYPROBE_REQUIRE_PINS=1 cargo check --locked -p kryprobe-privilege"
+
+  bpf-lane:
+    name: BPF lane (unprivileged)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - name: BPF nightly
+        run: rustup toolchain install nightly-2026-09-16 -c rust-src --profile minimal
+      - name: pinned linker
+        run: cargo install bpf-linker --version 0.10.4 --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: build objects
+        run: cargo xtask build --bpf
+      - name: pipeline lane
+        # Honest-denial asserts hold without caps; privileged asserts
+        # need the self-hosted runner (4B-H2).
+        run: cargo xtask test bpf
+
+  supply:
+    name: supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - name: scanners
+        run: cargo install cargo-deny cargo-audit --locked
+      - name: deny (licenses + bans + advisories)
+        run: cargo deny --locked check
+      - name: audit (RUSTSEC advisories)
+        run: cargo audit --deny warnings

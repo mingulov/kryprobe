@@ -16,8 +16,9 @@ use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_
 use std::io::Write;
 use std::path::Path;
 
-/// Finishes a capture: tables to stdout (exit 0) or the named failure to
-/// stderr (`Unusable` → 4, `Internal` → 1 via [`LiveError::exit_code`]).
+/// Finishes a capture: tables to stdout (exit 0, or 3 when the window
+/// was SIGINT-cut) or the named failure to stderr (`Unusable` → 4,
+/// `Internal` → 1 via [`LiveError::exit_code`]).
 fn finish_watch(
     result: Result<LiveOutcome, LiveError>,
     stdout: &mut dyn Write,
@@ -33,7 +34,15 @@ fn finish_watch(
                     &outcome.coverage
                 )
             );
-            0
+            // 4B-M5: an interrupted window is partial evidence even
+            // when every measured dimension held — exit 3, with the
+            // tables above as the preserved evidence.
+            if outcome.interrupted {
+                let _ = writeln!(stderr, "watch: interrupted by SIGINT — partial window");
+                3
+            } else {
+                0
+            }
         }
         Err(err) => {
             let _ = writeln!(stderr, "watch: {err}");
@@ -51,14 +60,14 @@ pub fn run_watch(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    // Ctrl-C keeps the default disposition and terminates the process:
-    // no trailer, no finalize (Task 1 installs no SIGINT handler —
-    // std-only). Graceful-shutdown-on-SIGINT is future work.
+    // 4B-M5: SIGINT finalizes and renders the partial window (exit 3),
+    // with a per-tick stderr progress line while the capture runs.
     let cfg = LiveConfig {
         source: source.to_owned(),
         duration_secs: duration,
         tick_ms: DEFAULT_TICK_MS,
         token: token.map(Path::to_owned),
+        json_audit: false,
     };
     finish_watch(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
@@ -332,6 +341,7 @@ pub(crate) mod fixtures {
             coverage,
             integrity: IntegritySummary::default(),
             terminal_state: kryprobe_core::session::SessionState::Finalized,
+            interrupted: false,
         }
     }
 
@@ -544,6 +554,30 @@ mod tests {
         assert!(
             String::from_utf8(stderr).expect("utf-8").contains("boom"),
             "internal reason surfaces"
+        );
+    }
+
+    #[test]
+    fn finish_interrupted_renders_tables_and_exits_3() {
+        // 4B-M5: SIGINT-cut windows keep their evidence (tables print)
+        // but exit 3 with the interruption named on stderr.
+        let mut outcome = watch_fixture();
+        outcome.interrupted = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_watch(Ok(outcome), &mut stdout, &mut stderr);
+        assert_eq!(code, 3);
+        assert!(
+            String::from_utf8(stdout)
+                .expect("utf-8")
+                .contains("COMPLETE"),
+            "evidence still renders"
+        );
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("interrupted by SIGINT"),
+            "interruption named"
         );
     }
 }

@@ -8,7 +8,7 @@ pub const USAGE: &str = "\
 usage: kryprobe [--json] <command> [args]
 
 commands:
-  doctor [--json]              probe matrix + backend rows
+  doctor [--json] [--versions]   probe matrix + backend rows (--versions: artifact versions)
   backends [--json]            backend registry + states
   inspect --pid N [--json]     snapshot one process
   selftest synthetic [--out F] deterministic scripted session
@@ -67,6 +67,8 @@ pub enum Command {
     Doctor {
         /// Render JSON instead of human tables.
         json: bool,
+        /// Artifact versions (binary + BPF objects) instead of probes.
+        versions: bool,
     },
     /// Backend registry + states.
     Backends {
@@ -200,7 +202,7 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
     // it; anywhere else it is a usage error (exit 2), never silently
     // discarded.
     let command = match sub.as_str() {
-        "doctor" => parse_simple(args, json, "doctor", |json| Command::Doctor { json })?,
+        "doctor" => parse_doctor(args, json)?,
         "backends" => parse_simple(args, json, "backends", |json| Command::Backends { json })?,
         "inspect" => crate::args_sub::parse_inspect(args, json)?,
         "selftest" => {
@@ -251,6 +253,23 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
 }
 
 /// `doctor`/`backends`: bare or `--json`, nothing else.
+/// `doctor`: bare, `--json`, `--versions` (each at most once,
+/// any order); anything else is a usage error.
+fn parse_doctor(args: &[String], json: bool) -> Result<Command, ArgsError> {
+    let mut json = json;
+    let mut versions = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if arg == "--versions" {
+            versions = true;
+        } else {
+            return Err(usage(format!("doctor: unexpected '{arg}'")));
+        }
+    }
+    Ok(Command::Doctor { json, versions })
+}
+
 fn parse_simple(
     args: &[String],
     json: bool,
@@ -299,11 +318,17 @@ mod tests {
     fn simple_commands_merge_json() {
         assert_eq!(
             parse(&argv(&["doctor"])).unwrap().command,
-            Command::Doctor { json: false }
+            Command::Doctor {
+                json: false,
+                versions: false
+            }
         );
         assert_eq!(
             parse(&argv(&["--json", "doctor"])).unwrap().command,
-            Command::Doctor { json: true }
+            Command::Doctor {
+                json: true,
+                versions: false
+            }
         );
         assert_eq!(
             parse(&argv(&["backends", "--json"])).unwrap().command,
@@ -313,6 +338,26 @@ mod tests {
             parse(&argv(&["doctor", "extra"])),
             Err(ArgsError::Usage(_))
         ));
+    }
+
+    #[test]
+    fn doctor_versions_flag() {
+        assert_eq!(
+            parse(&argv(&["doctor", "--versions"])).unwrap().command,
+            Command::Doctor {
+                json: false,
+                versions: true
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["--json", "doctor", "--versions"]))
+                .unwrap()
+                .command,
+            Command::Doctor {
+                json: true,
+                versions: true
+            }
+        );
     }
 
     #[test]

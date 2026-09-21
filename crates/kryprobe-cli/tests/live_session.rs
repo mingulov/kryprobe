@@ -148,6 +148,7 @@ fn live_gate_fail_names_gate() {
         duration_secs: Some(0),
         tick_ms: 1000,
         token: None,
+        json_audit: false,
     };
     let runtime = kryprobe_core::capability::RuntimeCapabilities {
         kernel_release: "test".to_owned(),
@@ -258,6 +259,7 @@ fn open_session() -> (
             duration_secs: Some(0),
             tick_ms: 1000,
             token: None,
+            json_audit: false,
         },
         kryprobe_core::capability::RuntimeCapabilities {
             kernel_release: "test".to_owned(),
@@ -655,6 +657,7 @@ fn live_capture_proves_session() {
         duration_secs: Some(8),
         tick_ms: 1000,
         token: None,
+        json_audit: false,
     };
     let outcome = kryprobe_cli::live::run_live_capture(&cfg, &lane_runtime())
         .unwrap_or_else(|err| panic!("live capture failed: {err}"));
@@ -833,6 +836,7 @@ fn live_capture_proves_session() {
         duration_secs: Some(0),
         tick_ms: 1000,
         token: None,
+        json_audit: false,
     };
     let outcome0 = kryprobe_cli::live::run_live_capture(&cfg0, &lane_runtime())
         .unwrap_or_else(|err| panic!("zero-window capture failed: {err}"));
@@ -1135,6 +1139,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         duration_secs: Some(60),
         tick_ms: 1,
         token: None,
+        json_audit: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut sensor = sensor;
@@ -1152,6 +1157,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         &kryprobe_core::ids::IdIssuer::default(),
         None,
         &mut controller,
+        None,
     )
     .expect("scripted session drives green");
     // Row counts: latest-per-key (2 agg + totals + who) + every
@@ -1286,6 +1292,7 @@ fn live_stop_mid_run_tears_down_cleanly() {
         duration_secs: Some(3600),
         tick_ms: 1,
         token: None,
+        json_audit: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = std::thread::scope(|scope| {
@@ -1306,6 +1313,7 @@ fn live_stop_mid_run_tears_down_cleanly() {
             &kryprobe_core::ids::IdIssuer::default(),
             None,
             &mut controller,
+            None,
         )
     })
     .expect("stopped session drives green");
@@ -1325,6 +1333,150 @@ fn live_stop_mid_run_tears_down_cleanly() {
     assert!(
         sensor.finished.load(std::sync::atomic::Ordering::Relaxed),
         "sensor finish ran once"
+    );
+}
+
+#[test]
+fn live_sigint_ends_window_with_interrupted_outcome() {
+    // 4B-M5: a recorded SIGINT ends the window like a stop, but the
+    // outcome carries `interrupted` so finishes render partial + exit 3.
+    // Serialized (suite guard): SIGINT_SEEN is process-global.
+    let _suite = suite_guard();
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let tick = kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![script_agg_as(10, b"cbc(aes)")],
+        totals: Some(script_totals(10)),
+        idents: vec![script_ident()],
+        overflow_identities: 0,
+        drops: 0,
+        monotonic_ns: 100,
+    };
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut sensor = MidStopSensor {
+        tick,
+        ticks: ticks.clone(),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = SuccessBackend {
+        decodes: std::sync::atomic::AtomicU64::new(0),
+        finalized: std::sync::atomic::AtomicBool::new(false),
+        table: kryprobe_privilege::kallsyms::SymTable::parse(""),
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: None,
+        tick_ms: 1,
+        token: None,
+        json_audit: false,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while ticks.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                std::thread::yield_now();
+            }
+            kryprobe_privilege::host::SIGINT_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        kryprobe_cli::live::drive_session(
+            &cfg,
+            &backend,
+            &mut sensor,
+            &stop,
+            9,
+            kryprobe_core::ids::SessionId::new(1),
+            kryprobe_core::ids::PlanGeneration::new(1),
+            &kryprobe_core::ids::IdIssuer::default(),
+            None,
+            &mut controller,
+            None,
+        )
+    })
+    .expect("interrupted session drives green");
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(outcome.interrupted, "outcome carries interrupted");
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+    assert!(
+        backend.finalized.load(std::sync::atomic::Ordering::Relaxed),
+        "finalize ran once"
+    );
+}
+
+#[test]
+fn live_progress_hook_sees_every_tick() {
+    // 4B-M5: the progress hook fires once per tick with (tick, rows, drops).
+    let _suite = suite_guard();
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress = {
+        let seen = std::sync::Arc::clone(&seen);
+        move |tick: u64, rows: u64, drops: u64| {
+            seen.lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((tick, rows, drops));
+        }
+    };
+    let tick = |wall: u64| kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+        rows: vec![script_agg_as(10, b"cbc(aes)")],
+        totals: Some(script_totals(10)),
+        idents: vec![script_ident()],
+        overflow_identities: 0,
+        drops: 0,
+        monotonic_ns: wall,
+    };
+    let mut sensor = ScriptedSensor {
+        script: vec![tick(100), tick(200)],
+        who: kryprobe_privilege::kcrypto_backend::WhoSnapshot {
+            key: Default::default(),
+            val: Default::default(),
+            stack_ips: Vec::new(),
+            first_errno: None,
+            params: None,
+        },
+        drop_sites: [0; 8],
+        barriers: std::sync::Mutex::new(Vec::new()),
+        tables: std::sync::atomic::AtomicU64::new(0),
+        finished: std::sync::atomic::AtomicBool::new(false),
+    };
+    let backend = SuccessBackend {
+        decodes: std::sync::atomic::AtomicU64::new(0),
+        finalized: std::sync::atomic::AtomicBool::new(false),
+        table: kryprobe_privilege::kallsyms::SymTable::parse(""),
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+        json_audit: false,
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let outcome = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+        &mut controller,
+        Some(&progress),
+    )
+    .expect("scripted session drives green");
+    assert!(!outcome.interrupted);
+    let seen = seen.lock().unwrap_or_else(|poison| poison.into_inner());
+    assert_eq!(seen.len(), 2, "one progress call per tick");
+    assert_eq!(seen[0].0, 1);
+    assert_eq!(seen[1].0, 2);
+    assert!(
+        seen.iter().all(|(_, rows, _)| *rows == 2),
+        "agg + ident rows"
     );
 }
 
@@ -1371,6 +1523,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         duration_secs: Some(60),
         tick_ms: 1,
         token: None,
+        json_audit: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let parses_before = kryprobe_privilege::kallsyms::parse_calls();
@@ -1385,6 +1538,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         &kryprobe_core::ids::IdIssuer::default(),
         None,
         &mut controller,
+        None,
     )
     .expect("scripted session drives green");
     assert_eq!(
@@ -1462,6 +1616,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         duration_secs: Some(60),
         tick_ms: 1,
         token: None,
+        json_audit: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     // The corrupt row fails before the who/kallsyms stage — the
@@ -1478,6 +1633,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         &kryprobe_core::ids::IdIssuer::default(),
         None,
         &mut controller,
+        None,
     )
     .expect_err("corrupt row must fail the session");
     let msg = format!("{err:?}");
@@ -1608,6 +1764,7 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         duration_secs: Some(60),
         tick_ms: 1,
         token: None,
+        json_audit: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let err = kryprobe_cli::live::drive_session(
@@ -1621,6 +1778,7 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         &kryprobe_core::ids::IdIssuer::default(),
         None,
         &mut controller,
+        None,
     )
     .expect_err("failing decode must fail the session");
     let msg = format!("{err:?}");

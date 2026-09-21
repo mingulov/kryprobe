@@ -59,7 +59,7 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 #[must_use]
 pub fn render_report_json(outcome: &LiveOutcome) -> String {
     let missing = kryprobe_report::live_render::trailer_dims(&outcome.coverage);
-    let status = if missing.is_empty() {
+    let status = if !outcome.interrupted && missing.is_empty() {
         "complete"
     } else {
         "partial"
@@ -107,7 +107,14 @@ fn finish_report_live(
             return err.exit_code();
         }
     };
-    let code = if kryprobe_report::live_render::trailer_dims(&outcome.coverage).is_empty() {
+    // 4B-M5: an interrupted window is partial evidence even when
+    // every measured dimension held.
+    if outcome.interrupted {
+        let _ = writeln!(stderr, "report: interrupted by SIGINT — partial window");
+    }
+    let code = if !outcome.interrupted
+        && kryprobe_report::live_render::trailer_dims(&outcome.coverage).is_empty()
+    {
         0
     } else {
         3
@@ -122,6 +129,7 @@ fn finish_report_live(
             match kryprobe_report::live_render::render_live_jsonl(
                 &outcome.observations,
                 &outcome.coverage,
+                outcome.interrupted,
             ) {
                 Ok(text) => text,
                 Err(err) => {
@@ -160,14 +168,16 @@ pub fn run_report_live(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    // Ctrl-C keeps the default disposition and terminates the process:
-    // no trailer, no finalize (Task 1 installs no SIGINT handler —
-    // std-only). Graceful-shutdown-on-SIGINT is future work.
+    // 4B-M5: SIGINT finalizes and renders the partial window (exit 3),
+    // with a per-tick stderr progress line while the capture runs.
     let cfg = LiveConfig {
         source: source.to_owned(),
         duration_secs: Some(report_window_secs(duration)),
         tick_ms: DEFAULT_TICK_MS,
         token: token.map(Path::to_owned),
+        // 4B-M4: machine formats get the structured stderr audit
+        // trail (object load + attach); human mode stays silent.
+        json_audit: !matches!(format, ReportFormat::Human),
     };
     finish_report_live(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
@@ -374,6 +384,46 @@ mod tests {
                 .contains("cannot write")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finish_interrupted_forces_partial_everywhere() {
+        // 4B-M5: a SIGINT-cut window exits 3 with partial status in
+        // every format, even when every measured dimension held.
+        let mut outcome = json_fixture();
+        outcome.interrupted = true;
+        for format in [ReportFormat::Human, ReportFormat::Json, ReportFormat::Jsonl] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code =
+                finish_report_live(Ok(outcome.clone()), format, None, &mut stdout, &mut stderr);
+            assert_eq!(code, 3, "interrupted exits 3 in {format:?}");
+            assert!(
+                String::from_utf8(stderr)
+                    .expect("utf-8")
+                    .contains("interrupted by SIGINT"),
+                "interruption named in {format:?}"
+            );
+        }
+        assert!(
+            render_report_json(&outcome).contains("\"status\":\"partial\""),
+            "JSON status flips to partial"
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        finish_report_live(
+            Ok(outcome),
+            ReportFormat::Jsonl,
+            None,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert!(
+            String::from_utf8(stdout)
+                .expect("utf-8")
+                .contains("\"PARTIAL\""),
+            "JSONL verdict flips to PARTIAL"
+        );
     }
 
     #[test]

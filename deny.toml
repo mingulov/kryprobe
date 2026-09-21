@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# cargo-deny policy (4B-H3): licenses + bans + advisories. Runs in CI
+# (`supply` job) and nightly; local runs need network for the advisory
+# DB, so `xtask check` stays offline and `xtask verify supply` is the
+# local entry point (exit 4 when the scanners are absent).
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[licenses]
+# Permissive-only closure (audited 2026-09-20 from the registry cache)
+# plus the workspace's own GPL-3.0-or-later.
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "GPL-3.0-or-later",
+  "ISC",
+  "MIT",
+  "Unlicense",
+  "Unicode-3.0",
+  "Zlib",
+  "0BSD",
+]
+exceptions = [
+  { name = "linux-raw-sys", allow = ["Apache-2.0 WITH LLVM-exception"] },
+  { name = "rustix", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+unlicensed = "deny"
+copyleft = "deny"
+
+[bans]
+# M-SEC-01 lock-in: the tree migrated off serde_yaml 0.9
+# (unmaintained, memory-unsafe C) to serde_saphyr — never regress.
+deny = [
+  { name = "serde_yaml" },
+  { name = "unsafe-libyaml" },
+]
+wildcards = "deny"
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "deny"
+yanked = "deny"
+notice = "warn"
+ignore = []

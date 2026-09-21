@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# cargo-audit policy (4B-H3): RUSTSEC advisory gate, CI `supply` job +
+# nightly schedule. Empty ignore list by posture: every advisory is
+# either fixed or recorded here with a justification + expiry.
+[advisories]
+ignore = []

@@ -32,12 +32,17 @@ path**: the middle tier of the D2 locator try order (`KRYPROBE_BPF_DIR`
 effective `CAP_BPF`/`CAP_SYS_ADMIN`, i.e. every file-cap deployment)
 loads **only** this tier — env and CWD tiers are refused, so a missing
 object fails closed at exit 4 (`kcrypto_object_unreadable`) instead
-of loading a stray file. Release builds additionally refuse any
-object whose sha256 is not in the `KRYPROBE_PIN_DIGESTS` build-time
-pin set (empty in dev builds: pin check skipped). `doctor` prints the
-resolved path (`kcrypto_object` row) so the effective configuration
-is inspectable; any deviation from the path above in a deployment is
-a finding, not a configuration.
+of loading a stray file. Pinned builds (non-empty
+`KRYPROBE_PIN_DIGESTS` baked at compile time) additionally refuse
+any object whose sha256 is not in the pin set; unpinned builds skip
+the check with a once-per-process stderr warning. Release packaging
+must set `KRYPROBE_REQUIRE_PINS=1` so a missing pin set fails the
+build instead of shipping an unpinned binary, and must record the
+baked digests in the release evidence. `doctor` prints the resolved
+path (`kcrypto_object` row) so the effective configuration is
+inspectable, and `doctor --versions` reports the object digests
+plus the `pins_enforced` bit; any deviation from the path above in
+a deployment is a finding, not a configuration.
 
 ## Privilege model
 

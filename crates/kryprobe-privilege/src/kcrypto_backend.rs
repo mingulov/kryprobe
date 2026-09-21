@@ -41,7 +41,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kryprobe_abi::kcrypto_agg::{
     KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCTX_KTHREAD, KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KCtl,
@@ -516,8 +516,9 @@ pub fn kcrypto_object_candidates(
     out
 }
 
-/// Lowercase hex sha256 of object bytes (H-SEC-01 pin check).
-fn object_digest_hex(bytes: &[u8]) -> String {
+/// Lowercase hex sha256 of bytes (H-SEC-01 pin check; G6 M1
+/// versions also hash the spine object through it).
+pub fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -528,6 +529,26 @@ fn object_digest_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// Whether the baked pin set is non-empty, i.e. the object pin
+/// check actually enforces (G6 fail-open observability; surfaced by
+/// `doctor --versions`).
+#[must_use]
+pub fn pins_enforced() -> bool {
+    !PINNED_DIGESTS.is_empty()
+}
+
+/// Warning text for the empty-pin skip (G6): the fail-open state is
+/// named at runtime instead of silent. Pure over the flag for tests.
+fn pin_skip_warning(pins_empty: bool) -> Option<&'static str> {
+    pins_empty.then_some(
+        "kryprobe: BPF object pin check SKIPPED (empty PINNED_DIGESTS dev build); \
+         set KRYPROBE_PIN_DIGESTS at compile time or KRYPROBE_REQUIRE_PINS=1 to fail closed",
+    )
+}
+
+/// Once-per-process guard for the pin-skip warning.
+static PIN_SKIP_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Pin check (H-SEC-01): empty pins (dev build) skip verification;
 /// otherwise the object sha256 must be pinned. Pure over inputs for
 /// unit tests; production passes [`PINNED_DIGESTS`].
@@ -535,7 +556,7 @@ fn verify_object_pinned(bytes: &[u8], pins: &[&str]) -> Result<(), String> {
     if pins.is_empty() {
         return Ok(());
     }
-    let digest = object_digest_hex(bytes);
+    let digest = sha256_hex(bytes);
     if pins.iter().any(|pin| *pin == digest) {
         Ok(())
     } else {
@@ -556,6 +577,13 @@ pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateE
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let env_tier = if elevated { None } else { env.as_deref() };
+    // G6: the empty-pin skip is fail-open by design (dev builds), so
+    // it warns once per process instead of loading silently unpinned.
+    if let Some(warning) = pin_skip_warning(PINNED_DIGESTS.is_empty())
+        && !PIN_SKIP_WARNED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!("{warning}");
+    }
     let mut misses = Vec::new();
     for candidate in kcrypto_object_candidates(env_tier, exe_dir.as_deref(), elevated) {
         let bytes = match std::fs::read(&candidate) {
@@ -587,6 +615,17 @@ pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateE
         env_dir: env,
         misses,
     })
+}
+
+/// Pin-trusted kcrypto object identity for `doctor --versions`
+/// (G6 M1): path plus sha256 of the winning locator candidate.
+/// `None` when no trusted object is present (environmental —
+/// unprivileged shells without a dev object, or a pinned release
+/// refusing every candidate).
+#[must_use]
+pub fn locate_kcrypto_object_identity() -> Option<(PathBuf, String)> {
+    let (path, bytes) = locate_kcrypto_object_bytes().ok()?;
+    Some((path, sha256_hex(&bytes)))
 }
 
 /// Read the kcrypto BPF object via the consolidated locator.
@@ -1994,18 +2033,35 @@ mod tests {
     fn verify_object_pin_rules() {
         // Hex encoding pins the standard sha256("abc") vector.
         assert_eq!(
-            object_digest_hex(b"abc"),
+            sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         // Empty pins (dev build): verification skipped.
         assert!(verify_object_pinned(b"anything", &[]).is_ok());
         // Pinned digest matches.
-        let digest = object_digest_hex(b"release-object");
+        let digest = sha256_hex(b"release-object");
         assert!(verify_object_pinned(b"release-object", &[digest.as_str()]).is_ok());
         // Mismatch fails loud with the failure named.
         let err = verify_object_pinned(b"tampered-object", &[digest.as_str()])
             .expect_err("tampered bytes must not verify");
         assert!(err.contains("untrusted object"), "names the failure: {err}");
+    }
+
+    #[test]
+    fn pin_skip_warning_names_dev_skip() {
+        // Empty pin set: the skip is named (fail-open made visible).
+        let warn = pin_skip_warning(true).expect("empty pins must warn");
+        assert!(
+            warn.contains("PINNED_DIGESTS") || warn.contains("pin"),
+            "warning names the skipped control: {warn}"
+        );
+        // Pinned builds stay silent.
+        assert_eq!(pin_skip_warning(false), None);
+    }
+
+    #[test]
+    fn pins_enforced_tracks_baked_pins() {
+        assert_eq!(pins_enforced(), !PINNED_DIGESTS.is_empty());
     }
 
     #[test]
