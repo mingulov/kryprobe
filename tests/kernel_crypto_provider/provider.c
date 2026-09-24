@@ -91,10 +91,11 @@ void kxc_ledger_reset(void)
 static struct kxc_run kxc_run;
 static DEFINE_MUTEX(kxc_run_lock);
 /*
- * Orders lockless STOP against PREPARE: STOP's idle-check+set and
- * PREPARE's flag-clear+begin are mutually exclusive, so a STOP
- * can never arm a run it did not observe. GO never takes this
- * lock, so STOP still interrupts a running scenario.
+ * Orders STOP against PREPARE: STOP's idle-check+set and
+ * PREPARE's flag-clear+begin are mutually exclusive under
+ * kxc_stop_lock, so a STOP can never arm a run it did not
+ * observe. GO never takes this lock, so STOP still interrupts
+ * a running scenario.
  */
 static DEFINE_MUTEX(kxc_stop_lock);
 
@@ -133,7 +134,7 @@ int kxc_run_begin(struct kxc_run *run, const char *id,
 	WRITE_ONCE(run->prepared, true);
 	WRITE_ONCE(run->done, false);
 	run->fixture_result = 0;
-	/* WRITE_ONCE: lockless STOP may store concurrently. */
+	/* WRITE_ONCE: STOP may store concurrently under kxc_stop_lock. */
 	WRITE_ONCE(run->stop, false);
 	kxc_ledger_reset();
 	return 0;
