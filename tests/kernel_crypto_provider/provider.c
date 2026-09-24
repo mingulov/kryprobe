@@ -90,6 +90,13 @@ void kxc_ledger_reset(void)
 
 static struct kxc_run kxc_run;
 static DEFINE_MUTEX(kxc_run_lock);
+/*
+ * Orders lockless STOP against PREPARE: STOP's idle-check+set and
+ * PREPARE's flag-clear+begin are mutually exclusive, so a STOP
+ * can never arm a run it did not observe. GO never takes this
+ * lock, so STOP still interrupts a running scenario.
+ */
+static DEFINE_MUTEX(kxc_stop_lock);
 
 u64 kxc_next_seq(struct kxc_run *run)
 {
@@ -236,6 +243,11 @@ static int kxc_sync_crypt(struct skcipher_request *req)
  */
 #define KXC_BQ_MAX_QLEN 1
 static struct crypto_queue kxc_bq;
+/*
+ * The crypto_queue API is caller-synchronized (no internal lock):
+ * this lock serializes submitters against the drain worker.
+ */
+static DEFINE_SPINLOCK(kxc_bq_lock);
 static struct work_struct kxc_drain_work;
 static atomic_t kxc_submit_hold;
 static atomic_t kxc_delay_ms;
@@ -247,7 +259,9 @@ static void kxc_async_fn(struct work_struct *work)
 	int delay_ms, err;
 
 	for (;;) {
+		spin_lock_bh(&kxc_bq_lock);
 		areq = crypto_dequeue_request(&kxc_bq);
+		spin_unlock_bh(&kxc_bq_lock);
 		if (!areq)
 			break;
 		delay_ms = atomic_read(&kxc_delay_ms);
@@ -300,7 +314,9 @@ static int kxc_async_crypt(struct skcipher_request *req)
 {
 	int err;
 
+	spin_lock_bh(&kxc_bq_lock);
 	err = crypto_enqueue_request(&kxc_bq, &req->base);
+	spin_unlock_bh(&kxc_bq_lock);
 	if (err != -EINPROGRESS && err != -EBUSY)
 		return err;
 	if (!atomic_read(&kxc_submit_hold))
@@ -365,17 +381,22 @@ static ssize_t kxc_control_write(struct file *file, const char __user *buf,
 	cmd[len] = '\0';
 
 	/*
-	 * STOP is lockless by design: GO holds kxc_run_lock for the
-	 * whole scenario, so a locking STOP could never interrupt
-	 * it. The idle check is best-effort (racy against DONE); a
-	 * stale flag is always cleared by the next PREPARE, and a
-	 * flag set with no run prepared is harmless (cleared too).
+	 * STOP takes only the stop lock (never the run lock): GO
+	 * holds kxc_run_lock for the whole scenario, so a run-locking
+	 * STOP could never interrupt it. Against a concurrently
+	 * finishing GO the idle check is best-effort, but a stale
+	 * flag is always cleared by the next PREPARE.
 	 */
 	if (!strcmp(cmd, "STOP\n") || !strcmp(cmd, "STOP")) {
-		if (!READ_ONCE(kxc_run.prepared) || READ_ONCE(kxc_run.done))
-			return -EALREADY;
-		kxc_run_request_stop(&kxc_run);
-		return (int)len;
+		mutex_lock(&kxc_stop_lock);
+		if (!kxc_run.prepared || kxc_run.done)
+			ret = -EALREADY;
+		else {
+			kxc_run_request_stop(&kxc_run);
+			ret = (int)len;
+		}
+		mutex_unlock(&kxc_stop_lock);
+		return ret;
 	}
 
 	mutex_lock(&kxc_run_lock);
@@ -397,7 +418,10 @@ static ssize_t kxc_control_write(struct file *file, const char __user *buf,
 	} else if (sscanf(cmd, "PREPARE %64s %32s %llu %n", id, scenario,
 			   &seed, &nchars) == 3 &&
 		   (cmd[nchars] == '\0' || cmd[nchars] == '\n')) {
+		/* run_lock -> stop_lock order; STOP takes only stop_lock. */
+		mutex_lock(&kxc_stop_lock);
 		ret = kxc_run_begin(&kxc_run, id, scenario, (u64)seed);
+		mutex_unlock(&kxc_stop_lock);
 		ret = ret < 0 ? ret : (int)len;
 	} else {
 		ret = -EINVAL;

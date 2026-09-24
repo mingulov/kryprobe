@@ -9,17 +9,22 @@
 use std::collections::HashSet;
 
 /// One parsed request: its fixture sequence, submitted operation
-/// label, terminal native errno and progress/terminal notification
-/// count.
+/// label, recorded errnos and progress/terminal notification count.
 ///
 /// A progress row is a waiter-side in-flight marker, never a kernel
 /// callback; only the terminal row is the completion notification.
+/// Every recorded errno is surfaced: altering any of them changes
+/// the parsed result, so corrupted truth cannot validate unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerRequest {
     /// Fixture invocation sequence.
     pub seq: u64,
     /// Operation label from the submit row (scenario tag).
     pub submit_op: String,
+    /// Native errno of the submit-return row.
+    pub return_errno: i32,
+    /// Native errno of the progress row, if one was recorded.
+    pub progress_errno: Option<i32>,
     /// Native errno of the terminal row.
     pub terminal_errno: i32,
     /// Progress + terminal rows observed for this sequence.
@@ -98,11 +103,12 @@ struct Build {
     seq: u64,
     /// Whether the submit row arrived (later phases require it).
     submitted: bool,
-    /// Whether the return row arrived (terminal requires it: every
-    /// invocation has a submit return, even async EINPROGRESS).
-    returned: bool,
     /// Operation label from the submit row.
     submit_op: Option<String>,
+    /// Submit-return errno once the return row arrives.
+    return_errno: Option<i32>,
+    /// Progress errno once the progress row arrives, if ever.
+    progress_errno: Option<i32>,
     /// Terminal errno once the terminal row arrives.
     terminal_errno: Option<i32>,
     /// Progress + terminal rows seen so far.
@@ -172,10 +178,12 @@ fn row_errno(row: &serde_json::Value, lineno: usize, phase: &str) -> Result<i32,
 ///
 /// Strictness is load-bearing: (sequence, phase) rows are unique
 /// (a future multi-progress fixture relaxes this with its own
-/// test), every request needs submit, return and terminal rows in
-/// that dependency order, free requires a prior alloc, every alloc
-/// must close before DONE, no row may follow DONE, and the run
-/// must close with DONE.
+/// test), every request needs submit, return and terminal rows
+/// (submit first; return existence required but unordered vs
+/// terminal — a genuine terminal may land first under preemption,
+/// matrix Q04), free requires a prior alloc, every alloc must
+/// close before DONE, no row may follow DONE, and the run must
+/// close with DONE.
 pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, LedgerError> {
     let mut reqs: Vec<Build> = Vec::new();
     let mut alloc_builds: Vec<AllocBuild> = Vec::new();
@@ -286,8 +294,9 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                         reqs.push(Build {
                             seq,
                             submitted: false,
-                            returned: false,
                             submit_op: None,
+                            return_errno: None,
+                            progress_errno: None,
                             terminal_errno: None,
                             notifications: 0,
                         });
@@ -304,19 +313,17 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                     )));
                 }
                 if phase == "return" {
-                    row_errno(&row, lineno, "return")?;
-                    reqs[idx].returned = true;
+                    reqs[idx].return_errno = Some(row_errno(&row, lineno, "return")?);
                 }
                 if phase == "progress" {
-                    row_errno(&row, lineno, "progress")?;
+                    reqs[idx].progress_errno = Some(row_errno(&row, lineno, "progress")?);
                     reqs[idx].notifications += 1;
                 }
                 if phase == "terminal" {
-                    if !reqs[idx].returned {
-                        return Err(LedgerError::PhaseInconsistency(format!(
-                            "seq {seq} terminal arrived before return"
-                        )));
-                    }
+                    // No order requirement vs return: a genuine
+                    // terminal may land first under preemption
+                    // (matrix Q04). Existence of the return row
+                    // is still required at finalize.
                     reqs[idx].terminal_errno = Some(row_errno(&row, lineno, "terminal")?);
                     reqs[idx].notifications += 1;
                 }
@@ -347,10 +354,12 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
     }
     let mut requests = Vec::with_capacity(reqs.len());
     for r in reqs {
-        match (r.submit_op, r.returned, r.terminal_errno) {
-            (Some(op), true, Some(errno)) => requests.push(LedgerRequest {
+        match (r.submit_op, r.return_errno, r.terminal_errno) {
+            (Some(op), Some(returned), Some(errno)) => requests.push(LedgerRequest {
                 seq: r.seq,
                 submit_op: op,
+                return_errno: returned,
+                progress_errno: r.progress_errno,
                 terminal_errno: errno,
                 notifications: r.notifications,
             }),
@@ -360,7 +369,7 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                     r.seq
                 )));
             }
-            (_, false, _) => {
+            (_, None, _) => {
                 return Err(LedgerError::PhaseInconsistency(format!(
                     "seq {} never returned",
                     r.seq

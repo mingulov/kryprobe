@@ -335,7 +335,13 @@ static int kxc_scenario_delayed_completion(struct kxc_run *run)
 		kxc_op_release(run, &op, aseq);
 		return err;
 	}
-	kxc_emit_progress(run, seq, -EINPROGRESS);
+	/*
+	 * Poll, don't assume: if this thread was descheduled past
+	 * the (genuinely delayed) completion, the marker truthfully
+	 * records 0 instead of a false in-flight -EINPROGRESS.
+	 */
+	kxc_emit_progress(run, seq,
+			  completion_done(&op.done) ? 0 : -EINPROGRESS);
 	err = kxc_wait_done(run, &op);
 	elapsed_ms = (ktime_get_ns() - t0) / 1000000;
 	kxc_set_delay_ms(0);

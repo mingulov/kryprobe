@@ -24,8 +24,37 @@ fn literal_async_submit_yields_one_completed_request_and_two_notifications() {
     let req = &ledger.requests[0];
     assert_eq!(req.seq, 7);
     assert_eq!(req.submit_op, "encrypt", "submit op label carried");
+    assert_eq!(req.return_errno, -115, "submit-return errno carried");
+    assert_eq!(req.progress_errno, Some(-115), "progress errno carried");
     assert_eq!(req.terminal_errno, 0, "terminal success");
     assert_eq!(req.notifications, 2, "progress + terminal notifications");
+}
+
+#[test]
+fn terminal_without_errno_rejected() {
+    let text =
+        LITERAL_ASYNC_SUBMIT.replace(r#""phase":"terminal","errno":0"#, r#""phase":"terminal""#);
+    let err = parse_ledger("run-1", &text).expect_err("errno-less terminal rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn terminal_before_return_parses() {
+    // Genuine preemption interleaving (matrix Q04): the terminal
+    // lands before the return row. Return existence is required,
+    // return order is not.
+    let mut lines: Vec<&str> = LITERAL_ASYNC_SUBMIT.lines().collect();
+    lines.swap(1, 3);
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let ledger = parse_ledger("run-1", &text).expect("interleaving parses");
+    assert_eq!(ledger.requests.len(), 1);
+    let req = &ledger.requests[0];
+    assert_eq!(req.return_errno, -115);
+    assert_eq!(req.terminal_errno, 0);
+    assert_eq!(req.notifications, 2);
 }
 
 #[test]

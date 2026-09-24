@@ -18,6 +18,10 @@ use kryprobe_testkit::kernel_crypto_ledger::{ParsedLedger, parse_ledger};
 
 /// Native ENOENT: `crypto_alloc_skcipher` on an unknown name.
 const ENOENT: i32 = 2;
+/// Native EINPROGRESS: async submit queued.
+const EINPROGRESS: i32 = 115;
+/// Native EBUSY: MAY_BACKLOG submit queued as backlog.
+const EBUSY: i32 = 16;
 
 fn load() -> (String, ParsedLedger) {
     let path = std::env::var("KCRYPTO_LEDGER_PATH").expect("KCRYPTO_LEDGER_PATH set");
@@ -53,6 +57,8 @@ fn guest_ledger_matches_scenario_contract() {
                 .collect();
             assert_eq!(ops, ["encrypt", "decrypt"], "submit op labels");
             for req in &ledger.requests {
+                assert_eq!(req.return_errno, 0, "sync return");
+                assert_eq!(req.progress_errno, None, "no progress marker");
                 assert_eq!(req.terminal_errno, 0, "sync success");
                 assert_eq!(req.notifications, 1, "one terminal notification");
             }
@@ -63,34 +69,60 @@ fn guest_ledger_matches_scenario_contract() {
             assert_eq!(ledger.requests.len(), 1, "one async invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt", "submit op label");
+            assert_eq!(req.return_errno, -EINPROGRESS, "async return");
+            assert_eq!(req.progress_errno, None, "no progress marker");
             assert_eq!(req.terminal_errno, 0, "terminal success");
             assert_eq!(req.notifications, 1, "one terminal notification");
         }
-        // Slow waiter: one progress marker plus the terminal.
+        // Genuine slow completion: in-flight progress marker,
+        // then the terminal ~200ms later (elapsed verified by the
+        // fixture; order + gap receipted per run).
         "delayed-completion" => {
             expect_single_lifetime(&ledger);
             assert_eq!(ledger.requests.len(), 1, "one delayed invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-delayed", "submit op label");
+            assert_eq!(req.return_errno, -EINPROGRESS, "async return");
+            assert_eq!(
+                req.progress_errno,
+                Some(-EINPROGRESS),
+                "genuinely in-flight marker"
+            );
             assert_eq!(req.terminal_errno, 0, "terminal success");
             assert_eq!(req.notifications, 2, "progress + terminal");
         }
-        // Four concurrent MAY_BACKLOG submits on one transform.
+        // Four MAY_BACKLOG submits on one transform against the
+        // depth-1 held queue: exactly EINPROGRESS then EBUSY x3.
         "backlog-accepted" => {
             expect_single_lifetime(&ledger);
             assert_eq!(ledger.requests.len(), 4, "burst of four");
+            let returns: Vec<i32> = ledger.requests.iter().map(|req| req.return_errno).collect();
+            assert_eq!(
+                returns,
+                [-EINPROGRESS, -EBUSY, -EBUSY, -EBUSY],
+                "exact backlog return script"
+            );
             for req in &ledger.requests {
                 assert_eq!(req.submit_op, "encrypt-burst", "submit op label");
+                assert_eq!(req.progress_errno, None, "no progress marker");
                 assert_eq!(req.terminal_errno, 0, "burst terminal success");
                 assert_eq!(req.notifications, 1, "one terminal notification each");
             }
         }
-        // Pre-wait poll recorded as one progress row either way.
+        // Pre-wait poll recorded as one progress row either way:
+        // 0 if the callback already landed, EINPROGRESS if still
+        // in flight. Both are truthful poll results.
         "early-callback" => {
             expect_single_lifetime(&ledger);
             assert_eq!(ledger.requests.len(), 1, "one polled invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-early", "submit op label");
+            assert_eq!(req.return_errno, -EINPROGRESS, "async return");
+            assert!(
+                req.progress_errno == Some(0) || req.progress_errno == Some(-EINPROGRESS),
+                "truthful poll result, got {:?}",
+                req.progress_errno
+            );
             assert_eq!(req.terminal_errno, 0, "terminal success");
             assert_eq!(req.notifications, 2, "poll progress + terminal");
         }
@@ -109,6 +141,8 @@ fn guest_ledger_matches_scenario_contract() {
             assert_eq!(ledger.requests.len(), 1, "one async invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-exact", "submit op label");
+            assert_eq!(req.return_errno, -EINPROGRESS, "async return");
+            assert_eq!(req.progress_errno, None, "no progress marker");
             assert_eq!(req.terminal_errno, 0, "terminal success");
             assert_eq!(req.notifications, 1, "one terminal notification");
         }
@@ -118,6 +152,8 @@ fn guest_ledger_matches_scenario_contract() {
             assert_eq!(ledger.requests.len(), 1, "one alloc probe");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "alloc-probe", "submit op label");
+            assert_eq!(req.return_errno, -ENOENT, "probe return carries ENOENT");
+            assert_eq!(req.progress_errno, None, "no progress marker");
             assert_eq!(req.terminal_errno, -ENOENT, "native ENOENT carried");
             assert_eq!(req.notifications, 1, "one terminal notification");
         }
