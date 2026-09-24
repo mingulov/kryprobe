@@ -177,7 +177,8 @@ struct Pending {
 }
 
 /// A completed id's retained truth: the emitted terminal plus whether
-/// a later identity-ambiguity gap invalidated it. Invalidation cannot
+/// identity ambiguity invalidated it — at completion (live
+/// identity-ambiguity gap) or after (later gap). Invalidation cannot
 /// retract the emitted record; consumers check
 /// [`LifecycleReducer::is_invalidated`].
 #[derive(Debug, Clone, Copy)]
@@ -214,10 +215,11 @@ impl LifecycleReducer {
         self.stats
     }
 
-    /// Whether a completed id was later invalidated by an
-    /// identity-ambiguity gap. False for live, never-admitted, and
-    /// evicted ids: eviction drops the invalidation fact with the
-    /// tombstone, so cross-lifetime invalidation tracking requires
+    /// Whether a completed id was invalidated by identity
+    /// ambiguity — at completion (live gap) or after (later gap).
+    /// False for live, never-admitted, and evicted ids: eviction
+    /// drops the invalidation fact with the tombstone, so
+    /// cross-lifetime invalidation tracking requires
     /// lifetime-unique ids (T08 prerequisite).
     pub fn is_invalidated(&self, id: u64) -> bool {
         self.completed
