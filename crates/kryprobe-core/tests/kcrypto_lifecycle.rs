@@ -160,6 +160,42 @@ fn stats_count_admitted_and_emitted() {
 }
 
 #[test]
+fn resubmit_of_completed_id_is_duplicate() {
+    // A next-generation submit under a tombstoned id never reopens or
+    // completes the old lifecycle (raw-address assignment is T08/T09).
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 30
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+    assert_eq!(r.stats().admitted, 1);
+    assert_eq!(r.stats().emitted, 1);
+}
+
+#[test]
 fn stats_count_rejections() {
     let mut r = LifecycleReducer::new(1);
     assert!(

@@ -263,6 +263,41 @@ mod tests {
     }
 
     #[test]
+    fn schema_file_matches_validator() {
+        // The standalone contract doc stays parseable and keeps the
+        // keys + version const the validator enforces (bytes freeze
+        // only after review; this pins the doc against rot).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/kcrypto-lifecycle-v1.schema.json");
+        let text = std::fs::read_to_string(&path).expect("schema file readable");
+        let schema: Value = serde_json::from_str(&text).expect("schema file parses");
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required array");
+        for key in [
+            "schema",
+            "request_id",
+            "tfm_id",
+            "terminal",
+            "status",
+            "duration_ns",
+        ] {
+            assert!(
+                required.iter().any(|k| k.as_str() == Some(key)),
+                "key {key}"
+            );
+        }
+        assert_eq!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("schema"))
+                .and_then(|s| s.get("const")),
+            Some(&serde_json::json!("kryprobe.kcrypto.lifecycle/v1")),
+        );
+    }
+
+    #[test]
     fn accepts_valid_payloads() {
         let sync = json!({
             "schema": "kryprobe.kcrypto.lifecycle/v1",
