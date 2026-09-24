@@ -35,7 +35,10 @@ pub enum CallbackDisposition {
 /// One observed lifecycle edge, in per-source arrival order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
-    /// Request submitted; opens the id's lifecycle.
+    /// Request submitted; opens the id's lifecycle. Submit-first
+    /// delivery is an adapter prerequisite: any edge for an id
+    /// arriving before its submit is a counted orphan, never joined
+    /// retroactively.
     Submit {
         /// Opaque request id.
         id: u64,
@@ -82,13 +85,17 @@ pub enum Edge {
 pub enum GapReason {
     /// An expected phase was never observed and will not arrive.
     MissingPhase,
-    /// The id's identity cannot be trusted for joins: the completion
-    /// emits [`Terminal::Unknown`] even when terminal truth was
-    /// retained, and further admission under the id is refused while
-    /// its tombstone is retained. After tombstone eviction the id may
-    /// be explicitly re-admitted (bounded memory cannot refuse
-    /// forever); cross-lifetime safety then requires lifetime-unique
-    /// ids (T08 prerequisite).
+    /// The id's identity cannot be trusted for joins. Before
+    /// emission, the completion emits [`Terminal::Unknown`] even
+    /// when terminal truth was retained, and further admission
+    /// under the id is refused while its tombstone is retained.
+    /// After emission, the gap flags the tombstone instead (counted
+    /// ambiguous, queryable via
+    /// [`LifecycleReducer::is_invalidated`]) without retracting the
+    /// record. After tombstone eviction the id may be explicitly
+    /// re-admitted (bounded memory cannot refuse forever);
+    /// cross-lifetime safety then requires lifetime-unique ids
+    /// (T08 prerequisite).
     IdentityAmbiguous,
     /// Evidence was lost between the kernel and the reducer.
     TransportLoss,
@@ -165,12 +172,22 @@ struct Pending {
     return_queued: bool,
 }
 
+/// A completed id's retained truth: the emitted terminal plus whether
+/// a later identity-ambiguity gap invalidated it. Invalidation cannot
+/// retract the emitted record; consumers check
+/// [`LifecycleReducer::is_invalidated`].
+#[derive(Debug, Clone, Copy)]
+struct Tombstone {
+    terminal: Terminal,
+    invalidated: bool,
+}
+
 /// Pure bounded reducer: folds [`Edge`]s into [`RequestRecord`]s.
 #[derive(Debug)]
 pub struct LifecycleReducer {
     capacity: usize,
     pending: HashMap<u64, Pending>,
-    completed: HashMap<u64, Terminal>,
+    completed: HashMap<u64, Tombstone>,
     tombstone_order: VecDeque<u64>,
     stats: ReducerStats,
 }
@@ -193,14 +210,31 @@ impl LifecycleReducer {
         self.stats
     }
 
+    /// Whether a completed id was later invalidated by an
+    /// identity-ambiguity gap. False for live, never-admitted, and
+    /// evicted ids: eviction drops the invalidation fact with the
+    /// tombstone, so cross-lifetime invalidation tracking requires
+    /// lifetime-unique ids (T08 prerequisite).
+    pub fn is_invalidated(&self, id: u64) -> bool {
+        self.completed
+            .get(&id)
+            .is_some_and(|stone| stone.invalidated)
+    }
+
     /// Tombstones a completed id with the emitted terminal truth,
     /// evicting the oldest tombstone past capacity. Eviction is
     /// explicit, never a silent merge: a resubmitted evicted id
     /// starts a fresh lifecycle with fresh counters. The retained
     /// truth lets late terminals be compared: repeats are
-    /// duplicates, contradictions are ambiguous.
+    /// duplicates, contradictions are ambiguous. A fresh tombstone
+    /// is never invalidated; only a later identity-ambiguity gap
+    /// flags it.
     fn tombstone(&mut self, id: u64, terminal: Terminal) {
-        if self.completed.insert(id, terminal).is_none() {
+        let stone = Tombstone {
+            terminal,
+            invalidated: false,
+        };
+        if self.completed.insert(id, stone).is_none() {
             self.tombstone_order.push_back(id);
             while self.tombstone_order.len() > self.capacity {
                 if let Some(old) = self.tombstone_order.pop_front() {
@@ -280,9 +314,9 @@ impl LifecycleReducer {
                 status,
                 disposition,
             } => {
-                if let Some(emitted) = self.completed.get(&id).copied() {
+                if let Some(stone) = self.completed.get(&id).copied() {
                     if disposition == CallbackDisposition::Terminal {
-                        self.diagnose_tombstoned(emitted, Terminal::Callback(status));
+                        self.diagnose_tombstoned(stone.terminal, Terminal::Callback(status));
                     } else {
                         self.stats.duplicate += 1;
                     }
@@ -339,9 +373,15 @@ impl LifecycleReducer {
                 status,
                 disposition,
             } => {
-                if let Some(emitted) = self.completed.get(&id).copied() {
+                if let Some(stone) = self.completed.get(&id).copied() {
                     if disposition == ReturnDisposition::Terminal {
-                        self.diagnose_tombstoned(emitted, Terminal::Sync(status));
+                        self.diagnose_tombstoned(stone.terminal, Terminal::Sync(status));
+                    } else if disposition == ReturnDisposition::Queued
+                        && matches!(stone.terminal, Terminal::Sync(_))
+                    {
+                        // A Queued classification after synchronous
+                        // completion contradicts the emitted truth.
+                        self.stats.ambiguous += 1;
                     } else {
                         self.stats.duplicate += 1;
                     }
@@ -428,7 +468,27 @@ impl LifecycleReducer {
             }
             Edge::Gap { id, reason } => {
                 if self.completed.contains_key(&id) {
-                    self.stats.duplicate += 1;
+                    // Identity ambiguity discovered after emission
+                    // cannot retract the record, but it must be loud
+                    // and queryable: the first late invalidation
+                    // counts ambiguous and flags the tombstone (see
+                    // `is_invalidated`); repeats are duplicates.
+                    if reason == GapReason::IdentityAmbiguous {
+                        let fresh = match self.completed.get_mut(&id) {
+                            Some(stone) if !stone.invalidated => {
+                                stone.invalidated = true;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if fresh {
+                            self.stats.ambiguous += 1;
+                        } else {
+                            self.stats.duplicate += 1;
+                        }
+                    } else {
+                        self.stats.duplicate += 1;
+                    }
                     return Vec::new();
                 }
                 let Some(p) = self.pending.remove(&id) else {

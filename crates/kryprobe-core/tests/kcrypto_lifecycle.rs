@@ -3,8 +3,8 @@
 //!
 //! A terminal callback arriving before its return must complete the
 //! request exactly once, with the callback's terminal status and the
-//! submit→return duration — and a duplicate terminal after completion
-//! must emit nothing.
+//! submit→terminal-edge duration — and a duplicate terminal after
+//! completion must emit nothing.
 
 use kryprobe_core::kcrypto::{
     CallbackDisposition, Edge, GapReason, LifecycleReducer, ReturnDisposition, Terminal,
@@ -348,6 +348,183 @@ fn identity_ambiguous_gap_invalidates() {
 }
 
 #[test]
+fn late_identity_gap_invalidates_emitted_record() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 20,
+        status: 0,
+        disposition: ReturnDisposition::Terminal,
+    });
+    assert_eq!(out.len(), 1);
+    assert!(out[0].evidence_valid());
+    assert!(!r.is_invalidated(1));
+    // Identity ambiguity discovered after emission cannot retract the
+    // record, but it must be loud and queryable — never a silent
+    // duplicate.
+    assert!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::IdentityAmbiguous,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().ambiguous, 1);
+    assert_eq!(r.stats().duplicate, 0);
+    assert!(r.is_invalidated(1));
+}
+
+#[test]
+fn repeat_late_identity_gap_is_duplicate() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::IdentityAmbiguous,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().ambiguous, 1);
+    assert!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::IdentityAmbiguous,
+        })
+        .is_empty()
+    );
+    // The invalidation fact is already known: a repeat is a duplicate.
+    assert_eq!(r.stats().ambiguous, 1);
+    assert_eq!(r.stats().duplicate, 1);
+    assert!(r.is_invalidated(1));
+}
+
+#[test]
+fn is_invalidated_false_for_live_and_unknown() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(!r.is_invalidated(1));
+    assert!(!r.is_invalidated(999));
+}
+
+#[test]
+fn eviction_drops_invalidation_fact() {
+    let mut r = LifecycleReducer::new(1);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::IdentityAmbiguous,
+        })
+        .is_empty()
+    );
+    assert!(r.is_invalidated(1));
+    // Completing a second id evicts the first tombstone — and the
+    // invalidation fact with it (T08 prerequisite).
+    assert!(
+        r.apply(Edge::Submit {
+            id: 2,
+            tfm_id: None,
+            ts_ns: 30
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 2,
+            ts_ns: 40,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert!(!r.is_invalidated(1));
+}
+
+#[test]
+fn deadline_gap_on_tombstone_does_not_invalidate() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::Deadline,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+    assert_eq!(r.stats().ambiguous, 0);
+    assert!(!r.is_invalidated(1));
+}
+
+#[test]
 fn evidence_valid_iff_terminal_truth() {
     let mut r = LifecycleReducer::new(4);
     assert!(
@@ -432,6 +609,46 @@ fn gap_on_unknown_id_is_orphan() {
         .is_empty()
     );
     assert_eq!(r.stats().orphan, 1);
+}
+
+#[test]
+fn pre_submit_terminal_is_orphan_not_joined() {
+    let mut r = LifecycleReducer::new(4);
+    // Submit-first delivery is an adapter prerequisite: a terminal
+    // arriving before its submit is a counted orphan.
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 5,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().orphan, 1);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    // The orphaned terminal is never joined retroactively: conservative
+    // loss (Unknown), not an invented completion.
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    let drained = r.finish(30);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].terminal, Terminal::Unknown);
+    assert!(!drained[0].evidence_valid());
 }
 
 #[test]
@@ -805,6 +1022,122 @@ fn counters_balance_after_full_drain() {
 }
 
 #[test]
+fn queued_return_after_sync_is_ambiguous() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    // A Queued classification after synchronous completion
+    // contradicts the emitted truth; it does not repeat known
+    // state.
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 30,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().ambiguous, 1);
+    assert_eq!(r.stats().duplicate, 0);
+}
+
+#[test]
+fn queued_return_after_callback_is_duplicate() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 30,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .len(),
+        1
+    );
+    // The async path already joined one Queued return; a repeat
+    // agrees with the emitted Callback truth.
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 40,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+    assert_eq!(r.stats().ambiguous, 0);
+}
+
+#[test]
+fn queued_return_after_unknown_is_duplicate() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::Deadline
+        })
+        .len(),
+        1
+    );
+    // Unknown claims no truth, so a late Queued classification
+    // contradicts nothing.
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 30,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+    assert_eq!(r.stats().ambiguous, 0);
+}
+
+#[test]
 fn tombstones_evict_oldest_beyond_capacity() {
     let mut r = LifecycleReducer::new(2);
     for (id, base) in [(1u64, 10u64), (2, 20), (3, 30)] {
@@ -855,6 +1188,67 @@ fn tombstones_evict_oldest_beyond_capacity() {
     assert_eq!(out[0].duration_ns, Some(10));
     assert_eq!(r.stats().admitted, 4);
     assert_eq!(r.stats().emitted, 4);
+}
+
+#[test]
+fn q04_fresh_request_independent_of_pending_old() {
+    // Q04: terminal callback before return, then callback-triggered
+    // request reuse. The reuse arrives as a fresh id (raw-address
+    // pairing is T08/T09): the old return must join the old
+    // invocation and the new request stays independent.
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Submit {
+            id: 2,
+            tfm_id: None,
+            ts_ns: 25
+        })
+        .is_empty()
+    );
+    let fresh = r.apply(Edge::Return {
+        id: 2,
+        ts_ns: 35,
+        status: 5,
+        disposition: ReturnDisposition::Terminal,
+    });
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].id, 2);
+    assert_eq!(fresh[0].terminal, Terminal::Sync(5));
+    assert_eq!(fresh[0].duration_ns, Some(10));
+    let old = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 30,
+        status: -115,
+        disposition: ReturnDisposition::Queued,
+    });
+    assert_eq!(old.len(), 1);
+    assert_eq!(old[0].id, 1);
+    assert_eq!(old[0].terminal, Terminal::Callback(0));
+    assert_eq!(old[0].duration_ns, Some(10));
+    // No lost terminal, no double count, no cross-join.
+    let s = r.stats();
+    assert_eq!(s.admitted, 2);
+    assert_eq!(s.emitted, 2);
+    assert_eq!(s.orphan, 0);
+    assert_eq!(s.duplicate, 0);
+    assert_eq!(s.ambiguous, 0);
 }
 
 #[test]

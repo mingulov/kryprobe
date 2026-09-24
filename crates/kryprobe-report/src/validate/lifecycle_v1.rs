@@ -47,6 +47,13 @@ pub enum LifecycleFinding {
         /// Offending schema value.
         found: String,
     },
+    /// A key outside the schema is present. Names the key only:
+    /// unknown values (which could be key material or buffer
+    /// contents) must never leak into diagnostics.
+    UnknownKey {
+        /// Offending key name.
+        key: String,
+    },
     /// Individually well-shaped fields contradict each other (terminal
     /// truth without status, status/duration without terminal truth).
     InvalidCombination {
@@ -85,16 +92,15 @@ pub fn validate_lifecycle_v1(payload: &Value) -> Vec<LifecycleFinding> {
         .collect();
     unknown.sort_unstable();
     for key in unknown {
-        out.push(LifecycleFinding::BadShape {
+        out.push(LifecycleFinding::UnknownKey {
             key: key.to_string(),
-            value: shorten(&render(&obj[key])),
         });
     }
     match obj.get("schema") {
         Some(Value::String(found)) if found == KCRYPTO_LIFECYCLE_V1 => {}
         Some(Value::String(found)) => {
             out.push(LifecycleFinding::UnknownVersion {
-                found: found.clone(),
+                found: shorten(found),
             });
         }
         other => out.push(LifecycleFinding::BadShape {
@@ -295,6 +301,11 @@ mod tests {
         })
     }
 
+    /// Exact canonical-decimal u64 range pattern the schema must
+    /// carry (generated + verified by an exact range script; any
+    /// schema-side weakening breaks this pin).
+    const EXPECTED_DURATION_PATTERN: &str = "^(0|[1-9][0-9]{0,18}|1(?:0[0-9]{18}|[1-7][0-9]{18}|8(?:(?:0[0-9]{17}|[1-3][0-9]{17}|4(?:(?:0[0-9]{16}|[1-3][0-9]{16}|4(?:(?:0[0-9]{15}|[1-5][0-9]{15}|6(?:(?:0[0-9]{14}|[1-6][0-9]{14}|7(?:(?:0[0-9]{13}|[1-3][0-9]{13}|4(?:(?:0[0-9]{12}|[1-3][0-9]{12}|4(?:0(?:0[0-9]{10}|[1-6][0-9]{10}|7(?:(?:0[0-9]{9}|[1-2][0-9]{9}|3(?:(?:0[0-9]{8}|[1-6][0-9]{8}|7(?:0(?:0[0-9]{6}|[1-8][0-9]{6}|9(?:(?:0[0-9]{5}|[1-4][0-9]{5}|5(?:(?:0[0-9]{4}|[1-4][0-9]{4}|5(?:(?:0[0-9]{3}|1(?:(?:0[0-9]{2}|[1-5][0-9]{2}|6(?:(?:0[0-9]|1(?:(?:0|[1-4]|5))))))))))))))))))))))))))))))))))$";
+
     #[test]
     fn schema_file_matches_validator() {
         // The standalone contract doc stays parseable and keeps the
@@ -359,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             duration_string.get("pattern"),
-            Some(&serde_json::json!("^(0|[1-9][0-9]*)$")),
+            Some(&serde_json::json!(EXPECTED_DURATION_PATTERN)),
         );
     }
 
@@ -531,16 +542,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_keys() {
+    fn rejects_unknown_keys_without_echoing_values() {
         let mut extra = base();
         extra
             .as_object_mut()
             .expect("object")
             .insert("key_material".to_string(), serde_json::json!("secret"));
-        assert!(matches!(
-            validate_lifecycle_v1(&extra)[..],
-            [LifecycleFinding::BadShape { .. }]
-        ));
+        let findings = validate_lifecycle_v1(&extra);
+        assert_eq!(
+            findings,
+            vec![LifecycleFinding::UnknownKey {
+                key: "key_material".to_string()
+            }]
+        );
+        // Forbidden contents must not leak into diagnostics: the
+        // finding names the key, never its value.
+        let rendered = format!("{findings:?}");
+        assert!(rendered.contains("key_material"));
+        assert!(!rendered.contains("secret"));
     }
 
     #[test]
@@ -595,23 +614,32 @@ mod tests {
 
     #[test]
     fn pins_u64_duration_boundary() {
-        // u64::MAX is the largest representable span; u64::MAX + 1
-        // (the round-1 counterexample) is rejected.
-        let mut max = base();
-        max.as_object_mut().expect("object").insert(
-            "duration_ns".to_string(),
-            serde_json::json!(u64::MAX.to_string()),
-        );
-        assert!(validate_lifecycle_v1(&max).is_empty());
-        let mut over = base();
-        over.as_object_mut().expect("object").insert(
-            "duration_ns".to_string(),
-            serde_json::json!("18446744073709551616"),
-        );
-        assert!(matches!(
-            validate_lifecycle_v1(&over)[..],
-            [LifecycleFinding::BadShape { .. }]
-        ));
+        // Canonical zero, u64::MAX - 1 and u64::MAX are the boundary
+        // accepts; u64::MAX + 1 (the round-1 counterexample) and a
+        // 20-digit overflow are rejected — exactly like the schema
+        // pattern.
+        for text in ["0", "18446744073709551614", &u64::MAX.to_string()] {
+            let mut payload = base();
+            payload
+                .as_object_mut()
+                .expect("object")
+                .insert("duration_ns".to_string(), serde_json::json!(text));
+            assert!(validate_lifecycle_v1(&payload).is_empty(), "{text}");
+        }
+        for text in ["18446744073709551616", "99999999999999999999"] {
+            let mut payload = base();
+            payload
+                .as_object_mut()
+                .expect("object")
+                .insert("duration_ns".to_string(), serde_json::json!(text));
+            assert!(
+                matches!(
+                    validate_lifecycle_v1(&payload)[..],
+                    [LifecycleFinding::BadShape { .. }]
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
