@@ -314,6 +314,73 @@ fn gap_with_retained_terminal_emits_it() {
 }
 
 #[test]
+fn identity_ambiguous_gap_invalidates() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: 5,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    // Identity cannot be trusted: the retained terminal must not emit
+    // as a trusted result.
+    let out = r.apply(Edge::Gap {
+        id: 1,
+        reason: GapReason::IdentityAmbiguous,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Unknown);
+    assert_eq!(out[0].duration_ns, None);
+    assert!(!out[0].evidence_valid());
+    assert_eq!(r.stats().ambiguous, 1);
+    assert_eq!(r.stats().emitted, 1);
+}
+
+#[test]
+fn evidence_valid_iff_terminal_truth() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 20,
+        status: 0,
+        disposition: ReturnDisposition::Terminal,
+    });
+    assert!(out[0].evidence_valid());
+    assert!(
+        r.apply(Edge::Submit {
+            id: 2,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Gap {
+        id: 2,
+        reason: GapReason::Deadline,
+    });
+    assert!(!out[0].evidence_valid());
+}
+
+#[test]
 fn edges_after_gap_completion_are_duplicates() {
     let mut r = LifecycleReducer::new(4);
     assert!(
@@ -493,6 +560,251 @@ fn conflicting_sync_return_keeps_first_terminal() {
 }
 
 #[test]
+fn conflicting_terminal_callback_status_counted() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: 5,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    // Same terminal repeated: pure duplicate.
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 21,
+            status: 5,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    // Conflicting terminal status: ambiguous, first truth retained.
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 22,
+            status: 7,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+    assert_eq!(r.stats().ambiguous, 1);
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 30,
+        status: -115,
+        disposition: ReturnDisposition::Queued,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Callback(5));
+}
+
+#[test]
+fn terminal_on_tombstone_compared_to_emitted() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    // Same terminal repeated: duplicate.
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 30,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    // Conflicting status and kind: ambiguous.
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 31,
+            status: 5,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 32,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    // Late terminal after an Unknown completion: suppressed duplicate,
+    // not a contradiction (Unknown claims no truth).
+    assert!(
+        r.apply(Edge::Submit {
+            id: 2,
+            tfm_id: None,
+            ts_ns: 40
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        r.apply(Edge::Gap {
+            id: 2,
+            reason: GapReason::Deadline
+        })
+        .len(),
+        1
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 2,
+            ts_ns: 50,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 2);
+    assert_eq!(r.stats().ambiguous, 2);
+    assert_eq!(r.stats().emitted, 2);
+}
+
+#[test]
+fn repeat_queued_return_is_duplicate() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 0);
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 21,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+}
+
+#[test]
+fn terminal_return_after_queued_is_ambiguous() {
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    // The terminal return completes, but contradicts the earlier Queued
+    // classification.
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 30,
+        status: 0,
+        disposition: ReturnDisposition::Terminal,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Sync(0));
+    assert_eq!(r.stats().ambiguous, 1);
+}
+
+#[test]
+fn counters_balance_after_full_drain() {
+    let mut r = LifecycleReducer::new(4);
+    // id1: sync completion. id2: explicit gap completion without
+    // truth (emitted, but not unfinished). id3: drained truthless.
+    for (id, base) in [(1u64, 10u64), (2, 20), (3, 30)] {
+        assert!(
+            r.apply(Edge::Submit {
+                id,
+                tfm_id: None,
+                ts_ns: base
+            })
+            .is_empty()
+        );
+    }
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 15,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert_eq!(
+        r.apply(Edge::Gap {
+            id: 2,
+            reason: GapReason::Deadline
+        })
+        .len(),
+        1
+    );
+    let drained = r.finish(100);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].id, 3);
+    // admitted == emitted + live(0); unfinished is the truthless
+    // drained subset of emitted, never double-counted.
+    let s = r.stats();
+    assert_eq!(s.admitted, 3);
+    assert_eq!(s.emitted, 3);
+    assert_eq!(s.unfinished, 1);
+    assert!(s.unfinished <= s.emitted);
+}
+
+#[test]
 fn tombstones_evict_oldest_beyond_capacity() {
     let mut r = LifecycleReducer::new(2);
     for (id, base) in [(1u64, 10u64), (2, 20), (3, 30)] {
@@ -512,13 +824,14 @@ fn tombstones_evict_oldest_beyond_capacity() {
         });
         assert_eq!(out.len(), 1);
     }
-    // Tombstones hold {2, 3}: id 3's late edge is still a duplicate.
+    // Tombstones hold {2, 3}: id 3's late repeat of the emitted
+    // terminal is still a duplicate.
     assert!(
-        r.apply(Edge::Callback {
+        r.apply(Edge::Return {
             id: 3,
             ts_ns: 45,
             status: 0,
-            disposition: CallbackDisposition::Terminal,
+            disposition: ReturnDisposition::Terminal,
         })
         .is_empty()
     );
@@ -688,7 +1001,8 @@ fn q08_terminal_at_most_once_across_paths() {
         1
     );
     assert_eq!(r.stats().emitted, 4);
-    // Repeats on every path: suppressed, all duplicates.
+    // Repeats on every path: suppressed. Terminals that repeat the emitted
+    // completion are duplicates; ones that contradict it are ambiguous.
     for id in [1u64, 2, 3, 4] {
         assert!(
             r.apply(Edge::Return {
@@ -716,6 +1030,11 @@ fn q08_terminal_at_most_once_across_paths() {
             .is_empty()
         );
     }
-    assert_eq!(r.stats().duplicate, 12);
+    // duplicate: id1/id4 terminal-return repeats, id2/id3 terminal-callback
+    // repeats, id4 callback after Unknown (suppressed late), 4 gap repeats
+    // = 9. ambiguous: id2/id3 terminal returns and the id1 terminal
+    // callback contradict the emitted completion kind = 3.
+    assert_eq!(r.stats().duplicate, 9);
+    assert_eq!(r.stats().ambiguous, 3);
     assert_eq!(r.stats().emitted, 4);
 }

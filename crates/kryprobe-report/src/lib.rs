@@ -38,6 +38,7 @@ pub const EVENT_SCHEMA_V0: &str = "kryprobe.event/v0";
 /// for what each version marker versions and the reader-tolerance rules).
 pub const CONTRACT_VERSION_V0: &str = "v0-proposed";
 
-/// kcrypto lifecycle payload version carried in `backend_payload.schema`.
+/// kcrypto lifecycle payload version for the standalone payload-v1
+/// `schema` field (no v0 envelope carriage; see ADR-0005).
 /// Draft: bytes freeze only after review (see T05).
 pub const KCRYPTO_LIFECYCLE_V1: &str = "kryprobe.kcrypto.lifecycle/v1";

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:kryprobe:design:kcrypto-lifecycle:v1",
   "title": "KryProbe kcrypto lifecycle payload v1",
-  "description": "Backend-payload profile for one reduced kcrypto request lifecycle. Carried inside a kryprobe.event/v0 operation_observation record's backend_payload with schema kryprobe.kcrypto.lifecycle/v1. Draft: bytes freeze only after review (no compiled-in pin yet). Structural validation never establishes evidence truth; see docs/CONTRACTS.md.",
+  "description": "Standalone report-JSON profile for one reduced kcrypto request lifecycle (schema kryprobe.kcrypto.lifecycle/v1). NOT carried in the v0 event envelope: event-v0 has no backend_payload property and forbids additional properties, so envelope carriage is deferred to a versioned envelope ADR (frozen v0 bytes are untouched). Draft: bytes freeze only after review (no compiled-in pin yet). Structural validation never establishes evidence truth; see docs/kcrypto-evidence.md.",
   "type": "object",
   "properties": {
     "schema": {
@@ -34,7 +34,7 @@
       ]
     },
     "status": {
-      "description": "Exact native errno from the terminal edge (JSON integer, i32 range). Null if and only if terminal is unknown.",
+      "description": "Exact native errno from the terminal edge (JSON integer, i32 range; zero-fraction numbers admitted per JSON Schema). Null if and only if terminal is unknown.",
       "anyOf": [
         {
           "type": "integer",
@@ -47,12 +47,12 @@
       ]
     },
     "duration_ns": {
-      "description": "Submit-to-terminal-edge span as a decimal string. Null when either endpoint is missing; never zero-filled for unknown terminals.",
+      "description": "Submit-to-terminal-edge span as a canonical decimal u64 string (0..=18446744073709551615; the validator enforces the exact range). Null when either endpoint is missing; never zero-filled for unknown terminals.",
       "anyOf": [
         {
           "type": "string",
           "pattern": "^(0|[1-9][0-9]*)$",
-          "maxLength": 24
+          "maxLength": 20
         },
         {
           "type": "null"

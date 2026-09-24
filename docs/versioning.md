@@ -11,7 +11,7 @@ marker's version.
 | `CONTRACT_VERSION_V0` (`kryprobe-report/src/lib.rs`) | `session_start` payload `contract_version` | frozen string | `v0-proposed` |
 | `SHELL_SCHEMA_V1` (`kryprobe-report/src/adapters.rs`) | import-shell `schema` field | frozen string | `kryprobe/shell/v1` |
 | policy `version` (`kryprobe-policy/src/rule.rs`) | policy YAML language | `u32`, exact match | `1` |
-| `KCRYPTO_LIFECYCLE_V1` (`kryprobe-report/src/lib.rs`) | kcrypto lifecycle `backend_payload.schema` | frozen string (bytes freeze after T05 review) | `kryprobe.kcrypto.lifecycle/v1` |
+| `KCRYPTO_LIFECYCLE_V1` (`kryprobe-report/src/lib.rs`) | kcrypto lifecycle payload `schema` (standalone report JSON; no v0 envelope carriage) | frozen string (bytes freeze after T05 review) | `kryprobe.kcrypto.lifecycle/v1` |
 
 ## Bump rules
 

@@ -250,8 +250,10 @@ addresses never land in any map or ring record.
 
 ## Lifecycle payload: userspace-derived, no new capture (T05)
 
-Payload-v1 (`schemas/kcrypto-lifecycle-v1.schema.json`, carried in
-`backend_payload`) is derived in userspace by the pure
+Payload-v1 (`schemas/kcrypto-lifecycle-v1.schema.json`, a
+standalone report-JSON profile — not carried in the v0 event
+envelope, which has no `backend_payload`; carriage deferred to an
+envelope ADR) is derived in userspace by the pure
 `LifecycleReducer` from already-captured edges — it reads no new
 kernel state and adds no BPF map/ring field (outside the
 `FIELDS`/canary pin; guarded instead by the payload-v1 validator

@@ -6,7 +6,7 @@
 //! errno alone. Durations span submit to the edge that carried
 //! terminal truth — never invented.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 /// How the qualified adapter classifies a function return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,8 +82,13 @@ pub enum Edge {
 pub enum GapReason {
     /// An expected phase was never observed and will not arrive.
     MissingPhase,
-    /// The id's identity cannot be trusted for joins; the id is
-    /// retired and further admission under it refused.
+    /// The id's identity cannot be trusted for joins: the completion
+    /// emits [`Terminal::Unknown`] even when terminal truth was
+    /// retained, and further admission under the id is refused while
+    /// its tombstone is retained. After tombstone eviction the id may
+    /// be explicitly re-admitted (bounded memory cannot refuse
+    /// forever); cross-lifetime safety then requires lifetime-unique
+    /// ids (T08 prerequisite).
     IdentityAmbiguous,
     /// Evidence was lost between the kernel and the reducer.
     TransportLoss,
@@ -116,9 +121,19 @@ pub struct RequestRecord {
     pub duration_ns: Option<u64>,
 }
 
+impl RequestRecord {
+    /// Evidence validity: true exactly when the record is grounded in
+    /// observed terminal truth (`Sync`/`Callback`). `Unknown` records
+    /// carry explicit absence-of-truth, never a trusted result.
+    pub fn evidence_valid(&self) -> bool {
+        self.terminal != Terminal::Unknown
+    }
+}
+
 /// Cumulative lifecycle counters. Every admitted id is accounted:
-/// `admitted == emitted + unfinished + live`, where live is the
-/// current pending-set size (not a counter).
+/// `admitted == emitted + live`, where live is the current
+/// pending-set size (not a counter). `unfinished` is the subset of
+/// `emitted` drained truthless by `finish`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReducerStats {
     /// Submits that opened a lifecycle.
@@ -130,11 +145,14 @@ pub struct ReducerStats {
     /// Edges repeating already-known state (tombstoned ids,
     /// duplicate submits, repeat terminals).
     pub duplicate: u64,
-    /// `Unresolved`-disposition edges on live ids.
+    /// Conflicting or unclassifiable evidence: `Unresolved`
+    /// dispositions, terminals contradicting the first truth, and
+    /// identity-invalidated completions.
     pub ambiguous: u64,
     /// Fresh submits refused because the live set was full.
     pub admission_failed: u64,
-    /// Ids dropped by `finish` without terminal truth.
+    /// Emitted records drained truthless by `finish` (subset of
+    /// `emitted`, never double-counted against `admitted`).
     pub unfinished: u64,
 }
 
@@ -152,7 +170,7 @@ struct Pending {
 pub struct LifecycleReducer {
     capacity: usize,
     pending: HashMap<u64, Pending>,
-    completed: HashSet<u64>,
+    completed: HashMap<u64, Terminal>,
     tombstone_order: VecDeque<u64>,
     stats: ReducerStats,
 }
@@ -164,7 +182,7 @@ impl LifecycleReducer {
         Self {
             capacity,
             pending: HashMap::new(),
-            completed: HashSet::new(),
+            completed: HashMap::new(),
             tombstone_order: VecDeque::new(),
             stats: ReducerStats::default(),
         }
@@ -175,18 +193,33 @@ impl LifecycleReducer {
         self.stats
     }
 
-    /// Tombstones a completed id, evicting the oldest tombstone past
-    /// capacity. Eviction is explicit, never a silent merge: a
-    /// resubmitted evicted id starts a fresh lifecycle with fresh
-    /// counters.
-    fn tombstone(&mut self, id: u64) {
-        if self.completed.insert(id) {
+    /// Tombstones a completed id with the emitted terminal truth,
+    /// evicting the oldest tombstone past capacity. Eviction is
+    /// explicit, never a silent merge: a resubmitted evicted id
+    /// starts a fresh lifecycle with fresh counters. The retained
+    /// truth lets late terminals be compared: repeats are
+    /// duplicates, contradictions are ambiguous.
+    fn tombstone(&mut self, id: u64, terminal: Terminal) {
+        if self.completed.insert(id, terminal).is_none() {
             self.tombstone_order.push_back(id);
             while self.tombstone_order.len() > self.capacity {
                 if let Some(old) = self.tombstone_order.pop_front() {
                     self.completed.remove(&old);
                 }
             }
+        }
+    }
+
+    /// Diagnoses a terminal edge against the emitted truth under a
+    /// tombstoned id: a repeat is a duplicate; a contradiction is
+    /// ambiguous; anything after an `Unknown` completion is a
+    /// suppressed duplicate (`Unknown` claims no truth to
+    /// contradict).
+    fn diagnose_tombstoned(&mut self, emitted: Terminal, candidate: Terminal) {
+        match emitted {
+            Terminal::Unknown => self.stats.duplicate += 1,
+            t if t == candidate => self.stats.duplicate += 1,
+            _ => self.stats.ambiguous += 1,
         }
     }
 
@@ -221,7 +254,7 @@ impl LifecycleReducer {
     pub fn apply(&mut self, edge: Edge) -> Vec<RequestRecord> {
         match edge {
             Edge::Submit { id, tfm_id, ts_ns } => {
-                if self.completed.contains(&id) || self.pending.contains_key(&id) {
+                if self.completed.contains_key(&id) || self.pending.contains_key(&id) {
                     self.stats.duplicate += 1;
                     return Vec::new();
                 }
@@ -247,8 +280,12 @@ impl LifecycleReducer {
                 status,
                 disposition,
             } => {
-                if self.completed.contains(&id) {
-                    self.stats.duplicate += 1;
+                if let Some(emitted) = self.completed.get(&id).copied() {
+                    if disposition == CallbackDisposition::Terminal {
+                        self.diagnose_tombstoned(emitted, Terminal::Callback(status));
+                    } else {
+                        self.stats.duplicate += 1;
+                    }
                     return Vec::new();
                 }
                 let snap = self
@@ -261,13 +298,20 @@ impl LifecycleReducer {
                 };
                 match disposition {
                     CallbackDisposition::Terminal => {
-                        if retained.is_some() {
-                            self.stats.duplicate += 1;
+                        // A second terminal callback confirms or
+                        // contradicts the retained truth; the first
+                        // still wins either way.
+                        if let Some((first, _)) = retained {
+                            if first == Terminal::Callback(status) {
+                                self.stats.duplicate += 1;
+                            } else {
+                                self.stats.ambiguous += 1;
+                            }
                             return Vec::new();
                         }
                         if return_queued {
                             self.pending.remove(&id);
-                            self.tombstone(id);
+                            self.tombstone(id, Terminal::Callback(status));
                             self.stats.emitted += 1;
                             return vec![RequestRecord {
                                 id,
@@ -295,8 +339,12 @@ impl LifecycleReducer {
                 status,
                 disposition,
             } => {
-                if self.completed.contains(&id) {
-                    self.stats.duplicate += 1;
+                if let Some(emitted) = self.completed.get(&id).copied() {
+                    if disposition == ReturnDisposition::Terminal {
+                        self.diagnose_tombstoned(emitted, Terminal::Sync(status));
+                    } else {
+                        self.stats.duplicate += 1;
+                    }
                     return Vec::new();
                 }
                 if !self.pending.contains_key(&id) {
@@ -316,7 +364,7 @@ impl LifecycleReducer {
                     };
                     if let Some((terminal, terminal_ts, tfm_id, submit_ts)) = conflict {
                         self.pending.remove(&id);
-                        self.tombstone(id);
+                        self.tombstone(id, terminal);
                         self.stats.emitted += 1;
                         self.stats.ambiguous += 1;
                         return vec![RequestRecord {
@@ -333,10 +381,11 @@ impl LifecycleReducer {
                             p.tfm_id,
                             Terminal::Sync(status),
                             ts_ns.checked_sub(p.submit_ts),
+                            p.return_queued,
                         )),
                         ReturnDisposition::Queued => p
                             .terminal
-                            .map(|(t, tts)| (p.tfm_id, t, tts.checked_sub(p.submit_ts))),
+                            .map(|(t, tts)| (p.tfm_id, t, tts.checked_sub(p.submit_ts), false)),
                         ReturnDisposition::Unresolved => None,
                     },
                     None => None,
@@ -344,13 +393,20 @@ impl LifecycleReducer {
                 // Non-emitting returns retain the pending record: a later
                 // terminal edge may still complete the request. Reaching
                 // `None` here means a Queued return with no terminal yet
-                // (unknown ids and Unresolved returns exit above), so mark
-                // the return observed for the joining callback.
+                // (unknown ids and Unresolved returns exit above): the
+                // first marks the return observed for the joining
+                // callback, a repeat is a duplicate.
                 match ready {
-                    Some((tfm_id, terminal, duration_ns)) => {
+                    Some((tfm_id, terminal, duration_ns, queued_before)) => {
                         self.pending.remove(&id);
-                        self.tombstone(id);
+                        self.tombstone(id, terminal);
                         self.stats.emitted += 1;
+                        // A terminal return after an observed Queued
+                        // return completes but contradicts the earlier
+                        // classification.
+                        if queued_before {
+                            self.stats.ambiguous += 1;
+                        }
                         vec![RequestRecord {
                             id,
                             tfm_id,
@@ -360,14 +416,18 @@ impl LifecycleReducer {
                     }
                     None => {
                         if let Some(p) = self.pending.get_mut(&id) {
-                            p.return_queued = true;
+                            if p.return_queued {
+                                self.stats.duplicate += 1;
+                            } else {
+                                p.return_queued = true;
+                            }
                         }
                         Vec::new()
                     }
                 }
             }
-            Edge::Gap { id, reason: _ } => {
-                if self.completed.contains(&id) {
+            Edge::Gap { id, reason } => {
+                if self.completed.contains_key(&id) {
                     self.stats.duplicate += 1;
                     return Vec::new();
                 }
@@ -375,9 +435,22 @@ impl LifecycleReducer {
                     self.stats.orphan += 1;
                     return Vec::new();
                 };
-                self.tombstone(id);
-                self.stats.emitted += 1;
+                // An untrusted identity invalidates even retained terminal
+                // truth: emit Unknown, never a trusted-looking result.
+                if reason == GapReason::IdentityAmbiguous {
+                    self.tombstone(id, Terminal::Unknown);
+                    self.stats.emitted += 1;
+                    self.stats.ambiguous += 1;
+                    return vec![RequestRecord {
+                        id,
+                        tfm_id: p.tfm_id,
+                        terminal: Terminal::Unknown,
+                        duration_ns: None,
+                    }];
+                }
                 let (record, _) = Self::reconcile(id, &p);
+                self.tombstone(id, record.terminal);
+                self.stats.emitted += 1;
                 vec![record]
             }
         }
@@ -401,7 +474,7 @@ impl LifecycleReducer {
             if !had_truth {
                 self.stats.unfinished += 1;
             }
-            self.tombstone(id);
+            self.tombstone(id, record.terminal);
             self.stats.emitted += 1;
             out.push(record);
         }

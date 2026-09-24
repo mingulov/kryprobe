@@ -2,10 +2,12 @@
 //! kcrypto lifecycle payload-v1 validator.
 //!
 //! Enforces `schemas/kcrypto-lifecycle-v1.schema.json` on a single
-//! `backend_payload` value: required keys, wire shapes, the version
-//! const, and terminal/status/duration consistency. Unknown versions
-//! fail closed. Schema bytes freeze only after review (no
-//! compiled-in pin yet).
+//! standalone report-JSON value: required keys, wire shapes, the
+//! version const, and terminal/status/duration consistency. Unknown
+//! versions fail closed. Schema bytes freeze only after review (no
+//! compiled-in pin yet). Not carried in the v0 event envelope (no
+//! `backend_payload` there); envelope carriage awaits an envelope
+//! ADR.
 
 use crate::KCRYPTO_LIFECYCLE_V1;
 use crate::checker::{is_digit_string, is_prefixed_id, render, shorten};
@@ -76,6 +78,18 @@ pub fn validate_lifecycle_v1(payload: &Value) -> Vec<LifecycleFinding> {
         return missing;
     }
     let mut out = Vec::new();
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .filter(|key| !REQUIRED.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    unknown.sort_unstable();
+    for key in unknown {
+        out.push(LifecycleFinding::BadShape {
+            key: key.to_string(),
+            value: shorten(&render(&obj[key])),
+        });
+    }
     match obj.get("schema") {
         Some(Value::String(found)) if found == KCRYPTO_LIFECYCLE_V1 => {}
         Some(Value::String(found)) => {
@@ -143,7 +157,10 @@ fn check_terminal(obj: &serde_json::Map<String, Value>, out: &mut Vec<LifecycleF
 }
 
 /// Validates the native status: JSON integer in i32 range, or null.
-/// Returns `Some(is_null)` when well-shaped, `None` otherwise.
+/// JSON Schema `integer` admits zero-fraction floats (`-5.0`), so the
+/// validator accepts them too; exactness is preserved (f64 holds
+/// every i32). Returns `Some(is_null)` when well-shaped, `None`
+/// otherwise.
 fn check_status(
     obj: &serde_json::Map<String, Value>,
     out: &mut Vec<LifecycleFinding>,
@@ -152,13 +169,16 @@ fn check_status(
         Some(Value::Null) => Some(true),
         Some(Value::Number(number)) => match number.as_i64() {
             Some(raw) if i32::try_from(raw).is_ok() => Some(false),
-            _ => {
-                out.push(LifecycleFinding::BadShape {
-                    key: "status".to_string(),
-                    value: shorten(&number.to_string()),
-                });
-                None
-            }
+            _ => match number.as_f64() {
+                Some(face) if is_integral_i32(face) => Some(false),
+                _ => {
+                    out.push(LifecycleFinding::BadShape {
+                        key: "status".to_string(),
+                        value: shorten(&number.to_string()),
+                    });
+                    None
+                }
+            },
         },
         Some(value) => {
             out.push(LifecycleFinding::BadShape {
@@ -176,6 +196,16 @@ fn check_status(
     }
 }
 
+/// A float the schema's `integer` type admits: zero fraction and
+/// inside the i32 range (f64 represents every i32 exactly).
+fn is_integral_i32(face: f64) -> bool {
+    face.fract() == 0.0 && face >= f64::from(i32::MIN) && face <= f64::from(i32::MAX)
+}
+
+/// Maximum duration-string length, per the schema: u64 needs at most
+/// 20 decimal digits; the `u64` parse enforces the exact range.
+const MAX_DURATION_LEN: usize = 20;
+
 /// Validates the duration: decimal u64 string, or null.
 /// Returns `Some(is_null)` when well-shaped, `None` otherwise.
 fn check_duration(
@@ -185,7 +215,10 @@ fn check_duration(
     match obj.get("duration_ns") {
         Some(Value::Null) => Some(true),
         Some(Value::String(text)) => {
-            if text.len() <= 24 && is_digit_string(text) && text.parse::<u64>().is_ok() {
+            if text.len() <= MAX_DURATION_LEN
+                && is_digit_string(text)
+                && text.parse::<u64>().is_ok()
+            {
                 Some(false)
             } else {
                 out.push(LifecycleFinding::BadShape {
@@ -294,6 +327,39 @@ mod tests {
                 .and_then(|p| p.get("schema"))
                 .and_then(|s| s.get("const")),
             Some(&serde_json::json!("kryprobe.kcrypto.lifecycle/v1")),
+        );
+        // Numeric bounds the validator enforces exactly: i32 status
+        // range, canonical-decimal duration capped at 20 digits (u64
+        // needs no more; the validator enforces the exact range).
+        let status_number = schema
+            .get("properties")
+            .and_then(|p| p.get("status"))
+            .and_then(|s| s.get("anyOf"))
+            .and_then(Value::as_array)
+            .and_then(|branches| branches.first())
+            .expect("status number branch");
+        assert_eq!(
+            status_number.get("minimum"),
+            Some(&serde_json::json!(-2147483648i64)),
+        );
+        assert_eq!(
+            status_number.get("maximum"),
+            Some(&serde_json::json!(2147483647i64)),
+        );
+        let duration_string = schema
+            .get("properties")
+            .and_then(|p| p.get("duration_ns"))
+            .and_then(|s| s.get("anyOf"))
+            .and_then(Value::as_array)
+            .and_then(|branches| branches.first())
+            .expect("duration string branch");
+        assert_eq!(
+            duration_string.get("maxLength"),
+            Some(&serde_json::json!(20u64)),
+        );
+        assert_eq!(
+            duration_string.get("pattern"),
+            Some(&serde_json::json!("^(0|[1-9][0-9]*)$")),
         );
     }
 
@@ -465,6 +531,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_keys() {
+        let mut extra = base();
+        extra
+            .as_object_mut()
+            .expect("object")
+            .insert("key_material".to_string(), serde_json::json!("secret"));
+        assert!(matches!(
+            validate_lifecycle_v1(&extra)[..],
+            [LifecycleFinding::BadShape { .. }]
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_terminal_word() {
         let mut bogus = base();
         bogus
@@ -486,6 +565,51 @@ mod tests {
         );
         assert!(matches!(
             validate_lifecycle_v1(&long)[..],
+            [LifecycleFinding::BadShape { .. }]
+        ));
+    }
+
+    #[test]
+    fn accepts_integral_float_status() {
+        // JSON Schema "integer" admits zero-fraction numbers; the
+        // validator matches the schema exactly on this axis.
+        for text in ["-5.0", "0.0", "1e3"] {
+            let mut payload = base();
+            let status: Value = serde_json::from_str(text).expect("number parses");
+            payload
+                .as_object_mut()
+                .expect("object")
+                .insert("status".to_string(), status);
+            assert!(validate_lifecycle_v1(&payload).is_empty(), "status {text}");
+        }
+        let mut frac = base();
+        let status: Value = serde_json::from_str("5.5").expect("number parses");
+        frac.as_object_mut()
+            .expect("object")
+            .insert("status".to_string(), status);
+        assert!(matches!(
+            validate_lifecycle_v1(&frac)[..],
+            [LifecycleFinding::BadShape { .. }]
+        ));
+    }
+
+    #[test]
+    fn pins_u64_duration_boundary() {
+        // u64::MAX is the largest representable span; u64::MAX + 1
+        // (the round-1 counterexample) is rejected.
+        let mut max = base();
+        max.as_object_mut().expect("object").insert(
+            "duration_ns".to_string(),
+            serde_json::json!(u64::MAX.to_string()),
+        );
+        assert!(validate_lifecycle_v1(&max).is_empty());
+        let mut over = base();
+        over.as_object_mut().expect("object").insert(
+            "duration_ns".to_string(),
+            serde_json::json!("18446744073709551616"),
+        );
+        assert!(matches!(
+            validate_lifecycle_v1(&over)[..],
             [LifecycleFinding::BadShape { .. }]
         ));
     }
