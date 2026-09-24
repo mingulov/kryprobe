@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kryprobe:design:kcrypto-lifecycle:v1",
+  "title": "KryProbe kcrypto lifecycle payload v1",
+  "description": "Backend-payload profile for one reduced kcrypto request lifecycle. Carried inside a kryprobe.event/v0 operation_observation record's backend_payload with schema kryprobe.kcrypto.lifecycle/v1. Draft: bytes freeze only after review (no compiled-in pin yet). Structural validation never establishes evidence truth; see docs/CONTRACTS.md.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "kryprobe.kcrypto.lifecycle/v1"
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+      "maxLength": 96
+    },
+    "tfm_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$",
+          "maxLength": 96
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "terminal": {
+      "type": "string",
+      "enum": [
+        "sync",
+        "callback",
+        "unknown"
+      ]
+    },
+    "status": {
+      "description": "Exact native errno from the terminal edge (JSON integer, i32 range). Null if and only if terminal is unknown.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "duration_ns": {
+      "description": "Submit-to-terminal-edge span as a decimal string. Null when either endpoint is missing; never zero-filled for unknown terminals.",
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$",
+          "maxLength": 24
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "schema",
+    "request_id",
+    "tfm_id",
+    "terminal",
+    "status",
+    "duration_ns"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "description": "Terminal truth requires an exact native status; unknown terminals carry no status or duration.",
+      "anyOf": [
+        {
+          "properties": {
+            "terminal": {
+              "enum": [
+                "sync",
+                "callback"
+              ]
+            },
+            "status": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "terminal",
+            "status"
+          ]
+        },
+        {
+          "properties": {
+            "terminal": {
+              "const": "unknown"
+            },
+            "status": {
+              "type": "null"
+            },
+            "duration_ns": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "terminal",
+            "status",
+            "duration_ns"
+          ]
+        }
+      ]
+    }
+  ]
+}

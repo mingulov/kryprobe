@@ -12,6 +12,7 @@ ADR your change touches, then the owning code.
 | [ADR-0002](decisions/ADR-0002.md) | Privilege seam (Rules A/B) | Accepted (reconstructed) |
 | [ADR-0003](decisions/ADR-0003.md) | Process identity is (pid, start-time) | Accepted (reconstructed) |
 | [ADR-0004](decisions/ADR-0004.md) | Kernel-crypto-only product scope | Accepted (owner-directed 2026-09-24) |
+| [ADR-0005](decisions/ADR-0005.md) | kcrypto lifecycle semantics + payload-v1 | Accepted (T05, 2026-09-24) |
 
 ADR-0001 predates the tree's records and is not reconstructed (see
 `docs/sources.md`).

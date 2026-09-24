@@ -24,9 +24,9 @@ pub use render::{render_summary, render_summary_reader, sanitize_cell};
 pub use session::{FinalBarrier, SessionEnd, SessionStart, SessionVerdict};
 pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
 pub use validate::{
-    MAX_VALIDATE_LINE_BYTES, ResolvedSchema, ValidationFinding, resolve_schema, resolve_schema_at,
-    schema_fnv1a_hex, validate_and_render_file, validate_and_render_reader, validate_file,
-    validate_reader, validate_str,
+    LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, ValidationFinding, resolve_schema,
+    resolve_schema_at, schema_fnv1a_hex, validate_and_render_file, validate_and_render_reader,
+    validate_file, validate_lifecycle_v1, validate_reader, validate_str,
 };
 pub use writer::{JsonlWriter, ReportError, write_str_atomic};
 
@@ -37,3 +37,7 @@ pub const EVENT_SCHEMA_V0: &str = "kryprobe.event/v0";
 /// one shared const, not a literal per emitter; see `docs/versioning.md`
 /// for what each version marker versions and the reader-tolerance rules).
 pub const CONTRACT_VERSION_V0: &str = "v0-proposed";
+
+/// kcrypto lifecycle payload version carried in `backend_payload.schema`.
+/// Draft: bytes freeze only after review (see T05).
+pub const KCRYPTO_LIFECYCLE_V1: &str = "kryprobe.kcrypto.lifecycle/v1";

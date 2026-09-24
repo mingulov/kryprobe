@@ -261,11 +261,11 @@ fn bad_shape(line: usize, key: &str, value: &str) -> StreamFinding {
     }
 }
 
-fn render(value: &Value) -> String {
+pub(crate) fn render(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unprintable>".to_string())
 }
 
-fn shorten(value: &str) -> String {
+pub(crate) fn shorten(value: &str) -> String {
     const LIMIT: usize = 160;
     if value.len() <= LIMIT {
         return value.to_string();
@@ -275,7 +275,7 @@ fn shorten(value: &str) -> String {
 }
 
 /// Matches `^(0|[1-9][0-9]*)$`: all digits, no leading zero unless `"0"`.
-fn is_digit_string(text: &str) -> bool {
+pub(crate) fn is_digit_string(text: &str) -> bool {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
@@ -283,7 +283,7 @@ fn is_digit_string(text: &str) -> bool {
 }
 
 /// Matches `^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$` without a regex dependency.
-fn is_prefixed_id(text: &str) -> bool {
+pub(crate) fn is_prefixed_id(text: &str) -> bool {
     let Some(colon) = text.find(':') else {
         return false;
     };

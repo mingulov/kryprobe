@@ -17,6 +17,7 @@ pub mod enums;
 pub mod error;
 pub mod evidence;
 pub mod ids;
+pub mod kcrypto;
 pub mod object;
 pub mod plan;
 pub mod program;

@@ -1,6 +1,6 @@
 # Versioning policy (1B-M5)
 
-Five markers version four independent surfaces. Each marker versions
+Six markers version six independent surfaces. Each marker versions
 exactly one surface; a change to one surface never bumps another
 marker's version.
 
@@ -11,6 +11,7 @@ marker's version.
 | `CONTRACT_VERSION_V0` (`kryprobe-report/src/lib.rs`) | `session_start` payload `contract_version` | frozen string | `v0-proposed` |
 | `SHELL_SCHEMA_V1` (`kryprobe-report/src/adapters.rs`) | import-shell `schema` field | frozen string | `kryprobe/shell/v1` |
 | policy `version` (`kryprobe-policy/src/rule.rs`) | policy YAML language | `u32`, exact match | `1` |
+| `KCRYPTO_LIFECYCLE_V1` (`kryprobe-report/src/lib.rs`) | kcrypto lifecycle `backend_payload.schema` | frozen string (bytes freeze after T05 review) | `kryprobe.kcrypto.lifecycle/v1` |
 
 ## Bump rules
 
@@ -31,6 +32,8 @@ All readers are strict today (accept-N only, reject anything else):
 - The JSONL validator requires exactly `EVENT_SCHEMA_V0` on every
   record.
 - `validate_shell` requires exactly `SHELL_SCHEMA_V1`.
+- `validate_lifecycle_v1` requires exactly `KCRYPTO_LIFECYCLE_V1`
+  (any other version is an `UnknownVersion` finding, fail-closed).
 - The policy parser accepts only `version: 1` (any other version is a
   usage error, exit 2).
 

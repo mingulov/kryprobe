@@ -248,6 +248,28 @@ Pointers are never stored either: the current-task pointer feeds only
 a null check, and request/tfm pointers feed only the offset chase —
 addresses never land in any map or ring record.
 
+## Lifecycle payload: userspace-derived, no new capture (T05)
+
+Payload-v1 (`schemas/kcrypto-lifecycle-v1.schema.json`, carried in
+`backend_payload`) is derived in userspace by the pure
+`LifecycleReducer` from already-captured edges — it reads no new
+kernel state and adds no BPF map/ring field (outside the
+`FIELDS`/canary pin; guarded instead by the payload-v1 validator
+and its contract vectors).
+
+| Field | Source | WHY (kp2 §9) |
+|---|---|---|
+| `request_id` | reducer id, rendered per-run opaque | correlation handle, not an address |
+| `tfm_id` | submit-carried transform id or null | correlation handle, not an address |
+| `terminal` | `sync`/`callback`/`unknown` disposition join | return/error class |
+| `status` | exact native errno or null | return/error class |
+| `duration_ns` | submit-to-terminal span or null | timestamp difference |
+
+No payload-v1 field carries key material, buffer contents, or
+pointers: ids are opaque handles, `status` is a scalar errno, and
+`duration_ns` is a timestamp difference. Anything else in a
+lifecycle payload is a validator finding, not data.
+
 ## NEVER list
 
 The sensor NEVER reads, stores, or emits: keys, IVs, nonces,
