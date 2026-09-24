@@ -383,6 +383,40 @@ fn late_identity_gap_invalidates_emitted_record() {
 }
 
 #[test]
+fn repeat_live_identity_gap_is_duplicate() {
+    // A live identity-ambiguity gap invalidates on completion, so
+    // repeating it hits an already-invalidated tombstone: the
+    // ambiguity is counted once, repeats are duplicates.
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Gap {
+        id: 1,
+        reason: GapReason::IdentityAmbiguous,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Unknown);
+    assert_eq!(r.stats().ambiguous, 1);
+    assert!(r.is_invalidated(1));
+    assert!(
+        r.apply(Edge::Gap {
+            id: 1,
+            reason: GapReason::IdentityAmbiguous,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().ambiguous, 1);
+    assert_eq!(r.stats().duplicate, 1);
+    assert!(r.is_invalidated(1));
+}
+
+#[test]
 fn repeat_late_identity_gap_is_duplicate() {
     let mut r = LifecycleReducer::new(4);
     assert!(
@@ -1405,31 +1439,33 @@ fn reversed_clock_yields_no_duration() {
 
 #[test]
 fn cross_stream_permutations_reconcile_once() {
-    // Plan §T05 (return×callback representative): every
+    // Plan §T05 (return×callback families): every
     // per-source-order-preserving interleaving of one Queued
-    // return against callback orders [T], [P, T] and [T, P]
-    // (T = terminal callback, P = progress callback). Each flow
-    // emits exactly one Callback(0); progress at or after
-    // terminal truth counts exactly one duplicate however it
-    // interleaves — anomaly accounting is order-independent.
-    // Companion classes live in focused tests: terminal-return
-    // orders (conflict/tombstone tests), gap interleavings (gap
-    // + invalidation tests), multi-id interleave (Q04). Edges
-    // keep fixed timestamps while delivery order permutes, so the
-    // sweep models cross-stream arrival skew rather than
-    // re-timestamping the evidence.
+    // return against callback orders [T], [P, T], [T, P],
+    // [T, T] and [T, T'] (T/T' = terminal callbacks with same /
+    // conflicting status, P = progress). Each flow emits exactly
+    // one Callback(0) — first terminal truth wins everywhere —
+    // and anomaly accounting is order-independent within each
+    // family. Companion classes live in focused tests:
+    // terminal-return orders (conflict/tombstone tests), gap
+    // interleavings (gap + invalidation tests), multi-id
+    // interleave (Q04). Edges keep fixed timestamps while
+    // delivery order permutes, so the sweep models cross-stream
+    // arrival skew rather than re-timestamping the evidence.
     #[derive(Debug, Clone, Copy)]
     enum Slot {
         R,
-        T,
+        T(i32),
         P,
     }
-    let orders: &[(&[Slot], u64)] = &[
-        (&[Slot::T], 0),
-        (&[Slot::P, Slot::T], 0),
-        (&[Slot::T, Slot::P], 1),
+    let orders: &[(&[Slot], u64, u64)] = &[
+        (&[Slot::T(0)], 0, 0),
+        (&[Slot::P, Slot::T(0)], 0, 0),
+        (&[Slot::T(0), Slot::P], 1, 0),
+        (&[Slot::T(0), Slot::T(0)], 1, 0),
+        (&[Slot::T(0), Slot::T(7)], 0, 1),
     ];
-    for (cb_seq, expected_dup) in orders {
+    for (cb_seq, expected_dup, expected_amb) in orders {
         for at in 0..=cb_seq.len() {
             let mut r = LifecycleReducer::new(4);
             assert!(
@@ -1443,9 +1479,11 @@ fn cross_stream_permutations_reconcile_once() {
             let mut seq = cb_seq.to_vec();
             seq.insert(at, Slot::R);
             let mut emitted = 0u32;
+            let mut seen_t = 0u32;
             for slot in seq.iter() {
                 // Fixed per-edge timestamps: only delivery order
-                // permutes.
+                // permutes (repeat terminals take successive
+                // timestamps).
                 let edge = match slot {
                     Slot::R => Edge::Return {
                         id: 1,
@@ -1453,12 +1491,16 @@ fn cross_stream_permutations_reconcile_once() {
                         status: -115,
                         disposition: ReturnDisposition::Queued,
                     },
-                    Slot::T => Edge::Callback {
-                        id: 1,
-                        ts_ns: 30,
-                        status: 0,
-                        disposition: CallbackDisposition::Terminal,
-                    },
+                    Slot::T(status) => {
+                        let ts = 30 + 5 * seen_t as u64;
+                        seen_t += 1;
+                        Edge::Callback {
+                            id: 1,
+                            ts_ns: ts,
+                            status: *status,
+                            disposition: CallbackDisposition::Terminal,
+                        }
+                    }
                     Slot::P => Edge::Callback {
                         id: 1,
                         ts_ns: 20,
@@ -1482,7 +1524,7 @@ fn cross_stream_permutations_reconcile_once() {
             assert_eq!(s.emitted, 1, "{label}");
             assert_eq!(s.orphan, 0, "{label}");
             assert_eq!(s.duplicate, *expected_dup, "{label}");
-            assert_eq!(s.ambiguous, 0, "{label}");
+            assert_eq!(s.ambiguous, *expected_amb, "{label}");
             assert_eq!(s.admission_failed, 0, "{label}");
             assert_eq!(s.unfinished, 0, "{label}");
             // Nothing left pending on any flow.

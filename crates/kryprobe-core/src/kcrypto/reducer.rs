@@ -71,8 +71,8 @@ pub enum Edge {
     },
     /// Adapter-declared phase loss for an id: completes a live id
     /// immediately (retained terminal truth if present, else
-    /// [`Terminal::Unknown`]; [`GapReason::IdentityAmbiguous` always
-    /// emits `Unknown`, invalidating even retained truth).
+    /// [`Terminal::Unknown`]; [`GapReason::IdentityAmbiguous`]
+    /// always emits `Unknown`, invalidating even retained truth).
     Gap {
         /// Opaque request id.
         id: u64,
@@ -230,13 +230,14 @@ impl LifecycleReducer {
     /// explicit, never a silent merge: a resubmitted evicted id
     /// starts a fresh lifecycle with fresh counters. The retained
     /// truth lets late terminals be compared: repeats are
-    /// duplicates, contradictions are ambiguous. A fresh tombstone
-    /// is never invalidated; only a later identity-ambiguity gap
-    /// flags it.
-    fn tombstone(&mut self, id: u64, terminal: Terminal) {
+    /// duplicates, contradictions are ambiguous. `invalidated`
+    /// starts true only for completions that are themselves
+    /// invalidations (live identity-ambiguity gaps); otherwise
+    /// only a later identity-ambiguity gap flags the tombstone.
+    fn tombstone(&mut self, id: u64, terminal: Terminal, invalidated: bool) {
         let stone = Tombstone {
             terminal,
-            invalidated: false,
+            invalidated,
         };
         if self.completed.insert(id, stone).is_none() {
             self.tombstone_order.push_back(id);
@@ -362,7 +363,7 @@ impl LifecycleReducer {
                         }
                         if return_queued {
                             self.pending.remove(&id);
-                            self.tombstone(id, Terminal::Callback(status));
+                            self.tombstone(id, Terminal::Callback(status), false);
                             self.stats.emitted += 1;
                             return vec![RequestRecord {
                                 id,
@@ -426,7 +427,7 @@ impl LifecycleReducer {
                     };
                     if let Some((terminal, terminal_ts, tfm_id, submit_ts)) = conflict {
                         self.pending.remove(&id);
-                        self.tombstone(id, terminal);
+                        self.tombstone(id, terminal, false);
                         self.stats.emitted += 1;
                         self.stats.ambiguous += 1;
                         return vec![RequestRecord {
@@ -461,7 +462,7 @@ impl LifecycleReducer {
                 match ready {
                     Some((tfm_id, terminal, duration_ns, queued_before)) => {
                         self.pending.remove(&id);
-                        self.tombstone(id, terminal);
+                        self.tombstone(id, terminal, false);
                         self.stats.emitted += 1;
                         // A terminal return after an observed Queued
                         // return completes but contradicts the earlier
@@ -520,7 +521,7 @@ impl LifecycleReducer {
                 // An untrusted identity invalidates even retained terminal
                 // truth: emit Unknown, never a trusted-looking result.
                 if reason == GapReason::IdentityAmbiguous {
-                    self.tombstone(id, Terminal::Unknown);
+                    self.tombstone(id, Terminal::Unknown, true);
                     self.stats.emitted += 1;
                     self.stats.ambiguous += 1;
                     return vec![RequestRecord {
@@ -531,7 +532,7 @@ impl LifecycleReducer {
                     }];
                 }
                 let (record, _) = Self::reconcile(id, &p);
-                self.tombstone(id, record.terminal);
+                self.tombstone(id, record.terminal, false);
                 self.stats.emitted += 1;
                 vec![record]
             }
@@ -557,7 +558,7 @@ impl LifecycleReducer {
             if !had_truth {
                 self.stats.unfinished += 1;
             }
-            self.tombstone(id, record.terminal);
+            self.tombstone(id, record.terminal, false);
             self.stats.emitted += 1;
             out.push(record);
         }
