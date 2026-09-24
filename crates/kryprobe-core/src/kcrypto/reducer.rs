@@ -338,6 +338,15 @@ impl LifecycleReducer {
                     return Vec::new();
                 };
                 match disposition {
+                    CallbackDisposition::Progress if retained.is_some() => {
+                        // Progress after terminal truth is known is
+                        // late traffic: diagnosed exactly like
+                        // post-completion progress, so anomaly
+                        // accounting does not depend on whether the
+                        // joining return has arrived yet.
+                        self.stats.duplicate += 1;
+                        Vec::new()
+                    }
                     CallbackDisposition::Terminal => {
                         // A second terminal callback confirms or
                         // contradicts the retained truth; the first
@@ -366,7 +375,8 @@ impl LifecycleReducer {
                         }
                         Vec::new()
                     }
-                    // Routine progress on a live id: observed, uncounted.
+                    // Routine progress before terminal truth is known:
+                    // observed, uncounted.
                     CallbackDisposition::Progress => Vec::new(),
                     CallbackDisposition::Unresolved => {
                         self.stats.ambiguous += 1;
@@ -530,9 +540,10 @@ impl LifecycleReducer {
     /// Drains every pending id in ascending id order: ids with
     /// retained terminal truth emit it; the rest emit
     /// [`Terminal::Unknown`] with no duration and count as
-    /// [`ReducerStats::unfinished`]. `stop_ns` labels when the drain
-    /// happened; reconciliation depends only on observed edges.
-    /// Drained ids are tombstoned. A second call emits nothing.
+    /// [`ReducerStats::unfinished`]. `stop_ns` is currently unused
+    /// (reserved for future drain labeling); reconciliation depends
+    /// only on observed edges. Drained ids are tombstoned. A second
+    /// call emits nothing.
     pub fn finish(&mut self, _stop_ns: u64) -> Vec<RequestRecord> {
         let mut ids: Vec<u64> = self.pending.keys().copied().collect();
         ids.sort_unstable();

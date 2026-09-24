@@ -1294,6 +1294,193 @@ fn unresolved_return_counts_ambiguous_in_both_orders() {
 }
 
 #[test]
+fn progress_after_terminal_truth_is_duplicate() {
+    // Progress arriving after terminal truth is known is late
+    // traffic — diagnosed exactly like post-completion progress —
+    // never silently absorbed.
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 25,
+            status: -115,
+            disposition: CallbackDisposition::Progress,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().duplicate, 1);
+    assert_eq!(r.stats().ambiguous, 0);
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 30,
+        status: -115,
+        disposition: ReturnDisposition::Queued,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Callback(0));
+}
+
+#[test]
+fn progress_before_terminal_is_uncounted() {
+    // Routine progress on the way to terminal truth stays
+    // uncounted.
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    for ts in [15, 16] {
+        assert!(
+            r.apply(Edge::Callback {
+                id: 1,
+                ts_ns: ts,
+                status: -115,
+                disposition: CallbackDisposition::Progress,
+            })
+            .is_empty()
+        );
+    }
+    assert_eq!(
+        r.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    let s = r.stats();
+    assert_eq!(s.duplicate, 0);
+    assert_eq!(s.ambiguous, 0);
+    assert_eq!(s.emitted, 1);
+}
+
+#[test]
+fn reversed_clock_yields_no_duration() {
+    // A terminal edge older than its submit cannot span a
+    // duration: `checked_sub` yields None instead of inventing
+    // one. Terminal truth itself is unaffected.
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 100
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 90,
+        status: 0,
+        disposition: ReturnDisposition::Terminal,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Sync(0));
+    assert_eq!(out[0].duration_ns, None);
+    assert!(out[0].evidence_valid());
+}
+
+#[test]
+fn cross_stream_permutations_reconcile_once() {
+    // Plan §T05: every per-source-order-preserving interleaving of
+    // one Queued return against callback orders [T], [P, T] and
+    // [T, P] (T = terminal callback, P = progress callback). Each
+    // flow emits exactly one Callback(0); progress at or after
+    // terminal truth counts exactly one duplicate however it
+    // interleaves — anomaly accounting is order-independent.
+    #[derive(Debug, Clone, Copy)]
+    enum Slot {
+        R,
+        T,
+        P,
+    }
+    let orders: &[(&[Slot], u64)] = &[
+        (&[Slot::T], 0),
+        (&[Slot::P, Slot::T], 0),
+        (&[Slot::T, Slot::P], 1),
+    ];
+    for (cb_seq, expected_dup) in orders {
+        for at in 0..=cb_seq.len() {
+            let mut r = LifecycleReducer::new(4);
+            assert!(
+                r.apply(Edge::Submit {
+                    id: 1,
+                    tfm_id: None,
+                    ts_ns: 10
+                })
+                .is_empty()
+            );
+            let mut seq = cb_seq.to_vec();
+            seq.insert(at, Slot::R);
+            let mut terminal_ts = 0u64;
+            let mut emitted = 0u32;
+            let mut terminal = Terminal::Unknown;
+            let mut duration = None;
+            for (i, slot) in seq.iter().enumerate() {
+                let ts = 20 + 10 * i as u64;
+                let edge = match slot {
+                    Slot::R => Edge::Return {
+                        id: 1,
+                        ts_ns: ts,
+                        status: -115,
+                        disposition: ReturnDisposition::Queued,
+                    },
+                    Slot::T => {
+                        terminal_ts = ts;
+                        Edge::Callback {
+                            id: 1,
+                            ts_ns: ts,
+                            status: 0,
+                            disposition: CallbackDisposition::Terminal,
+                        }
+                    }
+                    Slot::P => Edge::Callback {
+                        id: 1,
+                        ts_ns: ts,
+                        status: -115,
+                        disposition: CallbackDisposition::Progress,
+                    },
+                };
+                for rec in r.apply(edge) {
+                    emitted += 1;
+                    terminal = rec.terminal;
+                    duration = rec.duration_ns;
+                }
+            }
+            let label = format!("order {cb_seq:?} R@{at}");
+            assert_eq!(emitted, 1, "{label}");
+            assert_eq!(terminal, Terminal::Callback(0), "{label}");
+            assert_eq!(duration, terminal_ts.checked_sub(10), "{label}");
+            assert_eq!(r.stats().duplicate, *expected_dup, "{label}");
+            assert_eq!(r.stats().ambiguous, 0, "{label}");
+        }
+    }
+}
+
+#[test]
 fn tombstones_evict_oldest_beyond_capacity() {
     let mut r = LifecycleReducer::new(2);
     for (id, base) in [(1u64, 10u64), (2, 20), (3, 30)] {

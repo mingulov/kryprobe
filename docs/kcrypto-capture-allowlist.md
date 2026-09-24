@@ -270,7 +270,10 @@ and its contract vectors).
 No payload-v1 field carries key material, buffer contents, or
 pointers: ids are opaque handles, `status` is a scalar errno, and
 `duration_ns` is a timestamp difference. Anything else in a
-lifecycle payload is a validator finding, not data.
+lifecycle payload is a validator finding, not data. (Producer
+obligation: the schema checks ID shape, not provenance — the
+future producer must derive ids opaquely, never from addresses;
+validation cannot prove that.)
 
 ## NEVER list
 

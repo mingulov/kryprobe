@@ -27,9 +27,12 @@ const REQUIRED: &[&str] = &[
 const MAX_ID_LEN: usize = 96;
 
 /// One payload-v1 defect; empty means the payload validates clean.
-/// Findings are input-free by construction: they name keys and
-/// expected shapes, never rejected values (which could be key
-/// material or buffer contents).
+/// Findings are input-free over arbitrary rejected bytes: no
+/// property name, value, or length enters a finding (rejected
+/// bytes could be key material or buffer contents). Finding
+/// multiplicity still reflects defect count, and
+/// `InvalidCombination` names the validated terminal word from
+/// the closed `sync`/`callback`/`unknown` enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleFinding {
     /// A required key is absent.
