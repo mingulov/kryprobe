@@ -23,8 +23,19 @@ fn literal_async_submit_yields_one_completed_request_and_two_callbacks() {
     assert_eq!(ledger.requests.len(), 1, "exactly one request");
     let req = &ledger.requests[0];
     assert_eq!(req.seq, 7);
+    assert_eq!(req.submit_op, "encrypt", "submit op label carried");
     assert_eq!(req.terminal_errno, 0, "terminal success");
     assert_eq!(req.callbacks, 2, "progress + terminal notifications");
+}
+
+#[test]
+fn submit_without_op_rejected() {
+    let text = LITERAL_ASYNC_SUBMIT.replace(r#""op":"encrypt","#, "");
+    let err = parse_ledger("run-1", &text).expect_err("op-less submit rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
 }
 
 const TERMINAL_ROW: &str =
@@ -137,7 +148,7 @@ fn done_without_fixture_result_rejected() {
 /// Transform lifetime rows share the run's sequence counter:
 /// alloc takes a value, its free reuses it. Lifetimes need no
 /// terminal row, but free requires a prior alloc.
-const LITERAL_WITH_LIFETIME: &str = r#"{"v":1,"run":"run-1","seq":3,"phase":"alloc","drv":"kcipher-sync","ts":900}
+const LITERAL_WITH_LIFETIME: &str = r#"{"v":1,"run":"run-1","seq":3,"phase":"alloc","req":"kxcipher","drv":"kcipher-sync","ts":900}
 {"v":1,"run":"run-1","seq":7,"phase":"submit","op":"encrypt","ts":1000,"cpu":3}
 {"v":1,"run":"run-1","seq":7,"phase":"return","errno":-115,"ts":1200,"cpu":3}
 {"v":1,"run":"run-1","seq":7,"phase":"progress","errno":-115,"ts":1500,"cpu":5}
@@ -153,8 +164,30 @@ fn alloc_free_lifetime_parses_alongside_requests() {
     assert_eq!(ledger.allocs.len(), 1, "one transform lifetime");
     let alloc = &ledger.allocs[0];
     assert_eq!(alloc.seq, 3);
+    assert_eq!(alloc.req_name, "kxcipher", "requested name carried");
+    assert_eq!(alloc.drv_name, "kcipher-sync", "resolved driver carried");
     assert!(alloc.freed, "free row closed the lifetime");
     assert!(alloc.final_free, "final-free flag carried");
+}
+
+#[test]
+fn alloc_without_req_rejected() {
+    let text = LITERAL_WITH_LIFETIME.replace(r#""req":"kxcipher","#, "");
+    let err = parse_ledger("run-1", &text).expect_err("req-less alloc rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn alloc_without_drv_rejected() {
+    let text = LITERAL_WITH_LIFETIME.replace(r#""drv":"kcipher-sync","#, "");
+    let err = parse_ledger("run-1", &text).expect_err("drv-less alloc rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
 }
 
 #[test]

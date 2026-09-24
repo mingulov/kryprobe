@@ -8,6 +8,7 @@
  */
 #include <linux/completion.h>
 #include <linux/crypto.h>
+#include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -21,6 +22,10 @@
 /* Async wait sliced so STOP can abort the run. */
 #define KXC_WAIT_SLICE_MS 100
 #define KXC_WAIT_SLICES 100
+/* Backlog burst width (concurrent MAY_BACKLOG requests, one tfm). */
+#define KXC_BURST_NREQS 4
+/* Delayed-completion waiter sleep before the first wait slice. */
+#define KXC_DELAY_MS 200
 
 static const u8 kxc_key[KXC_KEYLEN] = "0123456789abcdef";
 static const u8 kxc_pt[KXC_BLOCK] = "fedcba9876543210";
@@ -78,6 +83,14 @@ static void kxc_emit_return(struct kxc_run *run, u64 seq, int errno_)
 		run->id, seq, errno_, ktime_get_ns(), smp_processor_id());
 }
 
+static void kxc_emit_progress(struct kxc_run *run, u64 seq, int errno_)
+{
+	kxc_ledger_emit(
+		"{\"v\":1,\"run\":\"%s\",\"seq\":%llu,\"phase\":\"progress\","
+		"\"errno\":%d,\"ts\":%llu,\"cpu\":%u}",
+		run->id, seq, errno_, ktime_get_ns(), smp_processor_id());
+}
+
 static void kxc_emit_terminal(struct kxc_run *run, u64 seq, int errno_)
 {
 	kxc_ledger_emit(
@@ -103,31 +116,57 @@ static void kxc_complete(void *data, int err)
 	complete(&op->done);
 }
 
-static int kxc_op_prepare(struct kxc_run *run, struct kxc_op *op,
-			  const char *drv_name, u64 *aseq)
+static void kxc_tfm_release(struct kxc_run *run, struct crypto_skcipher *tfm,
+			    u64 aseq);
+
+static int kxc_tfm_acquire(struct kxc_run *run, const char *req_name,
+			   struct crypto_skcipher **tfm, u64 *aseq)
+{
+	struct crypto_skcipher *t;
+
+	t = crypto_alloc_skcipher(req_name, 0, 0);
+	if (IS_ERR(t))
+		return PTR_ERR(t);
+	*aseq = kxc_next_seq(run);
+	kxc_emit_alloc(run, *aseq, req_name,
+		       crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t)));
+	if (crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN)) {
+		kxc_tfm_release(run, t, *aseq);
+		return -EKEYREJECTED;
+	}
+	*tfm = t;
+	return 0;
+}
+
+static void kxc_tfm_release(struct kxc_run *run, struct crypto_skcipher *tfm,
+			    u64 aseq)
+{
+	crypto_free_skcipher(tfm);
+	/* Fixture transforms are never shared: every free is final. */
+	kxc_emit_free(run, aseq, true);
+}
+
+static int kxc_req_setup(struct kxc_run *run, struct crypto_skcipher *tfm,
+			 struct kxc_op *op, u32 cb_flags)
 {
 	u8 *buf;
 
 	memset(op, 0, sizeof(*op));
 	op->run = run;
-	op->tfm = crypto_alloc_skcipher(drv_name, 0, 0);
-	if (IS_ERR(op->tfm))
-		return PTR_ERR(op->tfm);
-	*aseq = kxc_next_seq(run);
-	kxc_emit_alloc(run, *aseq, drv_name,
-		       crypto_tfm_alg_driver_name(crypto_skcipher_tfm(op->tfm)));
-	if (crypto_skcipher_setkey(op->tfm, kxc_key, KXC_KEYLEN))
-		return -EKEYREJECTED;
-	op->req = skcipher_request_alloc(op->tfm, GFP_KERNEL);
+	op->tfm = tfm;
+	op->req = skcipher_request_alloc(tfm, GFP_KERNEL);
 	if (!op->req)
 		return -ENOMEM;
 	op->page = alloc_page(GFP_KERNEL);
-	if (!op->page)
+	if (!op->page) {
+		skcipher_request_free(op->req);
+		op->req = NULL;
 		return -ENOMEM;
+	}
 	buf = page_address(op->page);
 	memcpy(buf, kxc_pt, KXC_BLOCK);
 	sg_init_one(&op->sg, buf, KXC_BLOCK);
-	skcipher_request_set_callback(op->req, 0, kxc_complete, op);
+	skcipher_request_set_callback(op->req, cb_flags, kxc_complete, op);
 	memcpy(op->iv, kxc_iv, KXC_IVLEN);
 	skcipher_request_set_crypt(op->req, &op->sg, &op->sg, KXC_BLOCK,
 				   op->iv);
@@ -136,13 +175,37 @@ static int kxc_op_prepare(struct kxc_run *run, struct kxc_op *op,
 	return 0;
 }
 
-static void kxc_op_release(struct kxc_run *run, struct kxc_op *op, u64 aseq)
+static void kxc_req_teardown(struct kxc_op *op)
 {
 	skcipher_request_free(op->req);
+	op->req = NULL;
 	__free_page(op->page);
-	crypto_free_skcipher(op->tfm);
-	/* Fixture transforms are never shared: every free is final. */
-	kxc_emit_free(run, aseq, true);
+	op->page = NULL;
+}
+
+static int kxc_op_prepare(struct kxc_run *run, struct kxc_op *op,
+			  const char *drv_name, u64 *aseq)
+{
+	struct crypto_skcipher *tfm;
+	int err;
+
+	err = kxc_tfm_acquire(run, drv_name, &tfm, aseq);
+	if (err)
+		return err;
+	err = kxc_req_setup(run, tfm, op, 0);
+	if (err) {
+		kxc_tfm_release(run, tfm, *aseq);
+		return err;
+	}
+	return 0;
+}
+
+static void kxc_op_release(struct kxc_run *run, struct kxc_op *op, u64 aseq)
+{
+	struct crypto_skcipher *tfm = op->tfm;
+
+	kxc_req_teardown(op);
+	kxc_tfm_release(run, tfm, aseq);
 }
 
 static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
@@ -236,11 +299,217 @@ static int kxc_scenario_async_once(struct kxc_run *run)
 	return err;
 }
 
+static int kxc_scenario_delayed_completion(struct kxc_run *run)
+{
+	struct kxc_op op;
+	u64 aseq, seq;
+	int err;
+
+	err = kxc_op_prepare(run, &op, kxc_async_driver_name(), &aseq);
+	if (err)
+		return err;
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	kxc_emit_submit(run, seq, "encrypt-delayed", KXC_BLOCK);
+	err = crypto_skcipher_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	if (err != -EINPROGRESS) {
+		kxc_emit_terminal(run, seq, err);
+		kxc_op_release(run, &op, aseq);
+		return err;
+	}
+	/*
+	 * Slow waiter: sleep before the first wait slice, then mark
+	 * the in-flight invocation with a progress row. Two
+	 * callbacks (progress + terminal) distinguish this from
+	 * async-once.
+	 */
+	msleep(KXC_DELAY_MS);
+	kxc_emit_progress(run, seq, -EINPROGRESS);
+	err = kxc_wait_done(run, &op);
+	kxc_op_release(run, &op, aseq);
+	return err;
+}
+
+static int kxc_scenario_backlog_accepted(struct kxc_run *run)
+{
+	struct crypto_skcipher *tfm;
+	struct kxc_op ops[KXC_BURST_NREQS];
+	u64 aseq, seqs[KXC_BURST_NREQS];
+	bool pending[KXC_BURST_NREQS];
+	int err, first_err = 0;
+	int i, nsetup = 0;
+
+	err = kxc_tfm_acquire(run, kxc_async_driver_name(), &tfm, &aseq);
+	if (err)
+		return err;
+	for (i = 0; i < KXC_BURST_NREQS; i++) {
+		err = kxc_req_setup(run, tfm, &ops[i],
+				    CRYPTO_TFM_REQ_MAY_BACKLOG);
+		if (err)
+			goto teardown;
+		nsetup++;
+		seqs[i] = kxc_next_seq(run);
+		ops[i].seq = seqs[i];
+		pending[i] = false;
+	}
+	for (i = 0; i < KXC_BURST_NREQS; i++) {
+		kxc_emit_submit(run, seqs[i], "encrypt-burst", KXC_BLOCK);
+		err = crypto_skcipher_encrypt(ops[i].req);
+		kxc_emit_return(run, seqs[i], err);
+		if (err == -EINPROGRESS || err == -EBUSY) {
+			/*
+			 * -EBUSY under MAY_BACKLOG means queued: the
+			 * terminal row still arrives via callback.
+			 */
+			pending[i] = true;
+		} else {
+			kxc_emit_terminal(run, seqs[i], err);
+			if (!first_err)
+				first_err = err;
+		}
+	}
+	for (i = 0; i < KXC_BURST_NREQS; i++) {
+		if (!pending[i])
+			continue;
+		err = kxc_wait_done(run, &ops[i]);
+		if (err && !first_err)
+			first_err = err;
+	}
+teardown:
+	for (i = 0; i < nsetup; i++)
+		kxc_req_teardown(&ops[i]);
+	kxc_tfm_release(run, tfm, aseq);
+	return first_err;
+}
+
+static int kxc_scenario_early_callback(struct kxc_run *run)
+{
+	struct kxc_op op;
+	u64 aseq, seq;
+	int err;
+
+	err = kxc_op_prepare(run, &op, kxc_async_driver_name(), &aseq);
+	if (err)
+		return err;
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	kxc_emit_submit(run, seq, "encrypt-early", KXC_BLOCK);
+	err = crypto_skcipher_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	if (err != -EINPROGRESS) {
+		kxc_emit_terminal(run, seq, err);
+		kxc_op_release(run, &op, aseq);
+		return err;
+	}
+	/*
+	 * Poll before waiting: the progress row records whether the
+	 * callback already delivered the terminal row (errno 0) or
+	 * the invocation is still in flight (EINPROGRESS). Either
+	 * way exactly one progress row lands: two callbacks total.
+	 */
+	kxc_emit_progress(run, seq,
+			  completion_done(&op.done) ? 0 : -EINPROGRESS);
+	err = kxc_wait_done(run, &op);
+	kxc_op_release(run, &op, aseq);
+	return err;
+}
+
+static int kxc_scenario_exact_driver(struct kxc_run *run)
+{
+	struct kxc_op op;
+	const char *resolved;
+	u64 aseq, seq;
+	int err;
+
+	/*
+	 * Request the GENERIC name: the crypto API must resolve it
+	 * to exactly the async fixture driver (highest priority).
+	 * Anything else rejects the run honestly.
+	 */
+	err = kxc_op_prepare(run, &op, KXC_GENERIC_NAME, &aseq);
+	if (err)
+		return err;
+	resolved = crypto_tfm_alg_driver_name(crypto_skcipher_tfm(op.tfm));
+	if (strcmp(resolved, kxc_async_driver_name())) {
+		kxc_op_release(run, &op, aseq);
+		return -ENODEV;
+	}
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	kxc_emit_submit(run, seq, "encrypt-exact", KXC_BLOCK);
+	err = crypto_skcipher_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	if (err != -EINPROGRESS) {
+		kxc_emit_terminal(run, seq, err);
+		kxc_op_release(run, &op, aseq);
+		return err;
+	}
+	err = kxc_wait_done(run, &op);
+	kxc_op_release(run, &op, aseq);
+	return err;
+}
+
+static int kxc_scenario_failed_alloc(struct kxc_run *run)
+{
+	struct crypto_skcipher *tfm;
+	u64 seq;
+	int err;
+
+	tfm = crypto_alloc_skcipher("kxcipher-no-such", 0, 0);
+	if (!IS_ERR(tfm)) {
+		/* Impossible: no such driver exists. Fail loudly. */
+		crypto_free_skcipher(tfm);
+		return -EEXIST;
+	}
+	err = PTR_ERR(tfm);
+	/*
+	 * The failed allocation IS the recorded invocation: a
+	 * submit/return/terminal triple carrying the native errno,
+	 * and no alloc row (nothing was allocated). The scenario
+	 * itself completed, so the run result is 0.
+	 */
+	seq = kxc_next_seq(run);
+	kxc_emit_submit(run, seq, "alloc-probe", 0);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	return 0;
+}
+
+static int kxc_scenario_refheld_release(struct kxc_run *run)
+{
+	struct kxc_op op;
+	u64 aseq;
+	int err;
+
+	/*
+	 * Hold the transform reference across the run with zero
+	 * invocations, then release it: alloc/free rows only.
+	 */
+	err = kxc_op_prepare(run, &op, kxc_sync_driver_name(), &aseq);
+	if (err)
+		return err;
+	kxc_op_release(run, &op, aseq);
+	return 0;
+}
+
 int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 {
 	if (!strcmp(scenario, "sync-once"))
 		return kxc_scenario_sync_once(run);
 	if (!strcmp(scenario, "async-once"))
 		return kxc_scenario_async_once(run);
+	if (!strcmp(scenario, "delayed-completion"))
+		return kxc_scenario_delayed_completion(run);
+	if (!strcmp(scenario, "backlog-accepted"))
+		return kxc_scenario_backlog_accepted(run);
+	if (!strcmp(scenario, "early-callback"))
+		return kxc_scenario_early_callback(run);
+	if (!strcmp(scenario, "exact-driver"))
+		return kxc_scenario_exact_driver(run);
+	if (!strcmp(scenario, "failed-alloc"))
+		return kxc_scenario_failed_alloc(run);
+	if (!strcmp(scenario, "refheld-release"))
+		return kxc_scenario_refheld_release(run);
 	return -EINVAL;
 }

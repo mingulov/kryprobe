@@ -8,24 +8,32 @@
 
 use std::collections::HashSet;
 
-/// One parsed request: its fixture sequence, terminal native errno
-/// and callback notification count (progress + terminal rows).
+/// One parsed request: its fixture sequence, submitted operation
+/// label, terminal native errno and callback notification count
+/// (progress + terminal rows).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerRequest {
     /// Fixture invocation sequence.
     pub seq: u64,
+    /// Operation label from the submit row (scenario tag).
+    pub submit_op: String,
     /// Native errno of the terminal row.
     pub terminal_errno: i32,
     /// Progress + terminal rows observed for this sequence.
     pub callbacks: u32,
 }
 
-/// One transform lifetime: allocation sequence, whether a free
-/// row closed it, and the fixture's final-free flag.
+/// One transform lifetime: allocation sequence, requested and
+/// resolved driver names, whether a free row closed it, and the
+/// fixture's final-free flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerAlloc {
     /// Fixture sequence shared by the alloc/free pair.
     pub seq: u64,
+    /// Name the consumer requested (generic or exact driver).
+    pub req_name: String,
+    /// Driver the crypto API resolved.
+    pub drv_name: String,
     /// Whether the free row arrived.
     pub freed: bool,
     /// Fixture-reported final free (vs release at refcount > 1).
@@ -87,6 +95,8 @@ struct Build {
     seq: u64,
     /// Whether the submit row arrived (later phases require it).
     submitted: bool,
+    /// Operation label from the submit row.
+    submit_op: Option<String>,
     /// Terminal errno once the terminal row arrives.
     terminal_errno: Option<i32>,
     /// Progress + terminal rows seen so far.
@@ -100,6 +110,10 @@ const RUN_LEVEL_SEQ: u64 = u64::MAX;
 struct AllocBuild {
     /// Fixture sequence shared by the alloc/free pair.
     seq: u64,
+    /// Requested name from the alloc row.
+    req_name: String,
+    /// Resolved driver from the alloc row.
+    drv_name: String,
     /// Whether the free row arrived.
     freed: bool,
     /// Fixture-reported final free.
@@ -115,9 +129,10 @@ fn malformed(lineno: usize, msg: &str) -> LedgerError {
 /// Row schema (all objects, unknown fields ignored so the fixture
 /// can grow): `v` (must be 1), `run` (must match), `phase` (one of
 /// submit/return/progress/terminal/alloc/free/done), `seq` on every
-/// phase but `done`, `errno` on terminal rows, optional `overflow`
-/// counter (nonzero rejects), required `fixture_result` on the DONE
-/// row (nonzero rejects), `final` flag on free rows.
+/// phase but `done`, `op` on submit rows, `req`/`drv` on alloc rows,
+/// `errno` on terminal rows, optional `overflow` counter (nonzero
+/// rejects), required `fixture_result` on the DONE row (nonzero
+/// rejects), `final` flag on free rows.
 ///
 /// Strictness is load-bearing: (sequence, phase) rows are unique
 /// (a future multi-progress fixture relaxes this with its own
@@ -191,8 +206,18 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
             "alloc" => {
                 // Duplicate allocs are rejected by the seen-set
                 // above, so no entry exists here.
+                let req_name = row
+                    .get("req")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| malformed(lineno, "alloc row missing req"))?;
+                let drv_name = row
+                    .get("drv")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| malformed(lineno, "alloc row missing drv"))?;
                 alloc_builds.push(AllocBuild {
                     seq,
+                    req_name: req_name.to_owned(),
+                    drv_name: drv_name.to_owned(),
                     freed: false,
                     final_free: false,
                 });
@@ -219,6 +244,7 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                         reqs.push(Build {
                             seq,
                             submitted: false,
+                            submit_op: None,
                             terminal_errno: None,
                             callbacks: 0,
                         });
@@ -226,6 +252,11 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                     }
                 };
                 if phase == "submit" {
+                    let op = row
+                        .get("op")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| malformed(lineno, "submit row missing op"))?;
+                    reqs[idx].submit_op = Some(op.to_owned());
                     reqs[idx].submitted = true;
                 } else if !reqs[idx].submitted {
                     return Err(LedgerError::PhaseInconsistency(format!(
@@ -263,19 +294,28 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
         }
         allocs.push(LedgerAlloc {
             seq: a.seq,
+            req_name: a.req_name,
+            drv_name: a.drv_name,
             freed: true,
             final_free: a.final_free,
         });
     }
     let mut requests = Vec::with_capacity(reqs.len());
     for r in reqs {
-        match r.terminal_errno {
-            Some(errno) => requests.push(LedgerRequest {
+        match (r.submit_op, r.terminal_errno) {
+            (Some(op), Some(errno)) => requests.push(LedgerRequest {
                 seq: r.seq,
+                submit_op: op,
                 terminal_errno: errno,
                 callbacks: r.callbacks,
             }),
-            None => {
+            (None, _) => {
+                return Err(LedgerError::PhaseInconsistency(format!(
+                    "seq {} submit carried no op",
+                    r.seq
+                )));
+            }
+            (_, None) => {
                 return Err(LedgerError::PhaseInconsistency(format!(
                     "seq {} never reached terminal",
                     r.seq

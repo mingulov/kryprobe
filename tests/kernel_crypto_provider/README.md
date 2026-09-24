@@ -54,7 +54,17 @@ all reject).
   row (a sync return IS its terminal result).
 - `async-once`: exact-driver async alloc, EINPROGRESS submit,
   workqueue completion on another CPU, free.
+- `delayed-completion`: slow waiter (200ms pre-wait sleep) plus a
+  progress marker: progress + terminal callbacks.
+- `backlog-accepted`: four concurrent `MAY_BACKLOG` submits on one
+  transform; `-EBUSY` still means queued (terminal via callback).
+- `early-callback`: pre-wait completion poll recorded as exactly one
+  progress row (hit or miss), then the terminal.
+- `exact-driver`: generic-name alloc must resolve to exactly the
+  async fixture driver (highest priority), else `-ENODEV`.
+- `failed-alloc`: unknown-name alloc; the probe triple carries the
+  native `ENOENT`, no alloc row, run result 0 (expected failure).
+- `refheld-release`: transform held across the run with zero
+  invocations, then released: alloc/free rows only.
 
-Planned (matrix F/Q/H): delayed/cross-CPU completion, accepted
-backlog, early callback, exact-driver vs generic selection, failed
-allocation, reference-held release, rapid reuse.
+Planned (matrix F/Q/H): rapid reuse.
