@@ -19,6 +19,26 @@ cargo xtask build --bpf
 sudo packaging/install.sh
 ```
 
+Release packaging (pinned) instead stages first, then installs from
+the verified stage:
+
+```sh
+packaging/build-release.sh --dest /owned/pkg-YYYYMMDD
+sudo packaging/install.sh --stage /owned/pkg-YYYYMMDD
+```
+
+`build-release.sh` enforces the two-phase order: build BPF objects,
+digest `kcrypto.bpf.o`, then build the release binary with
+`KRYPROBE_REQUIRE_PINS=1` and that digest baked in. It stages the
+binary + object atomically, writes `manifest.json` + `sha256sums.txt`
+(explicit object list — future lifecycle objects join the manifest,
+never an unbounded glob), and verifies the staged `doctor --versions`
+reports `pins_enforced: true` with the staged digest. Never rebuild
+objects after pinning without rebuilding the host binary: the pin
+would name bytes that no longer exist. Later privileged lanes use an
+immutable staged executable owned by the task, never a mutable
+worktree binary.
+
 Result:
 
 ```text

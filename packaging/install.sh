@@ -2,47 +2,71 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Install kryprobe: binary + bundled BPF object + file-cap grant + verify.
 #
-# Usage: packaging/install.sh [--prefix PREFIX] [--destdir DIR] [--no-mint]
+# Usage: packaging/install.sh [--prefix PREFIX] [--destdir DIR] [--no-mint] [--stage DIR]
 #   --prefix PREFIX  install root (default: /usr/local)
 #   --destdir DIR    staging root prepended to all paths (packaging)
 #   --no-mint        skip the root `token mint` cap grant (verify skipped too)
+#   --stage DIR      install from a `build-release.sh` stage (manifest
+#                    verified first); default sources are the worktree
+#                    target dirs (dev flow, no manifest)
 #
 # Layout (the H-SEC-01 trusted path — the ONLY tier an elevated
 # kryprobe loads from):
 #   $PREFIX/bin/kryprobe
 #   $PREFIX/bin/kryprobe-bpf/kcrypto.bpf.o
 #
-# Requires a prior `cargo xtask build` + `cargo xtask build --bpf`.
+# Requires a prior `cargo xtask build` + `cargo xtask build --bpf`,
+# or a `packaging/build-release.sh --dest DIR` stage for --stage.
 # Re-run after every binary swap: any replacement strips the xattr.
 set -eu
 
 PREFIX=/usr/local
 DESTDIR=
 MINT=1
+STAGE=
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --prefix|--destdir)
+        --prefix|--destdir|--stage)
             if [ $# -lt 2 ]; then
                 echo "install.sh: $1 needs a value" >&2
                 exit 2
             fi
-            if [ "$1" = "--prefix" ]; then PREFIX="$2"; else DESTDIR="$2"; fi
+            if [ "$1" = "--prefix" ]; then PREFIX="$2";
+            elif [ "$1" = "--destdir" ]; then DESTDIR="$2";
+            else STAGE="$2"; fi
             shift 2
             ;;
         --no-mint) MINT=0; shift ;;
         -h|--help)
-            sed -n '2,12p' "$0"
+            sed -n '2,16p' "$0"
             exit 0
             ;;
         *) echo "install.sh: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BIN_SRC="$ROOT/target/debug/kryprobe"
-OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
-[ -f "$ROOT/target/release/kryprobe" ] && BIN_SRC="$ROOT/target/release/kryprobe"
+if [ -n "$STAGE" ]; then
+    BIN_SRC="$STAGE/bin/kryprobe"
+    OBJ_SRC="$STAGE/bin/kryprobe-bpf/kcrypto.bpf.o"
+    if [ ! -f "$STAGE/manifest.json" ] || [ ! -f "$STAGE/sha256sums.txt" ]; then
+        echo "install.sh: stage $STAGE lacks manifest.json/sha256sums.txt" >&2
+        exit 1
+    fi
+    ( cd "$STAGE" && sha256sum -c sha256sums.txt ) || {
+        echo "install.sh: stage hash check failed" >&2
+        exit 1
+    }
+    grep -q -F '"pins_enforced":true' "$STAGE/manifest.json" || {
+        echo "install.sh: stage manifest is not pin-enforced" >&2
+        exit 1
+    }
+else
+    ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    BIN_SRC="$ROOT/target/debug/kryprobe"
+    OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
+    [ -f "$ROOT/target/release/kryprobe" ] && BIN_SRC="$ROOT/target/release/kryprobe"
+fi
 
 if [ ! -f "$BIN_SRC" ]; then
     echo "install.sh: missing $BIN_SRC (run \`cargo xtask build\` first)" >&2
