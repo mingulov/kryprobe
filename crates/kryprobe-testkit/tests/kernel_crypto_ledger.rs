@@ -133,3 +133,52 @@ fn done_without_fixture_result_rejected() {
         Err(LedgerError::Malformed(_))
     ));
 }
+
+/// Transform lifetime rows share the run's sequence counter:
+/// alloc takes a value, its free reuses it. Lifetimes need no
+/// terminal row, but free requires a prior alloc.
+const LITERAL_WITH_LIFETIME: &str = r#"{"v":1,"run":"run-1","seq":3,"phase":"alloc","drv":"kcipher-sync","ts":900}
+{"v":1,"run":"run-1","seq":7,"phase":"submit","op":"encrypt","ts":1000,"cpu":3}
+{"v":1,"run":"run-1","seq":7,"phase":"return","errno":-115,"ts":1200,"cpu":3}
+{"v":1,"run":"run-1","seq":7,"phase":"progress","errno":-115,"ts":1500,"cpu":5}
+{"v":1,"run":"run-1","seq":7,"phase":"terminal","errno":0,"ts":1800,"cpu":5}
+{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}
+{"v":1,"run":"run-1","phase":"done","fixture_result":0,"ts":1900}
+"#;
+
+#[test]
+fn alloc_free_lifetime_parses_alongside_requests() {
+    let ledger = parse_ledger("run-1", LITERAL_WITH_LIFETIME).expect("lifetime parses");
+    assert_eq!(ledger.requests.len(), 1);
+    assert_eq!(ledger.allocs.len(), 1, "one transform lifetime");
+    let alloc = &ledger.allocs[0];
+    assert_eq!(alloc.seq, 3);
+    assert!(alloc.freed, "free row closed the lifetime");
+    assert!(alloc.final_free, "final-free flag carried");
+}
+
+#[test]
+fn free_without_alloc_rejected() {
+    let text: String = LITERAL_WITH_LIFETIME
+        .lines()
+        .filter(|l| !l.contains(r#""phase":"alloc""#))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
+fn alloc_without_free_at_done_rejected() {
+    let text: String = LITERAL_WITH_LIFETIME
+        .lines()
+        .filter(|l| !l.contains(r#""phase":"free""#))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
