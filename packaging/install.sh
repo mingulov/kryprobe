@@ -6,9 +6,17 @@
 #   --prefix PREFIX  install root (default: /usr/local)
 #   --destdir DIR    staging root prepended to all paths (packaging)
 #   --no-mint        skip the root `token mint` cap grant (verify skipped too)
-#   --stage DIR      install from a `build-release.sh` stage (manifest
-#                    verified first); default sources are the worktree
-#                    target dirs (dev flow, no manifest)
+#   --stage DIR      install from a `build-release.sh` stage, verified
+#                    first and refused before copying when inconsistent:
+#                    byte-exact manifest v1 for the measured file
+#                    digests, checksum list covering exactly the
+#                    payload, staged binary enforcing the staged
+#                    object's pin, installed pair re-hashed after copy.
+#                    Default sources are the worktree target dirs (dev
+#                    flow, explicitly unverified — never a release).
+#
+# Tools: POSIX sh, sha256sum, grep — no jq/python. The manifest
+# template is owned by build-release.sh; format drift fails closed.
 #
 # Layout (the H-SEC-01 trusted path — the ONLY tier an elevated
 # kryprobe loads from):
@@ -39,7 +47,7 @@ while [ $# -gt 0 ]; do
             ;;
         --no-mint) MINT=0; shift ;;
         -h|--help)
-            sed -n '2,16p' "$0"
+            sed -n '2,28p' "$0"
             exit 0
             ;;
         *) echo "install.sh: unknown argument '$1'" >&2; exit 2 ;;
@@ -47,22 +55,74 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -n "$STAGE" ]; then
-    BIN_SRC="$STAGE/bin/kryprobe"
-    OBJ_SRC="$STAGE/bin/kryprobe-bpf/kcrypto.bpf.o"
-    if [ ! -f "$STAGE/manifest.json" ] || [ ! -f "$STAGE/sha256sums.txt" ]; then
-        echo "install.sh: stage $STAGE lacks manifest.json/sha256sums.txt" >&2
-        exit 1
-    fi
-    ( cd "$STAGE" && sha256sum -c sha256sums.txt ) || {
-        echo "install.sh: stage hash check failed" >&2
+    STAGE_ABS=$(cd "$STAGE" && pwd) || {
+        echo "install.sh: stage is not a directory: $STAGE" >&2
         exit 1
     }
-    grep -q -F '"pins_enforced":true' "$STAGE/manifest.json" || {
-        echo "install.sh: stage manifest is not pin-enforced" >&2
+    STAGE="$STAGE_ABS"
+    BIN_SRC="$STAGE/bin/kryprobe"
+    OBJ_SRC="$STAGE/bin/kryprobe-bpf/kcrypto.bpf.o"
+    MANIFEST="$STAGE/manifest.json"
+    SUMS="$STAGE/sha256sums.txt"
+    for f in "$MANIFEST" "$SUMS" "$BIN_SRC" "$OBJ_SRC"; do
+        if [ ! -f "$f" ]; then
+            echo "install.sh: stage lacks $f" >&2
+            exit 1
+        fi
+    done
+    # Hash the actual files being copied — the checksum list and the
+    # manifest are claims about these bytes, never the source of
+    # truth (F04). All validation below runs before anything is
+    # copied, so a refused stage leaves the destination untouched.
+    BIN_DIGEST=$(sha256sum "$BIN_SRC")
+    BIN_DIGEST=${BIN_DIGEST%% *}
+    OBJ_DIGEST=$(sha256sum "$OBJ_SRC")
+    OBJ_DIGEST=${OBJ_DIGEST%% *}
+    # The versioned manifest must be byte-exact manifest v1 for these
+    # measured digests: no JSON parser, no fragment grep — any format
+    # drift fails closed. Template owned by build-release.sh; keep
+    # the two in lockstep.
+    MANIFEST_EXPECTED=$(printf '{"kryprobe_release_manifest":1,"binary":{"path":"bin/kryprobe","sha256":"%s"},"objects":[{"name":"kcrypto.bpf.o","path":"bin/kryprobe-bpf/kcrypto.bpf.o","sha256":"%s"}],"pins_enforced":true,"pin_digests":["%s"]}' "$BIN_DIGEST" "$OBJ_DIGEST" "$OBJ_DIGEST")
+    if [ "$(wc -l < "$MANIFEST" | tr -d ' ')" != "1" ]; then
+        echo "install.sh: stage manifest is not one line: $MANIFEST" >&2
+        exit 1
+    fi
+    if [ "$(cat "$MANIFEST")" != "$MANIFEST_EXPECTED" ]; then
+        echo "install.sh: stage manifest is not manifest v1 for these files" >&2
+        exit 1
+    fi
+    # The checksum list must cover exactly the shipped payload.
+    SUMS_EXPECTED=$(printf '%s  bin/kryprobe\n%s  bin/kryprobe-bpf/kcrypto.bpf.o' "$BIN_DIGEST" "$OBJ_DIGEST")
+    if [ "$(wc -l < "$SUMS" | tr -d ' ')" != "2" ]; then
+        echo "install.sh: stage checksums do not cover exactly the payload" >&2
+        exit 1
+    fi
+    if [ "$(cat "$SUMS")" != "$SUMS_EXPECTED" ]; then
+        echo "install.sh: stage checksums do not match the payload files" >&2
+        exit 1
+    fi
+    # The staged binary itself must enforce the staged object's pin:
+    # same predicate build-release.sh verifies after staging.
+    STAGE_VERSIONS=$(cd / && env -u KRYPROBE_BPF_DIR -u KRYPROBE_BPF_OBJ \
+        "$BIN_SRC" doctor --versions --json) || {
+        echo "install.sh: staged binary doctor failed" >&2
+        exit 1
+    }
+    echo "$STAGE_VERSIONS" | grep -q -F '"pins_enforced":true' || {
+        echo "install.sh: staged binary is not pin-enforced: $STAGE_VERSIONS" >&2
+        exit 1
+    }
+    echo "$STAGE_VERSIONS" | grep -q -F "\"sha256\":\"$OBJ_DIGEST\"" || {
+        echo "install.sh: staged binary does not trust the staged object: $STAGE_VERSIONS" >&2
+        exit 1
+    }
+    echo "$STAGE_VERSIONS" | grep -q -F "\"path\":\"$OBJ_SRC\"" || {
+        echo "install.sh: staged identity path mismatch: $STAGE_VERSIONS" >&2
         exit 1
     }
 else
-    ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+    echo "install.sh: dev sources, no manifest verification" >&2
     BIN_SRC="$ROOT/target/debug/kryprobe"
     OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
     [ -f "$ROOT/target/release/kryprobe" ] && BIN_SRC="$ROOT/target/release/kryprobe"
@@ -88,6 +148,21 @@ chmod 0755 "$BIN_DST"
 chmod 0644 "$OBJ_DST"
 echo "+ installed $BIN_DST"
 echo "+ installed $OBJ_DST"
+if [ -n "$STAGE" ]; then
+    # Confirm the destination pair is the verified stage pair before
+    # declaring success (F04). On mismatch the destination may hold
+    # a corrupt pair: re-run from a valid stage (no auto-recovery).
+    INST_BIN_DIGEST=$(sha256sum "$BIN_DST")
+    INST_BIN_DIGEST=${INST_BIN_DIGEST%% *}
+    INST_OBJ_DIGEST=$(sha256sum "$OBJ_DST")
+    INST_OBJ_DIGEST=${INST_OBJ_DIGEST%% *}
+    if [ "$INST_BIN_DIGEST" != "$BIN_DIGEST" ] || [ "$INST_OBJ_DIGEST" != "$OBJ_DIGEST" ]; then
+        echo "install.sh: installed pair does not match the verified stage" >&2
+        exit 1
+    fi
+    echo "+ verified $BIN_DST"
+    echo "+ verified $OBJ_DST"
+fi
 
 if [ "$MINT" -eq 0 ]; then
     echo "install.sh: --no-mint, skipping cap grant + verify" >&2

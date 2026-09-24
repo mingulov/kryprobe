@@ -45,6 +45,11 @@ fn kcrypto_obs(
             serde_json::Value::String(algorithm.to_owned()),
         );
     }
+    // Live export requires a supported capture profile (F01).
+    payload.insert(
+        "capture_profile".to_owned(),
+        serde_json::Value::String("api-returns".to_owned()),
+    );
     NativeObservation {
         id: ObservationId::new(id),
         backend: BackendId::KCrypto,

@@ -84,18 +84,17 @@ fn payload_str<'a>(payload: &'a serde_json::Value, key: &str) -> &'a str {
 }
 
 /// Stage match (D3): only agg rows carry a stage — totals/ident rows
-/// are carriers/markers and never match (even though totals carry
-/// `Completed`).
+/// are carriers/markers and never match. `Executed` requires proved
+/// completion (F03): a bare API return, however selected, is
+/// `Returned`, never execution.
 fn stage_matches(stage: Stage, obs: &NativeObservation) -> bool {
     if payload_str(&obs.backend_payload, K::ROW) != "agg" {
         return false;
     }
     match stage {
         Stage::Selected => obs.phase == EvidencePhase::Selected,
-        Stage::Executed => matches!(
-            obs.phase,
-            EvidencePhase::Entered | EvidencePhase::Returned | EvidencePhase::Completed
-        ),
+        Stage::Returned => obs.phase == EvidencePhase::Returned,
+        Stage::Executed => obs.phase == EvidencePhase::Completed,
     }
 }
 

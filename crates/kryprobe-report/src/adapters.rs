@@ -11,8 +11,10 @@
 //!
 //! The legacy input docs under `tests/fixtures/` are preserved
 //! byte-for-byte as provenance (hash-pinned below); nothing adapts
-//! them. The frozen `import-shell-v1.jsonl` record is old emitted
-//! output kept so the structural reader stays honest.
+//! them. The frozen `import-shell-v1.jsonl` record is genuine old
+//! emitted output — bytes produced by `kryprobe import` from the
+//! preserved p11scope input before retirement, not hand-written —
+//! kept so the structural reader stays honest.
 
 use serde_json::Value;
 

@@ -4,8 +4,16 @@
 # atomic stage dir, manifest + hashes, doctor verify.
 #
 # Usage: packaging/build-release.sh --dest DIR [--cargo CARGO]
-#   --dest DIR     owned staging directory (must be absent or empty)
+#   --dest DIR     owned staging directory (must be absent or empty;
+#                  relative paths resolve against the caller's
+#                  directory before any build runs)
 #   --cargo CARGO  cargo binary (default: $CARGO or cargo from PATH)
+#
+# Honors an explicit CARGO_TARGET_DIR for the host build and stages
+# the executable from that build; the BPF phase always uses the
+# default target. Concurrent runs in one worktree serialize on a
+# target-dir lock. Tools: POSIX sh, cargo, sha256sum, flock —
+# no jq/python.
 #
 # Two-phase order -- never rebuild objects after pinning without
 # rebuilding the host binary (the pin would name bytes that no
@@ -49,7 +57,7 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         -h|--help)
-            sed -n '2,24p' "$0"
+            sed -n '2,32p' "$0"
             exit 0
             ;;
         *) echo "build-release.sh: unknown argument '$1'" >&2; exit 2 ;;
@@ -60,6 +68,16 @@ if [ -z "$DEST" ]; then
     echo "build-release.sh: --dest DIR is required" >&2
     exit 2
 fi
+# Resolve --dest against the caller's directory before anything
+# changes directory: verification runs the staged binary from `/`,
+# so a relative dest would fail after both builds (F06). A missing
+# parent is an early explicit error, like a non-empty dest.
+DEST_PARENT=$(dirname -- "$DEST")
+if [ ! -d "$DEST_PARENT" ]; then
+    echo "build-release.sh: dest parent missing: $DEST_PARENT" >&2
+    exit 1
+fi
+DEST="$(cd "$DEST_PARENT" && pwd)/$(basename -- "$DEST")"
 if ! command -v "$CARGO_BIN" >/dev/null 2>&1; then
     echo "build-release.sh: cargo not found: $CARGO_BIN" >&2
     exit 1
@@ -68,14 +86,29 @@ if ! command -v sha256sum >/dev/null 2>&1; then
     echo "build-release.sh: sha256sum not found" >&2
     exit 1
 fi
+if ! command -v flock >/dev/null 2>&1; then
+    echo "build-release.sh: flock not found" >&2
+    exit 1
+fi
 if [ -e "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
     echo "build-release.sh: refusing non-empty dest: $DEST" >&2
     exit 1
 fi
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# One release build per worktree at a time: concurrent runs race on
+# the shared target (a second BPF rewrite between our digest and our
+# copy trips the drift check, or tears a read). The lock releases on
+# process exit, so a killed run cannot wedge later ones.
+mkdir -p "$ROOT/target"
+exec 9>"$ROOT/target/.build-release.lock"
+flock 9 || { echo "build-release.sh: cannot lock $ROOT/target" >&2; exit 1; }
 OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
-BIN_SRC="$ROOT/target/release/kryprobe"
+# BIN_SRC is resolved after `cd "$ROOT"` (phase 2): the host build
+# honors an explicit CARGO_TARGET_DIR, and the staged executable must
+# come from that build — never assume the default target (F05). The
+# BPF phase above always uses the default target (unset
+# CARGO_TARGET_DIR), so OBJ_SRC stays fixed.
 
 echo "+ phase 1: BPF objects"
 ( unset CARGO_TARGET_DIR; cd "$ROOT" && "$CARGO_BIN" xtask build --bpf )
@@ -100,6 +133,18 @@ echo "+ object digest: $DIGEST"
 
 echo "+ phase 2: pinned release binary"
 cd "$ROOT"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    case "$CARGO_TARGET_DIR" in
+        /*) HOST_TARGET_DIR="$CARGO_TARGET_DIR" ;;
+        # Cargo resolves a relative target dir against its invocation
+        # CWD, which is ROOT here — mirror that exactly.
+        *) HOST_TARGET_DIR="$ROOT/$CARGO_TARGET_DIR" ;;
+    esac
+else
+    HOST_TARGET_DIR="$ROOT/target"
+fi
+BIN_SRC="$HOST_TARGET_DIR/release/kryprobe"
+echo "+ host target dir: $HOST_TARGET_DIR"
 KRYPROBE_REQUIRE_PINS=1 KRYPROBE_PIN_DIGESTS="$DIGEST" \
     "$CARGO_BIN" build --locked --release -p kryprobe-cli
 

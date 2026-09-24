@@ -301,7 +301,7 @@ fn counter(name: &str, value: u64) -> DimensionCounter {
 /// T02 (api-returns): internal reconciliation is measured, but kernel
 /// hook-delivery and terminal completion are not — so a reconciled
 /// session still reports `aggregate_counts`, `detailed_events`, and
-/// `completion` as `Unknown` (S04/O02). Exact-count and absence claims
+/// `completion` as `Unknown` (S04). Exact-count and absence claims
 /// over these sessions are therefore inconclusive, never clean.
 fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     let dim = |status| DimensionCoverage::new(status, m.interval);
@@ -373,7 +373,7 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
         .counters
         .push(counter("overflow_identities", m.overflow_identities));
     // Completion: the api-returns sensor observes returns, never
-    // terminal request completion (O02) — always `Unknown`, with the
+    // terminal request completion — always `Unknown`, with the
     // decoded count kept as a magnitude, not a completeness proof.
     let mut completion = dim(CoverageStatus::Unknown);
     completion
@@ -1171,7 +1171,7 @@ mod tests {
 
     #[test]
     fn coverage_healthy_session_leaves_delivery_unknown() {
-        // T02 (S04/O02): a reconciled twin with a clean ring proves
+        // T02 (S04): a reconciled twin with a clean ring proves
         // internal health, not kernel delivery or completion — those
         // three dimensions stay `Unknown` with reason counters, so no
         // exact-count or absence claim can go clean.

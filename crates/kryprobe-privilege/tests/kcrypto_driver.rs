@@ -237,25 +237,18 @@ fn expected_symbol(fam: u8, op: u8) -> Option<&'static str> {
 }
 
 fn expected_call_phase(op: u8, res: u8, inventory: bool) -> (CallKind, EvidencePhase) {
-    let completed = res == KRES_OK || res == KRES_ERR;
+    // Observed exec returns (ok, error, queued) are Returned — never
+    // completion; unobserved results stay Entered (no return claimed).
+    let observed_return = res == KRES_OK || res == KRES_ERR || res == KRES_QUEUED;
+    let exec_phase = if observed_return {
+        EvidencePhase::Returned
+    } else {
+        EvidencePhase::Entered
+    };
     let (call, phase) = match op {
         KOP_ALLOC => (CallKind::Initialization, EvidencePhase::Selected),
-        KOP_ENC | KOP_DEC | KOP_DIGEST => (
-            CallKind::Operation,
-            if completed {
-                EvidencePhase::Completed
-            } else {
-                EvidencePhase::Entered
-            },
-        ),
-        KOP_FINUP => (
-            CallKind::Finalization,
-            if completed {
-                EvidencePhase::Completed
-            } else {
-                EvidencePhase::Entered
-            },
-        ),
+        KOP_ENC | KOP_DEC | KOP_DIGEST => (CallKind::Operation, exec_phase),
+        KOP_FINUP => (CallKind::Finalization, exec_phase),
         KOP_DESTROY => (CallKind::Unknown, EvidencePhase::Returned),
         _ => (CallKind::Unknown, EvidencePhase::Entered),
     };
@@ -428,7 +421,7 @@ fn decode_spot_cases_pin_d8_tables() {
     let obs = decode_agg(KFAM_SK, KOP_ENC, KRES_OK, KCTX_PROC);
     assert_eq!(obs.backend, BackendId::KCrypto);
     assert_eq!(obs.call_kind, CallKind::Operation);
-    assert_eq!(obs.phase, EvidencePhase::Completed);
+    assert_eq!(obs.phase, EvidencePhase::Returned);
     assert_eq!(obs.native_result, NativeResult::KCrypto { status: 0 });
     assert_eq!(outcome_of_obs(&obs), "success");
     assert_eq!(
@@ -448,7 +441,7 @@ fn decode_spot_cases_pin_d8_tables() {
     let obs = decode_agg(KFAM_AEAD, KOP_DEC, KRES_ERR, KCTX_KTHREAD);
     assert_eq!(
         (obs.call_kind, obs.phase),
-        (CallKind::Operation, EvidencePhase::Completed)
+        (CallKind::Operation, EvidencePhase::Returned)
     );
     assert_eq!(obs.native_result, NativeResult::KCrypto { status: -5 });
     assert_eq!(outcome_of_obs(&obs), "failure");
@@ -466,7 +459,7 @@ fn decode_spot_cases_pin_d8_tables() {
     let obs = decode_agg(KFAM_SK, KOP_ENC, KRES_QUEUED, KCTX_SOFTIRQ);
     assert_eq!(
         (obs.call_kind, obs.phase),
-        (CallKind::Operation, EvidencePhase::Entered)
+        (CallKind::Operation, EvidencePhase::Returned)
     );
     assert_eq!(obs.native_result, NativeResult::KCrypto { status: -115 });
     assert_eq!(outcome_of_obs(&obs), "pending");
@@ -476,7 +469,7 @@ fn decode_spot_cases_pin_d8_tables() {
     let obs = decode_agg(KFAM_SHASH, KOP_FINUP, KRES_OK, KCTX_UNKNOWN);
     assert_eq!(
         (obs.call_kind, obs.phase),
-        (CallKind::Finalization, EvidencePhase::Completed)
+        (CallKind::Finalization, EvidencePhase::Returned)
     );
     assert_eq!(
         obs.native_name.as_ref().map(|n| n.as_str()),
@@ -525,7 +518,7 @@ fn decode_spot_cases_pin_d8_tables() {
     let obs = decode_agg(KFAM_SK, KOP_DIGEST, KRES_OK, KCTX_PROC);
     assert_eq!(
         (obs.call_kind, obs.phase),
-        (CallKind::Operation, EvidencePhase::Completed)
+        (CallKind::Operation, EvidencePhase::Returned)
     );
     assert_eq!(obs.native_name, None);
     assert!(obs.backend_payload.get("execution").is_none());
@@ -748,7 +741,7 @@ fn decode_rejects_corrupt_without_counting() {
 }
 
 #[test]
-fn totals_row_decodes_to_completed_aggregate() {
+fn totals_row_decodes_to_returned_aggregate() {
     let backend = KCryptoBackend::new();
     let totals = TotalsBytes::new(totals_payload_for(KRES_OK)).expect("totals");
     let event = raw_event_for_totals(&totals);
@@ -762,7 +755,7 @@ fn totals_row_decodes_to_completed_aggregate() {
     );
     let obs = backend.decode(&ctx, event).expect("totals decodes");
     assert_eq!(obs.backend, BackendId::KCrypto);
-    assert_eq!(obs.phase, EvidencePhase::Completed);
+    assert_eq!(obs.phase, EvidencePhase::Returned);
     assert_eq!(obs.call_kind, CallKind::Unknown);
     assert_eq!(obs.operation_class, OperationClass::Unknown);
     assert_eq!(obs.native_name, None);

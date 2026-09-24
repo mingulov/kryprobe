@@ -36,6 +36,12 @@ pub enum ReportError {
         /// The underlying serialization failure.
         detail: String,
     },
+    /// Live export saw an observation without a supported capture
+    /// profile: no honest boundary mapping exists (F01).
+    UnsupportedCaptureProfile {
+        /// Profile value found, or `"<missing>"`.
+        profile: String,
+    },
 }
 
 impl std::fmt::Display for ReportError {
@@ -50,6 +56,9 @@ impl std::fmt::Display for ReportError {
             Self::SignalOutOfRange(sig) => write!(f, "signal {sig} out of range 1-128"),
             Self::SerializeFailed { kind, detail } => {
                 write!(f, "cannot serialize {kind} record: {detail}")
+            }
+            Self::UnsupportedCaptureProfile { profile } => {
+                write!(f, "no supported export boundary for profile {profile:?}")
             }
         }
     }

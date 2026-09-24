@@ -42,13 +42,17 @@ pub enum Decision {
     Report,
 }
 
-/// Execution stage (D3): created vs actually executed.
+/// Execution stage (D3): created vs returned vs actually executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
     /// Transform/selection observed (`phase == Selected` on agg rows).
     Selected,
-    /// Real execution (agg row in Entered/Returned/Completed).
+    /// API invocation returned (`phase == Returned` on agg rows): the
+    /// call came back, with no claim about provider entry (F03).
+    Returned,
+    /// Real execution proved (`phase == Completed` on agg rows): only
+    /// observations carrying completion evidence match (F03).
     Executed,
 }
 

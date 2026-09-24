@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T02: kcrypto return/delivery evidence semantics (api-returns profile).
 //!
-//! S03/S04/O02 regression fixtures: a selected driver without driver-body
+//! S03/S04 regression fixtures: a selected driver without driver-body
 //! execution proof, no complete-delivery claim from internal
 //! reconciliation, and representative status that never poses as an
 //! exact native errno. Latency has no per-invocation claim: `lat`
@@ -123,11 +123,12 @@ fn s04_reconciled_totals_carry_no_delivery_claim() {
     assert_eq!(agg.backend_payload["completion_coverage"], "unobserved");
 }
 
-/// O02 (privilege leg): the aggregate representative status cannot
-/// satisfy an exact-errno predicate — exact native errnos appear only
-/// as `who` `first_errno`, never as the agg status.
+/// Representative-status honesty (privilege leg): the aggregate
+/// representative status cannot satisfy an exact-errno predicate —
+/// exact native errnos appear only as `who` `first_errno`, never as
+/// the agg status.
 #[test]
-fn o02_representative_status_is_not_exact_errno() {
+fn representative_status_is_not_exact_errno() {
     let agg = decode_agg(agg_row_bytes(AggSpec {
         family: KFAM_SK,
         op: KOP_ENC,

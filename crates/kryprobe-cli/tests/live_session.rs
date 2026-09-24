@@ -828,7 +828,7 @@ fn live_capture_proves_session() {
     assert_eq!(
         outcome.coverage.weaker_dimensions(),
         vec!["aggregate_counts", "detailed_events", "completion"],
-        "T02: reconciled session still leaves S04/O02 unknown"
+        "T02: reconciled session still leaves delivery/completion unknown"
     );
 
     // Zero window: exactly the opening tick (ids still sequence).

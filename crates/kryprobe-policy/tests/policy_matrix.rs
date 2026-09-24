@@ -458,7 +458,7 @@ fn result_names_grounded_from_result_name() {
 }
 
 #[test]
-fn stage_selected_vs_executed_per_d3() {
+fn stage_selected_returned_executed_per_d3() {
     let agg = |phase| {
         agg_obs(
             1, phase, "skcipher", "alloc", "ok", "cbc(aes)", "", "process",
@@ -479,28 +479,48 @@ fn stage_selected_vs_executed_per_d3() {
             "selected rejects {phase:?}"
         );
     }
-    // executed ⟺ row=agg ∧ phase ∈ {Entered, Returned, Completed}.
+    // returned ⟺ row=agg ∧ phase == Returned.
+    assert!(is_violation(&eval_deny(
+        "      stage: returned\n",
+        &[agg(EvidencePhase::Returned)]
+    )));
     for phase in [
+        EvidencePhase::Selected,
         EvidencePhase::Entered,
-        EvidencePhase::Returned,
         EvidencePhase::Completed,
     ] {
         assert!(
-            is_violation(&eval_deny("      stage: executed\n", &[agg(phase)])),
-            "executed accepts {phase:?}"
+            !is_violation(&eval_deny("      stage: returned\n", &[agg(phase)])),
+            "returned rejects {phase:?}"
         );
     }
-    assert!(!is_violation(&eval_deny(
+    // executed ⟺ row=agg ∧ phase == Completed: a bare API return
+    // never proves execution.
+    assert!(is_violation(&eval_deny(
         "      stage: executed\n",
-        &[agg(EvidencePhase::Selected)]
+        &[agg(EvidencePhase::Completed)]
     )));
+    for phase in [
+        EvidencePhase::Selected,
+        EvidencePhase::Entered,
+        EvidencePhase::Returned,
+    ] {
+        assert!(
+            !is_violation(&eval_deny("      stage: executed\n", &[agg(phase)])),
+            "executed rejects {phase:?}"
+        );
+    }
 }
 
 #[test]
 fn totals_and_ident_rows_never_match_any_stage() {
-    // Totals carry Completed: without the explicit exclusion they
-    // would match `executed` — carriers/markers must not.
-    for matches in ["      stage: selected\n", "      stage: executed\n"] {
+    // Totals carry Returned: without the explicit row exclusion they
+    // would match `returned` — carriers/markers must not.
+    for matches in [
+        "      stage: selected\n",
+        "      stage: returned\n",
+        "      stage: executed\n",
+    ] {
         assert!(
             !is_violation(&eval_deny(matches, &[totals_obs(1)])),
             "totals vs {matches:?}"
@@ -826,11 +846,101 @@ fn no_match_with_gaps_is_inconclusive_naming_dims() {
 }
 
 #[test]
-fn o02_unobserved_delivery_and_completion_are_inconclusive_never_clean() {
-    // T02/O02: a deny no observation matches, over a reconciled
+fn returned_row_does_not_prove_execution() {
+    // F03/S03: a selected-driver API return (pre-provider rejection,
+    // zero successes) must not satisfy `stage: executed`, even with
+    // complete coverage — absence of execution evidence is clean of
+    // execution, never a violation.
+    let observations = vec![agg_obs(
+        1,
+        EvidencePhase::Returned,
+        "skcipher",
+        "encrypt",
+        "error",
+        "cbc(aes)",
+        "aesni-intel",
+        "process",
+    )];
+    let text = policy_yaml(&deny_rule(
+        "r",
+        "kernel-crypto",
+        "      stage: executed\n      driver: aesni-intel\n",
+        "deny",
+    ));
+    let policy = parse_policy(&text).expect("parses");
+    assert_eq!(
+        evaluate(&policy, &observations, &complete_coverage()),
+        PolicyVerdict::Clean,
+        "a return is not proved execution"
+    );
+}
+
+#[test]
+fn returned_stage_matches_api_return_positive() {
+    // F03 positive control: `stage: returned` fires on the API return.
+    let observations = vec![agg_obs(
+        1,
+        EvidencePhase::Returned,
+        "skcipher",
+        "encrypt",
+        "error",
+        "cbc(aes)",
+        "aesni-intel",
+        "process",
+    )];
+    let text = policy_yaml(&deny_rule(
+        "r",
+        "kernel-crypto",
+        "      stage: returned\n      driver: aesni-intel\n",
+        "deny",
+    ));
+    let policy = parse_policy(&text).expect("parses");
+    assert!(
+        matches!(
+            evaluate(&policy, &observations, &complete_coverage()),
+            PolicyVerdict::Violation { .. }
+        ),
+        "returned rule fires on the return"
+    );
+}
+
+#[test]
+fn completed_row_proves_execution_positive() {
+    // F03 positive control: separately qualified completion evidence
+    // (Completed phase) satisfies `stage: executed`.
+    let observations = vec![agg_obs(
+        1,
+        EvidencePhase::Completed,
+        "skcipher",
+        "encrypt",
+        "error",
+        "cbc(aes)",
+        "aesni-intel",
+        "process",
+    )];
+    let text = policy_yaml(&deny_rule(
+        "r",
+        "kernel-crypto",
+        "      stage: executed\n      driver: aesni-intel\n",
+        "deny",
+    ));
+    let policy = parse_policy(&text).expect("parses");
+    assert!(
+        matches!(
+            evaluate(&policy, &observations, &complete_coverage()),
+            PolicyVerdict::Violation { .. }
+        ),
+        "executed rule fires on completion evidence"
+    );
+}
+
+#[test]
+fn unobserved_delivery_and_completion_are_inconclusive_never_clean() {
+    // T02: a deny no observation matches, over a reconciled
     // api-returns session (counts internally clean, delivery and
     // completion unmeasured) — absence cannot be proven, so the
-    // verdict is inconclusive naming those dims, never clean.
+    // verdict is inconclusive naming those dims, never clean. (The
+    // matrix's O02 is the separate T11 lifecycle case, still future.)
     let observations = vec![agg_obs(
         1,
         EvidencePhase::Completed,

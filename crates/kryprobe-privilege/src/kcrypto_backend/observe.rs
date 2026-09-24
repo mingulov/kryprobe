@@ -44,21 +44,26 @@ pub(crate) fn symbol_for(fam: u8, op: u8) -> Option<&'static str> {
     }
 }
 
-/// `op → (call_kind, phase)`: ALLOC initializes (Selected), exec ops
-/// complete on a terminal class else stay entered, DESTROY is the mapped
+/// `op → (call_kind, phase)`: ALLOC initializes (Selected); an
+/// exec op with an observed return — ok, error, or queued — is
+/// Returned (the fexit sensor sees the API return, never provider
+/// entry or terminal completion, so no api-returns row is
+/// Completed). An exec op with an unobserved result stays Entered
+/// (no return observed, no return claimed). DESTROY is the mapped
 /// unreachable arm (unknown, Returned). Out-of-range ops degrade to
-/// (unknown, Entered) — live-impossible (the BPF writes 1–6), never crash.
+/// (unknown, Entered) — live-impossible (the BPF writes 1–6), never
+/// crash.
 fn op_call_phase(op: u8, res: u8) -> (CallKind, EvidencePhase) {
-    let terminal = res == KRES_OK || res == KRES_ERR;
-    let entered_or_completed = if terminal {
-        EvidencePhase::Completed
+    let observed_return = res == KRES_OK || res == KRES_ERR || res == KRES_QUEUED;
+    let exec_phase = if observed_return {
+        EvidencePhase::Returned
     } else {
         EvidencePhase::Entered
     };
     match op {
         KOP_ALLOC => (CallKind::Initialization, EvidencePhase::Selected),
-        KOP_ENC | KOP_DEC | KOP_DIGEST => (CallKind::Operation, entered_or_completed),
-        KOP_FINUP => (CallKind::Finalization, entered_or_completed),
+        KOP_ENC | KOP_DEC | KOP_DIGEST => (CallKind::Operation, exec_phase),
+        KOP_FINUP => (CallKind::Finalization, exec_phase),
         KOP_DESTROY => (CallKind::Unknown, EvidencePhase::Returned),
         _ => (CallKind::Unknown, EvidencePhase::Entered),
     }
@@ -217,9 +222,10 @@ pub(crate) fn observation_for_agg(
     }
 }
 
-/// Totals row → observation: the aggregate-completion carrier. Status 0 is
-/// the READ verdict (KTOT landed intact), not an op verdict — per-class
-/// outcomes ride the payload counts, and K3 renders classes, never codes.
+/// Totals row → observation: the aggregate carrier. Status 0 is the
+/// READ verdict (KTOT landed intact), not an op verdict — per-class
+/// outcomes ride the payload counts, and K3 renders classes, never
+/// codes. Returned, like every api-returns row: no completion observed.
 pub(crate) fn observation_for_totals(vagg: &VAgg, id: ObservationId) -> NativeObservation {
     NativeObservation {
         id,
@@ -227,7 +233,7 @@ pub(crate) fn observation_for_totals(vagg: &VAgg, id: ObservationId) -> NativeOb
         target: None,
         object: None,
         implementation: None,
-        phase: EvidencePhase::Completed,
+        phase: EvidencePhase::Returned,
         call_kind: CallKind::Unknown,
         operation_class: OperationClass::Unknown,
         native_name: None,

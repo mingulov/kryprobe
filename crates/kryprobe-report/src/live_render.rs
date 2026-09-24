@@ -7,12 +7,15 @@
 //! differs. Pure over core evidence types — no CLI types here (the
 //! callers pass observations + coverage, never the outcome struct).
 
+use crate::cover::{CoverageGap, GapCtx};
 use crate::observe::ObservationExtra;
 use crate::session::{FinalBarrier, SessionEnd, SessionStart, SessionVerdict};
 use crate::writer::{JsonlWriter, ReportError};
 use kryprobe_core::enums::{BackendId, CaptureMode, CoverageStatus, TargetSelector};
 use kryprobe_core::evidence::payload_keys as K;
-use kryprobe_core::evidence::{CoverageSummary, NativeObservation};
+use kryprobe_core::evidence::{
+    CoverageDimension, CoverageSummary, DimensionCoverage, NativeObservation,
+};
 use std::collections::BTreeMap;
 
 /// Every payload key watch reads, top-level and nested under `counts`
@@ -397,21 +400,103 @@ pub const LIVE_SESSION_ID: &str = "live:run";
 /// its own id when it adopts the stream.
 pub const LIVE_QUALIFICATION_ID: &str = "live";
 
+/// Honest export boundary for one live observation:
+/// api-returns rows crossed the API boundary, never kernel
+/// completion. Anything else fails closed — no silent legacy mapping.
+fn boundary_for(obs: &NativeObservation) -> Result<&'static str, ReportError> {
+    match obs
+        .backend_payload
+        .get("capture_profile")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("api-returns") => Ok("api"),
+        Some(other) => Err(ReportError::UnsupportedCaptureProfile {
+            profile: other.to_owned(),
+        }),
+        None => Err(ReportError::UnsupportedCaptureProfile {
+            profile: String::from("<missing>"),
+        }),
+    }
+}
+
+/// Gap context for one weaker session dimension (F02): explicit
+/// fixed-vocabulary mapping, documented here because the frozen gap
+/// vocabulary has no direct completion dimension and no
+/// counter-reconciliation reason:
+///
+/// - aggregate counts / event transport, unknown delivery →
+///   `loader_state_unknown` (the sensor may never have run);
+/// - aggregate counts, measured drops → `counter_map_exhausted`;
+/// - aggregate counts, pure twin mismatch → `event_transport_loss`
+///   (closest measured-loss reason; severity rides `impact`, and the
+///   `ktot_gap` magnitude stays in session evidence);
+/// - event transport, measured loss → `event_transport_loss`;
+/// - completion unobserved → `observation_continuity` /
+///   `callback_discovery_window` (completion callbacks were never
+///   observed — a continuity unknown, not a renamed dimension);
+/// - attachment shortfall → `attachment_refused`;
+/// - anything else unknown → `loader_state_unknown`, partial →
+///   `event_transport_loss`.
+///
+/// Omitted counts stay null: unmeasured loss is uncounted, never zero.
+fn gap_ctx_for(dimension: CoverageDimension, dim: &DimensionCoverage) -> GapCtx {
+    let vocab = match dimension {
+        CoverageDimension::TargetPopulation => "target_enumeration",
+        CoverageDimension::ObjectDiscovery => "executable_discovery",
+        CoverageDimension::Attachment => "attachment",
+        CoverageDimension::AggregateCounts => "aggregate_counts",
+        CoverageDimension::DetailedEvents => "event_transport",
+        CoverageDimension::Attribution => "attribution",
+        CoverageDimension::Correlation => "correlation",
+        CoverageDimension::Completion => "observation_continuity",
+    };
+    let reason = match dim.status {
+        CoverageStatus::Unknown | CoverageStatus::NotRun => match dimension {
+            CoverageDimension::Completion => "callback_discovery_window",
+            _ => "loader_state_unknown",
+        },
+        CoverageStatus::Partial => match dimension {
+            CoverageDimension::AggregateCounts
+                if dim
+                    .counters
+                    .iter()
+                    .any(|c| c.name.starts_with("predrop_") && c.value > 0) =>
+            {
+                "counter_map_exhausted"
+            }
+            CoverageDimension::Attachment => "attachment_refused",
+            _ => "event_transport_loss",
+        },
+        CoverageStatus::CompleteForDeclaredBoundary | CoverageStatus::Unsupported => {
+            "loader_state_unknown"
+        }
+    };
+    GapCtx {
+        dimension: vocab.to_owned(),
+        target: None,
+        backend: String::from("kcrypto"),
+        reason: reason.to_owned(),
+        omitted_count: None,
+    }
+}
+
 /// Renders a finished live session as event-v0 JSONL (M1):
 /// `session_start`, one `operation_observation` per aggregated
-/// observation, `session_end`. Same single source as the human
-/// tables — observations + coverage, never the CLI outcome struct.
+/// observation, one `coverage_gap` per weaker coverage dimension,
+/// `session_end`. Same single source as the human tables —
+/// observations + coverage, never the CLI outcome struct.
 ///
 /// Every record is validated-shape: the verdict mirrors the human
 /// `COMPLETE`/`PARTIAL` trailer (`trailer_dims` empty ⟺
-/// `OBSERVED`), and each observation passes through the same
-/// fail-closed [`JsonlWriter::observation`] gate as scripted
-/// sessions (test-only `Synthetic` results refuse, never stamp).
-/// Native op/algorithm names come from the payload (`op` /
-/// `algorithm` keys); shapes without them (totals, who) report
-/// `unknown` rather than inventing names. `interrupted` (4B-M5: a
-/// SIGINT-cut window) forces `PARTIAL` even when every measured
-/// dimension held.
+/// `OBSERVED`), each observation passes through the same fail-closed
+/// [`JsonlWriter::observation`] gate as scripted sessions
+/// (test-only `Synthetic` results refuse, never stamp), and the end
+/// record references exactly the emitted gaps — so replay can only
+/// weaken coverage, never strengthen it. Native op/algorithm names
+/// come from the payload (`op` / `algorithm` keys); shapes without
+/// them (totals, who) report `unknown` rather than inventing names.
+/// `interrupted` (4B-M5: a SIGINT-cut window) forces `PARTIAL` and
+/// emits a continuity gap even when every measured dimension held.
 pub fn render_live_jsonl(
     observations: &[NativeObservation],
     coverage: &CoverageSummary,
@@ -429,7 +514,7 @@ pub fn render_live_jsonl(
         writer.observation(
             obs,
             &ObservationExtra {
-                boundary: "kernel_completion".to_owned(),
+                boundary: boundary_for(obs)?.to_owned(),
                 native_operation: payload
                     .get(K::OP)
                     .and_then(serde_json::Value::as_str)
@@ -444,6 +529,55 @@ pub fn render_live_jsonl(
             },
         )?;
     }
+    // F02: every weaker dimension becomes a gap record so replay can
+    // only weaken coverage, never strengthen it. Record ids are
+    // deterministic (`record:1` start, then observations, then gaps),
+    // so the end record references exactly the emitted gaps.
+    let mut gaps = Vec::new();
+    for (dimension, dim) in [
+        (
+            CoverageDimension::TargetPopulation,
+            &coverage.target_population,
+        ),
+        (
+            CoverageDimension::ObjectDiscovery,
+            &coverage.object_discovery,
+        ),
+        (CoverageDimension::Attachment, &coverage.attachment),
+        (
+            CoverageDimension::AggregateCounts,
+            &coverage.aggregate_counts,
+        ),
+        (CoverageDimension::DetailedEvents, &coverage.detailed_events),
+        (CoverageDimension::Attribution, &coverage.attribution),
+        (CoverageDimension::Correlation, &coverage.correlation),
+        (CoverageDimension::Completion, &coverage.completion),
+    ] {
+        if let Some(gap) = CoverageGap::from_dimension(&gap_ctx_for(dimension, dim), dim) {
+            gaps.push(gap);
+        }
+    }
+    if interrupted {
+        // A cut window is itself a continuity gap even when every
+        // measured dimension held (4B-M5), so replay cannot complete it.
+        gaps.push(CoverageGap {
+            target: None,
+            backend: String::from("kcrypto"),
+            dimension: String::from("observation_continuity"),
+            reason: String::from("observer_interrupted"),
+            begin_ns: coverage.completion.interval.start_ns,
+            end_ns: coverage.completion.interval.end_ns,
+            impact: String::from("partial"),
+            omitted_count: None,
+        });
+    }
+    let first_gap_record = 2 + observations.len() as u64;
+    for gap in &gaps {
+        writer.coverage(gap)?;
+    }
+    let unresolved_gap_ids: Vec<String> = (0..gaps.len() as u64)
+        .map(|offset| format!("record:{}", first_gap_record + offset))
+        .collect();
     let verdict = if !interrupted && trailer_dims(coverage).is_empty() {
         SessionVerdict::Observed
     } else {
@@ -452,7 +586,7 @@ pub fn render_live_jsonl(
     writer.session_end(&SessionEnd {
         verdict,
         final_barrier: FinalBarrier::Validated,
-        unresolved_gap_ids: Vec::new(),
+        unresolved_gap_ids,
         child_exit_code: None,
         child_signal: None,
     })?;

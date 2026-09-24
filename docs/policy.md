@@ -38,7 +38,7 @@ are wildcards, `{}` matches everything in the rule's source.
 
 | Key | Matches |
 |-----|---------|
-| `stage` | `selected` (transform/selection observed) or `executed` (real execution: agg row Entered/Returned/Completed) |
+| `stage` | `selected` (transform/selection observed), `returned` (API invocation returned, no provider-entry claim), or `executed` (completion evidence observed — api-returns rows never match) |
 | `algorithm` | Kernel algorithm name, exact or glob (`md5`, `cbc(*)`) |
 | `driver` | Kernel driver name, exact or glob |
 | `driver_not` | Matches when the `driver` glob does NOT match |

@@ -8,9 +8,10 @@ any schema change requires an ADR plus a version bump.
 ## Unreleased — kcrypto backend (K5)
 
 Live kernel-crypto observation on top of the thin spine: the BPF
-sensor, system-wide watch/report/check, policy verdicts, token
-bring-up, and third-party import. Exit codes were renumbered — see
-the migration note below.
+sensor, system-wide watch/report/check, policy verdicts, and token
+bring-up. KryProbe is kernel-crypto-only now (see ADR-0004): the
+`import` surface and the p11/openssl rows are retired. Exit codes
+were renumbered — see the migration note below.
 
 ### Added
 
@@ -22,9 +23,17 @@ the migration note below.
   policy engine (`VIOLATION`/`CLEAN`/`INCONCLUSIVE` verdicts).
 - Who attribution: per-identity rows with kallsyms symbolization
   and the K5 surface (`token mint|status`, doctor matrix rows).
-- `import`: osslscope/p11scope docs become shell JSONL records.
 - Deployment runbook (`docs/deployment.md`), policy guide
   (`docs/policy.md`), versioning policy (`docs/versioning.md`).
+
+### Removed
+
+- `import` (osslscope/p11scope docs as shell JSONL) and the
+  p11/openssl backend rows: kernel-crypto-only scope per ADR-0004.
+  Old shell JSONL still replays through `report FILE`.
+- Policy `stage: executed` no longer matches bare API returns; use
+  `stage: returned` for api-returns rows. Execution requires
+  completion evidence.
 
 ### Changed — exit-code migration
 
@@ -36,18 +45,32 @@ the migration note below.
   Stubs (`plan`/`observe`/`run`) and inspect denials moved from 3
   to 4 with the family.
 
+### Changed — evidence honesty
+
+- `check` absence is `INCONCLUSIVE` (exit 3), never clean, for the
+  api-returns profile: unmeasured delivery/completion cannot prove
+  absence.
+- Live JSONL exports api-returns rows at the `api` boundary with no
+  per-request latency and no exact errno: aggregate windows are not
+  operation latency, class representatives are not native errnos.
+- `install.sh --stage` verifies the versioned manifest, the exact
+  payload checksums, and the binary/object pin before copying, and
+  re-hashes the installed pair; inconsistent stages are refused.
+
 ### Fixed
 
 - Per-tick drain respawns replaced by one session drain; kallsyms
   parses once per tick (not per row); fail-open policy verdicts
   closed (unevaluable rules yield `INCONCLUSIVE`, never `Clean`).
 
-## Unreleased — thin-spine milestone
+## Unreleased — thin-spine milestone (historical)
 
 Executable skeleton: frozen contracts plus a working runtime spine
 (session/target/authority model, CLI, reporting, synthetic backend,
 BPF load/attach/drain pipeline, token plumbing, bench receipts) that
-the p11/openssl/kcrypto backends can later plug into without redesign.
+backends plug into without redesign. (Written when p11/openssl rows
+were still planned; those rows are retired by ADR-0004 — only
+kcrypto observes live.)
 
 ### Added
 

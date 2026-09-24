@@ -134,18 +134,32 @@ impl JsonlWriter {
         let Some(phase) = obs.phase.as_wire_str() else {
             return Err(ReportError::SucceededPhase);
         };
+        // F01: a canonical class representative is not an exact native
+        // errno — export null rather than an unqualified code.
+        let canonical = obs
+            .backend_payload
+            .get("status_canonical")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let (outcome, native_result) = match obs.phase {
             EvidencePhase::Discovered | EvidencePhase::Selected => ("not_applicable", None),
             EvidencePhase::Entered => ("pending", None),
-            EvidencePhase::Returned | EvidencePhase::Completed => (
-                outcome_of(obs.native_result),
-                Some(result_string(obs.native_result)),
-            ),
+            EvidencePhase::Returned | EvidencePhase::Completed => {
+                let native = (!canonical).then(|| result_string(obs.native_result));
+                (outcome_of(obs.native_result), native)
+            }
             EvidencePhase::Succeeded => return Err(ReportError::SucceededPhase),
         };
+        // F01: api-returns rows carry aggregate window bounds, never a
+        // per-request duration — export null rather than window width.
+        let api_returns = obs
+            .backend_payload
+            .get("capture_profile")
+            .and_then(serde_json::Value::as_str)
+            == Some("api-returns");
         let duration_ns = match (obs.started_ns, obs.ended_ns) {
-            (Some(start), Some(end)) => Some(end.saturating_sub(start).to_string()),
-            (Some(_), None) | (None, Some(_)) | (None, None) => None,
+            (Some(start), Some(end)) if !api_returns => Some(end.saturating_sub(start).to_string()),
+            _ => None,
         };
         self.emit(
             "operation_observation",

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! S05: staged release package binds one binary to exactly the BPF
 //! objects it allows (T03). Correct object accepted; missing,
-//! modified, and stale-from-another-build objects refused before
-//! load; empty required pins fail the build. Owned temp dirs only —
-//! no global install, no capabilities.
+//! modified, and wrong-family objects refused before load; empty
+//! required pins fail the build. Owned temp dirs only — no global
+//! install, no capabilities.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -115,8 +115,9 @@ fn s05_staged_package_binds_binary_to_object() {
         "modified object has no identity: {versions}"
     );
 
-    // Stale object from another build: genuine artifact bytes (the
-    // spine object) under the kcrypto name — wrong identity, refused.
+    // Wrong-family object: genuine artifact bytes (the spine
+    // object, a different object family — not a previous kcrypto
+    // build) under the kcrypto name — wrong identity, refused.
     let stale = scratch.path().join("stale");
     copy_file(&binary, &stale.join("bin/kryprobe"));
     copy_file(&spine, &stale.join("bin/kryprobe-bpf/kcrypto.bpf.o"));
