@@ -50,7 +50,8 @@ pub enum PolicyVerdict<'a> {
 }
 
 /// Capture-source name for a backend (`kernel-crypto` is the v0.1
-/// live source; `p11`/`openssl` arrive with their backends).
+/// live source; `p11` is retired/reserved and `openssl` reserved,
+/// naming only legacy data — ADR-0004).
 fn source_name(backend: BackendId) -> &'static str {
     match backend {
         BackendId::KCrypto => "kernel-crypto",

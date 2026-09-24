@@ -1,6 +1,4 @@
 synthetic: active (test-only)
   requires: uprobe_multi=false cookies=false ringbuf=false btf=false
-p11: not installed
-openssl: not installed
 kcrypto: available
   requires: uprobe_multi=false cookies=false ringbuf=false btf=true

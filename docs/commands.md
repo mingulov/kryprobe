@@ -34,7 +34,6 @@ kryprobe watch --system [--source S] [--duration N] [--token PATH]
 kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH]
 kryprobe report FILE
 kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH]
-kryprobe import FILE
 kryprobe token mint [--bin PATH] [--receipt PATH] [--force]
 kryprobe token status [--bin PATH]
 kryprobe plan|observe|run ...   # stub: exit 4, typed marker
@@ -46,7 +45,7 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   binary + kcrypto/spine object paths + sha256 + the
   `pins_enforced` bit (see `docs/json.md`).
 - `backends` lists the registry (`synthetic` active test-only;
-  `p11`/`openssl` not installed; `kcrypto` unavailable).
+  `kcrypto` live-gated: `available`, `degraded`, or `unavailable`).
 - `inspect` snapshots one process (bounded maps/exe/ELF reads;
   gone/bad pids are typed errors, never panics).
 - `selftest synthetic` runs the scripted session (twice internally)
@@ -73,7 +72,7 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   the only v0.1 scope, so fork/exec, new containers, and module loads
   need no new probes. `--duration` is a window in seconds (`>= 1`,
   60s default for `report`/`check`); `--source` accepts only
-  `kernel-crypto` (other sources arrive with their backends); live
+  `kernel-crypto` (kernel-only scope, ADR-0004); live
   `report` renders `--format human` (default), `json`, or `jsonl`
   (validated event-v0 JSONL: session envelope records, same
   coverage verdict as the human trailer) to stdout or `--out`
@@ -110,18 +109,11 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   ~100MB on quiet hosts but grow with crypto activity). Unbounded
   `watch` is for attended use with closed-stdin/SIGINT stops. A
   streaming sink that removes the bound is tracked as 2B-H2.
-- `import FILE` reads one osslscope report (`schema_version:
-  observed-crypto-v1[.minor]`) or p11scope profile (`schema:
-  p11scope/observed-profile/v3`) doc and emits one shell JSONL record
-  (`schema: kryprobe/shell/v1`) to stdout: mapped fields best-effort
-  plus `native` carrying the FULL original doc verbatim. Unprivileged;
-  exit 0 on success, 2 on unreadable/invalid input or an unknown schema
-  marker (naming the marker found), 1 on internal failure. Shell
-  shape (`schemas/shell-v1.schema.json`): `schema` (always
-  `kryprobe/shell/v1`), `source` (`osslscope`|`p11scope`), then
-  best-effort `scope`, `context`, `operation`, `implementation`,
-  `metrics`, `window`, `evidence`, and `native` (the full original
-  doc, always present).
+- `import FILE` is retired (ADR-0004): any `import` argv is an
+  unknown subcommand (exit 2) and reads nothing. Historical
+  `import_shell` records (`schema: kryprobe/shell/v1`, shape in
+  `schemas/shell-v1.schema.json`) still validate structurally via
+  `report FILE`; nothing produces new ones.
 - `token mint` is the root one-shot file-cap grant (the spec §3.3
   `setcap` fallback): it writes a `security.capability` xattr
   granting `cap_bpf,cap_perfmon+ep` on `--bin` (default: the running

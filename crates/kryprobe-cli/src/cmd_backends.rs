@@ -5,9 +5,10 @@
 //! row is backed by a live end-to-end driver pass (detect → plan →
 //! configure → decode → finalize) over one synthetic event. A driver
 //! failure fails closed (stderr plus exit 1) instead of claiming `active`.
-//! The p11/openssl rows are static thin-spine states shared with
-//! [`crate::cmd_doctor`]; the kcrypto row is live via an unprivileged
-//! detect+plan pass ([`live_kcrypto_gates`], no attach).
+//! Only synthetic/kcrypto rows exist (kernel-only scope, ADR-0004);
+//! the kcrypto row is live via an unprivileged detect+plan pass
+//! ([`live_kcrypto_gates`], no attach). Rows are shared with
+//! [`crate::cmd_doctor`].
 
 use kryprobe_core::backend::{
     BackendDriver, BackendRegistry, DetectContext, PlanContext, RawEvent,
@@ -25,7 +26,7 @@ use std::io::Write;
 /// One backend state row.
 #[derive(Debug)]
 pub struct BackendRow {
-    /// Backend id (`synthetic`, `p11`, `openssl`, `kcrypto`).
+    /// Backend id (`synthetic`, `kcrypto`).
     pub id: &'static str,
     /// State word (`active`, `not installed`, `available`, `degraded`,
     /// `unavailable`).
@@ -46,11 +47,11 @@ pub struct LiveKcrypto {
     pub gates: [(&'static str, bool); 4],
 }
 
-/// The four backend rows: synthetic/p11/openssl static, kcrypto live. A
-/// kcrypto gating defect (impossible by construction — detect+plan are
-/// total over the system instance) renders as `unavailable` with the
-/// defect as its note, never a panic (`doctor` always renders exit 0).
-pub fn backend_rows() -> [BackendRow; 4] {
+/// The two backend rows: synthetic static, kcrypto live. A kcrypto
+/// gating defect (impossible by construction — detect+plan are total
+/// over the system instance) renders as `unavailable` with the defect
+/// as its note, never a panic (`doctor` always renders exit 0).
+pub fn backend_rows() -> [BackendRow; 2] {
     let live = live_kcrypto_gates().unwrap_or_else(|defect| LiveKcrypto {
         state: "unavailable",
         note: Some(defect),
@@ -65,22 +66,12 @@ pub fn backend_rows() -> [BackendRow; 4] {
 }
 
 /// Rows for one already-probed [`LiveKcrypto`] (single detect pass).
-fn backend_rows_with(live: &LiveKcrypto) -> [BackendRow; 4] {
+fn backend_rows_with(live: &LiveKcrypto) -> [BackendRow; 2] {
     [
         BackendRow {
             id: "synthetic",
             state: "active",
             note: Some(String::from("test-only")),
-        },
-        BackendRow {
-            id: "p11",
-            state: "not installed",
-            note: None,
-        },
-        BackendRow {
-            id: "openssl",
-            state: "not installed",
-            note: None,
         },
         BackendRow {
             id: "kcrypto",

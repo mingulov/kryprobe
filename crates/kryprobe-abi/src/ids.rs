@@ -8,8 +8,12 @@
 pub const ABI_VERSION: u16 = 0;
 
 /// PKCS#11 backend (CONTRACTS §2 `BackendId::P11`).
+/// Retired/reserved: no p11 backend ships (ADR-0004); the value stays
+/// frozen so old records keep their meaning. Never reassign.
 pub const BACKEND_P11: u16 = 1;
 /// OpenSSL backend (CONTRACTS §2 `BackendId::OpenSsl`).
+/// Reserved for possible future use (ADR-0004); no backend ships today.
+/// Never reassign.
 pub const BACKEND_OPENSSL: u16 = 2;
 /// kcrypto backend (CONTRACTS §2 `BackendId::KCrypto`).
 pub const BACKEND_KCRYPTO: u16 = 3;

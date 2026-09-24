@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 /// Backend producing an observation (CONTRACTS §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendId {
-    /// PKCS#11 backend (`p11` on the wire).
+    /// PKCS#11 backend (`p11` on the wire). Compatibility-only: decodes
+    /// legacy data and generic tests; no backend ships (ADR-0004).
     P11,
-    /// OpenSSL backend (`openssl` on the wire).
+    /// OpenSSL backend (`openssl` on the wire). Reserved: no backend
+    /// ships (ADR-0004); kept for wire stability and generic tests.
     OpenSsl,
     /// Kernel-crypto backend (`kcrypto` on the wire).
     KCrypto,

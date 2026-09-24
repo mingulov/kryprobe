@@ -4,7 +4,7 @@ Paths below are relative to this product repo root (`kryprobe/`). Product work h
 
 ## Mission
 
-Build a Linux 6.12+ runtime cryptographic observer for p11, OpenSSL and kcrypto. Preserve evidence meaning and privacy. Do not expand into network/TLS plaintext, generic scanning, enforcement, daemon/server/UI, or dynamic privileged plugins.
+Build a Linux 6.12+ runtime observer of the kernel crypto API (kernel-only scope; see `docs/decisions/ADR-0004.md`). Preserve evidence meaning and privacy. Do not expand into network/TLS plaintext, generic scanning, enforcement, daemon/server/UI, or dynamic privileged plugins.
 
 ## Before editing
 

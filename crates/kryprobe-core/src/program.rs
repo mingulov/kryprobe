@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 pub enum ProgramId {
     /// uprobe-multi self-probe used by the thin-spine spike (T6b).
     UprobeMultiSelfProbe,
-    /// uprobe-multi probe for the p11 backend (first CONTRACTS §2
-    /// backend). Declared but NOT allowlisted: loads refuse until
-    /// its object and allowlist entry land.
+    /// uprobe-multi probe for the retired p11 backend (first
+    /// CONTRACTS §2 backend). Declared but NEVER allowlisted: loads
+    /// always refuse (ADR-0004); the negative tests pin this.
     UprobeMultiP11Probe,
     /// fexit kcrypto programs (1B-L3): the link-group/diagnostic
     /// label for kcrypto attaches. NOT on the spine-load allowlist

@@ -86,12 +86,14 @@ pub fn payload_str_opt<'a>(payload: &'a BackendPayload, key: &str) -> Option<&'a
 /// Domain-native result value; success is derived, never stored here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NativeResult {
-    /// PKCS#11 `CK_RV`.
+    /// PKCS#11 `CK_RV`. Compatibility-only: decodes legacy data;
+    /// no p11 backend ships (ADR-0004).
     P11 {
         /// Raw `CK_RV` value.
         rv: u64,
     },
-    /// OpenSSL callback return code.
+    /// OpenSSL callback return code. Reserved: no backend ships
+    /// (ADR-0004); kept for wire stability and legacy data.
     OpenSsl {
         /// Raw callback return value.
         code: i32,

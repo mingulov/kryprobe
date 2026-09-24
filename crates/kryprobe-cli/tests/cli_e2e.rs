@@ -76,18 +76,18 @@ fn backends_json_shape_case() {
         let json: serde_json::Value =
             serde_json::from_str(&stdout_of(&output)).expect("backends json");
         let backends = json["backends"].as_array().expect("backends array");
-        assert_eq!(backends.len(), 4);
+        assert_eq!(backends.len(), 2);
         let ids: Vec<&str> = backends
             .iter()
             .map(|b| b["id"].as_str().expect("id"))
             .collect();
-        assert_eq!(ids, ["synthetic", "p11", "openssl", "kcrypto"]);
+        assert_eq!(ids, ["synthetic", "kcrypto"]);
         let caps = &backends[0]["capabilities"];
         for gate in ["uprobe_multi", "cookies", "ringbuf", "btf"] {
             assert!(caps[gate].is_boolean(), "gate {gate}");
         }
         // K2.3: the live kcrypto row mirrors synthetic's capabilities shape.
-        let kcrypto_caps = &backends[3]["capabilities"];
+        let kcrypto_caps = &backends[1]["capabilities"];
         for gate in ["uprobe_multi", "cookies", "ringbuf", "btf"] {
             assert!(kcrypto_caps[gate].is_boolean(), "kcrypto gate {gate}");
         }
@@ -155,12 +155,16 @@ fn doctor_human_markers_case() {
             "missing probe {name}"
         );
     }
-    for row in [
-        "backend synthetic: active (test-only)",
-        "backend p11: not installed",
-        "backend openssl: not installed",
-    ] {
-        assert!(stdout.contains(row), "missing row {row}");
+    assert!(
+        stdout.contains("backend synthetic: active (test-only)"),
+        "missing synthetic row"
+    );
+    // ADR-0004: kernel-only scope — no p11/openssl backend rows.
+    for retired in ["backend p11:", "backend openssl:"] {
+        assert!(
+            !stdout.contains(retired),
+            "retired row {retired} still rendered"
+        );
     }
     // K2.3: live kcrypto row (BTF-gated; lane hosts have BTF).
     if btf_available() {
@@ -232,7 +236,7 @@ fn doctor_json_shape_case() {
             );
         }
     }
-    assert_eq!(json["backends"].as_array().expect("backends").len(), 4);
+    assert_eq!(json["backends"].as_array().expect("backends").len(), 2);
     // K2.3: coverage profile + verdict (exact keys, brief-exact spellings).
     assert_eq!(json["coverage_profile"], "kernel-crypto-v1");
     let verdict = &json["verdict"];
@@ -1534,4 +1538,27 @@ fn parser_report_stub_case() {
     assert!(parsed(&["kryprobe"]).is_err());
     assert!(parsed(&["kryprobe", "--bogus"]).is_err());
     assert!(parsed(&["kryprobe", "frobnicate"]).is_err());
+}
+
+#[test]
+fn kernel_only_surface_rejects_import() {
+    let dir = kryprobe_testkit::TempDir::named("retired-import").unwrap();
+    let input = dir.path().join("profile.json");
+    std::fs::write(
+        &input,
+        r#"{"schema":"p11scope/observed-profile/v3","capture":{"mode":"profile"}}"#,
+    )
+    .unwrap();
+    let valid = run(&["import", input.to_str().unwrap()]);
+    assert_eq!(valid.status.code(), Some(2));
+    assert!(stdout_of(&valid).is_empty());
+    let out = run(&["import", "/path-that-must-not-be-read"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!stdout_of(&out).contains("p11scope"));
+    let help = stdout_of(&run(&["--help"]));
+    assert!(!help.contains("import FILE"));
+    let backends = stdout_of(&run(&["backends"]));
+    assert!(!backends.lines().any(|l| l.starts_with("p11:")));
+    assert!(!backends.lines().any(|l| l.starts_with("openssl:")));
+    assert!(backends.contains("kcrypto:"));
 }

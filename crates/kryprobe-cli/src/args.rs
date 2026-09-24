@@ -25,7 +25,6 @@ commands:
   report FILE                  validate + render a JSONL stream
   check --system --policy F [--duration N] [--source S] [--token PATH]
                                system-wide policy check (exit 10 on violation)
-  import FILE                  import an osslscope/p11scope doc as shell JSONL
   plan|observe|run ...         unsupported in thin spine (exit 4)
 
 globals:
@@ -156,12 +155,6 @@ pub enum Command {
         /// Explicit BPF token path (overrides env + default pin).
         token: Option<PathBuf>,
     },
-    /// Import one osslscope report or p11scope profile doc as shell
-    /// JSONL (unpriv; exit 0 ok, 2 bad input/unknown marker, 1 internal).
-    Import {
-        /// Source doc file.
-        file: PathBuf,
-    },
     /// Thin-spine stub (`plan`/`observe`/`run`).
     Stub {
         /// Stub subcommand name (echoed in the refusal).
@@ -220,10 +213,6 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
         "check" => {
             reject_json("check", json)?;
             crate::args_sub::parse_check(args)?
-        }
-        "import" => {
-            reject_json("import", json)?;
-            crate::args_sub::parse_import(args)?
         }
         "token" => {
             reject_json("token", json)?;
@@ -644,7 +633,6 @@ mod tests {
             vec!["--json", "report", "--system"],
             vec!["--json", "watch", "--system"],
             vec!["--json", "check", "--system", "--policy", "p.yaml"],
-            vec!["--json", "import", "r.json"],
             vec!["--json", "plan"],
             vec!["--json", "observe"],
             vec!["--json", "run"],
@@ -665,22 +653,27 @@ mod tests {
     }
 
     #[test]
-    fn import_wants_exactly_one_file() {
-        assert_eq!(
-            parse(&argv(&["import", "r.json"])).unwrap().command,
-            Command::Import {
-                file: PathBuf::from("r.json"),
-            }
-        );
-        for bad in [vec!["import"], vec!["import", "a", "b"]] {
+    fn import_command_retired() {
+        // ADR-0004: the `import` command is retired (kernel-only scope).
+        // Any `import` argv is an unknown subcommand (usage error, exit 2),
+        // and USAGE no longer advertises it. Historical `import_shell`
+        // records still validate structurally (`report FILE`); see the
+        // report-crate compatibility test, not the parser.
+        for words in [
+            vec!["import"],
+            vec!["import", "r.json"],
+            vec!["import", "a", "b"],
+            vec!["--json", "import", "r.json"],
+        ] {
+            let err = parse(&argv(&words)).expect_err("import must not parse");
             assert!(
-                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
-                "args {bad:?} must be a usage error"
+                matches!(&err, ArgsError::Usage(reason) if reason.contains("unknown subcommand")),
+                "args {words:?} gave {err:?}"
             );
         }
         assert!(
-            USAGE.contains("import FILE"),
-            "usage misses import:\n{USAGE}"
+            !USAGE.contains("import FILE"),
+            "usage must not advertise import:\n{USAGE}"
         );
     }
 

@@ -2,9 +2,8 @@
 # KryProbe
 
 KryProbe is a Linux runtime cryptographic observer. It watches how
-processes use cryptographic interfaces — PKCS#11 providers, OpenSSL
-providers, and the kernel crypto API — and records what it observes as
-structured session evidence: implementation inventories, operation
+the system uses the kernel crypto API — and records what it observes
+as structured session evidence: implementation inventories, operation
 observations, coverage gaps, and integrity counters.
 
 Design rules: discovered is not selected, selected is not entered,
@@ -18,18 +17,15 @@ Status: the kcrypto backend is live. Beyond the thin-spine
 skeleton (session/target/authority model, CLI, reporting, synthetic
 backend, BPF spine, token lane, bench receipts), this tree ships
 system-wide kernel-crypto observation (`watch`/`report --system`),
-policy checks (`check --system`), token-delegated privileged
-bring-up (`token mint|status`), and third-party report import
-(`import`). `docs/commands.md` is the command reference; this file
-is the overview.
+policy checks (`check --system`), and token-delegated privileged
+bring-up (`token mint|status`). `docs/commands.md` is the command
+reference; this file is the overview.
 
 ## Backends
 
 | Backend     | Status                                |
 |-------------|---------------------------------------|
 | `synthetic` | active (test-only scripted backend)   |
-| `p11`       | not installed (later backend port)    |
-| `openssl`   | not installed (later backend port)    |
 | `kcrypto`   | live-gated: `available`, `degraded` (names the failing capability gates), or `unavailable` (names the detect error) |
 
 `kryprobe backends` prints the live states. The `synthetic` backend
@@ -52,7 +48,6 @@ kryprobe watch --system [--source S] [--duration N] [--token PATH]
 kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH]
 kryprobe report FILE
 kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH]
-kryprobe import FILE
 kryprobe plan|observe|run ...   # honest stub: exits 4, see below
 ```
 
@@ -65,8 +60,9 @@ counters against received events. `selftest token-smoke` exercises the
 token-delegated load path (root-only lane). `token mint` is the root
 one-shot file-cap grant; `token status` reports cap + pin usability
 without privilege. `report FILE` validates a session file against the
-frozen schema and renders counts, coverage, and integrity. `import`
-reads an osslscope/p11scope doc and emits one shell JSONL record.
+frozen schema and renders counts, coverage, and integrity. (The old
+`import` command is retired; historical `import_shell` records still
+validate structurally — see `docs/commands.md`.)
 
 `plan`, `observe`, and `run` parse their arguments and exit 4 with a
 typed `unsupported-in-thin-spine` marker; they never pretend success.

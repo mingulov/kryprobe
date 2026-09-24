@@ -8,8 +8,8 @@ use std::path::PathBuf;
 const DEFAULT_CALLS: u64 = 200;
 
 /// Only `--source` spelling accepted in v0.1 (kp2 §2: the CLI carries a
-/// source concept from the start; `openssl`/`p11` sources arrive with
-/// their backends).
+/// source concept from the start; kernel-only scope per ADR-0004, so no
+/// other source is accepted).
 const KERNEL_CRYPTO_SOURCE: &str = "kernel-crypto";
 
 /// Parses `inspect --pid N [--json]` (requires exactly one pid).
@@ -283,17 +283,6 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
         format,
         out,
         token,
-    })
-}
-
-/// `import FILE`: losslessly import one osslscope report or p11scope
-/// profile doc as kryprobe shell JSONL (exactly one positional arg).
-pub(crate) fn parse_import(args: &[String]) -> Result<Command, ArgsError> {
-    if args.len() != 1 {
-        return Err(usage("import: want exactly one FILE"));
-    }
-    Ok(Command::Import {
-        file: PathBuf::from(&args[0]),
     })
 }
 
