@@ -821,9 +821,14 @@ fn live_capture_proves_session() {
     );
     assert_eq!(
         outcome.coverage.overall(),
-        kryprobe_core::enums::CoverageStatus::CompleteForDeclaredBoundary,
-        "healthy lane: coverage COMPLETE (weaker: {:?})",
+        kryprobe_core::enums::CoverageStatus::Unknown,
+        "healthy lane: delivery/completion unmeasured (weaker: {:?})",
         outcome.coverage.weaker_dimensions()
+    );
+    assert_eq!(
+        outcome.coverage.weaker_dimensions(),
+        vec!["aggregate_counts", "detailed_events", "completion"],
+        "T02: reconciled session still leaves S04/O02 unknown"
     );
 
     // Zero window: exactly the opening tick (ids still sequence).
@@ -1070,9 +1075,12 @@ fn script_agg_as(calls: u64, name8: &[u8; 8]) -> kryprobe_privilege::kcrypto_sna
             result: kryprobe_abi::kcrypto_agg::KRES_OK,
             ctx: kryprobe_abi::kcrypto_agg::KCTX_PROC,
             name: name8.as_slice(),
+            drv: b"",
             calls,
             bytes: 0,
             ok: 0,
+            errors: 0,
+            queued: 0,
         });
     kryprobe_privilege::kcrypto_snapshot::RowBytes::new(out).expect("hand row")
 }
@@ -1200,7 +1208,19 @@ fn live_success_path_scripted_sensor_three_ticks() {
         .value;
     assert_eq!(ring, 7);
     // Interval walls come from the snapshots (first → closing).
-    assert_eq!(outcome.coverage.completion.counters.len(), 1);
+    // Completion carries the decoded magnitude plus the T02 unobserved
+    // reason (api-returns never observes terminal completion).
+    let completion_names: Vec<&str> = outcome
+        .coverage
+        .completion
+        .counters
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        completion_names,
+        vec!["observations_decoded", "uncovered:completion_unobserved"]
+    );
     // Exactly-once feed + finalize: Ok outcome proves the shared feed
     // ran once (double-feed errors) and finalize filed its summary.
     assert!(

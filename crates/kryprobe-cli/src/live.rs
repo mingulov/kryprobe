@@ -297,6 +297,12 @@ fn counter(name: &str, value: u64) -> DimensionCounter {
 /// `Partial` on measured loss, `Unknown` + reason counter when the
 /// measurement is absent (never `Complete` on a missing input — the
 /// no-silent-zeros rule). The interval stamps the session wall.
+///
+/// T02 (api-returns): internal reconciliation is measured, but kernel
+/// hook-delivery and terminal completion are not — so a reconciled
+/// session still reports `aggregate_counts`, `detailed_events`, and
+/// `completion` as `Unknown` (S04/O02). Exact-count and absence claims
+/// over these sessions are therefore inconclusive, never clean.
 fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     let dim = |status| DimensionCoverage::new(status, m.interval);
     // Attach: counted at bring-up (always measured).
@@ -314,7 +320,11 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     // Aggregate counts: the twin gap + the pre-KTOT skip sites (absent
     // totals → uncovered, not zero). Every KDROPS site rides as a
     // counter (always present — never silent); unexpected sites flip
-    // the dimension (measured loss), destroy stays Complete (C7-known).
+    // the dimension (measured loss), destroy stays non-flipping
+    // (C7-known). A reconciled twin (gap 0, no unexpected drops) is
+    // still `Unknown`: internal reconciliation cannot prove kernel
+    // hook-delivery (S04/G9) — delivery is unmeasured, so no
+    // exact-count claim follows.
     let mut unexpected_drops = 0u64;
     for (site, count) in m.drops.iter().enumerate() {
         if site < KDROP_DESTROY {
@@ -322,14 +332,17 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
         }
     }
     let mut aggregate_counts = match (m.totals_present, m.ktot_gap) {
-        (true, Some(0)) if unexpected_drops == 0 => {
-            dim(CoverageStatus::CompleteForDeclaredBoundary)
-        }
-        (true, Some(_)) => dim(CoverageStatus::Partial),
+        (true, Some(gap)) if gap > 0 || unexpected_drops > 0 => dim(CoverageStatus::Partial),
+        (true, Some(_)) => dim(CoverageStatus::Unknown),
         _ => dim(CoverageStatus::Unknown),
     };
     match (m.totals_present, m.ktot_gap) {
-        (true, Some(gap)) => aggregate_counts.counters.push(counter("ktot_gap", gap)),
+        (true, Some(gap)) => {
+            aggregate_counts.counters.push(counter("ktot_gap", gap));
+            aggregate_counts
+                .counters
+                .push(counter("uncovered:kernel_delivery_unmeasured", 1));
+        }
         _ => aggregate_counts
             .counters
             .push(counter("uncovered:ktot_baseline_missing", 1)),
@@ -339,23 +352,36 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
             .counters
             .push(counter(&format!("predrop_{name}"), m.drops[site]));
     }
-    // Detailed events: measured ring drops + accumulated overflow.
+    // Detailed events: measured ring drops + accumulated overflow. A
+    // clean ring is still `Unknown`: transport health cannot prove the
+    // kernel invoked the sensor for every operation (S04) — kernel-side
+    // skips are invisible to the ring.
     let mut detailed_events = dim(if m.ring_drops == 0 && m.overflow_identities == 0 {
-        CoverageStatus::CompleteForDeclaredBoundary
+        CoverageStatus::Unknown
     } else {
         CoverageStatus::Partial
     });
+    if m.ring_drops == 0 && m.overflow_identities == 0 {
+        detailed_events
+            .counters
+            .push(counter("uncovered:kernel_delivery_unmeasured", 1));
+    }
     detailed_events
         .counters
         .push(counter("ring_drops", m.ring_drops));
     detailed_events
         .counters
         .push(counter("overflow_identities", m.overflow_identities));
-    // Completion: finalize ran (reaching here means it did).
-    let mut completion = dim(CoverageStatus::CompleteForDeclaredBoundary);
+    // Completion: the api-returns sensor observes returns, never
+    // terminal request completion (O02) — always `Unknown`, with the
+    // decoded count kept as a magnitude, not a completeness proof.
+    let mut completion = dim(CoverageStatus::Unknown);
     completion
         .counters
         .push(counter("observations_decoded", m.observations_decoded));
+    completion
+        .counters
+        .push(counter("uncovered:completion_unobserved", 1));
     // Declared-boundary vacuous dimensions: the kcrypto-v0.1 contract
     // observes the whole machine (no target selection), kernel symbols
     // (detect resolved them — reaching here proves it), ctx-class-only
@@ -1144,38 +1170,87 @@ mod tests {
     }
 
     #[test]
-    fn coverage_healthy_session_is_complete() {
+    fn coverage_healthy_session_leaves_delivery_unknown() {
+        // T02 (S04/O02): a reconciled twin with a clean ring proves
+        // internal health, not kernel delivery or completion — those
+        // three dimensions stay `Unknown` with reason counters, so no
+        // exact-count or absence claim can go clean.
         let coverage = session_coverage(&measurements());
+        assert_eq!(coverage.overall(), CoverageStatus::Unknown);
         assert_eq!(
-            coverage.overall(),
-            CoverageStatus::CompleteForDeclaredBoundary
+            coverage.weaker_dimensions(),
+            vec!["aggregate_counts", "detailed_events", "completion"]
         );
-        assert!(coverage.weaker_dimensions().is_empty());
         assert_eq!(coverage.aggregate_counts.interval.start_ns, 100);
         assert_eq!(coverage.aggregate_counts.interval.end_ns, Some(200));
+        for (dim, reason) in [
+            (
+                &coverage.aggregate_counts,
+                "uncovered:kernel_delivery_unmeasured",
+            ),
+            (
+                &coverage.detailed_events,
+                "uncovered:kernel_delivery_unmeasured",
+            ),
+            (&coverage.completion, "uncovered:completion_unobserved"),
+        ] {
+            assert!(
+                dim.counters
+                    .iter()
+                    .any(|c| c.name == reason && c.value == 1),
+                "reason counter {reason} present: {:?}",
+                dim.counters
+            );
+        }
+        // Internal reconciliation magnitudes are kept, not dropped.
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "ktot_gap" && c.value == 0),
+            "ktot_gap kept: {:?}",
+            coverage.aggregate_counts.counters
+        );
     }
 
     #[test]
-    fn coverage_measured_loss_flips_only_its_dimension() {
+    fn coverage_measured_loss_flips_its_dimension() {
+        // Measured loss still flips its own dimension to `Partial`;
+        // overall stays `Unknown` (delivery/completion outrank loss).
         let mut m = measurements();
         m.ktot_gap = Some(7);
         let coverage = session_coverage(&m);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
-        assert_eq!(coverage.overall(), CoverageStatus::Partial);
-        assert_eq!(coverage.weaker_dimensions(), vec!["aggregate_counts"]);
+        assert_eq!(coverage.overall(), CoverageStatus::Unknown);
+        assert_eq!(
+            coverage.weaker_dimensions(),
+            vec!["aggregate_counts", "detailed_events", "completion"]
+        );
 
         let mut m = measurements();
         m.attached_points = 8;
         let coverage = session_coverage(&m);
         assert_eq!(coverage.attachment.status, CoverageStatus::Partial);
-        assert_eq!(coverage.weaker_dimensions(), vec!["attachment"]);
+        assert_eq!(
+            coverage.weaker_dimensions(),
+            vec![
+                "attachment",
+                "aggregate_counts",
+                "detailed_events",
+                "completion"
+            ]
+        );
 
         let mut m = measurements();
         m.ring_drops = 2;
         m.overflow_identities = 1;
         let coverage = session_coverage(&m);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
-        assert_eq!(coverage.weaker_dimensions(), vec!["detailed_events"]);
+        assert_eq!(
+            coverage.weaker_dimensions(),
+            vec!["aggregate_counts", "detailed_events", "completion"]
+        );
     }
 
     #[test]
@@ -1287,16 +1362,21 @@ mod tests {
         m.drops[3] = 7;
         let coverage = session_coverage(&m);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
-        assert_eq!(coverage.weaker_dimensions(), vec!["aggregate_counts"]);
-        // Destroy-only skips stay Complete (C7-expected, separately keyed).
+        assert_eq!(
+            coverage.weaker_dimensions(),
+            vec!["aggregate_counts", "detailed_events", "completion"]
+        );
+        // Destroy-only skips never flip to Partial (C7-expected,
+        // separately keyed) — but the dimension still cannot go
+        // `Complete`: delivery is unmeasured (S04).
         let mut m = measurements();
         m.drops[KDROP_DESTROY] = 50;
         let coverage = session_coverage(&m);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
         assert_eq!(
-            coverage.aggregate_counts.status,
-            CoverageStatus::CompleteForDeclaredBoundary
+            coverage.weaker_dimensions(),
+            vec!["aggregate_counts", "detailed_events", "completion"]
         );
-        assert!(coverage.weaker_dimensions().is_empty());
     }
 
     #[test]

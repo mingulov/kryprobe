@@ -22,9 +22,12 @@ fn agg_row(calls: u64) -> kryprobe_privilege::kcrypto_snapshot::RowBytes {
             result: KRES_OK,
             ctx: KCTX_PROC,
             name: b"cbc(aes)",
+            drv: b"",
             calls,
             bytes: 0,
             ok: 0,
+            errors: 0,
+            queued: 0,
         });
     kryprobe_privilege::kcrypto_snapshot::RowBytes::new(out).expect("hand row")
 }

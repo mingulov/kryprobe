@@ -102,6 +102,22 @@ pub const MIN_KEYSIZE: &str = "min_keysize";
 pub const MAX_KEYSIZE: &str = "max_keysize";
 /// First non-queued errno (who, rendered only).
 pub const FIRST_ERRNO: &str = "first_errno";
+/// Capture profile on every row: which capture produced it.
+pub const CAPTURE_PROFILE: &str = "capture_profile";
+/// Count unit on counted rows: what one count means.
+pub const COUNT_UNIT: &str = "count_unit";
+/// Completion coverage on counted rows: whether terminal request
+/// completion is observed by this capture.
+pub const COMPLETION_COVERAGE: &str = "completion_coverage";
+
+/// Capture-profile value: single-edge fexit API-return sensor
+/// (T02; the only profile in v0.1).
+pub const CAPTURE_API_RETURNS: &str = "api-returns";
+/// Count-unit value: one API-invocation return, not one delivered
+/// kernel operation and not one completed request.
+pub const COUNT_API_INVOCATION_RETURN: &str = "api_invocation_return";
+/// Completion-coverage value: terminal completion is not observed.
+pub const COVERAGE_UNOBSERVED: &str = "unobserved";
 
 /// Agg rows: always emitted.
 pub const AGG_KEYS: &[&str] = &[
@@ -118,13 +134,25 @@ pub const AGG_KEYS: &[&str] = &[
     LAT,
     WINDOW,
     STATUS_CANONICAL,
+    CAPTURE_PROFILE,
+    COUNT_UNIT,
+    COMPLETION_COVERAGE,
 ];
 
 /// Agg rows: emitted only when applicable.
 pub const AGG_OPTIONAL_KEYS: &[&str] = &[EXECUTION, RESULT_NOTE];
 
 /// Totals rows: always emitted, nothing optional.
-pub const TOTALS_KEYS: &[&str] = &[ROW, COUNTS, BYTES, WINDOW, STATUS_CANONICAL];
+pub const TOTALS_KEYS: &[&str] = &[
+    ROW,
+    COUNTS,
+    BYTES,
+    WINDOW,
+    STATUS_CANONICAL,
+    CAPTURE_PROFILE,
+    COUNT_UNIT,
+    COMPLETION_COVERAGE,
+];
 
 /// Ident rows: always emitted, nothing optional.
 pub const IDENT_KEYS: &[&str] = &[
@@ -137,11 +165,23 @@ pub const IDENT_KEYS: &[&str] = &[
     CONTEXT,
     NAME_LENS,
     FIRST_SEEN_NS,
+    CAPTURE_PROFILE,
 ];
 
 /// Who rows: always emitted.
 pub const WHO_KEYS: &[&str] = &[
-    ROW, KEY_HASH, TGID, TID, COMM, UID, CGROUP, STACK, CALLS, FIRST_NS, LAST_NS,
+    ROW,
+    KEY_HASH,
+    TGID,
+    TID,
+    COMM,
+    UID,
+    CGROUP,
+    STACK,
+    CALLS,
+    FIRST_NS,
+    LAST_NS,
+    CAPTURE_PROFILE,
 ];
 
 /// Who rows: emitted only when resolved.
@@ -217,4 +257,7 @@ pub const VOCAB: &[&str] = &[
     MIN_KEYSIZE,
     MAX_KEYSIZE,
     FIRST_ERRNO,
+    CAPTURE_PROFILE,
+    COUNT_UNIT,
+    COMPLETION_COVERAGE,
 ];

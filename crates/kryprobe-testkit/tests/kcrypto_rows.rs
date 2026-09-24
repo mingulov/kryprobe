@@ -16,9 +16,12 @@ fn agg_layout_pins_header_name_and_counters() {
         result: 0,
         ctx: 3,
         name: b"cbc(aes)",
+        drv: b"aesni",
         calls: 10,
         bytes: 640,
         ok: 9,
+        errors: 1,
+        queued: 2,
     });
     assert_eq!(row.len(), 382);
     assert_eq!(row[0], 0x01, "snapshot version");
@@ -26,11 +29,16 @@ fn agg_layout_pins_header_name_and_counters() {
     assert_eq!(&row[2..6], &[7, 1, 0, 3], "family/op/result/ctx");
     assert_eq!(&row[6..14], b"cbc(aes)", "algorithm name");
     assert_eq!(row[14], 0, "NUL terminator");
-    assert!(row[15..262].iter().all(|b| *b == 0), "name padding");
+    assert!(row[15..134].iter().all(|b| *b == 0), "alg padding");
+    assert_eq!(&row[134..139], b"aesni", "driver name");
+    assert_eq!(row[139], 0, "driver NUL terminator");
+    assert!(row[140..262].iter().all(|b| *b == 0), "drv padding");
     assert_eq!(le(&row, 262), 10, "calls");
     assert_eq!(le(&row, 270), 640, "bytes");
     assert_eq!(le(&row, 278), 9, "ok");
-    assert!(row[286..].iter().all(|b| *b == 0), "tail padding");
+    assert_eq!(le(&row, 286), 1, "errors");
+    assert_eq!(le(&row, 294), 2, "queued");
+    assert!(row[302..].iter().all(|b| *b == 0), "tail padding");
 }
 
 #[test]

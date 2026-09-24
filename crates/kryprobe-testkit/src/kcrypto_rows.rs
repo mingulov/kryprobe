@@ -29,11 +29,12 @@ pub const TOTALS_LEN: usize = 122;
 /// Ident row length (mirrors `IDENT_BYTES_LEN`).
 pub const IDENT_LEN: usize = 50;
 /// NUL-padded algorithm-name field inside an agg row.
-const NAME_FIELD: usize = 256;
+const ALG_FIELD: usize = 128;
 
-/// Agg-row fill spec: header identity plus the calls/bytes/ok
-/// counters. Fills stay explicit so call sites show their
-/// assumptions; the builder pins the layout around them.
+/// Agg-row fill spec: header identity, algorithm/driver names, plus
+/// the calls/bytes/ok/errors/queued counters. Fills stay explicit so
+/// call sites show their assumptions; the builder pins the layout
+/// around them.
 #[derive(Debug, Clone, Copy)]
 pub struct AggSpec<'a> {
     /// Key family byte.
@@ -44,35 +45,52 @@ pub struct AggSpec<'a> {
     pub result: u8,
     /// Context byte.
     pub ctx: u8,
-    /// Algorithm name (<256 bytes so the NUL terminator fits).
+    /// Algorithm name (<128 bytes so the NUL terminator fits).
     pub name: &'a [u8],
+    /// Driver name (<128 bytes so the NUL terminator fits; empty on
+    /// the alloc path, where the driver is not chosen yet).
+    pub drv: &'a [u8],
     /// Observed calls.
     pub calls: u64,
     /// Observed bytes.
     pub bytes: u64,
     /// Successful calls.
     pub ok: u64,
+    /// Error-classified calls.
+    pub errors: u64,
+    /// Queued-classified calls.
+    pub queued: u64,
 }
 
+/// NUL-padded driver-name field inside an agg row.
+const DRV_FIELD: usize = 128;
+
 /// One 382B agg row: version, kind, family/op/result/ctx, NUL-padded
-/// name, then the calls/bytes/ok counters and zero tail.
+/// algorithm + driver names, then the calls/bytes/ok/errors/queued
+/// counters and zero tail (window/lat stay zero: no durations).
 ///
-/// Panics when `name` reaches 256 bytes: silently truncating an
-/// algorithm name would build a lying fixture.
+/// Panics when a name reaches its field: silently truncating a
+/// kernel name would build a lying fixture.
 #[must_use]
 pub fn agg_row_bytes(spec: AggSpec<'_>) -> Vec<u8> {
-    assert!(spec.name.len() < NAME_FIELD, "algorithm name fits with NUL");
+    assert!(spec.name.len() < ALG_FIELD, "algorithm name fits with NUL");
+    assert!(spec.drv.len() < DRV_FIELD, "driver name fits with NUL");
     let mut out = Vec::with_capacity(AGG_LEN);
     out.push(VERSION);
     out.push(KIND_AGG);
     out.extend_from_slice(&[spec.family, spec.op, spec.result, spec.ctx]);
     out.extend_from_slice(spec.name);
     out.push(0);
-    out.extend_from_slice(&vec![0u8; NAME_FIELD - spec.name.len() - 1]);
+    out.extend_from_slice(&vec![0u8; ALG_FIELD - spec.name.len() - 1]);
+    out.extend_from_slice(spec.drv);
+    out.push(0);
+    out.extend_from_slice(&vec![0u8; DRV_FIELD - spec.drv.len() - 1]);
     out.extend_from_slice(&spec.calls.to_le_bytes());
     out.extend_from_slice(&spec.bytes.to_le_bytes());
     out.extend_from_slice(&spec.ok.to_le_bytes());
-    out.extend_from_slice(&[0u8; 120 - 24]);
+    out.extend_from_slice(&spec.errors.to_le_bytes());
+    out.extend_from_slice(&spec.queued.to_le_bytes());
+    out.extend_from_slice(&[0u8; 120 - 40]);
     assert_eq!(out.len(), AGG_LEN);
     out
 }

@@ -591,6 +591,9 @@ fn agg_obs(
             "bytes": bytes,
             "window": {"first_ns": 100, "last_ns": 200},
             "status_canonical": true,
+            "capture_profile": "api-returns",
+            "count_unit": "api_invocation_return",
+            "completion_coverage": "unobserved",
         }),
     }
 }
@@ -626,6 +629,9 @@ fn totals_obs(
             "bytes": bytes,
             "window": {"first_ns": 100, "last_ns": 200},
             "status_canonical": true,
+            "capture_profile": "api-returns",
+            "count_unit": "api_invocation_return",
+            "completion_coverage": "unobserved",
         }),
     }
 }
@@ -658,6 +664,7 @@ fn ident_obs(id: u64) -> NativeObservation {
             "context": "process",
             "name_lens": {"alg": 8, "drv": 5},
             "first_seen_ns": 100,
+            "capture_profile": "api-returns",
         }),
     }
 }
@@ -1490,9 +1497,9 @@ fn check_live_violation_exit10_case() {
 
 #[test]
 #[ignore = "BPF lane: run under sudo with the lane lock + lease"]
-fn check_live_clean_exit0_case() {
+fn check_live_clean_exit3_inconclusive_case() {
     let _guard = lane_guard();
-    if !lane_ready("check_live_clean_exit0_case") {
+    if !lane_ready("check_live_clean_exit3_inconclusive_case") {
         return;
     }
     let scratch = check_scratch("live-0");
@@ -1514,12 +1521,12 @@ fn check_live_clean_exit0_case() {
     traffic.join().expect("traffic joins");
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "healthy lane + clean policy exits 0; stderr: {}",
+        Some(3),
+        "healthy lane + clean policy exits 3 (T02: delivery/completion unmeasured); stderr: {}",
         stderr_of(&output)
     );
     assert!(
-        stdout_of(&output).contains("CLEAN"),
+        stdout_of(&output).contains("INCONCLUSIVE missing=capture-integrity,completion"),
         "stdout: {}",
         stdout_of(&output)
     );

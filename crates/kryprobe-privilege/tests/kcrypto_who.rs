@@ -255,6 +255,7 @@ fn k5_who_row_exact_keys_when_resolved() {
         "min_keysize",
         "max_keysize",
         "first_errno",
+        "capture_profile",
     ]
     .into_iter()
     .collect();
@@ -272,8 +273,18 @@ fn k5_who_row_omit_key_set_when_unresolved() {
         .map(String::as_str)
         .collect();
     let expected: BTreeSet<&str> = [
-        "row", "key_hash", "tgid", "tid", "comm", "uid", "cgroup", "stack", "calls", "first_ns",
+        "row",
+        "key_hash",
+        "tgid",
+        "tid",
+        "comm",
+        "uid",
+        "cgroup",
+        "stack",
+        "calls",
+        "first_ns",
         "last_ns",
+        "capture_profile",
     ]
     .into_iter()
     .collect();

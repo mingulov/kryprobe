@@ -140,6 +140,9 @@ pub(crate) mod fixtures {
                 "bytes": bytes,
                 "window": {"first_ns": 100, "last_ns": 200},
                 "status_canonical": true,
+                "capture_profile": "api-returns",
+                "count_unit": "api_invocation_return",
+                "completion_coverage": "unobserved",
             }),
         }
     }
@@ -174,6 +177,9 @@ pub(crate) mod fixtures {
                 "bytes": bytes,
                 "window": {"first_ns": 100, "last_ns": 200},
                 "status_canonical": true,
+                "capture_profile": "api-returns",
+                "count_unit": "api_invocation_return",
+                "completion_coverage": "unobserved",
             }),
         }
     }
@@ -205,6 +211,7 @@ pub(crate) mod fixtures {
                 "context": "process",
                 "name_lens": {"alg": 8, "drv": 5},
                 "first_seen_ns": 100,
+                "capture_profile": "api-returns",
             }),
         }
     }
@@ -254,6 +261,7 @@ pub(crate) mod fixtures {
                 "min_keysize": 16,
                 "max_keysize": 32,
                 "first_errno": -5,
+                "capture_profile": "api-returns",
             }),
         }
     }

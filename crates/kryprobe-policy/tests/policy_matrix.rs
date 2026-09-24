@@ -59,6 +59,9 @@ fn agg_payload(
         "bytes": 300,
         "window": {"first_ns": 100, "last_ns": 200},
         "status_canonical": true,
+        "capture_profile": "api-returns",
+        "count_unit": "api_invocation_return",
+        "completion_coverage": "unobserved",
     })
 }
 
@@ -93,6 +96,9 @@ fn totals_obs(id: u64) -> NativeObservation {
             "bytes": 1000,
             "window": {"first_ns": 100, "last_ns": 200},
             "status_canonical": true,
+            "capture_profile": "api-returns",
+            "count_unit": "api_invocation_return",
+            "completion_coverage": "unobserved",
         }),
     )
 }
@@ -112,6 +118,7 @@ fn ident_obs(id: u64) -> NativeObservation {
             "context": "process",
             "name_lens": {"alg": 8, "drv": 5},
             "first_seen_ns": 100,
+            "capture_profile": "api-returns",
         }),
     )
 }
@@ -815,6 +822,44 @@ fn no_match_with_gaps_is_inconclusive_naming_dims() {
             assert_eq!(missing_dims, vec!["attachment", "aggregate_counts"]);
         }
         other => panic!("gaps must be inconclusive, got {other:?}"),
+    }
+}
+
+#[test]
+fn o02_unobserved_delivery_and_completion_are_inconclusive_never_clean() {
+    // T02/O02: a deny no observation matches, over a reconciled
+    // api-returns session (counts internally clean, delivery and
+    // completion unmeasured) — absence cannot be proven, so the
+    // verdict is inconclusive naming those dims, never clean.
+    let observations = vec![agg_obs(
+        1,
+        EvidencePhase::Completed,
+        "skcipher",
+        "encrypt",
+        "ok",
+        "cbc(aes)",
+        "aesni",
+        "process",
+    )];
+    let text = policy_yaml(&deny_rule(
+        "r",
+        "kernel-crypto",
+        "      algorithm: md5\n",
+        "deny",
+    ));
+    let policy = parse_policy(&text).expect("parses");
+    let mut coverage = complete_coverage();
+    coverage.aggregate_counts = dim(CoverageStatus::Unknown);
+    coverage.detailed_events = dim(CoverageStatus::Unknown);
+    coverage.completion = dim(CoverageStatus::Unknown);
+    match evaluate(&policy, &observations, &coverage) {
+        PolicyVerdict::Inconclusive { missing_dims } => {
+            assert_eq!(
+                missing_dims,
+                vec!["aggregate_counts", "detailed_events", "completion"]
+            );
+        }
+        other => panic!("unmeasured delivery must be inconclusive, got {other:?}"),
     }
 }
 

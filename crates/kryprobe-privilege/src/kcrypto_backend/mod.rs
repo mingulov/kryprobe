@@ -1039,9 +1039,12 @@ mod tests {
             result: KRES_OK,
             ctx: KCTX_PROC,
             name: b"cbc(aes)",
+            drv: b"",
             calls,
             bytes: 0,
             ok: calls,
+            errors: 0,
+            queued: 0,
         })
     }
 

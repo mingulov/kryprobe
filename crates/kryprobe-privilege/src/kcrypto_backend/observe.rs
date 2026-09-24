@@ -15,7 +15,10 @@ use kryprobe_abi::kcrypto_agg::{
     kctl_unpack_lens, kh_of,
 };
 use kryprobe_core::enums::{BackendId, CallKind, EvidencePhase, OperationClass};
-use kryprobe_core::evidence::{IntegrityRef, NativeObservation, NativeResult, SafeTextId};
+use kryprobe_core::evidence::{
+    IntegrityRef, NativeObservation, NativeResult, SafeTextId,
+    payload_keys::{CAPTURE_API_RETURNS, COUNT_API_INVOCATION_RETURN, COVERAGE_UNOBSERVED},
+};
 use kryprobe_core::ids::ObservationId;
 use serde_json::json;
 
@@ -182,6 +185,9 @@ pub(crate) fn observation_for_agg(
         "lat": vagg.lat,
         "window": {"first_ns": vagg.first_ns, "last_ns": vagg.last_ns},
         "status_canonical": true,
+        "capture_profile": CAPTURE_API_RETURNS,
+        "count_unit": COUNT_API_INVOCATION_RETURN,
+        "completion_coverage": COVERAGE_UNOBSERVED,
     });
     if inventory {
         payload["execution"] = json!("unsupported");
@@ -237,6 +243,9 @@ pub(crate) fn observation_for_totals(vagg: &VAgg, id: ObservationId) -> NativeOb
             "bytes": vagg.bytes,
             "window": {"first_ns": vagg.first_ns, "last_ns": vagg.last_ns},
             "status_canonical": true,
+            "capture_profile": CAPTURE_API_RETURNS,
+            "count_unit": COUNT_API_INVOCATION_RETURN,
+            "completion_coverage": COVERAGE_UNOBSERVED,
         }),
     }
 }
@@ -282,6 +291,7 @@ pub(crate) fn observation_for_ident(kctl: &KCtl, id: ObservationId) -> NativeObs
             "context": context_name(ctx),
             "name_lens": {"alg": alg_len, "drv": drv_len},
             "first_seen_ns": kctl.val2,
+            "capture_profile": CAPTURE_API_RETURNS,
         }),
     }
 }
@@ -342,6 +352,7 @@ pub fn observation_for_who(
         "calls": who.val.calls,
         "first_ns": who.val.first_ns,
         "last_ns": who.val.last_ns,
+        "capture_profile": CAPTURE_API_RETURNS,
     });
     if parent_resolved {
         payload["ppid"] = json!(who.val.ppid);
