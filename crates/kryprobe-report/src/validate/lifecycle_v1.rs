@@ -10,7 +10,7 @@
 //! ADR.
 
 use crate::KCRYPTO_LIFECYCLE_V1;
-use crate::checker::{is_digit_string, is_prefixed_id, render, shorten};
+use crate::checker::{is_digit_string, is_prefixed_id};
 use serde_json::Value;
 
 /// Required top-level keys, in schema order.
@@ -27,6 +27,9 @@ const REQUIRED: &[&str] = &[
 const MAX_ID_LEN: usize = 96;
 
 /// One payload-v1 defect; empty means the payload validates clean.
+/// Findings are input-free by construction: they name keys and
+/// expected shapes, never rejected values (which could be key
+/// material or buffer contents).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleFinding {
     /// A required key is absent.
@@ -39,14 +42,12 @@ pub enum LifecycleFinding {
     BadShape {
         /// Offending key name.
         key: String,
-        /// Offending value, rendered and truncated.
-        value: String,
+        /// What the key must hold (static description, no input).
+        expected: String,
     },
-    /// `schema` is present but not `kryprobe.kcrypto.lifecycle/v1`.
-    UnknownVersion {
-        /// Offending schema value.
-        found: String,
-    },
+    /// `schema` is present but not `kryprobe.kcrypto.lifecycle/v1`
+    /// (the offered value is withheld: it is untrusted input).
+    UnknownVersion,
     /// A key outside the schema is present. Names the key only:
     /// unknown values (which could be key material or buffer
     /// contents) must never leak into diagnostics.
@@ -64,27 +65,24 @@ pub enum LifecycleFinding {
 
 /// Validates one lifecycle payload-v1 object. Fail-closed: any defect
 /// means the payload must not be evaluated as clean. Checks run in
-/// layers — presence, then version, then shapes, then combinations —
-/// so one defect class never cascades into another.
+/// layers — presence (missing and extra keys together), then
+/// version, then shapes, then combinations — so one defect class
+/// never cascades into another.
 pub fn validate_lifecycle_v1(payload: &Value) -> Vec<LifecycleFinding> {
     let Some(obj) = payload.as_object() else {
         return vec![LifecycleFinding::BadShape {
             key: "record".to_string(),
-            value: shorten(&render(payload)),
+            expected: "object".to_string(),
         }];
     };
-    let mut missing = Vec::new();
+    let mut out = Vec::new();
     for key in REQUIRED {
         if !obj.contains_key(*key) {
-            missing.push(LifecycleFinding::MissingKey {
+            out.push(LifecycleFinding::MissingKey {
                 key: key.to_string(),
             });
         }
     }
-    if !missing.is_empty() {
-        return missing;
-    }
-    let mut out = Vec::new();
     let mut unknown: Vec<&str> = obj
         .keys()
         .filter(|key| !REQUIRED.contains(&key.as_str()))
@@ -96,16 +94,17 @@ pub fn validate_lifecycle_v1(payload: &Value) -> Vec<LifecycleFinding> {
             key: key.to_string(),
         });
     }
+    if !out.is_empty() {
+        return out;
+    }
     match obj.get("schema") {
         Some(Value::String(found)) if found == KCRYPTO_LIFECYCLE_V1 => {}
-        Some(Value::String(found)) => {
-            out.push(LifecycleFinding::UnknownVersion {
-                found: shorten(found),
-            });
+        Some(Value::String(_)) => {
+            out.push(LifecycleFinding::UnknownVersion);
         }
-        other => out.push(LifecycleFinding::BadShape {
+        _ => out.push(LifecycleFinding::BadShape {
             key: "schema".to_string(),
-            value: shorten(&render(other.unwrap_or(&Value::Null))),
+            expected: "version string".to_string(),
         }),
     }
     check_id(obj, "request_id", false, &mut out);
@@ -126,12 +125,17 @@ fn check_id(
     nullable: bool,
     out: &mut Vec<LifecycleFinding>,
 ) {
+    let expected = if nullable {
+        "scope:name id (≤96 chars) or null"
+    } else {
+        "scope:name id (≤96 chars)"
+    };
     match obj.get(key) {
         Some(Value::String(text)) if text.len() <= MAX_ID_LEN && is_prefixed_id(text) => {}
         Some(value) if nullable && value.is_null() => {}
-        Some(value) => out.push(LifecycleFinding::BadShape {
+        Some(_) => out.push(LifecycleFinding::BadShape {
             key: key.to_string(),
-            value: shorten(&render(value)),
+            expected: expected.to_string(),
         }),
         // Unreachable: presence was checked above; fail closed anyway.
         None => out.push(LifecycleFinding::MissingKey {
@@ -146,10 +150,10 @@ fn check_terminal(obj: &serde_json::Map<String, Value>, out: &mut Vec<LifecycleF
         Some(Value::String(word)) if matches!(word.as_str(), "sync" | "callback" | "unknown") => {
             true
         }
-        Some(value) => {
+        Some(_) => {
             out.push(LifecycleFinding::BadShape {
                 key: "terminal".to_string(),
-                value: shorten(&render(value)),
+                expected: "`sync`, `callback` or `unknown`".to_string(),
             });
             false
         }
@@ -180,16 +184,16 @@ fn check_status(
                 _ => {
                     out.push(LifecycleFinding::BadShape {
                         key: "status".to_string(),
-                        value: shorten(&number.to_string()),
+                        expected: "JSON integer in i32 range or null".to_string(),
                     });
                     None
                 }
             },
         },
-        Some(value) => {
+        Some(_) => {
             out.push(LifecycleFinding::BadShape {
                 key: "status".to_string(),
-                value: shorten(&render(value)),
+                expected: "JSON integer in i32 range or null".to_string(),
             });
             None
         }
@@ -229,15 +233,15 @@ fn check_duration(
             } else {
                 out.push(LifecycleFinding::BadShape {
                     key: "duration_ns".to_string(),
-                    value: shorten(text),
+                    expected: "canonical decimal u64 string or null".to_string(),
                 });
                 None
             }
         }
-        Some(value) => {
+        Some(_) => {
             out.push(LifecycleFinding::BadShape {
                 key: "duration_ns".to_string(),
-                value: shorten(&render(value)),
+                expected: "canonical decimal u64 string or null".to_string(),
             });
             None
         }
@@ -301,10 +305,15 @@ mod tests {
         })
     }
 
+    /// Prefixed-id pattern the schema must carry (portable strict
+    /// end: `(?![\s\S])`, since `$` alone matches before a trailing
+    /// newline in some engines).
+    const EXPECTED_ID_PATTERN: &str = "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+(?![\\s\\S])";
+
     /// Exact canonical-decimal u64 range pattern the schema must
     /// carry (generated + verified by an exact range script; any
     /// schema-side weakening breaks this pin).
-    const EXPECTED_DURATION_PATTERN: &str = "^(0|[1-9][0-9]{0,18}|1(?:0[0-9]{18}|[1-7][0-9]{18}|8(?:(?:0[0-9]{17}|[1-3][0-9]{17}|4(?:(?:0[0-9]{16}|[1-3][0-9]{16}|4(?:(?:0[0-9]{15}|[1-5][0-9]{15}|6(?:(?:0[0-9]{14}|[1-6][0-9]{14}|7(?:(?:0[0-9]{13}|[1-3][0-9]{13}|4(?:(?:0[0-9]{12}|[1-3][0-9]{12}|4(?:0(?:0[0-9]{10}|[1-6][0-9]{10}|7(?:(?:0[0-9]{9}|[1-2][0-9]{9}|3(?:(?:0[0-9]{8}|[1-6][0-9]{8}|7(?:0(?:0[0-9]{6}|[1-8][0-9]{6}|9(?:(?:0[0-9]{5}|[1-4][0-9]{5}|5(?:(?:0[0-9]{4}|[1-4][0-9]{4}|5(?:(?:0[0-9]{3}|1(?:(?:0[0-9]{2}|[1-5][0-9]{2}|6(?:(?:0[0-9]|1(?:(?:0|[1-4]|5))))))))))))))))))))))))))))))))))$";
+    const EXPECTED_DURATION_PATTERN: &str = "^(0|[1-9][0-9]{0,18}|1(?:0[0-9]{18}|[1-7][0-9]{18}|8(?:(?:0[0-9]{17}|[1-3][0-9]{17}|4(?:(?:0[0-9]{16}|[1-3][0-9]{16}|4(?:(?:0[0-9]{15}|[1-5][0-9]{15}|6(?:(?:0[0-9]{14}|[1-6][0-9]{14}|7(?:(?:0[0-9]{13}|[1-3][0-9]{13}|4(?:(?:0[0-9]{12}|[1-3][0-9]{12}|4(?:0(?:0[0-9]{10}|[1-6][0-9]{10}|7(?:(?:0[0-9]{9}|[1-2][0-9]{9}|3(?:(?:0[0-9]{8}|[1-6][0-9]{8}|7(?:0(?:0[0-9]{6}|[1-8][0-9]{6}|9(?:(?:0[0-9]{5}|[1-4][0-9]{5}|5(?:(?:0[0-9]{4}|[1-4][0-9]{4}|5(?:(?:0[0-9]{3}|1(?:(?:0[0-9]{2}|[1-5][0-9]{2}|6(?:(?:0[0-9]|1(?:(?:0|[1-4]|5))))))))))))))))))))))))))))))))))(?![\\s\\S])";
 
     #[test]
     fn schema_file_matches_validator() {
@@ -372,6 +381,26 @@ mod tests {
             duration_string.get("pattern"),
             Some(&serde_json::json!(EXPECTED_DURATION_PATTERN)),
         );
+        // ID patterns use the same portable strict end assertion
+        // (`$` alone matches before a trailing newline in some
+        // engines).
+        for key in ["request_id", "tfm_id"] {
+            let branch = schema
+                .get("properties")
+                .and_then(|p| p.get(key))
+                .and_then(|s| {
+                    s.get("anyOf")
+                        .and_then(Value::as_array)
+                        .and_then(|branches| branches.first())
+                        .or(Some(s))
+                })
+                .expect("id string branch");
+            assert_eq!(
+                branch.get("pattern"),
+                Some(&serde_json::json!(EXPECTED_ID_PATTERN)),
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -484,9 +513,7 @@ mod tests {
         );
         assert_eq!(
             validate_lifecycle_v1(&wrong),
-            vec![LifecycleFinding::UnknownVersion {
-                found: "kryprobe.kcrypto.lifecycle/v9".to_string()
-            }]
+            vec![LifecycleFinding::UnknownVersion]
         );
         let mut untyped = base();
         untyped
@@ -560,6 +587,89 @@ mod tests {
         let rendered = format!("{findings:?}");
         assert!(rendered.contains("key_material"));
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn reports_unknown_keys_alongside_missing_keys() {
+        // Presence-layer defects are complete: a missing required
+        // key must not hide an extra key.
+        let mut payload = base();
+        let obj = payload.as_object_mut().expect("object");
+        obj.remove("terminal");
+        obj.insert("key_material".to_string(), json!("secret"));
+        assert_eq!(
+            validate_lifecycle_v1(&payload),
+            vec![
+                LifecycleFinding::MissingKey {
+                    key: "terminal".to_string()
+                },
+                LifecycleFinding::UnknownKey {
+                    key: "key_material".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_newlines() {
+        // The schema patterns use a portable strict end assertion;
+        // the validator agrees byte-for-byte (no `$`-before-newline
+        // leniency on either side).
+        for (key, value) in [
+            ("request_id", "kcrypto:req-1\n"),
+            ("tfm_id", "kcrypto:tfm-7\n"),
+            ("duration_ns", "20\n"),
+        ] {
+            let mut payload = base();
+            payload
+                .as_object_mut()
+                .expect("object")
+                .insert(key.to_string(), serde_json::json!(value));
+            assert!(
+                matches!(
+                    validate_lifecycle_v1(&payload)[..],
+                    [LifecycleFinding::BadShape { .. }]
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_rejected_values_on_every_path() {
+        // Every rejection path must leak no input bytes: findings
+        // name the key and the expected shape, never the offending
+        // value.
+        const SECRET: &str = "sekrit-redaction-probe";
+        let mut cases: Vec<Value> = Vec::new();
+        cases.push(json!([SECRET]));
+        for (key, value) in [
+            ("schema", json!(SECRET)),
+            ("request_id", json!(SECRET)),
+            ("tfm_id", json!(SECRET)),
+            ("terminal", json!(SECRET)),
+            ("status", json!({"nested": SECRET})),
+            ("duration_ns", json!(SECRET)),
+        ] {
+            let mut payload = base();
+            payload
+                .as_object_mut()
+                .expect("object")
+                .insert(key.to_string(), value);
+            cases.push(payload);
+        }
+        let mut extra = base();
+        extra
+            .as_object_mut()
+            .expect("object")
+            .insert("key_material".to_string(), json!(SECRET));
+        cases.push(extra);
+        for case in &cases {
+            let findings = validate_lifecycle_v1(case);
+            assert!(!findings.is_empty(), "{case}");
+            let rendered = format!("{findings:?}");
+            assert!(!rendered.contains(SECRET), "{case} -> {rendered}");
+        }
     }
 
     #[test]

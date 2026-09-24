@@ -317,6 +317,10 @@ impl LifecycleReducer {
                 if let Some(stone) = self.completed.get(&id).copied() {
                     if disposition == CallbackDisposition::Terminal {
                         self.diagnose_tombstoned(stone.terminal, Terminal::Callback(status));
+                    } else if disposition == CallbackDisposition::Unresolved {
+                        // Unclassifiable evidence stays loud after
+                        // completion, exactly as on a live id.
+                        self.stats.ambiguous += 1;
                     } else {
                         self.stats.duplicate += 1;
                     }
@@ -381,6 +385,10 @@ impl LifecycleReducer {
                     {
                         // A Queued classification after synchronous
                         // completion contradicts the emitted truth.
+                        self.stats.ambiguous += 1;
+                    } else if disposition == ReturnDisposition::Unresolved {
+                        // Unclassifiable evidence stays loud after
+                        // completion, exactly as on a live id.
                         self.stats.ambiguous += 1;
                     } else {
                         self.stats.duplicate += 1;

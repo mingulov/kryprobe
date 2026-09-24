@@ -1138,6 +1138,124 @@ fn queued_return_after_unknown_is_duplicate() {
 }
 
 #[test]
+fn unresolved_callback_counts_ambiguous_in_both_orders() {
+    // Unclassifiable evidence stays loud regardless of arrival
+    // order: live or post-completion, each Unresolved callback
+    // counts ambiguous.
+    let mut live = LifecycleReducer::new(4);
+    assert!(
+        live.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        live.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: -1,
+            disposition: CallbackDisposition::Unresolved,
+        })
+        .is_empty()
+    );
+    assert_eq!(live.stats().ambiguous, 1);
+    let mut late = LifecycleReducer::new(4);
+    assert!(
+        late.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        late.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: ReturnDisposition::Terminal,
+        })
+        .len(),
+        1
+    );
+    assert!(
+        late.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 30,
+            status: -1,
+            disposition: CallbackDisposition::Unresolved,
+        })
+        .is_empty()
+    );
+    assert_eq!(late.stats().ambiguous, 1);
+    assert_eq!(late.stats().duplicate, 0);
+}
+
+#[test]
+fn unresolved_return_counts_ambiguous_in_both_orders() {
+    let mut live = LifecycleReducer::new(4);
+    assert!(
+        live.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        live.apply(Edge::Return {
+            id: 1,
+            ts_ns: 20,
+            status: -1,
+            disposition: ReturnDisposition::Unresolved,
+        })
+        .is_empty()
+    );
+    assert_eq!(live.stats().ambiguous, 1);
+    let mut late = LifecycleReducer::new(4);
+    assert!(
+        late.apply(Edge::Submit {
+            id: 1,
+            tfm_id: None,
+            ts_ns: 10
+        })
+        .is_empty()
+    );
+    assert!(
+        late.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 20,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        late.apply(Edge::Return {
+            id: 1,
+            ts_ns: 30,
+            status: -115,
+            disposition: ReturnDisposition::Queued,
+        })
+        .len(),
+        1
+    );
+    assert!(
+        late.apply(Edge::Return {
+            id: 1,
+            ts_ns: 40,
+            status: -1,
+            disposition: ReturnDisposition::Unresolved,
+        })
+        .is_empty()
+    );
+    assert_eq!(late.stats().ambiguous, 1);
+    assert_eq!(late.stats().duplicate, 0);
+}
+
+#[test]
 fn tombstones_evict_oldest_beyond_capacity() {
     let mut r = LifecycleReducer::new(2);
     for (id, base) in [(1u64, 10u64), (2, 20), (3, 30)] {
