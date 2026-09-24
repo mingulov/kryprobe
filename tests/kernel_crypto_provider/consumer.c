@@ -44,9 +44,13 @@ struct kxc_op {
 	 * callback's terminal row: whichever runs first observes
 	 * true state, so a progress row can never claim in-flight
 	 * after the terminal landed (or vice versa). Lock order:
-	 * mark_lock -> ledger lock, never the reverse.
+	 * mark_lock -> ledger lock, never the reverse. The callback
+	 * never touches op after complete(): it sets completed and
+	 * unlocks first, so the waiter cannot release stack op
+	 * while the callback still uses it.
 	 */
 	spinlock_t mark_lock;
+	bool completed;
 	int err;
 	u64 seq;
 };
@@ -120,11 +124,31 @@ static void kxc_complete(void *data, int err)
 	 * Terminal truth is recorded HERE (completion context), never
 	 * inferred by the observer: CPU proves cross-CPU delivery.
 	 * Under the mark lock, so a concurrent progress sample
-	 * observes true state (sample-after-terminal reads done).
+	 * observes true state. completed is set and the lock
+	 * released BEFORE complete(): op lives on the waiter's
+	 * stack, and touching it after the wake would race the
+	 * waiter's teardown.
 	 */
 	spin_lock_bh(&op->mark_lock);
 	kxc_emit_terminal(op->run, op->seq, err);
+	op->completed = true;
+	spin_unlock_bh(&op->mark_lock);
 	complete(&op->done);
+}
+
+/*
+ * Truthful progress marker: sample completed under the mark lock
+ * so the sample and the marker are atomic against the callback's
+ * terminal row (0 iff the terminal landed, in either order).
+ */
+static void kxc_mark_progress(struct kxc_run *run, struct kxc_op *op,
+			      u64 seq)
+{
+	int marker;
+
+	spin_lock_bh(&op->mark_lock);
+	marker = op->completed ? 0 : -EINPROGRESS;
+	kxc_emit_progress(run, seq, marker);
 	spin_unlock_bh(&op->mark_lock);
 }
 
@@ -184,6 +208,7 @@ static int kxc_req_setup(struct kxc_run *run, struct crypto_skcipher *tfm,
 				   op->iv);
 	init_completion(&op->done);
 	spin_lock_init(&op->mark_lock);
+	op->completed = false;
 	op->err = -EINPROGRESS;
 	return 0;
 }
@@ -349,15 +374,7 @@ static int kxc_scenario_delayed_completion(struct kxc_run *run)
 		kxc_op_release(run, &op, aseq);
 		return err;
 	}
-	/*
-	 * Sample under the mark lock: the sample and the marker
-	 * are atomic against the callback's terminal row, so the
-	 * marker is truthful in either order (0 iff completed).
-	 */
-	spin_lock_bh(&op.mark_lock);
-	kxc_emit_progress(run, seq,
-			  completion_done(&op.done) ? 0 : -EINPROGRESS);
-	spin_unlock_bh(&op.mark_lock);
+	kxc_mark_progress(run, &op, seq);
 	err = kxc_wait_done(run, &op);
 	elapsed_ms = (ktime_get_ns() - t0) / 1000000;
 	kxc_set_delay_ms(0);
@@ -459,17 +476,11 @@ static int kxc_scenario_early_callback(struct kxc_run *run)
 		return err;
 	}
 	/*
-	 * Poll before waiting under the mark lock: the progress row
-	 * records whether the callback already delivered the
-	 * terminal row (errno 0) or the invocation is still in
-	 * flight (EINPROGRESS). Either way exactly one progress row
-	 * lands (two notifications total), and it is truthful in
-	 * either order.
+	 * Poll before waiting: exactly one progress row lands (two
+	 * notifications total), truthful in either order via the
+	 * mark helper (0 iff the terminal already landed).
 	 */
-	spin_lock_bh(&op.mark_lock);
-	kxc_emit_progress(run, seq,
-			  completion_done(&op.done) ? 0 : -EINPROGRESS);
-	spin_unlock_bh(&op.mark_lock);
+	kxc_mark_progress(run, &op, seq);
 	err = kxc_wait_done(run, &op);
 	kxc_op_release(run, &op, aseq);
 	return err;
