@@ -129,8 +129,9 @@ int kxc_run_begin(struct kxc_run *run, const char *id,
 	strscpy(run->scenario, scenario, sizeof(run->scenario));
 	run->seed = seed;
 	atomic64_set(&run->seq, 0);
-	run->prepared = true;
-	run->done = false;
+	/* WRITE_ONCE: STOP observes prepared/done across locks. */
+	WRITE_ONCE(run->prepared, true);
+	WRITE_ONCE(run->done, false);
 	run->fixture_result = 0;
 	/* WRITE_ONCE: lockless STOP may store concurrently. */
 	WRITE_ONCE(run->stop, false);
@@ -141,7 +142,8 @@ int kxc_run_begin(struct kxc_run *run, const char *id,
 void kxc_run_finish(struct kxc_run *run, int result)
 {
 	run->fixture_result = result;
-	run->done = true;
+	/* WRITE_ONCE: STOP observes done across locks. */
+	WRITE_ONCE(run->done, true);
 }
 
 bool kxc_run_stop_requested(struct kxc_run *run)
@@ -389,7 +391,7 @@ static ssize_t kxc_control_write(struct file *file, const char __user *buf,
 	 */
 	if (!strcmp(cmd, "STOP\n") || !strcmp(cmd, "STOP")) {
 		mutex_lock(&kxc_stop_lock);
-		if (!kxc_run.prepared || kxc_run.done)
+		if (!READ_ONCE(kxc_run.prepared) || READ_ONCE(kxc_run.done))
 			ret = -EALREADY;
 		else {
 			kxc_run_request_stop(&kxc_run);
