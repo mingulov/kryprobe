@@ -69,6 +69,13 @@ pub enum LifecycleFinding {
 /// layers — presence (missing and extra keys together), then
 /// version, then shapes, then combinations — so one defect class
 /// never cascades into another.
+///
+/// Parse boundary: the validator sees the parsed
+/// `serde_json::Value`, not the raw JSON lexemes — a fractional
+/// raw number that already rounded to integral under f64 validates
+/// as its parsed value. Lexeme-level exactness would need an
+/// arbitrary-precision parse boundary; the T06+ producer contract
+/// emits plain integers instead.
 pub fn validate_lifecycle_v1(payload: &Value) -> Vec<LifecycleFinding> {
     let Some(obj) = payload.as_object() else {
         return vec![LifecycleFinding::BadShape {

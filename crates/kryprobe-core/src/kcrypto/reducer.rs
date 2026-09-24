@@ -71,7 +71,8 @@ pub enum Edge {
     },
     /// Adapter-declared phase loss for an id: completes a live id
     /// immediately (retained terminal truth if present, else
-    /// [`Terminal::Unknown`]).
+    /// [`Terminal::Unknown`]; [`GapReason::IdentityAmbiguous` always
+    /// emits `Unknown`, invalidating even retained truth).
     Gap {
         /// Opaque request id.
         id: u64,

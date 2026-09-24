@@ -1405,12 +1405,19 @@ fn reversed_clock_yields_no_duration() {
 
 #[test]
 fn cross_stream_permutations_reconcile_once() {
-    // Plan §T05: every per-source-order-preserving interleaving of
-    // one Queued return against callback orders [T], [P, T] and
-    // [T, P] (T = terminal callback, P = progress callback). Each
-    // flow emits exactly one Callback(0); progress at or after
+    // Plan §T05 (return×callback representative): every
+    // per-source-order-preserving interleaving of one Queued
+    // return against callback orders [T], [P, T] and [T, P]
+    // (T = terminal callback, P = progress callback). Each flow
+    // emits exactly one Callback(0); progress at or after
     // terminal truth counts exactly one duplicate however it
     // interleaves — anomaly accounting is order-independent.
+    // Companion classes live in focused tests: terminal-return
+    // orders (conflict/tombstone tests), gap interleavings (gap
+    // + invalidation tests), multi-id interleave (Q04). Edges
+    // keep fixed timestamps while delivery order permutes, so the
+    // sweep models cross-stream arrival skew rather than
+    // re-timestamping the evidence.
     #[derive(Debug, Clone, Copy)]
     enum Slot {
         R,
@@ -1435,47 +1442,51 @@ fn cross_stream_permutations_reconcile_once() {
             );
             let mut seq = cb_seq.to_vec();
             seq.insert(at, Slot::R);
-            let mut terminal_ts = 0u64;
             let mut emitted = 0u32;
-            let mut terminal = Terminal::Unknown;
-            let mut duration = None;
-            for (i, slot) in seq.iter().enumerate() {
-                let ts = 20 + 10 * i as u64;
+            for slot in seq.iter() {
+                // Fixed per-edge timestamps: only delivery order
+                // permutes.
                 let edge = match slot {
                     Slot::R => Edge::Return {
                         id: 1,
-                        ts_ns: ts,
+                        ts_ns: 25,
                         status: -115,
                         disposition: ReturnDisposition::Queued,
                     },
-                    Slot::T => {
-                        terminal_ts = ts;
-                        Edge::Callback {
-                            id: 1,
-                            ts_ns: ts,
-                            status: 0,
-                            disposition: CallbackDisposition::Terminal,
-                        }
-                    }
+                    Slot::T => Edge::Callback {
+                        id: 1,
+                        ts_ns: 30,
+                        status: 0,
+                        disposition: CallbackDisposition::Terminal,
+                    },
                     Slot::P => Edge::Callback {
                         id: 1,
-                        ts_ns: ts,
+                        ts_ns: 20,
                         status: -115,
                         disposition: CallbackDisposition::Progress,
                     },
                 };
                 for rec in r.apply(edge) {
                     emitted += 1;
-                    terminal = rec.terminal;
-                    duration = rec.duration_ns;
+                    let label = format!("order {cb_seq:?} R@{at}");
+                    assert_eq!(rec.id, 1, "{label}");
+                    assert_eq!(rec.terminal, Terminal::Callback(0), "{label}");
+                    assert_eq!(rec.duration_ns, Some(20), "{label}");
                 }
             }
             let label = format!("order {cb_seq:?} R@{at}");
             assert_eq!(emitted, 1, "{label}");
-            assert_eq!(terminal, Terminal::Callback(0), "{label}");
-            assert_eq!(duration, terminal_ts.checked_sub(10), "{label}");
-            assert_eq!(r.stats().duplicate, *expected_dup, "{label}");
-            assert_eq!(r.stats().ambiguous, 0, "{label}");
+            // Full counter set: nothing else may move on any flow.
+            let s = r.stats();
+            assert_eq!(s.admitted, 1, "{label}");
+            assert_eq!(s.emitted, 1, "{label}");
+            assert_eq!(s.orphan, 0, "{label}");
+            assert_eq!(s.duplicate, *expected_dup, "{label}");
+            assert_eq!(s.ambiguous, 0, "{label}");
+            assert_eq!(s.admission_failed, 0, "{label}");
+            assert_eq!(s.unfinished, 0, "{label}");
+            // Nothing left pending on any flow.
+            assert!(r.finish(100).is_empty(), "{label}");
         }
     }
 }
