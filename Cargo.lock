@@ -229,6 +229,7 @@ version = "0.1.0"
 dependencies = [
  "kryprobe-abi",
  "libc",
+ "serde_json",
 ]
 
 [[package]]

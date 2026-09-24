@@ -12,6 +12,7 @@
 pub mod alg_fixture;
 pub mod golden;
 pub mod kcrypto_rows;
+pub mod kernel_crypto_ledger;
 pub mod tempdir;
 
 pub use alg_fixture::{
