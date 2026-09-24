@@ -54,10 +54,15 @@ all reject).
   row (a sync return IS its terminal result).
 - `async-once`: exact-driver async alloc, EINPROGRESS submit,
   workqueue completion on another CPU, free.
-- `delayed-completion`: slow waiter (200ms pre-wait sleep) plus a
-  progress marker: progress + terminal callbacks.
-- `backlog-accepted`: four concurrent `MAY_BACKLOG` submits on one
-  transform; `-EBUSY` still means queued (terminal via callback).
+- `delayed-completion`: provider delays the async completion by
+  200ms; the waiter marks the genuinely in-flight invocation with a
+  progress row and verifies the elapsed time (progress + terminal
+  notifications, in that order).
+- `backlog-accepted`: four `MAY_BACKLOG` submits on one transform
+  against a depth-1 driver queue with the drain held: submit 0
+  returns `-EINPROGRESS`, submits 1-3 genuinely return `-EBUSY`
+  (queued as backlog); all four complete via callback after the
+  kick. Any deviation fails the run (`-EPROTO`).
 - `early-callback`: pre-wait completion poll recorded as exactly one
   progress row (hit or miss), then the terminal.
 - `exact-driver`: generic-name alloc must resolve to exactly the

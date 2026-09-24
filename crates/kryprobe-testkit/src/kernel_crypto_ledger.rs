@@ -9,8 +9,11 @@
 use std::collections::HashSet;
 
 /// One parsed request: its fixture sequence, submitted operation
-/// label, terminal native errno and callback notification count
-/// (progress + terminal rows).
+/// label, terminal native errno and progress/terminal notification
+/// count.
+///
+/// A progress row is a waiter-side in-flight marker, never a kernel
+/// callback; only the terminal row is the completion notification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerRequest {
     /// Fixture invocation sequence.
@@ -20,7 +23,7 @@ pub struct LedgerRequest {
     /// Native errno of the terminal row.
     pub terminal_errno: i32,
     /// Progress + terminal rows observed for this sequence.
-    pub callbacks: u32,
+    pub notifications: u32,
 }
 
 /// One transform lifetime: allocation sequence, requested and
@@ -95,12 +98,15 @@ struct Build {
     seq: u64,
     /// Whether the submit row arrived (later phases require it).
     submitted: bool,
+    /// Whether the return row arrived (terminal requires it: every
+    /// invocation has a submit return, even async EINPROGRESS).
+    returned: bool,
     /// Operation label from the submit row.
     submit_op: Option<String>,
     /// Terminal errno once the terminal row arrives.
     terminal_errno: Option<i32>,
     /// Progress + terminal rows seen so far.
-    callbacks: u32,
+    notifications: u32,
 }
 
 /// Sequence key for run-level rows (DONE), which carry no `seq`.
@@ -124,21 +130,52 @@ fn malformed(lineno: usize, msg: &str) -> LedgerError {
     LedgerError::Malformed(format!("line {}: {msg}", lineno + 1))
 }
 
+/// Required non-empty string field (`op` on submit, `req`/`drv` on
+/// alloc). Empty values carry no identity and are rejected.
+fn nonempty_str<'a>(
+    row: &'a serde_json::Value,
+    lineno: usize,
+    phase: &str,
+    field: &str,
+) -> Result<&'a str, LedgerError> {
+    let value = row
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| malformed(lineno, &format!("{phase} row missing {field}")))?;
+    if value.is_empty() {
+        return Err(malformed(lineno, &format!("{phase} row has empty {field}")));
+    }
+    Ok(value)
+}
+
+/// Required native errno (`return`, `progress`, `terminal` rows).
+/// Presence and type are structural; values are truth data the
+/// per-scenario validator interprets.
+fn row_errno(row: &serde_json::Value, lineno: usize, phase: &str) -> Result<i32, LedgerError> {
+    let errno = row
+        .get("errno")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| malformed(lineno, &format!("{phase} row missing errno")))?;
+    i32::try_from(errno).map_err(|_| malformed(lineno, &format!("{phase} errno out of i32 range")))
+}
+
 /// Parses `text` as the JSONL ledger of run `expected_run`.
 ///
 /// Row schema (all objects, unknown fields ignored so the fixture
 /// can grow): `v` (must be 1), `run` (must match), `phase` (one of
 /// submit/return/progress/terminal/alloc/free/done), `seq` on every
-/// phase but `done`, `op` on submit rows, `req`/`drv` on alloc rows,
-/// `errno` on terminal rows, optional `overflow` counter (nonzero
-/// rejects), required `fixture_result` on the DONE row (nonzero
-/// rejects), `final` flag on free rows.
+/// phase but `done`, non-empty `op` on submit rows, non-empty
+/// `req`/`drv` on alloc rows, `errno` on return/progress/terminal
+/// rows, `overflow` counter on every row that carries it (nonzero
+/// rejects) and required on DONE, required `fixture_result` on the
+/// DONE row (nonzero rejects), required `final` flag on free rows.
 ///
 /// Strictness is load-bearing: (sequence, phase) rows are unique
 /// (a future multi-progress fixture relaxes this with its own
-/// test), later request phases require a prior submit, free
-/// requires a prior alloc, every alloc must close before DONE, and
-/// the run must close with DONE.
+/// test), every request needs submit, return and terminal rows in
+/// that dependency order, free requires a prior alloc, every alloc
+/// must close before DONE, no row may follow DONE, and the run
+/// must close with DONE.
 pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, LedgerError> {
     let mut reqs: Vec<Build> = Vec::new();
     let mut alloc_builds: Vec<AllocBuild> = Vec::new();
@@ -148,6 +185,12 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
         let line = raw.trim();
         if line.is_empty() {
             continue;
+        }
+        if done {
+            return Err(LedgerError::PhaseInconsistency(format!(
+                "row after done at line {}",
+                lineno + 1
+            )));
         }
         let row: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| malformed(lineno, &format!("invalid json: {e}")))?;
@@ -192,6 +235,9 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
         }
         match phase {
             "done" => {
+                if row.get("overflow").is_none() {
+                    return Err(malformed(lineno, "done row missing overflow"));
+                }
                 let result = row
                     .get("fixture_result")
                     .and_then(serde_json::Value::as_i64)
@@ -206,14 +252,8 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
             "alloc" => {
                 // Duplicate allocs are rejected by the seen-set
                 // above, so no entry exists here.
-                let req_name = row
-                    .get("req")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| malformed(lineno, "alloc row missing req"))?;
-                let drv_name = row
-                    .get("drv")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| malformed(lineno, "alloc row missing drv"))?;
+                let req_name = nonempty_str(&row, lineno, "alloc", "req")?;
+                let drv_name = nonempty_str(&row, lineno, "alloc", "drv")?;
                 alloc_builds.push(AllocBuild {
                     seq,
                     req_name: req_name.to_owned(),
@@ -227,8 +267,10 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 match entry {
                     Some(entry) => {
                         entry.freed = true;
-                        entry.final_free =
-                            row.get("final").and_then(serde_json::Value::as_bool) == Some(true);
+                        entry.final_free = row
+                            .get("final")
+                            .and_then(serde_json::Value::as_bool)
+                            .ok_or_else(|| malformed(lineno, "free row missing final"))?;
                     }
                     None => {
                         return Err(LedgerError::PhaseInconsistency(format!(
@@ -244,18 +286,16 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                         reqs.push(Build {
                             seq,
                             submitted: false,
+                            returned: false,
                             submit_op: None,
                             terminal_errno: None,
-                            callbacks: 0,
+                            notifications: 0,
                         });
                         reqs.len() - 1
                     }
                 };
                 if phase == "submit" {
-                    let op = row
-                        .get("op")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| malformed(lineno, "submit row missing op"))?;
+                    let op = nonempty_str(&row, lineno, "submit", "op")?;
                     reqs[idx].submit_op = Some(op.to_owned());
                     reqs[idx].submitted = true;
                 } else if !reqs[idx].submitted {
@@ -263,17 +303,22 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                         "seq {seq} {phase} arrived before submit"
                     )));
                 }
-                if phase == "progress" || phase == "terminal" {
-                    reqs[idx].callbacks += 1;
+                if phase == "return" {
+                    row_errno(&row, lineno, "return")?;
+                    reqs[idx].returned = true;
+                }
+                if phase == "progress" {
+                    row_errno(&row, lineno, "progress")?;
+                    reqs[idx].notifications += 1;
                 }
                 if phase == "terminal" {
-                    let errno = row
-                        .get("errno")
-                        .and_then(serde_json::Value::as_i64)
-                        .ok_or_else(|| malformed(lineno, "terminal row missing errno"))?;
-                    let errno = i32::try_from(errno)
-                        .map_err(|_| malformed(lineno, "terminal errno out of i32 range"))?;
-                    reqs[idx].terminal_errno = Some(errno);
+                    if !reqs[idx].returned {
+                        return Err(LedgerError::PhaseInconsistency(format!(
+                            "seq {seq} terminal arrived before return"
+                        )));
+                    }
+                    reqs[idx].terminal_errno = Some(row_errno(&row, lineno, "terminal")?);
+                    reqs[idx].notifications += 1;
                 }
             }
             // Reachable only if the phase list above drifts from the
@@ -302,20 +347,26 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
     }
     let mut requests = Vec::with_capacity(reqs.len());
     for r in reqs {
-        match (r.submit_op, r.terminal_errno) {
-            (Some(op), Some(errno)) => requests.push(LedgerRequest {
+        match (r.submit_op, r.returned, r.terminal_errno) {
+            (Some(op), true, Some(errno)) => requests.push(LedgerRequest {
                 seq: r.seq,
                 submit_op: op,
                 terminal_errno: errno,
-                callbacks: r.callbacks,
+                notifications: r.notifications,
             }),
-            (None, _) => {
+            (None, _, _) => {
                 return Err(LedgerError::PhaseInconsistency(format!(
                     "seq {} submit carried no op",
                     r.seq
                 )));
             }
-            (_, None) => {
+            (_, false, _) => {
+                return Err(LedgerError::PhaseInconsistency(format!(
+                    "seq {} never returned",
+                    r.seq
+                )));
+            }
+            (_, _, None) => {
                 return Err(LedgerError::PhaseInconsistency(format!(
                     "seq {} never reached terminal",
                     r.seq

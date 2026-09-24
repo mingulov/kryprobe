@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/crypto.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
@@ -124,7 +125,8 @@ int kxc_run_begin(struct kxc_run *run, const char *id,
 	run->prepared = true;
 	run->done = false;
 	run->fixture_result = 0;
-	run->stop = false;
+	/* WRITE_ONCE: lockless STOP may store concurrently. */
+	WRITE_ONCE(run->stop, false);
 	kxc_ledger_reset();
 	return 0;
 }
@@ -225,20 +227,36 @@ static int kxc_sync_crypt(struct skcipher_request *req)
 	return kxc_do_crypt(req);
 }
 
-struct kxc_async_work {
-	struct work_struct work;
-	struct skcipher_request *req;
-};
+/*
+ * Genuine crypto backlog: depth-1 driver queue. The first queued
+ * submit returns -EINPROGRESS; further concurrent submits with
+ * MAY_BACKLOG return -EBUSY and still complete via callback.
+ * The hold flag pauses drain queueing so the burst scenario's
+ * submit window is fully deterministic (no timing races).
+ */
+#define KXC_BQ_MAX_QLEN 1
+static struct crypto_queue kxc_bq;
+static struct work_struct kxc_drain_work;
+static atomic_t kxc_submit_hold;
+static atomic_t kxc_delay_ms;
 
 static void kxc_async_fn(struct work_struct *work)
 {
-	struct kxc_async_work *w =
-		container_of(work, struct kxc_async_work, work);
-	struct skcipher_request *req = w->req;
-	int err = kxc_do_crypt(req);
+	struct crypto_async_request *areq;
+	struct skcipher_request *req;
+	int delay_ms, err;
 
-	kfree(w);
-	crypto_request_complete(&req->base, err);
+	for (;;) {
+		areq = crypto_dequeue_request(&kxc_bq);
+		if (!areq)
+			break;
+		delay_ms = atomic_read(&kxc_delay_ms);
+		if (delay_ms > 0)
+			msleep((unsigned int)delay_ms);
+		req = skcipher_request_cast(areq);
+		err = kxc_do_crypt(req);
+		crypto_request_complete(areq, err);
+	}
 }
 
 /*
@@ -253,21 +271,41 @@ void kxc_flush_work(void)
 	flush_workqueue(kxc_wq);
 }
 
-static int kxc_async_crypt(struct skcipher_request *req)
+static void kxc_queue_drain(void)
 {
-	struct kxc_async_work *w;
 	int cpu, ncpu;
 
-	w = kmalloc(sizeof(*w), GFP_ATOMIC);
-	if (!w)
-		return -ENOMEM;
-	w->req = req;
-	INIT_WORK(&w->work, kxc_async_fn);
-	/* Cross-CPU completion: never the submitting CPU when one exists. */
+	/* Cross-CPU completion: never the queueing CPU when one exists. */
 	ncpu = num_online_cpus();
 	cpu = ncpu > 1 ? (int)((smp_processor_id() + 1) % (unsigned int)ncpu) : 0;
-	queue_work_on(cpu, kxc_wq, &w->work);
-	return -EINPROGRESS;
+	queue_work_on(cpu, kxc_wq, &kxc_drain_work);
+}
+
+void kxc_drain_kick(void)
+{
+	kxc_queue_drain();
+}
+
+void kxc_set_submit_hold(bool hold)
+{
+	atomic_set(&kxc_submit_hold, hold ? 1 : 0);
+}
+
+void kxc_set_delay_ms(int ms)
+{
+	atomic_set(&kxc_delay_ms, ms);
+}
+
+static int kxc_async_crypt(struct skcipher_request *req)
+{
+	int err;
+
+	err = crypto_enqueue_request(&kxc_bq, &req->base);
+	if (err != -EINPROGRESS && err != -EBUSY)
+		return err;
+	if (!atomic_read(&kxc_submit_hold))
+		kxc_queue_drain();
+	return err;
 }
 
 static struct skcipher_alg kxc_sync_alg = {
@@ -326,6 +364,20 @@ static ssize_t kxc_control_write(struct file *file, const char __user *buf,
 		return -EFAULT;
 	cmd[len] = '\0';
 
+	/*
+	 * STOP is lockless by design: GO holds kxc_run_lock for the
+	 * whole scenario, so a locking STOP could never interrupt
+	 * it. The idle check is best-effort (racy against DONE); a
+	 * stale flag is always cleared by the next PREPARE, and a
+	 * flag set with no run prepared is harmless (cleared too).
+	 */
+	if (!strcmp(cmd, "STOP\n") || !strcmp(cmd, "STOP")) {
+		if (!READ_ONCE(kxc_run.prepared) || READ_ONCE(kxc_run.done))
+			return -EALREADY;
+		kxc_run_request_stop(&kxc_run);
+		return (int)len;
+	}
+
 	mutex_lock(&kxc_run_lock);
 	if (!strcmp(cmd, "GO\n") || !strcmp(cmd, "GO")) {
 		if (!kxc_run.prepared) {
@@ -341,13 +393,6 @@ static ssize_t kxc_control_write(struct file *file, const char __user *buf,
 				kxc_ledger_dropped(), ktime_get_ns());
 			kxc_run_finish(&kxc_run, ret < 0 ? ret : 0);
 			ret = ret < 0 ? ret : (int)len;
-		}
-	} else if (!strcmp(cmd, "STOP\n") || !strcmp(cmd, "STOP")) {
-		if (!kxc_run.prepared || kxc_run.done) {
-			ret = -EALREADY;
-		} else {
-			kxc_run_request_stop(&kxc_run);
-			ret = (int)len;
 		}
 	} else if (sscanf(cmd, "PREPARE %64s %32s %llu %n", id, scenario,
 			   &seed, &nchars) == 3 &&
@@ -466,6 +511,10 @@ static int __init kxc_init(void)
 		vfree(kxc_log.rows);
 		return -ENOMEM;
 	}
+	crypto_init_queue(&kxc_bq, KXC_BQ_MAX_QLEN);
+	INIT_WORK(&kxc_drain_work, kxc_async_fn);
+	atomic_set(&kxc_submit_hold, 0);
+	atomic_set(&kxc_delay_ms, 0);
 
 	kxc_debugfs_dir = debugfs_create_dir("kcrypto_fixture", NULL);
 	debugfs_create_file("control", 0600, kxc_debugfs_dir, NULL,
@@ -502,8 +551,10 @@ static void __exit kxc_exit(void)
 	 * wait): async requests complete before GO returns, and rmmod
 	 * during GO is excluded by the run mutex held across the
 	 * scenario, but the destroy is the backstop either way.
+	 * A nonempty backlog queue at unload is a fixture leak: loud.
 	 */
 	destroy_workqueue(kxc_wq);
+	WARN_ON(crypto_queue_len(&kxc_bq) != 0);
 	vfree(kxc_log.rows);
 	pr_info("kcrypto_fixture: unloaded\n");
 }

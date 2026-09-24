@@ -8,6 +8,7 @@
  *   submit:   {"v":1,"run":R,"seq":N,"phase":"submit","op":O,"len":L,...}
  *   return:   {"v":1,"run":R,"seq":N,"phase":"return","errno":E,...}
  *   progress: {"v":1,"run":R,"seq":N,"phase":"progress","errno":E,...}
+ *     (waiter-side in-flight marker, never a kernel callback)
  *   terminal: {"v":1,"run":R,"seq":N,"phase":"terminal","errno":E,...}
  *   free:     {"v":1,"run":R,"seq":N,"phase":"free","final":B,...}
  *   done:     {"v":1,"run":R,"phase":"done","fixture_result":F,
@@ -17,6 +18,11 @@
  * (run_id at PREPARE, suffix at load, the rest are constants), so
  * no JSON escaping is needed; validation failure rejects the input,
  * never emits a lying row.
+ *
+ * Structural strictness (enforced by testkit kernel_crypto_ledger):
+ * every request needs submit, return and terminal rows; op/req/drv
+ * are non-empty; return/progress/terminal carry errno; free
+ * carries final; DONE carries overflow; no row follows DONE.
  */
 #ifndef KXC_FIXTURE_H
 #define KXC_FIXTURE_H
@@ -62,6 +68,9 @@ void kxc_run_request_stop(struct kxc_run *run);
 const char *kxc_sync_driver_name(void);
 const char *kxc_async_driver_name(void);
 void kxc_flush_work(void);
+void kxc_drain_kick(void);
+void kxc_set_submit_hold(bool hold);
+void kxc_set_delay_ms(int ms);
 
 /* consumer.c: scenarios. */
 int kxc_scenario_run(struct kxc_run *run, const char *scenario);

@@ -12,11 +12,11 @@ const LITERAL_ASYNC_SUBMIT: &str = r#"{"v":1,"run":"run-1","seq":7,"phase":"subm
 {"v":1,"run":"run-1","seq":7,"phase":"return","errno":-115,"ts":1200,"cpu":3}
 {"v":1,"run":"run-1","seq":7,"phase":"progress","errno":-115,"ts":1500,"cpu":5}
 {"v":1,"run":"run-1","seq":7,"phase":"terminal","errno":0,"ts":1800,"cpu":5}
-{"v":1,"run":"run-1","phase":"done","fixture_result":0,"ts":1900}
+{"v":1,"run":"run-1","phase":"done","fixture_result":0,"overflow":0,"ts":1900}
 "#;
 
 #[test]
-fn literal_async_submit_yields_one_completed_request_and_two_callbacks() {
+fn literal_async_submit_yields_one_completed_request_and_two_notifications() {
     let ledger = parse_ledger("run-1", LITERAL_ASYNC_SUBMIT).expect("literal parses");
     assert_eq!(ledger.run_id, "run-1");
     assert!(ledger.done, "run reached DONE");
@@ -25,7 +25,7 @@ fn literal_async_submit_yields_one_completed_request_and_two_callbacks() {
     assert_eq!(req.seq, 7);
     assert_eq!(req.submit_op, "encrypt", "submit op label carried");
     assert_eq!(req.terminal_errno, 0, "terminal success");
-    assert_eq!(req.callbacks, 2, "progress + terminal notifications");
+    assert_eq!(req.notifications, 2, "progress + terminal notifications");
 }
 
 #[test]
@@ -40,11 +40,24 @@ fn submit_without_op_rejected() {
 
 const TERMINAL_ROW: &str =
     r#"{"v":1,"run":"run-1","seq":7,"phase":"terminal","errno":0,"ts":1800,"cpu":5}"#;
-const DONE_ROW: &str = r#"{"v":1,"run":"run-1","phase":"done","fixture_result":0,"ts":1900}"#;
+const DONE_ROW: &str =
+    r#"{"v":1,"run":"run-1","phase":"done","fixture_result":0,"overflow":0,"ts":1900}"#;
 
 #[test]
 fn duplicate_terminal_row_rejected() {
-    let text = format!("{LITERAL_ASYNC_SUBMIT}{TERMINAL_ROW}\n");
+    // Duplicate lands BEFORE done: still the DuplicateRow class
+    // (anything after DONE is row-after-done instead).
+    let text: String = LITERAL_ASYNC_SUBMIT
+        .lines()
+        .flat_map(|l| {
+            if l.contains(r#""phase":"done""#) {
+                vec![TERMINAL_ROW, l]
+            } else {
+                vec![l]
+            }
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
     assert_eq!(
         parse_ledger("run-1", &text),
         Err(LedgerError::DuplicateRow {
@@ -55,15 +68,22 @@ fn duplicate_terminal_row_rejected() {
 }
 
 #[test]
-fn duplicate_done_row_rejected() {
+fn done_row_after_done_rejected() {
+    // A second DONE is a row after DONE, not a duplicate row.
     let text = format!("{LITERAL_ASYNC_SUBMIT}{DONE_ROW}\n");
-    assert_eq!(
+    assert!(matches!(
         parse_ledger("run-1", &text),
-        Err(LedgerError::DuplicateRow {
-            seq: u64::MAX,
-            phase: "done".to_owned(),
-        }),
-    );
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
+fn row_after_done_rejected() {
+    let text = format!("{LITERAL_ASYNC_SUBMIT}{TERMINAL_ROW}\n");
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
 }
 
 #[test]
@@ -98,6 +118,94 @@ fn return_before_submit_rejected() {
         parse_ledger("run-1", &text),
         Err(LedgerError::PhaseInconsistency(_))
     ));
+}
+
+#[test]
+fn terminal_without_return_rejected() {
+    // Every invocation has a submit return, even async EINPROGRESS.
+    let text: String = LITERAL_ASYNC_SUBMIT
+        .lines()
+        .filter(|l| !l.contains(r#""phase":"return""#))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
+fn return_without_errno_rejected() {
+    let text =
+        LITERAL_ASYNC_SUBMIT.replace(r#""phase":"return","errno":-115"#, r#""phase":"return""#);
+    let err = parse_ledger("run-1", &text).expect_err("errno-less return rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn progress_without_errno_rejected() {
+    let text = LITERAL_ASYNC_SUBMIT.replace(
+        r#""phase":"progress","errno":-115"#,
+        r#""phase":"progress""#,
+    );
+    let err = parse_ledger("run-1", &text).expect_err("errno-less progress rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn done_without_overflow_rejected() {
+    let text = LITERAL_ASYNC_SUBMIT.replace(r#""overflow":0,"#, "");
+    let err = parse_ledger("run-1", &text).expect_err("overflow-less done rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn free_without_final_rejected() {
+    let text = LITERAL_WITH_LIFETIME.replace(r#""final":true"#, r#""final":null"#);
+    let err = parse_ledger("run-1", &text).expect_err("final-less free rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn submit_empty_op_rejected() {
+    let text = LITERAL_ASYNC_SUBMIT.replace(r#""op":"encrypt""#, r#""op":"""#);
+    let err = parse_ledger("run-1", &text).expect_err("empty op rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn alloc_empty_req_rejected() {
+    let text = LITERAL_WITH_LIFETIME.replace(r#""req":"kxcipher""#, r#""req":"""#);
+    let err = parse_ledger("run-1", &text).expect_err("empty req rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn alloc_empty_drv_rejected() {
+    let text = LITERAL_WITH_LIFETIME.replace(r#""drv":"kcipher-sync""#, r#""drv":"""#);
+    let err = parse_ledger("run-1", &text).expect_err("empty drv rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
 }
 
 #[test]
@@ -154,7 +262,7 @@ const LITERAL_WITH_LIFETIME: &str = r#"{"v":1,"run":"run-1","seq":3,"phase":"all
 {"v":1,"run":"run-1","seq":7,"phase":"progress","errno":-115,"ts":1500,"cpu":5}
 {"v":1,"run":"run-1","seq":7,"phase":"terminal","errno":0,"ts":1800,"cpu":5}
 {"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}
-{"v":1,"run":"run-1","phase":"done","fixture_result":0,"ts":1900}
+{"v":1,"run":"run-1","phase":"done","fixture_result":0,"overflow":0,"ts":1900}
 "#;
 
 #[test]

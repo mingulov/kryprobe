@@ -8,7 +8,6 @@
  */
 #include <linux/completion.h>
 #include <linux/crypto.h>
-#include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -24,7 +23,7 @@
 #define KXC_WAIT_SLICES 100
 /* Backlog burst width (concurrent MAY_BACKLOG requests, one tfm). */
 #define KXC_BURST_NREQS 4
-/* Delayed-completion waiter sleep before the first wait slice. */
+/* Delayed-completion provider delay per async completion (ms). */
 #define KXC_DELAY_MS 200
 
 static const u8 kxc_key[KXC_KEYLEN] = "0123456789abcdef";
@@ -216,11 +215,17 @@ static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
 		if (kxc_run_stop_requested(run)) {
 			/*
 			 * No callback may touch op/ledger after we
-			 * return: flush the driver queue first. A late
-			 * terminal row still lands before DONE, and the
-			 * nonzero result rejects the run honestly.
+			 * return: flush the driver queue first. The
+			 * flush normally delivers the callback's own
+			 * terminal row; the waiter records one only
+			 * when completion is genuinely missing (no
+			 * duplicate possible: nothing is in flight
+			 * after the flush). Either way the nonzero
+			 * result rejects the run honestly.
 			 */
 			kxc_flush_work();
+			if (!completion_done(&op->done))
+				kxc_emit_terminal(run, op->seq, -ECANCELED);
 			return -ECANCELED;
 		}
 		if (wait_for_completion_timeout(&op->done,
@@ -228,6 +233,8 @@ static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
 			return op->err;
 	}
 	kxc_flush_work();
+	if (!completion_done(&op->done))
+		kxc_emit_terminal(run, op->seq, -ETIMEDOUT);
 	return -ETIMEDOUT;
 }
 
@@ -302,31 +309,38 @@ static int kxc_scenario_async_once(struct kxc_run *run)
 static int kxc_scenario_delayed_completion(struct kxc_run *run)
 {
 	struct kxc_op op;
-	u64 aseq, seq;
+	u64 aseq, seq, t0, elapsed_ms;
 	int err;
 
 	err = kxc_op_prepare(run, &op, kxc_async_driver_name(), &aseq);
 	if (err)
 		return err;
+	/*
+	 * Genuine slow completion: the provider delays every async
+	 * completion by KXC_DELAY_MS. The progress row below is a
+	 * true in-flight marker (completion still pending), and the
+	 * elapsed check verifies the delay was honored. Delay is
+	 * cleared on every exit so no later scenario inherits it.
+	 */
+	kxc_set_delay_ms(KXC_DELAY_MS);
 	seq = kxc_next_seq(run);
 	op.seq = seq;
 	kxc_emit_submit(run, seq, "encrypt-delayed", KXC_BLOCK);
+	t0 = ktime_get_ns();
 	err = crypto_skcipher_encrypt(op.req);
 	kxc_emit_return(run, seq, err);
 	if (err != -EINPROGRESS) {
 		kxc_emit_terminal(run, seq, err);
+		kxc_set_delay_ms(0);
 		kxc_op_release(run, &op, aseq);
 		return err;
 	}
-	/*
-	 * Slow waiter: sleep before the first wait slice, then mark
-	 * the in-flight invocation with a progress row. Two
-	 * callbacks (progress + terminal) distinguish this from
-	 * async-once.
-	 */
-	msleep(KXC_DELAY_MS);
 	kxc_emit_progress(run, seq, -EINPROGRESS);
 	err = kxc_wait_done(run, &op);
+	elapsed_ms = (ktime_get_ns() - t0) / 1000000;
+	kxc_set_delay_ms(0);
+	if (!err && elapsed_ms < KXC_DELAY_MS / 2)
+		err = -EPROTO;
 	kxc_op_release(run, &op, aseq);
 	return err;
 }
@@ -336,39 +350,60 @@ static int kxc_scenario_backlog_accepted(struct kxc_run *run)
 	struct crypto_skcipher *tfm;
 	struct kxc_op ops[KXC_BURST_NREQS];
 	u64 aseq, seqs[KXC_BURST_NREQS];
-	bool pending[KXC_BURST_NREQS];
+	bool pending[KXC_BURST_NREQS] = { false };
 	int err, first_err = 0;
 	int i, nsetup = 0;
 
 	err = kxc_tfm_acquire(run, kxc_async_driver_name(), &tfm, &aseq);
 	if (err)
 		return err;
+	/*
+	 * Hold the drain while submitting: with the depth-1 driver
+	 * queue, submit 0 deterministically returns -EINPROGRESS
+	 * and submits 1..3 deterministically return -EBUSY (genuine
+	 * backlog, not timing). Any deviation fails the run loudly.
+	 */
+	kxc_set_submit_hold(true);
 	for (i = 0; i < KXC_BURST_NREQS; i++) {
 		err = kxc_req_setup(run, tfm, &ops[i],
 				    CRYPTO_TFM_REQ_MAY_BACKLOG);
-		if (err)
+		if (err) {
+			if (!first_err)
+				first_err = err;
 			goto teardown;
+		}
 		nsetup++;
 		seqs[i] = kxc_next_seq(run);
 		ops[i].seq = seqs[i];
 		pending[i] = false;
 	}
 	for (i = 0; i < KXC_BURST_NREQS; i++) {
+		int expected = i == 0 ? -EINPROGRESS : -EBUSY;
+
 		kxc_emit_submit(run, seqs[i], "encrypt-burst", KXC_BLOCK);
 		err = crypto_skcipher_encrypt(ops[i].req);
 		kxc_emit_return(run, seqs[i], err);
 		if (err == -EINPROGRESS || err == -EBUSY) {
 			/*
-			 * -EBUSY under MAY_BACKLOG means queued: the
-			 * terminal row still arrives via callback.
+			 * Queued (normally or as backlog): the
+			 * terminal row still arrives via callback,
+			 * so this op MUST be waited even when the
+			 * return deviates from the script.
 			 */
 			pending[i] = true;
+			if (err != expected && !first_err)
+				first_err = -EPROTO;
 		} else {
+			/* Synchronous return is always a deviation. */
 			kxc_emit_terminal(run, seqs[i], err);
 			if (!first_err)
-				first_err = err;
+				first_err = -EPROTO;
 		}
 	}
+teardown:
+	/* Always release the hold and kick the drain: no stuck queue. */
+	kxc_set_submit_hold(false);
+	kxc_drain_kick();
 	for (i = 0; i < KXC_BURST_NREQS; i++) {
 		if (!pending[i])
 			continue;
@@ -376,7 +411,6 @@ static int kxc_scenario_backlog_accepted(struct kxc_run *run)
 		if (err && !first_err)
 			first_err = err;
 	}
-teardown:
 	for (i = 0; i < nsetup; i++)
 		kxc_req_teardown(&ops[i]);
 	kxc_tfm_release(run, tfm, aseq);
@@ -464,10 +498,18 @@ static int kxc_scenario_failed_alloc(struct kxc_run *run)
 	}
 	err = PTR_ERR(tfm);
 	/*
+	 * Only the expected ENOENT completes the scenario: any
+	 * other allocation error is unexpected behavior and fails
+	 * the run honestly (nonzero DONE rejects the truth).
+	 */
+	if (err != -ENOENT)
+		return err;
+	/*
 	 * The failed allocation IS the recorded invocation: a
 	 * submit/return/terminal triple carrying the native errno,
-	 * and no alloc row (nothing was allocated). The scenario
-	 * itself completed, so the run result is 0.
+	 * and no alloc row (nothing was allocated). The "alloc-probe"
+	 * op marks it as a probe, not a skcipher invocation. The
+	 * scenario itself completed, so the run result is 0.
 	 */
 	seq = kxc_next_seq(run);
 	kxc_emit_submit(run, seq, "alloc-probe", 0);

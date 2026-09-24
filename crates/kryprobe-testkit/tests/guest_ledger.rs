@@ -54,17 +54,17 @@ fn guest_ledger_matches_scenario_contract() {
             assert_eq!(ops, ["encrypt", "decrypt"], "submit op labels");
             for req in &ledger.requests {
                 assert_eq!(req.terminal_errno, 0, "sync success");
-                assert_eq!(req.callbacks, 1, "one terminal notification");
+                assert_eq!(req.notifications, 1, "one terminal notification");
             }
         }
-        // One submit, EINPROGRESS return, one terminal callback.
+        // One submit, EINPROGRESS return, one terminal notification.
         "async-once" => {
             expect_single_lifetime(&ledger);
             assert_eq!(ledger.requests.len(), 1, "one async invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt", "submit op label");
             assert_eq!(req.terminal_errno, 0, "terminal success");
-            assert_eq!(req.callbacks, 1, "one terminal callback");
+            assert_eq!(req.notifications, 1, "one terminal notification");
         }
         // Slow waiter: one progress marker plus the terminal.
         "delayed-completion" => {
@@ -73,7 +73,7 @@ fn guest_ledger_matches_scenario_contract() {
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-delayed", "submit op label");
             assert_eq!(req.terminal_errno, 0, "terminal success");
-            assert_eq!(req.callbacks, 2, "progress + terminal");
+            assert_eq!(req.notifications, 2, "progress + terminal");
         }
         // Four concurrent MAY_BACKLOG submits on one transform.
         "backlog-accepted" => {
@@ -82,7 +82,7 @@ fn guest_ledger_matches_scenario_contract() {
             for req in &ledger.requests {
                 assert_eq!(req.submit_op, "encrypt-burst", "submit op label");
                 assert_eq!(req.terminal_errno, 0, "burst terminal success");
-                assert_eq!(req.callbacks, 1, "one terminal callback each");
+                assert_eq!(req.notifications, 1, "one terminal notification each");
             }
         }
         // Pre-wait poll recorded as one progress row either way.
@@ -92,7 +92,7 @@ fn guest_ledger_matches_scenario_contract() {
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-early", "submit op label");
             assert_eq!(req.terminal_errno, 0, "terminal success");
-            assert_eq!(req.callbacks, 2, "poll progress + terminal");
+            assert_eq!(req.notifications, 2, "poll progress + terminal");
         }
         // Generic-name request resolved to exactly the async driver.
         "exact-driver" => {
@@ -110,7 +110,7 @@ fn guest_ledger_matches_scenario_contract() {
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-exact", "submit op label");
             assert_eq!(req.terminal_errno, 0, "terminal success");
-            assert_eq!(req.callbacks, 1, "one terminal callback");
+            assert_eq!(req.notifications, 1, "one terminal notification");
         }
         // Unknown-name alloc fails; the probe triple carries ENOENT.
         "failed-alloc" => {
@@ -119,7 +119,7 @@ fn guest_ledger_matches_scenario_contract() {
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "alloc-probe", "submit op label");
             assert_eq!(req.terminal_errno, -ENOENT, "native ENOENT carried");
-            assert_eq!(req.callbacks, 1, "one terminal notification");
+            assert_eq!(req.notifications, 1, "one terminal notification");
         }
         // Reference held across the run, zero invocations.
         "refheld-release" => {
