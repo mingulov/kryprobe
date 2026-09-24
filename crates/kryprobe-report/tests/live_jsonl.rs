@@ -38,6 +38,12 @@ fn kcrypto_obs(
     let mut payload = serde_json::Map::new();
     if let Some(op) = op {
         payload.insert("op".to_owned(), serde_json::Value::String(op.to_owned()));
+        // Op-bearing fixtures are agg rows (only agg rows take an
+        // outcome); who-shaped fixtures stay marker-like.
+        payload.insert(
+            "row".to_owned(),
+            serde_json::Value::String("agg".to_owned()),
+        );
     }
     if let Some(algorithm) = algorithm {
         payload.insert(

@@ -115,6 +115,19 @@ fn rewrite_checksums(stage: &Path, paths: &[&str]) {
     std::fs::write(stage.join("sha256sums.txt"), text).expect("checksums");
 }
 
+/// Rewrite `manifest.json` for the files currently staged: a fully
+/// self-consistent stage, so refusal must come from pin enforcement,
+/// never from manifest mismatch. Template mirrors
+/// `build-release.sh` (drift fails the test loudly, never silently).
+fn rewrite_manifest(stage: &Path) {
+    let bin = sha256_file(&stage.join("bin/kryprobe"));
+    let obj = sha256_file(&stage.join("bin/kryprobe-bpf/kcrypto.bpf.o"));
+    let manifest = format!(
+        "{{\"kryprobe_release_manifest\":1,\"binary\":{{\"path\":\"bin/kryprobe\",\"sha256\":\"{bin}\"}},\"objects\":[{{\"name\":\"kcrypto.bpf.o\",\"path\":\"bin/kryprobe-bpf/kcrypto.bpf.o\",\"sha256\":\"{obj}\"}}],\"pins_enforced\":true,\"pin_digests\":[\"{obj}\"]}}\n"
+    );
+    std::fs::write(stage.join("manifest.json"), manifest).expect("manifest");
+}
+
 /// Seed a destination with sentinel bytes; returns the marker pair so
 /// the test can prove a refused install changed nothing.
 fn seed_dest_pair(destdir: &Path) -> (Vec<u8>, Vec<u8>) {
@@ -178,9 +191,10 @@ fn installer_accepts_valid_pinned_stage() {
     );
 }
 
-/// Wrong-family object bytes under the kcrypto name with regenerated
-/// checksums: the manifest still pins the original digest and the
-/// pinned binary trusts only that digest — refuse, dest unchanged.
+/// Wrong-family object bytes under the kcrypto name in a fully
+/// self-consistent stage (checksums and manifest regenerated): only
+/// the staged binary's pin check can refuse — the pinned binary
+/// trusts its baked digest, not these bytes. Dest unchanged.
 #[test]
 fn installer_refuses_rehashed_wrong_object() {
     let scratch = kryprobe_testkit::TempDir::named("installer-object").expect("scratch");
@@ -192,20 +206,25 @@ fn installer_refuses_rehashed_wrong_object() {
     )
     .expect("wrong-family object");
     rewrite_checksums(&stage, &["bin/kryprobe", "bin/kryprobe-bpf/kcrypto.bpf.o"]);
+    rewrite_manifest(&stage);
     let destdir = scratch.path().join("installed");
     let markers = seed_dest_pair(&destdir);
     let out = install_stage(&stage, &destdir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "wrong object must be refused, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "wrong object must be refused, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not trust the staged object"),
+        "refusal comes from pin enforcement: {stderr}"
     );
     assert_dest_pair_unchanged(&destdir, &markers);
 }
 
-/// Unpinned dev binary with regenerated checksums and the old
-/// manifest: the binary reports `pins_enforced:false` — refuse, dest
-/// unchanged.
+/// Unpinned dev binary in a fully self-consistent stage (checksums
+/// and manifest regenerated): only the staged binary's pin check can
+/// refuse — the binary reports `pins_enforced:false`. Dest unchanged.
 #[test]
 fn installer_refuses_unpinned_binary() {
     let scratch = kryprobe_testkit::TempDir::named("installer-binary").expect("scratch");
@@ -230,13 +249,18 @@ fn installer_refuses_unpinned_binary() {
     let (stage, _pin) = build_pinned_stage(scratch.path(), "pkg");
     std::fs::copy(&debug_bin, stage.join("bin/kryprobe")).expect("unpinned binary");
     rewrite_checksums(&stage, &["bin/kryprobe", "bin/kryprobe-bpf/kcrypto.bpf.o"]);
+    rewrite_manifest(&stage);
     let destdir = scratch.path().join("installed");
     let markers = seed_dest_pair(&destdir);
     let out = install_stage(&stage, &destdir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "unpinned binary must be refused, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "unpinned binary must be refused, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("is not pin-enforced"),
+        "refusal comes from pin enforcement: {stderr}"
     );
     assert_dest_pair_unchanged(&destdir, &markers);
 }
@@ -252,10 +276,14 @@ fn installer_refuses_omitted_binary_checksum() {
     let destdir = scratch.path().join("installed");
     let markers = seed_dest_pair(&destdir);
     let out = install_stage(&stage, &destdir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "omitted binary checksum must be refused, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "omitted binary checksum must be refused, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("do not match the payload files"),
+        "refusal comes from checksum cover: {stderr}"
     );
     assert_dest_pair_unchanged(&destdir, &markers);
 }
@@ -275,10 +303,14 @@ fn installer_refuses_invalid_manifest() {
     let destdir = scratch.path().join("installed");
     let markers = seed_dest_pair(&destdir);
     let out = install_stage(&stage, &destdir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "invalid manifest must be refused, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "invalid manifest must be refused, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("is not manifest v1"),
+        "refusal comes from manifest validation: {stderr}"
     );
     assert_dest_pair_unchanged(&destdir, &markers);
 }
@@ -301,12 +333,31 @@ fn installer_refuses_manifest_digest_mismatch() {
     let destdir = scratch.path().join("installed");
     let markers = seed_dest_pair(&destdir);
     let out = install_stage(&stage, &destdir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "manifest digest mismatch must be refused, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "manifest digest mismatch must be refused, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("is not manifest v1"),
+        "refusal comes from manifest validation: {stderr}"
     );
     assert_dest_pair_unchanged(&destdir, &markers);
+}
+
+/// A `--cargo` wrapper applying a host-only strip setting to real
+/// `build` invocations (differentiates same-source builds without
+/// touching source); `xtask` invocations pass through untouched.
+fn write_strip_wrapper(path: &Path) {
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = build ]; then\n    export CARGO_PROFILE_RELEASE_STRIP=symbols\nfi\nexec {} \"$@\"\n",
+            env!("CARGO")
+        ),
+    )
+    .expect("wrapper");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
 /// A custom `CARGO_TARGET_DIR` build stages the executable from that
@@ -326,15 +377,7 @@ fn build_release_stages_actual_target_dir_build() {
 
     // Same source, isolated target dir, host-only strip setting.
     let wrapper = scratch.path().join("cargo-stripped.sh");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nset -eu\nif [ \"$1\" = build ]; then\n    export CARGO_PROFILE_RELEASE_STRIP=symbols\nfi\nexec {} \"$@\"\n",
-            env!("CARGO")
-        ),
-    )
-    .expect("wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_strip_wrapper(&wrapper);
     let isolated = scratch.path().join("isolated-target");
     let stage = scratch.path().join("pkg");
     let out = run(Command::new("sh")
@@ -363,6 +406,81 @@ fn build_release_stages_actual_target_dir_build() {
         sha256_file(&default_bin),
         prior_hash,
         "default target left alone"
+    );
+}
+
+/// A relative `CARGO_TARGET_DIR` resolves against the workspace root
+/// (Cargo's own rule at its invocation directory): the stage carries
+/// that build's executable, not the default-target binary.
+#[test]
+fn build_release_stages_relative_target_dir_build() {
+    let scratch = kryprobe_testkit::TempDir::named("target-dir-relative").expect("scratch");
+    let root = workspace_root();
+    let script = root.join("packaging/build-release.sh");
+    let default_bin = ambient_target_dir(&root).join("release/kryprobe");
+
+    // Prior distinguishable binary in the default target.
+    let (_prior_stage, _prior_pin) = build_pinned_stage(scratch.path(), "prior-pkg");
+    let prior_hash = sha256_file(&default_bin);
+
+    // Same source, process-unique relative target dir, strip setting.
+    let rel = format!("target-isolated-rel-{}", std::process::id());
+    assert!(!Path::new(&rel).is_absolute(), "test premise: relative dir");
+    let _ = std::fs::remove_dir_all(root.join(&rel));
+    let wrapper = scratch.path().join("cargo-stripped.sh");
+    write_strip_wrapper(&wrapper);
+    let stage = scratch.path().join("pkg");
+    let out = run(Command::new("sh")
+        .arg(&script)
+        .args(["--dest"])
+        .arg(&stage)
+        .args(["--cargo"])
+        .arg(&wrapper)
+        .env("CARGO_TARGET_DIR", &rel));
+    assert!(
+        out.status.success(),
+        "relative-target build stages: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let new_hash = sha256_file(&root.join(&rel).join("release/kryprobe"));
+    let staged_hash = sha256_file(&stage.join("bin/kryprobe"));
+    assert_ne!(
+        new_hash, prior_hash,
+        "strip setting distinguishes the new build"
+    );
+    assert_eq!(
+        staged_hash, new_hash,
+        "stage contains the relative-target build"
+    );
+    std::fs::remove_dir_all(root.join(&rel)).expect("cleanup");
+}
+
+/// A cold target dir (never built — no prebuilt binary to lean on)
+/// still stages: the script builds from scratch. A private scratch
+/// target dir proves the precondition; tests never mutate the shared
+/// ambient/default target dirs (concurrent script runs and sibling
+/// hashes race on them).
+#[test]
+fn build_release_builds_cold_target_dir() {
+    let scratch = kryprobe_testkit::TempDir::named("target-dir-cold").expect("scratch");
+    let script = workspace_root().join("packaging/build-release.sh");
+    let isolated = scratch.path().join("cold-target");
+    assert!(!isolated.exists(), "target dir starts cold");
+    let stage = scratch.path().join("pkg");
+    let out = run(Command::new("sh")
+        .arg(&script)
+        .args(["--dest"])
+        .arg(&stage)
+        .env("CARGO_TARGET_DIR", &isolated));
+    assert!(
+        out.status.success(),
+        "cold-target build stages: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        sha256_file(&stage.join("bin/kryprobe")),
+        sha256_file(&isolated.join("release/kryprobe")),
+        "stage contains the cold build"
     );
 }
 

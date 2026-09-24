@@ -14,7 +14,7 @@ rules:
   - id: no-kernel-md5
     source: kernel-crypto
     match:
-      stage: executed
+      stage: returned
       algorithm: md5
     decision: deny
   - id: watch-external-drivers

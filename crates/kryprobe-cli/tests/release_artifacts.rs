@@ -118,14 +118,14 @@ fn s05_staged_package_binds_binary_to_object() {
     // Wrong-family object: genuine artifact bytes (the spine
     // object, a different object family — not a previous kcrypto
     // build) under the kcrypto name — wrong identity, refused.
-    let stale = scratch.path().join("stale");
-    copy_file(&binary, &stale.join("bin/kryprobe"));
-    copy_file(&spine, &stale.join("bin/kryprobe-bpf/kcrypto.bpf.o"));
-    let versions = staged_versions(&stale.join("bin/kryprobe"), &neutral);
+    let wrong_family = scratch.path().join("wrong-family");
+    copy_file(&binary, &wrong_family.join("bin/kryprobe"));
+    copy_file(&spine, &wrong_family.join("bin/kryprobe-bpf/kcrypto.bpf.o"));
+    let versions = staged_versions(&wrong_family.join("bin/kryprobe"), &neutral);
     assert_eq!(versions["pins_enforced"], true);
     assert!(
         versions["kcrypto"].is_null(),
-        "stale object has no identity: {versions}"
+        "wrong-family object has no identity: {versions}"
     );
 }
 

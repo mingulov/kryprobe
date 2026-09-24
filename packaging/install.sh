@@ -15,8 +15,9 @@
 #                    Default sources are the worktree target dirs (dev
 #                    flow, explicitly unverified — never a release).
 #
-# Tools: POSIX sh, sha256sum, grep — no jq/python. The manifest
-# template is owned by build-release.sh; format drift fails closed.
+# Tools: POSIX sh, coreutils (sha256sum, cmp), grep — no jq/python.
+# The manifest template is owned by build-release.sh; format drift
+# fails closed.
 #
 # Layout (the H-SEC-01 trusted path — the ONLY tier an elevated
 # kryprobe loads from):
@@ -47,15 +48,24 @@ while [ $# -gt 0 ]; do
             ;;
         --no-mint) MINT=0; shift ;;
         -h|--help)
-            sed -n '2,28p' "$0"
+            sed -n '2,29p' "$0"
             exit 0
             ;;
         *) echo "install.sh: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
 
+if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "install.sh: sha256sum not found" >&2
+    exit 1
+fi
+if ! command -v cmp >/dev/null 2>&1; then
+    echo "install.sh: cmp not found" >&2
+    exit 1
+fi
+
 if [ -n "$STAGE" ]; then
-    STAGE_ABS=$(cd "$STAGE" && pwd) || {
+    STAGE_ABS=$(CDPATH='' cd "$STAGE" && pwd) || {
         echo "install.sh: stage is not a directory: $STAGE" >&2
         exit 1
     }
@@ -81,26 +91,20 @@ if [ -n "$STAGE" ]; then
     # The versioned manifest must be byte-exact manifest v1 for these
     # measured digests: no JSON parser, no fragment grep — any format
     # drift fails closed. Template owned by build-release.sh; keep
-    # the two in lockstep.
+    # the two in lockstep. Compared with cmp (byte-exact, NUL-safe):
+    # shell string comparison would normalize trailing newlines and
+    # strip NULs.
     MANIFEST_EXPECTED=$(printf '{"kryprobe_release_manifest":1,"binary":{"path":"bin/kryprobe","sha256":"%s"},"objects":[{"name":"kcrypto.bpf.o","path":"bin/kryprobe-bpf/kcrypto.bpf.o","sha256":"%s"}],"pins_enforced":true,"pin_digests":["%s"]}' "$BIN_DIGEST" "$OBJ_DIGEST" "$OBJ_DIGEST")
-    if [ "$(wc -l < "$MANIFEST" | tr -d ' ')" != "1" ]; then
-        echo "install.sh: stage manifest is not one line: $MANIFEST" >&2
-        exit 1
-    fi
-    if [ "$(cat "$MANIFEST")" != "$MANIFEST_EXPECTED" ]; then
+    printf '%s\n' "$MANIFEST_EXPECTED" | cmp -s - "$MANIFEST" || {
         echo "install.sh: stage manifest is not manifest v1 for these files" >&2
         exit 1
-    fi
+    }
     # The checksum list must cover exactly the shipped payload.
-    SUMS_EXPECTED=$(printf '%s  bin/kryprobe\n%s  bin/kryprobe-bpf/kcrypto.bpf.o' "$BIN_DIGEST" "$OBJ_DIGEST")
-    if [ "$(wc -l < "$SUMS" | tr -d ' ')" != "2" ]; then
-        echo "install.sh: stage checksums do not cover exactly the payload" >&2
-        exit 1
-    fi
-    if [ "$(cat "$SUMS")" != "$SUMS_EXPECTED" ]; then
+    printf '%s  bin/kryprobe\n%s  bin/kryprobe-bpf/kcrypto.bpf.o\n' \
+        "$BIN_DIGEST" "$OBJ_DIGEST" | cmp -s - "$SUMS" || {
         echo "install.sh: stage checksums do not match the payload files" >&2
         exit 1
-    fi
+    }
     # The staged binary itself must enforce the staged object's pin:
     # same predicate build-release.sh verifies after staging.
     STAGE_VERSIONS=$(cd / && env -u KRYPROBE_BPF_DIR -u KRYPROBE_BPF_OBJ \

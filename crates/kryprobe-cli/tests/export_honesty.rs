@@ -69,6 +69,20 @@ fn agg_spec(result: u8, calls: u64, ok: u64, errors: u64) -> Vec<u8> {
     })
 }
 
+/// Spread a decoded aggregate over a wide window (the review's
+/// 100..1000ns counterexample shape): duration assertions must face
+/// a real nonzero width, never a zero-window fixture.
+fn with_wide_window(mut obs: NativeObservation) -> NativeObservation {
+    obs.started_ns = Some(100);
+    obs.ended_ns = Some(1000);
+    assert_eq!(
+        obs.ended_ns.unwrap() - obs.started_ns.unwrap(),
+        900,
+        "premise: wide aggregate window"
+    );
+    obs
+}
+
 fn dim_unknown() -> kryprobe_core::evidence::DimensionCoverage {
     kryprobe_core::evidence::DimensionCoverage::new(
         CoverageStatus::Unknown,
@@ -122,7 +136,7 @@ fn observations_of(records: &[serde_json::Value]) -> Vec<&serde_json::Value> {
 /// duration and an exact errno.
 #[test]
 fn error_return_exports_no_completion_latency_or_exact_errno() {
-    let obs = decode_agg(agg_spec(KRES_ERR, 5, 0, 5));
+    let obs = with_wide_window(decode_agg(agg_spec(KRES_ERR, 5, 0, 5)));
     let text =
         kryprobe_report::live_render::render_live_jsonl(&[obs], &live_like_coverage(), false)
             .expect("renders");
@@ -149,7 +163,7 @@ fn error_return_exports_no_completion_latency_or_exact_errno() {
 fn ok_and_queued_rows_export_class_without_completion() {
     for (result, outcome) in [(KRES_OK, "success"), (KRES_QUEUED, "pending")] {
         let (ok, errors) = if result == KRES_OK { (4, 0) } else { (0, 0) };
-        let obs = decode_agg(agg_spec(result, 4, ok, errors));
+        let obs = with_wide_window(decode_agg(agg_spec(result, 4, ok, errors)));
         let text =
             kryprobe_report::live_render::render_live_jsonl(&[obs], &live_like_coverage(), false)
                 .expect("renders");
@@ -168,7 +182,7 @@ fn ok_and_queued_rows_export_class_without_completion() {
 /// still export no duration and no errno.
 #[test]
 fn wide_window_error_exports_no_duration_or_errno() {
-    let obs = decode_agg(agg_spec(KRES_ERR, 50, 0, 50));
+    let obs = with_wide_window(decode_agg(agg_spec(KRES_ERR, 50, 0, 50)));
     assert!(obs.native_code.is_none(), "fixture has no native errno");
     let text =
         kryprobe_report::live_render::render_live_jsonl(&[obs], &live_like_coverage(), false)
@@ -180,10 +194,14 @@ fn wide_window_error_exports_no_duration_or_errno() {
     assert!(payload["native_result"].is_null());
 }
 
-/// F01: totals carriers keep counts without completion claims.
+/// F01: totals carriers export as markers — returned at the API
+/// boundary with no outcome, latency, or errno. (The frozen
+/// operation record has no counts/row fields, so per-class counts
+/// stay in decoder JSON and human tables; the export must not invent
+/// an outcome for them instead.)
 #[test]
-fn totals_export_counts_without_completion() {
-    let obs = decode_totals(30);
+fn totals_export_carrier_without_outcome_or_latency() {
+    let obs = with_wide_window(decode_totals(30));
     let text =
         kryprobe_report::live_render::render_live_jsonl(&[obs], &live_like_coverage(), false)
             .expect("renders");
@@ -191,46 +209,72 @@ fn totals_export_counts_without_completion() {
     let payload = &observations_of(&records)[0]["payload"];
     assert_eq!(payload["boundary"], "api");
     assert_eq!(payload["phase"], "returned");
+    assert_eq!(payload["outcome"], "not_applicable");
     assert!(payload["duration_ns"].is_null());
+    assert!(payload["native_result"].is_null());
 }
 
 /// F02: unknown delivery/completion export as gap records and the end
-/// record references them; nothing structural is lost.
+/// record references exactly those records by id; the stream is
+/// valid event-v0.
 #[test]
 fn unknown_coverage_exports_gaps_and_references() {
     let obs = decode_agg(agg_spec(KRES_ERR, 5, 0, 5));
     let text =
         kryprobe_report::live_render::render_live_jsonl(&[obs], &live_like_coverage(), false)
             .expect("renders");
+    assert_stream_valid(&text);
     let records = export_records(&text);
     let gaps: Vec<&serde_json::Value> = records
         .iter()
         .filter(|rec| rec["kind"] == "coverage_gap")
         .collect();
-    assert!(
-        gaps.len() >= 3,
-        "aggregate, transport, and continuity gaps: {text}"
-    );
+    assert_eq!(gaps.len(), 3, "exactly the weaker dims: {text}");
     let dims: Vec<&str> = gaps
         .iter()
         .map(|gap| gap["payload"]["dimension"].as_str().expect("dim"))
         .collect();
-    for dim in [
-        "aggregate_counts",
-        "event_transport",
-        "observation_continuity",
-    ] {
-        assert!(dims.contains(&dim), "gap for {dim}: {dims:?}");
-    }
+    assert_eq!(
+        dims,
+        [
+            "aggregate_counts",
+            "event_transport",
+            "observation_continuity"
+        ],
+        "gap dims in dimension order"
+    );
+    let gap_ids: Vec<&str> = gaps
+        .iter()
+        .map(|gap| gap["record_id"].as_str().expect("gap record id"))
+        .collect();
+    assert_eq!(
+        gap_ids,
+        ["record:3", "record:4", "record:5"],
+        "start is record:1, the observation record:2"
+    );
     let end = records
         .iter()
         .find(|rec| rec["kind"] == "session_end")
         .expect("end");
     assert_eq!(end["payload"]["verdict"], "PARTIAL");
-    let unresolved = end["payload"]["unresolved_gap_ids"]
+    let unresolved: Vec<&str> = end["payload"]["unresolved_gap_ids"]
         .as_array()
-        .expect("gap id list");
-    assert_eq!(unresolved.len(), gaps.len(), "every gap referenced");
+        .expect("gap id list")
+        .iter()
+        .map(|id| id.as_str().expect("gap id string"))
+        .collect();
+    assert_eq!(
+        unresolved,
+        ["record:3", "record:4", "record:5"],
+        "end references exactly the emitted gaps"
+    );
+}
+
+fn assert_stream_valid(text: &str) {
+    let schema = kryprobe_report::resolve_schema();
+    let schema_bytes = schema.bytes().expect("schema resolves");
+    let findings = kryprobe_report::validate_str(text, schema_bytes);
+    assert!(findings.is_empty(), "export validates: {findings:?}");
 }
 
 /// F02: capture → JSONL → `report FILE` never strengthens coverage.
@@ -253,6 +297,8 @@ fn replay_never_strengthens_coverage() {
         String::from_utf8_lossy(&output.stderr)
     );
     let summary = String::from_utf8(output.stdout).expect("utf-8");
+    // Unknown in, unknown out: replay must reproduce the input
+    // weakness exactly — partial would already strengthen it.
     for dim in [
         "aggregate_counts",
         "event_transport",
@@ -263,10 +309,51 @@ fn replay_never_strengthens_coverage() {
             .find(|line| line.trim_start().starts_with(dim))
             .unwrap_or_else(|| panic!("{dim} line in:\n{summary}"));
         assert!(
-            !line.contains("complete;"),
-            "replay must not claim {dim} complete: {line}"
+            line.contains("unknown;"),
+            "replay keeps {dim} unknown: {line}"
         );
     }
+}
+
+/// F02: an interrupted window forces PARTIAL with a continuity gap
+/// even when every measured dimension held.
+#[test]
+fn interrupted_window_exports_continuity_gap_and_partial() {
+    let obs = decode_agg(agg_spec(KRES_OK, 4, 4, 0));
+    let complete = CoverageSummary {
+        target_population: dim_complete(),
+        object_discovery: dim_complete(),
+        attachment: dim_complete(),
+        aggregate_counts: dim_complete(),
+        detailed_events: dim_complete(),
+        attribution: dim_complete(),
+        correlation: dim_complete(),
+        completion: dim_complete(),
+    };
+    let text =
+        kryprobe_report::live_render::render_live_jsonl(&[obs], &complete, true).expect("renders");
+    assert_stream_valid(&text);
+    let records = export_records(&text);
+    let gaps: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|rec| rec["kind"] == "coverage_gap")
+        .collect();
+    assert_eq!(gaps.len(), 1, "only the interruption gap: {text}");
+    assert_eq!(gaps[0]["payload"]["dimension"], "observation_continuity");
+    assert_eq!(gaps[0]["payload"]["reason"], "observer_interrupted");
+    assert_eq!(gaps[0]["record_id"], "record:3");
+    let end = records
+        .iter()
+        .find(|rec| rec["kind"] == "session_end")
+        .expect("end");
+    assert_eq!(end["payload"]["verdict"], "PARTIAL");
+    let unresolved: Vec<&str> = end["payload"]["unresolved_gap_ids"]
+        .as_array()
+        .expect("gap id list")
+        .iter()
+        .map(|id| id.as_str().expect("gap id string"))
+        .collect();
+    assert_eq!(unresolved, ["record:3"]);
 }
 
 /// F02 positive control: a genuinely complete historical stream still

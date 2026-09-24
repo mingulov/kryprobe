@@ -141,13 +141,22 @@ impl JsonlWriter {
             .get("status_canonical")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        // Carriers/markers (totals, ident, who) are not operation
+        // outcomes: a healthy totals read is not a successful API
+        // return, so only agg rows take an outcome.
+        let is_agg = obs
+            .backend_payload
+            .get("row")
+            .and_then(serde_json::Value::as_str)
+            == Some("agg");
         let (outcome, native_result) = match obs.phase {
             EvidencePhase::Discovered | EvidencePhase::Selected => ("not_applicable", None),
             EvidencePhase::Entered => ("pending", None),
-            EvidencePhase::Returned | EvidencePhase::Completed => {
+            EvidencePhase::Returned | EvidencePhase::Completed if is_agg => {
                 let native = (!canonical).then(|| result_string(obs.native_result));
                 (outcome_of(obs.native_result), native)
             }
+            EvidencePhase::Returned | EvidencePhase::Completed => ("not_applicable", None),
             EvidencePhase::Succeeded => return Err(ReportError::SucceededPhase),
         };
         // F01: api-returns rows carry aggregate window bounds, never a

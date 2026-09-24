@@ -310,6 +310,21 @@ fn outcome_of_obs(obs: &NativeObservation) -> &'static str {
     let NativeResult::KCrypto { status } = obs.native_result else {
         panic!("kcrypto decode must emit KCrypto results");
     };
+    // Mirrors the report gate: carriers/markers are not operation
+    // outcomes, so only agg rows take an outcome.
+    let is_agg = obs
+        .backend_payload
+        .get("row")
+        .and_then(serde_json::Value::as_str)
+        == Some("agg");
+    if !is_agg
+        && matches!(
+            obs.phase,
+            EvidencePhase::Returned | EvidencePhase::Completed
+        )
+    {
+        return "not_applicable";
+    }
     expected_outcome(obs.phase, status)
 }
 
@@ -760,7 +775,9 @@ fn totals_row_decodes_to_returned_aggregate() {
     assert_eq!(obs.operation_class, OperationClass::Unknown);
     assert_eq!(obs.native_name, None);
     assert_eq!(obs.native_result, NativeResult::KCrypto { status: 0 });
-    assert_eq!(outcome_of_obs(&obs), "success");
+    // A healthy totals read is a carrier, not a successful API
+    // return: the export outcome is not_applicable.
+    assert_eq!(outcome_of_obs(&obs), "not_applicable");
     assert_eq!(obs.backend_payload["row"], "totals");
     assert_eq!(obs.backend_payload["counts"]["calls"].as_u64(), Some(7));
     assert_eq!(obs.backend_payload["counts"]["ok"].as_u64(), Some(7));

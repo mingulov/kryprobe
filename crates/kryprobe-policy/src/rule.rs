@@ -180,7 +180,7 @@ pub fn parse_rule(text: &str) -> Result<Rule, PolicyError> {
 /// use kryprobe_policy::{PolicyVerdict, evaluate, parse_policy};
 ///
 /// let policy = parse_policy(
-///     "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: md5\n    decision: deny\n",
+///     "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: returned\n      algorithm: md5\n    decision: deny\n",
 /// )
 /// .expect("example parses");
 /// assert_eq!(policy.rules.len(), 1);

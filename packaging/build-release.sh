@@ -12,8 +12,8 @@
 # Honors an explicit CARGO_TARGET_DIR for the host build and stages
 # the executable from that build; the BPF phase always uses the
 # default target. Concurrent runs in one worktree serialize on a
-# target-dir lock. Tools: POSIX sh, cargo, sha256sum, flock —
-# no jq/python.
+# target-dir lock. Tools: POSIX sh, cargo, coreutils (sha256sum,
+# mktemp), grep, flock — no jq/python.
 #
 # Two-phase order -- never rebuild objects after pinning without
 # rebuilding the host binary (the pin would name bytes that no
@@ -77,7 +77,7 @@ if [ ! -d "$DEST_PARENT" ]; then
     echo "build-release.sh: dest parent missing: $DEST_PARENT" >&2
     exit 1
 fi
-DEST="$(cd "$DEST_PARENT" && pwd)/$(basename -- "$DEST")"
+DEST="$(CDPATH='' cd "$DEST_PARENT" && pwd)/$(basename -- "$DEST")"
 if ! command -v "$CARGO_BIN" >/dev/null 2>&1; then
     echo "build-release.sh: cargo not found: $CARGO_BIN" >&2
     exit 1
