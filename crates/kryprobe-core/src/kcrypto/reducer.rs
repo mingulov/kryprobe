@@ -147,7 +147,10 @@ pub struct ReducerStats {
     pub admitted: u64,
     /// Records produced via `apply` or `finish`.
     pub emitted: u64,
-    /// Edges for ids never admitted (and never completed).
+    /// Edges for ids absent from both the live set and retained
+    /// tombstones: never-admitted ids, or admitted ids whose
+    /// tombstone was evicted (bounded history cannot tell them
+    /// apart).
     pub orphan: u64,
     /// Edges repeating already-known state (tombstoned ids,
     /// duplicate submits, repeat terminals).

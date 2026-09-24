@@ -48,13 +48,11 @@ pub enum LifecycleFinding {
     /// `schema` is present but not `kryprobe.kcrypto.lifecycle/v1`
     /// (the offered value is withheld: it is untrusted input).
     UnknownVersion,
-    /// A key outside the schema is present. Names the key only:
-    /// unknown values (which could be key material or buffer
-    /// contents) must never leak into diagnostics.
-    UnknownKey {
-        /// Offending key name.
-        key: String,
-    },
+    /// A key outside the schema is present. Carries nothing:
+    /// property names are untrusted input (they could smuggle key
+    /// material or buffer contents), so the finding records only
+    /// that an extra key exists. Repeated once per extra key.
+    UnknownKey,
     /// Individually well-shaped fields contradict each other (terminal
     /// truth without status, status/duration without terminal truth).
     InvalidCombination {
@@ -83,16 +81,10 @@ pub fn validate_lifecycle_v1(payload: &Value) -> Vec<LifecycleFinding> {
             });
         }
     }
-    let mut unknown: Vec<&str> = obj
-        .keys()
-        .filter(|key| !REQUIRED.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    unknown.sort_unstable();
-    for key in unknown {
-        out.push(LifecycleFinding::UnknownKey {
-            key: key.to_string(),
-        });
+    // One input-free finding per extra key (count preserved, names
+    // withheld: property names are untrusted input).
+    for _ in obj.keys().filter(|key| !REQUIRED.contains(&key.as_str())) {
+        out.push(LifecycleFinding::UnknownKey);
     }
     if !out.is_empty() {
         return out;
@@ -576,17 +568,12 @@ mod tests {
             .expect("object")
             .insert("key_material".to_string(), serde_json::json!("secret"));
         let findings = validate_lifecycle_v1(&extra);
-        assert_eq!(
-            findings,
-            vec![LifecycleFinding::UnknownKey {
-                key: "key_material".to_string()
-            }]
-        );
+        assert_eq!(findings, vec![LifecycleFinding::UnknownKey]);
         // Forbidden contents must not leak into diagnostics: the
-        // finding names the key, never its value.
+        // finding records only that an extra key exists.
         let rendered = format!("{findings:?}");
-        assert!(rendered.contains("key_material"));
         assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("key_material"));
     }
 
     #[test]
@@ -603,9 +590,7 @@ mod tests {
                 LifecycleFinding::MissingKey {
                     key: "terminal".to_string()
                 },
-                LifecycleFinding::UnknownKey {
-                    key: "key_material".to_string()
-                },
+                LifecycleFinding::UnknownKey,
             ]
         );
     }
@@ -664,6 +649,14 @@ mod tests {
             .expect("object")
             .insert("key_material".to_string(), json!(SECRET));
         cases.push(extra);
+        // Property names are untrusted input too: a secret smuggled
+        // in an extra key's NAME must not reach diagnostics either.
+        let mut sneaky = base();
+        sneaky
+            .as_object_mut()
+            .expect("object")
+            .insert(SECRET.to_string(), json!(null));
+        cases.push(sneaky);
         for case in &cases {
             let findings = validate_lifecycle_v1(case);
             assert!(!findings.is_empty(), "{case}");

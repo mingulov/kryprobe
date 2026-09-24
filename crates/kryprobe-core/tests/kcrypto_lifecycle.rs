@@ -492,6 +492,44 @@ fn eviction_drops_invalidation_fact() {
 }
 
 #[test]
+fn late_edge_after_eviction_is_orphan() {
+    // Bounded history cannot tell an evicted id from a
+    // never-admitted one: both are orphans.
+    let mut r = LifecycleReducer::new(1);
+    for (id, base) in [(1u64, 10u64), (2, 30)] {
+        assert!(
+            r.apply(Edge::Submit {
+                id,
+                tfm_id: None,
+                ts_ns: base
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            r.apply(Edge::Return {
+                id,
+                ts_ns: base + 10,
+                status: 0,
+                disposition: ReturnDisposition::Terminal,
+            })
+            .len(),
+            1
+        );
+    }
+    assert!(
+        r.apply(Edge::Callback {
+            id: 1,
+            ts_ns: 50,
+            status: 0,
+            disposition: CallbackDisposition::Terminal,
+        })
+        .is_empty()
+    );
+    assert_eq!(r.stats().orphan, 1);
+    assert_eq!(r.stats().emitted, 2);
+}
+
+#[test]
 fn deadline_gap_on_tombstone_does_not_invalidate() {
     let mut r = LifecycleReducer::new(4);
     assert!(
@@ -1413,6 +1451,44 @@ fn q05_backlog_progress_then_terminal() {
     assert_eq!(out[0].terminal, Terminal::Callback(0));
     assert_eq!(out[0].duration_ns, Some(40));
     assert_eq!(r.stats().emitted, 1);
+    // Error leg: same backlog→progress shape, terminal error status
+    // retained exactly.
+    assert!(
+        r.apply(Edge::Submit {
+            id: 2,
+            tfm_id: None,
+            ts_ns: 200
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Return {
+            id: 2,
+            ts_ns: 210,
+            status: -16,
+            disposition: ReturnDisposition::Queued,
+        })
+        .is_empty()
+    );
+    assert!(
+        r.apply(Edge::Callback {
+            id: 2,
+            ts_ns: 220,
+            status: -115,
+            disposition: CallbackDisposition::Progress,
+        })
+        .is_empty()
+    );
+    let err = r.apply(Edge::Callback {
+        id: 2,
+        ts_ns: 240,
+        status: -5,
+        disposition: CallbackDisposition::Terminal,
+    });
+    assert_eq!(err.len(), 1);
+    assert_eq!(err[0].terminal, Terminal::Callback(-5));
+    assert_eq!(err[0].duration_ns, Some(40));
+    assert_eq!(r.stats().emitted, 2);
 }
 
 #[test]
