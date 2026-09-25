@@ -3,8 +3,8 @@
 
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{
-    BPF_LINK_CREATE, BPF_TRACE_FEXIT, BPF_TRACE_UPROBE_MULTI, LinkTracing, LinkUprobeMulti, bpf,
-    fd_or_errno,
+    BPF_LINK_CREATE, BPF_TRACE_FENTRY, BPF_TRACE_FEXIT, BPF_TRACE_UPROBE_MULTI, LinkTracing,
+    LinkUprobeMulti, bpf, fd_or_errno,
 };
 use core::ffi::c_void;
 use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
@@ -218,6 +218,82 @@ pub(crate) fn fexit_link_attr(prog_fd: RawFd) -> LinkTracing {
     }
 }
 
+/// Tracing `LINK_CREATE` attr constructor, entry/exit split (T06):
+/// the same 64-byte R1 shape as [`fexit_link_attr`], with the
+/// caller-supplied attach type (`FENTRY` for entry programs, `FEXIT`
+/// for return programs). Any other attach type refuses instead of
+/// emitting a malformed attr. Token-free like the fexit twin (UAPI
+/// has no token field for link create).
+pub(crate) fn tracing_link_attr(
+    prog_fd: RawFd,
+    attach_type: u32,
+) -> Result<LinkTracing, AttachError> {
+    if attach_type != BPF_TRACE_FENTRY && attach_type != BPF_TRACE_FEXIT {
+        return Err(AttachError::Rejected {
+            reason: format!(
+                "tracing link needs FENTRY(24) or FEXIT(25) attach type, got {attach_type}"
+            ),
+        });
+    }
+    Ok(LinkTracing {
+        prog_fd: prog_fd as u32,
+        target_fd: 0,
+        attach_type,
+        flags: 0,
+        target_btf_id: 0,
+        pad: 0,
+        cookie: 0,
+        tail: [0; 4],
+    })
+}
+
+/// Attach one tracing program system-wide with an explicit attach
+/// type (T06 lifecycle entry/exit split).
+///
+/// Same authorization as [`attach_group`]'s System arm (generation
+/// guard + System-only + empty coords), reached crate-internally by
+/// the lifecycle bring-up; the shared [`AttachAuthority`] facet
+/// contract stays minimal per its SECURITY rationale. `attach_type`
+/// is `FENTRY` for entry programs, `FEXIT` for return programs (any
+/// other value refuses via [`tracing_link_attr`]).
+pub(crate) fn attach_group_tracing(
+    group: &LinkGroup,
+    guard: &GenerationGuard,
+    prog_fd: &OwnedFd,
+    attach_type: u32,
+) -> Result<OwnedLink, AttachError> {
+    if group.generation() != guard.generation {
+        return Err(AttachError::Rejected {
+            reason: format!(
+                "stale plan generation (group={} vs current={})",
+                group.generation(),
+                guard.generation
+            ),
+        });
+    }
+    if group.scope != TargetScope::System {
+        return Err(AttachError::Rejected {
+            reason: format!("tracing attach needs System scope, got {:?}", group.scope),
+        });
+    }
+    let mut attr = tracing_link_attr(prog_fd.as_raw_fd(), attach_type)?;
+    // SAFETY: attr outlives the syscall; no pointees.
+    let ret = unsafe {
+        bpf(
+            BPF_LINK_CREATE,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<LinkTracing>() as u32,
+        )
+    };
+    match fd_or_errno(ret) {
+        Ok(fd) => Ok(OwnedLink { _fd: fd }),
+        Err(errno) => Err(AttachError::LinkFailed {
+            stage: "tracing_link".to_owned(),
+            errno,
+        }),
+    }
+}
+
 /// Attach one fexit program system-wide (K1 Task 2, C1; K0 G4).
 ///
 /// Tracing `LINK_CREATE` via [`fexit_link_attr`]. `object`/`offsets`
@@ -307,6 +383,25 @@ mod tests {
         assert_eq!(attr.cookie, 0);
         assert_eq!(attr.tail, [0; 4]);
         assert_eq!(size_of::<super::LinkTracing>(), 64);
+    }
+
+    #[test]
+    fn tracing_link_attr_pins_entry_and_exit_shapes() {
+        // T06 split: the lifecycle dispatch builds one link attr per
+        // edge — FENTRY for entry programs, FEXIT for return programs
+        // (same 64-byte R1 shape, token-free); any other attach type
+        // refuses instead of emitting a malformed attr.
+        let entry = super::tracing_link_attr(99, super::BPF_TRACE_FENTRY)
+            .expect("FENTRY is a tracing attach type");
+        assert_eq!(entry.prog_fd, 99);
+        assert_eq!(entry.attach_type, super::BPF_TRACE_FENTRY);
+        assert_eq!(entry.target_btf_id, 0);
+        let exit = super::tracing_link_attr(99, super::BPF_TRACE_FEXIT)
+            .expect("FEXIT is a tracing attach type");
+        assert_eq!(exit.attach_type, super::BPF_TRACE_FEXIT);
+        assert_ne!(entry.attach_type, exit.attach_type);
+        let err = super::tracing_link_attr(99, 26).expect_err("prog type is not an attach type");
+        assert!(matches!(err, super::AttachError::Rejected { .. }), "{err}");
     }
 
     #[test]

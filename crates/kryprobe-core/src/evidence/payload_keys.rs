@@ -113,11 +113,30 @@ pub const COMPLETION_COVERAGE: &str = "completion_coverage";
 /// Capture-profile value: single-edge fexit API-return sensor
 /// (T02; the only profile in v0.1).
 pub const CAPTURE_API_RETURNS: &str = "api-returns";
+/// Capture-profile value: fentry+fexit edge-pairing sensor (T06).
+pub const CAPTURE_REQUEST_LIFECYCLE: &str = "request-lifecycle";
 /// Count-unit value: one API-invocation return, not one delivered
 /// kernel operation and not one completed request.
 pub const COUNT_API_INVOCATION_RETURN: &str = "api_invocation_return";
+/// Count-unit value: one request lifecycle outcome (completed or
+/// explicitly unknown), not one API return.
+pub const COUNT_REQUEST_LIFECYCLE: &str = "request_lifecycle";
 /// Completion-coverage value: terminal completion is not observed.
 pub const COVERAGE_UNOBSERVED: &str = "unobserved";
+/// Completion-coverage value: the terminal edge is the completion
+/// (sync returns and terminal callbacks only).
+pub const COVERAGE_OBSERVED: &str = "observed";
+/// Lifecycle terminal kind (`sync`/`callback`/`unknown`).
+pub const TERMINAL: &str = "terminal";
+/// Exact native errno (JSON integer; null iff terminal is unknown).
+pub const STATUS: &str = "status";
+/// Submit-to-terminal span as a canonical decimal u64 string (null
+/// when either endpoint is missing; never zero-filled for unknown).
+pub const DURATION_NS: &str = "duration_ns";
+/// Evidence validity: true exactly for grounded terminals.
+pub const EVIDENCE: &str = "evidence";
+/// Opaque transform id (number; null until transform attribution).
+pub const TFM_ID: &str = "tfm_id";
 
 /// Agg rows: always emitted.
 pub const AGG_KEYS: &[&str] = &[
@@ -195,6 +214,20 @@ pub const WHO_OPTIONAL_KEYS: &[&str] = &[
     FIRST_ERRNO,
 ];
 
+/// Lifecycle rows: always emitted, nothing optional (T06).
+pub const LIFECYCLE_KEYS: &[&str] = &[
+    ROW,
+    CAPTURE_PROFILE,
+    ID,
+    TFM_ID,
+    TERMINAL,
+    STATUS,
+    DURATION_NS,
+    EVIDENCE,
+    COUNT_UNIT,
+    COMPLETION_COVERAGE,
+];
+
 /// `counts` block keys.
 pub const COUNT_KEYS: &[&str] = &[CALLS, OK, ERRORS, QUEUED];
 
@@ -260,4 +293,9 @@ pub const VOCAB: &[&str] = &[
     CAPTURE_PROFILE,
     COUNT_UNIT,
     COMPLETION_COVERAGE,
+    TERMINAL,
+    STATUS,
+    DURATION_NS,
+    EVIDENCE,
+    TFM_ID,
 ];

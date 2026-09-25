@@ -17,6 +17,9 @@ mod reach;
 mod reloc;
 
 use crate::bpfloader::{KCRYPTO_MAPS, LoaderError, ParsedMap, ParsedProg};
+use crate::kcrypto_lifecycle::profile::{
+    LifecycleProfile, manifest as profile_manifest, max_programs, section_allowed,
+};
 use goblin::elf::Elf;
 
 /// 64-bit gate: the `u64 as usize` casts in this module (section
@@ -286,6 +289,168 @@ pub fn parse_kcrypto_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError> 
     let mut bases: Vec<(usize, usize)> = Vec::new();
     for (sec_idx, sec_name) in &sections {
         let symbol = sec_name.strip_prefix("fexit/").unwrap_or_default();
+        if symbol.is_empty() {
+            return Err(bad(format!(
+                "section '{sec_name}' has an empty target symbol"
+            )));
+        }
+        let sh = &elf.section_headers[*sec_idx];
+        let main = section_bytes(bytes, sh.sh_offset, sh.sh_size)?;
+        let mut insns = decode_insns(main, sec_name)?;
+        let main_len = insns.len();
+        insns.extend_from_slice(&text_insns);
+        let mut named: Option<(u64, String)> = None;
+        for sym in elf.syms.iter() {
+            if sym.st_shndx != *sec_idx
+                || goblin::elf::sym::st_type(sym.st_info) != goblin::elf::sym::STT_FUNC
+            {
+                continue;
+            }
+            let candidate = (
+                sym.st_value,
+                elf.strtab
+                    .get_at(sym.st_name)
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            if named.as_ref().is_none_or(|best| candidate.0 < best.0) {
+                named = Some(candidate);
+            }
+        }
+        let Some((_, name)) = named else {
+            return Err(bad(format!("section '{sec_name}' has no function symbol")));
+        };
+        bases.push((*sec_idx, main_len));
+        programs.push(ParsedProg {
+            name,
+            section: sec_name.clone(),
+            insns,
+        });
+    }
+    let mut map_relocs = Vec::new();
+    // Without `.text` no section can match the sentinel: call relocs
+    // fail closed ("call reloc outside .text"), map relocs in the main
+    // sections apply per stream.
+    reloc::apply_relocs(
+        &elf,
+        bytes,
+        text_idx.unwrap_or(usize::MAX),
+        &bases,
+        &mut programs,
+        &mut map_relocs,
+    )?;
+    let text_funcs = text_idx
+        .map(|idx| text_func_symbols(&elf, idx))
+        .unwrap_or_default();
+    for (prog, (_, main_len)) in programs.iter().zip(bases.iter()) {
+        let funcs: Vec<(String, usize)> = text_funcs
+            .iter()
+            .map(|(name, off)| (name.clone(), main_len + off / 8))
+            .collect();
+        reach::check_reachable(&prog.name, &prog.insns, &funcs)?;
+    }
+    Ok(ParsedKcrypto {
+        maps,
+        programs,
+        map_relocs,
+    })
+}
+
+/// ELF section flag `SHF_EXECINSTR`: marks program sections. Only
+/// sections carrying it are candidate programs; metadata sections
+/// (symtab, strtabs, relocs) never trip the section allowlist.
+const SHF_EXECINSTR: u64 = 0x4;
+/// ELF section type `SHT_NULL`: non-content (bpf-linker emits an
+/// unnamed `AX`-flagged NULL stub — `readelf` section [2] — which is
+/// never a program despite the exec flag).
+const SHT_NULL: u32 = 0;
+
+/// Parse a request-lifecycle object (T06): license, lifecycle dims,
+/// one insn stream per `fentry/*`+`fexit/*` section pair (main section
+/// ++ `.text` when present), required-site gate, relocs applied,
+/// reachability gated. No syscalls.
+///
+/// Unlike the api-returns path (per-point independence), a missing
+/// REQUIRED site refuses the whole object: lifecycle startup needs
+/// every edge to pair submit with result. The program limit derives
+/// from the profile manifest, not the api-returns 16-cap. `.text`
+/// stays optional (R4 strip rule, shared with the kcrypto path).
+/// Program names come from the first function symbol in each section.
+pub fn parse_lifecycle_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError> {
+    let profile = LifecycleProfile::RequestLifecycle;
+    let table = profile_manifest(profile);
+    let elf = Elf::parse(bytes).map_err(|err| bad(format!("ELF parse: {err}")))?;
+    if elf.header.e_machine != EM_BPF {
+        return Err(bad(format!(
+            "e_machine {} is not EM_BPF",
+            elf.header.e_machine
+        )));
+    }
+    let (_, license) = find_section(&elf, bytes, "license")?;
+    if !license.starts_with(b"GPL") {
+        return Err(bad("license section is not GPL".to_owned()));
+    }
+    // Section shape first: executable content sections outside the
+    // profile allowlist name themselves instead of tripping later
+    // gates. NULL-typed sections (the bpf-linker AX stub) and `.text`
+    // (optional, handled below) never trip the allowlist.
+    let mut sections: Vec<(usize, String)> = Vec::new();
+    for (idx, sh) in elf.section_headers.iter().enumerate() {
+        if sh.sh_type == SHT_NULL || sh.sh_flags & SHF_EXECINSTR == 0 {
+            continue;
+        }
+        let sec_name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default();
+        if sec_name == ".text" {
+            continue;
+        }
+        if !section_allowed(profile, sec_name) {
+            return Err(bad(format!(
+                "unsupported program section '{sec_name}' for profile '{}'",
+                table.name
+            )));
+        }
+        sections.push((idx, sec_name.to_owned()));
+    }
+    // Required-site gate: every manifest edge must have its section.
+    for site in table.required {
+        for (edge, want) in [("fentry", site.entry), ("fexit", site.exit)] {
+            if !want {
+                continue;
+            }
+            let section = format!("{edge}/{}", site.symbol);
+            if !sections.iter().any(|(_, name)| name == &section) {
+                return Err(bad(format!("missing required lifecycle site '{section}'")));
+            }
+        }
+    }
+    let limit = max_programs(&table);
+    if sections.len() > limit {
+        return Err(bad(format!(
+            "want {} programs from {} manifest, found {}",
+            limit,
+            table.name,
+            sections.len()
+        )));
+    }
+    let maps = maps::parse_lifecycle_maps(&elf, bytes)?;
+    // Present `.text` must decode (errors propagate); absent is fine.
+    let present = elf
+        .section_headers
+        .iter()
+        .any(|sh| elf.shdr_strtab.get_at(sh.sh_name).unwrap_or_default() == ".text");
+    let (text_idx, text_insns) = if present {
+        let (idx, text) = find_section(&elf, bytes, ".text")?;
+        (Some(idx), decode_insns(&text, ".text")?)
+    } else {
+        (None, Vec::new())
+    };
+    let mut programs: Vec<ParsedProg> = Vec::with_capacity(sections.len());
+    let mut bases: Vec<(usize, usize)> = Vec::new();
+    for (sec_idx, sec_name) in &sections {
+        let symbol = sec_name
+            .strip_prefix("fentry/")
+            .or_else(|| sec_name.strip_prefix("fexit/"))
+            .unwrap_or_default();
         if symbol.is_empty() {
             return Err(bad(format!(
                 "section '{sec_name}' has an empty target symbol"

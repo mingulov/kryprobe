@@ -19,6 +19,12 @@ pub(crate) fn build_bpf() -> i32 {
             "kcrypto.bpf.o",
             Strip::DropUnreferencedText,
         ),
+        (
+            "bpf-kcrypto",
+            "kcrypto-lifecycle",
+            "kcrypto-lifecycle.bpf.o",
+            Strip::DropUnreferencedText,
+        ),
     ])
 }
 
@@ -345,6 +351,9 @@ pub(crate) fn test_bpf() -> i32 {
         ("kryprobe-privilege", "kcrypto_attach"),
         ("kryprobe-privilege", "kcrypto_agg"),
         ("kryprobe-privilege", "kcrypto_canary"),
+        ("kryprobe-privilege", "kcrypto_lifecycle_object"),
+        ("kryprobe-privilege", "kcrypto_lifecycle_decode"),
+        ("kryprobe-privilege", "kcrypto_lifecycle_sensor"),
         ("kryprobe-cli", "cli_bpf_e2e"),
     ] {
         let code = run_child(

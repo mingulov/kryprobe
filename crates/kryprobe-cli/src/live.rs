@@ -2,7 +2,7 @@
 //! Live kcrypto capture session (K3 Task 1): the frozen-trait lifecycle
 //! driven per-tick against a session-owned sensor.
 //!
-//! Flow (D1): shared registry + [`register_kcrypto_shared`] → gate
+//! Flow (D1): shared registry + [`register_kcrypto_profile`] → gate
 //! check → `detect` → `plan` (Trace) → K5 token/caps pre-flight →
 //! stage bytes + token → `configure` once (loads the single sensor) →
 //! tick loop (`snapshot_rows` → raw events in row order → `decode` each
@@ -48,6 +48,15 @@
 //! stop on closed stdin; SIGINT is caught (4B-M5: a flag recorder, no
 //! libc in the CLI) — the tick loop observes it, finalizes, renders
 //! the partial window, and exits 3 instead of dying mid-capture.
+//!
+//! Profile twin (T06 item 4): `request-lifecycle` sessions drive the
+//! same machine through [`drive_lifecycle_session`] — per-tick ring
+//! drains into the terminal ledger, completed records decoded through
+//! the lifecycle envelope plus `decode`, stop-time `finish`
+//! reconciliation, `finalize` ONCE, and coverage from the terminal
+//! ledger. Registry and live entry points both select through
+//! [`register_kcrypto_profile`], so they can never choose different
+//! profiles/decoders.
 
 use kryprobe_abi::kcrypto_agg::kh_of;
 use kryprobe_core::backend::{
@@ -60,19 +69,24 @@ use kryprobe_core::enums::{BackendId, CaptureMode, CoverageStatus};
 use kryprobe_core::error::BackendError;
 use kryprobe_core::evidence::{
     CoverageSummary, DimensionCounter, DimensionCoverage, IntegritySummary, NativeObservation,
-    ValidityInterval,
+    SharedLosses, ValidityInterval,
 };
 use kryprobe_core::ids::{IdIssuer, PlanGeneration, SessionId};
+use kryprobe_core::kcrypto::RequestRecord;
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_core::session::{SessionController, SessionState};
 use kryprobe_privilege::btf_resolve::{ConfiguredKcrypto, KCRYPTO_SYMBOLS};
 use kryprobe_privilege::drain::DrainThread;
-use kryprobe_privilege::host::SIGINT_SEEN;
+use kryprobe_privilege::host::{SIGINT_SEEN, monotonic_ns};
 use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms};
 use kryprobe_privilege::kcrypto_backend::{
-    ClosingCounts, KCryptoBackend, KDROP_DESTROY, KDROP_SITES, WhoCache, WhoSnapshot,
-    observation_for_who, register_kcrypto_shared, snapshot_drops, snapshot_who_cached,
+    ClosingCounts, KCryptoBackend, KDROP_DESTROY, KDROP_SITES, ProfileBackend, WhoCache,
+    WhoSnapshot, observation_for_who, register_kcrypto_profile, snapshot_drops,
+    snapshot_who_cached,
 };
+use kryprobe_privilege::kcrypto_lifecycle::backend::{LifecycleBackend, lifecycle_event};
+use kryprobe_privilege::kcrypto_lifecycle::profile::{LifecycleProfile, manifest, max_programs};
+use kryprobe_privilege::kcrypto_lifecycle::sensor::{DrainOutcome, LifecycleLedger};
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
     shared_losses_from_snapshot, snapshot_rows_with_drain,
@@ -142,11 +156,14 @@ pub struct LiveConfig {
     /// privileged operation (object load, attach). Human mode stays
     /// silent (stderr is human-only/unstable there).
     pub json_audit: bool,
+    /// Capture profile (T06 F8a): registry + live entry points both
+    /// select this (never diverge); default keeps api-returns.
+    pub profile: LifecycleProfile,
 }
 
 impl Default for LiveConfig {
     /// `kernel-crypto`, unbounded, 1000ms ticks, no explicit token,
-    /// no audit trail.
+    /// no audit trail, `api-returns` profile.
     fn default() -> Self {
         Self {
             source: LIVE_SOURCE.to_owned(),
@@ -154,6 +171,7 @@ impl Default for LiveConfig {
             tick_ms: DEFAULT_TICK_MS,
             token: None,
             json_audit: false,
+            profile: LifecycleProfile::default(),
         }
     }
 }
@@ -400,6 +418,140 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     }
 }
 
+/// Lifecycle coverage from the terminal ledger (T06 item 4 twin of
+/// [`session_coverage`]): same no-silent-zeros rule — `Complete` iff
+/// measured-clean, `Partial` on measured loss, `Unknown` + reason
+/// counter when the measurement is absent.
+///
+/// The one dimension that differs structurally is `completion`: the
+/// aggregate sensor observes returns, never terminal request
+/// completion (always `Unknown`), while the lifecycle sensor pairs
+/// submit with terminal truth per request — so a session whose every
+/// emitted record grounded (`unfinished == 0`) completes
+/// `CompleteForDeclaredBoundary` over the admitted requests. The
+/// S04 kernel-delivery caveat (requests with zero delivered edges
+/// are invisible) rides `aggregate_counts`/`detailed_events` as
+/// `Unknown`, never silently inside `completion`.
+fn lifecycle_coverage(
+    ledger: &LifecycleLedger,
+    attached_points: usize,
+    expected_points: usize,
+    observations_decoded: u64,
+    interval: ValidityInterval,
+) -> CoverageSummary {
+    let dim = |status| DimensionCoverage::new(status, interval);
+    // Attach: counted at bring-up (always measured).
+    let mut attachment = dim(if attached_points == expected_points {
+        CoverageStatus::CompleteForDeclaredBoundary
+    } else {
+        CoverageStatus::Partial
+    });
+    attachment
+        .counters
+        .push(counter("probes_attached", attached_points as u64));
+    attachment
+        .counters
+        .push(counter("probes_expected", expected_points as u64));
+    // Count-corrupting loss: any kernel loss class (reserve failures
+    // drop edges; disabled/badkey/fret mean the sensor skipped work),
+    // any refused/corrupt/synthesized/stale decode evidence, and any
+    // reducer evidence that never became a trustworthy record
+    // (orphans, ambiguous, admission failures). Duplicates repeat
+    // known state — no information lost, never flipping. A
+    // loss-clean ledger is still `Unknown`: internal pairing cannot
+    // prove kernel hook-delivery (S04/G9 twin).
+    let count_loss = ledger
+        .kernel_loss
+        .iter()
+        .fold(0u64, |sum, loss| sum.saturating_add(*loss));
+    let count_loss = count_loss
+        .saturating_add(ledger.decode.submit_refused)
+        .saturating_add(ledger.decode.unknown_key_returns)
+        .saturating_add(ledger.decode.bad_records)
+        .saturating_add(ledger.decode.gaps_synthesized)
+        .saturating_add(ledger.decode.stale_returns)
+        .saturating_add(ledger.reducer.orphan)
+        .saturating_add(ledger.reducer.ambiguous)
+        .saturating_add(ledger.reducer.admission_failed);
+    let mut aggregate_counts = dim(if count_loss > 0 {
+        CoverageStatus::Partial
+    } else {
+        CoverageStatus::Unknown
+    });
+    if count_loss == 0 {
+        aggregate_counts
+            .counters
+            .push(counter("uncovered:kernel_delivery_unmeasured", 1));
+    }
+    for (hook, hits) in ledger.edge_hits.iter().enumerate() {
+        aggregate_counts
+            .counters
+            .push(counter(&format!("edge_hits_hook{hook}"), *hits));
+    }
+    aggregate_counts
+        .counters
+        .push(counter("count_loss", count_loss));
+    aggregate_counts
+        .counters
+        .push(counter("submits_admitted", ledger.reducer.admitted));
+    // Detailed events: measured ring reserve failures + retention
+    // drops past the ledger bound. A clean transport is still
+    // `Unknown` (S04 twin: transport health cannot prove the kernel
+    // invoked the sensor for every operation).
+    let ring_drops = ledger.kernel_loss[0];
+    let mut detailed_events = dim(if ring_drops == 0 && ledger.retained_dropped == 0 {
+        CoverageStatus::Unknown
+    } else {
+        CoverageStatus::Partial
+    });
+    if ring_drops == 0 && ledger.retained_dropped == 0 {
+        detailed_events
+            .counters
+            .push(counter("uncovered:kernel_delivery_unmeasured", 1));
+    }
+    detailed_events
+        .counters
+        .push(counter("ring_drops", ring_drops));
+    detailed_events
+        .counters
+        .push(counter("retained_dropped", ledger.retained_dropped));
+    // Completion: every emitted record grounded in observed terminal
+    // truth (`unfinished == 0`) completes over the admitted requests;
+    // truthless-drained records flip `Partial` (their terminals are
+    // explicit unknowns, never trusted results).
+    let mut completion = dim(if ledger.reducer.unfinished == 0 {
+        CoverageStatus::CompleteForDeclaredBoundary
+    } else {
+        CoverageStatus::Partial
+    });
+    completion
+        .counters
+        .push(counter("observations_decoded", observations_decoded));
+    completion.counters.push(counter(
+        "terminals_grounded",
+        ledger
+            .reducer
+            .emitted
+            .saturating_sub(ledger.reducer.unfinished),
+    ));
+    completion
+        .counters
+        .push(counter("unfinished_truthless", ledger.reducer.unfinished));
+    // Declared-boundary vacuous dimensions (the session_coverage
+    // rationale, unchanged: whole-machine, resolved symbols,
+    // ctx-class attribution, single backend).
+    CoverageSummary {
+        target_population: dim(CoverageStatus::CompleteForDeclaredBoundary),
+        object_discovery: dim(CoverageStatus::CompleteForDeclaredBoundary),
+        attachment,
+        aggregate_counts,
+        detailed_events,
+        attribution: dim(CoverageStatus::CompleteForDeclaredBoundary),
+        correlation: dim(CoverageStatus::CompleteForDeclaredBoundary),
+        completion,
+    }
+}
+
 /// Spawn the closed-stdin watcher: EOF (or a stdin error, read as closed)
 /// sets the stop flag. Input bytes are not a stop signal. Generic over
 /// the reader so tests feed a cursor; production passes `stdin()`. The
@@ -526,6 +678,76 @@ impl SessionSensor for RealSensor<'_> {
         if let Some(drain) = self.drain.take() {
             let _drain_stats = drain.stop();
         }
+    }
+}
+
+/// Lifecycle session sensor seam (T06 item 4 twin of [`SessionSensor`]):
+/// everything the lifecycle tick driver reads from the live backend.
+/// Production serves [`RealLifecycleSensor`] (the shared backend's own
+/// sensor, locked in place — no handle duplication); tests serve
+/// scripted drains with no privilege. The seam owns the ring-clock
+/// domain: [`now_ns`](LifecycleSessionSensor::now_ns) stamps the
+/// coverage interval and the stop-time `finish` in `CLOCK_MONOTONIC`.
+pub trait LifecycleSessionSensor {
+    /// Drain newly produced ring records into the terminal ledger (at
+    /// most `max_records` visits).
+    fn drain_tick(&mut self, max_records: usize) -> Result<DrainOutcome, LiveError>;
+    /// Drain retained completions (each record surfaces once).
+    fn take_completed(&mut self) -> Result<Vec<RequestRecord>, LiveError>;
+    /// Drain pending truthless (stop-the-world): the final
+    /// reconciliation at `stop_ns` (ring-clock domain).
+    fn finish_stop(&mut self, stop_ns: u64) -> Result<Vec<RequestRecord>, LiveError>;
+    /// Snapshot the terminal ledger (finalize + coverage read this).
+    fn ledger(&self) -> Result<LifecycleLedger, LiveError>;
+    /// Ring-clock now (`CLOCK_MONOTONIC` ns): the coverage interval
+    /// walls and the `finish` stamp come from here (measured, never a
+    /// separate wall clock the ring cannot share).
+    fn now_ns(&self) -> Result<u64, LiveError>;
+}
+
+/// Production lifecycle sensor: the shared backend, whose mutex is the
+/// single sensor owner (ticks lock it in place — the sensor is
+/// `!Clone` by design, so no H1(b) handle duplication exists here).
+#[derive(Debug)]
+pub struct RealLifecycleSensor<'a> {
+    backend: &'a LifecycleBackend,
+}
+
+impl<'a> RealLifecycleSensor<'a> {
+    /// Borrows the shared backend's sensor owner for the session.
+    #[must_use]
+    pub fn new(backend: &'a LifecycleBackend) -> Self {
+        Self { backend }
+    }
+}
+
+impl LifecycleSessionSensor for RealLifecycleSensor<'_> {
+    fn drain_tick(&mut self, max_records: usize) -> Result<DrainOutcome, LiveError> {
+        self.backend
+            .drain_tick(max_records)
+            .map_err(|err| backend_err("live lifecycle drain", err))
+    }
+
+    fn take_completed(&mut self) -> Result<Vec<RequestRecord>, LiveError> {
+        self.backend
+            .take_completed()
+            .map_err(|err| backend_err("live lifecycle take", err))
+    }
+
+    fn finish_stop(&mut self, stop_ns: u64) -> Result<Vec<RequestRecord>, LiveError> {
+        self.backend
+            .finish_stop(stop_ns)
+            .map_err(|err| backend_err("live lifecycle finish", err))
+    }
+
+    fn ledger(&self) -> Result<LifecycleLedger, LiveError> {
+        self.backend
+            .lifecycle_ledger()
+            .map_err(|err| backend_err("live lifecycle ledger", err))
+    }
+
+    fn now_ns(&self) -> Result<u64, LiveError> {
+        monotonic_ns().map_err(|err| LiveError::Internal(format!("live lifecycle clock: {err}")))
     }
 }
 
@@ -816,7 +1038,7 @@ fn drive_session_inner(
             coverage: &notrun,
             integrity: &baseline,
         })
-        .map_err(|err| LiveError::Internal(format!("live finalize: {err}")))?;
+        .map_err(|err| backend_err("live finalize", err))?;
     // Feed drops come from the closing snapshot's retained read (M3):
     // no end-of-session re-read of the key (a drop landing between the
     // closing snapshot and the feed is unattributed — a microseconds
@@ -859,17 +1081,217 @@ fn drive_session_inner(
     })
 }
 
+/// Per-tick ring-drain visit cap: matches the sensor core bounds
+/// (submit/reducer/ledger tables are 4096 each), so one tick can
+/// absorb a full table's worth of arrivals without an unbounded walk.
+const LIFECYCLE_DRAIN_BUDGET: usize = 4096;
+
+/// Governed lifecycle tick driver (T06 item 4 twin of [`drive_session`]):
+/// the same ARCH §4.1 tail — `Observing -> Quiescing -> Draining ->
+/// Finalized` on success, `FailedPartial` on any failure after
+/// `Observing` (best-effort; the original error always wins).
+#[allow(clippy::too_many_arguments)]
+pub fn drive_lifecycle_session(
+    cfg: &LiveConfig,
+    backend: &dyn Backend,
+    sensor: &mut dyn LifecycleSessionSensor,
+    stop: &AtomicBool,
+    attached_points: usize,
+    session: SessionId,
+    generation: PlanGeneration,
+    issuer: &IdIssuer,
+    controller: &mut SessionController,
+    progress: Option<&TickProgress>,
+) -> Result<LiveOutcome, LiveError> {
+    hop(controller, SessionState::Observing, "lifecycle start")?;
+    match drive_lifecycle_session_inner(
+        cfg,
+        backend,
+        sensor,
+        stop,
+        attached_points,
+        session,
+        generation,
+        issuer,
+        controller,
+        progress,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            let _ = controller.transition(SessionState::FailedPartial);
+            Err(err)
+        }
+    }
+}
+
+/// Lifecycle tick driver (T06 item 4 twin of [`drive_session_inner`]):
+/// per-tick ring drain → completed records → `decode` each (first
+/// error aborts `Internal`), then stop-time `finish` reconciliation,
+/// then `finalize` ONCE and the shared feed ONCE, then coverage from
+/// the terminal ledger. NEVER finalizes per tick (D1/M1).
+///
+/// Completed records are disjoint across ticks (each surfaces once
+/// from retention), so every decoded record is kept — memory is
+/// O(completions), the ident precedent, never O(ticks × rows).
+#[allow(clippy::too_many_arguments)]
+fn drive_lifecycle_session_inner(
+    cfg: &LiveConfig,
+    backend: &dyn Backend,
+    sensor: &mut dyn LifecycleSessionSensor,
+    stop: &AtomicBool,
+    attached_points: usize,
+    session: SessionId,
+    generation: PlanGeneration,
+    issuer: &IdIssuer,
+    controller: &mut SessionController,
+    progress: Option<&TickProgress>,
+) -> Result<LiveOutcome, LiveError> {
+    let baseline = IntegritySummary::default();
+    let tick_ms = cfg.tick_ms.max(1);
+    let start_wall = Instant::now();
+    let deadline = cfg
+        .duration_secs
+        .map(|secs| start_wall + Duration::from_secs(secs));
+    let mut observations: Vec<NativeObservation> = Vec::new();
+    let mut first_wall = 0u64;
+    let mut first_tick = true;
+    let mut barrier_id = 0u64;
+    let mut interrupted = false;
+    let decode_records = |records: Vec<RequestRecord>,
+                          observations: &mut Vec<NativeObservation>|
+     -> Result<(), LiveError> {
+        for record in &records {
+            let decode_ctx = DecodeContext {
+                session,
+                generation,
+                integrity: &baseline,
+                id_issuer: issuer,
+            };
+            let (header, payload) = lifecycle_event(record);
+            let observation = decode_tick_row(
+                backend,
+                &decode_ctx,
+                RawEvent {
+                    header,
+                    payload: &payload,
+                },
+                "lifecycle",
+            )?;
+            observations.push(observation);
+        }
+        Ok(())
+    };
+    loop {
+        barrier_id += 1;
+        let now = sensor.now_ns()?;
+        // Coverage interval walls come from the ring clock itself
+        // (the snapshot precedent: measured `CLOCK_MONOTONIC`, no
+        // separate clock read the ring cannot share).
+        if first_tick {
+            first_wall = now;
+            first_tick = false;
+        }
+        let drained = sensor.drain_tick(LIFECYCLE_DRAIN_BUDGET)?;
+        let completed = sensor.take_completed()?;
+        let completed_this_tick = completed.len() as u64;
+        decode_records(completed, &mut observations)?;
+        interrupted |= SIGINT_SEEN.load(Ordering::Relaxed);
+        if let Some(report) = progress {
+            // Human-only liveness (4B-M4): completions decoded this
+            // tick plus raw records consumed (drops ride the ledger).
+            report(barrier_id, completed_this_tick, drained.records as u64);
+        }
+        let stopped = stop.load(Ordering::Relaxed)
+            || interrupted
+            || deadline.is_some_and(|end| Instant::now() >= end);
+        if stopped {
+            break;
+        }
+        sleep_tick(tick_ms, stop);
+    }
+    // Observing -> Quiescing: the loop stopped taking new work.
+    hop(controller, SessionState::Quiescing, "lifecycle quiesce")?;
+    // Stop-time reconciliation: one last drain for edges that landed
+    // with the closing tick, then truthless `finish` at the closing
+    // wall — every pending request becomes a record (grounded or
+    // explicit-unknown), none stays pending past the session.
+    let end_ns = sensor.now_ns()?;
+    let _closing_drain = sensor.drain_tick(LIFECYCLE_DRAIN_BUDGET)?;
+    let completed = sensor.take_completed()?;
+    decode_records(completed, &mut observations)?;
+    let reconciled = sensor.finish_stop(end_ns)?;
+    decode_records(reconciled, &mut observations)?;
+    // Quiescing -> Draining: queued events become evidence now.
+    hop(controller, SessionState::Draining, "lifecycle drain")?;
+    // Finalize ONCE, then the shared feed ONCE.
+    let notrun = CoverageSummary::not_run();
+    let summary = backend
+        .finalize(&FinalizeContext {
+            session,
+            coverage: &notrun,
+            integrity: &baseline,
+        })
+        .map_err(|err| backend_err("live lifecycle finalize", err))?;
+    let ledger = sensor.ledger()?;
+    let mut report = DriverReport::default();
+    report.extend_observations(std::mem::take(&mut observations));
+    report.push_summary(summary);
+    // Empty shared feed (required, but zero): the lifecycle drain
+    // lives INSIDE the backend, so its ring reserve failures and
+    // retention drops already ride the summary integrity above —
+    // feeding the same counters here would double-count through
+    // `session_integrity` (which adds the shared feed on top of the
+    // per-backend sums). Nothing outside any backend observed loss.
+    report
+        .feed_shared_losses(SharedLosses::new(0, 0))
+        .map_err(|err| LiveError::Internal(format!("live lifecycle shared feed: {err}")))?;
+    let integrity = report
+        .session_integrity_checked()
+        .map_err(|err| LiveError::Internal(format!("live lifecycle session integrity: {err}")))?;
+    let coverage = lifecycle_coverage(
+        &ledger,
+        attached_points,
+        max_programs(&manifest(LifecycleProfile::RequestLifecycle)),
+        report.observations().len() as u64,
+        ValidityInterval {
+            start_ns: first_wall,
+            end_ns: Some(end_ns),
+        },
+    );
+    hop(controller, SessionState::Finalized, "lifecycle finalize")?;
+    Ok(LiveOutcome {
+        observations: report.take_observations(),
+        summary,
+        coverage,
+        integrity,
+        terminal_state: controller.state(),
+        interrupted,
+    })
+}
+
 /// Live kcrypto capture: shared registry + the concrete backend
 /// handle, then the injectable session below. See the module docs for
 /// the flow.
+///
+/// Profile dispatch (T06 item 4): registry and live entry points both
+/// select through [`register_kcrypto_profile`] — `api-returns` drives
+/// the aggregate session, `request-lifecycle` the lifecycle session —
+/// so the two can never choose different profiles/decoders.
 pub fn run_live_capture(
     cfg: &LiveConfig,
     runtime: &RuntimeCapabilities,
 ) -> Result<LiveOutcome, LiveError> {
     let mut registry = BackendRegistry::new();
-    let shared = register_kcrypto_shared(&mut registry)
+    let profiled = register_kcrypto_profile(&mut registry, cfg.profile)
         .map_err(|err| LiveError::Internal(format!("kcrypto registration: {err}")))?;
-    run_live_session(cfg, runtime, &registry, Some(shared.backend()))
+    match profiled {
+        ProfileBackend::ApiReturns(shared) => {
+            run_live_session(cfg, runtime, &registry, Some(shared.backend()))
+        }
+        ProfileBackend::RequestLifecycle(shared) => {
+            run_lifecycle_session(cfg, runtime, &registry, &shared)
+        }
+    }
 }
 
 /// Live capture over a caller-supplied registry (the injection seam:
@@ -882,6 +1304,158 @@ pub fn run_live_capture_with_registry(
     registry: &BackendRegistry,
 ) -> Result<LiveOutcome, LiveError> {
     run_live_session(cfg, runtime, registry, None)
+}
+
+/// Lifecycle orchestrator (T06 item 4 twin of [`run_live_session`]):
+/// the same bring-up machine (`Created -> Qualified -> Discovering
+/// -> Attaching`) over the lifecycle object + concrete backend, then
+/// [`drive_lifecycle_session`] for the governed tail. Same parking
+/// rule: a started session that fails parks in `FailedPartial`; a
+/// refused session never started and stays `Created`.
+fn run_lifecycle_session(
+    cfg: &LiveConfig,
+    runtime: &RuntimeCapabilities,
+    registry: &BackendRegistry,
+    concrete: &LifecycleBackend,
+) -> Result<LiveOutcome, LiveError> {
+    let mut controller = SessionController::new();
+    let outcome = run_lifecycle_session_inner(cfg, runtime, registry, concrete, &mut controller);
+    if outcome.is_err() && controller.state() != SessionState::Created {
+        let _ = controller.transition(SessionState::FailedPartial);
+    }
+    outcome
+}
+
+fn run_lifecycle_session_inner(
+    cfg: &LiveConfig,
+    runtime: &RuntimeCapabilities,
+    registry: &BackendRegistry,
+    concrete: &LifecycleBackend,
+    controller: &mut SessionController,
+) -> Result<LiveOutcome, LiveError> {
+    if cfg.source != LIVE_SOURCE {
+        return Err(LiveError::Unusable(format!(
+            "unsupported live source '{}': only '{}' is captured live",
+            cfg.source, LIVE_SOURCE
+        )));
+    }
+    let backend = registry
+        .get(BackendId::KCrypto)
+        .ok_or_else(|| LiveError::Unusable("kcrypto backend not registered".to_owned()))?;
+    gate_check("session", &backend.capabilities().required, runtime)?;
+    // Created -> Qualified: capabilities probed present.
+    hop(controller, SessionState::Qualified, "session qualify")?;
+    // Harness-style session state (fresh ids, open budgets; the
+    // driver owns the zero integrity baseline).
+    let session = SessionId::new(1);
+    let generation = PlanGeneration::new(1);
+    // Wide-open session budget is core's (1B-H1): the session gates
+    // on privilege/BTF, not on budgets.
+    let mut budget = BudgetManager::new(PlanBudget::open());
+    let issuer = IdIssuer::default();
+    // Qualified -> Discovering: targets and objects resolve now.
+    hop(controller, SessionState::Discovering, "session discover")?;
+    let instances = backend
+        .detect(&DetectContext { session, runtime })
+        .map_err(|err| backend_err("kcrypto detect", err))?;
+    let Some(instance) = instances.into_iter().next() else {
+        return Err(LiveError::Unusable(
+            "kcrypto detect found no instances".to_owned(),
+        ));
+    };
+    let plan = backend
+        .plan(
+            &PlanContext { session, runtime },
+            &instance,
+            CaptureMode::Trace,
+        )
+        .map_err(|err| backend_err("kcrypto plan", err))?;
+    gate_check("plan", &plan.required, runtime)?;
+    // Object bytes resolve once here (H1(b)/M2 twin): staged into the
+    // backend below so `configure` loads the single sensor from them
+    // instead of locating + reading a second time. The lifecycle
+    // object (`kcrypto-lifecycle.bpf.o`), never the aggregate one —
+    // the profile selects the object exactly as it selects the
+    // decoder.
+    let (object_path, object_bytes) = kryprobe_privilege::locate_lifecycle_object_bytes()
+        .map_err(|err| LiveError::Unusable(format!("lifecycle object: {err}")))?;
+    // 4B-M4: the object load is a privileged operation — in JSON mode
+    // it leaves one structured stderr line (path + sha256). The hash
+    // runs only when the line will print.
+    if cfg.json_audit {
+        let digest = kryprobe_privilege::sha256_hex(&object_bytes);
+        emit_audit(
+            true,
+            &audit_object_line(&object_path.display().to_string(), &digest),
+        );
+    }
+    // K5 bring-up authority (the aggregate pre-flight, unchanged): the
+    // first usable token in discovery order, refused AFTER the object
+    // resolves but BEFORE `configure` loads anything.
+    let token = crate::token::usable_token(cfg.token.as_deref());
+    if token.is_none() && !crate::runtime_facts::process_has_bpf_caps() {
+        return Err(LiveError::Unusable(crate::token::no_mechanism_reason(
+            cfg.token.as_deref(),
+        )));
+    }
+    concrete.stage_session_inputs(object_bytes, token);
+    // Discovering -> Attaching: the plan is validated and inputs are
+    // staged; `configure` loads and attaches the single sensor.
+    hop(controller, SessionState::Attaching, "session attach")?;
+    backend
+        .configure(
+            &mut ConfigureContext {
+                session,
+                generation,
+                budget: &mut budget,
+            },
+            &plan,
+        )
+        .map_err(|err| backend_err("kcrypto configure", err))?;
+    // Single sensor, single owner (the H1(b) twin): the tick loop
+    // drains the backend's own sensor in place (no handle
+    // duplication — the sensor is `!Clone` by design), and `finalize`
+    // assesses that same sensor. Attached points count the live links
+    // (links exist only for attached points); expected points derive
+    // from the lifecycle manifest (one program per required edge).
+    let attached_points = concrete
+        .attached_points()
+        .map_err(|err| backend_err("lifecycle attach count", err))?;
+    let expected_points = max_programs(&manifest(LifecycleProfile::RequestLifecycle));
+    // 4B-M4: the attach outcome is the second audit line.
+    emit_audit(
+        cfg.json_audit,
+        &audit_attach_line(attached_points, expected_points),
+    );
+    // Stop machinery: a session-local flag; the stdin watcher feeds it
+    // for unbounded runs, and the SIGINT recorder (4B-M5) ends any run
+    // with finalize + partial render + exit 3 instead of dying.
+    kryprobe_privilege::host::install_sigint_flag()
+        .map_err(|err| LiveError::Internal(format!("live SIGINT handler: {err}")))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    if cfg.duration_secs.is_none() {
+        let _watcher = spawn_stdin_watcher(std::io::stdin(), Arc::clone(&stop))?;
+    }
+    // No session drain spawn: the lifecycle drain lives inside the
+    // backend (`drain_tick` per tick) — one owner, one drain, no
+    // thread to stop after the closing tick.
+    let mut production = RealLifecycleSensor::new(concrete);
+    // 4B-M5 liveness line (stderr, human-only/unstable — never script on it).
+    let progress = |tick: u64, rows: u64, drops: u64| {
+        eprintln!("kryprobe: progress tick={tick} rows={rows} drops={drops}");
+    };
+    drive_lifecycle_session(
+        cfg,
+        backend,
+        &mut production,
+        &stop,
+        attached_points,
+        session,
+        generation,
+        &issuer,
+        controller,
+        Some(&progress),
+    )
 }
 
 /// Shared orchestrator: frozen-trait lifecycle through `registry`
@@ -1287,6 +1861,131 @@ mod tests {
         assert_eq!(
             session_coverage(&m).aggregate_counts.status,
             CoverageStatus::Unknown
+        );
+    }
+
+    fn lifecycle_ledger_clean() -> LifecycleLedger {
+        use kryprobe_core::kcrypto::ReducerStats;
+        use kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats;
+        LifecycleLedger {
+            completed: Vec::new(),
+            edge_hits: [4, 4, 2, 2],
+            decode: DecodeStats {
+                admitted: 6,
+                ..DecodeStats::default()
+            },
+            reducer: ReducerStats {
+                admitted: 6,
+                emitted: 6,
+                ..ReducerStats::default()
+            },
+            kernel_loss: [0; 4],
+            retained_dropped: 0,
+        }
+    }
+
+    #[test]
+    fn lifecycle_coverage_clean_session_completes_completion() {
+        // The structural twin difference: the lifecycle sensor pairs
+        // submit with terminal truth per request, so a session whose
+        // every emitted record grounded completes `completion` — while
+        // delivery-sensitive dimensions stay `Unknown` (S04 twin).
+        let coverage = lifecycle_coverage(
+            &lifecycle_ledger_clean(),
+            4,
+            4,
+            6,
+            ValidityInterval {
+                start_ns: 100,
+                end_ns: Some(200),
+            },
+        );
+        assert_eq!(
+            coverage.attachment.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
+        assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
+        assert_eq!(
+            coverage.completion.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
+        assert_eq!(coverage.overall(), CoverageStatus::Unknown);
+        assert_eq!(
+            coverage.weaker_dimensions(),
+            vec!["aggregate_counts", "detailed_events"]
+        );
+        for dim in [&coverage.aggregate_counts, &coverage.detailed_events] {
+            assert!(
+                dim.counters
+                    .iter()
+                    .any(|c| c.name == "uncovered:kernel_delivery_unmeasured" && c.value == 1),
+                "reason counter present: {:?}",
+                dim.counters
+            );
+        }
+        // Per-hook edge hits ride as counters (the VM gate's post-GO
+        // evidence), plus grounded-terminal magnitudes.
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "edge_hits_hook0" && c.value == 4),
+            "edge hits kept: {:?}",
+            coverage.aggregate_counts.counters
+        );
+        assert!(
+            coverage
+                .completion
+                .counters
+                .iter()
+                .any(|c| c.name == "terminals_grounded" && c.value == 6),
+            "grounded terminals kept: {:?}",
+            coverage.completion.counters
+        );
+    }
+
+    #[test]
+    fn lifecycle_coverage_measured_loss_flips_its_dimension() {
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        // Kernel reserve failure: counts AND transport flip.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.kernel_loss[0] = 2;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
+        assert_eq!(
+            coverage.completion.status,
+            CoverageStatus::CompleteForDeclaredBoundary,
+            "transport loss is not unfinished work"
+        );
+        // Refused decode evidence corrupts counts only.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.decode.submit_refused = 1;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
+        // Truthless-drained records flip completion only.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.reducer.unfinished = 1;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        assert_eq!(coverage.completion.status, CoverageStatus::Partial);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
+        // Attach shortfall flips attachment only.
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 3, 4, 6, interval);
+        assert_eq!(coverage.attachment.status, CoverageStatus::Partial);
+        // Duplicates repeat known state: no information lost, no flip.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.reducer.duplicate = 9;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
+        assert_eq!(
+            coverage.completion.status,
+            CoverageStatus::CompleteForDeclaredBoundary
         );
     }
 

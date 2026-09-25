@@ -355,23 +355,14 @@ pub fn shared_losses_from_snapshot(_snap: &SnapshotRows, drops: u8) -> SharedLos
     SharedLosses::new(u64::from(drops), 0)
 }
 
-/// `CLOCK_MONOTONIC` now (unprivileged; the snapshot wall).
+/// `CLOCK_MONOTONIC` now (unprivileged; the snapshot wall). The
+/// syscall lives in [`host::monotonic_ns`](crate::host::monotonic_ns)
+/// (single unsafe site); this keeps the snapshot error vocabulary.
 fn monotonic_now() -> Result<u64, MapOpsError> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: valid out-pointer; `CLOCK_MONOTONIC` is always supported.
-    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    if ret != 0 {
-        return Err(MapOpsError::LookupFailed {
-            stage: "snapshot/clock".to_owned(),
-            errno: std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        });
-    }
-    Ok((ts.tv_sec.max(0) as u64) * 1_000_000_000 + (ts.tv_nsec.max(0) as u64))
+    crate::host::monotonic_ns().map_err(|err| MapOpsError::LookupFailed {
+        stage: "snapshot/clock".to_owned(),
+        errno: err.raw_os_error().unwrap_or(libc::EIO),
+    })
 }
 
 /// Little-endian `VAgg` encode: the exact inverse of [`vagg_from_bytes`]

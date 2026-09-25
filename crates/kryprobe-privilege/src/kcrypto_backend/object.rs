@@ -11,11 +11,13 @@ include!(concat!(env!("OUT_DIR"), "/pinned_digests.rs"));
 
 /// kcrypto object file name (tier-1 dir join + tier-2 bundled path).
 const OBJECT_FILE_NAME: &str = "kcrypto.bpf.o";
+/// Lifecycle sensor object file name (T06 twin).
+const LIFECYCLE_OBJECT_FILE_NAME: &str = "kcrypto-lifecycle.bpf.o";
 
 /// Dev-object fallback, CWD-relative (tier 3; the K2 doctor spelling, kept
 /// verbatim so dev runs from the workspace root keep working).
-const DEV_OBJECT: &str = "target/kryprobe-bpf/kcrypto.bpf.o";
-
+/// (Tier-3 paths are built by joining, not from a second const.)
+///
 /// One tried candidate plus its exact fs error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocateMiss {
@@ -55,17 +57,22 @@ impl std::error::Error for ObjectLocateError {}
 
 /// Object candidates in D2 try order, pure over the inputs (unit-testable
 /// without env mutation): `KRYPROBE_BPF_DIR` (a file tried as-is, else a
-/// dir joined with `kcrypto.bpf.o`) → executable-dir
-/// `kryprobe-bpf/kcrypto.bpf.o` (bundled; skipped when the exe dir is
+/// dir joined with the object file name) → executable-dir
+/// `kryprobe-bpf/<object>` (bundled; skipped when the exe dir is
 /// unknown, never fabricated) → the CWD-relative dev object.
 ///
 /// When `elevated`, env and CWD tiers are refused (H-SEC-01): only the
 /// exe-bundled tier is returned, possibly nothing.
+///
+/// Generalized over the object file name (T06): the kcrypto and
+/// lifecycle locators share this try order and differ only in which
+/// object they name.
 #[must_use]
-pub fn kcrypto_object_candidates(
+pub(crate) fn object_candidates_for(
     env: Option<&str>,
     exe_dir: Option<&Path>,
     elevated: bool,
+    file_name: &str,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !elevated && let Some(value) = env {
@@ -73,16 +80,37 @@ pub fn kcrypto_object_candidates(
         if candidate.is_file() {
             out.push(candidate);
         } else {
-            out.push(candidate.join(OBJECT_FILE_NAME));
+            out.push(candidate.join(file_name));
         }
     }
     if let Some(dir) = exe_dir {
-        out.push(dir.join("kryprobe-bpf").join(OBJECT_FILE_NAME));
+        out.push(dir.join("kryprobe-bpf").join(file_name));
     }
     if !elevated {
-        out.push(PathBuf::from(DEV_OBJECT));
+        out.push(PathBuf::from("target/kryprobe-bpf").join(file_name));
     }
     out
+}
+
+/// Aggregate-sensor candidates (thin wrapper: same tiers, `kcrypto.bpf.o`).
+#[must_use]
+pub fn kcrypto_object_candidates(
+    env: Option<&str>,
+    exe_dir: Option<&Path>,
+    elevated: bool,
+) -> Vec<PathBuf> {
+    object_candidates_for(env, exe_dir, elevated, OBJECT_FILE_NAME)
+}
+
+/// Lifecycle-sensor candidates (T06 twin: same tiers,
+/// `kcrypto-lifecycle.bpf.o`).
+#[must_use]
+pub fn lifecycle_object_candidates(
+    env: Option<&str>,
+    exe_dir: Option<&Path>,
+    elevated: bool,
+) -> Vec<PathBuf> {
+    object_candidates_for(env, exe_dir, elevated, LIFECYCLE_OBJECT_FILE_NAME)
 }
 
 /// Lowercase hex sha256 of bytes (H-SEC-01 pin check; G6 M1
@@ -139,7 +167,12 @@ pub(crate) fn verify_object_pinned(bytes: &[u8], pins: &[&str]) -> Result<(), St
 /// double-read, L-SEC-06): first readable AND pin-trusted candidate
 /// wins; bytes return with the path so callers never re-open.
 /// Untrusted (pin mismatch) candidates are misses, not errors.
-pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateError> {
+///
+/// Generalized over the object file name (T06): both sensors share
+/// this walk and differ only in which object they name.
+pub(crate) fn locate_object_bytes_for(
+    file_name: &str,
+) -> Result<(PathBuf, Vec<u8>), ObjectLocateError> {
     let elevated = crate::elevate::process_is_elevated();
     let env = std::env::var("KRYPROBE_BPF_DIR").ok();
     let exe_dir = std::env::current_exe()
@@ -154,7 +187,7 @@ pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateE
         eprintln!("{warning}");
     }
     let mut misses = Vec::new();
-    for candidate in kcrypto_object_candidates(env_tier, exe_dir.as_deref(), elevated) {
+    for candidate in object_candidates_for(env_tier, exe_dir.as_deref(), elevated, file_name) {
         let bytes = match std::fs::read(&candidate) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -186,6 +219,17 @@ pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateE
     })
 }
 
+/// Aggregate-sensor locator (thin wrapper: same walk, `kcrypto.bpf.o`).
+pub fn locate_kcrypto_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateError> {
+    locate_object_bytes_for(OBJECT_FILE_NAME)
+}
+
+/// Lifecycle-sensor locator (T06 twin: same walk,
+/// `kcrypto-lifecycle.bpf.o`).
+pub fn locate_lifecycle_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocateError> {
+    locate_object_bytes_for(LIFECYCLE_OBJECT_FILE_NAME)
+}
+
 /// Pin-trusted kcrypto object identity for `doctor --versions`
 /// (G6 M1): path plus sha256 of the winning locator candidate.
 /// `None` when no trusted object is present (environmental —
@@ -209,4 +253,75 @@ pub(crate) fn kcrypto_object_bytes() -> Result<Vec<u8>, BackendError> {
         ))
     })?;
     Ok(bytes)
+}
+
+/// Read the lifecycle BPF object via the consolidated locator (T06
+/// F8c: the backend's first user — same walk, lifecycle filename,
+/// same `Unsupported` surface as the aggregate twin).
+pub(crate) fn lifecycle_object_bytes() -> Result<Vec<u8>, BackendError> {
+    let (_path, bytes) = locate_lifecycle_object_bytes().map_err(|err| {
+        BackendError::Unsupported(UnsupportedReason::with_detail(
+            "lifecycle_object_unreadable",
+            &err.to_string(),
+        ))
+    })?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_candidates_carry_lifecycle_filename_in_tier_order() {
+        // T06 twin: env tier → exe-bundled tier → CWD dev tier, all
+        // naming kcrypto-lifecycle.bpf.o (never the aggregate object).
+        let exe = PathBuf::from("/opt/kryprobe/bin");
+        let out = lifecycle_object_candidates(Some("/env/dir"), Some(&exe), false);
+        assert_eq!(
+            out,
+            [
+                PathBuf::from("/env/dir/kcrypto-lifecycle.bpf.o"),
+                PathBuf::from("/opt/kryprobe/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"),
+                PathBuf::from("target/kryprobe-bpf/kcrypto-lifecycle.bpf.o"),
+            ]
+        );
+        for candidate in &out {
+            assert_eq!(
+                candidate.file_name().unwrap().to_str().unwrap(),
+                "kcrypto-lifecycle.bpf.o"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_candidates_refuse_env_and_cwd_when_elevated() {
+        // H-SEC-01 parity: elevated callers get the exe-bundled tier
+        // only (possibly nothing).
+        let exe = PathBuf::from("/opt/kryprobe/bin");
+        let out = lifecycle_object_candidates(Some("/env/dir"), Some(&exe), true);
+        assert_eq!(
+            out,
+            [PathBuf::from(
+                "/opt/kryprobe/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
+            )]
+        );
+        assert!(lifecycle_object_candidates(Some("/env/dir"), None, true).is_empty());
+    }
+
+    #[test]
+    fn kcrypto_candidates_keep_aggregate_filename() {
+        // Refactor pin: generalizing the locator must not rename the
+        // aggregate object's tiers.
+        let exe = PathBuf::from("/opt/kryprobe/bin");
+        let out = kcrypto_object_candidates(Some("/env/dir"), Some(&exe), false);
+        assert_eq!(
+            out,
+            [
+                PathBuf::from("/env/dir/kcrypto.bpf.o"),
+                PathBuf::from("/opt/kryprobe/bin/kryprobe-bpf/kcrypto.bpf.o"),
+                PathBuf::from("target/kryprobe-bpf/kcrypto.bpf.o"),
+            ]
+        );
+    }
 }

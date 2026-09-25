@@ -5,6 +5,7 @@
 
 use crate::args::ReportFormat;
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_report::{validate_and_render_file, write_str_atomic};
 use std::io::Write;
 use std::path::Path;
@@ -176,12 +177,14 @@ fn finish_report_live(
 
 /// Runs `report --system`: one bounded capture (default 60s), rendered
 /// human (same tables as `watch`, plus the verdict exit) or JSON.
+#[allow(clippy::too_many_arguments)]
 pub fn run_report_live(
     source: &str,
     duration: Option<u64>,
     format: ReportFormat,
     out: Option<&Path>,
     token: Option<&Path>,
+    profile: LifecycleProfile,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -195,6 +198,7 @@ pub fn run_report_live(
         // 4B-M4: machine formats get the structured stderr audit
         // trail (object load + attach); human mode stays silent.
         json_audit: !matches!(format, ReportFormat::Human),
+        profile,
     };
     finish_report_live(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),

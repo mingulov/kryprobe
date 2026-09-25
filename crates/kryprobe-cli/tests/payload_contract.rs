@@ -59,6 +59,21 @@ fn decode(
     backend.decode(&ctx, event).expect("hand row decodes")
 }
 
+fn decode_lifecycle(
+    backend: &kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend,
+    event: kryprobe_core::backend::RawEvent<'_>,
+) -> kryprobe_core::evidence::NativeObservation {
+    let issuer = IdIssuer::default();
+    let integrity = kryprobe_core::evidence::IntegritySummary::default();
+    let ctx = DecodeContext {
+        session: SessionId::new(1),
+        generation: PlanGeneration::new(1),
+        integrity: &integrity,
+        id_issuer: &issuer,
+    };
+    backend.decode(&ctx, event).expect("hand envelope decodes")
+}
+
 /// Sorted top-level keys of a payload.
 fn keys(payload: &serde_json::Value) -> Vec<&str> {
     let mut keys: Vec<&str> = payload
@@ -168,6 +183,43 @@ fn payload_contract_producer_emits_pinned_shapes() {
         sorted(K::WINDOW_KEYS),
         "window block pins first/last"
     );
+    // Lifecycle rows (T06): grounded + unknown envelopes through the
+    // production lifecycle `decode` seam emit exactly the pinned set.
+    let lifecycle = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    for (terminal, status, duration) in [
+        (
+            kryprobe_core::kcrypto::Terminal::Sync(0),
+            serde_json::json!(0),
+            Some(50u64),
+        ),
+        (
+            kryprobe_core::kcrypto::Terminal::Unknown,
+            serde_json::json!(null),
+            None,
+        ),
+    ] {
+        let record = kryprobe_core::kcrypto::RequestRecord {
+            id: 1,
+            tfm_id: None,
+            terminal,
+            duration_ns: duration,
+        };
+        let (header, payload) =
+            kryprobe_privilege::kcrypto_lifecycle::backend::lifecycle_event(&record);
+        let obs = decode_lifecycle(
+            &lifecycle,
+            kryprobe_core::backend::RawEvent {
+                header,
+                payload: &payload,
+            },
+        );
+        assert_eq!(
+            keys(&obs.backend_payload),
+            sorted(K::LIFECYCLE_KEYS),
+            "lifecycle emits exactly the pinned set"
+        );
+        assert_eq!(obs.backend_payload[K::STATUS], status);
+    }
 }
 
 #[test]
@@ -181,6 +233,7 @@ fn payload_contract_consumers_read_only_emitted_keys() {
     emitted.extend_from_slice(K::WHO_KEYS);
     emitted.extend_from_slice(K::WHO_OPTIONAL_KEYS);
     emitted.extend_from_slice(K::AGG_OPTIONAL_KEYS);
+    emitted.extend_from_slice(K::LIFECYCLE_KEYS);
     for key in kryprobe_policy::eval::POLICY_READ_KEYS {
         if *key == K::MODULE {
             assert!(

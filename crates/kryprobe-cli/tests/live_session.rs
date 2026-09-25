@@ -154,6 +154,7 @@ fn live_gate_fail_names_gate() {
         tick_ms: 1000,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let runtime = kryprobe_core::capability::RuntimeCapabilities {
         kernel_release: "test".to_owned(),
@@ -265,6 +266,7 @@ fn open_session() -> (
             tick_ms: 1000,
             token: None,
             json_audit: false,
+            profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
         },
         kryprobe_core::capability::RuntimeCapabilities {
             kernel_release: "test".to_owned(),
@@ -665,6 +667,7 @@ fn live_capture_proves_session() {
         tick_ms: 1000,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let outcome = kryprobe_cli::live::run_live_capture(&cfg, &lane_runtime())
         .unwrap_or_else(|err| panic!("live capture failed: {err}"));
@@ -838,6 +841,7 @@ fn live_capture_proves_session() {
         tick_ms: 1000,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let outcome0 = kryprobe_cli::live::run_live_capture(&cfg0, &lane_runtime())
         .unwrap_or_else(|err| panic!("zero-window capture failed: {err}"));
@@ -1144,6 +1148,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut sensor = sensor;
@@ -1309,6 +1314,7 @@ fn live_stop_mid_run_tears_down_cleanly() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = std::thread::scope(|scope| {
@@ -1385,6 +1391,7 @@ fn live_sigint_ends_window_with_interrupted_outcome() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = std::thread::scope(|scope| {
@@ -1469,6 +1476,7 @@ fn live_progress_hook_sees_every_tick() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = kryprobe_cli::live::drive_session(
@@ -1540,6 +1548,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let parses_before = kryprobe_privilege::kallsyms::parse_calls();
@@ -1633,6 +1642,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     // The corrupt row fails before the who/kallsyms stage — the
@@ -1781,6 +1791,7 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         tick_ms: 1,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let err = kryprobe_cli::live::drive_session(
@@ -1811,5 +1822,324 @@ fn live_backend_failure_runs_failed_partial_recovery() {
             .transition(kryprobe_core::session::SessionState::Finalized)
             .is_ok(),
         "FailedPartial -> Finalized recovery edge stays legal"
+    );
+}
+
+/// T06 item 4: scripted lifecycle sensor serving canned per-tick
+/// completions through the `LifecycleSessionSensor` seam — the
+/// request-lifecycle success path without privilege. The stop flag is
+/// shared with the driver (the seam itself owns no stop): the last
+/// scripted tick latches it, so the session ends after its Nth tick.
+struct ScriptedLifecycleSensor<'a> {
+    ticks: Vec<Vec<kryprobe_core::kcrypto::RequestRecord>>,
+    finish_records: Vec<kryprobe_core::kcrypto::RequestRecord>,
+    ledger: kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger,
+    now: u64,
+    drains: std::sync::atomic::AtomicU64,
+    stop: &'a std::sync::atomic::AtomicBool,
+}
+
+impl kryprobe_cli::live::LifecycleSessionSensor for ScriptedLifecycleSensor<'_> {
+    fn drain_tick(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_lifecycle::sensor::DrainOutcome,
+        kryprobe_cli::live::LiveError,
+    > {
+        let call = self
+            .drains
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call + 1 >= self.ticks.len() as u64 {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let completed = self.ticks[(call as usize).min(self.ticks.len() - 1)].len();
+        Ok(
+            kryprobe_privilege::kcrypto_lifecycle::sensor::DrainOutcome {
+                records: completed,
+                completed,
+                busy: false,
+            },
+        )
+    }
+
+    fn take_completed(
+        &mut self,
+    ) -> Result<Vec<kryprobe_core::kcrypto::RequestRecord>, kryprobe_cli::live::LiveError> {
+        // The closing drain replays the last tick (nothing new
+        // retained — the script's completions already surfaced).
+        let call = self.drains.load(std::sync::atomic::Ordering::Relaxed);
+        if call > self.ticks.len() as u64 {
+            return Ok(Vec::new());
+        }
+        Ok(self.ticks[(call as usize - 1).min(self.ticks.len() - 1)].clone())
+    }
+
+    fn finish_stop(
+        &mut self,
+        stop_ns: u64,
+    ) -> Result<Vec<kryprobe_core::kcrypto::RequestRecord>, kryprobe_cli::live::LiveError> {
+        assert_eq!(stop_ns, self.now, "finish stamps the closing wall");
+        Ok(self.finish_records.clone())
+    }
+
+    fn ledger(
+        &self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger,
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok(self.ledger.clone())
+    }
+
+    fn now_ns(&self) -> Result<u64, kryprobe_cli::live::LiveError> {
+        Ok(self.now)
+    }
+}
+
+fn lifecycle_record(
+    id: u64,
+    terminal: kryprobe_core::kcrypto::Terminal,
+) -> kryprobe_core::kcrypto::RequestRecord {
+    kryprobe_core::kcrypto::RequestRecord {
+        id,
+        tfm_id: None,
+        terminal,
+        duration_ns: Some(1000 + id),
+    }
+}
+
+fn lifecycle_test_ledger(
+    admitted: u64,
+    emitted: u64,
+    unfinished: u64,
+) -> kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
+    kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
+        completed: Vec::new(),
+        edge_hits: [2, 2, 1, 1],
+        decode: kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats {
+            admitted,
+            ..kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats::default()
+        },
+        reducer: kryprobe_core::kcrypto::ReducerStats {
+            admitted,
+            emitted,
+            unfinished,
+            ..kryprobe_core::kcrypto::ReducerStats::default()
+        },
+        kernel_loss: [0; 4],
+        retained_dropped: 0,
+    }
+}
+
+fn lifecycle_live_config() -> kryprobe_cli::live::LiveConfig {
+    kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: None,
+        tick_ms: 1,
+        token: None,
+        json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::RequestLifecycle,
+    }
+}
+
+#[test]
+fn live_lifecycle_scripted_session_drives_green() {
+    // T06 item 4: two scripted ticks (grounded sync + callback) plus
+    // one truthless finish record decode through the REAL lifecycle
+    // backend into three kept observations; the machine finalizes;
+    // the shared feed adds nothing (no double count); completion
+    // flips on the unfinished record while delivery dimensions stay
+    // Unknown.
+    use kryprobe_core::kcrypto::Terminal;
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = ScriptedLifecycleSensor {
+        ticks: vec![
+            vec![lifecycle_record(1, Terminal::Sync(0))],
+            vec![lifecycle_record(2, Terminal::Callback(-5))],
+        ],
+        finish_records: vec![lifecycle_record(3, Terminal::Unknown)],
+        ledger: lifecycle_test_ledger(3, 3, 1),
+        now: 555,
+        drains: std::sync::atomic::AtomicU64::new(0),
+        stop: &stop,
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let cfg = lifecycle_live_config();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        4,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("scripted lifecycle session drives green");
+    assert_eq!(outcome.observations.len(), 3, "every completion kept");
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+    assert_eq!(outcome.summary.observations, 3, "decode counts all three");
+    // Same profile/decoder: every observation carries the lifecycle
+    // envelope (row + capture profile + terminal triple).
+    for observation in &outcome.observations {
+        assert_eq!(
+            observation.backend_payload["row"], "lifecycle",
+            "lifecycle row: {}",
+            observation.backend_payload
+        );
+        assert_eq!(
+            observation.backend_payload["capture_profile"], "request-lifecycle",
+            "lifecycle profile: {}",
+            observation.backend_payload
+        );
+    }
+    assert_eq!(
+        outcome.observations[0].backend_payload["terminal"],
+        serde_json::json!("sync")
+    );
+    assert_eq!(
+        outcome.observations[0].backend_payload["status"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        outcome.observations[1].backend_payload["terminal"],
+        serde_json::json!("callback")
+    );
+    assert_eq!(
+        outcome.observations[2].backend_payload["terminal"],
+        serde_json::json!("unknown")
+    );
+    assert!(
+        outcome.observations[2].backend_payload["status"].is_null(),
+        "unknown terminal carries no trusted status: {}",
+        outcome.observations[2].backend_payload
+    );
+    // Empty shared feed: session integrity equals the summary
+    // integrity exactly (a second accrual would double).
+    assert_eq!(
+        outcome.integrity, outcome.summary.integrity,
+        "no double count through the shared feed"
+    );
+    // Coverage: unfinished flips completion; delivery stays Unknown.
+    assert_eq!(
+        outcome.coverage.completion.status,
+        kryprobe_core::enums::CoverageStatus::Partial
+    );
+    assert_eq!(
+        outcome.coverage.aggregate_counts.status,
+        kryprobe_core::enums::CoverageStatus::Unknown
+    );
+    assert_eq!(
+        outcome.coverage.detailed_events.status,
+        kryprobe_core::enums::CoverageStatus::Unknown
+    );
+    assert_eq!(
+        outcome.coverage.attachment.status,
+        kryprobe_core::enums::CoverageStatus::CompleteForDeclaredBoundary
+    );
+    // Ring-clock interval: both walls are the scripted now.
+    assert_eq!(outcome.coverage.completion.interval.start_ns, 555);
+    assert_eq!(outcome.coverage.completion.interval.end_ns, Some(555));
+    // Two loop ticks plus the one closing drain.
+    assert_eq!(
+        sensor.drains.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "2 ticks + closing drain"
+    );
+}
+
+#[test]
+fn live_lifecycle_registry_backend_drives_same_decoder() {
+    // T06 item 4 core: the backend reached through the REAL registry
+    // (registered via `register_lifecycle_shared`) decodes and
+    // finalizes through the live driver — registry and live entry
+    // points choose the same profile/decoder, pinned without
+    // privilege (no configure/attach runs here).
+    let mut registry = kryprobe_core::backend::BackendRegistry::new();
+    kryprobe_privilege::kcrypto_lifecycle::backend::register_lifecycle_shared(&mut registry)
+        .expect("lifecycle registers once");
+    let backend = registry
+        .get(kryprobe_core::enums::BackendId::KCrypto)
+        .expect("registered backend resolves");
+    assert_eq!(backend.capabilities().name, "kcrypto-lifecycle");
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = ScriptedLifecycleSensor {
+        ticks: vec![Vec::new()],
+        finish_records: Vec::new(),
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 777,
+        drains: std::sync::atomic::AtomicU64::new(0),
+        stop: &stop,
+    };
+    let cfg = lifecycle_live_config();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        backend,
+        &mut sensor,
+        &stop,
+        4,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("registry backend drives through the live driver");
+    assert!(outcome.observations.is_empty(), "no completions, no rows");
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+    assert_eq!(
+        outcome.coverage.completion.status,
+        kryprobe_core::enums::CoverageStatus::CompleteForDeclaredBoundary,
+        "nothing unfinished completes"
+    );
+}
+
+#[test]
+fn live_lifecycle_unconfigured_sensor_refuses_typed() {
+    // The production sensor over an unconfigured backend refuses on
+    // the first tick with a typed `Internal` naming the lifecycle
+    // stage (the `session_sensor` precedent); the machine parks in
+    // `FailedPartial` (best-effort — the original error wins).
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let mut production = kryprobe_cli::live::RealLifecycleSensor::new(&backend);
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let cfg = lifecycle_live_config();
+    let err = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &backend,
+        &mut production,
+        &stop,
+        4,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect_err("unconfigured sensor must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("lifecycle"),
+        "names the lifecycle stage: {msg}"
+    );
+    assert!(
+        matches!(err, kryprobe_cli::live::LiveError::Internal(_)),
+        "driver defect maps Internal: {msg}"
+    );
+    assert_eq!(
+        controller.state(),
+        kryprobe_core::session::SessionState::FailedPartial
     );
 }

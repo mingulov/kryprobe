@@ -434,6 +434,7 @@ fn k5_live_no_mechanism_names_mint() {
         tick_ms: 1000,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let err = kryprobe_cli::live::run_live_capture_with_registry(
         &cfg,
@@ -804,6 +805,7 @@ fn k5_live_explicit_token_named_when_unusable() {
         tick_ms: 1000,
         token: Some(std::path::PathBuf::from("/nonexistent-k5-token-zzz")),
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let err = kryprobe_cli::live::run_live_capture_with_registry(
         &cfg,
@@ -835,6 +837,7 @@ fn k5_live_env_token_consulted() {
         tick_ms: 1000,
         token: None,
         json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
     };
     let err = kryprobe_cli::live::run_live_capture_with_registry(
         &cfg,

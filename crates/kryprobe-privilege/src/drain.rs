@@ -14,7 +14,7 @@
 //! (see `frame` tests); record bytes are copied out and parsed
 //! field-wise, so `split_header`'s alignment check never applies here.
 
-mod area;
+pub(crate) mod area;
 pub mod frame;
 mod worker;
 

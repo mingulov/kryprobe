@@ -24,6 +24,7 @@ pub mod host;
 pub mod inspect;
 pub mod kallsyms;
 pub mod kcrypto_backend;
+pub mod kcrypto_lifecycle;
 pub mod kcrypto_snapshot;
 pub mod local;
 pub mod mapops;
@@ -34,7 +35,7 @@ pub mod token;
 pub use inspect::{InspectError, TargetSnapshot};
 pub use kcrypto_backend::{
     LocateMiss, ObjectLocateError, locate_kcrypto_object_bytes, locate_kcrypto_object_identity,
-    pins_enforced, sha256_hex,
+    locate_lifecycle_object_bytes, pins_enforced, sha256_hex,
 };
 pub use kryprobe_core::ProgramId;
 pub use local::LocalPrivilegedAuthority;

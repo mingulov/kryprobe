@@ -2,6 +2,7 @@
 //! Subcommand grammars: inspect, selftest, report, watch, check.
 
 use crate::args::{ArgsError, Command, ReportFormat, usage};
+use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use std::path::PathBuf;
 
 /// Default fixture calls for `selftest bpf` (matches the T7 lane).
@@ -174,6 +175,16 @@ fn parse_duration(value: &str, what: &str) -> Result<u64, ArgsError> {
     Ok(seconds)
 }
 
+/// Capture profile by exact name; anything else is invalid input
+/// (exit 2), never a silent default.
+fn parse_profile(value: &str, what: &str) -> Result<LifecycleProfile, ArgsError> {
+    LifecycleProfile::parse(value).ok_or_else(|| {
+        usage(format!(
+            "{what}: unsupported --kcrypto-profile '{value}' (api-returns|request-lifecycle)"
+        ))
+    })
+}
+
 /// `watch --system [--source S] [--duration N] [--token PATH]`:
 /// continuous system-wide observe. `--system` is required (select-all
 /// is the only v0.1 scope).
@@ -182,6 +193,7 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
     let mut duration = None;
     let mut token = None;
+    let mut profile = LifecycleProfile::default();
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -204,6 +216,11 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
                 token = Some(PathBuf::from(value));
                 rest = next;
             }
+            "--kcrypto-profile" => {
+                let (value, next) = take_value(tail, "--kcrypto-profile", "watch")?;
+                profile = parse_profile(value, "watch")?;
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("watch", other)),
             other => return Err(usage(format!("watch: unexpected '{other}'"))),
         }
@@ -215,6 +232,7 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
         source,
         duration,
         token,
+        profile,
     })
 }
 
@@ -227,6 +245,7 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     let mut format = ReportFormat::Human;
     let mut out = None;
     let mut token = None;
+    let mut profile = LifecycleProfile::default();
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -268,6 +287,11 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
                 out = Some(PathBuf::from(value));
                 rest = next;
             }
+            "--kcrypto-profile" => {
+                let (value, next) = take_value(tail, "--kcrypto-profile", "report")?;
+                profile = parse_profile(value, "report")?;
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("report", other)),
             other => return Err(usage(format!("report: unexpected '{other}'"))),
         }
@@ -283,6 +307,7 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
         format,
         out,
         token,
+        profile,
     })
 }
 
@@ -295,6 +320,7 @@ pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
     let mut duration = None;
     let mut policy = None;
     let mut token = None;
+    let mut profile = LifecycleProfile::default();
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -322,6 +348,11 @@ pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
                 token = Some(PathBuf::from(value));
                 rest = next;
             }
+            "--kcrypto-profile" => {
+                let (value, next) = take_value(tail, "--kcrypto-profile", "check")?;
+                profile = parse_profile(value, "check")?;
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("check", other)),
             other => return Err(usage(format!("check: unexpected '{other}'"))),
         }
@@ -337,6 +368,7 @@ pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
         duration,
         policy,
         token,
+        profile,
     })
 }
 

@@ -9,6 +9,7 @@
 pub mod header;
 pub mod ids;
 pub mod kcrypto_agg;
+pub mod kcrypto_lifecycle;
 
 pub use header::{AbiError, RawEventHeader, SpineEvent, split_header};
 pub use ids::{

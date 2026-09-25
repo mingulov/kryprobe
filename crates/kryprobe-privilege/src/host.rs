@@ -45,6 +45,24 @@ pub fn install_sigint_flag() -> std::io::Result<()> {
     Ok(())
 }
 
+/// `CLOCK_MONOTONIC` now in nanoseconds (unprivileged; the ring-clock
+/// domain — lifecycle session walls and the `finish` stop stamp).
+/// The CLI owns no `libc` (ADR-0002 Rule B), so the syscall lives
+/// here behind this plain call; the single unsafe site for both this
+/// and the snapshot walls.
+pub fn monotonic_ns() -> std::io::Result<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid out-pointer; `CLOCK_MONOTONIC` is always supported.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((ts.tv_sec.max(0) as u64) * 1_000_000_000 + (ts.tv_nsec.max(0) as u64))
+}
+
 /// True for missing-path errnos (`ENOENT`/`ENOTDIR`): bad input paths.
 #[must_use]
 pub fn errno_is_missing(errno: i32) -> bool {

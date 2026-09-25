@@ -65,7 +65,8 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             source,
             duration,
             token,
-        } => cmd_watch::run_watch(&source, duration, token.as_deref(), stdout, stderr),
+            profile,
+        } => cmd_watch::run_watch(&source, duration, token.as_deref(), profile, stdout, stderr),
         Command::Report { file } => cmd_report::run(&file, stdout, stderr),
         Command::ReportLive {
             source,
@@ -73,12 +74,14 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             format,
             out,
             token,
+            profile,
         } => cmd_report::run_report_live(
             &source,
             duration,
             format,
             out.as_deref(),
             token.as_deref(),
+            profile,
             stdout,
             stderr,
         ),
@@ -87,7 +90,16 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             duration,
             policy,
             token,
-        } => cmd_check::run(&source, duration, &policy, token.as_deref(), stdout, stderr),
+            profile,
+        } => cmd_check::run(
+            &source,
+            duration,
+            &policy,
+            token.as_deref(),
+            profile,
+            stdout,
+            stderr,
+        ),
         Command::Stub { name } => cmd_stub::run(&name, stderr),
     }
 }

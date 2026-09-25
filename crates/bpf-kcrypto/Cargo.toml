@@ -20,6 +20,10 @@ license = "GPL-2.0-only"
 name = "kcrypto"
 path = "src/bin/kcrypto.rs"
 
+[[bin]]
+name = "kcrypto-lifecycle"
+path = "src/bin/kcrypto_lifecycle.rs"
+
 [dependencies]
 aya-ebpf = "=0.2.1"
 kryprobe-abi = { path = "../kryprobe-abi" }

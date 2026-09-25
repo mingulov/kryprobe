@@ -6,13 +6,18 @@
 //! gate ([`check_pin_name`]) and [`pin_fd`] (R2/R3).
 
 use super::mapcreate::map_create_raw;
-use super::parse::{BpfInsn, insns_to_bytes, parse_kcrypto_object, pseudo_map_fd};
-use super::progload::{prog_load_fexit_raw, prog_load_raw};
+use super::parse::{
+    BpfInsn, insns_to_bytes, parse_kcrypto_object, parse_lifecycle_object, pseudo_map_fd,
+};
+use super::progload::{
+    attach_type_for_section, prog_load_fentry_raw, prog_load_fexit_raw, prog_load_raw,
+};
 use crate::bpfloader::{
-    KcryptoMaps, LoadedKcrypto, LoadedSpine, LoaderError, ParsedSpine, PointStatus, SpineMaps,
-    SpineProgs,
+    KcryptoMaps, LifecycleMaps, LoadedKcrypto, LoadedLifecycle, LoadedSpine, LoaderError,
+    ParsedSpine, PointStatus, SpineMaps, SpineProgs,
 };
 use crate::fd::OwnedFd;
+use crate::kcrypto_lifecycle::profile::{missing_required_points, required_gate_error};
 use crate::probe::bpf_sys::{BPF_OBJ_PIN, bpf, fd_or_errno, last_errno};
 use core::ffi::{c_long, c_void};
 use std::ffi::CString;
@@ -271,6 +276,187 @@ pub fn load_kcrypto(
         },
         statuses,
     ))
+}
+
+/// Shape-authenticated lifecycle entry (T06, no `ProgramId`
+/// allowlist): the manifest's `fentry/`+`fexit/` sections + frozen
+/// [`LIFECYCLE_MAPS`](crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS)
+/// dims fully determine the loaded behavior. Unlike
+/// [`load_kcrypto`]'s per-point degrade, a missing required edge —
+/// missing section, missing BTF id, or refused load — fails the whole
+/// load (unpaired edges cannot pair submit with result).
+///
+/// `attach_ids` maps kernel symbol → vmlinux BTF id (profile-scoped:
+/// exactly the manifest's symbols). Point names are SECTIONS (the
+/// attach dispatch routes on the `fentry/`/`fexit/` prefix).
+pub fn load_lifecycle(
+    bytes: &[u8],
+    attach_ids: &[(String, u32)],
+    token_fd: Option<RawFd>,
+) -> Result<(LoadedLifecycle, Vec<PointStatus>), LoaderError> {
+    let parsed = parse_lifecycle_object(bytes)?;
+    let mut fds: Vec<(String, OwnedFd)> = Vec::with_capacity(parsed.maps.len());
+    for map in &parsed.maps {
+        let ret = map_create_raw(
+            map.dims.map_type,
+            map.dims.key_size,
+            map.dims.value_size,
+            map.dims.max_entries,
+            token_fd,
+        );
+        let fd = fd_or_errno(ret).map_err(|errno| LoaderError::MapFailed {
+            stage: map.name.clone(),
+            errno,
+        })?;
+        fds.push((map.name.clone(), fd));
+    }
+    let fd_of = |name: &str| -> Result<i32, LoaderError> {
+        fds.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, fd)| fd.as_raw_fd())
+            .ok_or_else(|| LoaderError::BadObject {
+                reason: format!("reloc names unknown map '{name}'"),
+            })
+    };
+    let mut streams: Vec<Vec<BpfInsn>> = parsed.programs.iter().map(|p| p.insns.clone()).collect();
+    for reloc in &parsed.map_relocs {
+        let fd = fd_of(&reloc.map)?;
+        let insns = streams
+            .get_mut(reloc.prog)
+            .ok_or_else(|| LoaderError::BadObject {
+                reason: format!("reloc names unknown program {}", reloc.prog),
+            })?;
+        let first = insns
+            .get_mut(reloc.insn_idx)
+            .ok_or_else(|| LoaderError::BadObject {
+                reason: "map reloc index out of range".to_owned(),
+            })?;
+        if first.code != 0x18 {
+            return Err(LoaderError::BadObject {
+                reason: "map reloc is not an ld_imm64 pair".to_owned(),
+            });
+        }
+        first.dst_src |= pseudo_map_fd() << 4;
+        first.imm = fd;
+        let second = insns
+            .get_mut(reloc.insn_idx + 1)
+            .ok_or_else(|| LoaderError::BadObject {
+                reason: "map reloc pair truncated".to_owned(),
+            })?;
+        second.imm = 0;
+    }
+    let mut progs: Vec<(String, OwnedFd)> = Vec::with_capacity(parsed.programs.len());
+    let mut statuses: Vec<PointStatus> = Vec::with_capacity(parsed.programs.len());
+    let mut load_errors: Vec<(String, LoaderError)> = Vec::new();
+    for (prog, insns) in parsed.programs.iter().zip(streams.iter()) {
+        let symbol = prog
+            .section
+            .strip_prefix("fentry/")
+            .or_else(|| prog.section.strip_prefix("fexit/"))
+            .unwrap_or_default();
+        let id = attach_ids.iter().find(|(name, _)| name == symbol);
+        let attach_type = attach_type_for_section(&prog.section);
+        match (id, attach_type) {
+            (Some((_, id)), Some(attach_type)) => {
+                match load_tracing_program(&prog.name, insns, *id, attach_type, token_fd) {
+                    Ok(fd) => {
+                        statuses.push(PointStatus::Loaded {
+                            name: prog.section.clone(),
+                        });
+                        progs.push((prog.section.clone(), fd));
+                    }
+                    Err(err) => {
+                        statuses.push(PointStatus::Unsupported {
+                            name: prog.section.clone(),
+                            detail: short_detail(&err),
+                        });
+                        load_errors.push((prog.section.clone(), err));
+                    }
+                }
+            }
+            _ => statuses.push(PointStatus::Missing {
+                name: prog.section.clone(),
+            }),
+        }
+    }
+    let refs: Vec<(&str, &PointStatus)> = statuses
+        .iter()
+        .map(|st| match st {
+            PointStatus::Loaded { name }
+            | PointStatus::Missing { name }
+            | PointStatus::Unsupported { name, .. } => (name.as_str(), st),
+        })
+        .collect();
+    let missing = missing_required_points(&refs);
+    if !missing.is_empty() {
+        return Err(required_gate_error(&missing, &load_errors));
+    }
+    let mut take = |name: &str| -> Result<OwnedFd, LoaderError> {
+        let pos =
+            fds.iter()
+                .position(|(n, _)| n == name)
+                .ok_or_else(|| LoaderError::BadObject {
+                    reason: format!("missing map '{name}'"),
+                })?;
+        Ok(fds.remove(pos).1)
+    };
+    Ok((
+        LoadedLifecycle {
+            maps: LifecycleMaps {
+                config: take("LCFG")?,
+                ring: take("LRING")?,
+                loss: take("LLOSS")?,
+            },
+            progs,
+        },
+        statuses,
+    ))
+}
+
+/// Load one tracing program with its attach type (entry/exit split):
+/// `FENTRY` sections ride [`prog_load_fentry_raw`], `FEXIT` sections
+/// the K0-proven [`prog_load_fexit_raw`].
+fn load_tracing_program(
+    name: &str,
+    insns: &[BpfInsn],
+    attach_btf_id: u32,
+    attach_type: u32,
+    token_fd: Option<RawFd>,
+) -> Result<OwnedFd, LoaderError> {
+    if insns.is_empty() {
+        return Err(LoaderError::BadObject {
+            reason: format!("program '{name}' has no insns"),
+        });
+    }
+    let bytes = insns_to_bytes(insns);
+    let mut log = vec![0u8; LOG_CAP];
+    let ret = if attach_type == crate::probe::bpf_sys::BPF_TRACE_FENTRY {
+        prog_load_fentry_raw(
+            name,
+            &bytes,
+            insns.len() as u32,
+            attach_btf_id,
+            &mut log,
+            token_fd,
+        )
+    } else {
+        prog_load_fexit_raw(
+            name,
+            &bytes,
+            insns.len() as u32,
+            attach_btf_id,
+            &mut log,
+            token_fd,
+        )
+    };
+    match fd_or_errno(ret) {
+        Ok(fd) => Ok(fd),
+        Err(errno) => Err(LoaderError::LoadFailed {
+            stage: name.to_owned(),
+            errno,
+            log: log_tail(&log),
+        }),
+    }
 }
 
 /// Short per-point failure reason: errno only for load refuses (the

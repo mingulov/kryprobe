@@ -36,6 +36,8 @@ pub const BPF_OBJ_PIN: u32 = 6;
 pub const BPF_PROG_TYPE_TRACING: u32 = 26;
 /// `BPF_TRACE_FEXIT` expected attach type id (K1 Task 2, C1).
 pub const BPF_TRACE_FEXIT: u32 = 25;
+/// `BPF_TRACE_FENTRY` expected attach type id (T06 lifecycle entry edge).
+pub const BPF_TRACE_FENTRY: u32 = 24;
 /// Required in map/prog flags when a token fd rides the attr.
 pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
 

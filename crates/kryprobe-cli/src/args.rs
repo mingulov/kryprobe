@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Hand argument parser: globals, subcommands, usage errors (exit 2).
 
+use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use std::path::PathBuf;
 
 /// Full usage text (also the `--help` output).
@@ -18,12 +19,12 @@ commands:
   token mint [--bin PATH] [--receipt PATH] [--force]
                                root one-shot file-cap grant + receipt (setcap)
   token status [--bin PATH]     file caps + token-pin usability (never privileged)
-  watch --system [--source S] [--duration N] [--token PATH]
+  watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P]
                                continuous system-wide observe (live kcrypto)
-  report --system [--duration N] [--format human|json|jsonl] [--out F] [--source S] [--token PATH]
+  report --system [--duration N] [--format human|json|jsonl] [--out F] [--source S] [--token PATH] [--kcrypto-profile P]
                                bounded system-wide capture + render (live kcrypto)
   report FILE                  validate + render a JSONL stream
-  check --system --policy F [--duration N] [--source S] [--token PATH]
+  check --system --policy F [--duration N] [--source S] [--token PATH] [--kcrypto-profile P]
                                system-wide policy check (exit 10 on violation)
   plan|observe|run ...         unsupported in thin spine (exit 4)
 
@@ -122,6 +123,8 @@ pub enum Command {
         duration: Option<u64>,
         /// Explicit BPF token path (overrides env + default pin).
         token: Option<PathBuf>,
+        /// Capture profile (`api-returns` default, `request-lifecycle`).
+        profile: LifecycleProfile,
     },
     /// Validate + render a stream.
     Report {
@@ -142,6 +145,8 @@ pub enum Command {
         out: Option<PathBuf>,
         /// Explicit BPF token path (overrides env + default pin).
         token: Option<PathBuf>,
+        /// Capture profile (`api-returns` default, `request-lifecycle`).
+        profile: LifecycleProfile,
     },
     /// System-wide policy check (live kcrypto capture evaluated
     /// against the policy; exit 10 on confirmed violation).
@@ -154,6 +159,8 @@ pub enum Command {
         policy: PathBuf,
         /// Explicit BPF token path (overrides env + default pin).
         token: Option<PathBuf>,
+        /// Capture profile (`api-returns` default, `request-lifecycle`).
+        profile: LifecycleProfile,
     },
     /// Thin-spine stub (`plan`/`observe`/`run`).
     Stub {
@@ -421,6 +428,7 @@ mod tests {
                 source: "kernel-crypto".to_owned(),
                 duration: None,
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -431,6 +439,7 @@ mod tests {
                 source: "kernel-crypto".to_owned(),
                 duration: Some(60),
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -441,6 +450,7 @@ mod tests {
                 source: "kernel-crypto".to_owned(),
                 duration: None,
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         for bad in [
@@ -475,6 +485,7 @@ mod tests {
                 format: ReportFormat::Human,
                 out: None,
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -496,6 +507,7 @@ mod tests {
                 format: ReportFormat::Json,
                 out: Some(PathBuf::from("o.json")),
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -508,6 +520,7 @@ mod tests {
                 format: ReportFormat::Jsonl,
                 out: None,
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         for bad in [
@@ -536,6 +549,7 @@ mod tests {
                 duration: None,
                 policy: PathBuf::from("p.yaml"),
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -554,6 +568,7 @@ mod tests {
                 duration: Some(60),
                 policy: PathBuf::from("p.yaml"),
                 token: None,
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         for bad in [
@@ -755,6 +770,94 @@ mod tests {
     }
 
     #[test]
+    fn f8a_live_commands_accept_kcrypto_profile() {
+        // Round-1 (sol-M5/astra-M8): live entry points select the
+        // capture profile by name; unset keeps api-returns, garbage
+        // is a usage error (never a silent default).
+        use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
+        assert_eq!(
+            parse(&argv(&[
+                "watch",
+                "--system",
+                "--kcrypto-profile",
+                "request-lifecycle",
+            ]))
+            .unwrap()
+            .command,
+            Command::Watch {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                token: None,
+                profile: LifecycleProfile::RequestLifecycle,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["watch", "--system"])).unwrap().command,
+            Command::Watch {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                token: None,
+                profile: LifecycleProfile::ApiReturns,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&[
+                "report",
+                "--system",
+                "--kcrypto-profile",
+                "request-lifecycle",
+            ]))
+            .unwrap()
+            .command,
+            Command::ReportLive {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                format: ReportFormat::Human,
+                out: None,
+                token: None,
+                profile: LifecycleProfile::RequestLifecycle,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&[
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--kcrypto-profile",
+                "request-lifecycle",
+            ]))
+            .unwrap()
+            .command,
+            Command::Check {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                policy: PathBuf::from("p.yaml"),
+                token: None,
+                profile: LifecycleProfile::RequestLifecycle,
+            }
+        );
+        for bad in [
+            vec!["watch", "--system", "--kcrypto-profile", "lifecycle"],
+            vec!["watch", "--system", "--kcrypto-profile"],
+            vec!["report", "--system", "--kcrypto-profile", "bogus"],
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--kcrypto-profile",
+                "bogus",
+            ],
+        ] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "{bad:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
     fn k5_live_commands_accept_token_path() {
         assert_eq!(
             parse(&argv(&["watch", "--system", "--token", "t"]))
@@ -764,6 +867,7 @@ mod tests {
                 source: "kernel-crypto".to_owned(),
                 duration: None,
                 token: Some(PathBuf::from("t")),
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -776,6 +880,7 @@ mod tests {
                 format: ReportFormat::Human,
                 out: None,
                 token: Some(PathBuf::from("t")),
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         assert_eq!(
@@ -789,6 +894,7 @@ mod tests {
                 duration: None,
                 policy: PathBuf::from("p.yaml"),
                 token: Some(PathBuf::from("t")),
+                profile: LifecycleProfile::ApiReturns,
             }
         );
         for bad in [

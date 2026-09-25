@@ -47,8 +47,9 @@ pub(crate) mod snapshot_who;
 pub(crate) use integrity::{integrity_for_counts, integrity_for_snapshot};
 pub(crate) use object::kcrypto_object_bytes;
 pub use object::{
-    LocateMiss, ObjectLocateError, kcrypto_object_candidates, locate_kcrypto_object_bytes,
-    locate_kcrypto_object_identity, pins_enforced, sha256_hex,
+    LocateMiss, ObjectLocateError, kcrypto_object_candidates, lifecycle_object_candidates,
+    locate_kcrypto_object_bytes, locate_kcrypto_object_identity, locate_lifecycle_object_bytes,
+    pins_enforced, sha256_hex,
 };
 pub use observe::observation_for_who;
 pub use snapshot_drops::{
@@ -75,6 +76,7 @@ use crate::btf_resolve::{
     AttachOutcome, BtfError, ConfiguredError, ConfiguredKcrypto, ConfiguredPoint, KCRYPTO_SYMBOLS,
     load_kcrypto_configured, resolve_btf_ids,
 };
+use crate::kcrypto_lifecycle::profile::{LifecycleProfile, SessionGuard, acquire_kcrypto_session};
 #[cfg(test)]
 use crate::kcrypto_snapshot::SnapshotRows;
 use crate::kcrypto_snapshot::{ParsedRow, parse_snapshot_row, snapshot_rows};
@@ -93,7 +95,7 @@ use kryprobe_core::backend::{
 use kryprobe_core::budget::BudgetKind;
 use kryprobe_core::enums::{BackendId, CaptureMode};
 use kryprobe_core::error::{
-    BackendError, BudgetReason, DeniedReason, InternalError, UnsupportedReason,
+    BackendError, BudgetReason, DeniedReason, InternalError, SafetyReason, UnsupportedReason,
 };
 use kryprobe_core::evidence::{IntegritySummary, NativeObservation};
 use kryprobe_core::ids::PlanGeneration;
@@ -129,6 +131,7 @@ pub struct KCryptoBackend {
     state: Mutex<Option<(PlanGeneration, ConfiguredKcrypto)>>,
     staged: Mutex<StagedBringup>,
     decoded: AtomicUsize,
+    session: Mutex<Option<SessionGuard>>,
 }
 
 /// One-shot bringup inputs staged by the live session (H1(b)/M2): the
@@ -169,6 +172,14 @@ impl std::fmt::Debug for KCryptoBackend {
                 "configured",
                 &self.state.try_lock().map(|s| s.is_some()).unwrap_or(false),
             )
+            .field(
+                "session_held",
+                &self
+                    .session
+                    .try_lock()
+                    .map(|s| s.is_some())
+                    .unwrap_or(false),
+            )
             .finish()
     }
 }
@@ -181,6 +192,7 @@ impl KCryptoBackend {
             state: Mutex::new(None),
             staged: Mutex::new(StagedBringup::default()),
             decoded: AtomicUsize::new(0),
+            session: Mutex::new(None),
         }
     }
 
@@ -366,9 +378,41 @@ pub fn register_kcrypto_shared(
     Ok(shared)
 }
 
+/// The live-held handle for the registered profile (T06 F8c): exactly
+/// one `BackendId::KCrypto` backend per registry — registering the
+/// second profile is a typed [`DuplicateBackend`], never a second
+/// capture (structural exclusion within a session).
+#[derive(Debug, Clone)]
+pub enum ProfileBackend {
+    /// Aggregate sensor handle (`api-returns`).
+    ApiReturns(SharedKcryptoBackend),
+    /// Edge-pairing sensor handle (`request-lifecycle`).
+    RequestLifecycle(crate::kcrypto_lifecycle::backend::SharedLifecycleBackend),
+}
+
+/// Profile registration (T06 F8c): the ONE registry entry point —
+/// registry and live entry points both select through this, so they
+/// can never diverge. The CLI live session imports this; never
+/// redefines it.
+pub fn register_kcrypto_profile(
+    registry: &mut BackendRegistry,
+    profile: LifecycleProfile,
+) -> Result<ProfileBackend, DuplicateBackend> {
+    match profile {
+        LifecycleProfile::ApiReturns => {
+            register_kcrypto_shared(registry).map(ProfileBackend::ApiReturns)
+        }
+        LifecycleProfile::RequestLifecycle => {
+            crate::kcrypto_lifecycle::backend::register_lifecycle_shared(registry)
+                .map(ProfileBackend::RequestLifecycle)
+        }
+    }
+}
+
 /// Charge one budget kind, mapping refusal to a typed exhaustion error
 /// (the [`SyntheticBackend`](kryprobe_core::synthetic::SyntheticBackend) pattern).
-fn charge(
+/// Shared with the lifecycle backend (same charging semantics).
+pub(crate) fn charge(
     ctx: &mut ConfigureContext<'_>,
     kind: BudgetKind,
     amount: u64,
@@ -385,8 +429,9 @@ fn charge(
 
 /// BTF resolution failure: the whole backend is unavailable (D4 — honest;
 /// BTF-complete kernels carry all 9 long-standing APIs). Shared by `detect`
-/// and the `Resolve` arm of [`configured_error_to_backend`].
-fn btf_unsupported(err: &BtfError) -> BackendError {
+/// and the `Resolve` arm of [`configured_error_to_backend`], and by the
+/// lifecycle backend's `detect` (same unavailability semantics).
+pub(crate) fn btf_unsupported(err: &BtfError) -> BackendError {
     BackendError::Unsupported(UnsupportedReason::with_detail(
         "kcrypto_btf_unresolvable",
         &err.to_string(),
@@ -420,8 +465,10 @@ fn points_summary(points: &[ConfiguredPoint]) -> String {
 /// Exact D5 error map: `Resolve → Unsupported`, `Load → Denied`,
 /// `Configure → Internal` (post-load map-write failure is a defect marker),
 /// `AttachSetup → Denied`, `NoPointAttached → Unsupported` iff every point
-/// is `Missing` (whole backend unavailable — honest) else `Denied`.
-fn configured_error_to_backend(err: ConfiguredError) -> BackendError {
+/// is `Missing` (whole backend unavailable — honest) else `Denied`,
+/// `SessionBusy → Unsafe` (cross-profile exclusion). Shared with the
+/// lifecycle backend (same taxonomy for both profiles' bring-up).
+pub(crate) fn configured_error_to_backend(err: ConfiguredError) -> BackendError {
     match err {
         ConfiguredError::Resolve(inner) => btf_unsupported(&inner),
         ConfiguredError::Load(inner) => BackendError::Denied(DeniedReason::with_detail(
@@ -453,6 +500,16 @@ fn configured_error_to_backend(err: ConfiguredError) -> BackendError {
                     &detail,
                 ))
             }
+        }
+        ConfiguredError::SessionBusy { live, want } => {
+            BackendError::Unsafe(SafetyReason::with_detail(
+                "kcrypto_session_busy",
+                &format!(
+                    "'{}' is live, '{}' refused (no duplicate capture)",
+                    live.as_str(),
+                    want.as_str()
+                ),
+            ))
         }
     }
 }
@@ -514,6 +571,17 @@ impl Backend for KCryptoBackend {
                 return Ok(());
             }
         }
+        // First call (or a new generation): claim the process share
+        // for api-returns (no duplicate capture: a live lifecycle
+        // session refuses this typed). The local hold covers the
+        // load; success stashes it with the sensor, failure drops it
+        // (a failed bring-up holds nothing).
+        let session = acquire_kcrypto_session(LifecycleProfile::ApiReturns).map_err(|busy| {
+            BackendError::Unsafe(SafetyReason::with_detail(
+                "kcrypto_session_busy",
+                &busy.to_string(),
+            ))
+        })?;
         // First call (or a new generation): staged inputs win when
         // the live session staged them (H1(b)/M2 — the already-read
         // bytes skip the locator re-read; the staged token loads
@@ -551,6 +619,13 @@ impl Backend for KCryptoBackend {
         charge(ctx, BudgetKind::Links, sensor.links.len() as u64)?;
         charge(ctx, BudgetKind::StateEntries, KCRYPTO_MAP_COUNT)?;
         *state = Some((ctx.generation, sensor));
+        // Stash the process hold with the sensor (replacing any prior
+        // hold on generation change; the replaced guard's drop keeps
+        // the count exact).
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(session);
         Ok(())
     }
 

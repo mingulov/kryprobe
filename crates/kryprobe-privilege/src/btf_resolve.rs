@@ -103,6 +103,14 @@ pub enum BtfError {
         /// Observed nonzero offset.
         offset: u32,
     },
+    /// Function prototype incompatible with the lifecycle sensor's
+    /// reads (arg0 must be a request pointer, return a 32-bit int).
+    BadPrototype {
+        /// Function name.
+        name: String,
+        /// Incompatibility detail.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for BtfError {
@@ -124,6 +132,9 @@ impl std::fmt::Display for BtfError {
                     f,
                     "BTF struct '{type_name}' member '{member}' moved to byte {offset} (BPF hardcodes 0)"
                 )
+            }
+            Self::BadPrototype { name, reason } => {
+                write!(f, "BTF FUNC '{name}' prototype refused: {reason}")
             }
         }
     }
@@ -475,6 +486,13 @@ pub enum ConfiguredError {
         /// Per-point load/attach outcomes (diagnosable).
         points: Vec<ConfiguredPoint>,
     },
+    /// Another profile holds the process (no duplicate capture).
+    SessionBusy {
+        /// Profile currently live in this process.
+        live: crate::kcrypto_lifecycle::profile::LifecycleProfile,
+        /// Profile that was refused.
+        want: crate::kcrypto_lifecycle::profile::LifecycleProfile,
+    },
 }
 
 impl std::fmt::Display for ConfiguredError {
@@ -491,6 +509,14 @@ impl std::fmt::Display for ConfiguredError {
                     f,
                     "kcrypto attach: no point attached ({} points)",
                     points.len()
+                )
+            }
+            Self::SessionBusy { live, want } => {
+                write!(
+                    f,
+                    "kcrypto session busy: '{}' is live, '{}' refused (no duplicate capture)",
+                    live.as_str(),
+                    want.as_str()
                 )
             }
         }
@@ -520,7 +546,7 @@ impl ConfiguredError {
 
 /// Zero-identity object for system-wide groups (the fexit path never
 /// reads it; same shape as the suite scaffolding).
-fn system_object() -> ObjectRef {
+pub(crate) fn system_object() -> ObjectRef {
     ObjectRef {
         dev: 0,
         ino: 0,
@@ -656,14 +682,50 @@ fn resolve_btf_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> 
 /// bringup combo parses once and shares the `Btf` across all three
 /// resolutions instead of parsing per resolver).
 fn btf_ids_from_btf(btf: &Btf) -> Result<HashMap<String, u32>, BtfError> {
-    let mut out = HashMap::with_capacity(KCRYPTO_SYMBOLS.len());
-    for name in KCRYPTO_SYMBOLS {
+    btf_ids_from_btf_for(btf, KCRYPTO_SYMBOLS)
+}
+
+/// Func-id resolution over an already-parsed image for an explicit
+/// symbol list (T06 profile scoping: the caller names exactly the
+/// symbols its profile needs — no more). Every symbol must resolve;
+/// the first missing one fails the whole call (fail-closed: a half
+/// map would silently drop attach points).
+fn btf_ids_from_btf_for(btf: &Btf, symbols: &[&str]) -> Result<HashMap<String, u32>, BtfError> {
+    let mut out = HashMap::with_capacity(symbols.len());
+    for name in symbols {
         let id = btf.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
             name: (*name).to_owned(),
         })?;
         out.insert((*name).to_owned(), id);
     }
     Ok(out)
+}
+
+/// Resolve the request-lifecycle manifest's symbols to vmlinux BTF
+/// ids (T06). Unprivileged. Profile-scoped: only the manifest's
+/// required symbols resolve (today: the two api sites) — the full
+/// 9-symbol api-returns set is a different profile's business.
+/// Every resolved symbol's prototype is validated against the
+/// sensor's reads (arg0 pointer, 32-bit int return); a name that
+/// resolves with an incompatible shape refuses startup.
+pub fn resolve_lifecycle_ids() -> Result<HashMap<String, u32>, BtfError> {
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    resolve_lifecycle_ids_from(bytes)
+}
+
+/// Resolve + prototype-validate over an explicit BTF image (the
+/// fixture seam: H02 drives synthetic images through this; the
+/// vmlinux path above delegates after reading the bytes).
+pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> {
+    use crate::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
+    let btf = Btf::parse(bytes)?;
+    let table = manifest(LifecycleProfile::RequestLifecycle);
+    let symbols: Vec<&str> = table.required.iter().map(|s| s.symbol).collect();
+    let ids = btf_ids_from_btf_for(&btf, &symbols)?;
+    for name in &symbols {
+        btf.lifecycle_proto_id(name)?;
+    }
+    Ok(ids)
 }
 
 /// C3 first-member links: struct/member pairs the BPF reads at

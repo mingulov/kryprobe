@@ -15,8 +15,8 @@
 //! privilege, no syscall).
 
 use crate::probe::bpf_sys::{
-    BPF_F_TOKEN_FD, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING, BPF_TRACE_FEXIT,
-    BPF_TRACE_UPROBE_MULTI, bpf,
+    BPF_F_TOKEN_FD, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING, BPF_TRACE_FENTRY,
+    BPF_TRACE_FEXIT, BPF_TRACE_UPROBE_MULTI, bpf,
 };
 use core::ffi::{c_long, c_void};
 use std::os::fd::RawFd;
@@ -127,6 +127,32 @@ pub(crate) const FEXIT_PROG_ATTR_LEN: u32 = 116;
 
 const _: () = assert!(size_of::<FexitProgAttr>() == 120);
 
+/// The fentry prog attr: the same 116-byte UAPI prefix as fexit (the
+/// entry/exit split rides `expected_attach_type`, not layout). A
+/// distinct name so call sites declare their edge.
+pub(crate) type FentryProgAttr = FexitProgAttr;
+
+/// Route a program section to its tracing attach type: `fentry/` →
+/// `FENTRY`, `fexit/` → `FEXIT` (nonempty target required); anything
+/// else is not a tracing program. Pure for tests; the lifecycle load
+/// dispatch builds each program's spec from this.
+#[must_use]
+pub(crate) fn attach_type_for_section(section: &str) -> Option<u32> {
+    if section
+        .strip_prefix("fentry/")
+        .is_some_and(|rest| !rest.is_empty())
+    {
+        Some(BPF_TRACE_FENTRY)
+    } else if section
+        .strip_prefix("fexit/")
+        .is_some_and(|rest| !rest.is_empty())
+    {
+        Some(BPF_TRACE_FEXIT)
+    } else {
+        None
+    }
+}
+
 static LICENSE: &[u8; 4] = b"GPL\0";
 
 fn prog_name16(name: &str) -> [u8; 16] {
@@ -204,6 +230,15 @@ pub(crate) fn token_prog_attr(spec: &ProgSpec<'_>, token_fd: RawFd) -> TokenProg
         log_true_size: 0,
         token_fd,
     }
+}
+
+/// Plain 116-byte fentry attr (T06 split): the same projection as
+/// fexit — the entry edge differs only in the spec's
+/// `expected_attach_type` (pinned `FENTRY` by the dispatch, never
+/// `FEXIT`). A distinct constructor so fentry call sites name their
+/// edge and review can audit the split.
+pub(crate) fn plain_fentry_attr(spec: &ProgSpec<'_>) -> FentryProgAttr {
+    plain_fexit_attr(spec)
 }
 
 /// Plain 116-byte fexit attr (the `None` path: privilege, the K0-proven
@@ -294,6 +329,65 @@ pub(crate) fn prog_load_raw(
 /// load (R1); `token: None` builds the 116-byte attr, `Some(fd)` the
 /// token-extended attr. No prog BTF (K0 P1 attaches without it).
 ///
+/// Raw `BPF_PROG_LOAD` for one fentry program (T06 split); `log`
+/// receives the verifier log. Returns fd or -1.
+///
+/// `TRACING(26)` + expected `FENTRY(24)` + per-prog `attach_btf_id` at
+/// load; `token: None` builds the 116-byte attr, `Some(fd)` the
+/// token-extended attr. No prog BTF (K0 P1 attaches without it).
+///
+/// Crate-private: reached only via the lifecycle load dispatch.
+pub(crate) fn prog_load_fentry_raw(
+    name: &str,
+    insn_bytes: &[u8],
+    insn_cnt: u32,
+    attach_btf_id: u32,
+    log: &mut [u8],
+    token: Option<RawFd>,
+) -> c_long {
+    // SAFETY: attr + pointees (insns, license, log) outlive the syscall.
+    unsafe {
+        if let Some(token_fd) = token {
+            let mut attr = token_prog_attr(
+                &ProgSpec {
+                    prog_type: BPF_PROG_TYPE_TRACING,
+                    name,
+                    insns_ptr: insn_bytes.as_ptr() as u64,
+                    insn_cnt,
+                    log_level: KCRYPTO_LOG_LEVEL,
+                    log_ptr: log.as_mut_ptr() as u64,
+                    log_len: log.len() as u32,
+                    expected_attach_type: BPF_TRACE_FENTRY,
+                    attach_btf_id,
+                },
+                token_fd,
+            );
+            bpf(
+                BPF_PROG_LOAD,
+                (&raw mut attr).cast::<c_void>(),
+                TOKEN_PROG_ATTR_LEN,
+            )
+        } else {
+            let mut attr = plain_fentry_attr(&ProgSpec {
+                prog_type: BPF_PROG_TYPE_TRACING,
+                name,
+                insns_ptr: insn_bytes.as_ptr() as u64,
+                insn_cnt,
+                log_level: KCRYPTO_LOG_LEVEL,
+                log_ptr: log.as_mut_ptr() as u64,
+                log_len: log.len() as u32,
+                expected_attach_type: BPF_TRACE_FENTRY,
+                attach_btf_id,
+            });
+            bpf(
+                BPF_PROG_LOAD,
+                (&raw mut attr).cast::<c_void>(),
+                FEXIT_PROG_ATTR_LEN,
+            )
+        }
+    }
+}
+
 /// Crate-private: reached only via [`load_kcrypto`](super::instantiate::load_kcrypto).
 pub(crate) fn prog_load_fexit_raw(
     name: &str,
@@ -408,6 +502,50 @@ mod tests {
         assert_eq!(attr.prog_name[5], 0);
         assert_eq!(attr.expected_attach_type, BPF_TRACE_UPROBE_MULTI);
         assert_eq!(size_of::<ProgLoadAttr>(), 72);
+    }
+
+    fn fentry_spec() -> ProgSpec<'static> {
+        ProgSpec {
+            prog_type: BPF_PROG_TYPE_TRACING,
+            name: "fentry_crypto",
+            insns_ptr: 0x5000,
+            insn_cnt: 100,
+            log_level: KCRYPTO_LOG_LEVEL,
+            log_ptr: 0x6000,
+            log_len: 2048,
+            expected_attach_type: BPF_TRACE_FENTRY,
+            attach_btf_id: 5150,
+        }
+    }
+
+    #[test]
+    fn plain_fentry_attr_pins_tracing_entry_shape() {
+        // The T06 split: fentry loads pin TRACING + FENTRY (not FEXIT)
+        // with the per-prog id at load, flags 0, level-1 log.
+        let spec = fentry_spec();
+        let attr = plain_fentry_attr(&spec);
+        assert_eq!(attr.prog_type, BPF_PROG_TYPE_TRACING);
+        assert_eq!(attr.attach_btf_id, 5150);
+        assert_eq!(attr.expected_attach_type, BPF_TRACE_FENTRY);
+        assert_ne!(attr.expected_attach_type, BPF_TRACE_FEXIT);
+        assert_eq!(attr.prog_flags, 0);
+        assert_eq!(attr.log_level, KCRYPTO_LOG_LEVEL);
+        assert_eq!(size_of::<FentryProgAttr>(), 120);
+    }
+
+    #[test]
+    fn attach_type_routes_by_section_prefix() {
+        assert_eq!(
+            attach_type_for_section("fentry/crypto_skcipher_encrypt"),
+            Some(BPF_TRACE_FENTRY)
+        );
+        assert_eq!(
+            attach_type_for_section("fexit/crypto_skcipher_encrypt"),
+            Some(BPF_TRACE_FEXIT)
+        );
+        assert_eq!(attach_type_for_section("kprobe/x"), None);
+        assert_eq!(attach_type_for_section("fentry"), None);
+        assert_eq!(attach_type_for_section(""), None);
     }
 
     #[test]

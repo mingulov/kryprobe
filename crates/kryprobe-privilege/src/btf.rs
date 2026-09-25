@@ -183,6 +183,84 @@ impl<'a> Btf<'a> {
         Ok(None)
     }
 
+    /// Chase qualifier wrappers (typedef/const/volatile/restrict) to
+    /// the first unwrapped type id (cap-bounded, cycle-guarded).
+    /// Dangling ids, void, cycles, and over-long chains are [`bad`]
+    /// (corrupt image), never a silent stop.
+    fn chase_wrappers(&self, mut id: u32) -> Result<u32, BtfError> {
+        let mut seen = [0u32; DESCENT_CAP + 1];
+        for depth in 0..=DESCENT_CAP {
+            if id == 0 {
+                return Err(bad("wrapper chase reached VOID".to_owned()));
+            }
+            if seen[..depth].contains(&id) {
+                return Err(bad("wrapper chase cycles".to_owned()));
+            }
+            seen[depth] = id;
+            let rec = self.rec(id)?;
+            match rec.kind {
+                KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT => {
+                    id = rec.size_or_type;
+                }
+                _ => return Ok(id),
+            }
+        }
+        Err(bad("wrapper chase exceeds the descent cap".to_owned()))
+    }
+
+    /// Validate that `name`'s prototype matches the lifecycle sensor's
+    /// reads and return its `FUNC` id: at least one argument, arg0 a
+    /// request pointer (after qualifier chase), return a 32-bit int
+    /// (round-1 sol-M2/astra-M2 — name-only resolution would mis-key
+    /// the join or misread the status on a signature change).
+    ///
+    /// Only what the BPF consumes is checked: the pointee type is
+    /// unchecked BY DESIGN (the key is never dereferenced — an opaque
+    /// pairing value), and extra arguments are allowed (arg0 +
+    /// return reads are unaffected by them). Corrupt images stay
+    /// [`BtfError::BadBtf`]; well-formed but incompatible prototypes
+    /// are [`BtfError::BadPrototype`].
+    pub(crate) fn lifecycle_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
+            name: name.to_owned(),
+        })?;
+        let target = self.rec(id)?.size_or_type;
+        let proto = self.rec(target)?;
+        if proto.kind != KIND_FUNC_PROTO {
+            return Err(bad_proto(format!(
+                "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                proto.kind
+            )));
+        }
+        if proto.vlen == 0 {
+            return Err(bad_proto("prototype takes no arguments".to_owned()));
+        }
+        let arg0 = read_u32(self.bytes, proto.aux_at + 4, "proto arg0 type")?;
+        if self.rec(self.chase_wrappers(arg0)?)?.kind != KIND_PTR {
+            return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        let ret = proto.size_or_type;
+        if ret == 0 {
+            return Err(bad_proto("return is VOID, not a 32-bit int".to_owned()));
+        }
+        let rec = self.rec(self.chase_wrappers(ret)?)?;
+        if rec.kind != KIND_INT {
+            return Err(bad_proto("return is not an INT".to_owned()));
+        }
+        let data = read_u32(self.bytes, rec.aux_at, "int data")?;
+        if data & 0xff != 32 {
+            return Err(bad_proto(format!(
+                "return INT is {} bits, not 32",
+                data & 0xff
+            )));
+        }
+        Ok(id)
+    }
+
     /// Byte offset of `member` in struct/union `type_name`, descending
     /// into anonymous members (offsets add). TYPEDEF names resolve to
     /// their struct; anything else is missing, never guessed.

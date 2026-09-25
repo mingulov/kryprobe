@@ -13,6 +13,7 @@
 //! facts + test fixtures.
 
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use std::io::Write;
 use std::path::Path;
 
@@ -57,6 +58,7 @@ pub fn run_watch(
     source: &str,
     duration: Option<u64>,
     token: Option<&Path>,
+    profile: LifecycleProfile,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -68,6 +70,7 @@ pub fn run_watch(
         tick_ms: DEFAULT_TICK_MS,
         token: token.map(Path::to_owned),
         json_audit: false,
+        profile,
     };
     finish_watch(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),

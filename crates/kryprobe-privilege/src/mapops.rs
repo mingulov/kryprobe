@@ -47,6 +47,19 @@ pub enum MapOpsError {
         /// Kernel errno.
         errno: i32,
     },
+    /// Full read-back verification failed: the map does not contain
+    /// the bytes just written (T06 LCFG gate — unwritten/zeroed configs
+    /// fail closed here instead of arming a disarmed sensor). The
+    /// detail names the exact refusal (length/magic/version/flags/
+    /// reserved); the read-back buffer always holds the map's full
+    /// value size (a short buffer would be a kernel overwrite — the
+    /// `u64` [`map_lookup`] helper is 8-byte values only).
+    ConfigRejected {
+        /// Verification stage that failed.
+        stage: String,
+        /// Exact refusal detail.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for MapOpsError {
@@ -57,6 +70,9 @@ impl std::fmt::Display for MapOpsError {
             }
             Self::UpdateFailed { stage, errno } => {
                 write!(f, "map update failed at {stage}: errno {errno}")
+            }
+            Self::ConfigRejected { stage, detail } => {
+                write!(f, "map config rejected at {stage}: {detail}")
             }
         }
     }
@@ -94,6 +110,11 @@ pub fn map_update(map: &OwnedFd, key: u32, value: u64, stage: &str) -> Result<()
 }
 
 /// Look up one u64 element.
+///
+/// The destination is exactly 8 bytes: callers must only use this for
+/// maps with `value_size == 8` (wider values need [`map_lookup_bytes`]
+/// with the map's exact value size — the kernel writes the full value
+/// size and a short buffer is a stack overwrite).
 pub fn map_lookup(map: &OwnedFd, key: u32, stage: &str) -> Result<u64, MapOpsError> {
     let key = key as u64;
     let mut value = 0u64;

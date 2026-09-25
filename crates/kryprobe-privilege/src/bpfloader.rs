@@ -23,7 +23,7 @@ pub(crate) mod mapcreate;
 pub mod parse;
 pub(crate) mod progload;
 
-pub use instantiate::{check_pin_name, load_kcrypto, pin_fd};
+pub use instantiate::{check_pin_name, load_kcrypto, load_lifecycle, pin_fd};
 pub use parse::{
     BpfInsn, MapReloc, ParsedKcrypto, ParsedSpine, insns_to_bytes, parse_kcrypto_object,
     parse_spine_object, valid_kcrypto_dims, valid_kcrypto_section,
@@ -415,6 +415,32 @@ impl LoadedKcrypto {
             progs,
         })
     }
+}
+
+/// Loaded lifecycle maps, by T06 profile name.
+#[derive(Debug)]
+pub struct LifecycleMaps {
+    /// `LCFG` (sensor config, 64 bytes).
+    pub config: OwnedFd,
+    /// `LRING` (raw edge ringbuf).
+    pub ring: OwnedFd,
+    /// `LLOSS` (per-CPU loss counters, 4 entries).
+    pub loss: OwnedFd,
+}
+
+/// Loaded lifecycle object: maps + programs as (section, handle)
+/// pairs (sections, not bare names: the attach dispatch routes on
+/// the `fentry/`/`fexit/` prefix each program was parsed from).
+///
+/// No `try_clone` by design (T06): the sensor has exactly one owner.
+/// The live-tick duplication (H1(b) pattern) arrives with the T08
+/// backend wiring, alongside its first user.
+#[derive(Debug)]
+pub struct LoadedLifecycle {
+    /// Loaded lifecycle maps.
+    pub maps: LifecycleMaps,
+    /// Loaded programs as (section, handle) pairs.
+    pub progs: Vec<(String, OwnedFd)>,
 }
 
 /// Per-point load outcome (K1 Task 1; the plan's Self-Review pre-authorizes
