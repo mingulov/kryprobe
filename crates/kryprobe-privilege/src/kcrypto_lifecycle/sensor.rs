@@ -259,16 +259,18 @@ impl SensorCore {
     /// counters + current miss absolutes + session context (the
     /// sensor shell reads `LLOSS` + `LAGG`, the current miss
     /// absolutes, and the M2 baseline/verdict; tests inject). The
-    /// pre-arm→final miss join computes HERE — the one join site.
-    #[must_use]
+    /// pre-arm→final miss join computes HERE — the one join site —
+    /// and its refusal (backwards, unbaselined, or vanished
+    /// counters) fails the ledger: no ledger, no clean verdict.
     pub fn ledger(
         &self,
         kernel_loss: [u64; 5],
         agg_accepted: [u64; 4],
         miss_current: Vec<ProgMisses>,
         ctx: SessionContext,
-    ) -> LifecycleLedger {
-        LifecycleLedger {
+    ) -> Result<LifecycleLedger, crate::kcrypto_lifecycle::view::ViewError> {
+        let prog_misses = join_miss_deltas(&ctx.miss_baseline, &miss_current)?;
+        Ok(LifecycleLedger {
             completed: self.completed.clone(),
             edge_hits: self.edge_hits,
             decode: self.decoder.stats(),
@@ -279,9 +281,9 @@ impl SensorCore {
             view_valid: ctx.view_valid,
             loss_baseline: ctx.loss_baseline,
             agg_baseline: ctx.agg_baseline,
-            prog_misses: join_miss_deltas(&ctx.miss_baseline, &miss_current),
+            prog_misses,
             miss_current,
-        }
+        })
     }
 }
 
@@ -501,24 +503,29 @@ impl LifecycleSensor {
     /// verdict with the counters + joined per-program miss deltas.
     /// The counter reads still run after a void verdict, and THEY
     /// fail independently on bad fds (an unreadable miss counter
-    /// fails the ledger — never a silent zero).
+    /// fails the ledger — never a silent zero); the checked
+    /// pre-arm→final join refuses backwards, unbaselined, or
+    /// vanished counters through the same [`LedgerError::Misses`]
+    /// channel.
     pub fn ledger(&self) -> Result<LifecycleLedger, LedgerError> {
         let _ = self.verify_identity();
         let (kernel_loss, agg_accepted) =
             read_kernel_counters(&self.configured).map_err(LedgerError::Counters)?;
         let miss_current =
             snapshot_prog_misses(&self.configured.loaded).map_err(LedgerError::Misses)?;
-        Ok(self.core.ledger(
-            kernel_loss,
-            agg_accepted,
-            miss_current,
-            SessionContext {
-                loss_baseline: self.loss_baseline,
-                agg_baseline: self.agg_baseline,
-                view_valid: self.view_valid.load(Ordering::Relaxed),
-                miss_baseline: self.miss_baseline.clone(),
-            },
-        ))
+        self.core
+            .ledger(
+                kernel_loss,
+                agg_accepted,
+                miss_current,
+                SessionContext {
+                    loss_baseline: self.loss_baseline,
+                    agg_baseline: self.agg_baseline,
+                    view_valid: self.view_valid.load(Ordering::Relaxed),
+                    miss_baseline: self.miss_baseline.clone(),
+                },
+            )
+            .map_err(LedgerError::Misses)
     }
 
     /// Ring positions `(consumer, producer)` for stage receipts (M2:

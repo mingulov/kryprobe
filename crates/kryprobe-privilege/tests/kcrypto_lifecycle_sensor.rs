@@ -57,7 +57,9 @@ fn ingest_paired_edges_complete_grounded_record() {
         edge_bytes(2, 1, 0xabc, 150, 0, 0),
     ];
     assert_eq!(core.ingest_records(&records), 1);
-    let ledger = core.ledger([0; 5], [0; 4], Vec::new(), ctx());
+    let ledger = core
+        .ledger([0; 5], [0; 4], Vec::new(), ctx())
+        .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     let rec = &ledger.completed[0];
     assert_eq!((rec.id, rec.tfm_id, rec.duration_ns), (1, None, Some(50)));
@@ -78,17 +80,21 @@ fn ingest_queued_return_stays_pending() {
     assert_eq!(core.ingest_records(&records), 0);
     assert!(
         core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+            .expect("empty miss join")
             .completed
             .is_empty()
     );
     assert_eq!(
         core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+            .expect("empty miss join")
             .decode
             .admitted,
         1
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 4], Vec::new(), ctx()).edge_hits,
+        core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+            .expect("empty miss join")
+            .edge_hits,
         [1, 1, 0, 0]
     );
 }
@@ -102,7 +108,9 @@ fn ingest_loss_counts_without_phantoms() {
         edge_bytes(9, 1, 1, 1, 0, 0),       // bad edge kind
     ];
     assert_eq!(core.ingest_records(&records), 0);
-    let ledger = core.ledger([7, 0, 0, 0, 0], [0; 4], Vec::new(), ctx());
+    let ledger = core
+        .ledger([7, 0, 0, 0, 0], [0; 4], Vec::new(), ctx())
+        .expect("empty miss join");
     assert!(ledger.completed.is_empty());
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
     assert_eq!(ledger.decode.bad_records, 2);
@@ -119,12 +127,14 @@ fn finish_drains_pending_truthless() {
     core.ingest_records(&[edge_bytes(1, 1, 0xabc, 100, 0, 0)]);
     assert!(
         core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+            .expect("empty miss join")
             .completed
             .is_empty()
     );
     core.finish(200);
     assert_eq!(
         core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+            .expect("empty miss join")
             .completed
             .len(),
         1
@@ -151,7 +161,9 @@ fn f7_completed_retention_is_bounded_and_counted() {
         ];
         assert_eq!(core.ingest_records(&records), 1);
     }
-    let ledger = core.ledger([0; 5], [0; 4], Vec::new(), ctx());
+    let ledger = core
+        .ledger([0; 5], [0; 4], Vec::new(), ctx())
+        .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 2);
     assert_eq!(ledger.retained_dropped, 1);
     assert_eq!(ledger.reducer.emitted, 3);
@@ -174,7 +186,9 @@ fn f7_take_completed_drains_and_releases_the_bound() {
         edge_bytes(2, 1, 0xabd, 250, 0, 0),
     ];
     assert_eq!(core.ingest_records(&two), 1);
-    let ledger = core.ledger([0; 5], [0; 4], Vec::new(), ctx());
+    let ledger = core
+        .ledger([0; 5], [0; 4], Vec::new(), ctx())
+        .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     assert_eq!(ledger.retained_dropped, 0);
 }
@@ -185,17 +199,19 @@ fn w8_ledger_carries_session_context() {
     // verdict land in the terminal ledger untouched (coverage and
     // integrity consult them; pairing never does).
     let core = SensorCore::new(16, 16, 16);
-    let ledger = core.ledger(
-        [1, 2, 3, 4, 5],
-        [6, 7, 8, 9],
-        Vec::new(),
-        SessionContext {
-            loss_baseline: [0, 1, 0, 0, 0],
-            agg_baseline: [0, 0, 2, 0],
-            view_valid: false,
-            miss_baseline: Vec::new(),
-        },
-    );
+    let ledger = core
+        .ledger(
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9],
+            Vec::new(),
+            SessionContext {
+                loss_baseline: [0, 1, 0, 0, 0],
+                agg_baseline: [0, 0, 2, 0],
+                view_valid: false,
+                miss_baseline: Vec::new(),
+            },
+        )
+        .expect("empty miss join");
     assert_eq!(ledger.kernel_loss, [1, 2, 3, 4, 5]);
     assert_eq!(ledger.agg_accepted, [6, 7, 8, 9]);
     assert_eq!(ledger.loss_baseline, [0, 1, 0, 0, 0]);
@@ -234,23 +250,57 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
             misses: 5,
         },
     ];
-    let ledger = core.ledger(
-        [0; 5],
-        [0; 4],
-        cur.clone(),
-        SessionContext {
-            loss_baseline: [0; 5],
-            agg_baseline: [0; 4],
-            view_valid: true,
-            miss_baseline: base,
-        },
-    );
+    let ledger = core
+        .ledger(
+            [0; 5],
+            [0; 4],
+            cur.clone(),
+            SessionContext {
+                loss_baseline: [0; 5],
+                agg_baseline: [0; 4],
+                view_valid: true,
+                miss_baseline: base,
+            },
+        )
+        .expect("monotone join");
     assert_eq!(ledger.miss_current, cur);
     assert_eq!(ledger.prog_misses.len(), 2);
     assert_eq!(ledger.prog_misses[0].section, "fsession/b");
     assert_eq!(ledger.prog_misses[0].delta(), 1);
     assert_eq!(ledger.prog_misses[1].section, "fsession/a");
     assert_eq!(ledger.prog_misses[1].delta(), 2);
+}
+
+#[test]
+fn w10_ledger_refuses_untrustworthy_miss_join() {
+    // Round-10 astra-Major: a backwards miss join refuses the
+    // terminal ledger (no ledger, no clean verdict — never zero).
+    use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
+    let core = SensorCore::new(16, 16, 16);
+    let base = vec![ProgMisses {
+        section: "fsession/a".to_owned(),
+        id: 11,
+        misses: 9,
+    }];
+    let cur = vec![ProgMisses {
+        section: "fsession/a".to_owned(),
+        id: 11,
+        misses: 4,
+    }];
+    let err = core
+        .ledger(
+            [0; 5],
+            [0; 4],
+            cur,
+            SessionContext {
+                loss_baseline: [0; 5],
+                agg_baseline: [0; 4],
+                view_valid: true,
+                miss_baseline: base,
+            },
+        )
+        .expect_err("backwards miss join must refuse the ledger");
+    assert!(format!("{err}").contains("ran backwards"), "{err:?}");
 }
 
 #[test]

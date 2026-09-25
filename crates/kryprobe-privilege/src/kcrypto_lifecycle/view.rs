@@ -56,8 +56,10 @@ pub enum ViewError {
         /// Required prefix length.
         want: u32,
     },
-    /// Identity mismatch (wrong type, drifted dims, id moved, or a
-    /// link that no longer names our program).
+    /// Identity mismatch (wrong type, drifted dims, id moved, a
+    /// link that no longer names our program, or a per-program
+    /// miss-counter join the kernel made untrustworthy: backwards,
+    /// unbaselined, or vanished mid-session).
     Identity {
         /// What mismatched (names + values, never raw pointers).
         detail: String,
@@ -356,12 +358,16 @@ pub struct ProgMissDelta {
 }
 
 impl ProgMissDelta {
-    /// Session-attributable misses (saturating: a counter that ran
-    /// backwards is a kernel impossibility the canary refuses
-    /// separately via checked subtraction — the ledger never wraps).
+    /// Session-attributable misses. A backwards counter (current
+    /// below baseline — counter replacement under a retained FD,
+    /// impossible without kernel foul play) voids LOUD: it reads
+    /// `u64::MAX`, never zero, so a hand-built backwards delta still
+    /// flips every void channel it reaches. The checked join refuses
+    /// these before they reach a ledger; this arm guards direct
+    /// construction only.
     #[must_use]
     pub fn delta(&self) -> u64 {
-        self.current.saturating_sub(self.baseline)
+        self.current.checked_sub(self.baseline).unwrap_or(u64::MAX)
     }
 }
 
@@ -392,31 +398,55 @@ pub fn snapshot_prog_misses(loaded: &LoadedLifecycle) -> Result<Vec<ProgMisses>,
 }
 
 /// Join pre-arm and post-ingest miss absolutes by section (pure —
-/// unit-tested without privilege). A current section with no baseline
-/// entry joins against zero (a program that appeared mid-session is
-/// already an identity-cardinality void; its whole absolute counts as
-/// session misses — conservative, never silent). A baseline section
-/// gone from current is dropped (detached program; identity is void).
-#[must_use]
-pub fn join_miss_deltas(baseline: &[ProgMisses], current: &[ProgMisses]) -> Vec<ProgMissDelta> {
-    current
-        .iter()
-        .map(|got| {
-            let base = baseline
-                .iter()
-                .find(|want| want.section == got.section)
-                .map_or(0, |want| want.misses);
-            ProgMissDelta {
-                section: got.section.clone(),
-                baseline: base,
-                current: got.misses,
-            }
-        })
-        .collect()
+/// unit-tested without privilege; the one production join site feeds
+/// `SensorCore::ledger`, which fails the terminal ledger on
+/// refusal). Every section must appear on BOTH sides with a monotone
+/// counter — a current below its baseline (counter replacement), a
+/// current section with no baseline (program appeared mid-session),
+/// or a baseline section gone from current (program vanished
+/// mid-session) REFUSES with [`ViewError::Identity`]: an
+/// untrustworthy miss join fails loud, never reads zero. (With
+/// retained FDs all three are kernel impossibilities; the refusal
+/// arm is fail-closed hardening, and the appeared/vanished cases
+/// additionally void identity.)
+pub fn join_miss_deltas(
+    baseline: &[ProgMisses],
+    current: &[ProgMisses],
+) -> Result<Vec<ProgMissDelta>, ViewError> {
+    let mut out = Vec::with_capacity(current.len());
+    for got in current {
+        let Some(want) = baseline.iter().find(|want| want.section == got.section) else {
+            return Err(ViewError::Identity {
+                detail: format!("prog_misses[{}] has no baseline", got.section),
+            });
+        };
+        if got.misses < want.misses {
+            return Err(ViewError::Identity {
+                detail: format!(
+                    "prog_misses[{}] ran backwards: baseline {} current {}",
+                    got.section, want.misses, got.misses
+                ),
+            });
+        }
+        out.push(ProgMissDelta {
+            section: got.section.clone(),
+            baseline: want.misses,
+            current: got.misses,
+        });
+    }
+    for want in baseline {
+        if !current.iter().any(|got| got.section == want.section) {
+            return Err(ViewError::Identity {
+                detail: format!("prog_misses[{}] baseline has no current", want.section),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Session miss total over joined deltas (saturating — the coverage
-/// gate's input: any nonzero voids exact counts).
+/// gate's input: any nonzero voids exact counts, and a backwards
+/// delta voids `u64::MAX`, never zero).
 #[must_use]
 pub fn prog_miss_delta_sum(deltas: &[ProgMissDelta]) -> u64 {
     deltas
@@ -550,7 +580,7 @@ mod tests {
     fn join_deltas_by_section() {
         let baseline = vec![misses("fsession/a", 11, 3), misses("fsession/b", 12, 0)];
         let current = vec![misses("fsession/b", 12, 2), misses("fsession/a", 11, 5)];
-        let joined = join_miss_deltas(&baseline, &current);
+        let joined = join_miss_deltas(&baseline, &current).expect("monotone join");
         assert_eq!(
             joined,
             vec![
@@ -572,31 +602,47 @@ mod tests {
     }
 
     #[test]
-    fn join_unbaselined_section_counts_whole_absolute() {
-        // A program that appeared mid-session (identity already void
-        // on cardinality) counts its whole absolute as session
-        // misses — conservative, never silent.
-        let joined = join_miss_deltas(&[], &[misses("fsession/a", 11, 7)]);
-        assert_eq!(joined[0].baseline, 0);
-        assert_eq!(joined[0].delta(), 7);
+    fn join_unbaselined_section_refuses() {
+        // W10: a program that appeared mid-session (identity already
+        // void on cardinality) refuses the join — an unbaselined
+        // current fails loud, never reads zero.
+        let err = join_miss_deltas(&[], &[misses("fsession/a", 11, 7)])
+            .expect_err("unbaselined current must refuse");
+        assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
     }
 
     #[test]
-    fn join_drops_detached_baseline_section() {
+    fn join_vanished_baseline_section_refuses() {
+        // W10: a baseline section gone from current (program
+        // vanished mid-session) refuses — dropped sections must fail
+        // loud, never read zero.
         let baseline = vec![misses("fsession/a", 11, 3)];
-        let joined = join_miss_deltas(&baseline, &[]);
-        assert!(joined.is_empty());
-        assert_eq!(prog_miss_delta_sum(&joined), 0);
+        let err = join_miss_deltas(&baseline, &[]).expect_err("vanished baseline must refuse");
+        assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
     }
 
     #[test]
-    fn delta_saturates_never_wraps() {
+    fn join_backwards_counter_refuses() {
+        // W10: a current below its baseline (counter replacement)
+        // refuses — backwards counters fail loud, never read zero.
+        let baseline = vec![misses("fsession/a", 11, 9)];
+        let current = vec![misses("fsession/a", 11, 4)];
+        let err = join_miss_deltas(&baseline, &current).expect_err("backwards must refuse");
+        assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn delta_backwards_voids_loud_never_zero() {
+        // W10: the checked join refuses backwards counters before
+        // they reach a ledger; a hand-built backwards delta still
+        // voids MAX (never zero) through every consumer it reaches.
         let back = ProgMissDelta {
             section: "fsession/a".to_owned(),
             baseline: 9,
             current: 4,
         };
-        assert_eq!(back.delta(), 0);
+        assert_eq!(back.delta(), u64::MAX);
+        assert_eq!(prog_miss_delta_sum(&[back]), u64::MAX);
         let sat = ProgMissDelta {
             section: "fsession/a".to_owned(),
             baseline: 0,
