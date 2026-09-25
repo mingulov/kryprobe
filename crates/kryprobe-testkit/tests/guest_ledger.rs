@@ -233,6 +233,10 @@ fn guest_ledger_matches_scenario_contract() {
             let alloc = &ledger.allocs[0];
             assert!(alloc.freed, "released");
             assert!(alloc.final_free, "last put was final");
+            // R5: the parser rejects any release after a final
+            // free, so releases == 2 + final proves the ordered
+            // [retained, final] sequence — a duplicate final
+            // never parses.
             assert_eq!(alloc.releases, 2, "retained release + final free");
             assert!(ledger.requests.is_empty(), "no invocations");
         }

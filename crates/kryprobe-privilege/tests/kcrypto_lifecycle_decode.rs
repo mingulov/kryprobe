@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T06 decode suite: raw `LEdge` bytes → T05 `Edge` events + join rules.
 //!
-//! Pins the v4 record twin (magic/version/edge/site/flags/aux/invoc/tfm/length),
+//! Pins the v5 record twin (magic/version/edge/site/flags/aux/invoc/tfm/drv/length),
 //! the invocation→opaque-id join (W8 fsession: fresh id per admission,
 //! bounded table, nested same-key calls pair exactly by cookie id),
 //! return classification (sync-terminal vs queued), and the named loss
@@ -21,7 +21,7 @@ use kryprobe_privilege::kcrypto_lifecycle::decode::{
 /// `LEDGE_TAINTED` flag bit (BPF nesting taint; mirrors the ABI const).
 const TAINTED: u16 = 0x0001;
 
-/// One 48-byte v4 `LEdge` (little-endian twin of the ABI struct).
+/// One 112-byte v5 `LEdge` (little-endian twin of the ABI struct).
 fn edge_bytes_invoc(
     edge: u8,
     site: u16,
@@ -30,12 +30,14 @@ fn edge_bytes_invoc(
     status: i32,
     flags: u16,
     invoc: u64,
-) -> [u8; 48] {
-    edge_bytes_tfm(edge, site, key, ts_ns, status, flags, invoc, 0)
+) -> [u8; 112] {
+    edge_bytes_tfm(edge, site, key, ts_ns, status, flags, invoc, 0, b"")
 }
 
 /// Full builder with an explicit transform word (0 = unknown link —
-/// the default; tests pinning first-seen pass a frontend here).
+/// the default; tests pinning first-seen pass a frontend here) and
+/// driver name (submit edges only — returns carry tfm 0 + empty
+/// name per the R2 twin).
 #[allow(clippy::too_many_arguments)]
 fn edge_bytes_tfm(
     edge: u8,
@@ -46,10 +48,11 @@ fn edge_bytes_tfm(
     flags: u16,
     invoc: u64,
     tfm: u64,
-) -> [u8; 48] {
-    let mut out = [0u8; 48];
+    drv: &[u8],
+) -> [u8; 112] {
+    let mut out = [0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 4;
+    out[2] = 5;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -58,15 +61,17 @@ fn edge_bytes_tfm(
     out[24..28].copy_from_slice(&status.to_le_bytes());
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out[40..48].copy_from_slice(&tfm.to_le_bytes());
+    let n = drv.len().min(63);
+    out[48..48 + n].copy_from_slice(&drv[..n]);
     out
 }
 
-/// Realistic default builder: same v4 record with a VALID
+/// Realistic default builder: same v5 record with a VALID
 /// invocation (nonzero, reserved-bit clear — tests sharing one call
 /// use the default 0x4000 so the join hits; tests with two live
 /// calls pass distinct invocations via [`edge_bytes_invoc`]
 /// explicitly, since the join keys by invocation alone).
-fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 48] {
+fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 112] {
     edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)
 }
 
@@ -95,10 +100,10 @@ fn decode_record_rejects_twin_drift() {
     let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
     bad[0] = 0;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMagic));
-    // v1, v2 AND v3 records refuse (fail closed across versions:
-    // an old decoder would misread the longer v4 record, so versions
+    // v1..v4 records refuse (fail closed across versions: an old
+    // decoder would misread the longer v5 record, so versions
     // never mix).
-    for version in [1u8, 2, 3] {
+    for version in [1u8, 2, 3, 4] {
         let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
         bad[2] = version;
         assert_eq!(
@@ -115,11 +120,14 @@ fn decode_record_rejects_twin_drift() {
         decode_record(&edge_bytes(1, 9, 9, 1, 0, 0)),
         Err(DecodeDrop::BadSite)
     );
-    // Only the taint bit is defined; any other flag bit is drift.
+    // Only taint + truncated bits are defined; any other flag bit
+    // is drift.
     let tainted = decode_record(&edge_bytes(1, 1, 9, 1, 0, TAINTED)).expect("taint parses");
     assert!(tainted.tainted);
+    let clipped = decode_record(&edge_bytes(1, 1, 9, 1, 0, 0x0002)).expect("truncated parses");
+    assert!(clipped.truncated);
     let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
-    bad[6] = 0x02;
+    bad[6] = 0x04;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadFlags));
     let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
     bad[28] = 1;
@@ -136,10 +144,10 @@ fn decode_record_rejects_twin_drift() {
 
 #[test]
 fn decode_record_rejects_shape_and_null_key() {
-    assert_eq!(decode_record(&[0u8; 47]), Err(DecodeDrop::BadLength));
-    assert_eq!(decode_record(&[0u8; 49]), Err(DecodeDrop::BadLength));
-    // The v3 40-byte record refuses by length AND version (twin lock).
-    assert_eq!(decode_record(&[0u8; 40]), Err(DecodeDrop::BadLength));
+    assert_eq!(decode_record(&[0u8; 111]), Err(DecodeDrop::BadLength));
+    assert_eq!(decode_record(&[0u8; 113]), Err(DecodeDrop::BadLength));
+    // The v4 48-byte record refuses by length AND version (twin lock).
+    assert_eq!(decode_record(&[0u8; 48]), Err(DecodeDrop::BadLength));
     assert_eq!(
         decode_record(&edge_bytes(1, 1, 0, 1, 0, 0)),
         Err(DecodeDrop::NullKey)
@@ -148,21 +156,63 @@ fn decode_record_rejects_shape_and_null_key() {
 
 #[test]
 fn decode_record_carries_transform_word() {
-    // T07.3: `tfm` admits any u64 — a frontend decodes verbatim, 0
-    // decodes as unknown (never refused either way: the op joins by
-    // invocation with or without its transform).
-    let raw =
-        decode_record(&edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, 0xf00d)).expect("tfm parses");
+    // T07.3: submit `tfm` admits any u64 — a frontend decodes
+    // verbatim, 0 decodes as unknown (never refused either way: the
+    // op joins by invocation with or without its transform).
+    let raw = decode_record(&edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, 0xf00d, b""))
+        .expect("tfm parses");
     assert_eq!(raw.tfm, 0xf00d);
     let raw = decode_record(&edge_bytes(1, 1, 0xabc, 100, 0, 0)).expect("zero tfm parses");
     assert_eq!(raw.tfm, 0);
-    // `tfm` never disturbs the invocation join: submit+return with
-    // different tfm words still pair by invocation.
+    // `tfm` never disturbs the invocation join: the submit's word
+    // pairs with the return's zero by invocation alone (R2).
     let mut dec = LifecycleDecoder::new(8);
-    let submit = dec.feed(&edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, 0xf00d));
+    let submit = dec.feed(&edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, 0xf00d, b""));
     assert_eq!(submit.len(), 1);
-    let ret = dec.feed(&edge_bytes_tfm(2, 1, 0xabc, 150, 0, 0, 0x4000, 0));
-    assert_eq!(ret.len(), 1, "tfm skew never breaks the join");
+    let ret = dec.feed(&edge_bytes_tfm(2, 1, 0xabc, 150, 0, 0, 0x4000, 0, b""));
+    assert_eq!(ret.len(), 1, "submit word + return zero join");
+}
+
+#[test]
+fn decode_record_v5_return_carries_no_chase() {
+    // R2: honest BPF never chases at exit — a return-side transform
+    // word or driver name is twin drift, refused loudly.
+    let mut bad = edge_bytes(2, 1, 0xabc, 150, 0, 0);
+    bad[40] = 1;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadReturnTfm));
+    let mut bad = edge_bytes(2, 1, 0xabc, 150, 0, 0);
+    bad[48] = b'x';
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
+}
+
+#[test]
+fn decode_record_v5_submit_carries_driver() {
+    // T07-04/F05: the submit's driver word decodes verbatim (empty
+    // when the chase was unreadable); a missing NUL or invalid
+    // UTF-8 is drift.
+    let raw = decode_record(&edge_bytes_tfm(
+        1,
+        1,
+        0xabc,
+        100,
+        0,
+        0,
+        0x4000,
+        0xf00d,
+        b"aes-generic",
+    ))
+    .expect("driver parses");
+    assert_eq!(raw.tfm, 0xf00d);
+    assert_eq!(raw.drv, "aes-generic");
+    let raw = decode_record(&edge_bytes(1, 1, 0xabc, 100, 0, 0)).expect("empty driver parses");
+    assert!(raw.drv.is_empty());
+    let mut bad = edge_bytes(1, 1, 0xabc, 100, 0, 0);
+    bad[48..112].fill(b'x');
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
+    let mut bad = edge_bytes(1, 1, 0xabc, 100, 0, 0);
+    bad[48] = 0xFF;
+    bad[49] = 0;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
 }
 
 #[test]

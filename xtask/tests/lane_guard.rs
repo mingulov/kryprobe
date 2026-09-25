@@ -9,8 +9,10 @@
 use std::path::{Path, PathBuf};
 
 /// Pinned ignored-test total: bump only when a lane test is added or
-/// removed, with its `BPF lane:` reason in place.
-const PINNED_IGNORED: usize = 32;
+/// removed, with its `BPF lane:` reason in place (34 at T07.7:
+/// +`lifecycle_canary_no_secret_bytes_in_views`,
+/// +`host_op_first_seen_carries_selected_driver` — both sudo-lane).
+const PINNED_IGNORED: usize = 34;
 
 /// Reason prefix every ignored test must carry.
 const LANE_PREFIX: &str = "BPF lane: ";

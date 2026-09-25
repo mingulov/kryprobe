@@ -23,6 +23,7 @@
 
 use crate::kcrypto_lifecycle::decode::DecodeStats;
 use crate::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
+use crate::kcrypto_lifecycle::tfm::TfmStats;
 use crate::kcrypto_lifecycle::view::ProgMisses;
 use kryprobe_core::kcrypto::{ReducerStats, RequestRecord, Terminal};
 
@@ -353,6 +354,10 @@ pub struct SensorBaseline {
     /// Per-program recursion-miss absolutes (H2 quiescence + delta
     /// verdict: pre-GO misses are baseline, post-GO misses fail).
     pub prog_misses: Vec<ProgMisses>,
+    /// Transform-lifetime counters (T07-05/R3: loss deltas join
+    /// the strict all-zero gate — normal transform accounting is
+    /// truth, never gated).
+    pub tfm: TfmStats,
 }
 
 /// Sensor evidence for one scenario (post-finish: completions include
@@ -391,6 +396,9 @@ pub struct SensorView<'a> {
     /// Final per-program recursion-miss absolutes (H2: every
     /// post-baseline delta must read zero — strict all-zero).
     pub prog_misses: Vec<ProgMisses>,
+    /// Final transform-lifetime counters (loss deltas join the
+    /// strict all-zero gate below).
+    pub tfm: TfmStats,
 }
 
 /// Exact verdict over one scenario: `Ok(())` passes, `Err(reason)`
@@ -557,6 +565,148 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 view.retained_dropped,
                 view.baseline.retained_dropped,
                 "retained_dropped",
+            )?,
+        ),
+        // Transform-lifetime loss (T07-05/R3: same loss/truth
+        // split as the backend buckets — refused, unadmitted,
+        // unjoined, and uncertain-identity evidence gates the
+        // run; admissions, completions, classified failures,
+        // proved retires, no-op releases, and joined configs
+        // incl. errno verdicts are truth, never gated).
+        (
+            "tfm_submit_refused",
+            sub(
+                view.tfm.submit_refused,
+                view.baseline.tfm.submit_refused,
+                "tfm_submit_refused",
+            )?,
+        ),
+        (
+            "tfm_tainted_refused",
+            sub(
+                view.tfm.tainted_refused,
+                view.baseline.tfm.tainted_refused,
+                "tfm_tainted_refused",
+            )?,
+        ),
+        (
+            "tfm_table_full",
+            sub(
+                view.tfm.table_full,
+                view.baseline.tfm.table_full,
+                "tfm_table_full",
+            )?,
+        ),
+        (
+            "tfm_live_full",
+            sub(
+                view.tfm.live_full,
+                view.baseline.tfm.live_full,
+                "tfm_live_full",
+            )?,
+        ),
+        (
+            "tfm_stale_returns",
+            sub(
+                view.tfm.stale_returns,
+                view.baseline.tfm.stale_returns,
+                "tfm_stale_returns",
+            )?,
+        ),
+        (
+            "tfm_bad_records",
+            sub(
+                view.tfm.bad_records,
+                view.baseline.tfm.bad_records,
+                "tfm_bad_records",
+            )?,
+        ),
+        (
+            "tfm_unlinked_ops",
+            sub(
+                view.tfm.unlinked_ops,
+                view.baseline.tfm.unlinked_ops,
+                "tfm_unlinked_ops",
+            )?,
+        ),
+        (
+            "tfm_unknown_returns",
+            sub(
+                view.tfm.unknown_returns,
+                view.baseline.tfm.unknown_returns,
+                "tfm_unknown_returns",
+            )?,
+        ),
+        (
+            "tfm_mismatched_returns",
+            sub(
+                view.tfm.mismatched_returns,
+                view.baseline.tfm.mismatched_returns,
+                "tfm_mismatched_returns",
+            )?,
+        ),
+        (
+            "tfm_unfinished",
+            sub(
+                view.tfm.unfinished,
+                view.baseline.tfm.unfinished,
+                "tfm_unfinished",
+            )?,
+        ),
+        (
+            "tfm_ambiguous_releases",
+            sub(
+                view.tfm.ambiguous_releases,
+                view.baseline.tfm.ambiguous_releases,
+                "tfm_ambiguous_releases",
+            )?,
+        ),
+        (
+            "tfm_forced_retires",
+            sub(
+                view.tfm.forced_retires,
+                view.baseline.tfm.forced_retires,
+                "tfm_forced_retires",
+            )?,
+        ),
+        (
+            "tfm_unknown_releases",
+            sub(
+                view.tfm.unknown_releases,
+                view.baseline.tfm.unknown_releases,
+                "tfm_unknown_releases",
+            )?,
+        ),
+        (
+            "tfm_stale_releases",
+            sub(
+                view.tfm.stale_releases,
+                view.baseline.tfm.stale_releases,
+                "tfm_stale_releases",
+            )?,
+        ),
+        (
+            "tfm_config_unlinked",
+            sub(
+                view.tfm.config_unlinked,
+                view.baseline.tfm.config_unlinked,
+                "tfm_config_unlinked",
+            )?,
+        ),
+        (
+            "tfm_unobserved_boundary",
+            sub(
+                view.tfm.unobserved_boundary,
+                view.baseline.tfm.unobserved_boundary,
+                "tfm_unobserved_boundary",
+            )?,
+        ),
+        (
+            "tfm_tombstone_evictions",
+            sub(
+                view.tfm.tombstone_evictions,
+                view.baseline.tfm.tombstone_evictions,
+                "tfm_tombstone_evictions",
             )?,
         ),
     ];
@@ -946,6 +1096,7 @@ mod tests {
             attached_links: 7,
             foreign_links: 0,
             prog_misses: misses,
+            tfm: TfmStats::default(),
         }
     }
 
@@ -1127,6 +1278,42 @@ mod tests {
         let mut truth = sync_truth();
         truth.fixture_result = -1;
         verdict("sync-once", &truth, &sync_view(&completed)).expect_err("fixture fail must fail");
+    }
+
+    #[test]
+    fn verdict_transform_loss_fails_but_truth_passes() {
+        // T07-05/R3: transform-lifetime loss deltas gate the run
+        // (D4 refusal, dangling close, uncertain identity) while
+        // truth-only transform traffic (proved retires, joined
+        // configs incl. errno verdicts, classified failures) gates
+        // nothing.
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut view = sync_view(&completed);
+        view.tfm.live_full = 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("D4 refusal must fail");
+        assert!(err.contains("tfm_live_full"), "names it: {err}");
+        let mut view = sync_view(&completed);
+        view.tfm.unfinished = 1;
+        verdict("sync-once", &truth, &view).expect_err("dangling close must fail");
+        let mut view = sync_view(&completed);
+        view.tfm.ambiguous_releases = 1;
+        verdict("sync-once", &truth, &view).expect_err("ambiguity must fail");
+        let mut view = sync_view(&completed);
+        view.tfm.unobserved_boundary = 1;
+        verdict("sync-once", &truth, &view).expect_err("uncertain identity must fail");
+        // Truth-only: proved retires + joined configs (one errno)
+        // + a classified failed alloc pass the gate.
+        let mut view = sync_view(&completed);
+        view.tfm.admitted = 4;
+        view.tfm.completed = 4;
+        view.tfm.releases = 2;
+        view.tfm.retired = 2;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.failed_allocs = 1;
+        view.tfm.noop_releases = 1;
+        verdict("sync-once", &truth, &view).expect("truth-only transform traffic green");
     }
 
     #[test]
@@ -1412,6 +1599,7 @@ mod tests {
             attached_links: 7,
             foreign_links: 0,
             prog_misses: Vec::new(),
+            tfm: TfmStats::default(),
         };
         let err = verdict("async-once", &truth, &view).expect_err("foreign terminal must fail");
         assert!(err.contains("terminals"), "names it: {err}");

@@ -182,6 +182,23 @@ fn overlong_value_truncates_and_flags_entry() {
 }
 
 #[test]
+fn overlong_name_truncates_and_flags_entry() {
+    // T07-08/R9: a 2000-char block key caps at the same 1024-char
+    // field bound — the block stays (inventory, not proof) with
+    // `truncated` set, never silently complete.
+    let long = "n".repeat(2000);
+    let text = format!("name : {long}\\ndriver : d\\n\\n");
+    let path = registry_file("longname", &text);
+    let snap = snapshot_proc_crypto(&path).expect("long name must parse");
+    let _ = std::fs::remove_file(&path);
+    assert!(!snap.truncated, "name cap is per-entry, not global");
+    assert_eq!(snap.entries.len(), 1);
+    let entry = &snap.entries[0];
+    assert!(entry.truncated);
+    assert_eq!(entry.name.len(), 1024);
+}
+
+#[test]
 fn entry_cap_stops_parse_and_flags_snapshot() {
     // Past 4096 entries the parse stops with `truncated` set —
     // bounded memory, loud stop.

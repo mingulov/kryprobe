@@ -31,8 +31,8 @@ use crate::mapops::{MapOpsError, map_lookup_percpu_sum};
 use kryprobe_abi::kcrypto_lifecycle::{
     LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_SETAUTH_RET,
     LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB, LAGG_SETKEYSK_RET,
-    LAGG_SETKEYSK_SUB, LEDGE_RETURN, LSITE_DEC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY,
-    LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
+    LAGG_SETKEYSK_SUB, LEDGE_RETURN, LEDGE_SUBMIT, LSITE_DEC, LTFM_SITE_ALLOC_SK,
+    LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
 };
 use kryprobe_core::kcrypto::{LifecycleReducer, ReducerStats, RequestRecord};
 use std::os::fd::RawFd;
@@ -145,6 +145,30 @@ fn read_kernel_counters(
     Ok((fold_loss_lanes(lanes), agg_accepted))
 }
 
+/// Registry-enrichment status (T07-09: the terminal ledger tells
+/// absent enrichment from an available snapshot — a failed
+/// startup read never refuses capture, but its report carries
+/// the reason, never silence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrichmentStatus {
+    /// Bring-up snapshotted `/proc/crypto` (entry count +
+    /// whether the snapshot hit a bound — current inventory
+    /// only, never proof of what an earlier allocation used).
+    Available {
+        /// Registry blocks inventoried.
+        entries: usize,
+        /// The snapshot hit a parse bound (partial inventory).
+        truncated: bool,
+    },
+    /// Bring-up could not snapshot `/proc/crypto` (capture
+    /// proceeded without enrichment — the reason is the `io`
+    /// error text, never a fabricated inventory).
+    Unavailable {
+        /// Why the snapshot failed.
+        reason: String,
+    },
+}
+
 /// Terminal ledger: completed records plus every loss class,
 /// snapshotted together (the single terminal accounting point).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +225,10 @@ pub struct LifecycleLedger {
     /// retire/ambiguity verdicts, configuration epochs; the
     /// canonical bases stay inside the tracker, never rendered).
     pub generations: Vec<GenerationInfo>,
+    /// Registry-enrichment status (T07-09: available snapshot vs
+    /// explicit unavailable reason — the report distinguishes
+    /// them, capture never refuses on the latter).
+    pub enrichment: EnrichmentStatus,
 }
 
 /// Terminal-ledger read failure (fail loud: an unreadable counter
@@ -237,6 +265,9 @@ pub struct SessionContext {
     pub view_valid: bool,
     /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
     pub miss_baseline: Vec<ProgMisses>,
+    /// Registry-enrichment status (the shell builds it from the
+    /// bring-up snapshot outcome; tests inject it).
+    pub enrichment: EnrichmentStatus,
 }
 
 /// Pure ingest core: decoder + reducer + completed records (no fds,
@@ -345,12 +376,18 @@ impl SensorCore {
                     continue;
                 }
             };
-            // T07.3 first-seen: every decoded op edge — tainted or
-            // not (BPF chases the link either way; taint is about
-            // the invocation, never the transform) — offers its
-            // transform word to the tracker. 0 admits nothing and
-            // counts `unlinked_ops` inside; known bases no-op.
-            self.tfm.admit_first_seen(raw.tfm);
+            // T07.3 first-seen, R2 submit-only: the SUBMIT's live
+            // entry chase (word + driver) offers the transform to
+            // the tracker — returns carry no chase (honest BPF
+            // never reads freed request memory at exit), so only
+            // submits admit; a return without submit evidence
+            // leaves the association unknown (the decoder counts
+            // the orphan, never a phantom admission). 0 admits
+            // nothing and counts `unlinked_ops` inside; known
+            // bases no-op.
+            if raw.edge == LEDGE_SUBMIT {
+                self.tfm.admit_first_seen(raw.tfm, &raw.drv, raw.truncated);
+            }
             let slot = edge_slot(raw.site, raw.edge);
             self.edge_hits[slot] += 1;
             for edge in self.decoder.join(raw) {
@@ -366,9 +403,13 @@ impl SensorCore {
     /// reducer `finish`). Returns nothing by design: the take below is
     /// the ONE read path — a finish that both returned and retained
     /// double-surfaced every reconciled record (round-3 async canary).
+    /// Transform attempts finalize alongside (T07-06: dangling
+    /// destroys mark their still-live bound generation ambiguous —
+    /// the ledger's `tfm_stats` carries the whole close account).
     pub fn finish(&mut self, stop_ns: u64) {
         let done = self.reducer.finish(stop_ns);
         self.retain(done);
+        self.tfm.finish();
     }
 
     /// Snapshot the terminal ledger with caller-supplied kernel
@@ -401,6 +442,7 @@ impl SensorCore {
             miss_current,
             tfm_stats: self.tfm.stats(),
             generations: self.tfm.generations(),
+            enrichment: ctx.enrichment,
         })
     }
 }
@@ -478,6 +520,10 @@ pub struct LifecycleSensor {
     /// context — `None` when the read failed; enrichment is
     /// optional, capture never refuses on it).
     registry: Option<ProcCryptoSnapshot>,
+    /// Bring-up snapshot failure text (T07-09: `Some` exactly when
+    /// `registry` is `None` — the terminal reason capture never
+    /// refuses on).
+    registry_error: Option<String>,
 }
 
 impl std::fmt::Debug for LifecycleSensor {
@@ -546,9 +592,14 @@ impl LifecycleSensor {
         let offsets = arm_lifecycle_config(&configured.loaded)?;
         // T07.5 registry context: one bounded `/proc/crypto` read
         // (optional enrichment — a failed read snapshots `None`
-        // and capture proceeds; runtime selected metadata never
+        // with the reason kept for the terminal ledger, and
+        // capture proceeds; runtime selected metadata never
         // depends on it).
-        let registry = snapshot_proc_crypto(std::path::Path::new("/proc/crypto")).ok();
+        let (registry, registry_error) =
+            match snapshot_proc_crypto(std::path::Path::new("/proc/crypto")) {
+                Ok(snap) => (Some(snap), None),
+                Err(err) => (None, Some(err.to_string())),
+            };
         Ok((
             Self {
                 configured,
@@ -563,6 +614,7 @@ impl LifecycleSensor {
                 agg_baseline,
                 miss_baseline,
                 registry,
+                registry_error,
             },
             points,
         ))
@@ -645,6 +697,26 @@ impl LifecycleSensor {
             read_kernel_counters(&self.configured).map_err(LedgerError::Counters)?;
         let miss_current =
             snapshot_prog_misses(&self.configured.loaded).map_err(LedgerError::Misses)?;
+        // T07-09: the bring-up snapshot outcome reaches the
+        // terminal ledger — available inventory vs an explicit
+        // unavailable reason (the `None`/`None` arm is unreachable
+        // by construction; it reports unreachable-loud, never a
+        // fabricated empty inventory).
+        let enrichment = match (&self.registry, &self.registry_error) {
+            (Some(snap), None) => EnrichmentStatus::Available {
+                entries: snap.entries.len(),
+                truncated: snap.truncated,
+            },
+            (None, Some(reason)) => EnrichmentStatus::Unavailable {
+                reason: reason.clone(),
+            },
+            (None, None) => EnrichmentStatus::Unavailable {
+                reason: "sensor invariant: snapshot outcome unrecorded".to_owned(),
+            },
+            (Some(_), Some(_)) => EnrichmentStatus::Unavailable {
+                reason: "sensor invariant: snapshot and error both set".to_owned(),
+            },
+        };
         self.core
             .ledger(
                 kernel_loss,
@@ -655,6 +727,7 @@ impl LifecycleSensor {
                     agg_baseline: self.agg_baseline,
                     view_valid: self.view_valid.load(Ordering::Relaxed),
                     miss_baseline: self.miss_baseline.clone(),
+                    enrichment,
                 },
             )
             .map_err(LedgerError::Misses)

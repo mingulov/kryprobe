@@ -8,7 +8,9 @@
 //! same `ingest_records` and is covered by the VM canary lane.
 
 use kryprobe_core::kcrypto::Terminal;
-use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext, fold_loss_lanes};
+use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+    EnrichmentStatus, SensorCore, SessionContext, fold_loss_lanes,
+};
 
 /// Clean session context (verified identity, zero baselines).
 fn ctx() -> SessionContext {
@@ -17,10 +19,14 @@ fn ctx() -> SessionContext {
         agg_baseline: [0; 16],
         view_valid: true,
         miss_baseline: Vec::new(),
+        enrichment: EnrichmentStatus::Available {
+            entries: 0,
+            truncated: false,
+        },
     }
 }
 
-/// One 48-byte v4 `LEdge` (little-endian twin of the ABI struct;
+/// One 112-byte v5 `LEdge` (little-endian twin of the ABI struct;
 /// the transform word defaults to 0 = unknown link).
 fn edge_bytes_invoc(
     edge: u8,
@@ -31,11 +37,12 @@ fn edge_bytes_invoc(
     flags: u16,
     invoc: u64,
 ) -> Vec<u8> {
-    edge_bytes_tfm(edge, site, key, ts_ns, status, flags, invoc, 0)
+    edge_bytes_tfm(edge, site, key, ts_ns, status, flags, invoc, 0, b"")
 }
 
 /// Full builder with an explicit transform word (T07.3 first-seen
-/// tests pass a frontend here).
+/// tests pass a frontend here) and driver name (submit edges only —
+/// returns carry tfm 0 + empty name per the R2 twin).
 #[allow(clippy::too_many_arguments)]
 fn edge_bytes_tfm(
     edge: u8,
@@ -46,10 +53,11 @@ fn edge_bytes_tfm(
     flags: u16,
     invoc: u64,
     tfm: u64,
+    drv: &[u8],
 ) -> Vec<u8> {
-    let mut out = vec![0u8; 48];
+    let mut out = vec![0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 4;
+    out[2] = 5;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -58,10 +66,12 @@ fn edge_bytes_tfm(
     out[24..28].copy_from_slice(&status.to_le_bytes());
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out[40..48].copy_from_slice(&tfm.to_le_bytes());
+    let n = drv.len().min(63);
+    out[48..48 + n].copy_from_slice(&drv[..n]);
     out
 }
 
-/// Realistic default builder: same v4 record with a VALID
+/// Realistic default builder: same v5 record with a VALID
 /// invocation (see the decode-suite twin).
 fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> Vec<u8> {
     edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)
@@ -230,6 +240,10 @@ fn w8_ledger_carries_session_context() {
                 agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 view_valid: false,
                 miss_baseline: Vec::new(),
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("empty miss join");
@@ -287,6 +301,10 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: base,
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("monotone join");
@@ -324,6 +342,10 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: base,
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect_err("backwards miss join must refuse the ledger");
@@ -332,19 +354,32 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
 
 #[test]
 fn ingest_op_edge_admits_first_seen_transform() {
-    // T07.3 wiring: an ingested op edge with a nonzero transform
+    // T07.3 wiring: an ingested op SUBMIT with a nonzero transform
     // word admits a first-seen generation in the core's tracker
-    // (provenance unknown); a second edge for the same base admits
-    // nothing more; a 0 word counts unlinked.
+    // (creation provenance unknown; the submit's driver rides along
+    // — F05). Returns never admit (R2: no exit-side chase — the
+    // paired return joins by invocation only); a 0 submit word
+    // counts unlinked.
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
-    core.ingest_records(&[edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, f1)]);
+    core.ingest_records(&[edge_bytes_tfm(
+        1,
+        1,
+        0xabc,
+        100,
+        0,
+        0,
+        0x4000,
+        f1,
+        b"aes-generic",
+    )]);
     let gens = core.tfm().generations();
-    assert_eq!(gens.len(), 1, "op edge admits its transform");
+    assert_eq!(gens.len(), 1, "op submit admits its transform");
     assert!(gens[0].first_seen);
     assert_eq!(gens[0].req_name, "");
-    core.ingest_records(&[edge_bytes_tfm(2, 1, 0xabc, 150, 0, 0, 0x4000, f1)]);
-    assert_eq!(core.tfm().generations().len(), 1, "same base no-op");
+    assert_eq!(gens[0].drv_name, "aes-generic", "submit driver captured");
+    core.ingest_records(&[edge_bytes_tfm(2, 1, 0xabc, 150, 0, 0, 0x4000, 0, b"")]);
+    assert_eq!(core.tfm().generations().len(), 1, "return admits nothing");
     core.ingest_records(&[edge_bytes(1, 1, 0xdef, 200, 0, 0)]);
     assert_eq!(core.tfm().stats().unlinked_ops, 1, "zero word counted");
 }
@@ -365,4 +400,41 @@ fn w7_fold_loss_lanes_sums_per_class_saturating() {
     lanes[64] = u64::MAX;
     lanes[79] = u64::MAX;
     assert_eq!(fold_loss_lanes(lanes), [10, 7, 0, 0, u64::MAX]);
+}
+
+#[test]
+fn ledger_carries_enrichment_status_both_arms() {
+    // T07-09: the terminal ledger distinguishes an available
+    // registry snapshot from a failed one WITH its reason —
+    // capture never refuses on enrichment, but the report never
+    // stays silent about its absence either.
+    let core = SensorCore::new(16, 16, 16, 8, true);
+    let mut available = ctx();
+    available.enrichment = EnrichmentStatus::Available {
+        entries: 41,
+        truncated: true,
+    };
+    let ledger = core
+        .ledger([0; 5], [0; 16], Vec::new(), available)
+        .expect("empty miss join");
+    assert_eq!(
+        ledger.enrichment,
+        EnrichmentStatus::Available {
+            entries: 41,
+            truncated: true,
+        }
+    );
+    let mut missing = ctx();
+    missing.enrichment = EnrichmentStatus::Unavailable {
+        reason: "No such file or directory (os error 2)".to_owned(),
+    };
+    let ledger = core
+        .ledger([0; 5], [0; 16], Vec::new(), missing)
+        .expect("empty miss join");
+    assert_eq!(
+        ledger.enrichment,
+        EnrichmentStatus::Unavailable {
+            reason: "No such file or directory (os error 2)".to_owned(),
+        }
+    );
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Raw-edge decode: v4 `LEdge` bytes → T05 `Edge` events (T06, v4 at T07.3).
+//! Raw-edge decode: v5 `LEdge` bytes → T05 `Edge` events (T06, v5 at T07.7:
+//! the submit-side driver word (F05) + return-side no-chase twin (R2)).
 //!
 //! The join is keyed by the BPF invocation id alone (W8 fsession: the
 //! entry run mints one id per call and stores it in the kernel-zeroed
@@ -31,22 +32,25 @@
 //! function — cross-site returns refuse stale).
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION,
-    LSITE_DEC, LSITE_ENC,
+    LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_TRUNCATED,
+    LEDGE_VERSION, LSITE_DEC, LSITE_ENC,
 };
 use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
 use std::collections::HashMap;
 
-/// Record twin size: `LEdge` is 48 bytes on the ring (v4: the
-/// transform word rides at 40..48).
-const RECORD_LEN: usize = 48;
+/// Record twin size: `LEdge` is 112 bytes on the ring (v5: the
+/// transform word rides at 40..48, the driver name at 48..112).
+const RECORD_LEN: usize = 112;
+
+/// Driver-name field length (v5 `LEdge::drv`: 63 bytes max + NUL).
+const DRV_LEN: usize = 64;
 
 /// One validated raw edge (post-twin-checks, pre-join).
 ///
 /// `Debug` is manual: [`RawEdge::key`] and [`RawEdge::tfm`] are raw
 /// kernel pointers and render as `<redacted>` (round-1
-/// sol-m9/astra-m9).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// sol-m9/astra-m9); [`RawEdge::drv`] renders (public inventory).
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawEdge {
     /// [`LEDGE_SUBMIT`] or [`LEDGE_RETURN`] (validated).
     pub edge: u8,
@@ -68,7 +72,18 @@ pub struct RawEdge {
     /// Frontend transform pointer behind the op (0 when the request
     /// link was unreadable — unknown, feeds first-seen admission;
     /// never leaves decode except into the tracker's opaque ids).
+    /// Submit edges only (R2: returns carry 0 — the twin refuses a
+    /// return-side word, since honest BPF never chases at exit).
     pub tfm: u64,
+    /// Runtime-selected driver name behind the submit's transform
+    /// (empty when the driver chase was unreadable — unknown, feeds
+    /// first-seen provenance; public inventory, never a secret).
+    /// Submit edges only (returns carry empty — the twin refuses a
+    /// return-side name).
+    pub drv: String,
+    /// The driver word filled the bound (D9: clipped names read as
+    /// partial, never complete — carried into the generation).
+    pub truncated: bool,
 }
 
 impl std::fmt::Debug for RawEdge {
@@ -82,6 +97,7 @@ impl std::fmt::Debug for RawEdge {
             .field("status", &self.status)
             .field("invoc", &self.invoc)
             .field("tfm", &"<redacted>")
+            .field("drv", &self.drv)
             .finish()
     }
 }
@@ -89,7 +105,7 @@ impl std::fmt::Debug for RawEdge {
 /// Why one ring record produced no edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeDrop {
-    /// Record is not exactly 48 bytes.
+    /// Record is not exactly 112 bytes.
     BadLength,
     /// Magic is not [`LEDGE_MAGIC`].
     BadMagic,
@@ -99,7 +115,7 @@ pub enum DecodeDrop {
     BadEdge,
     /// Site is neither encrypt nor decrypt.
     BadSite,
-    /// Flags carry bits outside [`LEDGE_TAINTED`].
+    /// Flags carry bits outside tainted/truncated.
     BadFlags,
     /// The twin defines no aux; nonzero is twin drift.
     BadAux,
@@ -114,6 +130,13 @@ pub enum DecodeDrop {
     /// clear). Honest BPF never emits either shape — fail closed,
     /// never join.
     BadInvoc,
+    /// Return edge with a nonzero transform word (R2: honest BPF
+    /// never chases at exit — a return-side word is twin drift).
+    BadReturnTfm,
+    /// Driver-name field violates the contract: no NUL within 64
+    /// bytes, invalid UTF-8, or a name on a return edge (returns
+    /// carry no name — the submit's admission owns the provenance).
+    BadDrv,
 }
 
 /// Named decode loss counters (loss ledger feed).
@@ -140,12 +163,13 @@ pub struct DecodeStats {
     pub stale_returns: u64,
 }
 
-/// Validate one ring record against the v4 `LEdge` twin: exact length,
+/// Validate one ring record against the v5 `LEdge` twin: exact length,
 /// magic, version, edge kind, site, defined-only flags, zero aux,
-/// non-null key, zero status on submit edges, the invocation id, and
-/// the transform word (`tfm` admits ANY u64 — 0 is unknown, never
-/// refused: the op joins by invocation with or without its
-/// transform).
+/// non-null key, zero status on submit edges, the invocation id, the
+/// transform word (submit edges: ANY u64 — 0 is unknown, never
+/// refused; return edges: 0 ONLY — R2, honest BPF never chases at
+/// exit), and the driver name (submit edges: NUL-terminated UTF-8,
+/// empty when unknown; return edges: empty ONLY).
 pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeDrop::BadLength);
@@ -178,7 +202,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         return Err(DecodeDrop::BadSite);
     }
     let flags = u16le(6);
-    if flags & !LEDGE_TAINTED != 0 {
+    if flags & !(LEDGE_TAINTED | LEDGE_TRUNCATED) != 0 {
         return Err(DecodeDrop::BadFlags);
     }
     let key = u64le(8);
@@ -195,10 +219,24 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     }
     let invoc = u64le(32);
     let tainted = flags & LEDGE_TAINTED != 0;
+    let truncated = flags & LEDGE_TRUNCATED != 0;
     if !tainted && (invoc == 0 || invoc & LEDGE_INVOC_POISON != 0) {
         return Err(DecodeDrop::BadInvoc);
     }
     let tfm = u64le(40);
+    if edge == LEDGE_RETURN && tfm != 0 {
+        return Err(DecodeDrop::BadReturnTfm);
+    }
+    let mut drv_field = [0u8; DRV_LEN];
+    drv_field.copy_from_slice(&bytes[48..48 + DRV_LEN]);
+    let drv_len = drv_field
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(DecodeDrop::BadDrv)?;
+    let drv = std::str::from_utf8(&drv_field[..drv_len]).map_err(|_| DecodeDrop::BadDrv)?;
+    if edge == LEDGE_RETURN && (!drv.is_empty() || truncated) {
+        return Err(DecodeDrop::BadDrv);
+    }
     Ok(RawEdge {
         edge,
         site,
@@ -208,6 +246,8 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         status,
         invoc,
         tfm,
+        drv: drv.to_owned(),
+        truncated,
     })
 }
 

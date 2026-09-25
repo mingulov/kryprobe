@@ -315,6 +315,30 @@ pub fn skcipher_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureEr
     skcipher_roundtrip_with(alg, ops, &[0x42u8; 16], &[0x11u8; 16], &[0xaau8; 32])
 }
 
+/// One 32B encrypt on an already-bound skcipher fd (T07-04/F05: the
+/// caller binds + keys the socket, the SENSOR attaches, then this op
+/// runs — the sensor's first observation of the transform is the
+/// submit edge, so the generation is op-first-seen. Caller keeps
+/// ownership of `bound_fd`; the op socket closes on return. Fixed
+/// bytes (IV 16B `0x11`, pt 32B `0xaa` — CBC-shaped algs; `ecb`
+/// callers must pass their own IV story, so this helper refuses
+/// nothing and documents CBC-only).
+pub fn skcipher_encrypt_once(bound_fd: std::os::fd::RawFd) -> Result<(), FixtureError> {
+    // SAFETY: no address capture; `bound_fd` stays caller-owned.
+    let op = unsafe { libc::accept(bound_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if op < 0 {
+        return Err(FixtureError::Syscall {
+            stage: "accept",
+            errno: last_errno(),
+        });
+    }
+    let op = AlgFd::new(op);
+    let mut out = [0u8; 32];
+    send_op(&op, ALG_OP_ENCRYPT, &[0x11u8; 16], &[0xaau8; 32])?;
+    read_exact(&op, &mut out, 32, "enc read")?;
+    Ok(())
+}
+
 /// Canary `skcipher` roundtrip (K1 Task 3): same choreography as
 /// [`skcipher_roundtrip`], but key, IV, and plaintext are the
 /// `KPROBE-CANARY-*` markers above.

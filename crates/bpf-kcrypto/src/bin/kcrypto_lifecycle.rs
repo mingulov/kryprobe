@@ -147,12 +147,13 @@ use core::mem::MaybeUninit;
 // ---------------------------------------------------------------------------
 
 const LEDGE_MAGIC: u16 = 0x434c;
-const LEDGE_VERSION: u8 = 4;
+const LEDGE_VERSION: u8 = 5;
 
 const LEDGE_SUBMIT: u8 = 1;
 const LEDGE_RETURN: u8 = 2;
 
 const LEDGE_TAINTED: u16 = 0x0001;
+const LEDGE_TRUNCATED: u16 = 0x0002;
 
 const LSITE_ENC: u16 = 1;
 const LSITE_DEC: u16 = 2;
@@ -226,11 +227,14 @@ const KFUNC_COOKIE_SENTINEL: usize = 0x5F4B_0002;
 // Twinned structs (mirror: kryprobe-abi/src/kcrypto_lifecycle.rs)
 // ---------------------------------------------------------------------------
 
-/// Raw lifecycle edge (48 bytes; field order pinned by ABI tests).
+/// Raw lifecycle edge (112 bytes; field order pinned by ABI tests).
 /// `tfm` is the frontend transform pointer behind the op
 /// (`req->base->tfm` chased at the `LCFG` request-link words, minus
 /// `sk_base` to the frontend — the tracker normalizes every pairing
-/// pointer uniformly), 0 when the link was unreadable.
+/// pointer uniformly), 0 when the link was unreadable. `drv` is the
+/// runtime-selected driver behind the submit's transform (F05).
+/// Submit edges only: returns carry `tfm` 0 + empty `drv` (R2: the
+/// exit run never chases — the request may be freed already).
 #[repr(C)]
 struct LEdge {
     magic: u16,
@@ -244,6 +248,7 @@ struct LEdge {
     aux: u32,
     invoc: u64,
     tfm: u64,
+    drv: [u8; NAME_LEN],
 }
 
 /// Sensor config (64 bytes, `LCFG` key 0): v3 adds the destroy
@@ -284,7 +289,7 @@ struct LTfm {
     token: u64,
     name: [u8; 64],
 }
-const _: () = assert!(size_of::<LEdge>() == 48);
+const _: () = assert!(size_of::<LEdge>() == 112);
 const _: () = assert!(size_of::<LConfig>() == 64);
 const _: () = assert!(size_of::<LTfm>() == 112);
 
@@ -615,8 +620,10 @@ fn agg_inc(idx: u32) {
     }
 }
 
-/// Emit one edge record: reserve 48 bytes, fill every field, submit.
-/// Reserve failure feeds `LLOSS_RESERVE` (never silent).
+/// Emit one edge record: reserve 112 bytes, fill every field, submit.
+/// Reserve failure feeds `LLOSS_RESERVE` (never silent). `drv` copies
+/// from the caller's 8-aligned `NameSlot` (entry: the chased driver;
+/// exit: a zeroed slot — returns carry no name).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn emit_edge(
@@ -628,6 +635,8 @@ fn emit_edge(
     tainted: bool,
     invoc: u64,
     tfm: u64,
+    drv: &NameSlot,
+    truncated: bool,
     hook: u32,
 ) {
     let Some(mut entry) = LRING.reserve::<LEdge>(0) else {
@@ -639,7 +648,10 @@ fn emit_edge(
     // zero chains fuse into `memset` calls and break R4).
     let slot: &mut MaybeUninit<LEdge> = &mut entry;
     let ptr = slot.as_mut_ptr();
-    let flags: u16 = if tainted { LEDGE_TAINTED } else { 0 };
+    let mut flags: u16 = if tainted { LEDGE_TAINTED } else { 0 };
+    if truncated {
+        flags |= LEDGE_TRUNCATED;
+    }
     unsafe {
         core::ptr::addr_of_mut!((*ptr).magic).write(LEDGE_MAGIC);
         core::ptr::addr_of_mut!((*ptr).version).write(LEDGE_VERSION);
@@ -656,6 +668,15 @@ fn emit_edge(
         // tail — a plain store here fuses into a `memset` call
         // under inlining (T07.2d R4 lesson); volatile never fuses.
         core::ptr::addr_of_mut!((*ptr).tfm).write_volatile(tfm);
+        // Volatile loads (same R4 rationale as `emit_tfm_edge`'s
+        // name copy: the stack source may be known-zero, and plain
+        // loads fuse the copy into a `memset` call).
+        let mut i = 0usize;
+        while i < NAME_LEN {
+            let word = (drv.0.as_ptr().add(i) as *const u64).read_volatile();
+            (core::ptr::addr_of_mut!((*ptr).drv).cast::<u8>().add(i) as *mut u64).write(word);
+            i += 8;
+        }
     }
     entry.submit(0);
 }
@@ -817,7 +838,10 @@ fn run_prologue(key: u64, hook: u32) -> Option<u64> {
 
 /// One site's session program (shared by encrypt/decrypt bodies):
 /// entry run issues the invocation into the cookie and emits the
-/// submit; exit run reads the cookie back and emits the return.
+/// submit (live entry chase: transform word + driver); exit run
+/// reads the cookie back and emits the return (NO chase — R2: the
+/// request may be freed already after an async completion, so a
+/// return without submit evidence leaves the association unknown).
 /// `lane`/`site`/`sub_hook`/`ret_hook` pin the caller's identity.
 #[inline(always)]
 fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: u32) -> i32 {
@@ -831,13 +855,30 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
         // Re-fetch the cookie in this run (never stored): a zero
         // cookie means the entry run never executed (guard skip) —
         // emit TAINTED with id 0 instead of joining another call.
+        // Either way the transform word is 0 and the name empty
+        // (R2: no exit-side chase — taint is about the invocation,
+        // and the association comes from the submit alone).
         let invoc = unsafe { *session_cookie(raw) };
+        let mut slot = MaybeUninit::<NameSlot>::uninit();
+        let raw_slot = slot.as_mut_ptr();
+        zero_name(raw_slot);
+        // SAFETY: volatile-zeroed above; exclusive stack slot.
+        let empty = unsafe { &*raw_slot };
         if invoc == 0 {
             agg_inc(ret_hook);
-            // Tainted by invocation (no id) — but the request link
-            // still chases: taint never hides the transform.
-            let tfm = chase_req_tfm(key);
-            emit_edge(site, LEDGE_RETURN, key, now, 0, true, 0, tfm, ret_hook);
+            emit_edge(
+                site,
+                LEDGE_RETURN,
+                key,
+                now,
+                0,
+                true,
+                0,
+                0,
+                empty,
+                false,
+                ret_hook,
+            );
             return 0;
         }
         let Some(ret) = func_ret(raw) else {
@@ -849,7 +890,6 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
             return 0;
         };
         agg_inc(ret_hook);
-        let tfm = chase_req_tfm(key);
         emit_edge(
             site,
             LEDGE_RETURN,
@@ -858,7 +898,9 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
             ret as i32,
             false,
             invoc,
-            tfm,
+            0,
+            empty,
+            false,
             ret_hook,
         );
         return 0;
@@ -880,8 +922,31 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
     unsafe {
         *session_cookie(raw) = invoc;
     }
+    // Live entry chase (the request is ours for the call's duration):
+    // the transform word plus the runtime-selected driver (F05 —
+    // empty when unreadable, never fabricated; clipped names flag
+    // TRUNCATED, never read as complete).
     let tfm = chase_req_tfm(key);
-    emit_edge(site, LEDGE_SUBMIT, key, now, 0, false, invoc, tfm, sub_hook);
+    let mut slot = MaybeUninit::<NameSlot>::uninit();
+    let raw_slot = slot.as_mut_ptr();
+    zero_name(raw_slot);
+    let truncated = chase_drv_name(raw_slot, tfm);
+    // SAFETY: `chase_drv_name` keeps the slot fully initialized on
+    // every path (pre-zeroed, then helper-overwritten in part).
+    let drv = unsafe { &*raw_slot };
+    emit_edge(
+        site,
+        LEDGE_SUBMIT,
+        key,
+        now,
+        0,
+        false,
+        invoc,
+        tfm,
+        drv,
+        truncated,
+        sub_hook,
+    );
     0
 }
 
@@ -1067,7 +1132,7 @@ fn destroy_run(ctx: &FEntryContext) -> i32 {
         );
         return 0;
     }
-    // ---- entry run: mint the token, snapshot mem + refcount ----
+    // ---- entry run: mint the token, snapshot base + refcount ----
     let Some(now) = alloc_prologue(LAGG_DESTROY_SUB) else {
         return 0;
     };
@@ -1084,6 +1149,17 @@ fn destroy_run(ctx: &FEntryContext) -> i32 {
     }
     let mem: u64 = ctx.arg(0);
     let tfm: u64 = ctx.arg(1);
+    // T07-03: the wire key is arg1 — the canonical `crypto_tfm` base
+    // for EVERY family (destroy's contract, not the skcipher-only
+    // frontend offset — a shash destroy can no longer misjoin
+    // through a wrong word). A null/ERR `mem` kernel-returns-early,
+    // so it emits as the null key (userspace no-op, exactly as
+    // before — the noop verdict keys on `mem`, never on the base).
+    let key = if mem == 0 || mem >= ERR_PTR_MIN {
+        0
+    } else {
+        tfm
+    };
     let (refcnt, observed) = read_refcnt(tfm);
     let mut slot = MaybeUninit::<NameSlot>::uninit();
     // The pointer stays typed as *mut NameSlot, so word
@@ -1095,7 +1171,7 @@ fn destroy_run(ctx: &FEntryContext) -> i32 {
     emit_tfm_edge(
         LTFM_SITE_DESTROY,
         LEDGE_SUBMIT,
-        mem,
+        key,
         now,
         0,
         refcnt,

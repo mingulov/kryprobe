@@ -275,6 +275,31 @@ obligation: the schema checks ID shape, not provenance — the
 future producer must derive ids opaquely, never from addresses;
 validation cannot prove that.)
 
+## `LRING`/`LCFG` lifecycle transport (T07, R6 pin)
+
+Lifecycle edges ride the `LRING` ring as 48B `LEdge` (op
+submit/return) and 112B `LTfm` (transform alloc/destroy/config
+halves); the 64B `LCFG` row is loader-written config like `KCFG`.
+All three carry `FIELDS` lists pinned by
+`allowlist_field_set_matches_docs` — same tripwire as the
+aggregate structs.
+
+| Struct | Fields | WHY (kp2 §9) |
+|---|---|---|
+| `LEdge` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `aux`, `invoc`, `tfm`, `drv` | wire tags + pairing pointers (`key`, `tfm` — kernel pairing material, `<redacted>` at every render) + timestamp + native errno + invocation id + submit-side selected driver (`drv` — public inventory); `aux` reserved-zero; returns carry `tfm` 0 + empty `drv` (R2: never chased) |
+| `LTfm` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `aux`, `aux2`, `token`, `name` | wire tags + pairing pointer (`key`, redacted) + timestamp + native errno + site scalars (alg type/mask, refcount snapshot, key length/authsize — sizes, not contents) + attempt token + bounded algorithm/driver name (public inventory) |
+| `LConfig` | `magic`, `version`, `flags`, `tfm_alg`, `alg_drv`, `sk_base`, `refcnt_off`, `refcnt_present`, `req_base`, `req_tfm`, `reserved` | arm tags + BTF-resolved struct offsets (loader-computed, no kernel reads) + disarm gate |
+
+No lifecycle field carries key material, IVs, plaintext,
+ciphertext, or buffer contents: `aux`/`aux2`/`len` words are
+length/type scalars, `name` is a bounded algorithm/driver name,
+and the two pairing pointers never render (manual `Debug`
+redaction, pinned by `public_views_carry_no_kernel_addresses`
+in decimal AND hex). The privileged
+`lifecycle_canary_no_secret_bytes_in_views` lane test keys a live
+transform with a `KPROBE-CANARY-*` marker and scans every
+generation/ledger render for zero occurrences.
+
 ## NEVER list
 
 The sensor NEVER reads, stores, or emits: keys, IVs, nonces,

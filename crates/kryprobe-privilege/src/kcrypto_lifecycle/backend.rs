@@ -560,10 +560,23 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 /// overflows. A void identity verdict (M2 — the sensor's kernel
 /// objects stopped matching the pre-arm baseline, so the session's
 /// evidence is unattributed) lands one count in state inserts.
-/// Evictions/unknown generations pin zero (HASH slots never evict,
-/// single generation driver); `output_omissions` (driver-reported
-/// observation-cap drops) lands in `budget_omissions`.
+/// Transform-lifetime loss (T07-05/R3) joins the same buckets:
+/// refused/unadmitted/twisted transform evidence (resubmits,
+/// taint, D4 table/live refusals, twin drift, unreadable links)
+/// → state inserts; dangling-at-close attempts → unmatched
+/// entries; returns for no outstanding attempt → unmatched
+/// returns; predated/mismatched joins → correlation overflows;
+/// uncertain-identity events (ambiguous/forced/unknown/stale
+/// releases, unlinked configs, unobserved-boundary attributions,
+/// evicted tombstone history) → unknown generations. Normal
+/// transform accounting (admissions, completions, classified
+/// failures, proved retires, joined configs incl. errno verdicts)
+/// is truth, not loss — unmapped by design. Evictions pin zero
+/// (HASH slots never evict, single generation driver);
+/// `output_omissions` (driver-reported observation-cap drops) lands
+/// in `budget_omissions`.
 fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> IntegritySummary {
+    let tfm = &ledger.tfm_stats;
     IntegritySummary {
         ring_reservation_failures: ledger.kernel_loss[0],
         user_queue_drops: ledger.retained_dropped,
@@ -578,19 +591,35 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> I
             .saturating_add(ledger.kernel_loss[2])
             .saturating_add(ledger.kernel_loss[4])
             .saturating_add(prog_miss_delta_sum(&ledger.prog_misses))
-            .saturating_add(u64::from(!ledger.view_valid)),
+            .saturating_add(u64::from(!ledger.view_valid))
+            .saturating_add(tfm.submit_refused)
+            .saturating_add(tfm.tainted_refused)
+            .saturating_add(tfm.table_full)
+            .saturating_add(tfm.live_full)
+            .saturating_add(tfm.bad_records)
+            .saturating_add(tfm.unlinked_ops),
         state_evictions: 0,
-        unmatched_entries: ledger.reducer.unfinished,
+        unmatched_entries: ledger.reducer.unfinished.saturating_add(tfm.unfinished),
         unmatched_returns: ledger
             .decode
             .unknown_invoc_returns
             .saturating_add(ledger.reducer.orphan)
-            .saturating_add(ledger.kernel_loss[3]),
+            .saturating_add(ledger.kernel_loss[3])
+            .saturating_add(tfm.unknown_returns),
         correlation_overflows: ledger
             .decode
             .gaps_synthesized
-            .saturating_add(ledger.decode.stale_returns),
-        unknown_generation_events: 0,
+            .saturating_add(ledger.decode.stale_returns)
+            .saturating_add(tfm.stale_returns)
+            .saturating_add(tfm.mismatched_returns),
+        unknown_generation_events: tfm
+            .ambiguous_releases
+            .saturating_add(tfm.forced_retires)
+            .saturating_add(tfm.unknown_releases)
+            .saturating_add(tfm.stale_releases)
+            .saturating_add(tfm.config_unlinked)
+            .saturating_add(tfm.unobserved_boundary)
+            .saturating_add(tfm.tombstone_evictions),
         budget_omissions: output_omissions,
     }
 }
@@ -784,6 +813,7 @@ impl Backend for LifecycleBackend {
 mod tests {
     use super::*;
     use crate::kcrypto_lifecycle::decode::DecodeStats;
+    use crate::kcrypto_lifecycle::sensor::EnrichmentStatus;
     use kryprobe_core::kcrypto::ReducerStats;
 
     fn ledger_with(kernel_loss: [u64; 5]) -> LifecycleLedger {
@@ -802,6 +832,10 @@ mod tests {
             miss_current: Vec::new(),
             tfm_stats: crate::kcrypto_lifecycle::tfm::TfmStats::default(),
             generations: Vec::new(),
+            enrichment: EnrichmentStatus::Available {
+                entries: 0,
+                truncated: false,
+            },
         }
     }
 
@@ -858,6 +892,67 @@ mod tests {
         assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 2);
         let ledger = ledger_with([0; 5]);
         assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 0);
+    }
+
+    #[test]
+    fn t0705_transform_loss_lands_in_integrity_buckets() {
+        // T07-05/R3: transform-lifetime loss joins the integrity
+        // summary — D4 refusals refuse silently no more, and every
+        // uncertain-identity event lands in unknown generations.
+        // Normal transform accounting (proved retires, joined
+        // configs incl. errno verdicts) is truth — unmapped.
+        use crate::kcrypto_lifecycle::tfm::TfmStats;
+        let mut ledger = ledger_with([0; 5]);
+        ledger.tfm_stats = TfmStats {
+            live_full: 3,
+            table_full: 1,
+            submit_refused: 2,
+            bad_records: 1,
+            unfinished: 4,
+            unknown_returns: 5,
+            stale_returns: 6,
+            mismatched_returns: 7,
+            ambiguous_releases: 8,
+            forced_retires: 9,
+            unknown_releases: 10,
+            stale_releases: 11,
+            config_unlinked: 12,
+            unobserved_boundary: 13,
+            tombstone_evictions: 14,
+            retired: 100,
+            configs_joined: 200,
+            configs_failed: 300,
+            ..TfmStats::default()
+        };
+        let integrity = integrity_for_lifecycle(&ledger, 0);
+        assert_eq!(integrity.state_insert_failures, 3 + 1 + 2 + 1);
+        assert_eq!(integrity.unmatched_entries, 4);
+        assert_eq!(integrity.unmatched_returns, 5);
+        assert_eq!(integrity.correlation_overflows, 6 + 7);
+        assert_eq!(
+            integrity.unknown_generation_events,
+            8 + 9 + 10 + 11 + 12 + 13 + 14
+        );
+        // Truth-only transform traffic keeps every loss bucket at
+        // zero (a busy-but-clean session reports clean).
+        let mut ledger = ledger_with([0; 5]);
+        ledger.tfm_stats = TfmStats {
+            admitted: 50,
+            completed: 50,
+            releases: 10,
+            retired: 10,
+            configs_joined: 20,
+            configs_failed: 2,
+            failed_allocs: 1,
+            noop_releases: 1,
+            ..TfmStats::default()
+        };
+        let integrity = integrity_for_lifecycle(&ledger, 0);
+        assert_eq!(integrity.state_insert_failures, 0);
+        assert_eq!(integrity.unmatched_entries, 0);
+        assert_eq!(integrity.unmatched_returns, 0);
+        assert_eq!(integrity.correlation_overflows, 0);
+        assert_eq!(integrity.unknown_generation_events, 0);
     }
 
     #[test]

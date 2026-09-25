@@ -165,6 +165,9 @@ pub enum TfmDrop {
     /// Config return with a nonzero aux/aux2 word (the length
     /// snapshot lives on the entry).
     BadConfigAux,
+    /// Reserved pad (bytes 36–39) nonzero (the BPF zeroes the
+    /// alignment gap per record — anything else is wire drift).
+    BadReserved,
 }
 
 /// Named tracker loss counters (loss ledger feed).
@@ -223,6 +226,12 @@ pub struct TfmStats {
     /// (alloc↔destroy cross — refused with the entry kept, so the
     /// true return still pairs).
     pub mismatched_returns: u64,
+    /// Destroy returns whose entry-bound generation no longer holds
+    /// the base (a realloc or an overlapping destroy retired /
+    /// superseded it between entry and return — the return retires
+    /// NOTHING, so an old destroy can never donate its retire to a
+    /// new lifetime reusing the address).
+    pub stale_releases: u64,
     /// Paired config returns, success and failure alike (the
     /// config analog of `completed` — every joined pair).
     pub configs_joined: u64,
@@ -234,6 +243,17 @@ pub struct TfmStats {
     /// frontend key, or a D4/id-exhaustion admission refusal whose
     /// reason is already counted — never a phantom).
     pub config_unlinked: u64,
+    /// Pending attempts finalized at close without their return
+    /// (T07-06: unknown outcome — alloc/config count only; a
+    /// dangling destroy on a still-live bound generation ALSO
+    /// marks it ambiguous, counted below).
+    pub unfinished: u64,
+    /// Joined configs attributed to a first-seen generation
+    /// (T07-02: the lifetime's creation boundary was never
+    /// observed — a missed free could have swapped the lifetime
+    /// under the address, so the epoch bump lands on an
+    /// uncertain identity and exact reuse voids).
+    pub unobserved_boundary: u64,
 }
 
 /// Normalize a frontend transform pointer to the canonical base
@@ -311,19 +331,24 @@ pub fn decode_tfm_record(bytes: &[u8]) -> Result<RawTfm, TfmDrop> {
     let status = i32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
     let aux = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
     let aux2 = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+    // T07-10: bytes 36–39 are the zeroed alignment pad — a changed
+    // reserved word refuses (twin drift, never joined).
+    if bytes[36] != 0 || bytes[37] != 0 || bytes[38] != 0 || bytes[39] != 0 {
+        return Err(TfmDrop::BadReserved);
+    }
     let token = u64le(40);
     let mut name = [0u8; NAME_LEN];
     name.copy_from_slice(&bytes[48..48 + NAME_LEN]);
     let tainted = flags & LEDGE_TAINTED != 0;
     let truncated = flags & LTFM_TRUNCATED != 0;
     if site == LTFM_SITE_DESTROY {
-        // T07.3 destroy twin: entry admits ANY key (the frontend
-        // `mem`, including null/ERR — classified at the join as a
-        // no-op release, never refused here) with the refcount
-        // value in aux and the observed bit alone in aux2; the bare
-        // return carries the token only (void call — every other
-        // word zero, the join replays the parked entry). Neither
-        // half carries a status or a name, ever.
+        // T07.3 destroy twin: entry admits ANY key (the canonical
+        // base — destroy arg1, including null/ERR — classified at
+        // the join as a no-op release, never refused here) with the
+        // refcount value in aux and the observed bit alone in aux2;
+        // the bare return carries the token only (void call — every
+        // other word zero, the join replays the parked entry).
+        // Neither half carries a status or a name, ever.
         if status != 0 {
             return Err(TfmDrop::BadDestroyStatus);
         }
@@ -450,9 +475,11 @@ pub struct GenerationInfo {
     /// paired with a flagged driver selection must not read as a
     /// complete driver name).
     pub drv_truncated: bool,
-    /// Admitted first-seen from an op edge (allocated before attach
-    /// or on an unhooked path — provenance unknown BY CONSTRUCTION,
-    /// distinct from "saw the alloc, name unreadable").
+    /// Admitted first-seen from an op/config edge (allocated before
+    /// attach or on an unhooked path — creation provenance unknown
+    /// BY CONSTRUCTION, distinct from "saw the alloc, name
+    /// unreadable"; op-admitted generations may still carry the
+    /// submit's runtime-selected driver — F05 selected metadata).
     pub first_seen: bool,
     /// Retired: a proved final-free ended this lifetime (normal
     /// retire) or a new alloc proved it ended unobserved (forced
@@ -507,13 +534,20 @@ enum PendingAttempt {
     },
     /// Destroy entry parked.
     Destroy {
-        /// Frontend `mem` from the entry edge (null/ERR classifies
-        /// at completion as a no-op release).
+        /// Canonical base from the entry edge (T07-03: destroy arg1
+        /// — null/ERR classifies at completion as a no-op release).
         mem: u64,
         /// Refcount value snapshot from the entry edge.
         refcnt: u32,
         /// The snapshot is a real read (observed bit).
         observed: bool,
+        /// Generation id holding the base at ENTRY (`None` when the
+        /// base was unmapped — the return retires NOTHING unless
+        /// the same id still holds the base, so a realloc between
+        /// the halves can never donate its retire to the new
+        /// lifetime; ids are stable under tombstone eviction,
+        /// indices are not).
+        bound_id: Option<u64>,
         /// Entry edge timestamp (stale returns refuse against it).
         ts_ns: u64,
     },
@@ -528,6 +562,11 @@ enum PendingAttempt {
         /// Entry site (one of the three config sites — a return
         /// from any other site refuses as mismatched).
         site: u16,
+        /// Generation id holding the base at ENTRY (`None` when the
+        /// base was unmapped — the return attributes NOTHING unless
+        /// the same id still holds the base, so a config straddling
+        /// a reuse can never bump the new lifetime's epoch).
+        bound_id: Option<u64>,
         /// Entry edge timestamp (stale returns refuse against it).
         ts_ns: u64,
     },
@@ -648,25 +687,45 @@ impl TransformTracker {
         self.generations.iter().map(|g| g.info.clone()).collect()
     }
 
-    /// Exact reuse claims are sound only when no ambiguity was ever
-    /// observed: any ambiguous release or forced retire (cumulative
-    /// counters — tombstone eviction cannot erase them) disables the
-    /// claim that a base's lifetimes chained exactly end-to-start.
+    /// Exact reuse claims are sound only when every lifetime
+    /// boundary was observed exactly: any ambiguous release,
+    /// forced retire, D4 refusal (`live_full`/`table_full` — a
+    /// lifetime unadmitted is a boundary unobserved), unfinished
+    /// close, or config on a first-seen (unobserved-creation)
+    /// lifetime (cumulative counters — tombstone eviction cannot
+    /// erase them) disables the claim that a base's lifetimes
+    /// chained exactly end-to-start.
     #[must_use]
     pub fn reuse_exact(&self) -> bool {
-        self.stats.ambiguous_releases == 0 && self.stats.forced_retires == 0
+        self.stats.ambiguous_releases == 0
+            && self.stats.forced_retires == 0
+            && self.stats.live_full == 0
+            && self.stats.table_full == 0
+            && self.stats.unfinished == 0
+            && self.stats.unobserved_boundary == 0
     }
 
-    /// Admit the transform behind an op edge (first-seen): `frontend`
-    /// normalizes to the canonical base; an already-live base admits
-    /// nothing (one lifetime, one id). A fresh admission carries
-    /// EMPTY provenance — unknown by construction, never fabricated —
-    /// flagged `first_seen`. A 0 frontend (unreadable request link)
-    /// admits nothing and counts `unlinked_ops`. Past the live bound
-    /// the admission refuses (`live_full`) — D4, no silent LRU.
-    /// Issues the next opaque id (id exhaustion refuses like the
-    /// submit path — the `u64::MAX` sentinel is never issued).
-    pub fn admit_first_seen(&mut self, frontend: u64) -> Option<u64> {
+    /// Admit the transform behind an op submit edge (first-seen):
+    /// `frontend` normalizes to the canonical base; an already-live
+    /// base admits nothing (one lifetime, one id — first admission
+    /// wins, a later name never backfills: the admitting edge owns
+    /// the provenance). A fresh admission carries the submit's
+    /// runtime-selected driver (`drv`, empty when the chase was
+    /// unreadable — F05: selected metadata captured, allocation /
+    /// requested name / previous configuration stay unknown) with
+    /// its truncation bit (`drv_truncated` — D9: clipped names read
+    /// as partial), flagged `first_seen`. A 0 frontend (unreadable
+    /// request link) admits nothing and counts `unlinked_ops`. Past
+    /// the live bound the admission refuses (`live_full`) — D4, no
+    /// silent LRU. Issues the next opaque id (id exhaustion refuses
+    /// like the submit path — the `u64::MAX` sentinel is never
+    /// issued).
+    pub fn admit_first_seen(
+        &mut self,
+        frontend: u64,
+        drv: &str,
+        drv_truncated: bool,
+    ) -> Option<u64> {
         if frontend == 0 {
             self.stats.unlinked_ops += 1;
             return None;
@@ -694,9 +753,9 @@ impl TransformTracker {
                 req_name: String::new(),
                 alg_type: 0,
                 alg_mask: 0,
-                drv_name: String::new(),
+                drv_name: drv.to_owned(),
                 name_truncated: false,
-                drv_truncated: false,
+                drv_truncated,
                 first_seen: true,
                 retired: false,
                 ambiguous: false,
@@ -746,6 +805,40 @@ impl TransformTracker {
         self.stats.bad_records += 1;
     }
 
+    /// Finalize pending attempts at close (T07-06): entries
+    /// without returns finalize as UNKNOWN, never joined. Alloc
+    /// and config attempts count `unfinished` (no generation
+    /// exists to taint / the epoch simply excludes the unknown
+    /// config — lifetime boundaries are unaffected). A dangling
+    /// destroy whose entry-bound generation STILL holds the base
+    /// marks it ambiguous and counts `ambiguous_releases` (its
+    /// end is no longer exactly knowable — `reuse_exact` voids —
+    /// while the generation stays live, end unproven). A
+    /// dangling destroy whose bound generation already retired
+    /// (or never existed) counts `unfinished` only — the proved
+    /// end stands.
+    pub fn finish(&mut self) {
+        for (_, attempt) in std::mem::take(&mut self.pending) {
+            self.stats.unfinished += 1;
+            let PendingAttempt::Destroy {
+                mem,
+                bound_id: Some(bound),
+                ..
+            } = attempt
+            else {
+                continue;
+            };
+            // Destroy keys are canonical bases (T07-03 — direct
+            // lookup, never normalized).
+            if let Some(&idx) = self.live.get(&mem)
+                && self.generations[idx].info.id == bound
+            {
+                self.generations[idx].info.ambiguous = true;
+                self.stats.ambiguous_releases += 1;
+            }
+        }
+    }
+
     /// Park an entry under a fresh pending attempt, keyed by its
     /// token. A same-token resubmit (BPF tokens are unique — this
     /// is twin drift or a replay) refuses with the FIRST entry
@@ -766,18 +859,40 @@ impl TransformTracker {
             self.stats.submit_refused += 1;
             return;
         }
+        // Entry-bound generation (R1/T07-01): the lifetime holding
+        // the base RIGHT NOW (stable id, not the eviction-shifting
+        // index) — completions honor it, never the return-time
+        // occupant. Destroy keys are ALREADY the canonical base
+        // (T07-03: the BPF emits destroy arg1, family-agnostic —
+        // never normalized); config keys are frontends (normalized
+        // with the skcipher word, exactly as before). Null/ERR keys
+        // and unmapped bases bind `None` (classified at completion,
+        // exactly as before).
+        // Destroy keys bind WITHOUT normalization (the match arms
+        // below branch per site — the destroy arm looks the base up
+        // directly, the config arm normalizes its frontend first).
+        let destroy_bound =
+            (raw.site == LTFM_SITE_DESTROY && raw.key != 0 && raw.key < ERR_PTR_FLOOR)
+                .then(|| self.live.get(&raw.key))
+                .flatten()
+                .map(|&idx| self.generations[idx].info.id);
         let entry = match raw.site {
             LTFM_SITE_DESTROY => PendingAttempt::Destroy {
                 mem: raw.key,
                 refcnt: raw.aux,
                 observed: raw.aux2 & 1 == 1,
+                bound_id: destroy_bound,
                 ts_ns: raw.ts_ns,
             },
             LTFM_SITE_SETKEY_SK | LTFM_SITE_SETAUTHSIZE | LTFM_SITE_SETKEY_AEAD => {
+                let bound_id = normalize_frontend(raw.key, self.frontend_off)
+                    .and_then(|base| self.live.get(&base))
+                    .map(|&idx| self.generations[idx].info.id);
                 PendingAttempt::Config {
                     key: raw.key,
                     len: raw.aux,
                     site: raw.site,
+                    bound_id,
                     ts_ns: raw.ts_ns,
                 }
             }
@@ -842,13 +957,20 @@ impl TransformTracker {
                 mem,
                 refcnt,
                 observed,
+                bound_id,
                 ..
             } => {
-                self.complete_destroy(mem, refcnt, observed);
+                self.complete_destroy(mem, refcnt, observed, bound_id);
                 Vec::new()
             }
-            PendingAttempt::Config { key, len, site, .. } => {
-                self.complete_config(raw, key, len, site);
+            PendingAttempt::Config {
+                key,
+                len,
+                site,
+                bound_id,
+                ..
+            } => {
+                self.complete_config(raw, key, len, site, bound_id);
                 Vec::new()
             }
         }
@@ -924,34 +1046,58 @@ impl TransformTracker {
         vec![id]
     }
 
-    /// Complete a destroy attempt (the parked entry's frontend +
-    /// refcount snapshot; the bare return carries nothing): null/ERR
-    /// frontends are no-op releases (the kernel returns early —
-    /// counted, disturb nothing); unknown bases count (never a
-    /// phantom); on always-final kernels (no `refcnt` field) every
-    /// observed destroy retires; otherwise only an OBSERVED refcount
+    /// Complete a destroy attempt (the parked entry's canonical
+    /// base + refcount snapshot; the bare return carries nothing):
+    /// null/ERR keys are no-op releases (the kernel returns early —
+    /// counted, disturb nothing); the return retires NOTHING unless
+    /// the entry-bound generation still holds the base (a realloc
+    /// or an overlapping destroy between the halves counts
+    /// `stale_releases` — an old destroy never donates its retire
+    /// to a new lifetime); unbound entries on unmapped bases count
+    /// `unknown_releases` (never a phantom); unbound entries whose
+    /// base became live between the halves ALSO count unknown (the
+    /// entry observed no live lifetime — attributing to the
+    /// newcomer would merge across the unobserved boundary); on
+    /// always-final kernels (no `refcnt` field) every observed
+    /// destroy retires; otherwise only an OBSERVED refcount
     /// of exactly 1 retires (the observer rule — the dec freed under
     /// either historical semantic). Anything else — retained,
     /// unobserved, or the impossible 0 — marks the generation
     /// ambiguous and leaves it live (a later final destroy still
     /// joins and retires it; the flag survives).
-    fn complete_destroy(&mut self, mem: u64, refcnt: u32, observed: bool) {
+    ///
+    /// The key is the CANONICAL BASE, never normalized (T07-03: the
+    /// BPF emits destroy arg1 — family-agnostic, so a shash destroy
+    /// can no longer misjoin through the skcipher-only word; digest
+    /// destroys without an admission path land `unknown_releases`).
+    fn complete_destroy(&mut self, mem: u64, refcnt: u32, observed: bool, bound_id: Option<u64>) {
         self.stats.releases += 1;
         // IS_ERR_OR_NULL: the kernel's early return (no dec-test).
         if mem == 0 || mem >= ERR_PTR_FLOOR {
             self.stats.noop_releases += 1;
             return;
         }
-        let base = match normalize_frontend(mem, self.frontend_off) {
-            Some(base) => base,
-            None => {
-                self.count_bad_record();
+        let base = mem;
+        // Entry-bound lifetime (R1/T07-01): the return honors the
+        // ENTRY's occupant, never the return-time one. Bound-but-
+        // superseded (realloc or overlapping destroy retired it
+        // between the halves) counts stale and retires nothing;
+        // unbound entries attribute nothing even when the base has
+        // since become live (the entry observed no live lifetime).
+        let occupant = self
+            .live
+            .get(&base)
+            .map(|&idx| (idx, self.generations[idx].info.id));
+        let idx = match (bound_id, occupant) {
+            (Some(bound), Some((idx, id))) if bound == id => idx,
+            (Some(_), _) => {
+                self.stats.stale_releases += 1;
                 return;
             }
-        };
-        let Some(&idx) = self.live.get(&base) else {
-            self.stats.unknown_releases += 1;
-            return;
+            (None, _) => {
+                self.stats.unknown_releases += 1;
+                return;
+            }
         };
         if !self.refcnt_present || (observed && refcnt == 1) {
             self.generations[idx].info.retired = true;
@@ -966,16 +1112,28 @@ impl TransformTracker {
 
     /// Complete a configuration attempt (the parked entry's
     /// frontend + length snapshot; the errno return carries the
-    /// verdict): unknown bases admit first-seen (a config edge
-    /// observes a live transform exactly like an op edge — same
-    /// EMPTY-provenance rule); a null key or a D4/id-exhaustion
-    /// admission refusal counts `config_unlinked` (the refusal
-    /// reason is already counted — never a phantom). Every
-    /// attributable pair records site/len/errno and bumps
-    /// `configs`; ONLY a zero errno bumps `epoch` (a failed rekey
-    /// changes no kernel state — bumping would split one keying
-    /// era into two), saturating.
-    fn complete_config(&mut self, raw: RawTfm, key: u64, len: u32, site: u16) {
+    /// verdict): the return attributes NOTHING unless the
+    /// entry-bound generation still holds the base (a config
+    /// straddling a reuse unlinks — it must never bump the new
+    /// lifetime's epoch); unbound entries on still-unmapped bases
+    /// admit first-seen (a config edge observes a live transform
+    /// exactly like an op edge — same EMPTY-provenance rule);
+    /// unbound entries whose base became live between the halves
+    /// unlink (the entry observed no live lifetime); a null key or
+    /// a D4/id-exhaustion admission refusal counts
+    /// `config_unlinked` (the refusal reason is already counted —
+    /// never a phantom). Every attributable pair records
+    /// site/len/errno and bumps `configs`; ONLY a zero errno bumps
+    /// `epoch` (a failed rekey changes no kernel state — bumping
+    /// would split one keying era into two), saturating.
+    fn complete_config(
+        &mut self,
+        raw: RawTfm,
+        key: u64,
+        len: u32,
+        site: u16,
+        bound_id: Option<u64>,
+    ) {
         self.stats.configs_joined += 1;
         if key == 0 {
             self.stats.config_unlinked += 1;
@@ -988,9 +1146,24 @@ impl TransformTracker {
                 return;
             }
         };
-        let idx = match self.live.get(&base) {
-            Some(&idx) => idx,
-            None => match self.admit_first_seen(key) {
+        // Entry-bound lifetime (R1/T07-01, config twin): the return
+        // honors the ENTRY's occupant. Bound-but-superseded unlinks
+        // (the config ran on the old lifetime — or a dead one —
+        // never the newcomer); unbound entries admit first-seen
+        // ONLY when the base is still unmapped (a base that became
+        // live between the halves leaves the config's true target
+        // unknowable — ring order is not kernel order).
+        let occupant = self
+            .live
+            .get(&base)
+            .map(|&idx| (idx, self.generations[idx].info.id));
+        let idx = match (bound_id, occupant) {
+            (Some(bound), Some((idx, id))) if bound == id => idx,
+            (Some(_), _) | (None, Some(_)) => {
+                self.stats.config_unlinked += 1;
+                return;
+            }
+            (None, None) => match self.admit_first_seen(key, "", false) {
                 Some(_) => match self.live.get(&base) {
                     // Admission just inserted this base (total
                     // lookup — no indexing panics on this path).
@@ -1006,6 +1179,14 @@ impl TransformTracker {
                 }
             },
         };
+        // T07-02: a config attributed to a first-seen lifetime
+        // lands on an uncertain identity (creation boundary never
+        // observed — a missed free could have swapped the lifetime
+        // under the address). Attributed best-effort AND counted —
+        // F06 partial, never a confident old identity.
+        if self.generations[idx].info.first_seen {
+            self.stats.unobserved_boundary += 1;
+        }
         let info = &mut self.generations[idx].info;
         info.configs += 1;
         info.last_config_site = site;

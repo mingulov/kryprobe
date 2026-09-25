@@ -33,7 +33,7 @@ pub const LEDGE_MAGIC: u16 = 0x434c;
 /// admission + T08 attribution; v1/v2/v3 records refuse — versions
 /// never mix, so an old decoder misreading the longer record is
 /// impossible).
-pub const LEDGE_VERSION: u8 = 4;
+pub const LEDGE_VERSION: u8 = 5;
 
 /// `LEdge.edge`: function entry (submit-side observation).
 pub const LEDGE_SUBMIT: u8 = 1;
@@ -76,8 +76,12 @@ pub const LTFM_TRUNCATED: u16 = 0x0002;
 /// never emits a tainted submit (NOSLOT drops silently); the decoder
 /// refuses every tainted edge WITHOUT disturbing the table
 /// (per-call cookies isolate invocations — a tainted edge disturbs
-/// no outstanding id). No other flag bit is defined.
+/// no outstanding id).
 pub const LEDGE_TAINTED: u16 = 0x0001;
+/// v5 submit edges: the driver word filled the 64-byte bound (the
+/// selected name may continue past it — D9: a clipped name reads as
+/// partial, never complete).
+pub const LEDGE_TRUNCATED: u16 = 0x0002;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
 pub const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
@@ -152,19 +156,31 @@ pub const LAGG_SETKEYAEAD_RET: u32 = 15;
 // Structs (twinned in kcrypto_lifecycle.rs; pinned by layout tests)
 // ---------------------------------------------------------------------------
 
-/// One raw lifecycle edge on `LRING` (48 bytes): site, edge kind,
-/// pairing key, timestamp, the return status (return edges only;
-/// submit edges carry 0), the BPF invocation id, and the frontend
+/// One raw lifecycle edge on `LRING` (112 bytes, v5): site, edge
+/// kind, pairing key, timestamp, the return status (return edges
+/// only; submit edges carry 0), the BPF invocation id, the frontend
 /// transform pointer behind the op (T07.3 first-seen admission +
-/// T08 attribution; 0 when the request link was unreadable).
+/// T08 attribution; 0 when the request link was unreadable), and the
+/// runtime-selected driver name (T07-04/F05: submit edges only).
 ///
 /// [`LEdge::tfm`] is the raw `crypto_skcipher` frontend pointer the
 /// op ran against (`req->base->tfm` chased BPF-side at the
-/// `LCFG`-pinned offsets). The tracker normalizes it to the
-/// canonical base with the same `sk_base` word the alloc join uses,
-/// so op-first and alloc-first observations of one transform meet
-/// at one identity. 0 admits as unknown (missing link, never
-/// fabricated, never refused — the op still joins by invocation).
+/// `LCFG`-pinned offsets — ENTRY run only: R2 proved the exit-side
+/// chase can read freed request memory after an async completion,
+/// so returns carry 0 and the transform association comes from the
+/// submit's word alone; a return without submit evidence leaves the
+/// association unknown). The tracker normalizes it to the canonical
+/// base with the same `sk_base` word the alloc join uses, so op-first
+/// and alloc-first observations of one transform meet at one
+/// identity. 0 admits as unknown (missing link, never fabricated,
+/// never refused — the op still joins by invocation).
+///
+/// [`LEdge::drv`] is the `cra_driver_name` behind the submit's
+/// transform (the F05 selected metadata for pre-attach transforms —
+/// allocation/requested name/previous configuration stay unknown;
+/// empty when the driver chase was unreadable). Returns carry no
+/// name (the twin refuses one — the submit's admission owns the
+/// provenance).
 ///
 /// [`LEdge::invoc`] is the return-carried invocation identity
 /// (round-4 W4, race-hardened round-6 W6, lane-split round-7 W7,
@@ -190,7 +206,8 @@ pub const LEDGE_INVOC_POISON: u64 = 1;
 /// kernel pointers and render as `<redacted>` (round-1
 /// sol-m9/astra-m9 — Debug output is a log surface and must keep
 /// the module's no-render promise).
-/// `invoc` is a counter, not an address, and renders plainly.
+/// `invoc` is a counter, not an address, and renders plainly;
+/// `drv` renders (driver names are public inventory, not secrets).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LEdge {
@@ -202,8 +219,8 @@ pub struct LEdge {
     pub edge: u8,
     /// [`LSITE_ENC`] or [`LSITE_DEC`].
     pub site: u16,
-    /// Flag bits (only [`LEDGE_TAINTED`] defined; BPF writes 0 for
-    /// clean edges).
+    /// Flag bits ([`LEDGE_TAINTED`] + [`LEDGE_TRUNCATED`] defined;
+    /// BPF writes 0 for clean untruncated edges).
     pub flags: u16,
     /// Raw kernel request pointer (pairing material; see module docs).
     pub key: u64,
@@ -218,7 +235,13 @@ pub struct LEdge {
     pub invoc: u64,
     /// Raw kernel frontend transform pointer behind the op (0 when
     /// the request link was unreadable — unknown, see struct docs).
+    /// Submit edges only (R2: returns carry 0, never chased).
     pub tfm: u64,
+    /// Runtime-selected driver name behind the submit's transform
+    /// (NUL-terminated, 63 bytes max + NUL; empty when the driver
+    /// chase was unreadable — unknown, never fabricated). Submit
+    /// edges only (returns carry empty — the twin refuses a name).
+    pub drv: [u8; 64],
 }
 
 impl core::fmt::Debug for LEdge {
@@ -235,8 +258,21 @@ impl core::fmt::Debug for LEdge {
             .field("aux", &self.aux)
             .field("invoc", &self.invoc)
             .field("tfm", &"<redacted>")
+            .field("drv", &self.drv)
             .finish()
     }
+}
+
+impl LEdge {
+    /// Manually-maintained field list (R6: the K1 Task 3 allowlist
+    /// tripwire extends to lifecycle transport — declaration order,
+    /// pinned by `allowlist_field_set_matches_docs`; adding a field
+    /// without updating this list + the test + the doc fails the
+    /// build — deliberate friction, same as `KConfig::FIELDS`).
+    pub const FIELDS: &[&str] = &[
+        "magic", "version", "edge", "site", "flags", "key", "ts_ns", "status", "aux", "invoc",
+        "tfm", "drv",
+    ];
 }
 
 /// One raw transform edge on `LRING` (112 bytes): allocation
@@ -323,6 +359,16 @@ impl core::fmt::Debug for LTfm {
     }
 }
 
+impl LTfm {
+    /// Manually-maintained field list (R6 allowlist tripwire —
+    /// declaration order; the 4-byte alignment pad before `token`
+    /// is unnamed by design and stays out of the list).
+    pub const FIELDS: &[&str] = &[
+        "magic", "version", "edge", "site", "flags", "key", "ts_ns", "status", "aux", "aux2",
+        "token", "name",
+    ];
+}
+
 /// Lifecycle sensor config in `LCFG` (64 bytes, key 0).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,4 +404,22 @@ pub struct LConfig {
     pub req_tfm: u32,
     /// Reserved (loader writes 0).
     pub reserved: [u8; 24],
+}
+
+impl LConfig {
+    /// Manually-maintained field list (R6 allowlist tripwire —
+    /// declaration order, loader-written config like `KConfig`).
+    pub const FIELDS: &[&str] = &[
+        "magic",
+        "version",
+        "flags",
+        "tfm_alg",
+        "alg_drv",
+        "sk_base",
+        "refcnt_off",
+        "refcnt_present",
+        "req_base",
+        "req_tfm",
+        "reserved",
+    ];
 }

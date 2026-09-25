@@ -16,8 +16,8 @@ use kryprobe_abi::kcrypto_lifecycle::{
 use std::mem::{offset_of, size_of};
 
 #[test]
-fn ledge_is_48_bytes_with_pinned_offsets() {
-    assert_eq!(size_of::<LEdge>(), 48);
+fn ledge_is_112_bytes_with_pinned_offsets() {
+    assert_eq!(size_of::<LEdge>(), 112);
     assert_eq!(offset_of!(LEdge, magic), 0);
     assert_eq!(offset_of!(LEdge, version), 2);
     assert_eq!(offset_of!(LEdge, edge), 3);
@@ -29,12 +29,13 @@ fn ledge_is_48_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LEdge, aux), 28);
     assert_eq!(offset_of!(LEdge, invoc), 32);
     assert_eq!(offset_of!(LEdge, tfm), 40);
+    assert_eq!(offset_of!(LEdge, drv), 48);
 }
 
 #[test]
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
-    assert_eq!(LEDGE_VERSION, 4);
+    assert_eq!(LEDGE_VERSION, 5);
     assert_eq!(LEDGE_INVOC_POISON, 1);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
@@ -164,7 +165,7 @@ fn f9_ledge_debug_redacts_kernel_key() {
     // Round-1 (sol-m9/astra-m9): the module promises no report, log,
     // or error string renders the raw kernel pointer. Debug is a log
     // surface: it must redact the key, not derive-print it.
-    let edge = LEdge {
+    let mut edge = LEdge {
         magic: LEDGE_MAGIC,
         version: LEDGE_VERSION,
         edge: LEDGE_SUBMIT,
@@ -176,13 +177,16 @@ fn f9_ledge_debug_redacts_kernel_key() {
         aux: 0,
         invoc: 41,
         tfm: 0xcafe_f00d_2468_1357,
+        drv: [0; 64],
     };
+    edge.drv[..11].copy_from_slice(b"aes-generic");
     let shown = format!("{edge:?}");
     assert!(shown.contains("<redacted>"), "{shown}");
     assert!(
         shown.contains("41"),
         "invoc is a counter, not redacted: {shown}"
     );
+    assert!(shown.contains("97"), "driver name renders: {shown}");
     // T07.3: `tfm` is a second raw kernel pointer — it redacts like
     // `key` (same no-render promise; Debug is a log surface).
     assert!(!shown.contains("dead"), "{shown}");

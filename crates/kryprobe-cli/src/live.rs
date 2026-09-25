@@ -475,11 +475,16 @@ fn lifecycle_coverage(
     // any per-program recursion-miss session delta (H2: the kernel
     // skipped whole runs — no edge, no LLOSS, only the miss counter
     // sees it), any refused/corrupt/synthesized/stale decode
-    // evidence, and any reducer evidence that never became a
-    // trustworthy record (orphans, ambiguous, admission failures).
-    // Duplicates repeat known state — no information lost, never
-    // flipping. A loss-clean ledger is still `Unknown`: internal
-    // pairing cannot prove kernel hook-delivery (S04/G9 twin).
+    // evidence, any reducer evidence that never became a
+    // trustworthy record (orphans, ambiguous, admission failures),
+    // and any transform-lifetime loss (T07-05/R3: refused,
+    // unadmitted, unjoined, or uncertain-identity transform
+    // evidence corrupts the generations the report counts —
+    // normal transform accounting stays unmapped, same as the
+    // backend buckets). Duplicates repeat known state — no
+    // information lost, never flipping. A loss-clean ledger is
+    // still `Unknown`: internal pairing cannot prove kernel
+    // hook-delivery (S04/G9 twin).
     let count_loss = ledger
         .kernel_loss
         .iter()
@@ -493,7 +498,24 @@ fn lifecycle_coverage(
         .saturating_add(ledger.decode.stale_returns)
         .saturating_add(ledger.reducer.orphan)
         .saturating_add(ledger.reducer.ambiguous)
-        .saturating_add(ledger.reducer.admission_failed);
+        .saturating_add(ledger.reducer.admission_failed)
+        .saturating_add(ledger.tfm_stats.submit_refused)
+        .saturating_add(ledger.tfm_stats.tainted_refused)
+        .saturating_add(ledger.tfm_stats.table_full)
+        .saturating_add(ledger.tfm_stats.live_full)
+        .saturating_add(ledger.tfm_stats.bad_records)
+        .saturating_add(ledger.tfm_stats.unlinked_ops)
+        .saturating_add(ledger.tfm_stats.unknown_returns)
+        .saturating_add(ledger.tfm_stats.stale_returns)
+        .saturating_add(ledger.tfm_stats.mismatched_returns)
+        .saturating_add(ledger.tfm_stats.unfinished)
+        .saturating_add(ledger.tfm_stats.ambiguous_releases)
+        .saturating_add(ledger.tfm_stats.forced_retires)
+        .saturating_add(ledger.tfm_stats.unknown_releases)
+        .saturating_add(ledger.tfm_stats.stale_releases)
+        .saturating_add(ledger.tfm_stats.config_unlinked)
+        .saturating_add(ledger.tfm_stats.unobserved_boundary)
+        .saturating_add(ledger.tfm_stats.tombstone_evictions);
     let mut aggregate_counts = dim(if count_loss > 0 {
         CoverageStatus::Partial
     } else {
@@ -626,6 +648,9 @@ fn lifecycle_coverage(
     // single backend with zero such events completes the declared
     // boundary. (Round-3 minor: omitting `unknown_invoc_returns` /
     // `submit_refused` let a lone tainted return claim Complete.)
+    // Transform join-health (T07-05/R3) joins the same count:
+    // unjoined/dangling/misjoined transform attempts and
+    // uncertain-identity releases are correlation events too.
     let correlation_events = ledger
         .decode
         .gaps_synthesized
@@ -633,7 +658,18 @@ fn lifecycle_coverage(
         .saturating_add(ledger.decode.unknown_invoc_returns)
         .saturating_add(ledger.decode.submit_refused)
         .saturating_add(ledger.reducer.ambiguous)
-        .saturating_add(ledger.reducer.orphan);
+        .saturating_add(ledger.reducer.orphan)
+        .saturating_add(ledger.tfm_stats.unknown_returns)
+        .saturating_add(ledger.tfm_stats.stale_returns)
+        .saturating_add(ledger.tfm_stats.mismatched_returns)
+        .saturating_add(ledger.tfm_stats.submit_refused)
+        .saturating_add(ledger.tfm_stats.unfinished)
+        .saturating_add(ledger.tfm_stats.ambiguous_releases)
+        .saturating_add(ledger.tfm_stats.forced_retires)
+        .saturating_add(ledger.tfm_stats.unknown_releases)
+        .saturating_add(ledger.tfm_stats.stale_releases)
+        .saturating_add(ledger.tfm_stats.config_unlinked)
+        .saturating_add(ledger.tfm_stats.unobserved_boundary);
     let mut correlation = dim(if correlation_events == 0 {
         CoverageStatus::CompleteForDeclaredBoundary
     } else {
@@ -2063,6 +2099,7 @@ mod tests {
     fn lifecycle_ledger_clean() -> LifecycleLedger {
         use kryprobe_core::kcrypto::ReducerStats;
         use kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats;
+        use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
         LifecycleLedger {
             completed: Vec::new(),
             edge_hits: [4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -2085,6 +2122,10 @@ mod tests {
             miss_current: Vec::new(),
             tfm_stats: kryprobe_privilege::kcrypto_lifecycle::tfm::TfmStats::default(),
             generations: Vec::new(),
+            enrichment: EnrichmentStatus::Available {
+                entries: 0,
+                truncated: false,
+            },
         }
     }
 
@@ -2270,6 +2311,54 @@ mod tests {
         ledger.agg_accepted = [5, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn t0705_transform_loss_flips_counts_and_correlation() {
+        // T07-05/R3: transform-lifetime loss reaches the public
+        // report — D4 exhaustion flips counts to Partial (never a
+        // clean verdict over missing identities), uncertain
+        // identity flips correlation, and truth-only transform
+        // traffic flips nothing.
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        // D4 live-table exhaustion: one refused identity.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.live_full = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        // Uncertain identity: an ambiguous release corrupts the
+        // generations the report counts AND the correlation claim.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.ambiguous_releases = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        // Dangling-at-close: unmatched entry, correlation flips.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.unfinished = 2;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        // Truth-only transform traffic (proved retires, joined
+        // configs incl. errno verdicts, classified failures) flips
+        // nothing: a busy-but-clean session reports clean.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.admitted = 50;
+        ledger.tfm_stats.completed = 50;
+        ledger.tfm_stats.releases = 10;
+        ledger.tfm_stats.retired = 10;
+        ledger.tfm_stats.configs_joined = 20;
+        ledger.tfm_stats.configs_failed = 2;
+        ledger.tfm_stats.failed_allocs = 1;
+        ledger.tfm_stats.noop_releases = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
+        assert_eq!(
+            coverage.correlation.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
     }
 
     #[test]

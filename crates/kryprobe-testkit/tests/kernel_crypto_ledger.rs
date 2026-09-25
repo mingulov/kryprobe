@@ -409,6 +409,62 @@ fn f04_repeated_release_last_final_wins() {
 }
 
 #[test]
+fn r5_duplicate_final_free_rejected() {
+    // Two finals is not a shared release — the second free lands
+    // after the lifetime ended (impossible history).
+    let text = LITERAL_WITH_LIFETIME.replace(
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        concat!(
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1840}"#,
+            "\n",
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        ),
+    );
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
+fn r5_final_nonfinal_final_rejected() {
+    // A retained release after a final free resurrects a dead
+    // lifetime — rejected at the second row already.
+    let text = LITERAL_WITH_LIFETIME.replace(
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        concat!(
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1830}"#,
+            "\n",
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":false,"ts":1840}"#,
+            "\n",
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        ),
+    );
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
+fn r5_config_after_final_free_rejected() {
+    // Configuration lands on a live transform — after the final
+    // free there is no transform to configure.
+    let text = LITERAL_WITH_CONFIG.replace(
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        concat!(
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+            "\n",
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"config","op":"setkey","errno":0,"len":16,"ts":1860}"#,
+        ),
+    );
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
 fn f04_single_nonfinal_release_not_final() {
     let text = LITERAL_WITH_LIFETIME.replace(
         r#""phase":"free","final":true"#,

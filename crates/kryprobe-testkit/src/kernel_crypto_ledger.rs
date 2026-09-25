@@ -360,6 +360,15 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 let entry = alloc_builds.iter_mut().find(|a| a.seq == seq);
                 match entry {
                     Some(entry) => {
+                        // R5: release history is ordered — a final
+                        // free ends the lifetime, so any further
+                        // release is an impossible history (a
+                        // duplicate final is not a shared release).
+                        if entry.final_free {
+                            return Err(LedgerError::PhaseInconsistency(format!(
+                                "seq {seq} free arrived after final free"
+                            )));
+                        }
                         entry.freed = true;
                         entry.final_free = row
                             .get("final")
@@ -375,9 +384,17 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 }
             }
             "config" => {
-                if !alloc_builds.iter().any(|a| a.seq == seq) {
+                let entry = alloc_builds.iter().find(|a| a.seq == seq);
+                let Some(entry) = entry else {
                     return Err(LedgerError::PhaseInconsistency(format!(
                         "seq {seq} config arrived without alloc"
+                    )));
+                };
+                // R5: configuration after the final free configures
+                // a dead transform — impossible history.
+                if entry.final_free {
+                    return Err(LedgerError::PhaseInconsistency(format!(
+                        "seq {seq} config arrived after final free"
                     )));
                 }
                 let op = nonempty_str(&row, lineno, "config", "op")?;

@@ -206,6 +206,7 @@ fn main() {
             reducer: ledger.reducer,
             retained_dropped: ledger.retained_dropped,
             prog_misses: ledger.miss_current.clone(),
+            tfm: ledger.tfm_stats,
         }
     };
     // Quiescence gates RUN validity (a noisy guest refuses the
@@ -571,6 +572,7 @@ fn main() {
         attached_links,
         foreign_links,
         prog_misses: ledger.miss_current.clone(),
+        tfm: ledger.tfm_stats,
     };
     if let Err(reason) = verdict(&scenario, &truth, &view) {
         fail(&out, &receipt, &reason);

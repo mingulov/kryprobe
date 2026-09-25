@@ -662,6 +662,8 @@ impl<'a> Btf<'a> {
     /// dereference it and read the pointee at further resolved
     /// offsets. Anything else (non-pointer, wrong pointee, missing)
     /// refuses — a valid offset with a lying type would mis-chase.
+    /// The 8-byte pointer read must sit inside the parent (R4
+    /// containment — the BPF target is 64-bit, pointers read u64).
     pub(crate) fn member_ptr_to_struct(
         &self,
         type_name: &str,
@@ -688,6 +690,7 @@ impl<'a> Btf<'a> {
                 "{type_name}.{member} points at the wrong STRUCT, not {pointee}"
             )));
         }
+        self.check_contained(type_name, off, 8)?;
         Ok(off)
     }
 
@@ -695,7 +698,9 @@ impl<'a> Btf<'a> {
     /// `name` (wrappers chased): the BPF may add further
     /// member offsets to it directly (no dereference). A pointer,
     /// scalar, or wrong-typed aggregate refuses — adding into a
-    /// pointer would read the pointer's bytes as a struct.
+    /// pointer would read the pointer's bytes as a struct. The
+    /// whole embedded extent must sit inside the parent (R4
+    /// containment — further offsets add into it).
     pub(crate) fn member_embedded_struct(
         &self,
         type_name: &str,
@@ -715,6 +720,7 @@ impl<'a> Btf<'a> {
                 "{type_name}.{member} embeds the wrong STRUCT, not {name}"
             )));
         }
+        self.check_contained(type_name, off, inner.size_or_type)?;
         Ok(off)
     }
 
@@ -722,7 +728,8 @@ impl<'a> Btf<'a> {
     /// `min_len` bytes (ARRAY of 1-byte INT, `nelems` covering the
     /// BPF copy bound): the bounded string copy may fill `min_len`
     /// bytes from it. Shorter arrays refuse — copying past the
-    /// member would read the next field as name bytes.
+    /// member would read the next field as name bytes. The copied
+    /// extent must also sit inside the parent (R4 containment).
     pub(crate) fn member_bytes(
         &self,
         type_name: &str,
@@ -750,27 +757,108 @@ impl<'a> Btf<'a> {
                 "{type_name}.{member} array holds {nelems} bytes, fewer than {min_len}"
             )));
         }
+        self.check_contained(type_name, off, min_len)?;
         Ok(off)
     }
 
-    /// Offset of `member` proven to carry a 4-byte counter at its
-    /// first word (INT ≥ 4 bytes, or STRUCT/UNION ≥ 4 bytes — both
-    /// spellings of `refcount_t`-style counters): the BPF may read
-    /// one u32 there. Pointers, narrower scalars, and smaller
-    /// aggregates refuse — the read width must land inside the
-    /// member on every kernel.
+    /// Offset of `member` proven to carry the counter value in its
+    /// FIRST 4 bytes (R4: the BPF reads exactly one u32 there and
+    /// the tracker treats 1 as final-free proof, so the shape must
+    /// prove the VALUE, not just the width). Accepted: an INT of
+    /// EXACTLY 4 bytes, or a 4-byte STRUCT/UNION with a 4-byte INT
+    /// word at byte 0 (the `refcount_t`/`atomic_t` shape — the
+    /// whole wrapper IS the one counter word). Refused: wider INTs
+    /// (a 64-bit `0x1_0000_0001` reads a lying low word),
+    /// multi-word wrappers (a marker before the counter reads the
+    /// marker — size ≠ 4 proves nothing about word 0's meaning),
+    /// pointers, and narrower shapes. The 4-byte read must also sit
+    /// inside the parent (`off + 4 ≤ parent size` — containment,
+    /// same as every lifecycle read).
     pub(crate) fn member_counter(&self, type_name: &str, member: &str) -> Result<u32, BtfError> {
         let (off, mtype) = self.member_typed(type_name, member)?;
-        let rec = self.rec(self.chase_wrappers(mtype)?)?;
-        let wide_enough =
-            matches!(rec.kind, KIND_INT | KIND_STRUCT | KIND_UNION) && rec.size_or_type >= 4;
-        if !wide_enough {
+        let target = self.chase_wrappers(mtype)?;
+        let rec = self.rec(target)?;
+        let is_counter = match rec.kind {
+            KIND_INT => rec.size_or_type == 4,
+            KIND_STRUCT | KIND_UNION => {
+                rec.size_or_type == 4 && self.counter_word_at_zero(target, 0)?
+            }
+            _ => false,
+        };
+        if !is_counter {
             return Err(bad(format!(
-                "{type_name}.{member} is kind {} size {}, not a 4-byte counter",
+                "{type_name}.{member} is kind {} size {}, not a first-word 4-byte counter",
                 rec.kind, rec.size_or_type
             )));
         }
+        self.check_contained(type_name, off, 4)?;
         Ok(off)
+    }
+
+    /// True when struct/union `id` carries a 4-byte INT word at byte
+    /// 0 (R4 counter-leaf proof: some member sits at byte offset 0
+    /// with a 4-byte INT leaf — a leading marker or a wider counter
+    /// leaves no such word). One nesting level descends (the real
+    /// `refcount_t { atomic_t refs; }` → `atomic_t { int counter; }`
+    /// chain — each wrapper must itself be exactly 4 bytes, so a
+    /// marker beside the nested counter still refuses). Bitfield /
+    /// misaligned members at 0 prove nothing (no byte offset to
+    /// read) and simply don't qualify.
+    fn counter_word_at_zero(&self, id: u32, depth: usize) -> Result<bool, BtfError> {
+        if depth > 2 {
+            return Ok(false);
+        }
+        let rec = self.rec(id)?;
+        if !matches!(rec.kind, KIND_STRUCT | KIND_UNION) {
+            return Ok(false);
+        }
+        for m in 0..rec.vlen as usize {
+            let at = rec.aux_at + m * 12;
+            let mtype = read_u32(self.bytes, at + 4, "counter member type")?;
+            if mtype == 0 {
+                continue;
+            }
+            let raw = read_u32(self.bytes, at + 8, "counter member offset")?;
+            let bits = if rec.kind_flag {
+                raw & 0x00ff_ffff
+            } else {
+                raw
+            };
+            let bitfield = rec.kind_flag && raw >> 24 != 0;
+            if bitfield || !bits.is_multiple_of(8) || bits / 8 != 0 {
+                continue;
+            }
+            let target = self.chase_wrappers(mtype)?;
+            let leaf = self.rec(target)?;
+            if leaf.kind == KIND_INT && leaf.size_or_type == 4 {
+                return Ok(true);
+            }
+            if matches!(leaf.kind, KIND_STRUCT | KIND_UNION)
+                && leaf.size_or_type == 4
+                && self.counter_word_at_zero(target, depth + 1)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Containment (R4): the `width`-byte BPF read at root-relative
+    /// `off` must sit inside the parent struct/union (a member
+    /// offset past the parent's size — corrupt or drifted BTF —
+    /// refuses instead of reading the next object as the member).
+    fn check_contained(&self, type_name: &str, off: u32, width: u32) -> Result<(), BtfError> {
+        let root = self.find_struct(type_name)?;
+        let size = self.rec(root)?.size_or_type;
+        let end = off
+            .checked_add(width)
+            .ok_or_else(|| bad(format!("{type_name} read offset {off} + {width} overflows")))?;
+        if end > size {
+            return Err(bad(format!(
+                "{type_name} read [{off}..{end}) escapes the {size}-byte parent"
+            )));
+        }
+        Ok(())
     }
 
     /// ARRAY shape: (element type id, element count). Index-type
@@ -960,5 +1048,248 @@ fn aux_len(kind: u8, vlen: u32) -> Result<usize, BtfError> {
         KIND_ENUM | KIND_FUNC_PROTO => Ok(vlen as usize * 8),
         KIND_DECL_TAG => fixed(4),
         other => Err(bad(format!("unknown BTF kind {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal hermetic BTF image builder (R4: counter-leaf and
+    /// containment regressions without the object-fixture block).
+    struct Img {
+        types: Vec<u8>,
+        strs: Vec<u8>,
+        next_id: u32,
+    }
+
+    impl Img {
+        fn new() -> Self {
+            Self {
+                types: Vec::new(),
+                strs: vec![0],
+                next_id: 1,
+            }
+        }
+
+        fn str(&mut self, s: &str) -> u32 {
+            let off = self.strs.len() as u32;
+            self.strs.extend_from_slice(s.as_bytes());
+            self.strs.push(0);
+            off
+        }
+
+        fn rec(
+            &mut self,
+            name_off: u32,
+            kind: u8,
+            vlen: u32,
+            size_or_type: u32,
+            aux: &[u8],
+        ) -> u32 {
+            let id = self.next_id;
+            self.next_id += 1;
+            let info = ((kind as u32) << 24) | (vlen & 0xffff);
+            self.types.extend_from_slice(&name_off.to_le_bytes());
+            self.types.extend_from_slice(&info.to_le_bytes());
+            self.types.extend_from_slice(&size_or_type.to_le_bytes());
+            self.types.extend_from_slice(aux);
+            id
+        }
+
+        fn int(&mut self, name: &str, size: u32) -> u32 {
+            let name_off = self.str(name);
+            // INT aux: 4 bytes encoding (unused here — all zeros).
+            self.rec(name_off, KIND_INT, 0, size, &[0, 0, 0, 0])
+        }
+
+        fn member_aux(name_off: u32, mtype: u32, bit_off: u32) -> [u8; 12] {
+            let mut out = [0u8; 12];
+            out[0..4].copy_from_slice(&name_off.to_le_bytes());
+            out[4..8].copy_from_slice(&mtype.to_le_bytes());
+            out[8..12].copy_from_slice(&bit_off.to_le_bytes());
+            out
+        }
+
+        fn image(&self) -> Vec<u8> {
+            let mut out = vec![0u8; 24];
+            out[0..2].copy_from_slice(&BTF_MAGIC.to_le_bytes());
+            out[2] = BTF_VERSION;
+            out[4..8].copy_from_slice(&24u32.to_le_bytes());
+            out[8..12].copy_from_slice(&0u32.to_le_bytes());
+            out[12..16].copy_from_slice(&(self.types.len() as u32).to_le_bytes());
+            out[16..20].copy_from_slice(&(self.types.len() as u32).to_le_bytes());
+            out[20..24].copy_from_slice(&(self.strs.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.types);
+            out.extend_from_slice(&self.strs);
+            out
+        }
+    }
+
+    /// `crypto_tfm` (size 8) with a plain-u32 `refcnt` at byte 4
+    /// (boundary-contained: 4 + 4 == 8).
+    fn tfm_with_u32_refcnt() -> Vec<u8> {
+        let mut img = Img::new();
+        let u32_id = img.int("unsigned int", 4);
+        let tfm_name = img.str("crypto_tfm");
+        let refcnt_name = img.str("refcnt");
+        let aux = Img::member_aux(refcnt_name, u32_id, 4 * 8);
+        img.rec(tfm_name, KIND_STRUCT, 1, 8, &aux);
+        img.image()
+    }
+
+    #[test]
+    fn r4_plain_u32_counter_accepts_at_boundary() {
+        let bytes = tfm_with_u32_refcnt();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert_eq!(
+            btf.member_counter("crypto_tfm", "refcnt")
+                .expect("u32 counter"),
+            4
+        );
+    }
+
+    #[test]
+    fn r4_wider_int_counter_refuses() {
+        // A 64-bit counter reads a lying low word (0x1_0000_0001).
+        let mut img = Img::new();
+        let u64_id = img.int("unsigned long", 8);
+        let tfm_name = img.str("crypto_tfm");
+        let refcnt_name = img.str("refcnt");
+        let aux = Img::member_aux(refcnt_name, u64_id, 0);
+        img.rec(tfm_name, KIND_STRUCT, 1, 8, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert!(
+            btf.member_counter("crypto_tfm", "refcnt").is_err(),
+            "u64 counter must refuse"
+        );
+    }
+
+    #[test]
+    fn r4_refcount_nesting_accepts() {
+        // The real kernel chain: refcount_t { atomic_t refs; } (4B)
+        // → atomic_t { int counter; } (4B) → int (4B).
+        let mut img = Img::new();
+        let int_id = img.int("int", 4);
+        let atomic_name = img.str("atomic_t");
+        let counter_name = img.str("counter");
+        let aux = Img::member_aux(counter_name, int_id, 0);
+        let atomic_id = img.rec(atomic_name, KIND_STRUCT, 1, 4, &aux);
+        let refcount_name = img.str("refcount_t");
+        let refs_name = img.str("refs");
+        let aux = Img::member_aux(refs_name, atomic_id, 0);
+        let refcount_id = img.rec(refcount_name, KIND_STRUCT, 1, 4, &aux);
+        let tfm_name = img.str("crypto_tfm");
+        let refcnt_name = img.str("refcnt");
+        let aux = Img::member_aux(refcnt_name, refcount_id, 0);
+        img.rec(tfm_name, KIND_STRUCT, 1, 4, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert_eq!(
+            btf.member_counter("crypto_tfm", "refcnt")
+                .expect("refcount_t chain"),
+            0
+        );
+    }
+
+    #[test]
+    fn r4_marker_before_counter_refuses() {
+        // A changed wrapper with a marker word before the counter
+        // (8 bytes — the first word's meaning is unproven).
+        let mut img = Img::new();
+        let int_id = img.int("int", 4);
+        let wrap_name = img.str("wrapped_refc");
+        let marker_name = img.str("marker");
+        let refs_name = img.str("refs");
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&Img::member_aux(marker_name, int_id, 0));
+        aux.extend_from_slice(&Img::member_aux(refs_name, int_id, 4 * 8));
+        let wrap_id = img.rec(wrap_name, KIND_STRUCT, 2, 8, &aux);
+        let tfm_name = img.str("crypto_tfm");
+        let refcnt_name = img.str("refcnt");
+        let aux = Img::member_aux(refcnt_name, wrap_id, 0);
+        img.rec(tfm_name, KIND_STRUCT, 1, 8, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert!(
+            btf.member_counter("crypto_tfm", "refcnt").is_err(),
+            "marker-first wrapper must refuse"
+        );
+    }
+
+    #[test]
+    fn r4_counter_outside_parent_refuses() {
+        // Corrupt/drifted BTF: the 4-byte read escapes the parent.
+        let mut img = Img::new();
+        let u32_id = img.int("unsigned int", 4);
+        let tfm_name = img.str("crypto_tfm");
+        let refcnt_name = img.str("refcnt");
+        let aux = Img::member_aux(refcnt_name, u32_id, 4 * 8);
+        img.rec(tfm_name, KIND_STRUCT, 1, 4, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        let err = btf
+            .member_counter("crypto_tfm", "refcnt")
+            .expect_err("escaping read must refuse");
+        assert!(
+            format!("{err:?}").contains("escapes"),
+            "names containment: {err:?}"
+        );
+    }
+
+    #[test]
+    fn r4_pointer_and_embedded_outside_parent_refuse() {
+        // member_ptr_to_struct (8-byte read) and
+        // member_embedded_struct (full extent) prove containment.
+        let mut img = Img::new();
+        let pointee_name = img.str("crypto_alg");
+        let pointee_id = img.rec(pointee_name, KIND_STRUCT, 0, 64, &[]);
+        let ptr_name = img.str("");
+        let ptr_id = img.rec(ptr_name, KIND_PTR, 0, pointee_id, &[]);
+        let tfm_name = img.str("crypto_tfm");
+        let alg_name = img.str("__crt_alg");
+        let aux = Img::member_aux(alg_name, ptr_id, 4 * 8);
+        img.rec(tfm_name, KIND_STRUCT, 1, 8, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert!(
+            btf.member_ptr_to_struct("crypto_tfm", "__crt_alg", "crypto_alg")
+                .is_err(),
+            "pointer read [4..12) escapes the 8-byte parent"
+        );
+        // Contained twin (16-byte parent) passes the same proof.
+        let mut img = Img::new();
+        let pointee_name = img.str("crypto_alg");
+        let pointee_id = img.rec(pointee_name, KIND_STRUCT, 0, 64, &[]);
+        let ptr_name = img.str("");
+        let ptr_id = img.rec(ptr_name, KIND_PTR, 0, pointee_id, &[]);
+        let tfm_name = img.str("crypto_tfm");
+        let alg_name = img.str("__crt_alg");
+        let aux = Img::member_aux(alg_name, ptr_id, 4 * 8);
+        img.rec(tfm_name, KIND_STRUCT, 1, 16, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert_eq!(
+            btf.member_ptr_to_struct("crypto_tfm", "__crt_alg", "crypto_alg")
+                .expect("contained pointer"),
+            4
+        );
+        // Embedded extent escaping the parent refuses too (a 16-byte
+        // `base` at 8 inside a 16-byte parent).
+        let mut img = Img::new();
+        let base_name = img.str("crypto_tfm");
+        let base_id = img.rec(base_name, KIND_STRUCT, 0, 16, &[]);
+        let sk_name = img.str("crypto_skcipher");
+        let member_name = img.str("base");
+        let aux = Img::member_aux(member_name, base_id, 8 * 8);
+        img.rec(sk_name, KIND_STRUCT, 1, 16, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert!(
+            btf.member_embedded_struct("crypto_skcipher", "base", "crypto_tfm")
+                .is_err(),
+            "embedded extent [8..24) escapes the 16-byte parent"
+        );
     }
 }

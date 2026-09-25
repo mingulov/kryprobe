@@ -2010,6 +2010,10 @@ fn lifecycle_test_ledger(
         miss_current: Vec::new(),
         tfm_stats: kryprobe_privilege::kcrypto_lifecycle::tfm::TfmStats::default(),
         generations: Vec::new(),
+        enrichment: kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus::Available {
+            entries: 0,
+            truncated: false,
+        },
     }
 }
 

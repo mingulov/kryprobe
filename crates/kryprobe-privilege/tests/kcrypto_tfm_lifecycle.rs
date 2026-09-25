@@ -394,21 +394,55 @@ fn twin_destroy_drift_refuses() {
 }
 
 #[test]
+fn twin_reserved_pad_refuses() {
+    // T07-10: bytes 36–39 are the emitter-zeroed alignment pad — a
+    // changed reserved word is wire drift on every half.
+    let mut bad = alloc_entry(7, b"aes", 0, 0);
+    bad[36] = 1;
+    assert_eq!(
+        decode_tfm_record(&bad),
+        Err(TfmDrop::BadReserved),
+        "alloc entry pad refused"
+    );
+    let mut bad = alloc_return_ok(7, 0x1008, b"aes-generic");
+    bad[39] = 0xFF;
+    assert_eq!(
+        decode_tfm_record(&bad),
+        Err(TfmDrop::BadReserved),
+        "alloc return pad refused"
+    );
+    let mut bad = destroy_entry(2, 0x1000, 1, 1);
+    bad[37] = 1;
+    assert_eq!(
+        decode_tfm_record(&bad),
+        Err(TfmDrop::BadReserved),
+        "destroy entry pad refused"
+    );
+}
+
+#[test]
 fn first_seen_admits_unknown_generation() {
     // T07.3: an op-first transform (allocated before attach) admits
-    // with EMPTY provenance — unknown, never fabricated — flagged
-    // first-seen so consumers distinguish it from "saw the alloc,
-    // name unreadable". A second sighting of the same base admits
-    // nothing (one lifetime, one id).
+    // with EMPTY creation provenance — unknown, never fabricated —
+    // flagged first-seen so consumers distinguish it from "saw the
+    // alloc, name unreadable". A second sighting of the same base
+    // admits nothing (one lifetime, one id). T07-04/F05: the
+    // submit's runtime-selected driver rides along (selected
+    // metadata captured; allocation/requested name stay unknown).
     let mut tracker = TransformTracker::new(16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
-    assert_eq!(tracker.admit_first_seen(f1), Some(1));
-    assert_eq!(tracker.admit_first_seen(f1), None, "no duplicate");
+    assert_eq!(tracker.admit_first_seen(f1, "aes-generic", false), Some(1));
+    assert_eq!(
+        tracker.admit_first_seen(f1, "other", true),
+        None,
+        "no duplicate"
+    );
     let gens = tracker.generations();
     assert_eq!(gens.len(), 1);
     assert!(gens[0].first_seen);
     assert_eq!(gens[0].req_name, "");
-    assert_eq!(gens[0].drv_name, "");
+    assert_eq!(gens[0].drv_name, "aes-generic", "selected driver captured");
+    assert!(!gens[0].drv_truncated, "unclipped submit reads complete");
     assert_eq!((gens[0].alg_type, gens[0].alg_mask), (0, 0));
     assert!(!gens[0].retired && !gens[0].ambiguous);
 }
@@ -418,7 +452,7 @@ fn first_seen_zero_link_counts_unlinked() {
     // T07.3: a 0 tfm word (unreadable request link) admits nothing
     // and counts `unlinked_ops` — a sensor-truth gap, never silent.
     let mut tracker = TransformTracker::new(16, 8, true);
-    assert_eq!(tracker.admit_first_seen(0), None);
+    assert_eq!(tracker.admit_first_seen(0, "", false), None);
     assert_eq!(tracker.stats().unlinked_ops, 1);
     assert!(tracker.generations().is_empty());
 }
@@ -432,7 +466,7 @@ fn destroy_final_free_retires() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0x05, 0x8f));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    tracker.feed(&destroy_entry(4, f1, 1, 1));
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
     tracker.feed(&destroy_return(4));
     let gens = tracker.generations();
     assert_eq!(gens.len(), 1);
@@ -454,7 +488,7 @@ fn destroy_retained_refcount_marks_ambiguous() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    tracker.feed(&destroy_entry(4, f1, 3, 1));
+    tracker.feed(&destroy_entry(4, f1 + 8, 3, 1));
     tracker.feed(&destroy_return(4));
     let gens = tracker.generations();
     assert!(!gens[0].retired, "retained destroy never retires");
@@ -463,7 +497,7 @@ fn destroy_retained_refcount_marks_ambiguous() {
     assert!(!tracker.reuse_exact(), "ambiguity disables exact reuse");
     // The final destroy still joins (live) and retires it — the
     // ambiguity flag survives (history is history).
-    tracker.feed(&destroy_entry(6, f1, 1, 1));
+    tracker.feed(&destroy_entry(6, f1 + 8, 1, 1));
     tracker.feed(&destroy_return(6));
     let gens = tracker.generations();
     assert!(gens[0].retired && gens[0].ambiguous);
@@ -477,7 +511,7 @@ fn destroy_unobserved_refcount_marks_ambiguous() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    tracker.feed(&destroy_entry(4, f1, 0, 0));
+    tracker.feed(&destroy_entry(4, f1 + 8, 0, 0));
     tracker.feed(&destroy_return(4));
     let gens = tracker.generations();
     assert!(!gens[0].retired && gens[0].ambiguous);
@@ -493,7 +527,7 @@ fn destroy_zero_refcount_is_impossible_input() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    tracker.feed(&destroy_entry(4, f1, 0, 1));
+    tracker.feed(&destroy_entry(4, f1 + 8, 0, 1));
     tracker.feed(&destroy_return(4));
     let gens = tracker.generations();
     assert!(!gens[0].retired && gens[0].ambiguous);
@@ -537,7 +571,7 @@ fn destroy_always_final_mode_retires_unconditionally() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    tracker.feed(&destroy_entry(4, f1, 0, 0));
+    tracker.feed(&destroy_entry(4, f1 + 8, 0, 0));
     tracker.feed(&destroy_return(4));
     assert!(tracker.generations()[0].retired);
     assert_eq!(tracker.stats().retired, 1);
@@ -553,7 +587,7 @@ fn alloc_after_proved_retire_assigns_fresh_id() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0x05, 0x8f));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    tracker.feed(&destroy_entry(4, f1, 1, 1));
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
     tracker.feed(&destroy_return(4));
     tracker.feed(&alloc_entry(6, b"kxcipher", 0x05, 0x8f));
     tracker.feed(&alloc_return_ok(6, f1, b"drv"));
@@ -768,6 +802,103 @@ fn config_cross_site_return_refuses_with_entry_kept() {
 }
 
 #[test]
+fn destroy_return_after_realloc_retires_nothing() {
+    // R1/T07-01: the kernel frees before `crypto_destroy_tfm`
+    // returns, so another CPU can reallocate the address between
+    // the entry and the return. The old return must NOT retire the
+    // new lifetime: it counts stale, the new id stays live, and
+    // the forced retire on the realloc already voided reuse_exact.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
+    // Realloc lands before the old destroy returns: forced retire.
+    tracker.feed(&alloc_entry(6, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(6, f1, b"drv"));
+    assert_eq!(tracker.stats().forced_retires, 1);
+    tracker.feed(&destroy_return(4));
+    assert_eq!(tracker.stats().stale_releases, 1, "old return goes stale");
+    assert_eq!(tracker.stats().retired, 0, "nothing proved final");
+    let gens = tracker.generations();
+    assert_eq!(gens.len(), 2);
+    assert!(gens[0].retired && gens[0].ambiguous, "forced old lifetime");
+    assert!(!gens[1].retired, "new lifetime stays live");
+    assert!(!tracker.reuse_exact(), "forced retire voids exactness");
+}
+
+#[test]
+fn destroy_entry_unmapped_then_live_refuses() {
+    // The entry observed no live lifetime; a base that became live
+    // between the halves leaves the destroy's true target
+    // unknowable (ring order is not kernel order) — the return
+    // counts unknown and touches nothing.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&destroy_entry(2, f1 + 8, 1, 1));
+    tracker.feed(&alloc_entry(4, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(4, f1, b"drv"));
+    tracker.feed(&destroy_return(2));
+    assert_eq!(tracker.stats().unknown_releases, 1);
+    assert_eq!(tracker.stats().retired, 0);
+    assert!(!tracker.generations()[0].retired, "newcomer untouched");
+}
+
+#[test]
+fn overlapping_destroy_second_return_goes_stale() {
+    // Two destroys overlap on one lifetime (double destroy): the
+    // first return retires it proved; the second return finds its
+    // bound generation gone and counts stale — never unknown (it
+    // HAD entry evidence) and never a second retire.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
+    tracker.feed(&destroy_entry(6, f1 + 8, 1, 1));
+    tracker.feed(&destroy_return(4));
+    assert_eq!(tracker.stats().retired, 1);
+    tracker.feed(&destroy_return(6));
+    assert_eq!(tracker.stats().stale_releases, 1);
+    assert_eq!(tracker.stats().unknown_releases, 0);
+    assert_eq!(tracker.stats().retired, 1, "retired exactly once");
+}
+
+#[test]
+fn config_return_after_realloc_unlinks() {
+    // Config twin of the destroy interleaving: a setkey straddling
+    // a reuse must never bump the new lifetime's epoch.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 32));
+    tracker.feed(&alloc_entry(6, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(6, f1, b"drv"));
+    tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 4, 0));
+    assert_eq!(tracker.stats().config_unlinked, 1);
+    let gens = tracker.generations();
+    assert_eq!(gens[1].epoch, 0, "newcomer epoch untouched");
+    assert_eq!(gens[1].configs, 0, "newcomer configs untouched");
+}
+
+#[test]
+fn config_entry_unmapped_then_live_unlinks() {
+    // Unbound config whose base became live between the halves:
+    // first-seen admission is refused (the entry observed no live
+    // lifetime and the base is taken) — unlinked, never merged.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 2, f1, 32));
+    tracker.feed(&alloc_entry(4, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(4, f1, b"drv"));
+    tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 2, 0));
+    assert_eq!(tracker.stats().config_unlinked, 1);
+    assert_eq!(tracker.generations().len(), 1, "no phantom admission");
+    assert_eq!(tracker.generations()[0].epoch, 0);
+}
+
+#[test]
 fn config_after_retire_admits_fresh_never_merges() {
     // The retired lifetime ended proved; a later config on the
     // same base is a NEW lifetime (base→single-live-id holds —
@@ -779,7 +910,7 @@ fn config_after_retire_admits_fresh_never_merges() {
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 32));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 4, 0));
-    tracker.feed(&destroy_entry(6, f1, 1, 1));
+    tracker.feed(&destroy_entry(6, f1 + 8, 1, 1));
     tracker.feed(&destroy_return(6));
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 8, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 8, 0));
@@ -790,7 +921,111 @@ fn config_after_retire_admits_fresh_never_merges() {
     assert_eq!(gens[1].id, 2, "fresh id, never merged");
     assert!(gens[1].first_seen);
     assert_eq!(gens[1].epoch, 1, "its own success bumps it");
-    assert!(tracker.reuse_exact(), "proved ends keep reuse exact");
+    // T07-02: the fresh lifetime's creation boundary was never
+    // observed (config-admitted) — chaining is no longer exactly
+    // provable, so exact reuse voids even though both ends here
+    // are proved.
+    assert_eq!(tracker.stats().unobserved_boundary, 1);
+    assert!(
+        !tracker.reuse_exact(),
+        "unobserved creation voids exact reuse"
+    );
+}
+
+#[test]
+fn config_on_first_seen_flags_uncertain_identity() {
+    // T07-02 attack shape: an AEAD lifetime (alloc unhooked — the
+    // creation boundary is never observable) admitted first-seen;
+    // a missed final-free, an address reuse, and a config for the
+    // NEW lifetime all land on the OLD id. The epoch bump is
+    // best-effort AND the uncertainty is counted — F06 partial,
+    // never a confident old identity.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.admit_first_seen(f1, "", false);
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_AEAD, 2, f1, 16));
+    tracker.feed(&config_return(LTFM_SITE_SETKEY_AEAD, 2, 0));
+    let gens = tracker.generations();
+    assert_eq!(gens.len(), 1);
+    assert!(gens[0].first_seen);
+    assert_eq!(gens[0].epoch, 1, "best-effort attribution bumps");
+    assert_eq!(tracker.stats().unobserved_boundary, 1);
+    assert!(
+        !tracker.reuse_exact(),
+        "config on unobserved creation voids exactness"
+    );
+}
+
+#[test]
+fn finish_dangling_destroy_marks_live_bound_ambiguous() {
+    // T07-06: a destroy entry whose return never arrives leaves
+    // its end unknown — the still-live bound generation flags
+    // ambiguous (stays live, end unproven) and exact reuse voids.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
+    assert!(tracker.reuse_exact(), "exact before the close");
+    tracker.finish();
+    assert_eq!(tracker.stats().unfinished, 1);
+    assert_eq!(tracker.stats().ambiguous_releases, 1);
+    let gens = tracker.generations();
+    assert!(!gens[0].retired, "unproven end never retires");
+    assert!(gens[0].ambiguous, "unknown end flags ambiguity");
+    assert!(!tracker.reuse_exact(), "dangling destroy voids exactness");
+    // The late return finds no attempt — unknown, never joined.
+    tracker.feed(&destroy_return(4));
+    assert_eq!(tracker.stats().unknown_returns, 1);
+    assert!(!tracker.generations()[0].retired);
+}
+
+#[test]
+fn finish_dangling_destroy_after_proved_end_counts_only() {
+    // T07-06 mirror: a second overlapping destroy still pending
+    // when the first already retired the generation — the proved
+    // end stands (no ambiguity), the dangling attempt counts.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
+    tracker.feed(&destroy_entry(6, f1 + 8, 1, 1));
+    tracker.feed(&destroy_return(4));
+    assert!(tracker.generations()[0].retired);
+    tracker.finish();
+    assert_eq!(tracker.stats().unfinished, 1);
+    assert_eq!(tracker.stats().ambiguous_releases, 0);
+    assert!(
+        !tracker.generations()[0].ambiguous,
+        "proved end keeps the generation clean"
+    );
+    assert!(
+        !tracker.reuse_exact(),
+        "the unfinished attempt still voids session exactness"
+    );
+}
+
+#[test]
+fn finish_dangling_alloc_and_config_count_without_taint() {
+    // T07-06: dangling alloc/config attempts finalize as unknown
+    // outcomes — counted, but no generation exists to taint (alloc)
+    // and lifetime boundaries are unaffected (config excludes the
+    // unknown change from the epoch).
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 32));
+    tracker.feed(&alloc_entry(6, b"other", 0, 0));
+    tracker.finish();
+    assert_eq!(tracker.stats().unfinished, 2);
+    assert_eq!(tracker.stats().ambiguous_releases, 0);
+    let gens = tracker.generations();
+    assert_eq!(gens.len(), 1, "dangling alloc assigns nothing");
+    assert_eq!(gens[0].configs, 0, "unknown config excluded");
+    assert_eq!(gens[0].epoch, 0);
+    assert!(!tracker.reuse_exact(), "unfinished close voids exactness");
 }
 
 #[test]
@@ -836,7 +1071,7 @@ fn d4_live_cap_refuses_new_generations() {
     assert_eq!(tracker.stats().live_full, 1);
     assert_eq!(tracker.stats().completed, 3, "attempt still consumed");
     // First-seen hits the same bound.
-    assert_eq!(tracker.admit_first_seen(0x4000), None);
+    assert_eq!(tracker.admit_first_seen(0x4000, "", false), None);
     assert_eq!(tracker.stats().live_full, 2);
 }
 
@@ -849,14 +1084,14 @@ fn d4_retired_history_is_fifo_bounded() {
     for (token, base) in [(2u64, 0x1000u64), (4, 0x2000)] {
         tracker.feed(&alloc_entry(token, b"k", 0, 0));
         tracker.feed(&alloc_return_ok(token, base, b"drv"));
-        tracker.feed(&destroy_entry(token + 100, base, 1, 1));
+        tracker.feed(&destroy_entry(token + 100, base + 8, 1, 1));
         tracker.feed(&destroy_return(token + 100));
     }
     assert_eq!(tracker.generations().len(), 2);
     for (token, base) in [(6u64, 0x3000u64), (8, 0x4000)] {
         tracker.feed(&alloc_entry(token, b"k", 0, 0));
         tracker.feed(&alloc_return_ok(token, base, b"drv"));
-        tracker.feed(&destroy_entry(token + 100, base, 1, 1));
+        tracker.feed(&destroy_entry(token + 100, base + 8, 1, 1));
         tracker.feed(&destroy_return(token + 100));
     }
     let gens = tracker.generations();
@@ -887,7 +1122,9 @@ fn twin_unterminated_name_refuses() {
 
 #[test]
 fn sensor_routes_tfm_records_to_tracker() {
-    use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext};
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+        EnrichmentStatus, SensorCore, SessionContext,
+    };
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     let records = vec![
         alloc_entry(2, b"kxcipher", 0, 0),
@@ -900,9 +1137,9 @@ fn sensor_routes_tfm_records_to_tracker() {
         "tfm pair routes to the tracker"
     );
     // An `LC`-magic op record still routes to the op decoder (magic-routed).
-    let mut op = vec![0u8; 48];
+    let mut op = vec![0u8; 112];
     op[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    op[2] = 4;
+    op[2] = 5;
     op[3] = 1;
     op[4..6].copy_from_slice(&1u16.to_le_bytes());
     op[8..16].copy_from_slice(&0xabcdu64.to_le_bytes());
@@ -920,6 +1157,10 @@ fn sensor_routes_tfm_records_to_tracker() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: Vec::new(),
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("empty miss join");
@@ -933,13 +1174,15 @@ fn sensor_tallies_destroy_pair_on_lanes_6_7_and_retires() {
     // and the tracker retires the generation. (Before the slot-arm
     // fix, a destroy record hit the alloc-only `debug_assert` and
     // would have corrupted the alloc-lane equation in release.)
-    use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext};
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+        EnrichmentStatus, SensorCore, SessionContext,
+    };
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[
         alloc_entry(2, b"kxcipher", 0x05, 0x8f),
         alloc_return_ok(2, f1, b"drv"),
-        destroy_entry(4, f1, 1, 1),
+        destroy_entry(4, f1 + 8, 1, 1),
         destroy_return(4),
     ]);
     assert_eq!(core.tfm().stats().retired, 1, "destroy pair retires");
@@ -954,6 +1197,10 @@ fn sensor_tallies_destroy_pair_on_lanes_6_7_and_retires() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: Vec::new(),
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("empty miss join");
@@ -968,7 +1215,9 @@ fn ledger_carries_generations_and_tfm_stats() {
     // T07.6 seam: the terminal ledger snapshots the tracker's
     // generations + loss counters — one terminal accounting
     // point, no side channel.
-    use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext};
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+        EnrichmentStatus, SensorCore, SessionContext,
+    };
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[
@@ -987,6 +1236,10 @@ fn ledger_carries_generations_and_tfm_stats() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: Vec::new(),
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("empty miss join");
@@ -1003,7 +1256,9 @@ fn public_views_carry_no_kernel_addresses() {
     // ledger) render with NO pointer-looking text — ids are small
     // opaques, names are bounded inventory. A future pointer field
     // added to any public view trips this tripwire.
-    use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext};
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+        EnrichmentStatus, SensorCore, SessionContext,
+    };
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[
@@ -1011,7 +1266,7 @@ fn public_views_carry_no_kernel_addresses() {
         alloc_return_ok(2, f1, b"drv"),
         config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 32),
         config_return(LTFM_SITE_SETKEY_SK, 4, 0),
-        destroy_entry(6, f1, 1, 1),
+        destroy_entry(6, f1 + 8, 1, 1),
         destroy_return(6),
     ]);
     let ledger = core
@@ -1024,6 +1279,10 @@ fn public_views_carry_no_kernel_addresses() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: Vec::new(),
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("empty miss join");
@@ -1042,6 +1301,18 @@ fn public_views_carry_no_kernel_addresses() {
         !rendered.contains("0x"),
         "no hex-pointer text in public views: {rendered}"
     );
+    // R6: an accidentally exposed u64 renders DECIMAL under ordinary
+    // `Debug` — pin the exact injected frontend AND its canonical
+    // base in decimal, lowercase hex, and uppercase hex.
+    let base = f1 + 8;
+    for ptr in [f1, base] {
+        for shape in [ptr.to_string(), format!("{ptr:x}"), format!("{ptr:X}")] {
+            assert!(
+                !rendered.contains(&shape),
+                "injected address {ptr:#x} never renders ({shape}): {rendered}"
+            );
+        }
+    }
     // The validated edge redacts its raw pointer even in Debug
     // (defense in depth — `RawTfm` never crosses the seam, but a
     // debug log of one must not leak either).
@@ -1058,6 +1329,10 @@ fn public_views_carry_no_kernel_addresses() {
         !raw_rendered.contains("ffff"),
         "raw key hex never renders: {raw_rendered}"
     );
+    assert!(
+        !raw_rendered.contains(&f1.to_string()),
+        "raw key decimal never renders: {raw_rendered}"
+    );
 }
 
 #[test]
@@ -1066,7 +1341,9 @@ fn sensor_tallies_config_pairs_on_lanes_8_11_14_15_and_bumps_epoch() {
     // other transform edge — setkey-sk on lanes 8/9, setauthsize
     // on 10/11, setkey-aead on 14/15 — and the tracker records +
     // bumps the epoch on the live generation.
-    use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext};
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+        EnrichmentStatus, SensorCore, SessionContext,
+    };
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     let f2 = 0xFFFF_8880_0000_2000u64;
@@ -1099,6 +1376,10 @@ fn sensor_tallies_config_pairs_on_lanes_8_11_14_15_and_bumps_epoch() {
                 agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: Vec::new(),
+                enrichment: EnrichmentStatus::Available {
+                    entries: 0,
+                    truncated: false,
+                },
             },
         )
         .expect("empty miss join");
@@ -1364,10 +1645,11 @@ fn afalg_bind_skcipher(name: &str) -> i32 {
 /// `crypto_skcipher_setkey` / `crypto_aead_setkey` call per
 /// tfm layer (outer, plus template-inner when the driver
 /// propagates through the API rather than the method pointer).
-fn afalg_set_key(fd: i32, key: &[u8]) {
+/// Returns the raw rc (the failing-key positive control needs it).
+fn afalg_try_set_key(fd: i32, key: &[u8]) -> i32 {
     const SOL_ALG: libc::c_int = 279;
     const ALG_SET_KEY: libc::c_int = 1;
-    let rc = unsafe {
+    unsafe {
         libc::setsockopt(
             fd,
             SOL_ALG,
@@ -1375,9 +1657,12 @@ fn afalg_set_key(fd: i32, key: &[u8]) {
             key.as_ptr() as *const libc::c_void,
             key.len() as libc::socklen_t,
         )
-    };
+    }
+}
+
+fn afalg_set_key(fd: i32, key: &[u8]) {
     assert_eq!(
-        rc,
+        afalg_try_set_key(fd, key),
         0,
         "AF_ALG setsockopt(KEY) failed: {}",
         std::io::Error::last_os_error()
@@ -1385,8 +1670,11 @@ fn afalg_set_key(fd: i32, key: &[u8]) {
 }
 
 /// `setsockopt(ALG_SET_AEAD_AUTHSIZE)` on an AF_ALG AEAD fd
-/// (`linux/if_alg.h`: `ALG_SET_AEAD_AUTHSIZE` 5, u32 value):
-/// drives one `crypto_aead_setauthsize` call.
+/// (`linux/if_alg.h`: `ALG_SET_AEAD_AUTHSIZE` 5): drives one
+/// `crypto_aead_setauthsize` call. Kernel quirk (same idiom as
+/// `alg_fixture::aead_roundtrip`): `optlen` CARRIES the authsize
+/// value — `optval` is ignored. Passing a u32 value with
+/// `optlen = 4` requests authsize 4 whatever the argument says.
 fn afalg_set_authsize(fd: i32, authsize: u32) {
     const SOL_ALG: libc::c_int = 279;
     const ALG_SET_AEAD_AUTHSIZE: libc::c_int = 5;
@@ -1395,8 +1683,8 @@ fn afalg_set_authsize(fd: i32, authsize: u32) {
             fd,
             SOL_ALG,
             ALG_SET_AEAD_AUTHSIZE,
-            &authsize as *const u32 as *const libc::c_void,
-            size_of::<u32>() as libc::socklen_t,
+            std::ptr::null(),
+            authsize as libc::socklen_t,
         )
     };
     assert_eq!(
@@ -1413,6 +1701,19 @@ fn afalg_set_authsize(fd: i32, authsize: u32) {
 /// sensor's chase resolves). Fails loud when the inventory is
 /// unreadable or the name is absent (broken positive control —
 /// never a silent skip).
+/// Suite serialization lock: the lifecycle sensor is system-wide
+/// and exclusive (`SessionBusy` on double attach), so the ignored
+/// host tests hold this across their whole body (bring-up through
+/// detach), making sensor lifetimes disjoint. Poison-tolerant: a
+/// failed test must not cascade into lock errors.
+static SUITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn suite_guard() -> std::sync::MutexGuard<'static, ()> {
+    SUITE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 fn proc_crypto_winning_driver(name: &str) -> String {
     let text = std::fs::read_to_string("/proc/crypto").expect("/proc/crypto must read");
     let mut winner: Option<(u32, String)> = None;
@@ -1456,6 +1757,7 @@ fn proc_crypto_winning_driver(name: &str) -> String {
 #[test]
 #[ignore = "BPF lane: run with scripts/sudo-lane.sh (needs root + BTF + built BPF object)"]
 fn host_alloc_capture_assigns_generations() {
+    let _guard = suite_guard();
     use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
     // Honest skips (same idiom as the bring-up BTF test): without
     // root, host BTF, or the built object there is no sensor.
@@ -1496,6 +1798,13 @@ fn host_alloc_capture_assigns_generations() {
     // T07.4: key every skcipher socket (32-byte AES-256 key —
     // valid for `cbc(aes)`, so every setkey succeeds and bumps).
     let key32 = [0x5au8; 32];
+    // Failure positive control FIRST (a 7-byte key is invalid for
+    // AES — the hooked `crypto_skcipher_setkey` fails loud with
+    // EINVAL): the valid rekey below still leaves every generation
+    // epoch ≥1 with a succeeding last config.
+    let key7 = [0x5au8; 7];
+    let bad_rc = afalg_try_set_key(held[0], &key7);
+    assert_ne!(bad_rc, 0, "7-byte AES key must fail");
     for fd in &held {
         afalg_set_key(*fd, &key32);
     }
@@ -1605,10 +1914,13 @@ fn host_alloc_capture_assigns_generations() {
         assert_eq!(miss.delta(), 0, "zero miss delta on {}", miss.section);
     }
     // Generations: the 5 socket tfms carry the requested name +
-    // a resolved driver; first-seen gens (the AEAD socket, whose
-    // alloc is unhooked, plus any template-inner layer the config
-    // path observed) carry EMPTY provenance — unknown, never
-    // fabricated.
+    // a resolved driver; config-admitted first-seen gens (the AEAD
+    // socket, whose alloc is unhooked, plus any template-inner
+    // layer the config path observed) carry EMPTY provenance —
+    // unknown, never fabricated. (Op-admitted first-seen gens
+    // carry the submit's driver instead — F05, pinned by
+    // `host_op_first_seen_carries_selected_driver`; this E2E runs
+    // no ops, so every first-seen gen here is config-admitted.)
     let gens = sensor.tfm().generations();
     let new_gens = gens.len() - pre_gens;
     assert!(
@@ -1620,7 +1932,7 @@ fn host_alloc_capture_assigns_generations() {
         if g.first_seen {
             assert!(
                 g.req_name.is_empty() && g.drv_name.is_empty(),
-                "first-seen carries no provenance: {g:?}"
+                "config-admitted first-seen carries no provenance: {g:?}"
             );
         } else {
             socket_gens += 1;
@@ -1761,10 +2073,13 @@ fn host_alloc_capture_assigns_generations() {
         sk_ret + sa_ret + aead_ret,
         "every config return joined"
     );
-    assert_eq!(
-        stats.configs_failed - pre_stats.configs_failed,
-        0,
-        "all test keys valid — no failures"
+    // The 7-byte failing key above joined exactly one errno
+    // verdict per tfm layer it reached (outer always — inner
+    // propagation is driver-shaped, hence ≥1, never exact).
+    assert!(
+        stats.configs_failed - pre_stats.configs_failed >= 1,
+        "failing key joined: {:?}",
+        stats
     );
     assert_eq!(
         stats.config_unlinked - pre_stats.config_unlinked,
@@ -1780,5 +2095,200 @@ fn host_alloc_capture_assigns_generations() {
             "keyed ≥once with epoch bump: {g:?}"
         );
         assert_eq!(g.last_config_errno, 0, "last config succeeded: {g:?}");
+    }
+    // R10: the requested authsize (16, carried by `optlen`) is the
+    // captured scalar — every generation whose most recent config
+    // is the setauthsize carries exactly 16, and at least one does
+    // (propagation order is driver-shaped — the scalar is not).
+    let mut saw_authsize = false;
+    for g in gens.iter().skip(pre_gens) {
+        if g.last_config_site == LTFM_SITE_SETAUTHSIZE {
+            saw_authsize = true;
+            assert_eq!(
+                g.last_config_len, 16,
+                "captured authsize equals the request: {g:?}"
+            );
+        }
+    }
+    assert!(saw_authsize, "setauthsize attributed to a generation");
+}
+
+/// Lifecycle secret-canary lane test (R6): key a live transform
+/// with a `KPROBE-CANARY-*` marker and prove no marker byte reaches
+/// any generation, counter, or ledger render — the config path
+/// captures the length scalar only, never key bytes. (The op path
+/// carries scalars only — `LEdge` has no bytes field to scan; the
+/// scan covers every string-carrying lifecycle view instead.)
+#[test]
+#[ignore = "BPF lane: run with scripts/sudo-lane.sh (needs root + BTF + built BPF object)"]
+fn lifecycle_canary_no_secret_bytes_in_views() {
+    let _guard = suite_guard();
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
+    if unsafe { libc::geteuid() } != 0 {
+        println!("SKIP: lifecycle canary needs root (sudo lane)");
+        return;
+    }
+    if std::fs::metadata("/sys/kernel/btf/vmlinux").is_err() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let object = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("kryprobe-bpf")
+        .join("kcrypto-lifecycle.bpf.o");
+    if !object.is_file() {
+        println!("SKIP: missing BPF lifecycle object — run `cargo xtask build --bpf`");
+        return;
+    }
+    let bytes = std::fs::read(&object).expect("test fixture must be readable");
+    let (mut sensor, _) = LifecycleSensor::bring_up(&bytes, None).expect("host sensor must attach");
+    // 16-byte AES-128 key with the marker prefix — a real key the
+    // kernel accepts, carrying canary bytes the sensor must never
+    // repeat back.
+    let marker_key = b"KPROBE-CANARY-12";
+    assert_eq!(marker_key.len(), 16);
+    let fd = afalg_bind_skcipher("cbc(aes)");
+    afalg_set_key(fd, marker_key);
+    for _ in 0..4 {
+        let drained = sensor.drain_once(8192).expect("drain");
+        if drained.records == 0 && !drained.busy {
+            break;
+        }
+    }
+    unsafe { libc::close(fd) };
+    let _ = sensor.take_completed();
+    sensor.close_input().expect("disarm+detach");
+    let quiet = sensor.drain_quiet().expect("quiet drain");
+    assert!(quiet.quiet, "close must reach a quiet round");
+    let ledger = sensor.ledger().expect("post-canary ledger");
+    let gens = sensor.tfm().generations();
+    assert!(!gens.is_empty(), "canary traffic assigned a generation");
+    // The length scalar IS captured (16) — sizes, not contents.
+    assert!(
+        gens.iter().any(|g| g.configs >= 1),
+        "marker setkey joined: {gens:?}"
+    );
+    // No marker byte in any surfaced view (names, ids, counters,
+    // full ledger render).
+    let rendered = format!(
+        "{:?}\n{:?}\n{:?}\n{:?}",
+        gens,
+        sensor.tfm().stats(),
+        ledger,
+        sensor
+            .registry()
+            .map(|r| format!("{r:?}"))
+            .unwrap_or_default(),
+    );
+    assert!(
+        !rendered.contains("KPROBE-CANARY"),
+        "no secret bytes in lifecycle views: {rendered}"
+    );
+    for g in &gens {
+        assert!(
+            !g.req_name.contains("KPROBE-CANARY") && !g.drv_name.contains("KPROBE-CANARY"),
+            "no secret bytes in provenance names: {g:?}"
+        );
+    }
+}
+
+/// Host F05 proof (T07-04): a transform bound + keyed BEFORE the
+/// sensor attaches is op-first-seen — its generation carries the
+/// runtime-selected driver (checked against the independent
+/// /proc/crypto winner oracle) with EMPTY creation provenance
+/// (allocation/requested name/previous configuration unknown: the
+/// alloc + setkey ran pre-attach, so configs == 0 and epoch == 0).
+#[test]
+#[ignore = "BPF lane: run with scripts/sudo-lane.sh (needs root + BTF + built BPF object)"]
+fn host_op_first_seen_carries_selected_driver() {
+    let _guard = suite_guard();
+    use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
+    if unsafe { libc::geteuid() } != 0 {
+        println!("SKIP: F05 oracle needs root (sudo lane)");
+        return;
+    }
+    if std::fs::metadata("/sys/kernel/btf/vmlinux").is_err() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let object = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("kryprobe-bpf")
+        .join("kcrypto-lifecycle.bpf.o");
+    if !object.is_file() {
+        println!("SKIP: missing BPF lifecycle object — run `cargo xtask build --bpf`");
+        return;
+    }
+    // Pre-attach: bind + key (the sensor observes NEITHER — its
+    // first sighting of this transform is the op submit below).
+    let fd = afalg_bind_skcipher("cbc(aes)");
+    afalg_set_key(fd, &[0x5au8; 32]);
+    let bytes = std::fs::read(&object).expect("test fixture must be readable");
+    let (mut sensor, _) = LifecycleSensor::bring_up(&bytes, None).expect("host sensor must attach");
+    let pre_gens = sensor.tfm().generations().len();
+    // Post-attach: exactly one encrypt on the pre-bound socket.
+    kryprobe_testkit::alg_fixture::skcipher_encrypt_once(fd)
+        .expect("pre-bound encrypt must succeed");
+    for _ in 0..4 {
+        let drained = sensor.drain_once(8192).expect("drain");
+        if drained.records == 0 && !drained.busy {
+            break;
+        }
+    }
+    // The oracle reads the live inventory (fd held), then the
+    // socket closes — all assertions run after release.
+    let expected_drv = proc_crypto_winning_driver("cbc(aes)");
+    unsafe { libc::close(fd) };
+    let _ = sensor.take_completed();
+    sensor.close_input().expect("disarm+detach");
+    let quiet = sensor.drain_quiet().expect("quiet drain");
+    assert!(quiet.quiet, "close must reach a quiet round");
+    let post = sensor.ledger().expect("post-op ledger");
+    eprintln!(
+        "f05-oracle: edge={:?} tfm={:?} gens={:?}",
+        post.edge_hits,
+        sensor.tfm().stats(),
+        sensor.tfm().generations(),
+    );
+    // Op pairs ran post-attach (quiet host brackets the window —
+    // the same assumption the alloc E2E already makes): one per
+    // encrypt API call. cbc(aes) on aesni hosts resolves through
+    // cryptd, whose child call trips the hook too (outer +
+    // cryptd-inner = 2 pairs); other hosts see 1 — the count is
+    // driver-shaped, the per-generation properties are not.
+    let submits = post.edge_hits[0];
+    assert!(
+        submits >= 1,
+        "the encrypt ran through the hooked API: {submits}"
+    );
+    assert_eq!(post.edge_hits[1], submits, "every submit returns");
+    // The op-first-seen generations: selected drivers captured
+    // (oracle), creation provenance empty (pre-attach truth).
+    let gens = sensor.tfm().generations();
+    let fresh: Vec<_> = gens.iter().skip(pre_gens).collect();
+    assert_eq!(
+        fresh.len() as u64,
+        submits,
+        "one generation per op pair: {fresh:?}"
+    );
+    assert!(
+        fresh.iter().any(|g| g.drv_name == expected_drv),
+        "outer driver matches /proc/crypto winner: {fresh:?}"
+    );
+    for g in &fresh {
+        assert!(g.first_seen, "op-first sighting: {g:?}");
+        assert!(!g.drv_name.is_empty(), "selected driver captured: {g:?}");
+        assert!(!g.drv_truncated, "short driver never truncates: {g:?}");
+        assert!(g.req_name.is_empty(), "requested name unknown: {g:?}");
+        assert_eq!(g.configs, 0, "pre-attach setkey unobserved: {g:?}");
+        assert_eq!(g.epoch, 0, "no observed configuration: {g:?}");
+        assert!(
+            g.retired && !g.ambiguous,
+            "close destroy retires exactly: {g:?}"
+        );
     }
 }

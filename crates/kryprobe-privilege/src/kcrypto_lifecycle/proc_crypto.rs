@@ -138,7 +138,11 @@ fn parse_block(lines: &[&str]) -> Option<ProcCryptoEntry> {
         fields.insert(key.trim(), value.trim());
     }
     let name = fields.get("name").filter(|n| !n.is_empty())?;
-    let mut truncated = false;
+    // R9/T07-08: the block key caps like every other field — a
+    // clipped name keeps its block (dropping would lose inventory)
+    // with `truncated` set (identity is partial, never silent).
+    let (name, name_cut) = cap_value(name);
+    let mut truncated = name_cut;
     let mut take = |key: &str| -> Option<String> {
         fields.get(key).map(|v| {
             let (capped, cut) = cap_value(v);
@@ -148,7 +152,7 @@ fn parse_block(lines: &[&str]) -> Option<ProcCryptoEntry> {
     };
     let priority = fields.get("priority").and_then(|v| v.parse::<u32>().ok());
     Some(ProcCryptoEntry {
-        name: (*name).to_owned(),
+        name,
         driver: take("driver"),
         entry_type: take("type"),
         priority,

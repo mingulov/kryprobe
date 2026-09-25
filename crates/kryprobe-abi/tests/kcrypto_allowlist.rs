@@ -10,6 +10,7 @@
 //! (brief Step 2): the field set, the doc, and the canary move as one.
 
 use kryprobe_abi::kcrypto_agg::{KAgg, KConfig, KCtl, KWhoKey, VAgg, VParams, VWho};
+use kryprobe_abi::kcrypto_lifecycle::{LConfig, LEdge, LTfm};
 use std::path::PathBuf;
 
 const KCONFIG_WANT: &[&str] = &[
@@ -45,6 +46,27 @@ const VWHO_WANT: &[&str] = &[
     "comm", "tid", "uid", "cgroup", "ppid", "pcomm", "stack", "calls", "first_ns", "last_ns",
 ];
 const VPARAMS_WANT: &[&str] = &["blocksize", "ivsize", "min_keysize", "max_keysize"];
+const LEDGE_WANT: &[&str] = &[
+    "magic", "version", "edge", "site", "flags", "key", "ts_ns", "status", "aux", "invoc", "tfm",
+    "drv",
+];
+const LTFM_WANT: &[&str] = &[
+    "magic", "version", "edge", "site", "flags", "key", "ts_ns", "status", "aux", "aux2", "token",
+    "name",
+];
+const LCONFIG_WANT: &[&str] = &[
+    "magic",
+    "version",
+    "flags",
+    "tfm_alg",
+    "alg_drv",
+    "sk_base",
+    "refcnt_off",
+    "refcnt_present",
+    "req_base",
+    "req_tfm",
+    "reserved",
+];
 
 /// Workspace `docs/kcrypto-capture-allowlist.md` (absolute via the
 /// crate manifest dir, so the test runs from any CWD).
@@ -73,6 +95,9 @@ fn allowlist_field_set_matches_docs() {
     assert_eq!(KWhoKey::FIELDS, KWHOKEY_WANT, "KWhoKey fields drifted");
     assert_eq!(VWho::FIELDS, VWHO_WANT, "VWho fields drifted");
     assert_eq!(VParams::FIELDS, VPARAMS_WANT, "VParams fields drifted");
+    assert_eq!(LEdge::FIELDS, LEDGE_WANT, "LEdge fields drifted");
+    assert_eq!(LTfm::FIELDS, LTFM_WANT, "LTfm fields drifted");
+    assert_eq!(LConfig::FIELDS, LCONFIG_WANT, "LConfig fields drifted");
     // Doc side: every listed field appears backticked in the allowlist
     // doc (updating FIELDS + this test but forgetting the doc fails).
     let doc = allowlist_doc();
@@ -84,6 +109,9 @@ fn allowlist_field_set_matches_docs() {
         ("KWhoKey", KWhoKey::FIELDS),
         ("VWho", VWho::FIELDS),
         ("VParams", VParams::FIELDS),
+        ("LEdge", LEdge::FIELDS),
+        ("LTfm", LTfm::FIELDS),
+        ("LConfig", LConfig::FIELDS),
     ] {
         for field in fields {
             let ticked = format!("`{field}`");

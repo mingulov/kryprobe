@@ -1392,14 +1392,17 @@ mod tests {
         for (name, ty, bits) in req {
             b.member(name, ty, bits);
         }
-        // [11] STRUCT crypto_skcipher { base: [7] @8 }.
+        // [11] STRUCT crypto_skcipher { base: [7] @8 } (72 bytes:
+        // the 64-byte embedded `base` must sit INSIDE the parent —
+        // R4 containment refuses the old 64-byte lie, exactly like
+        // real kernels, where `base` is the trailing member).
         let o_sk = b.str("crypto_skcipher");
         let o_sk_base = b.str("base");
         let mut sk: Vec<(u32, u32, u32)> = Vec::new();
         if let Some(ty) = shape("crypto_skcipher", "base", 7) {
             sk.push((o_sk_base, ty, 8 * 8));
         }
-        b.rec(o_sk, KIND_STRUCT, sk.len() as u32, false, 64);
+        b.rec(o_sk, KIND_STRUCT, sk.len() as u32, false, 72);
         for (name, ty, bits) in sk {
             b.member(name, ty, bits);
         }
