@@ -291,6 +291,13 @@ fn main() {
         "ring_ingest",
         format!("{ingest_cons},{ingest_prod}"),
     );
+    // M2 read-after-ingest: full identity re-verification while
+    // attached (the ledger re-verifies post-detach; both feed the
+    // same sticky bit, and the verdict consults it).
+    match sensor.verify_identity() {
+        Ok(()) => put(&mut out, "verify_preclose", "ok".to_owned()),
+        Err(err) => put(&mut out, "verify_preclose", format!("VOID: {err}")),
+    }
     sensor.close_input().unwrap_or_else(|err| {
         fail(
             &out,

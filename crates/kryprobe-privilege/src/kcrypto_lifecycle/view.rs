@@ -12,9 +12,7 @@
 use crate::attach::OwnedLink;
 use crate::bpfloader::{LifecycleMaps, LoadedLifecycle};
 use crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS;
-use crate::probe::bpf_sys::{
-    BPF_LINK_TYPE_TRACING, BPF_PROG_TYPE_TRACING, BPF_TRACE_FSESSION, obj_get_info,
-};
+use crate::probe::bpf_sys::{BPF_LINK_TYPE_TRACING, BPF_PROG_TYPE_TRACING, obj_get_info};
 use std::os::fd::RawFd;
 
 /// Info buffer: 512 zeroed bytes hold any current
@@ -138,8 +136,10 @@ pub struct LinkIdentity {
     pub id: u32,
     /// Linked program id (must name our program).
     pub prog_id: u32,
-    /// Link attach type (pinned `FSESSION` — lifecycle links are
-    /// session-only).
+    /// Reported link attach type (baseline-compared, never pinned:
+    /// 7.0.14 reports 0 for fsession links despite `LINK_CREATE`
+    /// carrying 58 — the program's load-time `expected_attach_type`
+    /// is the enforced pin, the link report is monitored drift).
     pub attach_type: u32,
     /// Attach BTF id (baseline-compared, never pinned: the kernel
     /// resolves it at load).
@@ -160,9 +160,11 @@ pub struct SensorIdentity {
 
 impl SensorIdentity {
     /// Snapshot every program, map, and link fd: absolute pins (prog
-    /// type `TRACING`, link type `TRACING` + attach `FSESSION`, map
-    /// dims vs the frozen manifest) hold HERE — a fresh sensor whose
-    /// fds fail them never arms.
+    /// type `TRACING`, link type `TRACING`, map dims vs the frozen
+    /// manifest, every link naming our program) hold HERE — a fresh
+    /// sensor whose fds fail them never arms. The link attach type
+    /// and target BTF id are recorded for baseline comparison, not
+    /// pinned (7.0.14 reports attach 0 for fsession links).
     pub fn snapshot(
         loaded: &LoadedLifecycle,
         links: &[(String, OwnedLink)],
@@ -192,14 +194,6 @@ impl SensorIdentity {
             if u32le(&buf, 0) != BPF_LINK_TYPE_TRACING {
                 return Err(ViewError::Identity {
                     detail: format!("{stage}: link type {} is not TRACING", u32le(&buf, 0)),
-                });
-            }
-            if u32le(&buf, 12) != BPF_TRACE_FSESSION {
-                return Err(ViewError::Identity {
-                    detail: format!(
-                        "{stage}: link attach type {} is not FSESSION",
-                        u32le(&buf, 12)
-                    ),
                 });
             }
             let prog_id = u32le(&buf, 8);
@@ -270,6 +264,49 @@ impl SensorIdentity {
         }
         Ok(())
     }
+
+    /// Re-verify after detach (links dropped by design): progs + maps
+    /// must still match, the link set must be EMPTY (a surviving
+    /// link post-detach is a leak — invalid), and the baseline must
+    /// have carried links (an empty baseline never armed).
+    pub fn verify_detached(&self, baseline: &Self) -> Result<(), ViewError> {
+        if baseline.links.is_empty() {
+            return Err(ViewError::Identity {
+                detail: "baseline carries no links — the sensor never armed".to_owned(),
+            });
+        }
+        if !self.links.is_empty() {
+            return Err(ViewError::Identity {
+                detail: format!("{} links survive detach (leak)", self.links.len()),
+            });
+        }
+        if self.progs.len() != baseline.progs.len() || self.maps.len() != baseline.maps.len() {
+            return Err(ViewError::Identity {
+                detail: format!(
+                    "cardinality moved post-detach (progs {}/{}, maps {}/{})",
+                    self.progs.len(),
+                    baseline.progs.len(),
+                    self.maps.len(),
+                    baseline.maps.len(),
+                ),
+            });
+        }
+        for (got, want) in self.progs.iter().zip(baseline.progs.iter()) {
+            if got != want {
+                return Err(ViewError::Identity {
+                    detail: format!("prog identity moved (was {want:?}, is {got:?})"),
+                });
+            }
+        }
+        for (got, want) in self.maps.iter().zip(baseline.maps.iter()) {
+            if got != want {
+                return Err(ViewError::Identity {
+                    detail: format!("map identity moved (was {want:?}, is {got:?})"),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn snapshot_maps(maps: &LifecycleMaps) -> Result<Vec<MapIdentity>, ViewError> {
@@ -323,6 +360,7 @@ fn snapshot_maps(maps: &LifecycleMaps) -> Result<Vec<MapIdentity>, ViewError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::bpf_sys::BPF_TRACE_FSESSION;
 
     fn prog(section: &str, id: u32, name: &str) -> ProgIdentity {
         ProgIdentity {
@@ -397,6 +435,33 @@ mod tests {
         let mut got = identity();
         got.links.clear();
         let err = got.verify_against(&identity()).expect_err("must refuse");
+        assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn detached_verifies_progs_maps_and_empty_links() {
+        // Post-detach: same progs+maps, no links → verifies.
+        let mut got = identity();
+        got.links.clear();
+        got.verify_detached(&identity()).expect("detached verifies");
+        // A surviving link post-detach is a leak → invalid.
+        let err = identity()
+            .verify_detached(&identity())
+            .expect_err("must refuse");
+        assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
+        // A moved prog post-detach still fails.
+        let mut moved = identity();
+        moved.links.clear();
+        moved.progs[0].id = 99;
+        let err = moved.verify_detached(&identity()).expect_err("must refuse");
+        assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
+        // An empty baseline never armed → invalid.
+        let empty = SensorIdentity {
+            progs: vec![],
+            maps: vec![],
+            links: vec![],
+        };
+        let err = empty.verify_detached(&empty).expect_err("must refuse");
         assert!(matches!(err, ViewError::Identity { .. }), "{err:?}");
     }
 }

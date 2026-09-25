@@ -423,21 +423,38 @@ impl LifecycleSensor {
         })
     }
 
-    /// Snapshot the terminal ledger: re-verify identity against
-    /// the pre-arm baseline (M2 — a mismatch flips the sticky verdict
-    /// off and the ledger reports it; the counter reads still run, and
-    /// THEY fail independently on bad fds), then read `LLOSS`
-    /// per-class totals + `LAGG` per-hook accepted totals.
-    pub fn ledger(&self) -> Result<LifecycleLedger, MapOpsError> {
-        if self.view_valid.load(Ordering::Relaxed) {
-            let current = SensorIdentity::snapshot(&self.configured.loaded, &self.configured.links);
-            let verified = current
-                .map(|view| view.verify_against(&self.baseline))
-                .is_ok_and(|result| result.is_ok());
-            if !verified {
-                self.view_valid.store(false, Ordering::Relaxed);
-            }
+    /// Re-verify identity against the pre-arm baseline (M2 "read
+    /// after ingest"): while attached the full view (progs + maps +
+    /// links) must match; after detach the progs + maps must match
+    /// with the link set empty (detached by design — a surviving
+    /// link is a leak). A mismatch flips the sticky verdict off
+    /// (never back on) and returns the cause. Drivers call this
+    /// post-ingest pre-close (full) AND the ledger calls it
+    /// post-close (detached) — both reads feed the same sticky bit.
+    pub fn verify_identity(&self) -> Result<(), crate::kcrypto_lifecycle::view::ViewError> {
+        if !self.view_valid.load(Ordering::Relaxed) {
+            // Already void — the sticky bit carries the first cause
+            // (re-verifying cannot clear it, so skip the syscalls).
+            return Ok(());
         }
+        let current = SensorIdentity::snapshot(&self.configured.loaded, &self.configured.links);
+        let verified = match current {
+            Ok(view) if self.configured.links.is_empty() => view.verify_detached(&self.baseline),
+            Ok(view) => view.verify_against(&self.baseline),
+            Err(err) => Err(err),
+        };
+        if verified.is_err() {
+            self.view_valid.store(false, Ordering::Relaxed);
+        }
+        verified
+    }
+
+    /// Snapshot the terminal ledger: re-verify identity (post-detach
+    /// shape — see [`Self::verify_identity`]) and report the sticky
+    /// verdict with the counters. The counter reads still run after
+    /// a void verdict, and THEY fail independently on bad fds.
+    pub fn ledger(&self) -> Result<LifecycleLedger, MapOpsError> {
+        let _ = self.verify_identity();
         let (kernel_loss, agg_accepted) = read_kernel_counters(&self.configured)?;
         Ok(self.core.ledger(
             kernel_loss,

@@ -154,6 +154,20 @@ impl LifecycleBackend {
         self.with_sensor(|sensor| sensor.attached_points())
     }
 
+    /// M2 read-after-ingest: re-verify sensor identity against the
+    /// pre-arm baseline (full while attached, detached-shape after;
+    /// see the sensor method). A mismatch voids the sticky verdict
+    /// and surfaces the cause here — teardown proceeds regardless.
+    pub fn verify_identity(&self) -> Result<(), BackendError> {
+        let verified = self.with_sensor(|sensor| sensor.verify_identity())?;
+        verified.map_err(|err| {
+            BackendError::Internal(InternalError::with_detail(
+                "lifecycle_verify",
+                &err.to_string(),
+            ))
+        })
+    }
+
     /// Disarm-then-detach, step 1 (M1): the sensor proves the
     /// disarmed config before dropping links; a disarm failure still
     /// detaches but surfaces typed here.

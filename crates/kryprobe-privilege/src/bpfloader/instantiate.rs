@@ -291,8 +291,9 @@ pub fn load_kcrypto(
 /// `attach_ids` maps kernel symbol → vmlinux BTF id (profile-scoped:
 /// exactly the manifest's symbols). Point names are SECTIONS (the
 /// attach dispatch routes on the `fsession/` prefix). Session-kfunc
-/// stubs rewrite against freshly resolved vmlinux FUNC ids (floor
-/// 7.0+: a kernel without the kfuncs refuses here, before any load).
+/// stubs rewrite against freshly resolved vmlinux FUNC ids (a kernel
+/// without the kfuncs refuses here, before any load; the 7.0+ floor
+/// itself is enforced by FSESSION attach acceptance at load).
 pub fn load_lifecycle(
     bytes: &[u8],
     attach_ids: &[(String, u32)],
@@ -350,8 +351,8 @@ pub fn load_lifecycle(
         second.imm = 0;
     }
     // Session kfuncs (W8): resolve the two vmlinux FUNC ids once
-    // (unprivileged BTF read; missing kfuncs refuse the whole load —
-    // floor 7.0+), then rewrite every sentinel `call imm` to
+    // (unprivileged BTF read; missing kfuncs refuse the whole load
+    // fail-closed), then rewrite every sentinel `call imm` to
     // `BPF_PSEUDO_KFUNC_CALL` before any program loads.
     let kfunc_ids = resolve_kfunc_ids().map_err(|err| LoaderError::BadObject {
         reason: format!("session kfunc BTF ids: {err}"),
@@ -461,9 +462,25 @@ fn load_tracing_program(
         Err(errno) => Err(LoaderError::LoadFailed {
             stage: name.to_owned(),
             errno,
-            log: log_tail(&log),
+            log: fsession_einval_hint(errno, log_tail(&log)),
         }),
     }
+}
+
+/// EINVAL hint for fsession loads (W8 floor story, guest-proven):
+/// the session kfuncs exist even on 6.12, so the floor discriminator
+/// is FSESSION attach acceptance (type 58) at load — and an unknown
+/// attach type surfaces as errno 22 exactly like a verifier
+/// rejection. The log disambiguates (an attr refused before
+/// verification leaves only the summary line); the hint says so
+/// without claiming which case fired.
+fn fsession_einval_hint(errno: i32, log: String) -> String {
+    if errno != libc::EINVAL {
+        return log;
+    }
+    format!(
+        "{log} [hint: EINVAL on an fsession load often means the kernel predates 7.0 (attach type 58 unknown); a rejection detail above means the program itself was refused]"
+    )
 }
 
 /// Short per-point failure reason: errno only for load refuses (the
@@ -605,8 +622,19 @@ fn log_tail(log: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::check_pin_name;
+    use super::{check_pin_name, fsession_einval_hint};
     use crate::bpfloader::LoaderError;
+
+    #[test]
+    fn einval_hint_fires_only_on_einval() {
+        // The floor hint appends only to errno-22 fsession refuses
+        // (any other errno passes the log through untouched).
+        let hinted = fsession_einval_hint(libc::EINVAL, "processed 0 insns".to_owned());
+        assert!(hinted.contains("predates 7.0"), "{hinted}");
+        assert!(hinted.starts_with("processed 0 insns"), "{hinted}");
+        let plain = fsession_einval_hint(libc::EPERM, "log".to_owned());
+        assert_eq!(plain, "log");
+    }
 
     #[test]
     fn pin_gate_rejects_dotted_names_typed() {

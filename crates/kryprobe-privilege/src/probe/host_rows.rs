@@ -11,15 +11,16 @@ use crate::probe::bpf_prog::load_minimal_fsession;
 use crate::probe::{cap_names, yama_verdict};
 
 /// Gate: can this kernel run the lifecycle session sensor (T06 W8)?
-/// Pass requires both session kfuncs (`bpf_session_is_return`,
-/// `bpf_session_cookie`) present in vmlinux BTF — kernel floor 7.0+ —
-/// AND a minimal `TRACING` load with `expected_attach_type = 58`
-/// against our real attach target (ratification C: the kfunc filter
-/// gates on the attach type, so a plain fentry probe would `-EACCES`
-/// and misreport). Missing kfuncs fail with the cause named (the
-/// loader refuses the same way before any load); a permission refusal
-/// on the load reports `Denied` (capability unproven, not absent —
-/// see `cap_state`); any other load errno fails loud.
+/// Pass requires a minimal `TRACING` load with
+/// `expected_attach_type = 58` against our real attach target
+/// (ratification C: the kfunc filter gates on the attach type, so a
+/// plain fentry probe would `-EACCES` and misreport) — the load is
+/// the floor discriminator (guest-proven: the session kfuncs exist
+/// even on 6.12, so their BTF presence only gates the cheap
+/// unprivileged pre-check, never the verdict). Missing kfuncs fail
+/// with the cause named; a permission refusal on the load reports
+/// `Denied` (capability unproven, not absent — see `cap_state`); any
+/// other load errno fails loud.
 pub fn fsession_capable() -> ProbeOutcome {
     match resolve_kfunc_ids() {
         Ok(ids) if ids.len() != 2 => {

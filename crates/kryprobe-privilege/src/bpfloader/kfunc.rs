@@ -6,7 +6,8 @@
 //! to `BPF_PSEUDO_KFUNC_CALL` with the vmlinux BTF FUNC id. An
 //! unrewritten sentinel is refused by the verifier as a helper id
 //! out of range (fail-closed); a missing kfunc FUNC refuses here
-//! with the cause named (floor 7.0+).
+//! with the cause named (fail-closed pre-check — the 7.0+ floor
+//! itself is enforced by FSESSION attach acceptance at load).
 
 use super::parse::BpfInsn;
 use crate::bpfloader::LoaderError;
@@ -14,8 +15,12 @@ use std::collections::HashMap;
 
 /// `call` opcode (`JMP | CALL`).
 const OP_CALL: u8 = 0x85;
-/// `src_reg` nibble marking a kfunc call (`BPF_PSEUDO_KFUNC_CALL`).
-const PSEUDO_KFUNC_CALL: u8 = 1;
+/// `src_reg` nibble marking a kfunc call (`BPF_PSEUDO_KFUNC_CALL` =
+/// 2, UAPI `linux/bpf.h` — 1 is `BPF_PSEUDO_CALL`, a pc-relative
+/// subprogram call; writing 1 here makes the verifier read the BTF
+/// id as a jump offset and refuse "call to invalid destination",
+/// as the 7.0.14 guest proved).
+const PSEUDO_KFUNC_CALL: u8 = 2;
 
 /// `bpf_session_is_return` stub sentinel (BPF twin:
 /// `KFUNC_IS_RETURN_SENTINEL` in `kcrypto_lifecycle.rs`; bit 31
@@ -99,12 +104,12 @@ mod tests {
             stub(KFUNC_COOKIE_SENTINEL),
         ];
         rewrite_kfunc_stubs(&mut insns, "fsession/f", &ids()).expect("rewrite");
-        assert_eq!(insns[0].dst_src, 0x10);
+        assert_eq!(insns[0].dst_src, 0x20); // src_reg = BPF_PSEUDO_KFUNC_CALL
         assert_eq!(insns[0].imm, 101);
         assert_eq!(insns[0].off, 0);
         assert_eq!(insns[1].dst_src, 0);
         assert_eq!(insns[1].imm, 1);
-        assert_eq!(insns[2].dst_src, 0x10);
+        assert_eq!(insns[2].dst_src, 0x20); // src_reg = BPF_PSEUDO_KFUNC_CALL
         assert_eq!(insns[2].imm, 102);
     }
 
@@ -131,7 +136,7 @@ mod tests {
         rewrite_kfunc_stubs(&mut insns, "fsession/f", &ids()).expect("rewrite");
         assert_eq!(insns[0].dst_src, 0);
         assert_eq!(insns[0].imm, KFUNC_IS_RETURN_SENTINEL);
-        assert_eq!(insns[1].dst_src, 0x10);
+        assert_eq!(insns[1].dst_src, 0x20); // src_reg = BPF_PSEUDO_KFUNC_CALL
     }
 
     #[test]

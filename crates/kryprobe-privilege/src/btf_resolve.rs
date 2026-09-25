@@ -267,8 +267,10 @@ pub fn resolve_btf_ids() -> Result<HashMap<String, u32>, BtfError> {
 }
 
 /// Session-kfunc FUNC names (T06 W8): the two kfuncs the fsession BPF
-/// calls through loader-rewritten stubs. Kernel 7.0+ only (absent
-/// from 6.x vmlinux BTF — the floor refusal).
+/// calls through loader-rewritten stubs. Guest-proven present even
+/// on 6.12.111 — kfunc presence is NOT the floor discriminator (the
+/// FSESSION attach acceptance at load is); a missing kfunc still
+/// refuses the rewrite fail-closed with the cause named.
 pub const KFUNC_SYMBOLS: &[&str] = &["bpf_session_is_return", "bpf_session_cookie"];
 
 /// Resolve the [`KFUNC_SYMBOLS`] to vmlinux BTF FUNC ids.

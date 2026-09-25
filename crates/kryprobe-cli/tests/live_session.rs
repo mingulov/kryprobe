@@ -1911,6 +1911,12 @@ impl kryprobe_cli::live::LifecycleSessionSensor for ScriptedLifecycleSensor<'_> 
         Ok(self.ticks[call as usize].clone())
     }
 
+    fn verify_identity(&self) -> Result<(), kryprobe_cli::live::LiveError> {
+        // Scripted sensor: identity is trivially valid (no kernel
+        // objects to re-verify).
+        Ok(())
+    }
+
     fn close_input(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);

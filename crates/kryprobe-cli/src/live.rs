@@ -790,6 +790,11 @@ pub trait LifecycleSessionSensor {
     fn drain_tick(&mut self, max_records: usize) -> Result<DrainOutcome, LiveError>;
     /// Drain retained completions (each record surfaces once).
     fn take_completed(&mut self) -> Result<Vec<RequestRecord>, LiveError>;
+    /// M2 read-after-ingest: re-verify sensor identity while attached
+    /// (the ledger re-verifies post-detach; both feed the same sticky
+    /// bit, and coverage consults it — a void verdict never aborts
+    /// teardown, it flips the report).
+    fn verify_identity(&self) -> Result<(), LiveError>;
     /// Detach-then-drain, step 1: drop the attach links (no hook
     /// fires after; the closing drain converges).
     fn close_input(&mut self) -> Result<(), LiveError>;
@@ -835,6 +840,12 @@ impl LifecycleSessionSensor for RealLifecycleSensor<'_> {
         self.backend
             .take_completed()
             .map_err(|err| backend_err("live lifecycle take", err))
+    }
+
+    fn verify_identity(&self) -> Result<(), LiveError> {
+        self.backend
+            .verify_identity()
+            .map_err(|err| backend_err("live lifecycle identity", err))
     }
 
     fn close_input(&mut self) -> Result<(), LiveError> {
@@ -1364,6 +1375,10 @@ fn drive_lifecycle_session_inner(
     // `finish` at the closing wall turns every pending request into
     // a record (grounded or explicit-unknown).
     let end_ns = sensor.now_ns()?;
+    // M2 read-after-ingest (full, while attached): a void verdict
+    // must NOT abort teardown — the sticky bit carries it into the
+    // ledger, where coverage flips Partial and integrity counts it.
+    let _ = sensor.verify_identity();
     sensor.close_input()?;
     // The quiet verdict feeds coverage below (backlog bytes flip
     // `detailed_events`) — consumed, never ignored, never asserted
