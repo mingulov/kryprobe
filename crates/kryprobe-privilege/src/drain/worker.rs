@@ -2,7 +2,6 @@
 //! Drain worker thread: epoll pace, budget, bounded queue (T7c2 split).
 
 use super::area::RingArea;
-use super::frame;
 use super::{DrainEvent, DrainStats};
 use crate::fd::OwnedFd;
 use std::sync::Arc;
@@ -19,7 +18,6 @@ pub(crate) struct Worker {
     pub(crate) barrier: Arc<AtomicU64>,
     pub(crate) budget: usize,
     pub(crate) timeout_ms: i32,
-    pub(crate) mask: u64,
 }
 
 impl Worker {
@@ -27,9 +25,6 @@ impl Worker {
         let mut stats = DrainStats::default();
         let mut consumer = self.area.consumer();
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
-        // Reusable full-size view: each round refreshes only the pending
-        // window (see `snapshot_into`); the walk never reads stale bytes.
-        let mut snap = vec![0u8; 2 * (self.mask + 1) as usize];
         'run: while !self.stop.load(Ordering::Acquire) {
             // SAFETY: epoll fd live; events buffer valid for one entry.
             unsafe {
@@ -45,8 +40,9 @@ impl Worker {
             }
             let producer = self.area.producer();
             if producer != consumer {
-                self.area.snapshot_into(&mut snap, consumer, producer);
-                let out = frame::consume_range(&snap, self.mask, consumer, producer, self.budget);
+                // Live walk (H1): per-record volatile reads straight
+                // from the mapping — no snapshot, no torn bulk copy.
+                let out = self.area.consume_live(consumer, producer, self.budget);
                 consumer = out.consumer;
                 self.area.set_consumer(consumer);
                 for record in out.records {

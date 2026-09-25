@@ -19,6 +19,7 @@ use crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS;
 use crate::kcrypto_lifecycle::sensor::{
     DrainOutcome, LifecycleLedger, LifecycleSensor, QuietOutcome,
 };
+use crate::probe::{ProbeOutcome, fsession_capable};
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, RawEventHeader};
 use kryprobe_core::backend::{
     Backend, BackendCapabilities, BackendPlan, BackendRegistry, BackendSummary, ConfigureContext,
@@ -27,7 +28,9 @@ use kryprobe_core::backend::{
 };
 use kryprobe_core::budget::BudgetKind;
 use kryprobe_core::enums::{BackendId, CallKind, CaptureMode, EvidencePhase, OperationClass};
-use kryprobe_core::error::{BackendError, BudgetReason, InputReason, InternalError};
+use kryprobe_core::error::{
+    BackendError, BudgetReason, InputReason, InternalError, UnsupportedReason,
+};
 use kryprobe_core::evidence::payload_keys as K;
 use kryprobe_core::evidence::{IntegrityRef, IntegritySummary, NativeObservation, NativeResult};
 use kryprobe_core::ids::{ObservationId, PlanGeneration};
@@ -151,10 +154,12 @@ impl LifecycleBackend {
         self.with_sensor(|sensor| sensor.attached_points())
     }
 
-    /// Detach-then-drain, step 1: drop the attach links (no hook
-    /// fires after; the closing drain converges).
+    /// Disarm-then-detach, step 1 (M1): the sensor proves the
+    /// disarmed config before dropping links; a disarm failure still
+    /// detaches but surfaces typed here.
     pub fn close_input(&self) -> Result<(), BackendError> {
-        self.with_sensor(|sensor| sensor.close_input())
+        let disarm = self.with_sensor(|sensor| sensor.close_input())?;
+        disarm.map_err(configured_error_to_backend)
     }
 
     /// Detach-then-drain, step 2: bounded quiet loop; records the
@@ -533,8 +538,11 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 /// observed, value unreadable) → unmatched returns; retention drops
 /// past the ledger bound → user queue; refused/bad/duplicate/
 /// ambiguous evidence → state inserts; unfinished-at-finish →
-/// unmatched entries; unknown keys + reducer orphans → unmatched
-/// returns; reuse gaps + stale returns → correlation overflows.
+/// unmatched entries; unknown invocations + reducer orphans →
+/// unmatched returns; reuse gaps + stale returns → correlation
+/// overflows. A void identity verdict (M2/H2 — the sensor's kernel
+/// objects stopped matching the pre-arm baseline, so the session's
+/// evidence is unattributed) lands one count in state inserts.
 /// Evictions/unknown generations pin zero (HASH slots never evict,
 /// single generation driver); `output_omissions` (driver-reported
 /// observation-cap drops) lands in `budget_omissions`.
@@ -551,12 +559,13 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> I
             .saturating_add(ledger.reducer.ambiguous)
             .saturating_add(ledger.kernel_loss[1])
             .saturating_add(ledger.kernel_loss[2])
-            .saturating_add(ledger.kernel_loss[4]),
+            .saturating_add(ledger.kernel_loss[4])
+            .saturating_add(u64::from(!ledger.view_valid)),
         state_evictions: 0,
         unmatched_entries: ledger.reducer.unfinished,
         unmatched_returns: ledger
             .decode
-            .unknown_key_returns
+            .unknown_invoc_returns
             .saturating_add(ledger.reducer.orphan)
             .saturating_add(ledger.kernel_loss[3]),
         correlation_overflows: ledger
@@ -579,10 +588,22 @@ impl Backend for LifecycleBackend {
 
     fn detect(&self, _ctx: &DetectContext<'_>) -> Result<Vec<DetectedInstance>, BackendError> {
         resolve_lifecycle_ids().map_err(|err| btf_unsupported(&err))?;
+        // M2 detector gate (W8 floor 7.0+): a kernel that FAILED the
+        // fsession capability probe refuses detection here (typed
+        // `Unsupported` — no detect-then-fail-configure). `Denied`
+        // (unprivileged load check) and the no-target pass still
+        // detect: privilege arrives at configure, and the loader
+        // re-refuses anything the probe could not prove.
+        if let ProbeOutcome::Failed { detail } = fsession_capable() {
+            return Err(BackendError::Unsupported(UnsupportedReason::with_detail(
+                "kcrypto_fsession_unavailable",
+                &detail,
+            )));
+        }
         Ok(vec![DetectedInstance {
             backend: BackendId::KCrypto,
             object: None,
-            detail: "system lifecycle sensor (4 fentry/fexit points)".to_owned(),
+            detail: "system lifecycle sensor (2 fsession sites)".to_owned(),
         }])
     }
 
@@ -753,6 +774,9 @@ mod tests {
             kernel_loss,
             agg_accepted: [0; 4],
             retained_dropped: 0,
+            view_valid: true,
+            loss_baseline: [0; 5],
+            agg_baseline: [0; 4],
         }
     }
 
@@ -773,6 +797,18 @@ mod tests {
         assert_eq!(integrity.state_evictions, 0);
         assert_eq!(integrity.unknown_generation_events, 0);
         assert_eq!(integrity.budget_omissions, 0);
+    }
+
+    #[test]
+    fn w8_void_identity_lands_one_state_insert() {
+        // H2: a void M2 identity verdict attests in the integrity
+        // summary (unattributed evidence counts as failed-to-enter
+        // backend state); a valid session adds nothing.
+        let mut ledger = ledger_with([0; 5]);
+        ledger.view_valid = false;
+        assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 1);
+        let ledger = ledger_with([0; 5]);
+        assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 0);
     }
 
     #[test]

@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Raw-edge decode: v3 `LEdge` bytes → T05 `Edge` events (T06).
 //!
-//! The join is keyed by (kernel request pointer, BPF invocation id):
-//! a submit admits a fresh opaque id recording its invocation, and a
-//! return joins the outstanding id for its key ONLY when the
-//! invocation matches. Raw keys never leave this module (only opaque
-//! ids reach `Edge`); every refusal is counted, never silent.
+//! The join is keyed by the BPF invocation id alone (W8 fsession: the
+//! entry run mints one id per call and stores it in the kernel-zeroed
+//! per-call session cookie; the exit run of the SAME call reads the
+//! SAME cookie back). A submit admits a fresh opaque id under its
+//! invocation, and a return joins the outstanding id for its
+//! invocation — nested same-key calls pair exactly, since distinct
+//! calls carry distinct cookies whatever request pointer they share.
+//! Raw keys never leave this module (only opaque ids reach `Edge`);
+//! every refusal is counted, never silent.
 //!
-//! Invocation identity (round-4 W4): BPF issues one id per submit
-//! and the slot carries it to the matching return, so a return from
-//! a DIFFERENT invocation — a later call after a lost return + lost
-//! submit, or a nested call's return — can never alias onto the
-//! outstanding id: the invocation mismatches and the return refuses
-//! stale with the outstanding id kept. Pairing soundness no longer
-//! depends on lossless transport.
+//! Pairing soundness never depends on lossless transport: a return
+//! from a DIFFERENT invocation — a later call after a lost return +
+//! lost submit — names an invocation with no outstanding id (or a
+//! live unrelated one it cannot alias onto: the lookup misses and
+//! the return refuses unknown with the table kept).
 //!
-//! Disturbance signals (unchanged): BPF TAINTS what it cannot pair —
-//! a submit nested over an outstanding call, or a return with no
-//! outstanding submit. A tainted submit on an outstanding key gaps
-//! that id `IdentityAmbiguous` promptly; tainted returns and
-//! tainted submits with nothing outstanding refuse quietly. A CLEAN
-//! same-key submit while an id is outstanding proves the old
-//! invocation ended without a delivered return (the BPF slot empties
-//! only on a return release): the old id gaps `IdentityAmbiguous`
-//! and the new submit admits fresh. Site is stored per submit and
-//! checked per return (one call, one function — cross-site returns
-//! refuse stale).
+//! Disturbance signals (W8): per-call cookies isolate invocations,
+//! so BPF TAINTS what it cannot pair and tainted edges disturb
+//! NOTHING — a tainted edge names no invocation (`invoc` 0: entry
+//! id-exhaustion, or an exit over a zero cookie from a skipped entry
+//! or a pre-attach call) and every tainted edge refuses quietly. A
+//! same-invocation resubmit (BPF ids are unique — this is twin drift
+//! or a replay) gaps the old id `IdentityAmbiguous` and admits
+//! fresh. An id whose return never arrives lingers until `finish`
+//! reconciles it (no prompt key-gap: under nesting, a second submit
+//! on the same key is a live second call, not proof the first ended).
+//! Site is stored per submit and checked per return (one call, one
+//! function — cross-site returns refuse stale).
 
 use kryprobe_abi::kcrypto_lifecycle::{
     LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION,
@@ -50,13 +53,15 @@ pub struct RawEdge {
     pub site: u16,
     /// [`LEDGE_TAINTED`] was set (BPF could not pair this edge).
     pub tainted: bool,
-    /// Raw kernel request pointer (join key; never leaves decode).
+    /// Raw kernel request pointer (validated pairing-adjacent
+    /// material; never leaves decode — the join keys by [`RawEdge::invoc`]).
     pub key: u64,
     /// Edge timestamp (ns).
     pub ts_ns: u64,
     /// Native return status (return edges) or 0 (submit edges).
     pub status: i32,
-    /// BPF invocation id (the join identity; 0 on slotless edges).
+    /// BPF invocation id (the join identity; 0 on tainted edges,
+    /// which name no invocation).
     pub invoc: u64,
 }
 
@@ -97,10 +102,10 @@ pub enum DecodeDrop {
     /// a status here is twin drift, silently discarded before).
     BadSubmitStatus,
     /// Clean (untainted) edge with a malformed invocation id: 0
-    /// ("no invocation", slotless tainted edges only) or the reserved
-    /// bit set (no honest-BPF path sets it — round-6 removed the slot
-    /// poison writer; contention quarantines instead). Honest BPF
-    /// never emits either shape — fail closed, never join.
+    /// ("no invocation", tainted edges only) or the reserved bit set
+    /// (no honest-BPF path sets it — W8 mints cookie ids with bit 0
+    /// clear). Honest BPF never emits either shape — fail closed,
+    /// never join.
     BadInvoc,
 }
 
@@ -110,21 +115,21 @@ pub struct DecodeStats {
     /// Submits admitted (fresh opaque ids issued).
     pub admitted: u64,
     /// Submits refused (table full, id space exhausted, or BPF
-    /// [`LEDGE_TAINTED`] nesting taint — never admitted; a tainted
-    /// submit on an outstanding key additionally gaps that id, since
-    /// no future return can be attributed after the disturbance).
+    /// [`LEDGE_TAINTED`] — never admitted, never disturbing: a
+    /// tainted edge names no invocation, so there is nothing to gap).
     pub submit_refused: u64,
-    /// Returns for keys with no outstanding submit (lost submit,
-    /// pre-attach call, or BPF taint — never joined, never disturbing).
-    pub unknown_key_returns: u64,
+    /// Returns for invocations with no outstanding submit (lost
+    /// submit, pre-attach call, or BPF taint — never joined, never
+    /// disturbing).
+    pub unknown_invoc_returns: u64,
     /// Records failing twin validation.
     pub bad_records: u64,
-    /// Gaps synthesized for clean same-key submits while an id is
-    /// outstanding (transport loss: the old return never arrived).
+    /// Gaps synthesized for same-invocation resubmits (BPF ids are
+    /// unique — a resubmit means the old id's return never arrived).
     pub gaps_synthesized: u64,
-    /// Returns refused against an outstanding submit: a different
-    /// invocation, predating it, or from the other site (one call,
-    /// one function — refused, never joined, outstanding kept).
+    /// Returns refused against an outstanding submit: predating it,
+    /// or from the other site (one call, one function — refused,
+    /// never joined, outstanding kept).
     pub stale_returns: u64,
 }
 
@@ -210,20 +215,20 @@ fn classify_return(status: i32) -> ReturnDisposition {
     }
 }
 
-/// Bounded key→id join: submits admit fresh opaque ids, returns join
-/// the outstanding id for their key.
+/// Bounded invocation→id join: submits admit fresh opaque ids,
+/// returns join the outstanding id for their invocation.
 ///
-/// `Debug` is manual: the outstanding table is keyed by raw kernel
-/// pointers, so only its length renders (round-1 sol-m9/astra-m9).
+/// `Debug` is manual: the outstanding table holds kernel-issued call
+/// identities, so only its length renders (round-1 sol-m9/astra-m9).
 pub struct LifecycleDecoder {
-    /// Maximum outstanding keys (admission refuses past this).
+    /// Maximum outstanding invocations (admission refuses past this).
     capacity: usize,
     /// Next opaque id (starts at 1; 0 is never issued).
     next_id: u64,
-    /// Outstanding key → (opaque id, submit ts, submit site, BPF
-    /// invocation id). The invocation is the join identity: a return
-    /// joins ONLY on invocation equality.
-    outstanding: HashMap<u64, (u64, u64, u16, u64)>,
+    /// Outstanding BPF invocation → (opaque id, submit ts, submit
+    /// site). The invocation is the join identity: a return joins
+    /// ONLY the id outstanding under its own invocation.
+    outstanding: HashMap<u64, (u64, u64, u16)>,
     /// Loss counters.
     stats: DecodeStats,
 }
@@ -276,26 +281,16 @@ impl LifecycleDecoder {
 
     /// Join one validated raw edge (the post-parse half of [`Self::feed`],
     /// split so the sensor tallies per-hook hits from the same parse).
-    /// A tainted SUBMIT on an outstanding key gaps that id
-    /// (`IdentityAmbiguous`) FIRST: BPF quarantined the key, so no
-    /// future return can be attributed to the outstanding invocation
-    /// (the first return could be either call's — joining it would
-    /// complete the wrong invocation with a trusted terminal).
-    /// Tainted submits with no outstanding id, and all tainted
-    /// returns, refuse without touching the table.
+    /// Tainted edges refuse quietly WITHOUT touching the table:
+    /// per-call cookies isolate invocations, so a tainted edge (which
+    /// names no invocation) disturbs no outstanding id — the paired
+    /// exit of a live call still arrives under its own cookie.
     pub fn join(&mut self, raw: RawEdge) -> Vec<Edge> {
         if raw.tainted {
             if raw.edge == LEDGE_SUBMIT {
                 self.stats.submit_refused += 1;
-                if let Some((old_id, _, _, _)) = self.outstanding.remove(&raw.key) {
-                    self.stats.gaps_synthesized += 1;
-                    return vec![Edge::Gap {
-                        id: old_id,
-                        reason: GapReason::IdentityAmbiguous,
-                    }];
-                }
             } else {
-                self.stats.unknown_key_returns += 1;
+                self.stats.unknown_invoc_returns += 1;
             }
             return Vec::new();
         }
@@ -312,17 +307,16 @@ impl LifecycleDecoder {
         self.stats.bad_records += 1;
     }
 
-    /// Admit a submit under a fresh opaque id, recording its BPF
-    /// invocation. A clean same-key submit while an id is outstanding
-    /// proves the old invocation ended without a delivered return
-    /// (the BPF slot empties only on a return release, so a clean
-    /// claim means the previous occupant returned): the old id gaps
+    /// Admit a submit under a fresh opaque id, keyed by its BPF
+    /// invocation. A same-invocation resubmit (BPF ids are unique —
+    /// this is twin drift or a replay) gaps the old id
     /// (`IdentityAmbiguous` — its return never arrived) first. A
     /// full table or an exhausted id space refuses (counted, no
-    /// phantom).
+    /// phantom). Same-key submits with FRESH invocations admit
+    /// alongside (nested calls pair exactly — never gapped).
     fn submit(&mut self, raw: RawEdge) -> Vec<Edge> {
         let mut out = Vec::new();
-        if let Some((old_id, _, _, _)) = self.outstanding.remove(&raw.key) {
+        if let Some((old_id, _, _)) = self.outstanding.remove(&raw.invoc) {
             self.stats.gaps_synthesized += 1;
             out.push(Edge::Gap {
                 id: old_id,
@@ -343,7 +337,7 @@ impl LifecycleDecoder {
         let id = self.next_id;
         self.next_id += 1;
         self.outstanding
-            .insert(raw.key, (id, raw.ts_ns, raw.site, raw.invoc));
+            .insert(raw.invoc, (id, raw.ts_ns, raw.site));
         self.stats.admitted += 1;
         out.push(Edge::Submit {
             id,
@@ -353,30 +347,27 @@ impl LifecycleDecoder {
         out
     }
 
-    /// Join a return to the outstanding id for its key — ONLY on
-    /// invocation equality. Unknown keys count and emit nothing — no
-    /// phantom completions. A return from a DIFFERENT invocation (a
-    /// later call after a lost return + lost submit, or a nested
-    /// call's return), a return PREDATING the outstanding submit, or
-    /// a return from the OTHER site (one call, one function — a
-    /// cross-site return cannot be this invocation's), is stale and
-    /// is refused without disturbing the outstanding id. Ties join
-    /// (coarse-clock ambiguity, pinned).
+    /// Join a return to the outstanding id for its invocation. Unknown
+    /// invocations count and emit nothing — no phantom completions. A
+    /// return PREDATING the outstanding submit, or from the OTHER site
+    /// (one call, one function — a cross-site return cannot be this
+    /// invocation's), is stale and is refused without disturbing the
+    /// outstanding id. Ties join (coarse-clock ambiguity, pinned).
     fn complete(&mut self, raw: RawEdge) -> Vec<Edge> {
-        let id = match self.outstanding.get(&raw.key) {
+        let id = match self.outstanding.get(&raw.invoc) {
             None => {
-                self.stats.unknown_key_returns += 1;
+                self.stats.unknown_invoc_returns += 1;
                 return Vec::new();
             }
-            Some(&(id, submit_ts, submit_site, submit_invoc)) => {
-                if raw.invoc != submit_invoc || raw.ts_ns < submit_ts || raw.site != submit_site {
+            Some(&(id, submit_ts, submit_site)) => {
+                if raw.ts_ns < submit_ts || raw.site != submit_site {
                     self.stats.stale_returns += 1;
                     return Vec::new();
                 }
                 id
             }
         };
-        self.outstanding.remove(&raw.key);
+        self.outstanding.remove(&raw.invoc);
         vec![Edge::Return {
             id,
             ts_ns: raw.ts_ns,

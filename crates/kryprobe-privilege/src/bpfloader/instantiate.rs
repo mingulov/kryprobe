@@ -5,17 +5,19 @@
 //! per-prog `attach_btf_id`, per-point outcomes) plus the dot-free pin
 //! gate ([`check_pin_name`]) and [`pin_fd`] (R2/R3).
 
+use super::kfunc::rewrite_kfunc_stubs;
 use super::mapcreate::map_create_raw;
 use super::parse::{
     BpfInsn, insns_to_bytes, parse_kcrypto_object, parse_lifecycle_object, pseudo_map_fd,
 };
 use super::progload::{
-    attach_type_for_section, prog_load_fentry_raw, prog_load_fexit_raw, prog_load_raw,
+    attach_type_for_section, prog_load_fexit_raw, prog_load_fsession_raw, prog_load_raw,
 };
 use crate::bpfloader::{
     KcryptoMaps, LifecycleMaps, LoadedKcrypto, LoadedLifecycle, LoadedSpine, LoaderError,
     ParsedSpine, PointStatus, SpineMaps, SpineProgs,
 };
+use crate::btf_resolve::resolve_kfunc_ids;
 use crate::fd::OwnedFd;
 use crate::kcrypto_lifecycle::profile::{missing_required_points, required_gate_error};
 use crate::probe::bpf_sys::{BPF_OBJ_PIN, bpf, fd_or_errno, last_errno};
@@ -279,16 +281,18 @@ pub fn load_kcrypto(
 }
 
 /// Shape-authenticated lifecycle entry (T06, no `ProgramId`
-/// allowlist): the manifest's `fentry/`+`fexit/` sections + frozen
+/// allowlist): the manifest's `fsession/` sections + frozen
 /// [`LIFECYCLE_MAPS`](crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS)
 /// dims fully determine the loaded behavior. Unlike
-/// [`load_kcrypto`]'s per-point degrade, a missing required edge —
+/// [`load_kcrypto`]'s per-point degrade, a missing required site —
 /// missing section, missing BTF id, or refused load — fails the whole
-/// load (unpaired edges cannot pair submit with result).
+/// load (one site alone cannot observe both operations).
 ///
 /// `attach_ids` maps kernel symbol → vmlinux BTF id (profile-scoped:
 /// exactly the manifest's symbols). Point names are SECTIONS (the
-/// attach dispatch routes on the `fentry/`/`fexit/` prefix).
+/// attach dispatch routes on the `fsession/` prefix). Session-kfunc
+/// stubs rewrite against freshly resolved vmlinux FUNC ids (floor
+/// 7.0+: a kernel without the kfuncs refuses here, before any load).
 pub fn load_lifecycle(
     bytes: &[u8],
     attach_ids: &[(String, u32)],
@@ -345,15 +349,21 @@ pub fn load_lifecycle(
             })?;
         second.imm = 0;
     }
+    // Session kfuncs (W8): resolve the two vmlinux FUNC ids once
+    // (unprivileged BTF read; missing kfuncs refuse the whole load —
+    // floor 7.0+), then rewrite every sentinel `call imm` to
+    // `BPF_PSEUDO_KFUNC_CALL` before any program loads.
+    let kfunc_ids = resolve_kfunc_ids().map_err(|err| LoaderError::BadObject {
+        reason: format!("session kfunc BTF ids: {err}"),
+    })?;
+    for (prog, insns) in parsed.programs.iter().zip(streams.iter_mut()) {
+        rewrite_kfunc_stubs(insns, &prog.section, &kfunc_ids)?;
+    }
     let mut progs: Vec<(String, OwnedFd)> = Vec::with_capacity(parsed.programs.len());
     let mut statuses: Vec<PointStatus> = Vec::with_capacity(parsed.programs.len());
     let mut load_errors: Vec<(String, LoaderError)> = Vec::new();
     for (prog, insns) in parsed.programs.iter().zip(streams.iter()) {
-        let symbol = prog
-            .section
-            .strip_prefix("fentry/")
-            .or_else(|| prog.section.strip_prefix("fexit/"))
-            .unwrap_or_default();
+        let symbol = prog.section.strip_prefix("fsession/").unwrap_or_default();
         let id = attach_ids.iter().find(|(name, _)| name == symbol);
         let attach_type = attach_type_for_section(&prog.section);
         match (id, attach_type) {
@@ -406,11 +416,8 @@ pub fn load_lifecycle(
                 config: take("LCFG")?,
                 ring: take("LRING")?,
                 loss: take("LLOSS")?,
-                state: take("LSTATE")?,
                 agg: take("LAGG")?,
                 ctr: take("LCTR")?,
-                quar: take("LQ")?,
-                glb: take("LGLB")?,
             },
             progs,
         },
@@ -418,9 +425,10 @@ pub fn load_lifecycle(
     ))
 }
 
-/// Load one tracing program with its attach type (entry/exit split):
-/// `FENTRY` sections ride [`prog_load_fentry_raw`], `FEXIT` sections
-/// the K0-proven [`prog_load_fexit_raw`].
+/// Load one lifecycle session program (T06 W8): `FSESSION` sections
+/// ride [`prog_load_fsession_raw`]. Any other attach type refuses —
+/// the lifecycle allowlist admits `fsession/` only, so anything else
+/// here is a dispatch bug, never a stale object.
 fn load_tracing_program(
     name: &str,
     insns: &[BpfInsn],
@@ -433,27 +441,21 @@ fn load_tracing_program(
             reason: format!("program '{name}' has no insns"),
         });
     }
+    if attach_type != crate::probe::bpf_sys::BPF_TRACE_FSESSION {
+        return Err(LoaderError::BadObject {
+            reason: format!("program '{name}' has non-fsession attach type {attach_type}"),
+        });
+    }
     let bytes = insns_to_bytes(insns);
     let mut log = vec![0u8; LOG_CAP];
-    let ret = if attach_type == crate::probe::bpf_sys::BPF_TRACE_FENTRY {
-        prog_load_fentry_raw(
-            name,
-            &bytes,
-            insns.len() as u32,
-            attach_btf_id,
-            &mut log,
-            token_fd,
-        )
-    } else {
-        prog_load_fexit_raw(
-            name,
-            &bytes,
-            insns.len() as u32,
-            attach_btf_id,
-            &mut log,
-            token_fd,
-        )
-    };
+    let ret = prog_load_fsession_raw(
+        name,
+        &bytes,
+        insns.len() as u32,
+        attach_btf_id,
+        &mut log,
+        token_fd,
+    );
     match fd_or_errno(ret) {
         Ok(fd) => Ok(fd),
         Err(errno) => Err(LoaderError::LoadFailed {

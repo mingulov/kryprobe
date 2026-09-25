@@ -3,7 +3,7 @@
 
 use kryprobe_privilege::{ProbeOutcome, run_probe_matrix};
 
-const EXPECTED: [&str; 14] = [
+const EXPECTED: [&str; 15] = [
     "kernel_release",
     "bpf_syscall",
     "map_create",
@@ -12,6 +12,7 @@ const EXPECTED: [&str; 14] = [
     "attach_cookies",
     "ringbuf_create",
     "btf_present",
+    "fsession_capable",
     "userns_create",
     "yama_scope",
     "cap_state",
@@ -23,7 +24,7 @@ const EXPECTED: [&str; 14] = [
 #[test]
 fn probe_degrades_honestly() {
     let matrix = run_probe_matrix();
-    assert_eq!(matrix.rows.len(), 14, "matrix must have exactly 14 rows");
+    assert_eq!(matrix.rows.len(), 15, "matrix must have exactly 15 rows");
     for (row, want) in matrix.rows.iter().zip(EXPECTED) {
         assert_eq!(row.name, want, "row order drifted");
         match &row.outcome {

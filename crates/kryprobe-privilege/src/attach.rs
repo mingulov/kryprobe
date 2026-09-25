@@ -3,8 +3,8 @@
 
 use crate::fd::OwnedFd;
 use crate::probe::bpf_sys::{
-    BPF_LINK_CREATE, BPF_TRACE_FENTRY, BPF_TRACE_FEXIT, BPF_TRACE_UPROBE_MULTI, LinkTracing,
-    LinkUprobeMulti, bpf, fd_or_errno,
+    BPF_LINK_CREATE, BPF_TRACE_FENTRY, BPF_TRACE_FEXIT, BPF_TRACE_FSESSION, BPF_TRACE_UPROBE_MULTI,
+    LinkTracing, LinkUprobeMulti, bpf, fd_or_errno,
 };
 use core::ffi::c_void;
 use kryprobe_core::attach::{COUNT_SLOTS, cookie_for};
@@ -218,20 +218,24 @@ pub(crate) fn fexit_link_attr(prog_fd: RawFd) -> LinkTracing {
     }
 }
 
-/// Tracing `LINK_CREATE` attr constructor, entry/exit split (T06):
+/// Tracing `LINK_CREATE` attr constructor, session split (T06 W8):
 /// the same 64-byte R1 shape as [`fexit_link_attr`], with the
-/// caller-supplied attach type (`FENTRY` for entry programs, `FEXIT`
-/// for return programs). Any other attach type refuses instead of
-/// emitting a malformed attr. Token-free like the fexit twin (UAPI
-/// has no token field for link create).
+/// caller-supplied attach type (`FSESSION` for lifecycle session
+/// programs; `FENTRY`/`FEXIT` retained for the frozen api-returns
+/// path). Any other attach type refuses instead of emitting a
+/// malformed attr. Token-free like the fexit twin (UAPI has no
+/// token field for link create).
 pub(crate) fn tracing_link_attr(
     prog_fd: RawFd,
     attach_type: u32,
 ) -> Result<LinkTracing, AttachError> {
-    if attach_type != BPF_TRACE_FENTRY && attach_type != BPF_TRACE_FEXIT {
+    if attach_type != BPF_TRACE_FSESSION
+        && attach_type != BPF_TRACE_FENTRY
+        && attach_type != BPF_TRACE_FEXIT
+    {
         return Err(AttachError::Rejected {
             reason: format!(
-                "tracing link needs FENTRY(24) or FEXIT(25) attach type, got {attach_type}"
+                "tracing link needs FSESSION(58), FENTRY(24) or FEXIT(25) attach type, got {attach_type}"
             ),
         });
     }

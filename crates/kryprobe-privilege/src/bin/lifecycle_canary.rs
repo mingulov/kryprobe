@@ -5,22 +5,23 @@
 //! live in [`canary`](kryprobe_privilege::kcrypto_lifecycle::canary),
 //! this bin is the IO shell).
 //!
-//! Flow: bring up the sensor (4 required links) → PREPARE →
+//! Flow: bring up the sensor (2 required session links) → PREPARE →
 //! clear-drain → two quiescence baselines (the guest must be idle:
 //! equal baselines prove no background crypto brackets the run) →
 //! GO (blocks until the scenario completes) → drain until quiet →
-//! detach + quiet-drain → `finish` reconciliation → verdict. Exit 0
-//! on PASS, 1 on verdict/parse/drain mismatch, 2 on
-//! usage/bring-up/fixture failure.
+//! disarm + detach + quiet-drain → `finish` reconciliation → H4
+//! foreign-link exclusion → verdict. Exit 0 on PASS, 1 on
+//! verdict/parse/drain mismatch, 2 on usage/bring-up/fixture failure.
 //!
 //! Expectations derive from the FIXTURE ledger plus the scenario's
 //! exact shape (see the oracle): the canary fails loudly on drift
 //! instead of pinning observations.
 
 use kryprobe_core::kcrypto::Terminal;
+use kryprobe_privilege::btf_resolve::{resolve_kfunc_ids, resolve_lifecycle_ids};
 use kryprobe_privilege::host::monotonic_ns;
 use kryprobe_privilege::kcrypto_lifecycle::canary::{
-    SensorBaseline, SensorView, parse_transcript, verdict,
+    SensorBaseline, SensorView, count_foreign_links, parse_transcript, verdict,
 };
 use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
 use std::io::Write;
@@ -72,6 +73,26 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_else(|_| "unknown".to_owned());
     put(&mut out, "kernel", kernel);
+    // A4 guest preempt evidence: the `preempt=` cmdline token plus the
+    // kernel's `Dynamic Preempt:` dmesg line (preempt model brackets
+    // the run's scheduling behavior).
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let preempt_cmd = cmdline
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("preempt="))
+        .unwrap_or("absent");
+    put(&mut out, "preempt_cmdline", preempt_cmd.to_owned());
+    let dmesg = std::process::Command::new("dmesg").output();
+    let preempt_dmesg = dmesg
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find(|line| line.contains("Dynamic Preempt"))
+                .map(|line| line.trim().to_owned())
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    put(&mut out, "preempt_dmesg", preempt_dmesg);
 
     let fail = |out: &[(String, String)], receipt: &str, reason: &str| -> ! {
         let mut text = String::new();
@@ -84,7 +105,7 @@ fn main() {
         std::process::exit(1);
     };
 
-    // 1. Bring up the sensor (all 4 required links or nothing).
+    // 1. Bring up the sensor (both required session links or nothing).
     let object_bytes = std::fs::read(&object).unwrap_or_else(|err| {
         eprintln!("canary error: cannot read object {object}: {err}");
         std::process::exit(2);
@@ -95,13 +116,54 @@ fn main() {
             std::process::exit(2);
         });
     put(&mut out, "links", points.len().to_string());
-    if points.len() != 4 {
+    if points.len() != 2 {
         fail(
             &out,
             &receipt,
-            &format!("want 4 links, have {}", points.len()),
+            &format!("want 2 session links, have {}", points.len()),
         );
     }
+    let attached_links = sensor.attached_points();
+    // M2 receipts: the session-kfunc BTF ids the loader rewrote, the
+    // kernel prog/map/link ids from the pre-arm identity baseline,
+    // and the ring positions at arm (abs snapshots; deltas below).
+    let kfunc_ids = resolve_kfunc_ids().unwrap_or_else(|err| {
+        eprintln!("canary error: kfunc ids unreadable: {err}");
+        std::process::exit(2);
+    });
+    put(
+        &mut out,
+        "kfunc_ids",
+        format!(
+            "is_return={} cookie={}",
+            kfunc_ids.get("bpf_session_is_return").copied().unwrap_or(0),
+            kfunc_ids.get("bpf_session_cookie").copied().unwrap_or(0),
+        ),
+    );
+    let identity = sensor.baseline_identity();
+    let join_ids = |ids: Vec<u32>| {
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    put(
+        &mut out,
+        "prog_ids",
+        join_ids(identity.progs.iter().map(|p| p.id).collect()),
+    );
+    put(
+        &mut out,
+        "map_ids",
+        join_ids(identity.maps.iter().map(|m| m.id).collect()),
+    );
+    put(
+        &mut out,
+        "link_ids",
+        join_ids(identity.links.iter().map(|l| l.id).collect()),
+    );
+    let (arm_cons, arm_prod) = sensor.ring_positions();
+    put(&mut out, "ring_arm", format!("{arm_cons},{arm_prod}"));
 
     // 2. PREPARE, then clear-drain (discarded) + two quiescence
     // baselines: equal baselines 200ms apart prove the guest emits
@@ -218,9 +280,56 @@ fn main() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // 5. Detach + quiet-drain + finish reconciliation (post-finish
-    // completions join the take: every pending request reconciled).
-    sensor.close_input();
+    // 5. Disarm + detach + quiet-drain + finish reconciliation
+    // (post-finish completions join the take: every pending request
+    // reconciled). Ring positions bracket the ingest (arm → ingest →
+    // disarm); the H4 exclusion enumerates AFTER detach (our links
+    // are gone — any tracing link left on our targets is foreign).
+    let (ingest_cons, ingest_prod) = sensor.ring_positions();
+    put(
+        &mut out,
+        "ring_ingest",
+        format!("{ingest_cons},{ingest_prod}"),
+    );
+    sensor.close_input().unwrap_or_else(|err| {
+        fail(
+            &out,
+            &receipt,
+            &format!("sensor disarm/detach failed: {err}"),
+        );
+    });
+    let (disarm_cons, disarm_prod) = sensor.ring_positions();
+    put(
+        &mut out,
+        "ring_disarm",
+        format!("{disarm_cons},{disarm_prod}"),
+    );
+    let attach_ids = resolve_lifecycle_ids().unwrap_or_else(|err| {
+        eprintln!("canary error: attach ids unreadable: {err}");
+        std::process::exit(2);
+    });
+    let own_prog_ids: Vec<u32> = sensor
+        .baseline_identity()
+        .progs
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    let target_btf_ids: Vec<u32> = attach_ids.values().copied().collect();
+    let foreign_links = count_foreign_links(&own_prog_ids, &target_btf_ids).unwrap_or_else(|err| {
+        use kryprobe_privilege::kcrypto_lifecycle::canary::ForeignLinksError;
+        match err {
+            // Not root (or LSM): environment failure, not evidence.
+            ForeignLinksError::Enumerate { errno, .. }
+                if errno == libc::EPERM || errno == libc::EACCES =>
+            {
+                eprintln!("canary error: H4 enumeration refused: {err}");
+                std::process::exit(2);
+            }
+            // Exclusion unverifiable: the run's evidence is void.
+            _ => fail(&out, &receipt, &format!("H4 exclusion failed: {err}")),
+        }
+    });
+    put(&mut out, "foreign_links", foreign_links.to_string());
     let quiet = sensor.drain_quiet().unwrap_or_else(|err| {
         fail(&out, &receipt, &format!("quiet drain failed: {err}"));
     });
@@ -293,8 +402,8 @@ fn main() {
                 baseline2.decode.submit_refused
             ),
             delta(
-                ledger.decode.unknown_key_returns,
-                baseline2.decode.unknown_key_returns
+                ledger.decode.unknown_invoc_returns,
+                baseline2.decode.unknown_invoc_returns
             ),
             delta(ledger.decode.bad_records, baseline2.decode.bad_records),
             delta(
@@ -352,6 +461,55 @@ fn main() {
             quiet.quiet, quiet.rounds, quiet.records, quiet.backlog_bytes,
         ),
     );
+    // M2 abs snapshots: pre-arm baselines + final absolutes (deltas
+    // above are GO-relative; these bracket the whole session).
+    put(
+        &mut out,
+        "arm_loss_abs",
+        format!(
+            "{},{},{},{},{}",
+            ledger.loss_baseline[0],
+            ledger.loss_baseline[1],
+            ledger.loss_baseline[2],
+            ledger.loss_baseline[3],
+            ledger.loss_baseline[4],
+        ),
+    );
+    put(
+        &mut out,
+        "arm_agg_abs",
+        format!(
+            "{},{},{},{}",
+            ledger.agg_baseline[0],
+            ledger.agg_baseline[1],
+            ledger.agg_baseline[2],
+            ledger.agg_baseline[3],
+        ),
+    );
+    put(
+        &mut out,
+        "loss_abs",
+        format!(
+            "{},{},{},{},{}",
+            ledger.kernel_loss[0],
+            ledger.kernel_loss[1],
+            ledger.kernel_loss[2],
+            ledger.kernel_loss[3],
+            ledger.kernel_loss[4],
+        ),
+    );
+    put(
+        &mut out,
+        "agg_abs",
+        format!(
+            "{},{},{},{}",
+            ledger.agg_accepted[0],
+            ledger.agg_accepted[1],
+            ledger.agg_accepted[2],
+            ledger.agg_accepted[3],
+        ),
+    );
+    put(&mut out, "view_valid", ledger.view_valid.to_string());
 
     let view = SensorView {
         completed: &completed,
@@ -363,6 +521,9 @@ fn main() {
         retained_dropped: ledger.retained_dropped,
         baseline: baseline2,
         quiet_backlog_bytes: quiet.backlog_bytes,
+        view_valid: ledger.view_valid,
+        attached_links,
+        foreign_links,
     };
     if let Err(reason) = verdict(&scenario, &truth, &view) {
         fail(&out, &receipt, &reason);

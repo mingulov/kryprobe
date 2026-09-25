@@ -8,7 +8,16 @@
 //! same `ingest_records` and is covered by the VM canary lane.
 
 use kryprobe_core::kcrypto::Terminal;
-use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, fold_loss_lanes};
+use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext, fold_loss_lanes};
+
+/// Clean session context (verified identity, zero baselines).
+fn ctx() -> SessionContext {
+    SessionContext {
+        loss_baseline: [0; 5],
+        agg_baseline: [0; 4],
+        view_valid: true,
+    }
+}
 
 /// One 40-byte v3 `LEdge` (little-endian twin of the ABI struct).
 fn edge_bytes_invoc(
@@ -47,7 +56,7 @@ fn ingest_paired_edges_complete_grounded_record() {
         edge_bytes(2, 1, 0xabc, 150, 0, 0),
     ];
     assert_eq!(core.ingest_records(&records), 1);
-    let ledger = core.ledger([0; 5], [0; 4]);
+    let ledger = core.ledger([0; 5], [0; 4], ctx());
     assert_eq!(ledger.completed.len(), 1);
     let rec = &ledger.completed[0];
     assert_eq!((rec.id, rec.tfm_id, rec.duration_ns), (1, None, Some(50)));
@@ -66,23 +75,23 @@ fn ingest_queued_return_stays_pending() {
         edge_bytes(2, 1, 0xabc, 150, -115, 0),
     ];
     assert_eq!(core.ingest_records(&records), 0);
-    assert!(core.ledger([0; 5], [0; 4]).completed.is_empty());
-    assert_eq!(core.ledger([0; 5], [0; 4]).decode.admitted, 1);
-    assert_eq!(core.ledger([0; 5], [0; 4]).edge_hits, [1, 1, 0, 0]);
+    assert!(core.ledger([0; 5], [0; 4], ctx()).completed.is_empty());
+    assert_eq!(core.ledger([0; 5], [0; 4], ctx()).decode.admitted, 1);
+    assert_eq!(core.ledger([0; 5], [0; 4], ctx()).edge_hits, [1, 1, 0, 0]);
 }
 
 #[test]
 fn ingest_loss_counts_without_phantoms() {
     let mut core = SensorCore::new(16, 16, 16);
     let records = vec![
-        edge_bytes(2, 1, 0xabc, 150, 0, 0), // unknown-key return
+        edge_bytes(2, 1, 0xabc, 150, 0, 0), // unknown-invocation return
         vec![0u8; 31],                      // short record
         edge_bytes(9, 1, 1, 1, 0, 0),       // bad edge kind
     ];
     assert_eq!(core.ingest_records(&records), 0);
-    let ledger = core.ledger([7, 0, 0, 0, 0], [0; 4]);
+    let ledger = core.ledger([7, 0, 0, 0, 0], [0; 4], ctx());
     assert!(ledger.completed.is_empty());
-    assert_eq!(ledger.decode.unknown_key_returns, 1);
+    assert_eq!(ledger.decode.unknown_invoc_returns, 1);
     assert_eq!(ledger.decode.bad_records, 2);
     assert_eq!(ledger.kernel_loss, [7, 0, 0, 0, 0]);
     assert_eq!(ledger.reducer.admitted, 0);
@@ -95,9 +104,9 @@ fn finish_drains_pending_truthless() {
     // every reconciled record — round-3 async canary).
     let mut core = SensorCore::new(16, 16, 16);
     core.ingest_records(&[edge_bytes(1, 1, 0xabc, 100, 0, 0)]);
-    assert!(core.ledger([0; 5], [0; 4]).completed.is_empty());
+    assert!(core.ledger([0; 5], [0; 4], ctx()).completed.is_empty());
     core.finish(200);
-    assert_eq!(core.ledger([0; 5], [0; 4]).completed.len(), 1);
+    assert_eq!(core.ledger([0; 5], [0; 4], ctx()).completed.len(), 1);
     let drained = core.take_completed();
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].terminal, Terminal::Unknown);
@@ -120,7 +129,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
         ];
         assert_eq!(core.ingest_records(&records), 1);
     }
-    let ledger = core.ledger([0; 5], [0; 4]);
+    let ledger = core.ledger([0; 5], [0; 4], ctx());
     assert_eq!(ledger.completed.len(), 2);
     assert_eq!(ledger.retained_dropped, 1);
     assert_eq!(ledger.reducer.emitted, 3);
@@ -143,9 +152,31 @@ fn f7_take_completed_drains_and_releases_the_bound() {
         edge_bytes(2, 1, 0xabd, 250, 0, 0),
     ];
     assert_eq!(core.ingest_records(&two), 1);
-    let ledger = core.ledger([0; 5], [0; 4]);
+    let ledger = core.ledger([0; 5], [0; 4], ctx());
     assert_eq!(ledger.completed.len(), 1);
     assert_eq!(ledger.retained_dropped, 0);
+}
+
+#[test]
+fn w8_ledger_carries_session_context() {
+    // M2/H2: the pre-arm counter baselines and the sticky identity
+    // verdict land in the terminal ledger untouched (coverage and
+    // integrity consult them; pairing never does).
+    let core = SensorCore::new(16, 16, 16);
+    let ledger = core.ledger(
+        [1, 2, 3, 4, 5],
+        [6, 7, 8, 9],
+        SessionContext {
+            loss_baseline: [0, 1, 0, 0, 0],
+            agg_baseline: [0, 0, 2, 0],
+            view_valid: false,
+        },
+    );
+    assert_eq!(ledger.kernel_loss, [1, 2, 3, 4, 5]);
+    assert_eq!(ledger.agg_accepted, [6, 7, 8, 9]);
+    assert_eq!(ledger.loss_baseline, [0, 1, 0, 0, 0]);
+    assert_eq!(ledger.agg_baseline, [0, 0, 2, 0]);
+    assert!(!ledger.view_valid);
 }
 
 #[test]

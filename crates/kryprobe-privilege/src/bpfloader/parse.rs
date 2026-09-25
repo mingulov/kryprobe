@@ -411,16 +411,11 @@ pub fn parse_lifecycle_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError
         }
         sections.push((idx, sec_name.to_owned()));
     }
-    // Required-site gate: every manifest edge must have its section.
+    // Required-site gate: every manifest site must have its section.
     for site in table.required {
-        for (edge, want) in [("fentry", site.entry), ("fexit", site.exit)] {
-            if !want {
-                continue;
-            }
-            let section = format!("{edge}/{}", site.symbol);
-            if !sections.iter().any(|(_, name)| name == &section) {
-                return Err(bad(format!("missing required lifecycle site '{section}'")));
-            }
+        let section = format!("fsession/{}", site.symbol);
+        if !sections.iter().any(|(_, name)| name == &section) {
+            return Err(bad(format!("missing required lifecycle site '{section}'")));
         }
     }
     let limit = max_programs(&table);
@@ -447,10 +442,7 @@ pub fn parse_lifecycle_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError
     let mut programs: Vec<ParsedProg> = Vec::with_capacity(sections.len());
     let mut bases: Vec<(usize, usize)> = Vec::new();
     for (sec_idx, sec_name) in &sections {
-        let symbol = sec_name
-            .strip_prefix("fentry/")
-            .or_else(|| sec_name.strip_prefix("fexit/"))
-            .unwrap_or_default();
+        let symbol = sec_name.strip_prefix("fsession/").unwrap_or_default();
         if symbol.is_empty() {
             return Err(bad(format!(
                 "section '{sec_name}' has an empty target symbol"

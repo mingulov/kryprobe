@@ -527,6 +527,12 @@ fn drain_setup_error(err: DrainError) -> MapOpsError {
             stage: format!("snapshot/ring-{stage}"),
             errno,
         },
+        // Unreachable from the spawn path (the snapshot ring has no
+        // sensor states) — mapped, never panicked, for totality.
+        DrainError::StateInvalid { expected, actual } => MapOpsError::LookupFailed {
+            stage: format!("snapshot/ring-state:expected {expected}, sensor is {actual}"),
+            errno: libc::EINVAL,
+        },
     }
 }
 

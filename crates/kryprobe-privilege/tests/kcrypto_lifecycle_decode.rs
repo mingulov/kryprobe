@@ -2,16 +2,16 @@
 //! T06 decode suite: raw `LEdge` bytes → T05 `Edge` events + join rules.
 //!
 //! Pins the v3 record twin (magic/version/edge/site/flags/aux/invoc/length),
-//! the key→opaque-id join (fresh id per admission, bounded table),
+//! the invocation→opaque-id join (W8 fsession: fresh id per admission,
+//! bounded table, nested same-key calls pair exactly by cookie id),
 //! return classification (sync-terminal vs queued), and the named loss
-//! counters. BPF taints nested submits/returns (`LEDGE_TAINTED`) and the
-//! decoder refuses them without disturbing the outstanding id — the
-//! round-2 counterexample (reuse then late return joining the wrong
-//! invocation) cannot complete. A same-key clean submit while an id is
-//! outstanding means transport loss (the BPF slot empties only on a
-//! return emit, so honest BPF never nests clean): the old id gaps
-//! `IdentityAmbiguous` and the new submit admits fresh; its return
-//! joins current (coarse-clock ties join — pinned).
+//! counters. BPF taints what it cannot pair (`LEDGE_TAINTED` — entry
+//! id-exhaustion, exits over a zero cookie) and tainted edges disturb
+//! NOTHING (they name no invocation): the outstanding table is keyed
+//! by invocation alone, so a same-key clean submit with a fresh
+//! invocation admits alongside (nesting), while a same-invocation
+//! resubmit (twin drift or replay — BPF ids are unique) gaps the old
+//! id `IdentityAmbiguous` and admits fresh. Coarse-clock ties join.
 
 use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
 use kryprobe_privilege::kcrypto_lifecycle::decode::{
@@ -45,9 +45,10 @@ fn edge_bytes_invoc(
 }
 
 /// Realistic default builder: same v3 record with a VALID
-/// invocation (nonzero, reserved-bit clear — the W2/W4 join tests
-/// don't vary invocation, so equality holds; tests that do use
-/// [`edge_bytes_invoc`] explicitly).
+/// invocation (nonzero, reserved-bit clear — tests sharing one call
+/// use the default 0x4000 so the join hits; tests with two live
+/// calls pass distinct invocations via [`edge_bytes_invoc`]
+/// explicitly, since the join keys by invocation alone).
 fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 40] {
     edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)
 }
@@ -188,16 +189,19 @@ fn feed_classifies_queued_vs_terminal_returns() {
 }
 
 #[test]
-fn feed_return_without_submit_counts_unknown_key() {
+fn feed_return_without_submit_counts_unknown_invoc() {
     let mut dec = LifecycleDecoder::new(16);
     let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0, 0));
     assert!(out.is_empty(), "no phantom edges: {out:?}");
-    assert_eq!(dec.stats().unknown_key_returns, 1);
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
     assert_eq!(dec.stats().admitted, 0);
 }
 
 #[test]
-fn feed_reuse_while_outstanding_gaps_old_and_admits_fresh() {
+fn feed_resubmit_while_outstanding_gaps_old_and_admits_fresh() {
+    // Same invocation submitted twice (BPF ids are unique — twin
+    // drift or replay): the old id gaps `IdentityAmbiguous` and the
+    // resubmit admits fresh under a new opaque id.
     let mut dec = LifecycleDecoder::new(16);
     dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
     let out = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
@@ -223,17 +227,23 @@ fn feed_reuse_while_outstanding_gaps_old_and_admits_fresh() {
 
 #[test]
 fn feed_refuses_admission_at_capacity() {
+    // Distinct invocations (a resubmit would gap-and-admit instead of
+    // refusing — the join keys by invocation, not by key).
     let mut dec = LifecycleDecoder::new(1);
-    assert_eq!(dec.feed(&edge_bytes(1, 1, 0xaa, 100, 0, 0)).len(), 1);
-    let out = dec.feed(&edge_bytes(1, 1, 0xbb, 110, 0, 0));
+    assert_eq!(
+        dec.feed(&edge_bytes_invoc(1, 1, 0xaa, 100, 0, 0, 0x4000))
+            .len(),
+        1
+    );
+    let out = dec.feed(&edge_bytes_invoc(1, 1, 0xbb, 110, 0, 0, 0x8000));
     assert!(out.is_empty(), "full table admits nothing: {out:?}");
     assert_eq!(dec.stats().submit_refused, 1);
-    // The refused submit leaves no phantom: its return is unknown-key.
-    let out = dec.feed(&edge_bytes(2, 1, 0xbb, 120, 0, 0));
+    // The refused submit leaves no phantom: its return is unknown.
+    let out = dec.feed(&edge_bytes_invoc(2, 1, 0xbb, 120, 0, 0, 0x8000));
     assert!(out.is_empty());
-    assert_eq!(dec.stats().unknown_key_returns, 1);
-    // And the admitted key still pairs.
-    let out = dec.feed(&edge_bytes(2, 1, 0xaa, 130, 0, 0));
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
+    // And the admitted invocation still pairs.
+    let out = dec.feed(&edge_bytes_invoc(2, 1, 0xaa, 130, 0, 0, 0x4000));
     assert_eq!(out.len(), 1);
 }
 
@@ -285,13 +295,13 @@ fn f4_ebusy_is_unresolved_einprogress_is_queued() {
 }
 
 #[test]
-fn f3_late_pre_reuse_return_is_stale_not_joined() {
-    // Round-1 (sol-M3/astra-M3): S1(t100), reuse S2(t200), then
-    // R(t150): R predates S2, so it cannot be op2's (same-address
-    // invocations never overlap in real time — a call's fexit runs
-    // after its fentry on a monotonic clock). The stale return is
-    // refused (counted, id2 stays outstanding); op2's own R(t250)
-    // then completes id2 with ITS status.
+fn f3_late_pre_resubmit_return_is_stale_not_joined() {
+    // Round-1 (sol-M3/astra-M3), W8 resubmit shape: S1(t100),
+    // resubmit S2(t200, same invocation), then R(t150): R predates
+    // S2, so it cannot be op2's (a call's exit runs after its entry
+    // on a monotonic clock). The stale return is refused (counted,
+    // id2 stays outstanding); op2's own R(t250) then completes id2
+    // with ITS status.
     let mut dec = LifecycleDecoder::new(16);
     let s1 = dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
     assert!(matches!(s1[..], [Edge::Submit { id: 1, .. }]));
@@ -325,12 +335,11 @@ fn f3_late_pre_reuse_return_is_stale_not_joined() {
 
 #[test]
 fn f3_return_at_same_tick_as_resubmit_joins() {
-    // Transport-loss shape: S1(t100), R1 dropped by the ring, S2(t200)
-    // gaps S1 `IdentityAmbiguous`, R2(t200) joins current — ties join
-    // under a coarse clock (pinned). This is NOT the reuse case:
-    // honest BPF taints nested submits (next test), so a clean
-    // same-key submit while an id is outstanding proves the old
-    // return never arrived.
+    // Resubmit shape: S1(t100), R1 dropped by the ring, resubmit
+    // S2(t200, same invocation) gaps S1 `IdentityAmbiguous`, R2(t200)
+    // joins current — ties join under a coarse clock (pinned). Same
+    // key with a FRESH invocation instead admits alongside (nesting
+    // — see the W8 test below), never gaps.
     let mut dec = LifecycleDecoder::new(16);
     dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
     dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
@@ -348,42 +357,33 @@ fn f3_return_at_same_tick_as_resubmit_joins() {
 }
 
 #[test]
-fn w3_tainted_submit_gaps_outstanding_never_misattributes() {
-    // Round-3 nesting killer (both exit orders): BPF taints the
-    // nested submit AND quarantines the key, so the decoder gaps the
-    // outstanding id FIRST — no future return can be attributed
-    // (the first return could be either call's). Whatever exits
-    // first, nothing trusted completes: every return refuses.
-    // Both exit orders, both return flaggings: after the gap the id
-    // is gone, so EVERY return refuses (unknown key) — the gap (not
-    // the taint bit) is what protects the pairing. The all-clean
-    // case is the strongest: even a clean first return cannot join.
+fn w8_tainted_submit_disturbs_nothing_outstanding_joins() {
+    // W8: per-call cookies isolate invocations, so a tainted submit
+    // (honest BPF never emits one — NOSLOT drops silently — so this
+    // is twin drift; it names no invocation) refuses WITHOUT touching
+    // the table: no gap, and the outstanding id still joins its own
+    // clean return. The loop covers both flaggings of the trailing
+    // return: after the join the invocation is gone, so the second
+    // return refuses (unknown invocation) either way.
     for second_flags in [TAINTED, 0] {
         let mut dec = LifecycleDecoder::new(16);
         dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
-        let gap = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, TAINTED));
-        assert_eq!(
-            gap,
-            vec![Edge::Gap {
-                id: 1,
-                reason: GapReason::IdentityAmbiguous,
-            }],
-            "tainted submit gaps the disturbed id"
-        );
+        let refused = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, TAINTED));
+        assert!(refused.is_empty(), "tainted submit emits nothing");
         assert_eq!(dec.stats().submit_refused, 1);
         assert_eq!(dec.stats().admitted, 1, "no fresh id for taint");
-        assert_eq!(dec.stats().gaps_synthesized, 1);
-        let first = dec.feed(&edge_bytes(2, 1, 0xabc, 220, -5, 0));
+        assert_eq!(dec.stats().gaps_synthesized, 0, "nothing gapped");
+        let done = dec.feed(&edge_bytes(2, 1, 0xabc, 220, -5, 0));
         assert!(
-            first.is_empty(),
-            "first return refuses (unknown key): {first:?}"
+            matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
+            "outstanding still joins: {done:?}"
         );
         let second = dec.feed(&edge_bytes(2, 1, 0xabc, 250, 0, second_flags));
         assert!(
             second.is_empty(),
-            "second return refuses (unknown key): {second:?}"
+            "second return refuses (unknown invocation): {second:?}"
         );
-        assert_eq!(dec.stats().unknown_key_returns, 2);
+        assert_eq!(dec.stats().unknown_invoc_returns, 1);
     }
 }
 
@@ -406,17 +406,17 @@ fn w3_tainted_submit_without_outstanding_refuses_quietly() {
 
 #[test]
 fn w2_tainted_return_never_joins_or_disturbs() {
-    // A tainted return (slot was empty at BPF exit: pre-attach call
-    // or NOSLOT drop) counts unknown-key and leaves
-    // any outstanding id alone — a later clean return still joins.
+    // A tainted return (exit over a zero cookie: skipped entry or
+    // pre-attach call) counts unknown-invocation and leaves any
+    // outstanding id alone — a later clean return still joins.
     let mut dec = LifecycleDecoder::new(16);
     let unknown = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0, TAINTED));
     assert!(unknown.is_empty());
-    assert_eq!(dec.stats().unknown_key_returns, 1);
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
     dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
     let tainted = dec.feed(&edge_bytes(2, 1, 0xabc, 210, -5, TAINTED));
     assert!(tainted.is_empty(), "tainted return emits nothing");
-    assert_eq!(dec.stats().unknown_key_returns, 2);
+    assert_eq!(dec.stats().unknown_invoc_returns, 2);
     let done = dec.feed(&edge_bytes(2, 1, 0xabc, 220, 0, 0));
     assert!(
         matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
@@ -442,19 +442,20 @@ fn w2_site_mismatch_refuses_stale_and_keeps_outstanding() {
 }
 
 #[test]
-fn w4_invocation_mismatch_refuses_stale_and_keeps_outstanding() {
-    // Round-4 (astra-M1): the join identity is the BPF invocation.
-    // A same-key, same-site, later-timestamped return from a
-    // DIFFERENT invocation (the lost-pair shape: A-submit
-    // delivered, A-return + B-submit lost, B-return delivered)
-    // refuses stale — never completes the outstanding id — and the
+fn w8_foreign_invocation_refuses_unknown_and_keeps_outstanding() {
+    // W8 (round-4 astra-M1 shape, invoc-keyed): the join identity is
+    // the BPF invocation. A same-key, same-site, later-timestamped
+    // return from a DIFFERENT invocation (the lost-pair shape:
+    // A-submit delivered, A-return + B-submit lost, B-return
+    // delivered) names an invocation with no outstanding id —
+    // refuses unknown, never completes the outstanding id — and the
     // outstanding id is kept for its real return.
     let mut dec = LifecycleDecoder::new(16);
     dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0x4000));
-    let stale = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 250, -5, 0, 0x8000));
-    assert!(stale.is_empty(), "cross-invocation return emits nothing");
-    assert_eq!(dec.stats().stale_returns, 1);
-    assert_eq!(dec.stats().unknown_key_returns, 0);
+    let unknown = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 250, -5, 0, 0x8000));
+    assert!(unknown.is_empty(), "foreign invocation emits nothing");
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
+    assert_eq!(dec.stats().stale_returns, 0);
     let done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 300, 0, 0, 0x4000));
     assert!(
         matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
@@ -463,98 +464,83 @@ fn w4_invocation_mismatch_refuses_stale_and_keeps_outstanding() {
 }
 
 #[test]
-fn w4_nested_continuation_never_cross_joins() {
-    // Round-4 (sol-M1): the three-call continuation
-    // `A-sub → B-sub → B-ret → C-sub → A-ret → C-ret` as the fixed
-    // BPF emits it — every edge after the nesting disturbance is
-    // tainted with its own invocation. The tainted B-submit gaps A;
-    // every later edge refuses; no id ever completes and no return
-    // ever touches another call's id.
+fn w8_nested_same_key_pairs_exactly() {
+    // W8 (the DECISION decoder requirement): nested same-key calls —
+    // `A-sub → B-sub → B-ret → A-ret`, all clean, distinct cookie
+    // ids — admit alongside and pair EXACTLY (no gaps: a second
+    // submit on the same key is a live second call, not proof the
+    // first ended). A tainted return for a live invocation in the
+    // middle refuses quietly WITHOUT disturbing it.
     let mut dec = LifecycleDecoder::new(16);
     dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0x4000));
-    let gap = dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 200, 0, TAINTED, 0x4002));
-    assert_eq!(
-        gap,
-        vec![Edge::Gap {
-            id: 1,
-            reason: GapReason::IdentityAmbiguous,
-        }],
-        "tainted B-submit gaps A"
-    );
-    // B's return (tainted, own invocation): unknown key.
+    let nested = dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 200, 0, 0, 0x4002));
     assert!(
-        dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 220, -5, TAINTED, 0x4002))
+        matches!(nested.as_slice(), [Edge::Submit { id: 2, .. }]),
+        "nested submit admits alongside (no gap): {nested:?}"
+    );
+    assert_eq!(dec.stats().gaps_synthesized, 0);
+    // Tainted return naming B's invocation: refused, B kept.
+    assert!(
+        dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 210, -5, TAINTED, 0x4002))
             .is_empty()
     );
-    // C's submit while the slot is still disturbed: tainted, refused
-    // quietly (nothing outstanding to gap).
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
+    let b_done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 220, 0, 0, 0x4002));
     assert!(
-        dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 230, 0, TAINTED, 0x4004))
-            .is_empty()
+        matches!(b_done.as_slice(), [Edge::Return { id: 2, .. }]),
+        "inner call pairs exactly: {b_done:?}"
     );
-    assert_eq!(dec.stats().admitted, 1, "no fresh id for taint");
-    // A's real return (tainted — the slot was disturbed): unknown.
+    let a_done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 250, -5, 0, 0x4000));
     assert!(
-        dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 250, 0, TAINTED, 0x4000))
-            .is_empty()
+        matches!(a_done.as_slice(), [Edge::Return { id: 1, .. }]),
+        "outer call pairs exactly: {a_done:?}"
     );
-    // C's return (tainted): unknown.
-    assert!(
-        dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 260, 0, TAINTED, 0x4004))
-            .is_empty()
-    );
-    assert_eq!(dec.stats().unknown_key_returns, 3);
-    assert_eq!(dec.stats().gaps_synthesized, 1);
+    assert_eq!(dec.stats().admitted, 2);
 }
 
 #[test]
-fn w5_noslot_ghost_stream_refuses_everything_forever() {
-    // Round-5 W5 (sticky quarantine): a NOSLOT-dropped submit leaves
-    // a ghost — BPF quarantines the key STICKILY (never clears:
-    // clearing misattributes shared ghosts, counting races), so the
-    // ghost's return AND every later same-key edge arrive TAINTED
-    // (never clean, never admitted, never joined). The decoder side
-    // is the already-pinned taint rules; this pins the exact
-    // quarantine-emitted shape end to end, INCLUDING that the key
-    // never recovers (a later clean claim on the same key is the
-    // round-5 misjoin shape — BPF must never emit it).
+fn w8_tainted_stream_disturbs_nothing_clean_recovers() {
+    // W8 (no slots, no quarantine): tainted edges — NOSLOT-dropped
+    // submits (invoc 0), exits over zero cookies — refuse quietly
+    // and disturb nothing, WHILE a clean same-key call with a fresh
+    // invocation admits alongside and pairs normally (the W5-forbidden
+    // clean-claim shape is REQUIRED nesting behavior now).
     let mut dec = LifecycleDecoder::new(16);
     // Ghost's return (submit was NOSLOT-dropped, return tainted):
-    // unknown key, nothing disturbed.
+    // unknown invocation, nothing disturbed.
     assert!(
         dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 150, -5, TAINTED, 0))
             .is_empty()
     );
-    // Interleaved same-key submit during quarantine: tainted,
-    // refused quietly (nothing outstanding to gap).
+    // Interleaved tainted submit: refused quietly.
     assert!(
         dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 200, 0, TAINTED, 0x4002))
             .is_empty()
     );
     assert_eq!(dec.stats().submit_refused, 1);
     assert_eq!(dec.stats().admitted, 0);
-    assert_eq!(dec.stats().unknown_key_returns, 1);
-    // The quarantine sticks: later same-key edges stay tainted
-    // (the ghost count never releases — round-5 Major 1).
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
+    // A clean same-key call admits alongside the taint and pairs.
+    let admitted = dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 300, 0, 0, 0x8000));
     assert!(
-        dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 300, 0, TAINTED, 0x8000))
-            .is_empty()
+        matches!(admitted.as_slice(), [Edge::Submit { id: 1, .. }]),
+        "clean same-key admits alongside taint: {admitted:?}"
     );
     assert!(
         dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 350, 0, TAINTED, 0))
-            .is_empty()
+            .is_empty(),
+        "tainted ghost return disturbs nothing"
     );
-    assert_eq!(dec.stats().admitted, 0, "quarantined key never admits");
-    // Other keys are unaffected (quarantine is per-key).
-    let admitted = dec.feed(&edge_bytes_invoc(1, 1, 0xdef, 400, 0, 0, 0xC000));
-    assert!(
-        matches!(admitted.as_slice(), [Edge::Submit { id: 1, .. }]),
-        "other keys admit fresh: {admitted:?}"
-    );
-    let done = dec.feed(&edge_bytes_invoc(2, 1, 0xdef, 450, 0, 0, 0xC000));
+    let done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 360, 0, 0, 0x8000));
     assert!(
         matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
-        "other keys join normally: {done:?}"
+        "clean call joins normally: {done:?}"
+    );
+    // Other keys are unaffected.
+    let admitted = dec.feed(&edge_bytes_invoc(1, 1, 0xdef, 400, 0, 0, 0xC000));
+    assert!(
+        matches!(admitted.as_slice(), [Edge::Submit { id: 2, .. }]),
+        "other keys admit fresh: {admitted:?}"
     );
 }
 
@@ -588,14 +574,14 @@ fn w5_malformed_clean_invoc_refuses() {
 }
 
 #[test]
-fn w4_clean_reuse_after_loss_gaps_and_readmits() {
-    // The sound remainder: a CLEAN same-key submit while an id is
-    // outstanding proves the old invocation ended (the BPF slot
-    // empties only on a return release) — the old id gaps and the
-    // new invocation admits fresh, and only ITS return joins.
+fn w8_resubmit_gaps_and_readmits_return_joins_current() {
+    // The W8 remainder: a same-INVOCATION resubmit (twin drift or
+    // replay — BPF ids are unique) gaps the old id and admits fresh,
+    // and only the current id joins that invocation's return. A
+    // never-seen invocation's return refuses unknown.
     let mut dec = LifecycleDecoder::new(16);
     dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0x4000));
-    let gap = dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 200, 0, 0, 0x8000));
+    let gap = dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 200, 0, 0, 0x4000));
     assert_eq!(
         gap.iter().filter(|e| matches!(e, Edge::Gap { .. })).count(),
         1,
@@ -606,16 +592,16 @@ fn w4_clean_reuse_after_loss_gaps_and_readmits() {
             gap.iter().find(|e| matches!(e, Edge::Submit { .. })),
             Some(Edge::Submit { id: 2, .. })
         ),
-        "new invocation admits fresh: {gap:?}"
+        "resubmit admits fresh: {gap:?}"
     );
-    // The old invocation's return (were it delivered late) cannot
-    // join the new id: invocation mismatch refuses stale.
-    let stale = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 250, 0, 0, 0x4000));
-    assert!(stale.is_empty(), "old return cannot join new id");
-    assert_eq!(dec.stats().stale_returns, 1);
-    let done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 300, 0, 0, 0x8000));
+    // A never-seen invocation cannot join: unknown, never stale.
+    let unknown = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 250, 0, 0, 0x8000));
+    assert!(unknown.is_empty(), "foreign return joins nothing");
+    assert_eq!(dec.stats().unknown_invoc_returns, 1);
+    assert_eq!(dec.stats().stale_returns, 0);
+    let done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 300, 0, 0, 0x4000));
     assert!(
         matches!(done.as_slice(), [Edge::Return { id: 2, .. }]),
-        "new invocation joins its own return: {done:?}"
+        "current id joins its return: {done:?}"
     );
 }

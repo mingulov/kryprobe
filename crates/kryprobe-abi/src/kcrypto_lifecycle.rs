@@ -40,15 +40,14 @@ pub const LSITE_ENC: u16 = 1;
 /// `LEdge.site`: `crypto_skcipher_decrypt`.
 pub const LSITE_DEC: u16 = 2;
 
-/// `LEdge.flags` bit 0: BPF nesting taint. Set when the edge's key
-/// had no usable `LSTATE` slot at hook time — a submit nested over
-/// an outstanding call, or a return with no outstanding submit
-/// (pre-attach call, `NOSLOT` drop). The decoder refuses tainted
-/// edges; a tainted SUBMIT on an outstanding key additionally gaps
-/// that id (`IdentityAmbiguous`, since no future return can be
-/// attributed after the disturbance), while tainted returns and
-/// tainted submits with nothing outstanding leave the table
-/// undisturbed. No other flag bit is defined.
+/// `LEdge.flags` bit 0: BPF pairing taint (W8). Set on a return
+/// emitted over a zero session cookie — the entry run never executed
+/// (config/key guard skip, NOSLOT id-exhaustion drop, or pre-attach
+/// call) — so the edge names no invocation (`invoc` 0). Honest BPF
+/// never emits a tainted submit (NOSLOT drops silently); the decoder
+/// refuses every tainted edge WITHOUT disturbing the table
+/// (per-call cookies isolate invocations — a tainted edge disturbs
+/// no outstanding id). No other flag bit is defined.
 pub const LEDGE_TAINTED: u16 = 0x0001;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
@@ -66,9 +65,11 @@ pub const LLOSS_BADKEY: u32 = 2;
 /// was refused (aggregate-sensor `KDROPS_FRET` precedent: an
 /// unclassified return is skipped, never misbucketed).
 pub const LLOSS_FRET: u32 = 3;
-/// `LLOSS[4]`: submit edges dropped because the `LSTATE` slot table
-/// was full (no eviction: a full table refuses the submit loudly
-/// rather than destroying another call's pairing state).
+/// `LLOSS[4]`: submit edges dropped on invocation-id exhaustion
+/// (W8: post-accept pure drop, agg'd — accepted-but-untransported,
+/// the equation's NOSLOT term; the cookie stays zero and nothing
+/// emits, so the exit taints by construction — never a wrapped id,
+/// never a phantom submit).
 pub const LLOSS_NOSLOT: u32 = 4;
 
 /// `LAGG[0]`: accepted encrypt-submit edges (post-gate, pre-reserve).
@@ -89,23 +90,23 @@ pub const LAGG_DEC_RET: u32 = 3;
 /// submit edges carry 0), and the BPF invocation id.
 ///
 /// [`LEdge::invoc`] is the return-carried invocation identity
-/// (round-4 W4, race-hardened round-6 W6, lane-split round-7 W7):
-/// every submit takes `(per-program per-CPU sequence << 15) |
-/// (lane << 14) | (cpu << 1)` from its own program's BPF `LCTR`
-/// lane (bit 0 reserved + always clear; 0 is never issued, it means
-/// "no invocation"); the slot stores it and the matching return
-/// carries it back. The decoder joins a return ONLY to an
-/// outstanding id with the SAME invocation — a lost return + lost
-/// submit can no longer alias one call's return onto another call's
-/// id, whatever the transport drops. Pairing soundness no longer
-/// depends on lossless delivery. The decoder additionally refuses
-/// malformed clean ids (0, or reserved-bit-set —
-/// `DecodeDrop::BadInvoc`); honest BPF never emits them.
+/// (round-4 W4, race-hardened round-6 W6, lane-split round-7 W7,
+/// cookie-carried round-8 W8): every submit takes
+/// `(per-program per-CPU sequence << 15) | (lane << 14) | (cpu << 1)`
+/// from its own program's BPF `LCTR` lane (bit 0 reserved + always
+/// clear; 0 is never issued, it means "no invocation"); the entry
+/// run stores it in the kernel-zeroed per-call session cookie and
+/// the exit run of the SAME call reads the SAME cookie back. The
+/// decoder joins a return ONLY to an outstanding id with the SAME
+/// invocation — a lost return + lost submit can no longer alias one
+/// call's return onto another call's id, whatever the transport
+/// drops. Pairing soundness no longer depends on lossless delivery.
+/// The decoder additionally refuses malformed clean ids (0, or
+/// reserved-bit-set — `DecodeDrop::BadInvoc`); honest BPF never
+/// emits them.
 ///
-/// [`LEdge::invoc`] bit 0: reserved (round-6: no slot-poison writer
-/// exists — contention quarantines instead — so the bit stays a
-/// pure validity check, not a state tag). Fresh submit ids always
-/// have it clear.
+/// [`LEdge::invoc`] bit 0: reserved (W8 mints cookie ids with it
+/// clear — a pure validity check, not a state tag).
 pub const LEDGE_INVOC_POISON: u64 = 1;
 ///
 /// `Debug` is manual: [`LEdge::key`] is a raw kernel pointer and

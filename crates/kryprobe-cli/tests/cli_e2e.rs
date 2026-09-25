@@ -94,7 +94,7 @@ fn backends_json_shape_case() {
     }
 }
 
-const PROBE_NAMES: [&str; 19] = [
+const PROBE_NAMES: [&str; 20] = [
     "kernel_release",
     "bpf_syscall",
     "map_create",
@@ -103,6 +103,8 @@ const PROBE_NAMES: [&str; 19] = [
     "attach_cookies",
     "ringbuf_create",
     "btf_present",
+    // W8: session-kfunc capability gate, beside the BTF row it reads.
+    "fsession_capable",
     "userns_create",
     "yama_scope",
     "cap_state",
@@ -211,12 +213,12 @@ fn doctor_json_shape_case() {
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     let json: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("doctor json");
     let probes = json["probes"].as_array().expect("probes array");
-    assert_eq!(probes.len(), 19);
+    assert_eq!(probes.len(), 20);
     for (probe, want) in probes.iter().zip(PROBE_NAMES) {
         assert_eq!(probe["name"], want);
         let outcome = probe["outcome"].as_str().expect("outcome");
         assert!(
-            ["pass", "denied", "skipped"].contains(&outcome),
+            ["pass", "denied", "skipped", "failed"].contains(&outcome),
             "bad outcome {outcome}"
         );
         // 4B-H6.3: a passing object row names the resolved artifact.

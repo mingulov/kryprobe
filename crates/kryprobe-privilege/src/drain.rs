@@ -4,11 +4,12 @@
 //! Layout (libbpf protocol): consumer page `mmap(fd, 0)` holds the u64
 //! consumer position at offset 0; `mmap(fd, page)` of
 //! `page + 2 * max_entries` holds the u64 producer position at offset 0
-//! and the double-mapped data area after one page. Each iteration copies
-//! only the pending window into a reusable full-size view and runs the
-//! pure [`frame`] walk over it (pending bytes are stable: the kernel
-//! appends past `producer` and fails reservations on a full ring
-//! instead of wrapping over `consumer`).
+//! and the double-mapped data area after one page. Each iteration walks
+//! the mapping live ([`area::RingArea::consume_live`], H1): per-record
+//! volatile header reads, no shared reference over live bytes, no
+//! snapshot — a bulk copy over concurrently-committed bytes tears (any
+//! arch), while the live walk stops on busy and revalidates every
+//! header it copies under.
 //!
 //! Alignment: ring offsets advance in multiples of 8 by construction
 //! (see `frame` tests); record bytes are copied out and parsed
@@ -79,6 +80,13 @@ pub enum DrainError {
         /// Kernel errno.
         errno: i32,
     },
+    /// Sensor-state protocol violation (M1: ADMIT → DRAIN → CLOSED).
+    StateInvalid {
+        /// Required state for the attempted call.
+        expected: &'static str,
+        /// State the sensor is actually in.
+        actual: &'static str,
+    },
 }
 
 impl std::fmt::Display for DrainError {
@@ -90,6 +98,12 @@ impl std::fmt::Display for DrainError {
             }
             Self::EpollFailed { stage, errno } => {
                 write!(f, "epoll setup failed at {stage}: errno {errno}")
+            }
+            Self::StateInvalid { expected, actual } => {
+                write!(
+                    f,
+                    "sensor state invalid: expected {expected}, sensor is {actual}"
+                )
             }
         }
     }
@@ -186,7 +200,6 @@ impl DrainThread {
             barrier: pending.clone(),
             budget: config.max_events_per_iter as usize,
             timeout_ms: config.poll_timeout_ms as i32,
-            mask: u64::from(max_entries) - 1,
         };
         let join = std::thread::spawn(move || worker.run());
         SPAWNS.fetch_add(1, Ordering::Relaxed);

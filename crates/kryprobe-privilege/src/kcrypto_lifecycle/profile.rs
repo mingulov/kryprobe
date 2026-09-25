@@ -58,12 +58,20 @@ pub struct SessionBusy {
 
 impl std::fmt::Display for SessionBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "kcrypto session busy: '{}' is live, '{}' refused (no cross-profile capture)",
-            self.live.as_str(),
-            self.want.as_str()
-        )
+        if self.live == self.want {
+            write!(
+                f,
+                "kcrypto session busy: '{}' is live, second holder refused (single lifecycle sensor per process)",
+                self.live.as_str(),
+            )
+        } else {
+            write!(
+                f,
+                "kcrypto session busy: '{}' is live, '{}' refused (no cross-profile capture)",
+                self.live.as_str(),
+                self.want.as_str()
+            )
+        }
     }
 }
 
@@ -71,13 +79,12 @@ impl std::error::Error for SessionBusy {}
 
 /// Process-wide live profile + holder count (round-1 sol-M5/astra-M8:
 /// no CROSS-PROFILE capture — the two profiles never capture together
-/// in one process). This is a cross-profile guard, NOT process-wide
-/// single-capture enforcement: same-profile holders share (aggregate
-/// concurrency is unchanged by design), and each same-profile session
-/// brings up its own sensor — concurrent same-profile sessions each
-/// attach and each observe the same machine-wide calls through their
-/// own ledger. The count releases the process when the last holder of
-/// a profile drops.
+/// in one process). `ApiReturns` holders share (aggregate concurrency
+/// is unchanged by design — each session brings up its own sensor and
+/// observes the same machine-wide calls through its own ledger), but
+/// `RequestLifecycle` is single-owner (H5: a second lifecycle sensor
+/// would double-capture through retired trampolines). The count
+/// releases the process when the last holder of a profile drops.
 static LIVE_PROFILE: std::sync::Mutex<(Option<LifecycleProfile>, usize)> =
     std::sync::Mutex::new((None, 0));
 
@@ -115,6 +122,17 @@ pub fn acquire_kcrypto_session(profile: LifecycleProfile) -> Result<SessionGuard
             Ok(SessionGuard { profile })
         }
         Some(held) if held == profile => {
+            // H5 (W8): a second RequestLifecycle holder would attach a
+            // duplicate sensor (mutual trampoline retirement +
+            // double-capture of the same machine-wide calls), so the
+            // lifecycle sensor is single-owner; ApiReturns sharing
+            // stays (aggregate concurrency by design).
+            if profile == LifecycleProfile::RequestLifecycle {
+                return Err(SessionBusy {
+                    live: held,
+                    want: profile,
+                });
+            }
             live.1 += 1;
             Ok(SessionGuard { profile })
         }
@@ -125,15 +143,12 @@ pub fn acquire_kcrypto_session(profile: LifecycleProfile) -> Result<SessionGuard
     }
 }
 
-/// One required attach site: kernel symbol + required edges.
+/// One required attach site: kernel symbol with a single fsession
+/// program (W8: entry+return ride one link; both edges required).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequiredSite {
-    /// Kernel function name (section suffix after `fentry/`/`fexit/`).
+    /// Kernel function name (section suffix after `fsession/`).
     pub symbol: &'static str,
-    /// Entry edge required.
-    pub entry: bool,
-    /// Return edge required.
-    pub exit: bool,
 }
 
 /// The profile contract: name, required sites, frozen map table.
@@ -155,20 +170,16 @@ pub const LLOSS_LANES_PER_CLASS: u32 = 4;
 /// `LLOSS` entries: 5 classes × [`LLOSS_LANES_PER_CLASS`].
 pub const LLOSS_ENTRIES: u32 = 5 * LLOSS_LANES_PER_CLASS;
 
-/// Frozen lifecycle map table: config, edge ringbuf, per-CPU loss
-/// (5 classes × 4 program lanes), global identity slots, per-CPU
-/// accepted-edge aggregate, the per-CPU per-program invocation
-/// sequences, the NOSLOT ghost quarantine, and the
-/// quarantine-overflow flag. `LSTATE` mirrors the userspace decode
-/// bound (4096 outstanding keys) with 16-byte slots (invocation +
-/// owner tid, immutable); `LCTR` issues the per-program per-CPU
-/// sequences (one lane per entry program — an interrupt can run a
-/// different program on the same CPU, so per-CPU alone lost
-/// updates); `LLOSS` lanes fold per class in
-/// [`crate::kcrypto_lifecycle::sensor::fold_loss_lanes`];
-/// `LQ`/`LGLB` are BPF-owned sticky quarantine state (userspace
-/// keeps the fds, never reads them); `LAGG` reconciles against
-/// consumed edges + `LLOSS_RESERVE` after a quiet drain.
+/// Frozen lifecycle map table (W8 fsession): config, edge ringbuf,
+/// per-CPU loss (5 classes × 4 hook lanes), per-CPU accepted-edge
+/// aggregate, and the per-CPU per-program invocation sequences.
+/// `LCTR` issues the per-program per-CPU sequences (one lane per
+/// site program — an interrupt can run a different program on the
+/// same CPU, so per-CPU alone lost updates); `LLOSS` lanes fold per
+/// class in [`crate::kcrypto_lifecycle::sensor::fold_loss_lanes`];
+/// `LAGG` reconciles against consumed edges + `LLOSS_RESERVE` after
+/// a quiet drain. Pairing state is kernel-owned (the per-call
+/// session cookie): no slot, quarantine, or overflow tables exist.
 pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
     (
         "LCFG",
@@ -198,15 +209,6 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
         },
     ),
     (
-        "LSTATE",
-        MapDims {
-            map_type: 1,
-            key_size: 8,
-            value_size: 16,
-            max_entries: 4096,
-        },
-    ),
-    (
         "LAGG",
         MapDims {
             map_type: 6,
@@ -224,37 +226,15 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             max_entries: 2,
         },
     ),
-    (
-        "LQ",
-        MapDims {
-            map_type: 1,
-            key_size: 8,
-            value_size: 1,
-            max_entries: 4096,
-        },
-    ),
-    (
-        "LGLB",
-        MapDims {
-            map_type: 2,
-            key_size: 4,
-            value_size: 8,
-            max_entries: 1,
-        },
-    ),
 ];
 
 /// Required sites for `RequestLifecycle` (T04-qualified api sites).
 const LIFECYCLE_REQUIRED: &[RequiredSite] = &[
     RequiredSite {
         symbol: "crypto_skcipher_encrypt",
-        entry: true,
-        exit: true,
     },
     RequiredSite {
         symbol: "crypto_skcipher_decrypt",
-        entry: true,
-        exit: true,
     },
 ];
 
@@ -276,21 +256,18 @@ pub fn manifest(profile: LifecycleProfile) -> ProfileManifest {
 }
 
 /// Program limit derived from the profile's own manifest: one program
-/// per required edge (`ApiReturns` keeps its frozen 16).
+/// per required site (W8 fsession: 2; `ApiReturns` keeps its frozen 16).
 #[must_use]
 pub fn max_programs(manifest: &ProfileManifest) -> usize {
     if manifest.required.is_empty() {
         return 16;
     }
-    manifest
-        .required
-        .iter()
-        .map(|s| usize::from(s.entry) + usize::from(s.exit))
-        .sum()
+    manifest.required.len()
 }
 
-/// Section allowlist for a profile: `fentry/X` + `fexit/X` (nonempty
-/// target) for lifecycle; fexit-only for api-returns (C1 frozen).
+/// Section allowlist for a profile: `fsession/X` (nonempty target)
+/// for lifecycle (W8: fentry/fexit objects refuse here, fail-closed);
+/// fexit-only for api-returns (C1 frozen).
 #[must_use]
 pub fn section_allowed(profile: LifecycleProfile, section: &str) -> bool {
     let target = |prefix: &str| {
@@ -300,32 +277,27 @@ pub fn section_allowed(profile: LifecycleProfile, section: &str) -> bool {
     };
     match profile {
         LifecycleProfile::ApiReturns => target("fexit/"),
-        LifecycleProfile::RequestLifecycle => target("fentry/") || target("fexit/"),
+        LifecycleProfile::RequestLifecycle => target("fsession/"),
     }
 }
 
-/// Required-edge load gate: names every manifest edge whose section
+/// Required-site load gate: names every manifest site whose section
 /// did not reach [`PointStatus::Loaded`] (missing section, missing
 /// BTF id, or refused load all count — a refused point is not a
 /// loaded point). Empty means lifecycle startup may proceed; the
-/// loader refuses startup otherwise (no per-point degrade: unpaired
-/// edges cannot pair submit with result).
+/// loader refuses startup otherwise (no per-point degrade: one site
+/// alone cannot observe both operations).
 #[must_use]
 pub fn missing_required_points(statuses: &[(&str, &PointStatus)]) -> Vec<String> {
     let table = manifest(LifecycleProfile::RequestLifecycle);
     let mut out = Vec::new();
     for site in table.required {
-        for (edge, want) in [("fentry", site.entry), ("fexit", site.exit)] {
-            if !want {
-                continue;
-            }
-            let section = format!("{edge}/{}", site.symbol);
-            let loaded = statuses
-                .iter()
-                .any(|(s, st)| *s == section && matches!(st, PointStatus::Loaded { .. }));
-            if !loaded {
-                out.push(section);
-            }
+        let section = format!("fsession/{}", site.symbol);
+        let loaded = statuses
+            .iter()
+            .any(|(s, st)| *s == section && matches!(st, PointStatus::Loaded { .. }));
+        if !loaded {
+            out.push(section);
         }
     }
     out

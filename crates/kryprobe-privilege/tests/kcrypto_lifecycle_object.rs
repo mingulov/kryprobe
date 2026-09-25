@@ -21,47 +21,44 @@ use kryprobe_privilege::kcrypto_lifecycle::profile::{
 };
 
 #[test]
-fn h01_lifecycle_manifest_requires_both_edges_per_site() {
-    // The T06 profile observes the two T04-qualified api sites, each at
-    // entry AND return; anything less cannot pair submit with result.
+fn h01_lifecycle_manifest_requires_both_sites() {
+    // The T06 profile observes the two T04-qualified api sites (W8:
+    // one fsession program per site runs at entry AND return — both
+    // edges ride one link; anything less cannot observe both ops).
     let m = manifest(LifecycleProfile::RequestLifecycle);
     assert_eq!(m.name, "request-lifecycle");
-    let sites: Vec<(&str, bool, bool)> = m
-        .required
-        .iter()
-        .map(|s| (s.symbol, s.entry, s.exit))
-        .collect();
+    let sites: Vec<&str> = m.required.iter().map(|s| s.symbol).collect();
     assert_eq!(
         sites,
-        [
-            ("crypto_skcipher_encrypt", true, true),
-            ("crypto_skcipher_decrypt", true, true),
-        ]
+        ["crypto_skcipher_encrypt", "crypto_skcipher_decrypt"]
     );
 }
 
 #[test]
 fn h01_program_limit_derives_from_manifest_not_global_cap() {
-    // 2 sites x 2 edges = 4; the api-returns 16-program cap is a
-    // different profile's limit and must not leak across.
+    // One fsession program per required site = 2; the api-returns
+    // 16-program cap is a different profile's limit and must not leak
+    // across.
     let lc = manifest(LifecycleProfile::RequestLifecycle);
-    assert_eq!(max_programs(&lc), 4);
+    assert_eq!(max_programs(&lc), 2);
     let api = manifest(LifecycleProfile::ApiReturns);
     assert_eq!(max_programs(&api), 16);
     assert_ne!(max_programs(&lc), max_programs(&api));
 }
 
 #[test]
-fn h01_lifecycle_sections_accept_entry_and_return_pairs() {
+fn h01_lifecycle_sections_accept_fsession_only() {
+    // W8: lifecycle objects carry `fsession/` programs only — stale
+    // fentry/fexit objects refuse here, fail-closed.
     let p = LifecycleProfile::RequestLifecycle;
-    assert!(section_allowed(p, "fentry/crypto_skcipher_encrypt"));
-    assert!(section_allowed(p, "fexit/crypto_skcipher_encrypt"));
-    assert!(section_allowed(p, "fentry/crypto_skcipher_decrypt"));
-    assert!(section_allowed(p, "fexit/crypto_skcipher_decrypt"));
-    assert!(!section_allowed(p, "fentry/"));
-    assert!(!section_allowed(p, "fexit/"));
-    assert!(!section_allowed(p, "fentry"));
-    assert!(!section_allowed(p, "fexit"));
+    assert!(section_allowed(p, "fsession/crypto_skcipher_encrypt"));
+    assert!(section_allowed(p, "fsession/crypto_skcipher_decrypt"));
+    assert!(!section_allowed(p, "fentry/crypto_skcipher_encrypt"));
+    assert!(!section_allowed(p, "fexit/crypto_skcipher_encrypt"));
+    assert!(!section_allowed(p, "fentry/crypto_skcipher_decrypt"));
+    assert!(!section_allowed(p, "fexit/crypto_skcipher_decrypt"));
+    assert!(!section_allowed(p, "fsession/"));
+    assert!(!section_allowed(p, "fsession"));
     assert!(!section_allowed(p, "kprobe/crypto_skcipher_encrypt"));
     assert!(!section_allowed(p, "uprobe.multi"));
     assert!(!section_allowed(p, ""));
@@ -76,6 +73,7 @@ fn h01_api_returns_sections_stay_fexit_only() {
     assert!(section_allowed(p, "fexit/x"));
     assert!(!section_allowed(p, "fentry/crypto_alloc_tfm_node"));
     assert!(!section_allowed(p, "fentry/x"));
+    assert!(!section_allowed(p, "fsession/x"));
     assert!(!section_allowed(p, "uprobe.multi"));
     assert!(!section_allowed(p, "fexit"));
     assert!(!section_allowed(p, ""));
@@ -84,19 +82,13 @@ fn h01_api_returns_sections_stay_fexit_only() {
 #[test]
 fn h01_lifecycle_map_table_is_exact_and_dot_free() {
     // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss,
-    // 5 classes x 4 program lanes), LSTATE (global identity slots,
-    // 16-byte invoc+tid), LAGG (per-CPU accepted aggregate), LCTR
-    // (per-CPU per-program invocation sequence), LQ (NOSLOT ghost
-    // quarantine), LGLB (quarantine-overflow flag): the T06 contract
-    // the BPF object must match byte-for-byte.
-    assert_eq!(LIFECYCLE_MAPS.len(), 8);
+    // 5 classes x 4 hook lanes), LAGG (per-CPU accepted aggregate),
+    // LCTR (per-CPU per-program invocation sequence): the W8 T06
+    // contract the BPF object must match byte-for-byte (pairing state
+    // is kernel-owned — no slot, quarantine, or overflow tables).
+    assert_eq!(LIFECYCLE_MAPS.len(), 5);
     let names: Vec<&str> = LIFECYCLE_MAPS.iter().map(|(n, _)| *n).collect();
-    assert_eq!(
-        names,
-        [
-            "LCFG", "LRING", "LLOSS", "LSTATE", "LAGG", "LCTR", "LQ", "LGLB"
-        ]
-    );
+    assert_eq!(names, ["LCFG", "LRING", "LLOSS", "LAGG", "LCTR"]);
     for name in &names {
         assert!(!name.contains('.'), "R3 dot-free gate: {name}");
     }
@@ -135,15 +127,6 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
         }
     );
     assert_eq!(
-        dims("LSTATE"),
-        MapDims {
-            map_type: 1,
-            key_size: 8,
-            value_size: 16,
-            max_entries: 4096,
-        }
-    );
-    assert_eq!(
         dims("LAGG"),
         MapDims {
             map_type: 6,
@@ -159,24 +142,6 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             key_size: 4,
             value_size: 8,
             max_entries: 2,
-        }
-    );
-    assert_eq!(
-        dims("LQ"),
-        MapDims {
-            map_type: 1,
-            key_size: 8,
-            value_size: 1,
-            max_entries: 4096,
-        }
-    );
-    assert_eq!(
-        dims("LGLB"),
-        MapDims {
-            map_type: 2,
-            key_size: 4,
-            value_size: 8,
-            max_entries: 1,
         }
     );
 }
@@ -233,11 +198,11 @@ fn f10_required_gate_preserves_load_error_type() {
     // Round-1 (sol-m10/astra-m10): a required point's load refusal
     // must surface typed (errno + verifier tail), not as a
     // shape-flavored BadObject. Shape-only misses stay BadObject.
-    let missing = vec!["fentry/crypto_skcipher_encrypt".to_owned()];
+    let missing = vec!["fsession/crypto_skcipher_encrypt".to_owned()];
     let load_errors = vec![(
-        "fentry/crypto_skcipher_encrypt".to_owned(),
+        "fsession/crypto_skcipher_encrypt".to_owned(),
         LoaderError::LoadFailed {
-            stage: "kcrypto_encrypt_entry".to_owned(),
+            stage: "kcrypto_encrypt_session".to_owned(),
             errno: 13,
             log: "verifier tail".to_owned(),
         },
@@ -246,14 +211,17 @@ fn f10_required_gate_preserves_load_error_type() {
         LoaderError::LoadFailed { stage, errno, log } => {
             assert_eq!(errno, 13);
             assert_eq!(log, "verifier tail");
-            assert!(stage.contains("fentry/crypto_skcipher_encrypt"), "{stage}");
+            assert!(
+                stage.contains("fsession/crypto_skcipher_encrypt"),
+                "{stage}"
+            );
         }
         other => panic!("want LoadFailed, got {other:?}"),
     }
     match required_gate_error(&missing, &[]) {
         LoaderError::BadObject { reason } => {
             assert!(
-                reason.contains("fentry/crypto_skcipher_encrypt"),
+                reason.contains("fsession/crypto_skcipher_encrypt"),
                 "{reason}"
             );
         }
@@ -443,27 +411,25 @@ fn build_lifecycle_fixture(prog_sections: &[&str], maps: &[(&str, MapDims)]) -> 
     out
 }
 
-/// The T06 contract as a fixture: both edges for both api sites plus
-/// the exact frozen map table.
+/// The T06 contract as a fixture: one fsession program per api site
+/// plus the exact frozen map table.
 fn valid_lifecycle_fixture() -> Vec<u8> {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
     build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
         ],
         &maps,
     )
 }
 
 #[test]
-fn h02_valid_entry_return_object_parses() {
+fn h02_valid_session_object_parses() {
     let bytes = valid_lifecycle_fixture();
     let parsed = parse_lifecycle_object(&bytes).expect("valid fixture must parse");
-    assert_eq!(parsed.maps.len(), 8);
-    assert_eq!(parsed.programs.len(), 4);
+    assert_eq!(parsed.maps.len(), 5);
+    assert_eq!(parsed.programs.len(), 2);
     for prog in &parsed.programs {
         assert_eq!(prog.insns.len(), 1, "{} stream drifted", prog.name);
     }
@@ -473,15 +439,8 @@ fn h02_valid_entry_return_object_parses() {
 #[test]
 fn h02_missing_required_site_refused_by_name() {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
-    let bytes = build_lifecycle_fixture(
-        &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-        ],
-        &maps,
-    );
-    let err = parse_lifecycle_object(&bytes).expect_err("missing fexit/decrypt must refuse");
+    let bytes = build_lifecycle_fixture(&["fsession/crypto_skcipher_encrypt"], &maps);
+    let err = parse_lifecycle_object(&bytes).expect_err("missing fsession/decrypt must refuse");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("crypto_skcipher_decrypt"),
@@ -494,9 +453,7 @@ fn h02_wrong_attach_prototype_refused() {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
     let bytes = build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
             "kprobe/crypto_skcipher_decrypt",
         ],
         &maps,
@@ -523,10 +480,8 @@ fn h02_extra_map_refused() {
     ));
     let bytes = build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
         ],
         &maps,
     );
@@ -547,10 +502,8 @@ fn h02_duplicate_map_refused_typed() {
     maps.push(maps[0]);
     let bytes = build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
         ],
         &maps,
     );
@@ -571,10 +524,8 @@ fn h02_bad_dims_refused() {
     maps[0].1.value_size = 128;
     let bytes = build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
         ],
         &maps,
     );
@@ -589,10 +540,8 @@ fn h02_missing_map_refused() {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS[..2].to_vec();
     let bytes = build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
         ],
         &maps,
     );
@@ -605,17 +554,15 @@ fn h02_too_many_programs_refused_at_manifest_limit() {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
     let bytes = build_lifecycle_fixture(
         &[
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_encrypt",
-            "fentry/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_decrypt",
-            "fentry/crypto_skcipher_extra",
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_extra",
         ],
         &maps,
     );
-    let err = parse_lifecycle_object(&bytes).expect_err("5th program must refuse");
+    let err = parse_lifecycle_object(&bytes).expect_err("3rd program must refuse");
     let msg = format!("{err:?}");
-    assert!(msg.contains('4'), "refusal names the manifest limit: {msg}");
+    assert!(msg.contains('2'), "refusal names the manifest limit: {msg}");
 }
 
 /// Workspace-relative path of the built lifecycle object.
@@ -647,10 +594,8 @@ fn h02_built_object_matches_manifest() {
     assert_eq!(
         sections,
         [
-            "fentry/crypto_skcipher_decrypt",
-            "fentry/crypto_skcipher_encrypt",
-            "fexit/crypto_skcipher_decrypt",
-            "fexit/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_skcipher_encrypt",
         ]
     );
     assert_eq!(parsed.maps.len(), LIFECYCLE_MAPS.len());
@@ -671,6 +616,73 @@ fn h02_built_object_matches_manifest() {
     }
     for prog in &parsed.programs {
         assert!(!prog.insns.is_empty(), "{} has no insns", prog.name);
+    }
+}
+
+#[test]
+fn w8_built_object_codegen_pins_kfunc_stubs() {
+    // Ratification B (implementer proof): the fsession BPF calls the
+    // session kfuncs through sentinel immediates with NO relocations
+    // (R4-safe by construction — aya has no kfunc support, so the
+    // loader rewrites plain `call imm` sites). Pins: zero
+    // `R_BPF_64_32` anywhere in the object (map refs ride 64_64), and
+    // per program exactly one `is_return` site (0x5F4B0001, the top
+    // branch) plus two `cookie` sites (0x5F4B0002, one per run).
+    // Every OTHER call imm is a small helper id — no other
+    // sentinel-shaped (unrewritable) call target exists.
+    const OP_CALL: u8 = 0x85;
+    const IS_RETURN: i32 = 0x5F4B_0001;
+    const COOKIE: i32 = 0x5F4B_0002;
+    let path = lifecycle_object_path();
+    assert!(
+        path.is_file(),
+        "missing BPF lifecycle object at {} — run `cargo xtask build --bpf`",
+        path.display()
+    );
+    let bytes = std::fs::read(&path).expect("test fixture must be readable");
+    // Zero R_BPF_64_32 (type 10) across every SHT_REL section.
+    let elf = goblin::elf::Elf::parse(&bytes).expect("valid ELF");
+    let mut call_relocs = 0usize;
+    for sh in elf.section_headers.iter() {
+        if sh.sh_type != 9 {
+            continue;
+        }
+        let base = sh.sh_offset as usize;
+        for entry in 0..sh.sh_size as usize / 16 {
+            let at = base + entry * 16;
+            let info = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().expect("rel entry"));
+            if (info & 0xffff_ffff) as u32 == 10 {
+                call_relocs += 1;
+            }
+        }
+    }
+    assert_eq!(call_relocs, 0, "kfunc stubs must carry no relocations");
+    // Pinned sentinel sites + helper-only remainder, per program.
+    let parsed = parse_lifecycle_object(&bytes).expect("built object must parse");
+    assert_eq!(parsed.programs.len(), 2);
+    for prog in &parsed.programs {
+        let mut is_return = 0usize;
+        let mut cookie = 0usize;
+        for insn in &prog.insns {
+            if insn.code != OP_CALL {
+                continue;
+            }
+            match insn.imm {
+                IS_RETURN => is_return += 1,
+                COOKIE => cookie += 1,
+                helper if helper > 0 && helper < 0x1000 => {}
+                other => panic!(
+                    "{}: call target {other:#x} is neither a pinned sentinel nor a helper id",
+                    prog.section
+                ),
+            }
+        }
+        assert_eq!(
+            (is_return, cookie),
+            (1, 2),
+            "{}: want 1 is_return + 2 cookie sites",
+            prog.section
+        );
     }
 }
 
@@ -710,30 +722,26 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
         )
     };
     let all = [
-        loaded("fentry/crypto_skcipher_encrypt"),
-        loaded("fexit/crypto_skcipher_encrypt"),
-        loaded("fentry/crypto_skcipher_decrypt"),
-        loaded("fexit/crypto_skcipher_decrypt"),
+        loaded("fsession/crypto_skcipher_encrypt"),
+        loaded("fsession/crypto_skcipher_decrypt"),
     ];
     let refs: Vec<(&str, &PointStatus)> = all.iter().map(|(s, st)| (s.as_str(), st)).collect();
     assert!(missing_required_points(&refs).is_empty());
-    // One edge missing → named.
-    let refs: Vec<(&str, &PointStatus)> = refs[..3].to_vec();
+    // One site missing → named.
+    let refs: Vec<(&str, &PointStatus)> = refs[..1].to_vec();
     assert_eq!(
         missing_required_points(&refs),
-        ["fexit/crypto_skcipher_decrypt"]
+        ["fsession/crypto_skcipher_decrypt"]
     );
     // Unsupported counts as missing (refused load ≠ loaded point).
     let bad = [
-        loaded("fentry/crypto_skcipher_encrypt"),
-        loaded("fexit/crypto_skcipher_encrypt"),
-        loaded("fentry/crypto_skcipher_decrypt"),
-        missing("fexit/crypto_skcipher_decrypt"),
+        loaded("fsession/crypto_skcipher_encrypt"),
+        missing("fsession/crypto_skcipher_decrypt"),
     ];
     let refs: Vec<(&str, &PointStatus)> = bad.iter().map(|(s, st)| (s.as_str(), st)).collect();
     assert_eq!(
         missing_required_points(&refs),
-        ["fexit/crypto_skcipher_decrypt"]
+        ["fsession/crypto_skcipher_decrypt"]
     );
 }
 
@@ -754,7 +762,7 @@ fn bringup_config_bytes_carry_exact_magic_version() {
 #[test]
 fn h02_api_returns_shape_rejected_by_lifecycle_parse() {
     // Cross-discrimination: an fexit-only api-returns-shaped object is
-    // not a lifecycle object (missing entry edges + wrong map table).
+    // not a lifecycle object (missing fsession sites + wrong sections).
     let bytes = build_lifecycle_fixture(
         &["fexit/crypto_alloc_tfm_node", "fexit/crypto_destroy_tfm"],
         LIFECYCLE_MAPS,
@@ -762,8 +770,8 @@ fn h02_api_returns_shape_rejected_by_lifecycle_parse() {
     let err = parse_lifecycle_object(&bytes).expect_err("api-returns shape must refuse");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("crypto_skcipher_encrypt") || msg.contains("crypto_skcipher_decrypt"),
-        "refusal names a missing required site: {msg}"
+        msg.contains("fexit/crypto_alloc_tfm_node"),
+        "refusal names the unsupported section: {msg}"
     );
 }
 
@@ -1039,10 +1047,12 @@ fn f8a_profile_parse_round_trips_both_names() {
 fn f8b_cross_profile_sessions_exclude_same_process() {
     // Round-1 (sol-M5/astra-M8): no cross-profile capture — a live
     // api-returns session refuses a request-lifecycle bring-up in the
-    // same process and vice versa. Same-profile holders share (today's
-    // aggregate concurrency is unchanged); dropping every holder
-    // releases the process for the other profile. Single test: the
-    // guard is process-global, so the sequence must not interleave.
+    // same process and vice versa. ApiReturns holders share (today's
+    // aggregate concurrency is unchanged), but RequestLifecycle is
+    // single-owner (H5: a second lifecycle sensor would double-capture
+    // through retired trampolines); dropping every holder releases the
+    // process for the other profile. Single test: the guard is
+    // process-global, so the sequence must not interleave.
     let agg = acquire_kcrypto_session(LifecycleProfile::ApiReturns).expect("first holder");
     assert!(matches!(
         acquire_kcrypto_session(LifecycleProfile::RequestLifecycle),
@@ -1054,6 +1064,11 @@ fn f8b_cross_profile_sessions_exclude_same_process() {
     drop(agg2);
     let life = acquire_kcrypto_session(LifecycleProfile::RequestLifecycle).expect("released");
     assert!(acquire_kcrypto_session(LifecycleProfile::ApiReturns).is_err());
+    // H5: a second lifecycle holder refuses (same-profile exclusion).
+    assert!(matches!(
+        acquire_kcrypto_session(LifecycleProfile::RequestLifecycle),
+        Err(SessionBusy { .. })
+    ));
     drop(life);
     assert!(acquire_kcrypto_session(LifecycleProfile::ApiReturns).is_ok());
 }

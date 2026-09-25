@@ -371,6 +371,16 @@ pub struct SensorView<'a> {
     pub baseline: SensorBaseline,
     /// Quiet-verdict close backlog in ring bytes (must be 0).
     pub quiet_backlog_bytes: u64,
+    /// M2 sticky identity verdict (must be true: a void identity
+    /// voids every exact count in the run).
+    pub view_valid: bool,
+    /// Attach count while armed (must be exactly 2 — the two
+    /// fsession session links, W8; captured pre-close since detach
+    /// drops the links before the verdict runs).
+    pub attached_links: usize,
+    /// Foreign tracing links on our attach targets (must be 0 — H4
+    /// retirement exclusion: any foreign link may have retired ours).
+    pub foreign_links: u64,
 }
 
 /// Exact verdict over one scenario: `Ok(())` passes, `Err(reason)`
@@ -394,6 +404,21 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         return Err(format!(
             "close backlog {} bytes (teardown loss)",
             view.quiet_backlog_bytes
+        ));
+    }
+    if !view.view_valid {
+        return Err("sensor identity unverified (M2 sticky validity void)".to_owned());
+    }
+    if view.attached_links != 2 {
+        return Err(format!(
+            "want exactly 2 session links, have {}",
+            view.attached_links
+        ));
+    }
+    if view.foreign_links != 0 {
+        return Err(format!(
+            "foreign tracing links on our targets: {} (H4 retirement exclusion)",
+            view.foreign_links
         ));
     }
     let sub = |a: u64, b: u64, what: &str| -> Result<u64, String> {
@@ -456,11 +481,11 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             )?,
         ),
         (
-            "unknown_key_returns",
+            "unknown_invoc_returns",
             sub(
-                view.decode.unknown_key_returns,
-                view.baseline.decode.unknown_key_returns,
-                "unknown_key_returns",
+                view.decode.unknown_invoc_returns,
+                view.baseline.decode.unknown_invoc_returns,
+                "unknown_invoc_returns",
             )?,
         ),
         (
@@ -705,6 +730,125 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     Ok(())
 }
 
+/// H4 foreign-link classifier (pure — the privileged enumeration
+/// in the canary shell feeds it): a link is foreign when it is a
+/// `TRACING` link on one of OUR attach targets with a program id
+/// outside OUR program set. Anything else (own links, other link
+/// types, other targets) is not ours to exclude.
+#[must_use]
+pub fn is_foreign_link(
+    link_type: u32,
+    prog_id: u32,
+    target_btf_id: u32,
+    own_prog_ids: &[u32],
+    target_btf_ids: &[u32],
+) -> bool {
+    link_type == crate::probe::bpf_sys::BPF_LINK_TYPE_TRACING
+        && target_btf_ids.contains(&target_btf_id)
+        && !own_prog_ids.contains(&prog_id)
+}
+
+/// Count foreign tracing links on our attach targets by root
+/// enumeration (`BPF_LINK_GET_NEXT_ID` + `GET_FD_BY_ID` + GET_INFO per
+/// link, classified by [`is_foreign_link`]). Bounded (refuses past
+/// the cap instead of looping forever); permission refusals surface
+/// typed (the canary shell maps them to its environment exit).
+pub fn count_foreign_links(
+    own_prog_ids: &[u32],
+    target_btf_ids: &[u32],
+) -> Result<u64, ForeignLinksError> {
+    use crate::probe::bpf_sys::{link_get_fd_by_id, link_get_next_id, obj_get_info};
+    const CAP: u32 = 65_536;
+    const PREFIX: u32 = 24;
+    let mut foreign = 0u64;
+    let mut id = 0u32;
+    let mut seen = 0u32;
+    loop {
+        let Some(next) = link_get_next_id(id).map_err(|errno| ForeignLinksError::Enumerate {
+            stage: "link_get_next_id",
+            errno,
+        })?
+        else {
+            return Ok(foreign);
+        };
+        id = next;
+        seen += 1;
+        if seen > CAP {
+            return Err(ForeignLinksError::TooMany { cap: CAP });
+        }
+        let fd = match link_get_fd_by_id(next) {
+            Ok(fd) => fd,
+            // Raced with detach (the link vanished between id and
+            // open) — not evidence either way, skip it.
+            Err(libc::ENOENT) => continue,
+            Err(errno) => {
+                return Err(ForeignLinksError::Enumerate {
+                    stage: "link_get_fd_by_id",
+                    errno,
+                });
+            }
+        };
+        let mut buf = [0u8; 512];
+        let got = obj_get_info(fd.as_raw_fd(), &mut buf).map_err(|errno| {
+            ForeignLinksError::Enumerate {
+                stage: "link_get_info",
+                errno,
+            }
+        })?;
+        if got < PREFIX {
+            return Err(ForeignLinksError::InfoShort { got, want: PREFIX });
+        }
+        let u32le =
+            |off: usize| u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        if is_foreign_link(u32le(0), u32le(8), u32le(20), own_prog_ids, target_btf_ids) {
+            foreign += 1;
+        }
+    }
+}
+
+/// H4 enumeration failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignLinksError {
+    /// Syscall refused (stage + errno; EPERM/EACCES = not root).
+    Enumerate {
+        /// Failing stage (static).
+        stage: &'static str,
+        /// Kernel errno.
+        errno: i32,
+    },
+    /// Link table past the sanity cap (refuse, never loop).
+    TooMany {
+        /// Cap that tripped.
+        cap: u32,
+    },
+    /// Kernel link-info shorter than the consumed prefix.
+    InfoShort {
+        /// Reported length.
+        got: u32,
+        /// Required prefix.
+        want: u32,
+    },
+}
+
+impl std::fmt::Display for ForeignLinksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enumerate { stage, errno } => {
+                write!(
+                    f,
+                    "foreign-link enumeration failed at {stage}: errno {errno}"
+                )
+            }
+            Self::TooMany { cap } => write!(f, "link table past cap {cap}"),
+            Self::InfoShort { got, want } => {
+                write!(f, "link info length {got} below prefix {want}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ForeignLinksError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +892,9 @@ mod tests {
             retained_dropped: 0,
             baseline: SensorBaseline::default(),
             quiet_backlog_bytes: 0,
+            view_valid: true,
+            attached_links: 2,
+            foreign_links: 0,
         }
     }
 
@@ -889,6 +1036,41 @@ mod tests {
         let mut truth = sync_truth();
         truth.fixture_result = -1;
         verdict("sync-once", &truth, &sync_view(&completed)).expect_err("fixture fail must fail");
+    }
+
+    #[test]
+    fn verdict_void_identity_or_links_fail() {
+        // W8/H4: a void M2 identity, a non-2 link count, or any
+        // foreign link on our targets fails the run — exact counts
+        // are void without identity + retirement exclusion.
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut view = sync_view(&completed);
+        view.view_valid = false;
+        let err = verdict("sync-once", &truth, &view).expect_err("void identity must fail");
+        assert!(err.contains("identity"), "names it: {err}");
+        let mut view = sync_view(&completed);
+        view.attached_links = 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("1 link must fail");
+        assert!(err.contains("2 session links"), "names it: {err}");
+        let mut view = sync_view(&completed);
+        view.foreign_links = 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("foreign link must fail");
+        assert!(err.contains("foreign"), "names it: {err}");
+    }
+
+    #[test]
+    fn foreign_link_classification() {
+        // Pure classifier behind the H4 root enumeration: only a
+        // TRACING link on OUR target with a prog id OUTSIDE our set
+        // counts as foreign (own links, other link types, and other
+        // targets never count).
+        let own = [11u32, 12];
+        let targets = [700u32, 701];
+        assert!(is_foreign_link(2, 99, 700, &own, &targets));
+        assert!(!is_foreign_link(2, 11, 700, &own, &targets));
+        assert!(!is_foreign_link(2, 99, 702, &own, &targets));
+        assert!(!is_foreign_link(1, 99, 700, &own, &targets));
     }
 
     #[test]
@@ -1105,6 +1287,9 @@ mod tests {
             retained_dropped: 0,
             baseline: SensorBaseline::default(),
             quiet_backlog_bytes: 0,
+            view_valid: true,
+            attached_links: 2,
+            foreign_links: 0,
         };
         let err = verdict("async-once", &truth, &view).expect_err("foreign terminal must fail");
         assert!(err.contains("terminals"), "names it: {err}");

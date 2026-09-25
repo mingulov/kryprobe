@@ -19,6 +19,7 @@
 //! dot-free pin gate (R3). The spine path above is byte-identical.
 
 pub(crate) mod instantiate;
+pub(crate) mod kfunc;
 pub(crate) mod mapcreate;
 pub mod parse;
 pub(crate) mod progload;
@@ -431,21 +432,14 @@ pub struct LifecycleMaps {
     pub config: OwnedFd,
     /// `LRING` (raw edge ringbuf).
     pub ring: OwnedFd,
-    /// `LLOSS` (per-CPU per-program loss counters, 5 classes × 4
+    /// `LLOSS` (per-CPU per-hook loss counters, 5 classes × 4
     /// lanes; userspace folds per class).
     pub loss: OwnedFd,
-    /// `LSTATE` (global outstanding-call slots, 16-byte
-    /// invocation + owner tid).
-    pub state: OwnedFd,
     /// `LAGG` (per-CPU accepted-edge aggregate, 4 entries).
     pub agg: OwnedFd,
     /// `LCTR` (per-CPU per-program invocation sequences, 2 lanes;
     /// BPF-owned — userspace keeps the fd, never reads it).
     pub ctr: OwnedFd,
-    /// `LQ` (NOSLOT ghost quarantine; BPF-owned, never read).
-    pub quar: OwnedFd,
-    /// `LGLB` (quarantine-overflow flag; BPF-owned, never read).
-    pub glb: OwnedFd,
 }
 
 /// Loaded lifecycle object: maps + programs as (section, handle)

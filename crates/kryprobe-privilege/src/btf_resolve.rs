@@ -266,6 +266,21 @@ pub fn resolve_btf_ids() -> Result<HashMap<String, u32>, BtfError> {
     resolve_btf_ids_from(bytes)
 }
 
+/// Session-kfunc FUNC names (T06 W8): the two kfuncs the fsession BPF
+/// calls through loader-rewritten stubs. Kernel 7.0+ only (absent
+/// from 6.x vmlinux BTF — the floor refusal).
+pub const KFUNC_SYMBOLS: &[&str] = &["bpf_session_is_return", "bpf_session_cookie"];
+
+/// Resolve the [`KFUNC_SYMBOLS`] to vmlinux BTF FUNC ids.
+/// Unprivileged. Both must resolve; a missing kfunc fails the whole
+/// call (fail-closed: a half rewrite would leave a sentinel the
+/// verifier refuses, but the typed error here names the cause).
+pub fn resolve_kfunc_ids() -> Result<HashMap<String, u32>, BtfError> {
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    let btf = Btf::parse(bytes)?;
+    btf_ids_from_btf_for(&btf, KFUNC_SYMBOLS)
+}
+
 /// Resolve the 9 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
 ///
 /// Fail-closed on the C3 first-member links: the BPF hardcodes 0 for

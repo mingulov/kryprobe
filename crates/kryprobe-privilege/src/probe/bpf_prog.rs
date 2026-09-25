@@ -2,8 +2,9 @@
 //! Program-load, self-link, and token probe rows (T6c1 split).
 
 use super::bpf_sys::{
-    BPF_LINK_CREATE, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_TOKEN_CREATE, BPF_TRACE_UPROBE_MULTI,
-    Insn, LinkUprobeMulti, ProgAttr, TokenAttr, bpf, denied_or_skipped, fd_or_errno, last_errno,
+    BPF_LINK_CREATE, BPF_PROG_LOAD, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING, BPF_TOKEN_CREATE,
+    BPF_TRACE_FSESSION, BPF_TRACE_UPROBE_MULTI, Insn, LinkUprobeMulti, ProgAttr, TokenAttr, bpf,
+    denied_or_skipped, fd_or_errno, last_errno,
 };
 use crate::elfread::{ElfBytes, MmapGuard, symbol_file_offset};
 use crate::fd::OwnedFd;
@@ -64,6 +65,51 @@ pub fn prog_load_minimal() -> ProbeOutcome {
             denied_or_skipped("prog_load", errno)
         }
     }
+}
+
+/// Loads a 2-insn `TRACING` program with `expected_attach_type =
+/// FSESSION` against `attach_btf_id` (ratification C: the capability
+/// probe MUST load with 58 — a plain fentry probe would `-EACCES` and
+/// misreport). `mov r0, 0; exit` verifies as the session entry shape;
+/// the fd (or errno) is the whole signal.
+pub(crate) fn load_minimal_fsession(attach_btf_id: u32) -> Result<OwnedFd, i32> {
+    // mov r0, 0; exit
+    let insns = [
+        Insn {
+            code: 0xb7,
+            dst_src: 0,
+            off: 0,
+            imm: 0,
+        },
+        Insn {
+            code: 0x95,
+            dst_src: 0,
+            off: 0,
+            imm: 0,
+        },
+    ];
+    let license = b"GPL\0";
+    let mut attr = ProgAttr {
+        prog_type: BPF_PROG_TYPE_TRACING,
+        insn_cnt: 2,
+        insns: (&raw const insns).addr() as u64,
+        license: (&raw const license).addr() as u64,
+        rest: [0; 20],
+    };
+    // UAPI offsets (cf. `FexitProgAttr`): 68 is
+    // `expected_attach_type` (high half of rest[5]); 108 is
+    // `attach_btf_id` (high half of rest[10]).
+    attr.rest[5] = (u64::from(BPF_TRACE_FSESSION)) << 32;
+    attr.rest[10] = (u64::from(attach_btf_id)) << 32;
+    // SAFETY: `attr` (+ pointed-to insns/license) outlive the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_PROG_LOAD,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<ProgAttr>() as u32,
+        )
+    };
+    fd_or_errno(ret)
 }
 
 fn libc_path() -> Option<String> {

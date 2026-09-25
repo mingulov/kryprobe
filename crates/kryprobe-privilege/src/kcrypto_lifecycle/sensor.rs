@@ -12,17 +12,20 @@
 use crate::btf_resolve::{ConfiguredError, ConfiguredPoint};
 use crate::drain::DrainError;
 use crate::drain::area::RingArea;
-use crate::drain::frame::consume_range;
 use crate::kcrypto_lifecycle::decode::{DecodeStats, LifecycleDecoder, decode_record};
 use crate::kcrypto_lifecycle::profile::{
     LIFECYCLE_MAPS, LLOSS_ENTRIES, LLOSS_LANES_PER_CLASS, LifecycleProfile, SessionGuard,
     acquire_kcrypto_session,
 };
-use crate::kcrypto_lifecycle::{ConfiguredLifecycle, load_lifecycle_configured};
+use crate::kcrypto_lifecycle::view::SensorIdentity;
+use crate::kcrypto_lifecycle::{
+    ConfiguredLifecycle, arm_lifecycle_config, disarm_lifecycle_config, load_lifecycle_configured,
+};
 use crate::mapops::{MapOpsError, map_lookup_percpu_sum};
 use kryprobe_abi::kcrypto_lifecycle::{LEDGE_RETURN, LSITE_DEC};
 use kryprobe_core::kcrypto::{LifecycleReducer, ReducerStats, RequestRecord};
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Tally slot for a validated raw edge: `[enc-submit, enc-return,
 /// dec-submit, dec-return]`. Validated inputs only (`decode_record`
@@ -60,6 +63,30 @@ pub fn fold_loss_lanes(lanes: [u64; LLOSS_ENTRIES as usize]) -> [u64; 5] {
     out
 }
 
+/// Read `LLOSS` per-class totals + `LAGG` per-hook accepted totals
+/// (shared by the pre-arm baseline and every ledger snapshot).
+fn read_kernel_counters(
+    configured: &ConfiguredLifecycle,
+) -> Result<([u64; 5], [u64; 4]), MapOpsError> {
+    let mut lanes = [0u64; LLOSS_ENTRIES as usize];
+    for (idx, slot) in lanes.iter_mut().enumerate() {
+        *slot = map_lookup_percpu_sum(
+            &configured.loaded.maps.loss,
+            idx as u32,
+            "lifecycle_sensor/lloss",
+        )?;
+    }
+    let mut agg_accepted = [0u64; 4];
+    for (idx, slot) in agg_accepted.iter_mut().enumerate() {
+        *slot = map_lookup_percpu_sum(
+            &configured.loaded.maps.agg,
+            idx as u32,
+            "lifecycle_sensor/lagg",
+        )?;
+    }
+    Ok((fold_loss_lanes(lanes), agg_accepted))
+}
+
 /// Terminal ledger: completed records plus every loss class,
 /// snapshotted together (the single terminal accounting point).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,12 +108,34 @@ pub struct LifecycleLedger {
     /// After a quiet drain with an empty close ring,
     /// `sum(agg_accepted) == sum(edge_hits) + kernel_loss[RESERVE] +
     /// kernel_loss[NOSLOT]` exactly — the reconciliation equation
-    /// (the canary asserts it; `LAGG` bumps before the slot claim,
-    /// so NOSLOT drops count as accepted-but-untransported).
+    /// (the canary asserts it; `LAGG` bumps before the invocation
+    /// issue, so NOSLOT drops count as accepted-but-untransported).
     pub agg_accepted: [u64; 4],
     /// Completions dropped from retention past the ledger bound
     /// (explicit loss; a draining reader never drops).
     pub retained_dropped: u64,
+    /// Sticky identity verdict (M2): every post-ingest verification
+    /// passed. Once false, the session's exact counts are void
+    /// (coverage consults this; pairing never does).
+    pub view_valid: bool,
+    /// Pre-arm `LLOSS` per-class totals (M2 baseline: receipts report
+    /// abs+delta; the oracle's own GO-baseline still owns the verdict).
+    pub loss_baseline: [u64; 5],
+    /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
+    pub agg_baseline: [u64; 4],
+}
+
+/// Kernel-side session context for the terminal ledger (M2/H2): the
+/// pre-arm counter baselines plus the sticky identity verdict. The
+/// sensor shell builds it; tests inject it.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionContext {
+    /// Pre-arm `LLOSS` per-class totals.
+    pub loss_baseline: [u64; 5],
+    /// Pre-arm `LAGG` per-hook accepted totals.
+    pub agg_baseline: [u64; 4],
+    /// Sticky identity verdict at ledger time.
+    pub view_valid: bool,
 }
 
 /// Pure ingest core: decoder + reducer + completed records (no fds,
@@ -104,9 +153,9 @@ pub struct SensorCore {
 impl SensorCore {
     /// New core with bounded decode + reducer tables and a bounded
     /// completed-retention ledger (design C12: every output queue has
-    /// a configured bound — round-1 astra-M7). The decode bound
-    /// mirrors the BPF `LSTATE` slots (4096): userspace never holds
-    /// more outstanding keys than the kernel tracks.
+    /// a configured bound — round-1 astra-M7). The decode bound is a
+    /// pure userspace cap (W8: the kernel holds no pairing state —
+    /// invocations live in per-call cookies, not a slot table).
     #[must_use]
     pub fn new(decode_capacity: usize, reducer_capacity: usize, ledger_capacity: usize) -> Self {
         Self {
@@ -173,9 +222,15 @@ impl SensorCore {
     }
 
     /// Snapshot the terminal ledger with caller-supplied kernel
-    /// counters (the sensor shell reads `LLOSS` + `LAGG`; tests inject).
+    /// counters + session context (the sensor shell reads `LLOSS` +
+    /// `LAGG` and the M2 baseline/verdict; tests inject).
     #[must_use]
-    pub fn ledger(&self, kernel_loss: [u64; 5], agg_accepted: [u64; 4]) -> LifecycleLedger {
+    pub fn ledger(
+        &self,
+        kernel_loss: [u64; 5],
+        agg_accepted: [u64; 4],
+        ctx: SessionContext,
+    ) -> LifecycleLedger {
         LifecycleLedger {
             completed: self.completed.clone(),
             edge_hits: self.edge_hits,
@@ -184,6 +239,9 @@ impl SensorCore {
             kernel_loss,
             agg_accepted,
             retained_dropped: self.retained_dropped,
+            view_valid: ctx.view_valid,
+            loss_baseline: ctx.loss_baseline,
+            agg_baseline: ctx.agg_baseline,
         }
     }
 }
@@ -209,6 +267,33 @@ pub const QUIET_DRAIN_BUDGET: usize = 8192;
 /// then the exact backlog, not silence, reaches the ledger.
 pub const CLOSE_DRAIN_ROUNDS: usize = 8;
 
+/// Sensor lifecycle state (M1: explicit ADMIT/DRAIN/CLOSED —
+/// arm-after-links, disarm-before-detach, never `Vec::clear` drop
+/// order). Transitions run one way: [`SensorState::Admit`] →
+/// [`SensorState::Draining`] (via [`LifecycleSensor::close_input`])
+/// → [`SensorState::Closed`] (via [`LifecycleSensor::drain_quiet`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorState {
+    /// Armed and admitting: live ticks drain here.
+    Admit,
+    /// Disarmed and detached: the closing drain runs here.
+    Draining,
+    /// Quiet-drained and reported: drains refuse, reads stay open.
+    Closed,
+}
+
+impl SensorState {
+    /// State word for protocol refusals.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admit => "Admit",
+            Self::Draining => "Draining",
+            Self::Closed => "Closed",
+        }
+    }
+}
+
 /// Attached lifecycle sensor: the single owner (configured maps,
 /// programs, links), the single drain (mmap'd ring + consumer
 /// position), and the ingest core feeding the terminal ledger.
@@ -218,6 +303,16 @@ pub struct LifecycleSensor {
     consumer: u64,
     core: SensorCore,
     session: SessionGuard,
+    state: SensorState,
+    /// Pre-arm identity baseline (M2: every fd pinned before ingest).
+    baseline: SensorIdentity,
+    /// Sticky identity verdict (M2: once false, never true again —
+    /// plain `Relaxed` load/store, cf. the backend's `decoded`).
+    view_valid: AtomicBool,
+    /// Pre-arm `LLOSS` per-class totals (M2 baseline).
+    loss_baseline: [u64; 5],
+    /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
+    agg_baseline: [u64; 4],
 }
 
 impl std::fmt::Debug for LifecycleSensor {
@@ -234,16 +329,20 @@ impl std::fmt::Debug for LifecycleSensor {
 }
 
 impl LifecycleSensor {
-    /// Bring up the sensor: resolve + load + configure + attach every
-    /// required edge (see [`load_lifecycle_configured`]), then mmap
-    /// the ring. Fails unless the full profile attaches.
+    /// Bring up the sensor: resolve + load + attach every required
+    /// site disarmed (see [`load_lifecycle_configured`]), mmap the
+    /// ring, then arm (M1: arm-after-links). Fails unless the full
+    /// profile attaches AND arms (all-or-nothing: a failed arm drops
+    /// the attached-but-disarmed sensor with the error, so a returned
+    /// error always means no live sensor).
     pub fn bring_up(
         object_bytes: &[u8],
         token_fd: Option<RawFd>,
     ) -> Result<(Self, Vec<ConfiguredPoint>), ConfiguredError> {
         // Claim the process share first (no cross-profile capture: a
-        // live api-returns session refuses this typed). Any later failure
-        // drops the local hold (a failed bring-up holds nothing).
+        // live api-returns session refuses this typed — and no second
+        // lifecycle holder, H5). Any later failure drops the local
+        // hold (a failed bring-up holds nothing).
         let session =
             acquire_kcrypto_session(LifecycleProfile::RequestLifecycle).map_err(|busy| {
                 ConfiguredError::SessionBusy {
@@ -258,6 +357,19 @@ impl LifecycleSensor {
                     detail: format!("lring mmap: {err}"),
                 }
             })?;
+        // M2 pre-arm baseline (identity + counters) BEFORE the M1 arm:
+        // a fresh sensor whose fds fail identity never arms, and edges
+        // firing while disarmed feed `LLOSS_DISABLED`, so the arm
+        // delay costs nothing silent.
+        let baseline =
+            SensorIdentity::snapshot(&configured.loaded, &configured.links).map_err(|err| {
+                ConfiguredError::AttachSetup {
+                    detail: format!("sensor identity: {err}"),
+                }
+            })?;
+        let (loss_baseline, agg_baseline) =
+            read_kernel_counters(&configured).map_err(ConfiguredError::Configure)?;
+        arm_lifecycle_config(&configured.loaded)?;
         Ok((
             Self {
                 configured,
@@ -265,20 +377,42 @@ impl LifecycleSensor {
                 consumer: 0,
                 core: SensorCore::new(4096, 4096, 4096),
                 session,
+                state: SensorState::Admit,
+                baseline,
+                view_valid: AtomicBool::new(true),
+                loss_baseline,
+                agg_baseline,
             },
             points,
         ))
     }
 
+    /// Current lifecycle state (M1 protocol position).
+    #[must_use]
+    pub fn sensor_state(&self) -> SensorState {
+        self.state
+    }
+
+    /// Pre-arm identity baseline (M2 receipts: kernel prog/map/link
+    /// ids; the H4 exclusion matches foreign links against these).
+    #[must_use]
+    pub fn baseline_identity(&self) -> &SensorIdentity {
+        &self.baseline
+    }
+
     /// Drain once: walk newly produced records (at most `budget`
-    /// visits), ingest them, advance the consumer. Pure frame walk +
-    /// [`SensorCore::ingest_records`]; the VM canary covers this shell.
+    /// visits), ingest them, advance the consumer. Live walk (H1: no
+    /// snapshot, no per-drain alloc) + [`SensorCore::ingest_records`];
+    /// the VM canary covers this shell.
     pub fn drain_once(&mut self, budget: usize) -> Result<DrainOutcome, DrainError> {
-        let max = ring_max() as u64;
+        if self.state == SensorState::Closed {
+            return Err(DrainError::StateInvalid {
+                expected: "Admit|Draining",
+                actual: self.state.as_str(),
+            });
+        }
         let producer = self.area.producer();
-        let mut buf = vec![0u8; 2 * max as usize];
-        self.area.snapshot_into(&mut buf, self.consumer, producer);
-        let consumed = consume_range(&buf, max - 1, self.consumer, producer, budget);
+        let consumed = self.area.consume_live(self.consumer, producer, budget);
         let completed = self.core.ingest_records(&consumed.records);
         self.consumer = consumed.consumer;
         self.area.set_consumer(consumed.consumer);
@@ -289,27 +423,38 @@ impl LifecycleSensor {
         })
     }
 
-    /// Snapshot the terminal ledger (reads `LLOSS` per-class totals
-    /// + `LAGG` per-hook accepted totals).
+    /// Snapshot the terminal ledger: re-verify identity against
+    /// the pre-arm baseline (M2 — a mismatch flips the sticky verdict
+    /// off and the ledger reports it; the counter reads still run, and
+    /// THEY fail independently on bad fds), then read `LLOSS`
+    /// per-class totals + `LAGG` per-hook accepted totals.
     pub fn ledger(&self) -> Result<LifecycleLedger, MapOpsError> {
-        let mut lanes = [0u64; LLOSS_ENTRIES as usize];
-        for (idx, slot) in lanes.iter_mut().enumerate() {
-            *slot = map_lookup_percpu_sum(
-                &self.configured.loaded.maps.loss,
-                idx as u32,
-                "lifecycle_sensor/lloss",
-            )?;
+        if self.view_valid.load(Ordering::Relaxed) {
+            let current = SensorIdentity::snapshot(&self.configured.loaded, &self.configured.links);
+            let verified = current
+                .map(|view| view.verify_against(&self.baseline))
+                .is_ok_and(|result| result.is_ok());
+            if !verified {
+                self.view_valid.store(false, Ordering::Relaxed);
+            }
         }
-        let kernel_loss = fold_loss_lanes(lanes);
-        let mut agg_accepted = [0u64; 4];
-        for (idx, slot) in agg_accepted.iter_mut().enumerate() {
-            *slot = map_lookup_percpu_sum(
-                &self.configured.loaded.maps.agg,
-                idx as u32,
-                "lifecycle_sensor/lagg",
-            )?;
-        }
-        Ok(self.core.ledger(kernel_loss, agg_accepted))
+        let (kernel_loss, agg_accepted) = read_kernel_counters(&self.configured)?;
+        Ok(self.core.ledger(
+            kernel_loss,
+            agg_accepted,
+            SessionContext {
+                loss_baseline: self.loss_baseline,
+                agg_baseline: self.agg_baseline,
+                view_valid: self.view_valid.load(Ordering::Relaxed),
+            },
+        ))
+    }
+
+    /// Ring positions `(consumer, producer)` for stage receipts (M2:
+    /// arm/drains/disarm ring-position snapshots).
+    #[must_use]
+    pub fn ring_positions(&self) -> (u64, u64) {
+        (self.consumer, self.area.producer())
     }
 
     /// Drain retained completions (the live tick's read path).
@@ -331,22 +476,41 @@ impl LifecycleSensor {
         self.core.finish(stop_ns);
     }
 
-    /// Detach-then-drain, step 1: drop every attach link (idempotent —
-    /// a second call clears an empty vec). No hook fires after this
-    /// returns, so the closing drain converges instead of chasing
+    /// Disarm-then-detach, step 1 (M1): prove the disarmed `LCFG`
+    /// value FIRST, then drop every attach link (explicit order —
+    /// never `Vec::clear` drop order). Idempotent (a second call is a
+    /// no-op `Ok`). A failed disarm still detaches — a detached
+    /// sensor fires nothing, so the config value is moot — but the
+    /// error attests the disarm was never proven. No hook fires after
+    /// this returns, so the closing drain converges instead of chasing
     /// arrivals.
-    pub fn close_input(&mut self) {
+    pub fn close_input(&mut self) -> Result<(), ConfiguredError> {
+        if self.state != SensorState::Admit {
+            return Ok(());
+        }
+        let disarm = disarm_lifecycle_config(&self.configured.loaded);
         self.configured.links.clear();
+        self.state = SensorState::Draining;
+        disarm
     }
 
     /// Detach-then-drain, step 2: bounded quiet loop (at most
     /// [`CLOSE_DRAIN_ROUNDS`] walks of [`QUIET_DRAIN_BUDGET`] visits).
-    /// A round is quiet when it consumes nothing and sees no busy
-    /// writer. The verdict carries the exact close backlog
+    /// Requires [`SensorState::Draining`] (call [`Self::close_input`]
+    /// first — draining an admitting sensor chases arrivals and never
+    /// certifies quiet). A round is quiet when it consumes nothing and
+    /// sees no busy writer. The verdict carries the exact close backlog
     /// (`producer - consumer` after the last round) to the caller —
     /// the driver feeds it to coverage, so teardown backlog flips
-    /// `detailed_events` instead of vanishing with the sensor.
+    /// `detailed_events` instead of vanishing with the sensor. Marks
+    /// the sensor [`SensorState::Closed`] — reported, never re-drained.
     pub fn drain_quiet(&mut self) -> Result<QuietOutcome, DrainError> {
+        if self.state != SensorState::Draining {
+            return Err(DrainError::StateInvalid {
+                expected: "Draining (call close_input first)",
+                actual: self.state.as_str(),
+            });
+        }
         let mut rounds = 0u64;
         let mut records = 0usize;
         let mut quiet = false;
@@ -360,6 +524,7 @@ impl LifecycleSensor {
             }
         }
         let backlog_bytes = self.area.producer().saturating_sub(self.consumer);
+        self.state = SensorState::Closed;
         Ok(QuietOutcome {
             rounds,
             records,

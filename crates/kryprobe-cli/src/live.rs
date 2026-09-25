@@ -483,7 +483,7 @@ fn lifecycle_coverage(
         .fold(0u64, |sum, loss| sum.saturating_add(*loss));
     let count_loss = count_loss
         .saturating_add(ledger.decode.submit_refused)
-        .saturating_add(ledger.decode.unknown_key_returns)
+        .saturating_add(ledger.decode.unknown_invoc_returns)
         .saturating_add(ledger.decode.bad_records)
         .saturating_add(ledger.decode.gaps_synthesized)
         .saturating_add(ledger.decode.stale_returns)
@@ -565,16 +565,30 @@ fn lifecycle_coverage(
         .push(counter("agg_residual_unexplained", residual));
     // Completion: every decoded record grounded in observed terminal
     // truth (no unfinished, no `Unknown` terminals, no truncation)
-    // completes over the admitted requests; truthless-drained,
-    // ambiguous, or truncated records flip `Partial` (their
-    // terminals are explicit unknowns, never trusted results).
+    // completes over the admitted requests — PROVISIONALLY (M2
+    // provisional-hold: the commit ALSO requires a loss-clean ledger,
+    // a clean transport, and a verified sensor identity, since any
+    // miss voids the exact counts the completion claim rests on).
+    // Truthless-drained, ambiguous, truncated, lossy, or
+    // identity-void records flip `Partial` (their terminals are
+    // explicit unknowns — or unattributed evidence — never trusted
+    // results). Commit-before-report: nothing downstream reads a
+    // completion verdict until this gate commits it.
+    let commit_clean = count_loss == 0 && transport_clean && ledger.view_valid;
     let mut completion = dim(
-        if ledger.reducer.unfinished == 0 && close.unknown_terminals == 0 && close.omitted == 0 {
+        if ledger.reducer.unfinished == 0
+            && close.unknown_terminals == 0
+            && close.omitted == 0
+            && commit_clean
+        {
             CoverageStatus::CompleteForDeclaredBoundary
         } else {
             CoverageStatus::Partial
         },
     );
+    completion
+        .counters
+        .push(counter("identity_verified", u64::from(ledger.view_valid)));
     completion
         .counters
         .push(counter("observations_decoded", observations_decoded));
@@ -602,13 +616,13 @@ fn lifecycle_coverage(
     // returns, refused submits, ambiguous evidence, and reducer
     // orphans are ALL correlation events — any flips `Partial`; a
     // single backend with zero such events completes the declared
-    // boundary. (Round-3 minor: omitting `unknown_key_returns` /
+    // boundary. (Round-3 minor: omitting `unknown_invoc_returns` /
     // `submit_refused` let a lone tainted return claim Complete.)
     let correlation_events = ledger
         .decode
         .gaps_synthesized
         .saturating_add(ledger.decode.stale_returns)
-        .saturating_add(ledger.decode.unknown_key_returns)
+        .saturating_add(ledger.decode.unknown_invoc_returns)
         .saturating_add(ledger.decode.submit_refused)
         .saturating_add(ledger.reducer.ambiguous)
         .saturating_add(ledger.reducer.orphan);
@@ -2041,6 +2055,9 @@ mod tests {
             kernel_loss: [0; 5],
             agg_accepted: [4, 4, 2, 2],
             retained_dropped: 0,
+            view_valid: true,
+            loss_baseline: [0; 5],
+            agg_baseline: [0; 4],
         }
     }
 
@@ -2060,8 +2077,8 @@ mod tests {
         // delivery-sensitive dimensions stay `Unknown` (S04 twin).
         let coverage = lifecycle_coverage(
             &lifecycle_ledger_clean(),
-            4,
-            4,
+            2,
+            2,
             6,
             &close_clean(),
             ValidityInterval {
@@ -2129,37 +2146,39 @@ mod tests {
             start_ns: 100,
             end_ns: Some(200),
         };
-        // Kernel reserve failure: counts AND transport flip.
+        // Kernel reserve failure: counts AND transport flip — and
+        // completion holds provisional (M2: any miss voids the exact
+        // counts the completion claim rests on).
         let mut ledger = lifecycle_ledger_clean();
         ledger.kernel_loss[0] = 2;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
         assert_eq!(
             coverage.completion.status,
-            CoverageStatus::CompleteForDeclaredBoundary,
-            "transport loss is not unfinished work"
+            CoverageStatus::Partial,
+            "misses void exact completion claims"
         );
         // Refused decode evidence corrupts counts only.
         let mut ledger = lifecycle_ledger_clean();
         ledger.decode.submit_refused = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
         // Truthless-drained records flip completion only.
         let mut ledger = lifecycle_ledger_clean();
         ledger.reducer.unfinished = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.completion.status, CoverageStatus::Partial);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
         // Attach shortfall flips attachment only.
         let coverage =
-            lifecycle_coverage(&lifecycle_ledger_clean(), 3, 4, 6, &close_clean(), interval);
+            lifecycle_coverage(&lifecycle_ledger_clean(), 1, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.attachment.status, CoverageStatus::Partial);
         // Duplicates repeat known state: no information lost, no flip.
         let mut ledger = lifecycle_ledger_clean();
         ledger.reducer.duplicate = 9;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
         assert_eq!(
             coverage.completion.status,
@@ -2171,14 +2190,14 @@ mod tests {
             unknown_terminals: 1,
             ..close_clean()
         };
-        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 2, 2, 6, &close, interval);
         assert_eq!(coverage.completion.status, CoverageStatus::Partial);
         // Truncation flips completion only.
         let close = LifecycleCloseStats {
             omitted: 7,
             ..close_clean()
         };
-        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 2, 2, 6, &close, interval);
         assert_eq!(coverage.completion.status, CoverageStatus::Partial);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
         // Close-time ring backlog flips transport only.
@@ -2186,30 +2205,73 @@ mod tests {
             backlog_bytes: 128,
             ..close_clean()
         };
-        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 2, 2, 6, &close, interval);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
-        // Correlation gaps (reuse transport loss) flip correlation only.
+        // Correlation gaps (resubmit transport loss) flip correlation
+        // — and completion holds provisional (M2: count loss voids
+        // exact completion claims).
         let mut ledger = lifecycle_ledger_clean();
         ledger.decode.gaps_synthesized = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
         assert_eq!(
             coverage.completion.status,
-            CoverageStatus::CompleteForDeclaredBoundary
+            CoverageStatus::Partial,
+            "misses void exact completion claims"
         );
         // Unexplained aggregate residual (accepted minus consumed,
         // reserve, and noslot, with an empty close ring) flips
         // transport: the accounting equation broke.
         let mut ledger = lifecycle_ledger_clean();
         ledger.agg_accepted = [5, 4, 2, 2];
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
     }
 
     #[test]
+    fn w8_completion_holds_provisional_without_identity() {
+        // M2 provisional-hold: a void sensor identity voids the
+        // completion claim (unattributed evidence never grounds a
+        // Complete), attested by the `identity_verified` counter; a
+        // verified session commits.
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.view_valid = false;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.completion.status, CoverageStatus::Partial);
+        assert!(
+            coverage
+                .completion
+                .counters
+                .iter()
+                .any(|c| c.name == "identity_verified" && c.value == 0),
+            "void verdict attested: {:?}",
+            coverage.completion.counters
+        );
+        let coverage =
+            lifecycle_coverage(&lifecycle_ledger_clean(), 2, 2, 6, &close_clean(), interval);
+        assert_eq!(
+            coverage.completion.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
+        assert!(
+            coverage
+                .completion
+                .counters
+                .iter()
+                .any(|c| c.name == "identity_verified" && c.value == 1),
+            "verified verdict attested: {:?}",
+            coverage.completion.counters
+        );
+    }
+
+    #[test]
     fn lifecycle_coverage_unjoined_returns_flip_correlation() {
-        // Round-3 minor: a lone tainted return (`unknown_key_returns`)
+        // Round-3 minor: a lone tainted return (`unknown_invoc_returns`)
         // or refused submit (`submit_refused`) is a failed join, so
         // correlation must read `Partial` — never Complete.
         let interval = ValidityInterval {
@@ -2217,8 +2279,8 @@ mod tests {
             end_ns: Some(200),
         };
         let mut ledger = lifecycle_ledger_clean();
-        ledger.decode.unknown_key_returns = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        ledger.decode.unknown_invoc_returns = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
         assert!(
             coverage
@@ -2231,7 +2293,7 @@ mod tests {
         );
         let mut ledger = lifecycle_ledger_clean();
         ledger.decode.submit_refused = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
     }
 

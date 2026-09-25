@@ -12,6 +12,7 @@
 use crate::fd::OwnedFd;
 use crate::probe::ProbeOutcome;
 use core::ffi::{c_long, c_void};
+use std::os::fd::RawFd;
 
 /// `BPF_MAP_CREATE` command id.
 pub const BPF_MAP_CREATE: u32 = 0;
@@ -36,10 +37,23 @@ pub const BPF_OBJ_PIN: u32 = 6;
 pub const BPF_PROG_TYPE_TRACING: u32 = 26;
 /// `BPF_TRACE_FEXIT` expected attach type id (K1 Task 2, C1).
 pub const BPF_TRACE_FEXIT: u32 = 25;
-/// `BPF_TRACE_FENTRY` expected attach type id (T06 lifecycle entry edge).
+/// `BPF_TRACE_FENTRY` expected attach type id (T06 lifecycle entry edge,
+/// pre-W8; retained as a UAPI constant).
 pub const BPF_TRACE_FENTRY: u32 = 24;
+/// `BPF_TRACE_FSESSION` expected attach type id (T06 W8 lifecycle
+/// session; floor 7.0+ — value 58 verified on v7.0, v7.0.14, v7.2
+/// and v7.2.6 UAPI headers).
+pub const BPF_TRACE_FSESSION: u32 = 58;
 /// Required in map/prog flags when a token fd rides the attr.
 pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
+/// `BPF_OBJ_GET_INFO_BY_FD` command id (M2 sensor identity).
+pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
+/// `BPF_LINK_GET_NEXT_ID` command id (H4 foreign-link enumeration).
+pub const BPF_LINK_GET_NEXT_ID: u32 = 31;
+/// `BPF_LINK_GET_FD_BY_ID` command id (H4 foreign-link enumeration).
+pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+/// `BPF_LINK_TYPE_TRACING` link type id (fentry/fexit/fsession links).
+pub const BPF_LINK_TYPE_TRACING: u32 = 2;
 
 /// Raw `bpf(cmd, attr, size)`; returns the fd or -1 (see [`last_errno`]).
 ///
@@ -187,3 +201,109 @@ pub struct LinkTracing {
 }
 
 const _: () = assert!(size_of::<LinkTracing>() == 64);
+
+/// `BPF_OBJ_GET_INFO_BY_FD` attr (16 bytes, UAPI order).
+#[repr(C)]
+#[derive(Debug)]
+pub struct ObjInfoAttr {
+    /// Object fd to describe.
+    pub bpf_fd: u32,
+    /// In: info buffer length. Out: kernel struct length.
+    pub info_len: u32,
+    /// Userspace pointer to the info buffer.
+    pub info: u64,
+}
+
+const _: () = assert!(size_of::<ObjInfoAttr>() == 16);
+
+/// Fetch kernel info for `fd` into `buf`; returns the kernel's struct
+/// length (`info_len` out). The kernel copies `min(in, struct)` and
+/// reports the full struct size — the caller validates the returned
+/// length covers every field it reads (M2: `info_len` + identity,
+/// never fdinfo).
+pub fn obj_get_info(fd: RawFd, buf: &mut [u8]) -> Result<u32, i32> {
+    let mut attr = ObjInfoAttr {
+        bpf_fd: fd as u32,
+        info_len: buf.len() as u32,
+        info: buf.as_mut_ptr() as u64,
+    };
+    // SAFETY: attr + buffer outlive the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_OBJ_GET_INFO_BY_FD,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<ObjInfoAttr>() as u32,
+        )
+    };
+    if ret < 0 {
+        Err(last_errno())
+    } else {
+        Ok(attr.info_len)
+    }
+}
+
+/// `BPF_LINK_GET_NEXT_ID` attr (16 bytes, UAPI order).
+#[repr(C)]
+#[derive(Debug)]
+pub struct LinkNextIdAttr {
+    /// Iterate past this link id.
+    pub start_id: u32,
+    /// Out: next link id.
+    pub next_id: u32,
+    /// Open flags (zero).
+    pub open_flags: u32,
+    /// Token fd for `GET_FD_BY_ID` (unused here, zero).
+    pub token_fd: i32,
+}
+
+const _: () = assert!(size_of::<LinkNextIdAttr>() == 16);
+
+/// Next link id past `start_id`; `Ok(None)` at iteration end
+/// (`ENOENT` is the documented terminator, not an error). Privileged
+/// (root enumeration for the H4 foreign-link exclusion).
+pub fn link_get_next_id(start_id: u32) -> Result<Option<u32>, i32> {
+    let mut attr = LinkNextIdAttr {
+        start_id,
+        next_id: 0,
+        open_flags: 0,
+        token_fd: 0,
+    };
+    // SAFETY: attr outlives the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_LINK_GET_NEXT_ID,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<LinkNextIdAttr>() as u32,
+        )
+    };
+    if ret < 0 {
+        let errno = last_errno();
+        if errno == libc::ENOENT {
+            Ok(None)
+        } else {
+            Err(errno)
+        }
+    } else {
+        Ok(Some(attr.next_id))
+    }
+}
+
+/// Open a link fd by id (H4 enumeration; privileged). Returns the
+/// owned fd or the kernel errno (`ENOENT` = raced with detach).
+pub fn link_get_fd_by_id(link_id: u32) -> Result<OwnedFd, i32> {
+    let mut attr = LinkNextIdAttr {
+        start_id: link_id,
+        next_id: 0,
+        open_flags: 0,
+        token_fd: 0,
+    };
+    // SAFETY: attr outlives the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_LINK_GET_FD_BY_ID,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<LinkNextIdAttr>() as u32,
+        )
+    };
+    fd_or_errno(ret)
+}

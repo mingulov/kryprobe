@@ -1997,6 +1997,9 @@ fn lifecycle_test_ledger(
         kernel_loss: [0; 5],
         agg_accepted: [2, 2, 1, 1],
         retained_dropped: 0,
+        view_valid: true,
+        loss_baseline: [0; 5],
+        agg_baseline: [0; 4],
     }
 }
 
@@ -2045,7 +2048,7 @@ fn live_lifecycle_scripted_session_drives_green() {
         &backend,
         &mut sensor,
         &stop,
-        4,
+        2,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2170,7 +2173,7 @@ fn live_lifecycle_observation_cap_truncates_deterministically() {
         &backend,
         &mut sensor,
         &stop,
-        4,
+        2,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2235,7 +2238,7 @@ fn live_lifecycle_close_backlog_flips_transport() {
         &backend,
         &mut sensor,
         &stop,
-        4,
+        2,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2260,8 +2263,8 @@ fn live_lifecycle_close_backlog_flips_transport() {
     );
     assert_eq!(
         outcome.coverage.completion.status,
-        kryprobe_core::enums::CoverageStatus::CompleteForDeclaredBoundary,
-        "backlog is not unfinished work"
+        kryprobe_core::enums::CoverageStatus::Partial,
+        "M2 provisional-hold: close backlog voids exact completion"
     );
 }
 
@@ -2300,7 +2303,7 @@ fn live_lifecycle_registry_backend_drives_same_decoder() {
         backend,
         &mut sensor,
         &stop,
-        4,
+        2,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2336,7 +2339,7 @@ fn live_lifecycle_unconfigured_sensor_refuses_typed() {
         &backend,
         &mut production,
         &stop,
-        4,
+        2,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),

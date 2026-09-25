@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Raw capability probe matrix: 14 rows consumed by `doctor`.
+//! Raw capability probe matrix: 15 rows consumed by `doctor`.
 //!
 //! Every row degrades honestly: `Pass`, `Denied{stage, errno}`, or
 //! `Skipped{reason}` — never a panic, never a faked Pass. Row order is the
@@ -17,7 +17,8 @@ pub use bpf_prog::{
 pub use bpf_rows::{bpf_syscall, kernel_release, map_create, ringbuf_create};
 pub use decoders::{cap_names, parse_kernel_release, yama_verdict};
 pub use host_rows::{
-    btf_present, cap_state, file_caps_gate, uretprobe_seccomp_fork, userns_create, yama_scope,
+    btf_present, cap_state, file_caps_gate, fsession_capable, uretprobe_seccomp_fork,
+    userns_create, yama_scope,
 };
 
 /// Minimum supported kernel: Linux 6.12 (thin-spine policy).
@@ -90,14 +91,14 @@ pub struct ProbeRow {
     pub outcome: ProbeOutcome,
 }
 
-/// The 14-row matrix, in canonical `doctor` order.
+/// The 15-row matrix, in canonical `doctor` order.
 #[derive(Debug)]
 pub struct ProbeMatrix {
     /// The 14 probe rows in canonical order.
     pub rows: Vec<ProbeRow>,
 }
 
-/// Runs all 14 probes in order; safe with and without privilege.
+/// Runs all 15 probes in order; safe with and without privilege.
 pub fn run_probe_matrix() -> ProbeMatrix {
     let rows = [
         ("kernel_release", kernel_release()),
@@ -108,6 +109,7 @@ pub fn run_probe_matrix() -> ProbeMatrix {
         ("attach_cookies", attach_cookies()),
         ("ringbuf_create", ringbuf_create()),
         ("btf_present", btf_present()),
+        ("fsession_capable", fsession_capable()),
         ("userns_create", userns_create()),
         ("yama_scope", yama_scope()),
         ("cap_state", cap_state()),

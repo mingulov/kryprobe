@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Pure ringbuf record walk: framing math, unit-tested (T7c2).
+//! Pure ringbuf framing step: one header word → one decision (T7c2,
+//! H1 rework).
 //!
-//! Operates on a linear view of the double-mapped data area, so wrap
-//! reads are plain slices. The mmap/epoll shell lives in `drain.rs`.
+//! The live walker ([`crate::drain::area::RingArea::consume_live`])
+//! reads each header straight from the mapping (volatile, never a
+//! shared reference over live bytes) and asks [`frame_step`] what the
+//! word means; payload bytes copy out only on [`FrameStep::Emit`],
+//! then the header revalidates (libbpf pattern) before anything
+//! advances. No snapshot, no bulk copy, no torn reads.
 
 /// Record header size: `len` u32 + kernel-internal `pg_off` u32.
 pub const HDR_SZ: usize = 8;
@@ -24,64 +29,51 @@ pub struct Consumed {
     pub busy: bool,
 }
 
-/// Walk records from `consumer` toward `producer` (both absolute).
+/// One header word's framing decision (pure over the word +
+/// positions; the live walker owns the bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameStep {
+    /// Copy `len` payload bytes, revalidate, advance `total`.
+    Emit {
+        /// Payload length in bytes.
+        len: u64,
+        /// Header + 8-aligned payload.
+        total: u64,
+    },
+    /// Advance `total` without emitting.
+    Skip {
+        /// Header + 8-aligned payload.
+        total: u64,
+    },
+    /// Stop the walk (busy/torn/corrupt): more may arrive later.
+    Stop,
+}
+
+/// Decide one record from its header word (both positions absolute).
 ///
-/// `data` is the double-mapped area (`2 * max_entries` bytes);
-/// `mask` is `max_entries - 1` (entries a power of two). At most
-/// `budget` record visits per call (discards count: a discard flood
-/// must not starve the iteration budget).
-pub fn consume_range(
-    data: &[u8],
-    mask: u64,
-    mut consumer: u64,
-    producer: u64,
-    budget: usize,
-) -> Consumed {
-    let mut records = Vec::new();
-    let mut busy = false;
-    let mut visited = 0;
-    let max = mask + 1;
-    while consumer < producer && visited < budget {
-        visited += 1;
-        let off = (consumer & mask) as usize;
-        let hdr_at = off + HDR_SZ;
-        if hdr_at > data.len() {
-            busy = true;
-            break;
-        }
-        let hdr = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-        if hdr & BUSY_BIT != 0 {
-            busy = true;
-            break;
-        }
-        let len = (hdr & LEN_MASK) as u64;
-        if len > max {
-            busy = true;
-            break;
-        }
-        let total = HDR_SZ as u64 + ((len + 7) & !7);
-        if consumer.saturating_add(total) > producer {
-            busy = true;
-            break;
-        }
-        if hdr & DISCARD_BIT == 0 {
-            let start = off + HDR_SZ;
-            // Defense in depth: framing math bounds this, but a corrupt
-            // consumer position must stop the walk, never panic it.
-            if start + len as usize > data.len() {
-                busy = true;
-                break;
-            }
-            records.push(data[start..start + len as usize].to_vec());
-        }
-        // Saturating: the check above admits `consumer == u64::MAX - total + 1`
-        // when the producer sits at `u64::MAX`, where `+=` would wrap.
-        consumer = consumer.saturating_add(total);
+/// `Stop` on: busy writer, length past the ring size, or a frame
+/// overrunning the producer snapshot (torn tail — the commit had not
+/// landed when the producer was read). Discards skip; exact fits emit
+/// (a frame ending exactly on the producer is committed, never torn).
+/// Saturating: `consumer + total` at `u64::MAX` saturates instead of
+/// wrapping (a corrupt producer near the top stops the walk, and a
+/// producer pinned at `u64::MAX` with an exact fit still emits).
+pub fn frame_step(hdr: u32, max: u64, consumer: u64, producer: u64) -> FrameStep {
+    if hdr & BUSY_BIT != 0 {
+        return FrameStep::Stop;
     }
-    Consumed {
-        records,
-        consumer,
-        busy,
+    let len = u64::from(hdr & LEN_MASK);
+    if len > max {
+        return FrameStep::Stop;
+    }
+    let total = HDR_SZ as u64 + ((len + 7) & !7);
+    if consumer.saturating_add(total) > producer {
+        return FrameStep::Stop;
+    }
+    if hdr & DISCARD_BIT != 0 {
+        FrameStep::Skip { total }
+    } else {
+        FrameStep::Emit { len, total }
     }
 }
 
@@ -89,132 +81,71 @@ pub fn consume_range(
 mod tests {
     use super::*;
 
-    /// Double-mapped area simulator: `2 * max` zeroed bytes.
-    fn area(max: usize) -> Vec<u8> {
-        vec![0u8; 2 * max]
-    }
-
-    /// Emit one record header + payload at absolute `pos`.
-    fn emit(area: &mut [u8], mask: u64, pos: u64, flags: u32, payload: &[u8]) -> u64 {
-        let off = (pos & mask) as usize;
-        let hdr = flags | payload.len() as u32;
-        area[off..off + 4].copy_from_slice(&hdr.to_le_bytes());
-        area[off + 8..off + 8 + payload.len()].copy_from_slice(payload);
-        pos + HDR_SZ as u64 + ((payload.len() as u64 + 7) & !7)
+    #[test]
+    fn emit_rounds_payload_up() {
+        assert_eq!(
+            frame_step(64, 256, 0, 72),
+            FrameStep::Emit { len: 64, total: 72 }
+        );
+        assert_eq!(
+            frame_step(1, 256, 0, 16),
+            FrameStep::Emit { len: 1, total: 16 }
+        );
+        // Exact fit on the producer emits (committed, never torn).
+        assert_eq!(
+            frame_step(8, 256, 0, 16),
+            FrameStep::Emit { len: 8, total: 16 }
+        );
     }
 
     #[test]
-    fn empty_range_keeps_consumer() {
-        let area = area(256);
-        let out = consume_range(&area, 255, 100, 100, 16);
+    fn discard_skips_without_emit() {
         assert_eq!(
-            out,
-            Consumed {
-                records: vec![],
-                consumer: 100,
-                busy: false
+            frame_step(DISCARD_BIT | 8, 256, 0, 16),
+            FrameStep::Skip { total: 16 }
+        );
+    }
+
+    #[test]
+    fn busy_stops() {
+        assert_eq!(frame_step(BUSY_BIT | 8, 256, 0, 100), FrameStep::Stop);
+    }
+
+    #[test]
+    fn oversize_stops() {
+        assert_eq!(frame_step(257, 256, 0, 1000), FrameStep::Stop);
+        assert_eq!(
+            frame_step(256, 256, 0, 264),
+            FrameStep::Emit {
+                len: 256,
+                total: 264
             }
         );
     }
 
     #[test]
-    fn one_record_advances_past_padding() {
-        let mut area = area(256);
-        let end = emit(&mut area, 255, 0, 0, &[7u8; 64]);
-        assert_eq!(end, 72);
-        let out = consume_range(&area, 255, 0, end, 16);
-        assert_eq!(out.records, vec![vec![7u8; 64]]);
-        assert_eq!(out.consumer, 72);
-        assert!(!out.busy);
-    }
-
-    #[test]
-    fn budget_bounds_visits() {
-        let mut area = area(256);
-        let mut pos = 0;
-        for _ in 0..4 {
-            pos = emit(&mut area, 255, pos, 0, &[1u8; 8]);
-        }
-        let out = consume_range(&area, 255, 0, pos, 1);
-        assert_eq!(out.records.len(), 1);
-        assert_eq!(out.consumer, 16);
-        assert!(!out.busy);
-    }
-
-    #[test]
-    fn discard_advances_without_emit() {
-        let mut area = area(256);
-        let mid = emit(&mut area, 255, 0, DISCARD_BIT, &[9u8; 8]);
-        let end = emit(&mut area, 255, mid, 0, &[3u8; 8]);
-        let out = consume_range(&area, 255, 0, end, 16);
-        assert_eq!(out.records, vec![vec![3u8; 8]]);
-        assert_eq!(out.consumer, end);
-    }
-
-    #[test]
-    fn busy_stops_without_advance() {
-        let mut area = area(256);
-        let end = emit(&mut area, 255, 0, BUSY_BIT, &[0u8; 8]);
-        let out = consume_range(&area, 255, 0, end, 16);
-        assert!(out.records.is_empty());
-        assert_eq!(out.consumer, 0);
-        assert!(out.busy);
-    }
-
-    #[test]
-    fn wrap_reads_linearly() {
-        let mut area = area(64);
-        // Record straddling the 64-byte boundary reads linearly
-        // from the double-mapped area.
-        let end = emit(&mut area, 63, 56, 0, &[5u8; 8]);
-        assert_eq!(end, 72);
-        let out = consume_range(&area, 63, 56, end, 16);
-        assert_eq!(out.records, vec![vec![5u8; 8]]);
-        assert_eq!(out.consumer, 72);
-    }
-
-    #[test]
-    fn torn_record_stops() {
-        let mut area = area(256);
-        let end = emit(&mut area, 255, 0, 0, &[1u8; 8]);
+    fn overrun_stops() {
         // Producer covers only the header: torn body, stop like busy.
-        let out = consume_range(&area, 255, 0, end - 1, 16);
-        assert!(out.records.is_empty());
-        assert_eq!(out.consumer, 0);
-        assert!(out.busy);
-    }
-
-    #[test]
-    fn short_payload_rounds_up() {
-        let mut area = area(256);
-        let end = emit(&mut area, 255, 0, 0, &[42u8; 1]);
-        assert_eq!(end, 16);
-        let out = consume_range(&area, 255, 0, end, 16);
-        assert_eq!(out.records, vec![vec![42u8]]);
-        assert_eq!(out.consumer, 16);
+        assert_eq!(frame_step(8, 256, 0, 15), FrameStep::Stop);
     }
 
     #[test]
     fn near_max_consumer_stops_without_wrap() {
-        // Corrupt producer just below u64::MAX: `consumer + total` would
-        // wrap (and panic in debug); saturation must stop the walk instead.
-        let area = area(256);
-        let consumer = u64::MAX - 7;
-        let out = consume_range(&area, 255, consumer, u64::MAX - 3, 16);
-        assert!(out.records.is_empty());
-        assert_eq!(out.consumer, consumer);
-        assert!(out.busy);
+        // Corrupt producer just below u64::MAX: `consumer + total`
+        // would wrap (and panic in debug); saturation stops instead.
+        assert_eq!(
+            frame_step(0, 256, u64::MAX - 7, u64::MAX - 3),
+            FrameStep::Stop
+        );
     }
 
     #[test]
-    fn max_producer_near_max_consumer_saturates() {
-        // Producer pinned at u64::MAX: the record fits exactly, so the
-        // walk emits it and saturates the consumer onto the producer.
-        let area = area(256);
-        let consumer = u64::MAX - 7;
-        let out = consume_range(&area, 255, consumer, u64::MAX, 16);
-        assert_eq!(out.records, vec![Vec::<u8>::new()]);
-        assert_eq!(out.consumer, u64::MAX);
-        assert!(!out.busy);
+    fn max_producer_exact_fit_emits() {
+        // Producer pinned at u64::MAX with an exact fit: emit (the
+        // walker saturates the consumer onto the producer).
+        assert_eq!(
+            frame_step(0, 256, u64::MAX - 7, u64::MAX),
+            FrameStep::Emit { len: 0, total: 8 }
+        );
     }
 }
