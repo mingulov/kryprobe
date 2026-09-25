@@ -22,6 +22,7 @@
 //! - Every loss counter must read zero; any close backlog fails.
 
 use crate::kcrypto_lifecycle::decode::DecodeStats;
+use crate::kcrypto_lifecycle::view::ProgMisses;
 use kryprobe_core::kcrypto::{ReducerStats, RequestRecord, Terminal};
 
 /// One fixture op (sequence order).
@@ -330,7 +331,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
 }
 
 /// Sensor counters at one instant (baselines + final read share it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SensorBaseline {
     /// Per-hook consumed edges `[enc-sub, enc-ret, dec-sub, dec-ret]`.
     pub edge_hits: [u64; 4],
@@ -347,6 +348,9 @@ pub struct SensorBaseline {
     pub reducer: ReducerStats,
     /// Retention drops past the ledger bound.
     pub retained_dropped: u64,
+    /// Per-program recursion-miss absolutes (H2 quiescence + delta
+    /// verdict: pre-GO misses are baseline, post-GO misses fail).
+    pub prog_misses: Vec<ProgMisses>,
 }
 
 /// Sensor evidence for one scenario (post-finish: completions include
@@ -381,6 +385,9 @@ pub struct SensorView<'a> {
     /// Foreign tracing links on our attach targets (must be 0 — H4
     /// retirement exclusion: any foreign link may have retired ours).
     pub foreign_links: u64,
+    /// Final per-program recursion-miss absolutes (H2: every
+    /// post-baseline delta must read zero — strict all-zero).
+    pub prog_misses: Vec<ProgMisses>,
 }
 
 /// Exact verdict over one scenario: `Ok(())` passes, `Err(reason)`
@@ -557,6 +564,27 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     for (i, loss) in loss_d.iter().enumerate() {
         if *loss != 0 {
             return Err(format!("kernel_loss[{i}] reads {loss}"));
+        }
+    }
+    // Strict all-zero recursion misses (H2/M2 miss gate): every
+    // post-baseline per-program delta must read zero — a wholly
+    // skipped call leaves no edge and no LLOSS, so a nonzero miss
+    // delta voids the run. Joined by section; a final program with
+    // no baseline entry fails closed (unattributed program).
+    for got in &view.prog_misses {
+        let base = view
+            .baseline
+            .prog_misses
+            .iter()
+            .find(|want| want.section == got.section)
+            .ok_or_else(|| format!("prog_misses[{}] has no baseline", got.section))?;
+        let delta = sub(
+            got.misses,
+            base.misses,
+            &format!("prog_misses[{}]", got.section),
+        )?;
+        if delta != 0 {
+            return Err(format!("prog_misses[{}] delta reads {delta}", got.section));
         }
     }
     // Per-hook expectations come from the LEDGER (fixture-derived),
@@ -874,7 +902,18 @@ mod tests {
         parse_transcript(&sync_text(), "run-sync-once").expect("valid sync transcript")
     }
 
+    fn miss_abs(section: &str, id: u32, misses: u64) -> ProgMisses {
+        ProgMisses {
+            section: section.to_owned(),
+            id,
+            misses,
+        }
+    }
+
     fn sync_view(completed: &[RequestRecord]) -> SensorView<'_> {
+        // Pre-GO misses (equal baseline/final absolutes) pass: the
+        // gate owns post-baseline deltas only.
+        let misses = vec![miss_abs("fsession/a", 11, 3), miss_abs("fsession/b", 12, 0)];
         SensorView {
             completed,
             edge_hits: [1, 1, 1, 1],
@@ -890,11 +929,15 @@ mod tests {
             kernel_loss: [0; 5],
             agg_accepted: [1, 1, 1, 1],
             retained_dropped: 0,
-            baseline: SensorBaseline::default(),
+            baseline: SensorBaseline {
+                prog_misses: misses.clone(),
+                ..SensorBaseline::default()
+            },
             quiet_backlog_bytes: 0,
             view_valid: true,
             attached_links: 2,
             foreign_links: 0,
+            prog_misses: misses,
         }
     }
 
@@ -953,6 +996,46 @@ mod tests {
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
         verdict("sync-once", &truth, &sync_view(&completed)).expect("sync green");
+    }
+
+    #[test]
+    fn verdict_prog_miss_delta_fails() {
+        // H2/M2 miss gate: a post-baseline recursion-miss delta
+        // voids the run (a wholly skipped call leaves no edge and
+        // no LLOSS — the gate is the only witness).
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut view = sync_view(&completed);
+        view.prog_misses[0].misses += 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("miss delta must fail");
+        assert!(
+            err.contains("prog_misses[fsession/a] delta reads 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn verdict_prog_miss_backwards_fails() {
+        // A miss counter that ran backwards fails (reset images are
+        // not silently absorbed — same rule as every verdict delta).
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut view = sync_view(&completed);
+        view.prog_misses[0].misses = 2;
+        let err = verdict("sync-once", &truth, &view).expect_err("backwards must fail");
+        assert!(err.contains("ran backwards"), "{err}");
+    }
+
+    #[test]
+    fn verdict_prog_miss_without_baseline_fails_closed() {
+        // A final program with no baseline entry fails closed (an
+        // unattributed program must never read as zero misses).
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut view = sync_view(&completed);
+        view.baseline.prog_misses.clear();
+        let err = verdict("sync-once", &truth, &view).expect_err("missing baseline must fail");
+        assert!(err.contains("has no baseline"), "{err}");
     }
 
     #[test]
@@ -1290,6 +1373,7 @@ mod tests {
             view_valid: true,
             attached_links: 2,
             foreign_links: 0,
+            prog_misses: Vec::new(),
         };
         let err = verdict("async-once", &truth, &view).expect_err("foreign terminal must fail");
         assert!(err.contains("terminals"), "names it: {err}");

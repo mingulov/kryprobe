@@ -135,8 +135,8 @@ pub struct LEdge {
     pub status: i32,
     /// Reserved auxiliary word (BPF writes 0).
     pub aux: u32,
-    /// BPF invocation id (≥1 on slotted edges; 0 with taint when the
-    /// edge has no slot to read it from).
+    /// BPF invocation id (≥1 on cookie-carrying edges; 0 with taint
+    /// when the return's session cookie reads zero).
     pub invoc: u64,
 }
 

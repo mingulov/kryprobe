@@ -17,7 +17,9 @@ use crate::kcrypto_lifecycle::profile::{
     LIFECYCLE_MAPS, LLOSS_ENTRIES, LLOSS_LANES_PER_CLASS, LifecycleProfile, SessionGuard,
     acquire_kcrypto_session,
 };
-use crate::kcrypto_lifecycle::view::SensorIdentity;
+use crate::kcrypto_lifecycle::view::{
+    ProgMissDelta, ProgMisses, SensorIdentity, join_miss_deltas, snapshot_prog_misses,
+};
 use crate::kcrypto_lifecycle::{
     ConfiguredLifecycle, arm_lifecycle_config, disarm_lifecycle_config, load_lifecycle_configured,
 };
@@ -123,12 +125,42 @@ pub struct LifecycleLedger {
     pub loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
     pub agg_baseline: [u64; 4],
+    /// Per-program recursion-miss abs+delta (H2 coverage: a wholly
+    /// skipped call leaves no edge and no `LLOSS` — only the kernel
+    /// miss counter sees it, so any nonzero delta voids exact
+    /// counts; receipts report abs+delta per program).
+    pub prog_misses: Vec<ProgMissDelta>,
+    /// Final per-program miss absolutes (the canary's own
+    /// GO-baselines measure from these — the pre-arm join above
+    /// brackets the whole session, the oracle owns the verdict).
+    pub miss_current: Vec<ProgMisses>,
 }
+
+/// Terminal-ledger read failure (fail loud: an unreadable counter
+/// must never read as zero — coverage would certify blind).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerError {
+    /// `LLOSS`/`LAGG` map-counter read failed.
+    Counters(MapOpsError),
+    /// Per-program recursion-miss read failed.
+    Misses(crate::kcrypto_lifecycle::view::ViewError),
+}
+
+impl std::fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Counters(err) => write!(f, "terminal ledger counters: {err}"),
+            Self::Misses(err) => write!(f, "terminal ledger prog misses: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for LedgerError {}
 
 /// Kernel-side session context for the terminal ledger (M2/H2): the
 /// pre-arm counter baselines plus the sticky identity verdict. The
 /// sensor shell builds it; tests inject it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionContext {
     /// Pre-arm `LLOSS` per-class totals.
     pub loss_baseline: [u64; 5],
@@ -136,6 +168,8 @@ pub struct SessionContext {
     pub agg_baseline: [u64; 4],
     /// Sticky identity verdict at ledger time.
     pub view_valid: bool,
+    /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
+    pub miss_baseline: Vec<ProgMisses>,
 }
 
 /// Pure ingest core: decoder + reducer + completed records (no fds,
@@ -222,13 +256,16 @@ impl SensorCore {
     }
 
     /// Snapshot the terminal ledger with caller-supplied kernel
-    /// counters + session context (the sensor shell reads `LLOSS` +
-    /// `LAGG` and the M2 baseline/verdict; tests inject).
+    /// counters + current miss absolutes + session context (the
+    /// sensor shell reads `LLOSS` + `LAGG`, the current miss
+    /// absolutes, and the M2 baseline/verdict; tests inject). The
+    /// pre-arm→final miss join computes HERE — the one join site.
     #[must_use]
     pub fn ledger(
         &self,
         kernel_loss: [u64; 5],
         agg_accepted: [u64; 4],
+        miss_current: Vec<ProgMisses>,
         ctx: SessionContext,
     ) -> LifecycleLedger {
         LifecycleLedger {
@@ -242,6 +279,8 @@ impl SensorCore {
             view_valid: ctx.view_valid,
             loss_baseline: ctx.loss_baseline,
             agg_baseline: ctx.agg_baseline,
+            prog_misses: join_miss_deltas(&ctx.miss_baseline, &miss_current),
+            miss_current,
         }
     }
 }
@@ -313,6 +352,8 @@ pub struct LifecycleSensor {
     loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
     agg_baseline: [u64; 4],
+    /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
+    miss_baseline: Vec<ProgMisses>,
 }
 
 impl std::fmt::Debug for LifecycleSensor {
@@ -369,6 +410,11 @@ impl LifecycleSensor {
             })?;
         let (loss_baseline, agg_baseline) =
             read_kernel_counters(&configured).map_err(ConfiguredError::Configure)?;
+        let miss_baseline = snapshot_prog_misses(&configured.loaded).map_err(|err| {
+            ConfiguredError::AttachSetup {
+                detail: format!("sensor prog misses: {err}"),
+            }
+        })?;
         arm_lifecycle_config(&configured.loaded)?;
         Ok((
             Self {
@@ -382,6 +428,7 @@ impl LifecycleSensor {
                 view_valid: AtomicBool::new(true),
                 loss_baseline,
                 agg_baseline,
+                miss_baseline,
             },
             points,
         ))
@@ -451,18 +498,25 @@ impl LifecycleSensor {
 
     /// Snapshot the terminal ledger: re-verify identity (post-detach
     /// shape — see [`Self::verify_identity`]) and report the sticky
-    /// verdict with the counters. The counter reads still run after
-    /// a void verdict, and THEY fail independently on bad fds.
-    pub fn ledger(&self) -> Result<LifecycleLedger, MapOpsError> {
+    /// verdict with the counters + joined per-program miss deltas.
+    /// The counter reads still run after a void verdict, and THEY
+    /// fail independently on bad fds (an unreadable miss counter
+    /// fails the ledger — never a silent zero).
+    pub fn ledger(&self) -> Result<LifecycleLedger, LedgerError> {
         let _ = self.verify_identity();
-        let (kernel_loss, agg_accepted) = read_kernel_counters(&self.configured)?;
+        let (kernel_loss, agg_accepted) =
+            read_kernel_counters(&self.configured).map_err(LedgerError::Counters)?;
+        let miss_current =
+            snapshot_prog_misses(&self.configured.loaded).map_err(LedgerError::Misses)?;
         Ok(self.core.ledger(
             kernel_loss,
             agg_accepted,
+            miss_current,
             SessionContext {
                 loss_baseline: self.loss_baseline,
                 agg_baseline: self.agg_baseline,
                 view_valid: self.view_valid.load(Ordering::Relaxed),
+                miss_baseline: self.miss_baseline.clone(),
             },
         ))
     }

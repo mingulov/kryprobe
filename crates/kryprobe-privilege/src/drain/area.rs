@@ -4,7 +4,7 @@
 use super::DrainError;
 use super::frame::{self, Consumed, HDR_SZ};
 use crate::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 fn page_size() -> usize {
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -81,14 +81,17 @@ impl RingArea {
         unsafe { (*(self.prod as *const AtomicU64)).load(Ordering::Acquire) }
     }
 
-    /// Walk `[consumer, producer)` live (H1): per-record volatile
-    /// header read → pure [`frame::frame_step`] → volatile payload
-    /// copy → header revalidation (libbpf pattern). Never forms a
-    /// shared reference over the mapping (the kernel producer may
-    /// commit concurrently — `&[u8]` over live bytes is UB); a header
-    /// that changes under the copy proves a torn read — discard, stop,
-    /// never advance past unverified bytes. In-order always: the walk
-    /// never skips past busy.
+    /// Walk `[consumer, producer)` live (H1): per-record `AtomicU32`
+    /// Acquire header load → pure [`frame::frame_step`] → raw-pointer
+    /// payload copy → header revalidation (aya/libbpf pattern). The
+    /// Acquire pairs the kernel's commit `xchg` (the producer's
+    /// `producer_pos` Release lands at RESERVE, before the payload —
+    /// only the per-record header Acquire orders the copy). Never
+    /// forms a shared reference over the mapping (the kernel producer
+    /// may commit concurrently — `&[u8]` over live bytes is UB); a
+    /// header that changes under the copy proves a wrap overwrite
+    /// mid-copy — discard, stop, never advance past unverified bytes.
+    /// In-order always: the walk never skips past busy.
     pub(crate) fn consume_live(&self, mut consumer: u64, producer: u64, budget: usize) -> Consumed {
         let mut records = Vec::new();
         let mut busy = false;
@@ -105,7 +108,16 @@ impl RingArea {
                 busy = true;
                 break;
             }
-            // SAFETY: bounded above — inside the double mapping.
+            // Alignment: the header is an `AtomicU32` load — a
+            // misaligned offset is a corrupt position (consumer
+            // advances in 8-multiples by construction), so it stops
+            // the walk, never traps the reader.
+            if !off.is_multiple_of(4) {
+                busy = true;
+                break;
+            }
+            // SAFETY: bounded + aligned above — inside the double
+            // mapping on a 4-byte boundary.
             let hdr = unsafe { self.read_hdr(off) };
             match frame::frame_step(hdr, max, consumer, producer) {
                 frame::FrameStep::Stop => {
@@ -124,8 +136,11 @@ impl RingArea {
                     // SAFETY: bounded above — inside the double mapping;
                     // `payload` holds `len` bytes.
                     unsafe { self.copy_payload(off, payload.as_mut_ptr(), len as usize) };
-                    // Revalidate: a header that changed under the copy
-                    // proves a torn read — discard, stop, no advance.
+                    // Revalidate: the Acquire above already orders the
+                    // copy against the commit — a header that changed
+                    // under it proves a wrap overwrite mid-copy
+                    // (consumer lagging a full ring) — discard, stop,
+                    // no advance.
                     let hdr2 = unsafe { self.read_hdr(off) };
                     if hdr2 != hdr {
                         busy = true;
@@ -143,27 +158,24 @@ impl RingArea {
         }
     }
 
-    /// One volatile header word (byte-wise: alignment-free — ring
-    /// offsets are 8-multiples in practice, but a corrupt consumer
-    /// must stop the walk, never trap the reader).
+    /// One header word via `AtomicU32` Acquire — the ratified H1
+    /// synchronization: the load pairs the kernel's commit `xchg`,
+    /// so a committed length observes the committed payload (a
+    /// volatile read assembles bytes but orders nothing).
     ///
     /// # Safety
     ///
-    /// `off + HDR_SZ` must lie inside the double mapping.
+    /// `off + HDR_SZ` must lie inside the double mapping and `off`
+    /// must be 4-aligned.
     unsafe fn read_hdr(&self, off: usize) -> u32 {
         // SAFETY: upheld by the caller (see above).
-        unsafe {
-            let base = self.prod.add(self.page + off);
-            u32::from_le_bytes([
-                base.read_volatile(),
-                base.add(1).read_volatile(),
-                base.add(2).read_volatile(),
-                base.add(3).read_volatile(),
-            ])
-        }
+        unsafe { (*(self.prod.add(self.page + off) as *const AtomicU32)).load(Ordering::Acquire) }
     }
 
-    /// Volatile payload copy out of the live mapping.
+    /// Raw-pointer payload copy out of the live mapping (byte-wise
+    /// volatile: no shared reference over concurrently-committed
+    /// bytes — `&[u8]` there is UB). Runs AFTER the Acquire header
+    /// load, which is what orders it against the kernel commit.
     ///
     /// # Safety
     ///
@@ -194,14 +206,17 @@ mod tests {
     use super::RingArea;
     use super::frame::BUSY_BIT;
     use super::frame::DISCARD_BIT;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     /// Simulated ringbuf area: anonymous mappings in the kernel layout
     /// (consumer page + producer word + a linear data span standing in
     /// for the double map — reads within the span behave identically).
-    /// The producer side (`commit`) follows the kernel protocol:
-    /// BUSY header → payload bytes → plain header swap → producer
-    /// advance (all Release; the reader's Acquire observes them).
+    /// The producer side follows the kernel protocol honestly:
+    /// BUSY reserve (Relaxed — no ordering) → producer publish
+    /// (Release, BEFORE the payload lands) → payload bytes → commit
+    /// through an atomic swap (the kernel's `xchg`). The reader's
+    /// per-record header Acquire pairs the swap — never the
+    /// producer-position Release, which precedes the payload.
     struct Sim {
         area: RingArea,
     }
@@ -250,20 +265,31 @@ mod tests {
             }
         }
 
+        /// Reserve write (Relaxed: the reserve carries no ordering —
+        /// the kernel's plain BUSY store is exactly this honest).
         fn write_hdr(&self, off: usize, word: u32) {
             debug_assert_eq!(off % 4, 0, "sim headers stay aligned");
             unsafe {
-                self.area
-                    .prod
-                    .add(self.area.page + off)
-                    .cast::<u32>()
-                    .write_volatile(word);
+                (*(self.area.prod.add(self.area.page + off) as *const AtomicU32))
+                    .store(word, Ordering::Relaxed);
+            }
+        }
+
+        /// Commit through an atomic swap (AcqRel: the kernel's `xchg`
+        /// — the reader's Acquire pairs HERE).
+        fn swap_hdr(&self, off: usize, word: u32) {
+            debug_assert_eq!(off % 4, 0, "sim headers stay aligned");
+            unsafe {
+                (*(self.area.prod.add(self.area.page + off) as *const AtomicU32))
+                    .swap(word, Ordering::AcqRel);
             }
         }
 
         /// Reserve→write→commit one record at absolute `pos` (BUSY
-        /// header, payload bytes, plain header swap); returns the next
-        /// position. The caller advances the producer past it.
+        /// reserve, payload bytes, atomic-swap commit); returns the
+        /// next position. The caller advances the producer past it
+        /// (committed records only — the concurrent test publishes at
+        /// reserve instead, per the kernel protocol).
         fn commit(&self, pos: u64, payload: &[u8]) -> u64 {
             let off = (pos & (self.area.max as u64 - 1)) as usize;
             self.write_hdr(off, BUSY_BIT | payload.len() as u32);
@@ -273,7 +299,7 @@ mod tests {
                     .add(self.area.page + off + super::frame::HDR_SZ)
                     .copy_from_nonoverlapping(payload.as_ptr(), payload.len());
             }
-            self.write_hdr(off, payload.len() as u32);
+            self.swap_hdr(off, payload.len() as u32);
             pos + super::frame::HDR_SZ as u64 + ((payload.len() as u64 + 7) & !7)
         }
     }
@@ -302,14 +328,17 @@ mod tests {
     #[test]
     fn busy_stops_then_recommits() {
         let sim = Sim::new(256);
-        // Reserve without commit: the walk stops, never advances.
+        // Reserve + producer publish WITHOUT the payload (the kernel
+        // publishes producer_pos at reserve): the walk sees the
+        // reservation and stops — never emits, never advances.
         sim.write_hdr(0, BUSY_BIT | 8);
         sim.set_producer(16);
         let out = sim.area.consume_live(0, 16, 16);
         assert!(out.records.is_empty());
         assert_eq!(out.consumer, 0);
         assert!(out.busy);
-        // Commit lands: the retry emits (in-order, never skipped past).
+        // Payload + atomic-swap commit land: the retry emits
+        // (in-order, never skipped past).
         let end = sim.commit(0, &[3u8; 8]);
         sim.set_producer(end);
         let out = sim.area.consume_live(0, end, 16);
@@ -362,6 +391,17 @@ mod tests {
     }
 
     #[test]
+    fn misaligned_consumer_stops_like_busy() {
+        // The header is an `AtomicU32` load: a misaligned offset is
+        // a corrupt position — the walk stops, never traps.
+        let sim = Sim::new(256);
+        let out = sim.area.consume_live(2, 100, 16);
+        assert!(out.records.is_empty());
+        assert_eq!(out.consumer, 2);
+        assert!(out.busy);
+    }
+
+    #[test]
     fn torn_tail_stops_like_busy() {
         let sim = Sim::new(256);
         let end = sim.commit(0, &[1u8; 8]);
@@ -375,9 +415,14 @@ mod tests {
 
     #[test]
     fn concurrent_producer_never_emits_torn_bytes() {
-        // Writer thread commits uniform records while the reader
-        // drains: every emitted payload must be byte-consistent
-        // (all one index value — never a mix of two commits).
+        // Writer thread follows the kernel protocol honestly —
+        // reserve (Relaxed) → publish producer (Release, BEFORE the
+        // payload) → payload bytes → atomic-swap commit — while the
+        // reader drains: every emitted payload must be byte-consistent
+        // (all one index value — never a mix of two commits), and a
+        // reader arriving mid-reserve sees BUSY, never torn bytes.
+        // (The deterministic reserve window is pinned by
+        // `busy_stops_then_recommits`; this is the race stress.)
         let sim = Sim::new(65536);
         let prod = sim.area.prod as usize;
         let page = sim.area.page;
@@ -390,16 +435,23 @@ mod tests {
                 let payload = [i as u8; 8];
                 let off = (pos & (max as u64 - 1)) as usize;
                 unsafe {
-                    prod.add(page + off)
-                        .cast::<u32>()
-                        .write_volatile(BUSY_BIT | 8);
-                    prod.add(page + off + super::frame::HDR_SZ)
-                        .copy_from_nonoverlapping(payload.as_ptr(), 8);
-                    prod.add(page + off).cast::<u32>().write_volatile(8);
+                    // Reserve: BUSY header, no ordering.
+                    (*(prod.add(page + off) as *const AtomicU32))
+                        .store(BUSY_BIT | 8, Ordering::Relaxed);
                 }
                 pos += 16;
+                // Publish the producer BEFORE the payload lands (the
+                // kernel's reserve-publish order): the reader's
+                // producer_pos Acquire precedes the commit, so only
+                // the per-record header Acquire orders the copy.
                 unsafe {
                     (*(prod as *const AtomicU64)).store(pos, Ordering::Release);
+                }
+                unsafe {
+                    prod.add(page + off + super::frame::HDR_SZ)
+                        .copy_from_nonoverlapping(payload.as_ptr(), 8);
+                    // Commit through an atomic swap (the kernel's xchg).
+                    (*(prod.add(page + off) as *const AtomicU32)).swap(8, Ordering::AcqRel);
                 }
             }
             pos

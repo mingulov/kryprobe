@@ -19,6 +19,7 @@ use crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS;
 use crate::kcrypto_lifecycle::sensor::{
     DrainOutcome, LifecycleLedger, LifecycleSensor, QuietOutcome,
 };
+use crate::kcrypto_lifecycle::view::prog_miss_delta_sum;
 use crate::probe::{ProbeOutcome, fsession_capable};
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, RawEventHeader};
 use kryprobe_core::backend::{
@@ -551,10 +552,12 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 /// the kernel refused to record) → state inserts; fret (return
 /// observed, value unreadable) → unmatched returns; retention drops
 /// past the ledger bound → user queue; refused/bad/duplicate/
-/// ambiguous evidence → state inserts; unfinished-at-finish →
+/// ambiguous evidence → state inserts; per-program recursion-miss
+/// deltas (H2 — the kernel skipped whole runs, the ultimate
+/// refused-to-record) → state inserts; unfinished-at-finish →
 /// unmatched entries; unknown invocations + reducer orphans →
 /// unmatched returns; reuse gaps + stale returns → correlation
-/// overflows. A void identity verdict (M2/H2 — the sensor's kernel
+/// overflows. A void identity verdict (M2 — the sensor's kernel
 /// objects stopped matching the pre-arm baseline, so the session's
 /// evidence is unattributed) lands one count in state inserts.
 /// Evictions/unknown generations pin zero (HASH slots never evict,
@@ -574,6 +577,7 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> I
             .saturating_add(ledger.kernel_loss[1])
             .saturating_add(ledger.kernel_loss[2])
             .saturating_add(ledger.kernel_loss[4])
+            .saturating_add(prog_miss_delta_sum(&ledger.prog_misses))
             .saturating_add(u64::from(!ledger.view_valid)),
         state_evictions: 0,
         unmatched_entries: ledger.reducer.unfinished,
@@ -605,9 +609,10 @@ impl Backend for LifecycleBackend {
         // M2 detector gate (W8 floor 7.0+): a kernel that FAILED the
         // fsession capability probe refuses detection here (typed
         // `Unsupported` — no detect-then-fail-configure). `Denied`
-        // (unprivileged load check) and the no-target pass still
-        // detect: privilege arrives at configure, and the loader
-        // re-refuses anything the probe could not prove.
+        // (unprivileged load check) still detects: privilege arrives
+        // at configure, and the loader re-refuses anything the probe
+        // could not prove. (A missing attach target never reaches
+        // this probe — `resolve_lifecycle_ids` above already refused.)
         if let ProbeOutcome::Failed { detail } = fsession_capable() {
             return Err(BackendError::Unsupported(UnsupportedReason::with_detail(
                 "kcrypto_fsession_unavailable",
@@ -791,6 +796,8 @@ mod tests {
             view_valid: true,
             loss_baseline: [0; 5],
             agg_baseline: [0; 4],
+            prog_misses: Vec::new(),
+            miss_current: Vec::new(),
         }
     }
 
@@ -821,6 +828,30 @@ mod tests {
         let mut ledger = ledger_with([0; 5]);
         ledger.view_valid = false;
         assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 1);
+        let ledger = ledger_with([0; 5]);
+        assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 0);
+    }
+
+    #[test]
+    fn w9_prog_miss_deltas_land_in_state_inserts() {
+        // Round-9 (sol/astra-Major 1): per-program recursion-miss
+        // session deltas attest in state inserts (the kernel skipped
+        // whole runs — refused-to-record); zero deltas add nothing.
+        use crate::kcrypto_lifecycle::view::ProgMissDelta;
+        let mut ledger = ledger_with([0; 5]);
+        ledger.prog_misses = vec![
+            ProgMissDelta {
+                section: "fsession/a".to_owned(),
+                baseline: 3,
+                current: 5,
+            },
+            ProgMissDelta {
+                section: "fsession/b".to_owned(),
+                baseline: 0,
+                current: 0,
+            },
+        ];
+        assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 2);
         let ledger = ledger_with([0; 5]);
         assert_eq!(integrity_for_lifecycle(&ledger, 0).state_insert_failures, 0);
     }

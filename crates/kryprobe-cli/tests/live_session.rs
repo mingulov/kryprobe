@@ -2006,6 +2006,8 @@ fn lifecycle_test_ledger(
         view_valid: true,
         loss_baseline: [0; 5],
         agg_baseline: [0; 4],
+        prog_misses: Vec::new(),
+        miss_current: Vec::new(),
     }
 }
 

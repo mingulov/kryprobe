@@ -23,6 +23,13 @@ const INFO_BUF: usize = 512;
 
 /// Consumed `bpf_prog_info` prefix: `type`@0, `id`@4, `name`@64..80.
 const PROG_PREFIX: u32 = 80;
+/// Consumed `bpf_prog_info` prefix for recursion-miss reads (H2):
+/// everything above through `recursion_misses`@208..216 (`run_time_ns`@192,
+/// `run_cnt`@200, `recursion_misses`@208 per the 7.0 UAPI layout —
+/// misses are coverage, read separately from identity, never pinned).
+const PROG_MISS_PREFIX: u32 = 216;
+/// `recursion_misses` offset in `bpf_prog_info` (7.0 UAPI).
+const RECURSION_MISSES_OFF: usize = 208;
 /// Consumed `bpf_map_info` prefix: type/id/key/value/max@0..20.
 const MAP_PREFIX: u32 = 20;
 /// Consumed `bpf_link_info` prefix: type/id/prog_id@0..12 +
@@ -81,6 +88,19 @@ impl std::error::Error for ViewError {}
 
 fn u32le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn u64le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
 }
 
 fn info_for(fd: RawFd, stage: &str, want: u32) -> Result<[u8; INFO_BUF], ViewError> {
@@ -309,6 +329,101 @@ impl SensorIdentity {
     }
 }
 
+/// Per-program recursion-miss absolute (H2 coverage, NOT identity:
+/// the counter legitimately moves, so it never joins
+/// [`SensorIdentity::verify_against`] — misses void exact counts, they
+/// never void identity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgMisses {
+    /// Section (our label for the program — the join key).
+    pub section: String,
+    /// Kernel program id (join audit: must match the identity read).
+    pub id: u32,
+    /// Absolute `recursion_misses` at read time.
+    pub misses: u64,
+}
+
+/// Per-program miss abs+delta (receipts report all three; gates void
+/// on a nonzero delta).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgMissDelta {
+    /// Section (join key).
+    pub section: String,
+    /// Pre-arm absolute.
+    pub baseline: u64,
+    /// Post-ingest absolute.
+    pub current: u64,
+}
+
+impl ProgMissDelta {
+    /// Session-attributable misses (saturating: a counter that ran
+    /// backwards is a kernel impossibility the canary refuses
+    /// separately via checked subtraction — the ledger never wraps).
+    #[must_use]
+    pub fn delta(&self) -> u64 {
+        self.current.saturating_sub(self.baseline)
+    }
+}
+
+/// Snapshot every program's `recursion_misses` absolute (H2 "read
+/// after ingest" twin of [`SensorIdentity::snapshot`]): same
+/// `BPF_OBJ_GET_INFO_BY_FD` path, same TRACING pin, deeper prefix
+/// (`PROG_MISS_PREFIX` covers `recursion_misses`@208). A short report
+/// refuses (ancient kernel — never read past it) and a failed GET_INFO
+/// fails the read (the ledger fails loud — an unreadable miss counter
+/// must never read as zero).
+pub fn snapshot_prog_misses(loaded: &LoadedLifecycle) -> Result<Vec<ProgMisses>, ViewError> {
+    let mut out = Vec::with_capacity(loaded.progs.len());
+    for (section, fd) in &loaded.progs {
+        let stage = format!("prog {section}");
+        let buf = info_for(fd.as_raw_fd(), &stage, PROG_MISS_PREFIX)?;
+        if u32le(&buf, 0) != BPF_PROG_TYPE_TRACING {
+            return Err(ViewError::Identity {
+                detail: format!("{stage}: prog type {} is not TRACING", u32le(&buf, 0)),
+            });
+        }
+        out.push(ProgMisses {
+            section: section.clone(),
+            id: u32le(&buf, 4),
+            misses: u64le(&buf, RECURSION_MISSES_OFF),
+        });
+    }
+    Ok(out)
+}
+
+/// Join pre-arm and post-ingest miss absolutes by section (pure —
+/// unit-tested without privilege). A current section with no baseline
+/// entry joins against zero (a program that appeared mid-session is
+/// already an identity-cardinality void; its whole absolute counts as
+/// session misses — conservative, never silent). A baseline section
+/// gone from current is dropped (detached program; identity is void).
+#[must_use]
+pub fn join_miss_deltas(baseline: &[ProgMisses], current: &[ProgMisses]) -> Vec<ProgMissDelta> {
+    current
+        .iter()
+        .map(|got| {
+            let base = baseline
+                .iter()
+                .find(|want| want.section == got.section)
+                .map_or(0, |want| want.misses);
+            ProgMissDelta {
+                section: got.section.clone(),
+                baseline: base,
+                current: got.misses,
+            }
+        })
+        .collect()
+}
+
+/// Session miss total over joined deltas (saturating — the coverage
+/// gate's input: any nonzero voids exact counts).
+#[must_use]
+pub fn prog_miss_delta_sum(deltas: &[ProgMissDelta]) -> u64 {
+    deltas
+        .iter()
+        .fold(0u64, |sum, delta| sum.saturating_add(delta.delta()))
+}
+
 fn snapshot_maps(maps: &LifecycleMaps) -> Result<Vec<MapIdentity>, ViewError> {
     use crate::fd::OwnedFd;
     let named: &[(&str, &OwnedFd)] = &[
@@ -404,6 +519,95 @@ mod tests {
         identity()
             .verify_against(&identity())
             .expect("identical verifies");
+    }
+
+    fn misses(section: &str, id: u32, misses: u64) -> ProgMisses {
+        ProgMisses {
+            section: section.to_owned(),
+            id,
+            misses,
+        }
+    }
+
+    #[test]
+    fn miss_prefix_covers_recursion_misses() {
+        // The 216-byte prefix must cover misses@208..216 inside the
+        // 512-byte info buffer (a short prefix would refuse every
+        // 7.0 kernel via InfoShort).
+        assert!(RECURSION_MISSES_OFF + 8 <= PROG_MISS_PREFIX as usize);
+        assert!(PROG_MISS_PREFIX as usize <= INFO_BUF);
+        assert_eq!(RECURSION_MISSES_OFF, 208);
+    }
+
+    #[test]
+    fn u64le_reads_little_endian() {
+        let mut buf = [0u8; 216];
+        buf[208..216].copy_from_slice(&0x0102030405060708u64.to_le_bytes());
+        assert_eq!(u64le(&buf, 208), 0x0102030405060708);
+    }
+
+    #[test]
+    fn join_deltas_by_section() {
+        let baseline = vec![misses("fsession/a", 11, 3), misses("fsession/b", 12, 0)];
+        let current = vec![misses("fsession/b", 12, 2), misses("fsession/a", 11, 5)];
+        let joined = join_miss_deltas(&baseline, &current);
+        assert_eq!(
+            joined,
+            vec![
+                ProgMissDelta {
+                    section: "fsession/b".to_owned(),
+                    baseline: 0,
+                    current: 2,
+                },
+                ProgMissDelta {
+                    section: "fsession/a".to_owned(),
+                    baseline: 3,
+                    current: 5,
+                },
+            ]
+        );
+        assert_eq!(joined[0].delta(), 2);
+        assert_eq!(joined[1].delta(), 2);
+        assert_eq!(prog_miss_delta_sum(&joined), 4);
+    }
+
+    #[test]
+    fn join_unbaselined_section_counts_whole_absolute() {
+        // A program that appeared mid-session (identity already void
+        // on cardinality) counts its whole absolute as session
+        // misses — conservative, never silent.
+        let joined = join_miss_deltas(&[], &[misses("fsession/a", 11, 7)]);
+        assert_eq!(joined[0].baseline, 0);
+        assert_eq!(joined[0].delta(), 7);
+    }
+
+    #[test]
+    fn join_drops_detached_baseline_section() {
+        let baseline = vec![misses("fsession/a", 11, 3)];
+        let joined = join_miss_deltas(&baseline, &[]);
+        assert!(joined.is_empty());
+        assert_eq!(prog_miss_delta_sum(&joined), 0);
+    }
+
+    #[test]
+    fn delta_saturates_never_wraps() {
+        let back = ProgMissDelta {
+            section: "fsession/a".to_owned(),
+            baseline: 9,
+            current: 4,
+        };
+        assert_eq!(back.delta(), 0);
+        let sat = ProgMissDelta {
+            section: "fsession/a".to_owned(),
+            baseline: 0,
+            current: u64::MAX,
+        };
+        let one = ProgMissDelta {
+            section: "fsession/b".to_owned(),
+            baseline: 0,
+            current: 1,
+        };
+        assert_eq!(prog_miss_delta_sum(&[sat, one]), u64::MAX);
     }
 
     #[test]

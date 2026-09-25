@@ -6,10 +6,11 @@
 //! `page + 2 * max_entries` holds the u64 producer position at offset 0
 //! and the double-mapped data area after one page. Each iteration walks
 //! the mapping live ([`area::RingArea::consume_live`], H1): per-record
-//! volatile header reads, no shared reference over live bytes, no
-//! snapshot — a bulk copy over concurrently-committed bytes tears (any
-//! arch), while the live walk stops on busy and revalidates every
-//! header it copies under.
+//! `AtomicU32` Acquire header loads (pairing the kernel's commit
+//! `xchg`), no shared reference over live bytes, no snapshot — a bulk
+//! copy over concurrently-committed bytes tears (any arch), while the
+//! live walk stops on busy and revalidates every header it copies
+//! under (a wrap overwrite mid-copy discards, never emits torn).
 //!
 //! Alignment: ring offsets advance in multiples of 8 by construction
 //! (see `frame` tests); record bytes are copied out and parsed

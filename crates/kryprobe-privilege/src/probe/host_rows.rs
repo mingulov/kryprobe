@@ -10,15 +10,16 @@ use crate::probe::ProbeOutcome;
 use crate::probe::bpf_prog::load_minimal_fsession;
 use crate::probe::{cap_names, yama_verdict};
 
-/// Gate: can this kernel run the lifecycle session sensor (T06 W8)?
-/// Pass requires a minimal `TRACING` load with
-/// `expected_attach_type = 58` against our real attach target
-/// (ratification C: the kfunc filter gates on the attach type, so a
-/// plain fentry probe would `-EACCES` and misreport) — the load is
-/// the floor discriminator (guest-proven: the session kfuncs exist
-/// even on 6.12, so their BTF presence only gates the cheap
-/// unprivileged pre-check, never the verdict). Missing kfuncs fail
-/// with the cause named; a permission refusal on the load reports
+/// Gate: can this kernel run the lifecycle sensor (T06 W8)? Pass
+/// requires a minimal `TRACING` load with `expected_attach_type = 58`
+/// against our real attach target (ratification C: the kfunc filter
+/// gates on the attach type, so a plain fentry probe would `-EACCES`
+/// and misreport) — the load is the floor discriminator
+/// (guest-proven: the session kfuncs exist even on 6.12, so their BTF
+/// presence only gates the cheap unprivileged pre-check, never the
+/// verdict). Missing kfuncs fail with the cause named, and a missing
+/// attach target fails too (kfunc presence must never pass for the
+/// attach-58 discriminator); a permission refusal on the load reports
 /// `Denied` (capability unproven, not absent — see `cap_state`); any
 /// other load errno fails loud.
 pub fn fsession_capable() -> ProbeOutcome {
@@ -36,12 +37,17 @@ pub fn fsession_capable() -> ProbeOutcome {
         }
         Ok(_) => {}
     }
-    let target = resolve_lifecycle_ids()
-        .ok()
-        .and_then(|ids| ids.get("crypto_skcipher_encrypt").copied());
+    let target = match resolve_lifecycle_ids() {
+        Ok(ids) => ids.get("crypto_skcipher_encrypt").copied(),
+        Err(err) => {
+            return ProbeOutcome::failed(format!(
+                "no kcrypto attach target ({err}; cannot prove attach type 58)"
+            ));
+        }
+    };
     let Some(target) = target else {
-        return ProbeOutcome::pass(
-            "session kfuncs present (load check skipped: no kcrypto attach target)",
+        return ProbeOutcome::failed(
+            "no kcrypto attach target (crypto_skcipher_encrypt unresolved; cannot prove attach type 58)",
         );
     };
     match load_minimal_fsession(target) {

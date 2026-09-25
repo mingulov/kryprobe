@@ -87,6 +87,7 @@ use kryprobe_privilege::kcrypto_backend::{
 use kryprobe_privilege::kcrypto_lifecycle::backend::{LifecycleBackend, lifecycle_event};
 use kryprobe_privilege::kcrypto_lifecycle::profile::{LifecycleProfile, manifest, max_programs};
 use kryprobe_privilege::kcrypto_lifecycle::sensor::{DrainOutcome, LifecycleLedger, QuietOutcome};
+use kryprobe_privilege::kcrypto_lifecycle::view::prog_miss_delta_sum;
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
     shared_losses_from_snapshot, snapshot_rows_with_drain,
@@ -471,17 +472,20 @@ fn lifecycle_coverage(
         .push(counter("probes_expected", expected_points as u64));
     // Count-corrupting loss: any kernel loss class (reserve failures
     // drop edges; disabled/badkey/fret mean the sensor skipped work),
-    // any refused/corrupt/synthesized/stale decode evidence, and any
-    // reducer evidence that never became a trustworthy record
-    // (orphans, ambiguous, admission failures). Duplicates repeat
-    // known state — no information lost, never flipping. A
-    // loss-clean ledger is still `Unknown`: internal pairing cannot
-    // prove kernel hook-delivery (S04/G9 twin).
+    // any per-program recursion-miss session delta (H2: the kernel
+    // skipped whole runs — no edge, no LLOSS, only the miss counter
+    // sees it), any refused/corrupt/synthesized/stale decode
+    // evidence, and any reducer evidence that never became a
+    // trustworthy record (orphans, ambiguous, admission failures).
+    // Duplicates repeat known state — no information lost, never
+    // flipping. A loss-clean ledger is still `Unknown`: internal
+    // pairing cannot prove kernel hook-delivery (S04/G9 twin).
     let count_loss = ledger
         .kernel_loss
         .iter()
         .fold(0u64, |sum, loss| sum.saturating_add(*loss));
     let count_loss = count_loss
+        .saturating_add(prog_miss_delta_sum(&ledger.prog_misses))
         .saturating_add(ledger.decode.submit_refused)
         .saturating_add(ledger.decode.unknown_invoc_returns)
         .saturating_add(ledger.decode.bad_records)
@@ -508,6 +512,10 @@ fn lifecycle_coverage(
     aggregate_counts
         .counters
         .push(counter("count_loss", count_loss));
+    aggregate_counts.counters.push(counter(
+        "prog_miss_delta",
+        prog_miss_delta_sum(&ledger.prog_misses),
+    ));
     aggregate_counts
         .counters
         .push(counter("submits_admitted", ledger.reducer.admitted));
@@ -2073,6 +2081,8 @@ mod tests {
             view_valid: true,
             loss_baseline: [0; 5],
             agg_baseline: [0; 4],
+            prog_misses: Vec::new(),
+            miss_current: Vec::new(),
         }
     }
 
@@ -2180,6 +2190,22 @@ mod tests {
         let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
+        // A per-program recursion-miss delta corrupts counts AND voids
+        // completion (H2: wholly skipped runs leave no edge and no
+        // LLOSS — the miss counter is the only witness).
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.prog_misses = vec![kryprobe_privilege::kcrypto_lifecycle::view::ProgMissDelta {
+            section: "fsession/a".to_owned(),
+            baseline: 0,
+            current: 1,
+        }];
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(
+            coverage.completion.status,
+            CoverageStatus::Partial,
+            "miss deltas void exact completion claims"
+        );
         // Truthless-drained records flip completion only.
         let mut ledger = lifecycle_ledger_clean();
         ledger.reducer.unfinished = 1;

@@ -24,6 +24,7 @@ use kryprobe_privilege::kcrypto_lifecycle::canary::{
     SensorBaseline, SensorView, count_foreign_links, parse_transcript, verdict,
 };
 use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
+use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -202,6 +203,7 @@ fn main() {
             decode: ledger.decode,
             reducer: ledger.reducer,
             retained_dropped: ledger.retained_dropped,
+            prog_misses: ledger.miss_current.clone(),
         }
     };
     // Quiescence gates RUN validity (a noisy guest refuses the
@@ -517,6 +519,41 @@ fn main() {
         ),
     );
     put(&mut out, "view_valid", ledger.view_valid.to_string());
+    // H2 per-program misses abs+delta (GO-relative join against the
+    // quiescence baseline + pre-arm session absolutes): the verdict
+    // owns the all-zero gate; the receipt shows both sides.
+    let miss_line = |base: &[ProgMisses], cur: &[ProgMisses]| -> String {
+        cur.iter()
+            .map(|got| {
+                let b = base
+                    .iter()
+                    .find(|want| want.section == got.section)
+                    .map_or(0, |want| want.misses);
+                format!(
+                    "{} base={b} cur={} delta={}",
+                    got.section,
+                    got.misses,
+                    got.misses.saturating_sub(b)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    put(
+        &mut out,
+        "prog_misses",
+        miss_line(&baseline2.prog_misses, &ledger.miss_current),
+    );
+    put(
+        &mut out,
+        "arm_miss_abs",
+        ledger
+            .prog_misses
+            .iter()
+            .map(|d| format!("{}={}", d.section, d.baseline))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
 
     let view = SensorView {
         completed: &completed,
@@ -531,6 +568,7 @@ fn main() {
         view_valid: ledger.view_valid,
         attached_links,
         foreign_links,
+        prog_misses: ledger.miss_current.clone(),
     };
     if let Err(reason) = verdict(&scenario, &truth, &view) {
         fail(&out, &receipt, &reason);

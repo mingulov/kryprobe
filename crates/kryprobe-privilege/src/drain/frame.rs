@@ -3,11 +3,12 @@
 //! H1 rework).
 //!
 //! The live walker ([`crate::drain::area::RingArea::consume_live`])
-//! reads each header straight from the mapping (volatile, never a
-//! shared reference over live bytes) and asks [`frame_step`] what the
-//! word means; payload bytes copy out only on [`FrameStep::Emit`],
-//! then the header revalidates (libbpf pattern) before anything
-//! advances. No snapshot, no bulk copy, no torn reads.
+//! loads each header straight from the mapping (`AtomicU32` Acquire,
+//! never a shared reference over live bytes) and asks [`frame_step`]
+//! what the word means; payload bytes copy out only on
+//! [`FrameStep::Emit`], then the header revalidates (a wrap overwrite
+//! mid-copy discards) before anything advances. No snapshot, no bulk
+//! copy, no torn reads.
 
 /// Record header size: `len` u32 + kernel-internal `pg_off` u32.
 pub const HDR_SZ: usize = 8;

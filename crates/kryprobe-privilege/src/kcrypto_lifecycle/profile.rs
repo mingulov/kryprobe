@@ -20,7 +20,8 @@ pub enum LifecycleProfile {
     /// (the default: selecting nothing keeps current behavior).
     #[default]
     ApiReturns,
-    /// Edge-pairing sensor: fentry+fexit per required site.
+    /// Edge-pairing sensor: one fsession program (paired
+    /// entry/return runs) per required site.
     RequestLifecycle,
 }
 
