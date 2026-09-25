@@ -142,6 +142,10 @@ fn main() {
             retained_dropped: ledger.retained_dropped,
         }
     };
+    // Quiescence gates RUN validity (a noisy guest refuses the
+    // run); traffic ORIGIN during GO is proven by the verdict's
+    // exact join (hook counts + errno + status + deltas), not by
+    // these baselines — background traffic breaks the join and fails.
     let baseline1 = snapshot(&sensor, 0);
     std::thread::sleep(Duration::from_millis(200));
     let baseline2 = snapshot(&sensor, 0);
@@ -171,28 +175,12 @@ fn main() {
         truth.fixture_overflow.to_string(),
     );
 
-    // Fixture display counts (receipt readers; the verdict owns rules).
-    let mut fx = [0u64; 4];
-    for op in &truth.ops {
-        match op.op.as_str() {
-            "encrypt" => fx[0] += 1,
-            "decrypt" => fx[2] += 1,
-            _ => {}
-        }
-    }
+    // Fixture-derived hook EXPECTATIONS (the verdict's oracle
+    // input — same `expected_hooks` the verdict compares deltas
+    // against, so the receipt shows both sides of the join).
+    let fx = truth.expected_hooks();
     let mut fx_completed = 0u64;
-    for (seq, errno) in &truth.returns {
-        let op = truth
-            .ops
-            .iter()
-            .find(|o| o.seq == *seq)
-            .map(|o| o.op.as_str())
-            .unwrap_or("");
-        match op {
-            "encrypt" => fx[1] += 1,
-            "decrypt" => fx[3] += 1,
-            _ => {}
-        }
+    for (_, errno) in &truth.returns {
         if *errno != -115 && *errno != -16 {
             fx_completed += 1;
         }

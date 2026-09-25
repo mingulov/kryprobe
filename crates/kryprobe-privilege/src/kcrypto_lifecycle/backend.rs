@@ -35,7 +35,7 @@ use kryprobe_core::plan::{CapabilityRequirements, OffsetProbe};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Lifecycle capabilities: kernel BTF (attach ids + prototype gate)
 /// and the ring-buffer transport are required; uprobes/cookies are
@@ -66,12 +66,21 @@ pub struct LifecycleBackend {
     state: Mutex<Option<(PlanGeneration, LifecycleSensor)>>,
     staged: Mutex<StagedLifecycle>,
     decoded: AtomicUsize,
+    /// Driver-side observation-cap omissions (reported via
+    /// [`Self::note_output_omissions`] before `finalize`, surfaced
+    /// as `budget_omissions` — the driver drops decoded records the
+    /// sensor counted, so the backend must attest them).
+    output_omissions: AtomicU64,
 }
 
 impl std::fmt::Debug for LifecycleBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecycleBackend")
             .field("decoded", &self.decoded.load(Ordering::Relaxed))
+            .field(
+                "output_omissions",
+                &self.output_omissions.load(Ordering::Relaxed),
+            )
             .field(
                 "configured",
                 &self.state.try_lock().map(|s| s.is_some()).unwrap_or(false),
@@ -91,6 +100,7 @@ impl LifecycleBackend {
                 token: None,
             }),
             decoded: AtomicUsize::new(0),
+            output_omissions: AtomicU64::new(0),
         }
     }
 
@@ -272,6 +282,10 @@ impl Backend for SharedLifecycleBackend {
 
     fn finalize(&self, ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError> {
         self.inner.finalize(ctx)
+    }
+
+    fn note_output_omissions(&self, omitted: u64) {
+        self.inner.note_output_omissions(omitted);
     }
 }
 
@@ -520,10 +534,10 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 /// ambiguous evidence → state inserts; unfinished-at-finish →
 /// unmatched entries; unknown keys + reducer orphans → unmatched
 /// returns; reuse gaps + stale returns → correlation overflows.
-/// Evictions/unknown generations/budget omissions pin zero (HASH
-/// slots never evict, single generation driver, decode never
-/// budget-omits).
-fn integrity_for_lifecycle(ledger: &LifecycleLedger) -> IntegritySummary {
+/// Evictions/unknown generations pin zero (HASH slots never evict,
+/// single generation driver); `output_omissions` (driver-reported
+/// observation-cap drops) lands in `budget_omissions`.
+fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> IntegritySummary {
     IntegritySummary {
         ring_reservation_failures: ledger.kernel_loss[0],
         user_queue_drops: ledger.retained_dropped,
@@ -549,7 +563,7 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger) -> IntegritySummary {
             .gaps_synthesized
             .saturating_add(ledger.decode.stale_returns),
         unknown_generation_events: 0,
-        budget_omissions: 0,
+        budget_omissions: output_omissions,
     }
 }
 
@@ -679,12 +693,21 @@ impl Backend for LifecycleBackend {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let Some((_, sensor)) = guard.as_ref() else {
-            // Pre-configure: no sensor to assess — counts echo, integrity
-            // pins zero (documented; never echo the ctx baseline).
+            // Pre-configure: no sensor to assess — counts echo,
+            // sensor-side integrity pins zero (documented; never echo
+            // the ctx baseline). Driver-reported cap omissions still
+            // attest: the live driver reports before finalize even when
+            // the sensor lives outside this backend (scripted/canary
+            // sessions), and a reported drop must never read back as
+            // zero. With no report this is exactly `default()`.
+            let integrity = IntegritySummary {
+                budget_omissions: self.output_omissions.load(Ordering::Relaxed),
+                ..IntegritySummary::default()
+            };
             return Ok(BackendSummary {
                 backend: BackendId::KCrypto,
                 observations,
-                integrity: IntegritySummary::default(),
+                integrity,
             });
         };
         // End-of-session assessment over the live ledger (the sensor is
@@ -698,8 +721,19 @@ impl Backend for LifecycleBackend {
         Ok(BackendSummary {
             backend: BackendId::KCrypto,
             observations,
-            integrity: integrity_for_lifecycle(&ledger),
+            integrity: integrity_for_lifecycle(
+                &ledger,
+                self.output_omissions.load(Ordering::Relaxed),
+            ),
         })
+    }
+
+    fn note_output_omissions(&self, omitted: u64) {
+        self.output_omissions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(omitted))
+            })
+            .ok();
     }
 }
 
@@ -728,7 +762,7 @@ mod tests {
         // state inserts (evidence that failed to enter backend
         // state), fret→unmatched returns (return observed, value
         // unreadable). Nothing silent, nothing double-counted.
-        let integrity = integrity_for_lifecycle(&ledger_with([7, 1, 2, 3, 4]));
+        let integrity = integrity_for_lifecycle(&ledger_with([7, 1, 2, 3, 4]), 0);
         assert_eq!(integrity.ring_reservation_failures, 7);
         assert_eq!(integrity.state_insert_failures, 1 + 2 + 4);
         assert_eq!(integrity.unmatched_returns, 3);
@@ -738,5 +772,21 @@ mod tests {
         assert_eq!(integrity.state_evictions, 0);
         assert_eq!(integrity.unknown_generation_events, 0);
         assert_eq!(integrity.budget_omissions, 0);
+    }
+
+    #[test]
+    fn w3_output_omissions_land_in_budget_omissions() {
+        // Round-3 (sol/astra-M3): driver-reported cap drops surface
+        // as `budget_omissions` — counted, never silently omitted.
+        let integrity = integrity_for_lifecycle(&ledger_with([0; 5]), 41);
+        assert_eq!(integrity.budget_omissions, 41);
+        let backend = LifecycleBackend::new();
+        backend.note_output_omissions(40);
+        backend.note_output_omissions(1);
+        assert_eq!(
+            backend.output_omissions.load(Ordering::Relaxed),
+            41,
+            "reports accumulate saturating"
+        );
     }
 }

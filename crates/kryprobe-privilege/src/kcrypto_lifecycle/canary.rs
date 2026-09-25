@@ -49,6 +49,30 @@ pub struct FixtureTruth {
     pub fixture_overflow: u64,
 }
 
+impl FixtureTruth {
+    /// Fixture-derived per-hook expectations
+    /// `[enc_sub, enc_ret, dec_sub, dec_ret]` : submits counted from
+    /// submit rows by op, returns counted from return rows joined to
+    /// their submit's op. The verdict compares sensor deltas against
+    /// THIS (ledger data), never scenario-name constants — a fixture
+    /// running two encrypts must fail against a 1+1 sensor view.
+    #[must_use]
+    pub fn expected_hooks(&self) -> [u64; 4] {
+        let mut hooks = [0u64; 4];
+        for op in &self.ops {
+            let (submit_lane, return_lane) = if op.op == "encrypt" { (0, 1) } else { (2, 3) };
+            hooks[submit_lane] = hooks[submit_lane].saturating_add(1);
+            let returns = self
+                .returns
+                .iter()
+                .filter(|(seq, _)| *seq == op.seq)
+                .count() as u64;
+            hooks[return_lane] = hooks[return_lane].saturating_add(returns);
+        }
+        hooks
+    }
+}
+
 /// Strict transcript failure: line number + static reason (no
 /// untrusted bytes interpolated — validator idiom).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,35 +89,66 @@ impl std::fmt::Display for TranscriptError {
     }
 }
 
-/// Extract `"key":value` (number) following a marker, or `None`
-/// (the fixture JSON shapes are fixed by the fixture C source —
-/// marker scans, never a JSON parser dependency in the oracle).
-fn num_after(row: &str, marker: &str) -> Option<i64> {
-    let at = row.find(marker)? + marker.len();
-    let rest = &row[at..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '-')
-        .unwrap_or(rest.len());
-    rest[..end].parse::<i64>().ok()
+/// Strict field readers over a parsed row: exact JSON types only
+/// (a float `0.5` is not an errno; a numeric prefix scan would
+/// misread it as `0`). Reasons are input-free (key + expectation,
+/// never the offered value).
+fn get_u64(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    line_no: usize,
+    what: &'static str,
+) -> Result<u64, TranscriptError> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(TranscriptError {
+            line: line_no,
+            reason: what,
+        })
 }
 
-/// Extract `"key":"str"` following a marker, or `None`.
-fn str_after(row: &str, marker: &str) -> Option<String> {
-    let at = row.find(marker)? + marker.len();
-    let rest = &row[at..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
+fn get_i32(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    line_no: usize,
+    what: &'static str,
+) -> Result<i32, TranscriptError> {
+    obj.get(key)
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or(TranscriptError {
+            line: line_no,
+            reason: what,
+        })
 }
 
-/// Parse a fixture transcript STRICTLY: JSON lines with
-/// `"run":"{run_id}"`, phases `alloc`/`submit`/`return`/`terminal`/
-/// `free`/`done`. Rows for other runs are out of scope (skipped);
-/// a row FOR this run with an unknown phase/op, a malformed field,
-/// a duplicate submit seq, a return/terminal for an unknown seq, a
-/// duplicate `done`, a missing `done`, or zero submits is a
+fn get_str<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    line_no: usize,
+    what: &'static str,
+) -> Result<&'a str, TranscriptError> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TranscriptError {
+            line: line_no,
+            reason: what,
+        })
+}
+
+/// Parse a fixture transcript STRICTLY, as real JSON (fixture.h
+/// contract, `"v":1`): every non-empty line must be a JSON object
+/// with a string `run`; rows for other runs are out of scope
+/// (skipped by EXACT run equality, never substring); rows for this
+/// run need known phases, exact-typed required fields, unique
+/// submit seqs, return/terminal only for submitted seqs, exactly
+/// one `done` with nothing after it, and at least one submit with
+/// its return AND terminal rows. Anything else is a
 /// [`TranscriptError`] (fail the run — never skip-and-pass).
+/// Extra keys on own rows are ignored per the fixture contract
+/// (every row shape ends `,...}` — extensibility reserved); the
+/// `v == 1` pin still fails a format revision loudly.
 pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, TranscriptError> {
-    let run_mark = format!("\"run\":\"{run_id}\"");
     let mut ops: Vec<FixtureOp> = Vec::new();
     let mut returns: Vec<(u64, i32)> = Vec::new();
     let mut terminals: Vec<(u64, i32)> = Vec::new();
@@ -101,27 +156,42 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw.trim();
-        if line.is_empty() || !line.contains(&run_mark) {
+        if line.is_empty() {
             continue;
         }
-        let phase = str_after(line, "\"phase\":\"").ok_or(TranscriptError {
+        let row: serde_json::Value = serde_json::from_str(line).map_err(|_| TranscriptError {
             line: line_no,
-            reason: "row has no phase field",
+            reason: "line is not a JSON object",
         })?;
-        match phase.as_str() {
-            // Lifecycle rows: known, not oracle evidence.
-            "alloc" | "free" => {}
+        let obj = row.as_object().ok_or(TranscriptError {
+            line: line_no,
+            reason: "line is not a JSON object",
+        })?;
+        let run = get_str(obj, "run", line_no, "row lacks a run id")?;
+        if run != run_id {
+            continue;
+        }
+        if done.is_some() {
+            return Err(TranscriptError {
+                line: line_no,
+                reason: "row follows done",
+            });
+        }
+        let version = get_u64(obj, "v", line_no, "row lacks a format version")?;
+        if version != 1 {
+            return Err(TranscriptError {
+                line: line_no,
+                reason: "unsupported transcript version",
+            });
+        }
+        let phase = get_str(obj, "phase", line_no, "row has no phase field")?;
+        match phase {
+            // Lifecycle + waiter markers: known, not oracle evidence
+            // (shape-checked above via v/run/phase; values ignored).
+            "alloc" | "free" | "progress" => {}
             "submit" => {
-                let seq = num_after(line, "\"seq\":")
-                    .and_then(|n| u64::try_from(n).ok())
-                    .ok_or(TranscriptError {
-                        line: line_no,
-                        reason: "submit row lacks a sequence",
-                    })?;
-                let op = str_after(line, "\"op\":\"").ok_or(TranscriptError {
-                    line: line_no,
-                    reason: "submit row lacks an op",
-                })?;
+                let seq = get_u64(obj, "seq", line_no, "submit row lacks a sequence")?;
+                let op = get_str(obj, "op", line_no, "submit row lacks an op")?;
                 if op != "encrypt" && op != "decrypt" {
                     return Err(TranscriptError {
                         line: line_no,
@@ -134,10 +204,14 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                         reason: "duplicate submit sequence",
                     });
                 }
-                ops.push(FixtureOp { seq, op });
+                ops.push(FixtureOp {
+                    seq,
+                    op: op.to_owned(),
+                });
             }
             "return" => {
-                let (seq, errno) = seq_errno(line, line_no, "return")?;
+                let seq = get_u64(obj, "seq", line_no, "return row lacks a sequence")?;
+                let errno = get_i32(obj, "errno", line_no, "return row lacks an errno")?;
                 if !ops.iter().any(|o: &FixtureOp| o.seq == seq) {
                     return Err(TranscriptError {
                         line: line_no,
@@ -147,7 +221,8 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 returns.push((seq, errno));
             }
             "terminal" => {
-                let (seq, errno) = seq_errno(line, line_no, "terminal")?;
+                let seq = get_u64(obj, "seq", line_no, "terminal row lacks a sequence")?;
+                let errno = get_i32(obj, "errno", line_no, "terminal row lacks an errno")?;
                 if !ops.iter().any(|o: &FixtureOp| o.seq == seq) {
                     return Err(TranscriptError {
                         line: line_no,
@@ -157,24 +232,8 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 terminals.push((seq, errno));
             }
             "done" => {
-                if done.is_some() {
-                    return Err(TranscriptError {
-                        line: line_no,
-                        reason: "duplicate done row",
-                    });
-                }
-                let result = num_after(line, "\"fixture_result\":")
-                    .and_then(|n| i32::try_from(n).ok())
-                    .ok_or(TranscriptError {
-                        line: line_no,
-                        reason: "done row lacks a result",
-                    })?;
-                let overflow = num_after(line, "\"overflow\":")
-                    .and_then(|n| u64::try_from(n).ok())
-                    .ok_or(TranscriptError {
-                        line: line_no,
-                        reason: "done row lacks an overflow",
-                    })?;
+                let result = get_i32(obj, "fixture_result", line_no, "done row lacks a result")?;
+                let overflow = get_u64(obj, "overflow", line_no, "done row lacks an overflow")?;
                 done = Some((result, overflow));
             }
             _ => {
@@ -195,6 +254,23 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
             reason: "transcript ran zero ops (no positive control)",
         });
     }
+    // Fixture.h structural rule: every request needs its return AND
+    // terminal rows (a submit without either is a broken scenario,
+    // not oracle evidence).
+    for op in &ops {
+        if !returns.iter().any(|(seq, _)| *seq == op.seq) {
+            return Err(TranscriptError {
+                line: 0,
+                reason: "submit seq lacks a return row",
+            });
+        }
+        if !terminals.iter().any(|(seq, _)| *seq == op.seq) {
+            return Err(TranscriptError {
+                line: 0,
+                reason: "submit seq lacks a terminal row",
+            });
+        }
+    }
     ops.sort_by_key(|op| op.seq);
     Ok(FixtureTruth {
         ops,
@@ -203,31 +279,6 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         fixture_result,
         fixture_overflow,
     })
-}
-
-/// `seq` + `errno` from a return/terminal row (strict pair).
-fn seq_errno(line: &str, line_no: usize, what: &str) -> Result<(u64, i32), TranscriptError> {
-    let seq = num_after(line, "\"seq\":")
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or(TranscriptError {
-            line: line_no,
-            reason: if what == "return" {
-                "return row lacks a sequence"
-            } else {
-                "terminal row lacks a sequence"
-            },
-        })?;
-    let errno = num_after(line, "\"errno\":")
-        .and_then(|n| i32::try_from(n).ok())
-        .ok_or(TranscriptError {
-            line: line_no,
-            reason: if what == "return" {
-                "return row lacks an errno"
-            } else {
-                "terminal row lacks an errno"
-            },
-        })?;
-    Ok((seq, errno))
 }
 
 /// Sensor counters at one instant (baselines + final read share it).
@@ -321,15 +372,28 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     }
     // Reconciliation equation over deltas (post-quiet, empty close
     // ring): accepted == consumed + reserve-dropped + noslot-dropped.
-    let (agg_sum, hits_sum): (u64, u64) = (
-        agg_d.iter().fold(0, |s, a| s.saturating_add(*a)),
-        hits_d.iter().fold(0, |s, h| s.saturating_add(*h)),
-    );
-    if agg_sum != hits_sum + loss_d[0] + loss_d[4] {
-        return Err(format!(
-            "reconciliation broke (agg {agg_sum} != hits {hits_sum} + reserve {} + noslot {})",
-            loss_d[0], loss_d[4]
-        ));
+    // Reserve/noslot drops are global classes (no per-lane
+    // attribution exists), so the lossless case demands EXACT
+    // per-lane equality (a permuted aggregate vector must fail) and
+    // the lossy case falls back to the totals equation.
+    let drops = loss_d[0].saturating_add(loss_d[4]);
+    if drops == 0 {
+        if agg_d != hits_d {
+            return Err(format!(
+                "per-lane reconciliation broke (agg {agg_d:?} != hits {hits_d:?})"
+            ));
+        }
+    } else {
+        let (agg_sum, hits_sum): (u64, u64) = (
+            agg_d.iter().fold(0, |s, a| s.saturating_add(*a)),
+            hits_d.iter().fold(0, |s, h| s.saturating_add(*h)),
+        );
+        if agg_sum != hits_sum.saturating_add(drops) {
+            return Err(format!(
+                "reconciliation broke (agg {agg_sum} != hits {hits_sum} + reserve {} + noslot {})",
+                loss_d[0], loss_d[4]
+            ));
+        }
     }
     // Every loss counter delta reads zero (checked deltas —
     // pre-clear traffic between bring-up and baseline cannot fake
@@ -422,15 +486,17 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             return Err(format!("kernel_loss[{i}] reads {loss}"));
         }
     }
-    // Per-hook expectations + terminal join per scenario.
-    let expected_hits: [u64; 4] = match scenario {
-        "sync-once" => [1, 1, 1, 1],
-        "async-once" => [1, 1, 0, 0],
-        _ => return Err(format!("unknown scenario {scenario}")),
-    };
+    // Per-hook expectations come from the LEDGER (fixture-derived),
+    // never scenario-name constants: the scenario selects only the
+    // oracle SHAPE below (grounding rules vs pending rules). A
+    // fixture running two encrypts must fail against a 1+1 view.
+    if !matches!(scenario, "sync-once" | "async-once") {
+        return Err(format!("unknown scenario {scenario}"));
+    }
+    let expected_hits = truth.expected_hooks();
     if hits_d != expected_hits {
         return Err(format!(
-            "edge hits {hits_d:?} != expected {expected_hits:?}"
+            "edge hits {hits_d:?} != fixture-derived {expected_hits:?}"
         ));
     }
     let admitted_d = sub(
@@ -493,6 +559,31 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                     "fixture return seqs {ret_seqs:?} != submit seqs {op_seqs:?}"
                 ));
             }
+            // Terminal reconciliation: every op's callback row must
+            // exist with errno EQUAL to its return errno (a missing
+            // or conflicting terminal row means the fixture did not
+            // run the scenario the sensor is graded against).
+            for op in &truth.ops {
+                let ret_errno = truth
+                    .returns
+                    .iter()
+                    .find(|(seq, _)| *seq == op.seq)
+                    .map(|(_, errno)| *errno);
+                let term_errno = truth
+                    .terminals
+                    .iter()
+                    .find(|(seq, _)| *seq == op.seq)
+                    .map(|(_, errno)| *errno);
+                match (ret_errno, term_errno) {
+                    (Some(ret), Some(term)) if ret == term => {}
+                    _ => {
+                        return Err(format!(
+                            "op seq {} return/terminal mismatch (ret {ret_errno:?}, term {term_errno:?})",
+                            op.seq
+                        ));
+                    }
+                }
+            }
             // Pairwise terminal join by index: grounded kind + EXACT
             // errno + observed duration per completion.
             for (i, record) in view.completed.iter().enumerate() {
@@ -533,11 +624,15 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                     truth.returns
                 ));
             }
-            if truth.terminals.len() != 1 || truth.terminals[0].1 != 0 {
-                return Err(
-                    "async fixture shows no clean terminal row (scenario did not complete)"
-                        .to_owned(),
-                );
+            // The callback row must belong to THE op (seq match) and
+            // show clean completion (errno 0): the sensor
+            // legitimately sees neither, but the scenario must have
+            // run to grade the pending shape against.
+            if truth.terminals.as_slice() != [(truth.ops[0].seq, 0)] {
+                return Err(format!(
+                    "async fixture terminals {:?} != [(op seq, 0)]",
+                    truth.terminals
+                ));
             }
             if view.completed.len() != 1 {
                 return Err(format!(
@@ -774,5 +869,153 @@ mod tests {
         view.decode.stale_returns = 4;
         let err = verdict("sync-once", &truth, &view).expect_err("scenario loss must fail");
         assert!(err.contains("stale_returns"), "names it: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_json_type_confusion() {
+        // A float errno is not errno 0 (numeric-prefix scans
+        // misread `"errno":0.5` as `0`); exact JSON types only.
+        let float_errno = sync_text().replacen("\"errno\":0", "\"errno\":0.5", 1);
+        let err =
+            parse_transcript(&float_errno, "run-sync-once").expect_err("float errno must reject");
+        assert!(err.reason.contains("errno"), "names it: {err}");
+        // Non-object lines and runless rows fail (unattributable).
+        for bad in [
+            sync_text().replace(
+                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\"}",
+                "not json at all",
+            ),
+            sync_text().replace(
+                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\"}",
+                "{\"v\":1,\"seq\":1,\"phase\":\"alloc\"}",
+            ),
+        ] {
+            assert!(parse_transcript(&bad, "run-sync-once").is_err());
+        }
+        // Substring spoof: the run mark inside another field's value
+        // does not scope the row (exact run equality only).
+        let spoof = "{\"v\":1,\"run\":\"other\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"x run-sync-once y\"}\n"
+            .to_owned()
+            + &sync_text();
+        parse_transcript(&spoof, "run-sync-once").expect("spoof row ignored");
+    }
+
+    #[test]
+    fn parse_enforces_version_order_and_completeness() {
+        // Wrong format version fails loudly (drift, not compat).
+        let v2 = sync_text().replace("\"v\":1", "\"v\":2");
+        assert!(parse_transcript(&v2, "run-sync-once").is_err());
+        // A row after done fails (fixture contract: nothing follows).
+        let mut after_done = sync_text();
+        after_done.push_str("\n{\"v\":1,\"run\":\"run-sync-once\",\"seq\":9,\"phase\":\"alloc\"}");
+        assert!(parse_transcript(&after_done, "run-sync-once").is_err());
+        // Every submit needs its return AND terminal rows.
+        let no_terminal = sync_text().replace(
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":3,\"phase\":\"terminal\",\"errno\":0}",
+            "",
+        );
+        let err = parse_transcript(&no_terminal, "run-sync-once")
+            .expect_err("missing terminal must fail");
+        assert!(err.reason.contains("terminal"), "names it: {err}");
+        // Known-ignored phases (progress/free) validate shape, not values.
+        let with_progress = sync_text().replace(
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}",
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}\n{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"progress\",\"errno\":-115}",
+        );
+        parse_transcript(&with_progress, "run-sync-once").expect("progress ignored");
+    }
+
+    #[test]
+    fn verdict_hooks_come_from_the_ledger() {
+        // Round-3 counterexample: a two-encrypt fixture must FAIL
+        // against a 1+1 sensor view (scenario constants passed it).
+        let run = "run-sync-once";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("valid transcript");
+        assert_eq!(truth.expected_hooks(), [2, 2, 0, 0]);
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let err = verdict("sync-once", &truth, &sync_view(&completed))
+            .expect_err("2-enc fixture vs 1+1 view must fail");
+        assert!(err.contains("fixture-derived"), "names it: {err}");
+    }
+
+    #[test]
+    fn verdict_reconciles_terminals_and_lanes() {
+        // Terminal errno must equal return errno per op.
+        let truth = sync_truth();
+        let mut conflict = truth.clone();
+        conflict.terminals[0].1 = -5;
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let err = verdict("sync-once", &conflict, &sync_view(&completed))
+            .expect_err("terminal conflict must fail");
+        assert!(err.contains("return/terminal mismatch"), "names it: {err}");
+        // Per-lane reconciliation: permuted aggregates fail even
+        // when totals match ([4,0,0,0] vs [1,1,1,1]).
+        let mut view = sync_view(&completed);
+        view.agg_accepted = [4, 0, 0, 0];
+        let err = verdict("sync-once", &truth, &view).expect_err("permuted agg must fail");
+        assert!(err.contains("per-lane"), "names it: {err}");
+    }
+
+    #[test]
+    fn verdict_async_terminal_belongs_to_the_op() {
+        // The async terminal row must match THE op's seq (errno-only
+        // checks pass a foreign terminal row).
+        let run = "run-async-once";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":7,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        // Parser rejects first (terminal for unknown seq) — the
+        // verdict seq check below covers a parser-passing shape.
+        assert!(parse_transcript(&text, run).is_err());
+        let mut truth = parse_transcript(
+            &text.replace(
+                "\"seq\":7,\"phase\":\"terminal\"",
+                "\"seq\":2,\"phase\":\"terminal\"",
+            ),
+            run,
+        )
+        .expect("valid async transcript");
+        truth.terminals = vec![(7, 0)];
+        let completed = [RequestRecord {
+            id: 1,
+            tfm_id: None,
+            terminal: Terminal::Unknown,
+            duration_ns: None,
+        }];
+        let view = SensorView {
+            completed: &completed,
+            edge_hits: [1, 1, 0, 0],
+            agg_accepted: [1, 1, 0, 0],
+            kernel_loss: [0; 5],
+            decode: DecodeStats {
+                admitted: 1,
+                ..DecodeStats::default()
+            },
+            reducer: ReducerStats {
+                admitted: 1,
+                emitted: 1,
+                unfinished: 1,
+                ..ReducerStats::default()
+            },
+            retained_dropped: 0,
+            baseline: SensorBaseline::default(),
+            quiet_backlog_bytes: 0,
+        };
+        let err = verdict("async-once", &truth, &view).expect_err("foreign terminal must fail");
+        assert!(err.contains("terminals"), "names it: {err}");
     }
 }

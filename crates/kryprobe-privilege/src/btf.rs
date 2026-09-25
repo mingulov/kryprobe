@@ -274,9 +274,10 @@ impl<'a> Btf<'a> {
             )));
         }
         // BTF INT data word (`linux/btf.h`): bits [0:8), offset
-        // [16:24), encoding [24:28) with bit 0 = SIGNED. All three
-        // are exact: a bitfield, an unsigned, or a narrow int would
-        // misread errnos.
+        // [16:24), encoding [24:28) with bit 0 = SIGNED, bit 1 =
+        // CHAR, bit 2 = BOOL. The encoding is EXACT, not a
+        // SIGNED-bit test: SIGNED combined with CHAR or BOOL bits
+        // is a different type, and the return gate is exact.
         let data = read_u32(self.bytes, rec.aux_at, "int data")?;
         let (bits, offset, encoding) = (data & 0xff, (data >> 16) & 0xff, (data >> 24) & 0x0f);
         if bits != 32 {
@@ -287,8 +288,10 @@ impl<'a> Btf<'a> {
                 "return INT has bit offset {offset}, not 0"
             )));
         }
-        if encoding & 0x01 == 0 {
-            return Err(bad_proto("return INT is not SIGNED".to_owned()));
+        if encoding != 0x01 {
+            return Err(bad_proto(format!(
+                "return INT encoding is {encoding:#x}, not exactly SIGNED"
+            )));
         }
         Ok(id)
     }

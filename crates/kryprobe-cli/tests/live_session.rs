@@ -2198,6 +2198,14 @@ fn live_lifecycle_observation_cap_truncates_deterministically() {
         "truncation counter present: {:?}",
         outcome.coverage.completion.counters
     );
+    // Round-3 (sol/astra-M3): the dropped record is COUNTED in
+    // session integrity (`budget_omissions`), never silently
+    // omitted — memory bounded AND output loss accounted.
+    assert_eq!(
+        outcome.integrity.budget_omissions, 1,
+        "one cap drop attested: {:?}",
+        outcome.integrity
+    );
 }
 
 #[test]

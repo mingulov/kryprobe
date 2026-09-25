@@ -93,7 +93,9 @@ pub struct DecodeStats {
     /// Submits admitted (fresh opaque ids issued).
     pub admitted: u64,
     /// Submits refused (table full, id space exhausted, or BPF
-    /// [`LEDGE_TAINTED`] nesting taint — never admitted, never gapped).
+    /// [`LEDGE_TAINTED`] nesting taint — never admitted; a tainted
+    /// submit on an outstanding key additionally gaps that id, since
+    /// no future return can be attributed after the disturbance).
     pub submit_refused: u64,
     /// Returns for keys with no outstanding submit (lost submit,
     /// pre-attach call, or BPF taint — never joined, never disturbing).
@@ -249,12 +251,24 @@ impl LifecycleDecoder {
 
     /// Join one validated raw edge (the post-parse half of [`Self::feed`],
     /// split so the sensor tallies per-hook hits from the same parse).
-    /// Tainted edges refuse before any table touch (no admission, no
-    /// gap, no join, no disturbance of the outstanding id).
+    /// A tainted SUBMIT on an outstanding key gaps that id
+    /// (`IdentityAmbiguous`) FIRST: the BPF slot poisoned, so no
+    /// future return can be attributed to the outstanding invocation
+    /// (the first return could be either call's — joining it would
+    /// complete the wrong invocation with a trusted terminal).
+    /// Tainted submits with no outstanding id, and all tainted
+    /// returns, refuse without touching the table.
     pub fn join(&mut self, raw: RawEdge) -> Vec<Edge> {
         if raw.tainted {
             if raw.edge == LEDGE_SUBMIT {
                 self.stats.submit_refused += 1;
+                if let Some((old_id, _, _)) = self.outstanding.remove(&raw.key) {
+                    self.stats.gaps_synthesized += 1;
+                    return vec![Edge::Gap {
+                        id: old_id,
+                        reason: GapReason::IdentityAmbiguous,
+                    }];
+                }
             } else {
                 self.stats.unknown_key_returns += 1;
             }

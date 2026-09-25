@@ -441,8 +441,9 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
 struct LifecycleCloseStats {
     /// Records with `Terminal::Unknown` (ambiguous or truthless).
     unknown_terminals: u64,
-    /// The observation cap stopped the session early.
-    truncated: bool,
+    /// Decoded records dropped by the observation cap (COUNTED, not
+    /// a flag — feeds `observations_truncated` and integrity).
+    omitted: u64,
     /// Quiet-verdict close backlog in ring bytes.
     backlog_bytes: u64,
 }
@@ -568,7 +569,7 @@ fn lifecycle_coverage(
     // ambiguous, or truncated records flip `Partial` (their
     // terminals are explicit unknowns, never trusted results).
     let mut completion = dim(
-        if ledger.reducer.unfinished == 0 && close.unknown_terminals == 0 && !close.truncated {
+        if ledger.reducer.unfinished == 0 && close.unknown_terminals == 0 && close.omitted == 0 {
             CoverageStatus::CompleteForDeclaredBoundary
         } else {
             CoverageStatus::Partial
@@ -587,10 +588,9 @@ fn lifecycle_coverage(
     completion
         .counters
         .push(counter("unknown_terminals", close.unknown_terminals));
-    completion.counters.push(counter(
-        "observations_truncated",
-        u64::from(close.truncated),
-    ));
+    completion
+        .counters
+        .push(counter("observations_truncated", close.omitted));
     // Attribution: lifecycle rows carry no context class (the
     // aggregate ctx-class rationale does not transfer) — always
     // `Unknown` with the reason counter.
@@ -598,14 +598,18 @@ fn lifecycle_coverage(
     attribution
         .counters
         .push(counter("uncovered:attribution_unobserved", 1));
-    // Correlation: reuse transport-loss gaps, stale joins, ambiguous
-    // evidence, and reducer orphans are correlation events — any
-    // flips `Partial`; a single backend with zero such events
-    // completes the declared boundary.
+    // Correlation: transport-loss gaps, stale joins, unjoined
+    // returns, refused submits, ambiguous evidence, and reducer
+    // orphans are ALL correlation events — any flips `Partial`; a
+    // single backend with zero such events completes the declared
+    // boundary. (Round-3 minor: omitting `unknown_key_returns` /
+    // `submit_refused` let a lone tainted return claim Complete.)
     let correlation_events = ledger
         .decode
         .gaps_synthesized
         .saturating_add(ledger.decode.stale_returns)
+        .saturating_add(ledger.decode.unknown_key_returns)
+        .saturating_add(ledger.decode.submit_refused)
         .saturating_add(ledger.reducer.ambiguous)
         .saturating_add(ledger.reducer.orphan);
     let mut correlation = dim(if correlation_events == 0 {
@@ -1270,15 +1274,19 @@ fn drive_lifecycle_session_inner(
     // unbounded — kept observations stay valid evidence.
     let mut unknown_terminals = 0u64;
     // Shared with the decode closure across loop iterations (the
-    // closure mutably borrows the terminal counter; the flag rides
-    // a `Cell` so the loop can read it while the closure is alive).
-    let truncated = std::cell::Cell::new(false);
+    // closure mutably borrows the terminal counter; the omission
+    // COUNT rides a `Cell` so the loop can read it while the closure
+    // is alive). The cap drops are COUNTED (remaining batch length
+    // at each break), never a bare flag: the count feeds coverage
+    // AND backend integrity (`budget_omissions`).
+    let omitted = std::cell::Cell::new(0u64);
     let mut decode_records = |records: Vec<RequestRecord>,
                               observations: &mut Vec<NativeObservation>|
      -> Result<(), LiveError> {
-        for record in &records {
+        for (idx, record) in records.iter().enumerate() {
             if observations.len() >= LIFECYCLE_OBSERVATION_CAP {
-                truncated.set(true);
+                let remaining = records.len().saturating_sub(idx) as u64;
+                omitted.set(omitted.get().saturating_add(remaining));
                 break;
             }
             let decode_ctx = DecodeContext {
@@ -1326,7 +1334,7 @@ fn drive_lifecycle_session_inner(
         }
         let stopped = stop.load(Ordering::Relaxed)
             || interrupted
-            || truncated.get()
+            || omitted.get() > 0
             || deadline.is_some_and(|end| Instant::now() >= end);
         if stopped {
             break;
@@ -1352,6 +1360,10 @@ fn drive_lifecycle_session_inner(
     sensor.finish_stop(end_ns)?;
     let reconciled = sensor.take_completed()?;
     decode_records(reconciled, &mut observations)?;
+    // Cap omissions attest BEFORE finalize reads them: the driver
+    // dropped decoded records the sensor counted, so the backend
+    // surfaces the count via `budget_omissions` (never silent).
+    backend.note_output_omissions(omitted.get());
     // Quiescing -> Draining: queued events become evidence now.
     hop(controller, SessionState::Draining, "lifecycle drain")?;
     // Finalize ONCE, then the shared feed ONCE.
@@ -1381,7 +1393,7 @@ fn drive_lifecycle_session_inner(
         .map_err(|err| LiveError::Internal(format!("live lifecycle session integrity: {err}")))?;
     let close = LifecycleCloseStats {
         unknown_terminals,
-        truncated: truncated.get(),
+        omitted: omitted.get(),
         backlog_bytes: quiet.backlog_bytes,
     };
     let coverage = lifecycle_coverage(
@@ -2035,7 +2047,7 @@ mod tests {
     fn close_clean() -> LifecycleCloseStats {
         LifecycleCloseStats {
             unknown_terminals: 0,
-            truncated: false,
+            omitted: 0,
             backlog_bytes: 0,
         }
     }
@@ -2163,7 +2175,7 @@ mod tests {
         assert_eq!(coverage.completion.status, CoverageStatus::Partial);
         // Truncation flips completion only.
         let close = LifecycleCloseStats {
-            truncated: true,
+            omitted: 7,
             ..close_clean()
         };
         let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
@@ -2193,6 +2205,34 @@ mod tests {
         ledger.agg_accepted = [5, 4, 2, 2];
         let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn lifecycle_coverage_unjoined_returns_flip_correlation() {
+        // Round-3 minor: a lone tainted return (`unknown_key_returns`)
+        // or refused submit (`submit_refused`) is a failed join, so
+        // correlation must read `Partial` — never Complete.
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.decode.unknown_key_returns = 1;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        assert!(
+            coverage
+                .correlation
+                .counters
+                .iter()
+                .any(|c| c.name == "correlation_events" && c.value == 1),
+            "unjoined return counted: {:?}",
+            coverage.correlation.counters
+        );
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.decode.submit_refused = 1;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
     }
 
     #[test]

@@ -486,7 +486,7 @@ pub enum ConfiguredError {
         /// Per-point load/attach outcomes (diagnosable).
         points: Vec<ConfiguredPoint>,
     },
-    /// Another profile holds the process (no duplicate capture).
+    /// Another profile holds the process (no cross-profile capture).
     SessionBusy {
         /// Profile currently live in this process.
         live: crate::kcrypto_lifecycle::profile::LifecycleProfile,
@@ -514,7 +514,7 @@ impl std::fmt::Display for ConfiguredError {
             Self::SessionBusy { live, want } => {
                 write!(
                     f,
-                    "kcrypto session busy: '{}' is live, '{}' refused (no duplicate capture)",
+                    "kcrypto session busy: '{}' is live, '{}' refused (no cross-profile capture)",
                     live.as_str(),
                     want.as_str()
                 )

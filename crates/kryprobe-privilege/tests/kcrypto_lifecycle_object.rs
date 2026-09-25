@@ -936,6 +936,21 @@ fn w2_narrow_return_refused() {
 }
 
 #[test]
+fn w3_combined_encoding_return_refused() {
+    // Round-3 minor: the gate tests the encoding EXACTLY, not the
+    // SIGNED bit — SIGNED combined with CHAR (0x03) or BOOL (0x05)
+    // is a different type, not a status word.
+    assert_encrypt_bad_proto(
+        &lifecycle_btf(1, 3, 1, 4, 2, 0x0300_0020, 4),
+        "SIGNED|CHAR INT",
+    );
+    assert_encrypt_bad_proto(
+        &lifecycle_btf(1, 3, 1, 4, 2, 0x0500_0020, 4),
+        "SIGNED|BOOL INT",
+    );
+}
+
+#[test]
 fn f8a_profile_parse_round_trips_both_names() {
     // Round-1 (sol-M5/astra-M8): registry/live entry points select
     // the profile by NAME; the spelling is exact, garbage refuses.
@@ -959,7 +974,7 @@ fn f8a_profile_parse_round_trips_both_names() {
 
 #[test]
 fn f8b_cross_profile_sessions_exclude_same_process() {
-    // Round-1 (sol-M5/astra-M8): no duplicate capture — a live
+    // Round-1 (sol-M5/astra-M8): no cross-profile capture — a live
     // api-returns session refuses a request-lifecycle bring-up in the
     // same process and vice versa. Same-profile holders share (today's
     // aggregate concurrency is unchanged); dropping every holder

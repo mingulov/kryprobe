@@ -60,7 +60,7 @@ impl std::fmt::Display for SessionBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "kcrypto session busy: '{}' is live, '{}' refused (no duplicate capture)",
+            "kcrypto session busy: '{}' is live, '{}' refused (no cross-profile capture)",
             self.live.as_str(),
             self.want.as_str()
         )
@@ -70,9 +70,13 @@ impl std::fmt::Display for SessionBusy {
 impl std::error::Error for SessionBusy {}
 
 /// Process-wide live profile + holder count (round-1 sol-M5/astra-M8:
-/// no duplicate capture — the two profiles never capture together in
-/// one process). Same-profile holders share (aggregate concurrency is
-/// unchanged); the count releases the process when the last holder of
+/// no CROSS-PROFILE capture — the two profiles never capture together
+/// in one process). This is a cross-profile guard, NOT process-wide
+/// single-capture enforcement: same-profile holders share (aggregate
+/// concurrency is unchanged by design), and each same-profile session
+/// brings up its own sensor — concurrent same-profile sessions each
+/// attach and each observe the same machine-wide calls through their
+/// own ledger. The count releases the process when the last holder of
 /// a profile drops.
 static LIVE_PROFILE: std::sync::Mutex<(Option<LifecycleProfile>, usize)> =
     std::sync::Mutex::new((None, 0));

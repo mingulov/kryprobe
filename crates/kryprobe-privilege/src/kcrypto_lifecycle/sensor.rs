@@ -222,8 +222,8 @@ impl LifecycleSensor {
         object_bytes: &[u8],
         token_fd: Option<RawFd>,
     ) -> Result<(Self, Vec<ConfiguredPoint>), ConfiguredError> {
-        // Claim the process share first (no duplicate capture: a live
-        // api-returns session refuses this typed). Any later failure
+        // Claim the process share first (no cross-profile capture: a
+        // live api-returns session refuses this typed). Any later failure
         // drops the local hold (a failed bring-up holds nothing).
         let session =
             acquire_kcrypto_session(LifecycleProfile::RequestLifecycle).map_err(|busy| {

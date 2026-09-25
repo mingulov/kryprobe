@@ -505,7 +505,7 @@ pub(crate) fn configured_error_to_backend(err: ConfiguredError) -> BackendError 
             BackendError::Unsafe(SafetyReason::with_detail(
                 "kcrypto_session_busy",
                 &format!(
-                    "'{}' is live, '{}' refused (no duplicate capture)",
+                    "'{}' is live, '{}' refused (no cross-profile capture)",
                     live.as_str(),
                     want.as_str()
                 ),
@@ -572,7 +572,7 @@ impl Backend for KCryptoBackend {
             }
         }
         // First call (or a new generation): claim the process share
-        // for api-returns (no duplicate capture: a live lifecycle
+        // for api-returns (no cross-profile capture: a live lifecycle
         // session refuses this typed). The local hold covers the
         // load; success stashes it with the sensor, failure drops it
         // (a failed bring-up holds nothing).

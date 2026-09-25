@@ -246,17 +246,36 @@ fn edge_prologue(key: u64) -> Option<u64> {
     Some(unsafe { bpf_ktime_get_ns() })
 }
 
+/// `LSTATE` slot states (the `u8` is a pairing state machine, not a
+/// bare presence bit). A nested same-key submit proves return↔call
+/// attribution is unknowable from the edge stream (the first return
+/// could be either invocation's): the slot POISONS, and every edge
+/// after the disturbance carries `LEDGE_TAINTED` until the poison is
+/// consumed — no clean edge is ever emitted for a disturbed pairing
+/// (design §Requests refusal-equivalent: entry↔exit correlation for
+/// one invocation is unobservable from fentry/fexit tracepoints, so
+/// the sensor refuses the ambiguous join instead of guessing).
+const LSTATE_HELD: u8 = 1;
+/// Disturbed pairing: a nested submit landed while held. Returns
+/// taint (never clean-join); the first return consumes the poison.
+const LSTATE_POISONED: u8 = 2;
+
 /// Submit-side slot claim: `Some(false)` = clean (slot claimed,
-/// emit untainted); `Some(true)` = nested (slot held — emit TAINTED,
-/// the outstanding call keeps its pairing); `None` = table full
-/// (drop + `LLOSS_NOSLOT`, never evicting another call's slot).
+/// emit untainted); `Some(true)` = disturbed (slot held or
+/// poisoned — POISON the slot and emit TAINTED; the decoder gaps
+/// the outstanding id, since no future return can be attributed);
+/// `None` = table full (drop + `LLOSS_NOSLOT`, never evicting
+/// another call's slot).
 #[inline(always)]
 fn submit_claim(key: u64) -> Option<bool> {
-    if LSTATE.get_ptr(key).is_some() {
+    if let Some(slot) = LSTATE.get_ptr_mut(key) {
+        // SAFETY: map value pointer from a checked lookup.
+        unsafe {
+            *slot = LSTATE_POISONED;
+        }
         return Some(true);
     }
-    let one: u8 = 1;
-    if LSTATE.insert(key, one, 0).is_err() {
+    if LSTATE.insert(key, LSTATE_HELD, 0).is_err() {
         loss_inc(LLOSS_NOSLOT);
         return None;
     }
@@ -264,15 +283,18 @@ fn submit_claim(key: u64) -> Option<bool> {
 }
 
 /// Return-side slot release: true = clean (slot held, released, emit
-/// untainted); false = no slot (pre-attach call or a dropped submit
-/// — emit TAINTED, never joined to a stranger's id).
+/// untainted); false = no slot (pre-attach call or a dropped submit)
+/// or POISONED (disturbed pairing — consume the poison, emit
+/// TAINTED, never joined to a stranger's id).
 #[inline(always)]
 fn return_release(key: u64) -> bool {
-    if LSTATE.get_ptr(key).is_none() {
+    let Some(slot) = LSTATE.get_ptr(key) else {
         return false;
-    }
+    };
+    // SAFETY: map value pointer from a checked lookup.
+    let poisoned = unsafe { *slot == LSTATE_POISONED };
     let _ = LSTATE.remove(key);
-    true
+    !poisoned
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +326,11 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
+        // The call exited without a readable status: the slot must
+        // still release (a held slot would taint the next submit and
+        // let ITS return join this stale id — same misattribution as
+        // an unpoisoned nest). No edge to emit; the FRET loss counts it.
+        let _ = return_release(key);
         loss_inc(LLOSS_FRET);
         return 0;
     };
@@ -338,6 +365,11 @@ pub fn lc_dec_exit(ctx: FExitContext) -> i32 {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
+        // The call exited without a readable status: the slot must
+        // still release (a held slot would taint the next submit and
+        // let ITS return join this stale id — same misattribution as
+        // an unpoisoned nest). No edge to emit; the FRET loss counts it.
+        let _ = return_release(key);
         loss_inc(LLOSS_FRET);
         return 0;
     };

@@ -153,4 +153,14 @@ pub trait Backend: Send + Sync {
     ) -> Result<NativeObservation, BackendError>;
     /// Report end-of-session facts for this backend.
     fn finalize(&self, ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError>;
+    /// Records driver-side output-budget omissions (decoded records
+    /// the driver dropped after taking them). Called before
+    /// `finalize`; the backend attests the count via
+    /// `budget_omissions` instead of silently omitting completed
+    /// work. The default ignores the report (backends whose drivers
+    /// never cap output); backends WITH a capping driver MUST
+    /// override — a missing override plus a capping driver drops
+    /// evidence silently, so the driver's cap test pins the
+    /// attested count end to end.
+    fn note_output_omissions(&self, _omitted: u64) {}
 }

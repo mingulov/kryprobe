@@ -322,27 +322,59 @@ fn f3_return_at_same_tick_as_resubmit_joins() {
 }
 
 #[test]
-fn w2_tainted_submit_refuses_and_keeps_outstanding() {
-    // Round-2 counterexample killer: BPF taints the nested submit
-    // (LSTATE held the key), so the decoder refuses it WITHOUT
-    // gapping the outstanding id — the late original return then
-    // joins the ORIGINAL id with its exact status, never the reuse.
+fn w3_tainted_submit_gaps_outstanding_never_misattributes() {
+    // Round-3 nesting killer (both exit orders): BPF taints the
+    // nested submit AND poisons the slot, so the decoder gaps the
+    // outstanding id FIRST — no future return can be attributed
+    // (the first return could be either call's). Whatever exits
+    // first, nothing trusted completes: every return refuses.
+    // Both exit orders, both return flaggings: after the gap the id
+    // is gone, so EVERY return refuses (unknown key) — the gap (not
+    // the taint bit) is what protects the pairing. The all-clean
+    // case is the strongest: even a clean first return cannot join.
+    for second_flags in [TAINTED, 0] {
+        let mut dec = LifecycleDecoder::new(16);
+        dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+        let gap = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, TAINTED));
+        assert_eq!(
+            gap,
+            vec![Edge::Gap {
+                id: 1,
+                reason: GapReason::IdentityAmbiguous,
+            }],
+            "tainted submit gaps the disturbed id"
+        );
+        assert_eq!(dec.stats().submit_refused, 1);
+        assert_eq!(dec.stats().admitted, 1, "no fresh id for taint");
+        assert_eq!(dec.stats().gaps_synthesized, 1);
+        let first = dec.feed(&edge_bytes(2, 1, 0xabc, 220, -5, 0));
+        assert!(
+            first.is_empty(),
+            "first return refuses (unknown key): {first:?}"
+        );
+        let second = dec.feed(&edge_bytes(2, 1, 0xabc, 250, 0, second_flags));
+        assert!(
+            second.is_empty(),
+            "second return refuses (unknown key): {second:?}"
+        );
+        assert_eq!(dec.stats().unknown_key_returns, 2);
+    }
+}
+
+#[test]
+fn w3_tainted_submit_without_outstanding_refuses_quietly() {
+    // No outstanding id, nothing to poison: the refusal counts and
+    // the table stays untouched (a later clean submit admits fresh).
     let mut dec = LifecycleDecoder::new(16);
-    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
     let refused = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, TAINTED));
-    assert!(refused.is_empty(), "tainted submit emits nothing");
+    assert!(refused.is_empty());
     assert_eq!(dec.stats().submit_refused, 1);
-    assert_eq!(dec.stats().admitted, 1, "no fresh id for taint");
-    assert_eq!(dec.stats().gaps_synthesized, 0, "outstanding kept");
-    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 220, -5, 0));
-    assert_eq!(
-        done,
-        vec![Edge::Return {
-            id: 1,
-            ts_ns: 220,
-            status: -5,
-            disposition: ReturnDisposition::Terminal,
-        }]
+    assert_eq!(dec.stats().gaps_synthesized, 0);
+    assert_eq!(dec.stats().admitted, 0);
+    let admitted = dec.feed(&edge_bytes(1, 1, 0xabc, 300, 0, 0));
+    assert!(
+        matches!(admitted.as_slice(), [Edge::Submit { id: 1, .. }]),
+        "clean submit admits fresh: {admitted:?}"
     );
 }
 

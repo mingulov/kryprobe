@@ -298,6 +298,29 @@ fn f8c_finalize_pre_configure_pins_zeros() {
 }
 
 #[test]
+fn w3_finalize_pre_configure_attests_noted_omissions() {
+    // Round-3 M3: the live driver reports cap drops before finalize
+    // even when the sensor lives outside the backend (scripted/canary
+    // sessions) — a reported drop must read back as `budget_omissions`,
+    // never as the pre-configure zero.
+    use kryprobe_core::backend::Backend as _;
+    let (backend, _shared) = register_lifecycle_shared_for_test();
+    backend.note_output_omissions(7);
+    let coverage = kryprobe_core::evidence::CoverageSummary::not_run();
+    let baseline = IntegritySummary::default();
+    let ctx = FinalizeContext {
+        session: SessionId::new(7),
+        coverage: &coverage,
+        integrity: &baseline,
+    };
+    let summary = backend.finalize(&ctx).expect("pre-configure finalize");
+    assert_eq!(summary.integrity.budget_omissions, 7);
+    let mut rest = summary.integrity;
+    rest.budget_omissions = 0;
+    assert_eq!(rest, IntegritySummary::default());
+}
+
+#[test]
 fn f8c_register_profile_selects_one_backend() {
     use kryprobe_core::backend::BackendRegistry;
     let mut registry = BackendRegistry::new();
