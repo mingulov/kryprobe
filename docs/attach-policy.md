@@ -10,7 +10,7 @@ path. This document is the policy; the mechanism is
 Generation semantics (fork/exec/reuse) follow ADR-0003; this policy
 covers admission only. The single-link entry (`attach_group`) still
 rejects non-Pid scopes: fan-out plans must be resolved first, and
-`System` (system-wide kernel probes) needs the kcrypto fentry path,
+`System` (system-wide kernel probes) needs the kcrypto fsession path,
 not a pid link.
 
 ## Who may observe

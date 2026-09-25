@@ -9,7 +9,8 @@ deviations in the lane evidence.
 
 ## Host
 
-- Linux x86-64, kernel 6.12+ with BTF (`/sys/kernel/btf/vmlinux`).
+- Linux x86-64, kernel 6.12+ with BTF (`/sys/kernel/btf/vmlinux`);
+  7.0+ for the lifecycle sensor lanes (fsession attach).
 - Privilege: root, or `cap_bpf,cap_perfmon+ep` on the kryprobe
   binary (`token mint` + `token status` to verify) plus a bpffs
   token pin when delegating.
@@ -33,15 +34,17 @@ deviations in the lane evidence.
 ## Kernel surface the lanes need
 
 - `bpf()` syscall family (map create, prog load, link create,
-  token create) and `BPF_TRACE_FEXIT` attach.
+  token create), `BPF_TRACE_FEXIT` attach, and
+  `BPF_TRACE_FSESSION` attach for the lifecycle sensor lanes.
 - AF_ALG (`algif_skcipher`/`algif_aead`/`algif_hash`) for the
   traffic fixtures; `cbc(aes)`, `ecb(aes)`, `gcm(aes)`,
   `sha256`, `md5` transforms loadable.
 
 ## What is NOT pinned (ambient, record in evidence)
 
-- Exact kernel release past the 6.12 floor (behavior gates on
-  runtime probes, not the release string).
+- Exact kernel release past the applicable floor (6.12 base,
+  7.0 lifecycle sensor — behavior gates on runtime probes, not
+  the release string).
 - CPU count (percpu fold lanes) and distro LLVM past the set above.
 - Host crypto load (leak comparisons tolerate ambient-only extras).
 

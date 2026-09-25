@@ -104,9 +104,12 @@ default) records what was granted where.
 ## Kernel requirements
 
 Kernel 6.12+ with BTF (`/sys/kernel/btf/vmlinux`), `bpf()`,
-per-task tracing links, and ringbuf. The authoritative gate is the
-runtime probe matrix (`doctor`), not the release string — deploy on
-what `doctor` passes, not on what `uname` prints.
+per-task tracing links, and ringbuf. The request-lifecycle sensor
+needs kernel 7.0+ (fsession attach, type 58 — see ADR-0006);
+pre-7.0 kernels refuse it typed (`Unsupported`, never a silent
+no-op). The authoritative gate is the runtime probe matrix
+(`doctor`), not the release string — deploy on what `doctor`
+passes, not on what `uname` prints.
 
 ## Supervision and cgroup notes
 
