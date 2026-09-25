@@ -96,7 +96,13 @@ pub const LAGG_DEC_RET: u32 = 3;
 /// return ONLY to an outstanding id with the SAME invocation — a
 /// lost return + lost submit can no longer alias one call's return
 /// onto another call's id, whatever the transport drops. Pairing
-/// soundness no longer depends on lossless delivery.
+/// soundness no longer depends on lossless delivery. The decoder
+/// additionally refuses malformed clean ids (0, or poison-bit-set
+/// — `DecodeDrop::BadInvoc`); honest BPF never emits them.
+///
+/// [`LEdge::invoc`] bit 0: the poison tag. Fresh submit ids always
+/// have it clear; a poisoned slot reports it set (tainted edge).
+pub const LEDGE_INVOC_POISON: u64 = 1;
 ///
 /// `Debug` is manual: [`LEdge::key`] is a raw kernel pointer and
 /// renders as `<redacted>` (round-1 sol-m9/astra-m9 — Debug output is

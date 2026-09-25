@@ -28,7 +28,8 @@
 //! refuse stale).
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION, LSITE_DEC, LSITE_ENC,
+    LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION,
+    LSITE_DEC, LSITE_ENC,
 };
 use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
 use std::collections::HashMap;
@@ -76,7 +77,7 @@ impl std::fmt::Debug for RawEdge {
 /// Why one ring record produced no edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeDrop {
-    /// Record is not exactly 32 bytes.
+    /// Record is not exactly 40 bytes.
     BadLength,
     /// Magic is not [`LEDGE_MAGIC`].
     BadMagic,
@@ -95,6 +96,11 @@ pub enum DecodeDrop {
     /// Submit edge with a nonzero status (ABI: submit edges carry 0 —
     /// a status here is twin drift, silently discarded before).
     BadSubmitStatus,
+    /// Clean (untainted) edge with a malformed invocation id: 0
+    /// ("no invocation", slotless tainted edges only) or the poison
+    /// bit set (poisoned slots always taint). Honest BPF never emits
+    /// either shape — fail closed, never join.
+    BadInvoc,
 }
 
 /// Named decode loss counters (loss ledger feed).
@@ -172,10 +178,14 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         return Err(DecodeDrop::BadSubmitStatus);
     }
     let invoc = u64le(32);
+    let tainted = flags & LEDGE_TAINTED != 0;
+    if !tainted && (invoc == 0 || invoc & LEDGE_INVOC_POISON != 0) {
+        return Err(DecodeDrop::BadInvoc);
+    }
     Ok(RawEdge {
         edge,
         site,
-        tainted: flags & LEDGE_TAINTED != 0,
+        tainted,
         key,
         ts_ns,
         status,

@@ -44,11 +44,12 @@ fn edge_bytes_invoc(
     out
 }
 
-/// Pre-invocation-identity builder: same v3 record with invoc 0
-/// (equality holds trivially — the W2/W3 join tests don't involve
-/// invocation; W4 tests use [`edge_bytes_invoc`] explicitly).
+/// Realistic default builder: same v3 record with a VALID
+/// invocation (nonzero, poison-bit clear — the W2/W4 join tests
+/// don't vary invocation, so equality holds; tests that do use
+/// [`edge_bytes_invoc`] explicitly).
 fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 40] {
-    edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0)
+    edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)
 }
 
 #[test]
@@ -58,7 +59,7 @@ fn decode_record_accepts_valid_submit_and_return() {
         (
             raw.edge, raw.site, raw.key, raw.ts_ns, raw.status, raw.invoc
         ),
-        (1, 1, 0xabc, 100, 0, 0)
+        (1, 1, 0xabc, 100, 0, 0x4000)
     );
     let raw =
         decode_record(&edge_bytes_invoc(2, 1, 0xabc, 150, 0, 0, 0x4002)).expect("invoc parses");
@@ -507,13 +508,16 @@ fn w4_nested_continuation_never_cross_joins() {
 }
 
 #[test]
-fn w4_noslot_ghost_stream_refuses_everything() {
-    // Round-4 W4 (quarantine audit trail): a NOSLOT-dropped submit
-    // leaves a ghost — BPF quarantines the key, so the ghost's
-    // return AND any interleaved same-key submit arrive TAINTED
+fn w5_noslot_ghost_stream_refuses_everything_forever() {
+    // Round-5 W5 (sticky quarantine): a NOSLOT-dropped submit leaves
+    // a ghost — BPF quarantines the key STICKILY (never clears:
+    // clearing misattributes shared ghosts, counting races), so the
+    // ghost's return AND every later same-key edge arrive TAINTED
     // (never clean, never admitted, never joined). The decoder side
     // is the already-pinned taint rules; this pins the exact
-    // quarantine-emitted shape end to end.
+    // quarantine-emitted shape end to end, INCLUDING that the key
+    // never recovers (a later clean claim on the same key is the
+    // round-5 misjoin shape — BPF must never emit it).
     let mut dec = LifecycleDecoder::new(16);
     // Ghost's return (submit was NOSLOT-dropped, return tainted):
     // unknown key, nothing disturbed.
@@ -530,17 +534,57 @@ fn w4_noslot_ghost_stream_refuses_everything() {
     assert_eq!(dec.stats().submit_refused, 1);
     assert_eq!(dec.stats().admitted, 0);
     assert_eq!(dec.stats().unknown_key_returns, 1);
-    // Post-quarantine clean submit admits fresh and joins normally.
-    let admitted = dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 300, 0, 0, 0x8000));
+    // The quarantine sticks: later same-key edges stay tainted
+    // (the ghost count never releases — round-5 Major 1).
+    assert!(
+        dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 300, 0, TAINTED, 0x8000))
+            .is_empty()
+    );
+    assert!(
+        dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 350, 0, TAINTED, 0))
+            .is_empty()
+    );
+    assert_eq!(dec.stats().admitted, 0, "quarantined key never admits");
+    // Other keys are unaffected (quarantine is per-key).
+    let admitted = dec.feed(&edge_bytes_invoc(1, 1, 0xdef, 400, 0, 0, 0xC000));
     assert!(
         matches!(admitted.as_slice(), [Edge::Submit { id: 1, .. }]),
-        "clean submit admits fresh: {admitted:?}"
+        "other keys admit fresh: {admitted:?}"
     );
-    let done = dec.feed(&edge_bytes_invoc(2, 1, 0xabc, 350, 0, 0, 0x8000));
+    let done = dec.feed(&edge_bytes_invoc(2, 1, 0xdef, 450, 0, 0, 0xC000));
     assert!(
         matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
-        "post-quarantine pairing works: {done:?}"
+        "other keys join normally: {done:?}"
     );
+}
+
+#[test]
+fn w5_malformed_clean_invoc_refuses() {
+    // Round-5 minor: honest BPF never emits a clean edge with
+    // invoc 0 ("no invocation") or the poison bit set — both
+    // refuse as twin drift, never join.
+    assert_eq!(
+        decode_record(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0)),
+        Err(DecodeDrop::BadInvoc)
+    );
+    assert_eq!(
+        decode_record(&edge_bytes_invoc(2, 1, 0xabc, 150, 0, 0, 0)),
+        Err(DecodeDrop::BadInvoc)
+    );
+    assert_eq!(
+        decode_record(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0x4001)),
+        Err(DecodeDrop::BadInvoc)
+    );
+    // Tainted edges may carry either (slotless 0 / poisoned store):
+    // the taint rules, not the twin check, govern them.
+    decode_record(&edge_bytes_invoc(2, 1, 0xabc, 150, -5, TAINTED, 0))
+        .expect("tainted zero parses");
+    decode_record(&edge_bytes_invoc(2, 1, 0xabc, 150, -5, TAINTED, 0x4001))
+        .expect("tainted poisoned parses");
+    let mut dec = LifecycleDecoder::new(16);
+    dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0));
+    assert_eq!(dec.stats().bad_records, 1);
+    assert_eq!(dec.stats().admitted, 0);
 }
 
 #[test]

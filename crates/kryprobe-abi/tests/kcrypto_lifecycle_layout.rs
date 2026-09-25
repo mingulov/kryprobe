@@ -5,8 +5,9 @@
 
 use kryprobe_abi::kcrypto_lifecycle::{
     LAGG_DEC_RET, LAGG_DEC_SUB, LAGG_ENC_RET, LAGG_ENC_SUB, LCONFIG_MAGIC, LCONFIG_VERSION,
-    LConfig, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION, LEdge,
-    LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE, LSITE_DEC, LSITE_ENC,
+    LConfig, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED,
+    LEDGE_VERSION, LEdge, LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE,
+    LSITE_DEC, LSITE_ENC,
 };
 use std::mem::{offset_of, size_of};
 
@@ -29,6 +30,7 @@ fn ledge_is_40_bytes_with_pinned_offsets() {
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
     assert_eq!(LEDGE_VERSION, 3);
+    assert_eq!(LEDGE_INVOC_POISON, 1);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
     assert_eq!(LEDGE_TAINTED, 0x0001);

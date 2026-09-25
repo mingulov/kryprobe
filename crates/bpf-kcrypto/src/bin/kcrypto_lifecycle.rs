@@ -25,18 +25,31 @@
 //! outstanding key gaps that id), so a nested reuse can never steal
 //! another invocation's return.
 //!
-//! NOSLOT quarantine (round-4 W4): a submit dropped for a full table
-//! leaves a GHOST invocation — it will return, but holds no slot,
-//! so its return would consume the next call's slot and misjoin.
-//! The dropped key quarantines in `LQ` (ghost count per key) instead:
-//! submits for a quarantined key emit TAINTED without claiming, and
-//! the ghost's own return emits TAINTED and decrements toward
-//! release. Invariant: a quarantined key holds no `LSTATE` slot (the
-//! quarantine starts slotless — a held slot nests instead of
-//! refusing — and quarantined submits never claim), so the first
-//! return during quarantine is always the ghost's. A full
-//! quarantine table sets the sticky `LGLB` overflow bit (all later
-//! edges taint — session fail-closed, counted via `LLOSS_NOSLOT`).
+//! NOSLOT quarantine (round-4 W4, hardened round-5 W5): a submit
+//! dropped for a full table — or refused for an exhausted invocation
+//! id — leaves a GHOST invocation: it will return, but holds no
+//! slot, so its return would consume the next call's slot and
+//! misjoin. The dropped key quarantines in `LQ` (STICKY presence)
+//! instead: submits for a quarantined key emit TAINTED without
+//! claiming, and returns for it emit TAINTED without joining. The
+//! quarantine NEVER clears (round-5: clearing on the first return
+//! misattributes when several ghosts share the key; counting ghosts
+//! races across CPUs) — a disturbed key taints for the session,
+//! fail-closed. A full quarantine table sets the sticky `LGLB`
+//! overflow bit (all later edges taint — session fail-closed,
+//! counted via `LLOSS_NOSLOT`).
+//!
+//! Race-freedom (round-5 W5): BPF has no user-reachable atomic RMW
+//! (the `bpfel` target exposes none through core), so this program
+//! performs NO shared read-modify-write at all — every cross-CPU
+//! state change is a single idempotent store, a kernel-atomic
+//! insert/remove, or a per-CPU-lane bump (migration-disabled,
+//! exclusive). Poison is set-only (sticky — never cleared, never
+//! counted down); quarantine is insert-only (sticky presence);
+//! overflow is set-only. Every taint decision derives from ONE
+//! atomic word read, and every decision is locally fail-closed, so
+//! every CPU interleave resolves soundly (the userspace decoder,
+//! single-threaded, serializes joins).
 //! `LAGG` counts accepted edges per hook
 //! (post-gate, pre-reserve — before the slot claim, so NOSLOT
 //! drops count as accepted-but-untransported): after a quiet drain
@@ -152,16 +165,16 @@ struct LConfig {
 /// `LSTATE` slot: one packed `u64` (a struct value would fuse
 /// into a `memset` call and break R4, so the state rides one word
 /// of pure arithmetic). Layout: bit 0 = poison (disturbed pairing),
-/// bits 1–13 = cpu tag, bits 14–55 = per-CPU sequence, bits 56–63 =
-/// nesting depth. Bits 0–55 are the invocation identity the return
-/// carries back; the depth never leaves the slot. Fresh invocation
-/// ids always have bit 0 clear; the poison bit doubles as a
-/// guaranteed-mismatch tag (a poisoned return can never equal a
-/// submitted id). The poison is STICKY (cleared only when the slot
-/// frees at depth 0): the first nested return cannot name the
-/// remaining invocation, so every edge stays tainted until the key
-/// fully unwinds — no later same-key call can claim a clean slot
-/// over an outstanding invocation.
+/// bits 1–13 = cpu tag, bits 14–63 = per-CPU sequence — the WHOLE
+/// word is the invocation identity the return carries back. Fresh
+/// invocation ids always have bit 0 clear; the poison bit doubles
+/// as a guaranteed-mismatch tag (a poisoned return can never equal
+/// a submitted id). The poison is STICKY (a poisoned slot is never
+/// removed: the first nested return cannot name the remaining
+/// invocation, and counting down to a free would race across CPUs
+/// — every edge for a disturbed key stays tainted for the session).
+/// One slot leaks per distinct key that ever nests (fail-closed:
+/// table pressure routes through NOSLOT → quarantine → overflow).
 const _: () = assert!(size_of::<LEdge>() == 40);
 const _: () = assert!(size_of::<LConfig>() == 64);
 
@@ -296,19 +309,13 @@ const INVOC_CPU_BITS: u32 = 13;
 const INVOC_CPU_MAX: u32 = 1 << INVOC_CPU_BITS;
 /// Sequence shift: past the poison bit + the cpu tag.
 const INVOC_SEQ_SHIFT: u32 = 1 + INVOC_CPU_BITS;
-/// Depth shift: past the 56-bit invocation identity.
-const INVOC_DEPTH_SHIFT: u32 = 56;
-/// Identity mask: bits 0–55 (poison + cpu + sequence, no depth).
-const INVOC_ID_MASK: u64 = (1 << INVOC_DEPTH_SHIFT) - 1;
-/// Per-CPU sequence ceiling: 42 bits (ids stay in 64 bits with tag
-/// + poison + depth).
-const INVOC_SEQ_MAX: u64 = (1 << (INVOC_DEPTH_SHIFT - INVOC_SEQ_SHIFT)) - 1;
-/// Nesting depth ceiling: saturates (fail-closed taint) past 255.
-const INVOC_DEPTH_MAX: u64 = 0xff;
+/// Per-CPU sequence ceiling: 50 bits (ids stay in 64 bits with tag
+/// + poison).
+const INVOC_SEQ_MAX: u64 = (1 << (64 - INVOC_SEQ_SHIFT)) - 1;
 
 /// Take the next invocation id: `(per-CPU sequence << 14) | (cpu <<
-/// 1)` (bit 0 clear — the poison tag; depth is slot-local, never
-/// part of the id). The sequence lane is this CPU's own
+/// 1)` (bit 0 clear — the poison tag). The sequence lane is this
+/// CPU's own
 /// (non-atomic bump — BPF runs migration-disabled, so the cpu read
 /// and the lane bump cannot split across CPUs; same discipline as
 /// [`loss_inc`]/[`agg_inc`]). The cpu tag keeps ids distinct across
@@ -339,13 +346,7 @@ fn invoc_next() -> Option<u64> {
 /// `LGLB` bit 0: quarantine overflow (sticky — all later edges
 /// taint; the session is fail-closed).
 const LGLB_OVERFLOW: u64 = 1;
-/// `LQ` count meaning stuck-quarantined: 255 ghosts saturated, never
-/// clears (the key taints forever — fail-closed, never a hole).
-const LQ_STUCK: u8 = u8::MAX;
-
-/// Quarantine overflow set? (Once set, `LQ` counts freeze —
-/// tracking may have gaps, so counts are meaningless — and every
-/// edge taints.)
+/// Quarantine overflow set? (Every edge taints past this point.)
 #[inline(always)]
 fn quarantine_overflowed() -> bool {
     let Some(word) = LGLB.get(0) else {
@@ -354,21 +355,17 @@ fn quarantine_overflowed() -> bool {
     *word & LGLB_OVERFLOW != 0
 }
 
-/// Quarantine a NOSLOT-dropped key: bump its ghost count (stuck at
-/// 255), inserting on first drop. A full quarantine table sets the
-/// sticky overflow bit instead. Frozen once overflowed.
+/// Quarantine a refused key (NOSLOT drop or exhausted invocation
+/// id): STICKY presence — insert once, never clear (round-5:
+/// clearing misattributes shared ghosts; counting races). A full
+/// quarantine table sets the sticky overflow bit instead. Frozen
+/// once overflowed (the bit already covers everything).
 #[inline(always)]
 fn quarantine_noslot(key: u64) {
     if quarantine_overflowed() {
         return;
     }
-    if let Some(count) = LQ.get_ptr_mut(key) {
-        // SAFETY: map value pointer from a checked lookup.
-        unsafe {
-            if *count < LQ_STUCK {
-                *count += 1;
-            }
-        }
+    if LQ.get_ptr(key).is_some() {
         return;
     }
     if LQ.insert(key, 1, 0).is_err()
@@ -383,7 +380,7 @@ fn quarantine_noslot(key: u64) {
 }
 
 /// Submit-side quarantine probe: true = taint without claiming
-/// (global overflow, or this key has ghosts outstanding).
+/// (global overflow, or this key quarantined).
 #[inline(always)]
 fn submit_quarantined(key: u64) -> bool {
     if quarantine_overflowed() {
@@ -392,27 +389,12 @@ fn submit_quarantined(key: u64) -> bool {
     LQ.get_ptr(key).is_some()
 }
 
-/// Return-side ghost resolution: true = this return resolves one
-/// ghost (tainted edge, no slot touch). Decrements toward release;
-/// stuck counts never clear. Callers check overflow FIRST (an
-/// overflowed session taints without consuming quarantine counts).
+/// Return-side quarantine probe: true = tainted edge, no join (the
+/// quarantine is sticky — presence never clears, so there is no
+/// ghost accounting to race). Callers check overflow FIRST.
 #[inline(always)]
 fn ghost_returned(key: u64) -> bool {
-    let Some(count) = LQ.get_ptr_mut(key) else {
-        return false;
-    };
-    // SAFETY: map value pointer from a checked lookup.
-    unsafe {
-        if *count == LQ_STUCK {
-            return true;
-        }
-        if *count <= 1 {
-            let _ = LQ.remove(key);
-        } else {
-            *count -= 1;
-        }
-    }
-    true
+    LQ.get_ptr(key).is_some()
 }
 
 /// Shared entry prologue: config gate + null-key gate. Returns the
@@ -432,36 +414,26 @@ fn edge_prologue(key: u64) -> Option<u64> {
     Some(unsafe { bpf_ktime_get_ns() })
 }
 
-/// Submit-side slot claim: `Some(false)` = clean (slot claimed at
-/// depth 1 for `invoc`, emit untainted); `Some(true)` = disturbed
-/// (slot held — depth +1 saturating, poison STICKY, store the new
-/// `invoc`, emit TAINTED; the decoder gaps the outstanding id, since
-/// no future return can be attributed); `None` = table full (drop +
+/// Submit-side slot claim: `Some(false)` = clean (slot claimed
+/// for `invoc`, emit untainted); `Some(true)` = disturbed (slot
+/// held — single store of `invoc | INVOC_POISON`, emit TAINTED; the
+/// decoder gaps the outstanding id, since no future return can be
+/// attributed); `None` = table full (quarantine the ghost key +
 /// `LLOSS_NOSLOT`, never evicting another call's slot).
 #[inline(always)]
 fn submit_claim(key: u64, invoc: u64) -> Option<bool> {
     if let Some(slot) = LSTATE.get_ptr_mut(key) {
         // SAFETY: map value pointer from a checked lookup; one word
-        // RMW (pure arithmetic — no struct literal, R4 holds).
+        // store (no read-modify-write — race-free, R4 holds).
         unsafe {
-            let stored = *slot;
-            let depth = stored >> INVOC_DEPTH_SHIFT;
-            let deeper = if depth < INVOC_DEPTH_MAX {
-                depth + 1
-            } else {
-                depth
-            };
-            *slot = (deeper << INVOC_DEPTH_SHIFT) | (invoc & INVOC_ID_MASK) | INVOC_POISON;
+            *slot = invoc | INVOC_POISON;
         }
         return Some(true);
     }
-    if LSTATE
-        .insert(key, (1 << INVOC_DEPTH_SHIFT) | invoc, 0)
-        .is_err()
-    {
+    if LSTATE.insert(key, invoc, 0).is_err() {
         // The dropped submit leaves a ghost invocation (it WILL
         // return, slotless): quarantine the key so the ghost's
-        // return resolves here instead of consuming another call's
+        // return taints here instead of consuming another call's
         // slot — then count the admission refusal.
         quarantine_noslot(key);
         loss_inc(LLOSS_NOSLOT);
@@ -471,36 +443,26 @@ fn submit_claim(key: u64, invoc: u64) -> Option<bool> {
 }
 
 /// Return-side slot release: `(clean, invoc)` — clean means the slot
-/// word had the poison bit clear (poison clear implies depth 1: the
-/// slot never nested — released; emit untainted with the stored
-/// invocation). No slot (pre-attach call or a dropped submit) emits
-/// TAINTED with invoc 0. A POISONED slot emits TAINTED with the
-/// stored identity (whose poison bit can never equal a submitted
+/// word had the poison bit clear (released; emit untainted with the
+/// stored invocation). No slot (pre-attach call or a dropped submit)
+/// emits TAINTED with invoc 0. A POISONED slot emits TAINTED with
+/// the stored word — whose poison bit can never equal a submitted
 /// id, so userspace refuses it on invocation inequality even past
-/// the taint check) and decrements toward 0 — the slot frees only at
-/// full unwind, so no later call claims a clean slot over an
-/// outstanding invocation. Never joined to a stranger's id.
+/// the taint check — and is NEVER removed (sticky: counting down to
+/// a free would race across CPUs). Never joined to a stranger's id.
 #[inline(always)]
 fn return_release(key: u64) -> (bool, u64) {
-    let Some(slot) = LSTATE.get_ptr_mut(key) else {
+    let Some(slot) = LSTATE.get_ptr(key) else {
         return (false, 0);
     };
-    // SAFETY: map value pointer from a checked lookup.
-    unsafe {
-        let stored = *slot;
-        let depth = stored >> INVOC_DEPTH_SHIFT;
-        let identity = stored & INVOC_ID_MASK;
-        if stored & INVOC_POISON == 0 {
-            let _ = LSTATE.remove(key);
-            return (true, identity);
-        }
-        if depth <= 1 {
-            let _ = LSTATE.remove(key);
-        } else {
-            *slot = ((depth - 1) << INVOC_DEPTH_SHIFT) | identity;
-        }
-        (false, identity)
+    // SAFETY: map value pointer from a checked lookup; one atomic
+    // word read drives a locally fail-closed decision.
+    let stored = unsafe { *slot };
+    if stored & INVOC_POISON != 0 {
+        return (false, stored);
     }
+    let _ = LSTATE.remove(key);
+    (true, stored)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +480,10 @@ pub fn lc_enc_entry(ctx: FEntryContext) -> i32 {
     };
     agg_inc(LAGG_ENC_SUB);
     let Some(invoc) = invoc_next() else {
+        // No invocation id (cpu/sequence bound or map failure): the
+        // call still executes and returns slotless — a ghost.
+        // Quarantine the key (its return taints here) and count it.
+        quarantine_noslot(key);
         loss_inc(LLOSS_NOSLOT);
         return 0;
     };
@@ -543,21 +509,27 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
-        // The call exited without a readable status: resolve its
-        // outstanding presence (slot release + ghost resolution —
-        // each no-ops when absent, and the quarantine invariant
-        // guarantees at most one hits) unless the session
+        // The call exited without a readable status: release a
+        // clean slot if held (poisoned slots stick; quarantine is
+        // sticky presence, nothing to resolve) unless the session
         // overflowed (frozen tables). No edge to emit; the FRET
         // loss counts it.
         if !quarantine_overflowed() {
             let _ = return_release(key);
-            let _ = ghost_returned(key);
         }
         loss_inc(LLOSS_FRET);
         return 0;
     };
     agg_inc(LAGG_ENC_RET);
-    if quarantine_overflowed() || ghost_returned(key) {
+    if quarantine_overflowed() {
+        emit_edge(LSITE_ENC, LEDGE_RETURN, key, now, ret as i32, true, 0);
+        return 0;
+    }
+    if ghost_returned(key) {
+        // Quarantine shadows the slot (tainted regardless): release
+        // a clean slot opportunistically (hygiene — future claims
+        // stay blocked by the sticky quarantine), then emit tainted.
+        let _ = return_release(key);
         emit_edge(LSITE_ENC, LEDGE_RETURN, key, now, ret as i32, true, 0);
         return 0;
     }
@@ -577,6 +549,10 @@ pub fn lc_dec_entry(ctx: FEntryContext) -> i32 {
     };
     agg_inc(LAGG_DEC_SUB);
     let Some(invoc) = invoc_next() else {
+        // No invocation id (cpu/sequence bound or map failure): the
+        // call still executes and returns slotless — a ghost.
+        // Quarantine the key (its return taints here) and count it.
+        quarantine_noslot(key);
         loss_inc(LLOSS_NOSLOT);
         return 0;
     };
@@ -602,21 +578,27 @@ pub fn lc_dec_exit(ctx: FExitContext) -> i32 {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
-        // The call exited without a readable status: resolve its
-        // outstanding presence (slot release + ghost resolution —
-        // each no-ops when absent, and the quarantine invariant
-        // guarantees at most one hits) unless the session
+        // The call exited without a readable status: release a
+        // clean slot if held (poisoned slots stick; quarantine is
+        // sticky presence, nothing to resolve) unless the session
         // overflowed (frozen tables). No edge to emit; the FRET
         // loss counts it.
         if !quarantine_overflowed() {
             let _ = return_release(key);
-            let _ = ghost_returned(key);
         }
         loss_inc(LLOSS_FRET);
         return 0;
     };
     agg_inc(LAGG_DEC_RET);
-    if quarantine_overflowed() || ghost_returned(key) {
+    if quarantine_overflowed() {
+        emit_edge(LSITE_DEC, LEDGE_RETURN, key, now, ret as i32, true, 0);
+        return 0;
+    }
+    if ghost_returned(key) {
+        // Quarantine shadows the slot (tainted regardless): release
+        // a clean slot opportunistically (hygiene — future claims
+        // stay blocked by the sticky quarantine), then emit tainted.
+        let _ = return_release(key);
         emit_edge(LSITE_DEC, LEDGE_RETURN, key, now, ret as i32, true, 0);
         return 0;
     }

@@ -143,13 +143,17 @@ fn main() {
         }
     };
     // Quiescence gates RUN validity (a noisy guest refuses the
-    // run); observed traffic during GO is ATTRIBUTED by the
-    // verdict's exact join (fixture-derived hook counts + errno +
-    // status + deltas — background traffic breaks the join and
-    // fails), not by these baselines. The join attributes the
-    // observed edges to the fixture script; it does not prove no
-    // other traffic existed (quiescence bounds that, and any extra
-    // edge breaks the exact join).
+    // run); the verdict then checks POSITIONAL agreement between
+    // the fixture ledger and the sensor ledger (per-hook counts,
+    // per-index errno/status, deltas — background traffic breaks
+    // the exact join and fails), not these baselines. That is
+    // count/order/status agreement under quiescence — NOT
+    // per-call origin proof: records carry no shared fixture
+    // identity (no seq/invocation survives into RequestRecord), so
+    // a same-shape foreign call replacing a missed fixture call is
+    // indistinguishable to the positional join. The archived
+    // sensor rows support independent count/order/status
+    // reconciliation, not individual call attribution.
     let baseline1 = snapshot(&sensor, 0);
     std::thread::sleep(Duration::from_millis(200));
     let baseline2 = snapshot(&sensor, 0);

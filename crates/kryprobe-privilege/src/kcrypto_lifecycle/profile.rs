@@ -153,10 +153,11 @@ pub struct ProfileManifest {
 /// aggregate, the per-CPU invocation sequence, the NOSLOT ghost
 /// quarantine, and the quarantine-overflow flag. `LSTATE` mirrors
 /// the userspace decode bound (4096 outstanding keys) with packed
-/// `u64` slots (poison + cpu + sequence + depth); `LCTR` issues the
-/// per-CPU sequences; `LQ`/`LGLB` are BPF-owned (userspace keeps
-/// the fds, never reads them); `LAGG` reconciles against consumed
-/// edges + `LLOSS_RESERVE` after a quiet drain.
+/// `u64` slots (poison + cpu + sequence, sticky poison); `LCTR`
+/// issues the per-CPU sequences; `LQ`/`LGLB` are BPF-owned sticky
+/// quarantine state (userspace keeps the fds, never reads them);
+/// `LAGG` reconciles against consumed edges + `LLOSS_RESERVE` after
+/// a quiet drain.
 pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
     (
         "LCFG",
