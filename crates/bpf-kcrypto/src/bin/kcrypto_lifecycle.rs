@@ -10,16 +10,18 @@
 //! entry with return by (key, invocation) and decodes T05 `Edge`
 //! events.
 //!
-//! Invocation identity (round-4 W4, race-hardened round-6 W6):
-//! every submit takes the next id from its CPU's `LCTR` sequence
-//! lane, tagged with the cpu number (`(seq << 14) | (cpu << 1)`,
-//! bit 0 reserved + always clear — distinct across CPUs without
-//! atomics); the `LSTATE` slot stores it and the matching return
-//! carries it back on the edge. Userspace joins a return ONLY to the
-//! outstanding id with the SAME invocation, so a lost return + lost
-//! submit can no longer alias one call's return onto another call's
-//! id — pairing soundness no longer depends on lossless transport.
-//! A submit that loses its claim (slot present — nested or racing)
+//! Invocation identity (round-4 W4, race-hardened round-6 W6,
+//! lane-split round-7 W7): every submit takes the next id from its
+//! CPU's `LCTR` sequence lane FOR ITS OWN PROGRAM (`(seq << 15) |
+//! (lane << 14) | (cpu << 1)`, bit 0 reserved + always clear —
+//! distinct across CPUs AND entry programs without atomics); the
+//! `LSTATE` slot stores it plus the entry thread id, and the
+//! matching return carries the invocation back on the edge.
+//! Userspace joins a return ONLY to the outstanding id with the
+//! SAME invocation, so a lost return + lost submit can no longer
+//! alias one call's return onto another call's id — pairing
+//! soundness no longer depends on lossless transport. A submit
+//! that loses its claim (slot present — nested or racing)
 //! quarantines the key and emits TAINTED (`LEDGE_TAINTED`); a return
 //! with no slot (pre-attach call) is TAINTED. Userspace refuses
 //! tainted edges (a tainted submit on an outstanding key gaps that
@@ -46,20 +48,35 @@
 //! sticky `LGLB` overflow bit (all later edges taint — session
 //! fail-closed, counted via `LLOSS_NOSLOT`).
 //!
-//! Race-freedom (round-6 W6): `LSTATE` slot words are IMMUTABLE —
+//! Race-freedom (round-7 W7): `LSTATE` slots are IMMUTABLE —
 //! written exactly once by a kernel-atomic create-only insert
 //! (`BPF_NOEXIST`: exactly one racing claimer wins; losers observe
 //! `EEXIST`), never mutated afterwards, deleted only by a return
-//! that first verified the key unquarantined. Quarantined paths
-//! never touch `LSTATE`, so a stale return can never consume a live
-//! slot however CPUs interleave; every decision is locally
+//! that first verified the key unquarantined AND the slot's entry
+//! thread id against its own. A return whose entry never executed
+//! (late attach, kernel recursion-guard skip) owns no slot: on a
+//! thread mismatch it emits TAINTED and touches
+//! nothing — never consuming, deleting, or quarantining over a live
+//! call's slot (same-thread returns are LIFO-ordered, so a match is
+//! genuinely the claimer's own return; cross-thread matches are
+//! impossible since two live threads never share a tid). Quarantined
+//! paths never touch `LSTATE`, so a stale return can never consume
+//! a live slot however CPUs interleave; every decision is locally
 //! fail-closed (the userspace decoder, single-threaded, serializes
 //! joins). The remaining shared writes are convergent by
 //! construction: quarantine is insert-only presence (every racing
-//! writer inserts the same constant), the `LGLB` overflow bit is
+//! writer inserts the same constant) and the `LGLB` overflow bit is
 //! set-only (racing `|=` writers set the same bit — the result
-//! cannot clear), and the counter lanes are per-CPU
-//! (migration-disabled, exclusive).
+//! cannot clear). Every counter lane is single-writer by
+//! construction: per-CPU AND per-program (`LCTR` one lane per entry
+//! program, `LLOSS` one lane per class per program, `LAGG` already
+//! one lane per hook — round-7: `migrate_disable` does NOT stop an
+//! interrupt running a DIFFERENT program on the same CPU mid-RMW,
+//! so per-CPU alone lost updates; per-program lanes close it
+//! because the kernel per-program recursion guard serializes each
+//! program against itself per CPU, and an NMI reentry would require
+//! the NMI path to call the traced function, which no NMI path
+//! does).
 //! `LAGG` counts accepted edges per hook
 //! (post-gate, pre-reserve — before the slot claim, so NOSLOT
 //! drops count as accepted-but-untransported): after a quiet drain
@@ -133,11 +150,21 @@ const LLOSS_DISABLED: u32 = 1;
 const LLOSS_BADKEY: u32 = 2;
 const LLOSS_FRET: u32 = 3;
 const LLOSS_NOSLOT: u32 = 4;
+/// `LLOSS` lanes per class: one per program (round-7 W7 — the lane
+/// index doubles as the hook id, same order as `LAGG_*` below).
+/// Entry `class * LLOSS_LANES + hook`; userspace folds the four.
+const LLOSS_LANES: u32 = 4;
 
 const LAGG_ENC_SUB: u32 = 0;
 const LAGG_ENC_RET: u32 = 1;
 const LAGG_DEC_SUB: u32 = 2;
 const LAGG_DEC_RET: u32 = 3;
+
+/// `LCTR` lane per entry program (round-7 W7): encrypt-entry takes
+/// lane 0, decrypt-entry lane 1. The lane bit rides invocation bit
+/// 14, so the two independent sequences can never alias.
+const LCTR_ENC: u32 = 0;
+const LCTR_DEC: u32 = 1;
 
 /// Outstanding-call slots: one presence marker per live address
 /// (mirrors the userspace decode bound — global, so cross-CPU
@@ -172,30 +199,41 @@ struct LConfig {
     reserved: [u8; 52],
 }
 
-/// `LSTATE` slot: one packed `u64` (a struct value would fuse
-/// into a `memset` call and break R4, so the state rides one word
-/// of pure arithmetic). Layout: bit 0 = reserved (always clear),
-/// bits 1–13 = cpu tag, bits 14–63 = per-CPU sequence — the WHOLE
-/// word is the invocation identity the return carries back. The word
-/// is IMMUTABLE (round-6 W6): written once by the winning
-/// `BPF_NOEXIST` claim, never mutated (no poison store exists —
-/// contention quarantines instead), removed only by a return that
-/// first verified the key unquarantined.
+/// `LSTATE` slot (16 bytes): the invocation identity the return
+/// carries back, PLUS the claiming thread id (round-7 W7: a return
+/// proves slot ownership by matching its own tid — a missed-entry
+/// return taints instead of consuming a stranger's slot). Layout:
+/// `invoc` (bit 0 = reserved, always clear; bits 1–13 = cpu tag;
+/// bit 14 = entry-program lane; bits 15–63 = per-program per-CPU
+/// sequence), `tid` (entry thread, `bpf_get_current_pid_tgid` low
+/// half), `rsv` (zero). The slot is IMMUTABLE: written once by the
+/// winning `BPF_NOEXIST` claim, never mutated, removed only by a
+/// return that first verified the key unquarantined AND the tid.
+/// Built as two scalar `u64` stores (a struct literal risks an
+/// LLVM `memset` fusion that breaks R4 — spine discipline).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LSlot {
+    invoc: u64,
+    tid: u32,
+    rsv: u32,
+}
 const _: () = assert!(size_of::<LEdge>() == 40);
 const _: () = assert!(size_of::<LConfig>() == 64);
+const _: () = assert!(size_of::<LSlot>() == 16);
 
 #[map]
 static LCFG: Array<LConfig> = Array::with_max_entries(1, 0);
 #[map]
 static LRING: RingBuf = RingBuf::with_byte_size(262_144, 0);
 #[map]
-static LLOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(5, 0);
+static LLOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(5 * LLOSS_LANES, 0);
 #[map]
-static LSTATE: HashMap<u64, u64> = HashMap::with_max_entries(LSTATE_MAX, 0);
+static LSTATE: HashMap<u64, LSlot> = HashMap::with_max_entries(LSTATE_MAX, 0);
 #[map]
 static LAGG: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
 #[map]
-static LCTR: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static LCTR: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
 #[map]
 static LQ: HashMap<u64, u8> = HashMap::with_max_entries(LSTATE_MAX, 0);
 #[map]
@@ -240,10 +278,13 @@ fn cfg_armed() -> bool {
     magic == LCONFIG_MAGIC && version == LCONFIG_VERSION && flags == 0
 }
 
-/// Saturating per-CPU loss bump (current CPU's lane, exclusive).
+/// Saturating loss bump (current CPU's lane FOR THIS PROGRAM —
+/// `class * LLOSS_LANES + hook` — exclusive: per-CPU plus
+/// per-program, since an interrupt can run a different program on
+/// this CPU mid-bump. Callers pass their `LAGG_*` hook id).
 #[inline(always)]
-fn loss_inc(idx: u32) {
-    if let Some(slot) = LLOSS.get_ptr_mut(idx) {
+fn loss_inc(class: u32, hook: u32) {
+    if let Some(slot) = LLOSS.get_ptr_mut(class * LLOSS_LANES + hook) {
         unsafe {
             *slot = (*slot).saturating_add(1);
         }
@@ -252,7 +293,9 @@ fn loss_inc(idx: u32) {
 
 /// Saturating per-CPU accepted-edge bump (post-gate, pre-reserve: an
 /// accepted edge that the ring cannot take still counts here AND in
-/// `LLOSS_RESERVE` — the canary reconciles the two).
+/// `LLOSS_RESERVE` — the canary reconciles the two). Already
+/// per-program: each hook id has exactly one writer program, so the
+/// lane is exclusive (same kernel-guard argument as `LCTR`).
 #[inline(always)]
 fn agg_inc(idx: u32) {
     if let Some(slot) = LAGG.get_ptr_mut(idx) {
@@ -265,9 +308,19 @@ fn agg_inc(idx: u32) {
 /// Emit one edge record: reserve 40 bytes, fill every field, submit.
 /// Reserve failure feeds `LLOSS_RESERVE` (never silent).
 #[inline(always)]
-fn emit_edge(site: u16, edge: u8, key: u64, now: u64, status: i32, tainted: bool, invoc: u64) {
+#[allow(clippy::too_many_arguments)]
+fn emit_edge(
+    site: u16,
+    edge: u8,
+    key: u64,
+    now: u64,
+    status: i32,
+    tainted: bool,
+    invoc: u64,
+    hook: u32,
+) {
     let Some(mut entry) = LRING.reserve::<LEdge>(0) else {
-        loss_inc(LLOSS_RESERVE);
+        loss_inc(LLOSS_RESERVE, hook);
         return;
     };
     // Slot init through the entry deref (spine discipline): every field
@@ -304,6 +357,22 @@ fn cpu_id() -> u32 {
     }
 }
 
+/// Current thread id: `bpf_get_current_pid_tgid` low half (helper
+/// 14, all kernels — the "pid" is the tid from userspace's view).
+/// Re-implemented `#[inline(always)]` (same R4 rationale as
+/// [`func_ret`]: aya's `#[inline]`-only wrapper may outline into a
+/// call reloc). fentry and fexit of one call run on the same thread,
+/// so the claim stores it and the release proves ownership against
+/// it (round-7 W7); migration cannot change it.
+#[inline(always)]
+fn thread_id() -> u32 {
+    // SAFETY: helper with no pointer arguments (id 14, all kernels).
+    unsafe {
+        let fun: unsafe extern "C" fn() -> u64 = core::mem::transmute(14usize);
+        fun() as u32
+    }
+}
+
 /// Map-update flag: create only, fail when the key exists
 /// (kernel UAPI `BPF_NOEXIST = 1`, `include/uapi/linux/bpf.h` —
 /// the claim race resolves inside the kernel, atomically).
@@ -318,31 +387,38 @@ const ERR_EEXIST: i32 = -17;
 const INVOC_CPU_BITS: u32 = 13;
 /// CPUs covered by the tag (`1 << 13`).
 const INVOC_CPU_MAX: u32 = 1 << INVOC_CPU_BITS;
-/// Sequence shift: past the reserved bit 0 + the cpu tag.
-const INVOC_SEQ_SHIFT: u32 = 1 + INVOC_CPU_BITS;
-/// Per-CPU sequence ceiling: 50 bits (ids stay in 64 bits with tag
-/// + reserved bit).
+/// Lane-bit shift: past the reserved bit 0 + the cpu tag.
+const INVOC_LANE_SHIFT: u32 = 1 + INVOC_CPU_BITS;
+/// Sequence shift: past reserved bit + cpu tag + lane bit.
+const INVOC_SEQ_SHIFT: u32 = 1 + INVOC_CPU_BITS + 1;
+/// Per-program per-CPU sequence ceiling: 49 bits (ids stay in 64
+/// bits with tag + lane + reserved bit).
 const INVOC_SEQ_MAX: u64 = (1 << (64 - INVOC_SEQ_SHIFT)) - 1;
 
-/// Take the next invocation id: `(per-CPU sequence << 14) | (cpu <<
-/// 1)` (bit 0 reserved + always clear). The sequence lane is this
-/// CPU's own
-/// (non-atomic bump — BPF runs migration-disabled, so the cpu read
-/// and the lane bump cannot split across CPUs; same discipline as
-/// [`loss_inc`]/[`agg_inc`]). The cpu tag keeps ids distinct across
-/// CPUs. 0 is never issued (it means "no invocation" on slotless
-/// edges). `None` = the cpu tag overflowed, the sequence saturated,
-/// or the map lookup failed — the caller refuses the submit through
-/// the NOSLOT path (never a wrapped/aliased id).
+/// Take the next invocation id: `(per-program per-CPU sequence <<
+/// 15) | (lane << 14) | (cpu << 1)` (bit 0 reserved + always
+/// clear). The sequence lane is this CPU's cell FOR THIS PROGRAM
+/// (`LCTR_ENC`/`LCTR_DEC` — non-atomic bump, exclusive: per-CPU via
+/// `migrate_disable`, per-program via the kernel per-program
+/// recursion guard, which serializes each program against itself
+/// per CPU even across interrupts; an NMI reentry would require
+/// the NMI path to call the traced function, which no NMI path
+/// does). The cpu tag keeps ids distinct across CPUs, the lane bit
+/// across the two entry programs. 0 is never issued (it means "no
+/// invocation" on slotless edges). `None` = the cpu tag overflowed,
+/// the sequence saturated, or the map lookup failed — the caller
+/// refuses the submit through the NOSLOT path (never a
+/// wrapped/aliased id).
 #[inline(always)]
-fn invoc_next() -> Option<u64> {
+fn invoc_next(lane: u32) -> Option<u64> {
     let cpu = cpu_id();
     if cpu >= INVOC_CPU_MAX {
         return None;
     }
-    let slot = LCTR.get_ptr_mut(0)?;
-    // SAFETY: per-CPU lane pointer from a checked lookup; this CPU's
-    // exclusive cell (migration-disabled), so plain RMW is exact.
+    let slot = LCTR.get_ptr_mut(lane)?;
+    // SAFETY: per-CPU per-program lane pointer from a checked
+    // lookup; this program's exclusive cell on this CPU (see
+    // above), so plain RMW is exact — no lost update, no reuse.
     let seq = unsafe {
         let prev = *slot;
         if prev >= INVOC_SEQ_MAX {
@@ -351,7 +427,7 @@ fn invoc_next() -> Option<u64> {
         *slot = prev + 1;
         prev + 1
     };
-    Some((seq << INVOC_SEQ_SHIFT) | (u64::from(cpu) << 1))
+    Some((seq << INVOC_SEQ_SHIFT) | (u64::from(lane) << INVOC_LANE_SHIFT) | (u64::from(cpu) << 1))
 }
 
 /// `LGLB` bit 0: quarantine overflow (sticky — all later edges
@@ -413,34 +489,41 @@ fn ghost_returned(key: u64) -> bool {
 /// timestamp on success; counts the refusal class and returns `None`
 /// otherwise.
 #[inline(always)]
-fn edge_prologue(key: u64) -> Option<u64> {
+fn edge_prologue(key: u64, hook: u32) -> Option<u64> {
     if !cfg_armed() {
-        loss_inc(LLOSS_DISABLED);
+        loss_inc(LLOSS_DISABLED, hook);
         return None;
     }
     if key == 0 {
-        loss_inc(LLOSS_BADKEY);
+        loss_inc(LLOSS_BADKEY, hook);
         return None;
     }
     // SAFETY: helper with no pointer arguments.
     Some(unsafe { bpf_ktime_get_ns() })
 }
 
-/// Submit-side slot claim (round-6 W6): `Some(false)` = clean
-/// (slot claimed for `invoc`, emit untainted); `Some(true)` =
-/// contended (the kernel-atomic `BPF_NOEXIST` insert lost with
-/// `EEXIST` — nested or racing — so the key quarantines and the edge
-/// emits TAINTED; the decoder gaps the outstanding id, since no
-/// future return can be attributed); `None` = table full (quarantine
-/// the ghost key + `LLOSS_NOSLOT`, never evicting another call's
-/// slot). There is NO lookup-then-insert: exactly one racing claimer
-/// wins inside the kernel, and losers never write the slot — the
-/// holder's word is immutable, so no interleave can overwrite,
-/// corrupt, or misattribute it. A contended claim emits a (counted)
-/// tainted edge, so it needs no loss class of its own.
+/// Submit-side slot claim (round-6 W6, owned round-7 W7):
+/// `Some(false)` = clean (slot claimed for `invoc` + this thread,
+/// emit untainted); `Some(true)` = contended (the kernel-atomic
+/// `BPF_NOEXIST` insert lost with `EEXIST` — nested or racing — so
+/// the key quarantines and the edge emits TAINTED; the decoder gaps
+/// the outstanding id, since no future return can be attributed);
+/// `None` = table full (quarantine the ghost key +
+/// `LLOSS_NOSLOT`, never evicting another call's slot). There is NO
+/// lookup-then-insert: exactly one racing claimer wins inside the
+/// kernel, and losers never write the slot — the holder's slot is
+/// immutable, so no interleave can overwrite, corrupt, or
+/// misattribute it. A contended claim emits a (counted) tainted
+/// edge, so it needs no loss class of its own.
 #[inline(always)]
-fn submit_claim(key: u64, invoc: u64) -> Option<bool> {
-    match LSTATE.insert(key, invoc, BPF_NOEXIST) {
+fn submit_claim(key: u64, invoc: u64, hook: u32) -> Option<bool> {
+    // Slot image: two scalar stores (`invoc`, then `tid` + zero
+    // `rsv` as one word — never a struct literal, R4).
+    let raw = [invoc, u64::from(thread_id())];
+    // SAFETY: `LSlot` is `#[repr(C)]`, 16 bytes, 8-aligned — the
+    // `[u64; 2]` image is layout-identical with all-valid fields.
+    let slot_value: &LSlot = unsafe { &*raw.as_ptr().cast::<LSlot>() };
+    match LSTATE.insert(key, slot_value, BPF_NOEXIST) {
         Ok(()) => Some(false),
         Err(ERR_EEXIST) => {
             // Lost the claim race (or nested on a held slot): the
@@ -457,39 +540,47 @@ fn submit_claim(key: u64, invoc: u64) -> Option<bool> {
             // return taints here instead of consuming another call's
             // slot — then count the admission refusal.
             quarantine_noslot(key);
-            loss_inc(LLOSS_NOSLOT);
+            loss_inc(LLOSS_NOSLOT, hook);
             None
         }
     }
 }
 
 /// Return-side slot release: `(clean, invoc)` — clean means a slot
-/// was held (released; emit untainted with the stored invocation).
-/// No slot (pre-attach call or a dropped submit) emits TAINTED with
-/// invoc 0. The read-then-remove is sound WITHOUT atomicity
-/// (round-6 W6): slot words are immutable (insert-once, never
-/// mutated), so a value read here is genuinely this call's; and a
+/// was held AND its entry thread id matches this return's thread
+/// (ownership proved; released; emit untainted with the stored
+/// invocation). No slot, or a slot owned by ANOTHER thread
+/// (pre-attach call, kernel-skipped entry, or a stranger's live
+/// slot), emits TAINTED with invoc 0 and removes NOTHING — a
+/// missed-entry return can neither consume nor delete another
+/// call's slot, and never quarantines over it (the holder's
+/// completion stays intact). The read-then-remove is sound WITHOUT
+/// atomicity: slots are immutable (insert-once, never mutated); a
 /// racing contender quarantines rather than claiming, while
-/// quarantined returns never touch `LSTATE` — a stale return can
-/// therefore never consume a live slot (the key it would consume
-/// from is quarantined, and quarantined returns don't consume).
-/// Never joined to a stranger's id.
+/// quarantined returns never touch `LSTATE`; and same-thread
+/// returns are LIFO-ordered, so a tid match is genuinely the
+/// claimer's own return (two live threads never share a tid).
+/// Under kernel cell reuse the read can return an unrelated slot —
+/// then either the tid mismatches (tainted here) or the invocation
+/// belongs to another key's submit (refused downstream on
+/// invocation inequality — fail-closed). Never joined to a
+/// stranger's id.
 #[inline(always)]
 fn return_release(key: u64) -> (bool, u64) {
     let Some(slot) = LSTATE.get_ptr(key) else {
         return (false, 0);
     };
-    // SAFETY: map value pointer from a checked lookup; one word
-    // read. The only concurrent remover is a nested quarantined
-    // return (every second claimant quarantines first, so removal
-    // implies quarantine — and only returns remove). A removed cell
-    // reads either its immutable value (genuinely this call's —
-    // sound) or, under kernel cell reuse, an unrelated word (refused
-    // downstream on invocation inequality — fail-closed); the
-    // remove below is idempotent either way.
+    // SAFETY: map value pointer from a checked lookup; two word
+    // reads of an immutable cell. The only concurrent remover is a
+    // same-key return that proved ownership (only owners remove);
+    // quarantine-era removals are gone (quarantined paths never
+    // touch `LSTATE`), so removal implies a genuine owner return.
     let stored = unsafe { *slot };
+    if stored.tid != thread_id() {
+        return (false, 0);
+    }
     let _ = LSTATE.remove(key);
-    (true, stored)
+    (true, stored.invoc)
 }
 
 // ---------------------------------------------------------------------------
@@ -502,26 +593,44 @@ fn return_release(key: u64) -> (bool, u64) {
 #[fentry(function = "crypto_skcipher_encrypt")]
 pub fn lc_enc_entry(ctx: FEntryContext) -> i32 {
     let key: u64 = ctx.arg(0);
-    let Some(now) = edge_prologue(key) else {
+    let Some(now) = edge_prologue(key, LAGG_ENC_SUB) else {
         return 0;
     };
     agg_inc(LAGG_ENC_SUB);
-    let Some(invoc) = invoc_next() else {
+    let Some(invoc) = invoc_next(LCTR_ENC) else {
         // No invocation id (cpu/sequence bound or map failure): the
         // call still executes and returns slotless — a ghost.
         // Quarantine the key (its return taints here) and count it.
         quarantine_noslot(key);
-        loss_inc(LLOSS_NOSLOT);
+        loss_inc(LLOSS_NOSLOT, LAGG_ENC_SUB);
         return 0;
     };
     if submit_quarantined(key) {
-        emit_edge(LSITE_ENC, LEDGE_SUBMIT, key, now, 0, true, invoc);
+        emit_edge(
+            LSITE_ENC,
+            LEDGE_SUBMIT,
+            key,
+            now,
+            0,
+            true,
+            invoc,
+            LAGG_ENC_SUB,
+        );
         return 0;
     }
-    let Some(tainted) = submit_claim(key, invoc) else {
+    let Some(tainted) = submit_claim(key, invoc, LAGG_ENC_SUB) else {
         return 0;
     };
-    emit_edge(LSITE_ENC, LEDGE_SUBMIT, key, now, 0, tainted, invoc);
+    emit_edge(
+        LSITE_ENC,
+        LEDGE_SUBMIT,
+        key,
+        now,
+        0,
+        tainted,
+        invoc,
+        LAGG_ENC_SUB,
+    );
     0
 }
 
@@ -532,25 +641,34 @@ pub fn lc_enc_entry(ctx: FEntryContext) -> i32 {
 #[fexit(function = "crypto_skcipher_encrypt")]
 pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
     let key: u64 = ctx.arg(0);
-    let Some(now) = edge_prologue(key) else {
+    let Some(now) = edge_prologue(key, LAGG_ENC_RET) else {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
         // The call exited without a readable status: release its own
-        // slot if the key is live (no contender can hold it — every
-        // second claimant quarantines first). A ghost's slot stays:
-        // quarantined paths never touch `LSTATE`, and overflow
-        // freezes the tables. No edge to emit; the FRET loss counts
-        // it.
+        // slot if the key is live (ownership is proved inside
+        // `return_release` — a missed-entry FRET taints there and
+        // removes nothing). A ghost's slot stays: quarantined paths
+        // never touch `LSTATE`, and overflow freezes the tables. No
+        // edge to emit; the FRET loss counts it.
         if !quarantine_overflowed() && !ghost_returned(key) {
             let _ = return_release(key);
         }
-        loss_inc(LLOSS_FRET);
+        loss_inc(LLOSS_FRET, LAGG_ENC_RET);
         return 0;
     };
     agg_inc(LAGG_ENC_RET);
     if quarantine_overflowed() {
-        emit_edge(LSITE_ENC, LEDGE_RETURN, key, now, ret as i32, true, 0);
+        emit_edge(
+            LSITE_ENC,
+            LEDGE_RETURN,
+            key,
+            now,
+            ret as i32,
+            true,
+            0,
+            LAGG_ENC_RET,
+        );
         return 0;
     }
     if ghost_returned(key) {
@@ -558,11 +676,29 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
         // (quarantined paths never touch `LSTATE`, so a stale return
         // can never consume a live slot; future claims stay blocked
         // by the sticky quarantine).
-        emit_edge(LSITE_ENC, LEDGE_RETURN, key, now, ret as i32, true, 0);
+        emit_edge(
+            LSITE_ENC,
+            LEDGE_RETURN,
+            key,
+            now,
+            ret as i32,
+            true,
+            0,
+            LAGG_ENC_RET,
+        );
         return 0;
     }
     let (clean, invoc) = return_release(key);
-    emit_edge(LSITE_ENC, LEDGE_RETURN, key, now, ret as i32, !clean, invoc);
+    emit_edge(
+        LSITE_ENC,
+        LEDGE_RETURN,
+        key,
+        now,
+        ret as i32,
+        !clean,
+        invoc,
+        LAGG_ENC_RET,
+    );
     0
 }
 
@@ -572,26 +708,44 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
 #[fentry(function = "crypto_skcipher_decrypt")]
 pub fn lc_dec_entry(ctx: FEntryContext) -> i32 {
     let key: u64 = ctx.arg(0);
-    let Some(now) = edge_prologue(key) else {
+    let Some(now) = edge_prologue(key, LAGG_DEC_SUB) else {
         return 0;
     };
     agg_inc(LAGG_DEC_SUB);
-    let Some(invoc) = invoc_next() else {
+    let Some(invoc) = invoc_next(LCTR_DEC) else {
         // No invocation id (cpu/sequence bound or map failure): the
         // call still executes and returns slotless — a ghost.
         // Quarantine the key (its return taints here) and count it.
         quarantine_noslot(key);
-        loss_inc(LLOSS_NOSLOT);
+        loss_inc(LLOSS_NOSLOT, LAGG_DEC_SUB);
         return 0;
     };
     if submit_quarantined(key) {
-        emit_edge(LSITE_DEC, LEDGE_SUBMIT, key, now, 0, true, invoc);
+        emit_edge(
+            LSITE_DEC,
+            LEDGE_SUBMIT,
+            key,
+            now,
+            0,
+            true,
+            invoc,
+            LAGG_DEC_SUB,
+        );
         return 0;
     }
-    let Some(tainted) = submit_claim(key, invoc) else {
+    let Some(tainted) = submit_claim(key, invoc, LAGG_DEC_SUB) else {
         return 0;
     };
-    emit_edge(LSITE_DEC, LEDGE_SUBMIT, key, now, 0, tainted, invoc);
+    emit_edge(
+        LSITE_DEC,
+        LEDGE_SUBMIT,
+        key,
+        now,
+        0,
+        tainted,
+        invoc,
+        LAGG_DEC_SUB,
+    );
     0
 }
 
@@ -602,25 +756,34 @@ pub fn lc_dec_entry(ctx: FEntryContext) -> i32 {
 #[fexit(function = "crypto_skcipher_decrypt")]
 pub fn lc_dec_exit(ctx: FExitContext) -> i32 {
     let key: u64 = ctx.arg(0);
-    let Some(now) = edge_prologue(key) else {
+    let Some(now) = edge_prologue(key, LAGG_DEC_RET) else {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
         // The call exited without a readable status: release its own
-        // slot if the key is live (no contender can hold it — every
-        // second claimant quarantines first). A ghost's slot stays:
-        // quarantined paths never touch `LSTATE`, and overflow
-        // freezes the tables. No edge to emit; the FRET loss counts
-        // it.
+        // slot if the key is live (ownership is proved inside
+        // `return_release` — a missed-entry FRET taints there and
+        // removes nothing). A ghost's slot stays: quarantined paths
+        // never touch `LSTATE`, and overflow freezes the tables. No
+        // edge to emit; the FRET loss counts it.
         if !quarantine_overflowed() && !ghost_returned(key) {
             let _ = return_release(key);
         }
-        loss_inc(LLOSS_FRET);
+        loss_inc(LLOSS_FRET, LAGG_DEC_RET);
         return 0;
     };
     agg_inc(LAGG_DEC_RET);
     if quarantine_overflowed() {
-        emit_edge(LSITE_DEC, LEDGE_RETURN, key, now, ret as i32, true, 0);
+        emit_edge(
+            LSITE_DEC,
+            LEDGE_RETURN,
+            key,
+            now,
+            ret as i32,
+            true,
+            0,
+            LAGG_DEC_RET,
+        );
         return 0;
     }
     if ghost_returned(key) {
@@ -628,11 +791,29 @@ pub fn lc_dec_exit(ctx: FExitContext) -> i32 {
         // (quarantined paths never touch `LSTATE`, so a stale return
         // can never consume a live slot; future claims stay blocked
         // by the sticky quarantine).
-        emit_edge(LSITE_DEC, LEDGE_RETURN, key, now, ret as i32, true, 0);
+        emit_edge(
+            LSITE_DEC,
+            LEDGE_RETURN,
+            key,
+            now,
+            ret as i32,
+            true,
+            0,
+            LAGG_DEC_RET,
+        );
         return 0;
     }
     let (clean, invoc) = return_release(key);
-    emit_edge(LSITE_DEC, LEDGE_RETURN, key, now, ret as i32, !clean, invoc);
+    emit_edge(
+        LSITE_DEC,
+        LEDGE_RETURN,
+        key,
+        now,
+        ret as i32,
+        !clean,
+        invoc,
+        LAGG_DEC_RET,
+    );
     0
 }
 

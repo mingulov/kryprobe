@@ -84,11 +84,11 @@ fn h01_api_returns_sections_stay_fexit_only() {
 #[test]
 fn h01_lifecycle_map_table_is_exact_and_dot_free() {
     // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss,
-    // 5 classes), LSTATE (global identity slots, packed words),
-    // LAGG (per-CPU accepted aggregate), LCTR (per-CPU invocation
-    // sequence), LQ (NOSLOT ghost quarantine), LGLB
-    // (quarantine-overflow flag): the T06 contract the BPF object
-    // must match byte-for-byte.
+    // 5 classes x 4 program lanes), LSTATE (global identity slots,
+    // 16-byte invoc+tid), LAGG (per-CPU accepted aggregate), LCTR
+    // (per-CPU per-program invocation sequence), LQ (NOSLOT ghost
+    // quarantine), LGLB (quarantine-overflow flag): the T06 contract
+    // the BPF object must match byte-for-byte.
     assert_eq!(LIFECYCLE_MAPS.len(), 8);
     let names: Vec<&str> = LIFECYCLE_MAPS.iter().map(|(n, _)| *n).collect();
     assert_eq!(
@@ -131,7 +131,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 5,
+            max_entries: 20,
         }
     );
     assert_eq!(
@@ -139,7 +139,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
         MapDims {
             map_type: 1,
             key_size: 8,
-            value_size: 8,
+            value_size: 16,
             max_entries: 4096,
         }
     );
@@ -158,7 +158,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 1,
+            max_entries: 2,
         }
     );
     assert_eq!(

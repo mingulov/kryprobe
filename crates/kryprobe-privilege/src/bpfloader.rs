@@ -431,14 +431,16 @@ pub struct LifecycleMaps {
     pub config: OwnedFd,
     /// `LRING` (raw edge ringbuf).
     pub ring: OwnedFd,
-    /// `LLOSS` (per-CPU loss counters, 5 entries).
+    /// `LLOSS` (per-CPU per-program loss counters, 5 classes × 4
+    /// lanes; userspace folds per class).
     pub loss: OwnedFd,
-    /// `LSTATE` (global outstanding-call slots, packed words).
+    /// `LSTATE` (global outstanding-call slots, 16-byte
+    /// invocation + owner tid).
     pub state: OwnedFd,
     /// `LAGG` (per-CPU accepted-edge aggregate, 4 entries).
     pub agg: OwnedFd,
-    /// `LCTR` (per-CPU invocation sequence, 1 entry; BPF-owned —
-    /// userspace keeps the fd, never reads it).
+    /// `LCTR` (per-CPU per-program invocation sequences, 2 lanes;
+    /// BPF-owned — userspace keeps the fd, never reads it).
     pub ctr: OwnedFd,
     /// `LQ` (NOSLOT ghost quarantine; BPF-owned, never read).
     pub quar: OwnedFd,

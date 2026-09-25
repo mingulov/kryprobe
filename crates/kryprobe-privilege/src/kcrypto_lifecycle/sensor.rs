@@ -15,7 +15,8 @@ use crate::drain::area::RingArea;
 use crate::drain::frame::consume_range;
 use crate::kcrypto_lifecycle::decode::{DecodeStats, LifecycleDecoder, decode_record};
 use crate::kcrypto_lifecycle::profile::{
-    LIFECYCLE_MAPS, LifecycleProfile, SessionGuard, acquire_kcrypto_session,
+    LIFECYCLE_MAPS, LLOSS_ENTRIES, LLOSS_LANES_PER_CLASS, LifecycleProfile, SessionGuard,
+    acquire_kcrypto_session,
 };
 use crate::kcrypto_lifecycle::{ConfiguredLifecycle, load_lifecycle_configured};
 use crate::mapops::{MapOpsError, map_lookup_percpu_sum};
@@ -39,6 +40,24 @@ fn ring_max() -> usize {
         .find(|(name, _)| *name == "LRING")
         .map(|(_, dims)| dims.max_entries as usize)
         .expect("manifest carries LRING")
+}
+
+/// Fold the 20 per-(class, program) `LLOSS` lanes into 5 per-class
+/// totals (round-7 W7: one lane per program per class, since an
+/// interrupt can run a different program on the same CPU mid-bump).
+/// Saturating — a saturated lane must not wrap the ledger.
+#[must_use]
+pub fn fold_loss_lanes(lanes: [u64; LLOSS_ENTRIES as usize]) -> [u64; 5] {
+    let mut out = [0u64; 5];
+    for (class, slot) in out.iter_mut().enumerate() {
+        let base = class * LLOSS_LANES_PER_CLASS as usize;
+        let mut total = 0u64;
+        for lane in 0..LLOSS_LANES_PER_CLASS as usize {
+            total = total.saturating_add(lanes[base + lane]);
+        }
+        *slot = total;
+    }
+    out
 }
 
 /// Terminal ledger: completed records plus every loss class,
@@ -273,14 +292,15 @@ impl LifecycleSensor {
     /// Snapshot the terminal ledger (reads `LLOSS` per-class totals
     /// + `LAGG` per-hook accepted totals).
     pub fn ledger(&self) -> Result<LifecycleLedger, MapOpsError> {
-        let mut kernel_loss = [0u64; 5];
-        for (idx, slot) in kernel_loss.iter_mut().enumerate() {
+        let mut lanes = [0u64; LLOSS_ENTRIES as usize];
+        for (idx, slot) in lanes.iter_mut().enumerate() {
             *slot = map_lookup_percpu_sum(
                 &self.configured.loaded.maps.loss,
                 idx as u32,
                 "lifecycle_sensor/lloss",
             )?;
         }
+        let kernel_loss = fold_loss_lanes(lanes);
         let mut agg_accepted = [0u64; 4];
         for (idx, slot) in agg_accepted.iter_mut().enumerate() {
             *slot = map_lookup_percpu_sum(

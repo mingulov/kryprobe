@@ -8,7 +8,7 @@
 //! same `ingest_records` and is covered by the VM canary lane.
 
 use kryprobe_core::kcrypto::Terminal;
-use kryprobe_privilege::kcrypto_lifecycle::sensor::SensorCore;
+use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, fold_loss_lanes};
 
 /// One 40-byte v3 `LEdge` (little-endian twin of the ABI struct).
 fn edge_bytes_invoc(
@@ -146,4 +146,22 @@ fn f7_take_completed_drains_and_releases_the_bound() {
     let ledger = core.ledger([0; 5], [0; 4]);
     assert_eq!(ledger.completed.len(), 1);
     assert_eq!(ledger.retained_dropped, 0);
+}
+
+#[test]
+fn w7_fold_loss_lanes_sums_per_class_saturating() {
+    // Round-7: one `LLOSS` lane per program per class (an interrupt
+    // can run a different program on the same CPU mid-bump, so
+    // per-CPU alone lost updates). The fold sums the four program
+    // lanes class-major, saturating — a saturated lane must not
+    // wrap the ledger.
+    let mut lanes = [0u64; 20];
+    lanes[0] = 1;
+    lanes[1] = 2;
+    lanes[2] = 3;
+    lanes[3] = 4;
+    lanes[6] = 7;
+    lanes[16] = u64::MAX;
+    lanes[19] = u64::MAX;
+    assert_eq!(fold_loss_lanes(lanes), [10, 7, 0, 0, u64::MAX]);
 }

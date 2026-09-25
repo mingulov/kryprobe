@@ -148,16 +148,27 @@ pub struct ProfileManifest {
     pub maps: &'static [(&'static str, MapDims)],
 }
 
+/// Program lanes per `LLOSS` class (BPF hook order: enc-sub,
+/// enc-ret, dec-sub, dec-ret); class `c` occupies entries
+/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 4`.
+pub const LLOSS_LANES_PER_CLASS: u32 = 4;
+/// `LLOSS` entries: 5 classes × [`LLOSS_LANES_PER_CLASS`].
+pub const LLOSS_ENTRIES: u32 = 5 * LLOSS_LANES_PER_CLASS;
+
 /// Frozen lifecycle map table: config, edge ringbuf, per-CPU loss
-/// (5 classes), global identity slots, per-CPU accepted-edge
-/// aggregate, the per-CPU invocation sequence, the NOSLOT ghost
-/// quarantine, and the quarantine-overflow flag. `LSTATE` mirrors
-/// the userspace decode bound (4096 outstanding keys) with packed
-/// `u64` slots (reserved bit + cpu + sequence, immutable words); `LCTR`
-/// issues the per-CPU sequences; `LQ`/`LGLB` are BPF-owned sticky
-/// quarantine state (userspace keeps the fds, never reads them);
-/// `LAGG` reconciles against consumed edges + `LLOSS_RESERVE` after
-/// a quiet drain.
+/// (5 classes × 4 program lanes), global identity slots, per-CPU
+/// accepted-edge aggregate, the per-CPU per-program invocation
+/// sequences, the NOSLOT ghost quarantine, and the
+/// quarantine-overflow flag. `LSTATE` mirrors the userspace decode
+/// bound (4096 outstanding keys) with 16-byte slots (invocation +
+/// owner tid, immutable); `LCTR` issues the per-program per-CPU
+/// sequences (one lane per entry program — an interrupt can run a
+/// different program on the same CPU, so per-CPU alone lost
+/// updates); `LLOSS` lanes fold per class in
+/// [`crate::kcrypto_lifecycle::sensor::fold_loss_lanes`];
+/// `LQ`/`LGLB` are BPF-owned sticky quarantine state (userspace
+/// keeps the fds, never reads them); `LAGG` reconciles against
+/// consumed edges + `LLOSS_RESERVE` after a quiet drain.
 pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
     (
         "LCFG",
@@ -183,7 +194,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 5,
+            max_entries: LLOSS_ENTRIES,
         },
     ),
     (
@@ -191,7 +202,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
         MapDims {
             map_type: 1,
             key_size: 8,
-            value_size: 8,
+            value_size: 16,
             max_entries: 4096,
         },
     ),
@@ -210,7 +221,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 1,
+            max_entries: 2,
         },
     ),
     (
