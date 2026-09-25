@@ -10,46 +10,56 @@
 //! entry with return by (key, invocation) and decodes T05 `Edge`
 //! events.
 //!
-//! Invocation identity (round-4 W4): every submit takes the next id
-//! from its CPU's `LCTR` sequence lane, tagged with the cpu number
-//! (`(seq << 14) | (cpu << 1)`, bit 0 reserved for the poison tag —
-//! distinct across CPUs without atomics);
-//! the `LSTATE` slot stores it and the matching return carries it
-//! back on the edge. Userspace joins a return ONLY to the
+//! Invocation identity (round-4 W4, race-hardened round-6 W6):
+//! every submit takes the next id from its CPU's `LCTR` sequence
+//! lane, tagged with the cpu number (`(seq << 14) | (cpu << 1)`,
+//! bit 0 reserved + always clear — distinct across CPUs without
+//! atomics); the `LSTATE` slot stores it and the matching return
+//! carries it back on the edge. Userspace joins a return ONLY to the
 //! outstanding id with the SAME invocation, so a lost return + lost
 //! submit can no longer alias one call's return onto another call's
 //! id — pairing soundness no longer depends on lossless transport.
-//! A submit nests (slot present) → the edge is TAINTED
-//! (`LEDGE_TAINTED`); a return with no slot (pre-attach call) is
-//! TAINTED. Userspace refuses tainted edges (a tainted submit on an
-//! outstanding key gaps that id), so a nested reuse can never steal
-//! another invocation's return.
+//! A submit that loses its claim (slot present — nested or racing)
+//! quarantines the key and emits TAINTED (`LEDGE_TAINTED`); a return
+//! with no slot (pre-attach call) is TAINTED. Userspace refuses
+//! tainted edges (a tainted submit on an outstanding key gaps that
+//! id), so a contended reuse can never steal another invocation's
+//! return.
 //!
-//! NOSLOT quarantine (round-4 W4, hardened round-5 W5): a submit
-//! dropped for a full table — or refused for an exhausted invocation
-//! id — leaves a GHOST invocation: it will return, but holds no
-//! slot, so its return would consume the next call's slot and
-//! misjoin. The dropped key quarantines in `LQ` (STICKY presence)
-//! instead: submits for a quarantined key emit TAINTED without
-//! claiming, and returns for it emit TAINTED without joining. The
-//! quarantine NEVER clears (round-5: clearing on the first return
-//! misattributes when several ghosts share the key; counting ghosts
-//! races across CPUs) — a disturbed key taints for the session,
-//! fail-closed. A full quarantine table sets the sticky `LGLB`
-//! overflow bit (all later edges taint — session fail-closed,
-//! counted via `LLOSS_NOSLOT`).
+//! NOSLOT quarantine (round-4 W4, hardened round-5 W5, merged
+//! round-6 W6): a submit dropped for a full table — or refused for
+//! an exhausted invocation id — leaves a GHOST invocation: it will
+//! return, but holds no slot, so its return would consume the next
+//! call's slot and misjoin. The dropped key quarantines in `LQ`
+//! (STICKY presence) instead: submits for a quarantined key emit
+//! TAINTED without claiming, and returns for it emit TAINTED without
+//! touching `LSTATE`. Round-6 also routes CLAIM CONTENTION here (a
+//! lost `BPF_NOEXIST` race quarantines instead of overwriting or
+//! poisoning — no cross-CPU slot write exists anymore), so quarantine
+//! is the single contention mechanism. The quarantine NEVER clears
+//! (round-5: clearing on the first return misattributes when several
+//! ghosts share the key; counting ghosts races across CPUs) — a
+//! disturbed key taints for the session, fail-closed. A quarantined
+//! key's held slot is never reclaimed (bounded by quarantine
+//! capacity; pressure routes through NOSLOT → overflow, same profile
+//! as the round-5 sticky poison). A full quarantine table sets the
+//! sticky `LGLB` overflow bit (all later edges taint — session
+//! fail-closed, counted via `LLOSS_NOSLOT`).
 //!
-//! Race-freedom (round-5 W5): BPF has no user-reachable atomic RMW
-//! (the `bpfel` target exposes none through core), so this program
-//! performs NO shared read-modify-write at all — every cross-CPU
-//! state change is a single idempotent store, a kernel-atomic
-//! insert/remove, or a per-CPU-lane bump (migration-disabled,
-//! exclusive). Poison is set-only (sticky — never cleared, never
-//! counted down); quarantine is insert-only (sticky presence);
-//! overflow is set-only. Every taint decision derives from ONE
-//! atomic word read, and every decision is locally fail-closed, so
-//! every CPU interleave resolves soundly (the userspace decoder,
-//! single-threaded, serializes joins).
+//! Race-freedom (round-6 W6): `LSTATE` slot words are IMMUTABLE —
+//! written exactly once by a kernel-atomic create-only insert
+//! (`BPF_NOEXIST`: exactly one racing claimer wins; losers observe
+//! `EEXIST`), never mutated afterwards, deleted only by a return
+//! that first verified the key unquarantined. Quarantined paths
+//! never touch `LSTATE`, so a stale return can never consume a live
+//! slot however CPUs interleave; every decision is locally
+//! fail-closed (the userspace decoder, single-threaded, serializes
+//! joins). The remaining shared writes are convergent by
+//! construction: quarantine is insert-only presence (every racing
+//! writer inserts the same constant), the `LGLB` overflow bit is
+//! set-only (racing `|=` writers set the same bit — the result
+//! cannot clear), and the counter lanes are per-CPU
+//! (migration-disabled, exclusive).
 //! `LAGG` counts accepted edges per hook
 //! (post-gate, pre-reserve — before the slot claim, so NOSLOT
 //! drops count as accepted-but-untransported): after a quiet drain
@@ -164,17 +174,13 @@ struct LConfig {
 
 /// `LSTATE` slot: one packed `u64` (a struct value would fuse
 /// into a `memset` call and break R4, so the state rides one word
-/// of pure arithmetic). Layout: bit 0 = poison (disturbed pairing),
+/// of pure arithmetic). Layout: bit 0 = reserved (always clear),
 /// bits 1–13 = cpu tag, bits 14–63 = per-CPU sequence — the WHOLE
-/// word is the invocation identity the return carries back. Fresh
-/// invocation ids always have bit 0 clear; the poison bit doubles
-/// as a guaranteed-mismatch tag (a poisoned return can never equal
-/// a submitted id). The poison is STICKY (a poisoned slot is never
-/// removed: the first nested return cannot name the remaining
-/// invocation, and counting down to a free would race across CPUs
-/// — every edge for a disturbed key stays tainted for the session).
-/// One slot leaks per distinct key that ever nests (fail-closed:
-/// table pressure routes through NOSLOT → quarantine → overflow).
+/// word is the invocation identity the return carries back. The word
+/// is IMMUTABLE (round-6 W6): written once by the winning
+/// `BPF_NOEXIST` claim, never mutated (no poison store exists —
+/// contention quarantines instead), removed only by a return that
+/// first verified the key unquarantined.
 const _: () = assert!(size_of::<LEdge>() == 40);
 const _: () = assert!(size_of::<LConfig>() == 64);
 
@@ -298,23 +304,28 @@ fn cpu_id() -> u32 {
     }
 }
 
-/// Poison tag: bit 0 of the packed slot word (fresh invocation ids
-/// always have it clear).
-const INVOC_POISON: u64 = 1;
+/// Map-update flag: create only, fail when the key exists
+/// (kernel UAPI `BPF_NOEXIST = 1`, `include/uapi/linux/bpf.h` —
+/// the claim race resolves inside the kernel, atomically).
+const BPF_NOEXIST: u64 = 1;
+/// `insert` failure when the key already exists: aya-ebpf 0.2.1
+/// surfaces the raw helper return, i.e. negated errno (`-EEXIST`,
+/// `EEXIST = 17`, `include/uapi/asm-generic/errno-base.h`).
+const ERR_EEXIST: i32 = -17;
 /// CPU tag width: 13 bits cover 8192 CPUs (the x86-64 `NR_CPUS`
 /// ceiling); ids from higher-numbered CPUs refuse loudly rather
 /// than alias.
 const INVOC_CPU_BITS: u32 = 13;
 /// CPUs covered by the tag (`1 << 13`).
 const INVOC_CPU_MAX: u32 = 1 << INVOC_CPU_BITS;
-/// Sequence shift: past the poison bit + the cpu tag.
+/// Sequence shift: past the reserved bit 0 + the cpu tag.
 const INVOC_SEQ_SHIFT: u32 = 1 + INVOC_CPU_BITS;
 /// Per-CPU sequence ceiling: 50 bits (ids stay in 64 bits with tag
-/// + poison).
+/// + reserved bit).
 const INVOC_SEQ_MAX: u64 = (1 << (64 - INVOC_SEQ_SHIFT)) - 1;
 
 /// Take the next invocation id: `(per-CPU sequence << 14) | (cpu <<
-/// 1)` (bit 0 clear — the poison tag). The sequence lane is this
+/// 1)` (bit 0 reserved + always clear). The sequence lane is this
 /// CPU's own
 /// (non-atomic bump — BPF runs migration-disabled, so the cpu read
 /// and the lane bump cannot split across CPUs; same discipline as
@@ -355,8 +366,9 @@ fn quarantine_overflowed() -> bool {
     *word & LGLB_OVERFLOW != 0
 }
 
-/// Quarantine a refused key (NOSLOT drop or exhausted invocation
-/// id): STICKY presence — insert once, never clear (round-5:
+/// Quarantine a refused key (NOSLOT drop, exhausted invocation
+/// id, or — round-6 — lost claim race): STICKY presence — insert
+/// once, never clear (round-5:
 /// clearing misattributes shared ghosts; counting races). A full
 /// quarantine table sets the sticky overflow bit instead. Frozen
 /// once overflowed (the bit already covers everything).
@@ -414,53 +426,68 @@ fn edge_prologue(key: u64) -> Option<u64> {
     Some(unsafe { bpf_ktime_get_ns() })
 }
 
-/// Submit-side slot claim: `Some(false)` = clean (slot claimed
-/// for `invoc`, emit untainted); `Some(true)` = disturbed (slot
-/// held — single store of `invoc | INVOC_POISON`, emit TAINTED; the
-/// decoder gaps the outstanding id, since no future return can be
-/// attributed); `None` = table full (quarantine the ghost key +
-/// `LLOSS_NOSLOT`, never evicting another call's slot).
+/// Submit-side slot claim (round-6 W6): `Some(false)` = clean
+/// (slot claimed for `invoc`, emit untainted); `Some(true)` =
+/// contended (the kernel-atomic `BPF_NOEXIST` insert lost with
+/// `EEXIST` — nested or racing — so the key quarantines and the edge
+/// emits TAINTED; the decoder gaps the outstanding id, since no
+/// future return can be attributed); `None` = table full (quarantine
+/// the ghost key + `LLOSS_NOSLOT`, never evicting another call's
+/// slot). There is NO lookup-then-insert: exactly one racing claimer
+/// wins inside the kernel, and losers never write the slot — the
+/// holder's word is immutable, so no interleave can overwrite,
+/// corrupt, or misattribute it. A contended claim emits a (counted)
+/// tainted edge, so it needs no loss class of its own.
 #[inline(always)]
 fn submit_claim(key: u64, invoc: u64) -> Option<bool> {
-    if let Some(slot) = LSTATE.get_ptr_mut(key) {
-        // SAFETY: map value pointer from a checked lookup; one word
-        // store (no read-modify-write — race-free, R4 holds).
-        unsafe {
-            *slot = invoc | INVOC_POISON;
+    match LSTATE.insert(key, invoc, BPF_NOEXIST) {
+        Ok(()) => Some(false),
+        Err(ERR_EEXIST) => {
+            // Lost the claim race (or nested on a held slot): the
+            // holder's integrity is now suspect — quarantine the key
+            // (its return taints here) and emit TAINTED. The slot is
+            // deliberately untouched: no stale pointer, no poison
+            // store, nothing a racing return can trip over.
+            quarantine_noslot(key);
+            Some(true)
         }
-        return Some(true);
+        Err(_) => {
+            // The dropped submit leaves a ghost invocation (it WILL
+            // return, slotless): quarantine the key so the ghost's
+            // return taints here instead of consuming another call's
+            // slot — then count the admission refusal.
+            quarantine_noslot(key);
+            loss_inc(LLOSS_NOSLOT);
+            None
+        }
     }
-    if LSTATE.insert(key, invoc, 0).is_err() {
-        // The dropped submit leaves a ghost invocation (it WILL
-        // return, slotless): quarantine the key so the ghost's
-        // return taints here instead of consuming another call's
-        // slot — then count the admission refusal.
-        quarantine_noslot(key);
-        loss_inc(LLOSS_NOSLOT);
-        return None;
-    }
-    Some(false)
 }
 
-/// Return-side slot release: `(clean, invoc)` — clean means the slot
-/// word had the poison bit clear (released; emit untainted with the
-/// stored invocation). No slot (pre-attach call or a dropped submit)
-/// emits TAINTED with invoc 0. A POISONED slot emits TAINTED with
-/// the stored word — whose poison bit can never equal a submitted
-/// id, so userspace refuses it on invocation inequality even past
-/// the taint check — and is NEVER removed (sticky: counting down to
-/// a free would race across CPUs). Never joined to a stranger's id.
+/// Return-side slot release: `(clean, invoc)` — clean means a slot
+/// was held (released; emit untainted with the stored invocation).
+/// No slot (pre-attach call or a dropped submit) emits TAINTED with
+/// invoc 0. The read-then-remove is sound WITHOUT atomicity
+/// (round-6 W6): slot words are immutable (insert-once, never
+/// mutated), so a value read here is genuinely this call's; and a
+/// racing contender quarantines rather than claiming, while
+/// quarantined returns never touch `LSTATE` — a stale return can
+/// therefore never consume a live slot (the key it would consume
+/// from is quarantined, and quarantined returns don't consume).
+/// Never joined to a stranger's id.
 #[inline(always)]
 fn return_release(key: u64) -> (bool, u64) {
     let Some(slot) = LSTATE.get_ptr(key) else {
         return (false, 0);
     };
-    // SAFETY: map value pointer from a checked lookup; one atomic
-    // word read drives a locally fail-closed decision.
+    // SAFETY: map value pointer from a checked lookup; one word
+    // read. The only concurrent remover is a nested quarantined
+    // return (every second claimant quarantines first, so removal
+    // implies quarantine — and only returns remove). A removed cell
+    // reads either its immutable value (genuinely this call's —
+    // sound) or, under kernel cell reuse, an unrelated word (refused
+    // downstream on invocation inequality — fail-closed); the
+    // remove below is idempotent either way.
     let stored = unsafe { *slot };
-    if stored & INVOC_POISON != 0 {
-        return (false, stored);
-    }
     let _ = LSTATE.remove(key);
     (true, stored)
 }
@@ -470,8 +497,8 @@ fn return_release(key: u64) -> (bool, u64) {
 // ---------------------------------------------------------------------------
 
 /// `crypto_skcipher_encrypt(req)` entry: submit-side edge, status 0.
-/// Takes an invocation id, then claims the key's slot (nested →
-/// tainted, full → dropped).
+/// Takes an invocation id, then claims the key's slot (contended →
+/// quarantined + tainted, full → dropped).
 #[fentry(function = "crypto_skcipher_encrypt")]
 pub fn lc_enc_entry(ctx: FEntryContext) -> i32 {
     let key: u64 = ctx.arg(0);
@@ -509,12 +536,13 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
-        // The call exited without a readable status: release a
-        // clean slot if held (poisoned slots stick; quarantine is
-        // sticky presence, nothing to resolve) unless the session
-        // overflowed (frozen tables). No edge to emit; the FRET
-        // loss counts it.
-        if !quarantine_overflowed() {
+        // The call exited without a readable status: release its own
+        // slot if the key is live (no contender can hold it — every
+        // second claimant quarantines first). A ghost's slot stays:
+        // quarantined paths never touch `LSTATE`, and overflow
+        // freezes the tables. No edge to emit; the FRET loss counts
+        // it.
+        if !quarantine_overflowed() && !ghost_returned(key) {
             let _ = return_release(key);
         }
         loss_inc(LLOSS_FRET);
@@ -526,10 +554,10 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
         return 0;
     }
     if ghost_returned(key) {
-        // Quarantine shadows the slot (tainted regardless): release
-        // a clean slot opportunistically (hygiene — future claims
-        // stay blocked by the sticky quarantine), then emit tainted.
-        let _ = return_release(key);
+        // Quarantine shadows the slot: emit tainted and touch nothing
+        // (quarantined paths never touch `LSTATE`, so a stale return
+        // can never consume a live slot; future claims stay blocked
+        // by the sticky quarantine).
         emit_edge(LSITE_ENC, LEDGE_RETURN, key, now, ret as i32, true, 0);
         return 0;
     }
@@ -539,8 +567,8 @@ pub fn lc_enc_exit(ctx: FExitContext) -> i32 {
 }
 
 /// `crypto_skcipher_decrypt(req)` entry: submit-side edge, status 0.
-/// Takes an invocation id, then claims the key's slot (nested →
-/// tainted, full → dropped).
+/// Takes an invocation id, then claims the key's slot (contended →
+/// quarantined + tainted, full → dropped).
 #[fentry(function = "crypto_skcipher_decrypt")]
 pub fn lc_dec_entry(ctx: FEntryContext) -> i32 {
     let key: u64 = ctx.arg(0);
@@ -578,12 +606,13 @@ pub fn lc_dec_exit(ctx: FExitContext) -> i32 {
         return 0;
     };
     let Some(ret) = func_ret(&ctx) else {
-        // The call exited without a readable status: release a
-        // clean slot if held (poisoned slots stick; quarantine is
-        // sticky presence, nothing to resolve) unless the session
-        // overflowed (frozen tables). No edge to emit; the FRET
-        // loss counts it.
-        if !quarantine_overflowed() {
+        // The call exited without a readable status: release its own
+        // slot if the key is live (no contender can hold it — every
+        // second claimant quarantines first). A ghost's slot stays:
+        // quarantined paths never touch `LSTATE`, and overflow
+        // freezes the tables. No edge to emit; the FRET loss counts
+        // it.
+        if !quarantine_overflowed() && !ghost_returned(key) {
             let _ = return_release(key);
         }
         loss_inc(LLOSS_FRET);
@@ -595,10 +624,10 @@ pub fn lc_dec_exit(ctx: FExitContext) -> i32 {
         return 0;
     }
     if ghost_returned(key) {
-        // Quarantine shadows the slot (tainted regardless): release
-        // a clean slot opportunistically (hygiene — future claims
-        // stay blocked by the sticky quarantine), then emit tainted.
-        let _ = return_release(key);
+        // Quarantine shadows the slot: emit tainted and touch nothing
+        // (quarantined paths never touch `LSTATE`, so a stale return
+        // can never consume a live slot; future claims stay blocked
+        // by the sticky quarantine).
         emit_edge(LSITE_DEC, LEDGE_RETURN, key, now, ret as i32, true, 0);
         return 0;
     }

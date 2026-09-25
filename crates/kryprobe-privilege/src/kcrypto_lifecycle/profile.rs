@@ -153,7 +153,7 @@ pub struct ProfileManifest {
 /// aggregate, the per-CPU invocation sequence, the NOSLOT ghost
 /// quarantine, and the quarantine-overflow flag. `LSTATE` mirrors
 /// the userspace decode bound (4096 outstanding keys) with packed
-/// `u64` slots (poison + cpu + sequence, sticky poison); `LCTR`
+/// `u64` slots (reserved bit + cpu + sequence, immutable words); `LCTR`
 /// issues the per-CPU sequences; `LQ`/`LGLB` are BPF-owned sticky
 /// quarantine state (userspace keeps the fds, never reads them);
 /// `LAGG` reconciles against consumed edges + `LLOSS_RESERVE` after

@@ -23,7 +23,13 @@ fn parse_map_def(def: &[u8]) -> Result<MapDims, LoaderError> {
     })
 }
 
-pub(crate) fn parse_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, LoaderError> {
+/// Shared symbol collector for the three table asserts below: one
+/// legacy map def per named symbol in the `maps` section. A name
+/// appearing TWICE refuses typed (`DuplicateMap`) — the frozen
+/// tables name each map once, so a duplicate is a corrupt/aliased
+/// object; silently taking the first would bless whichever def the
+/// symbol order happened to surface.
+fn collect_map_defs(elf: &Elf, bytes: &[u8]) -> Result<Vec<(String, MapDims)>, LoaderError> {
     let (maps_idx, maps_bytes) = find_section(elf, bytes, "maps")?;
     let mut found: Vec<(String, MapDims)> = Vec::new();
     for sym in elf.syms.iter() {
@@ -34,6 +40,11 @@ pub(crate) fn parse_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, Load
         if name.is_empty() {
             continue;
         }
+        if found.iter().any(|(seen, _)| seen == name) {
+            return Err(LoaderError::DuplicateMap {
+                name: name.to_owned(),
+            });
+        }
         let off = sym.st_value as usize;
         let def = maps_bytes
             .get(off..off.saturating_add(MAP_DEF_LEN))
@@ -41,6 +52,11 @@ pub(crate) fn parse_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, Load
             .ok_or_else(|| bad(format!("map '{name}' def outside maps section")))?;
         found.push((name.to_owned(), parse_map_def(def)?));
     }
+    Ok(found)
+}
+
+pub(crate) fn parse_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, LoaderError> {
+    let found = collect_map_defs(elf, bytes)?;
     let mut out = Vec::with_capacity(SPINE_MAPS.len());
     for (want_name, want_dims) in SPINE_MAPS {
         match found.iter().find(|(name, _)| name == want_name) {
@@ -67,25 +83,10 @@ pub(crate) fn parse_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, Load
 /// Kcrypto twin of [`parse_maps`]: same legacy `maps` decode, dims
 /// asserted against [`KCRYPTO_MAPS`] instead of the spine names (K1
 /// Task 1; K0 G1). Deliberately a second function, not a parameter: the
-/// spine path stays byte-identical.
+/// spine path stays byte-identical (both share only the symbol
+/// collector + duplicate gate).
 pub(crate) fn parse_kcrypto_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, LoaderError> {
-    let (maps_idx, maps_bytes) = find_section(elf, bytes, "maps")?;
-    let mut found: Vec<(String, MapDims)> = Vec::new();
-    for sym in elf.syms.iter() {
-        if sym.st_shndx != maps_idx || sym.st_name == 0 {
-            continue;
-        }
-        let name = elf.strtab.get_at(sym.st_name).unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
-        let off = sym.st_value as usize;
-        let def = maps_bytes
-            .get(off..off.saturating_add(MAP_DEF_LEN))
-            .filter(|d| d.len() == MAP_DEF_LEN)
-            .ok_or_else(|| bad(format!("map '{name}' def outside maps section")))?;
-        found.push((name.to_owned(), parse_map_def(def)?));
-    }
+    let found = collect_map_defs(elf, bytes)?;
     let mut out = Vec::with_capacity(KCRYPTO_MAPS.len());
     for (want_name, want_dims) in KCRYPTO_MAPS {
         match found.iter().find(|(name, _)| name == want_name) {
@@ -112,25 +113,10 @@ pub(crate) fn parse_kcrypto_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMa
 /// Lifecycle twin of [`parse_kcrypto_maps`]: same legacy `maps`
 /// decode, dims asserted against [`LIFECYCLE_MAPS`] (T06). Deliberately
 /// a third function, not a parameter: both older paths stay
-/// byte-identical.
+/// byte-identical (all three share only the symbol collector +
+/// duplicate gate).
 pub(crate) fn parse_lifecycle_maps(elf: &Elf, bytes: &[u8]) -> Result<Vec<ParsedMap>, LoaderError> {
-    let (maps_idx, maps_bytes) = find_section(elf, bytes, "maps")?;
-    let mut found: Vec<(String, MapDims)> = Vec::new();
-    for sym in elf.syms.iter() {
-        if sym.st_shndx != maps_idx || sym.st_name == 0 {
-            continue;
-        }
-        let name = elf.strtab.get_at(sym.st_name).unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
-        let off = sym.st_value as usize;
-        let def = maps_bytes
-            .get(off..off.saturating_add(MAP_DEF_LEN))
-            .filter(|d| d.len() == MAP_DEF_LEN)
-            .ok_or_else(|| bad(format!("map '{name}' def outside maps section")))?;
-        found.push((name.to_owned(), parse_map_def(def)?));
-    }
+    let found = collect_map_defs(elf, bytes)?;
     let mut out = Vec::with_capacity(LIFECYCLE_MAPS.len());
     for (want_name, want_dims) in LIFECYCLE_MAPS {
         match found.iter().find(|(name, _)| name == want_name) {

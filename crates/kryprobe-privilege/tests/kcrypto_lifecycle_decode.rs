@@ -45,7 +45,7 @@ fn edge_bytes_invoc(
 }
 
 /// Realistic default builder: same v3 record with a VALID
-/// invocation (nonzero, poison-bit clear — the W2/W4 join tests
+/// invocation (nonzero, reserved-bit clear — the W2/W4 join tests
 /// don't vary invocation, so equality holds; tests that do use
 /// [`edge_bytes_invoc`] explicitly).
 fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 40] {
@@ -350,7 +350,7 @@ fn f3_return_at_same_tick_as_resubmit_joins() {
 #[test]
 fn w3_tainted_submit_gaps_outstanding_never_misattributes() {
     // Round-3 nesting killer (both exit orders): BPF taints the
-    // nested submit AND poisons the slot, so the decoder gaps the
+    // nested submit AND quarantines the key, so the decoder gaps the
     // outstanding id FIRST — no future return can be attributed
     // (the first return could be either call's). Whatever exits
     // first, nothing trusted completes: every return refuses.
@@ -389,7 +389,7 @@ fn w3_tainted_submit_gaps_outstanding_never_misattributes() {
 
 #[test]
 fn w3_tainted_submit_without_outstanding_refuses_quietly() {
-    // No outstanding id, nothing to poison: the refusal counts and
+    // No outstanding id, nothing to gap: the refusal counts and
     // the table stays untouched (a later clean submit admits fresh).
     let mut dec = LifecycleDecoder::new(16);
     let refused = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, TAINTED));
@@ -561,7 +561,7 @@ fn w5_noslot_ghost_stream_refuses_everything_forever() {
 #[test]
 fn w5_malformed_clean_invoc_refuses() {
     // Round-5 minor: honest BPF never emits a clean edge with
-    // invoc 0 ("no invocation") or the poison bit set — both
+    // invoc 0 ("no invocation") or the reserved bit set — both
     // refuse as twin drift, never join.
     assert_eq!(
         decode_record(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0)),
@@ -575,12 +575,12 @@ fn w5_malformed_clean_invoc_refuses() {
         decode_record(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0x4001)),
         Err(DecodeDrop::BadInvoc)
     );
-    // Tainted edges may carry either (slotless 0 / poisoned store):
-    // the taint rules, not the twin check, govern them.
+    // Tainted edges may carry either (slotless 0 / reserved-bit
+    // set): the taint rules, not the twin check, govern them.
     decode_record(&edge_bytes_invoc(2, 1, 0xabc, 150, -5, TAINTED, 0))
         .expect("tainted zero parses");
     decode_record(&edge_bytes_invoc(2, 1, 0xabc, 150, -5, TAINTED, 0x4001))
-        .expect("tainted poisoned parses");
+        .expect("tainted reserved-bit parses");
     let mut dec = LifecycleDecoder::new(16);
     dec.feed(&edge_bytes_invoc(1, 1, 0xabc, 100, 0, 0, 0));
     assert_eq!(dec.stats().bad_records, 1);

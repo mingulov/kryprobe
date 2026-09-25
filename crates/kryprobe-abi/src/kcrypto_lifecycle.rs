@@ -89,19 +89,22 @@ pub const LAGG_DEC_RET: u32 = 3;
 /// submit edges carry 0), and the BPF invocation id.
 ///
 /// [`LEdge::invoc`] is the return-carried invocation identity
-/// (round-4 W4): every submit takes `(per-CPU sequence << 14) | (cpu
-/// << 1)` from the BPF `LCTR` lanes (bit 0 clear — the poison tag;
-/// 0 is never issued, it means "no invocation"); the slot stores it
-/// and the matching return carries it back. The decoder joins a
-/// return ONLY to an outstanding id with the SAME invocation — a
-/// lost return + lost submit can no longer alias one call's return
-/// onto another call's id, whatever the transport drops. Pairing
-/// soundness no longer depends on lossless delivery. The decoder
-/// additionally refuses malformed clean ids (0, or poison-bit-set
-/// — `DecodeDrop::BadInvoc`); honest BPF never emits them.
+/// (round-4 W4, race-hardened round-6 W6): every submit takes
+/// `(per-CPU sequence << 14) | (cpu << 1)` from the BPF `LCTR` lanes
+/// (bit 0 reserved + always clear; 0 is never issued, it means "no
+/// invocation"); the slot stores it and the matching return carries
+/// it back. The decoder joins a return ONLY to an outstanding id
+/// with the SAME invocation — a lost return + lost submit can no
+/// longer alias one call's return onto another call's id, whatever
+/// the transport drops. Pairing soundness no longer depends on
+/// lossless delivery. The decoder additionally refuses malformed
+/// clean ids (0, or reserved-bit-set — `DecodeDrop::BadInvoc`);
+/// honest BPF never emits them.
 ///
-/// [`LEdge::invoc`] bit 0: the poison tag. Fresh submit ids always
-/// have it clear; a poisoned slot reports it set (tainted edge).
+/// [`LEdge::invoc`] bit 0: reserved (round-6: no slot-poison writer
+/// exists — contention quarantines instead — so the bit stays a
+/// pure validity check, not a state tag). Fresh submit ids always
+/// have it clear.
 pub const LEDGE_INVOC_POISON: u64 = 1;
 ///
 /// `Debug` is manual: [`LEdge::key`] is a raw kernel pointer and

@@ -537,6 +537,35 @@ fn h02_extra_map_refused() {
 }
 
 #[test]
+fn h02_duplicate_map_refused_typed() {
+    // Round-6 minor: a map symbol defined twice refuses typed
+    // (`DuplicateMap`) — even when both defs carry identical dims
+    // (taking the first would bless whichever the symbol order
+    // happened to surface). The gate lives in the shared collector,
+    // so spine + kcrypto paths inherit it.
+    let mut maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
+    maps.push(maps[0]);
+    let bytes = build_lifecycle_fixture(
+        &[
+            "fentry/crypto_skcipher_encrypt",
+            "fexit/crypto_skcipher_encrypt",
+            "fentry/crypto_skcipher_decrypt",
+            "fexit/crypto_skcipher_decrypt",
+        ],
+        &maps,
+    );
+    let err = parse_lifecycle_object(&bytes).expect_err("duplicate LCFG must refuse");
+    assert!(
+        matches!(err, LoaderError::DuplicateMap { ref name } if name == "LCFG"),
+        "typed refusal names the map: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("LCFG"),
+        "Display names the map: {err}"
+    );
+}
+
+#[test]
 fn h02_bad_dims_refused() {
     let mut maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
     maps[0].1.value_size = 128;

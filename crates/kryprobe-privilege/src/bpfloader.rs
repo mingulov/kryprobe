@@ -248,6 +248,12 @@ pub enum LoaderError {
         /// Offending map name.
         name: String,
     },
+    /// Map symbol defined twice: the frozen table names each map once,
+    /// so a duplicate is a corrupt/aliased object, never a merge.
+    DuplicateMap {
+        /// Offending map name.
+        name: String,
+    },
     /// Map creation failed.
     MapFailed {
         /// Loader stage that failed.
@@ -289,6 +295,7 @@ impl std::fmt::Display for LoaderError {
             }
             Self::DimMismatch { name } => write!(f, "map '{name}' dims mismatch frozen SPINE_MAPS"),
             Self::UnsupportedMap { name } => write!(f, "object has unknown map '{name}'"),
+            Self::DuplicateMap { name } => write!(f, "object defines map '{name}' twice"),
             Self::MapFailed { stage, errno } => {
                 write!(f, "map create failed at {stage}: errno {errno}")
             }

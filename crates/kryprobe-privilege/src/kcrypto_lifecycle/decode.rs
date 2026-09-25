@@ -97,9 +97,10 @@ pub enum DecodeDrop {
     /// a status here is twin drift, silently discarded before).
     BadSubmitStatus,
     /// Clean (untainted) edge with a malformed invocation id: 0
-    /// ("no invocation", slotless tainted edges only) or the poison
-    /// bit set (poisoned slots always taint). Honest BPF never emits
-    /// either shape — fail closed, never join.
+    /// ("no invocation", slotless tainted edges only) or the reserved
+    /// bit set (no honest-BPF path sets it — round-6 removed the slot
+    /// poison writer; contention quarantines instead). Honest BPF
+    /// never emits either shape — fail closed, never join.
     BadInvoc,
 }
 
@@ -276,7 +277,7 @@ impl LifecycleDecoder {
     /// Join one validated raw edge (the post-parse half of [`Self::feed`],
     /// split so the sensor tallies per-hook hits from the same parse).
     /// A tainted SUBMIT on an outstanding key gaps that id
-    /// (`IdentityAmbiguous`) FIRST: the BPF slot poisoned, so no
+    /// (`IdentityAmbiguous`) FIRST: BPF quarantined the key, so no
     /// future return can be attributed to the outstanding invocation
     /// (the first return could be either call's — joining it would
     /// complete the wrong invocation with a trusted terminal).
