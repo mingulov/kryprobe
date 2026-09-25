@@ -2,12 +2,15 @@
 //! vmlinux BTF resolver: func ids + struct-member offsets, unprivileged.
 //!
 //! [`resolve_btf_ids`] finds the 9 P0 kcrypto attach symbols
-//! (`evidence/k0/P0-btf-ids.txt`) and [`resolve_offsets`] returns the 9
-//! explicit-offset reads the BPF needs (K0 P2 chain + `task_struct.flags`
-//! for the kthread classifier + the C2 AEAD/ahash length reads + the
-//! `crypto_shash.base` link (6.12 moved it to byte 8 — G6 option (a):
-//! loader-side resolution, no CO-RE relocations)) and asserts the C3
-//! first-member links at 0. Both parse `/sys/kernel/btf/vmlinux` raw
+//! (`evidence/k0/P0-btf-ids.txt`); [`resolve_aggregate_offsets`]
+//! returns the 9 explicit-offset reads the aggregate BPF needs (K0 P2
+//! chain + `task_struct.flags` for the kthread classifier + the C2
+//! AEAD/ahash length reads + the `crypto_shash.base` link (6.12 moved
+//! it to byte 8 — G6 option (a): loader-side resolution, no CO-RE
+//! relocations)) and asserts the C3 first-member links at 0; and
+//! [`resolve_lifecycle_offsets`] returns the shape-validated lifecycle
+//! set (D3: per-consumer resolution, no shared union). All parse
+//! `/sys/kernel/btf/vmlinux` raw
 //! (world-readable; no privilege, no bpftool subprocess) with a strict
 //! sequential walker: every truncation, unknown kind, or misaligned
 //! member offset is [`BtfError`], never a guess.
@@ -212,12 +215,17 @@ impl From<ResolveError> for BtfError {
     }
 }
 
-/// Explicit-offset reads for the kcrypto BPF (all u32 byte offsets):
-/// the K0 P2 identity chain plus `task_struct.flags` (kthread via
-/// [`PF_KTHREAD`]) plus the AEAD/ahash length reads (C2). Enter the BPF
-/// via the CONFIG map (G6 option (a)).
+/// Explicit-offset reads for the aggregate kcrypto BPF (all u32 byte
+/// offsets): the K0 P2 identity chain plus `task_struct.flags`
+/// (kthread via [`PF_KTHREAD`]) plus the AEAD/ahash length reads
+/// (C2). Enter the BPF via the CONFIG map (G6 option (a)).
+///
+/// D3: this is the AGGREGATE consumer's own set — the lifecycle's
+/// `sk_base` prerequisite it never used is gone (it lives in
+/// [`LifecycleOffsets` now), so an skcipher reorder refuses the
+/// lifecycle sensor, never the aggregate one, and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CryptoOffsets {
+pub struct AggregateOffsets {
     /// `skcipher_request.base`.
     pub sk_req_base: u32,
     /// `crypto_async_request.tfm`.
@@ -237,6 +245,42 @@ pub struct CryptoOffsets {
     /// `crypto_shash.base` (shash tfm link; @0 on 7.0, @8 on 6.12 —
     /// CONFIG-resolved so the reorder resolves instead of refusing).
     pub shash_base: u32,
+}
+
+/// Explicit-offset reads for the lifecycle BPF (all u32 byte
+/// offsets): the transform chase (`tfm_alg`/`alg_drv`), the
+/// frontend→base normalization (`sk_base`, shared with the
+/// userspace tracker), the op request link (`req_base`/`req_tfm`,
+/// first-seen admission), and the destroy refcount word
+/// (`refcnt_off`, meaningful only when `refcnt_present`).
+///
+/// D3: the LIFECYCLE consumer's own set — arming no longer requires
+/// the aggregate's legacy fields (`task_flags`, AEAD/hash lengths,
+/// shash link), and every member is SHAPE-validated, not just
+/// offset-resolved: pointers prove their pointee struct, embedded
+/// bases prove their struct, the name proves its array extent, and
+/// the refcount proves its counter width. `refcnt_present` is soft
+/// (7.2 dropped the field — absence means always-final mode, never
+/// a refusal); every other member is fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleOffsets {
+    /// `crypto_tfm.__crt_alg` (PTR at STRUCT `crypto_alg`).
+    pub tfm_alg: u32,
+    /// `crypto_alg.cra_driver_name` (byte ARRAY ≥ 64).
+    pub alg_drv: u32,
+    /// `crypto_skcipher.base` (embedded STRUCT `crypto_tfm`).
+    pub sk_base: u32,
+    /// `skcipher_request.base` (embedded STRUCT
+    /// `crypto_async_request`).
+    pub req_base: u32,
+    /// `crypto_async_request.tfm` (PTR at STRUCT `crypto_tfm`).
+    pub req_tfm: u32,
+    /// `crypto_tfm.refcnt` (4-byte counter; 0 when absent).
+    pub refcnt_off: u32,
+    /// The kernel carries `crypto_tfm.refcnt` (false on 7.2+:
+    /// unconditional destroy — the tracker retires every observed
+    /// destroy).
+    pub refcnt_present: bool,
 }
 
 /// Process-lifetime vmlinux BTF image (H1(a)): the sysfs image is
@@ -283,17 +327,30 @@ pub fn resolve_kfunc_ids() -> Result<HashMap<String, u32>, BtfError> {
     btf_ids_from_btf_for(&btf, KFUNC_SYMBOLS)
 }
 
-/// Resolve the 9 [`CryptoOffsets`] from vmlinux BTF. Unprivileged.
+/// Resolve the 9 [`AggregateOffsets`] from vmlinux BTF. Unprivileged.
 ///
 /// Fail-closed on the C3 first-member links: the BPF hardcodes 0 for
 /// the four [`FIRST_MEMBER_LINKS`] below, so any nonzero live offset is
 /// [`BtfError::FirstMemberMoved`] (a kernel struct reorder must refuse
 /// here, never mis-chase in BPF). The retired fifth link
-/// (`crypto_shash.base`) is CONFIG-resolved instead (see [`CryptoOffsets::shash_base`]):
-/// a missing member still fails closed as [`BtfError::MissingMember`].
-pub fn resolve_offsets() -> Result<CryptoOffsets, BtfError> {
+/// (`crypto_shash.base`) is CONFIG-resolved instead (see
+/// [`AggregateOffsets::shash_base`]): a missing member still fails
+/// closed as [`BtfError::MissingMember`].
+pub fn resolve_aggregate_offsets() -> Result<AggregateOffsets, BtfError> {
     let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
-    resolve_offsets_from(bytes)
+    resolve_aggregate_offsets_from(bytes)
+}
+
+/// Resolve the [`LifecycleOffsets`] from vmlinux BTF. Unprivileged.
+///
+/// D3: the lifecycle arm's OWN resolution — shape-validated per
+/// member (pointers prove pointees, bases prove structs, the name
+/// proves its extent, the refcount proves its width) and independent
+/// of the aggregate's legacy fields. Only `refcnt` is soft (absent
+/// on 7.2+ → always-final mode); every other gap fails the arm.
+pub fn resolve_lifecycle_offsets() -> Result<LifecycleOffsets, BtfError> {
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    resolve_lifecycle_offsets_from(bytes)
 }
 
 /// Resolve the 7 K5 attribution offsets from vmlinux BTF. Unprivileged.
@@ -326,10 +383,10 @@ pub fn resolve_kcrypto_offsets() -> Result<KcryptoOffsets, ResolveError> {
 /// two fail-closed resolutions can fail, as [`BtfError`].
 fn resolve_kcrypto_bringup_from(
     bytes: &[u8],
-) -> Result<(HashMap<String, u32>, CryptoOffsets, KcryptoOffsets), BtfError> {
+) -> Result<(HashMap<String, u32>, AggregateOffsets, KcryptoOffsets), BtfError> {
     let btf = Btf::parse(bytes)?;
     let ids = btf_ids_from_btf(&btf)?;
-    let off = offsets_from_btf(&btf)?;
+    let off = aggregate_offsets_from_btf(&btf)?;
     // Fail-soft member cases ride INSIDE `k5` (flags + zeros); only a
     // BTF image that vanished mid-bring-up fails here (fail-closed: the
     // two resolutions above already trusted that same image).
@@ -396,7 +453,7 @@ fn kcrypto_offsets_from_btf(btf: &Btf) -> KcryptoOffsets {
 /// flag pairs with group zeros by [`resolve_kcrypto_offsets`]).
 /// Total (no failure mode: every input word is copied verbatim).
 #[must_use]
-pub fn kconfig_from_offsets(off: CryptoOffsets, k5: KcryptoOffsets) -> KConfig {
+pub fn kconfig_from_offsets(off: AggregateOffsets, k5: KcryptoOffsets) -> KConfig {
     KConfig {
         sk_req_base: off.sk_req_base,
         async_tfm: off.async_tfm,
@@ -719,11 +776,16 @@ fn btf_ids_from_btf_for(btf: &Btf, symbols: &[&str]) -> Result<HashMap<String, u
 }
 
 /// Resolve the request-lifecycle manifest's symbols to vmlinux BTF
-/// ids (T06). Unprivileged. Profile-scoped: only the manifest's
-/// required symbols resolve (today: the two api sites) — the full
-/// 9-symbol api-returns set is a different profile's business.
-/// Every resolved symbol's prototype is validated against the
-/// sensor's reads (arg0 pointer, 32-bit int return); a name that
+/// ids (T06, grown by the T07.2 alloc site, the T07.3 destroy site,
+/// and the T07.4 configuration sites). Unprivileged.
+/// Profile-scoped: only the manifest's required symbols resolve —
+/// the full 9-symbol api-returns set is a different profile's
+/// business. Every resolved symbol's prototype is validated against
+/// the sensor's reads for its shape (op: arg0 pointer, 32-bit int
+/// return; alloc: `(name, type, mask)` args, tfm-pointer return;
+/// destroy: `(mem, tfm)` pointers, void return; setkey:
+/// `(frontend, key, len)` args, errno return; setauthsize:
+/// `(aead, authsize)` args, errno return); a name that
 /// resolves with an incompatible shape refuses startup.
 pub fn resolve_lifecycle_ids() -> Result<HashMap<String, u32>, BtfError> {
     let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
@@ -734,13 +796,32 @@ pub fn resolve_lifecycle_ids() -> Result<HashMap<String, u32>, BtfError> {
 /// fixture seam: H02 drives synthetic images through this; the
 /// vmlinux path above delegates after reading the bytes).
 pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, BtfError> {
-    use crate::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
+    use crate::kcrypto_lifecycle::profile::{LifecycleProfile, ProtoShape, manifest};
     let btf = Btf::parse(bytes)?;
     let table = manifest(LifecycleProfile::RequestLifecycle);
     let symbols: Vec<&str> = table.required.iter().map(|s| s.symbol).collect();
     let ids = btf_ids_from_btf_for(&btf, &symbols)?;
-    for name in &symbols {
-        btf.lifecycle_proto_id(name)?;
+    for site in table.required {
+        match site.shape {
+            ProtoShape::Op => {
+                btf.lifecycle_proto_id(site.symbol)?;
+            }
+            ProtoShape::Alloc => {
+                btf.alloc_proto_id(site.symbol)?;
+            }
+            ProtoShape::Destroy => {
+                btf.destroy_proto_id(site.symbol)?;
+            }
+            ProtoShape::SetkeySk => {
+                btf.setkey_proto_id(site.symbol, "crypto_skcipher")?;
+            }
+            ProtoShape::SetAuthsize => {
+                btf.setauthsize_proto_id(site.symbol)?;
+            }
+            ProtoShape::SetkeyAead => {
+                btf.setkey_proto_id(site.symbol, "crypto_aead")?;
+            }
+        }
     }
     Ok(ids)
 }
@@ -750,7 +831,7 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
 /// guarantees no padding before the initial member, so only a struct
 /// reorder can move them — which fails closed below). The retired fifth
 /// link (`crypto_shash.base`, @8 on 6.12) is CONFIG-resolved instead
-/// ([`CryptoOffsets::shash_base`]).
+/// ([`AggregateOffsets::shash_base`]).
 pub const FIRST_MEMBER_LINKS: &[(&str, &str)] = &[
     ("aead_request", "base"),
     ("ahash_request", "base"),
@@ -758,14 +839,14 @@ pub const FIRST_MEMBER_LINKS: &[(&str, &str)] = &[
     ("skcipher_request", "cryptlen"),
 ];
 
-fn resolve_offsets_from(bytes: &[u8]) -> Result<CryptoOffsets, BtfError> {
+fn resolve_aggregate_offsets_from(bytes: &[u8]) -> Result<AggregateOffsets, BtfError> {
     let btf = Btf::parse(bytes)?;
-    offsets_from_btf(&btf)
+    aggregate_offsets_from_btf(&btf)
 }
 
-/// Offset resolution over an already-parsed image (H1(a) combo core).
-fn offsets_from_btf(btf: &Btf) -> Result<CryptoOffsets, BtfError> {
-    let out = CryptoOffsets {
+/// Aggregate resolution over an already-parsed image (H1(a) combo core).
+fn aggregate_offsets_from_btf(btf: &Btf) -> Result<AggregateOffsets, BtfError> {
+    let out = AggregateOffsets {
         sk_req_base: btf.member_offset("skcipher_request", "base")?,
         async_tfm: btf.member_offset("crypto_async_request", "tfm")?,
         tfm_alg: btf.member_offset("crypto_tfm", "__crt_alg")?,
@@ -789,11 +870,56 @@ fn offsets_from_btf(btf: &Btf) -> Result<CryptoOffsets, BtfError> {
     Ok(out)
 }
 
+/// Lifecycle resolution over an explicit BTF image (fixture seam;
+/// the vmlinux path above delegates after reading the bytes).
+fn resolve_lifecycle_offsets_from(bytes: &[u8]) -> Result<LifecycleOffsets, BtfError> {
+    let btf = Btf::parse(bytes)?;
+    lifecycle_offsets_from_btf(&btf)
+}
+
+/// Name-array extent the lifecycle BPF copy trusts (T07.2 wire
+/// bound: 63 bytes + NUL — the resolver proves the member holds at
+/// least this many bytes before the chase copies into it).
+const LIFECYCLE_NAME_BOUND: u32 = 64;
+
+/// Lifecycle resolution over an already-parsed image: shape-proving
+/// (D3), not offset-only. Only the `refcnt` member is soft — its
+/// ABSENCE resolves to always-final mode (7.2 dropped the field);
+/// a present-but-misshapen `refcnt`, or any other gap, fails the
+/// arm (fail closed: a half-proven chase mis-chases in BPF).
+fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
+    let tfm_alg = btf.member_ptr_to_struct("crypto_tfm", "__crt_alg", "crypto_alg")?;
+    let alg_drv = btf.member_bytes("crypto_alg", "cra_driver_name", LIFECYCLE_NAME_BOUND)?;
+    let sk_base = btf.member_embedded_struct("crypto_skcipher", "base", "crypto_tfm")?;
+    let req_base =
+        btf.member_embedded_struct("skcipher_request", "base", "crypto_async_request")?;
+    let req_tfm = btf.member_ptr_to_struct("crypto_async_request", "tfm", "crypto_tfm")?;
+    let (refcnt_off, refcnt_present) = match btf.member_counter("crypto_tfm", "refcnt") {
+        Ok(off) => (off, true),
+        // Soft absence: the whole TYPE missing means the BTF is too
+        // old for the lifecycle sensor at all (the hard members
+        // above already proved `crypto_tfm` exists, so a missing
+        // TYPE here is unreachable — but match it soft anyway: it
+        // can only mean "no refcount to read", never "sensor-safe").
+        Err(BtfError::MissingMember { .. } | BtfError::MissingType { .. }) => (0, false),
+        Err(other) => return Err(other),
+    };
+    Ok(LifecycleOffsets {
+        tfm_alg,
+        alg_drv,
+        sk_base,
+        req_base,
+        req_tfm,
+        refcnt_off,
+        refcnt_present,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::btf::{
-        BTF_MAGIC, BTF_VERSION, Btf, KIND_FUNC, KIND_FUNC_PROTO, KIND_INT, KIND_STRUCT,
+        BTF_MAGIC, BTF_VERSION, Btf, KIND_FUNC, KIND_FUNC_PROTO, KIND_INT, KIND_PTR, KIND_STRUCT,
     };
 
     #[test]
@@ -960,6 +1086,71 @@ mod tests {
         ));
     }
 
+    /// Minimal destroy-shape image (T07.3): [1] INT u32,
+    /// [2] STRUCT `crypto_tfm`, [3] PTR→2, [4] STRUCT `other`,
+    /// [5] PTR→4, [6] PTR→0 (`void *`), [7] FUNC_PROTO
+    /// `(arg0, arg1) -> ret`, [8] FUNC `dstr`.
+    fn destroy_fixture(ret: u32, arg0: u32, arg1: u32, nargs: u32) -> Vec<u8> {
+        let mut b = BtfBuild::new();
+        let o_int = b.str("u32");
+        let o_tfm = b.str("crypto_tfm");
+        let o_other = b.str("other");
+        let o_dstr = b.str("dstr");
+        b.rec(o_int, KIND_INT, 0, false, 4);
+        b.word(0x0000_0020);
+        b.rec(o_tfm, KIND_STRUCT, 0, false, 64);
+        b.rec(0, KIND_PTR, 0, false, 2);
+        b.rec(o_other, KIND_STRUCT, 0, false, 64);
+        b.rec(0, KIND_PTR, 0, false, 4);
+        b.rec(0, KIND_PTR, 0, false, 0);
+        let params: Vec<u32> = if nargs == 2 {
+            vec![arg0, arg1]
+        } else {
+            vec![arg0; nargs as usize]
+        };
+        b.rec(0, KIND_FUNC_PROTO, nargs, false, ret);
+        for param in params {
+            b.word(0);
+            b.word(param);
+        }
+        b.rec(o_dstr, KIND_FUNC, 1, false, 7);
+        b.finish()
+    }
+
+    #[test]
+    fn destroy_wellformed_proto_resolves() {
+        let bytes = destroy_fixture(0, 6, 3, 2);
+        let btf = Btf::parse(&bytes).expect("fixture must parse");
+        assert_eq!(btf.destroy_proto_id("dstr").expect("good destroy"), 8);
+    }
+
+    #[test]
+    fn destroy_misshapen_protos_refuse() {
+        let bad = [
+            // Non-void return: the exit run would read a status.
+            (1, 6, 3, 2),
+            // One arg: no tfm to read the refcount from.
+            (0, 6, 3, 1),
+            // INT mem: not a pointer at all.
+            (0, 1, 3, 2),
+            // INT tfm: the refcount read needs a pointer.
+            (0, 6, 1, 2),
+            // Tfm at the wrong struct: refcount from a stranger.
+            (0, 6, 5, 2),
+        ];
+        for (ret, arg0, arg1, nargs) in bad {
+            let bytes = destroy_fixture(ret, arg0, arg1, nargs);
+            let btf = Btf::parse(&bytes).expect("fixture must parse");
+            assert!(
+                matches!(
+                    btf.destroy_proto_id("dstr"),
+                    Err(BtfError::BadPrototype { .. })
+                ),
+                "shape ({ret}, {arg0}, {arg1}, {nargs}) must refuse"
+            );
+        }
+    }
+
     #[test]
     fn hostile_images_fail_closed() {
         // Empty / truncated / bad-magic / bad-version.
@@ -1061,7 +1252,7 @@ mod tests {
         assert_eq!(PF_KTHREAD, 0x0020_0000);
     }
 
-    /// Synthetic crypto image: the 9 [`CryptoOffsets`] structs plus the
+    /// Synthetic crypto image: the 9 [`AggregateOffsets`] structs plus the
     /// 4 [`FIRST_MEMBER_LINKS`] members. `moved` relocates one member
     /// to byte 8 (fail-closed proof for C3 links; resolution proof for
     /// the CONFIG-resolved `crypto_shash.base`). `drop` omits one member
@@ -1102,16 +1293,191 @@ mod tests {
         named("ahash_request", &[("base", 0), ("nbytes", 48)]);
         named("shash_desc", &[("tfm", 0)]);
         named("crypto_shash", &[("base", 0)]);
+        named("crypto_skcipher", &[("base", 8)]);
+        b.finish()
+    }
+
+    /// Typed lifecycle fixture (D3): the five lifecycle structs with
+    /// REAL member shapes, not the shared-INT typing of
+    /// `crypto_fixture` — PTR links, an embedded STRUCT, a char
+    /// ARRAY bound, and a refcount STRUCT. Ids in emission order:
+    /// [1] INT u32, [2] INT char, [3] STRUCT `refcount_struct`,
+    /// [4] ARRAY char[64], [5] STRUCT `crypto_alg`, [6] PTR→alg,
+    /// [7] STRUCT `crypto_tfm`, [8] PTR→tfm,
+    /// [9] STRUCT `crypto_async_request`,
+    /// [10] STRUCT `skcipher_request`, [11] STRUCT `crypto_skcipher`.
+    /// `patch` forces one member's type id (negative shapes);
+    /// `drop` omits one member (absence probes).
+    fn lifecycle_fixture(patch: Option<(&str, &str, u32)>, drop: Option<(&str, &str)>) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_PTR};
+        let mut b = BtfBuild::new();
+        // `patch` forces one member's type id (negative shapes);
+        // `drop` omits one member (absence probes). Name strings
+        // don't consume type ids, so interning up front is safe.
+        let shape = |s: &str, m: &str, ty: u32| -> Option<u32> {
+            if drop == Some((s, m)) {
+                return None;
+            }
+            if let Some((ps, pm, pty)) = patch
+                && (ps, pm) == (s, m)
+            {
+                return Some(pty);
+            }
+            Some(ty)
+        };
+        // [1] INT u32, [2] INT char (array index + element).
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        // [3] STRUCT refcount_struct { refs: [1] @0 }.
+        let o_rc = b.str("refcount_struct");
+        let o_refs = b.str("refs");
+        b.rec(o_rc, KIND_STRUCT, 1, false, 4);
+        b.member(o_refs, 1, 0);
+        // [4] ARRAY char[64] (elem [2], index [1], 64 elems).
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [5] STRUCT crypto_alg { cra_driver_name: [4] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        let mut alg: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("crypto_alg", "cra_driver_name", 4) {
+            alg.push((o_drv, ty, 188 * 8));
+        }
+        b.rec(o_alg, KIND_STRUCT, alg.len() as u32, false, 256);
+        for (name, ty, bits) in alg {
+            b.member(name, ty, bits);
+        }
+        // [6] PTR -> [5].
+        b.rec(0, KIND_PTR, 0, false, 5);
+        // [7] STRUCT crypto_tfm { __crt_alg: [6] @32, refcnt: [3] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        let mut tfm: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("crypto_tfm", "__crt_alg", 6) {
+            tfm.push((o_crt, ty, 32 * 8));
+        }
+        if let Some(ty) = shape("crypto_tfm", "refcnt", 3) {
+            tfm.push((o_refcnt, ty, 40 * 8));
+        }
+        b.rec(o_tfm, KIND_STRUCT, tfm.len() as u32, false, 64);
+        for (name, ty, bits) in tfm {
+            b.member(name, ty, bits);
+        }
+        // [8] PTR -> [7].
+        b.rec(0, KIND_PTR, 0, false, 7);
+        // [9] STRUCT crypto_async_request { tfm: [8] @32 }.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        let mut asy: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("crypto_async_request", "tfm", 8) {
+            asy.push((o_tfm_m, ty, 32 * 8));
+        }
+        b.rec(o_async, KIND_STRUCT, asy.len() as u32, false, 64);
+        for (name, ty, bits) in asy {
+            b.member(name, ty, bits);
+        }
+        // [10] STRUCT skcipher_request { base: [9] @32 }.
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        let mut req: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("skcipher_request", "base", 9) {
+            req.push((o_base, ty, 32 * 8));
+        }
+        b.rec(o_req, KIND_STRUCT, req.len() as u32, false, 128);
+        for (name, ty, bits) in req {
+            b.member(name, ty, bits);
+        }
+        // [11] STRUCT crypto_skcipher { base: [7] @8 }.
+        let o_sk = b.str("crypto_skcipher");
+        let o_sk_base = b.str("base");
+        let mut sk: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("crypto_skcipher", "base", 7) {
+            sk.push((o_sk_base, ty, 8 * 8));
+        }
+        b.rec(o_sk, KIND_STRUCT, sk.len() as u32, false, 64);
+        for (name, ty, bits) in sk {
+            b.member(name, ty, bits);
+        }
+        // [12] ARRAY char[8] (negative-extent patch target: a name
+        // bound shorter than the BPF copy must refuse, not truncate
+        // silently past the member).
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(8);
         b.finish()
     }
 
     #[test]
-    fn synthetic_offsets_resolve_nine_exact() {
-        let bytes = crypto_fixture(None);
-        let off = resolve_offsets_from(&bytes).expect("crypto fixture resolves");
+    fn synthetic_lifecycle_offsets_resolve_exact() {
+        let bytes = lifecycle_fixture(None, None);
+        let off = resolve_lifecycle_offsets_from(&bytes).expect("typed fixture resolves");
         assert_eq!(
             off,
-            CryptoOffsets {
+            LifecycleOffsets {
+                tfm_alg: 32,
+                alg_drv: 188,
+                sk_base: 8,
+                req_base: 32,
+                req_tfm: 32,
+                refcnt_off: 40,
+                refcnt_present: true,
+            }
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_wrong_shapes_refuse() {
+        // PTR at the wrong pointee (tfm→crypto_tfm where the chase
+        // needs crypto_alg): a valid offset with a lying type must
+        // refuse — resolving it would mis-chase.
+        let bytes = lifecycle_fixture(Some(("crypto_tfm", "__crt_alg", 8)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+        // INT where the chase dereferences a PTR.
+        let bytes = lifecycle_fixture(Some(("crypto_async_request", "tfm", 1)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+        // INT where the chase reads an embedded STRUCT base.
+        let bytes = lifecycle_fixture(Some(("crypto_skcipher", "base", 1)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+        // Name ARRAY shorter than the 64-byte BPF copy bound.
+        let bytes = lifecycle_fixture(Some(("crypto_alg", "cra_driver_name", 12)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+        // Missing link member (not refcnt — refcnt absence is soft).
+        let bytes = lifecycle_fixture(None, Some(("crypto_async_request", "tfm")));
+        assert!(matches!(
+            resolve_lifecycle_offsets_from(&bytes),
+            Err(BtfError::MissingMember { .. })
+        ));
+    }
+
+    #[test]
+    fn synthetic_lifecycle_refcnt_absence_is_soft_but_shape_is_hard() {
+        // 7.2 has no `crypto_tfm.refcnt`: absence resolves soft
+        // (always-final mode), never a missing-member error.
+        let bytes = lifecycle_fixture(None, Some(("crypto_tfm", "refcnt")));
+        let off = resolve_lifecycle_offsets_from(&bytes).expect("absence is soft");
+        assert!(!off.refcnt_present);
+        assert_eq!(off.refcnt_off, 0);
+        // Present-but-wrong-shape (a PTR, not a counter) is drift,
+        // not absence: fail closed.
+        let bytes = lifecycle_fixture(Some(("crypto_tfm", "refcnt", 6)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+    }
+
+    #[test]
+    fn synthetic_aggregate_offsets_resolve_nine_exact() {
+        // D3: aggregate bring-up resolves its OWN 9 members — the
+        // T07 `sk_base` prerequisite it never used is gone.
+        let bytes = crypto_fixture(None);
+        let off = resolve_aggregate_offsets_from(&bytes).expect("crypto fixture resolves");
+        assert_eq!(
+            off,
+            AggregateOffsets {
                 sk_req_base: 32,
                 async_tfm: 32,
                 tfm_alg: 32,
@@ -1132,7 +1498,7 @@ mod tests {
         // layout in C2 word order, with the K5 attribution offsets +
         // flags verbatim in the tail (a false flag pairs with group
         // zeros — here the params group is off, so its words are 0).
-        let off = CryptoOffsets {
+        let off = AggregateOffsets {
             sk_req_base: 32,
             async_tfm: 32,
             tfm_alg: 32,
@@ -1285,7 +1651,7 @@ mod tests {
         // CONFIG-resolved like the other offsets — resolution, not
         // refusal — so this fixture must RESOLVE with `shash_base == 8`.
         let bytes = crypto_fixture(Some(("crypto_shash", "base")));
-        let off = resolve_offsets_from(&bytes).expect("6.12 shash layout must resolve");
+        let off = resolve_aggregate_offsets_from(&bytes).expect("6.12 shash layout must resolve");
         assert_eq!(off.shash_base, 8);
     }
 
@@ -1296,7 +1662,7 @@ mod tests {
         // retired C3 refusal — a kernel that drops the member refuses
         // here, never mis-chases in BPF).
         let bytes = crypto_fixture_inner(None, Some(("crypto_shash", "base")));
-        let err = resolve_offsets_from(&bytes).expect_err("missing shash.base must fail");
+        let err = resolve_aggregate_offsets_from(&bytes).expect_err("missing shash.base must fail");
         assert_eq!(
             err,
             BtfError::MissingMember {
@@ -1313,7 +1679,7 @@ mod tests {
         // a silently-resolved offset set).
         for (type_name, member) in FIRST_MEMBER_LINKS {
             let bytes = crypto_fixture(Some((type_name, member)));
-            let err = resolve_offsets_from(&bytes).expect_err("moved link must fail");
+            let err = resolve_aggregate_offsets_from(&bytes).expect_err("moved link must fail");
             assert_eq!(
                 err,
                 BtfError::FirstMemberMoved {
@@ -1374,6 +1740,7 @@ mod tests {
         named("ahash_request", &[("base", 0), ("nbytes", 48)]);
         named("shash_desc", &[("tfm", 0)]);
         named("crypto_shash", &[("base", 0)]);
+        named("crypto_skcipher", &[("base", 8)]);
         b.finish()
     }
 
@@ -1384,7 +1751,10 @@ mod tests {
         let bytes = bringup_fixture();
         let (ids, off, k5) = resolve_kcrypto_bringup_from(&bytes).expect("combo resolves");
         assert_eq!(ids, resolve_btf_ids_from(&bytes).expect("ids resolve"));
-        assert_eq!(off, resolve_offsets_from(&bytes).expect("offsets resolve"));
+        assert_eq!(
+            off,
+            resolve_aggregate_offsets_from(&bytes).expect("offsets resolve")
+        );
         assert_eq!(
             k5,
             resolve_kcrypto_offsets_from(&bytes).expect("k5 resolves")
@@ -1395,7 +1765,7 @@ mod tests {
         assert_eq!(ids["crypto_shash_finup"], 11);
         assert_eq!(
             off,
-            CryptoOffsets {
+            AggregateOffsets {
                 sk_req_base: 32,
                 async_tfm: 32,
                 tfm_alg: 32,

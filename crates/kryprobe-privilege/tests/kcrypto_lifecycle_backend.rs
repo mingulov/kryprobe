@@ -92,7 +92,7 @@ fn f8c_detect_finds_one_system_sensor() {
 }
 
 #[test]
-fn f8c_plan_requests_four_required_hooks() {
+fn f8c_plan_requests_two_hooks_per_required_site() {
     let (backend, _shared) = register_lifecycle_shared_for_test();
     let caps = runtime();
     let detect = DetectContext {
@@ -112,7 +112,18 @@ fn f8c_plan_requests_four_required_hooks() {
         )
         .expect("plan");
     assert_eq!(plan.backend, BackendId::KCrypto);
-    assert_eq!(plan.probes.len(), 4);
+    // Entry + return hook per required site, manifest-derived (new
+    // sites extend the plan — never a hardcoded count again).
+    assert_eq!(plan.probes.len(), 14, "7 sites × entry/return");
+    assert_eq!(
+        plan.probes.len(),
+        kryprobe_privilege::kcrypto_lifecycle::profile::manifest(
+            kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::RequestLifecycle
+        )
+        .required
+        .len()
+            * 2
+    );
     assert!(plan.required.btf && plan.required.ringbuf);
 }
 

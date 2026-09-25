@@ -4,16 +4,20 @@
 //! Any drift between BPF bytes and these mirrors must fail here.
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LAGG_DEC_RET, LAGG_DEC_SUB, LAGG_ENC_RET, LAGG_ENC_SUB, LCONFIG_MAGIC, LCONFIG_VERSION,
-    LConfig, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED,
-    LEDGE_VERSION, LEdge, LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE,
-    LSITE_DEC, LSITE_ENC,
+    LAGG_ALLOCAEAD_RET, LAGG_ALLOCAEAD_SUB, LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_DEC_RET,
+    LAGG_DEC_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_ENC_RET, LAGG_ENC_SUB, LAGG_SETAUTH_RET,
+    LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB, LAGG_SETKEYSK_RET,
+    LAGG_SETKEYSK_SUB, LCONFIG_MAGIC, LCONFIG_VERSION, LConfig, LEDGE_INVOC_POISON, LEDGE_MAGIC,
+    LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION, LEdge, LLOSS_BADKEY, LLOSS_DISABLED,
+    LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE, LSITE_DEC, LSITE_ENC, LTFM_MAGIC,
+    LTFM_SITE_ALLOC_AEAD, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE,
+    LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK, LTFM_TRUNCATED, LTFM_VERSION, LTfm,
 };
 use std::mem::{offset_of, size_of};
 
 #[test]
-fn ledge_is_40_bytes_with_pinned_offsets() {
-    assert_eq!(size_of::<LEdge>(), 40);
+fn ledge_is_48_bytes_with_pinned_offsets() {
+    assert_eq!(size_of::<LEdge>(), 48);
     assert_eq!(offset_of!(LEdge, magic), 0);
     assert_eq!(offset_of!(LEdge, version), 2);
     assert_eq!(offset_of!(LEdge, edge), 3);
@@ -24,12 +28,13 @@ fn ledge_is_40_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LEdge, status), 24);
     assert_eq!(offset_of!(LEdge, aux), 28);
     assert_eq!(offset_of!(LEdge, invoc), 32);
+    assert_eq!(offset_of!(LEdge, tfm), 40);
 }
 
 #[test]
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
-    assert_eq!(LEDGE_VERSION, 3);
+    assert_eq!(LEDGE_VERSION, 4);
     assert_eq!(LEDGE_INVOC_POISON, 1);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
@@ -39,18 +44,88 @@ fn ledge_enum_values_are_frozen() {
 }
 
 #[test]
+fn ltfm_is_112_bytes_with_pinned_offsets() {
+    assert_eq!(size_of::<LTfm>(), 112);
+    assert_eq!(offset_of!(LTfm, magic), 0);
+    assert_eq!(offset_of!(LTfm, version), 2);
+    assert_eq!(offset_of!(LTfm, edge), 3);
+    assert_eq!(offset_of!(LTfm, site), 4);
+    assert_eq!(offset_of!(LTfm, flags), 6);
+    assert_eq!(offset_of!(LTfm, key), 8);
+    assert_eq!(offset_of!(LTfm, ts_ns), 16);
+    assert_eq!(offset_of!(LTfm, status), 24);
+    assert_eq!(offset_of!(LTfm, aux), 28);
+    assert_eq!(offset_of!(LTfm, aux2), 32);
+    assert_eq!(offset_of!(LTfm, token), 40);
+    assert_eq!(offset_of!(LTfm, name), 48);
+    // The 4-byte alignment pad (36..40) is BPF-zeroed reserved
+    // storage: the emitter writes it per record (D2 — ring memory
+    // is uninitialized, so an unnamed gap would carry stale bytes).
+    assert_eq!(offset_of!(LTfm, token) - (offset_of!(LTfm, aux2) + 4), 4);
+}
+
+#[test]
+fn ltfm_enum_values_are_frozen() {
+    assert_eq!(LTFM_MAGIC, 0x544c);
+    assert_eq!(LTFM_VERSION, 1);
+    assert_eq!(LTFM_TRUNCATED, 0x0002);
+    assert_eq!(LTFM_SITE_ALLOC_SK, 1);
+    assert_eq!(LTFM_SITE_DESTROY, 2);
+    assert_eq!(LTFM_SITE_SETKEY_SK, 3);
+    assert_eq!(LTFM_SITE_SETAUTHSIZE, 4);
+    assert_eq!(LTFM_SITE_ALLOC_AEAD, 5);
+    assert_eq!(LTFM_SITE_SETKEY_AEAD, 6);
+}
+
+#[test]
+fn ltfm_debug_redacts_kernel_key_but_shows_name() {
+    // Same promise as `LEdge`: the raw kernel pointer redacts;
+    // the algorithm name is public inventory and renders.
+    let mut tfm = LTfm {
+        magic: LTFM_MAGIC,
+        version: LTFM_VERSION,
+        edge: LEDGE_SUBMIT,
+        site: LTFM_SITE_ALLOC_SK,
+        flags: 0,
+        key: 0xdead_beef_1234_5678,
+        ts_ns: 7,
+        status: 0,
+        aux: 0,
+        aux2: 0,
+        token: 42,
+        name: [0; 64],
+    };
+    tfm.name[..8].copy_from_slice(b"kxcipher");
+    let shown = format!("{tfm:?}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+    assert!(shown.contains("42"), "{shown}");
+    assert!(!shown.contains("dead"), "{shown}");
+    assert!(
+        !shown.contains(&0xdead_beef_1234_5678u64.to_string()),
+        "{shown}"
+    );
+}
+
+#[test]
 fn lconfig_is_64_bytes_with_pinned_offsets() {
     assert_eq!(size_of::<LConfig>(), 64);
     assert_eq!(offset_of!(LConfig, magic), 0);
     assert_eq!(offset_of!(LConfig, version), 4);
     assert_eq!(offset_of!(LConfig, flags), 8);
-    assert_eq!(offset_of!(LConfig, reserved), 12);
+    assert_eq!(offset_of!(LConfig, tfm_alg), 12);
+    assert_eq!(offset_of!(LConfig, alg_drv), 16);
+    assert_eq!(offset_of!(LConfig, sk_base), 20);
+    assert_eq!(offset_of!(LConfig, refcnt_off), 24);
+    assert_eq!(offset_of!(LConfig, refcnt_present), 28);
+    assert_eq!(offset_of!(LConfig, req_base), 32);
+    assert_eq!(offset_of!(LConfig, req_tfm), 36);
+    assert_eq!(offset_of!(LConfig, reserved), 40);
 }
 
 #[test]
 fn lconfig_magic_version_are_frozen() {
     assert_eq!(LCONFIG_MAGIC, 0x3143_4c4b);
-    assert_eq!(LCONFIG_VERSION, 1);
+    assert_eq!(LCONFIG_VERSION, 3);
 }
 
 #[test]
@@ -65,11 +140,23 @@ fn lloss_class_indices_are_frozen() {
 #[test]
 fn lagg_hook_indices_are_frozen() {
     // Per-hook accepted-edge order matches `edge_hits`
-    // (enc-submit, enc-return, dec-submit, dec-return).
+    // (op hooks 0-3 frozen; T07 transform hooks 4-15).
     assert_eq!(LAGG_ENC_SUB, 0);
     assert_eq!(LAGG_ENC_RET, 1);
     assert_eq!(LAGG_DEC_SUB, 2);
     assert_eq!(LAGG_DEC_RET, 3);
+    assert_eq!(LAGG_ALLOCSK_SUB, 4);
+    assert_eq!(LAGG_ALLOCSK_RET, 5);
+    assert_eq!(LAGG_DESTROY_SUB, 6);
+    assert_eq!(LAGG_DESTROY_RET, 7);
+    assert_eq!(LAGG_SETKEYSK_SUB, 8);
+    assert_eq!(LAGG_SETKEYSK_RET, 9);
+    assert_eq!(LAGG_SETAUTH_SUB, 10);
+    assert_eq!(LAGG_SETAUTH_RET, 11);
+    assert_eq!(LAGG_ALLOCAEAD_SUB, 12);
+    assert_eq!(LAGG_ALLOCAEAD_RET, 13);
+    assert_eq!(LAGG_SETKEYAEAD_SUB, 14);
+    assert_eq!(LAGG_SETKEYAEAD_RET, 15);
 }
 
 #[test]
@@ -88,6 +175,7 @@ fn f9_ledge_debug_redacts_kernel_key() {
         status: 0,
         aux: 0,
         invoc: 41,
+        tfm: 0xcafe_f00d_2468_1357,
     };
     let shown = format!("{edge:?}");
     assert!(shown.contains("<redacted>"), "{shown}");
@@ -95,9 +183,16 @@ fn f9_ledge_debug_redacts_kernel_key() {
         shown.contains("41"),
         "invoc is a counter, not redacted: {shown}"
     );
+    // T07.3: `tfm` is a second raw kernel pointer — it redacts like
+    // `key` (same no-render promise; Debug is a log surface).
     assert!(!shown.contains("dead"), "{shown}");
+    assert!(!shown.contains("cafe"), "{shown}");
     assert!(
         !shown.contains(&0xdead_beef_1234_5678u64.to_string()),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains(&0xcafe_f00d_2468_1357u64.to_string()),
         "{shown}"
     );
 }

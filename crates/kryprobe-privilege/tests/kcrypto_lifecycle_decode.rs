@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T06 decode suite: raw `LEdge` bytes → T05 `Edge` events + join rules.
 //!
-//! Pins the v3 record twin (magic/version/edge/site/flags/aux/invoc/length),
+//! Pins the v4 record twin (magic/version/edge/site/flags/aux/invoc/tfm/length),
 //! the invocation→opaque-id join (W8 fsession: fresh id per admission,
 //! bounded table, nested same-key calls pair exactly by cookie id),
 //! return classification (sync-terminal vs queued), and the named loss
@@ -21,7 +21,7 @@ use kryprobe_privilege::kcrypto_lifecycle::decode::{
 /// `LEDGE_TAINTED` flag bit (BPF nesting taint; mirrors the ABI const).
 const TAINTED: u16 = 0x0001;
 
-/// One 40-byte v3 `LEdge` (little-endian twin of the ABI struct).
+/// One 48-byte v4 `LEdge` (little-endian twin of the ABI struct).
 fn edge_bytes_invoc(
     edge: u8,
     site: u16,
@@ -30,10 +30,26 @@ fn edge_bytes_invoc(
     status: i32,
     flags: u16,
     invoc: u64,
-) -> [u8; 40] {
-    let mut out = [0u8; 40];
+) -> [u8; 48] {
+    edge_bytes_tfm(edge, site, key, ts_ns, status, flags, invoc, 0)
+}
+
+/// Full builder with an explicit transform word (0 = unknown link —
+/// the default; tests pinning first-seen pass a frontend here).
+#[allow(clippy::too_many_arguments)]
+fn edge_bytes_tfm(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    flags: u16,
+    invoc: u64,
+    tfm: u64,
+) -> [u8; 48] {
+    let mut out = [0u8; 48];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 3;
+    out[2] = 4;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -41,15 +57,16 @@ fn edge_bytes_invoc(
     out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
     out[24..28].copy_from_slice(&status.to_le_bytes());
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
+    out[40..48].copy_from_slice(&tfm.to_le_bytes());
     out
 }
 
-/// Realistic default builder: same v3 record with a VALID
+/// Realistic default builder: same v4 record with a VALID
 /// invocation (nonzero, reserved-bit clear — tests sharing one call
 /// use the default 0x4000 so the join hits; tests with two live
 /// calls pass distinct invocations via [`edge_bytes_invoc`]
 /// explicitly, since the join keys by invocation alone).
-fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 40] {
+fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 48] {
     edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)
 }
 
@@ -78,18 +95,18 @@ fn decode_record_rejects_twin_drift() {
     let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
     bad[0] = 0;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMagic));
-    // v1 AND v2 records refuse (fail closed across versions: an
-    // old decoder would misread the longer v3 record, so versions
+    // v1, v2 AND v3 records refuse (fail closed across versions:
+    // an old decoder would misread the longer v4 record, so versions
     // never mix).
-    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
-    bad[2] = 1;
-    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadVersion));
-    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
-    bad[2] = 2;
-    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadVersion));
-    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
-    bad[2] = 4;
-    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadVersion));
+    for version in [1u8, 2, 3] {
+        let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
+        bad[2] = version;
+        assert_eq!(
+            decode_record(&bad),
+            Err(DecodeDrop::BadVersion),
+            "version {version} refuses"
+        );
+    }
     assert_eq!(
         decode_record(&edge_bytes(3, 1, 9, 1, 0, 0)),
         Err(DecodeDrop::BadEdge)
@@ -119,12 +136,33 @@ fn decode_record_rejects_twin_drift() {
 
 #[test]
 fn decode_record_rejects_shape_and_null_key() {
-    assert_eq!(decode_record(&[0u8; 39]), Err(DecodeDrop::BadLength));
-    assert_eq!(decode_record(&[0u8; 41]), Err(DecodeDrop::BadLength));
+    assert_eq!(decode_record(&[0u8; 47]), Err(DecodeDrop::BadLength));
+    assert_eq!(decode_record(&[0u8; 49]), Err(DecodeDrop::BadLength));
+    // The v3 40-byte record refuses by length AND version (twin lock).
+    assert_eq!(decode_record(&[0u8; 40]), Err(DecodeDrop::BadLength));
     assert_eq!(
         decode_record(&edge_bytes(1, 1, 0, 1, 0, 0)),
         Err(DecodeDrop::NullKey)
     );
+}
+
+#[test]
+fn decode_record_carries_transform_word() {
+    // T07.3: `tfm` admits any u64 — a frontend decodes verbatim, 0
+    // decodes as unknown (never refused either way: the op joins by
+    // invocation with or without its transform).
+    let raw =
+        decode_record(&edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, 0xf00d)).expect("tfm parses");
+    assert_eq!(raw.tfm, 0xf00d);
+    let raw = decode_record(&edge_bytes(1, 1, 0xabc, 100, 0, 0)).expect("zero tfm parses");
+    assert_eq!(raw.tfm, 0);
+    // `tfm` never disturbs the invocation join: submit+return with
+    // different tfm words still pair by invocation.
+    let mut dec = LifecycleDecoder::new(8);
+    let submit = dec.feed(&edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, 0xf00d));
+    assert_eq!(submit.len(), 1);
+    let ret = dec.feed(&edge_bytes_tfm(2, 1, 0xabc, 150, 0, 0, 0x4000, 0));
+    assert_eq!(ret.len(), 1, "tfm skew never breaks the join");
 }
 
 #[test]

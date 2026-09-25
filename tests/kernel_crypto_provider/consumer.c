@@ -9,9 +9,12 @@
 #include <linux/completion.h>
 #include <linux/crypto.h>
 #include <linux/ktime.h>
+#include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#include <crypto/aead.h>
 #include <crypto/skcipher.h>
 
 #include "fixture.h"
@@ -60,12 +63,23 @@ struct kxc_op {
 /* ------------------------------------------------------------------ */
 
 static void kxc_emit_alloc(struct kxc_run *run, u64 seq, const char *req_name,
-			   const char *drv)
+			   const char *drv, u32 type, u32 mask)
 {
 	kxc_ledger_emit(
 		"{\"v\":1,\"run\":\"%s\",\"seq\":%llu,\"phase\":\"alloc\","
-		"\"req\":\"%s\",\"drv\":\"%s\",\"ts\":%llu,\"cpu\":%u}",
-		run->id, seq, req_name, drv, ktime_get_ns(),
+		"\"req\":\"%s\",\"drv\":\"%s\",\"type\":%u,\"mask\":%u,"
+		"\"ts\":%llu,\"cpu\":%u}",
+		run->id, seq, req_name, drv, type, mask, ktime_get_ns(),
+		smp_processor_id());
+}
+
+static void kxc_emit_config(struct kxc_run *run, u64 seq, const char *op,
+			    int errno_, unsigned int len)
+{
+	kxc_ledger_emit(
+		"{\"v\":1,\"run\":\"%s\",\"seq\":%llu,\"phase\":\"config\","
+		"\"op\":\"%s\",\"errno\":%d,\"len\":%u,\"ts\":%llu,\"cpu\":%u}",
+		run->id, seq, op, errno_, len, ktime_get_ns(),
 		smp_processor_id());
 }
 
@@ -155,8 +169,41 @@ static void kxc_mark_progress(struct kxc_run *run, struct kxc_op *op,
 static void kxc_tfm_release(struct kxc_run *run, struct crypto_skcipher *tfm,
 			    u64 aseq);
 
+static int kxc_tfm_acquire_typed(struct kxc_run *run, const char *req_name,
+				       u32 type, u32 mask,
+				       struct crypto_skcipher **tfm, u64 *aseq)
+{
+	struct crypto_skcipher *t;
+
+	t = crypto_alloc_skcipher(req_name, type, mask);
+	if (IS_ERR(t))
+		return PTR_ERR(t);
+	*aseq = kxc_next_seq(run);
+	kxc_emit_alloc(run, *aseq, req_name,
+		       crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t)),
+		       type, mask);
+	if (crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN)) {
+		kxc_tfm_release(run, t, *aseq);
+		return -EKEYREJECTED;
+	}
+	*tfm = t;
+	return 0;
+}
+
 static int kxc_tfm_acquire(struct kxc_run *run, const char *req_name,
 			   struct crypto_skcipher **tfm, u64 *aseq)
+{
+	return kxc_tfm_acquire_typed(run, req_name, 0, 0, tfm, aseq);
+}
+
+/*
+ * Raw skcipher acquisition: alloc + alloc row, NO setkey. For
+ * scenarios that drive configurations explicitly (every setkey
+ * they run is emitted as its own config row — no hidden setup
+ * key, unlike kxc_tfm_acquire whose setup setkey is unrecorded).
+ */
+static int kxc_tfm_acquire_raw(struct kxc_run *run, const char *req_name,
+			       struct crypto_skcipher **tfm, u64 *aseq)
 {
 	struct crypto_skcipher *t;
 
@@ -165,13 +212,35 @@ static int kxc_tfm_acquire(struct kxc_run *run, const char *req_name,
 		return PTR_ERR(t);
 	*aseq = kxc_next_seq(run);
 	kxc_emit_alloc(run, *aseq, req_name,
-		       crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t)));
-	if (crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN)) {
-		kxc_tfm_release(run, t, *aseq);
-		return -EKEYREJECTED;
-	}
+		       crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t)),
+		       0, 0);
 	*tfm = t;
 	return 0;
+}
+
+/* Raw AEAD acquisition: alloc + alloc row, no setkey/setauthsize. */
+static int kxc_aead_acquire(struct kxc_run *run, const char *req_name,
+			    struct crypto_aead **tfm, u64 *aseq)
+{
+	struct crypto_aead *t;
+
+	t = crypto_alloc_aead(req_name, 0, 0);
+	if (IS_ERR(t))
+		return PTR_ERR(t);
+	*aseq = kxc_next_seq(run);
+	kxc_emit_alloc(run, *aseq, req_name,
+		       crypto_tfm_alg_driver_name(crypto_aead_tfm(t)),
+		       0, 0);
+	*tfm = t;
+	return 0;
+}
+
+static void kxc_aead_release(struct kxc_run *run, struct crypto_aead *tfm,
+			     u64 aseq)
+{
+	crypto_free_aead(tfm);
+	/* Fixture AEAD transforms are never shared: every free is final. */
+	kxc_emit_free(run, aseq, true);
 }
 
 static void kxc_tfm_release(struct kxc_run *run, struct crypto_skcipher *tfm,
@@ -572,6 +641,226 @@ static int kxc_scenario_refheld_release(struct kxc_run *run)
 	return 0;
 }
 
+/* T07 F02: exact sync driver, untyped then restricted. */
+static int kxc_scenario_typed_sync(struct kxc_run *run)
+{
+	struct crypto_skcipher *t1, *t2;
+	u64 aseq1, aseq2;
+	int err;
+
+	err = kxc_tfm_acquire_typed(run, kxc_sync_driver_name(), 0, 0,
+				    &t1, &aseq1);
+	if (err)
+		return err;
+	err = kxc_tfm_acquire_typed(run, kxc_sync_driver_name(),
+				    CRYPTO_ALG_TYPE_SKCIPHER,
+				    CRYPTO_ALG_TYPE_MASK | CRYPTO_ALG_ASYNC,
+				    &t2, &aseq2);
+	if (err) {
+		kxc_tfm_release(run, t1, aseq1);
+		return err;
+	}
+	kxc_tfm_release(run, t2, aseq2);
+	kxc_tfm_release(run, t1, aseq1);
+	return 0;
+}
+
+/* T07 F03: the failing provider rejects allocation in cra_init. */
+static int kxc_scenario_failed_init(struct kxc_run *run)
+{
+	struct crypto_skcipher *tfm;
+	u64 seq;
+	int err;
+
+	tfm = crypto_alloc_skcipher(kxc_fail_driver_name(), 0, 0);
+	if (!IS_ERR(tfm)) {
+		/* Impossible: init always fails. Fail loudly. */
+		crypto_free_skcipher(tfm);
+		return -EEXIST;
+	}
+	err = PTR_ERR(tfm);
+	/* Only the init errno completes the scenario: anything else
+	 * is unexpected behavior and fails the run honestly. */
+	if (err != -EINVAL)
+		return err;
+	seq = kxc_next_seq(run);
+	kxc_emit_submit(run, seq, "alloc-probe", 0);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	return 0;
+}
+
+/*
+ * T07 F04: release at refcount 2 (no free), then the proved final
+ * free. 6.12/7.0 only: 7.2 removed the tfm refcount (destroy is
+ * unconditional there), so the shared case cannot exist and the
+ * scenario refuses with -EOPNOTSUPP. Soundness: the bump is
+ * verified BEFORE any destroy (always safe); destroy#1's dec-test
+ * hold is source-proven (see evidence/kcrypto-t07/
+ * destroy-semantics.md) — a regression double-frees and oopses
+ * LOUD, never a silent pass. No post-destroy reads.
+ */
+static int kxc_scenario_shared_release(struct kxc_run *run)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	return -EOPNOTSUPP;
+#else
+	struct crypto_skcipher *t;
+	struct crypto_tfm *base;
+	u64 aseq;
+	int err;
+
+	/* Build-time proof the refcount field exists on this
+	 * target: a missing field fails the build, never a
+	 * silent fallback. */
+	(void)sizeof(((struct crypto_tfm *)0)->refcnt);
+
+	err = kxc_tfm_acquire(run, kxc_sync_driver_name(), &t, &aseq);
+	if (err)
+		return err;
+	base = crypto_skcipher_tfm(t);
+	/* Simulate the second holder: nothing in mainline takes one,
+	 * so the fixture holds it directly. TEST ONLY. */
+	refcount_inc(&base->refcnt);
+	if (refcount_read(&base->refcnt) != 2) {
+		crypto_free_skcipher(t);
+		return -EPROTO;
+	}
+	crypto_free_skcipher(t);
+	kxc_emit_free(run, aseq, false);
+	crypto_free_skcipher(t);
+	kxc_emit_free(run, aseq, true);
+	return 0;
+#endif
+}
+
+/* T07 F06: one thousand alloc/free lifetimes, back to back. */
+#define KXC_REUSE_BURST 1000
+
+static int kxc_scenario_reuse_burst(struct kxc_run *run)
+{
+	struct crypto_skcipher *t;
+	u64 aseq;
+	int i, err;
+
+	for (i = 0; i < KXC_REUSE_BURST; i++) {
+		err = kxc_tfm_acquire(run, kxc_sync_driver_name(), &t, &aseq);
+		if (err)
+			return err;
+		kxc_tfm_release(run, t, aseq);
+	}
+	return 0;
+}
+
+/* T07 F07 skcipher leg: setkey ok, encrypt, rejected short key. */
+#define KXC_SHORT_KEYLEN 7
+
+static int kxc_scenario_rekey(struct kxc_run *run)
+{
+	struct crypto_skcipher *tfm;
+	struct kxc_op op;
+	u64 aseq, seq;
+	int err;
+
+	err = kxc_tfm_acquire_raw(run, kxc_sync_driver_name(), &tfm, &aseq);
+	if (err)
+		return err;
+	err = crypto_skcipher_setkey(tfm, kxc_key, KXC_KEYLEN);
+	kxc_emit_config(run, aseq, "setkey", err, KXC_KEYLEN);
+	if (err)
+		goto out_free;
+	err = kxc_req_setup(run, tfm, &op, 0);
+	if (err)
+		goto out_free;
+	seq = kxc_next_seq(run);
+	kxc_emit_submit(run, seq, "encrypt", KXC_BLOCK);
+	err = crypto_skcipher_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	kxc_req_teardown(&op);
+	if (err)
+		goto out_free;
+	err = crypto_skcipher_setkey(tfm, kxc_key, KXC_SHORT_KEYLEN);
+	kxc_emit_config(run, aseq, "setkey", err, KXC_SHORT_KEYLEN);
+	/* The short key MUST be rejected: anything else (including a
+	 * silent accept) fails the run honestly. */
+	if (err != -EINVAL) {
+		err = err ? err : -EPROTO;
+		goto out_free;
+	}
+	err = 0;
+out_free:
+	kxc_tfm_release(run, tfm, aseq);
+	return err;
+}
+
+/* T07 F07 AEAD leg: valid authsize, encrypt, oversize authsize. */
+#define KXC_AEAD_AUTHSIZE_OK 16
+#define KXC_AEAD_AUTHSIZE_BIG 64
+
+static int kxc_scenario_authsize(struct kxc_run *run)
+{
+	struct crypto_aead *tfm;
+	struct aead_request *req;
+	struct scatterlist sg;
+	struct page *page;
+	u8 *buf;
+	u8 iv[KXC_IVLEN];
+	u64 aseq, seq;
+	int err;
+
+	err = kxc_aead_acquire(run, kxc_aead_driver_name(), &tfm, &aseq);
+	if (err)
+		return err;
+	err = crypto_aead_setkey(tfm, kxc_key, KXC_KEYLEN);
+	kxc_emit_config(run, aseq, "setkey", err, KXC_KEYLEN);
+	if (err)
+		goto out_free;
+	err = crypto_aead_setauthsize(tfm, KXC_AEAD_AUTHSIZE_OK);
+	kxc_emit_config(run, aseq, "setauthsize", err, KXC_AEAD_AUTHSIZE_OK);
+	if (err)
+		goto out_free;
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!req) {
+		err = -ENOMEM;
+		goto out_free;
+	}
+	page = alloc_page(GFP_KERNEL);
+	if (!page) {
+		aead_request_free(req);
+		err = -ENOMEM;
+		goto out_free;
+	}
+	buf = page_address(page);
+	memcpy(buf, kxc_pt, KXC_BLOCK);
+	sg_init_one(&sg, buf, KXC_BLOCK);
+	/* Sync-only: no completion callback; the driver returns directly. */
+	aead_request_set_callback(req, 0, NULL, NULL);
+	memcpy(iv, kxc_iv, KXC_IVLEN);
+	aead_request_set_crypt(req, &sg, &sg, KXC_BLOCK, iv);
+	aead_request_set_ad(req, 0);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit(run, seq, "encrypt", KXC_BLOCK);
+	err = crypto_aead_encrypt(req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	aead_request_free(req);
+	__free_page(page);
+	if (err)
+		goto out_free;
+	err = crypto_aead_setauthsize(tfm, KXC_AEAD_AUTHSIZE_BIG);
+	kxc_emit_config(run, aseq, "setauthsize", err, KXC_AEAD_AUTHSIZE_BIG);
+	/* Oversize MUST be rejected: a silent accept fails honestly. */
+	if (err != -EINVAL) {
+		err = err ? err : -EPROTO;
+		goto out_free;
+	}
+	err = 0;
+out_free:
+	kxc_aead_release(run, tfm, aseq);
+	return err;
+}
+
 int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 {
 	if (!strcmp(scenario, "sync-once"))
@@ -590,5 +879,17 @@ int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 		return kxc_scenario_failed_alloc(run);
 	if (!strcmp(scenario, "refheld-release"))
 		return kxc_scenario_refheld_release(run);
+	if (!strcmp(scenario, "typed-sync"))
+		return kxc_scenario_typed_sync(run);
+	if (!strcmp(scenario, "failed-init"))
+		return kxc_scenario_failed_init(run);
+	if (!strcmp(scenario, "shared-release"))
+		return kxc_scenario_shared_release(run);
+	if (!strcmp(scenario, "reuse-burst"))
+		return kxc_scenario_reuse_burst(run);
+	if (!strcmp(scenario, "rekey"))
+		return kxc_scenario_rekey(run);
+	if (!strcmp(scenario, "authsize"))
+		return kxc_scenario_authsize(run);
 	return -EINVAL;
 }

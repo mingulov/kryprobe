@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * kcrypto_fixture provider: two test-only skcipher drivers plus the
- * JSONL ledger ring and debugfs control (see fixture.h, README.md).
+ * kcrypto_fixture provider: test-only skcipher drivers (sync, async,
+ * failing-init) plus a minimal sync AEAD driver (config-shape only,
+ * no tag semantics until T10), the JSONL ledger ring and debugfs
+ * control (see fixture.h, README.md).
  *
  * TEST ONLY. The "cipher" is XOR with the key byte. It provides no
  * confidentiality. Never install on a production host.
@@ -13,13 +15,16 @@
 #include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
+#include <crypto/aead.h>
 #include <crypto/algapi.h>
+#include <crypto/internal/aead.h>
 #include <crypto/internal/skcipher.h>
 #include <crypto/skcipher.h>
 
@@ -168,6 +173,8 @@ struct kxc_ctx {
 
 static char kxc_sync_name[KXC_DRV_NAME_MAX];
 static char kxc_async_name[KXC_DRV_NAME_MAX];
+static char kxc_fail_name[KXC_DRV_NAME_MAX];
+static char kxc_aead_name[KXC_DRV_NAME_MAX];
 
 const char *kxc_sync_driver_name(void)
 {
@@ -177,6 +184,16 @@ const char *kxc_sync_driver_name(void)
 const char *kxc_async_driver_name(void)
 {
 	return kxc_async_name;
+}
+
+const char *kxc_fail_driver_name(void)
+{
+	return kxc_fail_name;
+}
+
+const char *kxc_aead_driver_name(void)
+{
+	return kxc_aead_name;
 }
 
 static int kxc_cra_init(struct crypto_tfm *tfm)
@@ -361,6 +378,143 @@ static struct skcipher_alg kxc_async_alg = {
 	.decrypt = kxc_async_crypt,
 };
 
+/*
+ * Failing-init driver (T07 F03): registration succeeds, but every
+ * allocation fails in cra_init with -EINVAL — the allocation
+ * attempt/error truth without a fabricated transform. The
+ * encrypt/decrypt/setkey callbacks are wired only because the
+ * registration requires them; init fails first, so they are
+ * unreachable (any call would be a loud logic error, but there
+ * is no probe to trip — init gates everything).
+ */
+static int kxc_fail_cra_init(struct crypto_tfm *tfm)
+{
+	return -EINVAL;
+}
+
+static struct skcipher_alg kxc_fail_alg = {
+	.base = {
+		.cra_name = "kxcipher-broken",
+		.cra_priority = 100,
+		.cra_blocksize = 16,
+		.cra_ctxsize = sizeof(struct kxc_ctx),
+		.cra_module = THIS_MODULE,
+		.cra_init = kxc_fail_cra_init,
+		.cra_exit = kxc_cra_exit,
+	},
+	.min_keysize = 16,
+	.max_keysize = 32,
+	.setkey = kxc_setkey,
+	.encrypt = kxc_sync_crypt,
+	.decrypt = kxc_sync_crypt,
+};
+
+/* ------------------------------------------------------------------ */
+/* minimal AEAD driver (T07 F07 config shape; NOT T10 AEAD lifecycle)   */
+/* ------------------------------------------------------------------ */
+
+#define KXC_AEAD_GENERIC_NAME "kxaead"
+#define KXC_AEAD_MAXAUTHSIZE 16
+
+struct kxc_aead_ctx {
+	u8 key[32];
+	unsigned int keylen;
+	unsigned int authsize;
+};
+
+static int kxc_aead_cra_init(struct crypto_tfm *tfm)
+{
+	struct kxc_aead_ctx *ctx = crypto_tfm_ctx(tfm);
+
+	memset(ctx, 0, sizeof(*ctx));
+	return 0;
+}
+
+static void kxc_aead_cra_exit(struct crypto_tfm *tfm)
+{
+	struct kxc_aead_ctx *ctx = crypto_tfm_ctx(tfm);
+
+	memzero_explicit(ctx, sizeof(*ctx));
+}
+
+static int kxc_aead_setkey(struct crypto_aead *tfm, const u8 *key,
+			   unsigned int keylen)
+{
+	struct kxc_aead_ctx *ctx = crypto_aead_ctx(tfm);
+
+	if (keylen < 16 || keylen > sizeof(ctx->key))
+		return -EINVAL;
+	memcpy(ctx->key, key, keylen);
+	ctx->keylen = keylen;
+	return 0;
+}
+
+static int kxc_aead_setauthsize(struct crypto_aead *tfm,
+				unsigned int authsize)
+{
+	struct kxc_aead_ctx *ctx = crypto_aead_ctx(tfm);
+
+	if (authsize == 0 || authsize > KXC_AEAD_MAXAUTHSIZE)
+		return -EINVAL;
+	ctx->authsize = authsize;
+	return 0;
+}
+
+/*
+ * XOR "AEAD": encrypt/decrypt mirror the skcipher walk over
+ * cryptlen bytes. There are deliberately NO tag semantics here
+ * (no authentication, assoc ignored): T07 exercises the
+ * setauthsize CONFIGURATION shape only; T10 owns AEAD request
+ * lifecycle, tag checks and failure legs. Single-sg test
+ * buffers only (the scenario pins one page).
+ */
+static int kxc_aead_do_crypt(struct aead_request *req)
+{
+	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+	struct kxc_aead_ctx *ctx = crypto_aead_ctx(tfm);
+	u8 *dst;
+	const u8 *src;
+	unsigned int i;
+
+	if (!ctx->keylen)
+		return -ENOKEY;
+	if (!ctx->authsize)
+		return -EINVAL;
+	src = sg_virt(req->src);
+	dst = sg_virt(req->dst);
+	for (i = 0; i < req->cryptlen; i++)
+		dst[i] = src[i] ^ ctx->key[i % ctx->keylen];
+	return 0;
+}
+
+static int kxc_aead_encrypt(struct aead_request *req)
+{
+	return kxc_aead_do_crypt(req);
+}
+
+static int kxc_aead_decrypt(struct aead_request *req)
+{
+	return kxc_aead_do_crypt(req);
+}
+
+static struct aead_alg kxc_aead_alg = {
+	.base = {
+		.cra_name = KXC_AEAD_GENERIC_NAME,
+		.cra_priority = 100,
+		.cra_blocksize = 16,
+		.cra_ctxsize = sizeof(struct kxc_aead_ctx),
+		.cra_module = THIS_MODULE,
+		.cra_init = kxc_aead_cra_init,
+		.cra_exit = kxc_aead_cra_exit,
+	},
+	.ivsize = 16,
+	.maxauthsize = KXC_AEAD_MAXAUTHSIZE,
+	.setkey = kxc_aead_setkey,
+	.setauthsize = kxc_aead_setauthsize,
+	.encrypt = kxc_aead_encrypt,
+	.decrypt = kxc_aead_decrypt,
+};
+
 /* ------------------------------------------------------------------ */
 /* debugfs control + ledger                                            */
 /* ------------------------------------------------------------------ */
@@ -523,10 +677,18 @@ static int __init kxc_init(void)
 		  run_suffix);
 	scnprintf(kxc_async_name, sizeof(kxc_async_name), "kxcipher-async-%s",
 		  run_suffix);
+	scnprintf(kxc_fail_name, sizeof(kxc_fail_name), "kxcipher-broken-%s",
+		  run_suffix);
+	scnprintf(kxc_aead_name, sizeof(kxc_aead_name), "kxaead-sync-%s",
+		  run_suffix);
 	strscpy(kxc_sync_alg.base.cra_driver_name, kxc_sync_name,
 		sizeof(kxc_sync_alg.base.cra_driver_name));
 	strscpy(kxc_async_alg.base.cra_driver_name, kxc_async_name,
 		sizeof(kxc_async_alg.base.cra_driver_name));
+	strscpy(kxc_fail_alg.base.cra_driver_name, kxc_fail_name,
+		sizeof(kxc_fail_alg.base.cra_driver_name));
+	strscpy(kxc_aead_alg.base.cra_driver_name, kxc_aead_name,
+		sizeof(kxc_aead_alg.base.cra_driver_name));
 
 	kxc_log.rows = vmalloc(array_size(sizeof(*kxc_log.rows), KXC_ROWS_MAX));
 	if (!kxc_log.rows)
@@ -555,10 +717,20 @@ static int __init kxc_init(void)
 	ret = crypto_register_skcipher(&kxc_async_alg);
 	if (ret)
 		goto err_async;
+	ret = crypto_register_skcipher(&kxc_fail_alg);
+	if (ret)
+		goto err_fail;
+	ret = crypto_register_aead(&kxc_aead_alg);
+	if (ret)
+		goto err_aead;
 
 	pr_info("kcrypto_fixture: loaded (suffix %s, TEST ONLY)\n", run_suffix);
 	return 0;
 
+err_aead:
+	crypto_unregister_skcipher(&kxc_fail_alg);
+err_fail:
+	crypto_unregister_skcipher(&kxc_async_alg);
 err_async:
 	crypto_unregister_skcipher(&kxc_sync_alg);
 err_alg:
@@ -570,6 +742,8 @@ err_alg:
 
 static void __exit kxc_exit(void)
 {
+	crypto_unregister_aead(&kxc_aead_alg);
+	crypto_unregister_skcipher(&kxc_fail_alg);
 	crypto_unregister_skcipher(&kxc_async_alg);
 	crypto_unregister_skcipher(&kxc_sync_alg);
 	debugfs_remove_recursive(kxc_debugfs_dir);

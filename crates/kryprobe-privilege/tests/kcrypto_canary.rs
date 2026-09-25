@@ -26,7 +26,7 @@ use kryprobe_abi::kcrypto_agg::{
 use kryprobe_privilege::bpfloader::{PointStatus, pin_fd};
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredKcrypto, kconfig_from_offsets, load_kcrypto_configured,
-    resolve_kcrypto_offsets, resolve_offsets,
+    resolve_aggregate_offsets, resolve_kcrypto_offsets,
 };
 use kryprobe_privilege::mapops::{map_get_next_key, map_lookup_bytes, possible_cpus};
 use kryprobe_testkit::alg_fixture;
@@ -312,7 +312,7 @@ fn kconfig_bytes_match_live_resolver() {
         println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
         return;
     }
-    let off = resolve_offsets().expect("offsets must resolve");
+    let off = resolve_aggregate_offsets().expect("offsets must resolve");
     let k5 = resolve_kcrypto_offsets().expect("K5 offsets resolve fail-soft");
     let bytes = kconfig_from_offsets(off, k5).to_bytes();
     assert_eq!(
@@ -399,7 +399,7 @@ fn configured_entry_writes_kcfg_from_resolver() {
     assert_eq!(sensor.loaded.progs.len(), 9, "9 loaded programs");
     // The KCFG row reads back byte-identical to the resolver's bytes.
     let want = kconfig_from_offsets(
-        resolve_offsets().expect("offsets must resolve"),
+        resolve_aggregate_offsets().expect("offsets must resolve"),
         resolve_kcrypto_offsets().expect("K5 offsets resolve fail-soft"),
     )
     .to_bytes();

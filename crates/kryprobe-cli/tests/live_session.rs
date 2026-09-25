@@ -1989,7 +1989,7 @@ fn lifecycle_test_ledger(
 ) -> kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
     kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
         completed: Vec::new(),
-        edge_hits: [2, 2, 1, 1],
+        edge_hits: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         decode: kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats {
             admitted,
             ..kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats::default()
@@ -2001,13 +2001,15 @@ fn lifecycle_test_ledger(
             ..kryprobe_core::kcrypto::ReducerStats::default()
         },
         kernel_loss: [0; 5],
-        agg_accepted: [2, 2, 1, 1],
+        agg_accepted: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         retained_dropped: 0,
         view_valid: true,
         loss_baseline: [0; 5],
-        agg_baseline: [0; 4],
+        agg_baseline: [0; 16],
         prog_misses: Vec::new(),
         miss_current: Vec::new(),
+        tfm_stats: kryprobe_privilege::kcrypto_lifecycle::tfm::TfmStats::default(),
+        generations: Vec::new(),
     }
 }
 
@@ -2056,7 +2058,7 @@ fn live_lifecycle_scripted_session_drives_green() {
         &backend,
         &mut sensor,
         &stop,
-        2,
+        7,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2181,7 +2183,7 @@ fn live_lifecycle_observation_cap_truncates_deterministically() {
         &backend,
         &mut sensor,
         &stop,
-        2,
+        7,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2246,7 +2248,7 @@ fn live_lifecycle_close_backlog_flips_transport() {
         &backend,
         &mut sensor,
         &stop,
-        2,
+        7,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2311,7 +2313,7 @@ fn live_lifecycle_registry_backend_drives_same_decoder() {
         backend,
         &mut sensor,
         &stop,
-        2,
+        7,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),
@@ -2347,7 +2349,7 @@ fn live_lifecycle_unconfigured_sensor_refuses_typed() {
         &backend,
         &mut production,
         &stop,
-        2,
+        7,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),

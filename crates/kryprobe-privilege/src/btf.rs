@@ -21,8 +21,8 @@ pub(crate) const BTF_VERSION: u8 = 1;
 
 /// BTF kinds (`linux/btf.h`): only the aux shapes matter here.
 pub(crate) const KIND_INT: u8 = 1;
-const KIND_PTR: u8 = 2;
-const KIND_ARRAY: u8 = 3;
+pub(crate) const KIND_PTR: u8 = 2;
+pub(crate) const KIND_ARRAY: u8 = 3;
 pub(crate) const KIND_STRUCT: u8 = 4;
 const KIND_UNION: u8 = 5;
 const KIND_ENUM: u8 = 6;
@@ -296,10 +296,358 @@ impl<'a> Btf<'a> {
         Ok(id)
     }
 
+    /// Validate that `name`'s prototype is EXACTLY the qualified
+    /// allocation-sensor read — `struct crypto_skcipher *(const char
+    /// *, u32, u32)` — and return its `FUNC` id (T07.2, same
+    /// refuse-on-drift discipline as [`Btf::lifecycle_proto_id`]):
+    /// exactly three arguments, arg0 a pointer (after qualifier
+    /// chase) to 1-byte INT (`char` — the bounded name copy reads
+    /// raw bytes, so the width pins but the signedness does not),
+    /// arg1/arg2 4-byte INTs (the type/mask words travel as unshifted
+    /// `u32` copies — the width pins, the encoding does not), return
+    /// a pointer to STRUCT `crypto_skcipher` (the success chase reads
+    /// `__crt_alg` at the resolved offset — a pointer to any other
+    /// type would mis-chase). Corrupt images stay
+    /// [`BtfError::BadBtf`]; well-formed but incompatible prototypes
+    /// are [`BtfError::BadPrototype`].
+    pub(crate) fn alloc_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
+            name: name.to_owned(),
+        })?;
+        let target = self.rec(id)?.size_or_type;
+        let proto = self.rec(target)?;
+        if proto.kind != KIND_FUNC_PROTO {
+            return Err(bad_proto(format!(
+                "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                proto.kind
+            )));
+        }
+        if proto.vlen != 3 {
+            return Err(bad_proto(format!(
+                "prototype takes {} arguments, want exactly 3",
+                proto.vlen
+            )));
+        }
+        let arg0 = read_u32(self.bytes, proto.aux_at + 4, "proto arg0 type")?;
+        let ptr = self.rec(self.chase_wrappers(arg0)?)?;
+        if ptr.kind != KIND_PTR {
+            return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        // The name copy reads raw bytes through this pointer: the
+        // pointee must be 1-byte INT (`char` — any wider pointee
+        // changes what a byte copy means).
+        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        if pointee.kind != KIND_INT {
+            return Err(bad_proto(format!(
+                "arg0 points at kind {}, not INT char",
+                pointee.kind
+            )));
+        }
+        if pointee.size_or_type != 1 {
+            return Err(bad_proto(format!(
+                "arg0 pointee INT is {} bytes, not 1",
+                pointee.size_or_type
+            )));
+        }
+        // Type/mask words: 4-byte INTs (the BPF copies the low 32
+        // bits uninterpreted — a wider scalar would truncate, a
+        // non-scalar would misread).
+        for (n, at) in [(1u32, proto.aux_at + 12), (2u32, proto.aux_at + 20)] {
+            let arg = read_u32(self.bytes, at, "proto arg type")?;
+            let rec = self.rec(self.chase_wrappers(arg)?)?;
+            if rec.kind != KIND_INT {
+                return Err(bad_proto(format!("arg{n} is not an INT")));
+            }
+            if rec.size_or_type != 4 {
+                return Err(bad_proto(format!(
+                    "arg{n} INT is {} bytes, not 4",
+                    rec.size_or_type
+                )));
+            }
+        }
+        // The success value is a frontend pointer the exit run
+        // chases: it must point at STRUCT `crypto_skcipher`.
+        let ret = proto.size_or_type;
+        if ret == 0 {
+            return Err(bad_proto("return is VOID, not a tfm pointer".to_owned()));
+        }
+        let rec = self.rec(self.chase_wrappers(ret)?)?;
+        if rec.kind != KIND_PTR {
+            return Err(bad_proto("return is not a pointer".to_owned()));
+        }
+        let pointee = self.rec(self.chase_wrappers(rec.size_or_type)?)?;
+        if pointee.kind != KIND_STRUCT {
+            return Err(bad_proto(format!(
+                "return points at kind {}, not STRUCT crypto_skcipher",
+                pointee.kind
+            )));
+        }
+        if !self.name_is(pointee, "crypto_skcipher")? {
+            return Err(bad_proto(
+                "return points at the wrong STRUCT, not crypto_skcipher".to_owned(),
+            ));
+        }
+        Ok(id)
+    }
+
+    /// FUNC id of `name` proven to be the destroy shape
+    /// `void (void *, struct crypto_tfm *)` (T07.3): exactly two
+    /// args, arg0 a pointer (the frontend `mem` — pointee
+    /// unchecked: any pointer-typed arg0 carries the frontend
+    /// address, and the tracker classifies null/ERR as a no-op
+    /// release), arg1 a pointer at STRUCT `crypto_tfm` (the
+    /// refcount read lands in it — a wrong pointee would read a
+    /// stranger's word as a refcount), and a VOID return (the
+    /// exit run emits no status — reading a return register from
+    /// a void call would emit garbage as truth).
+    pub(crate) fn destroy_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
+            name: name.to_owned(),
+        })?;
+        let target = self.rec(id)?.size_or_type;
+        let proto = self.rec(target)?;
+        if proto.kind != KIND_FUNC_PROTO {
+            return Err(bad_proto(format!(
+                "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                proto.kind
+            )));
+        }
+        if proto.vlen != 2 {
+            return Err(bad_proto(format!(
+                "prototype takes {} arguments, want exactly 2",
+                proto.vlen
+            )));
+        }
+        let arg0 = read_u32(self.bytes, proto.aux_at + 4, "proto arg0 type")?;
+        let mem = self.rec(self.chase_wrappers(arg0)?)?;
+        if mem.kind != KIND_PTR {
+            return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        let arg1 = read_u32(self.bytes, proto.aux_at + 12, "proto arg1 type")?;
+        let tfm = self.rec(self.chase_wrappers(arg1)?)?;
+        if tfm.kind != KIND_PTR {
+            return Err(bad_proto("arg1 is not a pointer".to_owned()));
+        }
+        let pointee = self.rec(self.chase_wrappers(tfm.size_or_type)?)?;
+        if pointee.kind != KIND_STRUCT {
+            return Err(bad_proto(format!(
+                "arg1 points at kind {}, not STRUCT crypto_tfm",
+                pointee.kind
+            )));
+        }
+        if !self.name_is(pointee, "crypto_tfm")? {
+            return Err(bad_proto(
+                "arg1 points at the wrong STRUCT, not crypto_tfm".to_owned(),
+            ));
+        }
+        if proto.size_or_type != 0 {
+            return Err(bad_proto("return is not VOID".to_owned()));
+        }
+        Ok(id)
+    }
+
+    /// Prove the FUNC_PROTO return at `ret` is EXACTLY a SIGNED
+    /// 32-bit INT (the T07.4 errno gate): nonzero type id, INT
+    /// kind, 4 bytes, 32 bits, zero bit offset, and encoding
+    /// exactly SIGNED — same refusal discipline as
+    /// [`Btf::lifecycle_proto_id`]'s inline gate (a sign, width,
+    /// or encoding change would invert errno reads).
+    fn int_return_exact(&self, ret: u32, name: &str) -> Result<(), BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        if ret == 0 {
+            return Err(bad_proto("return is VOID, not a 32-bit int".to_owned()));
+        }
+        let rec = self.rec(self.chase_wrappers(ret)?)?;
+        if rec.kind != KIND_INT {
+            return Err(bad_proto("return is not an INT".to_owned()));
+        }
+        if rec.size_or_type != 4 {
+            return Err(bad_proto(format!(
+                "return INT is {} bytes, not 4",
+                rec.size_or_type
+            )));
+        }
+        let data = read_u32(self.bytes, rec.aux_at, "int data")?;
+        let (bits, offset, encoding) = (data & 0xff, (data >> 16) & 0xff, (data >> 24) & 0x0f);
+        if bits != 32 {
+            return Err(bad_proto(format!("return INT is {bits} bits, not 32")));
+        }
+        if offset != 0 {
+            return Err(bad_proto(format!(
+                "return INT has bit offset {offset}, not 0"
+            )));
+        }
+        if encoding != 0x01 {
+            return Err(bad_proto(format!(
+                "return INT encoding is {encoding:#x}, not exactly SIGNED"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Prove the FUNC_PROTO argument at `at` is a 4-byte INT (the
+    /// T07.4 length gate): scalar length words travel as unshifted
+    /// `u32` copies — the width pins, the signedness does not (a
+    /// wider scalar would truncate, a non-scalar would misread).
+    fn int_arg_4(&self, at: usize, arg: &str, name: &str) -> Result<(), BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = read_u32(self.bytes, at, "proto arg type")?;
+        let rec = self.rec(self.chase_wrappers(id)?)?;
+        if rec.kind != KIND_INT {
+            return Err(bad_proto(format!("{arg} is not an INT")));
+        }
+        if rec.size_or_type != 4 {
+            return Err(bad_proto(format!(
+                "{arg} INT is {} bytes, not 4",
+                rec.size_or_type
+            )));
+        }
+        Ok(())
+    }
+
+    /// FUNC id of `name` proven to be the setkey shape
+    /// `int (<frontend> *, const u8 *, unsigned int)` (T07.4):
+    /// exactly three arguments, arg0 a pointer (after qualifier
+    /// chase) at STRUCT `frontend` (the joined transform identity
+    /// — a pointer to any other type keys the epoch on a
+    /// stranger's address), arg1 a pointer (the key buffer
+    /// ADDRESS pins the register shape; its pointee is NEVER
+    /// READ — the validator deliberately blesses no pointee, so
+    /// no future reader can mistake validation for a dereference
+    /// license), arg2 a 4-byte INT (the key length), and a SIGNED
+    /// 32-bit INT return (the errno). Corrupt images stay
+    /// [`BtfError::BadBtf`]; well-formed but incompatible
+    /// prototypes are [`BtfError::BadPrototype`].
+    pub(crate) fn setkey_proto_id(&self, name: &str, frontend: &str) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
+            name: name.to_owned(),
+        })?;
+        let target = self.rec(id)?.size_or_type;
+        let proto = self.rec(target)?;
+        if proto.kind != KIND_FUNC_PROTO {
+            return Err(bad_proto(format!(
+                "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                proto.kind
+            )));
+        }
+        if proto.vlen != 3 {
+            return Err(bad_proto(format!(
+                "prototype takes {} arguments, want exactly 3",
+                proto.vlen
+            )));
+        }
+        let arg0 = read_u32(self.bytes, proto.aux_at + 4, "proto arg0 type")?;
+        let ptr = self.rec(self.chase_wrappers(arg0)?)?;
+        if ptr.kind != KIND_PTR {
+            return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        if pointee.kind != KIND_STRUCT {
+            return Err(bad_proto(format!(
+                "arg0 points at kind {}, not STRUCT {frontend}",
+                pointee.kind
+            )));
+        }
+        if !self.name_is(pointee, frontend)? {
+            return Err(bad_proto(format!(
+                "arg0 points at the wrong STRUCT, not {frontend}"
+            )));
+        }
+        let arg1 = read_u32(self.bytes, proto.aux_at + 12, "proto arg1 type")?;
+        let key = self.rec(self.chase_wrappers(arg1)?)?;
+        if key.kind != KIND_PTR {
+            return Err(bad_proto("arg1 is not a pointer".to_owned()));
+        }
+        self.int_arg_4(proto.aux_at + 20, "arg2", name)?;
+        self.int_return_exact(proto.size_or_type, name)?;
+        Ok(id)
+    }
+
+    /// FUNC id of `name` proven to be the setauthsize shape
+    /// `int (struct crypto_aead *, unsigned int)` (T07.4): exactly
+    /// two arguments, arg0 a pointer at STRUCT `crypto_aead` (the
+    /// joined transform identity), arg1 a 4-byte INT (the authsize),
+    /// and a SIGNED 32-bit INT return (the errno). Same
+    /// refuse-on-drift discipline as [`Btf::setkey_proto_id`].
+    pub(crate) fn setauthsize_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self.func_id(name)?.ok_or_else(|| BtfError::MissingFunc {
+            name: name.to_owned(),
+        })?;
+        let target = self.rec(id)?.size_or_type;
+        let proto = self.rec(target)?;
+        if proto.kind != KIND_FUNC_PROTO {
+            return Err(bad_proto(format!(
+                "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                proto.kind
+            )));
+        }
+        if proto.vlen != 2 {
+            return Err(bad_proto(format!(
+                "prototype takes {} arguments, want exactly 2",
+                proto.vlen
+            )));
+        }
+        let arg0 = read_u32(self.bytes, proto.aux_at + 4, "proto arg0 type")?;
+        let ptr = self.rec(self.chase_wrappers(arg0)?)?;
+        if ptr.kind != KIND_PTR {
+            return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        if pointee.kind != KIND_STRUCT {
+            return Err(bad_proto(format!(
+                "arg0 points at kind {}, not STRUCT crypto_aead",
+                pointee.kind
+            )));
+        }
+        if !self.name_is(pointee, "crypto_aead")? {
+            return Err(bad_proto(
+                "arg0 points at the wrong STRUCT, not crypto_aead".to_owned(),
+            ));
+        }
+        self.int_arg_4(proto.aux_at + 12, "arg1", name)?;
+        self.int_return_exact(proto.size_or_type, name)?;
+        Ok(id)
+    }
+
     /// Byte offset of `member` in struct/union `type_name`, descending
     /// into anonymous members (offsets add). TYPEDEF names resolve to
     /// their struct; anything else is missing, never guessed.
     pub(crate) fn member_offset(&self, type_name: &str, member: &str) -> Result<u32, BtfError> {
+        self.member_typed(type_name, member).map(|(off, _)| off)
+    }
+
+    /// Byte offset AND leaf type id of `member` in struct/union
+    /// `type_name` (D3: offsets alone don't prove the dereference
+    /// contract — the shape validators below chase the type id to
+    /// prove pointer targets, embedded bases, name-array extents,
+    /// and counter widths before any BPF read trusts the offset).
+    pub(crate) fn member_typed(
+        &self,
+        type_name: &str,
+        member: &str,
+    ) -> Result<(u32, u32), BtfError> {
         let root = self.find_struct(type_name)?;
         let mut path = [0u32; DESCENT_CAP + 1];
         self.member_at(root, member, 0, &mut path)?
@@ -307,6 +655,131 @@ impl<'a> Btf<'a> {
                 type_name: type_name.to_owned(),
                 member: member.to_owned(),
             })
+    }
+
+    /// Offset of `member` proven to be a pointer at STRUCT/UNION
+    /// `pointee` (wrappers chased on both sides): the BPF chase may
+    /// dereference it and read the pointee at further resolved
+    /// offsets. Anything else (non-pointer, wrong pointee, missing)
+    /// refuses — a valid offset with a lying type would mis-chase.
+    pub(crate) fn member_ptr_to_struct(
+        &self,
+        type_name: &str,
+        member: &str,
+        pointee: &str,
+    ) -> Result<u32, BtfError> {
+        let (off, mtype) = self.member_typed(type_name, member)?;
+        let ptr = self.rec(self.chase_wrappers(mtype)?)?;
+        if ptr.kind != KIND_PTR {
+            return Err(bad(format!(
+                "{type_name}.{member} is kind {}, not a pointer",
+                ptr.kind
+            )));
+        }
+        let target = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        if !matches!(target.kind, KIND_STRUCT | KIND_UNION) {
+            return Err(bad(format!(
+                "{type_name}.{member} points at kind {}, not STRUCT {pointee}",
+                target.kind
+            )));
+        }
+        if !self.name_is(target, pointee)? {
+            return Err(bad(format!(
+                "{type_name}.{member} points at the wrong STRUCT, not {pointee}"
+            )));
+        }
+        Ok(off)
+    }
+
+    /// Offset of `member` proven to be an embedded STRUCT/UNION
+    /// `name` (wrappers chased): the BPF may add further
+    /// member offsets to it directly (no dereference). A pointer,
+    /// scalar, or wrong-typed aggregate refuses — adding into a
+    /// pointer would read the pointer's bytes as a struct.
+    pub(crate) fn member_embedded_struct(
+        &self,
+        type_name: &str,
+        member: &str,
+        name: &str,
+    ) -> Result<u32, BtfError> {
+        let (off, mtype) = self.member_typed(type_name, member)?;
+        let inner = self.rec(self.chase_wrappers(mtype)?)?;
+        if !matches!(inner.kind, KIND_STRUCT | KIND_UNION) {
+            return Err(bad(format!(
+                "{type_name}.{member} is kind {}, not embedded STRUCT {name}",
+                inner.kind
+            )));
+        }
+        if !self.name_is(inner, name)? {
+            return Err(bad(format!(
+                "{type_name}.{member} embeds the wrong STRUCT, not {name}"
+            )));
+        }
+        Ok(off)
+    }
+
+    /// Offset of `member` proven to be a byte array of at least
+    /// `min_len` bytes (ARRAY of 1-byte INT, `nelems` covering the
+    /// BPF copy bound): the bounded string copy may fill `min_len`
+    /// bytes from it. Shorter arrays refuse — copying past the
+    /// member would read the next field as name bytes.
+    pub(crate) fn member_bytes(
+        &self,
+        type_name: &str,
+        member: &str,
+        min_len: u32,
+    ) -> Result<u32, BtfError> {
+        let (off, mtype) = self.member_typed(type_name, member)?;
+        let arr = self.rec(self.chase_wrappers(mtype)?)?;
+        if arr.kind != KIND_ARRAY {
+            return Err(bad(format!(
+                "{type_name}.{member} is kind {}, not a byte ARRAY",
+                arr.kind
+            )));
+        }
+        let (elem, nelems) = self.array_shape(arr)?;
+        let elem_rec = self.rec(self.chase_wrappers(elem)?)?;
+        if elem_rec.kind != KIND_INT || elem_rec.size_or_type != 1 {
+            return Err(bad(format!(
+                "{type_name}.{member} array element is kind {} size {}, not 1-byte INT",
+                elem_rec.kind, elem_rec.size_or_type
+            )));
+        }
+        if nelems < min_len {
+            return Err(bad(format!(
+                "{type_name}.{member} array holds {nelems} bytes, fewer than {min_len}"
+            )));
+        }
+        Ok(off)
+    }
+
+    /// Offset of `member` proven to carry a 4-byte counter at its
+    /// first word (INT ≥ 4 bytes, or STRUCT/UNION ≥ 4 bytes — both
+    /// spellings of `refcount_t`-style counters): the BPF may read
+    /// one u32 there. Pointers, narrower scalars, and smaller
+    /// aggregates refuse — the read width must land inside the
+    /// member on every kernel.
+    pub(crate) fn member_counter(&self, type_name: &str, member: &str) -> Result<u32, BtfError> {
+        let (off, mtype) = self.member_typed(type_name, member)?;
+        let rec = self.rec(self.chase_wrappers(mtype)?)?;
+        let wide_enough =
+            matches!(rec.kind, KIND_INT | KIND_STRUCT | KIND_UNION) && rec.size_or_type >= 4;
+        if !wide_enough {
+            return Err(bad(format!(
+                "{type_name}.{member} is kind {} size {}, not a 4-byte counter",
+                rec.kind, rec.size_or_type
+            )));
+        }
+        Ok(off)
+    }
+
+    /// ARRAY shape: (element type id, element count). Index-type
+    /// ignorance is deliberate (any index addresses the same
+    /// elements); malformed aux refuses.
+    fn array_shape(&self, arr: &TypeRec) -> Result<(u32, u32), BtfError> {
+        let elem = read_u32(self.bytes, arr.aux_at, "array elem_type")?;
+        let nelems = read_u32(self.bytes, arr.aux_at + 8, "array nelems")?;
+        Ok((elem, nelems))
     }
 
     /// Struct/union id for `name`, directly or through one TYPEDEF.
@@ -379,7 +852,9 @@ impl<'a> Btf<'a> {
     }
 
     /// Member search under struct/union `id`: `Ok(None)` when absent
-    /// here (callers keep looking outward). Alignment/bitfield checks
+    /// here (callers keep looking outward). Returns the byte offset
+    /// AND the leaf member's type id (the shape validators chase the
+    /// type; plain offset callers ignore it). Alignment/bitfield checks
     /// apply ONLY to the sought member and to anonymous members on the
     /// descent path (fail-closed: our reads are all byte-aligned, and a
     /// bitfield has no byte offset to read): non-sought members —
@@ -392,7 +867,7 @@ impl<'a> Btf<'a> {
         member: &str,
         depth: usize,
         path: &mut [u32; DESCENT_CAP + 1],
-    ) -> Result<Option<u32>, BtfError> {
+    ) -> Result<Option<(u32, u32)>, BtfError> {
         if depth > DESCENT_CAP || path[..depth].contains(&id) {
             return Ok(None);
         }
@@ -432,17 +907,21 @@ impl<'a> Btf<'a> {
             }
             let base = bits / 8;
             if wanted {
-                return Ok(Some(base));
+                return Ok(Some((base, mtype)));
             }
             if descend {
                 // Anonymous member: descend into struct/union shapes
-                // (through const/typedef wrappers), offsets add.
+                // (through const/typedef wrappers), offsets add; the
+                // LEAF type id propagates (the shape describes the
+                // sought member, not the anonymous carrier).
                 if let Some(tid) = self.anon_target(mtype)?
-                    && let Some(off) = self.member_at(tid, member, depth + 1, path)?
+                    && let Some((off, leaf)) = self.member_at(tid, member, depth + 1, path)?
                 {
-                    return Ok(Some(base.checked_add(off).ok_or_else(|| {
-                        bad("anonymous member offset overflows".to_owned())
-                    })?));
+                    return Ok(Some((
+                        base.checked_add(off)
+                            .ok_or_else(|| bad("anonymous member offset overflows".to_owned()))?,
+                        leaf,
+                    )));
                 }
             }
         }

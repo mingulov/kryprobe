@@ -9,7 +9,7 @@
 //! other profile's cap.
 
 use crate::bpfloader::{LoaderError, MapDims, PointStatus};
-use kryprobe_abi::kcrypto_lifecycle::{LCONFIG_MAGIC, LCONFIG_VERSION};
+use kryprobe_abi::kcrypto_lifecycle::{LCONFIG_DISABLED, LCONFIG_MAGIC, LCONFIG_VERSION};
 
 pub use crate::bpfloader::parse::parse_lifecycle_object;
 
@@ -144,12 +144,38 @@ pub fn acquire_kcrypto_session(profile: LifecycleProfile) -> Result<SessionGuard
     }
 }
 
+/// Prototype shape the bring-up validators pin per site: the op
+/// sites read `(request *) -> int`, the allocation sites read
+/// `(name, type, mask) -> tfm *`, the destroy site reads
+/// `(mem *, tfm *) -> void`, the setkey sites read
+/// `(frontend *, key *, len) -> int`, and the setauthsize site
+/// reads `(aead *, authsize) -> int`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtoShape {
+    /// `int (struct skcipher_request *)` (op sites).
+    Op,
+    /// `struct crypto_skcipher *(const char *, u32, u32)` (alloc sites).
+    Alloc,
+    /// `void (void *, struct crypto_tfm *)` (destroy site).
+    Destroy,
+    /// `int (struct crypto_skcipher *, const u8 *, unsigned int)`
+    /// (skcipher-setkey site).
+    SetkeySk,
+    /// `int (struct crypto_aead *, unsigned int)` (setauthsize site).
+    SetAuthsize,
+    /// `int (struct crypto_aead *, const u8 *, unsigned int)`
+    /// (aead-setkey site).
+    SetkeyAead,
+}
+
 /// One required attach site: kernel symbol with a single fsession
 /// program (W8: entry+return ride one link; both edges required).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequiredSite {
     /// Kernel function name (section suffix after `fsession/`).
     pub symbol: &'static str,
+    /// Prototype shape the validator pins for this symbol.
+    pub shape: ProtoShape,
 }
 
 /// The profile contract: name, required sites, frozen map table.
@@ -164,16 +190,17 @@ pub struct ProfileManifest {
     pub maps: &'static [(&'static str, MapDims)],
 }
 
-/// Program lanes per `LLOSS` class (BPF hook order: enc-sub,
-/// enc-ret, dec-sub, dec-ret); class `c` occupies entries
-/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 4`.
-pub const LLOSS_LANES_PER_CLASS: u32 = 4;
+/// Program lanes per `LLOSS` class (BPF hook order: the 16
+/// `LAGG_*` hooks, enc-sub first; class `c` occupies entries
+/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 16`).
+pub const LLOSS_LANES_PER_CLASS: u32 = 16;
 /// `LLOSS` entries: 5 classes × [`LLOSS_LANES_PER_CLASS`].
 pub const LLOSS_ENTRIES: u32 = 5 * LLOSS_LANES_PER_CLASS;
 
-/// Frozen lifecycle map table (W8 fsession): config, edge ringbuf,
-/// per-CPU loss (5 classes × 4 hook lanes), per-CPU accepted-edge
-/// aggregate, and the per-CPU per-program invocation sequences.
+/// Frozen lifecycle map table (W8 fsession grown to the T07-final
+/// counter shape): config, edge ringbuf, per-CPU loss (5 classes ×
+/// 16 hook lanes), the 16-lane per-CPU accepted-edge aggregate, and
+/// the per-CPU per-program mint sequences (8 site-program lanes).
 /// `LCTR` issues the per-program per-CPU sequences (one lane per
 /// site program — an interrupt can run a different program on the
 /// same CPU, so per-CPU alone lost updates); `LLOSS` lanes fold per
@@ -215,7 +242,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 4,
+            max_entries: 16,
         },
     ),
     (
@@ -224,18 +251,46 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 2,
+            max_entries: 8,
         },
     ),
 ];
 
-/// Required sites for `RequestLifecycle` (T04-qualified api sites).
+/// Required sites for `RequestLifecycle`: the T04-qualified api
+/// sites plus the T07.2 skcipher allocation site (generation
+/// assignment needs alloc entry/return capture) plus the T07.3
+/// destroy site (retire needs destroy entry/return capture —
+/// final-free proof, not inference) plus the T07.4 configuration
+/// sites (epochs need setkey/setauthsize entry/return capture —
+/// scalar lengths + errno, never key bytes).
 const LIFECYCLE_REQUIRED: &[RequiredSite] = &[
     RequiredSite {
         symbol: "crypto_skcipher_encrypt",
+        shape: ProtoShape::Op,
     },
     RequiredSite {
         symbol: "crypto_skcipher_decrypt",
+        shape: ProtoShape::Op,
+    },
+    RequiredSite {
+        symbol: "crypto_alloc_skcipher",
+        shape: ProtoShape::Alloc,
+    },
+    RequiredSite {
+        symbol: "crypto_destroy_tfm",
+        shape: ProtoShape::Destroy,
+    },
+    RequiredSite {
+        symbol: "crypto_skcipher_setkey",
+        shape: ProtoShape::SetkeySk,
+    },
+    RequiredSite {
+        symbol: "crypto_aead_setauthsize",
+        shape: ProtoShape::SetAuthsize,
+    },
+    RequiredSite {
+        symbol: "crypto_aead_setkey",
+        shape: ProtoShape::SetkeyAead,
     },
 ];
 
@@ -257,7 +312,7 @@ pub fn manifest(profile: LifecycleProfile) -> ProfileManifest {
 }
 
 /// Program limit derived from the profile's own manifest: one program
-/// per required site (W8 fsession: 2; `ApiReturns` keeps its frozen 16).
+/// per required site (T07.4 fsession: 7; `ApiReturns` keeps its frozen 16).
 #[must_use]
 pub fn max_programs(manifest: &ProfileManifest) -> usize {
     if manifest.required.is_empty() {
@@ -286,8 +341,8 @@ pub fn section_allowed(profile: LifecycleProfile, section: &str) -> bool {
 /// did not reach [`PointStatus::Loaded`] (missing section, missing
 /// BTF id, or refused load all count — a refused point is not a
 /// loaded point). Empty means lifecycle startup may proceed; the
-/// loader refuses startup otherwise (no per-point degrade: one site
-/// alone cannot observe both operations).
+/// loader refuses startup otherwise (no per-point degrade: a subset
+/// of the sites cannot observe the full lifecycle).
 #[must_use]
 pub fn missing_required_points(statuses: &[(&str, &PointStatus)]) -> Vec<String> {
     let table = manifest(LifecycleProfile::RequestLifecycle);
@@ -335,15 +390,49 @@ pub fn required_gate_error(
     }
 }
 
-/// The 64 bytes the loader writes to `LCFG` key 0: magic + version +
-/// zero flags/reserved — the exact words the BPF config gate checks
-/// before arming. The loader reads the map back after writing and
-/// refuses startup on mismatch (zeroed/unwritten configs fail closed).
+/// LCFG v3 arm bytes: magic/version/flags plus the BTF-resolved
+/// chase offsets the transform programs need (`crypto_tfm.__crt_alg`
+/// at 12, `crypto_alg.cra_driver_name` at 16, `crypto_skcipher.base`
+/// at 20, `crypto_tfm.refcnt` at 24 + its presence word at 28,
+/// `skcipher_request.base` at 32, `crypto_async_request.tfm` at
+/// 36); the reserved tail stays zero. The arm refuses before
+/// writing when resolution fails — these words are never zeroed
+/// guesses (a zero offset is only written when BTF resolved zero,
+/// and `refcnt_present` 0 is the honest 7.2 verdict, never a gap).
+/// The loader reads the map back after writing and refuses startup
+/// on mismatch (zeroed/unwritten configs fail closed).
 #[must_use]
-pub fn lifecycle_config_bytes() -> [u8; 64] {
+pub fn lifecycle_config_bytes(off: &crate::btf_resolve::LifecycleOffsets) -> [u8; 64] {
     let mut out = [0u8; 64];
     out[0..4].copy_from_slice(&LCONFIG_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&LCONFIG_VERSION.to_le_bytes());
+    out[12..16].copy_from_slice(&off.tfm_alg.to_le_bytes());
+    out[16..20].copy_from_slice(&off.alg_drv.to_le_bytes());
+    out[20..24].copy_from_slice(&off.sk_base.to_le_bytes());
+    out[24..28].copy_from_slice(&off.refcnt_off.to_le_bytes());
+    out[28..32].copy_from_slice(&u32::from(off.refcnt_present).to_le_bytes());
+    out[32..36].copy_from_slice(&off.req_base.to_le_bytes());
+    out[36..40].copy_from_slice(&off.req_tfm.to_le_bytes());
+    out
+}
+
+/// LCFG disarm bytes (D1): `current` with ONLY the flags word set
+/// to [`LCONFIG_DISABLED`] — magic, version, offsets and tail
+/// preserved bit-for-bit. The disarm path reads the live value and
+/// writes this back (then readback-verifies exact equality), so the
+/// chase words are immutable from arm until the map dies: a hook
+/// racing the disarm observes the armed value or a flags-nonzero
+/// value (gate closed), never valid offsets mixed with zeroed words
+/// (the old whole-value zeroing admitted exactly that mixture — a
+/// racing chase could read `sk_base` 0 with the other offsets valid
+/// and copy kernel code bytes as a well-formed driver name).
+/// Callers pass the live map value (normally the armed bytes, whose
+/// flags are 0 — a one-byte delta); an unwritten/zeroed map disarms
+/// to flags-only (gate still closed on magic), never to armed.
+#[must_use]
+pub fn disarm_config_bytes(current: &[u8; LCFG_VALUE_LEN]) -> [u8; LCFG_VALUE_LEN] {
+    let mut out = *current;
+    out[8..12].copy_from_slice(&LCONFIG_DISABLED.to_le_bytes());
     out
 }
 
@@ -393,16 +482,23 @@ pub enum ConfigVerifyError {
     BadVersion,
     /// Unknown flag bits set.
     BadFlags,
-    /// Nonzero reserved byte.
+    /// Tail mismatch against the written bytes (offset word or
+    /// reserved byte — a corrupted offset would mis-chase in BPF).
     BadReserved {
-        /// Offset of the first nonzero reserved byte.
+        /// Offset of the first mismatching tail byte.
         offset: usize,
     },
 }
 
-/// Validate a full LCFG read-back: exact length, magic, version, zero
-/// flags, zero reserved tail. Any deviation fails closed.
-pub fn verify_lifecycle_config_bytes(bytes: &[u8]) -> Result<(), ConfigVerifyError> {
+/// Validate a full LCFG read-back against the bytes the arm wrote:
+/// exact length, magic, version, zero flags, then byte equality
+/// from 12..64 (offset words plus reserved tail). Any deviation
+/// fails closed — the offsets steer BPF chases, so a shape-only
+/// check would certify a mis-chasing sensor.
+pub fn verify_lifecycle_config_bytes(
+    bytes: &[u8],
+    expected: &[u8; LCFG_VALUE_LEN],
+) -> Result<(), ConfigVerifyError> {
     if bytes.len() != LCFG_VALUE_LEN {
         return Err(ConfigVerifyError::BadLength { got: bytes.len() });
     }
@@ -413,8 +509,13 @@ pub fn verify_lifecycle_config_bytes(bytes: &[u8]) -> Result<(), ConfigVerifyErr
         Err(ConfigError::BadVersion) => return Err(ConfigVerifyError::BadVersion),
         Err(ConfigError::BadFlags) => return Err(ConfigVerifyError::BadFlags),
     }
-    if let Some(offset) = bytes.iter().enumerate().skip(12).find(|(_, b)| **b != 0) {
-        return Err(ConfigVerifyError::BadReserved { offset: offset.0 });
+    if let Some((offset, _)) = bytes
+        .iter()
+        .enumerate()
+        .skip(12)
+        .find(|(i, b)| **b != expected[*i])
+    {
+        return Err(ConfigVerifyError::BadReserved { offset });
     }
     Ok(())
 }

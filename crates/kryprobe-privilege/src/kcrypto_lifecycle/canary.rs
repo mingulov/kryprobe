@@ -22,6 +22,7 @@
 //! - Every loss counter must read zero; any close backlog fails.
 
 use crate::kcrypto_lifecycle::decode::DecodeStats;
+use crate::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
 use crate::kcrypto_lifecycle::view::ProgMisses;
 use kryprobe_core::kcrypto::{ReducerStats, RequestRecord, Terminal};
 
@@ -333,12 +334,13 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
 /// Sensor counters at one instant (baselines + final read share it).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SensorBaseline {
-    /// Per-hook consumed edges `[enc-sub, enc-ret, dec-sub, dec-ret]`.
-    pub edge_hits: [u64; 4],
+    /// Per-hook consumed edges in `LAGG_*` lane order (lanes 0–3 are
+    /// the op hooks `[enc-sub, enc-ret, dec-sub, dec-ret]`).
+    pub edge_hits: [u64; 16],
     /// `LLOSS` per-class totals (5 classes).
     pub kernel_loss: [u64; 5],
     /// `LAGG` per-hook accepted totals.
-    pub agg_accepted: [u64; 4],
+    pub agg_accepted: [u64; 16],
     /// Retained completions surfaced so far.
     pub completed_len: u64,
     /// Decoder counters (quiescence + delta verdict; robust to
@@ -359,16 +361,16 @@ pub struct SensorBaseline {
 pub struct SensorView<'a> {
     /// Post-finish completions (every pending request reconciled).
     pub completed: &'a [RequestRecord],
-    /// Final per-hook consumed edges.
-    pub edge_hits: [u64; 4],
+    /// Final per-hook consumed edges (16 `LAGG_*` lanes).
+    pub edge_hits: [u64; 16],
     /// Final decode counters.
     pub decode: DecodeStats,
     /// Final reducer counters.
     pub reducer: ReducerStats,
     /// Final kernel loss.
     pub kernel_loss: [u64; 5],
-    /// Final accepted aggregate.
-    pub agg_accepted: [u64; 4],
+    /// Final accepted aggregate (16 `LAGG_*` lanes).
+    pub agg_accepted: [u64; 16],
     /// Retention drops past the ledger bound.
     pub retained_dropped: u64,
     /// Quiescence-proven pre-GO baseline (deltas measure from here).
@@ -378,9 +380,10 @@ pub struct SensorView<'a> {
     /// M2 sticky identity verdict (must be true: a void identity
     /// voids every exact count in the run).
     pub view_valid: bool,
-    /// Attach count while armed (must be exactly 2 — the two
-    /// fsession session links, W8; captured pre-close since detach
-    /// drops the links before the verdict runs).
+    /// Attach count while armed (must be exactly 3 — the three
+    /// fsession session links, W8 grown by the T07.2 alloc site;
+    /// captured pre-close since detach drops the links before the
+    /// verdict runs).
     pub attached_links: usize,
     /// Foreign tracing links on our attach targets (must be 0 — H4
     /// retirement exclusion: any foreign link may have retired ours).
@@ -416,9 +419,10 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     if !view.view_valid {
         return Err("sensor identity unverified (M2 sticky validity void)".to_owned());
     }
-    if view.attached_links != 2 {
+    let want_links = manifest(LifecycleProfile::RequestLifecycle).required.len();
+    if view.attached_links != want_links {
         return Err(format!(
-            "want exactly 2 session links, have {}",
+            "want exactly {want_links} session links, have {}",
             view.attached_links
         ));
     }
@@ -432,10 +436,10 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         a.checked_sub(b)
             .ok_or_else(|| format!("counter {what} ran backwards"))
     };
-    let mut hits_d = [0u64; 4];
+    let mut hits_d = [0u64; 16];
     let mut loss_d = [0u64; 5];
-    let mut agg_d = [0u64; 4];
-    for i in 0..4 {
+    let mut agg_d = [0u64; 16];
+    for i in 0..16 {
         hits_d[i] = sub(view.edge_hits[i], view.baseline.edge_hits[i], "edge_hits")?;
         agg_d[i] = sub(
             view.agg_accepted[i],
@@ -595,9 +599,13 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         return Err(format!("unknown scenario {scenario}"));
     }
     let expected_hits = truth.expected_hooks();
-    if hits_d != expected_hits {
+    // Op lanes only: lanes 4+ are transform hooks with no
+    // fixture-derived truth until T07.6 (the per-lane equation above
+    // still binds every accepted transform edge to a consumed one).
+    let op_hits = [hits_d[0], hits_d[1], hits_d[2], hits_d[3]];
+    if op_hits != expected_hits {
         return Err(format!(
-            "edge hits {hits_d:?} != fixture-derived {expected_hits:?}"
+            "edge hits {op_hits:?} != fixture-derived {expected_hits:?}"
         ));
     }
     let admitted_d = sub(
@@ -916,7 +924,7 @@ mod tests {
         let misses = vec![miss_abs("fsession/a", 11, 3), miss_abs("fsession/b", 12, 0)];
         SensorView {
             completed,
-            edge_hits: [1, 1, 1, 1],
+            edge_hits: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             decode: DecodeStats {
                 admitted: 2,
                 ..DecodeStats::default()
@@ -927,7 +935,7 @@ mod tests {
                 ..ReducerStats::default()
             },
             kernel_loss: [0; 5],
-            agg_accepted: [1, 1, 1, 1],
+            agg_accepted: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             retained_dropped: 0,
             baseline: SensorBaseline {
                 prog_misses: misses.clone(),
@@ -935,7 +943,7 @@ mod tests {
             },
             quiet_backlog_bytes: 0,
             view_valid: true,
-            attached_links: 2,
+            attached_links: 7,
             foreign_links: 0,
             prog_misses: misses,
         }
@@ -1071,8 +1079,8 @@ mod tests {
         let truth = parse_transcript(&text, run).expect("valid async transcript");
         let completed = [record(1, Terminal::Unknown)];
         let mut view = sync_view(&completed);
-        view.edge_hits = [1, 1, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0];
+        view.edge_hits = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -1082,8 +1090,8 @@ mod tests {
         // produce the async shape it exists to prove.
         let completed = [record(1, Terminal::Sync(0))];
         let mut view = sync_view(&completed);
-        view.edge_hits = [1, 1, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0];
+        view.edge_hits = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -1097,7 +1105,7 @@ mod tests {
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
         // Equation: agg 5 != hits 4 + reserve 0 + noslot 0.
         let mut view = sync_view(&completed);
-        view.agg_accepted = [2, 1, 1, 1];
+        view.agg_accepted = [2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("equation must hold");
         assert!(err.contains("reconciliation"), "names it: {err}");
         // Any loss counter fails.
@@ -1113,7 +1121,7 @@ mod tests {
         verdict("sync-once", &truth, &view).expect_err("backlog must fail");
         // Backwards counters fail (no silent reset absorb).
         let mut view = sync_view(&completed);
-        view.baseline.edge_hits = [9, 9, 9, 9];
+        view.baseline.edge_hits = [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         verdict("sync-once", &truth, &view).expect_err("backwards must fail");
         // Fixture self-check failure fails.
         let mut truth = sync_truth();
@@ -1122,8 +1130,30 @@ mod tests {
     }
 
     #[test]
+    fn verdict_equation_covers_transform_lanes() {
+        // T07.2: the per-lane equation binds lanes 4+ exactly like
+        // op lanes (no fixture truth there yet — T07.6 — but every
+        // accepted transform edge must still be consumed once).
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut view = sync_view(&completed);
+        view.edge_hits[4] = 1;
+        view.edge_hits[5] = 1;
+        view.agg_accepted[4] = 1;
+        view.agg_accepted[5] = 1;
+        verdict("sync-once", &truth, &view).expect("matched transform lanes green");
+        let mut view = sync_view(&completed);
+        view.edge_hits[4] = 1;
+        view.edge_hits[5] = 1;
+        view.agg_accepted[4] = 2;
+        view.agg_accepted[5] = 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("alloc-lane skew must fail");
+        assert!(err.contains("reconciliation"), "names it: {err}");
+    }
+
+    #[test]
     fn verdict_void_identity_or_links_fail() {
-        // W8/H4: a void M2 identity, a non-2 link count, or any
+        // W8/H4: a void M2 identity, a short link count, or any
         // foreign link on our targets fails the run — exact counts
         // are void without identity + retirement exclusion.
         let truth = sync_truth();
@@ -1135,7 +1165,15 @@ mod tests {
         let mut view = sync_view(&completed);
         view.attached_links = 1;
         let err = verdict("sync-once", &truth, &view).expect_err("1 link must fail");
-        assert!(err.contains("2 session links"), "names it: {err}");
+        assert!(err.contains("7 session links"), "names it: {err}");
+        // Every earlier count is no longer a full attach: all 7
+        // sites must be linked.
+        for short in [2, 3, 4, 6] {
+            let mut view = sync_view(&completed);
+            view.attached_links = short;
+            let err = verdict("sync-once", &truth, &view).expect_err("short attach must fail");
+            assert!(err.contains("7 session links"), "names it: {err}");
+        }
         let mut view = sync_view(&completed);
         view.foreign_links = 1;
         let err = verdict("sync-once", &truth, &view).expect_err("foreign link must fail");
@@ -1164,13 +1202,13 @@ mod tests {
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
         let mut view = sync_view(&completed);
-        view.baseline.edge_hits = [5, 5, 5, 5];
-        view.baseline.agg_accepted = [5, 5, 5, 5];
+        view.baseline.edge_hits = [5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.baseline.agg_accepted = [5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         view.baseline.decode.admitted = 7;
         view.baseline.reducer.admitted = 7;
         view.baseline.reducer.emitted = 7;
-        view.edge_hits = [6, 6, 6, 6];
-        view.agg_accepted = [6, 6, 6, 6];
+        view.edge_hits = [6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 9;
         view.reducer.admitted = 9;
         view.reducer.emitted = 9;
@@ -1317,7 +1355,7 @@ mod tests {
         // Per-lane reconciliation: permuted aggregates fail even
         // when totals match ([4,0,0,0] vs [1,1,1,1]).
         let mut view = sync_view(&completed);
-        view.agg_accepted = [4, 0, 0, 0];
+        view.agg_accepted = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("permuted agg must fail");
         assert!(err.contains("per-lane"), "names it: {err}");
     }
@@ -1354,8 +1392,8 @@ mod tests {
         }];
         let view = SensorView {
             completed: &completed,
-            edge_hits: [1, 1, 0, 0],
-            agg_accepted: [1, 1, 0, 0],
+            edge_hits: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            agg_accepted: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             kernel_loss: [0; 5],
             decode: DecodeStats {
                 admitted: 1,
@@ -1371,7 +1409,7 @@ mod tests {
             baseline: SensorBaseline::default(),
             quiet_backlog_bytes: 0,
             view_valid: true,
-            attached_links: 2,
+            attached_links: 7,
             foreign_links: 0,
             prog_misses: Vec::new(),
         };

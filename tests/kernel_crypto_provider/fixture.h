@@ -4,13 +4,21 @@
  *
  * Ledger row contract (JSONL, parsed by testkit
  * kernel_crypto_ledger; unknown fields ignored):
- *   alloc:    {"v":1,"run":R,"seq":N,"phase":"alloc","req":R,"drv":D,...}
+ *   alloc:    {"v":1,"run":R,"seq":N,"phase":"alloc","req":R,"drv":D,
+ *              "type":T,"mask":M,...}
  *   submit:   {"v":1,"run":R,"seq":N,"phase":"submit","op":O,"len":L,...}
  *   return:   {"v":1,"run":R,"seq":N,"phase":"return","errno":E,...}
  *   progress: {"v":1,"run":R,"seq":N,"phase":"progress","errno":E,...}
  *     (waiter-side in-flight marker, never a kernel callback)
  *   terminal: {"v":1,"run":R,"seq":N,"phase":"terminal","errno":E,...}
+ *   config:   {"v":1,"run":R,"seq":N,"phase":"config","op":O,
+ *              "errno":E,"len":L,...}
+ *     (metadata-only configuration truth: op is setkey or
+ *     setauthsize, errno the native result, len the key/authsize
+ *     length offered — lengths only, never key/tag/IV bytes)
  *   free:     {"v":1,"run":R,"seq":N,"phase":"free","final":B,...}
+ *     (one row per put: a shared transform lands several; the
+ *     last final flag decides finality)
  *   done:     {"v":1,"run":R,"phase":"done","fixture_result":F,
  *              "overflow":C,...}
  * Every row also carries "ts" (ktime ns) and, where meaningful,
@@ -22,7 +30,10 @@
  * Structural strictness (enforced by testkit kernel_crypto_ledger):
  * every request needs submit, return and terminal rows; op/req/drv
  * are non-empty; return/progress/terminal carry errno; free
- * carries final; DONE carries overflow; no row follows DONE.
+ * carries final (repeatable per seq, last wins); config carries
+ * op/errno/len (repeatable per seq, requires a prior alloc);
+ * alloc carries u32 type/mask provenance; DONE carries overflow;
+ * no row follows DONE.
  */
 #ifndef KXC_FIXTURE_H
 #define KXC_FIXTURE_H
@@ -67,6 +78,8 @@ bool kxc_run_stop_requested(struct kxc_run *run);
 void kxc_run_request_stop(struct kxc_run *run);
 const char *kxc_sync_driver_name(void);
 const char *kxc_async_driver_name(void);
+const char *kxc_fail_driver_name(void);
+const char *kxc_aead_driver_name(void);
 void kxc_flush_work(void);
 void kxc_drain_kick(void);
 void kxc_set_submit_hold(bool hold);

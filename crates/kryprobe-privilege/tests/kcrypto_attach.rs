@@ -21,7 +21,9 @@ use kryprobe_privilege::bpfloader::{
     KCRYPTO_MAPS, LoaderError, PointStatus, check_pin_name, load_kcrypto, parse_kcrypto_object,
     parse_spine_object, pin_fd,
 };
-use kryprobe_privilege::btf_resolve::{KCRYPTO_SYMBOLS, resolve_btf_ids, resolve_offsets};
+use kryprobe_privilege::btf_resolve::{
+    KCRYPTO_SYMBOLS, resolve_aggregate_offsets, resolve_btf_ids, resolve_lifecycle_offsets,
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -180,7 +182,7 @@ fn resolve_offsets_are_structural() {
         println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
         return;
     }
-    let off = resolve_offsets().expect("offsets must resolve");
+    let off = resolve_aggregate_offsets().expect("offsets must resolve");
     // Structural only (exact values are host-coupled; the synthetic
     // unit test in `btf_resolve` pins exactness).
     for (name, value) in [
@@ -200,6 +202,35 @@ fn resolve_offsets_are_structural() {
         off.alg_drv > off.alg_name,
         "driver name sits past the name: {off:?}"
     );
+}
+
+#[test]
+fn resolve_lifecycle_offsets_are_structural() {
+    // D3: the shape-validated lifecycle set resolves on the live
+    // host BTF (structural only — exact values are host-coupled;
+    // the synthetic typed fixture pins exactness + refusals).
+    if !btf_available() {
+        println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
+        return;
+    }
+    let off = resolve_lifecycle_offsets().expect("lifecycle offsets must resolve");
+    for (name, value) in [
+        ("tfm_alg", off.tfm_alg),
+        ("alg_drv", off.alg_drv),
+        ("sk_base", off.sk_base),
+        ("req_base", off.req_base),
+        ("req_tfm", off.req_tfm),
+        ("refcnt_off", off.refcnt_off),
+    ] {
+        assert!(value < 4096, "{name}={value} out of range");
+    }
+    // Cross-consumer agreement: the lifecycle request link resolves
+    // the same members the aggregate identity chain uses.
+    let agg = resolve_aggregate_offsets().expect("aggregate offsets must resolve");
+    assert_eq!(off.req_base, agg.sk_req_base, "same skcipher_request.base");
+    assert_eq!(off.req_tfm, agg.async_tfm, "same async_request.tfm");
+    assert_eq!(off.tfm_alg, agg.tfm_alg, "same tfm.__crt_alg");
+    assert_eq!(off.alg_drv, agg.alg_drv, "same cra_driver_name");
 }
 
 fn is_root() -> bool {

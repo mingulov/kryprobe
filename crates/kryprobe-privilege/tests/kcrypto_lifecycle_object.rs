@@ -11,11 +11,26 @@
 
 use kryprobe_privilege::bpfloader::{LoaderError, MapDims, PointStatus};
 use kryprobe_privilege::btf_resolve::{
-    BtfError, resolve_lifecycle_ids, resolve_lifecycle_ids_from,
+    BtfError, LifecycleOffsets, resolve_lifecycle_ids, resolve_lifecycle_ids_from,
 };
+
+/// Canned chase offsets for LCFG v3 byte tests (values mirror the
+/// typed lifecycle fixture: tfm_alg 32, alg_drv 188, sk_base 8,
+/// req_base 32, req_tfm 32, refcnt 40 + present).
+fn test_offsets() -> LifecycleOffsets {
+    LifecycleOffsets {
+        tfm_alg: 32,
+        alg_drv: 188,
+        sk_base: 8,
+        req_base: 32,
+        req_tfm: 32,
+        refcnt_off: 40,
+        refcnt_present: true,
+    }
+}
 use kryprobe_privilege::kcrypto_lifecycle::profile::{
     ConfigVerifyError, LCFG_VALUE_LEN, LIFECYCLE_MAPS, LifecycleProfile, SessionBusy,
-    acquire_kcrypto_session, lifecycle_config_bytes, manifest, max_programs,
+    acquire_kcrypto_session, disarm_config_bytes, lifecycle_config_bytes, manifest, max_programs,
     missing_required_points, parse_lifecycle_object, required_gate_error, section_allowed,
     validate_lifecycle_config, validate_member, verify_lifecycle_config_bytes,
 };
@@ -25,22 +40,35 @@ fn h01_lifecycle_manifest_requires_both_sites() {
     // The T06 profile observes the two T04-qualified api sites (W8:
     // one fsession program per site runs at entry AND return — both
     // edges ride one link; anything less cannot observe both ops).
+    // T07.2 adds the skcipher allocation site (generation assignment
+    // needs alloc entry/return capture). T07.3 adds the destroy site
+    // (retire needs destroy entry/return capture). T07.4 adds the
+    // three configuration sites (epochs need setkey/setauthsize
+    // entry/return capture).
     let m = manifest(LifecycleProfile::RequestLifecycle);
     assert_eq!(m.name, "request-lifecycle");
     let sites: Vec<&str> = m.required.iter().map(|s| s.symbol).collect();
     assert_eq!(
         sites,
-        ["crypto_skcipher_encrypt", "crypto_skcipher_decrypt"]
+        [
+            "crypto_skcipher_encrypt",
+            "crypto_skcipher_decrypt",
+            "crypto_alloc_skcipher",
+            "crypto_destroy_tfm",
+            "crypto_skcipher_setkey",
+            "crypto_aead_setauthsize",
+            "crypto_aead_setkey"
+        ]
     );
 }
 
 #[test]
 fn h01_program_limit_derives_from_manifest_not_global_cap() {
-    // One fsession program per required site = 2; the api-returns
+    // One fsession program per required site = 7; the api-returns
     // 16-program cap is a different profile's limit and must not leak
     // across.
     let lc = manifest(LifecycleProfile::RequestLifecycle);
-    assert_eq!(max_programs(&lc), 2);
+    assert_eq!(max_programs(&lc), 7);
     let api = manifest(LifecycleProfile::ApiReturns);
     assert_eq!(max_programs(&api), 16);
     assert_ne!(max_programs(&lc), max_programs(&api));
@@ -82,10 +110,11 @@ fn h01_api_returns_sections_stay_fexit_only() {
 #[test]
 fn h01_lifecycle_map_table_is_exact_and_dot_free() {
     // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss,
-    // 5 classes x 4 hook lanes), LAGG (per-CPU accepted aggregate),
-    // LCTR (per-CPU per-program invocation sequence): the W8 T06
-    // contract the BPF object must match byte-for-byte (pairing state
-    // is kernel-owned — no slot, quarantine, or overflow tables).
+    // 5 classes x 16 hook lanes), LAGG (per-CPU accepted aggregate,
+    // 16 lanes), LCTR (per-CPU per-program mint sequence, 8 lanes):
+    // the W8 T06 contract grown to the T07-final counter shape the
+    // BPF object must match byte-for-byte (pairing state is
+    // kernel-owned — no slot, quarantine, or overflow tables).
     assert_eq!(LIFECYCLE_MAPS.len(), 5);
     let names: Vec<&str> = LIFECYCLE_MAPS.iter().map(|(n, _)| *n).collect();
     assert_eq!(names, ["LCFG", "LRING", "LLOSS", "LAGG", "LCTR"]);
@@ -123,7 +152,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 20,
+            max_entries: 80,
         }
     );
     assert_eq!(
@@ -132,7 +161,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 4,
+            max_entries: 16,
         }
     );
     assert_eq!(
@@ -141,7 +170,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 2,
+            max_entries: 8,
         }
     );
 }
@@ -149,11 +178,14 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
 #[test]
 fn h01_zeroed_config_fails_closed() {
     // All-zero LCFG (unwritten map read-back) never arms the sensor;
-    // only the exact magic+version arms it.
+    // only the exact magic+version arms it (T07.3: version 3 — older
+    // bytes disarm, versions never mix).
     assert!(validate_lifecycle_config(0, 0, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 0, 0).is_err());
-    assert!(validate_lifecycle_config(0, 1, 0).is_err());
-    assert!(validate_lifecycle_config(0x31434c4b, 1, 0).is_ok());
+    assert!(validate_lifecycle_config(0, 3, 0).is_err());
+    assert!(validate_lifecycle_config(0x31434c4b, 1, 0).is_err());
+    assert!(validate_lifecycle_config(0x31434c4b, 2, 0).is_err());
+    assert!(validate_lifecycle_config(0x31434c4b, 3, 0).is_ok());
 }
 
 #[test]
@@ -161,34 +193,166 @@ fn f1_lcfg_readback_validates_full_64_bytes() {
     // Round-1 finding (sol-M1/astra-M1): the verify path read the
     // 64-byte LCFG value into an 8-byte u64 (56-byte stack overwrite).
     // The read-back verifier takes the full 64 bytes: short reads fail
-    // closed, and every word (magic/version/flags/reserved) must match.
-    let good = lifecycle_config_bytes();
+    // closed, and every word (magic/version/flags/tail) must match.
+    // T07: the tail verifies against the WRITTEN bytes (offset words
+    // ride there now — shape-only would certify a mis-chaser).
+    use kryprobe_privilege::btf_resolve::LifecycleOffsets;
+    let off = LifecycleOffsets {
+        tfm_alg: 32,
+        alg_drv: 188,
+        sk_base: 8,
+        req_base: 0,
+        req_tfm: 0,
+        refcnt_off: 0,
+        refcnt_present: false,
+    };
+    let good = lifecycle_config_bytes(&off);
     assert_eq!(good.len(), 64);
-    assert!(verify_lifecycle_config_bytes(&good).is_ok());
+    assert!(verify_lifecycle_config_bytes(&good, &good).is_ok());
     assert!(matches!(
-        verify_lifecycle_config_bytes(&good[..8]),
+        verify_lifecycle_config_bytes(&good[..8], &good),
         Err(ConfigVerifyError::BadLength { got: 8 })
     ));
     assert!(matches!(
-        verify_lifecycle_config_bytes(&[0u8; 64]),
+        verify_lifecycle_config_bytes(&[0u8; 64], &good),
         Err(ConfigVerifyError::BadMagic)
     ));
     let mut bad_version = good;
     bad_version[4] = 0x7f;
     assert!(matches!(
-        verify_lifecycle_config_bytes(&bad_version),
+        verify_lifecycle_config_bytes(&bad_version, &good),
         Err(ConfigVerifyError::BadVersion)
     ));
     let mut bad_flags = good;
     bad_flags[8] = 1;
+    // (Byte 8 = 1 is exactly the disarmed shape — the ARM verifier
+    // rightly refuses it; arming a disarmed value is never valid.)
     assert!(matches!(
-        verify_lifecycle_config_bytes(&bad_flags),
+        verify_lifecycle_config_bytes(&bad_flags, &good),
         Err(ConfigVerifyError::BadFlags)
     ));
     let mut bad_reserved = good;
     bad_reserved[63] = 1;
     assert!(matches!(
-        verify_lifecycle_config_bytes(&bad_reserved),
+        verify_lifecycle_config_bytes(&bad_reserved, &good),
+        Err(ConfigVerifyError::BadReserved { offset: 63 })
+    ));
+}
+
+#[test]
+fn t07_lcfg_disarm_flips_flags_word_only() {
+    // D1: the disarm preserves magic/version/offsets/tail
+    // bit-for-bit and sets ONLY the flags word to LCONFIG_DISABLED
+    // — a hook racing the disarm never mixes valid offsets with
+    // zeroed words. From armed bytes (flags 0) the delta is exactly
+    // one byte (byte 8: 0 -> 1), which cannot tear under concurrent
+    // aligned-word readers.
+    use kryprobe_abi::kcrypto_lifecycle::LCONFIG_DISABLED;
+    use kryprobe_privilege::btf_resolve::LifecycleOffsets;
+    let off = LifecycleOffsets {
+        tfm_alg: 32,
+        alg_drv: 188,
+        sk_base: 8,
+        req_base: 0,
+        req_tfm: 0,
+        refcnt_off: 0,
+        refcnt_present: false,
+    };
+    let armed = lifecycle_config_bytes(&off);
+    let disarmed = disarm_config_bytes(&armed);
+    let diffs: Vec<usize> = (0..LCFG_VALUE_LEN)
+        .filter(|&i| armed[i] != disarmed[i])
+        .collect();
+    assert_eq!(diffs, vec![8], "single-byte delta at byte 8");
+    assert_eq!(
+        u32::from_le_bytes([disarmed[8], disarmed[9], disarmed[10], disarmed[11]]),
+        LCONFIG_DISABLED,
+        "flags word carries DISABLED"
+    );
+    assert_eq!(&armed[..8], &disarmed[..8], "magic+version intact");
+    assert_eq!(&armed[12..], &disarmed[12..], "offsets+tail intact");
+    // Idempotent (a second disarm pass changes nothing) and safe on
+    // an unwritten map (flags-only: gate still closed on magic).
+    assert_eq!(disarm_config_bytes(&disarmed), disarmed, "idempotent");
+    let zero_disarmed = disarm_config_bytes(&[0u8; LCFG_VALUE_LEN]);
+    assert_eq!(
+        u32::from_le_bytes([
+            zero_disarmed[8],
+            zero_disarmed[9],
+            zero_disarmed[10],
+            zero_disarmed[11]
+        ]),
+        LCONFIG_DISABLED,
+        "zero map disarms to flags-only"
+    );
+    assert!(zero_disarmed[..8].iter().all(|b| *b == 0));
+    assert!(zero_disarmed[12..].iter().all(|b| *b == 0));
+    // The disarmed shape fails the ARM verifier (flags nonzero) —
+    // disarming never produces an armable value.
+    assert!(matches!(
+        verify_lifecycle_config_bytes(&disarmed, &armed),
+        Err(ConfigVerifyError::BadFlags)
+    ));
+}
+
+#[test]
+fn t07_lcfg_v3_carries_chase_offsets() {
+    // T07.3: the arm writes the BTF-resolved chase offsets into the
+    // config words (version 3: chase + refcount + request-link
+    // words); the reserved tail stays zero.
+    use kryprobe_privilege::btf_resolve::LifecycleOffsets;
+    let off = LifecycleOffsets {
+        tfm_alg: 32,
+        alg_drv: 188,
+        sk_base: 8,
+        req_base: 48,
+        req_tfm: 52,
+        refcnt_off: 40,
+        refcnt_present: true,
+    };
+    let bytes = lifecycle_config_bytes(&off);
+    assert_eq!(bytes.len(), 64);
+    let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    assert_eq!(word(0), 0x31434c4b, "magic");
+    assert_eq!(word(4), 3, "version 3");
+    assert_eq!(word(8), 0, "flags");
+    assert_eq!(word(12), 32, "tfm_alg");
+    assert_eq!(word(16), 188, "alg_drv");
+    assert_eq!(word(20), 8, "sk_base");
+    assert_eq!(word(24), 40, "refcnt_off");
+    assert_eq!(word(28), 1, "refcnt_present");
+    assert_eq!(word(32), 48, "req_base");
+    assert_eq!(word(36), 52, "req_tfm");
+    assert!(bytes[40..].iter().all(|b| *b == 0), "reserved tail zero");
+}
+
+#[test]
+fn t07_lcfg_verify_checks_tail_against_written() {
+    // T07: the read-back must equal the written bytes in full — a
+    // corrupted offset word would mis-chase in BPF, so shape-only
+    // verification no longer suffices.
+    use kryprobe_privilege::btf_resolve::LifecycleOffsets;
+    let off = LifecycleOffsets {
+        tfm_alg: 32,
+        alg_drv: 188,
+        sk_base: 8,
+        req_base: 0,
+        req_tfm: 0,
+        refcnt_off: 0,
+        refcnt_present: false,
+    };
+    let good = lifecycle_config_bytes(&off);
+    assert!(verify_lifecycle_config_bytes(&good, &good).is_ok());
+    let mut bad_off = good;
+    bad_off[12] ^= 0xff;
+    assert!(matches!(
+        verify_lifecycle_config_bytes(&bad_off, &good),
+        Err(ConfigVerifyError::BadReserved { offset: 12 })
+    ));
+    let mut bad_tail = good;
+    bad_tail[63] = 1;
+    assert!(matches!(
+        verify_lifecycle_config_bytes(&bad_tail, &good),
         Err(ConfigVerifyError::BadReserved { offset: 63 })
     ));
 }
@@ -239,7 +403,10 @@ fn f1_lcfg_value_len_matches_manifest() {
         .find(|(name, _)| *name == "LCFG")
         .expect("LCFG in manifest");
     assert_eq!(dims.value_size as usize, LCFG_VALUE_LEN);
-    assert_eq!(lifecycle_config_bytes().len(), LCFG_VALUE_LEN);
+    assert_eq!(
+        lifecycle_config_bytes(&test_offsets()).len(),
+        LCFG_VALUE_LEN
+    );
 }
 
 #[test]
@@ -411,14 +578,19 @@ fn build_lifecycle_fixture(prog_sections: &[&str], maps: &[(&str, MapDims)]) -> 
     out
 }
 
-/// The T06 contract as a fixture: one fsession program per api site
-/// plus the exact frozen map table.
+/// The T07 contract as a fixture: one fsession program per required
+/// site plus the exact frozen map table.
 fn valid_lifecycle_fixture() -> Vec<u8> {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
     build_lifecycle_fixture(
         &[
             "fsession/crypto_skcipher_encrypt",
             "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+            "fsession/crypto_skcipher_setkey",
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
         ],
         &maps,
     )
@@ -429,7 +601,7 @@ fn h02_valid_session_object_parses() {
     let bytes = valid_lifecycle_fixture();
     let parsed = parse_lifecycle_object(&bytes).expect("valid fixture must parse");
     assert_eq!(parsed.maps.len(), 5);
-    assert_eq!(parsed.programs.len(), 2);
+    assert_eq!(parsed.programs.len(), 7);
     for prog in &parsed.programs {
         assert_eq!(prog.insns.len(), 1, "{} stream drifted", prog.name);
     }
@@ -444,6 +616,51 @@ fn h02_missing_required_site_refused_by_name() {
     let msg = format!("{err:?}");
     assert!(
         msg.contains("crypto_skcipher_decrypt"),
+        "refusal names the site: {msg}"
+    );
+}
+
+#[test]
+fn h02_pre_destroy_object_refused_by_name() {
+    // T07.3: the 3-program T07.2 shape (no destroy site) no longer
+    // satisfies the manifest — the refusal names the missing site
+    // (no silent partial bring-up off a stale object).
+    let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
+    let bytes = build_lifecycle_fixture(
+        &[
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+        ],
+        &maps,
+    );
+    let err = parse_lifecycle_object(&bytes).expect_err("missing destroy must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("crypto_destroy_tfm"),
+        "refusal names the site: {msg}"
+    );
+}
+
+#[test]
+fn h02_pre_config_object_refused_by_name() {
+    // T07.4: the 4-program T07.3 shape (no configuration sites) no
+    // longer satisfies the manifest — the refusal names the first
+    // missing site (no silent partial bring-up off a stale object).
+    let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
+    let bytes = build_lifecycle_fixture(
+        &[
+            "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+        ],
+        &maps,
+    );
+    let err = parse_lifecycle_object(&bytes).expect_err("missing setkey must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("crypto_skcipher_setkey"),
         "refusal names the site: {msg}"
     );
 }
@@ -482,6 +699,11 @@ fn h02_extra_map_refused() {
         &[
             "fsession/crypto_skcipher_encrypt",
             "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+            "fsession/crypto_skcipher_setkey",
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
         ],
         &maps,
     );
@@ -504,6 +726,11 @@ fn h02_duplicate_map_refused_typed() {
         &[
             "fsession/crypto_skcipher_encrypt",
             "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+            "fsession/crypto_skcipher_setkey",
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
         ],
         &maps,
     );
@@ -526,6 +753,11 @@ fn h02_bad_dims_refused() {
         &[
             "fsession/crypto_skcipher_encrypt",
             "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+            "fsession/crypto_skcipher_setkey",
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
         ],
         &maps,
     );
@@ -542,6 +774,11 @@ fn h02_missing_map_refused() {
         &[
             "fsession/crypto_skcipher_encrypt",
             "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+            "fsession/crypto_skcipher_setkey",
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
         ],
         &maps,
     );
@@ -556,13 +793,18 @@ fn h02_too_many_programs_refused_at_manifest_limit() {
         &[
             "fsession/crypto_skcipher_encrypt",
             "fsession/crypto_skcipher_decrypt",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
+            "fsession/crypto_skcipher_setkey",
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
             "fsession/crypto_skcipher_extra",
         ],
         &maps,
     );
-    let err = parse_lifecycle_object(&bytes).expect_err("3rd program must refuse");
+    let err = parse_lifecycle_object(&bytes).expect_err("8th program must refuse");
     let msg = format!("{err:?}");
-    assert!(msg.contains('2'), "refusal names the manifest limit: {msg}");
+    assert!(msg.contains('7'), "refusal names the manifest limit: {msg}");
 }
 
 /// Workspace-relative path of the built lifecycle object.
@@ -594,8 +836,13 @@ fn h02_built_object_matches_manifest() {
     assert_eq!(
         sections,
         [
+            "fsession/crypto_aead_setauthsize",
+            "fsession/crypto_aead_setkey",
+            "fsession/crypto_alloc_skcipher",
+            "fsession/crypto_destroy_tfm",
             "fsession/crypto_skcipher_decrypt",
             "fsession/crypto_skcipher_encrypt",
+            "fsession/crypto_skcipher_setkey",
         ]
     );
     assert_eq!(parsed.maps.len(), LIFECYCLE_MAPS.len());
@@ -659,7 +906,7 @@ fn w8_built_object_codegen_pins_kfunc_stubs() {
     assert_eq!(call_relocs, 0, "kfunc stubs must carry no relocations");
     // Pinned sentinel sites + helper-only remainder, per program.
     let parsed = parse_lifecycle_object(&bytes).expect("built object must parse");
-    assert_eq!(parsed.programs.len(), 2);
+    assert_eq!(parsed.programs.len(), 7);
     for prog in &parsed.programs {
         let mut is_return = 0usize;
         let mut cookie = 0usize;
@@ -695,9 +942,14 @@ fn bringup_resolve_finds_manifest_symbols() {
         return;
     }
     let ids = resolve_lifecycle_ids().expect("manifest symbols must resolve");
-    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.len(), 7);
     assert!(ids.contains_key("crypto_skcipher_encrypt"));
     assert!(ids.contains_key("crypto_skcipher_decrypt"));
+    assert!(ids.contains_key("crypto_alloc_skcipher"));
+    assert!(ids.contains_key("crypto_destroy_tfm"));
+    assert!(ids.contains_key("crypto_skcipher_setkey"));
+    assert!(ids.contains_key("crypto_aead_setauthsize"));
+    assert!(ids.contains_key("crypto_aead_setkey"));
     for (name, id) in &ids {
         assert_ne!(*id, 0, "{name} resolved to null id");
     }
@@ -724,19 +976,29 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
     let all = [
         loaded("fsession/crypto_skcipher_encrypt"),
         loaded("fsession/crypto_skcipher_decrypt"),
+        loaded("fsession/crypto_alloc_skcipher"),
+        loaded("fsession/crypto_destroy_tfm"),
+        loaded("fsession/crypto_skcipher_setkey"),
+        loaded("fsession/crypto_aead_setauthsize"),
+        loaded("fsession/crypto_aead_setkey"),
     ];
     let refs: Vec<(&str, &PointStatus)> = all.iter().map(|(s, st)| (s.as_str(), st)).collect();
     assert!(missing_required_points(&refs).is_empty());
     // One site missing → named.
-    let refs: Vec<(&str, &PointStatus)> = refs[..1].to_vec();
+    let refs: Vec<(&str, &PointStatus)> = refs[..6].to_vec();
     assert_eq!(
         missing_required_points(&refs),
-        ["fsession/crypto_skcipher_decrypt"]
+        ["fsession/crypto_aead_setkey"]
     );
     // Unsupported counts as missing (refused load ≠ loaded point).
     let bad = [
         loaded("fsession/crypto_skcipher_encrypt"),
         missing("fsession/crypto_skcipher_decrypt"),
+        loaded("fsession/crypto_alloc_skcipher"),
+        loaded("fsession/crypto_destroy_tfm"),
+        loaded("fsession/crypto_skcipher_setkey"),
+        loaded("fsession/crypto_aead_setauthsize"),
+        loaded("fsession/crypto_aead_setkey"),
     ];
     let refs: Vec<(&str, &PointStatus)> = bad.iter().map(|(s, st)| (s.as_str(), st)).collect();
     assert_eq!(
@@ -748,15 +1010,24 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
 #[test]
 fn bringup_config_bytes_carry_exact_magic_version() {
     // The 64 bytes the loader writes to LCFG key 0: magic + version +
-    // zero flags/reserved — the exact words the BPF gate checks.
-    let bytes = lifecycle_config_bytes();
+    // zero flags + the chase/refcount/request-link words (T07.3 v3) +
+    // zero reserved tail — the exact words the BPF gate checks.
+    let bytes = lifecycle_config_bytes(&test_offsets());
     assert_eq!(bytes.len(), 64);
     assert_eq!(
         u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
         0x3143_4c4b
     );
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
-    assert!(bytes[8..].iter().all(|b| *b == 0));
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 32);
+    assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 188);
+    assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 8);
+    assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 40);
+    assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 32);
+    assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 32);
+    assert!(bytes[40..].iter().all(|b| *b == 0));
 }
 
 #[test]
@@ -807,16 +1078,74 @@ fn btf_image(types: &[u8], strtab: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Minimal vmlinux-shaped BTF with the two lifecycle FUNCs. The
+/// Append the well-formed T07.4 configuration sides (hermetic:
+/// every type the three FUNC_PROTOs name is defined inside this
+/// block, so op/alloc-side mutations in the host builder never
+/// disturb config validation — and config validation never depends
+/// on host-builder type ids). `next` is the incoming next type id.
+/// Layout (offsets from `next`): +0 STRUCT crypto_skcipher, +1
+/// STRUCT crypto_aead, +2 PTR→+0, +3 PTR→+1, +4 INT char (1 byte),
+/// +5 PTR→+4, +6 INT u32 (4 bytes, unsigned), +7 INT int (4 bytes,
+/// SIGNED — the errno return), +8 setkey-sk FUNC_PROTO, +9
+/// setkey-sk FUNC, +10 setauthsize FUNC_PROTO, +11 setauthsize
+/// FUNC, +12 setkey-aead FUNC_PROTO, +13 setkey-aead FUNC.
+/// Returns the outgoing next id.
+fn append_config_sides(types: &mut Vec<u8>, strtab: &mut Vec<u8>, next: u32) -> u32 {
+    let sk_off = btf_push_str(strtab, "crypto_skcipher");
+    let aead_off = btf_push_str(strtab, "crypto_aead");
+    let char_off = btf_push_str(strtab, "char");
+    let u32_off = btf_push_str(strtab, "u32");
+    let int_off = btf_push_str(strtab, "int");
+    let skkey_off = btf_push_str(strtab, "crypto_skcipher_setkey");
+    let sa_off = btf_push_str(strtab, "crypto_aead_setauthsize");
+    let aeadkey_off = btf_push_str(strtab, "crypto_aead_setkey");
+    btf_rec(types, sk_off, 4, 0, 0, &[]);
+    btf_rec(types, aead_off, 4, 0, 0, &[]);
+    btf_rec(types, 0, 2, 0, next, &[]);
+    btf_rec(types, 0, 2, 0, next + 1, &[]);
+    btf_rec(types, char_off, 1, 0, 1, &0x0100_0008u32.to_le_bytes());
+    btf_rec(types, 0, 2, 0, next + 4, &[]);
+    btf_rec(types, u32_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    btf_rec(types, int_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
+    let mut aux = Vec::new();
+    for param in [next + 2, next + 5, next + 6] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(types, 0, 13, 3, next + 7, &aux);
+    btf_rec(types, skkey_off, 12, 1, next + 8, &[]);
+    let mut aux = Vec::new();
+    for param in [next + 3, next + 6] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(types, 0, 13, 2, next + 7, &aux);
+    btf_rec(types, sa_off, 12, 1, next + 10, &[]);
+    let mut aux = Vec::new();
+    for param in [next + 3, next + 5, next + 6] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(types, 0, 13, 3, next + 7, &aux);
+    btf_rec(types, aeadkey_off, 12, 1, next + 12, &[]);
+    next + 14
+}
+
+/// Minimal vmlinux-shaped BTF with the three lifecycle FUNCs. The
 /// decrypt proto is always well-formed
-/// (`int (struct skcipher_request *)`); the encrypt side takes the
-/// given (return id, param-0 id, nargs, func-target id, pointee id,
-/// INT data word, INT size) so refusal shapes are fixture-exact.
-/// Type ids: 1 INT int, 2 STRUCT skcipher_request, 3 PTR→pointee, 4
-/// encrypt FUNC_PROTO, 5 encrypt FUNC, 6 decrypt FUNC_PROTO, 7
-/// decrypt FUNC, 8 STRUCT other_struct (wrong-pointee control), 9
-/// PTR→2 (decrypt's own pointer, so encrypt-side pointee mutations
-/// never break the decrypt control).
+/// (`int (struct skcipher_request *)`), and the alloc chain is always
+/// well-formed (`struct crypto_skcipher *(const char *, u32, u32)`);
+/// the encrypt side takes the given (return id, param-0 id, nargs,
+/// func-target id, pointee id, INT data word, INT size) so refusal
+/// shapes are fixture-exact. Type ids: 1 INT int, 2 STRUCT
+/// skcipher_request, 3 PTR→pointee, 4 encrypt FUNC_PROTO, 5 encrypt
+/// FUNC, 6 decrypt FUNC_PROTO, 7 decrypt FUNC, 8 STRUCT other_struct
+/// (wrong-pointee control), 9 PTR→2 (decrypt's own pointer, so
+/// encrypt-side pointee mutations never break the decrypt control),
+/// 10 INT char, 11 PTR→10, 12 INT u32, 13 STRUCT crypto_skcipher, 14
+/// PTR→13, 15 alloc FUNC_PROTO, 16 alloc FUNC, 17 STRUCT crypto_tfm,
+/// 18 PTR→0 (`void *`), 19 PTR→17, 20 destroy FUNC_PROTO, 21
+/// destroy FUNC.
 fn lifecycle_btf(
     enc_ret: u32,
     enc_param: u32,
@@ -832,6 +1161,10 @@ fn lifecycle_btf(
     let other_off = btf_push_str(&mut strtab, "other_struct");
     let enc_off = btf_push_str(&mut strtab, "crypto_skcipher_encrypt");
     let dec_off = btf_push_str(&mut strtab, "crypto_skcipher_decrypt");
+    let char_off = btf_push_str(&mut strtab, "char");
+    let u32_off = btf_push_str(&mut strtab, "u32");
+    let sk_off = btf_push_str(&mut strtab, "crypto_skcipher");
+    let alloc_off = btf_push_str(&mut strtab, "crypto_alloc_skcipher");
     let mut types = Vec::new();
     btf_rec(&mut types, int_off, 1, 0, int_size, &int_data.to_le_bytes());
     btf_rec(&mut types, req_off, 4, 0, 0, &[]);
@@ -850,6 +1183,38 @@ fn lifecycle_btf(
     btf_rec(&mut types, dec_off, 12, 1, 6, &[]);
     btf_rec(&mut types, other_off, 4, 0, 0, &[]);
     btf_rec(&mut types, 0, 2, 0, 2, &[]);
+    btf_rec(&mut types, char_off, 1, 0, 1, &0x0100_0008u32.to_le_bytes());
+    btf_rec(&mut types, 0, 2, 0, 10, &[]);
+    btf_rec(&mut types, u32_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    btf_rec(&mut types, sk_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 13, &[]);
+    let mut aux = Vec::new();
+    for param in [11u32, 12, 12] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 3, 14, &aux);
+    btf_rec(&mut types, alloc_off, 12, 1, 15, &[]);
+    // T07.3 destroy side (ids 17-21): well-formed
+    // `void (void *, struct crypto_tfm *)` — STRUCT crypto_tfm
+    // (17), `void *` PTR→0 (18), PTR→17 (19), the 2-arg VOID
+    // FUNC_PROTO (20), and the destroy FUNC (21).
+    let tfm_off = btf_push_str(&mut strtab, "crypto_tfm");
+    let destroy_off = btf_push_str(&mut strtab, "crypto_destroy_tfm");
+    btf_rec(&mut types, tfm_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 17, &[]);
+    let mut aux = Vec::new();
+    for param in [18u32, 19] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 2, 0, &aux);
+    btf_rec(&mut types, destroy_off, 12, 1, 20, &[]);
+    // T07.4 configuration sides (ids 22-35): well-formed setkey-sk,
+    // setauthsize, and setkey-aead FUNCs (hermetic block — op-side
+    // mutations above never disturb config validation).
+    append_config_sides(&mut types, &mut strtab, 22);
     btf_image(&types, &strtab)
 }
 
@@ -859,13 +1224,363 @@ fn lifecycle_btf_good() -> Vec<u8> {
     lifecycle_btf(1, 3, 1, 4, 2, 0x0100_0020, 4)
 }
 
+/// Minimal vmlinux-shaped BTF with well-formed op FUNCs and a
+/// mutated alloc chain: (return id, arg0 id, nargs, func-target id,
+/// arg0-pointer target, arg1 id, arg2 id). Type ids: 1 INT int, 2
+/// STRUCT skcipher_request, 3 PTR→2, 4 encrypt FUNC_PROTO, 5 encrypt
+/// FUNC, 6 decrypt FUNC_PROTO, 7 decrypt FUNC, 8 STRUCT other_struct
+/// (wrong-pointee control), 9 PTR→2, 10 INT char, 11 PTR→arg0-target,
+/// 12 INT u32, 13 STRUCT crypto_skcipher, 14 PTR→13, 15 alloc
+/// FUNC_PROTO, 16 alloc FUNC, 17 PTR→8 (wrong-return control), 18
+/// STRUCT crypto_tfm, 19 PTR→0 (`void *`), 20 PTR→18, 21 destroy
+/// FUNC_PROTO, 22 destroy FUNC.
+fn lifecycle_btf_alloc(
+    alloc_ret: u32,
+    alloc_arg0: u32,
+    alloc_nargs: u32,
+    alloc_target: u32,
+    arg0_ptr_target: u32,
+    arg1_type: u32,
+    arg2_type: u32,
+) -> Vec<u8> {
+    let mut strtab = vec![0u8];
+    let int_off = btf_push_str(&mut strtab, "int");
+    let req_off = btf_push_str(&mut strtab, "skcipher_request");
+    let other_off = btf_push_str(&mut strtab, "other_struct");
+    let enc_off = btf_push_str(&mut strtab, "crypto_skcipher_encrypt");
+    let dec_off = btf_push_str(&mut strtab, "crypto_skcipher_decrypt");
+    let char_off = btf_push_str(&mut strtab, "char");
+    let u32_off = btf_push_str(&mut strtab, "u32");
+    let sk_off = btf_push_str(&mut strtab, "crypto_skcipher");
+    let alloc_off = btf_push_str(&mut strtab, "crypto_alloc_skcipher");
+    let mut types = Vec::new();
+    btf_rec(&mut types, int_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
+    btf_rec(&mut types, req_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 2, &[]);
+    let mut aux = Vec::new();
+    aux.extend_from_slice(&0u32.to_le_bytes());
+    aux.extend_from_slice(&3u32.to_le_bytes());
+    btf_rec(&mut types, 0, 13, 1, 1, &aux);
+    btf_rec(&mut types, enc_off, 12, 1, 4, &[]);
+    let mut aux = Vec::new();
+    aux.extend_from_slice(&0u32.to_le_bytes());
+    aux.extend_from_slice(&9u32.to_le_bytes());
+    btf_rec(&mut types, 0, 13, 1, 1, &aux);
+    btf_rec(&mut types, dec_off, 12, 1, 6, &[]);
+    btf_rec(&mut types, other_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 2, &[]);
+    btf_rec(&mut types, char_off, 1, 0, 1, &0x0100_0008u32.to_le_bytes());
+    btf_rec(&mut types, 0, 2, 0, arg0_ptr_target, &[]);
+    btf_rec(&mut types, u32_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    btf_rec(&mut types, sk_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 13, &[]);
+    let mut aux = Vec::new();
+    // Arity mutations repeat arg0 (the encrypt-builder idiom); the
+    // 3-arg shape carries the distinct arg ids.
+    let params: Vec<u32> = if alloc_nargs == 3 {
+        vec![alloc_arg0, arg1_type, arg2_type]
+    } else {
+        vec![alloc_arg0; alloc_nargs as usize]
+    };
+    for param in params {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, alloc_nargs, alloc_ret, &aux);
+    btf_rec(&mut types, alloc_off, 12, 1, alloc_target, &[]);
+    btf_rec(&mut types, 0, 2, 0, 8, &[]);
+    // T07.3 destroy side (ids 18-22): well-formed
+    // `void (void *, struct crypto_tfm *)`.
+    let tfm_off = btf_push_str(&mut strtab, "crypto_tfm");
+    let destroy_off = btf_push_str(&mut strtab, "crypto_destroy_tfm");
+    btf_rec(&mut types, tfm_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 18, &[]);
+    let mut aux = Vec::new();
+    for param in [19u32, 20] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 2, 0, &aux);
+    btf_rec(&mut types, destroy_off, 12, 1, 21, &[]);
+    // T07.4 configuration sides (ids 23-36): well-formed setkey-sk,
+    // setauthsize, and setkey-aead FUNCs (hermetic block — alloc-side
+    // mutations above never disturb config validation).
+    append_config_sides(&mut types, &mut strtab, 23);
+    btf_image(&types, &strtab)
+}
+
+/// Well-formed alloc side: `struct crypto_skcipher *(const char *,
+/// u32, u32)` over well-formed op FUNCs.
+fn lifecycle_btf_alloc_good() -> Vec<u8> {
+    lifecycle_btf_alloc(14, 11, 3, 15, 10, 12, 12)
+}
+
+/// Minimal vmlinux-shaped BTF with well-formed op/alloc/destroy
+/// FUNCs (ids 1-21, the `lifecycle_btf` numbering) and a mutated
+/// T07.4 configuration block (ids 22-39): the setkey-sk proto
+/// takes (nargs, arg0, arg1, arg2, ret), the setauthsize proto
+/// takes (nargs, arg0, arg1, ret), and the setkey-aead proto takes
+/// arg0 with every other word well-formed. Config-block layout
+/// (base 22): +0 STRUCT crypto_skcipher, +1 STRUCT crypto_aead, +2
+/// STRUCT other_struct (wrong-struct control), +3 PTR→+0, +4
+/// PTR→+1, +5 PTR→+2, +6 INT char, +7 PTR→+6, +8 INT u32, +9 INT
+/// int (SIGNED errno), +10 INT u16 (narrow control), +11 INT uint
+/// (unsigned control), +12 setkey-sk FUNC_PROTO, +13 setkey-sk
+/// FUNC, +14 setauthsize FUNC_PROTO, +15 setauthsize FUNC, +16
+/// setkey-aead FUNC_PROTO, +17 setkey-aead FUNC.
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_btf_config(
+    sk_nargs: u32,
+    sk_arg0: u32,
+    sk_arg1: u32,
+    sk_arg2: u32,
+    sk_ret: u32,
+    sa_nargs: u32,
+    sa_arg0: u32,
+    sa_arg1: u32,
+    sa_ret: u32,
+    aead_arg0: u32,
+) -> Vec<u8> {
+    let mut strtab = vec![0u8];
+    let int_off = btf_push_str(&mut strtab, "int");
+    let req_off = btf_push_str(&mut strtab, "skcipher_request");
+    let other_off = btf_push_str(&mut strtab, "other_struct");
+    let enc_off = btf_push_str(&mut strtab, "crypto_skcipher_encrypt");
+    let dec_off = btf_push_str(&mut strtab, "crypto_skcipher_decrypt");
+    let char_off = btf_push_str(&mut strtab, "char");
+    let u32_off = btf_push_str(&mut strtab, "u32");
+    let sk_off = btf_push_str(&mut strtab, "crypto_skcipher");
+    let alloc_off = btf_push_str(&mut strtab, "crypto_alloc_skcipher");
+    let mut types = Vec::new();
+    btf_rec(&mut types, int_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
+    btf_rec(&mut types, req_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 2, &[]);
+    let mut aux = Vec::new();
+    aux.extend_from_slice(&0u32.to_le_bytes());
+    aux.extend_from_slice(&3u32.to_le_bytes());
+    btf_rec(&mut types, 0, 13, 1, 1, &aux);
+    btf_rec(&mut types, enc_off, 12, 1, 4, &[]);
+    let mut aux = Vec::new();
+    aux.extend_from_slice(&0u32.to_le_bytes());
+    aux.extend_from_slice(&9u32.to_le_bytes());
+    btf_rec(&mut types, 0, 13, 1, 1, &aux);
+    btf_rec(&mut types, dec_off, 12, 1, 6, &[]);
+    btf_rec(&mut types, other_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 2, &[]);
+    btf_rec(&mut types, char_off, 1, 0, 1, &0x0100_0008u32.to_le_bytes());
+    btf_rec(&mut types, 0, 2, 0, 10, &[]);
+    btf_rec(&mut types, u32_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    btf_rec(&mut types, sk_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 13, &[]);
+    let mut aux = Vec::new();
+    for param in [11u32, 12, 12] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 3, 14, &aux);
+    btf_rec(&mut types, alloc_off, 12, 1, 15, &[]);
+    let tfm_off = btf_push_str(&mut strtab, "crypto_tfm");
+    let destroy_off = btf_push_str(&mut strtab, "crypto_destroy_tfm");
+    btf_rec(&mut types, tfm_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 17, &[]);
+    let mut aux = Vec::new();
+    for param in [18u32, 19] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 2, 0, &aux);
+    btf_rec(&mut types, destroy_off, 12, 1, 20, &[]);
+    // Config block (base 22): hermetic types, then the three
+    // protos with the caller's knobs. Arity mutations repeat
+    // arg0 (the alloc-builder idiom).
+    let base = 22u32;
+    let sk2_off = btf_push_str(&mut strtab, "crypto_skcipher");
+    let aead_off = btf_push_str(&mut strtab, "crypto_aead");
+    let other2_off = btf_push_str(&mut strtab, "other_struct");
+    let char2_off = btf_push_str(&mut strtab, "char");
+    let u32_2_off = btf_push_str(&mut strtab, "u32");
+    let int2_off = btf_push_str(&mut strtab, "int");
+    let u16_off = btf_push_str(&mut strtab, "u16");
+    let uint_off = btf_push_str(&mut strtab, "uint");
+    let skkey_off = btf_push_str(&mut strtab, "crypto_skcipher_setkey");
+    let sa_off = btf_push_str(&mut strtab, "crypto_aead_setauthsize");
+    let aeadkey_off = btf_push_str(&mut strtab, "crypto_aead_setkey");
+    btf_rec(&mut types, sk2_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, aead_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, other2_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, base, &[]);
+    btf_rec(&mut types, 0, 2, 0, base + 1, &[]);
+    btf_rec(&mut types, 0, 2, 0, base + 2, &[]);
+    btf_rec(
+        &mut types,
+        char2_off,
+        1,
+        0,
+        1,
+        &0x0100_0008u32.to_le_bytes(),
+    );
+    btf_rec(&mut types, 0, 2, 0, base + 6, &[]);
+    btf_rec(
+        &mut types,
+        u32_2_off,
+        1,
+        0,
+        4,
+        &0x0000_0020u32.to_le_bytes(),
+    );
+    btf_rec(&mut types, int2_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
+    btf_rec(&mut types, u16_off, 1, 0, 2, &0x0000_0010u32.to_le_bytes());
+    btf_rec(&mut types, uint_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    let mut aux = Vec::new();
+    let sk_params: Vec<u32> = if sk_nargs == 3 {
+        vec![sk_arg0, sk_arg1, sk_arg2]
+    } else {
+        vec![sk_arg0; sk_nargs as usize]
+    };
+    for param in sk_params {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, sk_nargs, sk_ret, &aux);
+    btf_rec(&mut types, skkey_off, 12, 1, base + 12, &[]);
+    let mut aux = Vec::new();
+    let sa_params: Vec<u32> = if sa_nargs == 2 {
+        vec![sa_arg0, sa_arg1]
+    } else {
+        vec![sa_arg0; sa_nargs as usize]
+    };
+    for param in sa_params {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, sa_nargs, sa_ret, &aux);
+    btf_rec(&mut types, sa_off, 12, 1, base + 14, &[]);
+    let mut aux = Vec::new();
+    for param in [aead_arg0, base + 7, base + 8] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 3, base + 9, &aux);
+    btf_rec(&mut types, aeadkey_off, 12, 1, base + 16, &[]);
+    btf_image(&types, &strtab)
+}
+
+/// Well-formed configuration sides: setkey-sk `(PTR→sk, PTR→char,
+/// u32) → int`, setauthsize `(PTR→aead, u32) → int`, setkey-aead
+/// `(PTR→aead, PTR→char, u32) → int`.
+fn lifecycle_btf_config_good() -> Vec<u8> {
+    lifecycle_btf_config(
+        3, 25, 29, 30, 31, // setkey-sk: nargs, arg0, arg1, arg2, ret
+        2, 26, 30, 31, // setauthsize: nargs, arg0, arg1, ret
+        26, // setkey-aead arg0
+    )
+}
+
+/// Assert the named configuration site refuses with `BadPrototype`.
+fn assert_config_bad_proto(image: &[u8], site: &str, why: &str) {
+    match resolve_lifecycle_ids_from(image) {
+        Err(BtfError::BadPrototype { name, reason }) => {
+            assert_eq!(name, site);
+            assert!(
+                !reason.is_empty(),
+                "refusal names its reason ({why}): {reason}"
+            );
+        }
+        other => panic!("want BadPrototype for {site}, got {other:?} ({why})"),
+    }
+}
+
+/// Assert the alloc side refuses with `BadPrototype` naming it.
+fn assert_alloc_bad_proto(image: &[u8], why: &str) {
+    match resolve_lifecycle_ids_from(image) {
+        Err(BtfError::BadPrototype { name, reason }) => {
+            assert_eq!(name, "crypto_alloc_skcipher");
+            assert!(
+                !reason.is_empty(),
+                "refusal names its reason ({why}): {reason}"
+            );
+        }
+        other => panic!("want BadPrototype, got {other:?} ({why})"),
+    }
+}
+
 #[test]
-fn f2_wellformed_protos_resolve_both_ids() {
-    // Control: int (struct skcipher_request *) on both sites resolves.
+fn f2_alloc_wellformed_proto_resolves() {
+    // Control: the alloc shape resolves alongside the op sites.
+    let ids = resolve_lifecycle_ids_from(&lifecycle_btf_alloc_good()).expect("good alloc proto");
+    assert_eq!(ids.len(), 7);
+    assert_eq!(ids["crypto_alloc_skcipher"], 16);
+    assert_eq!(ids["crypto_destroy_tfm"], 22);
+}
+
+#[test]
+fn f2_alloc_non_pointer_arg0_refused() {
+    // The name copy reads through arg0 — an INT arg0 must refuse.
+    assert_alloc_bad_proto(&lifecycle_btf_alloc(14, 1, 3, 15, 10, 12, 12), "INT arg0");
+}
+
+#[test]
+fn f2_alloc_wrong_arity_refused() {
+    // Two args is not the alloc shape (type/mask would mis-shift).
+    assert_alloc_bad_proto(
+        &lifecycle_btf_alloc(14, 11, 2, 15, 10, 12, 12),
+        "2-arg proto",
+    );
+}
+
+#[test]
+fn f2_alloc_wide_arg0_pointee_refused() {
+    // The name copy reads bytes: a 4-byte pointee changes what the
+    // byte copy means.
+    assert_alloc_bad_proto(
+        &lifecycle_btf_alloc(14, 11, 3, 15, 1, 12, 12),
+        "INT pointee",
+    );
+}
+
+#[test]
+fn f2_alloc_non_int_arg1_refused() {
+    // The type word must be a 4-byte scalar, not a pointer.
+    assert_alloc_bad_proto(&lifecycle_btf_alloc(14, 11, 3, 15, 10, 11, 12), "PTR arg1");
+}
+
+#[test]
+fn f2_alloc_non_pointer_return_refused() {
+    // An INT return has no tfm to chase on success.
+    assert_alloc_bad_proto(&lifecycle_btf_alloc(1, 11, 3, 15, 10, 12, 12), "INT return");
+}
+
+#[test]
+fn f2_alloc_wrong_return_struct_refused() {
+    // The success chase reads `__crt_alg` — a pointer to any other
+    // struct would mis-chase.
+    assert_alloc_bad_proto(
+        &lifecycle_btf_alloc(17, 11, 3, 15, 10, 12, 12),
+        "other_struct return",
+    );
+}
+
+#[test]
+fn f2_alloc_func_to_non_proto_refused() {
+    // A FUNC whose target is not a FUNC_PROTO has no prototype.
+    assert_alloc_bad_proto(
+        &lifecycle_btf_alloc(14, 11, 3, 14, 10, 12, 12),
+        "non-proto target",
+    );
+}
+
+#[test]
+fn f2_wellformed_protos_resolve_all_ids() {
+    // Control: int (struct skcipher_request *) on both op sites plus
+    // the alloc shape resolves.
     let ids = resolve_lifecycle_ids_from(&lifecycle_btf_good()).expect("good protos");
-    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.len(), 7);
     assert_eq!(ids["crypto_skcipher_encrypt"], 5);
     assert_eq!(ids["crypto_skcipher_decrypt"], 7);
+    assert_eq!(ids["crypto_alloc_skcipher"], 16);
+    assert_eq!(ids["crypto_destroy_tfm"], 21);
 }
 
 #[test]
@@ -923,6 +1638,10 @@ fn f2_typedef_wrapped_pointer_arg_accepted() {
     let alias_off = btf_push_str(&mut strtab, "req_ptr");
     let enc_off = btf_push_str(&mut strtab, "crypto_skcipher_encrypt");
     let dec_off = btf_push_str(&mut strtab, "crypto_skcipher_decrypt");
+    let char_off = btf_push_str(&mut strtab, "char");
+    let u32_off = btf_push_str(&mut strtab, "u32");
+    let sk_off = btf_push_str(&mut strtab, "crypto_skcipher");
+    let alloc_off = btf_push_str(&mut strtab, "crypto_alloc_skcipher");
     let mut types = Vec::new();
     btf_rec(&mut types, int_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
     btf_rec(&mut types, req_off, 4, 0, 0, &[]);
@@ -941,8 +1660,44 @@ fn f2_typedef_wrapped_pointer_arg_accepted() {
     btf_rec(&mut types, dec_off, 12, 1, 6, &[]);
     // id 8: TYPEDEF req_ptr -> 3.
     btf_rec(&mut types, alias_off, 8, 0, 3, &[]);
+    // ids 9-15: well-formed alloc chain (the resolve needs every
+    // manifest FUNC present).
+    btf_rec(&mut types, char_off, 1, 0, 1, &0x0100_0008u32.to_le_bytes());
+    btf_rec(&mut types, 0, 2, 0, 9, &[]);
+    btf_rec(&mut types, u32_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    btf_rec(&mut types, sk_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 12, &[]);
+    let mut aux = Vec::new();
+    for param in [10u32, 11, 11] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 3, 13, &aux);
+    btf_rec(&mut types, alloc_off, 12, 1, 14, &[]);
+    // T07.3 destroy side (ids 16-20): well-formed
+    // `void (void *, struct crypto_tfm *)`.
+    let tfm_off = btf_push_str(&mut strtab, "crypto_tfm");
+    let destroy_off = btf_push_str(&mut strtab, "crypto_destroy_tfm");
+    btf_rec(&mut types, tfm_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 16, &[]);
+    let mut aux = Vec::new();
+    for param in [17u32, 18] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(&mut types, 0, 13, 2, 0, &aux);
+    btf_rec(&mut types, destroy_off, 12, 1, 19, &[]);
+    // T07.4 configuration sides (ids 21-34): well-formed setkey-sk,
+    // setauthsize, and setkey-aead FUNCs (hermetic block).
+    append_config_sides(&mut types, &mut strtab, 21);
     let ids = resolve_lifecycle_ids_from(&btf_image(&types, &strtab)).expect("chased proto");
-    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.len(), 7);
+    assert_eq!(ids["crypto_alloc_skcipher"], 15);
+    assert_eq!(ids["crypto_destroy_tfm"], 20);
+    assert_eq!(ids["crypto_skcipher_setkey"], 30);
+    assert_eq!(ids["crypto_aead_setauthsize"], 32);
+    assert_eq!(ids["crypto_aead_setkey"], 34);
 }
 
 /// Assert the encrypt side refuses with `BadPrototype` naming it.
@@ -1018,6 +1773,161 @@ fn w3_combined_encoding_return_refused() {
     assert_encrypt_bad_proto(
         &lifecycle_btf(1, 3, 1, 4, 2, 0x0500_0020, 4),
         "SIGNED|BOOL INT",
+    );
+}
+
+#[test]
+fn t74_wellformed_config_protos_resolve_all_ids() {
+    // Control: the three configuration shapes resolve alongside
+    // the op/alloc/destroy sites.
+    let ids = resolve_lifecycle_ids_from(&lifecycle_btf_config_good()).expect("good config protos");
+    assert_eq!(ids.len(), 7);
+    assert_eq!(ids["crypto_skcipher_setkey"], 35);
+    assert_eq!(ids["crypto_aead_setauthsize"], 37);
+    assert_eq!(ids["crypto_aead_setkey"], 39);
+}
+
+#[test]
+fn t74_setkey_wrong_arity_refused() {
+    // Two args is not the setkey shape (key/len would mis-shift).
+    assert_config_bad_proto(
+        &lifecycle_btf_config(2, 25, 29, 30, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "2-arg proto",
+    );
+}
+
+#[test]
+fn t74_setkey_non_pointer_arg0_refused() {
+    // The epoch joins on the frontend address — an INT arg0 must refuse.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 31, 29, 30, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "INT arg0",
+    );
+}
+
+#[test]
+fn t74_setkey_wrong_struct_arg0_refused() {
+    // A pointer to any other STRUCT keys the epoch on a stranger.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 27, 29, 30, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "other_struct arg0",
+    );
+}
+
+#[test]
+fn t74_setkey_aead_struct_arg0_refused() {
+    // Same-kind wrong identity: the skcipher site refuses an AEAD
+    // frontend — the STRUCT name is part of the qualification.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 26, 29, 30, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "aead STRUCT at sk site",
+    );
+}
+
+#[test]
+fn t74_setkey_non_pointer_key_refused() {
+    // The key buffer pins the register shape as a pointer (its
+    // pointee stays unread — but a non-pointer arg1 is drift).
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 31, 30, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "INT arg1",
+    );
+}
+
+#[test]
+fn t74_setkey_non_int_len_refused() {
+    // The key length must be a scalar, not a pointer.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 29, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "PTR arg2",
+    );
+}
+
+#[test]
+fn t74_setkey_narrow_len_refused() {
+    // A 16-bit length would truncate key sizes.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 32, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "16-bit arg2",
+    );
+}
+
+#[test]
+fn t74_setkey_void_return_refused() {
+    // No errno, no success/failure verdict — VOID refuses.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 0, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "VOID return",
+    );
+}
+
+#[test]
+fn t74_setkey_unsigned_return_refused() {
+    // The native status is SIGNED: an unsigned return would invert
+    // errno reads.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 33, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "unsigned INT return",
+    );
+}
+
+#[test]
+fn t74_setauthsize_wrong_arity_refused() {
+    // Three args is not the setauthsize shape.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 31, 3, 26, 30, 31, 26),
+        "crypto_aead_setauthsize",
+        "3-arg proto",
+    );
+}
+
+#[test]
+fn t74_setauthsize_wrong_struct_arg0_refused() {
+    // A pointer to any other STRUCT keys the epoch on a stranger.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 31, 2, 27, 30, 31, 26),
+        "crypto_aead_setauthsize",
+        "other_struct arg0",
+    );
+}
+
+#[test]
+fn t74_setauthsize_non_int_arg1_refused() {
+    // The authsize must be a scalar, not a pointer.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 31, 2, 26, 29, 31, 26),
+        "crypto_aead_setauthsize",
+        "PTR arg1",
+    );
+}
+
+#[test]
+fn t74_setauthsize_void_return_refused() {
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 31, 2, 26, 30, 0, 26),
+        "crypto_aead_setauthsize",
+        "VOID return",
+    );
+}
+
+#[test]
+fn t74_setkey_aead_sk_struct_arg0_refused() {
+    // Cross-check the frontend parameter: the AEAD site refuses a
+    // skcipher frontend — setkey-sk and setkey-aead pin DIFFERENT
+    // identities.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 30, 31, 2, 26, 30, 31, 25),
+        "crypto_aead_setkey",
+        "skcipher STRUCT at aead site",
     );
 }
 

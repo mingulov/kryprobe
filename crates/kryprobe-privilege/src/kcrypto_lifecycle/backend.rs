@@ -15,7 +15,7 @@
 use crate::btf_resolve::resolve_lifecycle_ids;
 use crate::kcrypto_backend::object::lifecycle_object_bytes;
 use crate::kcrypto_backend::{btf_unsupported, charge, configured_error_to_backend};
-use crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS;
+use crate::kcrypto_lifecycle::profile::{LIFECYCLE_MAPS, LifecycleProfile, manifest};
 use crate::kcrypto_lifecycle::sensor::{
     DrainOutcome, LifecycleLedger, LifecycleSensor, QuietOutcome,
 };
@@ -622,7 +622,7 @@ impl Backend for LifecycleBackend {
         Ok(vec![DetectedInstance {
             backend: BackendId::KCrypto,
             object: None,
-            detail: "system lifecycle sensor (2 fsession sites)".to_owned(),
+            detail: "system lifecycle sensor (3 fsession sites)".to_owned(),
         }])
     }
 
@@ -634,15 +634,17 @@ impl Backend for LifecycleBackend {
     ) -> Result<BackendPlan, BackendError> {
         Ok(BackendPlan {
             backend: BackendId::KCrypto,
-            // One probe per required hook in manifest order
-            // (enc-entry, enc-return, dec-entry, dec-return);
-            // offsets/cookies are advisory (the attach runtime owns
-            // them) exactly like the aggregate plan.
-            probes: (0..4)
+            // One probe per required HOOK (entry + return edge) in
+            // manifest order — 2 per required site, derived from
+            // the manifest so new sites cannot strand the plan
+            // (T07.4: 7 sites = 14 probes); offsets/cookies are
+            // advisory (the attach runtime owns them) exactly like
+            // the aggregate plan.
+            probes: (0..manifest(LifecycleProfile::RequestLifecycle).required.len() * 2)
                 .map(|ordinal| OffsetProbe {
                     file_offset: 0,
                     cookie: 0,
-                    descriptor_id: ordinal,
+                    descriptor_id: ordinal as u32,
                 })
                 .collect(),
             required: LIFECYCLE_CAPABILITIES.required,
@@ -787,17 +789,19 @@ mod tests {
     fn ledger_with(kernel_loss: [u64; 5]) -> LifecycleLedger {
         LifecycleLedger {
             completed: Vec::new(),
-            edge_hits: [0; 4],
+            edge_hits: [0; 16],
             decode: DecodeStats::default(),
             reducer: ReducerStats::default(),
             kernel_loss,
-            agg_accepted: [0; 4],
+            agg_accepted: [0; 16],
             retained_dropped: 0,
             view_valid: true,
             loss_baseline: [0; 5],
-            agg_baseline: [0; 4],
+            agg_baseline: [0; 16],
             prog_misses: Vec::new(),
             miss_current: Vec::new(),
+            tfm_stats: crate::kcrypto_lifecycle::tfm::TfmStats::default(),
+            generations: Vec::new(),
         }
     }
 

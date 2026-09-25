@@ -14,13 +14,14 @@ use kryprobe_privilege::kcrypto_lifecycle::sensor::{SensorCore, SessionContext, 
 fn ctx() -> SessionContext {
     SessionContext {
         loss_baseline: [0; 5],
-        agg_baseline: [0; 4],
+        agg_baseline: [0; 16],
         view_valid: true,
         miss_baseline: Vec::new(),
     }
 }
 
-/// One 40-byte v3 `LEdge` (little-endian twin of the ABI struct).
+/// One 48-byte v4 `LEdge` (little-endian twin of the ABI struct;
+/// the transform word defaults to 0 = unknown link).
 fn edge_bytes_invoc(
     edge: u8,
     site: u16,
@@ -30,9 +31,25 @@ fn edge_bytes_invoc(
     flags: u16,
     invoc: u64,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; 40];
+    edge_bytes_tfm(edge, site, key, ts_ns, status, flags, invoc, 0)
+}
+
+/// Full builder with an explicit transform word (T07.3 first-seen
+/// tests pass a frontend here).
+#[allow(clippy::too_many_arguments)]
+fn edge_bytes_tfm(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    flags: u16,
+    invoc: u64,
+    tfm: u64,
+) -> Vec<u8> {
+    let mut out = vec![0u8; 48];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 3;
+    out[2] = 4;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -40,10 +57,11 @@ fn edge_bytes_invoc(
     out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
     out[24..28].copy_from_slice(&status.to_le_bytes());
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
+    out[40..48].copy_from_slice(&tfm.to_le_bytes());
     out
 }
 
-/// Realistic default builder: same v3 record with a VALID
+/// Realistic default builder: same v4 record with a VALID
 /// invocation (see the decode-suite twin).
 fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> Vec<u8> {
     edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)
@@ -51,57 +69,60 @@ fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16
 
 #[test]
 fn ingest_paired_edges_complete_grounded_record() {
-    let mut core = SensorCore::new(16, 16, 16);
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
     let records = vec![
         edge_bytes(1, 1, 0xabc, 100, 0, 0),
         edge_bytes(2, 1, 0xabc, 150, 0, 0),
     ];
     assert_eq!(core.ingest_records(&records), 1);
     let ledger = core
-        .ledger([0; 5], [0; 4], Vec::new(), ctx())
+        .ledger([0; 5], [0; 16], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     let rec = &ledger.completed[0];
     assert_eq!((rec.id, rec.tfm_id, rec.duration_ns), (1, None, Some(50)));
     assert_eq!(rec.terminal, Terminal::Sync(0));
     assert!(rec.evidence_valid());
-    assert_eq!(ledger.edge_hits, [1, 1, 0, 0]);
+    assert_eq!(
+        ledger.edge_hits,
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
     assert_eq!(ledger.decode.admitted, 1);
     assert_eq!(ledger.reducer.admitted, 1);
 }
 
 #[test]
 fn ingest_queued_return_stays_pending() {
-    let mut core = SensorCore::new(16, 16, 16);
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
     let records = vec![
         edge_bytes(1, 1, 0xabc, 100, 0, 0),
         edge_bytes(2, 1, 0xabc, 150, -115, 0),
     ];
     assert_eq!(core.ingest_records(&records), 0);
     assert!(
-        core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .is_empty()
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
             .expect("empty miss join")
             .decode
             .admitted,
         1
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
             .expect("empty miss join")
             .edge_hits,
-        [1, 1, 0, 0]
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
 }
 
 #[test]
 fn ingest_loss_counts_without_phantoms() {
-    let mut core = SensorCore::new(16, 16, 16);
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
     let records = vec![
         edge_bytes(2, 1, 0xabc, 150, 0, 0), // unknown-invocation return
         vec![0u8; 31],                      // short record
@@ -109,7 +130,7 @@ fn ingest_loss_counts_without_phantoms() {
     ];
     assert_eq!(core.ingest_records(&records), 0);
     let ledger = core
-        .ledger([7, 0, 0, 0, 0], [0; 4], Vec::new(), ctx())
+        .ledger([7, 0, 0, 0, 0], [0; 16], Vec::new(), ctx())
         .expect("empty miss join");
     assert!(ledger.completed.is_empty());
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
@@ -123,17 +144,17 @@ fn finish_drains_pending_truthless() {
     // `finish` reconciles into retention and returns nothing: the
     // take is the ONE read path (a returning finish double-surfaced
     // every reconciled record — round-3 async canary).
-    let mut core = SensorCore::new(16, 16, 16);
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
     core.ingest_records(&[edge_bytes(1, 1, 0xabc, 100, 0, 0)]);
     assert!(
-        core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .is_empty()
     );
     core.finish(200);
     assert_eq!(
-        core.ledger([0; 5], [0; 4], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .len(),
@@ -152,7 +173,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
     // configured bound. Past the ledger cap, completions stop being
     // retained and count retained_dropped (explicit loss, never
     // silent growth).
-    let mut core = SensorCore::new(16, 16, 2);
+    let mut core = SensorCore::new(16, 16, 2, 8, true);
     for i in 0..3u64 {
         let key = 0x1000 + i;
         let records = vec![
@@ -162,7 +183,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
         assert_eq!(core.ingest_records(&records), 1);
     }
     let ledger = core
-        .ledger([0; 5], [0; 4], Vec::new(), ctx())
+        .ledger([0; 5], [0; 16], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 2);
     assert_eq!(ledger.retained_dropped, 1);
@@ -173,7 +194,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
 fn f7_take_completed_drains_and_releases_the_bound() {
     // The live tick drains retained completions; drained records
     // free retention for new ones (a draining reader never drops).
-    let mut core = SensorCore::new(16, 16, 1);
+    let mut core = SensorCore::new(16, 16, 1, 8, true);
     let one = vec![
         edge_bytes(1, 1, 0xabc, 100, 0, 0),
         edge_bytes(2, 1, 0xabc, 150, 0, 0),
@@ -187,7 +208,7 @@ fn f7_take_completed_drains_and_releases_the_bound() {
     ];
     assert_eq!(core.ingest_records(&two), 1);
     let ledger = core
-        .ledger([0; 5], [0; 4], Vec::new(), ctx())
+        .ledger([0; 5], [0; 16], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     assert_eq!(ledger.retained_dropped, 0);
@@ -198,24 +219,30 @@ fn w8_ledger_carries_session_context() {
     // M2/H2: the pre-arm counter baselines and the sticky identity
     // verdict land in the terminal ledger untouched (coverage and
     // integrity consult them; pairing never does).
-    let core = SensorCore::new(16, 16, 16);
+    let core = SensorCore::new(16, 16, 16, 8, true);
     let ledger = core
         .ledger(
             [1, 2, 3, 4, 5],
-            [6, 7, 8, 9],
+            [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0, 1, 0, 0, 0],
-                agg_baseline: [0, 0, 2, 0],
+                agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 view_valid: false,
                 miss_baseline: Vec::new(),
             },
         )
         .expect("empty miss join");
     assert_eq!(ledger.kernel_loss, [1, 2, 3, 4, 5]);
-    assert_eq!(ledger.agg_accepted, [6, 7, 8, 9]);
+    assert_eq!(
+        ledger.agg_accepted,
+        [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
     assert_eq!(ledger.loss_baseline, [0, 1, 0, 0, 0]);
-    assert_eq!(ledger.agg_baseline, [0, 0, 2, 0]);
+    assert_eq!(
+        ledger.agg_baseline,
+        [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
     assert!(!ledger.view_valid);
 }
 
@@ -225,7 +252,7 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
     // per-program miss absolutes by section (the one join site) and
     // carries the final absolutes for the canary's GO-baselines.
     use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
-    let core = SensorCore::new(16, 16, 16);
+    let core = SensorCore::new(16, 16, 16, 8, true);
     let base = vec![
         ProgMisses {
             section: "fsession/a".to_owned(),
@@ -253,11 +280,11 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 4],
+            [0; 16],
             cur.clone(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 4],
+                agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: base,
             },
@@ -276,7 +303,7 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
     // Round-10 astra-Major: a backwards miss join refuses the
     // terminal ledger (no ledger, no clean verdict — never zero).
     use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
-    let core = SensorCore::new(16, 16, 16);
+    let core = SensorCore::new(16, 16, 16, 8, true);
     let base = vec![ProgMisses {
         section: "fsession/a".to_owned(),
         id: 11,
@@ -290,11 +317,11 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
     let err = core
         .ledger(
             [0; 5],
-            [0; 4],
+            [0; 16],
             cur,
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 4],
+                agg_baseline: [0; 16],
                 view_valid: true,
                 miss_baseline: base,
             },
@@ -304,19 +331,38 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
 }
 
 #[test]
+fn ingest_op_edge_admits_first_seen_transform() {
+    // T07.3 wiring: an ingested op edge with a nonzero transform
+    // word admits a first-seen generation in the core's tracker
+    // (provenance unknown); a second edge for the same base admits
+    // nothing more; a 0 word counts unlinked.
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    core.ingest_records(&[edge_bytes_tfm(1, 1, 0xabc, 100, 0, 0, 0x4000, f1)]);
+    let gens = core.tfm().generations();
+    assert_eq!(gens.len(), 1, "op edge admits its transform");
+    assert!(gens[0].first_seen);
+    assert_eq!(gens[0].req_name, "");
+    core.ingest_records(&[edge_bytes_tfm(2, 1, 0xabc, 150, 0, 0, 0x4000, f1)]);
+    assert_eq!(core.tfm().generations().len(), 1, "same base no-op");
+    core.ingest_records(&[edge_bytes(1, 1, 0xdef, 200, 0, 0)]);
+    assert_eq!(core.tfm().stats().unlinked_ops, 1, "zero word counted");
+}
+
+#[test]
 fn w7_fold_loss_lanes_sums_per_class_saturating() {
     // Round-7: one `LLOSS` lane per program per class (an interrupt
     // can run a different program on the same CPU mid-bump, so
-    // per-CPU alone lost updates). The fold sums the four program
+    // per-CPU alone lost updates). The fold sums the sixteen hook
     // lanes class-major, saturating — a saturated lane must not
     // wrap the ledger.
-    let mut lanes = [0u64; 20];
+    let mut lanes = [0u64; 80];
     lanes[0] = 1;
     lanes[1] = 2;
     lanes[2] = 3;
     lanes[3] = 4;
-    lanes[6] = 7;
-    lanes[16] = u64::MAX;
-    lanes[19] = u64::MAX;
+    lanes[17] = 7;
+    lanes[64] = u64::MAX;
+    lanes[79] = u64::MAX;
     assert_eq!(fold_loss_lanes(lanes), [10, 7, 0, 0, u64::MAX]);
 }

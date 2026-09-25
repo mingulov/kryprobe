@@ -7,7 +7,10 @@
 //! pre-arm baseline, then arms via [`arm_lifecycle_config`] (M1:
 //! arm-after-links — edges firing between attach and arm feed
 //! `LLOSS_DISABLED`, counted, never silent), and disarms via
-//! [`disarm_lifecycle_config`] before detach. Any missing required
+//! [`disarm_lifecycle_config`] before detach (flags-word flip only —
+//! the chase offsets stay immutable from arm until the map dies, so a
+//! hook racing the disarm never mixes valid offsets with zeroed
+//! words). Any missing required
 //! site — at resolve, load, or attach time — fails the whole
 //! bring-up (no per-point degrade: one site alone cannot observe both
 //! operations).
@@ -15,19 +18,22 @@
 pub mod backend;
 pub mod canary;
 pub mod decode;
+pub mod proc_crypto;
 pub mod profile;
 pub mod sensor;
+pub mod tfm;
 pub mod view;
 
 use crate::attach::{OwnedLink, attach_group_tracing};
 use crate::bpfloader::progload::attach_type_for_section;
 use crate::bpfloader::{LoadedLifecycle, PointStatus, load_lifecycle};
 use crate::btf_resolve::{
-    AttachOutcome, ConfiguredError, ConfiguredPoint, resolve_lifecycle_ids, system_object,
+    AttachOutcome, ConfiguredError, ConfiguredPoint, resolve_lifecycle_ids,
+    resolve_lifecycle_offsets, system_object,
 };
 use crate::kcrypto_lifecycle::profile::{
-    LCFG_VALUE_LEN, LifecycleProfile, lifecycle_config_bytes, manifest, missing_required_points,
-    verify_lifecycle_config_bytes,
+    LCFG_VALUE_LEN, LifecycleProfile, disarm_config_bytes, lifecycle_config_bytes, manifest,
+    missing_required_points, verify_lifecycle_config_bytes,
 };
 use crate::mapops::{MapOpsError, map_lookup_bytes, map_update_bytes};
 use kryprobe_core::attach::CookieAllocator;
@@ -157,13 +163,26 @@ pub fn load_lifecycle_configured(
 }
 
 /// Arm the sensor (M1: after links attach, after the pre-arm
-/// baseline): write `LCFG` key 0 and read the full 64-byte value back.
-/// Any mismatch (unwritten/zeroed map, short write, drifted word)
-/// fails closed instead of claiming an armed sensor. The readback
-/// proves the final value only — edges straddling the arm land in
-/// `LLOSS_DISABLED` or accepted, counted either way, never certified.
-pub fn arm_lifecycle_config(loaded: &LoadedLifecycle) -> Result<(), ConfiguredError> {
-    let bytes = lifecycle_config_bytes();
+/// baseline): resolve the BTF chase offsets, write `LCFG` key 0, and
+/// read the full 64-byte value back. Unresolvable offsets refuse the
+/// arm BEFORE any write (T07: the transform programs chase through
+/// these words — zeroed guesses would mis-chase). Any readback
+/// mismatch (unwritten/zeroed map, short write, drifted word, offset
+/// corruption) fails closed instead of claiming an armed sensor. The
+/// readback proves the final value only — edges straddling the arm
+/// land in `LLOSS_DISABLED` or accepted, counted either way, never
+/// certified. Returns the resolved offsets: the tracker normalizes
+/// frontend pointers with the same `sk_base` word the BPF chase
+/// adds, so both sides of the join resolve per kernel, never from a
+/// hardcoded layout (T07.2d: `crypto_skcipher.base` sits at 8 on
+/// 64-bit — `reqsize` + alignment padding — not 4).
+/// D3: the arm resolves ONLY the lifecycle set (shape-validated);
+/// the aggregate's legacy fields can neither arm nor refuse us.
+pub fn arm_lifecycle_config(
+    loaded: &LoadedLifecycle,
+) -> Result<crate::btf_resolve::LifecycleOffsets, ConfiguredError> {
+    let offsets = resolve_lifecycle_offsets().map_err(ConfiguredError::Resolve)?;
+    let bytes = lifecycle_config_bytes(&offsets);
     map_update_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
@@ -186,25 +205,53 @@ pub fn arm_lifecycle_config(loaded: &LoadedLifecycle) -> Result<(), ConfiguredEr
         )
     }
     .map_err(ConfiguredError::Configure)?;
-    verify_lifecycle_config_bytes(&got).map_err(|reason| {
+    verify_lifecycle_config_bytes(&got, &bytes).map_err(|reason| {
         ConfiguredError::Configure(MapOpsError::ConfigRejected {
             stage: "lifecycle_configured/lcfg-verify".to_owned(),
             detail: format!("{reason:?}"),
         })
-    })
+    })?;
+    Ok(offsets)
 }
 
-/// Disarm the sensor (M1: before links detach): zero `LCFG` key 0 and
-/// read the full 64-byte value back. A non-all-zero readback fails —
+/// Disarm the sensor (M1: before links detach): read `LCFG` key 0,
+/// write it back with ONLY the flags word set ([`disarm_config_bytes`]),
+/// and read the full 64-byte value back. The chase offsets are NEVER
+/// rewritten by the disarm (D1: whole-value zeroing let a racing hook
+/// mix valid offsets with zeroed words — a one-word flags flip keeps
+/// every other word identical old-vs-new, so each racing aligned-word
+/// read observes the armed value or a gate-closed value, never a
+/// mixture). A readback that differs from the written bytes fails —
 /// the caller still detaches (a detached sensor fires nothing, so the
 /// config value is moot), but the error attests the disarm was never
 /// proven. Like the arm, the readback proves the final value only.
 pub fn disarm_lifecycle_config(loaded: &LoadedLifecycle) -> Result<(), ConfiguredError> {
-    let zero = [0u8; LCFG_VALUE_LEN];
+    // SAFETY: same pinned-width argument as the arm readback above.
+    let current = unsafe {
+        map_lookup_bytes(
+            &loaded.maps.config,
+            &0u32.to_le_bytes(),
+            LCFG_VALUE_LEN,
+            "lifecycle_disarm/lcfg-read",
+        )
+    }
+    .map_err(ConfiguredError::Configure)?;
+    if current.len() != LCFG_VALUE_LEN {
+        return Err(ConfiguredError::Configure(MapOpsError::ConfigRejected {
+            stage: "lifecycle_disarm/lcfg-read".to_owned(),
+            detail: format!(
+                "disarm pre-read is {} bytes, want {LCFG_VALUE_LEN}",
+                current.len()
+            ),
+        }));
+    }
+    let mut live = [0u8; LCFG_VALUE_LEN];
+    live.copy_from_slice(&current);
+    let disarmed = disarm_config_bytes(&live);
     map_update_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),
-        &zero,
+        &disarmed,
         "lifecycle_disarm/lcfg",
     )
     .map_err(ConfiguredError::Configure)?;
@@ -218,10 +265,10 @@ pub fn disarm_lifecycle_config(loaded: &LoadedLifecycle) -> Result<(), Configure
         )
     }
     .map_err(ConfiguredError::Configure)?;
-    if got.len() != LCFG_VALUE_LEN || got.iter().any(|b| *b != 0) {
+    if got.len() != LCFG_VALUE_LEN || got != disarmed {
         return Err(ConfiguredError::Configure(MapOpsError::ConfigRejected {
             stage: "lifecycle_disarm/lcfg-verify".to_owned(),
-            detail: "disarm readback is not all-zero".to_owned(),
+            detail: "disarm readback differs from written bytes".to_owned(),
         }));
     }
     Ok(())

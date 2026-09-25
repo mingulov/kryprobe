@@ -13,9 +13,13 @@ use crate::btf_resolve::{ConfiguredError, ConfiguredPoint};
 use crate::drain::DrainError;
 use crate::drain::area::RingArea;
 use crate::kcrypto_lifecycle::decode::{DecodeStats, LifecycleDecoder, decode_record};
+use crate::kcrypto_lifecycle::proc_crypto::{ProcCryptoSnapshot, snapshot_proc_crypto};
 use crate::kcrypto_lifecycle::profile::{
     LIFECYCLE_MAPS, LLOSS_ENTRIES, LLOSS_LANES_PER_CLASS, LifecycleProfile, SessionGuard,
     acquire_kcrypto_session,
+};
+use crate::kcrypto_lifecycle::tfm::{
+    GenerationInfo, TfmStats, TransformTracker, decode_tfm_record, is_tfm_record,
 };
 use crate::kcrypto_lifecycle::view::{
     ProgMissDelta, ProgMisses, SensorIdentity, join_miss_deltas, snapshot_prog_misses,
@@ -24,18 +28,70 @@ use crate::kcrypto_lifecycle::{
     ConfiguredLifecycle, arm_lifecycle_config, disarm_lifecycle_config, load_lifecycle_configured,
 };
 use crate::mapops::{MapOpsError, map_lookup_percpu_sum};
-use kryprobe_abi::kcrypto_lifecycle::{LEDGE_RETURN, LSITE_DEC};
+use kryprobe_abi::kcrypto_lifecycle::{
+    LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_SETAUTH_RET,
+    LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB, LAGG_SETKEYSK_RET,
+    LAGG_SETKEYSK_SUB, LEDGE_RETURN, LSITE_DEC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY,
+    LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
+};
 use kryprobe_core::kcrypto::{LifecycleReducer, ReducerStats, RequestRecord};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Tally slot for a validated raw edge: `[enc-submit, enc-return,
-/// dec-submit, dec-return]`. Validated inputs only (`decode_record`
-/// guarantees site ∈ {enc, dec} and edge ∈ {submit, return}).
+/// Tally slot for a validated raw op edge: `[enc-submit, enc-return,
+/// dec-submit, dec-return]` (lanes 0–3 of the 16-wide tally).
+/// Validated inputs only (`decode_record` guarantees site ∈ {enc,
+/// dec} and edge ∈ {submit, return}).
 fn edge_slot(site: u16, edge: u8) -> usize {
     let site_idx = u16::from(site == LSITE_DEC);
     let edge_idx = u16::from(edge == LEDGE_RETURN);
     (site_idx * 2 + edge_idx) as usize
+}
+
+/// Tally slot for a validated raw transform edge: the `LAGG_*` hook
+/// lane the BPF program bumped (T07.2 alloc-sk submit/return on
+/// lanes 4–5; T07.3 destroy submit/return on lanes 6–7; T07.4
+/// setkey-sk on lanes 8–9, setauthsize on lanes 10–11, setkey-aead
+/// on lanes 14–15). Validated inputs only (`decode_tfm_record`
+/// guarantees the site/edge shape).
+fn tfm_slot(site: u16, edge: u8) -> usize {
+    debug_assert!(
+        site == LTFM_SITE_ALLOC_SK
+            || site == LTFM_SITE_DESTROY
+            || site == LTFM_SITE_SETKEY_SK
+            || site == LTFM_SITE_SETAUTHSIZE
+            || site == LTFM_SITE_SETKEY_AEAD
+    );
+    let ret = edge == LEDGE_RETURN;
+    if site == LTFM_SITE_DESTROY {
+        if ret {
+            LAGG_DESTROY_RET as usize
+        } else {
+            LAGG_DESTROY_SUB as usize
+        }
+    } else if site == LTFM_SITE_SETKEY_SK {
+        if ret {
+            LAGG_SETKEYSK_RET as usize
+        } else {
+            LAGG_SETKEYSK_SUB as usize
+        }
+    } else if site == LTFM_SITE_SETAUTHSIZE {
+        if ret {
+            LAGG_SETAUTH_RET as usize
+        } else {
+            LAGG_SETAUTH_SUB as usize
+        }
+    } else if site == LTFM_SITE_SETKEY_AEAD {
+        if ret {
+            LAGG_SETKEYAEAD_RET as usize
+        } else {
+            LAGG_SETKEYAEAD_SUB as usize
+        }
+    } else if ret {
+        LAGG_ALLOCSK_RET as usize
+    } else {
+        LAGG_ALLOCSK_SUB as usize
+    }
 }
 
 /// `LRING` size (single source: the profile manifest's frozen dims).
@@ -47,8 +103,8 @@ fn ring_max() -> usize {
         .expect("manifest carries LRING")
 }
 
-/// Fold the 20 per-(class, program) `LLOSS` lanes into 5 per-class
-/// totals (round-7 W7: one lane per program per class, since an
+/// Fold the 80 per-(class, hook) `LLOSS` lanes into 5 per-class
+/// totals (round-7 W7: one lane per hook per class, since an
 /// interrupt can run a different program on the same CPU mid-bump).
 /// Saturating — a saturated lane must not wrap the ledger.
 #[must_use]
@@ -69,7 +125,7 @@ pub fn fold_loss_lanes(lanes: [u64; LLOSS_ENTRIES as usize]) -> [u64; 5] {
 /// (shared by the pre-arm baseline and every ledger snapshot).
 fn read_kernel_counters(
     configured: &ConfiguredLifecycle,
-) -> Result<([u64; 5], [u64; 4]), MapOpsError> {
+) -> Result<([u64; 5], [u64; 16]), MapOpsError> {
     let mut lanes = [0u64; LLOSS_ENTRIES as usize];
     for (idx, slot) in lanes.iter_mut().enumerate() {
         *slot = map_lookup_percpu_sum(
@@ -78,7 +134,7 @@ fn read_kernel_counters(
             "lifecycle_sensor/lloss",
         )?;
     }
-    let mut agg_accepted = [0u64; 4];
+    let mut agg_accepted = [0u64; 16];
     for (idx, slot) in agg_accepted.iter_mut().enumerate() {
         *slot = map_lookup_percpu_sum(
             &configured.loaded.maps.agg,
@@ -95,9 +151,11 @@ fn read_kernel_counters(
 pub struct LifecycleLedger {
     /// Completed request records (grounded + truthless-drained).
     pub completed: Vec<RequestRecord>,
-    /// Per-hook raw-edge hits `[enc-submit, enc-return, dec-submit,
-    /// dec-return]` (the VM gate's "post-GO event per required hook").
-    pub edge_hits: [u64; 4],
+    /// Per-hook raw-edge hits in `LAGG_*` lane order (lanes 0–3
+    /// are the op hooks `[enc-submit, enc-return, dec-submit,
+    /// dec-return]` — the VM gate's "post-GO event per required
+    /// hook"; lanes 4+ are the transform hooks as their halves land).
+    pub edge_hits: [u64; 16],
     /// Decode loss counters.
     pub decode: DecodeStats,
     /// Reducer counters.
@@ -105,14 +163,14 @@ pub struct LifecycleLedger {
     /// Kernel `LLOSS` per-class totals
     /// (reserve/disabled/badkey/fret/noslot).
     pub kernel_loss: [u64; 5],
-    /// Kernel `LAGG` per-hook accepted totals `[enc-submit,
-    /// enc-return, dec-submit, dec-return]` (post-gate, pre-reserve).
-    /// After a quiet drain with an empty close ring,
-    /// `sum(agg_accepted) == sum(edge_hits) + kernel_loss[RESERVE] +
-    /// kernel_loss[NOSLOT]` exactly — the reconciliation equation
-    /// (the canary asserts it; `LAGG` bumps before the invocation
-    /// issue, so NOSLOT drops count as accepted-but-untransported).
-    pub agg_accepted: [u64; 4],
+    /// Kernel `LAGG` per-hook accepted totals in `LAGG_*` lane
+    /// order (post-gate, pre-reserve). After a quiet drain with an
+    /// empty close ring, `sum(agg_accepted) == sum(edge_hits) +
+    /// kernel_loss[RESERVE] + kernel_loss[NOSLOT]` exactly — the
+    /// reconciliation equation (the canary asserts it; `LAGG` bumps
+    /// before the invocation issue, so NOSLOT drops count as
+    /// accepted-but-untransported).
+    pub agg_accepted: [u64; 16],
     /// Completions dropped from retention past the ledger bound
     /// (explicit loss; a draining reader never drops).
     pub retained_dropped: u64,
@@ -124,7 +182,7 @@ pub struct LifecycleLedger {
     /// abs+delta; the oracle's own GO-baseline still owns the verdict).
     pub loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
-    pub agg_baseline: [u64; 4],
+    pub agg_baseline: [u64; 16],
     /// Per-program recursion-miss abs+delta (H2 coverage: a wholly
     /// skipped call leaves no edge and no `LLOSS` — only the kernel
     /// miss counter sees it, so any nonzero delta voids exact
@@ -134,6 +192,15 @@ pub struct LifecycleLedger {
     /// GO-baselines measure from these — the pre-arm join above
     /// brackets the whole session, the oracle owns the verdict).
     pub miss_current: Vec<ProgMisses>,
+    /// Transform-lifetime loss counters (T07.6 seam: the
+    /// tracker's drops/unknowns/ambiguity join the terminal
+    /// accounting — a quiet ledger with nonzero loss is loud).
+    pub tfm_stats: TfmStats,
+    /// Opaque transform generations assigned this session (T07.6
+    /// seam: pointer-free public view — ids, provenance,
+    /// retire/ambiguity verdicts, configuration epochs; the
+    /// canonical bases stay inside the tracker, never rendered).
+    pub generations: Vec<GenerationInfo>,
 }
 
 /// Terminal-ledger read failure (fail loud: an unreadable counter
@@ -165,7 +232,7 @@ pub struct SessionContext {
     /// Pre-arm `LLOSS` per-class totals.
     pub loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals.
-    pub agg_baseline: [u64; 4],
+    pub agg_baseline: [u64; 16],
     /// Sticky identity verdict at ledger time.
     pub view_valid: bool,
     /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
@@ -179,9 +246,10 @@ pub struct SensorCore {
     decoder: LifecycleDecoder,
     reducer: LifecycleReducer,
     completed: Vec<RequestRecord>,
-    edge_hits: [u64; 4],
+    edge_hits: [u64; 16],
     ledger_capacity: usize,
     retained_dropped: u64,
+    tfm: TransformTracker,
 }
 
 impl SensorCore {
@@ -189,17 +257,39 @@ impl SensorCore {
     /// completed-retention ledger (design C12: every output queue has
     /// a configured bound — round-1 astra-M7). The decode bound is a
     /// pure userspace cap (W8: the kernel holds no pairing state —
-    /// invocations live in per-call cookies, not a slot table).
+    /// invocations live in per-call cookies, not a slot table); the
+    /// transform tracker shares the decode-bound scale for its
+    /// pending table (in-flight allocations are rarer than
+    /// invocations, so the shared bound is generous — one
+    /// decode-bound scale for all decode tables). `frontend_off` is
+    /// the BTF-resolved `crypto_skcipher.base` offset the arm hands
+    /// down (the tracker normalizes frontends with it);
+    /// `refcnt_present` is the arm's kernel verdict (the tracker
+    /// retires on observed refcount 1 when true, unconditionally
+    /// when false — 7.2 dropped the field).
     #[must_use]
-    pub fn new(decode_capacity: usize, reducer_capacity: usize, ledger_capacity: usize) -> Self {
+    pub fn new(
+        decode_capacity: usize,
+        reducer_capacity: usize,
+        ledger_capacity: usize,
+        frontend_off: u32,
+        refcnt_present: bool,
+    ) -> Self {
         Self {
             decoder: LifecycleDecoder::new(decode_capacity),
             reducer: LifecycleReducer::new(reducer_capacity),
             completed: Vec::new(),
-            edge_hits: [0; 4],
+            edge_hits: [0; 16],
             ledger_capacity,
             retained_dropped: 0,
+            tfm: TransformTracker::new(decode_capacity, frontend_off, refcnt_present),
         }
+    }
+
+    /// The transform-lifetime tracker (T07 generations + loss).
+    #[must_use]
+    pub fn tfm(&self) -> &TransformTracker {
+        &self.tfm
     }
 
     /// Retain completions up to the ledger bound; past the bound the
@@ -228,6 +318,26 @@ impl SensorCore {
     pub fn ingest_records(&mut self, records: &[Vec<u8>]) -> usize {
         let mut newly = 0;
         for record in records {
+            // Magic-routed: transform edges validate, tally their
+            // `LAGG_*` hook lane (the equation's consumed side covers
+            // transform hooks exactly like op hooks), and join in the
+            // tracker (their generations surface in the ledger at
+            // T07.6; T07.2 tracks allocs, T07.3 retires destroys).
+            // Everything else feeds the op
+            // decoder (which refuses non-`LEdge` shapes as twin
+            // drift).
+            if is_tfm_record(record) {
+                let raw = match decode_tfm_record(record) {
+                    Ok(raw) => raw,
+                    Err(_) => {
+                        self.tfm.count_bad_record();
+                        continue;
+                    }
+                };
+                self.edge_hits[tfm_slot(raw.site, raw.edge)] += 1;
+                self.tfm.join(raw);
+                continue;
+            }
             let raw = match decode_record(record) {
                 Ok(raw) => raw,
                 Err(_) => {
@@ -235,6 +345,12 @@ impl SensorCore {
                     continue;
                 }
             };
+            // T07.3 first-seen: every decoded op edge — tainted or
+            // not (BPF chases the link either way; taint is about
+            // the invocation, never the transform) — offers its
+            // transform word to the tracker. 0 admits nothing and
+            // counts `unlinked_ops` inside; known bases no-op.
+            self.tfm.admit_first_seen(raw.tfm);
             let slot = edge_slot(raw.site, raw.edge);
             self.edge_hits[slot] += 1;
             for edge in self.decoder.join(raw) {
@@ -265,7 +381,7 @@ impl SensorCore {
     pub fn ledger(
         &self,
         kernel_loss: [u64; 5],
-        agg_accepted: [u64; 4],
+        agg_accepted: [u64; 16],
         miss_current: Vec<ProgMisses>,
         ctx: SessionContext,
     ) -> Result<LifecycleLedger, crate::kcrypto_lifecycle::view::ViewError> {
@@ -283,6 +399,8 @@ impl SensorCore {
             agg_baseline: ctx.agg_baseline,
             prog_misses,
             miss_current,
+            tfm_stats: self.tfm.stats(),
+            generations: self.tfm.generations(),
         })
     }
 }
@@ -353,9 +471,13 @@ pub struct LifecycleSensor {
     /// Pre-arm `LLOSS` per-class totals (M2 baseline).
     loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
-    agg_baseline: [u64; 4],
+    agg_baseline: [u64; 16],
     /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
     miss_baseline: Vec<ProgMisses>,
+    /// Bounded startup `/proc/crypto` snapshot (T07.5 registry
+    /// context — `None` when the read failed; enrichment is
+    /// optional, capture never refuses on it).
+    registry: Option<ProcCryptoSnapshot>,
 }
 
 impl std::fmt::Debug for LifecycleSensor {
@@ -367,6 +489,10 @@ impl std::fmt::Debug for LifecycleSensor {
             .field("consumer", &self.consumer)
             .field("completed", &self.core.completed.len())
             .field("session", &self.session)
+            .field(
+                "registry_entries",
+                &self.registry.as_ref().map(|r| r.entries.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -417,13 +543,18 @@ impl LifecycleSensor {
                 detail: format!("sensor prog misses: {err}"),
             }
         })?;
-        arm_lifecycle_config(&configured.loaded)?;
+        let offsets = arm_lifecycle_config(&configured.loaded)?;
+        // T07.5 registry context: one bounded `/proc/crypto` read
+        // (optional enrichment — a failed read snapshots `None`
+        // and capture proceeds; runtime selected metadata never
+        // depends on it).
+        let registry = snapshot_proc_crypto(std::path::Path::new("/proc/crypto")).ok();
         Ok((
             Self {
                 configured,
                 area,
                 consumer: 0,
-                core: SensorCore::new(4096, 4096, 4096),
+                core: SensorCore::new(4096, 4096, 4096, offsets.sk_base, offsets.refcnt_present),
                 session,
                 state: SensorState::Admit,
                 baseline,
@@ -431,6 +562,7 @@ impl LifecycleSensor {
                 loss_baseline,
                 agg_baseline,
                 miss_baseline,
+                registry,
             },
             points,
         ))
@@ -540,11 +672,29 @@ impl LifecycleSensor {
         self.core.take_completed()
     }
 
+    /// The transform-lifetime tracker (T07.6 ledger seam LANDED:
+    /// generations + loss surface in [`LifecycleLedger`]; this
+    /// accessor stays for qualification drivers and ignored tests
+    /// that read live tracker state mid-session).
+    #[must_use]
+    pub fn tfm(&self) -> &TransformTracker {
+        self.core.tfm()
+    }
+
     /// Live attach count: one link per required edge (the session
     /// coverage counts this — links exist only for attached points).
     #[must_use]
     pub fn attached_points(&self) -> usize {
         self.configured.links.len()
+    }
+
+    /// Bounded startup `/proc/crypto` snapshot (T07.5 registry
+    /// context — current inventory only, never proof of what an
+    /// earlier allocation used; `None` when the bring-up read
+    /// failed, which never refuses capture).
+    #[must_use]
+    pub fn registry(&self) -> Option<&ProcCryptoSnapshot> {
+        self.registry.as_ref()
     }
 
     /// Drain pending truthless into retention (stop-the-world): the

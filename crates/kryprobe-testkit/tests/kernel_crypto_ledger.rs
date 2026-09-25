@@ -352,3 +352,137 @@ fn alloc_without_free_at_done_rejected() {
         Err(LedgerError::PhaseInconsistency(_))
     ));
 }
+
+// T07 RED: allocation type/mask provenance (F02), repeated
+// releases with last-final-wins (F04), config epochs (F07).
+
+#[test]
+fn f02_alloc_carries_type_and_mask_provenance() {
+    let text = LITERAL_WITH_LIFETIME.replace(
+        r#""drv":"kcipher-sync","#,
+        r#""drv":"kcipher-sync","type":2,"mask":15,"#,
+    );
+    let ledger = parse_ledger("run-1", &text).expect("typed alloc parses");
+    assert_eq!(ledger.allocs.len(), 1);
+    assert_eq!(ledger.allocs[0].alg_type, Some(2), "type carried");
+    assert_eq!(ledger.allocs[0].alg_mask, Some(15), "mask carried");
+}
+
+#[test]
+fn f02_alloc_without_type_and_mask_parses_as_unknown() {
+    let ledger = parse_ledger("run-1", LITERAL_WITH_LIFETIME).expect("literal parses");
+    assert_eq!(ledger.allocs.len(), 1);
+    assert_eq!(ledger.allocs[0].alg_type, None, "untyped stays unknown");
+    assert_eq!(ledger.allocs[0].alg_mask, None, "unmasked stays unknown");
+}
+
+#[test]
+fn f02_alloc_non_u32_type_rejected() {
+    let text = LITERAL_WITH_LIFETIME.replace(
+        r#""drv":"kcipher-sync","#,
+        r#""drv":"kcipher-sync","type":"skcipher","#,
+    );
+    let err = parse_ledger("run-1", &text).expect_err("non-u32 type rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn f04_repeated_release_last_final_wins() {
+    // Refcount-retained release then the proved final free: two
+    // free rows share the alloc seq; the last final flag wins.
+    let text = LITERAL_WITH_LIFETIME.replace(
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        concat!(
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":false,"ts":1840}"#,
+            "\n",
+            r#"{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}"#,
+        ),
+    );
+    let ledger = parse_ledger("run-1", &text).expect("repeated free parses");
+    assert_eq!(ledger.allocs.len(), 1);
+    assert!(ledger.allocs[0].freed, "released");
+    assert!(ledger.allocs[0].final_free, "last final wins");
+    assert_eq!(ledger.allocs[0].releases, 2, "both puts counted");
+}
+
+#[test]
+fn f04_single_nonfinal_release_not_final() {
+    let text = LITERAL_WITH_LIFETIME.replace(
+        r#""phase":"free","final":true"#,
+        r#""phase":"free","final":false"#,
+    );
+    let ledger = parse_ledger("run-1", &text).expect("nonfinal free parses");
+    assert!(ledger.allocs[0].freed, "released");
+    assert!(!ledger.allocs[0].final_free, "not finally freed");
+    assert_eq!(ledger.allocs[0].releases, 1, "one put counted");
+}
+
+const LITERAL_WITH_CONFIG: &str = r#"{"v":1,"run":"run-1","seq":3,"phase":"alloc","req":"kxcipher","drv":"kcipher-sync","ts":900}
+{"v":1,"run":"run-1","seq":3,"phase":"config","op":"setkey","errno":0,"len":16,"ts":950}
+{"v":1,"run":"run-1","seq":3,"phase":"config","op":"setkey","errno":-22,"len":7,"ts":960}
+{"v":1,"run":"run-1","seq":3,"phase":"config","op":"setauthsize","errno":0,"len":16,"ts":970}
+{"v":1,"run":"run-1","seq":3,"phase":"free","final":true,"ts":1850}
+{"v":1,"run":"run-1","phase":"done","fixture_result":0,"overflow":0,"ts":1900}
+"#;
+
+#[test]
+fn f07_config_rows_parse_with_op_errno_len() {
+    let ledger = parse_ledger("run-1", LITERAL_WITH_CONFIG).expect("configs parse");
+    assert_eq!(ledger.configs.len(), 3, "three config rows");
+    assert_eq!(ledger.configs[0].op, "setkey");
+    assert_eq!(ledger.configs[0].result_errno, 0);
+    assert_eq!(ledger.configs[0].len, 16);
+    assert_eq!(ledger.configs[1].result_errno, -22, "failed setkey kept");
+    assert_eq!(ledger.configs[1].len, 7, "rejected length kept");
+    assert_eq!(ledger.configs[2].op, "setauthsize");
+    assert!(
+        ledger.configs.iter().all(|c| c.seq == 3),
+        "configs join the alloc"
+    );
+}
+
+#[test]
+fn f07_config_requires_prior_alloc() {
+    let text: String = LITERAL_WITH_CONFIG
+        .lines()
+        .filter(|l| !l.contains(r#""phase":"alloc""#))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(matches!(
+        parse_ledger("run-1", &text),
+        Err(LedgerError::PhaseInconsistency(_))
+    ));
+}
+
+#[test]
+fn f07_config_missing_len_rejected() {
+    let text = LITERAL_WITH_CONFIG.replace(r#""errno":0,"len":16"#, r#""errno":0"#);
+    let err = parse_ledger("run-1", &text).expect_err("len-less config rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn f07_config_missing_op_rejected() {
+    let text = LITERAL_WITH_CONFIG.replace(r#""op":"setkey","errno""#, r#""errno""#);
+    let err = parse_ledger("run-1", &text).expect_err("op-less config rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}
+
+#[test]
+fn f07_config_missing_errno_rejected() {
+    let text = LITERAL_WITH_CONFIG.replace(r#""errno":0,"len""#, r#""len""#);
+    let err = parse_ledger("run-1", &text).expect_err("errno-less config rejected");
+    assert!(
+        matches!(err, LedgerError::Malformed(_)),
+        "malformed: {err:?}"
+    );
+}

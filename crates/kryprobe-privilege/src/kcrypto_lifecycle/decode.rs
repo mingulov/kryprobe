@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Raw-edge decode: v3 `LEdge` bytes → T05 `Edge` events (T06).
+//! Raw-edge decode: v4 `LEdge` bytes → T05 `Edge` events (T06, v4 at T07.3).
 //!
 //! The join is keyed by the BPF invocation id alone (W8 fsession: the
 //! entry run mints one id per call and stores it in the kernel-zeroed
@@ -37,13 +37,15 @@ use kryprobe_abi::kcrypto_lifecycle::{
 use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
 use std::collections::HashMap;
 
-/// Record twin size: `LEdge` is 40 bytes on the ring.
-const RECORD_LEN: usize = 40;
+/// Record twin size: `LEdge` is 48 bytes on the ring (v4: the
+/// transform word rides at 40..48).
+const RECORD_LEN: usize = 48;
 
 /// One validated raw edge (post-twin-checks, pre-join).
 ///
-/// `Debug` is manual: [`RawEdge::key`] is a raw kernel pointer and
-/// renders as `<redacted>` (round-1 sol-m9/astra-m9).
+/// `Debug` is manual: [`RawEdge::key`] and [`RawEdge::tfm`] are raw
+/// kernel pointers and render as `<redacted>` (round-1
+/// sol-m9/astra-m9).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RawEdge {
     /// [`LEDGE_SUBMIT`] or [`LEDGE_RETURN`] (validated).
@@ -63,6 +65,10 @@ pub struct RawEdge {
     /// BPF invocation id (the join identity; 0 on tainted edges,
     /// which name no invocation).
     pub invoc: u64,
+    /// Frontend transform pointer behind the op (0 when the request
+    /// link was unreadable — unknown, feeds first-seen admission;
+    /// never leaves decode except into the tracker's opaque ids).
+    pub tfm: u64,
 }
 
 impl std::fmt::Debug for RawEdge {
@@ -75,6 +81,7 @@ impl std::fmt::Debug for RawEdge {
             .field("ts_ns", &self.ts_ns)
             .field("status", &self.status)
             .field("invoc", &self.invoc)
+            .field("tfm", &"<redacted>")
             .finish()
     }
 }
@@ -82,7 +89,7 @@ impl std::fmt::Debug for RawEdge {
 /// Why one ring record produced no edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeDrop {
-    /// Record is not exactly 40 bytes.
+    /// Record is not exactly 48 bytes.
     BadLength,
     /// Magic is not [`LEDGE_MAGIC`].
     BadMagic,
@@ -94,7 +101,7 @@ pub enum DecodeDrop {
     BadSite,
     /// Flags carry bits outside [`LEDGE_TAINTED`].
     BadFlags,
-    /// v1 defines no aux; nonzero is twin drift.
+    /// The twin defines no aux; nonzero is twin drift.
     BadAux,
     /// Null pairing key (the BPF `BADKEY` gate should have dropped it).
     NullKey,
@@ -133,9 +140,12 @@ pub struct DecodeStats {
     pub stale_returns: u64,
 }
 
-/// Validate one ring record against the v3 `LEdge` twin: exact length,
+/// Validate one ring record against the v4 `LEdge` twin: exact length,
 /// magic, version, edge kind, site, defined-only flags, zero aux,
-/// non-null key, zero status on submit edges, and the invocation id.
+/// non-null key, zero status on submit edges, the invocation id, and
+/// the transform word (`tfm` admits ANY u64 — 0 is unknown, never
+/// refused: the op joins by invocation with or without its
+/// transform).
 pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeDrop::BadLength);
@@ -188,6 +198,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if !tainted && (invoc == 0 || invoc & LEDGE_INVOC_POISON != 0) {
         return Err(DecodeDrop::BadInvoc);
     }
+    let tfm = u64le(40);
     Ok(RawEdge {
         edge,
         site,
@@ -196,6 +207,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         ts_ns,
         status,
         invoc,
+        tfm,
     })
 }
 

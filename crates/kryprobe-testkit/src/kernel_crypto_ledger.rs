@@ -36,16 +36,43 @@ pub struct LedgerRequest {
 /// fixture's final-free flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerAlloc {
-    /// Fixture sequence shared by the alloc/free pair.
+    /// Fixture sequence shared by the alloc/free rows.
     pub seq: u64,
     /// Name the consumer requested (generic or exact driver).
     pub req_name: String,
     /// Driver the crypto API resolved.
     pub drv_name: String,
-    /// Whether the free row arrived.
+    /// Requested algorithm type mask (F02 provenance; `None`
+    /// when the fixture row predates it — unknown, never zero).
+    pub alg_type: Option<u32>,
+    /// Requested algorithm mask (F02 provenance; `None` when
+    /// the fixture row predates it — unknown, never zero).
+    pub alg_mask: Option<u32>,
+    /// Whether a free row arrived.
     pub freed: bool,
-    /// Fixture-reported final free (vs release at refcount > 1).
+    /// Fixture-reported final free (last free row's flag: a
+    /// refcount-retained release lands `false`, the proved final
+    /// free lands `true`).
     pub final_free: bool,
+    /// Free rows observed for this sequence (each put counts;
+    /// a shared transform legitimately lands several).
+    pub releases: u32,
+}
+
+/// One transform configuration: metadata-only truth (operation,
+/// native result, length) — never key/tag/IV bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerConfig {
+    /// Fixture sequence of the owning alloc row.
+    pub seq: u64,
+    /// Configuration operation (`setkey`, `setauthsize`).
+    pub op: String,
+    /// Native errno of the operation (0 on success; a failure
+    /// is truth, never a dropped row).
+    pub result_errno: i32,
+    /// Metadata length the operation carried (key/authsize
+    /// bytes offered — lengths only, never content).
+    pub len: u32,
 }
 
 /// A fully parsed run ledger.
@@ -57,6 +84,8 @@ pub struct ParsedLedger {
     pub requests: Vec<LedgerRequest>,
     /// Transform lifetimes, in first-seen sequence order.
     pub allocs: Vec<LedgerAlloc>,
+    /// Transform configurations, in row order.
+    pub configs: Vec<LedgerConfig>,
     /// Whether a DONE row closed the run.
     pub done: bool,
 }
@@ -120,16 +149,22 @@ const RUN_LEVEL_SEQ: u64 = u64::MAX;
 
 /// In-progress transform lifetime while scanning rows.
 struct AllocBuild {
-    /// Fixture sequence shared by the alloc/free pair.
+    /// Fixture sequence shared by the alloc/free rows.
     seq: u64,
     /// Requested name from the alloc row.
     req_name: String,
     /// Resolved driver from the alloc row.
     drv_name: String,
-    /// Whether the free row arrived.
+    /// Requested algorithm type mask, when the row carries it.
+    alg_type: Option<u32>,
+    /// Requested algorithm mask, when the row carries it.
+    alg_mask: Option<u32>,
+    /// Whether a free row arrived.
     freed: bool,
-    /// Fixture-reported final free.
+    /// Last free row's final flag.
     final_free: bool,
+    /// Free rows observed so far.
+    releases: u32,
 }
 
 fn malformed(lineno: usize, msg: &str) -> LedgerError {
@@ -165,28 +200,71 @@ fn row_errno(row: &serde_json::Value, lineno: usize, phase: &str) -> Result<i32,
     i32::try_from(errno).map_err(|_| malformed(lineno, &format!("{phase} errno out of i32 range")))
 }
 
+/// Required u32 metadata (`len` on `config` rows).
+fn row_u32(
+    row: &serde_json::Value,
+    lineno: usize,
+    phase: &str,
+    field: &str,
+) -> Result<u32, LedgerError> {
+    let value = row
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| malformed(lineno, &format!("{phase} row missing {field}")))?;
+    u32::try_from(value)
+        .map_err(|_| malformed(lineno, &format!("{phase} {field} out of u32 range")))
+}
+
+/// Optional u32 provenance (`type`/`mask` on `alloc` rows):
+/// absent stays unknown, present-but-not-u32 is malformed
+/// (a lying provenance field must not parse as truth).
+fn row_opt_u32(
+    row: &serde_json::Value,
+    lineno: usize,
+    phase: &str,
+    field: &str,
+) -> Result<Option<u32>, LedgerError> {
+    match row.get(field) {
+        None => Ok(None),
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| malformed(lineno, &format!("{phase} {field} is not a u32")))?;
+            u32::try_from(raw)
+                .map(Some)
+                .map_err(|_| malformed(lineno, &format!("{phase} {field} out of u32 range")))
+        }
+    }
+}
+
 /// Parses `text` as the JSONL ledger of run `expected_run`.
 ///
 /// Row schema (all objects, unknown fields ignored so the fixture
 /// can grow): `v` (must be 1), `run` (must match), `phase` (one of
-/// submit/return/progress/terminal/alloc/free/done), `seq` on every
-/// phase but `done`, non-empty `op` on submit rows, non-empty
-/// `req`/`drv` on alloc rows, `errno` on return/progress/terminal
-/// rows, `overflow` counter on every row that carries it (nonzero
-/// rejects) and required on DONE, required `fixture_result` on the
-/// DONE row (nonzero rejects), required `final` flag on free rows.
+/// submit/return/progress/terminal/alloc/free/config/done), `seq`
+/// on every phase but `done`, non-empty `op` on submit rows,
+/// non-empty `req`/`drv` on alloc rows (plus optional u32
+/// `type`/`mask` provenance), `errno` on
+/// return/progress/terminal rows, `overflow` counter on every row
+/// that carries it (nonzero rejects) and required on DONE,
+/// required `fixture_result` on the DONE row (nonzero rejects),
+/// required `final` flag on free rows, and on `config` rows a
+/// non-empty `op`, an `errno` result and a u32 `len`.
 ///
 /// Strictness is load-bearing: (sequence, phase) rows are unique
-/// (a future multi-progress fixture relaxes this with its own
-/// test), every request needs submit, return and terminal rows
-/// (submit first; return existence required but unordered vs
-/// terminal — a genuine terminal may land first under preemption,
-/// matrix Q04), free requires a prior alloc, every alloc must
-/// close before DONE, no row may follow DONE, and the run must
-/// close with DONE.
+/// except `free` (each put counts; a shared transform lands
+/// several, last `final` wins) and `config` (each configuration
+/// counts; a transform is configured repeatedly) — both
+/// exemptions carry their own tests. Every request needs submit,
+/// return and terminal rows (submit first; return existence
+/// required but unordered vs terminal — a genuine terminal may
+/// land first under preemption, matrix Q04), free and config
+/// require a prior alloc, every alloc must close before DONE, no
+/// row may follow DONE, and the run must close with DONE.
 pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, LedgerError> {
     let mut reqs: Vec<Build> = Vec::new();
     let mut alloc_builds: Vec<AllocBuild> = Vec::new();
+    let mut configs: Vec<LedgerConfig> = Vec::new();
     let mut seen: HashSet<(u64, String)> = HashSet::new();
     let mut done = false;
     for (lineno, raw) in text.lines().enumerate() {
@@ -221,7 +299,7 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
             .ok_or_else(|| malformed(lineno, "missing phase"))?;
         let seq = match phase {
             "done" => RUN_LEVEL_SEQ,
-            "submit" | "return" | "progress" | "terminal" | "alloc" | "free" => row
+            "submit" | "return" | "progress" | "terminal" | "alloc" | "free" | "config" => row
                 .get("seq")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| malformed(lineno, "missing seq"))?,
@@ -235,7 +313,10 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 return Err(LedgerError::Overflow { seq });
             }
         }
-        if !seen.insert((seq, phase.to_owned())) {
+        // `free` and `config` rows repeat per sequence by design
+        // (each put / each configuration counts); every other
+        // phase stays (sequence, phase) unique.
+        if phase != "free" && phase != "config" && !seen.insert((seq, phase.to_owned())) {
             return Err(LedgerError::DuplicateRow {
                 seq,
                 phase: phase.to_owned(),
@@ -262,12 +343,17 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 // above, so no entry exists here.
                 let req_name = nonempty_str(&row, lineno, "alloc", "req")?;
                 let drv_name = nonempty_str(&row, lineno, "alloc", "drv")?;
+                let alg_type = row_opt_u32(&row, lineno, "alloc", "type")?;
+                let alg_mask = row_opt_u32(&row, lineno, "alloc", "mask")?;
                 alloc_builds.push(AllocBuild {
                     seq,
                     req_name: req_name.to_owned(),
                     drv_name: drv_name.to_owned(),
+                    alg_type,
+                    alg_mask,
                     freed: false,
                     final_free: false,
+                    releases: 0,
                 });
             }
             "free" => {
@@ -279,6 +365,7 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                             .get("final")
                             .and_then(serde_json::Value::as_bool)
                             .ok_or_else(|| malformed(lineno, "free row missing final"))?;
+                        entry.releases = entry.releases.saturating_add(1);
                     }
                     None => {
                         return Err(LedgerError::PhaseInconsistency(format!(
@@ -286,6 +373,22 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                         )));
                     }
                 }
+            }
+            "config" => {
+                if !alloc_builds.iter().any(|a| a.seq == seq) {
+                    return Err(LedgerError::PhaseInconsistency(format!(
+                        "seq {seq} config arrived without alloc"
+                    )));
+                }
+                let op = nonempty_str(&row, lineno, "config", "op")?;
+                let result_errno = row_errno(&row, lineno, "config")?;
+                let len = row_u32(&row, lineno, "config", "len")?;
+                configs.push(LedgerConfig {
+                    seq,
+                    op: op.to_owned(),
+                    result_errno,
+                    len,
+                });
             }
             "submit" | "return" | "progress" | "terminal" => {
                 let idx = match reqs.iter().position(|r| r.seq == seq) {
@@ -348,8 +451,11 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
             seq: a.seq,
             req_name: a.req_name,
             drv_name: a.drv_name,
+            alg_type: a.alg_type,
+            alg_mask: a.alg_mask,
             freed: true,
             final_free: a.final_free,
+            releases: a.releases,
         });
     }
     let mut requests = Vec::with_capacity(reqs.len());
@@ -387,6 +493,7 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
         run_id: expected_run.to_owned(),
         requests,
         allocs,
+        configs,
         done,
     })
 }

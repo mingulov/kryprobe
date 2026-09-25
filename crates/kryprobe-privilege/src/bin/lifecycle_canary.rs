@@ -5,7 +5,7 @@
 //! live in [`canary`](kryprobe_privilege::kcrypto_lifecycle::canary),
 //! this bin is the IO shell).
 //!
-//! Flow: bring up the sensor (2 required session links) → PREPARE →
+//! Flow: bring up the sensor (3 required session links) → PREPARE →
 //! clear-drain → two quiescence baselines (the guest must be idle:
 //! equal baselines prove no background crypto brackets the run) →
 //! GO (blocks until the scenario completes) → drain until quiet →
@@ -23,6 +23,7 @@ use kryprobe_privilege::host::monotonic_ns;
 use kryprobe_privilege::kcrypto_lifecycle::canary::{
     SensorBaseline, SensorView, count_foreign_links, parse_transcript, verdict,
 };
+use kryprobe_privilege::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
 use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
 use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
 use std::io::Write;
@@ -106,7 +107,7 @@ fn main() {
         std::process::exit(1);
     };
 
-    // 1. Bring up the sensor (both required session links or nothing).
+    // 1. Bring up the sensor (all required session links or nothing).
     let object_bytes = std::fs::read(&object).unwrap_or_else(|err| {
         eprintln!("canary error: cannot read object {object}: {err}");
         std::process::exit(2);
@@ -117,11 +118,12 @@ fn main() {
             std::process::exit(2);
         });
     put(&mut out, "links", points.len().to_string());
-    if points.len() != 2 {
+    let want_links = manifest(LifecycleProfile::RequestLifecycle).required.len();
+    if points.len() != want_links {
         fail(
             &out,
             &receipt,
-            &format!("want 2 session links, have {}", points.len()),
+            &format!("want {want_links} session links, have {}", points.len()),
         );
     }
     let attached_links = sensor.attached_points();
@@ -384,16 +386,18 @@ fn main() {
 
     // 6. Receipt sensor lines (post-finish deltas) + oracle verdict.
     let delta = |a: u64, b: u64| a.saturating_sub(b);
-    let hits = [
-        delta(ledger.edge_hits[0], baseline2.edge_hits[0]),
-        delta(ledger.edge_hits[1], baseline2.edge_hits[1]),
-        delta(ledger.edge_hits[2], baseline2.edge_hits[2]),
-        delta(ledger.edge_hits[3], baseline2.edge_hits[3]),
-    ];
+    let hits: Vec<u64> = ledger
+        .edge_hits
+        .iter()
+        .zip(baseline2.edge_hits.iter())
+        .map(|(a, b)| delta(*a, *b))
+        .collect();
     put(&mut out, "se_enc_sub", hits[0].to_string());
     put(&mut out, "se_enc_ret", hits[1].to_string());
     put(&mut out, "se_dec_sub", hits[2].to_string());
     put(&mut out, "se_dec_ret", hits[3].to_string());
+    put(&mut out, "se_allocsk_sub", hits[4].to_string());
+    put(&mut out, "se_allocsk_ret", hits[5].to_string());
     put(&mut out, "se_completed", completed.len().to_string());
     let terms: Vec<String> = completed
         .iter()
@@ -454,13 +458,13 @@ fn main() {
     put(
         &mut out,
         "agg",
-        format!(
-            "{},{},{},{}",
-            delta(ledger.agg_accepted[0], baseline2.agg_accepted[0]),
-            delta(ledger.agg_accepted[1], baseline2.agg_accepted[1]),
-            delta(ledger.agg_accepted[2], baseline2.agg_accepted[2]),
-            delta(ledger.agg_accepted[3], baseline2.agg_accepted[3]),
-        ),
+        ledger
+            .agg_accepted
+            .iter()
+            .zip(baseline2.agg_accepted.iter())
+            .map(|(a, b)| delta(*a, *b).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
     );
     put(
         &mut out,
@@ -487,13 +491,12 @@ fn main() {
     put(
         &mut out,
         "arm_agg_abs",
-        format!(
-            "{},{},{},{}",
-            ledger.agg_baseline[0],
-            ledger.agg_baseline[1],
-            ledger.agg_baseline[2],
-            ledger.agg_baseline[3],
-        ),
+        ledger
+            .agg_baseline
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     put(
         &mut out,
@@ -510,13 +513,12 @@ fn main() {
     put(
         &mut out,
         "agg_abs",
-        format!(
-            "{},{},{},{}",
-            ledger.agg_accepted[0],
-            ledger.agg_accepted[1],
-            ledger.agg_accepted[2],
-            ledger.agg_accepted[3],
-        ),
+        ledger
+            .agg_accepted
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     put(&mut out, "view_valid", ledger.view_valid.to_string());
     // H2 per-program misses abs+delta (GO-relative join against the

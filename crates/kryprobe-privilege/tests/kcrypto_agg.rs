@@ -36,8 +36,8 @@ use kryprobe_privilege::LocalPrivilegedAuthority;
 use kryprobe_privilege::attach::OwnedLink;
 use kryprobe_privilege::bpfloader::{LoadedKcrypto, load_kcrypto};
 use kryprobe_privilege::btf_resolve::{
-    FIRST_MEMBER_LINKS, KCRYPTO_SYMBOLS, PF_KTHREAD, resolve_btf_ids, resolve_member_offset,
-    resolve_offsets,
+    FIRST_MEMBER_LINKS, KCRYPTO_SYMBOLS, PF_KTHREAD, resolve_aggregate_offsets, resolve_btf_ids,
+    resolve_member_offset,
 };
 use kryprobe_privilege::mapops::{
     map_get_next_key, map_lookup_bytes, map_update_bytes, possible_cpus,
@@ -125,7 +125,7 @@ impl Sensor {
             "all 9 must load: {statuses:?}"
         );
         assert_eq!(loaded.progs.len(), 9);
-        let off = resolve_offsets().expect("offsets must resolve");
+        let off = resolve_aggregate_offsets().expect("offsets must resolve");
         let cfg = KConfig {
             sk_req_base: off.sk_req_base,
             async_tfm: off.async_tfm,
@@ -730,7 +730,7 @@ fn kcfg_roundtrip_matches_resolver() {
         .map(|name| ((*name).to_owned(), ids[*name]))
         .collect();
     let (loaded, _) = load_kcrypto(&bytes, &entries, None).expect("load for KCFG roundtrip");
-    let off = resolve_offsets().expect("offsets must resolve");
+    let off = resolve_aggregate_offsets().expect("offsets must resolve");
     let cfg = KConfig {
         sk_req_base: off.sk_req_base,
         async_tfm: off.async_tfm,
