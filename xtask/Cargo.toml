@@ -8,13 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 goblin = "0.10"
-kryprobe-core = { path = "../crates/kryprobe-core" }
-kryprobe-privilege = { path = "../crates/kryprobe-privilege" }
+kryprobe-core.workspace = true
+kryprobe-privilege.workspace = true
 libc = "0.2"
 serde_json = "1"
 
 [dev-dependencies]
-kryprobe-testkit = { path = "../crates/kryprobe-testkit" }
+kryprobe-testkit.workspace = true
 
 [lints]
 workspace = true

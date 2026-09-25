@@ -406,6 +406,8 @@ pub fn load_lifecycle(
                 config: take("LCFG")?,
                 ring: take("LRING")?,
                 loss: take("LLOSS")?,
+                state: take("LSTATE")?,
+                agg: take("LAGG")?,
             },
             progs,
         },

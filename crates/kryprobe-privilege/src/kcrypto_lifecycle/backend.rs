@@ -15,7 +15,9 @@ use crate::btf_resolve::resolve_lifecycle_ids;
 use crate::kcrypto_backend::object::lifecycle_object_bytes;
 use crate::kcrypto_backend::{btf_unsupported, charge, configured_error_to_backend};
 use crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS;
-use crate::kcrypto_lifecycle::sensor::{DrainOutcome, LifecycleLedger, LifecycleSensor};
+use crate::kcrypto_lifecycle::sensor::{
+    DrainOutcome, LifecycleLedger, LifecycleSensor, QuietOutcome,
+};
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, RawEventHeader};
 use kryprobe_core::backend::{
     Backend, BackendCapabilities, BackendPlan, BackendRegistry, BackendSummary, ConfigureContext,
@@ -138,6 +140,24 @@ impl LifecycleBackend {
         self.with_sensor(|sensor| sensor.attached_points())
     }
 
+    /// Detach-then-drain, step 1: drop the attach links (no hook
+    /// fires after; the closing drain converges).
+    pub fn close_input(&self) -> Result<(), BackendError> {
+        self.with_sensor(|sensor| sensor.close_input())
+    }
+
+    /// Detach-then-drain, step 2: bounded quiet loop; records the
+    /// exact close backlog into the core for the ledger.
+    pub fn drain_quiet(&self) -> Result<QuietOutcome, BackendError> {
+        let quiet = self.with_sensor(|sensor| sensor.drain_quiet())?;
+        quiet.map_err(|err| {
+            BackendError::Internal(InternalError::with_detail(
+                "lifecycle_drain",
+                &err.to_string(),
+            ))
+        })
+    }
+
     /// One live tick: drain up to `max_records` ring records into the
     /// terminal ledger.
     pub fn drain_tick(&self, max_records: usize) -> Result<DrainOutcome, BackendError> {
@@ -155,8 +175,10 @@ impl LifecycleBackend {
         self.with_sensor(|sensor| sensor.take_completed())
     }
 
-    /// Stop-time reconciliation: drain pending truthless.
-    pub fn finish_stop(&self, stop_ns: u64) -> Result<Vec<RequestRecord>, BackendError> {
+    /// Stop-time reconciliation: drain pending truthless into
+    /// retention. Returns nothing — read via [`Self::take_completed`]
+    /// (one read path; a returning finish double-surfaced records).
+    pub fn finish_stop(&self, stop_ns: u64) -> Result<(), BackendError> {
         self.with_sensor(|sensor| sensor.finish(stop_ns))
     }
 
@@ -253,7 +275,12 @@ impl Backend for SharedLifecycleBackend {
     }
 }
 
-/// Single registration helper (the CLI imports this; never redefines it).
+/// Single registration helper without a live-held handle: the minimal
+/// seam for decode/finalize tests that never bring up a sensor.
+/// Production always uses [`register_lifecycle_shared`] (the live
+/// session needs the handle to drive drains + finalize). Held gate:
+/// no production caller by design — the shared variant is the
+/// production entry, and this one keeps test registries minimal.
 pub fn register_lifecycle(registry: &mut BackendRegistry) -> Result<(), DuplicateBackend> {
     registry.register(Box::new(LifecycleBackend::new()))
 }
@@ -301,7 +328,9 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
     for key in obj.keys() {
         match key.as_str() {
             "request_id" | "terminal" | "status" | "duration_ns" | "tfm_id" => {}
-            other => return Err(input(format!("unknown envelope key: {other:?}"))),
+            // Input-free (T05 `UnknownKey` precedent): the name is
+            // untrusted input and could smuggle key material.
+            _ => return Err(input("unknown envelope key present".to_owned())),
         }
     }
     let get = |key: &str| {
@@ -327,9 +356,12 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
         ("callback", Some(status)) => ValidTerminal::Callback(status),
         ("unknown", None) => ValidTerminal::Unknown,
         _ => {
-            return Err(input(format!(
-                "terminal/status mismatch: {terminal_name:?} with {status:?}"
-            )));
+            // Input-free: the offered terminal word is untrusted
+            // input — name the rule, never the value.
+            return Err(input(
+                "terminal/status mismatch: want sync|callback with i32 status, or unknown with null"
+                    .to_owned(),
+            ));
         }
     };
     let duration_ns = match get("duration_ns")? {
@@ -340,9 +372,8 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
                     && !duration.starts_with('0')
                     && duration.bytes().all(|b| b.is_ascii_digit()));
             if !canonical || duration.parse::<u64>().is_err() {
-                return Err(input(format!(
-                    "duration_ns not a canonical u64: {duration:?}"
-                )));
+                // Input-free: the offered string is untrusted input.
+                return Err(input("duration_ns not a canonical u64 string".to_owned()));
             }
             Some(duration.clone())
         }
@@ -355,6 +386,14 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
                 .ok_or_else(|| input("tfm_id is not a u64|null".to_owned()))?,
         ),
     };
+    // T05 parity: an unobserved terminal carries neither status (ruled
+    // out above) nor duration (a span without endpoints is fabricated
+    // timing).
+    if matches!(terminal, ValidTerminal::Unknown) && duration_ns.is_some() {
+        return Err(input(
+            "terminal 'unknown' must not carry a duration".to_owned(),
+        ));
+    }
     Ok(LifecycleEnvelope {
         request_id,
         terminal,
@@ -366,24 +405,24 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
 /// One completed record → observation (pure over the validated
 /// envelope + minted id). Grounded terminals (`Sync`/`Callback`)
 /// complete with their exact status; `Unknown` enters (never
-/// completes) with the status placeholder 0 per the `status_for_res`
-/// precedent — the payload's terminal/status/evidence triple carries
-/// the explicit unknown, never a trusted result. Started/ended stay
-/// `None`: T05 records carry spans, not absolute timestamps, and the
-/// backend never fabricates per-request timing.
+/// completes) with [`NativeResult::KCryptoUnknown`] — no status
+/// exists, and a zero placeholder would fabricate success beside the
+/// payload's explicit `"status": null`. Started/ended stay `None`:
+/// T05 records carry spans, not absolute timestamps, and the backend
+/// never fabricates per-request timing.
 fn observation_for_lifecycle(env: &LifecycleEnvelope, id: ObservationId) -> NativeObservation {
     let terminal = &env.terminal;
-    let (phase, call_kind, status, coverage) = match terminal {
+    let (phase, call_kind, native_result, coverage) = match terminal {
         ValidTerminal::Sync(status) | ValidTerminal::Callback(status) => (
             EvidencePhase::Completed,
             CallKind::Operation,
-            *status,
+            NativeResult::KCrypto { status: *status },
             K::COVERAGE_OBSERVED,
         ),
         ValidTerminal::Unknown => (
             EvidencePhase::Entered,
             CallKind::Unknown,
-            0,
+            NativeResult::KCryptoUnknown,
             K::COVERAGE_UNOBSERVED,
         ),
     };
@@ -424,7 +463,7 @@ fn observation_for_lifecycle(env: &LifecycleEnvelope, id: ObservationId) -> Nati
         operation_class: OperationClass::Unknown,
         native_name: None,
         native_code: None,
-        native_result: NativeResult::KCrypto { status },
+        native_result,
         started_ns: None,
         ended_ns: None,
         correlation: None,
@@ -474,13 +513,16 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 
 /// Final-ledger → integrity (every loss counter lands somewhere —
 /// nothing silent; zeros are documented-absent paths, never gaps):
-/// kernel reserve failures → ring; retention drops past the ledger
-/// bound → user queue; refused/bad/duplicate/ambiguous evidence →
-/// state inserts; unfinished-at-finish → unmatched entries; unknown
-/// keys + reducer orphans → unmatched returns; reuse gaps + stale
-/// returns → correlation overflows. Evictions/unknown generations/
-/// budget omissions pin zero (no silent eviction path, single
-/// generation driver, decode never budget-omits).
+/// kernel reserve failures → ring; disabled/badkey/noslot (evidence
+/// the kernel refused to record) → state inserts; fret (return
+/// observed, value unreadable) → unmatched returns; retention drops
+/// past the ledger bound → user queue; refused/bad/duplicate/
+/// ambiguous evidence → state inserts; unfinished-at-finish →
+/// unmatched entries; unknown keys + reducer orphans → unmatched
+/// returns; reuse gaps + stale returns → correlation overflows.
+/// Evictions/unknown generations/budget omissions pin zero (HASH
+/// slots never evict, single generation driver, decode never
+/// budget-omits).
 fn integrity_for_lifecycle(ledger: &LifecycleLedger) -> IntegritySummary {
     IntegritySummary {
         ring_reservation_failures: ledger.kernel_loss[0],
@@ -491,13 +533,17 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger) -> IntegritySummary {
             .saturating_add(ledger.decode.bad_records)
             .saturating_add(ledger.reducer.admission_failed)
             .saturating_add(ledger.reducer.duplicate)
-            .saturating_add(ledger.reducer.ambiguous),
+            .saturating_add(ledger.reducer.ambiguous)
+            .saturating_add(ledger.kernel_loss[1])
+            .saturating_add(ledger.kernel_loss[2])
+            .saturating_add(ledger.kernel_loss[4]),
         state_evictions: 0,
         unmatched_entries: ledger.reducer.unfinished,
         unmatched_returns: ledger
             .decode
             .unknown_key_returns
-            .saturating_add(ledger.reducer.orphan),
+            .saturating_add(ledger.reducer.orphan)
+            .saturating_add(ledger.kernel_loss[3]),
         correlation_overflows: ledger
             .decode
             .gaps_synthesized
@@ -654,5 +700,43 @@ impl Backend for LifecycleBackend {
             observations,
             integrity: integrity_for_lifecycle(&ledger),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kcrypto_lifecycle::decode::DecodeStats;
+    use kryprobe_core::kcrypto::ReducerStats;
+
+    fn ledger_with(kernel_loss: [u64; 5]) -> LifecycleLedger {
+        LifecycleLedger {
+            completed: Vec::new(),
+            edge_hits: [0; 4],
+            decode: DecodeStats::default(),
+            reducer: ReducerStats::default(),
+            kernel_loss,
+            agg_accepted: [0; 4],
+            retained_dropped: 0,
+        }
+    }
+
+    #[test]
+    fn w2_every_kernel_loss_class_lands_somewhere() {
+        // Round-2 (sol-M5/astra-M6): each LLOSS class maps to exactly
+        // one integrity field — reserve→ring, disabled/badkey/noslot→
+        // state inserts (evidence that failed to enter backend
+        // state), fret→unmatched returns (return observed, value
+        // unreadable). Nothing silent, nothing double-counted.
+        let integrity = integrity_for_lifecycle(&ledger_with([7, 1, 2, 3, 4]));
+        assert_eq!(integrity.ring_reservation_failures, 7);
+        assert_eq!(integrity.state_insert_failures, 1 + 2 + 4);
+        assert_eq!(integrity.unmatched_returns, 3);
+        assert_eq!(integrity.user_queue_drops, 0);
+        assert_eq!(integrity.unmatched_entries, 0);
+        assert_eq!(integrity.correlation_overflows, 0);
+        assert_eq!(integrity.state_evictions, 0);
+        assert_eq!(integrity.unknown_generation_events, 0);
+        assert_eq!(integrity.budget_omissions, 0);
     }
 }

@@ -42,6 +42,9 @@ pub enum ReportError {
         /// Profile value found, or `"<missing>"`.
         profile: String,
     },
+    /// An unobserved lifecycle terminal has no status, hence no wire
+    /// outcome spelling (a zero-fill would fabricate success).
+    UnknownNativeResult,
 }
 
 impl std::fmt::Display for ReportError {
@@ -59,6 +62,9 @@ impl std::fmt::Display for ReportError {
             }
             Self::UnsupportedCaptureProfile { profile } => {
                 write!(f, "no supported export boundary for profile {profile:?}")
+            }
+            Self::UnknownNativeResult => {
+                write!(f, "unobserved terminal has no wire spelling")
             }
         }
     }

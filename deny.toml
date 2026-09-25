@@ -25,8 +25,8 @@ exceptions = [
   { name = "linux-raw-sys", allow = ["Apache-2.0 WITH LLVM-exception"] },
   { name = "rustix", allow = ["Apache-2.0 WITH LLVM-exception"] },
 ]
-unlicensed = "deny"
-copyleft = "deny"
+# cargo-deny 0.20 schema: `unlicensed`/`copyleft` levels were removed —
+# licenses not in `allow` are denied by default (same enforcement).
 
 [bans]
 # M-SEC-01 lock-in: the tree migrated off serde_yaml 0.9
@@ -38,8 +38,10 @@ deny = [
 wildcards = "deny"
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "deny"
+# cargo-deny 0.20 schema: `vulnerability`/`notice` levels were removed
+# (both always emit errors now — strictly stronger than the old
+# deny/warn); `unmaintained` selects the failing scope (`all` keeps the
+# old deny-everywhere intent).
+unmaintained = "all"
 yanked = "deny"
-notice = "warn"
 ignore = []

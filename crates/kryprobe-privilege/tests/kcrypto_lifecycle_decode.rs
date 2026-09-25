@@ -1,25 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T06 decode suite: raw `LEdge` bytes → T05 `Edge` events + join rules.
 //!
-//! Pins the record twin (magic/version/edge/site/flags/aux/length),
+//! Pins the v2 record twin (magic/version/edge/site/flags/aux/length),
 //! the key→opaque-id join (fresh id per admission, bounded table),
 //! return classification (sync-terminal vs queued), and the named loss
-//! counters. Reuse-while-outstanding gaps the old id and admits fresh;
-//! a late return for the old key joins the CURRENT id (known T06
-//! limitation — T08 assigns BPF-side generations).
+//! counters. BPF taints nested submits/returns (`LEDGE_TAINTED`) and the
+//! decoder refuses them without disturbing the outstanding id — the
+//! round-2 counterexample (reuse then late return joining the wrong
+//! invocation) cannot complete. A same-key clean submit while an id is
+//! outstanding means transport loss (the BPF slot empties only on a
+//! return emit, so honest BPF never nests clean): the old id gaps
+//! `IdentityAmbiguous` and the new submit admits fresh; its return
+//! joins current (coarse-clock ties join — pinned).
 
 use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
 use kryprobe_privilege::kcrypto_lifecycle::decode::{
     DecodeDrop, DecodeStats, LifecycleDecoder, decode_record,
 };
 
-/// One 32-byte `LEdge` (little-endian twin of the ABI struct).
-fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32) -> [u8; 32] {
+/// `LEDGE_TAINTED` flag bit (BPF nesting taint; mirrors the ABI const).
+const TAINTED: u16 = 0x0001;
+
+/// One 32-byte v2 `LEdge` (little-endian twin of the ABI struct).
+fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 1;
+    out[2] = 2;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
+    out[6..8].copy_from_slice(&flags.to_le_bytes());
     out[8..16].copy_from_slice(&key.to_le_bytes());
     out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
     out[24..28].copy_from_slice(&status.to_le_bytes());
@@ -28,12 +37,12 @@ fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32) -> [u8; 32
 
 #[test]
 fn decode_record_accepts_valid_submit_and_return() {
-    let raw = decode_record(&edge_bytes(1, 1, 0xabc, 100, 0)).expect("valid submit parses");
+    let raw = decode_record(&edge_bytes(1, 1, 0xabc, 100, 0, 0)).expect("valid submit parses");
     assert_eq!(
         (raw.edge, raw.site, raw.key, raw.ts_ns, raw.status),
         (1, 1, 0xabc, 100, 0)
     );
-    let raw = decode_record(&edge_bytes(2, 2, 0xdef, 200, -5)).expect("valid return parses");
+    let raw = decode_record(&edge_bytes(2, 2, 0xdef, 200, -5, 0)).expect("valid return parses");
     assert_eq!(
         (raw.edge, raw.site, raw.key, raw.ts_ns, raw.status),
         (2, 2, 0xdef, 200, -5)
@@ -43,26 +52,42 @@ fn decode_record_accepts_valid_submit_and_return() {
 #[test]
 fn decode_record_rejects_twin_drift() {
     // Bad magic / version / edge / site / flags / aux each name their drop.
-    let mut bad = edge_bytes(1, 1, 9, 1, 0);
+    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
     bad[0] = 0;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMagic));
-    let mut bad = edge_bytes(1, 1, 9, 1, 0);
-    bad[2] = 2;
+    // v1 records refuse (fail closed across versions: a v1 decoder
+    // would misread v2 flags, so versions never mix).
+    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
+    bad[2] = 1;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadVersion));
+    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
+    bad[2] = 3;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadVersion));
     assert_eq!(
-        decode_record(&edge_bytes(3, 1, 9, 1, 0)),
+        decode_record(&edge_bytes(3, 1, 9, 1, 0, 0)),
         Err(DecodeDrop::BadEdge)
     );
     assert_eq!(
-        decode_record(&edge_bytes(1, 9, 9, 1, 0)),
+        decode_record(&edge_bytes(1, 9, 9, 1, 0, 0)),
         Err(DecodeDrop::BadSite)
     );
-    let mut bad = edge_bytes(1, 1, 9, 1, 0);
-    bad[6] = 1;
+    // Only the taint bit is defined; any other flag bit is drift.
+    let tainted = decode_record(&edge_bytes(1, 1, 9, 1, 0, TAINTED)).expect("taint parses");
+    assert!(tainted.tainted);
+    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
+    bad[6] = 0x02;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadFlags));
-    let mut bad = edge_bytes(1, 1, 9, 1, 0);
+    let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
     bad[28] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadAux));
+    // Submit edges carry status 0 (ABI): a nonzero submit status is
+    // twin drift, rejected — never silently discarded.
+    assert_eq!(
+        decode_record(&edge_bytes(1, 1, 9, 1, -5, 0)),
+        Err(DecodeDrop::BadSubmitStatus)
+    );
+    // Returns keep their full i32 range.
+    decode_record(&edge_bytes(2, 1, 9, 1, -5, 0)).expect("return status parses");
 }
 
 #[test]
@@ -70,7 +95,7 @@ fn decode_record_rejects_shape_and_null_key() {
     assert_eq!(decode_record(&[0u8; 31]), Err(DecodeDrop::BadLength));
     assert_eq!(decode_record(&[0u8; 33]), Err(DecodeDrop::BadLength));
     assert_eq!(
-        decode_record(&edge_bytes(1, 1, 0, 1, 0)),
+        decode_record(&edge_bytes(1, 1, 0, 1, 0, 0)),
         Err(DecodeDrop::NullKey)
     );
 }
@@ -78,13 +103,13 @@ fn decode_record_rejects_shape_and_null_key() {
 #[test]
 fn feed_pairs_submit_with_sync_return() {
     let mut dec = LifecycleDecoder::new(16);
-    let out = dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0));
+    let out = dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
     assert_eq!(out.len(), 1);
     let Edge::Submit { id, tfm_id, ts_ns } = out[0] else {
         panic!("submit must emit Submit, got {:?}", out[0]);
     };
     assert_eq!((id, tfm_id, ts_ns), (1, None, 100));
-    let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0));
+    let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0, 0));
     assert_eq!(out.len(), 1);
     assert!(matches!(
         out[0],
@@ -116,8 +141,8 @@ fn feed_classifies_queued_vs_terminal_returns() {
         (1, true),
     ] {
         let mut dec = LifecycleDecoder::new(16);
-        dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0));
-        let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, status));
+        dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+        let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, status, 0));
         assert_eq!(out.len(), 1, "status {status}");
         let Edge::Return {
             disposition,
@@ -139,7 +164,7 @@ fn feed_classifies_queued_vs_terminal_returns() {
 #[test]
 fn feed_return_without_submit_counts_unknown_key() {
     let mut dec = LifecycleDecoder::new(16);
-    let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0));
+    let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0, 0));
     assert!(out.is_empty(), "no phantom edges: {out:?}");
     assert_eq!(dec.stats().unknown_key_returns, 1);
     assert_eq!(dec.stats().admitted, 0);
@@ -148,8 +173,8 @@ fn feed_return_without_submit_counts_unknown_key() {
 #[test]
 fn feed_reuse_while_outstanding_gaps_old_and_admits_fresh() {
     let mut dec = LifecycleDecoder::new(16);
-    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0));
-    let out = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0));
+    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+    let out = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
     assert_eq!(out.len(), 2);
     assert!(matches!(
         out[0],
@@ -173,16 +198,16 @@ fn feed_reuse_while_outstanding_gaps_old_and_admits_fresh() {
 #[test]
 fn feed_refuses_admission_at_capacity() {
     let mut dec = LifecycleDecoder::new(1);
-    assert_eq!(dec.feed(&edge_bytes(1, 1, 0xaa, 100, 0)).len(), 1);
-    let out = dec.feed(&edge_bytes(1, 1, 0xbb, 110, 0));
+    assert_eq!(dec.feed(&edge_bytes(1, 1, 0xaa, 100, 0, 0)).len(), 1);
+    let out = dec.feed(&edge_bytes(1, 1, 0xbb, 110, 0, 0));
     assert!(out.is_empty(), "full table admits nothing: {out:?}");
     assert_eq!(dec.stats().submit_refused, 1);
     // The refused submit leaves no phantom: its return is unknown-key.
-    let out = dec.feed(&edge_bytes(2, 1, 0xbb, 120, 0));
+    let out = dec.feed(&edge_bytes(2, 1, 0xbb, 120, 0, 0));
     assert!(out.is_empty());
     assert_eq!(dec.stats().unknown_key_returns, 1);
     // And the admitted key still pairs.
-    let out = dec.feed(&edge_bytes(2, 1, 0xaa, 130, 0));
+    let out = dec.feed(&edge_bytes(2, 1, 0xaa, 130, 0, 0));
     assert_eq!(out.len(), 1);
 }
 
@@ -190,7 +215,7 @@ fn feed_refuses_admission_at_capacity() {
 fn feed_bad_records_count_without_edges() {
     let mut dec = LifecycleDecoder::new(16);
     assert!(dec.feed(&[0u8; 31]).is_empty());
-    assert!(dec.feed(&edge_bytes(9, 1, 1, 1, 0)).is_empty());
+    assert!(dec.feed(&edge_bytes(9, 1, 1, 1, 0, 0)).is_empty());
     assert_eq!(dec.stats().bad_records, 2);
     assert_eq!(dec.stats().admitted, 0);
 }
@@ -201,12 +226,12 @@ fn f9_raw_edge_and_decoder_debug_redact_kernel_keys() {
     // must never render in diagnostics. Both the edge and the decoder
     // (whose table is keyed by raw addresses) redact them.
     let key = 0xdead_beef_1234_5678u64;
-    let raw = decode_record(&edge_bytes(1, 1, key, 100, 0)).expect("valid submit");
+    let raw = decode_record(&edge_bytes(1, 1, key, 100, 0, 0)).expect("valid submit");
     let shown = format!("{raw:?}");
     assert!(shown.contains("<redacted>"), "{shown}");
     assert!(!shown.contains(&key.to_string()), "{shown}");
     let mut decoder = LifecycleDecoder::new(8);
-    decoder.feed(&edge_bytes(1, 1, key, 100, 0));
+    decoder.feed(&edge_bytes(1, 1, key, 100, 0, 0));
     let dshown = format!("{decoder:?}");
     assert!(dshown.contains("outstanding"), "{dshown}");
     assert!(!dshown.contains(&key.to_string()), "{dshown}");
@@ -223,8 +248,8 @@ fn f4_ebusy_is_unresolved_einprogress_is_queued() {
         (-16, ReturnDisposition::Unresolved),
     ] {
         let mut dec = LifecycleDecoder::new(16);
-        dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0));
-        let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, status));
+        dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+        let out = dec.feed(&edge_bytes(2, 1, 0xabc, 150, status, 0));
         assert_eq!(out.len(), 1, "status {status}");
         let Edge::Return { disposition, .. } = out[0] else {
             panic!("status {status} must emit Return");
@@ -242,9 +267,9 @@ fn f3_late_pre_reuse_return_is_stale_not_joined() {
     // refused (counted, id2 stays outstanding); op2's own R(t250)
     // then completes id2 with ITS status.
     let mut dec = LifecycleDecoder::new(16);
-    let s1 = dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0));
+    let s1 = dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
     assert!(matches!(s1[..], [Edge::Submit { id: 1, .. }]));
-    let s2 = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0));
+    let s2 = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
     assert_eq!(s2.len(), 2);
     assert!(matches!(
         s2[0],
@@ -254,13 +279,13 @@ fn f3_late_pre_reuse_return_is_stale_not_joined() {
         }
     ));
     assert!(matches!(s2[1], Edge::Submit { id: 2, .. }));
-    let stale = dec.feed(&edge_bytes(2, 1, 0xabc, 150, -5));
+    let stale = dec.feed(&edge_bytes(2, 1, 0xabc, 150, -5, 0));
     assert!(
         stale.is_empty(),
         "stale return must emit nothing: {stale:?}"
     );
     assert_eq!(dec.stats().stale_returns, 1);
-    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 250, 0));
+    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 250, 0, 0));
     assert_eq!(
         done,
         vec![Edge::Return {
@@ -274,13 +299,16 @@ fn f3_late_pre_reuse_return_is_stale_not_joined() {
 
 #[test]
 fn f3_return_at_same_tick_as_resubmit_joins() {
-    // Ties are ambiguous under a coarse clock: R(t200) against a
-    // resubmit S2(t200) joins current (pinned; T08 generations
-    // disambiguate).
+    // Transport-loss shape: S1(t100), R1 dropped by the ring, S2(t200)
+    // gaps S1 `IdentityAmbiguous`, R2(t200) joins current — ties join
+    // under a coarse clock (pinned). This is NOT the reuse case:
+    // honest BPF taints nested submits (next test), so a clean
+    // same-key submit while an id is outstanding proves the old
+    // return never arrived.
     let mut dec = LifecycleDecoder::new(16);
-    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0));
-    dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0));
-    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 200, -5));
+    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+    dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
+    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 200, -5, 0));
     assert_eq!(
         done,
         vec![Edge::Return {
@@ -291,4 +319,66 @@ fn f3_return_at_same_tick_as_resubmit_joins() {
         }]
     );
     assert_eq!(dec.stats().stale_returns, 0);
+}
+
+#[test]
+fn w2_tainted_submit_refuses_and_keeps_outstanding() {
+    // Round-2 counterexample killer: BPF taints the nested submit
+    // (LSTATE held the key), so the decoder refuses it WITHOUT
+    // gapping the outstanding id — the late original return then
+    // joins the ORIGINAL id with its exact status, never the reuse.
+    let mut dec = LifecycleDecoder::new(16);
+    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+    let refused = dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, TAINTED));
+    assert!(refused.is_empty(), "tainted submit emits nothing");
+    assert_eq!(dec.stats().submit_refused, 1);
+    assert_eq!(dec.stats().admitted, 1, "no fresh id for taint");
+    assert_eq!(dec.stats().gaps_synthesized, 0, "outstanding kept");
+    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 220, -5, 0));
+    assert_eq!(
+        done,
+        vec![Edge::Return {
+            id: 1,
+            ts_ns: 220,
+            status: -5,
+            disposition: ReturnDisposition::Terminal,
+        }]
+    );
+}
+
+#[test]
+fn w2_tainted_return_never_joins_or_disturbs() {
+    // A tainted return (slot was empty at BPF exit: pre-attach call
+    // or NOSLOT drop) counts unknown-key and leaves
+    // any outstanding id alone — a later clean return still joins.
+    let mut dec = LifecycleDecoder::new(16);
+    let unknown = dec.feed(&edge_bytes(2, 1, 0xabc, 150, 0, TAINTED));
+    assert!(unknown.is_empty());
+    assert_eq!(dec.stats().unknown_key_returns, 1);
+    dec.feed(&edge_bytes(1, 1, 0xabc, 200, 0, 0));
+    let tainted = dec.feed(&edge_bytes(2, 1, 0xabc, 210, -5, TAINTED));
+    assert!(tainted.is_empty(), "tainted return emits nothing");
+    assert_eq!(dec.stats().unknown_key_returns, 2);
+    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 220, 0, 0));
+    assert!(
+        matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
+        "outstanding undisturbed: {done:?}"
+    );
+}
+
+#[test]
+fn w2_site_mismatch_refuses_stale_and_keeps_outstanding() {
+    // Submit site is stored; a return from the other site for the
+    // same key cannot be this invocation's return (one call, one
+    // function) — refused stale, outstanding kept for its real return.
+    let mut dec = LifecycleDecoder::new(16);
+    dec.feed(&edge_bytes(1, 1, 0xabc, 100, 0, 0));
+    let stale = dec.feed(&edge_bytes(2, 2, 0xabc, 150, 0, 0));
+    assert!(stale.is_empty(), "cross-site return emits nothing");
+    assert_eq!(dec.stats().stale_returns, 1);
+    let done = dec.feed(&edge_bytes(2, 1, 0xabc, 200, 0, 0));
+    assert!(
+        matches!(done.as_slice(), [Edge::Return { id: 1, .. }]),
+        "outstanding undisturbed: {done:?}"
+    );
 }

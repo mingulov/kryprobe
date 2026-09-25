@@ -1,112 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T06 VM canary: attach the lifecycle sensor in a vng guest, drive one
-//! fixture scenario, and cross-check sensor edges against the fixture's
-//! own ledger rows (independent oracle).
+//! fixture scenario, and verdict the sensor ledger against the
+//! fixture's own ledger rows (independent oracle — the exact rules
+//! live in [`canary`](kryprobe_privilege::kcrypto_lifecycle::canary),
+//! this bin is the IO shell).
 //!
-//! Flow: bring up the sensor (4 required links) → clear-drain pre-GO
-//! traffic → `PREPARE <id> <scenario> <seed>` + `GO` on the fixture
-//! control file → read the fixture ledger → drain until the sensor
-//! matches the fixture's submit/return counts (or the deadline) →
-//! write the receipt. Exit 0 on PASS, 1 on totals mismatch, 2 on
+//! Flow: bring up the sensor (4 required links) → PREPARE →
+//! clear-drain → two quiescence baselines (the guest must be idle:
+//! equal baselines prove no background crypto brackets the run) →
+//! GO (blocks until the scenario completes) → drain until quiet →
+//! detach + quiet-drain → `finish` reconciliation → verdict. Exit 0
+//! on PASS, 1 on verdict/parse/drain mismatch, 2 on
 //! usage/bring-up/fixture failure.
 //!
-//! Expectations derive from the FIXTURE ledger (per-op submit/return/
-//! terminal rows joined by seq), never from hardcoded counts: the
-//! canary fails loudly on drift instead of pinning observations.
+//! Expectations derive from the FIXTURE ledger plus the scenario's
+//! exact shape (see the oracle): the canary fails loudly on drift
+//! instead of pinning observations.
 
+use kryprobe_core::kcrypto::Terminal;
+use kryprobe_privilege::host::monotonic_ns;
+use kryprobe_privilege::kcrypto_lifecycle::canary::{
+    SensorBaseline, SensorView, parse_transcript, verdict,
+};
 use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Fixture rows for one run id, joined by seq.
-#[derive(Debug, Default)]
-struct FixtureTruth {
-    /// seq → op ("encrypt"/"decrypt") from submit rows.
-    ops: HashMap<u64, String>,
-    /// (op, errno) per return row, in ledger order.
-    returns: Vec<(String, i64)>,
-    /// Terminal-row errnos, in ledger order.
-    terminals: Vec<i64>,
-    /// Done-row result + ledger overflow.
-    fixture_result: i64,
-    /// Done-row overflow count.
-    overflow: u64,
-    /// Done row present.
-    done: bool,
-}
-
-/// Extract `"key":value` (number) following a marker, or `None`.
-fn num_after(row: &str, marker: &str) -> Option<i64> {
-    let at = row.find(marker)? + marker.len();
-    let rest = &row[at..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '-')
-        .unwrap_or(rest.len());
-    rest[..end].parse::<i64>().ok()
-}
-
-/// Extract `"key":"str"` following a marker, or `None`.
-fn str_after(row: &str, marker: &str) -> Option<String> {
-    let at = row.find(marker)? + marker.len();
-    let rest = &row[at..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
-}
-
-/// Parse fixture ledger rows for `run_id` (JSON lines; manual scan —
-/// the formats are fixed by the fixture C source).
-fn parse_fixture_ledger(text: &str, run_id: &str) -> FixtureTruth {
-    let mut truth = FixtureTruth::default();
-    let run_mark = format!("\"run\":\"{run_id}\"");
-    for row in text.lines() {
-        if !row.contains(&run_mark) {
-            continue;
-        }
-        let Some(phase) = str_after(row, "\"phase\":\"") else {
-            continue;
-        };
-        match phase.as_str() {
-            "submit" => {
-                if let (Some(seq), Some(op)) = (
-                    num_after(row, "\"seq\":").and_then(|n| u64::try_from(n).ok()),
-                    str_after(row, "\"op\":\""),
-                ) {
-                    truth.ops.insert(seq, op);
-                }
-            }
-            "return" => {
-                if let (Some(seq), Some(errno)) = (
-                    num_after(row, "\"seq\":").and_then(|n| u64::try_from(n).ok()),
-                    num_after(row, "\"errno\":"),
-                ) {
-                    let op = truth.ops.get(&seq).cloned().unwrap_or_default();
-                    truth.returns.push((op, errno));
-                }
-            }
-            "terminal" => {
-                if let Some(errno) = num_after(row, "\"errno\":") {
-                    truth.terminals.push(errno);
-                }
-            }
-            "done" => {
-                truth.done = true;
-                truth.fixture_result = num_after(row, "\"fixture_result\":").unwrap_or(-9999);
-                truth.overflow = num_after(row, "\"overflow\":")
-                    .and_then(|n| u64::try_from(n).ok())
-                    .unwrap_or(u64::MAX);
-            }
-            _ => {}
-        }
-    }
-    truth
-}
-
 fn usage() -> ! {
     eprintln!(
         "usage: lifecycle_canary --object PATH --fixture-dir PATH --scenario NAME \
-         --run-id ID --seed N --receipt PATH [--timeout-ms MS]"
+         --run-id ID --seed N --receipt PATH [--sensor-ledger PATH] [--timeout-ms MS]"
     );
     std::process::exit(2);
 }
@@ -127,6 +51,11 @@ fn main() {
     ) else {
         usage()
     };
+    if scenario != "sync-once" && scenario != "async-once" {
+        eprintln!("canary error: unknown scenario {scenario}");
+        std::process::exit(2);
+    }
+    let sensor_ledger_path = arg_value(&args, "--sensor-ledger");
     let timeout_ms: u64 = arg_value(&args, "--timeout-ms")
         .map(|v| v.parse().unwrap_or_else(|_| usage()))
         .unwrap_or(5000);
@@ -174,23 +103,55 @@ fn main() {
         );
     }
 
-    // 2. Clear-drain pre-GO traffic (discarded; deltas measured after).
-    if let Err(err) = sensor.drain_once(4096) {
-        eprintln!("canary error: clear drain failed: {err}");
-        std::process::exit(2);
-    }
-    let baseline = sensor.ledger().unwrap_or_else(|err| {
-        eprintln!("canary error: baseline ledger failed: {err}");
-        std::process::exit(2);
-    });
-
-    // 3. Drive the fixture (GO blocks until the scenario completes).
+    // 2. PREPARE, then clear-drain (discarded) + two quiescence
+    // baselines: equal baselines 200ms apart prove the guest emits
+    // no background crypto around the scenario (the oracle joins
+    // deltas, so foreign traffic would corrupt the join).
     let control = PathBuf::from(&fixture_dir).join("control");
     let cmd = format!("PREPARE {run_id} {scenario} {seed}");
     if let Err(err) = std::fs::write(&control, &cmd) {
         eprintln!("canary error: PREPARE failed: {err}");
         std::process::exit(2);
     }
+    for _ in 0..8 {
+        match sensor.drain_once(8192) {
+            Ok(drained) => {
+                let _ = sensor.take_completed();
+                if drained.records == 0 && !drained.busy {
+                    break;
+                }
+            }
+            Err(err) => {
+                eprintln!("canary error: clear drain failed: {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let snapshot = |sensor: &LifecycleSensor, taken: u64| -> SensorBaseline {
+        let ledger = sensor.ledger().unwrap_or_else(|err| {
+            eprintln!("canary error: ledger read failed: {err}");
+            std::process::exit(2);
+        });
+        SensorBaseline {
+            edge_hits: ledger.edge_hits,
+            kernel_loss: ledger.kernel_loss,
+            agg_accepted: ledger.agg_accepted,
+            completed_len: taken,
+            decode: ledger.decode,
+            reducer: ledger.reducer,
+            retained_dropped: ledger.retained_dropped,
+        }
+    };
+    let baseline1 = snapshot(&sensor, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    let baseline2 = snapshot(&sensor, 0);
+    if baseline1 != baseline2 {
+        fail(&out, &receipt, "guest not quiet (baselines differ)");
+    }
+    put(&mut out, "quiescence", "ok".to_owned());
+
+    // 3. GO (blocks until the scenario completes), then parse the
+    // fixture transcript STRICTLY (any malformed own-row fails).
     if let Err(err) = std::fs::write(&control, "GO") {
         eprintln!("canary error: GO failed: {err}");
         std::process::exit(2);
@@ -200,86 +161,127 @@ fn main() {
             eprintln!("canary error: cannot read fixture ledger: {err}");
             std::process::exit(2);
         });
-    let truth = parse_fixture_ledger(&ledger_text, &run_id);
+    let truth = parse_transcript(&ledger_text, &run_id).unwrap_or_else(|err| {
+        fail(&out, &receipt, &format!("fixture transcript: {err}"));
+    });
     put(&mut out, "fixture_result", truth.fixture_result.to_string());
-    put(&mut out, "fixture_overflow", truth.overflow.to_string());
-    if !truth.done {
-        fail(&out, &receipt, "fixture ledger has no done row");
-    }
-    if truth.fixture_result != 0 {
-        fail(
-            &out,
-            &receipt,
-            &format!("fixture failed: result {}", truth.fixture_result),
-        );
-    }
-    if truth.overflow != 0 {
-        fail(&out, &receipt, "fixture ledger overflowed");
-    }
+    put(
+        &mut out,
+        "fixture_overflow",
+        truth.fixture_overflow.to_string(),
+    );
 
-    // 4. Expected sensor totals from the fixture rows (independent oracle).
-    let mut exp = [0u64; 4];
-    for op in truth.ops.values() {
-        match op.as_str() {
-            "encrypt" => exp[0] += 1,
-            "decrypt" => exp[2] += 1,
+    // Fixture display counts (receipt readers; the verdict owns rules).
+    let mut fx = [0u64; 4];
+    for op in &truth.ops {
+        match op.op.as_str() {
+            "encrypt" => fx[0] += 1,
+            "decrypt" => fx[2] += 1,
             _ => {}
         }
     }
-    let mut exp_completed = 0u64;
-    for (op, errno) in &truth.returns {
-        match op.as_str() {
-            "encrypt" => exp[1] += 1,
-            "decrypt" => exp[3] += 1,
+    let mut fx_completed = 0u64;
+    for (seq, errno) in &truth.returns {
+        let op = truth
+            .ops
+            .iter()
+            .find(|o| o.seq == *seq)
+            .map(|o| o.op.as_str())
+            .unwrap_or("");
+        match op {
+            "encrypt" => fx[1] += 1,
+            "decrypt" => fx[3] += 1,
             _ => {}
         }
         if *errno != -115 && *errno != -16 {
-            exp_completed += 1;
+            fx_completed += 1;
         }
     }
-    put(&mut out, "fx_enc_sub", exp[0].to_string());
-    put(&mut out, "fx_enc_ret", exp[1].to_string());
-    put(&mut out, "fx_dec_sub", exp[2].to_string());
-    put(&mut out, "fx_dec_ret", exp[3].to_string());
-    put(&mut out, "fx_completed", exp_completed.to_string());
+    put(&mut out, "fx_enc_sub", fx[0].to_string());
+    put(&mut out, "fx_enc_ret", fx[1].to_string());
+    put(&mut out, "fx_dec_sub", fx[2].to_string());
+    put(&mut out, "fx_dec_ret", fx[3].to_string());
+    put(&mut out, "fx_completed", fx_completed.to_string());
 
-    // 5. Drain until the sensor matches (or the deadline).
+    // 4. Drain until a quiet round (records==0, no busy writer) or
+    // the deadline — the poll owns NO count expectations (the oracle
+    // does); drain errors fail loudly, never fall back.
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let ledger = loop {
-        if sensor.drain_once(1024).is_err() {
-            break sensor.ledger().unwrap_or_else(|_| baseline.clone());
-        }
-        let ledger = sensor.ledger().unwrap_or_else(|_| baseline.clone());
-        let hits = [
-            ledger.edge_hits[0] - baseline.edge_hits[0],
-            ledger.edge_hits[1] - baseline.edge_hits[1],
-            ledger.edge_hits[2] - baseline.edge_hits[2],
-            ledger.edge_hits[3] - baseline.edge_hits[3],
-        ];
-        let done = ledger.completed.len() as u64 - baseline.completed.len() as u64;
-        if hits == exp && done == exp_completed {
-            break ledger;
+    let mut completed = Vec::new();
+    loop {
+        let drained = sensor.drain_once(8192).unwrap_or_else(|err| {
+            fail(&out, &receipt, &format!("sensor drain failed: {err}"));
+        });
+        completed.extend(sensor.take_completed());
+        if drained.records == 0 && !drained.busy {
+            break;
         }
         if Instant::now() >= deadline {
-            break ledger;
+            fail(&out, &receipt, "drain deadline (sensor never quiet)");
         }
         std::thread::sleep(Duration::from_millis(20));
-    };
+    }
 
-    // 6. Receipt + verdict (deltas vs the fixture oracle).
+    // 5. Detach + quiet-drain + finish reconciliation (post-finish
+    // completions join the take: every pending request reconciled).
+    sensor.close_input();
+    let quiet = sensor.drain_quiet().unwrap_or_else(|err| {
+        fail(&out, &receipt, &format!("quiet drain failed: {err}"));
+    });
+    completed.extend(sensor.take_completed());
+    let stop_ns = monotonic_ns().unwrap_or_else(|err| {
+        eprintln!("canary error: clock read failed: {err}");
+        std::process::exit(2);
+    });
+    // `finish` reconciles into retention; the take is the ONE read
+    // path (finish returns nothing by design — a returning finish
+    // double-surfaced every reconciled record).
+    sensor.finish(stop_ns);
+    completed.extend(sensor.take_completed());
+    let ledger = sensor.ledger().unwrap_or_else(|err| {
+        eprintln!("canary error: final ledger failed: {err}");
+        std::process::exit(2);
+    });
+
+    // Sensor-ledger evidence file (exact join inputs for reviewers).
+    if let Some(path) = sensor_ledger_path {
+        let mut text = String::new();
+        for record in &completed {
+            let (terminal, status) = match record.terminal {
+                Terminal::Sync(status) => ("sync", Some(status)),
+                Terminal::Callback(status) => ("callback", Some(status)),
+                Terminal::Unknown => ("unknown", None),
+            };
+            text.push_str(&format!(
+                "{{\"id\":{},\"terminal\":\"{}\",\"status\":{},\"duration_ns\":{}}}\n",
+                record.id,
+                terminal,
+                status.map_or("null".to_owned(), |s| s.to_string()),
+                record
+                    .duration_ns
+                    .map_or("null".to_owned(), |d| d.to_string()),
+            ));
+        }
+        if let Err(err) = std::fs::write(&path, &text) {
+            eprintln!("canary error: cannot write sensor ledger: {err}");
+            std::process::exit(2);
+        }
+    }
+
+    // 6. Receipt sensor lines (post-finish deltas) + oracle verdict.
+    let delta = |a: u64, b: u64| a.saturating_sub(b);
     let hits = [
-        ledger.edge_hits[0] - baseline.edge_hits[0],
-        ledger.edge_hits[1] - baseline.edge_hits[1],
-        ledger.edge_hits[2] - baseline.edge_hits[2],
-        ledger.edge_hits[3] - baseline.edge_hits[3],
+        delta(ledger.edge_hits[0], baseline2.edge_hits[0]),
+        delta(ledger.edge_hits[1], baseline2.edge_hits[1]),
+        delta(ledger.edge_hits[2], baseline2.edge_hits[2]),
+        delta(ledger.edge_hits[3], baseline2.edge_hits[3]),
     ];
-    let done = ledger.completed.len() as u64 - baseline.completed.len() as u64;
     put(&mut out, "se_enc_sub", hits[0].to_string());
     put(&mut out, "se_enc_ret", hits[1].to_string());
     put(&mut out, "se_dec_sub", hits[2].to_string());
     put(&mut out, "se_dec_ret", hits[3].to_string());
-    put(&mut out, "se_completed", done.to_string());
-    let terms: Vec<String> = ledger.completed[baseline.completed.len()..]
+    put(&mut out, "se_completed", completed.len().to_string());
+    let terms: Vec<String> = completed
         .iter()
         .map(|r| format!("{:?}", r.terminal))
         .collect();
@@ -288,82 +290,95 @@ fn main() {
         &mut out,
         "decode",
         format!(
-            "admitted={} refused={} unknown={} bad={} gaps={}",
-            ledger.decode.admitted - baseline.decode.admitted,
-            ledger.decode.submit_refused - baseline.decode.submit_refused,
-            ledger.decode.unknown_key_returns - baseline.decode.unknown_key_returns,
-            ledger.decode.bad_records - baseline.decode.bad_records,
-            ledger.decode.gaps_synthesized - baseline.decode.gaps_synthesized,
+            "admitted={} refused={} unknown={} bad={} gaps={} stale={}",
+            delta(ledger.decode.admitted, baseline2.decode.admitted),
+            delta(
+                ledger.decode.submit_refused,
+                baseline2.decode.submit_refused
+            ),
+            delta(
+                ledger.decode.unknown_key_returns,
+                baseline2.decode.unknown_key_returns
+            ),
+            delta(ledger.decode.bad_records, baseline2.decode.bad_records),
+            delta(
+                ledger.decode.gaps_synthesized,
+                baseline2.decode.gaps_synthesized
+            ),
+            delta(ledger.decode.stale_returns, baseline2.decode.stale_returns),
         ),
     );
     put(
         &mut out,
         "reducer",
         format!(
-            "admitted={} emitted={} unfinished={}",
-            ledger.reducer.admitted - baseline.reducer.admitted,
-            ledger.reducer.emitted - baseline.reducer.emitted,
-            ledger.reducer.unfinished - baseline.reducer.unfinished,
+            "admitted={} emitted={} unfinished={} orphan={} dup={} ambiguous={} admission_failed={}",
+            delta(ledger.reducer.admitted, baseline2.reducer.admitted),
+            delta(ledger.reducer.emitted, baseline2.reducer.emitted),
+            delta(ledger.reducer.unfinished, baseline2.reducer.unfinished),
+            delta(ledger.reducer.orphan, baseline2.reducer.orphan),
+            delta(ledger.reducer.duplicate, baseline2.reducer.duplicate),
+            delta(ledger.reducer.ambiguous, baseline2.reducer.ambiguous),
+            delta(
+                ledger.reducer.admission_failed,
+                baseline2.reducer.admission_failed
+            ),
         ),
     );
     put(
         &mut out,
         "kernel_loss",
         format!(
+            "{},{},{},{},{}",
+            delta(ledger.kernel_loss[0], baseline2.kernel_loss[0]),
+            delta(ledger.kernel_loss[1], baseline2.kernel_loss[1]),
+            delta(ledger.kernel_loss[2], baseline2.kernel_loss[2]),
+            delta(ledger.kernel_loss[3], baseline2.kernel_loss[3]),
+            delta(ledger.kernel_loss[4], baseline2.kernel_loss[4]),
+        ),
+    );
+    put(
+        &mut out,
+        "agg",
+        format!(
             "{},{},{},{}",
-            ledger.kernel_loss[0] - baseline.kernel_loss[0],
-            ledger.kernel_loss[1] - baseline.kernel_loss[1],
-            ledger.kernel_loss[2] - baseline.kernel_loss[2],
-            ledger.kernel_loss[3] - baseline.kernel_loss[3],
+            delta(ledger.agg_accepted[0], baseline2.agg_accepted[0]),
+            delta(ledger.agg_accepted[1], baseline2.agg_accepted[1]),
+            delta(ledger.agg_accepted[2], baseline2.agg_accepted[2]),
+            delta(ledger.agg_accepted[3], baseline2.agg_accepted[3]),
+        ),
+    );
+    put(
+        &mut out,
+        "close",
+        format!(
+            "quiet={} rounds={} records={} backlog_bytes={}",
+            quiet.quiet, quiet.rounds, quiet.records, quiet.backlog_bytes,
         ),
     );
 
-    let mut reasons: Vec<String> = Vec::new();
-    if hits != exp {
-        reasons.push(format!("edge_hits {hits:?} != fixture {exp:?}"));
+    let view = SensorView {
+        completed: &completed,
+        edge_hits: ledger.edge_hits,
+        decode: ledger.decode,
+        reducer: ledger.reducer,
+        kernel_loss: ledger.kernel_loss,
+        agg_accepted: ledger.agg_accepted,
+        retained_dropped: ledger.retained_dropped,
+        baseline: baseline2,
+        quiet_backlog_bytes: quiet.backlog_bytes,
+    };
+    if let Err(reason) = verdict(&scenario, &truth, &view) {
+        fail(&out, &receipt, &reason);
     }
-    if done != exp_completed {
-        reasons.push(format!("completed {done} != fixture {exp_completed}"));
+    let mut text = String::new();
+    for (k, v) in &out {
+        text.push_str(&format!("{k}={v}\n"));
     }
-    for (i, term) in ledger.completed[baseline.completed.len()..]
-        .iter()
-        .enumerate()
-    {
-        if !term.evidence_valid() {
-            reasons.push(format!(
-                "completion {i} not evidence-valid: {:?}",
-                term.terminal
-            ));
-        }
+    text.push_str("verdict=PASS\n");
+    if let Err(err) = std::fs::write(&receipt, &text) {
+        eprintln!("canary error: cannot write receipt: {err}");
+        std::process::exit(2);
     }
-    if ledger.decode.submit_refused != baseline.decode.submit_refused
-        || ledger.decode.unknown_key_returns != baseline.decode.unknown_key_returns
-        || ledger.decode.bad_records != baseline.decode.bad_records
-        || ledger.decode.gaps_synthesized != baseline.decode.gaps_synthesized
-    {
-        reasons.push("decode loss nonzero".to_owned());
-    }
-    if ledger.kernel_loss != baseline.kernel_loss {
-        reasons.push(format!(
-            "kernel loss nonzero: {:?} -> {:?}",
-            baseline.kernel_loss, ledger.kernel_loss
-        ));
-    }
-    if ledger.reducer.unfinished != baseline.reducer.unfinished {
-        reasons.push("reducer unfinished nonzero".to_owned());
-    }
-    if reasons.is_empty() {
-        let mut text = String::new();
-        for (k, v) in &out {
-            text.push_str(&format!("{k}={v}\n"));
-        }
-        text.push_str("verdict=PASS\n");
-        if let Err(err) = std::fs::write(&receipt, &text) {
-            eprintln!("canary error: cannot write receipt: {err}");
-            std::process::exit(2);
-        }
-        let _ = std::io::stdout().write_all(text.as_bytes());
-    } else {
-        fail(&out, &receipt, &reasons.join("; "));
-    }
+    let _ = std::io::stdout().write_all(text.as_bytes());
 }

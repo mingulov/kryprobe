@@ -76,9 +76,18 @@ pub fn render_report_json(outcome: &LiveOutcome) -> Result<String, String> {
     } else {
         "partial"
     };
+    // Lifecycle rows project to the standalone payload-v1 object
+    // (validated, fail-closed): the report carries exactly the six
+    // schema keys, never the live dispatch envelope.
+    let mut observations = outcome.observations.clone();
+    for obs in &mut observations {
+        if let Some(projected) = kryprobe_report::lifecycle_v1_payload(obs) {
+            obs.backend_payload = projected?;
+        }
+    }
     let mut buf = Vec::new();
     buf.extend_from_slice(b"{\"observations\":");
-    serde_json::to_writer(&mut buf, &outcome.observations)
+    serde_json::to_writer(&mut buf, &observations)
         .map_err(|err| format!("defect: observations do not serialize: {err}"))?;
     buf.extend_from_slice(b",\"coverage\":");
     serde_json::to_writer(&mut buf, &outcome.coverage)
@@ -188,6 +197,20 @@ pub fn run_report_live(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    // Presentation gate: the frozen event-v0 envelope has no
+    // `backend_payload` and forbids additional properties, so a
+    // request-lifecycle capture can never export to JSONL (envelope
+    // carriage awaits a versioned-envelope ADR). Refuse BEFORE the
+    // capture — a bounded window that can only end in an export error
+    // must not run. Human and JSON reports carry lifecycle rows.
+    if profile == LifecycleProfile::RequestLifecycle && matches!(format, ReportFormat::Jsonl) {
+        let _ = writeln!(
+            stderr,
+            "report: --format jsonl cannot export request-lifecycle rows \
+             (event-v0 carries no lifecycle payload); use human or json"
+        );
+        return 1;
+    }
     // 4B-M5: SIGINT finalizes and renders the partial window (exit 3),
     // with a per-tick stderr progress line while the capture runs.
     let cfg = LiveConfig {
@@ -284,6 +307,122 @@ mod tests {
     fn window_defaults_to_60s() {
         assert_eq!(report_window_secs(None), 60);
         assert_eq!(report_window_secs(Some(2)), 2);
+    }
+
+    #[test]
+    fn json_lifecycle_rows_carry_v1_payloads() {
+        // Report JSON projects lifecycle rows to the standalone
+        // payload-v1 object: `schema` present, exactly six keys, and
+        // the validator accepts every projected payload.
+        use kryprobe_core::enums::{BackendId, CallKind, EvidencePhase, OperationClass};
+        use kryprobe_core::evidence::{IntegrityRef, NativeObservation, NativeResult};
+        use kryprobe_core::ids::ObservationId;
+        let obs = NativeObservation {
+            id: ObservationId::new(1),
+            backend: BackendId::KCrypto,
+            target: None,
+            object: None,
+            implementation: None,
+            phase: EvidencePhase::Completed,
+            call_kind: CallKind::Operation,
+            operation_class: OperationClass::Unknown,
+            native_name: None,
+            native_code: None,
+            native_result: NativeResult::KCrypto { status: 0 },
+            started_ns: None,
+            ended_ns: None,
+            correlation: None,
+            integrity: IntegrityRef::new(0),
+            backend_payload: serde_json::json!({
+                "row": "lifecycle",
+                "capture_profile": "request-lifecycle",
+                "id": "lc:1",
+                "tfm_id": null,
+                "terminal": "sync",
+                "status": 0,
+                "duration_ns": "50",
+                "evidence": true,
+                "count_unit": "request_lifecycle",
+                "completion_coverage": "observed",
+            }),
+        };
+        let mut outcome = json_fixture();
+        outcome.observations.push(obs);
+        let text = render_report_json(&outcome).expect("fixture renders");
+        let doc: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("report json parses");
+        let rows = doc["observations"].as_array().expect("observations array");
+        let payload = &rows[rows.len() - 1]["backend_payload"];
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .expect("payload object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "duration_ns",
+                "request_id",
+                "schema",
+                "status",
+                "terminal",
+                "tfm_id"
+            ]
+        );
+        assert_eq!(payload["schema"], "kryprobe.kcrypto.lifecycle/v1");
+        assert!(
+            kryprobe_report::validate_lifecycle_v1(payload).is_empty(),
+            "projected payload validates"
+        );
+    }
+
+    #[test]
+    fn jsonl_lifecycle_gate_refuses_before_capture() {
+        // The frozen event-v0 envelope cannot carry lifecycle rows:
+        // jsonl + request-lifecycle refuses (exit 1) before any
+        // capture runs — the bogus source proves it (a capture would
+        // exit 4 naming the source instead).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_report_live(
+            "bogus-source",
+            Some(0),
+            ReportFormat::Jsonl,
+            None,
+            None,
+            LifecycleProfile::RequestLifecycle,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+        let detail = String::from_utf8(stderr).expect("stderr is UTF-8");
+        assert!(
+            detail.contains("cannot export request-lifecycle rows"),
+            "gate names the refusal: {detail}"
+        );
+        assert!(stdout.is_empty(), "no capture output past the gate");
+        // Control: human + lifecycle reaches the capture (bogus
+        // source exits 4) — the gate only fires for jsonl.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_report_live(
+            "bogus-source",
+            Some(0),
+            ReportFormat::Human,
+            None,
+            None,
+            LifecycleProfile::RequestLifecycle,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 4);
+        let detail = String::from_utf8(stderr).expect("stderr is UTF-8");
+        assert!(
+            detail.contains("bogus-source"),
+            "capture names the source: {detail}"
+        );
     }
 
     #[test]

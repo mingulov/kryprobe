@@ -168,10 +168,10 @@ fn f8c_decode_sync_record_maps_completed() {
 }
 
 #[test]
-fn f8c_decode_unknown_record_maps_entered_placeholder() {
-    // Unknown terminal: Entered phase (never Completed), status
-    // placeholder 0 per the status_for_res precedent, payload carries
-    // the explicit unknown triple.
+fn f8c_decode_unknown_record_maps_entered_without_status() {
+    // Unknown terminal: Entered phase (never Completed), NO status
+    // (`KCryptoUnknown` — a zero placeholder would fabricate success
+    // beside the payload's explicit `"status": null`).
     let (backend, _shared) = register_lifecycle_shared_for_test();
     let integrity = IntegritySummary::default();
     let issuer = issuer();
@@ -191,7 +191,7 @@ fn f8c_decode_unknown_record_maps_entered_placeholder() {
         .expect("valid envelope");
     assert_eq!(obs.phase, EvidencePhase::Entered);
     assert_eq!(obs.call_kind, CallKind::Unknown);
-    assert_eq!(obs.native_result, NativeResult::KCrypto { status: 0 });
+    assert_eq!(obs.native_result, NativeResult::KCryptoUnknown);
     let p = &obs.backend_payload;
     assert_eq!(p[K::TERMINAL], serde_json::json!("unknown"));
     assert_eq!(p[K::STATUS], serde_json::json!(null));
@@ -230,6 +230,10 @@ fn f8c_decode_rejects_malformed_envelopes() {
             "extra-key",
             br#"{"request_id":1,"terminal":"sync","status":0,"duration_ns":"1","tfm_id":null,"op":"encrypt"}"#.to_vec(),
         ),
+        (
+            "unknown-with-duration",
+            br#"{"request_id":1,"terminal":"unknown","status":null,"duration_ns":"1","tfm_id":null}"#.to_vec(),
+        ),
     ] {
         let header = header_for(payload.len());
         assert!(
@@ -238,6 +242,41 @@ fn f8c_decode_rejects_malformed_envelopes() {
                 Err(BackendError::CorruptInput(_))
             ),
             "{name} must be corrupt_input"
+        );
+    }
+}
+
+#[test]
+fn f8c_decode_rejections_are_input_free() {
+    // Rejection diagnostics name the rule, never the offered bytes
+    // (T05 input-free precedent — rejected bytes could be key
+    // material or buffer contents).
+    let (backend, _shared) = register_lifecycle_shared_for_test();
+    let integrity = IntegritySummary::default();
+    let issuer = issuer();
+    let ctx = decode_ctx(&integrity, &issuer);
+    for (sentinel, payload) in [
+        (
+            "SECRETKEY",
+            br#"{"request_id":1,"terminal":"sync","status":0,"duration_ns":"1","tfm_id":null,"SECRETKEY":1}"#.to_vec(),
+        ),
+        (
+            "not-a-duration-SECRET",
+            br#"{"request_id":1,"terminal":"sync","status":0,"duration_ns":"not-a-duration-SECRET","tfm_id":null}"#.to_vec(),
+        ),
+        (
+            "frobnicate-SECRET",
+            br#"{"request_id":1,"terminal":"frobnicate-SECRET","status":0,"duration_ns":"1","tfm_id":null}"#.to_vec(),
+        ),
+    ] {
+        let header = header_for(payload.len());
+        let err = backend
+            .decode(&ctx, RawEvent { header, payload: &payload })
+            .expect_err("must reject");
+        let text = format!("{err:?}");
+        assert!(
+            !text.contains(sentinel),
+            "rejection leaks input {sentinel:?}: {text}"
         );
     }
 }

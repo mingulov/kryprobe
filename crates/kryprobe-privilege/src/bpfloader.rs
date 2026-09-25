@@ -424,8 +424,12 @@ pub struct LifecycleMaps {
     pub config: OwnedFd,
     /// `LRING` (raw edge ringbuf).
     pub ring: OwnedFd,
-    /// `LLOSS` (per-CPU loss counters, 4 entries).
+    /// `LLOSS` (per-CPU loss counters, 5 entries).
     pub loss: OwnedFd,
+    /// `LSTATE` (global outstanding-call slots).
+    pub state: OwnedFd,
+    /// `LAGG` (per-CPU accepted-edge aggregate, 4 entries).
+    pub agg: OwnedFd,
 }
 
 /// Loaded lifecycle object: maps + programs as (section, handle)

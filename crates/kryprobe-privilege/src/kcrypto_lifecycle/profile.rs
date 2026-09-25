@@ -144,7 +144,11 @@ pub struct ProfileManifest {
     pub maps: &'static [(&'static str, MapDims)],
 }
 
-/// Frozen lifecycle map table: config, edge ringbuf, per-CPU loss.
+/// Frozen lifecycle map table: config, edge ringbuf, per-CPU loss
+/// (5 classes), global identity slots, per-CPU accepted-edge
+/// aggregate. `LSTATE` mirrors the userspace decode bound (4096
+/// outstanding keys); `LAGG` reconciles against consumed edges +
+/// `LLOSS_RESERVE` after a quiet drain.
 pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
     (
         "LCFG",
@@ -166,6 +170,24 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
     ),
     (
         "LLOSS",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 5,
+        },
+    ),
+    (
+        "LSTATE",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 1,
+            max_entries: 4096,
+        },
+    ),
+    (
+        "LAGG",
         MapDims {
             map_type: 6,
             key_size: 4,

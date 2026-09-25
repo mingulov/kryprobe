@@ -25,8 +25,10 @@
 
 /// `LEdge.magic`: `LC` (little-endian u16).
 pub const LEDGE_MAGIC: u16 = 0x434c;
-/// `LEdge.version` the T06 decoder understands.
-pub const LEDGE_VERSION: u8 = 1;
+/// `LEdge.version` the T06 decoder understands (v2: `flags` carries
+/// [`LEDGE_TAINTED`]; v1 records refuse — versions never mix, so a v1
+/// decoder misreading v2 flags is impossible).
+pub const LEDGE_VERSION: u8 = 2;
 
 /// `LEdge.edge`: function entry (submit-side observation).
 pub const LEDGE_SUBMIT: u8 = 1;
@@ -37,6 +39,14 @@ pub const LEDGE_RETURN: u8 = 2;
 pub const LSITE_ENC: u16 = 1;
 /// `LEdge.site`: `crypto_skcipher_decrypt`.
 pub const LSITE_DEC: u16 = 2;
+
+/// `LEdge.flags` bit 0: BPF nesting taint. Set when the edge's key
+/// had no usable `LSTATE` slot at hook time — a submit nested over
+/// an outstanding call, or a return with no outstanding submit
+/// (pre-attach call, `NOSLOT` drop). The decoder refuses tainted
+/// edges without disturbing the outstanding id: first-wins pairing,
+/// never a misjoin. No other flag bit is defined.
+pub const LEDGE_TAINTED: u16 = 0x0001;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
 pub const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
@@ -53,6 +63,19 @@ pub const LLOSS_BADKEY: u32 = 2;
 /// was refused (aggregate-sensor `KDROPS_FRET` precedent: an
 /// unclassified return is skipped, never misbucketed).
 pub const LLOSS_FRET: u32 = 3;
+/// `LLOSS[4]`: submit edges dropped because the `LSTATE` slot table
+/// was full (no eviction: a full table refuses the submit loudly
+/// rather than destroying another call's pairing state).
+pub const LLOSS_NOSLOT: u32 = 4;
+
+/// `LAGG[0]`: accepted encrypt-submit edges (post-gate, pre-reserve).
+pub const LAGG_ENC_SUB: u32 = 0;
+/// `LAGG[1]`: accepted encrypt-return edges.
+pub const LAGG_ENC_RET: u32 = 1;
+/// `LAGG[2]`: accepted decrypt-submit edges.
+pub const LAGG_DEC_SUB: u32 = 2;
+/// `LAGG[3]`: accepted decrypt-return edges.
+pub const LAGG_DEC_RET: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Structs (twinned in kcrypto_lifecycle.rs; pinned by layout tests)
@@ -76,7 +99,8 @@ pub struct LEdge {
     pub edge: u8,
     /// [`LSITE_ENC`] or [`LSITE_DEC`].
     pub site: u16,
-    /// Reserved flags (BPF writes 0).
+    /// Flag bits (only [`LEDGE_TAINTED`] defined; BPF writes 0 for
+    /// clean edges).
     pub flags: u16,
     /// Raw kernel request pointer (pairing material; see module docs).
     pub key: u64,

@@ -4,9 +4,9 @@
 //! Any drift between BPF bytes and these mirrors must fail here.
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LCONFIG_MAGIC, LCONFIG_VERSION, LConfig, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT,
-    LEDGE_VERSION, LEdge, LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_RESERVE, LSITE_DEC,
-    LSITE_ENC,
+    LAGG_DEC_RET, LAGG_DEC_SUB, LAGG_ENC_RET, LAGG_ENC_SUB, LCONFIG_MAGIC, LCONFIG_VERSION,
+    LConfig, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION, LEdge,
+    LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE, LSITE_DEC, LSITE_ENC,
 };
 use std::mem::{offset_of, size_of};
 
@@ -27,9 +27,10 @@ fn ledge_is_32_bytes_with_pinned_offsets() {
 #[test]
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
-    assert_eq!(LEDGE_VERSION, 1);
+    assert_eq!(LEDGE_VERSION, 2);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
+    assert_eq!(LEDGE_TAINTED, 0x0001);
     assert_eq!(LSITE_ENC, 1);
     assert_eq!(LSITE_DEC, 2);
 }
@@ -55,6 +56,17 @@ fn lloss_class_indices_are_frozen() {
     assert_eq!(LLOSS_DISABLED, 1);
     assert_eq!(LLOSS_BADKEY, 2);
     assert_eq!(LLOSS_FRET, 3);
+    assert_eq!(LLOSS_NOSLOT, 4);
+}
+
+#[test]
+fn lagg_hook_indices_are_frozen() {
+    // Per-hook accepted-edge order matches `edge_hits`
+    // (enc-submit, enc-return, dec-submit, dec-return).
+    assert_eq!(LAGG_ENC_SUB, 0);
+    assert_eq!(LAGG_ENC_RET, 1);
+    assert_eq!(LAGG_DEC_SUB, 2);
+    assert_eq!(LAGG_DEC_RET, 3);
 }
 
 #[test]

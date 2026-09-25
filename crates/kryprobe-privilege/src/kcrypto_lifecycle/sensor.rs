@@ -54,8 +54,17 @@ pub struct LifecycleLedger {
     pub decode: DecodeStats,
     /// Reducer counters.
     pub reducer: ReducerStats,
-    /// Kernel `LLOSS` per-class totals (reserve/disabled/badkey/fret).
-    pub kernel_loss: [u64; 4],
+    /// Kernel `LLOSS` per-class totals
+    /// (reserve/disabled/badkey/fret/noslot).
+    pub kernel_loss: [u64; 5],
+    /// Kernel `LAGG` per-hook accepted totals `[enc-submit,
+    /// enc-return, dec-submit, dec-return]` (post-gate, pre-reserve).
+    /// After a quiet drain with an empty close ring,
+    /// `sum(agg_accepted) == sum(edge_hits) + kernel_loss[RESERVE] +
+    /// kernel_loss[NOSLOT]` exactly — the reconciliation equation
+    /// (the canary asserts it; `LAGG` bumps before the slot claim,
+    /// so NOSLOT drops count as accepted-but-untransported).
+    pub agg_accepted: [u64; 4],
     /// Completions dropped from retention past the ledger bound
     /// (explicit loss; a draining reader never drops).
     pub retained_dropped: u64,
@@ -76,7 +85,9 @@ pub struct SensorCore {
 impl SensorCore {
     /// New core with bounded decode + reducer tables and a bounded
     /// completed-retention ledger (design C12: every output queue has
-    /// a configured bound — round-1 astra-M7).
+    /// a configured bound — round-1 astra-M7). The decode bound
+    /// mirrors the BPF `LSTATE` slots (4096): userspace never holds
+    /// more outstanding keys than the kernel tracks.
     #[must_use]
     pub fn new(decode_capacity: usize, reducer_capacity: usize, ledger_capacity: usize) -> Self {
         Self {
@@ -133,24 +144,26 @@ impl SensorCore {
         newly
     }
 
-    /// Drain pending truthless (stop-the-world; see reducer `finish`).
-    /// Returns the drained records (also retained per the ledger bound).
-    pub fn finish(&mut self, stop_ns: u64) -> Vec<RequestRecord> {
+    /// Drain pending truthless into retention (stop-the-world; see
+    /// reducer `finish`). Returns nothing by design: the take below is
+    /// the ONE read path — a finish that both returned and retained
+    /// double-surfaced every reconciled record (round-3 async canary).
+    pub fn finish(&mut self, stop_ns: u64) {
         let done = self.reducer.finish(stop_ns);
-        self.retain(done.iter().copied());
-        done
+        self.retain(done);
     }
 
-    /// Snapshot the terminal ledger with caller-supplied kernel loss
-    /// (the sensor shell reads `LLOSS`; tests inject).
+    /// Snapshot the terminal ledger with caller-supplied kernel
+    /// counters (the sensor shell reads `LLOSS` + `LAGG`; tests inject).
     #[must_use]
-    pub fn ledger(&self, kernel_loss: [u64; 4]) -> LifecycleLedger {
+    pub fn ledger(&self, kernel_loss: [u64; 5], agg_accepted: [u64; 4]) -> LifecycleLedger {
         LifecycleLedger {
             completed: self.completed.clone(),
             edge_hits: self.edge_hits,
             decode: self.decoder.stats(),
             reducer: self.reducer.stats(),
             kernel_loss,
+            agg_accepted,
             retained_dropped: self.retained_dropped,
         }
     }
@@ -166,6 +179,16 @@ pub struct DrainOutcome {
     /// Stopped on a busy/torn record: more may arrive later.
     pub busy: bool,
 }
+
+/// Quiet-drain visit budget per round: 8192 covers a full ring
+/// (262144 B / 40 B per record ≈ 6553 records) plus margin, still
+/// bounded — one round plays any close backlog the ring can hold.
+pub const QUIET_DRAIN_BUDGET: usize = 8192;
+
+/// Quiet-drain round cap: post-detach arrivals are impossible, so 8
+/// rounds (≈52K records) can only exhaust on a corrupt ring — and
+/// then the exact backlog, not silence, reaches the ledger.
+pub const CLOSE_DRAIN_ROUNDS: usize = 8;
 
 /// Attached lifecycle sensor: the single owner (configured maps,
 /// programs, links), the single drain (mmap'd ring + consumer
@@ -247,9 +270,10 @@ impl LifecycleSensor {
         })
     }
 
-    /// Snapshot the terminal ledger (reads `LLOSS` per-class totals).
+    /// Snapshot the terminal ledger (reads `LLOSS` per-class totals
+    /// + `LAGG` per-hook accepted totals).
     pub fn ledger(&self) -> Result<LifecycleLedger, MapOpsError> {
-        let mut kernel_loss = [0u64; 4];
+        let mut kernel_loss = [0u64; 5];
         for (idx, slot) in kernel_loss.iter_mut().enumerate() {
             *slot = map_lookup_percpu_sum(
                 &self.configured.loaded.maps.loss,
@@ -257,7 +281,15 @@ impl LifecycleSensor {
                 "lifecycle_sensor/lloss",
             )?;
         }
-        Ok(self.core.ledger(kernel_loss))
+        let mut agg_accepted = [0u64; 4];
+        for (idx, slot) in agg_accepted.iter_mut().enumerate() {
+            *slot = map_lookup_percpu_sum(
+                &self.configured.loaded.maps.agg,
+                idx as u32,
+                "lifecycle_sensor/lagg",
+            )?;
+        }
+        Ok(self.core.ledger(kernel_loss, agg_accepted))
     }
 
     /// Drain retained completions (the live tick's read path).
@@ -272,9 +304,62 @@ impl LifecycleSensor {
         self.configured.links.len()
     }
 
-    /// Drain pending truthless (stop-the-world): the live driver's
-    /// final reconciliation (see reducer `finish`).
-    pub fn finish(&mut self, stop_ns: u64) -> Vec<RequestRecord> {
-        self.core.finish(stop_ns)
+    /// Drain pending truthless into retention (stop-the-world): the
+    /// live driver's final reconciliation (see reducer `finish`).
+    /// Returns nothing — read via [`Self::take_completed`].
+    pub fn finish(&mut self, stop_ns: u64) {
+        self.core.finish(stop_ns);
     }
+
+    /// Detach-then-drain, step 1: drop every attach link (idempotent —
+    /// a second call clears an empty vec). No hook fires after this
+    /// returns, so the closing drain converges instead of chasing
+    /// arrivals.
+    pub fn close_input(&mut self) {
+        self.configured.links.clear();
+    }
+
+    /// Detach-then-drain, step 2: bounded quiet loop (at most
+    /// [`CLOSE_DRAIN_ROUNDS`] walks of [`QUIET_DRAIN_BUDGET`] visits).
+    /// A round is quiet when it consumes nothing and sees no busy
+    /// writer. The verdict carries the exact close backlog
+    /// (`producer - consumer` after the last round) to the caller —
+    /// the driver feeds it to coverage, so teardown backlog flips
+    /// `detailed_events` instead of vanishing with the sensor.
+    pub fn drain_quiet(&mut self) -> Result<QuietOutcome, DrainError> {
+        let mut rounds = 0u64;
+        let mut records = 0usize;
+        let mut quiet = false;
+        for _ in 0..CLOSE_DRAIN_ROUNDS {
+            let drained = self.drain_once(QUIET_DRAIN_BUDGET)?;
+            rounds += 1;
+            records += drained.records;
+            if drained.records == 0 && !drained.busy {
+                quiet = true;
+                break;
+            }
+        }
+        let backlog_bytes = self.area.producer().saturating_sub(self.consumer);
+        Ok(QuietOutcome {
+            rounds,
+            records,
+            quiet,
+            backlog_bytes,
+        })
+    }
+}
+
+/// One quiet-drain verdict: rounds walked, records consumed, whether
+/// a quiet round was reached, and the exact close backlog in ring
+/// bytes (zero on a clean close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuietOutcome {
+    /// Walk rounds executed (≤ [`CLOSE_DRAIN_ROUNDS`]).
+    pub rounds: u64,
+    /// Records consumed across all rounds.
+    pub records: usize,
+    /// A round consumed nothing with no busy writer.
+    pub quiet: bool,
+    /// `producer - consumer` after the last round.
+    pub backlog_bytes: u64,
 }

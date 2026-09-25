@@ -80,6 +80,10 @@ fn outcome_of(result: NativeResult) -> &'static str {
                 "failure"
             }
         }
+        // Unreachable through `observation` (refused above — an
+        // unobserved terminal has no wire outcome); the arm exists
+        // only for exhaustiveness, never emitted.
+        NativeResult::KCryptoUnknown => "unknown",
         NativeResult::Synthetic { code } => {
             if code == 0 {
                 "success"
@@ -101,6 +105,8 @@ fn result_string(result: NativeResult) -> String {
         }
         NativeResult::OpenSsl { code } => code.to_string(),
         NativeResult::KCrypto { status } => status.to_string(),
+        // Same unreachability contract as the outcome arm above.
+        NativeResult::KCryptoUnknown => "unknown".to_owned(),
         NativeResult::Synthetic { code } => code.to_string(),
     }
 }
@@ -109,7 +115,7 @@ fn namespace_of(result: NativeResult) -> &'static str {
     match result {
         NativeResult::P11 { .. } => "pkcs11",
         NativeResult::OpenSsl { .. } => "openssl-provider",
-        NativeResult::KCrypto { .. } => "kcrypto",
+        NativeResult::KCrypto { .. } | NativeResult::KCryptoUnknown => "kcrypto",
         NativeResult::Synthetic { .. } => "synthetic",
     }
 }
@@ -130,6 +136,9 @@ impl JsonlWriter {
         };
         if matches!(obs.native_result, NativeResult::Synthetic { .. }) {
             return Err(ReportError::SyntheticResult);
+        }
+        if matches!(obs.native_result, NativeResult::KCryptoUnknown) {
+            return Err(ReportError::UnknownNativeResult);
         }
         let Some(phase) = obs.phase.as_wire_str() else {
             return Err(ReportError::SucceededPhase);

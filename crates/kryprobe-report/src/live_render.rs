@@ -39,6 +39,10 @@ pub const WATCH_READ_KEYS: &[&str] = &[
     K::TGID,
     K::COMM,
     K::UID,
+    K::ID,
+    K::TERMINAL,
+    K::STATUS,
+    K::DURATION_NS,
 ];
 
 /// Exact table header (brief-exact column set).
@@ -49,6 +53,14 @@ pub const WHO_HEADER: &str = "KH TGID COMM UID CALLS";
 
 /// Max WHO rows rendered; the rest collapse into the `+N more` trailer.
 pub const WHO_MAX_ROWS: usize = 32;
+
+/// Lifecycle block column header: `ID TERMINAL STATUS DURATION_NS`.
+pub const LIFECYCLE_HEADER: &str = "ID TERMINAL STATUS DURATION_NS";
+
+/// Max lifecycle request rows rendered; the rest collapse into the
+/// `+N more` trailer (the terminal-count TOTAL below always covers
+/// every row — the cap bounds text, never the counts).
+pub const LIFECYCLE_MAX_ROWS: usize = 64;
 
 /// Accumulated counters for one rendered row.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -315,11 +327,85 @@ pub fn render_who_block(obs: &[NativeObservation]) -> String {
     text
 }
 
+/// Projected lifecycle row (M4 idiom: each row's JSON walks once,
+/// at projection time — sort/render below never touch JSON).
+#[derive(Debug, Clone)]
+struct LifecycleProj<'a> {
+    id: &'a str,
+    terminal: &'a str,
+    status: Option<i64>,
+    duration_ns: Option<&'a str>,
+}
+
+/// Renders the lifecycle block over `obs`: only `row="lifecycle"`
+/// observations feed it; rows sort by id (deterministic) and render
+/// as `ID TERMINAL STATUS DURATION_NS` (absent status/duration render
+/// `unknown`, never zero-filled); at most [`LIFECYCLE_MAX_ROWS`] rows
+/// render, the rest collapse into a `+N more` trailer. The
+/// `LIFECYCLE TOTAL` line always counts every row by terminal, so the
+/// row cap bounds text, never the totals. Empty renders nothing (agg
+/// sessions keep their exact existing bytes).
+#[must_use]
+pub fn render_lifecycle_block(obs: &[NativeObservation]) -> String {
+    let mut rows: Vec<LifecycleProj<'_>> = Vec::new();
+    for ob in obs {
+        let payload = &ob.backend_payload;
+        if payload.get(K::ROW).and_then(serde_json::Value::as_str) != Some("lifecycle") {
+            continue;
+        }
+        rows.push(LifecycleProj {
+            id: raw(payload, K::ID),
+            terminal: raw(payload, K::TERMINAL),
+            status: payload.get(K::STATUS).and_then(serde_json::Value::as_i64),
+            duration_ns: payload
+                .get(K::DURATION_NS)
+                .and_then(serde_json::Value::as_str),
+        });
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    rows.sort_by(|a, b| a.id.cmp(b.id));
+    let (mut sync, mut callback, mut unknown) = (0u64, 0u64, 0u64);
+    for row in &rows {
+        match row.terminal {
+            "sync" => sync += 1,
+            "callback" => callback += 1,
+            "unknown" => unknown += 1,
+            _ => {}
+        }
+    }
+    let mut text = String::from(LIFECYCLE_HEADER);
+    text.push('\n');
+    for row in rows.iter().take(LIFECYCLE_MAX_ROWS) {
+        text.push_str(&format!(
+            "{} {} {} {}\n",
+            show(row.id),
+            show(row.terminal),
+            row.status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| String::from("unknown")),
+            row.duration_ns
+                .map(show)
+                .unwrap_or_else(|| String::from("unknown")),
+        ));
+    }
+    if rows.len() > LIFECYCLE_MAX_ROWS {
+        text.push_str(&format!("+{} more\n", rows.len() - LIFECYCLE_MAX_ROWS));
+    }
+    text.push_str(&format!(
+        "LIFECYCLE TOTAL n={} sync={sync} callback={callback} unknown={unknown}\n",
+        rows.len(),
+    ));
+    text
+}
+
 /// Renders observations + coverage: header + one row per
 /// (family, op, algorithm, driver) + `TOTAL` + the WHO attribution
-/// block + the `COMPLETE` / `PARTIAL: <dims>` trailer. Latest wins
-/// per full row key (cumulative snapshots), then classes/contexts
-/// sum; idents never render as rows;
+/// block + the lifecycle block (request-lifecycle rows only; empty
+/// when the session captured none) + the `COMPLETE` / `PARTIAL:
+/// <dims>` trailer. Latest wins per full row key (cumulative
+/// snapshots), then classes/contexts sum; idents never render as rows;
 /// `TOTAL` comes from the latest totals carrier (column sums when totals
 /// are absent — the coverage trailer separately attests the gap).
 #[must_use]
@@ -381,6 +467,7 @@ pub fn render_watch_tables(
         totals.calls, totals.bytes, totals.ok, totals.queued, totals.errors
     ));
     text.push_str(&render_who_block(observations));
+    text.push_str(&render_lifecycle_block(observations));
     let dims = trailer_dims(coverage);
     if dims.is_empty() {
         text.push_str("COMPLETE\n");

@@ -9,6 +9,7 @@
 //! with result).
 
 pub mod backend;
+pub mod canary;
 pub mod decode;
 pub mod profile;
 pub mod sensor;

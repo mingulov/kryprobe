@@ -224,6 +224,28 @@ fn live_bad_source_rejected() {
 }
 
 #[test]
+fn live_registry_injection_dispatches_on_profile() {
+    // The injection seam dispatches exactly like the production entry:
+    // a request-lifecycle config refuses typed (no concrete backend
+    // handle exists here) — it must never silently run aggregate.
+    let registry = fake_registry(1);
+    let (mut cfg, runtime) = open_session();
+    cfg.profile =
+        kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::RequestLifecycle;
+    let err = kryprobe_cli::live::run_live_capture_with_registry(&cfg, &runtime, &registry)
+        .expect_err("lifecycle over injection must fail");
+    match err {
+        kryprobe_cli::live::LiveError::Unusable(reason) => {
+            assert!(
+                reason.contains("concrete backend"),
+                "names the missing handle, got: {reason}"
+            );
+        }
+        other => panic!("expected Unusable, got {other:?}"),
+    }
+}
+
+#[test]
 fn live_shared_feed_exactly_once() {
     use kryprobe_core::backend::{DriverReport, SharedFeedError};
     use kryprobe_core::evidence::SharedLosses;
@@ -1833,9 +1855,14 @@ fn live_backend_failure_runs_failed_partial_recovery() {
 struct ScriptedLifecycleSensor<'a> {
     ticks: Vec<Vec<kryprobe_core::kcrypto::RequestRecord>>,
     finish_records: Vec<kryprobe_core::kcrypto::RequestRecord>,
+    finish_staged: bool,
     ledger: kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger,
     now: u64,
     drains: std::sync::atomic::AtomicU64,
+    taken: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+    quiets: std::sync::atomic::AtomicU64,
+    quiet_backlog: u64,
     stop: &'a std::sync::atomic::AtomicBool,
 }
 
@@ -1866,21 +1893,52 @@ impl kryprobe_cli::live::LifecycleSessionSensor for ScriptedLifecycleSensor<'_> 
     fn take_completed(
         &mut self,
     ) -> Result<Vec<kryprobe_core::kcrypto::RequestRecord>, kryprobe_cli::live::LiveError> {
-        // The closing drain replays the last tick (nothing new
-        // retained — the script's completions already surfaced).
-        let call = self.drains.load(std::sync::atomic::Ordering::Relaxed);
-        if call > self.ticks.len() as u64 {
+        // Retention drains once: the Nth take surfaces the Nth
+        // scripted tick; takes past the script (the closing take)
+        // surface nothing new — until `finish_stop` stages the
+        // reconciled records, which the next take surfaces (the
+        // production retain-then-take protocol).
+        if self.finish_staged {
+            self.finish_staged = false;
+            return Ok(self.finish_records.clone());
+        }
+        let call = self
+            .taken
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call >= self.ticks.len() as u64 {
             return Ok(Vec::new());
         }
-        Ok(self.ticks[(call as usize - 1).min(self.ticks.len() - 1)].clone())
+        Ok(self.ticks[call as usize].clone())
     }
 
-    fn finish_stop(
+    fn close_input(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn drain_quiet(
         &mut self,
-        stop_ns: u64,
-    ) -> Result<Vec<kryprobe_core::kcrypto::RequestRecord>, kryprobe_cli::live::LiveError> {
+    ) -> Result<
+        kryprobe_privilege::kcrypto_lifecycle::sensor::QuietOutcome,
+        kryprobe_cli::live::LiveError,
+    > {
+        self.quiets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(
+            kryprobe_privilege::kcrypto_lifecycle::sensor::QuietOutcome {
+                rounds: 1,
+                records: 0,
+                quiet: self.quiet_backlog == 0,
+                backlog_bytes: self.quiet_backlog,
+            },
+        )
+    }
+
+    fn finish_stop(&mut self, stop_ns: u64) -> Result<(), kryprobe_cli::live::LiveError> {
         assert_eq!(stop_ns, self.now, "finish stamps the closing wall");
-        Ok(self.finish_records.clone())
+        self.finish_staged = true;
+        Ok(())
     }
 
     fn ledger(
@@ -1901,11 +1959,20 @@ fn lifecycle_record(
     id: u64,
     terminal: kryprobe_core::kcrypto::Terminal,
 ) -> kryprobe_core::kcrypto::RequestRecord {
+    // Mirrors the reducer contract: grounded terminals carry the
+    // submit-to-terminal span; Unknown carries no duration (T05
+    // rejects unknown+duration — a span without endpoints would be
+    // fabricated timing).
+    let duration_ns = if terminal == kryprobe_core::kcrypto::Terminal::Unknown {
+        None
+    } else {
+        Some(1000 + id)
+    };
     kryprobe_core::kcrypto::RequestRecord {
         id,
         tfm_id: None,
         terminal,
-        duration_ns: Some(1000 + id),
+        duration_ns,
     }
 }
 
@@ -1927,7 +1994,8 @@ fn lifecycle_test_ledger(
             unfinished,
             ..kryprobe_core::kcrypto::ReducerStats::default()
         },
-        kernel_loss: [0; 4],
+        kernel_loss: [0; 5],
+        agg_accepted: [2, 2, 1, 1],
         retained_dropped: 0,
     }
 }
@@ -1960,9 +2028,14 @@ fn live_lifecycle_scripted_session_drives_green() {
             vec![lifecycle_record(2, Terminal::Callback(-5))],
         ],
         finish_records: vec![lifecycle_record(3, Terminal::Unknown)],
+        finish_staged: false,
         ledger: lifecycle_test_ledger(3, 3, 1),
         now: 555,
         drains: std::sync::atomic::AtomicU64::new(0),
+        taken: std::sync::atomic::AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        quiets: std::sync::atomic::AtomicU64::new(0),
+        quiet_backlog: 0,
         stop: &stop,
     };
     let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
@@ -2047,11 +2120,140 @@ fn live_lifecycle_scripted_session_drives_green() {
     // Ring-clock interval: both walls are the scripted now.
     assert_eq!(outcome.coverage.completion.interval.start_ns, 555);
     assert_eq!(outcome.coverage.completion.interval.end_ns, Some(555));
-    // Two loop ticks plus the one closing drain.
+    // Two loop ticks (the close drains quiet, not ticked).
     assert_eq!(
         sensor.drains.load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "2 ticks + closing drain"
+        2,
+        "2 loop ticks"
+    );
+    // Detach-then-drain ran exactly once at close.
+    assert!(
+        sensor.closed.load(std::sync::atomic::Ordering::Relaxed),
+        "input closed at close"
+    );
+    assert_eq!(
+        sensor.quiets.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one quiet drain at close"
+    );
+}
+
+#[test]
+fn live_lifecycle_observation_cap_truncates_deterministically() {
+    // Round-2 (sol-M2/astra-M4, C12): past 100K decoded records the
+    // session stops early with exactly the cap kept, an explicit
+    // truncation counter, and `Partial` completion — bounded
+    // memory, valid kept evidence, loud stop.
+    use kryprobe_core::kcrypto::Terminal;
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let flood: Vec<kryprobe_core::kcrypto::RequestRecord> = (0..100_001)
+        .map(|id| lifecycle_record(id, Terminal::Sync(0)))
+        .collect();
+    let mut sensor = ScriptedLifecycleSensor {
+        ticks: vec![flood],
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(100_001, 100_001, 0),
+        now: 999,
+        drains: std::sync::atomic::AtomicU64::new(0),
+        taken: std::sync::atomic::AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        quiets: std::sync::atomic::AtomicU64::new(0),
+        quiet_backlog: 0,
+        stop: &stop,
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let cfg = lifecycle_live_config();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        4,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("truncated session still finalizes");
+    assert_eq!(outcome.observations.len(), 100_000, "cap kept exactly");
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+    assert_eq!(
+        outcome.coverage.completion.status,
+        kryprobe_core::enums::CoverageStatus::Partial,
+        "truncation flips completion"
+    );
+    assert!(
+        outcome
+            .coverage
+            .completion
+            .counters
+            .iter()
+            .any(|c| c.name == "observations_truncated" && c.value == 1),
+        "truncation counter present: {:?}",
+        outcome.coverage.completion.counters
+    );
+}
+
+#[test]
+fn live_lifecycle_close_backlog_flips_transport() {
+    // Round-2 (sol-M2/astra-M3): a nonzero quiet-verdict backlog
+    // reaches coverage and flips `detailed_events` — teardown
+    // backlog is reported evidence, never vanishing state.
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = ScriptedLifecycleSensor {
+        ticks: vec![Vec::new()],
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 111,
+        drains: std::sync::atomic::AtomicU64::new(0),
+        taken: std::sync::atomic::AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        quiets: std::sync::atomic::AtomicU64::new(0),
+        quiet_backlog: 80,
+        stop: &stop,
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let cfg = lifecycle_live_config();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        4,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("backlogged close still finalizes");
+    assert_eq!(
+        outcome.coverage.detailed_events.status,
+        kryprobe_core::enums::CoverageStatus::Partial,
+        "backlog flips transport"
+    );
+    assert!(
+        outcome
+            .coverage
+            .detailed_events
+            .counters
+            .iter()
+            .any(|c| c.name == "close_backlog_bytes" && c.value == 80),
+        "backlog counter present: {:?}",
+        outcome.coverage.detailed_events.counters
+    );
+    assert_eq!(
+        outcome.coverage.completion.status,
+        kryprobe_core::enums::CoverageStatus::CompleteForDeclaredBoundary,
+        "backlog is not unfinished work"
     );
 }
 
@@ -2074,9 +2276,14 @@ fn live_lifecycle_registry_backend_drives_same_decoder() {
     let mut sensor = ScriptedLifecycleSensor {
         ticks: vec![Vec::new()],
         finish_records: Vec::new(),
+        finish_staged: false,
         ledger: lifecycle_test_ledger(0, 0, 0),
         now: 777,
         drains: std::sync::atomic::AtomicU64::new(0),
+        taken: std::sync::atomic::AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        quiets: std::sync::atomic::AtomicU64::new(0),
+        quiet_backlog: 0,
         stop: &stop,
     };
     let cfg = lifecycle_live_config();

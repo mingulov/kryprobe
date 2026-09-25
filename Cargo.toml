@@ -18,6 +18,18 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.98"
 
+# Shared intra-workspace deps: one version+path pin per crate (members
+# inherit via `kryprobe-*.workspace = true`). Explicit versions keep
+# `cargo deny check bans` (`wildcards = "deny"`) green — bare path deps
+# read as wildcards. Bump alongside `[workspace.package] version`.
+[workspace.dependencies]
+kryprobe-abi = { version = "0.1.0", path = "crates/kryprobe-abi" }
+kryprobe-testkit = { version = "0.1.0", path = "crates/kryprobe-testkit" }
+kryprobe-core = { version = "0.1.0", path = "crates/kryprobe-core" }
+kryprobe-privilege = { version = "0.1.0", path = "crates/kryprobe-privilege" }
+kryprobe-report = { version = "0.1.0", path = "crates/kryprobe-report" }
+kryprobe-policy = { version = "0.1.0", path = "crates/kryprobe-policy" }
+
 # Shared lint table (BP-M3): every member inherits via `[lints]
 # workspace = true`. The gate runs clippy with `-D warnings`, so
 # `warn` here denies in CI. Deliberately NOT included: `pedantic`

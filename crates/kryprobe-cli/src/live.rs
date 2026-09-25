@@ -86,7 +86,7 @@ use kryprobe_privilege::kcrypto_backend::{
 };
 use kryprobe_privilege::kcrypto_lifecycle::backend::{LifecycleBackend, lifecycle_event};
 use kryprobe_privilege::kcrypto_lifecycle::profile::{LifecycleProfile, manifest, max_programs};
-use kryprobe_privilege::kcrypto_lifecycle::sensor::{DrainOutcome, LifecycleLedger};
+use kryprobe_privilege::kcrypto_lifecycle::sensor::{DrainOutcome, LifecycleLedger, QuietOutcome};
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
     shared_losses_from_snapshot, snapshot_rows_with_drain,
@@ -427,16 +427,32 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
 /// aggregate sensor observes returns, never terminal request
 /// completion (always `Unknown`), while the lifecycle sensor pairs
 /// submit with terminal truth per request — so a session whose every
-/// emitted record grounded (`unfinished == 0`) completes
+/// decoded record grounded (`unfinished == 0` AND zero
+/// `Unknown`-terminal records — the ambiguous branch emits `Unknown`
+/// without touching `unfinished`, so the driver counts terminals
+/// from the records themselves) completes
 /// `CompleteForDeclaredBoundary` over the admitted requests. The
 /// S04 kernel-delivery caveat (requests with zero delivered edges
 /// are invisible) rides `aggregate_counts`/`detailed_events` as
 /// `Unknown`, never silently inside `completion`.
+/// Driver-measured close stats (beyond the terminal ledger): the
+/// driver sees every record and the quiet verdict, so it counts
+/// `Unknown` terminals, truncation, and close backlog itself.
+struct LifecycleCloseStats {
+    /// Records with `Terminal::Unknown` (ambiguous or truthless).
+    unknown_terminals: u64,
+    /// The observation cap stopped the session early.
+    truncated: bool,
+    /// Quiet-verdict close backlog in ring bytes.
+    backlog_bytes: u64,
+}
+
 fn lifecycle_coverage(
     ledger: &LifecycleLedger,
     attached_points: usize,
     expected_points: usize,
     observations_decoded: u64,
+    close: &LifecycleCloseStats,
     interval: ValidityInterval,
 ) -> CoverageSummary {
     let dim = |status| DimensionCoverage::new(status, interval);
@@ -495,16 +511,35 @@ fn lifecycle_coverage(
         .counters
         .push(counter("submits_admitted", ledger.reducer.admitted));
     // Detailed events: measured ring reserve failures + retention
-    // drops past the ledger bound. A clean transport is still
-    // `Unknown` (S04 twin: transport health cannot prove the kernel
-    // invoked the sensor for every operation).
+    // drops + close-time ring backlog + unexplained aggregate
+    // residual (accepted minus consumed, reserve, and noslot with an
+    // empty close ring — the accounting equation broke). A clean
+    // transport is still `Unknown` (S04 twin: transport health
+    // cannot prove the kernel invoked the sensor for every
+    // operation).
     let ring_drops = ledger.kernel_loss[0];
-    let mut detailed_events = dim(if ring_drops == 0 && ledger.retained_dropped == 0 {
+    let agg_sum: u64 = ledger
+        .agg_accepted
+        .iter()
+        .fold(0, |s, a| s.saturating_add(*a));
+    let hits_sum: u64 = ledger.edge_hits.iter().fold(0, |s, h| s.saturating_add(*h));
+    let residual = agg_sum
+        .saturating_sub(hits_sum)
+        .saturating_sub(ledger.kernel_loss[0])
+        .saturating_sub(ledger.kernel_loss[4]);
+    // The residual flips only with an empty close ring (backlog
+    // bytes explain accepted-but-unconsumed edges — roughly, a byte
+    // count, not a record count, so the equation stays descriptive).
+    let transport_clean = ring_drops == 0
+        && ledger.retained_dropped == 0
+        && close.backlog_bytes == 0
+        && residual == 0;
+    let mut detailed_events = dim(if transport_clean {
         CoverageStatus::Unknown
     } else {
         CoverageStatus::Partial
     });
-    if ring_drops == 0 && ledger.retained_dropped == 0 {
+    if transport_clean {
         detailed_events
             .counters
             .push(counter("uncovered:kernel_delivery_unmeasured", 1));
@@ -515,39 +550,82 @@ fn lifecycle_coverage(
     detailed_events
         .counters
         .push(counter("retained_dropped", ledger.retained_dropped));
-    // Completion: every emitted record grounded in observed terminal
-    // truth (`unfinished == 0`) completes over the admitted requests;
-    // truthless-drained records flip `Partial` (their terminals are
-    // explicit unknowns, never trusted results).
-    let mut completion = dim(if ledger.reducer.unfinished == 0 {
-        CoverageStatus::CompleteForDeclaredBoundary
-    } else {
-        CoverageStatus::Partial
-    });
+    detailed_events
+        .counters
+        .push(counter("close_backlog_bytes", close.backlog_bytes));
+    detailed_events
+        .counters
+        .push(counter("agg_accepted", agg_sum));
+    detailed_events
+        .counters
+        .push(counter("agg_consumed", hits_sum));
+    detailed_events
+        .counters
+        .push(counter("agg_residual_unexplained", residual));
+    // Completion: every decoded record grounded in observed terminal
+    // truth (no unfinished, no `Unknown` terminals, no truncation)
+    // completes over the admitted requests; truthless-drained,
+    // ambiguous, or truncated records flip `Partial` (their
+    // terminals are explicit unknowns, never trusted results).
+    let mut completion = dim(
+        if ledger.reducer.unfinished == 0 && close.unknown_terminals == 0 && !close.truncated {
+            CoverageStatus::CompleteForDeclaredBoundary
+        } else {
+            CoverageStatus::Partial
+        },
+    );
     completion
         .counters
         .push(counter("observations_decoded", observations_decoded));
     completion.counters.push(counter(
         "terminals_grounded",
-        ledger
-            .reducer
-            .emitted
-            .saturating_sub(ledger.reducer.unfinished),
+        observations_decoded.saturating_sub(close.unknown_terminals),
     ));
     completion
         .counters
         .push(counter("unfinished_truthless", ledger.reducer.unfinished));
+    completion
+        .counters
+        .push(counter("unknown_terminals", close.unknown_terminals));
+    completion.counters.push(counter(
+        "observations_truncated",
+        u64::from(close.truncated),
+    ));
+    // Attribution: lifecycle rows carry no context class (the
+    // aggregate ctx-class rationale does not transfer) — always
+    // `Unknown` with the reason counter.
+    let mut attribution = dim(CoverageStatus::Unknown);
+    attribution
+        .counters
+        .push(counter("uncovered:attribution_unobserved", 1));
+    // Correlation: reuse transport-loss gaps, stale joins, ambiguous
+    // evidence, and reducer orphans are correlation events — any
+    // flips `Partial`; a single backend with zero such events
+    // completes the declared boundary.
+    let correlation_events = ledger
+        .decode
+        .gaps_synthesized
+        .saturating_add(ledger.decode.stale_returns)
+        .saturating_add(ledger.reducer.ambiguous)
+        .saturating_add(ledger.reducer.orphan);
+    let mut correlation = dim(if correlation_events == 0 {
+        CoverageStatus::CompleteForDeclaredBoundary
+    } else {
+        CoverageStatus::Partial
+    });
+    correlation
+        .counters
+        .push(counter("correlation_events", correlation_events));
     // Declared-boundary vacuous dimensions (the session_coverage
-    // rationale, unchanged: whole-machine, resolved symbols,
-    // ctx-class attribution, single backend).
+    // rationale, unchanged: whole-machine, resolved symbols).
     CoverageSummary {
         target_population: dim(CoverageStatus::CompleteForDeclaredBoundary),
         object_discovery: dim(CoverageStatus::CompleteForDeclaredBoundary),
         attachment,
         aggregate_counts,
         detailed_events,
-        attribution: dim(CoverageStatus::CompleteForDeclaredBoundary),
-        correlation: dim(CoverageStatus::CompleteForDeclaredBoundary),
+        attribution,
+        correlation,
         completion,
     }
 }
@@ -694,9 +772,16 @@ pub trait LifecycleSessionSensor {
     fn drain_tick(&mut self, max_records: usize) -> Result<DrainOutcome, LiveError>;
     /// Drain retained completions (each record surfaces once).
     fn take_completed(&mut self) -> Result<Vec<RequestRecord>, LiveError>;
-    /// Drain pending truthless (stop-the-world): the final
-    /// reconciliation at `stop_ns` (ring-clock domain).
-    fn finish_stop(&mut self, stop_ns: u64) -> Result<Vec<RequestRecord>, LiveError>;
+    /// Detach-then-drain, step 1: drop the attach links (no hook
+    /// fires after; the closing drain converges).
+    fn close_input(&mut self) -> Result<(), LiveError>;
+    /// Detach-then-drain, step 2: bounded quiet loop; the exact
+    /// close backlog reaches the ledger (coverage flips on it).
+    fn drain_quiet(&mut self) -> Result<QuietOutcome, LiveError>;
+    /// Drain pending truthless into retention (stop-the-world): the
+    /// final reconciliation at `stop_ns` (ring-clock domain).
+    /// Returns nothing — read via [`Self::take_completed`].
+    fn finish_stop(&mut self, stop_ns: u64) -> Result<(), LiveError>;
     /// Snapshot the terminal ledger (finalize + coverage read this).
     fn ledger(&self) -> Result<LifecycleLedger, LiveError>;
     /// Ring-clock now (`CLOCK_MONOTONIC` ns): the coverage interval
@@ -734,7 +819,19 @@ impl LifecycleSessionSensor for RealLifecycleSensor<'_> {
             .map_err(|err| backend_err("live lifecycle take", err))
     }
 
-    fn finish_stop(&mut self, stop_ns: u64) -> Result<Vec<RequestRecord>, LiveError> {
+    fn close_input(&mut self) -> Result<(), LiveError> {
+        self.backend
+            .close_input()
+            .map_err(|err| backend_err("live lifecycle close", err))
+    }
+
+    fn drain_quiet(&mut self) -> Result<QuietOutcome, LiveError> {
+        self.backend
+            .drain_quiet()
+            .map_err(|err| backend_err("live lifecycle quiet", err))
+    }
+
+    fn finish_stop(&mut self, stop_ns: u64) -> Result<(), LiveError> {
         self.backend
             .finish_stop(stop_ns)
             .map_err(|err| backend_err("live lifecycle finish", err))
@@ -1081,10 +1178,17 @@ fn drive_session_inner(
     })
 }
 
-/// Per-tick ring-drain visit cap: matches the sensor core bounds
-/// (submit/reducer/ledger tables are 4096 each), so one tick can
-/// absorb a full table's worth of arrivals without an unbounded walk.
-const LIFECYCLE_DRAIN_BUDGET: usize = 4096;
+/// Per-tick ring-drain visit cap: 8192 covers a full ring (≈6553
+/// records) plus margin, still bounded — a tick never leaves routine
+/// backlog for the next one.
+const LIFECYCLE_DRAIN_BUDGET: usize = 8192;
+
+/// Session observation cap (design C12: configured bound, counted
+/// admission, deterministic stop): past 100K decoded records the
+/// session stops early with an explicit truncation counter and
+/// `Partial` completion — memory stays ≈tens of MB, never
+/// O(flood).
+const LIFECYCLE_OBSERVATION_CAP: usize = 100_000;
 
 /// Governed lifecycle tick driver (T06 item 4 twin of [`drive_session`]):
 /// the same ARCH §4.1 tail — `Observing -> Quiescing -> Draining ->
@@ -1157,10 +1261,26 @@ fn drive_lifecycle_session_inner(
     let mut first_tick = true;
     let mut barrier_id = 0u64;
     let mut interrupted = false;
-    let decode_records = |records: Vec<RequestRecord>,
-                          observations: &mut Vec<NativeObservation>|
+    // `Unknown`-terminal records counted from the records
+    // themselves: the ambiguous reducer branch emits `Unknown`
+    // without touching `unfinished`, so the ledger alone cannot
+    // prove grounding — the driver (which sees every record) can.
+    // The observation cap truncates deterministically: at capacity
+    // the session stops early (flag below) instead of growing
+    // unbounded — kept observations stay valid evidence.
+    let mut unknown_terminals = 0u64;
+    // Shared with the decode closure across loop iterations (the
+    // closure mutably borrows the terminal counter; the flag rides
+    // a `Cell` so the loop can read it while the closure is alive).
+    let truncated = std::cell::Cell::new(false);
+    let mut decode_records = |records: Vec<RequestRecord>,
+                              observations: &mut Vec<NativeObservation>|
      -> Result<(), LiveError> {
         for record in &records {
+            if observations.len() >= LIFECYCLE_OBSERVATION_CAP {
+                truncated.set(true);
+                break;
+            }
             let decode_ctx = DecodeContext {
                 session,
                 generation,
@@ -1177,6 +1297,9 @@ fn drive_lifecycle_session_inner(
                 },
                 "lifecycle",
             )?;
+            if record.terminal == kryprobe_core::kcrypto::Terminal::Unknown {
+                unknown_terminals += 1;
+            }
             observations.push(observation);
         }
         Ok(())
@@ -1203,6 +1326,7 @@ fn drive_lifecycle_session_inner(
         }
         let stopped = stop.load(Ordering::Relaxed)
             || interrupted
+            || truncated.get()
             || deadline.is_some_and(|end| Instant::now() >= end);
         if stopped {
             break;
@@ -1211,15 +1335,22 @@ fn drive_lifecycle_session_inner(
     }
     // Observing -> Quiescing: the loop stopped taking new work.
     hop(controller, SessionState::Quiescing, "lifecycle quiesce")?;
-    // Stop-time reconciliation: one last drain for edges that landed
-    // with the closing tick, then truthless `finish` at the closing
-    // wall — every pending request becomes a record (grounded or
-    // explicit-unknown), none stays pending past the session.
+    // Stop-time reconciliation, detach-then-drain: links drop first
+    // (no hook fires after, so the close converges), then the quiet
+    // loop plays every landed edge — its verdict's backlog reaches
+    // the ledger and flips coverage, never ignored — then truthless
+    // `finish` at the closing wall turns every pending request into
+    // a record (grounded or explicit-unknown).
     let end_ns = sensor.now_ns()?;
-    let _closing_drain = sensor.drain_tick(LIFECYCLE_DRAIN_BUDGET)?;
+    sensor.close_input()?;
+    // The quiet verdict feeds coverage below (backlog bytes flip
+    // `detailed_events`) — consumed, never ignored, never asserted
+    // (a corrupt ring reports Partial, it does not panic).
+    let quiet = sensor.drain_quiet()?;
     let completed = sensor.take_completed()?;
     decode_records(completed, &mut observations)?;
-    let reconciled = sensor.finish_stop(end_ns)?;
+    sensor.finish_stop(end_ns)?;
+    let reconciled = sensor.take_completed()?;
     decode_records(reconciled, &mut observations)?;
     // Quiescing -> Draining: queued events become evidence now.
     hop(controller, SessionState::Draining, "lifecycle drain")?;
@@ -1248,11 +1379,17 @@ fn drive_lifecycle_session_inner(
     let integrity = report
         .session_integrity_checked()
         .map_err(|err| LiveError::Internal(format!("live lifecycle session integrity: {err}")))?;
+    let close = LifecycleCloseStats {
+        unknown_terminals,
+        truncated: truncated.get(),
+        backlog_bytes: quiet.backlog_bytes,
+    };
     let coverage = lifecycle_coverage(
         &ledger,
         attached_points,
         max_programs(&manifest(LifecycleProfile::RequestLifecycle)),
         report.observations().len() as u64,
+        &close,
         ValidityInterval {
             start_ns: first_wall,
             end_ns: Some(end_ns),
@@ -1297,13 +1434,23 @@ pub fn run_live_capture(
 /// Live capture over a caller-supplied registry (the injection seam:
 /// tests pass scripted fakes that stop before any attach — no
 /// concrete backend, so a session that reaches the sensor errors
-/// typed instead of loading).
+/// typed instead of loading). Dispatches on `cfg.profile` exactly
+/// like [`run_live_capture`]: a request-lifecycle config over an
+/// injected registry refuses typed (the lifecycle session needs its
+/// concrete backend handle, which injection cannot supply) — it must
+/// never silently run the aggregate session instead.
 pub fn run_live_capture_with_registry(
     cfg: &LiveConfig,
     runtime: &RuntimeCapabilities,
     registry: &BackendRegistry,
 ) -> Result<LiveOutcome, LiveError> {
-    run_live_session(cfg, runtime, registry, None)
+    match cfg.profile {
+        LifecycleProfile::ApiReturns => run_live_session(cfg, runtime, registry, None),
+        LifecycleProfile::RequestLifecycle => Err(LiveError::Unusable(
+            "request-lifecycle capture needs a concrete backend; registry injection carries none"
+                .to_owned(),
+        )),
+    }
 }
 
 /// Lifecycle orchestrator (T06 item 4 twin of [`run_live_session`]):
@@ -1879,8 +2026,17 @@ mod tests {
                 emitted: 6,
                 ..ReducerStats::default()
             },
-            kernel_loss: [0; 4],
+            kernel_loss: [0; 5],
+            agg_accepted: [4, 4, 2, 2],
             retained_dropped: 0,
+        }
+    }
+
+    fn close_clean() -> LifecycleCloseStats {
+        LifecycleCloseStats {
+            unknown_terminals: 0,
+            truncated: false,
+            backlog_bytes: 0,
         }
     }
 
@@ -1895,6 +2051,7 @@ mod tests {
             4,
             4,
             6,
+            &close_clean(),
             ValidityInterval {
                 start_ns: 100,
                 end_ns: Some(200),
@@ -1910,10 +2067,18 @@ mod tests {
             coverage.completion.status,
             CoverageStatus::CompleteForDeclaredBoundary
         );
+        // Lifecycle rows carry no context class: attribution can never
+        // complete (the aggregate rationale does not transfer).
+        assert_eq!(coverage.attribution.status, CoverageStatus::Unknown);
+        // Zero correlation events across one backend: complete.
+        assert_eq!(
+            coverage.correlation.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
         assert_eq!(coverage.overall(), CoverageStatus::Unknown);
         assert_eq!(
             coverage.weaker_dimensions(),
-            vec!["aggregate_counts", "detailed_events"]
+            vec!["aggregate_counts", "detailed_events", "attribution"]
         );
         for dim in [&coverage.aggregate_counts, &coverage.detailed_events] {
             assert!(
@@ -1955,7 +2120,7 @@ mod tests {
         // Kernel reserve failure: counts AND transport flip.
         let mut ledger = lifecycle_ledger_clean();
         ledger.kernel_loss[0] = 2;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
         assert_eq!(
@@ -1966,27 +2131,68 @@ mod tests {
         // Refused decode evidence corrupts counts only.
         let mut ledger = lifecycle_ledger_clean();
         ledger.decode.submit_refused = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
         // Truthless-drained records flip completion only.
         let mut ledger = lifecycle_ledger_clean();
         ledger.reducer.unfinished = 1;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
         assert_eq!(coverage.completion.status, CoverageStatus::Partial);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
         // Attach shortfall flips attachment only.
-        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 3, 4, 6, interval);
+        let coverage =
+            lifecycle_coverage(&lifecycle_ledger_clean(), 3, 4, 6, &close_clean(), interval);
         assert_eq!(coverage.attachment.status, CoverageStatus::Partial);
         // Duplicates repeat known state: no information lost, no flip.
         let mut ledger = lifecycle_ledger_clean();
         ledger.reducer.duplicate = 9;
-        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, interval);
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
         assert_eq!(
             coverage.completion.status,
             CoverageStatus::CompleteForDeclaredBoundary
         );
+        // Ambiguous-Unknown terminals (emitted, never unfinished) flip
+        // completion: grounded means observed terminal truth.
+        let close = LifecycleCloseStats {
+            unknown_terminals: 1,
+            ..close_clean()
+        };
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
+        assert_eq!(coverage.completion.status, CoverageStatus::Partial);
+        // Truncation flips completion only.
+        let close = LifecycleCloseStats {
+            truncated: true,
+            ..close_clean()
+        };
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
+        assert_eq!(coverage.completion.status, CoverageStatus::Partial);
+        assert_eq!(coverage.detailed_events.status, CoverageStatus::Unknown);
+        // Close-time ring backlog flips transport only.
+        let close = LifecycleCloseStats {
+            backlog_bytes: 128,
+            ..close_clean()
+        };
+        let coverage = lifecycle_coverage(&lifecycle_ledger_clean(), 4, 4, 6, &close, interval);
+        assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
+        // Correlation gaps (reuse transport loss) flip correlation only.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.decode.gaps_synthesized = 1;
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        assert_eq!(
+            coverage.completion.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
+        // Unexplained aggregate residual (accepted minus consumed,
+        // reserve, and noslot, with an empty close ring) flips
+        // transport: the accounting equation broke.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.agg_accepted = [5, 4, 2, 2];
+        let coverage = lifecycle_coverage(&ledger, 4, 4, 6, &close_clean(), interval);
+        assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
     }
 
     #[test]

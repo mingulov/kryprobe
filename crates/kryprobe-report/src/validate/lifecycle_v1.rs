@@ -291,6 +291,69 @@ fn check_combination(obj: &serde_json::Map<String, Value>, out: &mut Vec<Lifecyc
     }
 }
 
+/// Projects one live lifecycle observation to its standalone
+/// payload-v1 object (`None` for non-lifecycle rows). The live
+/// backend payload is a pinned dispatch envelope (`LIFECYCLE_KEYS`:
+/// row/profile/evidence/coverage keys the renderers and policy read);
+/// the report artifact carries exactly the six schema keys instead —
+/// validated here, fail-closed, so a drifting producer breaks the
+/// report (exit 1) rather than emitting a schema-violating document.
+///
+/// Shape map: `id` passes through (the `lc:{n}` spelling already
+/// matches the prefixed-id pattern); numeric `tfm_id` becomes
+/// `kcrypto:tfm-{n}` per the T05 spelling (null stays null);
+/// terminal/status/duration pass through untouched.
+pub fn lifecycle_v1_payload(
+    obs: &kryprobe_core::evidence::NativeObservation,
+) -> Option<Result<Value, String>> {
+    use kryprobe_core::evidence::payload_keys as K;
+    let payload = obs.backend_payload.as_object()?;
+    if payload.get(K::ROW).and_then(Value::as_str) != Some("lifecycle") {
+        return None;
+    }
+    let get = |key: &str| {
+        payload
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("defect: lifecycle observation lacks `{key}`"))
+    };
+    let projected = (|| -> Result<Value, String> {
+        let request_id = get(K::ID)?;
+        if !request_id.is_string() {
+            return Err("defect: lifecycle `id` is not a string".to_owned());
+        }
+        let tfm_id = match get(K::TFM_ID)? {
+            Value::Null => Value::Null,
+            Value::Number(n) => n
+                .as_u64()
+                .map(|n| Value::String(format!("kcrypto:tfm-{n}")))
+                .ok_or_else(|| "defect: lifecycle `tfm_id` is not a u64".to_owned())?,
+            _ => return Err("defect: lifecycle `tfm_id` is not u64|null".to_owned()),
+        };
+        Ok(serde_json::json!({
+            "schema": KCRYPTO_LIFECYCLE_V1,
+            "request_id": request_id,
+            "tfm_id": tfm_id,
+            "terminal": get(K::TERMINAL)?,
+            "status": get(K::STATUS)?,
+            "duration_ns": get(K::DURATION_NS)?,
+        }))
+    })();
+    let projected = match projected {
+        Ok(value) => value,
+        Err(defect) => return Some(Err(defect)),
+    };
+    let findings = validate_lifecycle_v1(&projected);
+    if findings.is_empty() {
+        Some(Ok(projected))
+    } else {
+        // Findings are input-free by validator contract: safe to quote.
+        Some(Err(format!(
+            "defect: lifecycle observation projects to invalid payload-v1: {findings:?}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LifecycleFinding, validate_lifecycle_v1};

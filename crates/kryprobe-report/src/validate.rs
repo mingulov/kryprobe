@@ -11,7 +11,7 @@
 mod kinds;
 mod lifecycle_v1;
 
-pub use lifecycle_v1::{LifecycleFinding, validate_lifecycle_v1};
+pub use lifecycle_v1::{LifecycleFinding, lifecycle_v1_payload, validate_lifecycle_v1};
 
 use self::kinds::KIND_TABLE;
 use crate::EVENT_SCHEMA_V0;

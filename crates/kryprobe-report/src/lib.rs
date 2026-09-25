@@ -24,9 +24,10 @@ pub use render::{render_summary, render_summary_reader, sanitize_cell};
 pub use session::{FinalBarrier, SessionEnd, SessionStart, SessionVerdict};
 pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
 pub use validate::{
-    LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, ValidationFinding, resolve_schema,
-    resolve_schema_at, schema_fnv1a_hex, validate_and_render_file, validate_and_render_reader,
-    validate_file, validate_lifecycle_v1, validate_reader, validate_str,
+    LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, ValidationFinding,
+    lifecycle_v1_payload, resolve_schema, resolve_schema_at, schema_fnv1a_hex,
+    validate_and_render_file, validate_and_render_reader, validate_file, validate_lifecycle_v1,
+    validate_reader, validate_str,
 };
 pub use writer::{JsonlWriter, ReportError, write_str_atomic};
 

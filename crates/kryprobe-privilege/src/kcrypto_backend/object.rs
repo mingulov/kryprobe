@@ -93,6 +93,9 @@ pub(crate) fn object_candidates_for(
 }
 
 /// Aggregate-sensor candidates (thin wrapper: same tiers, `kcrypto.bpf.o`).
+/// Tier-shape seam, same held gate as [`lifecycle_object_candidates`]:
+/// unit tests pin the candidate order through this; production walks
+/// the same tiers through `locate_object_bytes_for`.
 #[must_use]
 pub fn kcrypto_object_candidates(
     env: Option<&str>,
@@ -103,7 +106,11 @@ pub fn kcrypto_object_candidates(
 }
 
 /// Lifecycle-sensor candidates (T06 twin: same tiers,
-/// `kcrypto-lifecycle.bpf.o`).
+/// `kcrypto-lifecycle.bpf.o`). Tier-shape seam: pins the per-object
+/// candidate ORDER for unit tests without filesystem reads or the pin
+/// check; production walks these same tiers through
+/// `locate_object_bytes_for` (single-read + pin verification).
+/// Held gate: no production caller by design.
 #[must_use]
 pub fn lifecycle_object_candidates(
     env: Option<&str>,

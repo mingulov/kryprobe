@@ -208,18 +208,15 @@ impl<'a> Btf<'a> {
         Err(bad("wrapper chase exceeds the descent cap".to_owned()))
     }
 
-    /// Validate that `name`'s prototype matches the lifecycle sensor's
-    /// reads and return its `FUNC` id: at least one argument, arg0 a
-    /// request pointer (after qualifier chase), return a 32-bit int
-    /// (round-1 sol-M2/astra-M2 — name-only resolution would mis-key
-    /// the join or misread the status on a signature change).
-    ///
-    /// Only what the BPF consumes is checked: the pointee type is
-    /// unchecked BY DESIGN (the key is never dereferenced — an opaque
-    /// pairing value), and extra arguments are allowed (arg0 +
-    /// return reads are unaffected by them). Corrupt images stay
-    /// [`BtfError::BadBtf`]; well-formed but incompatible prototypes
-    /// are [`BtfError::BadPrototype`].
+    /// Validate that `name`'s prototype is EXACTLY the qualified
+    /// sensor read — `int (struct skcipher_request *)` — and return
+    /// its `FUNC` id (round-1 sol-M2/astra-M2, hardened round-2
+    /// sol-M4/astra-M7): exactly one argument, arg0 a pointer (after
+    /// qualifier chase) to STRUCT `skcipher_request`, return a
+    /// signed 32-bit INT at offset 0. Any signature drift refuses
+    /// startup rather than mis-keying the join or misreading the
+    /// status. Corrupt images stay [`BtfError::BadBtf`]; well-formed
+    /// but incompatible prototypes are [`BtfError::BadPrototype`].
     pub(crate) fn lifecycle_proto_id(&self, name: &str) -> Result<u32, BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
@@ -236,12 +233,31 @@ impl<'a> Btf<'a> {
                 proto.kind
             )));
         }
-        if proto.vlen == 0 {
-            return Err(bad_proto("prototype takes no arguments".to_owned()));
+        if proto.vlen != 1 {
+            return Err(bad_proto(format!(
+                "prototype takes {} arguments, want exactly 1",
+                proto.vlen
+            )));
         }
         let arg0 = read_u32(self.bytes, proto.aux_at + 4, "proto arg0 type")?;
-        if self.rec(self.chase_wrappers(arg0)?)?.kind != KIND_PTR {
+        let ptr = self.rec(self.chase_wrappers(arg0)?)?;
+        if ptr.kind != KIND_PTR {
             return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        // The pointee IS the qualified request identity: arg0 must
+        // point at STRUCT `skcipher_request` (a pointer to any other
+        // type keys the join on a stranger's address).
+        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        if pointee.kind != KIND_STRUCT {
+            return Err(bad_proto(format!(
+                "arg0 points at kind {}, not STRUCT skcipher_request",
+                pointee.kind
+            )));
+        }
+        if !self.name_is(pointee, "skcipher_request")? {
+            return Err(bad_proto(
+                "arg0 points at the wrong STRUCT, not skcipher_request".to_owned(),
+            ));
         }
         let ret = proto.size_or_type;
         if ret == 0 {
@@ -251,12 +267,28 @@ impl<'a> Btf<'a> {
         if rec.kind != KIND_INT {
             return Err(bad_proto("return is not an INT".to_owned()));
         }
-        let data = read_u32(self.bytes, rec.aux_at, "int data")?;
-        if data & 0xff != 32 {
+        if rec.size_or_type != 4 {
             return Err(bad_proto(format!(
-                "return INT is {} bits, not 32",
-                data & 0xff
+                "return INT is {} bytes, not 4",
+                rec.size_or_type
             )));
+        }
+        // BTF INT data word (`linux/btf.h`): bits [0:8), offset
+        // [16:24), encoding [24:28) with bit 0 = SIGNED. All three
+        // are exact: a bitfield, an unsigned, or a narrow int would
+        // misread errnos.
+        let data = read_u32(self.bytes, rec.aux_at, "int data")?;
+        let (bits, offset, encoding) = (data & 0xff, (data >> 16) & 0xff, (data >> 24) & 0x0f);
+        if bits != 32 {
+            return Err(bad_proto(format!("return INT is {bits} bits, not 32")));
+        }
+        if offset != 0 {
+            return Err(bad_proto(format!(
+                "return INT has bit offset {offset}, not 0"
+            )));
+        }
+        if encoding & 0x01 == 0 {
+            return Err(bad_proto("return INT is not SIGNED".to_owned()));
         }
         Ok(id)
     }

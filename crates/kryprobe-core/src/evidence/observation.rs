@@ -103,6 +103,10 @@ pub enum NativeResult {
         /// Raw completion status.
         status: i32,
     },
+    /// Kernel-crypto request with an unobserved terminal: no status
+    /// exists (the backend must never zero-fill one — an unknown
+    /// terminal beside `status: 0` fabricates success).
+    KCryptoUnknown,
     /// Synthetic scripted result (test-only backends).
     Synthetic {
         /// Scripted return code.

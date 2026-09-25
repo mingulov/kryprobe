@@ -83,11 +83,13 @@ fn h01_api_returns_sections_stay_fexit_only() {
 
 #[test]
 fn h01_lifecycle_map_table_is_exact_and_dot_free() {
-    // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss): the
-    // T06 contract the BPF object must match byte-for-byte.
-    assert_eq!(LIFECYCLE_MAPS.len(), 3);
+    // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss,
+    // 5 classes), LSTATE (global identity slots), LAGG (per-CPU
+    // accepted aggregate): the T06 contract the BPF object must
+    // match byte-for-byte.
+    assert_eq!(LIFECYCLE_MAPS.len(), 5);
     let names: Vec<&str> = LIFECYCLE_MAPS.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["LCFG", "LRING", "LLOSS"]);
+    assert_eq!(names, ["LCFG", "LRING", "LLOSS", "LSTATE", "LAGG"]);
     for name in &names {
         assert!(!name.contains('.'), "R3 dot-free gate: {name}");
     }
@@ -118,6 +120,24 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
     );
     assert_eq!(
         dims("LLOSS"),
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 5,
+        }
+    );
+    assert_eq!(
+        dims("LSTATE"),
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 1,
+            max_entries: 4096,
+        }
+    );
+    assert_eq!(
+        dims("LAGG"),
         MapDims {
             map_type: 6,
             key_size: 4,
@@ -408,7 +428,7 @@ fn valid_lifecycle_fixture() -> Vec<u8> {
 fn h02_valid_entry_return_object_parses() {
     let bytes = valid_lifecycle_fixture();
     let parsed = parse_lifecycle_object(&bytes).expect("valid fixture must parse");
-    assert_eq!(parsed.maps.len(), 3);
+    assert_eq!(parsed.maps.len(), 5);
     assert_eq!(parsed.programs.len(), 4);
     for prog in &parsed.programs {
         assert_eq!(prog.insns.len(), 1, "{} stream drifted", prog.name);
@@ -719,20 +739,32 @@ fn btf_image(types: &[u8], strtab: &[u8]) -> Vec<u8> {
 /// Minimal vmlinux-shaped BTF with the two lifecycle FUNCs. The
 /// decrypt proto is always well-formed
 /// (`int (struct skcipher_request *)`); the encrypt side takes the
-/// given (return id, param-0 id, nargs, func-target id) so refusal
-/// shapes are fixture-exact. Type ids: 1 INT int, 2 STRUCT
-/// skcipher_request, 3 PTR→2, 4 encrypt FUNC_PROTO, 5 encrypt FUNC,
-/// 6 decrypt FUNC_PROTO, 7 decrypt FUNC.
-fn lifecycle_btf(enc_ret: u32, enc_param: u32, enc_nargs: u32, enc_target: u32) -> Vec<u8> {
+/// given (return id, param-0 id, nargs, func-target id, pointee id,
+/// INT data word, INT size) so refusal shapes are fixture-exact.
+/// Type ids: 1 INT int, 2 STRUCT skcipher_request, 3 PTR→pointee, 4
+/// encrypt FUNC_PROTO, 5 encrypt FUNC, 6 decrypt FUNC_PROTO, 7
+/// decrypt FUNC, 8 STRUCT other_struct (wrong-pointee control), 9
+/// PTR→2 (decrypt's own pointer, so encrypt-side pointee mutations
+/// never break the decrypt control).
+fn lifecycle_btf(
+    enc_ret: u32,
+    enc_param: u32,
+    enc_nargs: u32,
+    enc_target: u32,
+    ptr_target: u32,
+    int_data: u32,
+    int_size: u32,
+) -> Vec<u8> {
     let mut strtab = vec![0u8];
     let int_off = btf_push_str(&mut strtab, "int");
     let req_off = btf_push_str(&mut strtab, "skcipher_request");
+    let other_off = btf_push_str(&mut strtab, "other_struct");
     let enc_off = btf_push_str(&mut strtab, "crypto_skcipher_encrypt");
     let dec_off = btf_push_str(&mut strtab, "crypto_skcipher_decrypt");
     let mut types = Vec::new();
-    btf_rec(&mut types, int_off, 1, 0, 4, &0x0001_0020u32.to_le_bytes());
+    btf_rec(&mut types, int_off, 1, 0, int_size, &int_data.to_le_bytes());
     btf_rec(&mut types, req_off, 4, 0, 0, &[]);
-    btf_rec(&mut types, 0, 2, 0, 2, &[]);
+    btf_rec(&mut types, 0, 2, 0, ptr_target, &[]);
     let mut aux = Vec::new();
     for _ in 0..enc_nargs {
         aux.extend_from_slice(&0u32.to_le_bytes());
@@ -742,16 +774,24 @@ fn lifecycle_btf(enc_ret: u32, enc_param: u32, enc_nargs: u32, enc_target: u32) 
     btf_rec(&mut types, enc_off, 12, 1, enc_target, &[]);
     let mut aux = Vec::new();
     aux.extend_from_slice(&0u32.to_le_bytes());
-    aux.extend_from_slice(&3u32.to_le_bytes());
+    aux.extend_from_slice(&9u32.to_le_bytes());
     btf_rec(&mut types, 0, 13, 1, 1, &aux);
     btf_rec(&mut types, dec_off, 12, 1, 6, &[]);
+    btf_rec(&mut types, other_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, 0, 2, 0, 2, &[]);
     btf_image(&types, &strtab)
+}
+
+/// Well-formed encrypt side: `int (struct skcipher_request *)` —
+/// signed 32-bit INT (offset 0), PTR→STRUCT skcipher_request.
+fn lifecycle_btf_good() -> Vec<u8> {
+    lifecycle_btf(1, 3, 1, 4, 2, 0x0100_0020, 4)
 }
 
 #[test]
 fn f2_wellformed_protos_resolve_both_ids() {
     // Control: int (struct skcipher_request *) on both sites resolves.
-    let ids = resolve_lifecycle_ids_from(&lifecycle_btf(1, 3, 1, 4)).expect("good protos");
+    let ids = resolve_lifecycle_ids_from(&lifecycle_btf_good()).expect("good protos");
     assert_eq!(ids.len(), 2);
     assert_eq!(ids["crypto_skcipher_encrypt"], 5);
     assert_eq!(ids["crypto_skcipher_decrypt"], 7);
@@ -761,7 +801,7 @@ fn f2_wellformed_protos_resolve_both_ids() {
 fn f2_non_pointer_arg0_refused() {
     // Round-1 (sol-M2/astra-M2): the BPF reads arg(0) as the request
     // key — an INT arg0 must refuse startup, not mis-key the join.
-    match resolve_lifecycle_ids_from(&lifecycle_btf(1, 1, 1, 4)) {
+    match resolve_lifecycle_ids_from(&lifecycle_btf(1, 1, 1, 4, 2, 0x0100_0020, 4)) {
         Err(BtfError::BadPrototype { name, .. }) => {
             assert_eq!(name, "crypto_skcipher_encrypt");
         }
@@ -772,7 +812,7 @@ fn f2_non_pointer_arg0_refused() {
 #[test]
 fn f2_non_int_return_refused() {
     // A VOID return cannot be cast to the native i32 status.
-    match resolve_lifecycle_ids_from(&lifecycle_btf(0, 3, 1, 4)) {
+    match resolve_lifecycle_ids_from(&lifecycle_btf(0, 3, 1, 4, 2, 0x0100_0020, 4)) {
         Err(BtfError::BadPrototype { name, .. }) => {
             assert_eq!(name, "crypto_skcipher_encrypt");
         }
@@ -783,7 +823,7 @@ fn f2_non_int_return_refused() {
 #[test]
 fn f2_zero_arg_proto_refused() {
     // No args: there is no arg(0) key to read at all.
-    match resolve_lifecycle_ids_from(&lifecycle_btf(1, 3, 0, 4)) {
+    match resolve_lifecycle_ids_from(&lifecycle_btf(1, 3, 0, 4, 2, 0x0100_0020, 4)) {
         Err(BtfError::BadPrototype { name, .. }) => {
             assert_eq!(name, "crypto_skcipher_encrypt");
         }
@@ -794,7 +834,7 @@ fn f2_zero_arg_proto_refused() {
 #[test]
 fn f2_func_to_non_proto_refused() {
     // A FUNC whose target is not a FUNC_PROTO has no prototype.
-    match resolve_lifecycle_ids_from(&lifecycle_btf(1, 3, 1, 1)) {
+    match resolve_lifecycle_ids_from(&lifecycle_btf(1, 3, 1, 1, 2, 0x0100_0020, 4)) {
         Err(BtfError::BadPrototype { name, .. }) => {
             assert_eq!(name, "crypto_skcipher_encrypt");
         }
@@ -813,7 +853,7 @@ fn f2_typedef_wrapped_pointer_arg_accepted() {
     let enc_off = btf_push_str(&mut strtab, "crypto_skcipher_encrypt");
     let dec_off = btf_push_str(&mut strtab, "crypto_skcipher_decrypt");
     let mut types = Vec::new();
-    btf_rec(&mut types, int_off, 1, 0, 4, &0x0001_0020u32.to_le_bytes());
+    btf_rec(&mut types, int_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
     btf_rec(&mut types, req_off, 4, 0, 0, &[]);
     btf_rec(&mut types, 0, 2, 0, 2, &[]);
     // id 4: encrypt proto with arg0 = typedef id 8 (emitted below as
@@ -832,6 +872,67 @@ fn f2_typedef_wrapped_pointer_arg_accepted() {
     btf_rec(&mut types, alias_off, 8, 0, 3, &[]);
     let ids = resolve_lifecycle_ids_from(&btf_image(&types, &strtab)).expect("chased proto");
     assert_eq!(ids.len(), 2);
+}
+
+/// Assert the encrypt side refuses with `BadPrototype` naming it.
+fn assert_encrypt_bad_proto(image: &[u8], why: &str) {
+    match resolve_lifecycle_ids_from(image) {
+        Err(BtfError::BadPrototype { name, reason }) => {
+            assert_eq!(name, "crypto_skcipher_encrypt");
+            assert!(
+                !reason.is_empty(),
+                "refusal names its reason ({why}): {reason}"
+            );
+        }
+        other => panic!("want BadPrototype ({why}), got {other:?}"),
+    }
+}
+
+#[test]
+fn w2_extra_arg_proto_refused() {
+    // Round-2 (sol-M4/astra-M7): the qualified prototype takes
+    // EXACTLY one argument — a two-arg variant refuses startup
+    // rather than attaching to a changed signature.
+    assert_encrypt_bad_proto(&lifecycle_btf(1, 3, 2, 4, 2, 0x0100_0020, 4), "extra arg");
+}
+
+#[test]
+fn w2_non_struct_pointee_refused() {
+    // arg0 must point at STRUCT skcipher_request (the qualified
+    // request identity) — a pointer to INT refuses.
+    assert_encrypt_bad_proto(&lifecycle_btf(1, 3, 1, 4, 1, 0x0100_0020, 4), "INT pointee");
+}
+
+#[test]
+fn w2_wrong_struct_pointee_refused() {
+    // Same-kind wrong identity: a pointer to another STRUCT refuses
+    // — the name is part of the qualification, not just the kind.
+    assert_encrypt_bad_proto(
+        &lifecycle_btf(1, 3, 1, 4, 8, 0x0100_0020, 4),
+        "wrong STRUCT",
+    );
+}
+
+#[test]
+fn w2_unsigned_return_refused() {
+    // The native status is a SIGNED int: encoding 0 (unsigned/none)
+    // refuses — a sign change would invert errno reads.
+    assert_encrypt_bad_proto(
+        &lifecycle_btf(1, 3, 1, 4, 2, 0x0000_0020, 4),
+        "unsigned INT",
+    );
+}
+
+#[test]
+fn w2_offset_return_refused() {
+    // A bit-offset INT is a bitfield, not a status word.
+    assert_encrypt_bad_proto(&lifecycle_btf(1, 3, 1, 4, 2, 0x0101_0020, 4), "offset INT");
+}
+
+#[test]
+fn w2_narrow_return_refused() {
+    // 16-bit status would truncate errnos.
+    assert_encrypt_bad_proto(&lifecycle_btf(1, 3, 1, 4, 2, 0x0100_0010, 2), "16-bit INT");
 }
 
 #[test]
