@@ -1182,9 +1182,9 @@ fn drive_session_inner(
     })
 }
 
-/// Per-tick ring-drain visit cap: 8192 covers a full ring (≈6553
-/// records) plus margin, still bounded — a tick never leaves routine
-/// backlog for the next one.
+/// Per-tick ring-drain visit cap: 8192 covers a full ring (≈5461
+/// records at 48 B per frame) plus margin, still bounded — a tick
+/// never leaves routine backlog for the next one.
 const LIFECYCLE_DRAIN_BUDGET: usize = 8192;
 
 /// Session observation cap (design C12: configured bound, counted

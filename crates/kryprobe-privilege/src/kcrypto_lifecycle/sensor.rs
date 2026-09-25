@@ -181,12 +181,12 @@ pub struct DrainOutcome {
 }
 
 /// Quiet-drain visit budget per round: 8192 covers a full ring
-/// (262144 B / 40 B per record ≈ 6553 records) plus margin, still
+/// (262144 B / 48 B per frame ≈ 5461 records) plus margin, still
 /// bounded — one round plays any close backlog the ring can hold.
 pub const QUIET_DRAIN_BUDGET: usize = 8192;
 
 /// Quiet-drain round cap: post-detach arrivals are impossible, so 8
-/// rounds (≈52K records) can only exhaust on a corrupt ring — and
+/// rounds (≈43K records) can only exhaust on a corrupt ring — and
 /// then the exact backlog, not silence, reaches the ledger.
 pub const CLOSE_DRAIN_ROUNDS: usize = 8;
 

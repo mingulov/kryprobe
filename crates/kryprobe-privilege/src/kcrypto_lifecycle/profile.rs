@@ -150,9 +150,13 @@ pub struct ProfileManifest {
 
 /// Frozen lifecycle map table: config, edge ringbuf, per-CPU loss
 /// (5 classes), global identity slots, per-CPU accepted-edge
-/// aggregate. `LSTATE` mirrors the userspace decode bound (4096
-/// outstanding keys); `LAGG` reconciles against consumed edges +
-/// `LLOSS_RESERVE` after a quiet drain.
+/// aggregate, the per-CPU invocation sequence, the NOSLOT ghost
+/// quarantine, and the quarantine-overflow flag. `LSTATE` mirrors
+/// the userspace decode bound (4096 outstanding keys) with packed
+/// `u64` slots (poison + cpu + sequence + depth); `LCTR` issues the
+/// per-CPU sequences; `LQ`/`LGLB` are BPF-owned (userspace keeps
+/// the fds, never reads them); `LAGG` reconciles against consumed
+/// edges + `LLOSS_RESERVE` after a quiet drain.
 pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
     (
         "LCFG",
@@ -186,7 +190,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
         MapDims {
             map_type: 1,
             key_size: 8,
-            value_size: 1,
+            value_size: 8,
             max_entries: 4096,
         },
     ),
@@ -197,6 +201,33 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             key_size: 4,
             value_size: 8,
             max_entries: 4,
+        },
+    ),
+    (
+        "LCTR",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+        },
+    ),
+    (
+        "LQ",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 1,
+            max_entries: 4096,
+        },
+    ),
+    (
+        "LGLB",
+        MapDims {
+            map_type: 2,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
         },
     ),
 ];

@@ -11,8 +11,8 @@ use kryprobe_abi::kcrypto_lifecycle::{
 use std::mem::{offset_of, size_of};
 
 #[test]
-fn ledge_is_32_bytes_with_pinned_offsets() {
-    assert_eq!(size_of::<LEdge>(), 32);
+fn ledge_is_40_bytes_with_pinned_offsets() {
+    assert_eq!(size_of::<LEdge>(), 40);
     assert_eq!(offset_of!(LEdge, magic), 0);
     assert_eq!(offset_of!(LEdge, version), 2);
     assert_eq!(offset_of!(LEdge, edge), 3);
@@ -22,12 +22,13 @@ fn ledge_is_32_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LEdge, ts_ns), 16);
     assert_eq!(offset_of!(LEdge, status), 24);
     assert_eq!(offset_of!(LEdge, aux), 28);
+    assert_eq!(offset_of!(LEdge, invoc), 32);
 }
 
 #[test]
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
-    assert_eq!(LEDGE_VERSION, 2);
+    assert_eq!(LEDGE_VERSION, 3);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
     assert_eq!(LEDGE_TAINTED, 0x0001);
@@ -84,9 +85,14 @@ fn f9_ledge_debug_redacts_kernel_key() {
         ts_ns: 7,
         status: 0,
         aux: 0,
+        invoc: 41,
     };
     let shown = format!("{edge:?}");
     assert!(shown.contains("<redacted>"), "{shown}");
+    assert!(
+        shown.contains("41"),
+        "invoc is a counter, not redacted: {shown}"
+    );
     assert!(!shown.contains("dead"), "{shown}");
     assert!(
         !shown.contains(&0xdead_beef_1234_5678u64.to_string()),

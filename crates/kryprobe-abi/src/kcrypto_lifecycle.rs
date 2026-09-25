@@ -25,10 +25,10 @@
 
 /// `LEdge.magic`: `LC` (little-endian u16).
 pub const LEDGE_MAGIC: u16 = 0x434c;
-/// `LEdge.version` the T06 decoder understands (v2: `flags` carries
-/// [`LEDGE_TAINTED`]; v1 records refuse — versions never mix, so a v1
-/// decoder misreading v2 flags is impossible).
-pub const LEDGE_VERSION: u8 = 2;
+/// `LEdge.version` the T06 decoder understands (v3: `invoc` carries
+/// the BPF invocation id; v1/v2 records refuse — versions never mix,
+/// so an old decoder misreading the longer record is impossible).
+pub const LEDGE_VERSION: u8 = 3;
 
 /// `LEdge.edge`: function entry (submit-side observation).
 pub const LEDGE_SUBMIT: u8 = 1;
@@ -44,8 +44,11 @@ pub const LSITE_DEC: u16 = 2;
 /// had no usable `LSTATE` slot at hook time — a submit nested over
 /// an outstanding call, or a return with no outstanding submit
 /// (pre-attach call, `NOSLOT` drop). The decoder refuses tainted
-/// edges without disturbing the outstanding id: first-wins pairing,
-/// never a misjoin. No other flag bit is defined.
+/// edges; a tainted SUBMIT on an outstanding key additionally gaps
+/// that id (`IdentityAmbiguous`, since no future return can be
+/// attributed after the disturbance), while tainted returns and
+/// tainted submits with nothing outstanding leave the table
+/// undisturbed. No other flag bit is defined.
 pub const LEDGE_TAINTED: u16 = 0x0001;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
@@ -81,13 +84,24 @@ pub const LAGG_DEC_RET: u32 = 3;
 // Structs (twinned in kcrypto_lifecycle.rs; pinned by layout tests)
 // ---------------------------------------------------------------------------
 
-/// One raw lifecycle edge on `LRING` (32 bytes): site, edge kind,
-/// pairing key, timestamp, and the return status (return edges only;
-/// submit edges carry 0).
+/// One raw lifecycle edge on `LRING` (40 bytes): site, edge kind,
+/// pairing key, timestamp, the return status (return edges only;
+/// submit edges carry 0), and the BPF invocation id.
+///
+/// [`LEdge::invoc`] is the return-carried invocation identity
+/// (round-4 W4): every submit takes `(per-CPU sequence << 14) | (cpu
+/// << 1)` from the BPF `LCTR` lanes (bit 0 clear — the poison tag;
+/// 0 is never issued, it means "no invocation"); the slot stores it
+/// and the matching return carries it back. The decoder joins a
+/// return ONLY to an outstanding id with the SAME invocation — a
+/// lost return + lost submit can no longer alias one call's return
+/// onto another call's id, whatever the transport drops. Pairing
+/// soundness no longer depends on lossless delivery.
 ///
 /// `Debug` is manual: [`LEdge::key`] is a raw kernel pointer and
 /// renders as `<redacted>` (round-1 sol-m9/astra-m9 — Debug output is
 /// a log surface and must keep the module's no-render promise).
+/// `invoc` is a counter, not an address, and renders plainly.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LEdge {
@@ -110,6 +124,9 @@ pub struct LEdge {
     pub status: i32,
     /// Reserved auxiliary word (BPF writes 0).
     pub aux: u32,
+    /// BPF invocation id (≥1 on slotted edges; 0 with taint when the
+    /// edge has no slot to read it from).
+    pub invoc: u64,
 }
 
 impl core::fmt::Debug for LEdge {
@@ -124,6 +141,7 @@ impl core::fmt::Debug for LEdge {
             .field("ts_ns", &self.ts_ns)
             .field("status", &self.status)
             .field("aux", &self.aux)
+            .field("invoc", &self.invoc)
             .finish()
     }
 }

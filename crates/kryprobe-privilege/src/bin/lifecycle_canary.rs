@@ -143,9 +143,13 @@ fn main() {
         }
     };
     // Quiescence gates RUN validity (a noisy guest refuses the
-    // run); traffic ORIGIN during GO is proven by the verdict's
-    // exact join (hook counts + errno + status + deltas), not by
-    // these baselines — background traffic breaks the join and fails.
+    // run); observed traffic during GO is ATTRIBUTED by the
+    // verdict's exact join (fixture-derived hook counts + errno +
+    // status + deltas — background traffic breaks the join and
+    // fails), not by these baselines. The join attributes the
+    // observed edges to the fixture script; it does not prove no
+    // other traffic existed (quiescence bounds that, and any extra
+    // edge breaks the exact join).
     let baseline1 = snapshot(&sensor, 0);
     std::thread::sleep(Duration::from_millis(200));
     let baseline2 = snapshot(&sensor, 0);

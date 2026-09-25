@@ -1,24 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Raw-edge decode: v2 `LEdge` bytes → T05 `Edge` events (T06).
+//! Raw-edge decode: v3 `LEdge` bytes → T05 `Edge` events (T06).
 //!
-//! The join is keyed by the kernel request pointer carried in each
-//! record: a submit admits a fresh opaque id, the matching return
-//! joins the outstanding id for its key. Raw keys never leave this
-//! module (only opaque ids reach `Edge`); every refusal is counted,
-//! never silent.
+//! The join is keyed by (kernel request pointer, BPF invocation id):
+//! a submit admits a fresh opaque id recording its invocation, and a
+//! return joins the outstanding id for its key ONLY when the
+//! invocation matches. Raw keys never leave this module (only opaque
+//! ids reach `Edge`); every refusal is counted, never silent.
 //!
-//! First-wins pairing (round-2 U1/U2): BPF holds one `LSTATE` slot per
-//! outstanding address and TAINTS what it cannot pair — a submit
-//! nested over an outstanding call, or a return with no outstanding
-//! submit. Tainted edges refuse here without disturbing the
-//! outstanding id, so the round-1/round-2 counterexample (reuse, then
-//! a late return joining the wrong invocation) cannot complete: the
-//! reuse never admits, and the late original return joins its own id.
-//! A CLEAN same-key submit while an id is outstanding therefore
-//! proves transport loss (the BPF slot empties only on a return
-//! emit): the old id gaps `IdentityAmbiguous` and the new submit
-//! admits fresh. Site is stored per submit and checked per return
-//! (one call, one function — cross-site returns refuse stale).
+//! Invocation identity (round-4 W4): BPF issues one id per submit
+//! and the slot carries it to the matching return, so a return from
+//! a DIFFERENT invocation — a later call after a lost return + lost
+//! submit, or a nested call's return — can never alias onto the
+//! outstanding id: the invocation mismatches and the return refuses
+//! stale with the outstanding id kept. Pairing soundness no longer
+//! depends on lossless transport.
+//!
+//! Disturbance signals (unchanged): BPF TAINTS what it cannot pair —
+//! a submit nested over an outstanding call, or a return with no
+//! outstanding submit. A tainted submit on an outstanding key gaps
+//! that id `IdentityAmbiguous` promptly; tainted returns and
+//! tainted submits with nothing outstanding refuse quietly. A CLEAN
+//! same-key submit while an id is outstanding proves the old
+//! invocation ended without a delivered return (the BPF slot empties
+//! only on a return release): the old id gaps `IdentityAmbiguous`
+//! and the new submit admits fresh. Site is stored per submit and
+//! checked per return (one call, one function — cross-site returns
+//! refuse stale).
 
 use kryprobe_abi::kcrypto_lifecycle::{
     LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION, LSITE_DEC, LSITE_ENC,
@@ -26,8 +33,8 @@ use kryprobe_abi::kcrypto_lifecycle::{
 use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
 use std::collections::HashMap;
 
-/// Record twin size: `LEdge` is 32 bytes on the ring.
-const RECORD_LEN: usize = 32;
+/// Record twin size: `LEdge` is 40 bytes on the ring.
+const RECORD_LEN: usize = 40;
 
 /// One validated raw edge (post-twin-checks, pre-join).
 ///
@@ -48,6 +55,8 @@ pub struct RawEdge {
     pub ts_ns: u64,
     /// Native return status (return edges) or 0 (submit edges).
     pub status: i32,
+    /// BPF invocation id (the join identity; 0 on slotless edges).
+    pub invoc: u64,
 }
 
 impl std::fmt::Debug for RawEdge {
@@ -59,6 +68,7 @@ impl std::fmt::Debug for RawEdge {
             .field("key", &"<redacted>")
             .field("ts_ns", &self.ts_ns)
             .field("status", &self.status)
+            .field("invoc", &self.invoc)
             .finish()
     }
 }
@@ -105,15 +115,15 @@ pub struct DecodeStats {
     /// Gaps synthesized for clean same-key submits while an id is
     /// outstanding (transport loss: the old return never arrived).
     pub gaps_synthesized: u64,
-    /// Returns refused against an outstanding submit: predating it, or
-    /// from the other site (one call, one function — refused, never
-    /// joined, outstanding kept).
+    /// Returns refused against an outstanding submit: a different
+    /// invocation, predating it, or from the other site (one call,
+    /// one function — refused, never joined, outstanding kept).
     pub stale_returns: u64,
 }
 
-/// Validate one ring record against the v2 `LEdge` twin: exact length,
+/// Validate one ring record against the v3 `LEdge` twin: exact length,
 /// magic, version, edge kind, site, defined-only flags, zero aux,
-/// non-null key, and zero status on submit edges.
+/// non-null key, zero status on submit edges, and the invocation id.
 pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeDrop::BadLength);
@@ -161,6 +171,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if edge == LEDGE_SUBMIT && status != 0 {
         return Err(DecodeDrop::BadSubmitStatus);
     }
+    let invoc = u64le(32);
     Ok(RawEdge {
         edge,
         site,
@@ -168,6 +179,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         key,
         ts_ns,
         status,
+        invoc,
     })
 }
 
@@ -197,8 +209,10 @@ pub struct LifecycleDecoder {
     capacity: usize,
     /// Next opaque id (starts at 1; 0 is never issued).
     next_id: u64,
-    /// Outstanding key → (opaque id, submit ts, submit site).
-    outstanding: HashMap<u64, (u64, u64, u16)>,
+    /// Outstanding key → (opaque id, submit ts, submit site, BPF
+    /// invocation id). The invocation is the join identity: a return
+    /// joins ONLY on invocation equality.
+    outstanding: HashMap<u64, (u64, u64, u16, u64)>,
     /// Loss counters.
     stats: DecodeStats,
 }
@@ -262,7 +276,7 @@ impl LifecycleDecoder {
         if raw.tainted {
             if raw.edge == LEDGE_SUBMIT {
                 self.stats.submit_refused += 1;
-                if let Some((old_id, _, _)) = self.outstanding.remove(&raw.key) {
+                if let Some((old_id, _, _, _)) = self.outstanding.remove(&raw.key) {
                     self.stats.gaps_synthesized += 1;
                     return vec![Edge::Gap {
                         id: old_id,
@@ -287,15 +301,17 @@ impl LifecycleDecoder {
         self.stats.bad_records += 1;
     }
 
-    /// Admit a submit under a fresh opaque id. A clean same-key
-    /// submit while an id is outstanding proves transport loss (the
-    /// BPF slot empties only on a return emit, so honest BPF never
-    /// nests clean): the old id gaps (`IdentityAmbiguous` — its
-    /// return never arrived) first. A full table or an exhausted id
-    /// space refuses (counted, no phantom).
+    /// Admit a submit under a fresh opaque id, recording its BPF
+    /// invocation. A clean same-key submit while an id is outstanding
+    /// proves the old invocation ended without a delivered return
+    /// (the BPF slot empties only on a return release, so a clean
+    /// claim means the previous occupant returned): the old id gaps
+    /// (`IdentityAmbiguous` — its return never arrived) first. A
+    /// full table or an exhausted id space refuses (counted, no
+    /// phantom).
     fn submit(&mut self, raw: RawEdge) -> Vec<Edge> {
         let mut out = Vec::new();
-        if let Some((old_id, _, _)) = self.outstanding.remove(&raw.key) {
+        if let Some((old_id, _, _, _)) = self.outstanding.remove(&raw.key) {
             self.stats.gaps_synthesized += 1;
             out.push(Edge::Gap {
                 id: old_id,
@@ -315,7 +331,8 @@ impl LifecycleDecoder {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.outstanding.insert(raw.key, (id, raw.ts_ns, raw.site));
+        self.outstanding
+            .insert(raw.key, (id, raw.ts_ns, raw.site, raw.invoc));
         self.stats.admitted += 1;
         out.push(Edge::Submit {
             id,
@@ -325,20 +342,23 @@ impl LifecycleDecoder {
         out
     }
 
-    /// Join a return to the outstanding id for its key. Unknown keys
-    /// count and emit nothing — no phantom completions. A return
-    /// PREDATING the outstanding submit, or arriving from the OTHER
-    /// site (one call, one function — a cross-site return cannot be
-    /// this invocation's), is stale and is refused without disturbing
-    /// the outstanding id. Ties join (coarse-clock ambiguity, pinned).
+    /// Join a return to the outstanding id for its key — ONLY on
+    /// invocation equality. Unknown keys count and emit nothing — no
+    /// phantom completions. A return from a DIFFERENT invocation (a
+    /// later call after a lost return + lost submit, or a nested
+    /// call's return), a return PREDATING the outstanding submit, or
+    /// a return from the OTHER site (one call, one function — a
+    /// cross-site return cannot be this invocation's), is stale and
+    /// is refused without disturbing the outstanding id. Ties join
+    /// (coarse-clock ambiguity, pinned).
     fn complete(&mut self, raw: RawEdge) -> Vec<Edge> {
         let id = match self.outstanding.get(&raw.key) {
             None => {
                 self.stats.unknown_key_returns += 1;
                 return Vec::new();
             }
-            Some(&(id, submit_ts, submit_site)) => {
-                if raw.ts_ns < submit_ts || raw.site != submit_site {
+            Some(&(id, submit_ts, submit_site, submit_invoc)) => {
+                if raw.invoc != submit_invoc || raw.ts_ns < submit_ts || raw.site != submit_site {
                     self.stats.stale_returns += 1;
                     return Vec::new();
                 }

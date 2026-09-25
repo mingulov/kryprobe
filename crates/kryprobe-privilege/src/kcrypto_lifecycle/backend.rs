@@ -5,7 +5,8 @@
 //! One [`BackendId::KCrypto`] slot serves both profiles — registering
 //! the second is a typed [`DuplicateBackend`], never a second capture
 //! (structural exclusion within a session; the process-wide
-//! [`SessionGuard`] covers cross-session bring-up). The driver feeds
+//! [`SessionGuard`] covers cross-PROFILE bring-up — same-profile
+//! concurrency still shares by design, see the guard docs). The driver feeds
 //! completed [`RequestRecord`]s through [`lifecycle_event`] +
 //! [`Backend::decode`]; the JSON envelope is validated strictly
 //! (fail-closed [`BackendError::CorruptInput`]), so a foreign event fed here

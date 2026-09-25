@@ -11,17 +11,32 @@ use kryprobe_core::kcrypto::Terminal;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::SensorCore;
 
 /// One 32-byte `LEdge` (little-endian twin of the ABI struct).
-fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> Vec<u8> {
-    let mut out = vec![0u8; 32];
+fn edge_bytes_invoc(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    flags: u16,
+    invoc: u64,
+) -> Vec<u8> {
+    let mut out = vec![0u8; 40];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 2;
+    out[2] = 3;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
     out[8..16].copy_from_slice(&key.to_le_bytes());
     out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
     out[24..28].copy_from_slice(&status.to_le_bytes());
+    out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out
+}
+
+/// Pre-invocation-identity builder: same v3 record with invoc 0
+/// (see the decode-suite twin).
+fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> Vec<u8> {
+    edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0)
 }
 
 #[test]

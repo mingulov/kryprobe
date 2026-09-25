@@ -136,14 +136,31 @@ fn get_str<'a>(
         })
 }
 
+fn get_bool(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    line_no: usize,
+    what: &'static str,
+) -> Result<bool, TranscriptError> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(TranscriptError {
+            line: line_no,
+            reason: what,
+        })
+}
+
 /// Parse a fixture transcript STRICTLY, as real JSON (fixture.h
 /// contract, `"v":1`): every non-empty line must be a JSON object
 /// with a string `run`; rows for other runs are out of scope
 /// (skipped by EXACT run equality, never substring); rows for this
-/// run need known phases, exact-typed required fields, unique
-/// submit seqs, return/terminal only for submitted seqs, exactly
-/// one `done` with nothing after it, and at least one submit with
-/// its return AND terminal rows. Anything else is a
+/// run need known phases, exact-typed required fields (INCLUDING
+/// the alloc/free/progress markers — a malformed marker is a broken
+/// transcript, not ignorable noise), unique submit/return/terminal
+/// seqs (a duplicate evidence row could shadow the verdict's
+/// first-match lookup), return/terminal only for submitted seqs,
+/// exactly one `done` with nothing after it, and at least one
+/// submit with its return AND terminal rows. Anything else is a
 /// [`TranscriptError`] (fail the run — never skip-and-pass).
 /// Extra keys on own rows are ignored per the fixture contract
 /// (every row shape ends `,...}` — extensibility reserved); the
@@ -186,9 +203,28 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         }
         let phase = get_str(obj, "phase", line_no, "row has no phase field")?;
         match phase {
-            // Lifecycle + waiter markers: known, not oracle evidence
-            // (shape-checked above via v/run/phase; values ignored).
-            "alloc" | "free" | "progress" => {}
+            // Lifecycle + waiter markers: not oracle evidence, but
+            // their REQUIRED fields validate (fixture.h: a malformed
+            // marker is a broken transcript — round-4 minor).
+            "alloc" => {
+                get_u64(obj, "seq", line_no, "alloc row lacks a sequence")?;
+                let req = get_str(obj, "req", line_no, "alloc row lacks a req")?;
+                let drv = get_str(obj, "drv", line_no, "alloc row lacks a drv")?;
+                if req.is_empty() || drv.is_empty() {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "alloc row has an empty req or drv",
+                    });
+                }
+            }
+            "free" => {
+                get_u64(obj, "seq", line_no, "free row lacks a sequence")?;
+                get_bool(obj, "final", line_no, "free row lacks a bool final")?;
+            }
+            "progress" => {
+                get_u64(obj, "seq", line_no, "progress row lacks a sequence")?;
+                get_i32(obj, "errno", line_no, "progress row lacks an errno")?;
+            }
             "submit" => {
                 let seq = get_u64(obj, "seq", line_no, "submit row lacks a sequence")?;
                 let op = get_str(obj, "op", line_no, "submit row lacks an op")?;
@@ -218,6 +254,12 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                         reason: "return for an unknown sequence",
                     });
                 }
+                if returns.iter().any(|(s, _)| *s == seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "duplicate return sequence",
+                    });
+                }
                 returns.push((seq, errno));
             }
             "terminal" => {
@@ -227,6 +269,12 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     return Err(TranscriptError {
                         line: line_no,
                         reason: "terminal for an unknown sequence",
+                    });
+                }
+                if terminals.iter().any(|(s, _)| *s == seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "duplicate terminal sequence",
                     });
                 }
                 terminals.push((seq, errno));
@@ -665,14 +713,14 @@ mod tests {
     fn sync_text() -> String {
         let run = "run-sync-once";
         [
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-sync-t06a","drv":"kxcipher-sync-t06a"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"decrypt"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
             format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
         ]
         .join("\n")
@@ -782,11 +830,11 @@ mod tests {
     fn verdict_async_expects_pending() {
         let run = "run-async-once";
         let text = [
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t06a","drv":"kxcipher-async-t06a"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
             format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
         ]
         .join("\n");
@@ -882,11 +930,11 @@ mod tests {
         // Non-object lines and runless rows fail (unattributable).
         for bad in [
             sync_text().replace(
-                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\"}",
+                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"kxcipher-sync-t06a\",\"drv\":\"kxcipher-sync-t06a\"}",
                 "not json at all",
             ),
             sync_text().replace(
-                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\"}",
+                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"kxcipher-sync-t06a\",\"drv\":\"kxcipher-sync-t06a\"}",
                 "{\"v\":1,\"seq\":1,\"phase\":\"alloc\"}",
             ),
         ] {
@@ -923,6 +971,49 @@ mod tests {
             "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}\n{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"progress\",\"errno\":-115}",
         );
         parse_transcript(&with_progress, "run-sync-once").expect("progress ignored");
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_evidence_rows() {
+        // Round-4 (sol-M2/astra-M2): the verdict looks up the FIRST
+        // return/terminal per seq, so a conflicting duplicate row
+        // would be silently shadowed — duplicates reject at parse.
+        let dup_terminal = sync_text().replace(
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}",
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}\n{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":-5}",
+        );
+        let err = parse_transcript(&dup_terminal, "run-sync-once")
+            .expect_err("duplicate terminal must fail");
+        assert!(err.reason.contains("duplicate terminal"), "names it: {err}");
+        let dup_return = sync_text().replace(
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":3,\"phase\":\"return\",\"errno\":0}",
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":3,\"phase\":\"return\",\"errno\":0}\n{\"v\":1,\"run\":\"run-sync-once\",\"seq\":3,\"phase\":\"return\",\"errno\":-5}",
+        );
+        let err =
+            parse_transcript(&dup_return, "run-sync-once").expect_err("duplicate return must fail");
+        assert!(err.reason.contains("duplicate return"), "names it: {err}");
+    }
+
+    #[test]
+    fn parse_validates_marker_rows() {
+        // Round-4 minor: alloc/free/progress are not oracle evidence,
+        // but their required fields validate — a malformed marker is
+        // a broken transcript (fixture.h contract).
+        let no_req = sync_text().replace("\"req\":\"kxcipher-sync-t06a\",", "");
+        assert!(parse_transcript(&no_req, "run-sync-once").is_err());
+        let empty_drv = sync_text().replace("\"drv\":\"kxcipher-sync-t06a\"", "\"drv\":\"\"");
+        assert!(parse_transcript(&empty_drv, "run-sync-once").is_err());
+        let no_final = sync_text().replace(",\"final\":true", "");
+        assert!(parse_transcript(&no_final, "run-sync-once").is_err());
+        let bad_final = sync_text().replace("\"final\":true", "\"final\":\"yes\"");
+        let err =
+            parse_transcript(&bad_final, "run-sync-once").expect_err("mistyped final must fail");
+        assert!(err.reason.contains("final"), "names it: {err}");
+        let no_errno = sync_text().replace(
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}",
+            "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"terminal\",\"errno\":0}\n{\"v\":1,\"run\":\"run-sync-once\",\"seq\":2,\"phase\":\"progress\"}",
+        );
+        assert!(parse_transcript(&no_errno, "run-sync-once").is_err());
     }
 
     #[test]

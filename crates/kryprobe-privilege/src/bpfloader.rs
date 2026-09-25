@@ -426,10 +426,17 @@ pub struct LifecycleMaps {
     pub ring: OwnedFd,
     /// `LLOSS` (per-CPU loss counters, 5 entries).
     pub loss: OwnedFd,
-    /// `LSTATE` (global outstanding-call slots).
+    /// `LSTATE` (global outstanding-call slots, packed words).
     pub state: OwnedFd,
     /// `LAGG` (per-CPU accepted-edge aggregate, 4 entries).
     pub agg: OwnedFd,
+    /// `LCTR` (per-CPU invocation sequence, 1 entry; BPF-owned —
+    /// userspace keeps the fd, never reads it).
+    pub ctr: OwnedFd,
+    /// `LQ` (NOSLOT ghost quarantine; BPF-owned, never read).
+    pub quar: OwnedFd,
+    /// `LGLB` (quarantine-overflow flag; BPF-owned, never read).
+    pub glb: OwnedFd,
 }
 
 /// Loaded lifecycle object: maps + programs as (section, handle)

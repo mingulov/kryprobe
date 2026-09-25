@@ -84,12 +84,19 @@ fn h01_api_returns_sections_stay_fexit_only() {
 #[test]
 fn h01_lifecycle_map_table_is_exact_and_dot_free() {
     // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss,
-    // 5 classes), LSTATE (global identity slots), LAGG (per-CPU
-    // accepted aggregate): the T06 contract the BPF object must
-    // match byte-for-byte.
-    assert_eq!(LIFECYCLE_MAPS.len(), 5);
+    // 5 classes), LSTATE (global identity slots, packed words),
+    // LAGG (per-CPU accepted aggregate), LCTR (per-CPU invocation
+    // sequence), LQ (NOSLOT ghost quarantine), LGLB
+    // (quarantine-overflow flag): the T06 contract the BPF object
+    // must match byte-for-byte.
+    assert_eq!(LIFECYCLE_MAPS.len(), 8);
     let names: Vec<&str> = LIFECYCLE_MAPS.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["LCFG", "LRING", "LLOSS", "LSTATE", "LAGG"]);
+    assert_eq!(
+        names,
+        [
+            "LCFG", "LRING", "LLOSS", "LSTATE", "LAGG", "LCTR", "LQ", "LGLB"
+        ]
+    );
     for name in &names {
         assert!(!name.contains('.'), "R3 dot-free gate: {name}");
     }
@@ -132,7 +139,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
         MapDims {
             map_type: 1,
             key_size: 8,
-            value_size: 1,
+            value_size: 8,
             max_entries: 4096,
         }
     );
@@ -143,6 +150,33 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             key_size: 4,
             value_size: 8,
             max_entries: 4,
+        }
+    );
+    assert_eq!(
+        dims("LCTR"),
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+        }
+    );
+    assert_eq!(
+        dims("LQ"),
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 1,
+            max_entries: 4096,
+        }
+    );
+    assert_eq!(
+        dims("LGLB"),
+        MapDims {
+            map_type: 2,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
         }
     );
 }
@@ -428,7 +462,7 @@ fn valid_lifecycle_fixture() -> Vec<u8> {
 fn h02_valid_entry_return_object_parses() {
     let bytes = valid_lifecycle_fixture();
     let parsed = parse_lifecycle_object(&bytes).expect("valid fixture must parse");
-    assert_eq!(parsed.maps.len(), 5);
+    assert_eq!(parsed.maps.len(), 8);
     assert_eq!(parsed.programs.len(), 4);
     for prog in &parsed.programs {
         assert_eq!(prog.insns.len(), 1, "{} stream drifted", prog.name);
