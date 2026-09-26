@@ -307,6 +307,11 @@ pub const CANARY_KEY: &[u8; 16] = b"KPROBE-CANARY-K!";
 pub const CANARY_IV: &[u8; 16] = b"KPROBE-CANARY-IV";
 /// Canary plaintext (K1 Task 3): 32B input carrying the marker.
 pub const CANARY_PT: &[u8; 32] = b"KPROBE-CANARY-PT-BUFFER-01234567";
+/// Canary AEAD tag (R2-04): 16B tag carrying the marker — a
+/// decrypt leg fed this tag must fail `EBADMSG` (proving the
+/// marked tag traversed the kernel decrypt path) while the
+/// sensor captures none of its bytes.
+pub const CANARY_TAG: &[u8; 16] = b"KPROBE-CANARY-TG";
 
 /// `skcipher` roundtrip: `ops` encrypts + `ops` decrypts of 32B (C
 /// `do_skcipher`: key 16B `0x42`, IV 16B `0x11`, pt 32B `0xaa`,
@@ -324,6 +329,17 @@ pub fn skcipher_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureEr
 /// callers must pass their own IV story, so this helper refuses
 /// nothing and documents CBC-only).
 pub fn skcipher_encrypt_once(bound_fd: std::os::fd::RawFd) -> Result<(), FixtureError> {
+    skcipher_encrypt_once_with(bound_fd, &[0x11u8; 16], &[0xaau8; 32]).map(|_| ())
+}
+
+/// One 32B encrypt on a bound fd with caller buffers (R2-04: the
+/// privacy lane passes canary IV/plaintext; returns the 32B
+/// ciphertext for a decrypt-back leg).
+pub fn skcipher_encrypt_once_with(
+    bound_fd: std::os::fd::RawFd,
+    iv: &[u8],
+    pt: &[u8; 32],
+) -> Result<[u8; 32], FixtureError> {
     // SAFETY: no address capture; `bound_fd` stays caller-owned.
     let op = unsafe { libc::accept(bound_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
     if op < 0 {
@@ -334,9 +350,32 @@ pub fn skcipher_encrypt_once(bound_fd: std::os::fd::RawFd) -> Result<(), Fixture
     }
     let op = AlgFd::new(op);
     let mut out = [0u8; 32];
-    send_op(&op, ALG_OP_ENCRYPT, &[0x11u8; 16], &[0xaau8; 32])?;
+    send_op(&op, ALG_OP_ENCRYPT, iv, pt)?;
     read_exact(&op, &mut out, 32, "enc read")?;
-    Ok(())
+    Ok(out)
+}
+
+/// One 32B decrypt on a bound fd with caller buffers (R2-04: the
+/// privacy lane decrypts back with the canary IV; returns the 32B
+/// plaintext so the caller proves the roundtrip).
+pub fn skcipher_decrypt_once_with(
+    bound_fd: std::os::fd::RawFd,
+    iv: &[u8],
+    ct: &[u8; 32],
+) -> Result<[u8; 32], FixtureError> {
+    // SAFETY: no address capture; `bound_fd` stays caller-owned.
+    let op = unsafe { libc::accept(bound_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if op < 0 {
+        return Err(FixtureError::Syscall {
+            stage: "accept",
+            errno: last_errno(),
+        });
+    }
+    let op = AlgFd::new(op);
+    let mut out = [0u8; 32];
+    send_op(&op, ALG_OP_DECRYPT, iv, ct)?;
+    read_exact(&op, &mut out, 32, "dec read")?;
+    Ok(out)
 }
 
 /// Canary `skcipher` roundtrip (K1 Task 3): same choreography as
@@ -378,11 +417,30 @@ fn skcipher_roundtrip_with(
 /// `aead` roundtrip: `ops` encrypts + `ops` decrypts of 32B + 16B tag (C
 /// `do_aead`: the authsize quirk rides `optlen`, `optval` ignored).
 pub fn aead_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureError> {
+    aead_roundtrip_with(alg, ops, &[0x42u8; 16], &[0x11u8; 12], &[0xaau8; 32])
+}
+
+/// Canary `aead` roundtrip (R2-04): same choreography as
+/// [`aead_roundtrip`], but key, IV, and plaintext carry the
+/// `KPROBE-CANARY-*` markers (IV is the 12B marker prefix —
+/// gcm-shaped algs take a 12B IV).
+pub fn aead_canary_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureError> {
+    let mut iv12 = [0u8; 12];
+    iv12.copy_from_slice(&CANARY_IV[..12]);
+    aead_roundtrip_with(alg, ops, CANARY_KEY, &iv12, CANARY_PT)
+}
+
+/// [`aead_roundtrip`] over caller-supplied buffers (the canary
+/// lane passes markers; the tag stays kernel-computed).
+pub fn aead_roundtrip_with(
+    alg: &str,
+    ops: u64,
+    key: &[u8; 16],
+    iv: &[u8],
+    msg: &[u8; 32],
+) -> Result<CipherCounts, FixtureError> {
     let tfm = alg_bind("aead", alg)?;
-    let key = [0x42u8; 16];
-    let iv = [0x11u8; 12];
-    let msg = [0xaau8; 32];
-    set_key(&tfm, &key)?;
+    set_key(&tfm, key)?;
     // SAFETY: null value, `optlen` carries the authsize (kernel quirk).
     let auth = unsafe {
         libc::setsockopt(
@@ -404,13 +462,13 @@ pub fn aead_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureError>
     let mut dout = [0u8; 32];
     let mut enc = 0u64;
     while enc < ops {
-        send_op(&op, ALG_OP_ENCRYPT, &iv, &msg)?;
+        send_op(&op, ALG_OP_ENCRYPT, iv, msg)?;
         read_exact(&op, &mut out, 48, "aead enc read")?;
         enc += 1;
     }
     let mut dec = 0u64;
     while dec < ops {
-        send_op(&op, ALG_OP_DECRYPT, &iv, &out)?;
+        send_op(&op, ALG_OP_DECRYPT, iv, &out)?;
         read_exact(&op, &mut dout, 32, "aead dec read")?;
         dec += 1;
     }
@@ -465,6 +523,61 @@ pub fn aead_decrypt_bad_tag(alg: &str) -> Result<(), FixtureError> {
     }
     Err(FixtureError::UnexpectedOk {
         stage: "bad tag decrypt",
+        got,
+    })
+}
+
+/// `aead` marker-tag decrypt (R2-04): one encrypt with canary
+/// key/IV/plaintext, then one decrypt whose 16B tag is
+/// [`CANARY_TAG`]. `Ok(())` iff the decrypt leg fails `EBADMSG`
+/// (the marked tag traversed the kernel decrypt path — the
+/// positive control that tag bytes were live traffic while the
+/// sensor captured none of them); any other outcome is
+/// [`FixtureError`].
+pub fn aead_decrypt_marker_tag(alg: &str) -> Result<(), FixtureError> {
+    let tfm = alg_bind("aead", alg)?;
+    let mut iv12 = [0u8; 12];
+    iv12.copy_from_slice(&CANARY_IV[..12]);
+    set_key(&tfm, CANARY_KEY)?;
+    // SAFETY: null value, `optlen` carries the authsize (kernel quirk).
+    let auth = unsafe {
+        libc::setsockopt(
+            tfm.0,
+            libc::SOL_ALG,
+            ALG_SET_AEAD_AUTHSIZE,
+            std::ptr::null(),
+            16,
+        )
+    };
+    if auth != 0 {
+        return Err(FixtureError::Syscall {
+            stage: "authsize",
+            errno: last_errno(),
+        });
+    }
+    let op = op_socket(&tfm)?;
+    let mut out = [0u8; 48];
+    send_op(&op, ALG_OP_ENCRYPT, &iv12, CANARY_PT)?;
+    read_exact(&op, &mut out, 48, "marker tag enc read")?;
+    // Swap the kernel tag for the canary tag: the decrypt leg
+    // must fail EBADMSG.
+    out[32..48].copy_from_slice(CANARY_TAG);
+    send_op(&op, ALG_OP_DECRYPT, &iv12, &out)?;
+    let mut dout = [0u8; 32];
+    // SAFETY: `dout` outlives the call.
+    let got = unsafe { libc::read(op.0, dout.as_mut_ptr().cast::<libc::c_void>(), dout.len()) };
+    if got < 0 {
+        let errno = last_errno();
+        if errno == libc::EBADMSG {
+            return Ok(());
+        }
+        return Err(FixtureError::Syscall {
+            stage: "marker tag decrypt",
+            errno,
+        });
+    }
+    Err(FixtureError::UnexpectedOk {
+        stage: "marker tag decrypt",
         got,
     })
 }

@@ -54,7 +54,20 @@ fn main() {
     ) else {
         usage()
     };
-    if scenario != "sync-once" && scenario != "async-once" {
+    if !matches!(
+        scenario.as_str(),
+        "sync-once"
+            | "async-once"
+            | "reuse-burst"
+            | "refheld-release"
+            | "shared-release"
+            | "rekey"
+            | "authsize"
+            | "typed-sync"
+            | "exact-driver"
+            | "failed-alloc"
+            | "failed-init"
+    ) {
         eprintln!("canary error: unknown scenario {scenario}");
         std::process::exit(2);
     }
@@ -207,6 +220,7 @@ fn main() {
             retained_dropped: ledger.retained_dropped,
             prog_misses: ledger.miss_current.clone(),
             tfm: ledger.tfm_stats,
+            generations_len: sensor.tfm().generations().len() as u64,
         }
     };
     // Quiescence gates RUN validity (a noisy guest refuses the
@@ -229,11 +243,54 @@ fn main() {
     }
     put(&mut out, "quiescence", "ok".to_owned());
 
-    // 3. GO (blocks until the scenario completes), then parse the
-    // fixture transcript STRICTLY (any malformed own-row fails).
-    if let Err(err) = std::fs::write(&control, "GO") {
-        eprintln!("canary error: GO failed: {err}");
-        std::process::exit(2);
+    // 3. GO in a writer thread (the write BLOCKS until the
+    // scenario completes) while the main thread drains: a
+    // 1,000-lifetime burst emits ~6,000 records, past the ring —
+    // drain-during-GO keeps the ring from dropping (T07-R2-04).
+    // The sensor stays on the main thread (no sharing); the GO
+    // thread only signals completion. Then parse the fixture
+    // transcript STRICTLY (any malformed own-row fails).
+    let mut completed = Vec::new();
+    let control_go = control.clone();
+    let go = std::thread::spawn(move || std::fs::write(&control_go, "GO"));
+    loop {
+        match sensor.drain_once(8192) {
+            Ok(drained) => {
+                completed.extend(sensor.take_completed());
+                // Adaptive poll: while records flow (or the
+                // writer holds one open), re-poll IMMEDIATELY —
+                // a 1,000-lifetime burst emits ~6,000 records in
+                // a few ms, past the 256 KiB ring; any fixed
+                // sleep drops (T07-R2-04: the 20 ms poll lost
+                // 3,816 records). Sleep only on a truly quiet
+                // round (the GO thread owns completion — this
+                // loop only feeds the consumer).
+                if drained.records == 0 && !drained.busy {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(err) => {
+                fail(
+                    &out,
+                    &receipt,
+                    &format!("sensor drain during GO failed: {err}"),
+                );
+            }
+        }
+        if go.is_finished() {
+            break;
+        }
+    }
+    match go.join() {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            eprintln!("canary error: GO failed: {err}");
+            std::process::exit(2);
+        }
+        Err(_) => {
+            eprintln!("canary error: GO thread panicked");
+            std::process::exit(2);
+        }
     }
     let ledger_text = std::fs::read_to_string(PathBuf::from(&fixture_dir).join("ledger"))
         .unwrap_or_else(|err| {
@@ -265,12 +322,30 @@ fn main() {
     put(&mut out, "fx_dec_sub", fx[2].to_string());
     put(&mut out, "fx_dec_ret", fx[3].to_string());
     put(&mut out, "fx_completed", fx_completed.to_string());
+    // T07-R2-04: fixture transform truth (the lifetime oracle's
+    // input — counts here, per-lifetime rows in the fixture
+    // ledger the receipt archives beside).
+    put(&mut out, "fx_allocs", truth.allocs.len().to_string());
+    put(&mut out, "fx_frees", truth.frees.len().to_string());
+    put(
+        &mut out,
+        "fx_final_frees",
+        truth
+            .frees
+            .iter()
+            .filter(|f| f.final_free)
+            .count()
+            .to_string(),
+    );
+    put(&mut out, "fx_configs", truth.configs.len().to_string());
+    put(&mut out, "fx_probes", truth.probes.len().to_string());
 
     // 4. Drain until a quiet round (records==0, no busy writer) or
     // the deadline — the poll owns NO count expectations (the oracle
-    // does); drain errors fail loudly, never fall back.
+    // does); drain errors fail loudly, never fall back. (Continues
+    // the `completed` take from the drain-during-GO loop above —
+    // one take stream, no reset between GO and quiet.)
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut completed = Vec::new();
     loop {
         let drained = sensor.drain_once(8192).unwrap_or_else(|err| {
             fail(&out, &receipt, &format!("sensor drain failed: {err}"));
@@ -363,6 +438,26 @@ fn main() {
     // Sensor-ledger evidence file (exact join inputs for reviewers).
     if let Some(path) = sensor_ledger_path {
         let mut text = String::new();
+        // T07-R2-04: per-lifetime generation rows (fixture alloc[i]
+        // joins generations[baseline + i] — both sides archived).
+        for generation in sensor.tfm().generations() {
+            text.push_str(&format!(
+                "{{\"kind\":\"gen\",\"id\":{},\"req\":{:?},\"drv\":{:?},\"type\":{},\"mask\":{},\"first_seen\":{},\"retired\":{},\"ambiguous\":{},\"epoch\":{},\"configs\":{},\"site\":{},\"len\":{},\"errno\":{}}}\n",
+                generation.id,
+                generation.req_name,
+                generation.drv_name,
+                generation.alg_type,
+                generation.alg_mask,
+                generation.first_seen,
+                generation.retired,
+                generation.ambiguous,
+                generation.epoch,
+                generation.configs,
+                generation.last_config_site,
+                generation.last_config_len,
+                generation.last_config_errno,
+            ));
+        }
         for record in &completed {
             let (terminal, status) = match record.terminal {
                 Terminal::Sync(status) => ("sync", Some(status)),
@@ -399,6 +494,61 @@ fn main() {
     put(&mut out, "se_dec_ret", hits[3].to_string());
     put(&mut out, "se_allocsk_sub", hits[4].to_string());
     put(&mut out, "se_allocsk_ret", hits[5].to_string());
+    // T07-R2-04: sensor transform evidence (both sides of the
+    // lifetime join — per-lifetime rows ride the sensor ledger).
+    put(&mut out, "se_destroy_sub", hits[6].to_string());
+    put(&mut out, "se_destroy_ret", hits[7].to_string());
+    put(&mut out, "se_setkeysk_sub", hits[8].to_string());
+    put(&mut out, "se_setkeysk_ret", hits[9].to_string());
+    put(&mut out, "se_setauthsize_sub", hits[10].to_string());
+    put(&mut out, "se_setauthsize_ret", hits[11].to_string());
+    put(&mut out, "se_allocaead_sub", hits[12].to_string());
+    put(&mut out, "se_allocaead_ret", hits[13].to_string());
+    put(&mut out, "se_setkeyaead_sub", hits[14].to_string());
+    put(&mut out, "se_setkeyaead_ret", hits[15].to_string());
+    let tfm_delta = |got: u64, base: u64| delta(got, base).to_string();
+    put(
+        &mut out,
+        "se_tfm",
+        format!(
+            "admitted={} completed={} releases={} retired={} joined={} failed_cfg={} failed_alloc={} ambiguous={} unobserved={}",
+            tfm_delta(ledger.tfm_stats.admitted, baseline2.tfm.admitted),
+            tfm_delta(ledger.tfm_stats.completed, baseline2.tfm.completed),
+            tfm_delta(ledger.tfm_stats.releases, baseline2.tfm.releases),
+            tfm_delta(ledger.tfm_stats.retired, baseline2.tfm.retired),
+            tfm_delta(
+                ledger.tfm_stats.configs_joined,
+                baseline2.tfm.configs_joined
+            ),
+            tfm_delta(
+                ledger.tfm_stats.configs_failed,
+                baseline2.tfm.configs_failed
+            ),
+            tfm_delta(ledger.tfm_stats.failed_allocs, baseline2.tfm.failed_allocs),
+            tfm_delta(
+                ledger.tfm_stats.ambiguous_releases,
+                baseline2.tfm.ambiguous_releases
+            ),
+            tfm_delta(
+                ledger.tfm_stats.unobserved_boundary,
+                baseline2.tfm.unobserved_boundary
+            ),
+        ),
+    );
+    put(
+        &mut out,
+        "se_gens",
+        format!(
+            "baseline={} final={}",
+            baseline2.generations_len,
+            sensor.tfm().generations().len()
+        ),
+    );
+    put(
+        &mut out,
+        "se_reuse_exact",
+        sensor.tfm().reuse_exact().to_string(),
+    );
     put(&mut out, "se_completed", completed.len().to_string());
     let terms: Vec<String> = completed
         .iter()
@@ -558,6 +708,7 @@ fn main() {
             .join(","),
     );
 
+    let generations = sensor.tfm().generations();
     let view = SensorView {
         completed: &completed,
         edge_hits: ledger.edge_hits,
@@ -573,6 +724,8 @@ fn main() {
         foreign_links,
         prog_misses: ledger.miss_current.clone(),
         tfm: ledger.tfm_stats,
+        generations: &generations,
+        reuse_exact: sensor.tfm().reuse_exact(),
     };
     if let Err(reason) = verdict(&scenario, &truth, &view) {
         fail(&out, &receipt, &reason);

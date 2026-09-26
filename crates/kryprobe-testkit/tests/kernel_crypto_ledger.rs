@@ -45,16 +45,55 @@ fn terminal_without_errno_rejected() {
 fn terminal_before_return_parses() {
     // Genuine preemption interleaving (matrix Q04): the terminal
     // lands before the return row. Return existence is required,
-    // return order is not.
-    let mut lines: Vec<&str> = LITERAL_ASYNC_SUBMIT.lines().collect();
+    // return order is not. (R2-05: the swapped history keeps its
+    // progress marker truthful — terminal already landed, so the
+    // late poll samples 0. This pins legitimate order 2:
+    // terminal → progress(0) → return.)
+    let mut lines: Vec<String> = LITERAL_ASYNC_SUBMIT.lines().map(str::to_owned).collect();
     lines.swap(1, 3);
+    lines[2] = lines[2].replace(r#""errno":-115"#, r#""errno":0"#);
     let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let ledger = parse_ledger("run-1", &text).expect("interleaving parses");
     assert_eq!(ledger.requests.len(), 1);
     let req = &ledger.requests[0];
     assert_eq!(req.return_errno, -115);
+    assert_eq!(req.progress_errno, Some(0), "late poll samples completed");
     assert_eq!(req.terminal_errno, 0);
     assert_eq!(req.notifications, 2);
+}
+
+#[test]
+fn progress_inflight_marker_after_terminal_rejected() {
+    // R2-05 impossible combination 1: the terminal row lands
+    // BEFORE `completed` flips (same lock), so any later sample
+    // observes completed — an -EINPROGRESS marker after a
+    // terminal is fixture-impossible history.
+    let mut lines: Vec<&str> = LITERAL_ASYNC_SUBMIT.lines().collect();
+    lines.swap(1, 3);
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let err = parse_ledger("run-1", &text).expect_err("crossed marker rejected");
+    assert!(
+        matches!(err, LedgerError::PhaseInconsistency(ref msg)
+            if msg.contains("progress marker -115 with terminal already recorded")),
+        "names the crossing: {err:?}"
+    );
+}
+
+#[test]
+fn progress_zero_marker_before_terminal_rejected() {
+    // R2-05 impossible combination 2: a 0 marker requires
+    // `completed`, which requires the terminal row — 0 before
+    // any terminal is fixture-impossible history.
+    let text = LITERAL_ASYNC_SUBMIT.replace(
+        r#""phase":"progress","errno":-115"#,
+        r#""phase":"progress","errno":0"#,
+    );
+    let err = parse_ledger("run-1", &text).expect_err("early zero rejected");
+    assert!(
+        matches!(err, LedgerError::PhaseInconsistency(ref msg)
+            if msg.contains("progress marker 0 with terminal not yet recorded")),
+        "names the crossing: {err:?}"
+    );
 }
 
 #[test]

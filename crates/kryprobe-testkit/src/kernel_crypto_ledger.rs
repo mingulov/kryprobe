@@ -436,7 +436,28 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                     reqs[idx].return_errno = Some(row_errno(&row, lineno, "return")?);
                 }
                 if phase == "progress" {
-                    reqs[idx].progress_errno = Some(row_errno(&row, lineno, "progress")?);
+                    let marker = row_errno(&row, lineno, "progress")?;
+                    // R2-05: the marker is atomic against the
+                    // terminal row under the fixture's mark lock
+                    // (`marker = completed ? 0 : -EINPROGRESS`,
+                    // and the terminal row lands BEFORE
+                    // `completed` flips) — so a 0 marker arrives
+                    // iff a terminal already landed in the stream
+                    // for this sequence. Either crossed
+                    // combination is fixture-impossible history.
+                    let terminal_seen = reqs[idx].terminal_errno.is_some();
+                    let want = if terminal_seen { 0 } else { -libc::EINPROGRESS };
+                    if marker != want {
+                        return Err(LedgerError::PhaseInconsistency(format!(
+                            "seq {seq} progress marker {marker} with terminal {}",
+                            if terminal_seen {
+                                "already recorded"
+                            } else {
+                                "not yet recorded"
+                            }
+                        )));
+                    }
+                    reqs[idx].progress_errno = Some(marker);
                     reqs[idx].notifications += 1;
                 }
                 if phase == "terminal" {

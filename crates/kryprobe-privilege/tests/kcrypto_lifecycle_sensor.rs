@@ -7,6 +7,9 @@
 //! drains pending truthless. The mmap shell (`drain_once`) rides the
 //! same `ingest_records` and is covered by the VM canary lane.
 
+use kryprobe_abi::kcrypto_lifecycle::{
+    LEDGE_RETURN, LEDGE_SUBMIT, LTFM_MAGIC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_VERSION,
+};
 use kryprobe_core::kcrypto::Terminal;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::{
     EnrichmentStatus, SensorCore, SessionContext, fold_loss_lanes,
@@ -436,5 +439,269 @@ fn ledger_carries_enrichment_status_both_arms() {
         EnrichmentStatus::Unavailable {
             reason: "No such file or directory (os error 2)".to_owned(),
         }
+    );
+}
+
+#[test]
+fn enrichment_projection_folds_entry_truncation() {
+    // R2-06: the REAL snapshot-to-status conversion (the same
+    // `from_snapshot` the sensor shell calls) reports truncated
+    // when EITHER the snapshot hit a bound OR any entry clipped
+    // a field — a clipped name must never read untruncated.
+    use kryprobe_privilege::kcrypto_lifecycle::proc_crypto::{ProcCryptoEntry, ProcCryptoSnapshot};
+    use std::time::SystemTime;
+    fn entry(name: &str, truncated: bool) -> ProcCryptoEntry {
+        ProcCryptoEntry {
+            name: name.to_owned(),
+            driver: None,
+            entry_type: None,
+            priority: None,
+            module: None,
+            flags: None,
+            truncated,
+            name_truncated: false,
+        }
+    }
+    fn snap(entries: Vec<ProcCryptoEntry>, truncated: bool) -> ProcCryptoSnapshot {
+        ProcCryptoSnapshot {
+            at: SystemTime::UNIX_EPOCH,
+            entries,
+            truncated,
+        }
+    }
+    // Clean snapshot: available, untruncated, entry count kept.
+    assert_eq!(
+        EnrichmentStatus::from_snapshot(&Some(snap(vec![entry("cbc(aes)", false)], false)), &None),
+        EnrichmentStatus::Available {
+            entries: 1,
+            truncated: false,
+        }
+    );
+    // Snapshot-level bound: truncated.
+    assert_eq!(
+        EnrichmentStatus::from_snapshot(&Some(snap(vec![], true)), &None),
+        EnrichmentStatus::Available {
+            entries: 0,
+            truncated: true,
+        }
+    );
+    // Entry-level field clip ALONE (snapshot clean): truncated.
+    assert_eq!(
+        EnrichmentStatus::from_snapshot(&Some(snap(vec![entry("cbc(aes)", true)], false)), &None),
+        EnrichmentStatus::Available {
+            entries: 1,
+            truncated: true,
+        }
+    );
+    // Failed read: unavailable with the reason, never empty.
+    assert_eq!(
+        EnrichmentStatus::from_snapshot(&None, &Some("os error 2".to_owned())),
+        EnrichmentStatus::Unavailable {
+            reason: "os error 2".to_owned(),
+        }
+    );
+    // Unreachable-by-construction arms report loud, never invent.
+    assert!(matches!(
+        EnrichmentStatus::from_snapshot(&None, &None),
+        EnrichmentStatus::Unavailable { reason } if reason.contains("invariant")
+    ));
+    assert!(matches!(
+        EnrichmentStatus::from_snapshot(
+            &Some(snap(vec![], false)),
+            &Some("x".to_owned())
+        ),
+        EnrichmentStatus::Unavailable { reason } if reason.contains("invariant")
+    ));
+}
+
+/// Twin-valid 112B `LTfm` record (byte layout mirrors the
+/// canonical `tfm_bytes` builder in `kcrypto_tfm_lifecycle` —
+/// magic, version, edge, site, key, timestamp, status, aux words,
+/// token, name).
+#[allow(clippy::too_many_arguments)]
+fn tfm_record(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    aux: u32,
+    aux2: u32,
+    token: u64,
+    name: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0u8; 112];
+    out[0..2].copy_from_slice(&LTFM_MAGIC.to_le_bytes());
+    out[2] = LTFM_VERSION;
+    out[3] = edge;
+    out[4..6].copy_from_slice(&site.to_le_bytes());
+    out[8..16].copy_from_slice(&key.to_le_bytes());
+    out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
+    out[24..28].copy_from_slice(&status.to_le_bytes());
+    out[28..32].copy_from_slice(&aux.to_le_bytes());
+    out[32..36].copy_from_slice(&aux2.to_le_bytes());
+    out[40..48].copy_from_slice(&token.to_le_bytes());
+    let n = name.len().min(64);
+    out[48..48 + n].copy_from_slice(&name[..n]);
+    out
+}
+
+#[test]
+fn suppressed_free_forces_ambiguous_retire_at_ingest() {
+    // T07-R2-04 suppressed-free qualification (deterministic,
+    // sensor-facing): a recorded-shape edge stream — alloc pair,
+    // WITHHELD destroy pair (the deliberately suppressed free
+    // observation), realloc pair at the same base — through the
+    // PRODUCTION ingest path (decode + join + tracker). The
+    // observer must force-retire the old lifetime as AMBIGUOUS
+    // (never merge, never confident), mint the newcomer fresh,
+    // and void exact reuse. (Live BPF edge-completeness is proven
+    // separately by the in-guest reuse-burst equation + zero-loss
+    // gate; together they qualify the suppressed-free case.)
+    let base = 0xFFFF_8880_0000_1000u64;
+    let stream = vec![
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_ALLOC_SK,
+            0,
+            100,
+            0,
+            0,
+            0,
+            2,
+            b"kxcipher",
+        ),
+        tfm_record(
+            LEDGE_RETURN,
+            LTFM_SITE_ALLOC_SK,
+            base,
+            150,
+            0,
+            0,
+            0,
+            2,
+            b"drv",
+        ),
+        // Destroy pair for `base` deliberately withheld here.
+        // (Tokens stay even: the LSB is the BPF invoc-poison bit —
+        // an odd token is twin drift and refuses at decode.)
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_ALLOC_SK,
+            0,
+            200,
+            0,
+            0,
+            0,
+            4,
+            b"kxcipher",
+        ),
+        tfm_record(
+            LEDGE_RETURN,
+            LTFM_SITE_ALLOC_SK,
+            base,
+            250,
+            0,
+            0,
+            0,
+            4,
+            b"drv",
+        ),
+    ];
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    core.ingest_records(&stream);
+    let tracker = core.tfm();
+    let stats = tracker.stats();
+    assert_eq!(stats.forced_retires, 1, "realloc forces the retire");
+    assert_eq!(stats.releases, 0, "no destroy observed at all");
+    let generations = tracker.generations();
+    assert_eq!(generations.len(), 2, "old + newcomer");
+    assert!(
+        generations[0].retired && generations[0].ambiguous,
+        "old lifetime ambiguous-retired: {:?}",
+        generations[0]
+    );
+    assert!(
+        !generations[1].retired && !generations[1].ambiguous,
+        "newcomer live and clean: {:?}",
+        generations[1]
+    );
+    assert_ne!(
+        generations[0].id, generations[1].id,
+        "no id merge across the gap"
+    );
+    assert!(
+        !tracker.reuse_exact(),
+        "exactness voids on the unobserved end"
+    );
+}
+
+#[test]
+fn shared_release_retained_then_final_at_ingest() {
+    // T07-R2-04 retained/final-release qualification
+    // (deterministic, sensor-facing): the fixture `shared-release`
+    // shape — alloc pair, retained destroy pair (refcount 2,
+    // observed), final destroy pair (refcount 1) — through the
+    // PRODUCTION ingest path. The observer must retire the
+    // lifetime on the proved final free, keep the ambiguity the
+    // retained release proved (one end uncertain), and void exact
+    // reuse. (In-guest this scenario is kernel-excluded from the
+    // sensor lane: 7.2+ removed the tfm refcount so the fixture
+    // refuses, while 6.12 predates fsession so the sensor
+    // refuses — the host ingest pins the same verdict shape the
+    // canary asserts: retired + ambiguous + exactness void.)
+    let frontend = 0xFFFF_8880_0000_1000u64;
+    let base = frontend + 8;
+    let stream = vec![
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_ALLOC_SK,
+            0,
+            100,
+            0,
+            0,
+            0,
+            2,
+            b"kxcipher",
+        ),
+        tfm_record(
+            LEDGE_RETURN,
+            LTFM_SITE_ALLOC_SK,
+            frontend,
+            150,
+            0,
+            0,
+            0,
+            2,
+            b"drv",
+        ),
+        // Retained release: refcount 2 observed (no free yet).
+        tfm_record(LEDGE_SUBMIT, LTFM_SITE_DESTROY, base, 200, 0, 2, 1, 4, b""),
+        tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 250, 0, 0, 0, 4, b""),
+        // Proved final free: refcount 1 observed.
+        tfm_record(LEDGE_SUBMIT, LTFM_SITE_DESTROY, base, 300, 0, 1, 1, 6, b""),
+        tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 350, 0, 0, 0, 6, b""),
+    ];
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    core.ingest_records(&stream);
+    let tracker = core.tfm();
+    let stats = tracker.stats();
+    assert_eq!(stats.releases, 2, "both destroys join");
+    assert_eq!(stats.retired, 1, "final free retires");
+    assert_eq!(
+        stats.ambiguous_releases, 1,
+        "retained release flags ambiguity"
+    );
+    assert_eq!(stats.forced_retires, 0, "no realloc, no force");
+    let generations = tracker.generations();
+    assert_eq!(generations.len(), 1, "one lifetime, never split");
+    assert!(
+        generations[0].retired && generations[0].ambiguous,
+        "retired on proved final, ambiguity survives: {:?}",
+        generations[0]
+    );
+    assert!(
+        !tracker.reuse_exact(),
+        "exactness voids on the retained release"
     );
 }

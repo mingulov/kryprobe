@@ -127,3 +127,219 @@ fn allowlist_field_set_matches_docs() {
         "allowlist doc must carry the NEVER capture boundary"
     );
 }
+
+#[test]
+fn field_lists_match_declarations() {
+    // R2-04: FIELDS↔declaration binding — every pattern below
+    // names EVERY field (no `..rest`, literals in FIELDS order):
+    // a struct gaining/losing/renaming a field fails COMPILE
+    // here, so FIELDS cannot drift from the declaration it
+    // claims to mirror. (BPF-read binding is empirical: the
+    // record-tap lane test scans every raw transport byte for
+    // secret markers — any undeclared secret capture trips it.)
+    let KConfig {
+        sk_req_base,
+        async_tfm,
+        tfm_alg,
+        alg_name,
+        alg_drv,
+        task_flags,
+        pf_kthread,
+        aead_cryptlen_off,
+        ahash_nbytes_off,
+        shash_base,
+        _pad,
+        task_real_parent,
+        task_tgid,
+        task_comm,
+        cra_blocksize,
+        cra_ivsize,
+        cra_min_keysize,
+        cra_max_keysize,
+        parent_ok,
+        params_ok,
+        _pad2,
+    } = KConfig::default();
+    let _ = (
+        sk_req_base,
+        async_tfm,
+        tfm_alg,
+        alg_name,
+        alg_drv,
+        task_flags,
+        pf_kthread,
+        aead_cryptlen_off,
+        ahash_nbytes_off,
+        shash_base,
+        _pad,
+        task_real_parent,
+        task_tgid,
+        task_comm,
+        cra_blocksize,
+        cra_ivsize,
+        cra_min_keysize,
+        cra_max_keysize,
+        parent_ok,
+        params_ok,
+        _pad2,
+    );
+    let KAgg {
+        fam,
+        op,
+        res,
+        ctx,
+        alg,
+        drv,
+    } = KAgg {
+        fam: 0,
+        op: 0,
+        res: 0,
+        ctx: 0,
+        alg: [0; 16],
+        drv: [0; 16],
+    };
+    let _ = (fam, op, res, ctx, alg, drv);
+    let VAgg {
+        calls,
+        bytes,
+        ok,
+        errors,
+        queued,
+        first_ns,
+        last_ns,
+        lat,
+    } = VAgg::default();
+    let _ = (calls, bytes, ok, errors, queued, first_ns, last_ns, lat);
+    let KCtl {
+        kind,
+        _p,
+        key_hash,
+        val0,
+        val1,
+        val2,
+        val3,
+    } = KCtl::default();
+    let _ = (kind, _p, key_hash, val0, val1, val2, val3);
+    let KWhoKey { kh, tgid, _pad } = KWhoKey::default();
+    let _ = (kh, tgid, _pad);
+    let VWho {
+        comm,
+        tid,
+        uid,
+        cgroup,
+        ppid,
+        pcomm,
+        stack,
+        calls,
+        first_ns,
+        last_ns,
+    } = VWho::default();
+    let _ = (
+        comm, tid, uid, cgroup, ppid, pcomm, stack, calls, first_ns, last_ns,
+    );
+    let VParams {
+        blocksize,
+        ivsize,
+        min_keysize,
+        max_keysize,
+    } = VParams::default();
+    let _ = (blocksize, ivsize, min_keysize, max_keysize);
+    let LEdge {
+        magic,
+        version,
+        edge,
+        site,
+        flags,
+        key,
+        ts_ns,
+        status,
+        aux,
+        invoc,
+        tfm,
+        drv,
+    } = LEdge {
+        magic: 0,
+        version: 0,
+        edge: 0,
+        site: 0,
+        flags: 0,
+        key: 0,
+        ts_ns: 0,
+        status: 0,
+        aux: 0,
+        invoc: 0,
+        tfm: 0,
+        drv: [0; 64],
+    };
+    let _ = (
+        magic, version, edge, site, flags, key, ts_ns, status, aux, invoc, tfm, drv,
+    );
+    let LTfm {
+        magic,
+        version,
+        edge,
+        site,
+        flags,
+        key,
+        ts_ns,
+        status,
+        aux,
+        aux2,
+        token,
+        name,
+    } = LTfm {
+        magic: 0,
+        version: 0,
+        edge: 0,
+        site: 0,
+        flags: 0,
+        key: 0,
+        ts_ns: 0,
+        status: 0,
+        aux: 0,
+        aux2: 0,
+        token: 0,
+        name: [0; 64],
+    };
+    let _ = (
+        magic, version, edge, site, flags, key, ts_ns, status, aux, aux2, token, name,
+    );
+    let LConfig {
+        magic,
+        version,
+        flags,
+        tfm_alg,
+        alg_drv,
+        sk_base,
+        refcnt_off,
+        refcnt_present,
+        req_base,
+        req_tfm,
+        reserved,
+    } = LConfig {
+        magic: 0,
+        version: 0,
+        flags: 0,
+        tfm_alg: 0,
+        alg_drv: 0,
+        sk_base: 0,
+        refcnt_off: 0,
+        refcnt_present: 0,
+        req_base: 0,
+        req_tfm: 0,
+        reserved: [0; 24],
+    };
+    let _ = (
+        magic,
+        version,
+        flags,
+        tfm_alg,
+        alg_drv,
+        sk_base,
+        refcnt_off,
+        refcnt_present,
+        req_base,
+        req_tfm,
+        reserved,
+    );
+}

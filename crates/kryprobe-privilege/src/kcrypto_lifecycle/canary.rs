@@ -23,8 +23,11 @@
 
 use crate::kcrypto_lifecycle::decode::DecodeStats;
 use crate::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
-use crate::kcrypto_lifecycle::tfm::TfmStats;
+use crate::kcrypto_lifecycle::tfm::{GenerationInfo, TfmStats};
 use crate::kcrypto_lifecycle::view::ProgMisses;
+use kryprobe_abi::kcrypto_lifecycle::{
+    LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
+};
 use kryprobe_core::kcrypto::{ReducerStats, RequestRecord, Terminal};
 
 /// One fixture op (sequence order).
@@ -34,6 +37,47 @@ pub struct FixtureOp {
     pub seq: u64,
     /// `encrypt` or `decrypt`.
     pub op: String,
+}
+
+/// One fixture allocation (T07-R2-04: retained transform truth —
+/// the oracle pairs these with sensor generations by index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureAlloc {
+    /// Alloc sequence (unique per run; shares the run's seq
+    /// counter with submits — never collides with an op seq).
+    pub seq: u64,
+    /// Requested name (`req`).
+    pub req: String,
+    /// Resolved driver (`drv`).
+    pub drv: String,
+    /// Type (`type`).
+    pub alg_type: u32,
+    /// Mask (`mask`).
+    pub alg_mask: u32,
+}
+
+/// One fixture release (row order — a shared lifetime frees more
+/// than once, so seqs repeat here by design).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureFree {
+    /// Alloc sequence being released.
+    pub seq: u64,
+    /// Whether this release freed the transform.
+    pub final_free: bool,
+}
+
+/// One fixture configuration (row order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureConfig {
+    /// Alloc sequence being configured.
+    pub seq: u64,
+    /// `setkey` or `setauthsize` (sk-vs-aead disambiguated by the
+    /// scenario arm — the row carries no family).
+    pub op: String,
+    /// Native errno (0 on success).
+    pub errno: i32,
+    /// Length scalar (key length or authsize).
+    pub len: u32,
 }
 
 /// Fixture ground truth: parsed transcript (strict — see
@@ -46,6 +90,15 @@ pub struct FixtureTruth {
     pub returns: Vec<(u64, i32)>,
     /// `(seq, errno)` terminal (callback) rows in row order.
     pub terminals: Vec<(u64, i32)>,
+    /// Allocation rows in sequence order (T07-R2-04).
+    pub allocs: Vec<FixtureAlloc>,
+    /// Release rows in row order (T07-R2-04).
+    pub frees: Vec<FixtureFree>,
+    /// Configuration rows in row order (T07-R2-04).
+    pub configs: Vec<FixtureConfig>,
+    /// `alloc-probe` submit seqs (failed-alloc/init scenarios —
+    /// probes, not ops: no hooks, no generations).
+    pub probes: Vec<u64>,
     /// Fixture self-check result (must be 0).
     pub fixture_result: i32,
     /// Fixture self-check overflow (must be 0).
@@ -63,7 +116,14 @@ impl FixtureTruth {
     pub fn expected_hooks(&self) -> [u64; 4] {
         let mut hooks = [0u64; 4];
         for op in &self.ops {
-            let (submit_lane, return_lane) = if op.op == "encrypt" { (0, 1) } else { (2, 3) };
+            // Family classification over the parser's closed
+            // label set (suffixed labels are encrypt flavors).
+            let (submit_lane, return_lane) = match op.op.as_str() {
+                "encrypt" | "encrypt-exact" | "encrypt-delayed" | "encrypt-burst"
+                | "encrypt-early" => (0, 1),
+                "decrypt" => (2, 3),
+                _ => unreachable!("parser admits only the closed label set"),
+            };
             hooks[submit_lane] = hooks[submit_lane].saturating_add(1);
             let returns = self
                 .returns
@@ -125,6 +185,21 @@ fn get_i32(
         })
 }
 
+fn get_u32(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    line_no: usize,
+    what: &'static str,
+) -> Result<u32, TranscriptError> {
+    obj.get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or(TranscriptError {
+            line: line_no,
+            reason: what,
+        })
+}
+
 fn get_str<'a>(
     obj: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -158,12 +233,14 @@ fn get_bool(
 /// with a string `run`; rows for other runs are out of scope
 /// (skipped by EXACT run equality, never substring); rows for this
 /// run need known phases, exact-typed required fields (INCLUDING
-/// the alloc/free/progress markers — a malformed marker is a broken
-/// transcript, not ignorable noise), unique submit/return/terminal
-/// seqs (a duplicate evidence row could shadow the verdict's
-/// first-match lookup), return/terminal only for submitted seqs,
-/// exactly one `done` with nothing after it, and at least one
-/// submit with its return AND terminal rows. Anything else is a
+/// the alloc/free/config/progress rows — a malformed row is a
+/// broken transcript, not ignorable noise), unique
+/// submit/probe/alloc/return/terminal seqs (a duplicate evidence
+/// row could shadow the verdict's first-match lookup),
+/// return/terminal only for submitted/probed seqs, frees/configs
+/// only for allocated seqs, exactly one `done` with nothing after
+/// it, and a positive control (≥1 submit with its return AND
+/// terminal rows, ≥1 alloc, or ≥1 probe). Anything else is a
 /// [`TranscriptError`] (fail the run — never skip-and-pass).
 /// Extra keys on own rows are ignored per the fixture contract
 /// (every row shape ends `,...}` — extensibility reserved); the
@@ -172,6 +249,10 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     let mut ops: Vec<FixtureOp> = Vec::new();
     let mut returns: Vec<(u64, i32)> = Vec::new();
     let mut terminals: Vec<(u64, i32)> = Vec::new();
+    let mut allocs: Vec<FixtureAlloc> = Vec::new();
+    let mut frees: Vec<FixtureFree> = Vec::new();
+    let mut configs: Vec<FixtureConfig> = Vec::new();
+    let mut probes: Vec<u64> = Vec::new();
     let mut done: Option<(i32, u64)> = None;
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
@@ -206,11 +287,11 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         }
         let phase = get_str(obj, "phase", line_no, "row has no phase field")?;
         match phase {
-            // Lifecycle + waiter markers: not oracle evidence, but
-            // their REQUIRED fields validate (fixture.h: a malformed
-            // marker is a broken transcript — round-4 minor).
+            // Lifecycle rows: RETAINED oracle evidence (T07-R2-04 —
+            // the transform verdict pairs these with sensor
+            // generations); waiter markers validate only.
             "alloc" => {
-                get_u64(obj, "seq", line_no, "alloc row lacks a sequence")?;
+                let seq = get_u64(obj, "seq", line_no, "alloc row lacks a sequence")?;
                 let req = get_str(obj, "req", line_no, "alloc row lacks a req")?;
                 let drv = get_str(obj, "drv", line_no, "alloc row lacks a drv")?;
                 if req.is_empty() || drv.is_empty() {
@@ -219,10 +300,42 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                         reason: "alloc row has an empty req or drv",
                     });
                 }
+                if allocs.iter().any(|a: &FixtureAlloc| a.seq == seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "duplicate alloc sequence",
+                    });
+                }
+                allocs.push(FixtureAlloc {
+                    seq,
+                    req: req.to_owned(),
+                    drv: drv.to_owned(),
+                    alg_type: get_u32(obj, "type", line_no, "alloc row lacks a type")?,
+                    alg_mask: get_u32(obj, "mask", line_no, "alloc row lacks a mask")?,
+                });
             }
             "free" => {
-                get_u64(obj, "seq", line_no, "free row lacks a sequence")?;
-                get_bool(obj, "final", line_no, "free row lacks a bool final")?;
+                let seq = get_u64(obj, "seq", line_no, "free row lacks a sequence")?;
+                let final_free = get_bool(obj, "final", line_no, "free row lacks a bool final")?;
+                // Seqs repeat by design (shared lifetimes free more
+                // than once) — row order retained, no dup check.
+                frees.push(FixtureFree { seq, final_free });
+            }
+            "config" => {
+                let seq = get_u64(obj, "seq", line_no, "config row lacks a sequence")?;
+                let op = get_str(obj, "op", line_no, "config row lacks an op")?;
+                if op != "setkey" && op != "setauthsize" {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "unknown config op",
+                    });
+                }
+                configs.push(FixtureConfig {
+                    seq,
+                    op: op.to_owned(),
+                    errno: get_i32(obj, "errno", line_no, "config row lacks an errno")?,
+                    len: get_u32(obj, "len", line_no, "config row lacks a len")?,
+                });
             }
             "progress" => {
                 get_u64(obj, "seq", line_no, "progress row lacks a sequence")?;
@@ -231,7 +344,34 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
             "submit" => {
                 let seq = get_u64(obj, "seq", line_no, "submit row lacks a sequence")?;
                 let op = get_str(obj, "op", line_no, "submit row lacks an op")?;
-                if op != "encrypt" && op != "decrypt" {
+                // `alloc-probe` submits are failure-path probes
+                // (F03), not invocations: retained separately, no
+                // hook expectations, no generations.
+                if op == "alloc-probe" {
+                    if probes.contains(&seq) {
+                        return Err(TranscriptError {
+                            line: line_no,
+                            reason: "duplicate probe sequence",
+                        });
+                    }
+                    probes.push(seq);
+                    continue;
+                }
+                // Closed fixture label set (T07-R2-04: the suffixed
+                // labels are per-scenario encrypt flavors hooked at
+                // the encrypt site — `exact-driver` runs
+                // `encrypt-exact`, never plain `encrypt`; an
+                // unknown label is still drift, never a default
+                // family).
+                if !matches!(
+                    op,
+                    "encrypt"
+                        | "decrypt"
+                        | "encrypt-exact"
+                        | "encrypt-delayed"
+                        | "encrypt-burst"
+                        | "encrypt-early"
+                ) {
                     return Err(TranscriptError {
                         line: line_no,
                         reason: "unknown op name",
@@ -251,7 +391,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
             "return" => {
                 let seq = get_u64(obj, "seq", line_no, "return row lacks a sequence")?;
                 let errno = get_i32(obj, "errno", line_no, "return row lacks an errno")?;
-                if !ops.iter().any(|o: &FixtureOp| o.seq == seq) {
+                if !ops.iter().any(|o: &FixtureOp| o.seq == seq) && !probes.contains(&seq) {
                     return Err(TranscriptError {
                         line: line_no,
                         reason: "return for an unknown sequence",
@@ -268,7 +408,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
             "terminal" => {
                 let seq = get_u64(obj, "seq", line_no, "terminal row lacks a sequence")?;
                 let errno = get_i32(obj, "errno", line_no, "terminal row lacks an errno")?;
-                if !ops.iter().any(|o: &FixtureOp| o.seq == seq) {
+                if !ops.iter().any(|o: &FixtureOp| o.seq == seq) && !probes.contains(&seq) {
                     return Err(TranscriptError {
                         line: line_no,
                         reason: "terminal for an unknown sequence",
@@ -299,10 +439,12 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         line: 0,
         reason: "transcript has no done row",
     })?;
-    if ops.is_empty() {
+    // Positive control: transform-only scenarios run zero ops
+    // (allocs are their evidence); failure probes likewise.
+    if ops.is_empty() && allocs.is_empty() && probes.is_empty() {
         return Err(TranscriptError {
             line: 0,
-            reason: "transcript ran zero ops (no positive control)",
+            reason: "transcript ran zero ops and zero allocs (no positive control)",
         });
     }
     // Fixture.h structural rule: every request needs its return AND
@@ -322,11 +464,71 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
             });
         }
     }
+    for probe in &probes {
+        if !returns.iter().any(|(seq, _)| seq == probe) {
+            return Err(TranscriptError {
+                line: 0,
+                reason: "probe seq lacks a return row",
+            });
+        }
+        if !terminals.iter().any(|(seq, _)| seq == probe) {
+            return Err(TranscriptError {
+                line: 0,
+                reason: "probe seq lacks a terminal row",
+            });
+        }
+    }
+    // One run-wide seq counter: submit, probe, and alloc seqs must
+    // never collide (a collision shadows the verdict's lookups).
+    {
+        let mut seen: Vec<u64> = ops.iter().map(|op| op.seq).collect();
+        for probe in &probes {
+            if seen.contains(probe) {
+                return Err(TranscriptError {
+                    line: 0,
+                    reason: "probe sequence collides with a submit",
+                });
+            }
+            seen.push(*probe);
+        }
+        for alloc in &allocs {
+            if seen.contains(&alloc.seq) {
+                return Err(TranscriptError {
+                    line: 0,
+                    reason: "alloc sequence collides with a submit",
+                });
+            }
+            seen.push(alloc.seq);
+        }
+    }
+    // Frees and configs reference allocated seqs (a release for an
+    // unrecorded alloc is a broken transcript, not evidence).
+    for free in &frees {
+        if !allocs.iter().any(|a| a.seq == free.seq) {
+            return Err(TranscriptError {
+                line: 0,
+                reason: "free row references an unrecorded alloc",
+            });
+        }
+    }
+    for config in &configs {
+        if !allocs.iter().any(|a| a.seq == config.seq) {
+            return Err(TranscriptError {
+                line: 0,
+                reason: "config row references an unrecorded alloc",
+            });
+        }
+    }
     ops.sort_by_key(|op| op.seq);
+    allocs.sort_by_key(|alloc| alloc.seq);
     Ok(FixtureTruth {
         ops,
         returns,
         terminals,
+        allocs,
+        frees,
+        configs,
+        probes,
         fixture_result,
         fixture_overflow,
     })
@@ -358,6 +560,11 @@ pub struct SensorBaseline {
     /// the strict all-zero gate — normal transform accounting is
     /// truth, never gated).
     pub tfm: TfmStats,
+    /// Generation count at this instant (T07-R2-04: fixture
+    /// allocs pair with generations ABOVE this baseline — the
+    /// fixture runs sequentially, so alloc[i] joins
+    /// generations[baseline + i]).
+    pub generations_len: u64,
 }
 
 /// Sensor evidence for one scenario (post-finish: completions include
@@ -399,6 +606,240 @@ pub struct SensorView<'a> {
     /// Final transform-lifetime counters (loss deltas join the
     /// strict all-zero gate below).
     pub tfm: TfmStats,
+    /// Final generations (T07-R2-04: paired against fixture
+    /// allocs above `baseline.generations_len` — provenance,
+    /// retirement, epochs, and config scalars compared
+    /// per-lifetime, never just counted).
+    pub generations: &'a [GenerationInfo],
+    /// Session exact-reuse predicate at verdict time (T07-R2-04:
+    /// read off the live tracker — reuse-burst asserts it true,
+    /// proving 1,000 observed boundaries chained exactly).
+    pub reuse_exact: bool,
+}
+
+/// Checked counter delta (a counter that ran BACKWARDS fails —
+/// reset images are not silently absorbed).
+fn delta(a: u64, b: u64, what: &str) -> Result<u64, String> {
+    a.checked_sub(b)
+        .ok_or_else(|| format!("counter {what} ran backwards"))
+}
+
+/// Fresh sensor generations for this scenario (T07-R2-04): the
+/// fixture runs sequentially, so fixture alloc[i] pairs with
+/// generations[baseline + i] — the count must match EXACTLY (a
+/// civilian background allocation fails the run, never hides in
+/// the join).
+fn fresh_generations<'v>(
+    truth: &FixtureTruth,
+    view: &'v SensorView<'v>,
+) -> Result<&'v [GenerationInfo], String> {
+    let base = view.baseline.generations_len as usize;
+    if view.generations.len() < base {
+        return Err(format!(
+            "generations {} < baseline {base} (went backwards)",
+            view.generations.len()
+        ));
+    }
+    let fresh = &view.generations[base..];
+    if fresh.len() != truth.allocs.len() {
+        return Err(format!(
+            "fresh generations {} != {} fixture allocs",
+            fresh.len(),
+            truth.allocs.len()
+        ));
+    }
+    Ok(fresh)
+}
+
+/// One alloc-observed (sk) lifetime vs its generation (T07-R2-04):
+/// provenance, retirement, ambiguity, and config scalars compared
+/// per-lifetime. `expect_ambiguous` is true only for the
+/// shared-release intermediate (a retained release that a later
+/// final destroy retires — the flag truthfully survives).
+fn verdict_lifetime_sk(
+    truth: &FixtureTruth,
+    alloc: &FixtureAlloc,
+    generation: &GenerationInfo,
+    expect_ambiguous: bool,
+) -> Result<(), String> {
+    let tag = format!("alloc seq {}", alloc.seq);
+    if generation.req_name != alloc.req {
+        return Err(format!(
+            "{tag}: req {:?} != fixture {:?}",
+            generation.req_name, alloc.req
+        ));
+    }
+    if generation.drv_name != alloc.drv {
+        return Err(format!(
+            "{tag}: drv {:?} != fixture {:?}",
+            generation.drv_name, alloc.drv
+        ));
+    }
+    if generation.alg_type != alloc.alg_type || generation.alg_mask != alloc.alg_mask {
+        return Err(format!(
+            "{tag}: type/mask {}/{} != fixture {}/{}",
+            generation.alg_type, generation.alg_mask, alloc.alg_type, alloc.alg_mask
+        ));
+    }
+    if generation.name_truncated || generation.drv_truncated {
+        return Err(format!(
+            "{tag}: fixture names are short — truncation is drift"
+        ));
+    }
+    if generation.first_seen {
+        return Err(format!(
+            "{tag}: alloc-observed lifetime must not be first-seen"
+        ));
+    }
+    let frees: Vec<&FixtureFree> = truth.frees.iter().filter(|f| f.seq == alloc.seq).collect();
+    match frees.last() {
+        Some(last) if generation.retired != last.final_free => {
+            return Err(format!(
+                "{tag}: retired {} != fixture final {}",
+                generation.retired, last.final_free
+            ));
+        }
+        None if generation.retired => {
+            return Err(format!("{tag}: unreleased lifetime retired"));
+        }
+        _ => {}
+    }
+    if generation.ambiguous != expect_ambiguous {
+        return Err(format!(
+            "{tag}: ambiguous {} != expected {expect_ambiguous}",
+            generation.ambiguous
+        ));
+    }
+    let configs: Vec<&FixtureConfig> = truth
+        .configs
+        .iter()
+        .filter(|c| c.seq == alloc.seq)
+        .collect();
+    if generation.configs != configs.len() as u64 {
+        return Err(format!(
+            "{tag}: configs {} != {} fixture rows",
+            generation.configs,
+            configs.len()
+        ));
+    }
+    let ok = configs.iter().filter(|c| c.errno == 0).count() as u64;
+    if generation.epoch != ok {
+        return Err(format!(
+            "{tag}: epoch {} != {ok} successful configs",
+            generation.epoch
+        ));
+    }
+    if let Some(last) = configs.last() {
+        if generation.last_config_len != last.len {
+            return Err(format!(
+                "{tag}: last config len {} != fixture {}",
+                generation.last_config_len, last.len
+            ));
+        }
+        if generation.last_config_errno != last.errno {
+            return Err(format!(
+                "{tag}: last config errno {} != fixture {}",
+                generation.last_config_errno, last.errno
+            ));
+        }
+        let want_site = if last.op == "setauthsize" {
+            LTFM_SITE_SETAUTHSIZE
+        } else {
+            LTFM_SITE_SETKEY_SK
+        };
+        if generation.last_config_site != want_site {
+            return Err(format!(
+                "{tag}: last config site {} != {want_site} for {:?}",
+                generation.last_config_site, last.op
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One config-admitted (AEAD) lifetime vs its generation
+/// (T07-R2-04): the narrowed contract — allocation unhooked, so
+/// the generation is first-seen with EMPTY provenance (honest
+/// unknown, never a fabricated name), while retirement, epochs,
+/// and config scalars still compare exactly.
+fn verdict_lifetime_aead(
+    truth: &FixtureTruth,
+    alloc: &FixtureAlloc,
+    generation: &GenerationInfo,
+) -> Result<(), String> {
+    let tag = format!("aead alloc seq {}", alloc.seq);
+    if !generation.first_seen {
+        return Err(format!(
+            "{tag}: AEAD lifetime must be first-seen (alloc unhooked)"
+        ));
+    }
+    if !generation.req_name.is_empty() || !generation.drv_name.is_empty() {
+        return Err(format!(
+            "{tag}: AEAD provenance must be empty (got {:?}/{:?})",
+            generation.req_name, generation.drv_name
+        ));
+    }
+    let frees: Vec<&FixtureFree> = truth.frees.iter().filter(|f| f.seq == alloc.seq).collect();
+    match frees.last() {
+        Some(last) if generation.retired != last.final_free => {
+            return Err(format!(
+                "{tag}: retired {} != fixture final {}",
+                generation.retired, last.final_free
+            ));
+        }
+        None if generation.retired => {
+            return Err(format!("{tag}: unreleased lifetime retired"));
+        }
+        _ => {}
+    }
+    if generation.ambiguous {
+        return Err(format!("{tag}: clean AEAD release must not flag ambiguous"));
+    }
+    let configs: Vec<&FixtureConfig> = truth
+        .configs
+        .iter()
+        .filter(|c| c.seq == alloc.seq)
+        .collect();
+    if generation.configs != configs.len() as u64 {
+        return Err(format!(
+            "{tag}: configs {} != {} fixture rows",
+            generation.configs,
+            configs.len()
+        ));
+    }
+    let ok = configs.iter().filter(|c| c.errno == 0).count() as u64;
+    if generation.epoch != ok {
+        return Err(format!(
+            "{tag}: epoch {} != {ok} successful configs",
+            generation.epoch
+        ));
+    }
+    if let Some(last) = configs.last() {
+        if generation.last_config_len != last.len {
+            return Err(format!(
+                "{tag}: last config len {} != fixture {}",
+                generation.last_config_len, last.len
+            ));
+        }
+        if generation.last_config_errno != last.errno {
+            return Err(format!(
+                "{tag}: last config errno {} != fixture {}",
+                generation.last_config_errno, last.errno
+            ));
+        }
+        let want_site = if last.op == "setauthsize" {
+            LTFM_SITE_SETAUTHSIZE
+        } else {
+            LTFM_SITE_SETKEY_AEAD
+        };
+        if generation.last_config_site != want_site {
+            return Err(format!(
+                "{tag}: last config site {} != {want_site} for {:?}",
+                generation.last_config_site, last.op
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Exact verdict over one scenario: `Ok(())` passes, `Err(reason)`
@@ -572,7 +1013,10 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         // unjoined, and uncertain-identity evidence gates the
         // run; admissions, completions, classified failures,
         // proved retires, no-op releases, and joined configs
-        // incl. errno verdicts are truth, never gated).
+        // incl. errno verdicts are truth, never gated; unbound
+        // destroys are inventory, never gated either — T07-R2-05:
+        // a missed fixture identity still fails via its op
+        // admission or the edge-hit equation).
         (
             "tfm_submit_refused",
             sub(
@@ -653,14 +1097,8 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 "tfm_unfinished",
             )?,
         ),
-        (
-            "tfm_ambiguous_releases",
-            sub(
-                view.tfm.ambiguous_releases,
-                view.baseline.tfm.ambiguous_releases,
-                "tfm_ambiguous_releases",
-            )?,
-        ),
+        // (T07-R2-04: `tfm_ambiguous_releases` is ledger-derived
+        // below — retained fixture releases EXPECT it.)
         (
             "tfm_forced_retires",
             sub(
@@ -669,14 +1107,10 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 "tfm_forced_retires",
             )?,
         ),
-        (
-            "tfm_unknown_releases",
-            sub(
-                view.tfm.unknown_releases,
-                view.baseline.tfm.unknown_releases,
-                "tfm_unknown_releases",
-            )?,
-        ),
+        // (T07-R2-05: `tfm_unknown_releases` deliberately NOT
+        // gated — expected digest/shash releases share the
+        // counter; a missed fixture identity fails via
+        // `tfm_unobserved_boundary` or the edge-hit equation.)
         (
             "tfm_stale_releases",
             sub(
@@ -693,14 +1127,8 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 "tfm_config_unlinked",
             )?,
         ),
-        (
-            "tfm_unobserved_boundary",
-            sub(
-                view.tfm.unobserved_boundary,
-                view.baseline.tfm.unobserved_boundary,
-                "tfm_unobserved_boundary",
-            )?,
-        ),
+        // (T07-R2-04: `tfm_unobserved_boundary` is ledger-derived
+        // below — AEAD config admission EXPECTS it.)
         (
             "tfm_tombstone_evictions",
             sub(
@@ -714,6 +1142,37 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         if value != 0 {
             return Err(format!("loss counter {name} delta reads {value}"));
         }
+    }
+    // Ledger-derived ambiguity/admission (T07-R2-04): retained
+    // fixture releases expect exactly that many ambiguous
+    // releases, and the AEAD scenario expects one first-seen
+    // admission per alloc — every other expectation is zero, so
+    // unexpected ambiguity still fails here, never hides.
+    let ambiguous_d = sub(
+        view.tfm.ambiguous_releases,
+        view.baseline.tfm.ambiguous_releases,
+        "tfm_ambiguous_releases",
+    )?;
+    let want_ambiguous = truth.frees.iter().filter(|f| !f.final_free).count() as u64;
+    if ambiguous_d != want_ambiguous {
+        return Err(format!(
+            "tfm ambiguous_releases delta {ambiguous_d} != {want_ambiguous} retained fixture releases"
+        ));
+    }
+    let unobserved_d = sub(
+        view.tfm.unobserved_boundary,
+        view.baseline.tfm.unobserved_boundary,
+        "tfm_unobserved_boundary",
+    )?;
+    let want_unobserved = if scenario == "authsize" {
+        truth.allocs.len() as u64
+    } else {
+        0
+    };
+    if unobserved_d != want_unobserved {
+        return Err(format!(
+            "tfm unobserved_boundary delta {unobserved_d} != {want_unobserved} (AEAD config admissions)"
+        ));
     }
     for (i, loss) in loss_d.iter().enumerate() {
         if *loss != 0 {
@@ -745,17 +1204,76 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     // never scenario-name constants: the scenario selects only the
     // oracle SHAPE below (grounding rules vs pending rules). A
     // fixture running two encrypts must fail against a 1+1 view.
-    if !matches!(scenario, "sync-once" | "async-once") {
+    if !matches!(
+        scenario,
+        "sync-once"
+            | "async-once"
+            | "reuse-burst"
+            | "refheld-release"
+            | "shared-release"
+            | "rekey"
+            | "authsize"
+            | "typed-sync"
+            | "exact-driver"
+            | "failed-alloc"
+            | "failed-init"
+    ) {
         return Err(format!("unknown scenario {scenario}"));
     }
-    let expected_hits = truth.expected_hooks();
-    // Op lanes only: lanes 4+ are transform hooks with no
-    // fixture-derived truth until T07.6 (the per-lane equation above
-    // still binds every accepted transform edge to a consumed one).
+    // Op lanes: ledger-derived — EXCEPT `authsize`, whose op is an
+    // AEAD encrypt (unhooked by design): the sensor must observe
+    // NOTHING there (negative control — a phantom AEAD op fails).
+    let expected_hits = if scenario == "authsize" {
+        [0, 0, 0, 0]
+    } else {
+        truth.expected_hooks()
+    };
     let op_hits = [hits_d[0], hits_d[1], hits_d[2], hits_d[3]];
     if op_hits != expected_hits {
         return Err(format!(
             "edge hits {op_hits:?} != fixture-derived {expected_hits:?}"
+        ));
+    }
+    // Transform lanes (T07-R2-04): ledger-derived per-lane
+    // expectations — alloc/destroy/config halves counted from
+    // fixture rows (the scenario selects only the FAMILY shape:
+    // sk scenarios observe alloc halves, the AEAD scenario must
+    // not, failed probes observe the attempt but admit nothing).
+    let alloc_halves = if scenario == "authsize" {
+        0
+    } else {
+        truth.allocs.len() as u64
+    };
+    let setkey_rows = truth.configs.iter().filter(|c| c.op == "setkey").count() as u64;
+    let authsize_rows = truth
+        .configs
+        .iter()
+        .filter(|c| c.op == "setauthsize")
+        .count() as u64;
+    let (sk_setkey, aead_setkey) = if scenario == "authsize" {
+        (0, setkey_rows)
+    } else {
+        (setkey_rows, 0)
+    };
+    let probe_halves = truth.probes.len() as u64;
+    let want_tfm = [
+        alloc_halves + probe_halves, // 4 alloc-sk sub
+        alloc_halves + probe_halves, // 5 alloc-sk ret
+        truth.frees.len() as u64,    // 6 destroy sub
+        truth.frees.len() as u64,    // 7 destroy ret
+        sk_setkey,                   // 8 setkey-sk sub
+        sk_setkey,                   // 9 setkey-sk ret
+        authsize_rows,               // 10 setauthsize sub
+        authsize_rows,               // 11 setauthsize ret
+        0,                           // 12 alloc-aead sub (unhooked)
+        0,                           // 13 alloc-aead ret (unhooked)
+        aead_setkey,                 // 14 setkey-aead sub
+        aead_setkey,                 // 15 setkey-aead ret
+    ];
+    let got_tfm: Vec<u64> = hits_d[4..16].to_vec();
+    if got_tfm.as_slice() != want_tfm {
+        return Err(format!(
+            "transform lanes {got_tfm:?} != fixture-derived {want_tfm:?}"
         ));
     }
     let admitted_d = sub(
@@ -763,10 +1281,16 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         view.baseline.decode.admitted,
         "decode.admitted",
     )?;
-    if admitted_d != truth.ops.len() as u64 {
+    // Decode admission: one per hooked op submit (`authsize` admits
+    // nothing — its op never reaches the decoder).
+    let expect_admitted = if scenario == "authsize" {
+        0
+    } else {
+        truth.ops.len() as u64
+    };
+    if admitted_d != expect_admitted {
         return Err(format!(
-            "admitted delta {admitted_d} != {} ops",
-            truth.ops.len()
+            "admitted delta {admitted_d} != {expect_admitted} hooked ops",
         ));
     }
     // Admission lockstep: one reducer id per decoded submit, and
@@ -799,119 +1323,427 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     )?;
     match scenario {
         "sync-once" => {
-            if view.completed.len() != truth.ops.len() {
-                return Err(format!(
-                    "completed {} != {} ops",
-                    view.completed.len(),
-                    truth.ops.len()
-                ));
-            }
-            if unfinished_d != 0 {
-                return Err(format!("unfinished delta {unfinished_d}"));
-            }
-            // Exact return join: one return row per op, in submit
-            // order (the fixture is sequential — any reorder fails).
-            let op_seqs: Vec<u64> = truth.ops.iter().map(|op| op.seq).collect();
-            let ret_seqs: Vec<u64> = truth.returns.iter().map(|(seq, _)| *seq).collect();
-            if ret_seqs != op_seqs {
-                return Err(format!(
-                    "fixture return seqs {ret_seqs:?} != submit seqs {op_seqs:?}"
-                ));
-            }
-            // Terminal reconciliation: every op's callback row must
-            // exist with errno EQUAL to its return errno (a missing
-            // or conflicting terminal row means the fixture did not
-            // run the scenario the sensor is graded against).
-            for op in &truth.ops {
-                let ret_errno = truth
-                    .returns
-                    .iter()
-                    .find(|(seq, _)| *seq == op.seq)
-                    .map(|(_, errno)| *errno);
-                let term_errno = truth
-                    .terminals
-                    .iter()
-                    .find(|(seq, _)| *seq == op.seq)
-                    .map(|(_, errno)| *errno);
-                match (ret_errno, term_errno) {
-                    (Some(ret), Some(term)) if ret == term => {}
-                    _ => {
-                        return Err(format!(
-                            "op seq {} return/terminal mismatch (ret {ret_errno:?}, term {term_errno:?})",
-                            op.seq
-                        ));
-                    }
-                }
-            }
-            // Pairwise terminal join by index: grounded kind + EXACT
-            // errno + observed duration per completion.
-            for (i, record) in view.completed.iter().enumerate() {
-                let (seq, errno) = truth.returns[i];
-                let status = match record.terminal {
-                    Terminal::Sync(status) | Terminal::Callback(status) => status,
-                    Terminal::Unknown => {
-                        return Err(format!("completion {i} (seq {seq}) has Unknown terminal"));
-                    }
-                };
-                if status != errno {
-                    return Err(format!(
-                        "completion {i} (seq {seq}) status {status} != fixture errno {errno}"
-                    ));
-                }
-                if record.duration_ns.is_none() {
-                    return Err(format!("completion {i} (seq {seq}) lacks a duration"));
-                }
-            }
+            verdict_op_sync(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
         }
         "async-once" => {
-            // The pending shape T06 can observe: submit + queued
-            // return, completion invisible until T09 — post-finish
-            // the request truthless-drains as one `Unknown` record.
-            if truth.ops.len() != 1 {
-                return Err(format!(
-                    "async-once runs 1 op, fixture ran {}",
-                    truth.ops.len()
-                ));
+            verdict_op_async(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "rekey" => {
+            verdict_op_sync(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "exact-driver" => {
+            verdict_op_async(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "authsize" => {
+            verdict_op_negative(scenario, truth, view)?;
+            verdict_tfm_aead(truth, view)?;
+        }
+        "reuse-burst" | "refheld-release" | "typed-sync" => {
+            verdict_op_negative(scenario, truth, view)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "shared-release" => {
+            verdict_op_negative(scenario, truth, view)?;
+            verdict_tfm_sk(truth, view, true)?;
+            // The retained release voids exactness BY DESIGN (an
+            // ambiguous release happened — the predicate must say
+            // so, and the assertion pins that it does).
+            if view.reuse_exact {
+                return Err("shared-release: ambiguous release must void exactness".to_owned());
             }
-            // Positive controls: the fixture queued exactly once
-            // (`-EINPROGRESS`, kernel UAPI) AND observed async
-            // completion (errno 0) — the sensor legitimately sees
-            // neither the queue code's meaning nor the callback.
-            if truth.returns.as_slice() != [(truth.ops[0].seq, -115)] {
+        }
+        "failed-alloc" | "failed-init" => {
+            verdict_op_negative(scenario, truth, view)?;
+            verdict_tfm_failed(truth, view)?;
+        }
+        _ => unreachable!("scenario matched above"),
+    }
+    Ok(())
+}
+
+/// Sync op shape: grounded completions pairwise-joined to fixture
+/// errnos (shared by every scenario with synchronous sk ops).
+fn verdict_op_sync(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    // Exact submit labels per scenario (T07-R2-04: the labels pin
+    // WHICH fixture path ran — a mislabeled transcript never
+    // grades against the wrong shape).
+    let want_ops: &[&str] = match scenario {
+        "sync-once" => &["encrypt", "decrypt"],
+        "rekey" => &["encrypt"],
+        _ => unreachable!("sync shape covers sync-once + rekey"),
+    };
+    let got_ops: Vec<&str> = truth.ops.iter().map(|op| op.op.as_str()).collect();
+    if got_ops.as_slice() != want_ops {
+        return Err(format!(
+            "{scenario} runs {want_ops:?}, fixture ran {got_ops:?}"
+        ));
+    }
+    if view.completed.len() != truth.ops.len() {
+        return Err(format!(
+            "completed {} != {} ops",
+            view.completed.len(),
+            truth.ops.len()
+        ));
+    }
+    if unfinished_d != 0 {
+        return Err(format!("unfinished delta {unfinished_d}"));
+    }
+    // Exact return join: one return row per op, in submit
+    // order (the fixture is sequential — any reorder fails).
+    let op_seqs: Vec<u64> = truth.ops.iter().map(|op| op.seq).collect();
+    let ret_seqs: Vec<u64> = truth.returns.iter().map(|(seq, _)| *seq).collect();
+    if ret_seqs != op_seqs {
+        return Err(format!(
+            "fixture return seqs {ret_seqs:?} != submit seqs {op_seqs:?}"
+        ));
+    }
+    // Terminal reconciliation: every op's callback row must
+    // exist with errno EQUAL to its return errno (a missing
+    // or conflicting terminal row means the fixture did not
+    // run the scenario the sensor is graded against).
+    for op in &truth.ops {
+        let ret_errno = truth
+            .returns
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, errno)| *errno);
+        let term_errno = truth
+            .terminals
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, errno)| *errno);
+        match (ret_errno, term_errno) {
+            (Some(ret), Some(term)) if ret == term => {}
+            _ => {
                 return Err(format!(
-                    "async fixture returns {:?} != [(seq, -EINPROGRESS)]",
-                    truth.returns
-                ));
-            }
-            // The callback row must belong to THE op (seq match) and
-            // show clean completion (errno 0): the sensor
-            // legitimately sees neither, but the scenario must have
-            // run to grade the pending shape against.
-            if truth.terminals.as_slice() != [(truth.ops[0].seq, 0)] {
-                return Err(format!(
-                    "async fixture terminals {:?} != [(op seq, 0)]",
-                    truth.terminals
-                ));
-            }
-            if view.completed.len() != 1 {
-                return Err(format!(
-                    "async post-finish completed {} != 1",
-                    view.completed.len()
-                ));
-            }
-            if view.completed[0].terminal != Terminal::Unknown {
-                return Err(format!(
-                    "async post-finish terminal {:?} != Unknown (unexpected sync completion)",
-                    view.completed[0].terminal
-                ));
-            }
-            if unfinished_d != 1 {
-                return Err(format!(
-                    "async unfinished delta {unfinished_d} != 1 (expected-pending)"
+                    "op seq {} return/terminal mismatch (ret {ret_errno:?}, term {term_errno:?})",
+                    op.seq
                 ));
             }
         }
-        _ => unreachable!("scenario matched above"),
+    }
+    // Pairwise terminal join by index: grounded kind + EXACT
+    // errno + observed duration per completion.
+    for (i, record) in view.completed.iter().enumerate() {
+        let (seq, errno) = truth.returns[i];
+        let status = match record.terminal {
+            Terminal::Sync(status) | Terminal::Callback(status) => status,
+            Terminal::Unknown => {
+                return Err(format!("completion {i} (seq {seq}) has Unknown terminal"));
+            }
+        };
+        if status != errno {
+            return Err(format!(
+                "completion {i} (seq {seq}) status {status} != fixture errno {errno}"
+            ));
+        }
+        if record.duration_ns.is_none() {
+            return Err(format!("completion {i} (seq {seq}) lacks a duration"));
+        }
+    }
+    Ok(())
+}
+
+/// Async op shape: the pending shape T06 can observe (submit +
+/// queued return, completion invisible until T09 — post-finish the
+/// request truthless-drains as one `Unknown` record). Shared by
+/// every scenario with one async sk op.
+fn verdict_op_async(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    if truth.ops.len() != 1 {
+        return Err(format!(
+            "{scenario} runs 1 op, fixture ran {}",
+            truth.ops.len()
+        ));
+    }
+    // Exact submit label per scenario (T07-R2-04: the label pins
+    // WHICH fixture path ran — a mislabeled transcript never
+    // grades against the wrong shape).
+    let want_op = match scenario {
+        "async-once" => "encrypt",
+        "exact-driver" => "encrypt-exact",
+        _ => unreachable!("async shape covers async-once + exact-driver"),
+    };
+    if truth.ops[0].op != want_op {
+        return Err(format!(
+            "{scenario} runs `{want_op}`, fixture ran `{}`",
+            truth.ops[0].op
+        ));
+    }
+    // Positive controls: the fixture queued exactly once
+    // (`-EINPROGRESS`, kernel UAPI) AND observed async
+    // completion (errno 0) — the sensor legitimately sees
+    // neither the queue code's meaning nor the callback.
+    if truth.returns.as_slice() != [(truth.ops[0].seq, -115)] {
+        return Err(format!(
+            "async fixture returns {:?} != [(seq, -EINPROGRESS)]",
+            truth.returns
+        ));
+    }
+    // The callback row must belong to THE op (seq match) and
+    // show clean completion (errno 0): the sensor
+    // legitimately sees neither, but the scenario must have
+    // run to grade the pending shape against.
+    if truth.terminals.as_slice() != [(truth.ops[0].seq, 0)] {
+        return Err(format!(
+            "async fixture terminals {:?} != [(op seq, 0)]",
+            truth.terminals
+        ));
+    }
+    if view.completed.len() != 1 {
+        return Err(format!(
+            "async post-finish completed {} != 1",
+            view.completed.len()
+        ));
+    }
+    if view.completed[0].terminal != Terminal::Unknown {
+        return Err(format!(
+            "async post-finish terminal {:?} != Unknown (unexpected sync completion)",
+            view.completed[0].terminal
+        ));
+    }
+    if unfinished_d != 1 {
+        return Err(format!(
+            "async unfinished delta {unfinished_d} != 1 (expected-pending)"
+        ));
+    }
+    Ok(())
+}
+
+/// Op-negative shape: the sensor completes NOTHING here —
+/// transform-only scenarios run zero ops, and `authsize`'s op is
+/// an unhooked AEAD encrypt (any completion would be a phantom).
+fn verdict_op_negative(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+) -> Result<(), String> {
+    if scenario == "authsize" {
+        if truth.ops.len() != 1 {
+            return Err(format!(
+                "authsize runs 1 (unhooked) op, fixture ran {}",
+                truth.ops.len()
+            ));
+        }
+        // Exact label (T07-R2-04: the AEAD leg encrypts — a
+        // mislabeled transcript never grades the negative
+        // control).
+        if truth.ops[0].op != "encrypt" {
+            return Err(format!(
+                "authsize runs `encrypt`, fixture ran `{}`",
+                truth.ops[0].op
+            ));
+        }
+    } else if scenario == "failed-alloc" || scenario == "failed-init" {
+        if !truth.ops.is_empty() {
+            return Err(format!("{scenario}: failed scenario ran ops"));
+        }
+        // Probes are expected here — counted in `verdict_tfm_failed`.
+    } else if !truth.ops.is_empty() || !truth.probes.is_empty() {
+        return Err(format!(
+            "{scenario}: transform-only scenario ran ops/probes"
+        ));
+    }
+    if !view.completed.is_empty() {
+        return Err(format!(
+            "{scenario}: {} phantom completions observed",
+            view.completed.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Sk transform shape (T07-R2-04): per-lifetime correlation
+/// (provenance, retirement, ambiguity, config scalars) plus
+/// ledger-derived stat deltas. `expect_ambiguous` is true only
+/// for shared-release's retained-then-final lifetime.
+fn verdict_tfm_sk(
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    expect_ambiguous: bool,
+) -> Result<(), String> {
+    let fresh = fresh_generations(truth, view)?;
+    for (alloc, generation) in truth.allocs.iter().zip(fresh.iter()) {
+        verdict_lifetime_sk(truth, alloc, generation, expect_ambiguous)?;
+    }
+    let frees = truth.frees.len() as u64;
+    let finals = truth.frees.iter().filter(|f| f.final_free).count() as u64;
+    let configs = truth.configs.len() as u64;
+    let failed_configs = truth.configs.iter().filter(|c| c.errno != 0).count() as u64;
+    let allocs = truth.allocs.len() as u64;
+    let tfm = &view.tfm;
+    let base = &view.baseline.tfm;
+    let expect = [
+        (
+            "admitted",
+            allocs + frees + configs,
+            tfm.admitted,
+            base.admitted,
+        ),
+        ("completed", allocs, tfm.completed, base.completed),
+        ("releases", frees, tfm.releases, base.releases),
+        ("retired", finals, tfm.retired, base.retired),
+        (
+            "configs_joined",
+            configs,
+            tfm.configs_joined,
+            base.configs_joined,
+        ),
+        (
+            "configs_failed",
+            failed_configs,
+            tfm.configs_failed,
+            base.configs_failed,
+        ),
+        ("failed_allocs", 0, tfm.failed_allocs, base.failed_allocs),
+        (
+            "ambiguous_releases",
+            frees - finals,
+            tfm.ambiguous_releases,
+            base.ambiguous_releases,
+        ),
+        (
+            "unobserved_boundary",
+            0,
+            tfm.unobserved_boundary,
+            base.unobserved_boundary,
+        ),
+    ];
+    for (name, want, got, got_base) in expect {
+        let d = delta(got, got_base, name)?;
+        if d != want {
+            return Err(format!("tfm {name} delta {d} != {want} (fixture-derived)"));
+        }
+    }
+    // Clean sk lifetimes chain exactly (every boundary observed);
+    // the shared intermediate voids BY DESIGN (asserted false by
+    // its arm — the predicate must say so).
+    if !expect_ambiguous && !view.reuse_exact {
+        return Err("clean sk lifetimes must chain exactly".to_owned());
+    }
+    Ok(())
+}
+
+/// AEAD transform shape (T07-R2-04): the narrowed contract —
+/// allocation unhooked (no alloc halves, config admission shapes
+/// the generations), everything else ledger-derived. The
+/// first-seen admission is EXPECTED truth here (asserted
+/// exactly), never gated loss.
+fn verdict_tfm_aead(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), String> {
+    let fresh = fresh_generations(truth, view)?;
+    for (alloc, generation) in truth.allocs.iter().zip(fresh.iter()) {
+        verdict_lifetime_aead(truth, alloc, generation)?;
+    }
+    let frees = truth.frees.len() as u64;
+    let finals = truth.frees.iter().filter(|f| f.final_free).count() as u64;
+    let configs = truth.configs.len() as u64;
+    let failed_configs = truth.configs.iter().filter(|c| c.errno != 0).count() as u64;
+    let allocs = truth.allocs.len() as u64;
+    let tfm = &view.tfm;
+    let base = &view.baseline.tfm;
+    let expect = [
+        ("admitted", frees + configs, tfm.admitted, base.admitted),
+        ("completed", 0, tfm.completed, base.completed),
+        ("releases", frees, tfm.releases, base.releases),
+        ("retired", finals, tfm.retired, base.retired),
+        (
+            "configs_joined",
+            configs,
+            tfm.configs_joined,
+            base.configs_joined,
+        ),
+        (
+            "configs_failed",
+            failed_configs,
+            tfm.configs_failed,
+            base.configs_failed,
+        ),
+        ("failed_allocs", 0, tfm.failed_allocs, base.failed_allocs),
+        (
+            "ambiguous_releases",
+            0,
+            tfm.ambiguous_releases,
+            base.ambiguous_releases,
+        ),
+        (
+            "unobserved_boundary",
+            allocs,
+            tfm.unobserved_boundary,
+            base.unobserved_boundary,
+        ),
+    ];
+    for (name, want, got, got_base) in expect {
+        let d = delta(got, got_base, name)?;
+        if d != want {
+            return Err(format!("tfm {name} delta {d} != {want} (fixture-derived)"));
+        }
+    }
+    if view.reuse_exact {
+        return Err("authsize: first-seen admission must void exactness".to_owned());
+    }
+    Ok(())
+}
+
+/// Failed-allocation shape (T07-R2-04/F03): the attempt observed
+/// and classified, zero generations (no phantom from an ERR
+/// return), exactness intact (a classified failure is truth, not
+/// boundary uncertainty).
+fn verdict_tfm_failed(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), String> {
+    if !truth.allocs.is_empty() || !truth.frees.is_empty() || !truth.configs.is_empty() {
+        return Err("failed scenario recorded alloc/free/config rows".to_owned());
+    }
+    if truth.probes.len() != 1 {
+        return Err(format!(
+            "failed scenario ran {} probes, want 1",
+            truth.probes.len()
+        ));
+    }
+    // Zero allocs ⇒ zero fresh generations (any generation here
+    // is a phantom from the ERR return — the count check names
+    // it).
+    let _fresh = fresh_generations(truth, view)?;
+    let tfm = &view.tfm;
+    let base = &view.baseline.tfm;
+    let failed_d = delta(tfm.failed_allocs, base.failed_allocs, "failed_allocs")?;
+    if failed_d != 1 {
+        return Err(format!("tfm failed_allocs delta {failed_d} != 1 probe"));
+    }
+    let admitted_d = delta(tfm.admitted, base.admitted, "admitted")?;
+    if admitted_d != 1 {
+        return Err(format!("tfm admitted delta {admitted_d} != 1 attempt"));
+    }
+    let completed_d = delta(tfm.completed, base.completed, "completed")?;
+    if completed_d != 1 {
+        return Err(format!("tfm completed delta {completed_d} != 1 attempt"));
+    }
+    // Nothing else may account: no releases, no retires, no joined
+    // configs from an allocation that never happened.
+    for (name, got, got_base) in [
+        ("releases", tfm.releases, base.releases),
+        ("retired", tfm.retired, base.retired),
+        ("configs_joined", tfm.configs_joined, base.configs_joined),
+        ("configs_failed", tfm.configs_failed, base.configs_failed),
+    ] {
+        let d = delta(got, got_base, name)?;
+        if d != 0 {
+            return Err(format!("tfm {name} delta {d} != 0 (failed alloc)"));
+        }
+    }
+    if !view.reuse_exact {
+        return Err("failed alloc must not void exactness (classified truth)".to_owned());
     }
     Ok(())
 }
@@ -1039,11 +1871,14 @@ impl std::error::Error for ForeignLinksError {}
 mod tests {
     use super::*;
 
-    /// Real sync transcript shape (alloc/submit/return/terminal/free/done).
+    /// Real sync transcript shape (alloc/config/submit/return/
+    /// terminal/free/done — the setup setkey rides its own config
+    /// row since T07-R2-04).
     fn sync_text() -> String {
         let run = "run-sync-once";
         [
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-sync-t06a","drv":"kxcipher-sync-t06a"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-sync-t06a","drv":"kxcipher-sync-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
@@ -1068,13 +1903,39 @@ mod tests {
         }
     }
 
-    fn sync_view(completed: &[RequestRecord]) -> SensorView<'_> {
+    /// The sync fixture's one lifetime as the sensor observes
+    /// it: alloc-observed provenance, one setup setkey (epoch 1),
+    /// proved final retire.
+    fn sync_gen() -> GenerationInfo {
+        GenerationInfo {
+            id: 1,
+            req_name: "kxcipher-sync-t06a".to_owned(),
+            alg_type: 0,
+            alg_mask: 0,
+            drv_name: "kxcipher-sync-t06a".to_owned(),
+            name_truncated: false,
+            drv_truncated: false,
+            first_seen: false,
+            retired: true,
+            ambiguous: false,
+            epoch: 1,
+            configs: 1,
+            last_config_site: LTFM_SITE_SETKEY_SK,
+            last_config_len: 16,
+            last_config_errno: 0,
+        }
+    }
+
+    fn sync_view<'a>(
+        completed: &'a [RequestRecord],
+        generations: &'a [GenerationInfo],
+    ) -> SensorView<'a> {
         // Pre-GO misses (equal baseline/final absolutes) pass: the
         // gate owns post-baseline deltas only.
         let misses = vec![miss_abs("fsession/a", 11, 3), miss_abs("fsession/b", 12, 0)];
         SensorView {
             completed,
-            edge_hits: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            edge_hits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
             decode: DecodeStats {
                 admitted: 2,
                 ..DecodeStats::default()
@@ -1085,7 +1946,7 @@ mod tests {
                 ..ReducerStats::default()
             },
             kernel_loss: [0; 5],
-            agg_accepted: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            agg_accepted: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
             retained_dropped: 0,
             baseline: SensorBaseline {
                 prog_misses: misses.clone(),
@@ -1096,7 +1957,16 @@ mod tests {
             attached_links: 7,
             foreign_links: 0,
             prog_misses: misses,
-            tfm: TfmStats::default(),
+            tfm: TfmStats {
+                admitted: 3,
+                completed: 1,
+                releases: 1,
+                retired: 1,
+                configs_joined: 1,
+                ..TfmStats::default()
+            },
+            generations,
+            reuse_exact: true,
         }
     }
 
@@ -1109,12 +1979,322 @@ mod tests {
         }
     }
 
+    /// One burst lifetime transcript row-set (alloc + setup config +
+    /// proved free) at `seq`.
+    fn burst_rows(run: &str, seq: u64) -> Vec<String> {
+        vec![
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"alloc","req":"kxcipher-sync-t06a","drv":"kxcipher-sync-t06a","type":0,"mask":0}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"config","op":"setkey","errno":0,"len":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"free","final":true}}"#),
+        ]
+    }
+
+    #[test]
+    fn verdict_reuse_burst_pairs_many_lifetimes() {
+        // T07-R2-04: three sequential lifetimes pair by index
+        // (provenance, retirement, epochs each) and chain exactly
+        // (unit-scale stand-in — the guest proves 1,000).
+        let run = "run-reuse-burst";
+        let mut rows = Vec::new();
+        for seq in [1u64, 2, 3] {
+            rows.extend(burst_rows(run, seq));
+        }
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#
+        ));
+        let truth = parse_transcript(&rows.join("\n"), run).expect("burst parses");
+        assert_eq!(truth.allocs.len(), 3);
+        let gens = [sync_gen(), sync_gen(), sync_gen()];
+        let completed: [RequestRecord; 0] = [];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 9;
+        view.tfm.completed = 3;
+        view.tfm.releases = 3;
+        view.tfm.retired = 3;
+        view.tfm.configs_joined = 3;
+        verdict("reuse-burst", &truth, &view).expect("burst pairs green");
+        // A provenance lie on lifetime 3 fails, naming it.
+        let mut bad_gens = [sync_gen(), sync_gen(), sync_gen()];
+        bad_gens[2].drv_name = "wrong-driver".to_owned();
+        let mut view = sync_view(&completed, &bad_gens);
+        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 9;
+        view.tfm.completed = 3;
+        view.tfm.releases = 3;
+        view.tfm.retired = 3;
+        view.tfm.configs_joined = 3;
+        let err = verdict("reuse-burst", &truth, &view).expect_err("drv lie must fail");
+        assert!(err.contains("alloc seq 3"), "names the lifetime: {err}");
+    }
+
+    #[test]
+    fn verdict_shared_release_expects_ambiguous_retire() {
+        // T07-R2-04: retained release then proved final — the
+        // generation retires WITH the ambiguity flag surviving
+        // (truthful history, asserted exactly).
+        let run = "run-shared-release";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-sync-t06a","drv":"kxcipher-sync-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":false}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("shared parses");
+        let mut shared = sync_gen();
+        shared.ambiguous = true;
+        let gens = [shared];
+        let completed: [RequestRecord; 0] = [];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 2;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 1;
+        view.tfm.ambiguous_releases = 1;
+        view.reuse_exact = false;
+        verdict("shared-release", &truth, &view).expect("shared green");
+        // A non-ambiguous flag on the shared lifetime fails.
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 2;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 1;
+        view.tfm.ambiguous_releases = 1;
+        view.reuse_exact = false;
+        let err = verdict("shared-release", &truth, &view).expect_err("clean flag must fail");
+        assert!(err.contains("ambiguous"), "names it: {err}");
+    }
+
+    #[test]
+    fn verdict_authsize_pins_narrowed_contract() {
+        // T07-R2-04: the AEAD lifetime is first-seen with EMPTY
+        // provenance (alloc unhooked — honest unknown), the op
+        // unobserved (negative control), epochs/configs exact, and
+        // exactness void (the admission says so).
+        let run = "run-authsize";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxc-aead-t07a","drv":"kxc-aead-t07a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":-22,"len":64}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("authsize parses");
+        let gens = [GenerationInfo {
+            req_name: String::new(),
+            drv_name: String::new(),
+            first_seen: true,
+            epoch: 2,
+            configs: 3,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 64,
+            last_config_errno: -22,
+            ..sync_gen()
+        }];
+        let completed: [RequestRecord; 0] = [];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 0;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 1;
+        view.reuse_exact = false;
+        verdict("authsize", &truth, &view).expect("authsize green");
+        // Claimed exactness on a first-seen admission fails.
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 0;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 1;
+        view.reuse_exact = true;
+        verdict("authsize", &truth, &view).expect_err("false exactness must fail");
+    }
+
+    #[test]
+    fn verdict_failed_alloc_classifies_without_phantoms() {
+        // T07-R2-04/F03: the failed attempt observed and classified
+        // (lanes + failed_allocs), zero generations, exactness
+        // intact — a phantom gen or a missed classification fails.
+        let run = "run-failed-alloc";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"alloc-probe"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"return","errno":-2}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"terminal","errno":-2}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("probe parses");
+        assert_eq!(truth.probes, vec![1]);
+        assert!(truth.ops.is_empty() && truth.allocs.is_empty());
+        let gens: [GenerationInfo; 0] = [];
+        let completed: [RequestRecord; 0] = [];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 1;
+        view.tfm.completed = 1;
+        view.tfm.failed_allocs = 1;
+        view.tfm.releases = 0;
+        view.tfm.retired = 0;
+        view.tfm.configs_joined = 0;
+        verdict("failed-alloc", &truth, &view).expect("failed probe green");
+        // A phantom generation from the ERR return fails.
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 1;
+        view.tfm.completed = 1;
+        view.tfm.failed_allocs = 1;
+        view.tfm.releases = 0;
+        view.tfm.retired = 0;
+        view.tfm.configs_joined = 0;
+        let err = verdict("failed-alloc", &truth, &view).expect_err("phantom must fail");
+        assert!(
+            err.contains("fresh generations 1 != 0 fixture allocs"),
+            "names it: {err}"
+        );
+    }
+
+    #[test]
+    fn verdict_rekey_epochs_and_errno() {
+        // T07-R2-04: two setkeys (one ok, one short-key EINVAL)
+        // epoch once, record the failing tail exactly.
+        let run = "run-rekey";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-sync-t06a","drv":"kxcipher-sync-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":-22,"len":7}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("rekey parses");
+        let gens = [GenerationInfo {
+            epoch: 1,
+            configs: 2,
+            last_config_site: LTFM_SITE_SETKEY_SK,
+            last_config_len: 7,
+            last_config_errno: -22,
+            ..sync_gen()
+        }];
+        let completed = [record(1, Terminal::Sync(0))];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 2;
+        view.tfm.configs_failed = 1;
+        verdict("rekey", &truth, &view).expect("rekey green");
+    }
+
+    #[test]
+    fn parse_rejects_transform_inconsistencies() {
+        // T07-R2-04: frees/configs must reference recorded allocs,
+        // alloc seqs must not collide with submits, config ops are
+        // closed, and a rowless transcript has no positive control.
+        let run = "run-sync-once";
+        let dangling_free =
+            sync_text().replace(r#""seq":1,"phase":"free""#, r#""seq":9,"phase":"free""#);
+        assert!(parse_transcript(&dangling_free, run).is_err());
+        let dangling_config =
+            sync_text().replace(r#""seq":1,"phase":"config""#, r#""seq":9,"phase":"config""#);
+        assert!(parse_transcript(&dangling_config, run).is_err());
+        let colliding_alloc =
+            sync_text().replace(r#""seq":1,"phase":"alloc""#, r#""seq":2,"phase":"alloc""#);
+        assert!(parse_transcript(&colliding_alloc, run).is_err());
+        let bad_op = sync_text().replace(r#""op":"setkey""#, r#""op":"rekey""#);
+        assert!(parse_transcript(&bad_op, run).is_err());
+        let rowless =
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#);
+        let err = parse_transcript(&rowless, run).expect_err("rowless must fail");
+        assert!(err.reason.contains("positive control"), "names it: {err}");
+    }
+
     #[test]
     fn parse_accepts_valid_transcript() {
         let truth = sync_truth();
         assert_eq!(truth.ops.len(), 2);
         assert_eq!(truth.returns, vec![(2, 0), (3, 0)]);
         assert_eq!(truth.terminals, vec![(2, 0), (3, 0)]);
+        // T07-R2-04: transform truth retained (one lifetime, one
+        // setup setkey, one proved final release).
+        assert_eq!(truth.allocs.len(), 1);
+        assert_eq!(truth.allocs[0].req, "kxcipher-sync-t06a");
+        assert_eq!(truth.allocs[0].drv, "kxcipher-sync-t06a");
+        assert_eq!(truth.configs.len(), 1);
+        assert_eq!(truth.configs[0].op, "setkey");
+        assert_eq!(truth.configs[0].len, 16);
+        assert_eq!(
+            truth.frees,
+            vec![FixtureFree {
+                seq: 1,
+                final_free: true
+            }]
+        );
+        assert!(truth.probes.is_empty());
         assert_eq!(truth.fixture_result, 0);
     }
 
@@ -1154,7 +2334,7 @@ mod tests {
     fn verdict_sync_green() {
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        verdict("sync-once", &truth, &sync_view(&completed)).expect("sync green");
+        verdict("sync-once", &truth, &sync_view(&completed, &[sync_gen()])).expect("sync green");
     }
 
     #[test]
@@ -1164,7 +2344,8 @@ mod tests {
         // no LLOSS — the gate is the only witness).
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.prog_misses[0].misses += 1;
         let err = verdict("sync-once", &truth, &view).expect_err("miss delta must fail");
         assert!(
@@ -1179,7 +2360,8 @@ mod tests {
         // not silently absorbed — same rule as every verdict delta).
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.prog_misses[0].misses = 2;
         let err = verdict("sync-once", &truth, &view).expect_err("backwards must fail");
         assert!(err.contains("ran backwards"), "{err}");
@@ -1191,7 +2373,8 @@ mod tests {
         // unattributed program must never read as zero misses).
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.baseline.prog_misses.clear();
         let err = verdict("sync-once", &truth, &view).expect_err("missing baseline must fail");
         assert!(err.contains("has no baseline"), "{err}");
@@ -1203,8 +2386,8 @@ mod tests {
         // even when every count matches.
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(-5)), record(2, Terminal::Sync(0))];
-        let err =
-            verdict("sync-once", &truth, &sync_view(&completed)).expect_err("status must join");
+        let err = verdict("sync-once", &truth, &sync_view(&completed, &[sync_gen()]))
+            .expect_err("status must join");
         assert!(err.contains("status -5"), "names the mismatch: {err}");
     }
 
@@ -1212,14 +2395,16 @@ mod tests {
     fn verdict_sync_unknown_terminal_fails() {
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Unknown)];
-        verdict("sync-once", &truth, &sync_view(&completed)).expect_err("Unknown must fail sync");
+        verdict("sync-once", &truth, &sync_view(&completed, &[sync_gen()]))
+            .expect_err("Unknown must fail sync");
     }
 
     #[test]
     fn verdict_async_expects_pending() {
         let run = "run-async-once";
         let text = [
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t06a","drv":"kxcipher-async-t06a"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t06a","drv":"kxcipher-async-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
@@ -1228,10 +2413,15 @@ mod tests {
         ]
         .join("\n");
         let truth = parse_transcript(&text, run).expect("valid async transcript");
+        let gens = [GenerationInfo {
+            req_name: "kxcipher-async-t06a".to_owned(),
+            drv_name: "kxcipher-async-t06a".to_owned(),
+            ..sync_gen()
+        }];
         let completed = [record(1, Terminal::Unknown)];
-        let mut view = sync_view(&completed);
-        view.edge_hits = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -1240,9 +2430,9 @@ mod tests {
         // A grounded async completion fails: the scenario did not
         // produce the async shape it exists to prove.
         let completed = [record(1, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
-        view.edge_hits = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -1255,29 +2445,35 @@ mod tests {
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
         // Equation: agg 5 != hits 4 + reserve 0 + noslot 0.
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.agg_accepted = [2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("equation must hold");
         assert!(err.contains("reconciliation"), "names it: {err}");
         // Any loss counter fails.
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.decode.stale_returns = 1;
         verdict("sync-once", &truth, &view).expect_err("stale must fail");
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.kernel_loss[2] = 1;
         verdict("sync-once", &truth, &view).expect_err("badkey must fail");
         // Close backlog fails.
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.quiet_backlog_bytes = 40;
         verdict("sync-once", &truth, &view).expect_err("backlog must fail");
         // Backwards counters fail (no silent reset absorb).
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.baseline.edge_hits = [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         verdict("sync-once", &truth, &view).expect_err("backwards must fail");
         // Fixture self-check failure fails.
         let mut truth = sync_truth();
         truth.fixture_result = -1;
-        verdict("sync-once", &truth, &sync_view(&completed)).expect_err("fixture fail must fail");
+        verdict("sync-once", &truth, &sync_view(&completed, &[sync_gen()]))
+            .expect_err("fixture fail must fail");
     }
 
     #[test]
@@ -1289,47 +2485,70 @@ mod tests {
         // nothing.
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.tfm.live_full = 1;
         let err = verdict("sync-once", &truth, &view).expect_err("D4 refusal must fail");
         assert!(err.contains("tfm_live_full"), "names it: {err}");
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.tfm.unfinished = 1;
         verdict("sync-once", &truth, &view).expect_err("dangling close must fail");
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.tfm.ambiguous_releases = 1;
         verdict("sync-once", &truth, &view).expect_err("ambiguity must fail");
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.tfm.unobserved_boundary = 1;
         verdict("sync-once", &truth, &view).expect_err("uncertain identity must fail");
-        // Truth-only: proved retires + joined configs (one errno)
-        // + a classified failed alloc pass the gate.
-        let mut view = sync_view(&completed);
-        view.tfm.admitted = 4;
-        view.tfm.completed = 4;
-        view.tfm.releases = 2;
-        view.tfm.retired = 2;
-        view.tfm.configs_joined = 3;
-        view.tfm.configs_failed = 1;
-        view.tfm.failed_allocs = 1;
+        // Truth-only: the fixture's own lifetime (admitted 3 =
+        // alloc + free + setup config, proved retire, one joined
+        // config) + a classified no-op release pass the gate AND
+        // the ledger-derived arms. (Classified failed allocs pass
+        // via the failed scenarios — `verdict_tfm_failed`.)
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.tfm.admitted = 3;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 1;
+        view.tfm.configs_failed = 0;
+        view.tfm.failed_allocs = 0;
         view.tfm.noop_releases = 1;
         verdict("sync-once", &truth, &view).expect("truth-only transform traffic green");
+        // T07-R2-05: routine unbound destroys (digest/shash
+        // background in the guest) gate nothing — while a missed
+        // identity that was USED still fails via its admission.
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.tfm.unknown_releases = 5;
+        verdict("sync-once", &truth, &view).expect("unbound destroys are inventory");
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.tfm.unknown_releases = 5;
+        view.tfm.unobserved_boundary = 1;
+        verdict("sync-once", &truth, &view).expect_err("used missed identity must fail");
     }
 
     #[test]
     fn verdict_equation_covers_transform_lanes() {
         // T07.2: the per-lane equation binds lanes 4+ exactly like
-        // op lanes (no fixture truth there yet — T07.6 — but every
-        // accepted transform edge must still be consumed once).
+        // op lanes (fixture truth pins them since T07-R2-04 — and
+        // every accepted transform edge must still be consumed
+        // once).
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.edge_hits[4] = 1;
         view.edge_hits[5] = 1;
         view.agg_accepted[4] = 1;
         view.agg_accepted[5] = 1;
         verdict("sync-once", &truth, &view).expect("matched transform lanes green");
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.edge_hits[4] = 1;
         view.edge_hits[5] = 1;
         view.agg_accepted[4] = 2;
@@ -1345,23 +2564,27 @@ mod tests {
         // are void without identity + retirement exclusion.
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.view_valid = false;
         let err = verdict("sync-once", &truth, &view).expect_err("void identity must fail");
         assert!(err.contains("identity"), "names it: {err}");
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.attached_links = 1;
         let err = verdict("sync-once", &truth, &view).expect_err("1 link must fail");
         assert!(err.contains("7 session links"), "names it: {err}");
         // Every earlier count is no longer a full attach: all 7
         // sites must be linked.
         for short in [2, 3, 4, 6] {
-            let mut view = sync_view(&completed);
+            let gens = [sync_gen()];
+            let mut view = sync_view(&completed, &gens);
             view.attached_links = short;
             let err = verdict("sync-once", &truth, &view).expect_err("short attach must fail");
             assert!(err.contains("7 session links"), "names it: {err}");
         }
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.foreign_links = 1;
         let err = verdict("sync-once", &truth, &view).expect_err("foreign link must fail");
         assert!(err.contains("foreign"), "names it: {err}");
@@ -1388,21 +2611,23 @@ mod tests {
         // fake a pass nor a fail: the verdict joins deltas.
         let truth = sync_truth();
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let mut view = sync_view(&completed);
-        view.baseline.edge_hits = [5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.baseline.agg_accepted = [5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.baseline.edge_hits = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0];
+        view.baseline.agg_accepted = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0];
         view.baseline.decode.admitted = 7;
         view.baseline.reducer.admitted = 7;
         view.baseline.reducer.emitted = 7;
-        view.edge_hits = [6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 9;
         view.reducer.admitted = 9;
         view.reducer.emitted = 9;
         verdict("sync-once", &truth, &view).expect("pre-clear traffic tolerated");
         // ...but a loss inside the scenario window still fails even
         // with a dirty baseline.
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.baseline.decode.stale_returns = 3;
         view.decode.stale_returns = 4;
         let err = verdict("sync-once", &truth, &view).expect_err("scenario loss must fail");
@@ -1420,11 +2645,11 @@ mod tests {
         // Non-object lines and runless rows fail (unattributable).
         for bad in [
             sync_text().replace(
-                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"kxcipher-sync-t06a\",\"drv\":\"kxcipher-sync-t06a\"}",
+                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"kxcipher-sync-t06a\",\"drv\":\"kxcipher-sync-t06a\",\"type\":0,\"mask\":0}",
                 "not json at all",
             ),
             sync_text().replace(
-                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"kxcipher-sync-t06a\",\"drv\":\"kxcipher-sync-t06a\"}",
+                "{\"v\":1,\"run\":\"run-sync-once\",\"seq\":1,\"phase\":\"alloc\",\"req\":\"kxcipher-sync-t06a\",\"drv\":\"kxcipher-sync-t06a\",\"type\":0,\"mask\":0}",
                 "{\"v\":1,\"seq\":1,\"phase\":\"alloc\"}",
             ),
         ] {
@@ -1486,9 +2711,9 @@ mod tests {
 
     #[test]
     fn parse_validates_marker_rows() {
-        // Round-4 minor: alloc/free/progress are not oracle evidence,
-        // but their required fields validate — a malformed marker is
-        // a broken transcript (fixture.h contract).
+        // Round-4 minor (+T07-R2-04: alloc/free/config are oracle
+        // evidence now): required fields validate either way — a
+        // malformed row is a broken transcript (fixture.h contract).
         let no_req = sync_text().replace("\"req\":\"kxcipher-sync-t06a\",", "");
         assert!(parse_transcript(&no_req, "run-sync-once").is_err());
         let empty_drv = sync_text().replace("\"drv\":\"kxcipher-sync-t06a\"", "\"drv\":\"\"");
@@ -1524,7 +2749,7 @@ mod tests {
         let truth = parse_transcript(&text, run).expect("valid transcript");
         assert_eq!(truth.expected_hooks(), [2, 2, 0, 0]);
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let err = verdict("sync-once", &truth, &sync_view(&completed))
+        let err = verdict("sync-once", &truth, &sync_view(&completed, &[sync_gen()]))
             .expect_err("2-enc fixture vs 1+1 view must fail");
         assert!(err.contains("fixture-derived"), "names it: {err}");
     }
@@ -1536,12 +2761,17 @@ mod tests {
         let mut conflict = truth.clone();
         conflict.terminals[0].1 = -5;
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let err = verdict("sync-once", &conflict, &sync_view(&completed))
-            .expect_err("terminal conflict must fail");
+        let err = verdict(
+            "sync-once",
+            &conflict,
+            &sync_view(&completed, &[sync_gen()]),
+        )
+        .expect_err("terminal conflict must fail");
         assert!(err.contains("return/terminal mismatch"), "names it: {err}");
         // Per-lane reconciliation: permuted aggregates fail even
         // when totals match ([4,0,0,0] vs [1,1,1,1]).
-        let mut view = sync_view(&completed);
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
         view.agg_accepted = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("permuted agg must fail");
         assert!(err.contains("per-lane"), "names it: {err}");
@@ -1600,8 +2830,131 @@ mod tests {
             foreign_links: 0,
             prog_misses: Vec::new(),
             tfm: TfmStats::default(),
+            generations: &[],
+            reuse_exact: true,
         };
         let err = verdict("async-once", &truth, &view).expect_err("foreign terminal must fail");
         assert!(err.contains("terminals"), "names it: {err}");
+    }
+
+    #[test]
+    fn transcript_accepts_closed_fixture_label_set() {
+        // T07-R2-04: every submit label the fixture emits parses
+        // (the suffixed labels are encrypt flavors) while an
+        // unknown label still refuses as drift.
+        let run = "run-labels";
+        let mut rows = Vec::new();
+        for (i, op) in [
+            "encrypt",
+            "decrypt",
+            "encrypt-exact",
+            "encrypt-delayed",
+            "encrypt-burst",
+            "encrypt-early",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seq = i as u64 + 1;
+            rows.push(format!(
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"submit","op":"{op}"}}"#
+            ));
+            rows.push(format!(
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"return","errno":0}}"#
+            ));
+            rows.push(format!(
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"terminal","errno":0}}"#
+            ));
+        }
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#
+        ));
+        let truth = parse_transcript(&rows.join("\n"), run).expect("labels parse");
+        let got: Vec<&str> = truth.ops.iter().map(|o| o.op.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "encrypt",
+                "decrypt",
+                "encrypt-exact",
+                "encrypt-delayed",
+                "encrypt-burst",
+                "encrypt-early"
+            ]
+        );
+        // Family classification: five encrypt flavors hit lanes
+        // 0/1, the decrypt hits 2/3.
+        assert_eq!(truth.expected_hooks(), [5, 5, 1, 1]);
+        // An unknown label refuses (never a default family).
+        let bad = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"splice"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let err = parse_transcript(&bad, run).expect_err("unknown label must fail");
+        assert_eq!(err.reason, "unknown op name");
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn verdict_exact_driver_pins_encrypt_exact() {
+        // T07-R2-04: `exact-driver` runs ONE `encrypt-exact` op on
+        // the generically requested transform (the sensor sees the
+        // async-pending shape + the resolved async provenance); a
+        // transcript carrying plain `encrypt` grades against the
+        // wrong shape and must fail naming the label.
+        let run = "run-exact-driver";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher","drv":"kxcipher-async-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-exact"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("exact transcript parses");
+        let gens = [GenerationInfo {
+            req_name: "kxcipher".to_owned(),
+            drv_name: "kxcipher-async-t06a".to_owned(),
+            ..sync_gen()
+        }];
+        let completed = [record(1, Terminal::Unknown)];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.reducer.unfinished = 1;
+        verdict("exact-driver", &truth, &view).expect("exact-driver green");
+        // Plain `encrypt` on this scenario is the wrong shape.
+        let text = text.replace("encrypt-exact", "encrypt");
+        let truth = parse_transcript(&text, run).expect("relabeled parses");
+        let err = verdict("exact-driver", &truth, &view).expect_err("label lie must fail");
+        assert!(err.contains("encrypt-exact"), "names the label: {err}");
+    }
+
+    #[test]
+    fn verdict_sync_pins_submit_labels() {
+        // T07-R2-04: `sync-once` runs exactly encrypt-then-decrypt;
+        // a transcript with both submits relabeled still joins
+        // seqs/errnos but grades the wrong path and must fail.
+        let truth = sync_truth();
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let gens = [sync_gen()];
+        let view = sync_view(&completed, &gens);
+        verdict("sync-once", &truth, &view).expect("sync labels green");
+        let text = sync_text().replace(r#""op":"decrypt""#, r#""op":"encrypt""#);
+        let truth = parse_transcript(&text, "run-sync-once").expect("relabeled parses");
+        let gens = [sync_gen()];
+        // A sensor view matching the RELABELED lanes sails the
+        // edge-hits gate — the label pin must still catch it.
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        let err = verdict("sync-once", &truth, &view).expect_err("label lie must fail");
+        assert!(err.contains("decrypt"), "names the label: {err}");
     }
 }

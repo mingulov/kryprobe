@@ -496,10 +496,44 @@ impl<'a> Btf<'a> {
         Ok(())
     }
 
+    /// Prove the INT `id` carries a full 32-bit VALUE at bit
+    /// offset 0 (T07-R2-01: the BPF reads exactly one u32 there — a
+    /// 4-byte container holding a shifted/narrower value would
+    /// misread, so the encoding must prove VALUE width, not just
+    /// storage width). Encoding (signed/unsigned/char/bool) stays
+    /// unpinned: the read compares/copies the raw u32, whose bits
+    /// don't depend on it. (Errno returns keep their own SIGNED
+    /// pin in [`Btf::int_return_exact`] — a sign change would
+    /// invert error reads.)
+    fn int_value_exact(&self, id: u32, what: &str) -> Result<(), BtfError> {
+        let rec = self.rec(self.chase_wrappers(id)?)?;
+        if rec.kind != KIND_INT {
+            return Err(bad(format!("{what} is kind {}, not INT", rec.kind)));
+        }
+        if rec.size_or_type != 4 {
+            return Err(bad(format!(
+                "{what} INT is {} bytes, not 4",
+                rec.size_or_type
+            )));
+        }
+        let data = read_u32(self.bytes, rec.aux_at, "int data")?;
+        let (bits, offset) = (data & 0xff, (data >> 16) & 0xff);
+        if bits != 32 {
+            return Err(bad(format!("{what} INT is {bits} bits, not 32")));
+        }
+        if offset != 0 {
+            return Err(bad(format!("{what} INT has bit offset {offset}, not 0")));
+        }
+        Ok(())
+    }
+
     /// Prove the FUNC_PROTO argument at `at` is a 4-byte INT (the
     /// T07.4 length gate): scalar length words travel as unshifted
     /// `u32` copies — the width pins, the signedness does not (a
     /// wider scalar would truncate, a non-scalar would misread).
+    /// (T07-R2-01: same VALUE-width proof as the counter — a
+    /// shifted/narrow encoding in 4-byte storage would misread
+    /// the length exactly like the counter.)
     fn int_arg_4(&self, at: usize, arg: &str, name: &str) -> Result<(), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
@@ -514,6 +548,16 @@ impl<'a> Btf<'a> {
             return Err(bad_proto(format!(
                 "{arg} INT is {} bytes, not 4",
                 rec.size_or_type
+            )));
+        }
+        let data = read_u32(self.bytes, rec.aux_at, "int data")?;
+        let (bits, offset) = (data & 0xff, (data >> 16) & 0xff);
+        if bits != 32 {
+            return Err(bad_proto(format!("{arg} INT is {bits} bits, not 32")));
+        }
+        if offset != 0 {
+            return Err(bad_proto(format!(
+                "{arg} INT has bit offset {offset}, not 0"
             )));
         }
         Ok(())
@@ -700,7 +744,9 @@ impl<'a> Btf<'a> {
     /// scalar, or wrong-typed aggregate refuses — adding into a
     /// pointer would read the pointer's bytes as a struct. The
     /// whole embedded extent must sit inside the parent (R4
-    /// containment — further offsets add into it).
+    /// containment — further offsets add into it) and must be
+    /// NONEMPTY (T07-R2-02: adding offsets into a zero-size
+    /// embedded struct reads past its proven extent).
     pub(crate) fn member_embedded_struct(
         &self,
         type_name: &str,
@@ -718,6 +764,11 @@ impl<'a> Btf<'a> {
         if !self.name_is(inner, name)? {
             return Err(bad(format!(
                 "{type_name}.{member} embeds the wrong STRUCT, not {name}"
+            )));
+        }
+        if inner.size_or_type == 0 {
+            return Err(bad(format!(
+                "{type_name}.{member} embeds an empty STRUCT {name} — no extent to add into"
             )));
         }
         self.check_contained(type_name, off, inner.size_or_type)?;
@@ -765,21 +816,27 @@ impl<'a> Btf<'a> {
     /// FIRST 4 bytes (R4: the BPF reads exactly one u32 there and
     /// the tracker treats 1 as final-free proof, so the shape must
     /// prove the VALUE, not just the width). Accepted: an INT of
-    /// EXACTLY 4 bytes, or a 4-byte STRUCT/UNION with a 4-byte INT
-    /// word at byte 0 (the `refcount_t`/`atomic_t` shape — the
-    /// whole wrapper IS the one counter word). Refused: wider INTs
-    /// (a 64-bit `0x1_0000_0001` reads a lying low word),
-    /// multi-word wrappers (a marker before the counter reads the
-    /// marker — size ≠ 4 proves nothing about word 0's meaning),
-    /// pointers, and narrower shapes. The 4-byte read must also sit
-    /// inside the parent (`off + 4 ≤ parent size` — containment,
-    /// same as every lifecycle read).
+    /// EXACTLY 4 bytes with a full 32-bit zero-offset encoding
+    /// (T07-R2-01: storage width alone proves nothing — a 4-byte
+    /// container with a shifted/narrow value misreads), or a
+    /// 4-byte STRUCT/UNION with a proven 4-byte INT word at byte 0
+    /// (the `refcount_t`/`atomic_t` shape — the whole wrapper IS
+    /// the one counter word). Refused: wider INTs (a 64-bit
+    /// `0x1_0000_0001` reads a lying low word), narrowed/shifted
+    /// encodings, multi-word wrappers (a marker before the counter
+    /// reads the marker — size ≠ 4 proves nothing about word 0's
+    /// meaning), pointers, and narrower shapes. The 4-byte read
+    /// must also sit inside the parent (`off + 4 ≤ parent size` —
+    /// containment, same as every lifecycle read).
     pub(crate) fn member_counter(&self, type_name: &str, member: &str) -> Result<u32, BtfError> {
         let (off, mtype) = self.member_typed(type_name, member)?;
         let target = self.chase_wrappers(mtype)?;
         let rec = self.rec(target)?;
         let is_counter = match rec.kind {
-            KIND_INT => rec.size_or_type == 4,
+            KIND_INT => {
+                self.int_value_exact(target, &format!("{type_name}.{member}"))?;
+                true
+            }
             KIND_STRUCT | KIND_UNION => {
                 rec.size_or_type == 4 && self.counter_word_at_zero(target, 0)?
             }
@@ -797,11 +854,14 @@ impl<'a> Btf<'a> {
 
     /// True when struct/union `id` carries a 4-byte INT word at byte
     /// 0 (R4 counter-leaf proof: some member sits at byte offset 0
-    /// with a 4-byte INT leaf — a leading marker or a wider counter
-    /// leaves no such word). One nesting level descends (the real
-    /// `refcount_t { atomic_t refs; }` → `atomic_t { int counter; }`
-    /// chain — each wrapper must itself be exactly 4 bytes, so a
-    /// marker beside the nested counter still refuses). Bitfield /
+    /// with a proven 4-byte INT leaf — a leading marker or a wider
+    /// counter leaves no such word; T07-R2-01: the leaf INT must
+    /// prove VALUE width too — a shifted/narrow encoding in
+    /// 4-byte storage refuses, never qualifies by size alone).
+    /// One nesting level descends (the real `refcount_t {
+    /// atomic_t refs; }` → `atomic_t { int counter; }` chain —
+    /// each wrapper must itself be exactly 4 bytes, so a marker
+    /// beside the nested counter still refuses). Bitfield /
     /// misaligned members at 0 prove nothing (no byte offset to
     /// read) and simply don't qualify.
     fn counter_word_at_zero(&self, id: u32, depth: usize) -> Result<bool, BtfError> {
@@ -830,7 +890,13 @@ impl<'a> Btf<'a> {
             }
             let target = self.chase_wrappers(mtype)?;
             let leaf = self.rec(target)?;
-            if leaf.kind == KIND_INT && leaf.size_or_type == 4 {
+            if leaf.kind == KIND_INT {
+                // Fail fast (never skip-and-continue): word 0 names
+                // an INT, so the wrapper's counter claim stands or
+                // falls on THIS leaf's encoding — a malformed leaf
+                // must refuse the wrapper, not fall through to a
+                // sibling that happens to sit at 0 (union overlap).
+                self.int_value_exact(target, "counter leaf")?;
                 return Ok(true);
             }
             if matches!(leaf.kind, KIND_STRUCT | KIND_UNION)
@@ -841,6 +907,41 @@ impl<'a> Btf<'a> {
             }
         }
         Ok(false)
+    }
+
+    /// Byte extent of the member TYPE `id` (T07-R2-02: per-level
+    /// containment needs each member's storage — fixed sizes
+    /// chase through wrappers; arrays multiply out (depth-capped:
+    /// corrupt self-nesting refuses); anything else is malformed
+    /// BTF, never guessed. Pointers read u64 (the 64-bit BPF
+    /// target — same width the pointer proof checks).
+    fn type_extent(&self, id: u32) -> Result<u32, BtfError> {
+        self.type_extent_at(id, 0)
+    }
+
+    /// Depth-capped worker behind [`Btf::type_extent`].
+    fn type_extent_at(&self, id: u32, depth: usize) -> Result<u32, BtfError> {
+        if depth > DESCENT_CAP {
+            return Err(bad("member type nesting exceeds the descent cap".to_owned()));
+        }
+        let rec = self.rec(self.chase_wrappers(id)?)?;
+        match rec.kind {
+            KIND_INT | KIND_STRUCT | KIND_UNION | KIND_ENUM | KIND_ENUM64 | KIND_FLOAT => {
+                Ok(rec.size_or_type)
+            }
+            KIND_PTR => Ok(8),
+            KIND_ARRAY => {
+                let (elem, nelems) = self.array_shape(rec)?;
+                let elem_extent = self.type_extent_at(elem, depth + 1)?;
+                nelems
+                    .checked_mul(elem_extent)
+                    .ok_or_else(|| bad(format!("array {nelems} x {elem_extent} bytes overflows")))
+            }
+            _ => Err(bad(format!(
+                "member type id {id} is kind {}, not sized storage",
+                rec.kind
+            ))),
+        }
     }
 
     /// Containment (R4): the `width`-byte BPF read at root-relative
@@ -995,6 +1096,21 @@ impl<'a> Btf<'a> {
             }
             let base = bits / 8;
             if wanted {
+                // T07-R2-02: the sought member's TYPE extent must
+                // sit inside its immediate carrier (a nested member
+                // that fits the root but escapes its carrier is
+                // corrupt/drifted BTF — the read would chase an
+                // adjacent word as the member).
+                let extent = self.type_extent(mtype)?;
+                let end = base
+                    .checked_add(extent)
+                    .ok_or_else(|| bad("member extent offset overflows".to_owned()))?;
+                if end > rec.size_or_type {
+                    return Err(bad(format!(
+                        "member extent [{base}..{end}) escapes its {}-byte carrier",
+                        rec.size_or_type
+                    )));
+                }
                 return Ok(Some((base, mtype)));
             }
             if descend {
@@ -1002,14 +1118,28 @@ impl<'a> Btf<'a> {
                 // (through const/typedef wrappers), offsets add; the
                 // LEAF type id propagates (the shape describes the
                 // sought member, not the anonymous carrier).
-                if let Some(tid) = self.anon_target(mtype)?
-                    && let Some((off, leaf)) = self.member_at(tid, member, depth + 1, path)?
-                {
-                    return Ok(Some((
-                        base.checked_add(off)
-                            .ok_or_else(|| bad("anonymous member offset overflows".to_owned()))?,
-                        leaf,
-                    )));
+                // (T07-R2-02: the carrier itself must sit inside its
+                // parent — nesting proves at EVERY level, not just
+                // the root.)
+                if let Some(tid) = self.anon_target(mtype)? {
+                    let carrier = self.rec(tid)?.size_or_type;
+                    let carrier_end = base
+                        .checked_add(carrier)
+                        .ok_or_else(|| bad("anonymous carrier offset overflows".to_owned()))?;
+                    if carrier_end > rec.size_or_type {
+                        return Err(bad(format!(
+                            "anonymous carrier [{base}..{carrier_end}) escapes its {}-byte parent",
+                            rec.size_or_type
+                        )));
+                    }
+                    if let Some((off, leaf)) = self.member_at(tid, member, depth + 1, path)? {
+                        return Ok(Some((
+                            base.checked_add(off).ok_or_else(|| {
+                                bad("anonymous member offset overflows".to_owned())
+                            })?,
+                            leaf,
+                        )));
+                    }
                 }
             }
         }
@@ -1098,9 +1228,21 @@ mod tests {
         }
 
         fn int(&mut self, name: &str, size: u32) -> u32 {
+            // Realistic kernel encoding: full width, zero offset
+            // (signed iff the name says `int` — pahole-shape-exact;
+            // the T07-R2-01 adversarial shapes use `int_enc`).
+            let encoding = if name == "int" { 1u32 } else { 0u32 };
+            self.int_enc(name, size, size * 8, 0, encoding)
+        }
+
+        /// INT with explicit encoding: storage `size` bytes, value
+        /// `bits` wide at bit `offset` (T07-R2-01 adversarial
+        /// shapes: narrowed/shifted values in 4-byte storage).
+        fn int_enc(&mut self, name: &str, size: u32, bits: u32, offset: u32, encoding: u32) -> u32 {
             let name_off = self.str(name);
-            // INT aux: 4 bytes encoding (unused here — all zeros).
-            self.rec(name_off, KIND_INT, 0, size, &[0, 0, 0, 0])
+            // INT aux: bits[0..8) + offset[16..24) + encoding[24..28).
+            let data = (bits & 0xff) | ((offset & 0xff) << 16) | ((encoding & 0x0f) << 24);
+            self.rec(name_off, KIND_INT, 0, size, &data.to_le_bytes())
         }
 
         fn member_aux(name_off: u32, mtype: u32, bit_off: u32) -> [u8; 12] {
@@ -1235,6 +1377,125 @@ mod tests {
         assert!(
             format!("{err:?}").contains("escapes"),
             "names containment: {err:?}"
+        );
+    }
+
+    #[test]
+    fn r4_shifted_or_narrow_int_counter_refuses() {
+        // T07-R2-01: 4-byte storage proves nothing alone — a
+        // shifted 16-bit value (offset 16) or a narrow 16-bit
+        // value (offset 0) in a 4-byte container must refuse:
+        // the BPF reads the full u32, not the value.
+        for (bits, offset, why) in [(16u32, 16u32, "shifted"), (16, 0, "narrow")] {
+            let mut img = Img::new();
+            let v16_id = img.int_enc("narrow_t", 4, bits, offset, 0);
+            let tfm_name = img.str("crypto_tfm");
+            let refcnt_name = img.str("refcnt");
+            let aux = Img::member_aux(refcnt_name, v16_id, 0);
+            img.rec(tfm_name, KIND_STRUCT, 1, 8, &aux);
+            let bytes = img.image();
+            let btf = Btf::parse(&bytes).expect("fixture parses");
+            let err = btf
+                .member_counter("crypto_tfm", "refcnt")
+                .expect_err("narrow/shifted counter must refuse");
+            assert!(
+                format!("{err:?}").contains("bits") || format!("{err:?}").contains("offset"),
+                "{why} names the encoding: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r4_shifted_leaf_counter_refuses() {
+        // T07-R2-01 nested arm: the refcount_t-shaped wrapper
+        // with a shifted 16-bit leaf INT refuses — the leaf
+        // proof is VALUE width, not storage width.
+        let mut img = Img::new();
+        let leaf_id = img.int_enc("shifted_counter", 4, 16, 16, 0);
+        let atomic_name = img.str("atomic_t");
+        let counter_name = img.str("counter");
+        let aux = Img::member_aux(counter_name, leaf_id, 0);
+        let atomic_id = img.rec(atomic_name, KIND_STRUCT, 1, 4, &aux);
+        let tfm_name = img.str("crypto_tfm");
+        let refcnt_name = img.str("refcnt");
+        let aux = Img::member_aux(refcnt_name, atomic_id, 0);
+        img.rec(tfm_name, KIND_STRUCT, 1, 4, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert!(
+            btf.member_counter("crypto_tfm", "refcnt").is_err(),
+            "shifted leaf must refuse"
+        );
+    }
+
+    #[test]
+    fn r4_nested_carrier_escape_refuses() {
+        // T07-R2-02: a purported 8-byte pointer at carrier offset
+        // 8 inside a 4-byte anonymous carrier, inside a 64-byte
+        // root — fits the root, escapes the carrier: the read
+        // would chase an adjacent word as the member.
+        let mut img = Img::new();
+        let pointee_name = img.str("crypto_alg");
+        let pointee_id = img.rec(pointee_name, KIND_STRUCT, 0, 64, &[]);
+        let anon_off = img.str("");
+        let ptr_id = img.rec(anon_off, KIND_PTR, 0, pointee_id, &[]);
+        let carrier_name = img.str("carrier");
+        let p_name = img.str("p");
+        let aux = Img::member_aux(p_name, ptr_id, 8 * 8);
+        let carrier_id = img.rec(carrier_name, KIND_STRUCT, 1, 4, &aux);
+        let root_name = img.str("root");
+        let aux = Img::member_aux(0, carrier_id, 0);
+        img.rec(root_name, KIND_STRUCT, 1, 64, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        let err = btf
+            .member_ptr_to_struct("root", "p", "crypto_alg")
+            .expect_err("carrier escape must refuse");
+        assert!(
+            format!("{err:?}").contains("escapes its 4-byte carrier"),
+            "names the carrier: {err:?}"
+        );
+        // Contained twin: a 16-byte anonymous carrier with the
+        // pointer at carrier offset 8 still resolves (the proof
+        // refuses escapes, not nesting).
+        let mut img = Img::new();
+        let pointee_name = img.str("crypto_alg");
+        let pointee_id = img.rec(pointee_name, KIND_STRUCT, 0, 64, &[]);
+        let anon_off = img.str("");
+        let ptr_id = img.rec(anon_off, KIND_PTR, 0, pointee_id, &[]);
+        let carrier_name = img.str("carrier");
+        let p_name = img.str("p");
+        let aux = Img::member_aux(p_name, ptr_id, 8 * 8);
+        let carrier_id = img.rec(carrier_name, KIND_STRUCT, 1, 16, &aux);
+        let root_name = img.str("root");
+        let aux = Img::member_aux(0, carrier_id, 0);
+        img.rec(root_name, KIND_STRUCT, 1, 64, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert_eq!(
+            btf.member_ptr_to_struct("root", "p", "crypto_alg")
+                .expect("contained nesting resolves"),
+            8
+        );
+    }
+
+    #[test]
+    fn r4_empty_embedded_refuses() {
+        // T07-R2-02: a zero-size embedded struct proves no extent
+        // — further offsets would add past it.
+        let mut img = Img::new();
+        let base_name = img.str("crypto_tfm");
+        let base_id = img.rec(base_name, KIND_STRUCT, 0, 0, &[]);
+        let sk_name = img.str("crypto_skcipher");
+        let member_name = img.str("base");
+        let aux = Img::member_aux(member_name, base_id, 0);
+        img.rec(sk_name, KIND_STRUCT, 1, 8, &aux);
+        let bytes = img.image();
+        let btf = Btf::parse(&bytes).expect("fixture parses");
+        assert!(
+            btf.member_embedded_struct("crypto_skcipher", "base", "crypto_tfm")
+                .is_err(),
+            "empty embedded must refuse"
         );
     }
 

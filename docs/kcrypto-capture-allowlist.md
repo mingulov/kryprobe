@@ -277,9 +277,11 @@ validation cannot prove that.)
 
 ## `LRING`/`LCFG` lifecycle transport (T07, R6 pin)
 
-Lifecycle edges ride the `LRING` ring as 48B `LEdge` (op
-submit/return) and 112B `LTfm` (transform alloc/destroy/config
-halves); the 64B `LCFG` row is loader-written config like `KCFG`.
+Lifecycle edges ride the `LRING` ring as 112B `LEdge` v5 (op
+submit/return — the v4 48B shape is retired: the transform word
+rides at 40..48, the driver name at 48..112) and 112B `LTfm`
+(transform alloc/destroy/config halves); the 64B `LCFG` row is
+loader-written config like `KCFG`.
 All three carry `FIELDS` lists pinned by
 `allowlist_field_set_matches_docs` — same tripwire as the
 aggregate structs.

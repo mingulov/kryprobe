@@ -757,6 +757,8 @@ fn outcome_with(
         integrity: IntegritySummary::default(),
         terminal_state: kryprobe_core::session::SessionState::Finalized,
         interrupted: false,
+        // Aggregate-profile fixture: no registry snapshot.
+        enrichment: None,
     }
 }
 
@@ -860,13 +862,25 @@ fn report_json_handfed_shape_case() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["coverage", "integrity", "observations", "verdict"]);
+    assert_eq!(
+        keys,
+        [
+            "coverage",
+            "enrichment",
+            "integrity",
+            "observations",
+            "verdict"
+        ]
+    );
     // Brief order on the wire starts with `observations` (the byte-exact
     // golden pins the full order).
     assert!(
         text.starts_with("{\"observations\":"),
         "key order: {text:?}"
     );
+    // T07-R2-09: the hand-fed aggregate fixture honestly reports no
+    // registry snapshot (null, not a fabricated inventory).
+    assert!(doc["enrichment"].is_null(), "no silent inventory: {text:?}");
     assert_eq!(doc["verdict"]["status"], "complete");
     assert_eq!(doc["verdict"]["missing"], serde_json::json!([]));
     assert_eq!(doc["observations"].as_array().expect("obs array").len(), 1);

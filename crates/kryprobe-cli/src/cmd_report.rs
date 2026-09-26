@@ -6,6 +6,7 @@
 use crate::args::ReportFormat;
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
+use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
 use kryprobe_report::{validate_and_render_file, write_str_atomic};
 use std::io::Write;
 use std::path::Path;
@@ -52,8 +53,8 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
 
 /// Renders one outcome as a single JSON doc plus a trailing newline:
 /// brief-exact keys in brief order (`observations`, `coverage`,
-/// `integrity`, `verdict`), with the `doctor`-shaped verdict
-/// `{status, missing}`. Serialized straight into one growing buffer
+/// `integrity`, `enrichment`, `verdict`), with the `doctor`-shaped
+/// verdict `{status, missing}`. Serialized straight into one growing buffer
 /// (M7: a `json!` map would sort the keys, and four `to_string`s plus
 /// `format!` would peak at ~2× the doc size); byte-identical to the
 /// piece-assembled form.
@@ -95,6 +96,25 @@ pub fn render_report_json(outcome: &LiveOutcome) -> Result<String, String> {
     buf.extend_from_slice(b",\"integrity\":");
     serde_json::to_writer(&mut buf, &outcome.integrity)
         .map_err(|err| format!("defect: integrity does not serialize: {err}"))?;
+    // T07-R2-09: the ledger's enrichment verdict rides the JSON
+    // report — available/unavailable/not-attempted, never dropped.
+    buf.extend_from_slice(b",\"enrichment\":");
+    match &outcome.enrichment {
+        None => buf.extend_from_slice(b"null"),
+        Some(EnrichmentStatus::Available { entries, truncated }) => {
+            buf.extend_from_slice(b"{\"status\":\"available\",\"entries\":");
+            buf.extend_from_slice(entries.to_string().as_bytes());
+            buf.extend_from_slice(b",\"truncated\":");
+            buf.extend_from_slice(truncated.to_string().as_bytes());
+            buf.extend_from_slice(b"}");
+        }
+        Some(EnrichmentStatus::Unavailable { reason }) => {
+            buf.extend_from_slice(b"{\"status\":\"unavailable\",\"reason\":");
+            serde_json::to_writer(&mut buf, reason)
+                .map_err(|err| format!("defect: enrichment does not serialize: {err}"))?;
+            buf.extend_from_slice(b"}");
+        }
+    }
     buf.extend_from_slice(b",\"verdict\":{\"status\":\"");
     buf.extend_from_slice(status.as_bytes());
     buf.extend_from_slice(b"\",\"missing\":");
@@ -141,10 +161,16 @@ fn finish_report_live(
         3
     };
     let text = match format {
-        ReportFormat::Human => kryprobe_report::live_render::render_watch_tables(
-            &outcome.observations,
-            &outcome.coverage,
-        ),
+        ReportFormat::Human => {
+            let mut text = kryprobe_report::live_render::render_watch_tables(
+                &outcome.observations,
+                &outcome.coverage,
+            );
+            // T07-R2-09: the enrichment verdict trailers the human
+            // report (same line as `watch` — one shared renderer).
+            text.push_str(&crate::live::render_enrichment_line(&outcome.enrichment));
+            text
+        }
         ReportFormat::Json => match render_report_json(&outcome) {
             Ok(text) => text,
             Err(err) => {
@@ -288,8 +314,23 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["coverage", "integrity", "observations", "verdict"]);
+        assert_eq!(
+            keys,
+            [
+                "coverage",
+                "enrichment",
+                "integrity",
+                "observations",
+                "verdict"
+            ]
+        );
         assert!(text.starts_with("{\"observations\":"), "brief key order");
+        // T07-R2-09: enrichment rides between integrity and
+        // verdict; the aggregate fixture never snapshots (null).
+        assert!(
+            text.contains(",\"enrichment\":null,\"verdict\":"),
+            "enrichment key placement: {text}"
+        );
         assert_eq!(doc["verdict"]["status"], "complete");
         assert_eq!(doc["verdict"]["missing"], serde_json::json!([]));
 
@@ -300,6 +341,53 @@ mod tests {
         assert_eq!(
             doc["verdict"]["missing"],
             serde_json::json!(["attach", "capture-integrity"])
+        );
+    }
+
+    #[test]
+    fn json_and_human_carry_enrichment_verdict() {
+        // T07-R2-09: every enrichment arm reaches BOTH user
+        // surfaces — the JSON key and the human trailer line — so
+        // an unreadable `/proc/crypto` never looks like available
+        // enrichment.
+        let mut outcome = json_fixture();
+        outcome.enrichment = Some(EnrichmentStatus::Available {
+            entries: 41,
+            truncated: true,
+        });
+        let text = render_report_json(&outcome).expect("available renders");
+        let doc: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("available json parses");
+        assert_eq!(
+            doc["enrichment"],
+            serde_json::json!({"status": "available", "entries": 41, "truncated": true})
+        );
+        assert_eq!(
+            crate::live::render_enrichment_line(&outcome.enrichment),
+            "enrichment: available (entries=41, truncated=true)\n"
+        );
+        outcome.enrichment = Some(EnrichmentStatus::Unavailable {
+            reason: "os error 2".to_owned(),
+        });
+        let text = render_report_json(&outcome).expect("unavailable renders");
+        let doc: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("unavailable json parses");
+        assert_eq!(
+            doc["enrichment"],
+            serde_json::json!({"status": "unavailable", "reason": "os error 2"})
+        );
+        assert_eq!(
+            crate::live::render_enrichment_line(&outcome.enrichment),
+            "enrichment: unavailable (reason: os error 2)\n"
+        );
+        outcome.enrichment = None;
+        let text = render_report_json(&outcome).expect("none renders");
+        let doc: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("none json parses");
+        assert!(doc["enrichment"].is_null(), "not-attempted is null");
+        assert_eq!(
+            crate::live::render_enrichment_line(&outcome.enrichment),
+            "enrichment: not attempted (profile snapshots no registry)\n"
         );
     }
 
@@ -438,11 +526,13 @@ mod tests {
             &mut stderr,
         );
         assert_eq!(code, 0);
+        let human = String::from_utf8(stdout).expect("utf-8");
+        assert!(human.contains("COMPLETE\n"), "human trailer kept");
+        // T07-R2-09: the enrichment verdict trailers the tables
+        // (aggregate fixture: honestly not attempted).
         assert!(
-            String::from_utf8(stdout)
-                .expect("utf-8")
-                .ends_with("COMPLETE\n"),
-            "human trailer"
+            human.ends_with("enrichment: not attempted (profile snapshots no registry)\n"),
+            "enrichment trailer: {human}"
         );
         // Gaps → 3 (findings stand: the tables still render).
         let mut stdout = Vec::new();
@@ -540,13 +630,16 @@ mod tests {
         );
         assert_eq!(code, 0);
         assert!(stdout.is_empty(), "file mode prints no stdout");
+        let mut human_text = kryprobe_report::live_render::render_watch_tables(
+            &json_fixture().observations,
+            &json_fixture().coverage,
+        );
+        human_text.push_str(&crate::live::render_enrichment_line(
+            &json_fixture().enrichment,
+        ));
         assert_eq!(
             std::fs::read(&human).expect("read human out file"),
-            kryprobe_report::live_render::render_watch_tables(
-                &json_fixture().observations,
-                &json_fixture().coverage,
-            )
-            .as_bytes()
+            human_text.as_bytes()
         );
         // Unwritable destination fails closed (exit 1, nothing on stdout).
         let missing = scratch.path().join("no-such-dir").join("report.json");

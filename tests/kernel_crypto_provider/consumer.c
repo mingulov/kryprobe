@@ -174,6 +174,7 @@ static int kxc_tfm_acquire_typed(struct kxc_run *run, const char *req_name,
 				       struct crypto_skcipher **tfm, u64 *aseq)
 {
 	struct crypto_skcipher *t;
+	int err;
 
 	t = crypto_alloc_skcipher(req_name, type, mask);
 	if (IS_ERR(t))
@@ -182,7 +183,13 @@ static int kxc_tfm_acquire_typed(struct kxc_run *run, const char *req_name,
 	kxc_emit_alloc(run, *aseq, req_name,
 		       crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t)),
 		       type, mask);
-	if (crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN)) {
+	/* T07-R2-04: the setup setkey is hooked sensor traffic — it
+	 * rides the transcript as its own config row (success or
+	 * failure), so the transform oracle compares complete
+	 * fixture truth, never a silent setup step. */
+	err = crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN);
+	kxc_emit_config(run, *aseq, "setkey", err, KXC_KEYLEN);
+	if (err) {
 		kxc_tfm_release(run, t, *aseq);
 		return -EKEYREJECTED;
 	}
@@ -199,8 +206,8 @@ static int kxc_tfm_acquire(struct kxc_run *run, const char *req_name,
 /*
  * Raw skcipher acquisition: alloc + alloc row, NO setkey. For
  * scenarios that drive configurations explicitly (every setkey
- * they run is emitted as its own config row — no hidden setup
- * key, unlike kxc_tfm_acquire whose setup setkey is unrecorded).
+ * they run is emitted as its own config row — including the
+ * setup setkey, which kxc_tfm_acquire_typed records as well).
  */
 static int kxc_tfm_acquire_raw(struct kxc_run *run, const char *req_name,
 			       struct crypto_skcipher **tfm, u64 *aseq)

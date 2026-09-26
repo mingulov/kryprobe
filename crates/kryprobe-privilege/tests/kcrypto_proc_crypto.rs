@@ -187,7 +187,7 @@ fn overlong_name_truncates_and_flags_entry() {
     // field bound — the block stays (inventory, not proof) with
     // `truncated` set, never silently complete.
     let long = "n".repeat(2000);
-    let text = format!("name : {long}\\ndriver : d\\n\\n");
+    let text = format!("name : {long}\ndriver : d\n\n");
     let path = registry_file("longname", &text);
     let snap = snapshot_proc_crypto(&path).expect("long name must parse");
     let _ = std::fs::remove_file(&path);
@@ -259,6 +259,45 @@ fn winning_driver_selects_highest_priority() {
     let win = snap.winning_driver("pick").expect("a winner exists");
     assert_eq!(win.driver.as_deref(), Some("high"));
     assert!(snap.winning_driver("absent").is_none());
+}
+
+#[test]
+fn winning_driver_excludes_clipped_name_keys() {
+    // T07-R2-07: a high-priority 2,000-char name clips to the same
+    // 1,024-char prefix as a genuine 1,024-char name — the clipped
+    // key must NOT win the exact lookup (partial identity never
+    // matches as a full key); the genuine entry wins instead, and
+    // a name matching ONLY a clipped key resolves to nothing.
+    let genuine = "n".repeat(1024);
+    let long = "n".repeat(2000);
+    let text = format!(
+        "name : {long}\ndriver : clipped-high\npriority : 400\n\nname : {genuine}\ndriver : exact-low\npriority : 100\n\n"
+    );
+    let path = registry_file("clipkey", &text);
+    let snap = snapshot_proc_crypto(&path).expect("clipkey must parse");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(snap.entries.len(), 2);
+    assert!(snap.entries[0].name_truncated, "long key flags clipped");
+    assert!(!snap.entries[1].name_truncated, "genuine key exact");
+    let win = snap
+        .winning_driver(&genuine)
+        .expect("exact key still resolves");
+    assert_eq!(
+        win.driver.as_deref(),
+        Some("exact-low"),
+        "clipped high-priority key must not win"
+    );
+    // A lookup matching only a clipped key proves no winner.
+    let solo = registry_file(
+        "clipkey-solo",
+        &format!("name : {long}\ndriver : x\npriority : 400\n\n"),
+    );
+    let solo_snap = snapshot_proc_crypto(&solo).expect("solo must parse");
+    let _ = std::fs::remove_file(&solo);
+    assert!(
+        solo_snap.winning_driver(&genuine).is_none(),
+        "partial key resolves to nothing"
+    );
 }
 
 #[test]

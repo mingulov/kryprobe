@@ -35,6 +35,11 @@ fn finish_watch(
                     &outcome.coverage
                 )
             );
+            let _ = write!(
+                stdout,
+                "{}",
+                crate::live::render_enrichment_line(&outcome.enrichment)
+            );
             // 4B-M5: an interrupted window is partial evidence even
             // when every measured dimension held — exit 3, with the
             // tables above as the preserved evidence.
@@ -353,6 +358,8 @@ pub(crate) mod fixtures {
             integrity: IntegritySummary::default(),
             terminal_state: kryprobe_core::session::SessionState::Finalized,
             interrupted: false,
+            // Aggregate-profile fixture: no registry snapshot.
+            enrichment: None,
         }
     }
 

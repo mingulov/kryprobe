@@ -210,8 +210,15 @@ pub struct TfmStats {
     /// Releases of a null/ERR frontend (the kernel returns early —
     /// no dec-test, no free — counted, disturb nothing).
     pub noop_releases: u64,
-    /// Releases for a base with no live generation (missed alloc
-    /// AND missed ops, or a foreign transform — never a phantom).
+    /// Releases for a base with no live generation (T07-R2-05:
+    /// verdict-neutral INVENTORY, never loss — the destroy edge
+    /// carries no family, so an expected digest/shash release
+    /// (destroy-observed-only families) is indistinguishable from
+    /// a destroy-only missed identity. A missed identity that is
+    /// USED or CONFIGURED still votes loss via
+    /// `unobserved_boundary`/`config_unlinked`/D4 — only the
+    /// never-observed-at-all lifetime stays silent here, honestly
+    /// unclassifiable).
     pub unknown_releases: u64,
     /// Generations forced-retired as ambiguous by a new alloc at
     /// their live base (the old lifetime ended unobserved).
@@ -248,11 +255,11 @@ pub struct TfmStats {
     /// dangling destroy on a still-live bound generation ALSO
     /// marks it ambiguous, counted below).
     pub unfinished: u64,
-    /// Joined configs attributed to a first-seen generation
-    /// (T07-02: the lifetime's creation boundary was never
-    /// observed — a missed free could have swapped the lifetime
-    /// under the address, so the epoch bump lands on an
-    /// uncertain identity and exact reuse voids).
+    /// First-seen admissions (T07-02/R2-01: the lifetime's
+    /// creation boundary was never observed — a missed free
+    /// could have swapped the lifetime under the address, so the
+    /// generation carries an uncertain identity and exact reuse
+    /// voids from admission, not from a later config).
     pub unobserved_boundary: u64,
 }
 
@@ -691,10 +698,17 @@ impl TransformTracker {
     /// boundary was observed exactly: any ambiguous release,
     /// forced retire, D4 refusal (`live_full`/`table_full` — a
     /// lifetime unadmitted is a boundary unobserved), unfinished
-    /// close, or config on a first-seen (unobserved-creation)
-    /// lifetime (cumulative counters — tombstone eviction cannot
+    /// close, first-seen admission (unobserved creation), corrupt
+    /// record, unpaired edge, unjoinable return, or cross-site
+    /// return (cumulative counters — tombstone eviction cannot
     /// erase them) disables the claim that a base's lifetimes
-    /// chained exactly end-to-start.
+    /// chained exactly end-to-start. (R2-01: a corrupt/unpaired/
+    /// unjoinable/crossed record can hide a creation or
+    /// destruction boundary, so every identity-affecting refusal
+    /// voids — except `unknown_releases`, which post-R2-05 counts
+    /// expected destroy-only family traffic as inventory, and the
+    /// kept-attempt classes `submit_refused`/`stale_returns`/
+    /// `stale_releases`, whose first/true pairing still stands.)
     #[must_use]
     pub fn reuse_exact(&self) -> bool {
         self.stats.ambiguous_releases == 0
@@ -703,6 +717,10 @@ impl TransformTracker {
             && self.stats.table_full == 0
             && self.stats.unfinished == 0
             && self.stats.unobserved_boundary == 0
+            && self.stats.bad_records == 0
+            && self.stats.tainted_refused == 0
+            && self.stats.unknown_returns == 0
+            && self.stats.mismatched_returns == 0
     }
 
     /// Admit the transform behind an op submit edge (first-seen):
@@ -714,12 +732,15 @@ impl TransformTracker {
     /// unreadable — F05: selected metadata captured, allocation /
     /// requested name / previous configuration stay unknown) with
     /// its truncation bit (`drv_truncated` — D9: clipped names read
-    /// as partial), flagged `first_seen`. A 0 frontend (unreadable
-    /// request link) admits nothing and counts `unlinked_ops`. Past
-    /// the live bound the admission refuses (`live_full`) — D4, no
-    /// silent LRU. Issues the next opaque id (id exhaustion refuses
-    /// like the submit path — the `u64::MAX` sentinel is never
-    /// issued).
+    /// as partial), flagged `first_seen` — AND counts
+    /// `unobserved_boundary` (R2-01: the creation boundary is
+    /// unobserved AT admission, so exactness voids from the
+    /// admitting edge, never from a later config). A 0 frontend
+    /// (unreadable request link) admits nothing and counts
+    /// `unlinked_ops`. Past the live bound the admission refuses
+    /// (`live_full`) — D4, no silent LRU. Issues the next opaque
+    /// id (id exhaustion refuses like the submit path — the
+    /// `u64::MAX` sentinel is never issued).
     pub fn admit_first_seen(
         &mut self,
         frontend: u64,
@@ -746,6 +767,7 @@ impl TransformTracker {
         }
         let id = self.next_id;
         self.next_id += 1;
+        self.stats.unobserved_boundary += 1;
         self.live.insert(base, self.generations.len());
         self.generations.push(Generation {
             info: GenerationInfo {
@@ -1179,14 +1201,13 @@ impl TransformTracker {
                 }
             },
         };
-        // T07-02: a config attributed to a first-seen lifetime
-        // lands on an uncertain identity (creation boundary never
-        // observed — a missed free could have swapped the lifetime
-        // under the address). Attributed best-effort AND counted —
-        // F06 partial, never a confident old identity.
-        if self.generations[idx].info.first_seen {
-            self.stats.unobserved_boundary += 1;
-        }
+        // T07-02/R2-01: a config attributed to a first-seen
+        // lifetime lands on an uncertain identity (creation
+        // boundary never observed — a missed free could have
+        // swapped the lifetime under the address). Attributed
+        // best-effort — F06 partial, never a confident old
+        // identity — with the uncertainty already counted once at
+        // admission (no per-config double count).
         let info = &mut self.generations[idx].info;
         info.configs += 1;
         info.last_config_site = site;

@@ -169,6 +169,41 @@ pub enum EnrichmentStatus {
     },
 }
 
+impl EnrichmentStatus {
+    /// Project the bring-up snapshot outcome (T07-09: the terminal
+    /// ledger tells absent enrichment from an available snapshot —
+    /// a failed startup read never refuses capture, but its report
+    /// carries the reason, never silence). The `None`/`None` and
+    /// `Some`/`Some` arms are unreachable by construction; they
+    /// report unreachable-loud, never a fabricated inventory.
+    ///
+    /// (R2-06: `truncated` folds BOTH the snapshot-level bound
+    /// verdict AND per-entry field clipping — `snap.truncated`
+    /// covers only the read/entry caps, so a 2,000-char name
+    /// clipped to 1,024 must still read truncated.)
+    #[must_use]
+    pub fn from_snapshot(
+        registry: &Option<ProcCryptoSnapshot>,
+        registry_error: &Option<String>,
+    ) -> Self {
+        match (registry, registry_error) {
+            (Some(snap), None) => Self::Available {
+                entries: snap.entries.len(),
+                truncated: snap.truncated || snap.entries.iter().any(|e| e.truncated),
+            },
+            (None, Some(reason)) => Self::Unavailable {
+                reason: reason.clone(),
+            },
+            (None, None) => Self::Unavailable {
+                reason: "sensor invariant: snapshot outcome unrecorded".to_owned(),
+            },
+            (Some(_), Some(_)) => Self::Unavailable {
+                reason: "sensor invariant: snapshot and error both set".to_owned(),
+            },
+        }
+    }
+}
+
 /// Terminal ledger: completed records plus every loss class,
 /// snapshotted together (the single terminal accounting point).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,6 +673,21 @@ impl LifecycleSensor {
     /// snapshot, no per-drain alloc) + [`SensorCore::ingest_records`];
     /// the VM canary covers this shell.
     pub fn drain_once(&mut self, budget: usize) -> Result<DrainOutcome, DrainError> {
+        Ok(self.drain_once_raw(budget)?.0)
+    }
+
+    /// Drain once with the raw transport tapped (R2-04): the same
+    /// walk + ingest + consumer advance as [`Self::drain_once`],
+    /// PLUS the walked record bytes (pre-decode transport —
+    /// including records the decoder later refuses, so the
+    /// privacy tripwire sees discarded bytes too, never just
+    /// rendered views). The privacy lane test scans these bytes
+    /// for secret markers; production drains use `drain_once`
+    /// (identical ingest path — the tap observes, never forks).
+    pub fn drain_once_raw(
+        &mut self,
+        budget: usize,
+    ) -> Result<(DrainOutcome, Vec<Vec<u8>>), DrainError> {
         if self.state == SensorState::Closed {
             return Err(DrainError::StateInvalid {
                 expected: "Admit|Draining",
@@ -649,11 +699,12 @@ impl LifecycleSensor {
         let completed = self.core.ingest_records(&consumed.records);
         self.consumer = consumed.consumer;
         self.area.set_consumer(consumed.consumer);
-        Ok(DrainOutcome {
+        let outcome = DrainOutcome {
             records: consumed.records.len(),
             completed,
             busy: consumed.busy,
-        })
+        };
+        Ok((outcome, consumed.records))
     }
 
     /// Re-verify identity against the pre-arm baseline (M2 "read
@@ -698,25 +749,10 @@ impl LifecycleSensor {
         let miss_current =
             snapshot_prog_misses(&self.configured.loaded).map_err(LedgerError::Misses)?;
         // T07-09: the bring-up snapshot outcome reaches the
-        // terminal ledger — available inventory vs an explicit
-        // unavailable reason (the `None`/`None` arm is unreachable
-        // by construction; it reports unreachable-loud, never a
-        // fabricated empty inventory).
-        let enrichment = match (&self.registry, &self.registry_error) {
-            (Some(snap), None) => EnrichmentStatus::Available {
-                entries: snap.entries.len(),
-                truncated: snap.truncated,
-            },
-            (None, Some(reason)) => EnrichmentStatus::Unavailable {
-                reason: reason.clone(),
-            },
-            (None, None) => EnrichmentStatus::Unavailable {
-                reason: "sensor invariant: snapshot outcome unrecorded".to_owned(),
-            },
-            (Some(_), Some(_)) => EnrichmentStatus::Unavailable {
-                reason: "sensor invariant: snapshot and error both set".to_owned(),
-            },
-        };
+        // terminal ledger via the shared projection (same arms the
+        // sensor test pins — available inventory vs an explicit
+        // unavailable reason).
+        let enrichment = EnrichmentStatus::from_snapshot(&self.registry, &self.registry_error);
         self.core
             .ledger(
                 kernel_loss,

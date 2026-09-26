@@ -1464,6 +1464,18 @@ fn lifecycle_btf_config(
     }
     btf_rec(&mut types, 0, 13, 3, base + 9, &aux);
     btf_rec(&mut types, aeadkey_off, 12, 1, base + 16, &[]);
+    // T07-R2-01 adversarial length: 4-byte storage with a shifted
+    // 16-bit value (id base + 18 — appended AFTER the protos so no
+    // existing id shifts).
+    let narrow_off = btf_push_str(&mut strtab, "narrow_u32");
+    btf_rec(
+        &mut types,
+        narrow_off,
+        1,
+        0,
+        4,
+        &0x0010_0010u32.to_le_bytes(),
+    );
     btf_image(&types, &strtab)
 }
 
@@ -1856,6 +1868,18 @@ fn t74_setkey_narrow_len_refused() {
         &lifecycle_btf_config(3, 25, 29, 32, 31, 2, 26, 30, 31, 26),
         "crypto_skcipher_setkey",
         "16-bit arg2",
+    );
+}
+
+#[test]
+fn t74_setkey_shifted_len_refused() {
+    // T07-R2-01: 4-byte storage with a shifted 16-bit value is
+    // not a length word — the unshifted u32 copy would misread
+    // it exactly like a narrowed counter.
+    assert_config_bad_proto(
+        &lifecycle_btf_config(3, 25, 29, 40, 31, 2, 26, 30, 31, 26),
+        "crypto_skcipher_setkey",
+        "shifted 16-bit arg2",
     );
 }
 

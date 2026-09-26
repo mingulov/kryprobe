@@ -54,6 +54,20 @@ fn expect_single_lifetime(ledger: &ParsedLedger) {
     assert!(ledger.allocs[0].final_free, "final free");
 }
 
+/// T07-R2-04: every `kxc_tfm_acquire` setup setkey rides the
+/// transcript as its own config row (success or failure) — the
+/// oracle pins exactly `n` of them (setkey, errno 0, len 16),
+/// never a silent setup step. (`rekey`/`authsize` acquire raw
+/// and drive configs explicitly, so they assert their own rows.)
+fn expect_setup_configs(ledger: &ParsedLedger, n: usize) {
+    assert_eq!(ledger.configs.len(), n, "setup setkey rows");
+    for (i, cfg) in ledger.configs.iter().enumerate() {
+        assert_eq!(cfg.op, "setkey", "setup row {i} op");
+        assert_eq!(cfg.result_errno, 0, "setup row {i} ok");
+        assert_eq!(cfg.len, 16, "setup row {i} key length");
+    }
+}
+
 #[test]
 #[ignore = "lab-driven: needs KCRYPTO_* guest ledger env (see scripts/kcrypto-lab.py)"]
 fn guest_ledger_matches_scenario_contract() {
@@ -66,6 +80,7 @@ fn guest_ledger_matches_scenario_contract() {
         // Terminal rows count as the completion notification.
         "sync-once" => {
             expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
             assert_eq!(ledger.requests.len(), 2, "encrypt + decrypt");
             let ops: Vec<&str> = ledger
                 .requests
@@ -83,6 +98,7 @@ fn guest_ledger_matches_scenario_contract() {
         // One submit, EINPROGRESS return, one terminal notification.
         "async-once" => {
             expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
             assert_eq!(ledger.requests.len(), 1, "one async invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt", "submit op label");
@@ -96,6 +112,7 @@ fn guest_ledger_matches_scenario_contract() {
         // fixture; order + gap receipted per run).
         "delayed-completion" => {
             expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
             assert_eq!(ledger.requests.len(), 1, "one delayed invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-delayed", "submit op label");
@@ -112,6 +129,7 @@ fn guest_ledger_matches_scenario_contract() {
         // depth-1 held queue: exactly EINPROGRESS then EBUSY x3.
         "backlog-accepted" => {
             expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
             assert_eq!(ledger.requests.len(), 4, "burst of four");
             let returns: Vec<i32> = ledger.requests.iter().map(|req| req.return_errno).collect();
             assert_eq!(
@@ -131,6 +149,7 @@ fn guest_ledger_matches_scenario_contract() {
         // in flight. Both are truthful poll results.
         "early-callback" => {
             expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
             assert_eq!(ledger.requests.len(), 1, "one polled invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-early", "submit op label");
@@ -155,6 +174,7 @@ fn guest_ledger_matches_scenario_contract() {
                 "resolved to the async fixture driver"
             );
             assert!(alloc.freed && alloc.final_free, "transform finally freed");
+            expect_setup_configs(&ledger, 1);
             assert_eq!(ledger.requests.len(), 1, "one async invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-exact", "submit op label");
@@ -177,6 +197,7 @@ fn guest_ledger_matches_scenario_contract() {
         // Reference held across the run, zero invocations.
         "refheld-release" => {
             expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
             assert!(ledger.requests.is_empty(), "no invocations");
         }
         // T07 F02: exact lower-priority sync driver, twice — once
@@ -208,7 +229,9 @@ fn guest_ledger_matches_scenario_contract() {
                 "restricted mask carried"
             );
             assert!(ledger.requests.is_empty(), "no invocations");
-            assert!(ledger.configs.is_empty(), "no configurations");
+            // Both typed acquisitions key their transform (one setup
+            // row each — the oracle pins them, never silent).
+            expect_setup_configs(&ledger, 2);
         }
         // T07 F03: the failing provider's cra_init rejects the
         // allocation; the probe triple carries EINVAL, nothing
@@ -238,6 +261,7 @@ fn guest_ledger_matches_scenario_contract() {
             // [retained, final] sequence — a duplicate final
             // never parses.
             assert_eq!(alloc.releases, 2, "retained release + final free");
+            expect_setup_configs(&ledger, 1);
             assert!(ledger.requests.is_empty(), "no invocations");
         }
         // T07 F06: one thousand alloc/free lifetimes back to
@@ -254,7 +278,9 @@ fn guest_ledger_matches_scenario_contract() {
                 assert_eq!(alloc.releases, 1, "lifetime {i} one put");
             }
             assert!(ledger.requests.is_empty(), "no invocations");
-            assert!(ledger.configs.is_empty(), "no configurations");
+            // Every burst lifetime keys its transform: 1,000 setup
+            // rows, one per lifetime, all pinned.
+            expect_setup_configs(&ledger, 1000);
         }
         // T07 F07 (skcipher leg): setkey ok, an encrypt between
         // the changes, then a rejected short key; epochs and

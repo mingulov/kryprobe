@@ -86,7 +86,9 @@ use kryprobe_privilege::kcrypto_backend::{
 };
 use kryprobe_privilege::kcrypto_lifecycle::backend::{LifecycleBackend, lifecycle_event};
 use kryprobe_privilege::kcrypto_lifecycle::profile::{LifecycleProfile, manifest, max_programs};
-use kryprobe_privilege::kcrypto_lifecycle::sensor::{DrainOutcome, LifecycleLedger, QuietOutcome};
+use kryprobe_privilege::kcrypto_lifecycle::sensor::{
+    DrainOutcome, EnrichmentStatus, LifecycleLedger, QuietOutcome,
+};
 use kryprobe_privilege::kcrypto_lifecycle::view::prog_miss_delta_sum;
 use kryprobe_privilege::kcrypto_snapshot::{
     ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
@@ -197,6 +199,29 @@ pub struct LiveOutcome {
     /// SIGINT ended the window early (4B-M5): the outcome is final
     /// evidence for a cut-short window — callers render and exit 3.
     pub interrupted: bool,
+    /// Registry-enrichment outcome (T07-R2-09: `Some` on the
+    /// lifecycle profile — the ledger's available/unavailable
+    /// verdict reaches the user report; `None` where the profile
+    /// never snapshots the registry, rendered as not-attempted,
+    /// never silent).
+    pub enrichment: Option<EnrichmentStatus>,
+}
+
+/// One human-report trailer line for the enrichment verdict
+/// (T07-R2-09: shared by `watch` and `report --system` human —
+/// the ledger's available/unavailable verdict is user-visible;
+/// profiles that never snapshot say so, never stay silent).
+#[must_use]
+pub fn render_enrichment_line(enrichment: &Option<EnrichmentStatus>) -> String {
+    match enrichment {
+        Some(EnrichmentStatus::Available { entries, truncated }) => {
+            format!("enrichment: available (entries={entries}, truncated={truncated})\n")
+        }
+        Some(EnrichmentStatus::Unavailable { reason }) => {
+            format!("enrichment: unavailable (reason: {reason})\n")
+        }
+        None => "enrichment: not attempted (profile snapshots no registry)\n".to_owned(),
+    }
 }
 
 /// Live failure: unusable environment (→ exit 4) or internal defect
@@ -481,10 +506,11 @@ fn lifecycle_coverage(
     // unadmitted, unjoined, or uncertain-identity transform
     // evidence corrupts the generations the report counts —
     // normal transform accounting stays unmapped, same as the
-    // backend buckets). Duplicates repeat known state — no
-    // information lost, never flipping. A loss-clean ledger is
-    // still `Unknown`: internal pairing cannot prove kernel
-    // hook-delivery (S04/G9 twin).
+    // backend buckets; unbound destroys ride the inventory
+    // counter below, never the loss vote — T07-R2-05).
+    // Duplicates repeat known state — no information lost, never
+    // flipping. A loss-clean ledger is still `Unknown`: internal
+    // pairing cannot prove kernel hook-delivery (S04/G9 twin).
     let count_loss = ledger
         .kernel_loss
         .iter()
@@ -511,7 +537,6 @@ fn lifecycle_coverage(
         .saturating_add(ledger.tfm_stats.unfinished)
         .saturating_add(ledger.tfm_stats.ambiguous_releases)
         .saturating_add(ledger.tfm_stats.forced_retires)
-        .saturating_add(ledger.tfm_stats.unknown_releases)
         .saturating_add(ledger.tfm_stats.stale_releases)
         .saturating_add(ledger.tfm_stats.config_unlinked)
         .saturating_add(ledger.tfm_stats.unobserved_boundary)
@@ -534,6 +559,14 @@ fn lifecycle_coverage(
     aggregate_counts
         .counters
         .push(counter("count_loss", count_loss));
+    // T07-R2-05: unbound destroys stay VISIBLE as inventory
+    // (expected digest/shash releases share the counter with
+    // destroy-only missed identities) — verdict-neutral, never
+    // silent, never a loss vote.
+    aggregate_counts.counters.push(counter(
+        "unbound_destroy_inventory",
+        ledger.tfm_stats.unknown_releases,
+    ));
     aggregate_counts.counters.push(counter(
         "prog_miss_delta",
         prog_miss_delta_sum(&ledger.prog_misses),
@@ -651,22 +684,36 @@ fn lifecycle_coverage(
     // Transform join-health (T07-05/R3) joins the same count:
     // unjoined/dangling/misjoined transform attempts and
     // uncertain-identity releases are correlation events too.
+    // (T07-R2-08: D4 bound refusals, tainted/unlinked edges, and
+    // twin-validation refusals join as well — a refused identity
+    // or unjoinable edge breaks the join claim exactly like a
+    // stale return. Only `tombstone_evictions` stays out: eviction
+    // drops retired tombstones whose records already emitted; any
+    // late edge for one surfaces via unknown/stale. Unbound
+    // destroys stay out too (T07-R2-05: expected digest/shash
+    // releases are unjoinable BY DESIGN — no identity exists to
+    // join — so they ride inventory, never the join claim).
     let correlation_events = ledger
         .decode
         .gaps_synthesized
         .saturating_add(ledger.decode.stale_returns)
         .saturating_add(ledger.decode.unknown_invoc_returns)
         .saturating_add(ledger.decode.submit_refused)
+        .saturating_add(ledger.decode.bad_records)
         .saturating_add(ledger.reducer.ambiguous)
         .saturating_add(ledger.reducer.orphan)
         .saturating_add(ledger.tfm_stats.unknown_returns)
         .saturating_add(ledger.tfm_stats.stale_returns)
         .saturating_add(ledger.tfm_stats.mismatched_returns)
         .saturating_add(ledger.tfm_stats.submit_refused)
+        .saturating_add(ledger.tfm_stats.tainted_refused)
+        .saturating_add(ledger.tfm_stats.table_full)
+        .saturating_add(ledger.tfm_stats.live_full)
+        .saturating_add(ledger.tfm_stats.bad_records)
+        .saturating_add(ledger.tfm_stats.unlinked_ops)
         .saturating_add(ledger.tfm_stats.unfinished)
         .saturating_add(ledger.tfm_stats.ambiguous_releases)
         .saturating_add(ledger.tfm_stats.forced_retires)
-        .saturating_add(ledger.tfm_stats.unknown_releases)
         .saturating_add(ledger.tfm_stats.stale_releases)
         .saturating_add(ledger.tfm_stats.config_unlinked)
         .saturating_add(ledger.tfm_stats.unobserved_boundary);
@@ -1248,6 +1295,8 @@ fn drive_session_inner(
         integrity,
         terminal_state: controller.state(),
         interrupted,
+        // The aggregate profile never snapshots the registry.
+        enrichment: None,
     })
 }
 
@@ -1488,6 +1537,10 @@ fn drive_lifecycle_session_inner(
         integrity,
         terminal_state: controller.state(),
         interrupted,
+        // T07-R2-09: the ledger's enrichment verdict rides the
+        // outcome to the user report (available/unavailable —
+        // never dropped between sensor and render).
+        enrichment: Some(ledger.enrichment.clone()),
     })
 }
 
@@ -2099,7 +2152,6 @@ mod tests {
     fn lifecycle_ledger_clean() -> LifecycleLedger {
         use kryprobe_core::kcrypto::ReducerStats;
         use kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats;
-        use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
         LifecycleLedger {
             completed: Vec::new(),
             edge_hits: [4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -2319,7 +2371,9 @@ mod tests {
         // report — D4 exhaustion flips counts to Partial (never a
         // clean verdict over missing identities), uncertain
         // identity flips correlation, and truth-only transform
-        // traffic flips nothing.
+        // traffic flips nothing. (T07-R2-08: every refusal flips
+        // BOTH counts and correlation — a refused identity breaks
+        // the join claim, never just the count.)
         let interval = ValidityInterval {
             start_ns: 100,
             end_ns: Some(200),
@@ -2329,6 +2383,31 @@ mod tests {
         ledger.tfm_stats.live_full = 1;
         let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        // D4 pending-table exhaustion: same, both dimensions.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.table_full = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        // Every other refusal/unjoinable class flips both too.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.tainted_refused = 1;
+        ledger.tfm_stats.bad_records = 1;
+        ledger.tfm_stats.unlinked_ops = 1;
+        ledger.decode.bad_records = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        assert!(
+            coverage
+                .correlation
+                .counters
+                .iter()
+                .any(|c| c.name == "correlation_events" && c.value == 4),
+            "all four refusals counted: {:?}",
+            coverage.correlation.counters
+        );
         // Uncertain identity: an ambiguous release corrupts the
         // generations the report counts AND the correlation claim.
         let mut ledger = lifecycle_ledger_clean();
@@ -2359,6 +2438,54 @@ mod tests {
             coverage.correlation.status,
             CoverageStatus::CompleteForDeclaredBoundary
         );
+    }
+
+    #[test]
+    fn t07r205_unbound_destroys_are_inventory_not_loss() {
+        // T07-R2-05 mixed traffic: routine digest/shash releases
+        // (unbound destroys) during an otherwise clean capture
+        // flip NOTHING — counts stay Unknown, correlation stays
+        // Complete — while the magnitude stays visible on the
+        // inventory counter. A missed identity that is USED still
+        // flips both dimensions via its unobserved admission.
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.unknown_releases = 7;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Unknown);
+        assert_eq!(
+            coverage.correlation.status,
+            CoverageStatus::CompleteForDeclaredBoundary
+        );
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "unbound_destroy_inventory" && c.value == 7),
+            "inventory magnitude visible: {:?}",
+            coverage.aggregate_counts.counters
+        );
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "count_loss" && c.value == 0),
+            "no loss vote: {:?}",
+            coverage.aggregate_counts.counters
+        );
+        // Preserved loss: the same session where the missed
+        // identity was USED (op admission) flips both.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.unknown_releases = 7;
+        ledger.tfm_stats.unobserved_boundary = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
     }
 
     #[test]

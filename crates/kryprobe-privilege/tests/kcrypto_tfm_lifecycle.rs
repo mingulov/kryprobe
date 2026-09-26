@@ -957,6 +957,59 @@ fn config_on_first_seen_flags_uncertain_identity() {
 }
 
 #[test]
+fn exactness_voids_at_admission_and_on_identity_refusals() {
+    // R2-01/T07-R2-03: exactness is cumulative from the FIRST
+    // uncertainty — an op-only first-seen admission voids WITHOUT
+    // any later config (the creation boundary is unobserved at
+    // the admitting edge), and every identity-affecting refusal
+    // voids too (a corrupt/unpaired/unjoinable/crossed record can
+    // hide a boundary). Fresh tracker per arm: the counters are
+    // session-cumulative by design.
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    // Arm 1: op-only first-seen — no config, no destroy, just the
+    // admitting op. Exactness voids at admission.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    assert!(tracker.reuse_exact(), "clean tracker starts exact");
+    tracker.admit_first_seen(f1, "aesni", false);
+    assert_eq!(tracker.stats().unobserved_boundary, 1);
+    assert!(
+        !tracker.reuse_exact(),
+        "op-only admission voids exactness with no config"
+    );
+    // Arm 2: malformed destroy half (wire drift) voids.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut bad = destroy_entry(2, f1, 1, 1);
+    bad[37] = 1;
+    tracker.feed(&bad);
+    assert_eq!(tracker.stats().bad_records, 1);
+    assert!(!tracker.reuse_exact(), "corrupt record voids exactness");
+    // Arm 3: unpaired (tainted) edge voids.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut entry = alloc_entry(2, b"kxcipher", 0, 0);
+    entry[6] = LEDGE_TAINTED as u8;
+    tracker.feed(&entry);
+    assert_eq!(tracker.stats().tainted_refused, 1);
+    assert!(!tracker.reuse_exact(), "unpaired edge voids exactness");
+    // Arm 4: return for an unknown token (missed/pre-attach entry)
+    // voids — the attempt's start boundary went unobserved.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    assert_eq!(tracker.stats().unknown_returns, 1);
+    assert!(!tracker.reuse_exact(), "unjoinable return voids exactness");
+    // Arm 5: cross-site return voids even though the true return
+    // still pairs — the crossed half is corruption evidence.
+    let mut tracker = TransformTracker::new(16, 8, true);
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 32));
+    tracker.feed(&config_return(LTFM_SITE_SETAUTHSIZE, 4, 0));
+    assert_eq!(tracker.stats().mismatched_returns, 1);
+    tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 4, 0));
+    assert_eq!(tracker.stats().configs_joined, 1, "true pair lands");
+    assert!(!tracker.reuse_exact(), "cross-site return voids exactness");
+}
+
+#[test]
 fn finish_dangling_destroy_marks_live_bound_ambiguous() {
     // T07-06: a destroy entry whose return never arrives leaves
     // its end unknown — the still-live bound generation flags
@@ -2113,17 +2166,73 @@ fn host_alloc_capture_assigns_generations() {
     assert!(saw_authsize, "setauthsize attributed to a generation");
 }
 
-/// Lifecycle secret-canary lane test (R6): key a live transform
-/// with a `KPROBE-CANARY-*` marker and prove no marker byte reaches
-/// any generation, counter, or ledger render — the config path
-/// captures the length scalar only, never key bytes. (The op path
-/// carries scalars only — `LEdge` has no bytes field to scan; the
-/// scan covers every string-carrying lifecycle view instead.)
+/// Canary needles (R2-04 tripwire): the full 13B marker prefix
+/// every `KPROBE-CANARY-*` buffer carries, plus its 12B truncation
+/// (the gcm AEAD IV is 12B — a leak clipped to a name field could
+/// also truncate, so the short needle guards clipped copies too).
+const CANARY_NEEDLES: &[&[u8]] = &[b"KPROBE-CANARY", b"KPROBE-CANAR"];
+
+/// True when `data` carries any canary needle (the R2-04
+/// tripwire shared by the raw-transport scan and the
+/// rendered-view scan — one scanner, unit-pinned below).
+fn transport_carries_marker(data: &[u8]) -> bool {
+    CANARY_NEEDLES.iter().any(|needle| {
+        data.len() >= needle.len() && data.windows(needle.len()).any(|w| w == *needle)
+    })
+}
+
+#[test]
+fn canary_scanner_trips_on_marker_bytes() {
+    // The tripwire proves itself: a synthetic 112B record with
+    // marker bytes in the driver-name field trips, the truncated
+    // 12B IV form trips, and clean record bytes pass.
+    let mut dirty = vec![0u8; 112];
+    dirty[48..48 + 16].copy_from_slice(b"KPROBE-CANARY-K!");
+    assert!(
+        transport_carries_marker(&dirty),
+        "full marker trips the wire"
+    );
+    let mut clipped = vec![0u8; 112];
+    clipped[48..48 + 12].copy_from_slice(b"KPROBE-CANAR");
+    assert!(
+        transport_carries_marker(&clipped),
+        "truncated marker trips the wire"
+    );
+    let clean = tfm_bytes(
+        LEDGE_SUBMIT,
+        LTFM_SITE_SETKEY_SK,
+        0,
+        0x1000,
+        100,
+        0,
+        16,
+        0,
+        2,
+        b"cbc(aes)",
+    );
+    assert!(!transport_carries_marker(&clean), "clean record bytes pass");
+}
+
+/// Lifecycle secret-canary lane test (R6/R2-04): marked key, IV,
+/// plaintext, and tag bytes traverse every hooked lifecycle path
+/// (skcipher setkey + encrypt + decrypt, AEAD setkey + encrypt +
+/// marker-tag decrypt) while the sensor captures — then the test
+/// scans the RAW pre-decode transport (every walked ring record,
+/// including decode-refused bytes the views never render) AND
+/// every public view for the markers. Positive controls prove the
+/// marked traffic actually ran (per-lane submit/return pairing,
+/// completed records, joined config scalars, the EBADMSG
+/// marker-tag leg, the decrypt roundtrip) — a silent sensor or
+/// an untraversed path fails here, never passes vacuously.
 #[test]
 #[ignore = "BPF lane: run with scripts/sudo-lane.sh (needs root + BTF + built BPF object)"]
 fn lifecycle_canary_no_secret_bytes_in_views() {
     let _guard = suite_guard();
     use kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleSensor;
+    use kryprobe_testkit::alg_fixture::{
+        CANARY_IV, CANARY_KEY, CANARY_PT, aead_canary_roundtrip, aead_decrypt_marker_tag,
+        skcipher_decrypt_once_with, skcipher_encrypt_once_with,
+    };
     if unsafe { libc::geteuid() } != 0 {
         println!("SKIP: lifecycle canary needs root (sudo lane)");
         return;
@@ -2144,51 +2253,124 @@ fn lifecycle_canary_no_secret_bytes_in_views() {
     }
     let bytes = std::fs::read(&object).expect("test fixture must be readable");
     let (mut sensor, _) = LifecycleSensor::bring_up(&bytes, None).expect("host sensor must attach");
-    // 16-byte AES-128 key with the marker prefix — a real key the
-    // kernel accepts, carrying canary bytes the sensor must never
-    // repeat back.
-    let marker_key = b"KPROBE-CANARY-12";
-    assert_eq!(marker_key.len(), 16);
+    let pre = sensor.ledger().expect("pre-canary ledger");
+    let pre_gens = sensor.tfm().generations().len();
+    assert!(
+        sensor.take_completed().is_empty(),
+        "fresh sensor holds no completions"
+    );
+    // Skcipher leg: marker key + marker-IV encrypt/decrypt pair.
     let fd = afalg_bind_skcipher("cbc(aes)");
-    afalg_set_key(fd, marker_key);
-    for _ in 0..4 {
-        let drained = sensor.drain_once(8192).expect("drain");
+    afalg_set_key(fd, CANARY_KEY);
+    let ct =
+        skcipher_encrypt_once_with(fd, CANARY_IV, CANARY_PT).expect("marked encrypt must succeed");
+    let pt = skcipher_decrypt_once_with(fd, CANARY_IV, &ct).expect("marked decrypt must succeed");
+    assert_eq!(pt, *CANARY_PT, "decrypt roundtrips the marked plaintext");
+    unsafe { libc::close(fd) };
+    // AEAD legs: marker key/IV/plaintext roundtrip, then a decrypt
+    // fed the canary tag (EBADMSG proves the marked tag traversed
+    // the kernel decrypt path).
+    let counts = aead_canary_roundtrip("gcm(aes)", 1).expect("marked AEAD roundtrip must succeed");
+    assert_eq!((counts.enc, counts.dec), (1, 1), "AEAD legs ran");
+    aead_decrypt_marker_tag("gcm(aes)").expect("marked tag must fail EBADMSG");
+    // Drain with the raw tap: every walked record byte is scanned
+    // pre-decode (decode-refused records included).
+    let mut raw_all: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..8 {
+        let (drained, raw) = sensor.drain_once_raw(8192).expect("drain");
+        raw_all.extend(raw);
         if drained.records == 0 && !drained.busy {
             break;
         }
     }
-    unsafe { libc::close(fd) };
-    let _ = sensor.take_completed();
+    let completed = sensor.take_completed();
     sensor.close_input().expect("disarm+detach");
     let quiet = sensor.drain_quiet().expect("quiet drain");
     assert!(quiet.quiet, "close must reach a quiet round");
-    let ledger = sensor.ledger().expect("post-canary ledger");
-    let gens = sensor.tfm().generations();
-    assert!(!gens.is_empty(), "canary traffic assigned a generation");
-    // The length scalar IS captured (16) — sizes, not contents.
+    let post = sensor.ledger().expect("post-canary ledger");
+    let stats = sensor.tfm().stats();
+    // Positive controls: every marked path ran through the hooks
+    // (quiet host brackets the window — counts are ≥, pairing is
+    // exact, same driver-shaped discipline as the F05 oracle).
+    let d = |lane: usize| post.edge_hits[lane] - pre.edge_hits[lane];
     assert!(
-        gens.iter().any(|g| g.configs >= 1),
-        "marker setkey joined: {gens:?}"
+        d(0) >= 1 && d(0) == d(1),
+        "marked encrypt pair: {:?}",
+        post.edge_hits
     );
-    // No marker byte in any surfaced view (names, ids, counters,
-    // full ledger render).
+    assert!(
+        d(2) >= 1 && d(2) == d(3),
+        "marked decrypt pair: {:?}",
+        post.edge_hits
+    );
+    assert!(
+        d(8) >= 1 && d(8) == d(9),
+        "marked sk setkey pair: {:?}",
+        post.edge_hits
+    );
+    assert!(
+        d(10) >= 2 && d(10) == d(11),
+        "marked setauthsize pairs: {:?}",
+        post.edge_hits
+    );
+    assert!(
+        d(14) >= 2 && d(14) == d(15),
+        "marked aead setkey pairs: {:?}",
+        post.edge_hits
+    );
+    assert_eq!(d(12), 0, "aead-alloc lane stays dark (unhooked)");
+    assert_eq!(d(13), 0, "aead-alloc lane stays dark (unhooked)");
+    assert!(
+        completed.len() >= 2,
+        "marked ops completed records: {}",
+        completed.len()
+    );
+    let gens = sensor.tfm().generations();
+    let fresh: Vec<_> = gens.iter().skip(pre_gens).collect();
+    assert!(
+        fresh.iter().any(|g| !g.first_seen && g.configs >= 1),
+        "marked sk setkey joined its alloc-observed gen: {fresh:?}"
+    );
+    assert!(
+        fresh.iter().any(|g| g.first_seen && g.configs >= 1),
+        "marked aead setkey joined a first-seen gen: {fresh:?}"
+    );
+    assert!(
+        fresh.iter().any(|g| g.last_config_len == 16),
+        "length scalars captured (sizes, not contents): {fresh:?}"
+    );
+    // THE TRIPWIRE — raw pre-decode transport first (non-vacuous:
+    // records flowed), then every public view.
+    assert!(
+        !raw_all.is_empty(),
+        "raw tap captured records (non-vacuous scan)"
+    );
+    for (i, record) in raw_all.iter().enumerate() {
+        assert!(
+            !transport_carries_marker(record),
+            "marker bytes in raw record {i} ({}B pre-decode)",
+            record.len()
+        );
+    }
     let rendered = format!(
-        "{:?}\n{:?}\n{:?}\n{:?}",
+        "{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
         gens,
-        sensor.tfm().stats(),
-        ledger,
+        stats,
+        post,
+        completed,
         sensor
             .registry()
             .map(|r| format!("{r:?}"))
             .unwrap_or_default(),
     );
     assert!(
-        !rendered.contains("KPROBE-CANARY"),
+        !transport_carries_marker(rendered.as_bytes()),
         "no secret bytes in lifecycle views: {rendered}"
     );
     for g in &gens {
+        let names = format!("{}\n{}", g.req_name, g.drv_name);
         assert!(
-            !g.req_name.contains("KPROBE-CANARY") && !g.drv_name.contains("KPROBE-CANARY"),
+            !transport_carries_marker(names.as_bytes()),
             "no secret bytes in provenance names: {g:?}"
         );
     }

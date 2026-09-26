@@ -68,6 +68,10 @@ pub struct ProcCryptoEntry {
     /// Some value in this block breached [`MAX_FIELD_CHARS`] and
     /// truncated (partial inventory — recorded, never silent).
     pub truncated: bool,
+    /// The block KEY breached [`MAX_FIELD_CHARS`] (T07-R2-07: a
+    /// clipped name is a partial identity — excluded from exact
+    /// lookup, never matched as a full key).
+    pub name_truncated: bool,
 }
 
 /// A point-in-time registry snapshot: entries in file order plus
@@ -89,11 +93,19 @@ impl ProcCryptoSnapshot {
     /// same winner a chase resolves — current context only, never
     /// proof of what an earlier allocation used). Entries without
     /// a parsable priority lose to any ranked entry; unranked ties
-    /// keep file order (first wins).
+    /// keep file order (first wins). Entries whose NAME clipped
+    /// never match (T07-R2-07: a 2,000-char name sharing a
+    /// 1,024-char prefix must not win a lookup for the genuine
+    /// 1,024-char name — no exact winner is provable from a
+    /// partial key, so lookup returns the best exact-keyed entry
+    /// or `None`).
     #[must_use]
     pub fn winning_driver(&self, name: &str) -> Option<&ProcCryptoEntry> {
         let mut best: Option<&ProcCryptoEntry> = None;
         for entry in &self.entries {
+            if entry.name_truncated {
+                continue;
+            }
             if entry.name != name {
                 continue;
             }
@@ -159,6 +171,7 @@ fn parse_block(lines: &[&str]) -> Option<ProcCryptoEntry> {
         module: take("module"),
         flags: take("flags"),
         truncated,
+        name_truncated: name_cut,
     })
 }
 
