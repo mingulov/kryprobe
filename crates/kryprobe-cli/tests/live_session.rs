@@ -2527,7 +2527,7 @@ impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
 fn live_lifecycle_tick_drains_to_quiet() {
     // T07-R3-05: one tick sustains three drain rounds (busy, busy,
     // quiet) — the burst collapses into a SINGLE window (one
-    // progress call with the summed rows/drops), not three
+    // progress call with the summed rows/records), not three
     // sleep-separated ticks that let the ring drop mid-burst.
     use kryprobe_core::kcrypto::Terminal;
     kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);

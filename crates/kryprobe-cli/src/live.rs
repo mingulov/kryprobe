@@ -113,7 +113,9 @@ pub const DEFAULT_TICK_MS: u64 = 1000;
 /// closed-stdin stops a session promptly.
 const STOP_POLL_MS: u64 = 50;
 
-/// Per-tick progress hook (4B-M5): `(tick_1_based, rows, drops)`.
+/// Progress hook (4B-M5): `(tick_1_based, rows, activity)`.
+/// Aggregate sessions report drops as activity; lifecycle sessions
+/// report consumed raw records. Callers label the counter accordingly.
 /// Production prints a stderr liveness line; tests pass `None`.
 /// Stderr progress is human-only/unstable (4B-M4): never script on it.
 pub type TickProgress = dyn Fn(u64, u64, u64);
@@ -1818,8 +1820,8 @@ fn run_lifecycle_session_inner(
     // thread to stop after the closing tick.
     let mut production = RealLifecycleSensor::new(concrete);
     // 4B-M5 liveness line (stderr, human-only/unstable — never script on it).
-    let progress = |tick: u64, rows: u64, drops: u64| {
-        eprintln!("kryprobe: progress tick={tick} rows={rows} drops={drops}");
+    let progress = |tick: u64, rows: u64, records: u64| {
+        eprintln!("kryprobe: progress tick={tick} rows={rows} records={records}");
     };
     drive_lifecycle_session(
         cfg,
