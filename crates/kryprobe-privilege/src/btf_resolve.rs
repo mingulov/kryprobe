@@ -825,9 +825,33 @@ fn btf_ids_from_btf_for(btf: &Btf, symbols: &[&str]) -> Result<HashMap<String, u
 /// `(frontend, key, len)` args, errno return; setauthsize:
 /// `(aead, authsize)` args, errno return); a name that
 /// resolves with an incompatible shape refuses startup.
+/// T07-R4-N2: each prototype's STRUCT root must be the SAME bound
+/// entry id the offsets resolver binds — a prototype pointing at a
+/// rival same-named def refuses instead of keying the join on one
+/// def while BPF reads at another's offsets.
 pub fn resolve_lifecycle_ids() -> Result<HashMap<String, u32>, BtfError> {
     let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
     resolve_lifecycle_ids_from(bytes)
+}
+
+/// Prototype root must be the bound entry def (T07-R4-N2): same
+/// [`BtfError::IncompatibleDefinitions`] refusal the offsets
+/// resolver raises for rival chain links.
+fn require_proto_root(
+    type_name: &str,
+    entry_id: u32,
+    pointee_id: u32,
+    via: &str,
+) -> Result<(), BtfError> {
+    if pointee_id != entry_id {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: type_name.to_owned(),
+            entry_id,
+            linked_id: pointee_id,
+            via: via.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve + prototype-validate over an explicit BTF image (the
@@ -839,25 +863,50 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
     let table = manifest(LifecycleProfile::RequestLifecycle);
     let symbols: Vec<&str> = table.required.iter().map(|s| s.symbol).collect();
     let ids = btf_ids_from_btf_for(&btf, &symbols)?;
+    // T07-R4-N2 single-definition roots: each prototype-referenced
+    // STRUCT binds ONCE (first match — the same entry
+    // `lifecycle_offsets_from_btf` binds); a prototype pointing at a
+    // rival same-named def refuses below.
+    let tfm_entry = btf.find_struct("crypto_tfm")?;
+    let sk_entry = btf.find_struct("crypto_skcipher")?;
+    let sreq_entry = btf.find_struct("skcipher_request")?;
+    let aead_entry = btf.find_struct("crypto_aead")?;
     for site in table.required {
+        let sym = site.symbol;
         match site.shape {
             ProtoShape::Op => {
-                btf.lifecycle_proto_id(site.symbol)?;
+                let (_, pointee) = btf.lifecycle_proto_id(site.symbol)?;
+                require_proto_root(
+                    "skcipher_request",
+                    sreq_entry,
+                    pointee,
+                    &format!("{sym}.arg0"),
+                )?;
             }
             ProtoShape::Alloc => {
-                btf.alloc_proto_id(site.symbol)?;
+                let (_, pointee) = btf.alloc_proto_id(site.symbol)?;
+                require_proto_root(
+                    "crypto_skcipher",
+                    sk_entry,
+                    pointee,
+                    &format!("{sym}.return"),
+                )?;
             }
             ProtoShape::Destroy => {
-                btf.destroy_proto_id(site.symbol)?;
+                let (_, pointee) = btf.destroy_proto_id(site.symbol)?;
+                require_proto_root("crypto_tfm", tfm_entry, pointee, &format!("{sym}.arg1"))?;
             }
             ProtoShape::SetkeySk => {
-                btf.setkey_proto_id(site.symbol, "crypto_skcipher")?;
+                let (_, pointee) = btf.setkey_proto_id(site.symbol, "crypto_skcipher")?;
+                require_proto_root("crypto_skcipher", sk_entry, pointee, &format!("{sym}.arg0"))?;
             }
             ProtoShape::SetAuthsize => {
-                btf.setauthsize_proto_id(site.symbol)?;
+                let (_, pointee) = btf.setauthsize_proto_id(site.symbol)?;
+                require_proto_root("crypto_aead", aead_entry, pointee, &format!("{sym}.arg0"))?;
             }
             ProtoShape::SetkeyAead => {
-                btf.setkey_proto_id(site.symbol, "crypto_aead")?;
+                let (_, pointee) = btf.setkey_proto_id(site.symbol, "crypto_aead")?;
+                require_proto_root("crypto_aead", aead_entry, pointee, &format!("{sym}.arg0"))?;
             }
         }
     }
@@ -1093,6 +1142,18 @@ mod tests {
             self.word(bits);
         }
 
+        /// INT type with explicit storage size + value encoding
+        /// (bits/offset/encoding), for narrowed/shifted/malformed
+        /// leaves. Ids stay positional, as in every fixture.
+        fn int_enc(&mut self, name: &str, size: u32, bits: u32, offset: u32, encoding: u32) {
+            let name_off = self.str(name);
+            let data = (bits & 0xff) | ((offset & 0xff) << 16) | ((encoding & 0x0f) << 24);
+            self.word(name_off);
+            self.word(u32::from(KIND_INT) << 24);
+            self.word(size);
+            self.word(data);
+        }
+
         fn finish(&self) -> Vec<u8> {
             let mut out = Vec::new();
             out.extend_from_slice(&BTF_MAGIC.to_le_bytes());
@@ -1215,7 +1276,7 @@ mod tests {
     fn destroy_wellformed_proto_resolves() {
         let bytes = destroy_fixture(0, 6, 3, 2);
         let btf = Btf::parse(&bytes).expect("fixture must parse");
-        assert_eq!(btf.destroy_proto_id("dstr").expect("good destroy"), 8);
+        assert_eq!(btf.destroy_proto_id("dstr").expect("good destroy"), (8, 2));
     }
 
     #[test]
@@ -2130,5 +2191,492 @@ mod tests {
             }
         );
         assert!(k5.parent_ok && k5.params_ok);
+    }
+
+    /// T07-R4-N1 fixture: full lifecycle image whose
+    /// `crypto_tfm.refcnt` is a 4-byte kind-flagged UNION of a
+    /// full-width `raw` u32 view and a 16-bit bitfield view at bit
+    /// offset 8, in `raw_first` member order. The bitfield overlaps
+    /// word 0 ([8,24) ⊂ [0,32)) without proving it.
+    fn lifecycle_union_bitfield_fixture(raw_first: bool) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_UNION};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        // [3] UNION counter_u (kind-flagged): bitfield member word
+        // carries (width << 24) | bit_offset per `linux/btf.h`.
+        let v0 = b.str("v0");
+        let v1 = b.str("v1");
+        let u_name = b.str("counter_u");
+        let bitfield_word = (16u32 << 24) | 8;
+        b.rec(u_name, KIND_UNION, 2, true, 4);
+        if raw_first {
+            b.member(v0, 1, 0);
+            b.member(v1, 1, bitfield_word);
+        } else {
+            b.member(v0, 1, bitfield_word);
+            b.member(v1, 1, 0);
+        }
+        // [4] ARRAY char[64].
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [5] STRUCT crypto_alg { cra_driver_name: [4] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 4, 188 * 8);
+        // [6] PTR -> [5].
+        b.rec(0, KIND_PTR, 0, false, 5);
+        // [7] STRUCT crypto_tfm { __crt_alg: [6] @32, refcnt: [3] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 6, 32 * 8);
+        b.member(o_refcnt, 3, 40 * 8);
+        // [8] PTR -> [7].
+        b.rec(0, KIND_PTR, 0, false, 7);
+        // [9] async, [10] sreq, [11] sk.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 8, 32 * 8);
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 9, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 7, 8 * 8);
+        b.finish()
+    }
+
+    /// T07-R4-N1 fixture: full lifecycle image whose
+    /// `crypto_tfm.refcnt` is a 4-byte UNION (no kind flag) of a
+    /// full-width `raw` u32 view at bit 0 and a u16 view at bit
+    /// offset 16, in `raw_first` member order. The u16 overlaps
+    /// word 0 ([16,32) ⊂ [0,32)) without proving it.
+    fn lifecycle_union_offset_fixture(raw_first: bool) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_UNION};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char, [3] INT u16.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        b.int_enc("", 2, 16, 0, 1);
+        // [4] UNION counter_u { raw @0, narrow @16 }.
+        let v0 = b.str("v0");
+        let v1 = b.str("v1");
+        let u_name = b.str("counter_u");
+        b.rec(u_name, KIND_UNION, 2, false, 4);
+        if raw_first {
+            b.member(v0, 1, 0);
+            b.member(v1, 3, 16);
+        } else {
+            b.member(v0, 3, 16);
+            b.member(v1, 1, 0);
+        }
+        // [5] ARRAY char[64].
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [6] STRUCT crypto_alg { cra_driver_name: [5] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 5, 188 * 8);
+        // [7] PTR -> [6].
+        b.rec(0, KIND_PTR, 0, false, 6);
+        // [8] STRUCT crypto_tfm { __crt_alg: [7] @32, refcnt: [4] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 7, 32 * 8);
+        b.member(o_refcnt, 4, 40 * 8);
+        // [9] PTR -> [8].
+        b.rec(0, KIND_PTR, 0, false, 8);
+        // [10] async, [11] sreq, [12] sk.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 9, 32 * 8);
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 10, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 8, 8 * 8);
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_lifecycle_union_bitfield_raw_first_refuses() {
+        let bytes = lifecycle_union_bitfield_fixture(true);
+        assert!(
+            resolve_lifecycle_offsets_from(&bytes).is_err(),
+            "raw-first union must refuse the overlapping bitfield sibling"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_union_bitfield_narrow_first_refuses() {
+        let bytes = lifecycle_union_bitfield_fixture(false);
+        assert!(
+            resolve_lifecycle_offsets_from(&bytes).is_err(),
+            "narrow-first union must refuse regardless of order"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_union_offset_raw_first_refuses() {
+        let bytes = lifecycle_union_offset_fixture(true);
+        assert!(
+            resolve_lifecycle_offsets_from(&bytes).is_err(),
+            "raw-first union must refuse the overlapping u16-at-16 sibling"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_union_offset_narrow_first_refuses() {
+        let bytes = lifecycle_union_offset_fixture(false);
+        assert!(
+            resolve_lifecycle_offsets_from(&bytes).is_err(),
+            "narrow-first union must refuse regardless of order"
+        );
+    }
+
+    /// T07-R4-N2 fixture: full lifecycle image (layout chains on the
+    /// entry defs + all 7 manifest prototypes valid) with a rival
+    /// second `crypto_tfm` def `B` ([8], 4 bytes). When
+    /// `destroy_rival` is set, `crypto_destroy_tfm`'s arg1 points at
+    /// `B` while every layout chain references the entry def `A`
+    /// ([7]); otherwise all roots agree on `A` (positive control).
+    fn lifecycle_proto_rival_fixture(destroy_rival: bool) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_PTR};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        // [3] STRUCT refcount_struct { refs: [1] @0 }.
+        let o_rc = b.str("refcount_struct");
+        let o_refs = b.str("refs");
+        b.rec(o_rc, KIND_STRUCT, 1, false, 4);
+        b.member(o_refs, 1, 0);
+        // [4] ARRAY char[64].
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [5] STRUCT crypto_alg { cra_driver_name: [4] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 4, 188 * 8);
+        // [6] PTR -> [5].
+        b.rec(0, KIND_PTR, 0, false, 5);
+        // [7] STRUCT crypto_tfm A { __crt_alg: [6] @32, refcnt: [3] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 6, 32 * 8);
+        b.member(o_refcnt, 3, 40 * 8);
+        // [8] STRUCT crypto_tfm B (rival, 4 bytes, nonempty).
+        let o_pad = b.str("pad");
+        b.rec(o_tfm, KIND_STRUCT, 1, false, 4);
+        b.member(o_pad, 1, 0);
+        // [9] PTR -> [7].
+        b.rec(0, KIND_PTR, 0, false, 7);
+        // [10] STRUCT crypto_async_request { tfm: [9] @32 }.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 9, 32 * 8);
+        // [11] STRUCT skcipher_request { base: [10] @32 }.
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 10, 32 * 8);
+        // [12] STRUCT crypto_skcipher { base: [7] @8 }.
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 7, 8 * 8);
+        // [13] STRUCT crypto_aead {} (prototype root only).
+        let o_aead = b.str("crypto_aead");
+        b.rec(o_aead, KIND_STRUCT, 0, false, 64);
+        // [14] PTR -> [11] (op arg0), [15] PTR -> [12] (alloc
+        // return, setkey-sk arg0), [16] PTR -> destroy target ([8]
+        // rival or [7] entry), [17] PTR -> [13] (aead roots),
+        // [18] PTR -> [2] (char/key/mem pointers).
+        b.rec(0, KIND_PTR, 0, false, 11);
+        b.rec(0, KIND_PTR, 0, false, 12);
+        b.rec(0, KIND_PTR, 0, false, if destroy_rival { 8 } else { 7 });
+        b.rec(0, KIND_PTR, 0, false, 13);
+        b.rec(0, KIND_PTR, 0, false, 2);
+        // [19] PROTO op (sreq *) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 1, false, 1);
+        b.word(0);
+        b.word(14);
+        // [20] PROTO alloc (char *, u32, u32) -> sk *.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 15);
+        b.word(0);
+        b.word(18);
+        b.word(0);
+        b.word(1);
+        b.word(0);
+        b.word(1);
+        // [21] PROTO destroy (mem *, tfm *) -> void.
+        b.rec(0, KIND_FUNC_PROTO, 2, false, 0);
+        b.word(0);
+        b.word(18);
+        b.word(0);
+        b.word(16);
+        // [22] PROTO setkey-sk (sk *, key *, u32) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 1);
+        b.word(0);
+        b.word(15);
+        b.word(0);
+        b.word(18);
+        b.word(0);
+        b.word(1);
+        // [23] PROTO setauthsize (aead *, u32) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 2, false, 1);
+        b.word(0);
+        b.word(17);
+        b.word(0);
+        b.word(1);
+        // [24] PROTO setkey-aead (aead *, key *, u32) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 1);
+        b.word(0);
+        b.word(17);
+        b.word(0);
+        b.word(18);
+        b.word(0);
+        b.word(1);
+        // [25..31] the 7 manifest FUNCs.
+        for (name, proto) in [
+            ("crypto_skcipher_encrypt", 19),
+            ("crypto_skcipher_decrypt", 19),
+            ("crypto_alloc_skcipher", 20),
+            ("crypto_destroy_tfm", 21),
+            ("crypto_skcipher_setkey", 22),
+            ("crypto_aead_setauthsize", 23),
+            ("crypto_aead_setkey", 24),
+        ] {
+            let o_name = b.str(name);
+            b.rec(o_name, KIND_FUNC, 1, false, proto);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_lifecycle_ids_destroy_rival_root_refuses() {
+        // The layout chains agree on the entry def, so the offsets
+        // resolver passes — the refusal must come from the prototype
+        // root binding (ids resolver), which sees destroy point at
+        // the rival def.
+        let bytes = lifecycle_proto_rival_fixture(true);
+        let off = resolve_lifecycle_offsets_from(&bytes).expect("chains agree on A");
+        assert_eq!(off.refcnt_off, 40);
+        assert!(off.refcnt_present);
+        let err = resolve_lifecycle_ids_from(&bytes)
+            .expect_err("destroy rooted in the rival def must refuse");
+        assert!(
+            matches!(
+                err,
+                BtfError::IncompatibleDefinitions {
+                    entry_id: 7,
+                    linked_id: 8,
+                    ..
+                }
+            ),
+            "rival root must refuse as incompatible definitions, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_ids_all_entry_roots_resolve() {
+        // Positive control: every prototype root points at the bound
+        // entry def — both resolvers agree with exact offsets.
+        let bytes = lifecycle_proto_rival_fixture(false);
+        let ids = resolve_lifecycle_ids_from(&bytes).expect("all-A roots resolve");
+        assert_eq!(ids.len(), 7);
+        assert_eq!(ids["crypto_destroy_tfm"], 28);
+        assert_eq!(
+            resolve_lifecycle_offsets_from(&bytes).expect("all-A chains resolve"),
+            LifecycleOffsets {
+                tfm_alg: 32,
+                alg_drv: 188,
+                sk_base: 8,
+                req_base: 32,
+                req_tfm: 32,
+                refcnt_off: 40,
+                refcnt_present: true,
+            }
+        );
+    }
+
+    /// T07-R4-02 fixture: full lifecycle image whose
+    /// `crypto_tfm.refcnt` is a 4-byte UNION of a full-width `raw`
+    /// u32 view and a malformed INT leaf declaring storage size
+    /// `0x2000_0004` with a 32-bit zero-offset value, in `raw_first`
+    /// member order. The wrapper (4 bytes) passes every extent
+    /// gate, so the leaf reaches the size check directly: `size * 8`
+    /// wraps to 32 in release (fail-open) and panics in debug/test.
+    fn lifecycle_malformed_leaf_fixture(raw_first: bool) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_UNION};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char, [3] INT malformed size.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        b.int_enc("", 0x2000_0004, 32, 0, 1);
+        // [4] UNION counter_u { raw @0, bad @0 }.
+        let v0 = b.str("v0");
+        let v1 = b.str("v1");
+        let u_name = b.str("counter_u");
+        b.rec(u_name, KIND_UNION, 2, false, 4);
+        if raw_first {
+            b.member(v0, 1, 0);
+            b.member(v1, 3, 0);
+        } else {
+            b.member(v0, 3, 0);
+            b.member(v1, 1, 0);
+        }
+        // [5] ARRAY char[64].
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [6] STRUCT crypto_alg { cra_driver_name: [5] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 5, 188 * 8);
+        // [7] PTR -> [6].
+        b.rec(0, KIND_PTR, 0, false, 6);
+        // [8] STRUCT crypto_tfm { __crt_alg: [7] @32, refcnt: [4] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 7, 32 * 8);
+        b.member(o_refcnt, 4, 40 * 8);
+        // [9] PTR -> [8].
+        b.rec(0, KIND_PTR, 0, false, 8);
+        // [10] async, [11] sreq, [12] sk.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 9, 32 * 8);
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 10, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 8, 8 * 8);
+        b.finish()
+    }
+
+    /// T07-R4-02 fixture: full lifecycle image whose
+    /// `cra_driver_name` is an EMPTY array (`nelems == 0`, so the
+    /// member-extent gate computes `0 * size == 0` and lets the
+    /// member through) of INTs declaring storage size `0x2000_0001`
+    /// with an 8-bit zero-offset value. The element reaches the size
+    /// check directly: `size * 8` wraps to 8 in release (where the
+    /// later `nelems` gate still refuses) and panics in debug/test.
+    fn lifecycle_malformed_element_fixture() -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_PTR};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT malformed size.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.int_enc("", 0x2000_0001, 8, 0, 1);
+        // [3] STRUCT refcount_struct { refs: [1] @0 }.
+        let o_rc = b.str("refcount_struct");
+        let o_refs = b.str("refs");
+        b.rec(o_rc, KIND_STRUCT, 1, false, 4);
+        b.member(o_refs, 1, 0);
+        // [4] ARRAY [2] x 0 (empty: extent 0 passes the member
+        // gate so the element itself reaches the size check).
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(0);
+        // [5] STRUCT crypto_alg { cra_driver_name: [4] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 4, 188 * 8);
+        // [6] PTR -> [5].
+        b.rec(0, KIND_PTR, 0, false, 5);
+        // [7] STRUCT crypto_tfm { __crt_alg: [6] @32, refcnt: [3] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 6, 32 * 8);
+        b.member(o_refcnt, 3, 40 * 8);
+        // [8] PTR -> [7].
+        b.rec(0, KIND_PTR, 0, false, 7);
+        // [9] async, [10] sreq, [11] sk.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 8, 32 * 8);
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 9, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 7, 8 * 8);
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_lifecycle_malformed_leaf_raw_first_refuses() {
+        let bytes = lifecycle_malformed_leaf_fixture(true);
+        let err = resolve_lifecycle_offsets_from(&bytes)
+            .expect_err("wrapping leaf size must refuse, never pass or panic");
+        assert!(
+            matches!(err, BtfError::BadBtf { ref reason } if reason.contains("bytes, not 4")),
+            "size gate must refuse the wrapping leaf, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_malformed_leaf_narrow_first_refuses() {
+        let bytes = lifecycle_malformed_leaf_fixture(false);
+        let err = resolve_lifecycle_offsets_from(&bytes)
+            .expect_err("wrapping leaf size must refuse, never pass or panic");
+        assert!(
+            matches!(err, BtfError::BadBtf { ref reason } if reason.contains("bytes, not 4")),
+            "size gate must refuse the wrapping leaf, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_malformed_element_int_refuses() {
+        let bytes = lifecycle_malformed_element_fixture();
+        let err = resolve_lifecycle_offsets_from(&bytes)
+            .expect_err("wrapping element size must refuse, never pass or panic");
+        assert!(
+            matches!(err, BtfError::BadBtf { ref reason } if reason.contains("bytes, not 1")),
+            "size gate must refuse the wrapping element, got {err:?}"
+        );
     }
 }

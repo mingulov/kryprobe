@@ -24,7 +24,7 @@ pub(crate) const KIND_INT: u8 = 1;
 pub(crate) const KIND_PTR: u8 = 2;
 pub(crate) const KIND_ARRAY: u8 = 3;
 pub(crate) const KIND_STRUCT: u8 = 4;
-const KIND_UNION: u8 = 5;
+pub(crate) const KIND_UNION: u8 = 5;
 const KIND_ENUM: u8 = 6;
 const KIND_FWD: u8 = 7;
 const KIND_TYPEDEF: u8 = 8;
@@ -210,14 +210,15 @@ impl<'a> Btf<'a> {
 
     /// Validate that `name`'s prototype is EXACTLY the qualified
     /// sensor read — `int (struct skcipher_request *)` — and return
-    /// its `FUNC` id (round-1 sol-M2/astra-M2, hardened round-2
-    /// sol-M4/astra-M7): exactly one argument, arg0 a pointer (after
+    /// its `FUNC` id plus the chased STRUCT pointee id (round-1
+    /// sol-M2/astra-M2, hardened round-2 sol-M4/astra-M7, T07-R4-N2
+    /// root binding): exactly one argument, arg0 a pointer (after
     /// qualifier chase) to STRUCT `skcipher_request`, return a
     /// signed 32-bit INT at offset 0. Any signature drift refuses
     /// startup rather than mis-keying the join or misreading the
     /// status. Corrupt images stay [`BtfError::BadBtf`]; well-formed
     /// but incompatible prototypes are [`BtfError::BadPrototype`].
-    pub(crate) fn lifecycle_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+    pub(crate) fn lifecycle_proto_id(&self, name: &str) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -247,7 +248,8 @@ impl<'a> Btf<'a> {
         // The pointee IS the qualified request identity: arg0 must
         // point at STRUCT `skcipher_request` (a pointer to any other
         // type keys the join on a stranger's address).
-        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        let pointee_id = self.chase_wrappers(ptr.size_or_type)?;
+        let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
                 "arg0 points at kind {}, not STRUCT skcipher_request",
@@ -293,12 +295,13 @@ impl<'a> Btf<'a> {
                 "return INT encoding is {encoding:#x}, not exactly SIGNED"
             )));
         }
-        Ok(id)
+        Ok((id, pointee_id))
     }
 
     /// Validate that `name`'s prototype is EXACTLY the qualified
     /// allocation-sensor read — `struct crypto_skcipher *(const char
-    /// *, u32, u32)` — and return its `FUNC` id (T07.2, same
+    /// *, u32, u32)` — and return its `FUNC` id plus the chased
+    /// STRUCT pointee id (T07.2, same
     /// refuse-on-drift discipline as [`Btf::lifecycle_proto_id`]):
     /// exactly three arguments, arg0 a pointer (after qualifier
     /// chase) to 1-byte INT (`char` — the bounded name copy reads
@@ -310,7 +313,7 @@ impl<'a> Btf<'a> {
     /// type would mis-chase). Corrupt images stay
     /// [`BtfError::BadBtf`]; well-formed but incompatible prototypes
     /// are [`BtfError::BadPrototype`].
-    pub(crate) fn alloc_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+    pub(crate) fn alloc_proto_id(&self, name: &str) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -379,7 +382,8 @@ impl<'a> Btf<'a> {
         if rec.kind != KIND_PTR {
             return Err(bad_proto("return is not a pointer".to_owned()));
         }
-        let pointee = self.rec(self.chase_wrappers(rec.size_or_type)?)?;
+        let pointee_id = self.chase_wrappers(rec.size_or_type)?;
+        let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
                 "return points at kind {}, not STRUCT crypto_skcipher",
@@ -391,11 +395,12 @@ impl<'a> Btf<'a> {
                 "return points at the wrong STRUCT, not crypto_skcipher".to_owned(),
             ));
         }
-        Ok(id)
+        Ok((id, pointee_id))
     }
 
     /// FUNC id of `name` proven to be the destroy shape
-    /// `void (void *, struct crypto_tfm *)` (T07.3): exactly two
+    /// `void (void *, struct crypto_tfm *)`, plus the chased STRUCT
+    /// pointee id (T07.3): exactly two
     /// args, arg0 a pointer (the frontend `mem` — pointee
     /// unchecked: any pointer-typed arg0 carries the frontend
     /// address, and the tracker classifies null/ERR as a no-op
@@ -404,7 +409,7 @@ impl<'a> Btf<'a> {
     /// stranger's word as a refcount), and a VOID return (the
     /// exit run emits no status — reading a return register from
     /// a void call would emit garbage as truth).
-    pub(crate) fn destroy_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+    pub(crate) fn destroy_proto_id(&self, name: &str) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -436,7 +441,8 @@ impl<'a> Btf<'a> {
         if tfm.kind != KIND_PTR {
             return Err(bad_proto("arg1 is not a pointer".to_owned()));
         }
-        let pointee = self.rec(self.chase_wrappers(tfm.size_or_type)?)?;
+        let pointee_id = self.chase_wrappers(tfm.size_or_type)?;
+        let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
                 "arg1 points at kind {}, not STRUCT crypto_tfm",
@@ -451,7 +457,7 @@ impl<'a> Btf<'a> {
         if proto.size_or_type != 0 {
             return Err(bad_proto("return is not VOID".to_owned()));
         }
-        Ok(id)
+        Ok((id, pointee_id))
     }
 
     /// Prove the FUNC_PROTO return at `ret` is EXACTLY a SIGNED
@@ -518,7 +524,10 @@ impl<'a> Btf<'a> {
         if rec.kind != KIND_INT {
             return Err(bad(format!("{what} is kind {}, not INT", rec.kind)));
         }
-        if rec.size_or_type * 8 != want {
+        // T07-R4-02: exact byte-size comparison — the old
+        // `size * 8` multiplication wrapped on malformed sizes
+        // (fail-open pass in release, panic in debug/test).
+        if rec.size_or_type != want / 8 {
             return Err(bad(format!(
                 "{what} INT is {} bytes, not {}",
                 rec.size_or_type,
@@ -573,7 +582,8 @@ impl<'a> Btf<'a> {
     }
 
     /// FUNC id of `name` proven to be the setkey shape
-    /// `int (<frontend> *, const u8 *, unsigned int)` (T07.4):
+    /// `int (<frontend> *, const u8 *, unsigned int)` (T07.4),
+    /// plus the chased STRUCT pointee id:
     /// exactly three arguments, arg0 a pointer (after qualifier
     /// chase) at STRUCT `frontend` (the joined transform identity
     /// — a pointer to any other type keys the epoch on a
@@ -585,7 +595,11 @@ impl<'a> Btf<'a> {
     /// 32-bit INT return (the errno). Corrupt images stay
     /// [`BtfError::BadBtf`]; well-formed but incompatible
     /// prototypes are [`BtfError::BadPrototype`].
-    pub(crate) fn setkey_proto_id(&self, name: &str, frontend: &str) -> Result<u32, BtfError> {
+    pub(crate) fn setkey_proto_id(
+        &self,
+        name: &str,
+        frontend: &str,
+    ) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -612,7 +626,8 @@ impl<'a> Btf<'a> {
         if ptr.kind != KIND_PTR {
             return Err(bad_proto("arg0 is not a pointer".to_owned()));
         }
-        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        let pointee_id = self.chase_wrappers(ptr.size_or_type)?;
+        let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
                 "arg0 points at kind {}, not STRUCT {frontend}",
@@ -631,16 +646,17 @@ impl<'a> Btf<'a> {
         }
         self.int_arg_4(proto.aux_at + 20, "arg2", name)?;
         self.int_return_exact(proto.size_or_type, name)?;
-        Ok(id)
+        Ok((id, pointee_id))
     }
 
     /// FUNC id of `name` proven to be the setauthsize shape
-    /// `int (struct crypto_aead *, unsigned int)` (T07.4): exactly
+    /// `int (struct crypto_aead *, unsigned int)` (T07.4), plus the
+    /// chased STRUCT pointee id: exactly
     /// two arguments, arg0 a pointer at STRUCT `crypto_aead` (the
     /// joined transform identity), arg1 a 4-byte INT (the authsize),
     /// and a SIGNED 32-bit INT return (the errno). Same
     /// refuse-on-drift discipline as [`Btf::setkey_proto_id`].
-    pub(crate) fn setauthsize_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+    pub(crate) fn setauthsize_proto_id(&self, name: &str) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -667,7 +683,8 @@ impl<'a> Btf<'a> {
         if ptr.kind != KIND_PTR {
             return Err(bad_proto("arg0 is not a pointer".to_owned()));
         }
-        let pointee = self.rec(self.chase_wrappers(ptr.size_or_type)?)?;
+        let pointee_id = self.chase_wrappers(ptr.size_or_type)?;
+        let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
                 "arg0 points at kind {}, not STRUCT crypto_aead",
@@ -681,7 +698,7 @@ impl<'a> Btf<'a> {
         }
         self.int_arg_4(proto.aux_at + 12, "arg1", name)?;
         self.int_return_exact(proto.size_or_type, name)?;
-        Ok(id)
+        Ok((id, pointee_id))
     }
 
     /// Byte offset of `member` in struct/union `type_name`, descending
@@ -904,12 +921,14 @@ impl<'a> Btf<'a> {
     /// One nesting level descends (the real `refcount_t {
     /// atomic_t refs; }` → `atomic_t { int counter; }` chain —
     /// each wrapper must itself be exactly 4 bytes, so a marker
-    /// beside the nested counter still refuses). Bitfield /
-    /// misaligned members at 0 prove nothing (no byte offset to
-    /// read) and simply don't qualify. T07-R3-08: EVERY
-    /// byte-aligned word-0 view must prove — overlapping union
-    /// views are unanimous, so a full-width alias can never
-    /// launder a shifted sibling and member order never decides.
+    /// beside the nested counter still refuses). T07-R4-N1:
+    /// EVERY view overlapping word 0 must prove — a bitfield /
+    /// misaligned / shifted view starting inside [0,32) fails the
+    /// word (union alias or crowded struct: the word is
+    /// ambiguous), so a full-width alias can never launder an
+    /// unproven overlapping sibling and member order never
+    /// decides. T07-R3-08: EVERY byte-aligned word-0 view must
+    /// prove — overlapping union views are unanimous.
     fn counter_word_at_zero(&self, id: u32, depth: usize) -> Result<bool, BtfError> {
         if depth > 2 {
             return Ok(false);
@@ -933,6 +952,15 @@ impl<'a> Btf<'a> {
             };
             let bitfield = rec.kind_flag && raw >> 24 != 0;
             if bitfield || !bits.is_multiple_of(8) || bits / 8 != 0 {
+                // T07-R4-N1: a view starting inside word 0 overlaps
+                // it — an overlapping view that cannot prove the word
+                // (bitfield, sub-byte, or shifted member offset) makes
+                // word 0 ambiguous (union alias or crowded struct), so
+                // the word does NOT qualify. Only views fully past
+                // [0,32) are genuinely different words and stay skipped.
+                if bits < 32 {
+                    return Ok(false);
+                }
                 continue;
             }
             let target = self.chase_wrappers(mtype)?;

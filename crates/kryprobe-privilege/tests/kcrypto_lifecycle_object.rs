@@ -1090,7 +1090,18 @@ fn btf_image(types: &[u8], strtab: &[u8]) -> Vec<u8> {
 /// setkey-sk FUNC, +10 setauthsize FUNC_PROTO, +11 setauthsize
 /// FUNC, +12 setkey-aead FUNC_PROTO, +13 setkey-aead FUNC.
 /// Returns the outgoing next id.
-fn append_config_sides(types: &mut Vec<u8>, strtab: &mut Vec<u8>, next: u32) -> u32 {
+/// Well-formed T07.4 configuration sides (14 ids at `next`):
+/// setkey-sk, setauthsize, and setkey-aead FUNCs plus their local
+/// types. T07-R4-N2: the block aliases the caller's FIRST
+/// `crypto_skcipher` STRUCT (`sk_target`) via TYPEDEF instead of
+/// emitting a rival STRUCT — every prototype root chases to the
+/// same bound entry id (a rival same-named STRUCT would refuse).
+fn append_config_sides(
+    types: &mut Vec<u8>,
+    strtab: &mut Vec<u8>,
+    next: u32,
+    sk_target: u32,
+) -> u32 {
     let sk_off = btf_push_str(strtab, "crypto_skcipher");
     let aead_off = btf_push_str(strtab, "crypto_aead");
     let char_off = btf_push_str(strtab, "char");
@@ -1099,7 +1110,7 @@ fn append_config_sides(types: &mut Vec<u8>, strtab: &mut Vec<u8>, next: u32) -> 
     let skkey_off = btf_push_str(strtab, "crypto_skcipher_setkey");
     let sa_off = btf_push_str(strtab, "crypto_aead_setauthsize");
     let aeadkey_off = btf_push_str(strtab, "crypto_aead_setkey");
-    btf_rec(types, sk_off, 4, 0, 0, &[]);
+    btf_rec(types, sk_off, 8, 0, sk_target, &[]);
     btf_rec(types, aead_off, 4, 0, 0, &[]);
     btf_rec(types, 0, 2, 0, next, &[]);
     btf_rec(types, 0, 2, 0, next + 1, &[]);
@@ -1213,8 +1224,9 @@ fn lifecycle_btf(
     btf_rec(&mut types, destroy_off, 12, 1, 20, &[]);
     // T07.4 configuration sides (ids 22-35): well-formed setkey-sk,
     // setauthsize, and setkey-aead FUNCs (hermetic block — op-side
-    // mutations above never disturb config validation).
-    append_config_sides(&mut types, &mut strtab, 22);
+    // mutations above never disturb config validation; the block
+    // aliases STRUCT crypto_skcipher id 13).
+    append_config_sides(&mut types, &mut strtab, 22, 13);
     btf_image(&types, &strtab)
 }
 
@@ -1305,8 +1317,9 @@ fn lifecycle_btf_alloc(
     btf_rec(&mut types, destroy_off, 12, 1, 21, &[]);
     // T07.4 configuration sides (ids 23-36): well-formed setkey-sk,
     // setauthsize, and setkey-aead FUNCs (hermetic block — alloc-side
-    // mutations above never disturb config validation).
-    append_config_sides(&mut types, &mut strtab, 23);
+    // mutations above never disturb config validation; the block
+    // aliases STRUCT crypto_skcipher id 13).
+    append_config_sides(&mut types, &mut strtab, 23, 13);
     btf_image(&types, &strtab)
 }
 
@@ -1322,7 +1335,8 @@ fn lifecycle_btf_alloc_good() -> Vec<u8> {
 /// takes (nargs, arg0, arg1, arg2, ret), the setauthsize proto
 /// takes (nargs, arg0, arg1, ret), and the setkey-aead proto takes
 /// arg0 with every other word well-formed. Config-block layout
-/// (base 22): +0 STRUCT crypto_skcipher, +1 STRUCT crypto_aead, +2
+/// (base 22): +0 TYPEDEF crypto_skcipher → 13 (T07-R4-N2: alias the
+/// first STRUCT, never a rival def), +1 STRUCT crypto_aead, +2
 /// STRUCT other_struct (wrong-struct control), +3 PTR→+0, +4
 /// PTR→+1, +5 PTR→+2, +6 INT char, +7 PTR→+6, +8 INT u32, +9 INT
 /// int (SIGNED errno), +10 INT u16 (narrow control), +11 INT uint
@@ -1407,7 +1421,7 @@ fn lifecycle_btf_config(
     let skkey_off = btf_push_str(&mut strtab, "crypto_skcipher_setkey");
     let sa_off = btf_push_str(&mut strtab, "crypto_aead_setauthsize");
     let aeadkey_off = btf_push_str(&mut strtab, "crypto_aead_setkey");
-    btf_rec(&mut types, sk2_off, 4, 0, 0, &[]);
+    btf_rec(&mut types, sk2_off, 8, 0, 13, &[]);
     btf_rec(&mut types, aead_off, 4, 0, 0, &[]);
     btf_rec(&mut types, other2_off, 4, 0, 0, &[]);
     btf_rec(&mut types, 0, 2, 0, base, &[]);
@@ -1701,8 +1715,9 @@ fn f2_typedef_wrapped_pointer_arg_accepted() {
     btf_rec(&mut types, 0, 13, 2, 0, &aux);
     btf_rec(&mut types, destroy_off, 12, 1, 19, &[]);
     // T07.4 configuration sides (ids 21-34): well-formed setkey-sk,
-    // setauthsize, and setkey-aead FUNCs (hermetic block).
-    append_config_sides(&mut types, &mut strtab, 21);
+    // setauthsize, and setkey-aead FUNCs (hermetic block aliasing
+    // STRUCT crypto_skcipher id 12).
+    append_config_sides(&mut types, &mut strtab, 21, 12);
     let ids = resolve_lifecycle_ids_from(&btf_image(&types, &strtab)).expect("chased proto");
     assert_eq!(ids.len(), 7);
     assert_eq!(ids["crypto_alloc_skcipher"], 15);
