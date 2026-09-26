@@ -8,7 +8,8 @@
 //! same `ingest_records` and is covered by the VM canary lane.
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LEDGE_RETURN, LEDGE_SUBMIT, LTFM_MAGIC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_VERSION,
+    LEDGE_RETURN, LEDGE_SUBMIT, LTFM_MAGIC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY,
+    LTFM_SITE_SETAUTHSIZE, LTFM_VERSION,
 };
 use kryprobe_core::kcrypto::Terminal;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::{
@@ -704,4 +705,80 @@ fn shared_release_retained_then_final_at_ingest() {
         !tracker.reuse_exact(),
         "exactness voids on the retained release"
     );
+}
+
+#[test]
+fn invalid_authsize_records_failure_without_epoch_at_ingest() {
+    // T07-R2-04 sensor-facing invalid-authsize case (the round-2
+    // coverage note): an oversize setauthsize (errno -EINVAL)
+    // through the PRODUCTION ingest path. The observer must join
+    // the config onto the live generation (scalars recorded,
+    // failure classified) WITHOUT bumping the epoch — a rejected
+    // length changes nothing — while exact reuse stands (a
+    // classified failure is truth, not boundary uncertainty).
+    let frontend = 0xFFFF_8880_0000_1000u64;
+    let stream = vec![
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_ALLOC_SK,
+            0,
+            100,
+            0,
+            0,
+            0,
+            2,
+            b"kxcipher",
+        ),
+        tfm_record(
+            LEDGE_RETURN,
+            LTFM_SITE_ALLOC_SK,
+            frontend,
+            150,
+            0,
+            0,
+            0,
+            2,
+            b"drv",
+        ),
+        // Oversize authsize: entry carries frontend + length 64,
+        // the errno return carries status + token only.
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_SETAUTHSIZE,
+            frontend,
+            200,
+            0,
+            64,
+            0,
+            4,
+            b"",
+        ),
+        tfm_record(
+            LEDGE_RETURN,
+            LTFM_SITE_SETAUTHSIZE,
+            0,
+            250,
+            -22,
+            0,
+            0,
+            4,
+            b"",
+        ),
+    ];
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    core.ingest_records(&stream);
+    let tracker = core.tfm();
+    let stats = tracker.stats();
+    assert_eq!(stats.configs_joined, 1, "config joins");
+    assert_eq!(stats.configs_failed, 1, "errno verdict classified");
+    let generations = tracker.generations();
+    assert_eq!(generations.len(), 1, "one lifetime");
+    let info = &generations[0];
+    assert_eq!(info.configs, 1, "config attributed");
+    assert_eq!(info.epoch, 0, "rejected length bumps no epoch");
+    assert_eq!(info.last_config_site, LTFM_SITE_SETAUTHSIZE);
+    assert_eq!(info.last_config_len, 64, "rejected length kept");
+    assert_eq!(info.last_config_errno, -22, "native errno kept");
+    assert!(!info.ambiguous, "classified failure is not ambiguity");
+    assert!(tracker.reuse_exact(), "truth keeps reuse exact");
 }
