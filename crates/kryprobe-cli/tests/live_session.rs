@@ -2880,3 +2880,305 @@ fn live_lifecycle_busy_without_progress_services_wait_and_stop() {
         "busy record spun through multiple windows instead of yielding"
     );
 }
+
+#[test]
+fn sustained_backlog_services_stop() {
+    // P2/K05: records keep flowing (sustained backlog); stop must be
+    // serviced inside the same window — the round cap and quiet are
+    // bounds, not prerequisites. Stop latched at round 5 of 8 ends
+    // the session at exactly 5 drains; every completion is kept.
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    use kryprobe_core::kcrypto::Terminal;
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(10, false); 8],
+        takes: (1..=5)
+            .map(|id| vec![lifecycle_record(id, Terminal::Sync(0))])
+            .collect(),
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(5, 5, 0),
+        now: 555,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: 5,
+        stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: false,
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &lifecycle_live_config(),
+        &backend,
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("stopped session still finalizes");
+    assert_eq!(
+        sensor
+            .drain_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        5,
+        "stop waited for quiet/round cap instead of ending the window"
+    );
+    assert_eq!(outcome.observations.len(), 5, "every completion kept");
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+}
+
+#[test]
+fn busy_record_yields_without_spin() {
+    // P2/K05: a busy head with zero progress yields through
+    // `wait_for_activity` (pending-writer retry, bounded wait —
+    // asserted inside the fake) instead of spinning windows.
+    // Cancellation latched at that single wait ends the session:
+    // exactly 8 capped rounds + 1 stop round proves one yield.
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(0, true); 17],
+        takes: Vec::new(),
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 555,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: 17, // watchdog bounds the broken spin path
+        stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: true,
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &lifecycle_live_config(),
+        &backend,
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("yielded session still finalizes");
+    assert_eq!(
+        sensor
+            .drain_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        9,
+        "busy record spun past one window instead of yielding once"
+    );
+    assert!(outcome.observations.is_empty());
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+}
+
+#[test]
+fn observation_cap_counts_omissions() {
+    // P2/K05: cap truncation counts EVERY dropped record across
+    // batches — loop batches plus stop-time reconciliation — not a
+    // bare flag. 60K + 60K loop records with a 10-record finish tail
+    // keeps exactly 100K and attests 20,010 omissions in both the
+    // coverage counter and session integrity (the existing
+    // single-drop test cannot tell a flag from a count).
+    use kryprobe_core::kcrypto::Terminal;
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let batch = |base: u64| {
+        (base..base + 60_000)
+            .map(|id| lifecycle_record(id, Terminal::Sync(0)))
+            .collect::<Vec<_>>()
+    };
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(60_000, false), (60_000, false)],
+        takes: vec![batch(0), batch(60_000)],
+        finish_records: (120_000..120_010)
+            .map(|id| lifecycle_record(id, Terminal::Sync(0)))
+            .collect(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(120_010, 120_010, 0),
+        now: 999,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: u64::MAX, // the cap itself must stop the loop
+        stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: false,
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &lifecycle_live_config(),
+        &backend,
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("truncated session still finalizes");
+    assert_eq!(
+        sensor
+            .drain_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "cap must stop the loop after the second batch"
+    );
+    assert_eq!(outcome.observations.len(), 100_000, "cap kept exactly");
+    assert_eq!(
+        outcome.integrity.budget_omissions, 20_010,
+        "every dropped record attested: {:?}",
+        outcome.integrity
+    );
+    assert!(
+        outcome
+            .coverage
+            .completion
+            .counters
+            .iter()
+            .any(|c| c.name == "observations_truncated" && c.value == 20_010),
+        "truncation count (not flag) present: {:?}",
+        outcome.coverage.completion.counters
+    );
+    assert_eq!(
+        outcome.coverage.completion.status,
+        kryprobe_core::enums::CoverageStatus::Partial,
+        "truncation flips completion"
+    );
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+}
+
+/// P2/K05: lifecycle backend whose terminal accounting fails — the
+/// final-output seam. Decodes delegate to the real backend; only
+/// `finalize` (end-of-session facts) reports a defect.
+struct FinalizeFailingBackend {
+    inner: kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend,
+}
+
+impl kryprobe_core::backend::Backend for FinalizeFailingBackend {
+    fn id(&self) -> kryprobe_core::enums::BackendId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &'static kryprobe_core::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn detect(
+        &self,
+        ctx: &kryprobe_core::backend::DetectContext<'_>,
+    ) -> Result<Vec<kryprobe_core::backend::DetectedInstance>, kryprobe_core::error::BackendError>
+    {
+        self.inner.detect(ctx)
+    }
+
+    fn plan(
+        &self,
+        ctx: &kryprobe_core::backend::PlanContext<'_>,
+        instance: &kryprobe_core::backend::DetectedInstance,
+        mode: kryprobe_core::enums::CaptureMode,
+    ) -> Result<kryprobe_core::backend::BackendPlan, kryprobe_core::error::BackendError> {
+        self.inner.plan(ctx, instance, mode)
+    }
+
+    fn configure(
+        &self,
+        ctx: &mut kryprobe_core::backend::ConfigureContext<'_>,
+        plan: &kryprobe_core::backend::BackendPlan,
+    ) -> Result<(), kryprobe_core::error::BackendError> {
+        self.inner.configure(ctx, plan)
+    }
+
+    fn decode(
+        &self,
+        ctx: &kryprobe_core::backend::DecodeContext<'_>,
+        event: kryprobe_core::backend::RawEvent<'_>,
+    ) -> Result<kryprobe_core::evidence::NativeObservation, kryprobe_core::error::BackendError>
+    {
+        self.inner.decode(ctx, event)
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &kryprobe_core::backend::FinalizeContext<'_>,
+    ) -> Result<kryprobe_core::backend::BackendSummary, kryprobe_core::error::BackendError> {
+        Err(kryprobe_core::error::BackendError::Internal(
+            kryprobe_core::error::InternalError::new("p2_probe_finalize_failed"),
+        ))
+    }
+
+    fn note_output_omissions(&self, omitted: u64) {
+        self.inner.note_output_omissions(omitted);
+    }
+}
+
+#[test]
+fn final_output_failure_cannot_be_clean() {
+    // P2/K05: a terminal-accounting (finalize) failure cannot yield a
+    // clean session — the driver surfaces the error and parks the
+    // machine in `FailedPartial`, never `Finalized`.
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = ScriptedLifecycleSensor {
+        ticks: vec![Vec::new()],
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 555,
+        drains: std::sync::atomic::AtomicU64::new(0),
+        taken: std::sync::atomic::AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        quiets: std::sync::atomic::AtomicU64::new(0),
+        quiet_backlog: 0,
+        stop: &stop,
+    };
+    let backend = FinalizeFailingBackend {
+        inner: kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new(),
+    };
+    let err = kryprobe_cli::live::drive_lifecycle_session(
+        &lifecycle_live_config(),
+        &backend,
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect_err("finalize failure must surface, not pass clean");
+    assert!(
+        matches!(err, kryprobe_cli::live::LiveError::Internal(_)),
+        "defect-class finalize failure stays Internal: {err:?}"
+    );
+    assert_eq!(
+        controller.state(),
+        kryprobe_core::session::SessionState::FailedPartial,
+        "failed session parks FailedPartial, never Finalized"
+    );
+}

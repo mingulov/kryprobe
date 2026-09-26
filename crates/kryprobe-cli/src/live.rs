@@ -1332,9 +1332,29 @@ fn drive_session_inner(
     })
 }
 
-/// Per-tick ring-drain visit cap: 8192 covers a full ring (≈5461
-/// records at 48 B per frame) plus margin, still bounded — one
-/// round consumes any backlog a quiet window can hold.
+/// Per-round ring-drain visit cap, from actual wire sizes (P2/K05,
+/// 2026-09-26: the old "48 B per frame" note belonged to the
+/// aggregate `KCtl` control shape, never to lifecycle edges).
+/// `LRING` is 262,144 bytes; one `LEdge` v5 (or `LTfm` v1
+/// transform) record costs 112 payload bytes + the 8-byte ring
+/// header = 120 bytes/frame (already 8-aligned), so a ringful
+/// holds ≈2184 mixed records ≈ 1092 two-edge calls before other
+/// traffic — fewer while a busy (reserved-uncommitted) record
+/// holds space. 8192 visits cover ≈3.75 ringfuls plus margin,
+/// still bounded; the sustained loop re-polls while records flow.
+/// In-flight bounds behind the drain: decode 4096 / reducer 4096 /
+/// completed-retention 4096 (the sensor arm; the transform tracker
+/// shares the decode scale) — overflows are counted
+/// (`admission_failed`, `retained_dropped`, `LLOSS`), never silent.
+/// Rate/burst/interval/cap relation: a burst larger than the ring
+/// survives iff the consumer drains faster than the producer
+/// fills (else reservation fails loud); the display tick (default
+/// 1000 ms) paces human progress only, never transport; past
+/// 100,000 kept observations the session stops early with counted
+/// omissions — detail duration ≤ 100000/R s at R completions/s.
+/// Long-running aggregates must not silently depend on unlimited
+/// per-request retention: continuous summaries need the P6
+/// versioned output contract (open gate — see the P2 report).
 const LIFECYCLE_DRAIN_BUDGET: usize = 8192;
 
 /// Sustained-drain rounds per tick (T07-R3-05): a tick re-polls

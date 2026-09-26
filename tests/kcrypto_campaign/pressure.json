@@ -1,0 +1,273 @@
+{
+  "$schema": "kryprobe-pressure-campaign/v1",
+  "campaign": "kcrypto-pressure-p2",
+  "manifest_version": 1,
+  "frozen_utc": "2026-09-26",
+  "frozen_by": "P2a envelope host work",
+  "source_plan": "docs/superpowers/plans/2026-09-26-kryprobe-remaining-tests.md (P2/P7 pressure cells)",
+  "freeze_rule": "Immutable once frozen. Limits below are proposed campaign stimuli, not throughput promises. Do NOT adjust limits in response to an observed failure — ever. First collect the unobserved workload control; if it cannot meet its own deadline, mark the cell invalid and explain the environment before starting an observed comparison.",
+  "global": {
+    "profile": "request-lifecycle",
+    "display_tick_ms": 1000,
+    "observation_cap": 100000,
+    "lring_bytes": 262144,
+    "ledge_v5_bytes": 112,
+    "ring_frame_bytes": 8,
+    "decode_bound": 4096,
+    "reducer_bound": 4096,
+    "retention_bound": 4096,
+    "drain_rounds_per_window": 8,
+    "drain_visits_per_round": 8192,
+    "stop_reap_seconds": 10,
+    "commands": [
+      "report --system --kcrypto-profile request-lifecycle --duration N --format json",
+      "watch --system --kcrypto-profile request-lifecycle"
+    ],
+    "attach_gate": "structured attach-ready before GO",
+    "clock": "monotonic with explicitly recorded cross-process/kernel anchors; wall-clock ordering alone is not identity",
+    "mandatory_measurements": [
+      "observer process-tree CPU/RSS",
+      "drain lag",
+      "ring occupancy where observable",
+      "table/retention admission",
+      "expected and actual operations",
+      "every loss counter",
+      "tick/stop responsiveness",
+      "output bytes/flush result"
+    ]
+  },
+  "mode_decision": {
+    "bounded_detail": "Bounded detail capture may stop at 100,000 observations with explicit truncation (counted omissions, Partial completion).",
+    "continuous_summary": "Continuous summaries must aggregate independently of retained per-request detail. This needs a P6 versioned output contract.",
+    "p6_gate": "OPEN — P6 output-contract dependency recorded, streaming cells stay NOT_RUN until P6/P7 qualify them. Not designed here."
+  },
+  "cells": [
+    {
+      "id": "E01",
+      "title": "idle-then-burst controlled total",
+      "status": "P2",
+      "stimulus": {
+        "quiet_ms_after_ready": 150,
+        "fresh_ecb_lifetimes": 1000,
+        "op_bytes": 16,
+        "display_tick_ms": 1000
+      },
+      "oracle": {
+        "E01a": "1,000 correct fixture results and 1,000 distinct product observations in the isolated guest; accepted/consumed hook totals reconcile; zero measured drops; attribution remains unqualified",
+        "E01b": "exact owned per-request correspondence and foreign-traffic rejection"
+      },
+      "bounds": {
+        "workload_seconds": 1,
+        "report_seconds": 4,
+        "child_seconds": 30
+      },
+      "portions": [
+        {
+          "id": "E01a",
+          "status": "P2",
+          "note": "controlled-total checkpoint only; does not close E01b"
+        },
+        {
+          "id": "E01b",
+          "status": "NOT_RUN",
+          "deferred_to": "P3/P6",
+          "note": "needs per-request identity correspondence or an independent owned-correspondence oracle"
+        }
+      ]
+    },
+    {
+      "id": "E02",
+      "title": "sustained load",
+      "status": "P2",
+      "stimulus": {
+        "ops_per_second": 500,
+        "duration_seconds": 60,
+        "retained_tfm": true,
+        "op_bytes": 4096
+      },
+      "oracle": {
+        "ledger": "independent 30,000 issued/completed ledger",
+        "result": "exact admitted results within qualified envelope; no display-dependent drain gaps; schedule deviation recorded"
+      },
+      "bounds": {
+        "guest_seconds": 120
+      },
+      "portions": [
+        {
+          "id": "E02-totals",
+          "status": "P2",
+          "note": "isolated owned-guest totals; attribution unqualified"
+        },
+        {
+          "id": "E02-ownership",
+          "status": "NOT_RUN",
+          "deferred_to": "P3/P6",
+          "note": "ownership-sensitive reconciliation deferred"
+        }
+      ]
+    },
+    {
+      "id": "E03",
+      "title": "repeated bursts",
+      "status": "P2",
+      "stimulus": {
+        "burst_ops": 1000,
+        "burst_period_seconds": 2,
+        "duration_seconds": 30,
+        "burst_count": 15,
+        "fresh_lifetimes": true
+      },
+      "oracle": {
+        "result": "15,000 unique operations; each burst source/count recorded; no loss hidden by idle gaps"
+      },
+      "bounds": {
+        "guest_seconds": 90
+      },
+      "portions": [
+        {
+          "id": "E03-totals",
+          "status": "P2",
+          "note": "isolated owned-guest totals; attribution unqualified"
+        },
+        {
+          "id": "E03-ownership",
+          "status": "NOT_RUN",
+          "deferred_to": "P3/P6",
+          "note": "ownership-sensitive reconciliation deferred"
+        }
+      ]
+    },
+    {
+      "id": "E04",
+      "title": "slow output / backpressure",
+      "status": "NOT_RUN",
+      "deferred_to": "P6/P7",
+      "stimulus": {
+        "sink_read_bytes": 1024,
+        "sink_read_period_ms": 100,
+        "then_resumes": true
+      },
+      "oracle": {
+        "result": "backpressure/omission per declared mode; explicit output status, responsive stop and bounded memory; a shorter report cannot silently be clean"
+      },
+      "bounds": {
+        "slow_phase_seconds": 10,
+        "stop_reap_seconds": 10
+      },
+      "portions": [
+        {
+          "id": "E04-detail-stream",
+          "status": "NOT_RUN",
+          "deferred_to": "P6/P7",
+          "note": "detail/stream backpressure needs the P6 output contract, then P7 finalization"
+        }
+      ]
+    },
+    {
+      "id": "E05",
+      "title": "cancellation at fixture gates",
+      "status": "P2",
+      "stimulus": {
+        "signal": "SIGINT",
+        "gates": ["before-GO", "active-burst", "queued-async-pending", "closing-drain"]
+      },
+      "oracle": {
+        "result": "deterministic stop phase, admitted/terminal/unfinished equation, final writer outcome; no global-machine idle requirement"
+      },
+      "bounds": {
+        "stop_reap_seconds": 10,
+        "async_deadline": "declared before GO"
+      },
+      "portions": [
+        {
+          "id": "E05-sync",
+          "status": "P2",
+          "note": "before-GO, active-burst and closing-drain synchronous stop cases"
+        },
+        {
+          "id": "E05-queued-async",
+          "status": "NOT_RUN",
+          "deferred_to": "P4/P7",
+          "note": "queued-async cancellation needs the P4 terminal adapter, then P7 stop handling"
+        }
+      ]
+    },
+    {
+      "id": "E06",
+      "title": "observation cap boundary",
+      "status": "P2",
+      "stimulus": {
+        "planned_completions": 100005,
+        "observation_cap": 100000
+      },
+      "oracle": {
+        "result": "literal 100,000 boundary exercised; truncated/retained/unfinished populations reconcile and product is explicit partial; if early admission fence prevents all planned work, compare actual admitted ledger, never demand or fabricate 100,005 admissions"
+      },
+      "bounds": {
+        "guest_seconds": 180
+      },
+      "portions": [
+        {
+          "id": "E06-cap",
+          "status": "P2",
+          "note": "bounded-mode cap cell"
+        }
+      ]
+    },
+    {
+      "id": "E07",
+      "title": "deliberate overload per stage",
+      "status": "P2",
+      "stimulus": {
+        "stages": ["ring", "map", "user-queue"],
+        "independent": true
+      },
+      "oracle": {
+        "result": "correct stage-specific partial/unknown and bounded resource use; missing hook delivery is unknown magnitude unless separately proved; exact-inside-envelope gate still remains separate"
+      },
+      "bounds": {
+        "injection_seconds": 30,
+        "stop_reap_seconds": 10
+      },
+      "portions": [
+        {
+          "id": "E07-overload",
+          "status": "P2",
+          "note": "public-command overload; fine-grained stage attribution reconciles with P7"
+        }
+      ]
+    },
+    {
+      "id": "E08",
+      "title": "20-minute low-rate summary capture",
+      "status": "NOT_RUN",
+      "deferred_to": "P6/P7",
+      "stimulus": {
+        "ops_per_second": 10,
+        "duration_seconds": 1200,
+        "planned_operations": 12000,
+        "detail_windows": "named/capped"
+      },
+      "oracle": {
+        "result": "12,000 planned operations, actual independent ledger reconciled; no silent restart/cap reset; stable resource envelope; final coverage/cleanup explicit"
+      },
+      "bounds": {
+        "outer_seconds_including_cleanup": 1500
+      },
+      "portions": [
+        {
+          "id": "E08-continuous-summary",
+          "status": "NOT_RUN",
+          "deferred_to": "P6/P7",
+          "note": "continuous summary and detail windows need the P6 mode contract, then P7 requalification"
+        },
+        {
+          "id": "E08-ownership",
+          "status": "NOT_RUN",
+          "deferred_to": "P3/P6",
+          "note": "ownership-sensitive reconciliation deferred"
+        }
+      ]
+    }
+  ]
+}
