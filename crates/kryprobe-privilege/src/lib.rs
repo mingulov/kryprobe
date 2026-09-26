@@ -35,7 +35,8 @@ pub mod token;
 pub use inspect::{InspectError, TargetSnapshot};
 pub use kcrypto_backend::{
     LocateMiss, ObjectLocateError, locate_kcrypto_object_bytes, locate_kcrypto_object_identity,
-    locate_lifecycle_object_bytes, pins_enforced, sha256_hex,
+    locate_lifecycle_object_bytes, locate_lifecycle_object_identity, pins_enforced,
+    profile_pins_enforced, sha256_hex,
 };
 pub use kryprobe_core::ProgramId;
 pub use local::LocalPrivilegedAuthority;

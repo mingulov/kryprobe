@@ -16,9 +16,11 @@
 //! `sha256`, `ctr(aes)`): compat uses `ecb(aes)` (distinct); the
 //! exactness test reuses `cbc(aes)`/`gcm(aes)` (the only sane AEAD on
 //! this host is `gcm(aes)`) with `sha512` for hash. Cross-binary alg
-//! reuse is safe: privileged runs are lane-exclusive (lease
-//! `leases/k2-lane.json`), each test owns a fresh sensor, and rows
-//! match by decoded identity.
+//! reuse is serialized by the lane lease and a fresh sensor. The
+//! exactness fixture prepares its algorithms before attaching: module
+//! loading itself can generate SHA-512 calls under modprobe. Synchronous
+//! hash/AEAD caller rows must reconcile to the fixture PID, not merely
+//! its algorithm name.
 
 use kryprobe_abi::kcrypto_agg::{
     KCTL_IDENT, KCTL_OVERFLOW, KCtl, KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK,
@@ -630,8 +632,9 @@ fn decode_snapshot_idents(snap: &SnapshotRows) -> Vec<KCtl> {
         .collect()
 }
 
-/// Sum rows matching `(fam, op, res, alg)` over all contexts (the P4
-/// find/sum: background + cross-test traffic lives in other rows).
+/// Sum rows matching `(fam, op, res, alg)` over all contexts. Same-name
+/// background traffic can share these rows; exact fixture claims also
+/// require the separately checked caller boundary below.
 fn sum_rows(rows: &[SnapRow], fam: u8, op: u8, res: u8, alg: &str) -> VAgg {
     let mut out = VAgg::default();
     for row in rows
@@ -751,6 +754,18 @@ fn snapshot_byte_exactness_against_fixture() {
     if !lane_ready("snapshot_byte_exactness_against_fixture") {
         return;
     }
+    // Complete deterministic algorithm setup before the measured window.
+    // The cold diagnostic observed modprobe SHA-512 work during setup;
+    // that is real system crypto activity, but is not part of this
+    // fixture's eight measured digests. No count tolerance or in-window traffic is
+    // discarded: the measured calls/bytes and caller checks remain exact.
+    let ready_sk = alg_fixture::skcipher_roundtrip("cbc(aes)", 1).expect("prepare skcipher");
+    assert_eq!((ready_sk.enc, ready_sk.dec), (1, 1));
+    let ready_hash = alg_fixture::hash_digest("sha512", 1).expect("prepare hash");
+    assert_eq!((ready_hash.digests, ready_hash.digest_len), (1, 64));
+    let prepared = alg_fixture::PreparedHashFinups::new("sha512").expect("prepare hash prefix");
+    let ready_aead = alg_fixture::aead_roundtrip("gcm(aes)", 1).expect("prepare AEAD");
+    assert_eq!((ready_aead.enc, ready_aead.dec), (1, 1));
     let bytes = kcrypto_bytes();
     let (sensor, _points) = load_kcrypto_configured(&bytes, None)
         .unwrap_or_else(|err| panic!("configured bring-up failed: {err}"));
@@ -759,14 +774,63 @@ fn snapshot_byte_exactness_against_fixture() {
     assert_eq!((sk.enc, sk.dec), (20, 20));
     let single = alg_fixture::hash_digest("sha512", 8).expect("hash traffic");
     assert_eq!((single.digests, single.digest_len), (8, 64));
-    let multi = alg_fixture::hash_digest_multi("sha512", 4).expect("hashmulti traffic");
-    assert_eq!(multi.digests, 4);
+    let multi = prepared
+        .finish(4)
+        .expect("cloned finup traffic and digest goldens");
+    assert_eq!((multi.digests, multi.digest_len), (4, 64));
     let aead = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
     assert_eq!((aead.enc, aead.dec), (10, 10));
     alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
     let snap = snapshot_rows(&sensor).expect("snapshot_rows");
     let rows = decode_snapshot_rows(&snap);
     assert!(!rows.is_empty(), "snapshot must carry agg rows");
+    // Keep caller evidence when an exact fixture expectation fails. A lane
+    // lease serializes our tests; it does not exclude guest kernel traffic.
+    let (who, who_drops) = kryprobe_privilege::kcrypto_backend::snapshot_who(&sensor)
+        .expect("exactness caller diagnostics");
+    eprintln!("fixture_tgid={} who_drops={who_drops}", std::process::id());
+    assert_eq!(who_drops, 0, "caller attribution must be measured clean");
+    for row in &rows {
+        let kh = kryprobe_abi::kcrypto_agg::kh_of(
+            row.fam,
+            row.op,
+            row.res,
+            row.ctx,
+            &row.alg_words,
+            &row.drv_words,
+        );
+        eprintln!(
+            "snapshot fam={} op={} res={} ctx={} alg={} driver={} counts={:?}",
+            row.fam, row.op, row.res, row.ctx, row.alg, row.drv, row.val
+        );
+        for caller in who.iter().filter(|caller| caller.key.kh == kh) {
+            eprintln!(
+                "caller tgid={} tid={} comm={} calls={} first_ns={} last_ns={}",
+                caller.key.tgid,
+                caller.val.tid,
+                cstr(&caller.val.comm),
+                caller.val.calls,
+                caller.val.first_ns,
+                caller.val.last_ns
+            );
+        }
+        if (row.alg == "sha512" && matches!(row.fam, KFAM_AHASH | KFAM_SHASH))
+            || (row.alg == "gcm(aes)" && row.fam == KFAM_AEAD)
+        {
+            let callers: Vec<_> = who.iter().filter(|caller| caller.key.kh == kh).collect();
+            assert_eq!(
+                callers.iter().map(|caller| caller.val.calls).sum::<u64>(),
+                row.val.calls,
+                "synchronous caller totals must reconcile before attributing fixture work"
+            );
+            assert!(
+                callers
+                    .iter()
+                    .all(|caller| caller.key.tgid == std::process::id()),
+                "foreign synchronous calls cannot satisfy the fixture oracle"
+            );
+        }
+    }
     // P4 skcipher exactness (fixture truth vs sensor delta). BOUNDED
     // 18..=20, not exact (G9 kworker-miss finding: cbc(aes) is
     // cryptd-async here and ~1% of kworker completions never reach BPF
@@ -788,7 +852,7 @@ fn snapshot_byte_exactness_against_fixture() {
     assert_eq!(alloc.calls, 1, "sk alloc calls (one bind)");
     assert_eq!(alloc.bytes, 0, "alloc carries no bytes");
     // P4 hash exactness: one ahash + one shash observation per
-    // single-shot op (each 64B), two finups per multi digest.
+    // single-shot op (each 64B), one finup per prepared clone (16B).
     let ahash = sum_rows(&rows, KFAM_AHASH, KOP_DIGEST, KRES_OK, "sha512");
     assert_eq!(ahash.calls, 8, "ahash digest calls");
     assert_eq!(ahash.bytes, 8 * 64, "ahash digest bytes");
@@ -798,9 +862,10 @@ fn snapshot_byte_exactness_against_fixture() {
     assert_eq!(shash.bytes, 8 * 64, "shash digest bytes");
     assert_eq!(shash.ok, 8, "shash digest ok");
     let finup = sum_rows(&rows, KFAM_SHASH, KOP_FINUP, KRES_OK, "sha512");
-    assert_eq!(finup.calls, 8, "finup calls (2 per multi digest)");
-    assert_eq!(finup.bytes, 4 * 32, "finup bytes conserved");
-    assert_eq!(finup.ok, 8, "finup ok");
+    assert_eq!(finup.calls, 4, "one finup per clone");
+    assert_eq!(finup.bytes, 4 * 16, "finup argument bytes, not full input");
+    assert_eq!(finup.ok, 4, "finup ok");
+    assert_eq!((finup.errors, finup.queued), (0, 0));
     // P4 AEAD exactness: N=10 clean + bad-tag setup enc + failed dec.
     let aenc = sum_rows(&rows, KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)");
     assert_eq!(aenc.calls, 11, "aead enc calls (10 + bad-tag setup)");

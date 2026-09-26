@@ -111,6 +111,45 @@ fn parse_finds_nine_fexit_programs() {
 }
 
 #[test]
+fn destroy_exit_does_not_read_released_transform_memory() {
+    // The final destroy can free the transform before its fexit program
+    // runs. A successful probe read would still not establish a live
+    // object. This bytecode regression catches the actual helper-based
+    // chase that produced name-read losses on 6.12 (and could read reused
+    // storage). Only the skip counter is valid at this boundary.
+    let parsed = parse_kcrypto_object(&kcrypto_bytes()).expect("real object must parse");
+    let destroy = parsed
+        .programs
+        .iter()
+        .find(|p| p.section == "fexit/crypto_destroy_tfm")
+        .expect("destroy boundary remains attached");
+    let helpers: Vec<_> = destroy
+        .insns
+        .iter()
+        .filter(|insn| insn.code == 0x85)
+        .map(|insn| insn.imm)
+        .collect();
+    assert!(
+        !helpers.is_empty() && helpers.iter().all(|&helper| helper == 1),
+        "destroy exit may only look up its skip counter, not probe released memory: {helpers:?}"
+    );
+    // Positive control: parse the real operation's probe-read helper too,
+    // so a parser that erased helper calls cannot satisfy the audit.
+    let encrypt = parsed
+        .programs
+        .iter()
+        .find(|p| p.section == "fexit/crypto_skcipher_encrypt")
+        .expect("operation boundary remains attached");
+    assert!(
+        encrypt
+            .insns
+            .iter()
+            .any(|insn| insn.code == 0x85 && insn.imm == 113),
+        "positive control must contain bpf_probe_read_kernel"
+    );
+}
+
+#[test]
 fn rejects_garbage_as_kcrypto() {
     assert!(matches!(
         parse_kcrypto_object(b"not an elf file at all...................."),

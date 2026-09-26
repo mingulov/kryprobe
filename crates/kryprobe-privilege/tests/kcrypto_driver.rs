@@ -1152,6 +1152,7 @@ fn driver_e2e_matches_fixture_truth() {
             object_path.as_os_str().to_string_lossy().into_owned(),
         );
     }
+    let prepared = alg_fixture::PreparedHashFinups::new("sha512").expect("prepare hash prefix");
     let bytes = kcrypto_bytes();
     let (sensor, _points) = load_kcrypto_configured(&bytes, None)
         .unwrap_or_else(|err| panic!("bring-up failed: {err}"));
@@ -1160,8 +1161,10 @@ fn driver_e2e_matches_fixture_truth() {
     assert_eq!((sk.enc, sk.dec), (20, 20));
     let single = alg_fixture::hash_digest("sha512", 8).expect("hash traffic");
     assert_eq!((single.digests, single.digest_len), (8, 64));
-    let multi = alg_fixture::hash_digest_multi("sha512", 4).expect("hashmulti traffic");
-    assert_eq!(multi.digests, 4);
+    let multi = prepared
+        .finish(4)
+        .expect("cloned finup traffic and digest goldens");
+    assert_eq!((multi.digests, multi.digest_len), (4, 64));
     let aead = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
     assert_eq!((aead.enc, aead.dec), (10, 10));
     alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
@@ -1170,6 +1173,9 @@ fn driver_e2e_matches_fixture_truth() {
     // (registry + register_kcrypto + live-shape runtime caps). The owned
     // blobs outlive the run; events borrow them (D6).
     let snap: SnapshotRows = snapshot_rows(&sensor).expect("snapshot_rows");
+    let (who, who_drops) =
+        kryprobe_privilege::kcrypto_backend::snapshot_who(&sensor).expect("finup caller evidence");
+    assert_eq!(who_drops, 0, "caller evidence must be measured clean");
     assert!(!snap.rows.is_empty(), "snapshot must carry agg rows");
     let mut events: Vec<RawEvent<'_>> = snap.rows.iter().map(raw_event_for_agg).collect();
     if let Some(totals) = snap.totals.as_ref() {
@@ -1237,7 +1243,7 @@ fn driver_e2e_matches_fixture_truth() {
         "one bind alloc"
     );
     // Hash: one ahash + one shash observation per single-shot op (64B
-    // each), two finups per multi digest.
+    // each), one finup per prepared clone (16 final-argument bytes).
     assert_eq!(
         sum_obs(observations, "ahash", "digest", "ok", "sha512"),
         (8, 8 * 64, 8, 0, 0)
@@ -1248,8 +1254,30 @@ fn driver_e2e_matches_fixture_truth() {
     );
     assert_eq!(
         sum_obs(observations, "shash", "finup", "ok", "sha512"),
-        (8, 4 * 32, 8, 0, 0)
+        (4, 4 * 16, 4, 0, 0)
     );
+    for observation in observations.iter().filter(|o| {
+        o.backend_payload["row"] == "agg"
+            && o.backend_payload["family"] == "shash"
+            && o.backend_payload["op"] == "finup"
+            && o.backend_payload["algorithm"] == "sha512"
+    }) {
+        let hash = observation.backend_payload["key_hash"]
+            .as_u64()
+            .expect("row hash");
+        let callers: Vec<_> = who.iter().filter(|w| w.key.kh == hash).collect();
+        assert!(
+            callers.iter().all(|w| w.key.tgid == std::process::id()),
+            "foreign finup cannot satisfy the fixture"
+        );
+        assert_eq!(
+            callers.iter().map(|w| w.val.calls).sum::<u64>(),
+            observation.backend_payload["counts"]["calls"]
+                .as_u64()
+                .expect("calls"),
+            "finup caller counts reconcile"
+        );
+    }
     // AEAD: 10 clean + bad-tag setup enc + failed dec.
     assert_eq!(
         sum_obs(observations, "aead", "encrypt", "ok", "gcm(aes)"),

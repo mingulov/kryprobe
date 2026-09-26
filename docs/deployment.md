@@ -10,7 +10,7 @@ the runbook.)
 
 One installer owns the layout: `packaging/install.sh` (`--prefix`,
 default `/usr/local`; `--destdir` for staged packaging). It copies
-the binary plus the kcrypto object into the exe-bundled tier and —
+the binary plus both kcrypto objects into the exe-bundled tier and —
 as root — grants file caps and verifies:
 
 ```sh
@@ -28,12 +28,16 @@ sudo packaging/install.sh --stage /owned/pkg-YYYYMMDD
 ```
 
 `build-release.sh` enforces the two-phase order: build BPF objects,
-digest `kcrypto.bpf.o`, then build the release binary with
-`KRYPROBE_REQUIRE_PINS=1` and that digest baked in. It stages the
-binary + object atomically, writes `manifest.json` + `sha256sums.txt`
-(explicit object list — future lifecycle objects join the manifest,
-never an unbounded glob), and verifies the staged `doctor --versions`
-reports `pins_enforced: true` with the staged digest. Never rebuild
+digest `kcrypto.bpf.o` and `kcrypto-lifecycle.bpf.o`, then build the
+release binary with `KRYPROBE_REQUIRE_PINS=1` and
+`KRYPROBE_PIN_OBJECTS=kcrypto.bpf.o=<sha256>,kcrypto-lifecycle.bpf.o=<sha256>`.
+Each digest is bound to its object name; swapping two trusted objects
+is refused. It stages the binary and both objects atomically, writes
+`manifest.json` v2 and `sha256sums.txt` with that explicit object set,
+and verifies that staged `doctor --versions` reports
+`profile_pins_enforced: true` with both paths and digests. The installer
+requires this byte-exact v2 manifest and verifies all three payload
+files before copying. Older v1 stages must be rebuilt. Never rebuild
 objects after pinning without rebuilding the host binary: the pin
 would name bytes that no longer exist. Later privileged lanes use an
 immutable staged executable owned by the task, never a mutable
@@ -44,24 +48,28 @@ Result:
 ```text
 $PREFIX/bin/kryprobe
 $PREFIX/bin/kryprobe-bpf/kcrypto.bpf.o
+$PREFIX/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o
 ```
 
-`<exe-dir>/kryprobe-bpf/kcrypto.bpf.o` is the **trusted object
-path**: the middle tier of the D2 locator try order (`KRYPROBE_BPF_DIR`
+`<exe-dir>/kryprobe-bpf/<object-name>` is the **trusted object
+path** for each profile: the middle tier of the D2 locator try order (`KRYPROBE_BPF_DIR`
 → exe-bundled → CWD dev path). An elevated kryprobe (euid 0 or
 effective `CAP_BPF`/`CAP_SYS_ADMIN`, i.e. every file-cap deployment)
 loads **only** this tier — env and CWD tiers are refused, so a missing
 object fails closed at exit 4 (`kcrypto_object_unreadable`) instead
-of loading a stray file. Pinned builds (non-empty
-`KRYPROBE_PIN_DIGESTS` baked at compile time) additionally refuse
-any object whose sha256 is not in the pin set; unpinned builds skip
+of loading a stray file. Release builds additionally require the
+name-bound sha256 baked into the binary. Legacy manual builds using
+`KRYPROBE_PIN_DIGESTS` retain a flat allowlist and report
+`profile_pins_enforced: false`; they are not accepted by the release
+installer. The two pin variables cannot be combined. Unpinned builds skip
 the check with a once-per-process stderr warning. Release packaging
 must set `KRYPROBE_REQUIRE_PINS=1` so a missing pin set fails the
 build instead of shipping an unpinned binary, and must record the
 baked digests in the release evidence. `doctor` prints the resolved
 path (`kcrypto_object` row) so the effective configuration is
 inspectable, and `doctor --versions` reports the object digests
-plus the `pins_enforced` bit; any deviation from the path above in
+under `kcrypto` and `kcrypto_lifecycle`, plus `pins_enforced` and
+`profile_pins_enforced`; any deviation from the path above in
 a deployment is a finding, not a configuration.
 
 ## Privilege model
@@ -110,6 +118,54 @@ pre-7.0 kernels refuse it typed (`Unsupported`, never a silent
 no-op). The authoritative gate is the runtime probe matrix
 (`doctor`), not the release string — deploy on what `doctor`
 passes, not on what `uname` prints.
+
+## Privileged qualification
+
+Run `scripts/sudo-lane.sh --out /owned/new-run` from the selected
+worktree (through the project's Rust tool manager). This needs Python
+3.10+, `mount`, `unshare`, `setpriv`, and root or `sudo -n`. It builds with Cargo's
+JSON artifact output, records package/target/features and hashes, and
+checks the complete ignored-body inventory before privileged execution.
+It never chooses an executable by modification time. The TFM suite's
+host tests also run in `cargo xtask test bpf`; its three privileged
+bodies belong to this runtime-qualified lane.
+
+The runner stages both kcrypto objects, the selftest spine object and
+the current executables. The privileged executor copies the complete
+bundle into an owned tmpfs under `/run`, verifies every required file,
+and makes that root-owned copy read-only in a private mount namespace.
+Copies appear at compiled-in fixture paths, including a custom Cargo
+target directory. It holds `flock` with an ownership receipt and runs
+each of the 34 lane bodies separately, with a 180-second deadline:
+33 as root and the privilege-refusal proof under a recorded non-root UID.
+An empty test result, timeout, unexplained `SKIP`, missing body or
+changed artifact fails. The guest-ledger body is recorded as
+`OTHER_LANE` and remains the responsibility of `scripts/kcrypto-lab.py`.
+
+`--prepare-only` builds and seals without privilege;
+`--run-prepared /owned/new-run` executes those bytes, including inside
+an owned VM with the same checkout paths. A prepared directory permits
+one execution attempt; use a fresh bundle for a repeat. Preparation
+requires a lab traffic generator: `--traffic-generator PATH` snapshots
+an explicitly supplied file (the default input is `/tmp/kcrypto_gen.py`).
+Tests receive the verified runtime copy through an explicit path;
+there is no ambient `/tmp` fallback during a lane run. Its input path
+and digest are recorded. Absent prerequisites cannot produce a green result.
+
+Cancellation closes the wrapper's custody pipe. The executor terminates
+and reaps its owned descendants, including children that started another
+session, before releasing the lock. The runner creates no PID namespace:
+kernel TGIDs and test traffic identities remain in the same namespace.
+If a child cannot yet be reaped, the lock remains held and cleanup is
+reported as pending; the enclosing VM supervisor supplies the final bound.
+
+`results.json`, `summary.json`, `ownership.json`, Cargo messages and
+per-body commands/logs remain in the run directory. Exit 0 means every
+required privileged body passed. Exit 1 means failure. Exit 4 means
+the lane lock is held or the runtime proves lifecycle fsession refusal;
+each affected body is explicitly `SUPPORTED_REFUSAL`, never `PASS`.
+The aggregate results remain visible on that kernel. No mount outside
+the private namespace is changed.
 
 ## Supervision and cgroup notes
 

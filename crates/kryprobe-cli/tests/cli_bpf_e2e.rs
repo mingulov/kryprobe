@@ -29,7 +29,10 @@ fn selftest_bpf_clean_or_denied() {
             assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
             assert!(end["payload"]["child_signal"].is_null(), "stdout: {stdout}");
         }
-        Some(4) => assert!(stderr.contains("Denied{"), "stderr: {stderr}"),
+        Some(4) => {
+            assert!(stderr.contains("Denied{"), "stderr: {stderr}");
+            eprintln!("SKIP: selftest BPF denied: {stderr}");
+        }
         Some(code) => panic!("unexpected exit {code}: {stderr}"),
         None => panic!("killed by signal: {stderr}"),
     }

@@ -5,8 +5,8 @@ use kryprobe_core::error::{BackendError, UnsupportedReason};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-// Pinned release-object digests (H-SEC-01), baked by build.rs from
-// `KRYPROBE_PIN_DIGESTS`; empty in dev builds (pin check skipped).
+// Baked by build.rs from KRYPROBE_PIN_OBJECTS (release) or the legacy
+// flat KRYPROBE_PIN_DIGESTS. Both empty in dev builds.
 include!(concat!(env!("OUT_DIR"), "/pinned_digests.rs"));
 
 /// kcrypto object file name (tier-1 dir join + tier-2 bundled path).
@@ -138,15 +138,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// `doctor --versions`).
 #[must_use]
 pub fn pins_enforced() -> bool {
-    !PINNED_DIGESTS.is_empty()
+    !PINNED_DIGESTS.is_empty() || !PINNED_OBJECTS.is_empty()
+}
+
+/// Both shipped profiles have a name-bound digest. A legacy flat
+/// allowlist does not protect against swapping two trusted profiles.
+#[must_use]
+pub fn profile_pins_enforced() -> bool {
+    [OBJECT_FILE_NAME, LIFECYCLE_OBJECT_FILE_NAME]
+        .iter()
+        .all(|name| PINNED_OBJECTS.iter().any(|(pinned, _)| pinned == name))
 }
 
 /// Warning text for the empty-pin skip (G6): the fail-open state is
 /// named at runtime instead of silent. Pure over the flag for tests.
 pub(crate) fn pin_skip_warning(pins_empty: bool) -> Option<&'static str> {
     pins_empty.then_some(
-        "kryprobe: BPF object pin check SKIPPED (empty PINNED_DIGESTS dev build); \
-         set KRYPROBE_PIN_DIGESTS at compile time or KRYPROBE_REQUIRE_PINS=1 to fail closed",
+        "kryprobe: BPF object pin check SKIPPED (empty pins in dev build); \
+         set KRYPROBE_PIN_OBJECTS at compile time or KRYPROBE_REQUIRE_PINS=1 to fail closed",
     )
 }
 
@@ -170,6 +179,31 @@ pub(crate) fn verify_object_pinned(bytes: &[u8], pins: &[&str]) -> Result<(), St
     }
 }
 
+/// When named pins exist, a trusted digest is valid only for its
+/// declared object. Never fall back to the legacy allowlist on a
+/// missing name or mismatched digest.
+fn verify_object_for_profile(
+    name: &str,
+    bytes: &[u8],
+    objects: &[(&str, &str)],
+    legacy: &[&str],
+) -> Result<(), String> {
+    if objects.is_empty() {
+        return verify_object_pinned(bytes, legacy);
+    }
+    let Some((_, expected)) = objects.iter().find(|(pinned, _)| *pinned == name) else {
+        return Err(format!("untrusted object (no release pin for {name})"));
+    };
+    let digest = sha256_hex(bytes);
+    if digest == *expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "untrusted object (sha256 {digest} does not match release pin for {name})"
+        ))
+    }
+}
+
 /// D2 consolidated locator, single-read form (replaces the probe/use
 /// double-read, L-SEC-06): first readable AND pin-trusted candidate
 /// wins; bytes return with the path so callers never re-open.
@@ -188,7 +222,7 @@ pub(crate) fn locate_object_bytes_for(
     let env_tier = if elevated { None } else { env.as_deref() };
     // G6: the empty-pin skip is fail-open by design (dev builds), so
     // it warns once per process instead of loading silently unpinned.
-    if let Some(warning) = pin_skip_warning(PINNED_DIGESTS.is_empty())
+    if let Some(warning) = pin_skip_warning(!pins_enforced())
         && !PIN_SKIP_WARNED.swap(true, Ordering::Relaxed)
     {
         eprintln!("{warning}");
@@ -205,7 +239,9 @@ pub(crate) fn locate_object_bytes_for(
                 continue;
             }
         };
-        if let Err(detail) = verify_object_pinned(&bytes, PINNED_DIGESTS) {
+        if let Err(detail) =
+            verify_object_for_profile(file_name, &bytes, PINNED_OBJECTS, PINNED_DIGESTS)
+        {
             misses.push(LocateMiss {
                 candidate,
                 error: detail,
@@ -245,6 +281,14 @@ pub fn locate_lifecycle_object_bytes() -> Result<(PathBuf, Vec<u8>), ObjectLocat
 #[must_use]
 pub fn locate_kcrypto_object_identity() -> Option<(PathBuf, String)> {
     let (path, bytes) = locate_kcrypto_object_bytes().ok()?;
+    Some((path, sha256_hex(&bytes)))
+}
+
+/// Pin-trusted lifecycle identity, using the same single-read locator
+/// as the lifecycle loader. No BPF load or privilege is needed.
+#[must_use]
+pub fn locate_lifecycle_object_identity() -> Option<(PathBuf, String)> {
+    let (path, bytes) = locate_lifecycle_object_bytes().ok()?;
     Some((path, sha256_hex(&bytes)))
 }
 

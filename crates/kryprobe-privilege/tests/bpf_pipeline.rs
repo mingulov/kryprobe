@@ -125,7 +125,7 @@ fn load_spine_or_skip() -> Option<LoadedSpine> {
         Err(LoaderError::MapFailed { errno, .. }) | Err(LoaderError::LoadFailed { errno, .. })
             if errno == libc::EPERM || errno == libc::EACCES =>
         {
-            eprintln!("pipeline: unprivileged, loader honestly denied (errno {errno})");
+            eprintln!("SKIP: pipeline loader denied (errno {errno})");
             None
         }
         Err(other) => panic!("loader failed dishonestly: {other}"),

@@ -5,6 +5,9 @@ use kryprobe_testkit::assert_golden;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/api_return.rs"]
+mod api_return;
+
 fn kryprobe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_kryprobe"))
 }
@@ -1182,13 +1185,20 @@ fn watch_live_proves_traffic_case() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "healthy lane exits 0; stderr: {}",
+        "uninterrupted watch completes with exit 0; stderr: {}",
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
-    for marker in ["cbc(aes)", "gcm(aes)", "sha512", "TOTAL", "COMPLETE"] {
+    for marker in ["cbc(aes)", "gcm(aes)", "sha512", "TOTAL"] {
         assert!(stdout.contains(marker), "missing {marker}: {stdout}");
     }
+    // Human output proves traffic and trailer rendering. The separate JSON
+    // report test checks measured loss counters that watch does not display.
+    let trailers: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("PARTIAL:") || *line == "COMPLETE")
+        .collect();
+    assert_eq!(trailers, ["PARTIAL: capture-integrity,completion"]);
 }
 
 #[test]
@@ -1207,8 +1217,8 @@ fn report_live_proves_json_case() {
     traffic.join().expect("traffic joins");
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "healthy lane exits 0; stderr: {}",
+        Some(3),
+        "API returns leave delivery/completion unknown; stderr: {}",
         stderr_of(&output)
     );
     let doc: serde_json::Value =
@@ -1216,7 +1226,7 @@ fn report_live_proves_json_case() {
     for key in ["observations", "coverage", "integrity", "verdict"] {
         assert!(doc.get(key).is_some(), "missing key {key}");
     }
-    assert_eq!(doc["verdict"]["status"], "complete");
+    api_return::assert_report(&doc);
     // Totals conserved across all ticks (ambient-proof summation).
     let observations = doc["observations"].as_array().expect("obs array");
     let sum = |row: &str, field: &str| -> u64 {
@@ -1265,8 +1275,8 @@ fn report_live_proves_json_case() {
     traffic.join().expect("traffic joins");
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "healthy lane exits 0; stderr: {}",
+        Some(3),
+        "API returns leave delivery/completion unknown; stderr: {}",
         stderr_of(&output)
     );
     assert!(output.stdout.is_empty(), "file mode prints no stdout");
@@ -1276,7 +1286,7 @@ fn report_live_proves_json_case() {
         "file holds one doc plus newline"
     );
     let file_doc: serde_json::Value = serde_json::from_slice(&via_file).expect("file json parses");
-    assert_eq!(file_doc["verdict"]["status"], "complete");
+    api_return::assert_report(&file_doc);
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,7 +1489,7 @@ fn check_live_violation_exit10_case() {
     let dir = scratch.path();
     let policy = write_policy(
         dir,
-        "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: \"*md5*\"\n    decision: deny\n",
+        "version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: returned\n      algorithm: \"*md5*\"\n    decision: deny\n",
     );
     let traffic = spawn_md5_traffic();
     let output = Command::new(kryprobe())

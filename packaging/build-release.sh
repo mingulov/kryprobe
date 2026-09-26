@@ -19,20 +19,20 @@
 # rebuilding the host binary (the pin would name bytes that no
 # longer exist):
 #   1. cargo xtask build --bpf
-#   2. digest target/kryprobe-bpf/kcrypto.bpf.o
-#   3. KRYPROBE_REQUIRE_PINS=1 KRYPROBE_PIN_DIGESTS=<digest>
+#   2. digest kcrypto.bpf.o and kcrypto-lifecycle.bpf.o
+#   3. KRYPROBE_REQUIRE_PINS=1 KRYPROBE_PIN_OBJECTS=<name=digest,...>
 #        cargo build --locked --release -p kryprobe-cli
-#   4. stage binary + object atomically, write manifest + sha256sums
-#   5. verify staged doctor --versions: pins_enforced + digest match
+#   4. stage binary + both objects atomically, manifest v2 + sha256sums
+#   5. verify staged doctor --versions: profile pins + both identities
 #
 # Stage layout (installed verbatim by install.sh --stage):
 #   $DEST/bin/kryprobe
 #   $DEST/bin/kryprobe-bpf/kcrypto.bpf.o
+#   $DEST/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o
 #   $DEST/manifest.json
 #   $DEST/sha256sums.txt
 #
-# Future lifecycle objects join the manifest explicitly, never via an
-# unbounded directory glob.
+# The shipped object set is explicit, never an unbounded directory glob.
 set -eu
 
 DEST=
@@ -104,6 +104,7 @@ mkdir -p "$ROOT/target"
 exec 9>"$ROOT/target/.build-release.lock"
 flock 9 || { echo "build-release.sh: cannot lock $ROOT/target" >&2; exit 1; }
 OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
+LIFECYCLE_SRC="$ROOT/target/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
 # BIN_SRC is resolved after `cd "$ROOT"` (phase 2): the host build
 # honors an explicit CARGO_TARGET_DIR, and the staged executable must
 # come from that build — never assume the default target (F05). The
@@ -113,23 +114,28 @@ OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
 echo "+ phase 1: BPF objects"
 ( unset CARGO_TARGET_DIR; cd "$ROOT" && "$CARGO_BIN" xtask build --bpf )
 
-if [ ! -f "$OBJ_SRC" ]; then
-    echo "build-release.sh: missing $OBJ_SRC after xtask build --bpf" >&2
-    exit 1
-fi
+for source in "$OBJ_SRC" "$LIFECYCLE_SRC"; do
+    if [ ! -f "$source" ]; then
+        echo "build-release.sh: missing $source after xtask build --bpf" >&2
+        exit 1
+    fi
+done
 DIGEST=$(sha256sum "$OBJ_SRC")
 DIGEST=${DIGEST%% *}
-case "$DIGEST" in
+LIFECYCLE_DIGEST=$(sha256sum "$LIFECYCLE_SRC")
+LIFECYCLE_DIGEST=${LIFECYCLE_DIGEST%% *}
+case "$DIGEST$LIFECYCLE_DIGEST" in
     *[!0-9a-f]*|"")
         echo "build-release.sh: bad digest: $DIGEST" >&2
         exit 1
         ;;
 esac
-if [ "${#DIGEST}" -ne 64 ]; then
+if [ "${#DIGEST}" -ne 64 ] || [ "${#LIFECYCLE_DIGEST}" -ne 64 ]; then
     echo "build-release.sh: bad digest length: $DIGEST" >&2
     exit 1
 fi
 echo "+ object digest: $DIGEST"
+echo "+ lifecycle digest: $LIFECYCLE_DIGEST"
 
 echo "+ phase 2: pinned release binary"
 cd "$ROOT"
@@ -145,7 +151,8 @@ else
 fi
 BIN_SRC="$HOST_TARGET_DIR/release/kryprobe"
 echo "+ host target dir: $HOST_TARGET_DIR"
-KRYPROBE_REQUIRE_PINS=1 KRYPROBE_PIN_DIGESTS="$DIGEST" \
+KRYPROBE_REQUIRE_PINS=1 KRYPROBE_PIN_DIGESTS= \
+    KRYPROBE_PIN_OBJECTS="kcrypto.bpf.o=$DIGEST,kcrypto-lifecycle.bpf.o=$LIFECYCLE_DIGEST" \
     "$CARGO_BIN" build --locked --release -p kryprobe-cli
 
 if [ ! -f "$BIN_SRC" ]; then
@@ -159,19 +166,23 @@ trap 'rm -rf "$STAGE_TMP"' EXIT INT TERM
 mkdir -p "$STAGE_TMP/bin/kryprobe-bpf"
 cp -f "$BIN_SRC" "$STAGE_TMP/bin/kryprobe"
 cp -f "$OBJ_SRC" "$STAGE_TMP/bin/kryprobe-bpf/kcrypto.bpf.o"
+cp -f "$LIFECYCLE_SRC" "$STAGE_TMP/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
 chmod 0755 "$STAGE_TMP/bin/kryprobe"
 chmod 0644 "$STAGE_TMP/bin/kryprobe-bpf/kcrypto.bpf.o"
+chmod 0644 "$STAGE_TMP/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
 BIN_DIGEST=$(sha256sum "$STAGE_TMP/bin/kryprobe")
 BIN_DIGEST=${BIN_DIGEST%% *}
 OBJ_DIGEST=$(sha256sum "$STAGE_TMP/bin/kryprobe-bpf/kcrypto.bpf.o")
 OBJ_DIGEST=${OBJ_DIGEST%% *}
-if [ "$OBJ_DIGEST" != "$DIGEST" ]; then
-    echo "build-release.sh: staged object digest drifted ($OBJ_DIGEST != $DIGEST)" >&2
+STAGED_LIFECYCLE_DIGEST=$(sha256sum "$STAGE_TMP/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o")
+STAGED_LIFECYCLE_DIGEST=${STAGED_LIFECYCLE_DIGEST%% *}
+if [ "$OBJ_DIGEST" != "$DIGEST" ] || [ "$STAGED_LIFECYCLE_DIGEST" != "$LIFECYCLE_DIGEST" ]; then
+    echo "build-release.sh: staged object digest drifted" >&2
     exit 1
 fi
-(cd "$STAGE_TMP" && sha256sum bin/kryprobe bin/kryprobe-bpf/kcrypto.bpf.o > sha256sums.txt)
+(cd "$STAGE_TMP" && sha256sum bin/kryprobe bin/kryprobe-bpf/kcrypto.bpf.o bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o > sha256sums.txt)
 cat > "$STAGE_TMP/manifest.json" <<EOF
-{"kryprobe_release_manifest":1,"binary":{"path":"bin/kryprobe","sha256":"$BIN_DIGEST"},"objects":[{"name":"kcrypto.bpf.o","path":"bin/kryprobe-bpf/kcrypto.bpf.o","sha256":"$OBJ_DIGEST"}],"pins_enforced":true,"pin_digests":["$DIGEST"]}
+{"kryprobe_release_manifest":2,"binary":{"path":"bin/kryprobe","sha256":"$BIN_DIGEST"},"objects":[{"name":"kcrypto.bpf.o","path":"bin/kryprobe-bpf/kcrypto.bpf.o","sha256":"$OBJ_DIGEST"},{"name":"kcrypto-lifecycle.bpf.o","path":"bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o","sha256":"$LIFECYCLE_DIGEST"}],"pins_enforced":true,"profile_pins_enforced":true,"pin_digests":["$DIGEST","$LIFECYCLE_DIGEST"]}
 EOF
 chmod 0644 "$STAGE_TMP/manifest.json" "$STAGE_TMP/sha256sums.txt"
 
@@ -181,10 +192,16 @@ VERSIONS=$(cd / && env -u KRYPROBE_BPF_DIR -u KRYPROBE_BPF_OBJ \
     || { echo "build-release.sh: staged doctor --versions failed" >&2; exit 1; }
 echo "$VERSIONS" | grep -q -F '"pins_enforced":true' \
     || { echo "build-release.sh: staged binary is not pin-enforced: $VERSIONS" >&2; exit 1; }
+echo "$VERSIONS" | grep -q -F '"profile_pins_enforced":true' \
+    || { echo "build-release.sh: staged binary lacks profile-bound pins: $VERSIONS" >&2; exit 1; }
 echo "$VERSIONS" | grep -q -F "\"sha256\":\"$DIGEST\"" \
     || { echo "build-release.sh: staged identity digest mismatch: $VERSIONS" >&2; exit 1; }
 echo "$VERSIONS" | grep -q -F "\"path\":\"$STAGE_TMP/bin/kryprobe-bpf/kcrypto.bpf.o\"" \
     || { echo "build-release.sh: staged identity path mismatch: $VERSIONS" >&2; exit 1; }
+echo "$VERSIONS" | grep -q -F "\"sha256\":\"$LIFECYCLE_DIGEST\"" \
+    || { echo "build-release.sh: lifecycle identity digest mismatch: $VERSIONS" >&2; exit 1; }
+echo "$VERSIONS" | grep -q -F "\"path\":\"$STAGE_TMP/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o\"" \
+    || { echo "build-release.sh: lifecycle identity path mismatch: $VERSIONS" >&2; exit 1; }
 
 if [ -e "$DEST" ]; then
     rmdir "$DEST" 2>/dev/null || {

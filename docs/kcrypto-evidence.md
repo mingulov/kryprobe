@@ -67,3 +67,25 @@ within the stated bound", not "delivery was complete".
 Out of scope: request completion, per-request latency, driver-body
 entry proof, exact missing-operation counts, and any claim that a
 clean ring implies complete kernel delivery.
+
+## Hash API routing differs between kernels
+
+The hash hooks are `crypto_ahash_digest`, `crypto_shash_digest`, and
+`crypto_shash_finup`. Separate update/final APIs are not hooked.
+On the observed 6.12.111 SHA-256/SHA-512 AF_ALG route, a multipart
+message ending with an empty send uses those separate update/final
+APIs and produces no finup observation. On 7.2.6, shash update/final
+wrappers route through finup instead. A zero finup count therefore
+does not establish that no multipart hashing occurred.
+
+Finup byte counts sum the `len` argument of observed finup calls;
+they do not necessarily include input handled by an unhooked update.
+Kernel release strings alone do not establish this call route.
+
+The exact finup tests use a separate prepared-operation control: feed a
+32-byte prefix before attachment, retain that operation, then clone and
+finalize it with a 16-byte chunk for each measured digest. Independent
+worker-only traces on 6.12.111 and 7.2.6 qualify one shash finup per clone
+for the tested shash-backed SHA-256/SHA-512 routes. Digest goldens check
+the full 48-byte message; observed finup bytes remain 16 per call. Native
+ahash providers are not covered by that shash-route expectation.

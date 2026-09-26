@@ -71,6 +71,9 @@ fn s05_staged_package_binds_binary_to_object() {
     )
     .expect("manifest json");
     assert_eq!(manifest["pins_enforced"], true);
+    assert_eq!(manifest["kryprobe_release_manifest"], 2);
+    assert_eq!(manifest["profile_pins_enforced"], true);
+    assert_eq!(manifest["objects"].as_array().expect("objects").len(), 2);
     let pin = manifest["pin_digests"][0]
         .as_str()
         .expect("one pin")
@@ -78,16 +81,27 @@ fn s05_staged_package_binds_binary_to_object() {
 
     let binary = stage.join("bin/kryprobe");
     let object = stage.join("bin/kryprobe-bpf/kcrypto.bpf.o");
+    let lifecycle = stage.join("bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o");
+    assert!(lifecycle.is_file(), "release includes the lifecycle object");
     let neutral = scratch.path().join("neutral");
     std::fs::create_dir_all(&neutral).expect("neutral cwd");
 
     // Correct object: accepted, identity is the staged path + pin.
     let versions = staged_versions(&binary, &neutral);
     assert_eq!(versions["pins_enforced"], true);
+    assert_eq!(versions["profile_pins_enforced"], true);
     assert_eq!(versions["kcrypto"]["sha256"], pin.as_str());
     assert_eq!(
         versions["kcrypto"]["path"],
         object.to_str().expect("utf-8 path")
+    );
+    assert_eq!(
+        versions["kcrypto_lifecycle"]["sha256"],
+        manifest["pin_digests"][1]
+    );
+    assert_eq!(
+        versions["kcrypto_lifecycle"]["path"],
+        lifecycle.to_str().unwrap()
     );
 
     // Missing object: refused before load (null identity, pins hold).
@@ -98,6 +112,26 @@ fn s05_staged_package_binds_binary_to_object() {
     assert!(
         versions["kcrypto"].is_null(),
         "missing object has no identity: {versions}"
+    );
+    assert!(versions["kcrypto_lifecycle"].is_null());
+
+    // Both digests are trusted, but never under each other's name.
+    let swapped = scratch.path().join("swapped");
+    copy_file(&binary, &swapped.join("bin/kryprobe"));
+    copy_file(&lifecycle, &swapped.join("bin/kryprobe-bpf/kcrypto.bpf.o"));
+    copy_file(
+        &object,
+        &swapped.join("bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"),
+    );
+    let versions = staged_versions(&swapped.join("bin/kryprobe"), &neutral);
+    assert_eq!(versions["profile_pins_enforced"], true);
+    assert!(
+        versions["kcrypto"].is_null(),
+        "swapped aggregate: {versions}"
+    );
+    assert!(
+        versions["kcrypto_lifecycle"].is_null(),
+        "swapped lifecycle: {versions}"
     );
 
     // One-byte-modified object: digest mismatch, refused before load.
@@ -139,6 +173,7 @@ fn s05_empty_required_pins_fail_the_build() {
         .args(["build", "--locked", "-p", "kryprobe-privilege"])
         .current_dir(&root)
         .env("KRYPROBE_REQUIRE_PINS", "1")
+        .env_remove("KRYPROBE_PIN_OBJECTS")
         .env_remove("KRYPROBE_PIN_DIGESTS"));
     assert!(
         !out.status.success(),
@@ -149,4 +184,35 @@ fn s05_empty_required_pins_fail_the_build() {
         stderr.contains("refusing to bake an unpinned binary"),
         "fail-closed reason named: {stderr}"
     );
+}
+
+#[test]
+fn incomplete_or_ambiguous_profile_pins_fail_the_build() {
+    let root = workspace_root();
+    let digest = "a".repeat(64);
+    for (pins, reason) in [
+        (
+            format!("kcrypto.bpf.o={digest}"),
+            "must bind both kcrypto profiles",
+        ),
+        (
+            format!("kcrypto.bpf.o={digest},kcrypto.bpf.o={digest}"),
+            "repeats object",
+        ),
+        (format!("unknown.bpf.o={digest}"), "unknown object"),
+        (
+            "kcrypto.bpf.o=bad-digest".to_owned(),
+            "must be 64 hex chars",
+        ),
+    ] {
+        let out = run(Command::new(env!("CARGO"))
+            .args(["build", "--locked", "-p", "kryprobe-privilege"])
+            .current_dir(&root)
+            .env("KRYPROBE_REQUIRE_PINS", "1")
+            .env("KRYPROBE_PIN_OBJECTS", pins)
+            .env_remove("KRYPROBE_PIN_DIGESTS"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "invalid pin map must fail");
+        assert!(stderr.contains(reason), "expected {reason}: {stderr}");
+    }
 }

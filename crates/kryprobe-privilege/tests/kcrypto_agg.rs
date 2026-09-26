@@ -647,12 +647,15 @@ fn hash_points_observed() {
     if !lane_ready("hash_points_observed") {
         return;
     }
+    let prepared = alg_fixture::PreparedHashFinups::new("sha256").expect("prepare hash prefix");
     let sensor = Sensor::attach();
     let single = alg_fixture::hash_digest("sha256", 10).expect("hash traffic");
     assert_eq!(single.digests, 10);
     assert_eq!(single.digest_len, 32);
-    let multi = alg_fixture::hash_digest_multi("sha256", 6).expect("hashmulti traffic");
-    assert_eq!(multi.digests, 6);
+    let multi = prepared
+        .finish(6)
+        .expect("cloned finup traffic and digest goldens");
+    assert_eq!((multi.digests, multi.digest_len), (6, 32));
     let rows = dump_kagg(&sensor);
     let tot = dump_ktot(&sensor);
     let ring = drain_ring(&sensor);
@@ -667,12 +670,68 @@ fn hash_points_observed() {
     assert_eq!(shash.calls, 10, "shash digest calls");
     assert_eq!(shash.bytes, 10 * 64, "shash digest bytes (len arg)");
     assert_eq!(shash.ok, 10, "shash digest ok");
-    // Multi-part path: the update→final shape issues two finups per
-    // digest (len=32 data + len=0 final chunk: 32B conserved per op).
+    // Prepared prefix is outside capture. One finup per clone on the
+    // qualified shash route, sized only by its 16-byte final argument.
     let finup = sum_rows(&rows, KFAM_SHASH, KOP_FINUP, KRES_OK, "sha256");
-    assert_eq!(finup.calls, 12, "finup calls (2 per multi digest)");
-    assert_eq!(finup.bytes, 6 * 32, "finup bytes conserved");
-    assert_eq!(finup.ok, 12, "finup ok");
+    assert_eq!(finup.calls, 6, "one finup per clone");
+    assert_eq!(finup.bytes, 6 * 16, "finup argument bytes, not full input");
+    assert_eq!(finup.ok, 6, "finup ok");
+    assert_eq!((finup.errors, finup.queued), (0, 0));
+    // Global counts cannot be satisfied by foreign traffic replacing a
+    // missing owned call. Join each finup row to its full KWHO identity.
+    for row in rows
+        .iter()
+        .filter(|r| r.fam == KFAM_SHASH && r.op == KOP_FINUP && r.alg == "sha256")
+    {
+        use kryprobe_abi::kcrypto_agg::{kh_of, kwho_key_from_bytes, vwho_from_bytes};
+        let hash = kh_of(
+            row.fam,
+            row.op,
+            row.res,
+            row.ctx,
+            &row.alg_words,
+            &row.drv_words,
+        );
+        let mut key = None;
+        let mut owned_calls = 0;
+        loop {
+            // SAFETY: KWHO keys are 16 bytes, values 80 bytes per possible CPU.
+            let next = unsafe {
+                map_get_next_key(&sensor.loaded.maps.who, key.as_deref(), 16, "hash/who-key")
+            }
+            .expect("caller keys");
+            let Some(k) = next else { break };
+            let identity = kwho_key_from_bytes(&k).expect("caller key layout");
+            if identity.kh == hash {
+                let raw = unsafe {
+                    map_lookup_bytes(
+                        &sensor.loaded.maps.who,
+                        &k,
+                        80 * possible_cpus() as usize,
+                        "hash/who-value",
+                    )
+                }
+                .expect("caller values");
+                let calls: u64 = raw
+                    .as_chunks::<80>()
+                    .0
+                    .iter()
+                    .map(|lane| vwho_from_bytes(lane).expect("caller value layout").calls)
+                    .sum();
+                assert_eq!(
+                    identity.tgid,
+                    std::process::id(),
+                    "foreign finup traffic cannot satisfy the fixture"
+                );
+                owned_calls += calls;
+            }
+            key = Some(k);
+        }
+        assert_eq!(
+            owned_calls, row.val.calls,
+            "finup callers reconcile to aggregate"
+        );
+    }
     assert_conservation(&rows, "hash");
     assert_totals_conservation(&rows, &tot, "hash");
     assert_honest_zeros(&rows, &ring, "hash");

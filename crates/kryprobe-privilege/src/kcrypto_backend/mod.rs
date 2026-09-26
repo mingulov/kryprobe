@@ -49,7 +49,7 @@ pub(crate) use object::kcrypto_object_bytes;
 pub use object::{
     LocateMiss, ObjectLocateError, kcrypto_object_candidates, lifecycle_object_candidates,
     locate_kcrypto_object_bytes, locate_kcrypto_object_identity, locate_lifecycle_object_bytes,
-    pins_enforced, sha256_hex,
+    locate_lifecycle_object_identity, pins_enforced, profile_pins_enforced, sha256_hex,
 };
 pub use observe::observation_for_who;
 pub use snapshot_drops::{
@@ -60,7 +60,7 @@ pub use snapshot_who::{WhoCache, WhoJoins, WhoSnapshot, snapshot_who, snapshot_w
 // 1A-M10: unit-test-only helpers (the tests mod stayed whole in
 // this file; production reaches them through the phases above).
 #[cfg(test)]
-pub(crate) use object::{PINNED_DIGESTS, pin_skip_warning, verify_object_pinned};
+pub(crate) use object::{PINNED_DIGESTS, PINNED_OBJECTS, pin_skip_warning, verify_object_pinned};
 #[cfg(test)]
 pub(crate) use observe::{name_from_words, symbol_for, unpack_head};
 pub(crate) use observe::{observation_for_agg, observation_for_ident, observation_for_totals};
@@ -1090,7 +1090,10 @@ mod tests {
 
     #[test]
     fn pins_enforced_tracks_baked_pins() {
-        assert_eq!(pins_enforced(), !PINNED_DIGESTS.is_empty());
+        assert_eq!(
+            pins_enforced(),
+            !PINNED_DIGESTS.is_empty() || !PINNED_OBJECTS.is_empty()
+        );
     }
 
     #[test]

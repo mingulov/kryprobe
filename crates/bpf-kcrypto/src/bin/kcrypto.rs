@@ -78,7 +78,7 @@ const KFAM_AHASH: u8 = 3;
 const KFAM_SHASH: u8 = 4;
 
 const KOP_ALLOC: u8 = 1;
-const KOP_DESTROY: u8 = 2;
+// Op 2 (destroy) stays reserved: its exit cannot establish a live transform.
 const KOP_ENC: u8 = 3;
 const KOP_DEC: u8 = 4;
 const KOP_DIGEST: u8 = 5;
@@ -87,7 +87,7 @@ const KOP_FINUP: u8 = 6;
 const KRES_OK: u8 = 0;
 const KRES_ERR: u8 = 1;
 const KRES_QUEUED: u8 = 2;
-const KRES_UNOBSERVED: u8 = 3;
+// Result 3 (unobserved) stays reserved for the unobservable destroy boundary.
 
 const KCTX_PROC: u8 = 0;
 const KCTX_KTHREAD: u8 = 1;
@@ -114,8 +114,8 @@ const KDROPS_FRET: u32 = 1;
 const KDROPS_ARGNULL: u32 = 2;
 const KDROPS_CHASE: u32 = 3;
 const KDROPS_NAME: u32 = 4;
-/// Destroy chase-skip, separately keyed: it ALWAYS skips (C7 — the tfm
-/// is zeroed at the exit edge), so it is C7-expected, never a loss
+/// Destroy exclusion, separately keyed: live transform identity is
+/// unavailable at the exit edge (C7), so this is expected, never a loss
 /// signal. Excluded from loss verdicts, still counted (never silent).
 const KDROPS_DESTROY: u32 = 5;
 // Sites 6–7 are spare, reserved (BPF never writes them).
@@ -426,8 +426,7 @@ fn chase_req(req: u64, base_off: u32, async_tfm: u32, tfm_alg: u32) -> u64 {
     read_u64(tfm.wrapping_add(tfm_alg as u64))
 }
 
-/// Chase `tfm -> __crt_alg` for direct-`crypto_tfm` args (destroy
-/// `arg1`; the shash sites add the KCFG `shash_base` to the
+/// Chase a live `tfm -> __crt_alg` (the shash sites add the KCFG `shash_base` to the
 /// `shash_desc.tfm` pointer first — `crypto_shash.base` is @ 0 on 7.0
 /// but @ 8 on 6.12, so the shash pointer is NOT the `crypto_tfm`
 /// numerically on every kernel; the offset is loader-resolved, and
@@ -1179,45 +1178,22 @@ pub fn kcrypto_alloc(ctx: FExitContext) -> i32 {
     observe(KFAM_ANY, KOP_ALLOC, res, 0, name, 0, &cfg, alg, kerr, &ctx)
 }
 
-/// `crypto_destroy_tfm(mem, tfm)` exit: `arg1` is the `struct crypto_tfm
-/// *` (BTF proto + `linux/crypto.h` decl), chased for `(cra, drv)`.
-/// Void return → `RES_UNOBSERVED` (C7: no return value to classify).
-///
-/// KNOWN LIMITATION (kernel behavior, proven by kretprobe
-/// `evidence/k1-2/step3-destroy-unobservable.txt`): at the exit edge the
-/// tfm allocation is already zeroed (`*(tfm+32) == 0`: crypto key hygiene
-/// zeroes the tfm before freeing it), so the chase yields 0 and the
-/// observation skips via the standard chase-failure path. Destroy rows
-/// therefore never materialize on this kernel — the program fires,
-/// reads `arg1`, and fail-closes rather than misattributing. (An entry
-/// edge could read the live tfm, but C1 mandates all-fexit.)
+/// `crypto_destroy_tfm(mem, tfm)` exit cannot establish a live transform.
+/// A final release already freed it; even a successful probe read could
+/// return recycled storage. Zeroing before free does not preserve zeroes
+/// after free (6.12 reproduced a nonzero chase followed by a name fault).
+/// Retain the attached boundary and its explicit skip count, without
+/// reading either argument or target memory. C1 remains fexit-only; C7
+/// supplies no destroy identity or return-value observation.
 #[fexit(function = "crypto_destroy_tfm")]
-pub fn kcrypto_destroy(ctx: FExitContext) -> i32 {
-    let Some(cfg) = load_cfg() else {
+pub fn kcrypto_destroy(_ctx: FExitContext) -> i32 {
+    if load_cfg().is_none() {
         drop_inc(KDROPS_CFG);
         return 0;
-    };
-    let tfm: u64 = ctx.arg(1);
-    let alg = chase_tfm(tfm, cfg.tfm_alg);
-    if alg == 0 {
-        // Separately keyed (C7-expected — never a loss signal).
-        drop_inc(KDROPS_DESTROY);
-        return 0;
     }
-    // Void return: no errno to record (kerr 0); the chased alg feeds
-    // the params chase.
-    observe(
-        KFAM_ANY,
-        KOP_DESTROY,
-        KRES_UNOBSERVED,
-        0,
-        alg.wrapping_add(cfg.alg_name as u64),
-        alg.wrapping_add(cfg.alg_drv as u64),
-        &cfg,
-        alg,
-        0,
-        &ctx,
-    )
+    // Separately keyed expected exclusion, not a measured operation loss.
+    drop_inc(KDROPS_DESTROY);
+    0
 }
 
 /// `crypto_skcipher_encrypt(req)` exit: `cryptlen` @ 0 bytes (first member

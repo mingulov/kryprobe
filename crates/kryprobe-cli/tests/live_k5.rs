@@ -14,8 +14,15 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "support/api_return.rs"]
+mod api_return;
+
 /// Traffic generator (hash-only mode default; proven lane fixture).
-const GEN: &str = "/tmp/kcrypto_gen.py";
+fn generator_path() -> PathBuf {
+    std::env::var_os("KRYPROBE_TEST_TRAFFIC_GENERATOR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/kcrypto_gen.py"))
+}
 
 /// Decoded agg identity: family/op/result/algorithm/driver/context.
 type DecodedIdentity = (String, String, String, String, String, String);
@@ -231,7 +238,8 @@ fn gate_wait(test: &'static str, mut guard: ChildGuard) -> ChildGuard {
 /// hash-only: 50 sha256 digests).
 fn hash_traffic(test: &str) {
     let output = Command::new("python3")
-        .args([GEN, "1"])
+        .arg(generator_path())
+        .arg("1")
         .output()
         .expect("spawn kcrypto_gen.py");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -344,8 +352,8 @@ fn setcap_roundtrip_unpriv() {
         println!("SKIP: {TEST} requires setpriv + the nobody user");
         return;
     }
-    if !std::path::Path::new(GEN).is_file() {
-        println!("SKIP: {TEST} requires {GEN}");
+    if !generator_path().is_file() {
+        println!("SKIP: {TEST} requires {}", generator_path().display());
         return;
     }
     let object = kcrypto_object_path();
@@ -520,8 +528,8 @@ fn attribution_golden_python() {
     if !lane_ready(TEST) {
         return;
     }
-    if !std::path::Path::new(GEN).is_file() {
-        println!("SKIP: {TEST} requires {GEN}");
+    if !generator_path().is_file() {
+        println!("SKIP: {TEST} requires {}", generator_path().display());
         return;
     }
     if Command::new("bpftrace").arg("--version").output().is_err() {
@@ -601,7 +609,11 @@ fn attribution_golden_python() {
     let output = guard.release().wait_with_output().expect("report output");
     let stdout = String::from_utf8(output.stdout).expect("report stdout utf-8");
     let stderr = String::from_utf8(output.stderr).expect("report stderr utf-8");
-    assert_eq!(output.status.code(), Some(0), "report exits 0: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "API-return report is partial: {stderr}"
+    );
 
     // Stop the oracle the moment the window closes (SIGINT prints the
     // map; SIGKILL would not). Shells out to `kill` so the test needs
@@ -628,6 +640,7 @@ fn attribution_golden_python() {
     // goldens take the latest value per row key (the WHO-block idiom).
     let doc: serde_json::Value =
         serde_json::from_str(stdout.trim_end()).expect("report json parses");
+    api_return::assert_report(&doc);
     let observations = doc["observations"].as_array().expect("observations array");
 
     let mut python_who: BTreeMap<(u64, u64), u64> = BTreeMap::new();
@@ -770,8 +783,8 @@ fn stack_symbol_smoke() {
     if !lane_ready(TEST) {
         return;
     }
-    if !std::path::Path::new(GEN).is_file() {
-        println!("SKIP: {TEST} requires {GEN}");
+    if !generator_path().is_file() {
+        println!("SKIP: {TEST} requires {}", generator_path().display());
         return;
     }
     let object = kcrypto_object_path();
@@ -800,10 +813,15 @@ fn stack_symbol_smoke() {
     let output = guard.release().wait_with_output().expect("report output");
     let stdout = String::from_utf8(output.stdout).expect("report stdout utf-8");
     let stderr = String::from_utf8(output.stderr).expect("report stderr utf-8");
-    assert_eq!(output.status.code(), Some(0), "report exits 0: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "API-return report is partial: {stderr}"
+    );
 
     let doc: serde_json::Value =
         serde_json::from_str(stdout.trim_end()).expect("report json parses");
+    api_return::assert_report(&doc);
     let observations = doc["observations"].as_array().expect("observations array");
     let whos: Vec<&serde_json::Value> = observations
         .iter()

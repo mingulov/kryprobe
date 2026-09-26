@@ -9,6 +9,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const PAYLOAD: [&str; 3] = [
+    "bin/kryprobe",
+    "bin/kryprobe-bpf/kcrypto.bpf.o",
+    "bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o",
+];
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -87,6 +93,9 @@ fn build_pinned_stage(scratch: &Path, name: &str) -> (PathBuf, String) {
     )
     .expect("manifest json");
     assert_eq!(manifest["pins_enforced"], true);
+    assert_eq!(manifest["profile_pins_enforced"], true);
+    assert_eq!(manifest["kryprobe_release_manifest"], 2);
+    assert_eq!(manifest["objects"].as_array().expect("objects").len(), 2);
     let pin = manifest["pin_digests"][0]
         .as_str()
         .expect("one pin")
@@ -122,22 +131,21 @@ fn rewrite_checksums(stage: &Path, paths: &[&str]) {
 fn rewrite_manifest(stage: &Path) {
     let bin = sha256_file(&stage.join("bin/kryprobe"));
     let obj = sha256_file(&stage.join("bin/kryprobe-bpf/kcrypto.bpf.o"));
+    let lifecycle = sha256_file(&stage.join("bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"));
     let manifest = format!(
-        "{{\"kryprobe_release_manifest\":1,\"binary\":{{\"path\":\"bin/kryprobe\",\"sha256\":\"{bin}\"}},\"objects\":[{{\"name\":\"kcrypto.bpf.o\",\"path\":\"bin/kryprobe-bpf/kcrypto.bpf.o\",\"sha256\":\"{obj}\"}}],\"pins_enforced\":true,\"pin_digests\":[\"{obj}\"]}}\n"
+        "{{\"kryprobe_release_manifest\":2,\"binary\":{{\"path\":\"bin/kryprobe\",\"sha256\":\"{bin}\"}},\"objects\":[{{\"name\":\"kcrypto.bpf.o\",\"path\":\"bin/kryprobe-bpf/kcrypto.bpf.o\",\"sha256\":\"{obj}\"}},{{\"name\":\"kcrypto-lifecycle.bpf.o\",\"path\":\"bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o\",\"sha256\":\"{lifecycle}\"}}],\"pins_enforced\":true,\"profile_pins_enforced\":true,\"pin_digests\":[\"{obj}\",\"{lifecycle}\"]}}\n"
     );
     std::fs::write(stage.join("manifest.json"), manifest).expect("manifest");
 }
 
-/// Seed a destination with sentinel bytes; returns the marker pair so
+/// Seed every destination file with sentinel bytes so
 /// the test can prove a refused install changed nothing.
-fn seed_dest_pair(destdir: &Path) -> (Vec<u8>, Vec<u8>) {
-    let bin = destdir.join("usr/local/bin/kryprobe");
-    let obj = destdir.join("usr/local/bin/kryprobe-bpf/kcrypto.bpf.o");
-    let bin_marker = b"sentinel-binary-not-overwritten".to_vec();
-    let obj_marker = b"sentinel-object-not-overwritten".to_vec();
-    copy_file_assert_bytes(&bin, &bin_marker);
-    copy_file_assert_bytes(&obj, &obj_marker);
-    (bin_marker, obj_marker)
+fn seed_destination(destdir: &Path) -> [Vec<u8>; 3] {
+    PAYLOAD.map(|path| {
+        let marker = format!("sentinel-{path}-not-overwritten").into_bytes();
+        copy_file_assert_bytes(&destdir.join("usr/local").join(path), &marker);
+        marker
+    })
 }
 
 fn copy_file_assert_bytes(dst: &Path, bytes: &[u8]) {
@@ -147,12 +155,11 @@ fn copy_file_assert_bytes(dst: &Path, bytes: &[u8]) {
     std::fs::write(dst, bytes).expect("write");
 }
 
-fn assert_dest_pair_unchanged(destdir: &Path, markers: &(Vec<u8>, Vec<u8>)) {
-    let bin = std::fs::read(destdir.join("usr/local/bin/kryprobe")).expect("seeded bin");
-    let obj = std::fs::read(destdir.join("usr/local/bin/kryprobe-bpf/kcrypto.bpf.o"))
-        .expect("seeded obj");
-    assert_eq!(bin, markers.0, "refused install leaves dest binary alone");
-    assert_eq!(obj, markers.1, "refused install leaves dest object alone");
+fn assert_destination_unchanged(destdir: &Path, markers: &[Vec<u8>; 3]) {
+    for (path, marker) in PAYLOAD.iter().zip(markers) {
+        let bytes = std::fs::read(destdir.join("usr/local").join(path)).expect("seeded file");
+        assert_eq!(&bytes, marker, "refused install leaves {path} alone");
+    }
 }
 
 /// Valid pinned stage installs; the installed pair is the staged pair
@@ -170,6 +177,11 @@ fn installer_accepts_valid_pinned_stage() {
     );
     let bin = destdir.join("usr/local/bin/kryprobe");
     let obj = destdir.join("usr/local/bin/kryprobe-bpf/kcrypto.bpf.o");
+    let lifecycle = destdir.join("usr/local/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o");
+    assert!(
+        lifecycle.is_file(),
+        "installed package must contain the request-lifecycle object"
+    );
     assert_eq!(
         sha256_file(&bin),
         sha256_file(&stage.join("bin/kryprobe")),
@@ -180,14 +192,28 @@ fn installer_accepts_valid_pinned_stage() {
         sha256_file(&stage.join("bin/kryprobe-bpf/kcrypto.bpf.o")),
         "installed object is the staged object"
     );
+    assert_eq!(
+        sha256_file(&lifecycle),
+        sha256_file(&stage.join("bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o")),
+        "installed lifecycle object is the staged object"
+    );
     let neutral = scratch.path().join("neutral");
     std::fs::create_dir_all(&neutral).expect("neutral cwd");
     let versions = installed_versions(&bin, &neutral);
     assert_eq!(versions["pins_enforced"], true);
+    assert_eq!(versions["profile_pins_enforced"], true);
     assert_eq!(versions["kcrypto"]["sha256"], pin.as_str());
     assert_eq!(
         versions["kcrypto"]["path"],
         obj.to_str().expect("utf-8 path")
+    );
+    assert_eq!(
+        versions["kcrypto_lifecycle"]["path"],
+        lifecycle.to_str().expect("utf-8 path")
+    );
+    assert_eq!(
+        versions["kcrypto_lifecycle"]["sha256"],
+        sha256_file(&lifecycle)
     );
 }
 
@@ -205,10 +231,10 @@ fn installer_refuses_rehashed_wrong_object() {
         stage.join("bin/kryprobe-bpf/kcrypto.bpf.o"),
     )
     .expect("wrong-family object");
-    rewrite_checksums(&stage, &["bin/kryprobe", "bin/kryprobe-bpf/kcrypto.bpf.o"]);
+    rewrite_checksums(&stage, &PAYLOAD);
     rewrite_manifest(&stage);
     let destdir = scratch.path().join("installed");
-    let markers = seed_dest_pair(&destdir);
+    let markers = seed_destination(&destdir);
     let out = install_stage(&stage, &destdir);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -219,7 +245,65 @@ fn installer_refuses_rehashed_wrong_object() {
         stderr.contains("does not trust the staged object"),
         "refusal comes from pin enforcement: {stderr}"
     );
-    assert_dest_pair_unchanged(&destdir, &markers);
+    assert_destination_unchanged(&destdir, &markers);
+}
+
+/// The lifecycle object is mandatory, and its name is part of its
+/// trusted identity. Recomputing all packaging metadata must not make
+/// changed bytes or two swapped (individually trusted) objects valid.
+#[test]
+fn installer_refuses_lifecycle_damage_and_profile_swaps() {
+    let scratch = kryprobe_testkit::TempDir::named("installer-profiles").expect("scratch");
+    let (original, _) = build_pinned_stage(scratch.path(), "original");
+    for (variant, reason) in [
+        ("missing", "stage lacks"),
+        ("modified", "does not trust the staged lifecycle object"),
+        ("swapped", "does not trust the staged object"),
+        ("omitted-checksum", "do not match the payload files"),
+        ("manifest-nul", "is not manifest v2"),
+    ] {
+        let stage = scratch.path().join(variant);
+        std::fs::create_dir_all(stage.join("bin/kryprobe-bpf")).expect("mkdir");
+        for path in PAYLOAD
+            .into_iter()
+            .chain(["manifest.json", "sha256sums.txt"])
+        {
+            std::fs::copy(original.join(path), stage.join(path)).expect("copy stage");
+        }
+        let object = stage.join(PAYLOAD[1]);
+        let lifecycle = stage.join(PAYLOAD[2]);
+        match variant {
+            "missing" => std::fs::remove_file(&lifecycle).expect("remove lifecycle"),
+            "modified" => {
+                let mut bytes = std::fs::read(&lifecycle).expect("lifecycle");
+                bytes[100] ^= 1;
+                std::fs::write(&lifecycle, bytes).expect("change lifecycle");
+                rewrite_checksums(&stage, &PAYLOAD);
+                rewrite_manifest(&stage);
+            }
+            "swapped" => {
+                let aggregate_bytes = std::fs::read(&object).expect("aggregate");
+                std::fs::copy(&lifecycle, &object).expect("swap aggregate");
+                std::fs::write(&lifecycle, aggregate_bytes).expect("swap lifecycle");
+                rewrite_checksums(&stage, &PAYLOAD);
+                rewrite_manifest(&stage);
+            }
+            "omitted-checksum" => rewrite_checksums(&stage, &PAYLOAD[..2]),
+            "manifest-nul" => {
+                let mut bytes = std::fs::read(stage.join("manifest.json")).expect("manifest");
+                bytes.push(0);
+                std::fs::write(stage.join("manifest.json"), bytes).expect("append NUL");
+            }
+            _ => unreachable!(),
+        }
+        let destdir = scratch.path().join(format!("installed-{variant}"));
+        let markers = seed_destination(&destdir);
+        let out = install_stage(&stage, &destdir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{variant} must be refused: {stderr}");
+        assert!(stderr.contains(reason), "{variant} refusal: {stderr}");
+        assert_destination_unchanged(&destdir, &markers);
+    }
 }
 
 /// Unpinned dev binary in a fully self-consistent stage (checksums
@@ -231,7 +315,10 @@ fn installer_refuses_unpinned_binary() {
     let root = workspace_root();
     let out = run(Command::new(env!("CARGO"))
         .args(["build", "--locked", "-p", "kryprobe-cli"])
-        .current_dir(&root));
+        .current_dir(&root)
+        .env_remove("KRYPROBE_PIN_DIGESTS")
+        .env_remove("KRYPROBE_PIN_OBJECTS")
+        .env_remove("KRYPROBE_REQUIRE_PINS"));
     assert!(
         out.status.success(),
         "debug binary builds: {}",
@@ -248,10 +335,10 @@ fn installer_refuses_unpinned_binary() {
     );
     let (stage, _pin) = build_pinned_stage(scratch.path(), "pkg");
     std::fs::copy(&debug_bin, stage.join("bin/kryprobe")).expect("unpinned binary");
-    rewrite_checksums(&stage, &["bin/kryprobe", "bin/kryprobe-bpf/kcrypto.bpf.o"]);
+    rewrite_checksums(&stage, &PAYLOAD);
     rewrite_manifest(&stage);
     let destdir = scratch.path().join("installed");
-    let markers = seed_dest_pair(&destdir);
+    let markers = seed_destination(&destdir);
     let out = install_stage(&stage, &destdir);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -262,7 +349,7 @@ fn installer_refuses_unpinned_binary() {
         stderr.contains("is not pin-enforced"),
         "refusal comes from pin enforcement: {stderr}"
     );
-    assert_dest_pair_unchanged(&destdir, &markers);
+    assert_destination_unchanged(&destdir, &markers);
 }
 
 /// Checksum list that omits the binary: consistency data must cover
@@ -274,7 +361,7 @@ fn installer_refuses_omitted_binary_checksum() {
     let (stage, _pin) = build_pinned_stage(scratch.path(), "pkg");
     rewrite_checksums(&stage, &["bin/kryprobe-bpf/kcrypto.bpf.o"]);
     let destdir = scratch.path().join("installed");
-    let markers = seed_dest_pair(&destdir);
+    let markers = seed_destination(&destdir);
     let out = install_stage(&stage, &destdir);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -285,7 +372,7 @@ fn installer_refuses_omitted_binary_checksum() {
         stderr.contains("do not match the payload files"),
         "refusal comes from checksum cover: {stderr}"
     );
-    assert_dest_pair_unchanged(&destdir, &markers);
+    assert_destination_unchanged(&destdir, &markers);
 }
 
 /// Non-JSON manifest containing the old `"pins_enforced":true`
@@ -301,7 +388,7 @@ fn installer_refuses_invalid_manifest() {
     )
     .expect("invalid manifest");
     let destdir = scratch.path().join("installed");
-    let markers = seed_dest_pair(&destdir);
+    let markers = seed_destination(&destdir);
     let out = install_stage(&stage, &destdir);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -309,10 +396,10 @@ fn installer_refuses_invalid_manifest() {
         "invalid manifest must be refused, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("is not manifest v1"),
+        stderr.contains("is not manifest v2"),
         "refusal comes from manifest validation: {stderr}"
     );
-    assert_dest_pair_unchanged(&destdir, &markers);
+    assert_destination_unchanged(&destdir, &markers);
 }
 
 /// Well-shaped manifest whose binary digest no longer matches the
@@ -331,7 +418,7 @@ fn installer_refuses_manifest_digest_mismatch() {
     assert_ne!(tampered, manifest, "digest actually replaced");
     std::fs::write(stage.join("manifest.json"), tampered).expect("tampered manifest");
     let destdir = scratch.path().join("installed");
-    let markers = seed_dest_pair(&destdir);
+    let markers = seed_destination(&destdir);
     let out = install_stage(&stage, &destdir);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -339,10 +426,10 @@ fn installer_refuses_manifest_digest_mismatch() {
         "manifest digest mismatch must be refused, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("is not manifest v1"),
+        stderr.contains("is not manifest v2"),
         "refusal comes from manifest validation: {stderr}"
     );
-    assert_dest_pair_unchanged(&destdir, &markers);
+    assert_destination_unchanged(&destdir, &markers);
 }
 
 /// A `--cargo` wrapper applying a host-only strip setting to real
@@ -515,4 +602,18 @@ fn build_release_accepts_relative_and_absolute_dest() {
         .expect("manifest json");
         assert_eq!(manifest["pins_enforced"], true);
     }
+}
+
+#[test]
+fn build_release_refuses_nonempty_destination_without_clobbering() {
+    let scratch = kryprobe_testkit::TempDir::named("stage-no-clobber").expect("scratch");
+    let marker = scratch.path().join("keep");
+    std::fs::write(&marker, "previous release").expect("sentinel");
+    let out = run(Command::new("sh")
+        .arg(workspace_root().join("packaging/build-release.sh"))
+        .arg("--dest")
+        .arg(scratch.path()));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("refusing non-empty dest"));
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "previous release");
 }

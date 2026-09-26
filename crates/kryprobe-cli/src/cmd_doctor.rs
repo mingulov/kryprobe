@@ -152,13 +152,15 @@ fn spine_object_identity() -> Option<(String, String)> {
     None
 }
 
-/// Artifact versions object (G6 M1): binary plus both BPF objects
-/// plus the pin-enforcement bit. Pure over inputs for tests.
+/// Artifact versions: binary, both kcrypto profiles, optional spine,
+/// and pin enforcement. Pure over inputs for tests.
 fn versions_value(
     binary: &str,
     kcrypto: Option<(String, String)>,
+    lifecycle: Option<(String, String)>,
     spine: Option<(String, String)>,
     pins_enforced: bool,
+    profile_pins_enforced: bool,
 ) -> serde_json::Value {
     let object = |identity: Option<(String, String)>| match identity {
         Some((path, sha256)) => serde_json::json!({"path": path, "sha256": sha256}),
@@ -167,8 +169,10 @@ fn versions_value(
     serde_json::json!({
         "binary": binary,
         "kcrypto": object(kcrypto),
+        "kcrypto_lifecycle": object(lifecycle),
         "spine": object(spine),
         "pins_enforced": pins_enforced,
+        "profile_pins_enforced": profile_pins_enforced,
     })
 }
 
@@ -178,10 +182,17 @@ fn run_versions(json: bool, stdout: &mut dyn Write) -> i32 {
     let binary = env!("CARGO_PKG_VERSION");
     let kcrypto = kryprobe_privilege::locate_kcrypto_object_identity()
         .map(|(path, digest)| (path.display().to_string(), digest));
+    let lifecycle = kryprobe_privilege::locate_lifecycle_object_identity()
+        .map(|(path, digest)| (path.display().to_string(), digest));
     let spine = spine_object_identity();
     let pins = kryprobe_privilege::pins_enforced();
+    let profile_pins = kryprobe_privilege::profile_pins_enforced();
     if json {
-        let _ = writeln!(stdout, "{}", versions_value(binary, kcrypto, spine, pins));
+        let _ = writeln!(
+            stdout,
+            "{}",
+            versions_value(binary, kcrypto, lifecycle, spine, pins, profile_pins)
+        );
         return 0;
     }
     let word = |identity: &Option<(String, String)>| match identity {
@@ -190,8 +201,10 @@ fn run_versions(json: bool, stdout: &mut dyn Write) -> i32 {
     };
     let _ = writeln!(stdout, "binary: {binary}");
     let _ = writeln!(stdout, "kcrypto: {}", word(&kcrypto));
+    let _ = writeln!(stdout, "kcrypto_lifecycle: {}", word(&lifecycle));
     let _ = writeln!(stdout, "spine: {}", word(&spine));
     let _ = writeln!(stdout, "pins_enforced: {pins}");
+    let _ = writeln!(stdout, "profile_pins_enforced: {profile_pins}");
     0
 }
 
@@ -477,7 +490,9 @@ mod tests {
         let value = versions_value(
             "0.1.0",
             Some(("kcrypto.bpf.o".to_owned(), "aa".to_owned())),
+            Some(("kcrypto-lifecycle.bpf.o".to_owned(), "bb".to_owned())),
             None,
+            true,
             true,
         );
         assert_eq!(
@@ -485,13 +500,17 @@ mod tests {
             serde_json::json!({
                 "binary": "0.1.0",
                 "kcrypto": {"path": "kcrypto.bpf.o", "sha256": "aa"},
+                "kcrypto_lifecycle": {"path": "kcrypto-lifecycle.bpf.o", "sha256": "bb"},
                 "spine": null,
                 "pins_enforced": true,
+                "profile_pins_enforced": true,
             })
         );
-        let absent = versions_value("0.1.0", None, None, false);
+        let absent = versions_value("0.1.0", None, None, None, false, false);
         assert_eq!(absent["kcrypto"], serde_json::Value::Null);
+        assert_eq!(absent["kcrypto_lifecycle"], serde_json::Value::Null);
         assert_eq!(absent["pins_enforced"], serde_json::json!(false));
+        assert_eq!(absent["profile_pins_enforced"], serde_json::json!(false));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Install kryprobe: binary + bundled BPF object + file-cap grant + verify.
+# Install kryprobe: binary + both BPF profiles + file-cap grant + verify.
 #
 # Usage: packaging/install.sh [--prefix PREFIX] [--destdir DIR] [--no-mint] [--stage DIR]
 #   --prefix PREFIX  install root (default: /usr/local)
@@ -8,10 +8,10 @@
 #   --no-mint        skip the root `token mint` cap grant (verify skipped too)
 #   --stage DIR      install from a `build-release.sh` stage, verified
 #                    first and refused before copying when inconsistent:
-#                    byte-exact manifest v1 for the measured file
+#                    byte-exact manifest v2 for the measured file
 #                    digests, checksum list covering exactly the
 #                    payload, staged binary enforcing the staged
-#                    object's pin, installed pair re-hashed after copy.
+#                    objects' named pins, installed files re-hashed after copy.
 #                    Default sources are the worktree target dirs (dev
 #                    flow, explicitly unverified — never a release).
 #
@@ -23,6 +23,7 @@
 # kryprobe loads from):
 #   $PREFIX/bin/kryprobe
 #   $PREFIX/bin/kryprobe-bpf/kcrypto.bpf.o
+#   $PREFIX/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o
 #
 # Requires a prior `cargo xtask build` + `cargo xtask build --bpf`,
 # or a `packaging/build-release.sh --dest DIR` stage for --stage.
@@ -72,9 +73,10 @@ if [ -n "$STAGE" ]; then
     STAGE="$STAGE_ABS"
     BIN_SRC="$STAGE/bin/kryprobe"
     OBJ_SRC="$STAGE/bin/kryprobe-bpf/kcrypto.bpf.o"
+    LIFECYCLE_SRC="$STAGE/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
     MANIFEST="$STAGE/manifest.json"
     SUMS="$STAGE/sha256sums.txt"
-    for f in "$MANIFEST" "$SUMS" "$BIN_SRC" "$OBJ_SRC"; do
+    for f in "$MANIFEST" "$SUMS" "$BIN_SRC" "$OBJ_SRC" "$LIFECYCLE_SRC"; do
         if [ ! -f "$f" ]; then
             echo "install.sh: stage lacks $f" >&2
             exit 1
@@ -88,20 +90,22 @@ if [ -n "$STAGE" ]; then
     BIN_DIGEST=${BIN_DIGEST%% *}
     OBJ_DIGEST=$(sha256sum "$OBJ_SRC")
     OBJ_DIGEST=${OBJ_DIGEST%% *}
-    # The versioned manifest must be byte-exact manifest v1 for these
+    LIFECYCLE_DIGEST=$(sha256sum "$LIFECYCLE_SRC")
+    LIFECYCLE_DIGEST=${LIFECYCLE_DIGEST%% *}
+    # The versioned manifest must be byte-exact manifest v2 for these
     # measured digests: no JSON parser, no fragment grep — any format
     # drift fails closed. Template owned by build-release.sh; keep
     # the two in lockstep. Compared with cmp (byte-exact, NUL-safe):
     # shell string comparison would normalize trailing newlines and
     # strip NULs.
-    MANIFEST_EXPECTED=$(printf '{"kryprobe_release_manifest":1,"binary":{"path":"bin/kryprobe","sha256":"%s"},"objects":[{"name":"kcrypto.bpf.o","path":"bin/kryprobe-bpf/kcrypto.bpf.o","sha256":"%s"}],"pins_enforced":true,"pin_digests":["%s"]}' "$BIN_DIGEST" "$OBJ_DIGEST" "$OBJ_DIGEST")
+    MANIFEST_EXPECTED=$(printf '{"kryprobe_release_manifest":2,"binary":{"path":"bin/kryprobe","sha256":"%s"},"objects":[{"name":"kcrypto.bpf.o","path":"bin/kryprobe-bpf/kcrypto.bpf.o","sha256":"%s"},{"name":"kcrypto-lifecycle.bpf.o","path":"bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o","sha256":"%s"}],"pins_enforced":true,"profile_pins_enforced":true,"pin_digests":["%s","%s"]}' "$BIN_DIGEST" "$OBJ_DIGEST" "$LIFECYCLE_DIGEST" "$OBJ_DIGEST" "$LIFECYCLE_DIGEST")
     printf '%s\n' "$MANIFEST_EXPECTED" | cmp -s - "$MANIFEST" || {
-        echo "install.sh: stage manifest is not manifest v1 for these files" >&2
+        echo "install.sh: stage manifest is not manifest v2 for these files" >&2
         exit 1
     }
     # The checksum list must cover exactly the shipped payload.
-    printf '%s  bin/kryprobe\n%s  bin/kryprobe-bpf/kcrypto.bpf.o\n' \
-        "$BIN_DIGEST" "$OBJ_DIGEST" | cmp -s - "$SUMS" || {
+    printf '%s  bin/kryprobe\n%s  bin/kryprobe-bpf/kcrypto.bpf.o\n%s  bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o\n' \
+        "$BIN_DIGEST" "$OBJ_DIGEST" "$LIFECYCLE_DIGEST" | cmp -s - "$SUMS" || {
         echo "install.sh: stage checksums do not match the payload files" >&2
         exit 1
     }
@@ -116,6 +120,10 @@ if [ -n "$STAGE" ]; then
         echo "install.sh: staged binary is not pin-enforced: $STAGE_VERSIONS" >&2
         exit 1
     }
+    echo "$STAGE_VERSIONS" | grep -q -F '"profile_pins_enforced":true' || {
+        echo "install.sh: staged binary lacks profile-bound pins: $STAGE_VERSIONS" >&2
+        exit 1
+    }
     echo "$STAGE_VERSIONS" | grep -q -F "\"sha256\":\"$OBJ_DIGEST\"" || {
         echo "install.sh: staged binary does not trust the staged object: $STAGE_VERSIONS" >&2
         exit 1
@@ -124,11 +132,20 @@ if [ -n "$STAGE" ]; then
         echo "install.sh: staged identity path mismatch: $STAGE_VERSIONS" >&2
         exit 1
     }
+    echo "$STAGE_VERSIONS" | grep -q -F "\"sha256\":\"$LIFECYCLE_DIGEST\"" || {
+        echo "install.sh: staged binary does not trust the staged lifecycle object: $STAGE_VERSIONS" >&2
+        exit 1
+    }
+    echo "$STAGE_VERSIONS" | grep -q -F "\"path\":\"$LIFECYCLE_SRC\"" || {
+        echo "install.sh: staged lifecycle identity path mismatch: $STAGE_VERSIONS" >&2
+        exit 1
+    }
 else
     ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
     echo "install.sh: dev sources, no manifest verification" >&2
     BIN_SRC="$ROOT/target/debug/kryprobe"
     OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
+    LIFECYCLE_SRC="$ROOT/target/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
     [ -f "$ROOT/target/release/kryprobe" ] && BIN_SRC="$ROOT/target/release/kryprobe"
 fi
 
@@ -136,36 +153,44 @@ if [ ! -f "$BIN_SRC" ]; then
     echo "install.sh: missing $BIN_SRC (run \`cargo xtask build\` first)" >&2
     exit 1
 fi
-if [ ! -f "$OBJ_SRC" ]; then
-    echo "install.sh: missing $OBJ_SRC (run \`cargo xtask build --bpf\` first)" >&2
-    exit 1
-fi
+for source in "$OBJ_SRC" "$LIFECYCLE_SRC"; do
+    if [ ! -f "$source" ]; then
+        echo "install.sh: missing $source (run \`cargo xtask build --bpf\` first)" >&2
+        exit 1
+    fi
+done
 
 BIN_DST="$DESTDIR$PREFIX/bin/kryprobe"
 OBJ_DIR="$DESTDIR$PREFIX/bin/kryprobe-bpf"
 OBJ_DST="$OBJ_DIR/kcrypto.bpf.o"
+LIFECYCLE_DST="$OBJ_DIR/kcrypto-lifecycle.bpf.o"
 
 mkdir -p "$(dirname -- "$BIN_DST")" "$OBJ_DIR"
 cp -f "$BIN_SRC" "$BIN_DST"
 cp -f "$OBJ_SRC" "$OBJ_DST"
+cp -f "$LIFECYCLE_SRC" "$LIFECYCLE_DST"
 chmod 0755 "$BIN_DST"
-chmod 0644 "$OBJ_DST"
+chmod 0644 "$OBJ_DST" "$LIFECYCLE_DST"
 echo "+ installed $BIN_DST"
 echo "+ installed $OBJ_DST"
+echo "+ installed $LIFECYCLE_DST"
 if [ -n "$STAGE" ]; then
-    # Confirm the destination pair is the verified stage pair before
+    # Confirm all destination files match the verified stage before
     # declaring success (F04). On mismatch the destination may hold
     # a corrupt pair: re-run from a valid stage (no auto-recovery).
     INST_BIN_DIGEST=$(sha256sum "$BIN_DST")
     INST_BIN_DIGEST=${INST_BIN_DIGEST%% *}
     INST_OBJ_DIGEST=$(sha256sum "$OBJ_DST")
     INST_OBJ_DIGEST=${INST_OBJ_DIGEST%% *}
-    if [ "$INST_BIN_DIGEST" != "$BIN_DIGEST" ] || [ "$INST_OBJ_DIGEST" != "$OBJ_DIGEST" ]; then
-        echo "install.sh: installed pair does not match the verified stage" >&2
+    INST_LIFECYCLE_DIGEST=$(sha256sum "$LIFECYCLE_DST")
+    INST_LIFECYCLE_DIGEST=${INST_LIFECYCLE_DIGEST%% *}
+    if [ "$INST_BIN_DIGEST" != "$BIN_DIGEST" ] || [ "$INST_OBJ_DIGEST" != "$OBJ_DIGEST" ] || [ "$INST_LIFECYCLE_DIGEST" != "$LIFECYCLE_DIGEST" ]; then
+        echo "install.sh: installed files do not match the verified stage" >&2
         exit 1
     fi
     echo "+ verified $BIN_DST"
     echo "+ verified $OBJ_DST"
+    echo "+ verified $LIFECYCLE_DST"
 fi
 
 if [ "$MINT" -eq 0 ]; then

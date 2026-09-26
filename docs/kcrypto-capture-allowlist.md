@@ -72,10 +72,13 @@ the BPF cannot chase request→tfm→algorithm.
 | `alg` | 128B | `cra_name` (or requested alloc name), NUL-padded whole | bounded algorithm name (kp2 §9) |
 | `drv` | 128B | `cra_driver_name`, NUL-padded whole (zeros on alloc: driver not chosen yet) | bounded driver name (kp2 §9) |
 
-Destroy rows never materialize: the kernel zeroes the tfm allocation
-before `crypto_destroy_tfm` returns (kretprobe-proven), so the
-exit-edge chase yields 0 and fail-closes. The destroy program, op
-bucket, and `KRES_UNOBSERVED` exist; no `op=DESTROY` row is asserted.
+Destroy rows never materialize: a final release frees the transform
+before `crypto_destroy_tfm` returns. Zeroing before free does not make
+an exit-edge read safe or guarantee that freed storage still contains
+zeroes. This program reads no target memory or arguments and counts
+only `destroy_skip` (or `cfg_fail` when unconfigured). The attached
+program and reserved op/result IDs remain; no `op=DESTROY` identity
+or final-free proof is supplied by this profile.
 
 ## `KAGG`/`KTOT` value: counters + stamps (120B `VAgg`)
 
@@ -204,8 +207,8 @@ site (`cfg_fail` / `fret_fail` / `arg_null` / `chase_fail` /
 `return 0` before the `KTOT` update bumps its site; userspace folds
 lanes and surfaces per-site coverage counters. Scalar skip counts
 only — no identities, no names (kp2 §8 capture integrity, kp2 §9
-scalar counts). The destroy site always counts (C7: the tfm is zeroed
-at the exit edge); it is separately keyed and excluded from loss
+scalar counts). The configured destroy site always counts (C7: live
+transform identity is unavailable at the exit edge); it is separately keyed and excluded from loss
 verdicts, still counted (never silent).
 
 ## Known-uncountable remainder: fexit guard-skips (fix wave, G-C1)

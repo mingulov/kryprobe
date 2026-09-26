@@ -8,8 +8,9 @@
 //! tests compare sensor deltas against fixture-reported truth (P4
 //! method), never against requested inputs.
 //!
-//! Only the verbs the Task-2 suite needs are ported (`skcipher`, `aead`,
-//! `hash`, `burst`); the K0-only `prealloc`/`hashmulti` shapes stay in C.
+//! The `hash_digest_multi` helper also preserves C `hashmulti` parity.
+//! `PreparedHashFinups` is a separate, digest-checked finalization control;
+//! it deliberately prepares input before a sensor's measured window.
 //! Added: `aead_decrypt_bad_tag` (EBADMSG proof for the errors bucket).
 
 use std::io;
@@ -56,6 +57,10 @@ pub enum FixtureError {
         /// Bytes returned.
         got: isize,
     },
+    /// The prepared-finup control supports only its two fixed goldens.
+    UnsupportedFinupAlgorithm,
+    /// A synthetic digest disagreed with the independent fixed golden.
+    DigestMismatch,
 }
 
 impl std::fmt::Display for FixtureError {
@@ -70,6 +75,8 @@ impl std::fmt::Display for FixtureError {
             Self::UnexpectedOk { stage, got } => {
                 write!(f, "AF_ALG fixture {stage}: expected failure, got {got}")
             }
+            Self::UnsupportedFinupAlgorithm => write!(f, "prepared finup needs sha256 or sha512"),
+            Self::DigestMismatch => write!(f, "prepared finup digest disagrees with golden"),
         }
     }
 }
@@ -618,8 +625,10 @@ pub fn hash_digest(alg: &str, ops: u64) -> Result<HashCounts, FixtureError> {
 
 /// Multi-part `hash` digests: `ops` digests, each fed as 32B
 /// (`MSG_MORE`) + empty final chunk (C `do_hashmulti`). Exercises the
-/// update→final path (`crypto_shash_finup`) rather than single-shot
-/// `crypto_shash_digest`.
+/// update→final path rather than single-shot `crypto_shash_digest`.
+/// This does not imply a finup observation: the qualified 6.12 route
+/// uses separate, unhooked update/final APIs. See `PreparedHashFinups`
+/// for an explicit in-window finup control on the qualified shash routes.
 pub fn hash_digest_multi(alg: &str, ops: u64) -> Result<HashCounts, FixtureError> {
     let tfm = alg_bind("hash", alg)?;
     let op = op_socket(&tfm)?;
@@ -665,6 +674,98 @@ pub fn hash_digest_multi(alg: &str, ops: u64) -> Result<HashCounts, FixtureError
         digests,
         digest_len,
     })
+}
+
+/// An unfinished operation retained across the measurement window.
+/// Prepare before attaching the sensor, then call [`Self::finish`].
+/// Each cloned operation finalizes 16 bytes; the full message is 48 bytes.
+/// Exact shash-finup expectations apply only to independently qualified
+/// shash-backed SHA-256/SHA-512 routes, not arbitrary ahash providers.
+pub struct PreparedHashFinups {
+    parent: AlgFd,
+    expected: &'static [u8],
+}
+
+impl std::fmt::Debug for PreparedHashFinups {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedHashFinups").finish_non_exhaustive()
+    }
+}
+
+impl PreparedHashFinups {
+    /// Feed 32 synthetic AA bytes with MSG_MORE before measurement.
+    /// Goldens are SHA-256/SHA-512 of AA*32 || BB*16, independently
+    /// computed with Python hashlib; they are never sensor-derived.
+    pub fn new(alg: &str) -> Result<Self, FixtureError> {
+        let expected: &'static [u8] = match alg {
+            "sha256" => &[
+                0x0f, 0x96, 0x3b, 0xa3, 0x6a, 0x53, 0x2c, 0xb4, 0x20, 0x73, 0xce, 0x5b, 0xb4, 0xb9,
+                0x46, 0xb9, 0x11, 0x09, 0xed, 0x40, 0x9e, 0x02, 0x92, 0x05, 0x67, 0xfc, 0x11, 0x92,
+                0xa7, 0x73, 0xa9, 0x28,
+            ],
+            "sha512" => &[
+                0x3b, 0x8f, 0xb0, 0xcf, 0xb8, 0x24, 0xa5, 0xc2, 0x79, 0xb7, 0x4e, 0x3f, 0x68, 0xba,
+                0xe1, 0x82, 0x73, 0x2d, 0x4d, 0x4a, 0xa2, 0x75, 0x7e, 0xe0, 0xe2, 0x37, 0xc8, 0xf4,
+                0x04, 0xac, 0xd8, 0x78, 0x9f, 0xdb, 0xd8, 0xcf, 0xe5, 0x04, 0x20, 0x83, 0x75, 0x2a,
+                0xe3, 0x02, 0x91, 0x77, 0xfe, 0xd6, 0x75, 0x4f, 0x80, 0xda, 0x95, 0x8c, 0xa8, 0xa4,
+                0x26, 0xe9, 0x5f, 0x70, 0xee, 0x32, 0x90, 0xc7,
+            ],
+            _ => return Err(FixtureError::UnsupportedFinupAlgorithm),
+        };
+        let tfm = alg_bind("hash", alg)?;
+        let parent = op_socket(&tfm)?;
+        let prefix = [0xaau8; 32];
+        // SAFETY: prefix outlives the call; parent is an owned operation fd.
+        let sent = unsafe {
+            libc::send(
+                parent.0,
+                prefix.as_ptr().cast(),
+                prefix.len(),
+                libc::MSG_MORE,
+            )
+        };
+        if sent != prefix.len() as isize {
+            return Err(FixtureError::ShortRead {
+                stage: "finup prefix send",
+                want: prefix.len(),
+                got: sent,
+            });
+        }
+        Ok(Self { parent, expected })
+    }
+
+    /// Accept on the unfinished operation (not the transform binding),
+    /// then finalize each clone. The parent stays unchanged and open.
+    /// Only completed, length-checked, golden-matching digests count.
+    pub fn finish(&self, ops: u64) -> Result<HashCounts, FixtureError> {
+        // A final chunk cannot straddle a Linux page and become two updates.
+        #[repr(align(64))]
+        struct FinalChunk([u8; 16]);
+        let tail = FinalChunk([0xbb; 16]);
+        let mut out = [0u8; 128];
+        let mut digests = 0;
+        while digests < ops {
+            let clone = op_socket(&self.parent)?;
+            // SAFETY: tail and out outlive the calls; clone is owned.
+            let sent = unsafe { libc::send(clone.0, tail.0.as_ptr().cast(), tail.0.len(), 0) };
+            if sent != tail.0.len() as isize {
+                return Err(FixtureError::ShortRead {
+                    stage: "finup final send",
+                    want: tail.0.len(),
+                    got: sent,
+                });
+            }
+            read_exact(&clone, &mut out, self.expected.len(), "finup digest read")?;
+            if &out[..self.expected.len()] != self.expected {
+                return Err(FixtureError::DigestMismatch);
+            }
+            digests += 1;
+        }
+        Ok(HashCounts {
+            digests,
+            digest_len: if digests == 0 { 0 } else { self.expected.len() },
+        })
+    }
 }
 
 /// `burst`: 4KB encrypts in a `secs`-whole-seconds window (C `do_burst`:

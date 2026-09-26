@@ -189,10 +189,21 @@ const LINT_TIMEOUT_SECS: u64 = 600;
 fn lint_bpf(root: &std::path::Path, channel: &str, rows: &[(&str, &str, &str, Strip)]) -> i32 {
     for (dir, _, _, _) in rows {
         let workdir = root.join("crates").join(dir);
+        let target_dir = workdir.join("target");
+        let target_dir = target_dir.to_string_lossy();
         for argv in [
             &["run", channel, "cargo", "fmt", "--check"][..],
             &[
-                "run", channel, "cargo", "clippy", "--locked", "--", "-D", "warnings",
+                "run",
+                channel,
+                "cargo",
+                "clippy",
+                "--locked",
+                "--target-dir",
+                &target_dir,
+                "--",
+                "-D",
+                "warnings",
             ][..],
         ] {
             match run_child_in_timeout(&workdir, "rustup", argv, LINT_TIMEOUT_SECS) {
@@ -224,6 +235,10 @@ fn build_one(
     strip: Strip,
 ) -> i32 {
     let workdir = root.join("crates").join(dir);
+    // This is also the path consumed below. An ambient host target must
+    // never redirect compilation while we read an older per-crate object.
+    let target_dir = workdir.join("target");
+    let target_dir = target_dir.to_string_lossy();
     // BP-M2: the committed lockfiles are authoritative, like every host lane.
     let argv: &[&str] = &[
         "run",
@@ -232,6 +247,8 @@ fn build_one(
         "build",
         "--locked",
         "--release",
+        "--target-dir",
+        &target_dir,
         "--bin",
         bin,
     ];
@@ -354,21 +371,17 @@ pub(crate) fn test_bpf() -> i32 {
         ("kryprobe-privilege", "kcrypto_lifecycle_object"),
         ("kryprobe-privilege", "kcrypto_lifecycle_decode"),
         ("kryprobe-privilege", "kcrypto_lifecycle_sensor"),
+        ("kryprobe-privilege", "kcrypto_tfm_lifecycle"),
         ("kryprobe-cli", "cli_bpf_e2e"),
     ] {
-        let code = run_child(
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                package,
-                "--test",
-                suite,
-                "--",
-                "--include-ignored",
-            ],
-        );
+        let mut args = vec!["test", "--locked", "-p", package, "--test", suite];
+        // The TFM suite's three live bodies need a successful runtime
+        // fsession probe. The sudo runner accounts for those individually;
+        // this lane always runs the suite's host and fixture bodies.
+        if suite != "kcrypto_tfm_lifecycle" {
+            args.extend(["--", "--include-ignored"]);
+        }
+        let code = run_child("cargo", &args);
         if code != 0 {
             return code;
         }

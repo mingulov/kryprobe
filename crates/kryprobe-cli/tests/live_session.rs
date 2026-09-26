@@ -657,7 +657,11 @@ fn live_capture_proves_session() {
     // session sensor fully attached (9 true `trace_fexit` links — one
     // session per K4 graded gates) — deterministic, no sleep-guessing
     // against BPF load times — and done well before the window closes.
-    let traffic = std::thread::spawn(|| {
+    // Synchronously prepare before run_live_capture can attach. The
+    // worker only clones/finalizes the retained operation after readiness.
+    let prepared = kryprobe_testkit::alg_fixture::PreparedHashFinups::new("sha512")
+        .expect("prepare hash prefix before attachment");
+    let traffic = std::thread::spawn(move || {
         let start = std::time::Instant::now();
         loop {
             if link_count_or_none().is_some_and(|n| n >= 9) {
@@ -674,8 +678,9 @@ fn live_capture_proves_session() {
         let sk =
             kryprobe_testkit::alg_fixture::skcipher_roundtrip("cbc(aes)", 20).expect("skcipher");
         let single = kryprobe_testkit::alg_fixture::hash_digest("sha512", 8).expect("hash");
-        let multi =
-            kryprobe_testkit::alg_fixture::hash_digest_multi("sha512", 4).expect("hashmulti");
+        let multi = prepared
+            .finish(4)
+            .expect("cloned finups and digest goldens");
         let aead = kryprobe_testkit::alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead");
         kryprobe_testkit::alg_fixture::aead_decrypt_bad_tag("gcm(aes)")
             .expect("bad-tag decrypt must EBADMSG");
@@ -698,7 +703,11 @@ fn live_capture_proves_session() {
     println!("live proof: attach gate passed after {gate_wait:?}");
     assert_eq!((sk.enc, sk.dec), (20, 20), "skcipher positive control");
     assert_eq!((single.digests, single.digest_len), (8, 64), "hash control");
-    assert_eq!(multi.digests, 4, "hashmulti control");
+    assert_eq!(
+        (multi.digests, multi.digest_len),
+        (4, 64),
+        "cloned finup control"
+    );
     assert_eq!((aead.enc, aead.dec), (10, 10), "aead control");
 
     // Observations decode; ids are unique and positive. (G9: NOT
@@ -779,10 +788,57 @@ fn live_capture_proves_session() {
         sum_obs(&outcome.observations, "shash", "digest", "ok", "sha512") >= 8,
         "shash digest rows decode"
     );
-    assert!(
-        sum_obs(&outcome.observations, "shash", "finup", "ok", "sha512") >= 8,
-        "shash finup rows decode"
+    assert_eq!(
+        sum_obs(&outcome.observations, "shash", "finup", "ok", "sha512"),
+        4,
+        "one shash finup per prepared clone"
     );
+    let finups: Vec<_> = outcome
+        .observations
+        .iter()
+        .filter(|o| {
+            row_kind(o) == "agg"
+                && o.backend_payload["family"] == "shash"
+                && o.backend_payload["op"] == "finup"
+                && o.backend_payload["algorithm"] == "sha512"
+        })
+        .collect();
+    assert_eq!(
+        finups
+            .iter()
+            .map(|o| o.backend_payload["bytes"].as_u64().expect("bytes"))
+            .sum::<u64>(),
+        4 * 16,
+        "only final-argument bytes, not full input"
+    );
+    for row in finups {
+        assert_eq!(row.backend_payload["counts"]["errors"], 0);
+        assert_eq!(row.backend_payload["counts"]["queued"], 0);
+        let callers: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter(|o| {
+                row_kind(o) == "who"
+                    && o.backend_payload["key_hash"] == row.backend_payload["key_hash"]
+            })
+            .collect();
+        assert!(
+            callers
+                .iter()
+                .all(|o| o.backend_payload["tgid"] == std::process::id()),
+            "foreign finup cannot satisfy the fixture"
+        );
+        assert_eq!(
+            callers
+                .iter()
+                .map(|o| o.backend_payload["calls"].as_u64().expect("caller calls"))
+                .sum::<u64>(),
+            row.backend_payload["counts"]["calls"]
+                .as_u64()
+                .expect("calls"),
+            "finup caller counts reconcile"
+        );
+    }
     assert!(
         sum_obs(&outcome.observations, "aead", "encrypt", "ok", "gcm(aes)") >= 10,
         "aead encrypt rows decode"
