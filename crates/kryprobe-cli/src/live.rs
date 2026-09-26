@@ -1931,6 +1931,38 @@ mod tests {
     // error attribution over the shared vocabulary.)
 
     #[test]
+    fn enrichment_line_renders_all_three_arms() {
+        // T07-R2-09: the public report surfaces the enrichment
+        // verdict — available (with the entry-aware truncation
+        // flag), unavailable (with the reason, never silent), or
+        // not attempted (never a fabricated inventory).
+        assert_eq!(
+            render_enrichment_line(&Some(EnrichmentStatus::Available {
+                entries: 3,
+                truncated: false,
+            })),
+            "enrichment: available (entries=3, truncated=false)\n"
+        );
+        assert_eq!(
+            render_enrichment_line(&Some(EnrichmentStatus::Available {
+                entries: 1,
+                truncated: true,
+            })),
+            "enrichment: available (entries=1, truncated=true)\n"
+        );
+        assert_eq!(
+            render_enrichment_line(&Some(EnrichmentStatus::Unavailable {
+                reason: "os error 2".to_owned(),
+            })),
+            "enrichment: unavailable (reason: os error 2)\n"
+        );
+        assert_eq!(
+            render_enrichment_line(&None),
+            "enrichment: not attempted (profile snapshots no registry)\n"
+        );
+    }
+
+    #[test]
     fn audit_lines_pin_json_shapes() {
         // 4B-M4: one structured stderr line per privileged operation
         // in JSON mode — object load carries path + sha256, attach
