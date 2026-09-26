@@ -257,16 +257,20 @@ fn main() {
         match sensor.drain_once(8192) {
             Ok(drained) => {
                 completed.extend(sensor.take_completed());
-                // Adaptive poll: while records flow (or the
-                // writer holds one open), re-poll IMMEDIATELY —
-                // a 1,000-lifetime burst emits ~6,000 records in
-                // a few ms, past the 256 KiB ring; any fixed
-                // sleep drops (T07-R2-04: the 20 ms poll lost
-                // 3,816 records). Sleep only on a truly quiet
-                // round (the GO thread owns completion — this
-                // loop only feeds the consumer).
-                if drained.records == 0 && !drained.busy {
-                    std::thread::sleep(Duration::from_millis(1));
+                // Wake on the owned ring after a quiet drain: even
+                // a fixed 1 ms idle sleep can miss a short fixture
+                // burst. Reserved-but-uncommitted records need the
+                // same bounded retry yield as production collection.
+                // The timeout also services a GO that ends quietly.
+                if drained.records == 0
+                    && let Err(err) =
+                        sensor.wait_for_activity(Duration::from_millis(1), drained.busy)
+                {
+                    fail(
+                        &out,
+                        &receipt,
+                        &format!("sensor wait during GO failed: {err}"),
+                    );
                 }
             }
             Err(err) => {
