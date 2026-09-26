@@ -9,6 +9,13 @@ as regression tests (``test_oracles.py``). Every function is pure
 loads the archived files and calls these. ``receipt.verify`` gates on
 the returned ``checks``/``oracle_failed`` (P2r/C4).
 
+P2r2 repair (R1): the E07 map stage requires a POSITIVE non-hook-miss
+residual (``state_insert - prog_miss > 0``) — the product composite
+cannot isolate map-table failures further, so this is the exact
+honesty bound — and the gap cover counts each hook miss once (the P2r
+cover double-counted the folded ``prog_miss``). The ``fold_consistent``
+guard fails closed if the product ever stops folding.
+
 P2r repair (C1, C2): E07 expected counts derive from independent
 issued/ledger counts (never product admissions); each stage carries
 an exact arrival equation plus a gap-coverage inequality over named
@@ -214,8 +221,22 @@ def check_overload_stage(name: str, s: dict, integrity: dict | None) -> tuple[bo
     # miss) or landed in a counted refused/retained/unmatched/omitted
     # bucket; the product's closed transport equation (residual 0)
     # leaves no other path. Tolerance 0: the inequality is exact.
-    cover = (ring_drops + prog_miss + state_insert + user_drops
+    #
+    # P2r2/R1: state_insert_failures already folds prog_miss_delta
+    # (backend.rs integrity_for_lifecycle saturating-adds
+    # prog_miss_delta_sum), so the cover counts each hook miss ONCE,
+    # inside state_insert — the P2r cover added prog_miss a second
+    # time and let gap <= cover pass on double count. `fold_consistent`
+    # below pins the fold assumption: if the product ever stops
+    # folding, the oracle fails closed instead of under-counting.
+    cover = (ring_drops + state_insert + user_drops
              + unmatched + overflows + budget)
+    # P2r2/R1: the non-hook-miss residual inside the composite. The
+    # product composite cannot isolate map-table failures further, so
+    # a POSITIVE residual is the exact honesty bound for map overload:
+    # residual > 0 proves failures beyond hook misses; residual == 0
+    # (all four preserved map runs) proves nothing map-specific.
+    map_residual = state_insert - prog_miss
     checks = {}
     checks["worker_ok"] = s["worker_wait"]["ok"] is True
     checks["cli_exit_partial"] = s["cli_exit"] == 3
@@ -228,6 +249,9 @@ def check_overload_stage(name: str, s: dict, integrity: dict | None) -> tuple[bo
     checks["gap_nonnegative"] = gap >= 0
     checks["gap_covered"] = gap <= cover
     checks["named_counter_nonzero"] = named > 0
+    checks["fold_consistent"] = state_insert >= prog_miss
+    if name == "map":
+        checks["map_residual_positive"] = map_residual > 0
     checks["rss_bounded"] = s["observer"]["observer_peak_rss_bytes"] < RSS_BOUND_BYTES
     checks["verdict_partial"] = s["verdict"]["status"] == "partial"
     checks["reaped"] = bool(s["cli_reaped"] and s["worker_reaped"])
@@ -238,6 +262,7 @@ def check_overload_stage(name: str, s: dict, integrity: dict | None) -> tuple[bo
               "named_counter": NAMED_COUNTER[name], "named_value": named,
               "ring_drops": ring_drops, "prog_miss_delta": prog_miss,
               "state_insert_failures": state_insert,
+              "map_residual": map_residual,
               "peak_rss": s["observer"]["observer_peak_rss_bytes"],
               "cli_exit": s["cli_exit"], "checks": checks}
     return ok, detail

@@ -71,6 +71,18 @@ fn stdout_exit(base: i32, failed: Option<&str>, stderr: &mut dyn Write) -> i32 {
     }
 }
 
+/// Main tail (P2r2/R2 seam): the final flush (its failure records
+/// like any write) plus the stdout exit mapping, factored verbatim
+/// from `main` so unit tests can drive it with an injected writer.
+/// `main` calls exactly this — no behavior change (same calls, same
+/// order, generic over the same [`Write`] impl).
+fn finish<W: Write>(code: i32, stdout: &mut StdoutGuard<W>, stderr: &mut dyn Write) -> i32 {
+    // Final flush (its failure records like any write):
+    // `process::exit` below skips destructors, so buffered bytes go now.
+    let _ = stdout.flush();
+    stdout_exit(code, stdout.failed(), stderr)
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args_os()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -82,10 +94,7 @@ fn main() {
         &mut stdout as &mut dyn Write,
         &mut stderr as &mut dyn Write,
     );
-    // Final flush (its failure records like any write): `process::exit`
-    // below skips destructors, so buffered bytes must go now.
-    let _ = stdout.flush();
-    let code = stdout_exit(code, stdout.failed(), &mut stderr);
+    let code = finish(code, &mut stdout, &mut stderr);
     std::process::exit(code);
 }
 
@@ -118,6 +127,44 @@ mod tests {
         // A second failure does not overwrite the first.
         assert!(guard.write(b"boom").is_err());
         assert_eq!(guard.failed(), Some("boom"));
+    }
+
+    /// P2r2/R2(b): a flush-ONLY failure (writes succeed, the final
+    /// flush fails) exits not-clean with the stdout note. The
+    /// `/dev/full` integration test fails at write time, so it stays
+    /// green when the final flush is removed (Astra's mutation) — this
+    /// injected writer is the only seam that sees the flush. Control:
+    /// a clean writer stays exit 0 with silent stderr.
+    #[test]
+    fn flush_only_failure_is_not_clean() {
+        struct FlushFailing;
+        impl Write for FlushFailing {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "flush failed",
+                ))
+            }
+        }
+        let mut guard = StdoutGuard::new(FlushFailing);
+        guard
+            .write_all(b"{\"complete\":true}\n")
+            .expect("writes succeed");
+        assert!(guard.failed().is_none(), "no failure before the flush");
+        let mut stderr = Vec::new();
+        let code = finish(0, &mut guard, &mut stderr);
+        assert_eq!(code, 1, "a flush-only failure must not exit clean");
+        let text = String::from_utf8(stderr).expect("stderr utf-8");
+        assert!(text.contains("stdout"), "stderr names stdout: {text}");
+        // Control: a clean writer through the same tail stays clean.
+        let mut guard = StdoutGuard::new(Vec::new());
+        guard.write_all(b"x").expect("write");
+        let mut stderr = Vec::new();
+        assert_eq!(finish(0, &mut guard, &mut stderr), 0);
+        assert!(stderr.is_empty(), "clean run stays silent");
     }
 
     /// 1A-L11: truncated stdout turns exit 0 into exit 1 with a

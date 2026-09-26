@@ -3233,13 +3233,113 @@ fn selftest_out_write_failure_cannot_be_clean() {
 }
 
 #[test]
+fn report_live_unwritable_out_reaches_live_handler() {
+    // P2r2/R2(a): the run()-level proof on the LIVE report path
+    // (ReportLive argv -> cmd_report::run_report_live, not the
+    // selftest writer). The jsonl + request-lifecycle pre-gate refuses
+    // BEFORE any capture, so this runs deterministically on every
+    // host — a kernel-crypto capture would need privilege and would
+    // execute a real window where available. Control first: a good
+    // --out still refuses (exit 1, no file written — refusal precedes
+    // any write); then the unwritable --out reaches the same live
+    // refusal, never a selftest verdict.
+    //
+    // Residual, stated not claimed: the --out write-failure branch
+    // itself (cmd_report.rs finish) needs a completed capture to
+    // reach at run() level (privilege); it stays covered by the
+    // direct unit test. This test pins the live dispatch, the --out
+    // plumbing, and the refusal-before-write order.
+    let dir = scratch("report-live-out");
+    let good = dir.path().join("report.jsonl");
+    let argv_good: Vec<String> = [
+        "kryprobe",
+        "report",
+        "--system",
+        "--format",
+        "jsonl",
+        "--kcrypto-profile",
+        "request-lifecycle",
+        "--out",
+        good.to_str().expect("utf-8 scratch path"),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = kryprobe_cli::run(&argv_good, &mut stdout, &mut stderr);
+    assert_eq!(
+        code,
+        1,
+        "live pre-gate refuses: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let text = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        text.contains("cannot export request-lifecycle rows"),
+        "live refusal named: {text}"
+    );
+    assert!(
+        text.contains("report:"),
+        "verdict comes from the live report handler: {text}"
+    );
+    assert!(stdout.is_empty(), "no capture output past the gate");
+    assert!(!good.exists(), "refusal precedes any --out write");
+    // Fault: unwritable --out (missing parent dir) reaches the same
+    // live refusal — the failure mode is the gate's, not a write's.
+    let bad = dir.path().join("no-such-dir").join("report.jsonl");
+    let argv_bad: Vec<String> = [
+        "kryprobe",
+        "report",
+        "--system",
+        "--format",
+        "jsonl",
+        "--kcrypto-profile",
+        "request-lifecycle",
+        "--out",
+        bad.to_str().expect("utf-8 scratch path"),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = kryprobe_cli::run(&argv_bad, &mut stdout, &mut stderr);
+    assert_eq!(
+        code,
+        1,
+        "unwritable --out keeps the live refusal: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let text = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        text.contains("cannot export request-lifecycle rows"),
+        "live refusal named: {text}"
+    );
+    assert!(
+        !text.contains("cannot write"),
+        "no write attempted past the gate: {text}"
+    );
+    assert!(
+        !text.contains("selftest"),
+        "verdict is the live handler's, not selftest's: {text}"
+    );
+    assert!(stdout.is_empty());
+}
+
+#[test]
 fn stdout_flush_failure_cannot_be_clean() {
-    // P2r/C5: the reached stdout-flush seam (main.rs final flush +
-    // StdoutGuard exit mapping), end to end: the real binary with
-    // stdout wired to /dev/full (every write fails ENOSPC) must exit
-    // not-clean with the stdout note on stderr. Positive control
-    // first: piped stdout exits 0, proving the command itself is
-    // clean in this environment.
+    // P2r/C5: the reached stdout write-failure seam end to end: the
+    // real binary with stdout wired to /dev/full (every write fails
+    // ENOSPC) must exit not-clean with the stdout note on stderr.
+    // Positive control first: piped stdout exits 0, proving the
+    // command itself is clean in this environment.
+    //
+    // P2r2/R2(b): this test fails at WRITE time, so it cannot see a
+    // flush-only failure (Astra's flush-removal mutation stayed
+    // green). Flush-only sensitivity lives in the main.rs unit test
+    // `flush_only_failure_is_not_clean`, which drives the factored
+    // main tail with an injected writer.
     let bin = env!("CARGO_BIN_EXE_kryprobe");
     let control = std::process::Command::new(bin)
         .args(["selftest", "synthetic"])

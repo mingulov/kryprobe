@@ -132,14 +132,43 @@ class E07PositiveTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertEqual(detail["gap"], 272)
 
-    def test_map_overload_with_reconciled_gap_passes(self):
-        # Parallel-flood shape: hook-miss pressure lands in the
-        # state-insert bucket (product taxonomy); arrival exact.
+    def test_map_hook_miss_only_composite_fails(self):
+        # P2r2/R1: the P2r blessing shape (prog_miss == state) is hook
+        # misses only — state_insert_failures folds prog_miss_delta
+        # (backend.rs integrity_for_lifecycle), so a zero residual
+        # proves no map-table failure. Must FAIL now.
         cov = coverage(19992, prog_miss=50, accepted=159950, consumed=159950)
         s = stage_result(20000, 20000, 19992, cov)
         ok, detail = oracles.check_overload_stage(
             "map", s, integrity(state=50))
+        self.assertFalse(ok, detail)
+        self.assertEqual(detail["map_residual"], 0)
+
+    def test_map_overload_with_positive_residual_passes(self):
+        # P2r2/R1: the repaired positive map shape — a POSITIVE
+        # non-hook-miss residual (state 80 - prog_miss 50 = 30) proves
+        # map-table failures beyond hook misses; arrival exact, gap
+        # covered once (no double count).
+        cov = coverage(19992, prog_miss=50, accepted=159950, consumed=159950)
+        s = stage_result(20000, 20000, 19992, cov)
+        ok, detail = oracles.check_overload_stage(
+            "map", s, integrity(state=80))
         self.assertTrue(ok, detail)
+        self.assertEqual(detail["map_residual"], 30)
+
+    def test_map_double_count_mutation_fails(self):
+        # P2r2/R1: Astra's 39,500/40,000 mutation on the k7206/r2 map
+        # counters (prog_miss == state == 282): gap 500 must NOT pass
+        # against a cover that counts the 282 misses twice (old cover
+        # 564). De-duplicated cover is 282 < 500 -> FAIL.
+        cov = coverage(39500, prog_miss=282, accepted=319718,
+                       consumed=319718)
+        s = stage_result(40000, 40000, 39500, cov)
+        ok, detail = oracles.check_overload_stage(
+            "map", s, integrity(state=282))
+        self.assertFalse(ok, detail)
+        self.assertEqual(detail["gap"], 500)
+        self.assertEqual(detail["loss_cover"], 282)
 
     def test_user_overload_with_reconciled_gap_passes(self):
         cov = coverage(15900, accepted=128000, consumed=128000)
