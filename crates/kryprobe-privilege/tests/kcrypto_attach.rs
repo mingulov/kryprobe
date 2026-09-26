@@ -253,6 +253,10 @@ fn resolve_lifecycle_offsets_are_structural() {
         return;
     }
     let off = resolve_lifecycle_offsets().expect("lifecycle offsets must resolve");
+    // P1e/E1: print the live resolution so a `--nocapture` resolving
+    // run binds the refcount verdict (`refcnt_present`) to the
+    // resolving kernel (output only — assertions below unchanged).
+    println!("lifecycle offsets: {off:?}");
     for (name, value) in [
         ("tfm_alg", off.tfm_alg),
         ("alg_drv", off.alg_drv),

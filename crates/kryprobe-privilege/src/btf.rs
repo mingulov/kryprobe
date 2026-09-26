@@ -929,6 +929,8 @@ impl<'a> Btf<'a> {
     /// unproven overlapping sibling and member order never
     /// decides. T07-R3-08: EVERY byte-aligned word-0 view must
     /// prove — overlapping union views are unanimous.
+    /// T07-R5-01: a zero-type (VOID) view overlapping word 0
+    /// proves nothing and fails the word (no silent skip).
     fn counter_word_at_zero(&self, id: u32, depth: usize) -> Result<bool, BtfError> {
         if depth > 2 {
             return Ok(false);
@@ -941,15 +943,26 @@ impl<'a> Btf<'a> {
         for m in 0..rec.vlen as usize {
             let at = rec.aux_at + m * 12;
             let mtype = read_u32(self.bytes, at + 4, "counter member type")?;
-            if mtype == 0 {
-                continue;
-            }
             let raw = read_u32(self.bytes, at + 8, "counter member offset")?;
             let bits = if rec.kind_flag {
                 raw & 0x00ff_ffff
             } else {
                 raw
             };
+            if mtype == 0 {
+                // T07-R5-01: a zero-type (VOID) member overlapping
+                // word 0 fails the word — the id carries no proof,
+                // so an overlapping VOID view is an unproven
+                // overlapping sibling exactly like N1 (skipping it
+                // would let a full-width alias launder it and dodge
+                // the wrapper-chase VOID refusal). Only VOID views
+                // fully past [0,32) stay skipped (genuinely
+                // different words).
+                if bits < 32 {
+                    return Ok(false);
+                }
+                continue;
+            }
             let bitfield = rec.kind_flag && raw >> 24 != 0;
             if bitfield || !bits.is_multiple_of(8) || bits / 8 != 0 {
                 // T07-R4-N1: a view starting inside word 0 overlaps

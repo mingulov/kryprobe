@@ -2354,6 +2354,92 @@ mod tests {
         );
     }
 
+    /// T07-R5-01 fixture: full lifecycle image whose
+    /// `crypto_tfm.refcnt` is a 4-byte kind-flagged UNION of a
+    /// full-width `raw` u32 view and a zero-type (VOID, id 0)
+    /// 16-bit bitfield view at bit offset 8, in `raw_first`
+    /// member order. The VOID sibling overlaps word 0 ([8,24)
+    /// ⊂ [0,32)) without proving it — the `mtype == 0` early
+    /// skip must not bypass the N1 overlap refusal.
+    fn lifecycle_union_zerotype_fixture(raw_first: bool) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_UNION};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        // [3] UNION counter_u (kind-flagged): bitfield member word
+        // carries (width << 24) | bit_offset per `linux/btf.h`.
+        // The narrow sibling names type id 0 (VOID).
+        let v0 = b.str("v0");
+        let v1 = b.str("v1");
+        let u_name = b.str("counter_u");
+        let bitfield_word = (16u32 << 24) | 8;
+        b.rec(u_name, KIND_UNION, 2, true, 4);
+        if raw_first {
+            b.member(v0, 1, 0);
+            b.member(v1, 0, bitfield_word);
+        } else {
+            b.member(v0, 0, bitfield_word);
+            b.member(v1, 1, 0);
+        }
+        // [4] ARRAY char[64].
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [5] STRUCT crypto_alg { cra_driver_name: [4] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 4, 188 * 8);
+        // [6] PTR -> [5].
+        b.rec(0, KIND_PTR, 0, false, 5);
+        // [7] STRUCT crypto_tfm { __crt_alg: [6] @32, refcnt: [3] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 6, 32 * 8);
+        b.member(o_refcnt, 3, 40 * 8);
+        // [8] PTR -> [7].
+        b.rec(0, KIND_PTR, 0, false, 7);
+        // [9] async, [10] sreq, [11] sk.
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 8, 32 * 8);
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 9, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 7, 8 * 8);
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_lifecycle_union_zerotype_raw_first_refuses() {
+        let bytes = lifecycle_union_zerotype_fixture(true);
+        let res = resolve_lifecycle_offsets_from(&bytes);
+        assert!(
+            res.is_err(),
+            "raw-first union must refuse the overlapping zero-type sibling, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_lifecycle_union_zerotype_narrow_first_refuses() {
+        let bytes = lifecycle_union_zerotype_fixture(false);
+        let res = resolve_lifecycle_offsets_from(&bytes);
+        assert!(
+            res.is_err(),
+            "narrow-first union must refuse the zero-type sibling regardless of order, got {res:?}"
+        );
+    }
+
     /// T07-R4-N2 fixture: full lifecycle image (layout chains on the
     /// entry defs + all 7 manifest prototypes valid) with a rival
     /// second `crypto_tfm` def `B` ([8], 4 bytes). When
