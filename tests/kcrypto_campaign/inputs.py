@@ -4,8 +4,10 @@
 
 P2/K05 host half: reads ``pressure.json`` (schema
 ``kryprobe-pressure-campaign/v1``) and refuses anything else —
-unknown schema/version, missing required keys, duplicate cell IDs,
-unknown statuses, or non-mapping cells. The manifest is immutable
+unknown schema/version (type-strict: ``True`` is not ``1``), missing
+required keys, duplicate cell or portion IDs, unknown statuses,
+non-mapping cells, or empty/non-mapping stimulus/oracle/bounds/
+global tables (P2r/C7). The manifest is immutable
 once frozen: :func:`load_inputs` returns the manifest sha256 so
 receipts can bind the exact bytes they ran against (P8 extension:
 full preflight hash/limit binding in ``inputs.py`` per the test
@@ -70,9 +72,17 @@ def load_inputs(path: Path) -> dict:
         raise InputError(
             f"unknown manifest schema {manifest['$schema']!r} (want {SCHEMA!r})"
         )
-    if manifest["manifest_version"] != 1:
+    # P2r/C7: type-strict — True == 1 in Python, so == alone would
+    # accept a bool version.
+    if type(manifest["manifest_version"]) is not int or manifest["manifest_version"] != 1:
         raise InputError(
-            f"unknown manifest_version {manifest['manifest_version']!r} (want 1)"
+            f"unknown manifest_version {manifest['manifest_version']!r} (want int 1)"
+        )
+    # P2r/C7: the shared limits table must be a genuine nonempty
+    # mapping, not an empty/non-mapping placeholder.
+    if not isinstance(manifest["global"], dict) or not manifest["global"]:
+        raise InputError(
+            f"manifest 'global' must be a nonempty mapping, got {manifest['global']!r}"
         )
     cells = manifest["cells"]
     if not isinstance(cells, list) or not cells:
@@ -92,9 +102,18 @@ def load_inputs(path: Path) -> dict:
         seen.add(cell_id)
         if cell["status"] not in STATUSES:
             raise InputError(f"cell {cell_id!r} has unknown status {cell['status']!r}")
+        # P2r/C7: stimulus/oracle/bounds must be nonempty mappings —
+        # an empty dict would silently unbind the frozen limits.
+        for key in ("stimulus", "oracle", "bounds"):
+            if not isinstance(cell[key], dict) or not cell[key]:
+                raise InputError(
+                    f"cell {cell_id!r} {key!r} must be a nonempty mapping, "
+                    f"got {cell[key]!r}"
+                )
         portions = cell["portions"]
         if not isinstance(portions, list) or not portions:
             raise InputError(f"cell {cell_id!r} 'portions' must be a non-empty list")
+        seen_portions: set[str] = set()
         for portion in portions:
             if not isinstance(portion, dict):
                 raise InputError(f"cell {cell_id!r} has a non-object portion")
@@ -103,6 +122,12 @@ def load_inputs(path: Path) -> dict:
                 raise InputError(
                     f"cell {cell_id!r} portion missing required keys: {sorted(missing)}"
                 )
+            portion_id = portion["id"]
+            if portion_id in seen_portions:
+                raise InputError(
+                    f"cell {cell_id!r} has a duplicate portion id {portion_id!r}"
+                )
+            seen_portions.add(portion_id)
             if portion["status"] not in STATUSES:
                 raise InputError(
                     f"cell {cell_id!r} portion {portion.get('id', '?')!r} "

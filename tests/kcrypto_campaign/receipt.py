@@ -110,7 +110,9 @@ def verify(receipt: dict) -> dict:
     Gates (any failure -> FAIL): worker exit 0, no timeout, reaped,
     no remaining owned resources, preexisting resources unchanged,
     staged/input hashes unchanged, expected == actual counts where
-    both are present. A receipt declaring ``NOT_RUN``/refusal passes
+    both are present, every oracle check true, no named oracle
+    failure (P2r/C4: a failed zero-loss gate cannot ride a clean
+    receipt to PASS). A receipt declaring ``NOT_RUN``/refusal passes
     only with its required reason + positive control named. Never
     launches work, never rewrites inputs.
     """
@@ -147,5 +149,17 @@ def verify(receipt: dict) -> dict:
         reasons.append(f"expected {expected!r} != actual {actual!r}")
     if observation.get("omitted_loss_dimensions"):
         reasons.append(f"loss dimensions omitted: {observation['omitted_loss_dimensions']!r}")
+    checks = receipt.get("checks")
+    if checks is not None:
+        if not isinstance(checks, dict):
+            reasons.append(f"checks is not a mapping: {checks!r}")
+        else:
+            for name in sorted(checks):
+                if checks[name] is not True:
+                    reasons.append(f"oracle check failed: {name}")
+    failed = receipt.get("oracle_failed")
+    if failed:
+        names = sorted(failed) if isinstance(failed, list) else [failed]
+        reasons.append(f"oracle failures named: {names!r}")
 
     return {"verdict": "FAIL" if reasons else "PASS", "reasons": reasons}

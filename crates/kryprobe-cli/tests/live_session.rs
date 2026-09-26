@@ -3136,10 +3136,12 @@ impl kryprobe_core::backend::Backend for FinalizeFailingBackend {
 }
 
 #[test]
-fn final_output_failure_cannot_be_clean() {
-    // P2/K05: a terminal-accounting (finalize) failure cannot yield a
-    // clean session — the driver surfaces the error and parks the
-    // machine in `FailedPartial`, never `Finalized`.
+fn backend_finalize_failure_parks_failed_partial() {
+    // P2/K05 (P2r/C5 renamed: this covers backend finalization, not
+    // the final-output seams — a terminal-accounting (finalize)
+    // failure cannot yield a clean session): the driver surfaces the
+    // error and parks the machine in `FailedPartial`, never
+    // `Finalized`.
     kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
     let mut controller = attached_controller();
     let stop = std::sync::atomic::AtomicBool::new(false);
@@ -3180,5 +3182,89 @@ fn final_output_failure_cannot_be_clean() {
         controller.state(),
         kryprobe_core::session::SessionState::FailedPartial,
         "failed session parks FailedPartial, never Finalized"
+    );
+}
+
+#[test]
+fn selftest_out_write_failure_cannot_be_clean() {
+    // P2r/C5: the reached `--out` final-write seam through `run()`.
+    // `selftest synthetic` is deterministic and needs no privilege;
+    // an unwritable `--out` (missing parent dir, so the atomic
+    // tmp+rename cannot land) must exit not-clean with the path on
+    // stderr. Positive control first: the same command to a good
+    // writer exits 0, proving validation passed and only the write
+    // failed below.
+    let argv_ok: Vec<String> = ["kryprobe", "selftest", "synthetic"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = kryprobe_cli::run(&argv_ok, &mut stdout, &mut stderr);
+    assert_eq!(
+        code,
+        0,
+        "control run must exit clean: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!stdout.is_empty(), "control run must emit JSONL");
+    let dir = scratch("out-fail");
+    let bad = dir.path().join("no-such-dir").join("synth.jsonl");
+    let argv_bad: Vec<String> = [
+        "kryprobe",
+        "selftest",
+        "synthetic",
+        "--out",
+        bad.to_str().expect("utf-8 scratch path"),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = kryprobe_cli::run(&argv_bad, &mut stdout, &mut stderr);
+    assert_ne!(code, 0, "failed --out write must not exit clean");
+    let stderr_text = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        stderr_text.contains("cannot write") && stderr_text.contains("no-such-dir"),
+        "stderr names the failed write: {stderr_text}"
+    );
+    assert!(stdout.is_empty(), "file run writes no stdout");
+}
+
+#[test]
+fn stdout_flush_failure_cannot_be_clean() {
+    // P2r/C5: the reached stdout-flush seam (main.rs final flush +
+    // StdoutGuard exit mapping), end to end: the real binary with
+    // stdout wired to /dev/full (every write fails ENOSPC) must exit
+    // not-clean with the stdout note on stderr. Positive control
+    // first: piped stdout exits 0, proving the command itself is
+    // clean in this environment.
+    let bin = env!("CARGO_BIN_EXE_kryprobe");
+    let control = std::process::Command::new(bin)
+        .args(["selftest", "synthetic"])
+        .output()
+        .expect("spawn control");
+    assert!(
+        control.status.success(),
+        "control run must exit clean: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(!control.stdout.is_empty(), "control run must emit JSONL");
+    let full = std::fs::File::create("/dev/full").expect("open /dev/full");
+    let out = std::process::Command::new(bin)
+        .args(["selftest", "synthetic"])
+        .stdout(std::process::Stdio::from(full))
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("spawn /dev/full run");
+    assert!(
+        !out.status.success(),
+        "failed stdout flush must not exit clean"
+    );
+    let stderr_text = String::from_utf8(out.stderr).expect("stderr utf-8");
+    assert!(
+        stderr_text.contains("stdout"),
+        "stderr names stdout: {stderr_text}"
     );
 }

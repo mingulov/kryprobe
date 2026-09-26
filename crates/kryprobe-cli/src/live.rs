@@ -1346,12 +1346,18 @@ fn drive_session_inner(
 /// completed-retention 4096 (the sensor arm; the transform tracker
 /// shares the decode scale) — overflows are counted
 /// (`admission_failed`, `retained_dropped`, `LLOSS`), never silent.
-/// Rate/burst/interval/cap relation: a burst larger than the ring
-/// survives iff the consumer drains faster than the producer
-/// fills (else reservation fails loud); the display tick (default
-/// 1000 ms) paces human progress only, never transport; past
-/// 100,000 kept observations the session stops early with counted
-/// omissions — detail duration ≤ 100000/R s at R completions/s.
+/// Rate/burst/interval/cap relation (P2r/C3: headroom, not just
+/// rate, decides): with ring capacity C ≈ 2184 records and burst-start
+/// occupancy O, a burst of B records arriving at rate A over a
+/// consumer draining at rate D survives iff O + B·(1 − D/A) ≤ C
+/// when D < A (the unconsumed remainder fits the C − O headroom;
+/// e.g. B=3000 at A=1000/s over D=500/s peaks ≈1500, below C —
+/// a slower consumer still survives); D ≥ A always survives.
+/// Past the headroom, reservation fails loud. The display tick
+/// (default 1000 ms) paces human progress only, never transport;
+/// past 100,000 kept observations the session stops early with
+/// counted omissions — detail duration ≤ 100000/R s at R
+/// completions/s.
 /// Long-running aggregates must not silently depend on unlimited
 /// per-request retention: continuous summaries need the P6
 /// versioned output contract (open gate — see the P2 report).

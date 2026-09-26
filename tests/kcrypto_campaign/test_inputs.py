@@ -123,6 +123,69 @@ class LoaderTests(unittest.TestCase):
             with self.assertRaisesRegex(inputs.InputError, "not valid JSON"):
                 inputs.load_inputs(write_manifest(Path(tmp), "{nope"))
 
+    def test_bool_manifest_version_refuses(self):
+        # P2r/C7: True == 1 in Python, so a bare != check accepts the
+        # bool. The loader must demand a genuine int.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["manifest_version"] = True
+            with self.assertRaisesRegex(inputs.InputError, "manifest_version"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_duplicate_portion_id_refuses(self):
+        # P2r/C7: portion IDs must be unique within their cell.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["cells"][0]["portions"].append(
+                copy.deepcopy(bad["cells"][0]["portions"][0])
+            )
+            with self.assertRaisesRegex(inputs.InputError, "duplicate portion id"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_empty_stimulus_refuses(self):
+        # P2r/C7: stimulus/oracle/bounds must be nonempty mappings.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["cells"][0]["stimulus"] = {}
+            with self.assertRaisesRegex(inputs.InputError, "nonempty mapping"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_empty_oracle_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["cells"][1]["oracle"] = {}
+            with self.assertRaisesRegex(inputs.InputError, "nonempty mapping"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_empty_bounds_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["cells"][2]["bounds"] = {}
+            with self.assertRaisesRegex(inputs.InputError, "nonempty mapping"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_non_mapping_stimulus_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["cells"][0]["stimulus"] = ["burst"]
+            with self.assertRaisesRegex(inputs.InputError, "nonempty mapping"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_empty_global_refuses(self):
+        # P2r/C7: the shared limits table must be a nonempty mapping.
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["global"] = {}
+            with self.assertRaisesRegex(inputs.InputError, "global"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
+    def test_non_mapping_global_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = base_manifest()
+            bad["global"] = ["profile"]
+            with self.assertRaisesRegex(inputs.InputError, "global"):
+                inputs.load_inputs(write_manifest(Path(tmp), bad))
+
 
 def passing_receipt() -> dict:
     return {
@@ -187,6 +250,40 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(receipt.verify(rec)["verdict"], "FAIL")
         rec = {"verdict": "NOT_RUN", "reason": "P6 gate open", "positive_control": "E01a"}
         self.assertEqual(receipt.verify(rec)["verdict"], "NOT_RUN")
+
+    def test_false_oracle_check_cannot_pass(self):
+        # P2r/C4: the reviewers' E01a-shaped counterexample — counts
+        # equal, but the zero-loss gate failed (ring_drops=1). The old
+        # verifier ignored `checks` and returned PASS.
+        rec = passing_receipt()
+        rec["checks"] = {"ledger_exact": True, "zero_ring_drops": False}
+        verdict = receipt.verify(rec)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertTrue(
+            any("zero_ring_drops" in r for r in verdict["reasons"]),
+            verdict["reasons"],
+        )
+
+    def test_nonempty_oracle_failed_cannot_pass(self):
+        # P2r/C4: a named failed oracle always fails the receipt, even
+        # when every other gate holds.
+        rec = passing_receipt()
+        rec["checks"] = {"zero_ring_drops": False}
+        rec["oracle_failed"] = ["zero_ring_drops"]
+        verdict = receipt.verify(rec)
+        self.assertEqual(verdict["verdict"], "FAIL")
+        self.assertTrue(
+            any("zero_ring_drops" in r for r in verdict["reasons"]),
+            verdict["reasons"],
+        )
+
+    def test_empty_oracle_failed_with_true_checks_passes(self):
+        # An explicitly empty failure list alongside all-true checks is
+        # the honest pass shape — it must stay green.
+        rec = passing_receipt()
+        rec["checks"] = {"ledger_exact": True, "zero_ring_drops": True}
+        rec["oracle_failed"] = []
+        self.assertEqual(receipt.verify(rec)["verdict"], "PASS")
 
 
 class SealTests(unittest.TestCase):
