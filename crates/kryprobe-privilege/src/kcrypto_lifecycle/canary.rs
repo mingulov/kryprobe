@@ -253,6 +253,11 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     let mut frees: Vec<FixtureFree> = Vec::new();
     let mut configs: Vec<FixtureConfig> = Vec::new();
     let mut probes: Vec<u64> = Vec::new();
+    // T07-R3-11 lifetime order state (row order — the testkit
+    // ledger's R5 equivalent: a free/config before its alloc, or
+    // any row after the final free, is an impossible history).
+    let mut alloc_seen: Vec<u64> = Vec::new();
+    let mut final_seen: Vec<u64> = Vec::new();
     let mut done: Option<(i32, u64)> = None;
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
@@ -313,12 +318,30 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     alg_type: get_u32(obj, "type", line_no, "alloc row lacks a type")?,
                     alg_mask: get_u32(obj, "mask", line_no, "alloc row lacks a mask")?,
                 });
+                alloc_seen.push(seq);
             }
             "free" => {
                 let seq = get_u64(obj, "seq", line_no, "free row lacks a sequence")?;
                 let final_free = get_bool(obj, "final", line_no, "free row lacks a bool final")?;
                 // Seqs repeat by design (shared lifetimes free more
-                // than once) — row order retained, no dup check.
+                // than once) — row order retained, no dup check —
+                // but every free follows its alloc and precedes any
+                // final (T07-R3-11: a final free ends the lifetime).
+                if !alloc_seen.contains(&seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "free row arrived before its alloc",
+                    });
+                }
+                if final_seen.contains(&seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "free row arrived after final free",
+                    });
+                }
+                if final_free {
+                    final_seen.push(seq);
+                }
                 frees.push(FixtureFree { seq, final_free });
             }
             "config" => {
@@ -328,6 +351,21 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     return Err(TranscriptError {
                         line: line_no,
                         reason: "unknown config op",
+                    });
+                }
+                // A config follows its alloc and precedes any final
+                // free (T07-R3-11: configuring a dead transform is
+                // an impossible history).
+                if !alloc_seen.contains(&seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "config row arrived before its alloc",
+                    });
+                }
+                if final_seen.contains(&seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "config row arrived after final free",
                     });
                 }
                 configs.push(FixtureConfig {
@@ -503,6 +541,8 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     }
     // Frees and configs reference allocated seqs (a release for an
     // unrecorded alloc is a broken transcript, not evidence).
+    // (T07-R3-11: the row-order checks above subsume these — they
+    // stay as the `FixtureTruth`-level invariant.)
     for free in &frees {
         if !allocs.iter().any(|a| a.seq == free.seq) {
             return Err(TranscriptError {
@@ -624,11 +664,40 @@ fn delta(a: u64, b: u64, what: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("counter {what} ran backwards"))
 }
 
+/// Unbound-destroy inventory delta (T07-R3-12): digest/shash
+/// background pairs reconcile into the destroy lanes and the
+/// admitted/releases equations with their complete production
+/// baggage (one attempt, one release, one edge pair each — a
+/// counter-only view is not real inventory). Sound because the
+/// loss gates above already passed: zero loss means every fixture
+/// alloc was observed, zero forced/evicted means fixture
+/// generations stay bindable, and fixture destroys then always
+/// bind at entry — never unknown. So this delta counts exactly
+/// non-fixture pairs, and the exact-equality equations (no
+/// tolerance) cross-check the baggage both ways: edges without
+/// the counter fail, and the counter without edges fails. (A null
+/// background destroy still fails loudly — it bumps lanes and
+/// releases without inventory standing behind them — same as any
+/// unattributed edge; nothing absorbs silently.)
+fn unknown_inventory_d(view: &SensorView<'_>) -> Result<u64, String> {
+    delta(
+        view.tfm.unknown_releases,
+        view.baseline.tfm.unknown_releases,
+        "tfm_unknown_releases",
+    )
+}
+
 /// Fresh sensor generations for this scenario (T07-R2-04): the
 /// fixture runs sequentially, so fixture alloc[i] pairs with
 /// generations[baseline + i] — the count must match EXACTLY (a
 /// civilian background allocation fails the run, never hides in
-/// the join).
+/// the join). Generation IDs must be nonzero and STRICTLY
+/// INCREASING across the whole visible slice (T07-R3-03 / astra
+/// R3-05): the tracker mints monotonically in assignment order and
+/// never reuses (eviction preserves order), so one strict-increase
+/// check pins fresh distinctness, fresh order, AND separation from
+/// baseline identities — a regression emitting 1,000 correct rows
+/// under one ID fails here, never certifies.
 fn fresh_generations<'v>(
     truth: &FixtureTruth,
     view: &'v SensorView<'v>,
@@ -647,6 +716,19 @@ fn fresh_generations<'v>(
             fresh.len(),
             truth.allocs.len()
         ));
+    }
+    let mut prev = 0u64;
+    for (i, g) in view.generations.iter().enumerate() {
+        if g.id == 0 {
+            return Err(format!("generation id at index {i} is zero (never issued)"));
+        }
+        if g.id <= prev {
+            return Err(format!(
+                "generation id {} at index {i} is not above previous id {prev} (duplicate, unordered, or baseline-reusing)",
+                g.id
+            ));
+        }
+        prev = g.id;
     }
     Ok(fresh)
 }
@@ -779,6 +861,21 @@ fn verdict_lifetime_aead(
             generation.req_name, generation.drv_name
         ));
     }
+    // T07-R3-07: unknown creation provenance pins the WHOLE
+    // creation record — a fabricated nonzero type/mask, or a
+    // truncation claim on names that were never read, fails the
+    // verdict exactly like a fabricated name.
+    if generation.alg_type != 0 || generation.alg_mask != 0 {
+        return Err(format!(
+            "{tag}: AEAD type/mask {}/{} must stay unknown (0/0 — alloc unhooked)",
+            generation.alg_type, generation.alg_mask
+        ));
+    }
+    if generation.name_truncated || generation.drv_truncated {
+        return Err(format!(
+            "{tag}: AEAD truncation flags must be clear (no names were read)"
+        ));
+    }
     let frees: Vec<&FixtureFree> = truth.frees.iter().filter(|f| f.seq == alloc.seq).collect();
     match frees.last() {
         Some(last) if generation.retired != last.final_free => {
@@ -845,7 +942,14 @@ fn verdict_lifetime_aead(
 /// Exact verdict over one scenario: `Ok(())` passes, `Err(reason)`
 /// fails with the named mismatch. Counter deltas use checked
 /// subtraction — a counter that ran BACKWARDS fails (reset images
-/// are not silently absorbed).
+/// are not silently absorbed). This is the SESSION-level exactness
+/// verdict (astra R3-04): ingest-level exactness (the tracker's
+/// `reuse_exact`, required true-or-false per scenario arm) AND
+/// transport validity (zero kernel-loss deltas, zero program-miss
+/// deltas, zero close backlog) must both hold — transport that
+/// erases both halves of a boundary pair leaves no tracker trace,
+/// so the loss/miss gates below are part of the release claim,
+/// not defense in depth.
 pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), String> {
     if truth.fixture_result != 0 {
         return Err(format!(
@@ -1107,16 +1211,26 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 "tfm_forced_retires",
             )?,
         ),
-        // (T07-R2-05: `tfm_unknown_releases` deliberately NOT
-        // gated — expected digest/shash releases share the
-        // counter; a missed fixture identity fails via
-        // `tfm_unobserved_boundary` or the edge-hit equation.)
+        // (T07-R2-05, narrowed T07-R3-02: `tfm_unknown_releases`
+        // deliberately NOT gated — expected digest/shash releases
+        // at unoccupied bases share the counter; a missed fixture
+        // identity fails via `tfm_unobserved_boundary` or the
+        // edge-hit equation. `tfm_colliding_releases` IS gated
+        // below — a live occupant makes it indeterminate.)
         (
             "tfm_stale_releases",
             sub(
                 view.tfm.stale_releases,
                 view.baseline.tfm.stale_releases,
                 "tfm_stale_releases",
+            )?,
+        ),
+        (
+            "tfm_colliding_releases",
+            sub(
+                view.tfm.colliding_releases,
+                view.baseline.tfm.colliding_releases,
+                "tfm_colliding_releases",
             )?,
         ),
         (
@@ -1256,11 +1370,15 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         (setkey_rows, 0)
     };
     let probe_halves = truth.probes.len() as u64;
+    let frees = truth.frees.len() as u64;
+    // T07-R3-12: permitted digest inventory rides the destroy
+    // lanes exactly (see `unknown_inventory_d`).
+    let unknown_d = unknown_inventory_d(view)?;
     let want_tfm = [
         alloc_halves + probe_halves, // 4 alloc-sk sub
         alloc_halves + probe_halves, // 5 alloc-sk ret
-        truth.frees.len() as u64,    // 6 destroy sub
-        truth.frees.len() as u64,    // 7 destroy ret
+        frees + unknown_d,           // 6 destroy sub
+        frees + unknown_d,           // 7 destroy ret
         sk_setkey,                   // 8 setkey-sk sub
         sk_setkey,                   // 9 setkey-sk ret
         authsize_rows,               // 10 setauthsize sub
@@ -1586,15 +1704,18 @@ fn verdict_tfm_sk(
     let allocs = truth.allocs.len() as u64;
     let tfm = &view.tfm;
     let base = &view.baseline.tfm;
+    // T07-R3-12: permitted digest inventory carries one admitted
+    // attempt + one release per pair (never completed/retired).
+    let unknown_d = unknown_inventory_d(view)?;
     let expect = [
         (
             "admitted",
-            allocs + frees + configs,
+            allocs + frees + configs + unknown_d,
             tfm.admitted,
             base.admitted,
         ),
         ("completed", allocs, tfm.completed, base.completed),
-        ("releases", frees, tfm.releases, base.releases),
+        ("releases", frees + unknown_d, tfm.releases, base.releases),
         ("retired", finals, tfm.retired, base.retired),
         (
             "configs_joined",
@@ -1654,10 +1775,17 @@ fn verdict_tfm_aead(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), S
     let allocs = truth.allocs.len() as u64;
     let tfm = &view.tfm;
     let base = &view.baseline.tfm;
+    // T07-R3-12: permitted digest inventory (see the sk arm).
+    let unknown_d = unknown_inventory_d(view)?;
     let expect = [
-        ("admitted", frees + configs, tfm.admitted, base.admitted),
+        (
+            "admitted",
+            frees + configs + unknown_d,
+            tfm.admitted,
+            base.admitted,
+        ),
         ("completed", 0, tfm.completed, base.completed),
-        ("releases", frees, tfm.releases, base.releases),
+        ("releases", frees + unknown_d, tfm.releases, base.releases),
         ("retired", finals, tfm.retired, base.retired),
         (
             "configs_joined",
@@ -1721,25 +1849,31 @@ fn verdict_tfm_failed(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(),
     if failed_d != 1 {
         return Err(format!("tfm failed_allocs delta {failed_d} != 1 probe"));
     }
+    // T07-R3-12: permitted digest inventory (one admitted attempt +
+    // one release per pair — the probe attempt itself stays exact).
+    let unknown_d = unknown_inventory_d(view)?;
     let admitted_d = delta(tfm.admitted, base.admitted, "admitted")?;
-    if admitted_d != 1 {
-        return Err(format!("tfm admitted delta {admitted_d} != 1 attempt"));
+    if admitted_d != 1 + unknown_d {
+        return Err(format!(
+            "tfm admitted delta {admitted_d} != 1 attempt + {unknown_d} inventory"
+        ));
     }
     let completed_d = delta(tfm.completed, base.completed, "completed")?;
     if completed_d != 1 {
         return Err(format!("tfm completed delta {completed_d} != 1 attempt"));
     }
-    // Nothing else may account: no releases, no retires, no joined
-    // configs from an allocation that never happened.
-    for (name, got, got_base) in [
-        ("releases", tfm.releases, base.releases),
-        ("retired", tfm.retired, base.retired),
-        ("configs_joined", tfm.configs_joined, base.configs_joined),
-        ("configs_failed", tfm.configs_failed, base.configs_failed),
+    // Nothing else may account: no retires, no joined configs from
+    // an allocation that never happened; releases carry exactly
+    // the permitted inventory.
+    for (name, want, got, got_base) in [
+        ("releases", unknown_d, tfm.releases, base.releases),
+        ("retired", 0, tfm.retired, base.retired),
+        ("configs_joined", 0, tfm.configs_joined, base.configs_joined),
+        ("configs_failed", 0, tfm.configs_failed, base.configs_failed),
     ] {
         let d = delta(got, got_base, name)?;
-        if d != 0 {
-            return Err(format!("tfm {name} delta {d} != 0 (failed alloc)"));
+        if d != want {
+            return Err(format!("tfm {name} delta {d} != {want} (failed alloc)"));
         }
     }
     if !view.reuse_exact {
@@ -1906,6 +2040,18 @@ mod tests {
     /// The sync fixture's one lifetime as the sensor observes
     /// it: alloc-observed provenance, one setup setkey (epoch 1),
     /// proved final retire.
+    /// Three sync-shaped generations with explicit IDs (T07-R3-03:
+    /// the verdict must see distinct ordered IDs — three copies of
+    /// `sync_gen()`'s shared `id: 1` no longer pass a multi-lifetime
+    /// pairing).
+    fn sync_gens3(a: u64, b: u64, c: u64) -> [GenerationInfo; 3] {
+        let mut gens = [sync_gen(), sync_gen(), sync_gen()];
+        gens[0].id = a;
+        gens[1].id = b;
+        gens[2].id = c;
+        gens
+    }
+
     fn sync_gen() -> GenerationInfo {
         GenerationInfo {
             id: 1,
@@ -2008,7 +2154,9 @@ mod tests {
         ));
         let truth = parse_transcript(&rows.join("\n"), run).expect("burst parses");
         assert_eq!(truth.allocs.len(), 3);
-        let gens = [sync_gen(), sync_gen(), sync_gen()];
+        // T07-R3-03: the positive fixture carries distinct ordered
+        // IDs — the verdict must pin the tracker's monotonic mint.
+        let gens = sync_gens3(1, 2, 3);
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
@@ -2023,7 +2171,7 @@ mod tests {
         view.tfm.configs_joined = 3;
         verdict("reuse-burst", &truth, &view).expect("burst pairs green");
         // A provenance lie on lifetime 3 fails, naming it.
-        let mut bad_gens = [sync_gen(), sync_gen(), sync_gen()];
+        let mut bad_gens = sync_gens3(1, 2, 3);
         bad_gens[2].drv_name = "wrong-driver".to_owned();
         let mut view = sync_view(&completed, &bad_gens);
         view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
@@ -2038,6 +2186,55 @@ mod tests {
         view.tfm.configs_joined = 3;
         let err = verdict("reuse-burst", &truth, &view).expect_err("drv lie must fail");
         assert!(err.contains("alloc seq 3"), "names the lifetime: {err}");
+        // T07-R3-03: duplicate, unordered, and zero generation IDs
+        // fail — the verdict pins nonzero, distinct, ordered IDs,
+        // not just row count and metadata.
+        for (ids, why) in [
+            ((1, 1, 1), "duplicate"),
+            ((1, 3, 2), "unordered"),
+            ((0, 1, 2), "zero"),
+        ] {
+            let gens = sync_gens3(ids.0, ids.1, ids.2);
+            let mut view = sync_view(&completed, &gens);
+            view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+            view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+            view.decode.admitted = 0;
+            view.reducer.admitted = 0;
+            view.reducer.emitted = 0;
+            view.tfm.admitted = 9;
+            view.tfm.completed = 3;
+            view.tfm.releases = 3;
+            view.tfm.retired = 3;
+            view.tfm.configs_joined = 3;
+            let err =
+                verdict("reuse-burst", &truth, &view).expect_err(&format!("{why} IDs must fail"));
+            assert!(err.contains("generation id"), "names it: {err}");
+        }
+    }
+
+    #[test]
+    fn verdict_generation_ids_must_not_reuse_baseline() {
+        // T07-R3-03 / astra R3-05: a fresh generation reusing a
+        // baseline ID fails (no separation); a fresh ID above the
+        // baseline passes. The sync fixture carries one lifetime.
+        let truth = sync_truth();
+        assert_eq!(truth.allocs.len(), 1);
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let mut fresh = sync_gen();
+        fresh.id = 1;
+        let gens = [sync_gen(), fresh];
+        let mut view = sync_view(&completed, &gens);
+        view.baseline.generations_len = 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("baseline reuse must fail");
+        assert!(err.contains("generation id"), "names it: {err}");
+        // Positive control: the same shape with a separated fresh
+        // ID passes.
+        let mut fresh = sync_gen();
+        fresh.id = 2;
+        let gens = [sync_gen(), fresh];
+        let mut view = sync_view(&completed, &gens);
+        view.baseline.generations_len = 1;
+        verdict("sync-once", &truth, &view).expect("separated fresh ID passes");
     }
 
     #[test]
@@ -2155,6 +2352,78 @@ mod tests {
         view.tfm.unobserved_boundary = 1;
         view.reuse_exact = true;
         verdict("authsize", &truth, &view).expect_err("false exactness must fail");
+        // T07-R3-07: fabricated creation metadata on a first-seen
+        // AEAD generation fails — unknown provenance means the
+        // type/mask stay zero and neither truncation bit is set.
+        let mut fb = gens.clone();
+        fb[0].alg_type = 5;
+        let mut view = sync_view(&completed, &fb);
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 0;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 1;
+        view.reuse_exact = false;
+        let err = verdict("authsize", &truth, &view).expect_err("fabricated type must fail");
+        assert!(err.contains("type/mask"), "names it: {err}");
+        let mut fb = gens.clone();
+        fb[0].alg_mask = 0x8f;
+        let mut view = sync_view(&completed, &fb);
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 0;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 1;
+        view.reuse_exact = false;
+        verdict("authsize", &truth, &view).expect_err("fabricated mask must fail");
+        let mut fb = gens.clone();
+        fb[0].name_truncated = true;
+        let mut view = sync_view(&completed, &fb);
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 0;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 1;
+        view.reuse_exact = false;
+        verdict("authsize", &truth, &view).expect_err("truncation claim must fail");
+        let mut fb = gens.clone();
+        fb[0].drv_truncated = true;
+        let mut view = sync_view(&completed, &fb);
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 0;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 1;
+        view.reuse_exact = false;
+        verdict("authsize", &truth, &view).expect_err("drv truncation claim must fail");
     }
 
     #[test]
@@ -2271,6 +2540,51 @@ mod tests {
             format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#);
         let err = parse_transcript(&rowless, run).expect_err("rowless must fail");
         assert!(err.reason.contains("positive control"), "names it: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_impossible_lifetime_order() {
+        // T07-R3-11 / astra R3-06: the canary entry point enforces
+        // the testkit-equivalent lifetime order statefully, in row
+        // order — a config after the final free, a free before its
+        // alloc, or a repeated final free is an impossible history,
+        // rejected before any `FixtureTruth` is produced (sharing
+        // the testkit parser itself would invert the dev-dependency
+        // direction — the canary binary cannot depend on testkit).
+        let run = "run-sync-once";
+        let text = sync_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 10, "sync fixture shape");
+        // Config-after-final: move the setup config (line 1) to
+        // just after the final free (line 8), before done.
+        let mut moved = lines.clone();
+        let config = moved.remove(1);
+        moved.insert(8, config);
+        let err =
+            parse_transcript(&moved.join("\n"), run).expect_err("config-after-final must fail");
+        assert!(err.reason.contains("after final free"), "names it: {err}");
+        // Free-before-alloc: move the final free (line 8) ahead of
+        // the alloc (line 0).
+        let mut moved = lines.clone();
+        let free = moved.remove(8);
+        moved.insert(0, free);
+        let err =
+            parse_transcript(&moved.join("\n"), run).expect_err("free-before-alloc must fail");
+        assert!(err.reason.contains("before its alloc"), "names it: {err}");
+        // Repeated final: a second final free after the first.
+        let mut moved = lines.clone();
+        moved.insert(9, lines[8]);
+        let err = parse_transcript(&moved.join("\n"), run).expect_err("repeated final must fail");
+        assert!(err.reason.contains("after final free"), "names it: {err}");
+        // Positive control: a retained (non-final) free ahead of
+        // the final free is a legal shared release, still parses.
+        let shared = sync_text().replace(
+            r#""seq":1,"phase":"free","final":true"#,
+            r#""seq":1,"phase":"free","final":false"#,
+        );
+        let mut moved: Vec<&str> = shared.lines().collect();
+        moved.insert(9, lines[8]);
+        parse_transcript(&moved.join("\n"), run).expect("retained-then-final parses");
     }
 
     #[test]
@@ -2502,6 +2816,13 @@ mod tests {
         let mut view = sync_view(&completed, &gens);
         view.tfm.unobserved_boundary = 1;
         verdict("sync-once", &truth, &view).expect_err("uncertain identity must fail");
+        // T07-R3-02: a colliding destroy (unbound at a live base)
+        // gates the run — indeterminate identity, never inventory.
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.tfm.colliding_releases = 1;
+        let err = verdict("sync-once", &truth, &view).expect_err("colliding must fail");
+        assert!(err.contains("tfm_colliding_releases"), "names it: {err}");
         // Truth-only: the fixture's own lifetime (admitted 3 =
         // alloc + free + setup config, proved retire, one joined
         // config) + a classified no-op release pass the gate AND
@@ -2518,13 +2839,34 @@ mod tests {
         view.tfm.failed_allocs = 0;
         view.tfm.noop_releases = 1;
         verdict("sync-once", &truth, &view).expect("truth-only transform traffic green");
-        // T07-R2-05: routine unbound destroys (digest/shash
-        // background in the guest) gate nothing — while a missed
-        // identity that was USED still fails via its admission.
+        // T07-R2-05, reconciled T07-R3-12: routine unbound
+        // destroys (digest/shash background in the guest) gate
+        // nothing — WITH their complete production baggage (one
+        // admitted attempt, one release, one destroy submit/return
+        // edge pair each: a counter-only view is not real
+        // inventory). A missed identity that was USED still fails
+        // via its admission.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
         view.tfm.unknown_releases = 5;
+        view.tfm.admitted += 5;
+        view.tfm.releases += 5;
+        view.edge_hits[6] += 5;
+        view.edge_hits[7] += 5;
+        view.agg_accepted[6] += 5;
+        view.agg_accepted[7] += 5;
         verdict("sync-once", &truth, &view).expect("unbound destroys are inventory");
+        // Partial baggage is NOT inventory: destroy edges without
+        // the matching admitted attempts fail the equations (no
+        // laundering through the reconciled counter).
+        let gens = [sync_gen()];
+        let mut view = sync_view(&completed, &gens);
+        view.tfm.unknown_releases = 5;
+        view.edge_hits[6] += 5;
+        view.edge_hits[7] += 5;
+        view.agg_accepted[6] += 5;
+        view.agg_accepted[7] += 5;
+        verdict("sync-once", &truth, &view).expect_err("partial baggage must fail");
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
         view.tfm.unknown_releases = 5;

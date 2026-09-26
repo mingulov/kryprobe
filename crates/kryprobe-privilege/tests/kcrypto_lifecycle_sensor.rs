@@ -9,9 +9,12 @@
 
 use kryprobe_abi::kcrypto_lifecycle::{
     LEDGE_RETURN, LEDGE_SUBMIT, LTFM_MAGIC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY,
-    LTFM_SITE_SETAUTHSIZE, LTFM_VERSION,
+    LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_SK, LTFM_VERSION,
 };
 use kryprobe_core::kcrypto::Terminal;
+use kryprobe_privilege::kcrypto_lifecycle::canary::{
+    SensorBaseline, SensorView, parse_transcript, verdict,
+};
 use kryprobe_privilege::kcrypto_lifecycle::sensor::{
     EnrichmentStatus, SensorCore, SessionContext, fold_loss_lanes,
 };
@@ -386,6 +389,134 @@ fn ingest_op_edge_admits_first_seen_transform() {
     assert_eq!(core.tfm().generations().len(), 1, "return admits nothing");
     core.ingest_records(&[edge_bytes(1, 1, 0xdef, 200, 0, 0)]);
     assert_eq!(core.tfm().stats().unlinked_ops, 1, "zero word counted");
+}
+
+#[test]
+fn mixed_inventory_destroys_green_through_production_ingest() {
+    // T07-R3-12 / astra R3-07: complete digest destroy pairs
+    // (never-live bases) ingested through the PRODUCTION path
+    // alongside one clean fixture lifetime — the reconciled
+    // verdict greens: the unknown counter, the destroy lanes, and
+    // the admitted/releases equations all agree on the inventory
+    // magnitude (a counter-only view is not real inventory).
+    let run = "run-mixed-inventory";
+    let text = [
+        format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher","drv":"drv","type":0,"mask":0}}"#),
+        format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+        format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+        format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+    ]
+    .join("\n");
+    let truth = parse_transcript(&text, run).expect("mixed transcript parses");
+    let f1 = 0xFFFF_8880_0000_1000u64;
+    let b1 = f1 + 8;
+    let stream = vec![
+        // Fixture alloc pair (submit names req, return names drv).
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_ALLOC_SK,
+            0,
+            100,
+            0,
+            0,
+            0,
+            2,
+            b"kxcipher",
+        ),
+        tfm_record(
+            LEDGE_RETURN,
+            LTFM_SITE_ALLOC_SK,
+            f1,
+            150,
+            0,
+            0,
+            0,
+            2,
+            b"drv",
+        ),
+        // Fixture setkey pair.
+        tfm_record(LEDGE_SUBMIT, LTFM_SITE_SETKEY_SK, f1, 200, 0, 16, 0, 4, b""),
+        tfm_record(LEDGE_RETURN, LTFM_SITE_SETKEY_SK, 0, 250, 0, 0, 0, 4, b""),
+        // Fixture destroy pair (observed refcount 1: proved final).
+        tfm_record(LEDGE_SUBMIT, LTFM_SITE_DESTROY, b1, 300, 0, 1, 1, 6, b""),
+        tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 350, 0, 0, 0, 6, b""),
+        // Two background digest destroy pairs (never-live bases).
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_DESTROY,
+            0xFFFF_8880_0000_2000,
+            400,
+            0,
+            1,
+            1,
+            8,
+            b"",
+        ),
+        tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 450, 0, 0, 0, 8, b""),
+        tfm_record(
+            LEDGE_SUBMIT,
+            LTFM_SITE_DESTROY,
+            0xFFFF_8880_0000_3000,
+            500,
+            0,
+            1,
+            1,
+            10,
+            b"",
+        ),
+        tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 550, 0, 0, 0, 10, b""),
+    ];
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    core.ingest_records(&stream);
+    core.finish(600);
+    // Lossless ring: accepted == consumed on every lane.
+    let probe = core
+        .ledger([0; 5], [0; 16], Vec::new(), ctx())
+        .expect("probe ledger");
+    let ledger = core
+        .ledger([0; 5], probe.edge_hits, Vec::new(), ctx())
+        .expect("mixed ledger");
+    assert_eq!(
+        ledger.tfm_stats.unknown_releases, 2,
+        "digest pairs land unknown"
+    );
+    assert_eq!(ledger.tfm_stats.releases, 3);
+    assert_eq!(ledger.tfm_stats.admitted, 5);
+    assert!(core.tfm().reuse_exact(), "inventory keeps exactness");
+    let view = SensorView {
+        completed: &ledger.completed,
+        edge_hits: ledger.edge_hits,
+        decode: ledger.decode,
+        reducer: ledger.reducer,
+        kernel_loss: [0; 5],
+        agg_accepted: ledger.edge_hits,
+        retained_dropped: 0,
+        baseline: SensorBaseline::default(),
+        quiet_backlog_bytes: 0,
+        view_valid: true,
+        attached_links: 7,
+        foreign_links: 0,
+        prog_misses: Vec::new(),
+        tfm: ledger.tfm_stats,
+        generations: &ledger.generations,
+        reuse_exact: core.tfm().reuse_exact(),
+    };
+    verdict("reuse-burst", &truth, &view).expect("mixed inventory greens");
+}
+
+#[test]
+fn ingest_zero_word_op_voids_exact_reuse() {
+    // T07-R3-01 / astra R3-04 sensor-ingest regression: a lone
+    // zero-word op submit (no admission, no other refusal) still
+    // voids exact reuse — the unidentified operation is an identity
+    // gap, not a clean session.
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    core.ingest_records(&[edge_bytes(1, 1, 0xdef, 200, 0, 0)]);
+    assert_eq!(core.tfm().stats().unlinked_ops, 1);
+    assert!(
+        !core.tfm().reuse_exact(),
+        "unlinked op voids exact reuse through ingest"
+    );
 }
 
 #[test]

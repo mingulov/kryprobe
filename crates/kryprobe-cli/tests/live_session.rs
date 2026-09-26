@@ -2375,3 +2375,238 @@ fn live_lifecycle_unconfigured_sensor_refuses_typed() {
         kryprobe_core::session::SessionState::FailedPartial
     );
 }
+
+/// Scripted drain outcomes for sustained-drain tests (T07-R3-05):
+/// `drain_tick` serves one scripted `(records, busy)` outcome per
+/// call, `take_completed` serves one scripted batch per take; past
+/// either script, drains go quiet and takes go empty. Sets the
+/// shared stop flag once `stop_after_drains` drains have run
+/// (`u64::MAX` disables — the session's own deadline/cap ends it).
+struct BurstLifecycleSensor<'a> {
+    drains: Vec<(usize, bool)>,
+    takes: Vec<Vec<kryprobe_core::kcrypto::RequestRecord>>,
+    finish_records: Vec<kryprobe_core::kcrypto::RequestRecord>,
+    finish_staged: bool,
+    ledger: kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger,
+    now: u64,
+    drain_calls: std::sync::atomic::AtomicU64,
+    take_calls: std::sync::atomic::AtomicU64,
+    stop_after_drains: u64,
+    stop: &'a std::sync::atomic::AtomicBool,
+}
+
+impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
+    fn drain_tick(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_lifecycle::sensor::DrainOutcome,
+        kryprobe_cli::live::LiveError,
+    > {
+        let call = self
+            .drain_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call + 1 >= self.stop_after_drains {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (records, busy) = self
+            .drains
+            .get(call as usize)
+            .copied()
+            .unwrap_or((0, false));
+        Ok(
+            kryprobe_privilege::kcrypto_lifecycle::sensor::DrainOutcome {
+                records,
+                completed: records,
+                busy,
+            },
+        )
+    }
+
+    fn take_completed(
+        &mut self,
+    ) -> Result<Vec<kryprobe_core::kcrypto::RequestRecord>, kryprobe_cli::live::LiveError> {
+        if self.finish_staged {
+            self.finish_staged = false;
+            return Ok(self.finish_records.clone());
+        }
+        let call = self
+            .take_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.takes.get(call as usize).cloned().unwrap_or_default())
+    }
+
+    fn verify_identity(&self) -> Result<(), kryprobe_cli::live::LiveError> {
+        Ok(())
+    }
+
+    fn close_input(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {
+        Ok(())
+    }
+
+    fn drain_quiet(
+        &mut self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_lifecycle::sensor::QuietOutcome,
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok(
+            kryprobe_privilege::kcrypto_lifecycle::sensor::QuietOutcome {
+                rounds: 1,
+                records: 0,
+                quiet: true,
+                backlog_bytes: 0,
+            },
+        )
+    }
+
+    fn finish_stop(&mut self, stop_ns: u64) -> Result<(), kryprobe_cli::live::LiveError> {
+        assert_eq!(stop_ns, self.now, "finish stamps the closing wall");
+        self.finish_staged = true;
+        Ok(())
+    }
+
+    fn ledger(
+        &self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger,
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok(self.ledger.clone())
+    }
+
+    fn now_ns(&self) -> Result<u64, kryprobe_cli::live::LiveError> {
+        Ok(self.now)
+    }
+}
+
+#[test]
+fn live_lifecycle_tick_drains_to_quiet() {
+    // T07-R3-05: one tick sustains three drain rounds (busy, busy,
+    // quiet) — the burst collapses into a SINGLE window (one
+    // progress call with the summed rows/drops), not three
+    // sleep-separated ticks that let the ring drop mid-burst.
+    use kryprobe_core::kcrypto::Terminal;
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(5, false), (3, false), (0, false)],
+        takes: vec![
+            vec![lifecycle_record(1, Terminal::Sync(0))],
+            vec![lifecycle_record(2, Terminal::Sync(0))],
+            Vec::new(),
+        ],
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(2, 2, 0),
+        now: 555,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: 3,
+        stop: &stop,
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress = {
+        let seen = std::sync::Arc::clone(&seen);
+        move |tick: u64, rows: u64, drops: u64| {
+            seen.lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((tick, rows, drops));
+        }
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let cfg = lifecycle_live_config();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        Some(&progress),
+    )
+    .expect("sustained session drives green");
+    assert_eq!(
+        sensor
+            .drain_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "three rounds drained"
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "one window for the burst: {seen:?}");
+    assert_eq!(seen[0], (1, 2, 8), "rows and drops summed: {seen:?}");
+    assert_eq!(outcome.observations.len(), 2, "every completion kept");
+    assert_eq!(outcome.summary.observations, 2);
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+}
+
+#[test]
+fn live_lifecycle_drain_round_cap_bounds_flood() {
+    // T07-R3-05: an endless busy producer cannot starve the window
+    // — the per-tick round cap bounds the sustained loop (the
+    // first window drains exactly 8 rounds), the window still
+    // elapses (progress flows), and the stop flag ends the session
+    // on the next round.
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut controller = attached_controller();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(10, false); 20],
+        takes: Vec::new(),
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 555,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: 9,
+        stop: &stop,
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress = {
+        let seen = std::sync::Arc::clone(&seen);
+        move |tick: u64, rows: u64, drops: u64| {
+            seen.lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((tick, rows, drops));
+        }
+    };
+    let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+    let cfg = lifecycle_live_config();
+    let outcome = kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        Some(&progress),
+    )
+    .expect("capped session drives green");
+    assert_eq!(
+        sensor
+            .drain_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        9,
+        "8 capped rounds + 1 stop round"
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "windows elapse under flood: {seen:?}");
+    assert_eq!(seen[0], (1, 0, 80), "first window capped at 8×10: {seen:?}");
+    assert!(outcome.observations.is_empty());
+    assert_eq!(
+        outcome.terminal_state,
+        kryprobe_core::session::SessionState::Finalized
+    );
+}

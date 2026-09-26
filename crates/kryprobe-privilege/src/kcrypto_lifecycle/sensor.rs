@@ -842,19 +842,42 @@ impl LifecycleSensor {
     /// `detailed_events` instead of vanishing with the sensor. Marks
     /// the sensor [`SensorState::Closed`] — reported, never re-drained.
     pub fn drain_quiet(&mut self) -> Result<QuietOutcome, DrainError> {
+        Ok(self.drain_quiet_impl(false)?.0)
+    }
+
+    /// Close drain with the raw transport tapped (T07-R3-04): the
+    /// same quieting walk as [`Self::drain_quiet`], PLUS the walked
+    /// record bytes (pre-decode — including decoder-refused
+    /// records). The privacy lane test scans these WITH the
+    /// pre-close tapped bytes, so no consumed record — however
+    /// late, however busy the writer — escapes the tripwire. The
+    /// tap observes, never forks (identical ingest path).
+    pub fn drain_quiet_raw(&mut self) -> Result<(QuietOutcome, Vec<Vec<u8>>), DrainError> {
+        self.drain_quiet_impl(true)
+    }
+
+    /// Shared close-drain core: at most [`CLOSE_DRAIN_ROUNDS`]
+    /// rounds of [`QUIET_DRAIN_BUDGET`] visits, stopping at the
+    /// first quiet round. Collects walked bytes only when `tap`
+    /// (the untapped close allocates nothing).
+    fn drain_quiet_impl(&mut self, tap: bool) -> Result<(QuietOutcome, Vec<Vec<u8>>), DrainError> {
         if self.state != SensorState::Draining {
             return Err(DrainError::StateInvalid {
                 expected: "Draining (call close_input first)",
                 actual: self.state.as_str(),
             });
         }
+        let mut raw_all: Vec<Vec<u8>> = Vec::new();
         let mut rounds = 0u64;
         let mut records = 0usize;
         let mut quiet = false;
         for _ in 0..CLOSE_DRAIN_ROUNDS {
-            let drained = self.drain_once(QUIET_DRAIN_BUDGET)?;
+            let (drained, raw) = self.drain_once_raw(QUIET_DRAIN_BUDGET)?;
             rounds += 1;
             records += drained.records;
+            if tap {
+                raw_all.extend(raw);
+            }
             if drained.records == 0 && !drained.busy {
                 quiet = true;
                 break;
@@ -862,12 +885,15 @@ impl LifecycleSensor {
         }
         let backlog_bytes = self.area.producer().saturating_sub(self.consumer);
         self.state = SensorState::Closed;
-        Ok(QuietOutcome {
-            rounds,
-            records,
-            quiet,
-            backlog_bytes,
-        })
+        Ok((
+            QuietOutcome {
+                rounds,
+                records,
+                quiet,
+                backlog_bytes,
+            },
+            raw_all,
+        ))
     }
 }
 

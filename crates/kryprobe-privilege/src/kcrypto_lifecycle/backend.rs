@@ -566,14 +566,17 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 /// → state inserts; dangling-at-close attempts → unmatched
 /// entries; returns for no outstanding attempt → unmatched
 /// returns; predated/mismatched joins → correlation overflows;
-/// uncertain-identity events (ambiguous/forced/stale releases,
-/// unlinked configs, unobserved-boundary attributions, evicted
-/// tombstone history) → unknown generations. Unbound destroys
-/// (`unknown_releases`) stay UNMAPPED (T07-R2-05: expected
-/// digest/shash releases share the counter with destroy-only
-/// missed identities — inventory, never a loss vote; a missed
-/// identity that is used/configured votes via its admission or
-/// config counter instead). Normal transform accounting
+/// uncertain-identity events (ambiguous/forced/stale/colliding
+/// releases, unlinked configs, unobserved-boundary attributions,
+/// evicted tombstone history) → unknown generations. Unbound
+/// destroys at UNOCCUPIED bases (`unknown_releases`) stay UNMAPPED
+/// (T07-R2-05, narrowed T07-R3-02: expected digest/shash releases
+/// share the counter with destroy-only missed identities that
+/// never touched in-boundary state — inventory, never a loss
+/// vote; a missed identity that is used/configured votes via its
+/// admission or config counter instead, and an unbound destroy
+/// colliding with a live occupant votes via
+/// `colliding_releases`). Normal transform accounting
 /// (admissions, completions, classified failures, proved retires,
 /// joined configs incl. errno verdicts) is truth, not loss —
 /// unmapped by design. Evictions pin zero
@@ -623,6 +626,7 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> I
             .saturating_add(tfm.stale_releases)
             .saturating_add(tfm.config_unlinked)
             .saturating_add(tfm.unobserved_boundary)
+            .saturating_add(tfm.colliding_releases)
             .saturating_add(tfm.tombstone_evictions),
         budget_omissions: output_omissions,
     }
@@ -905,8 +909,10 @@ mod tests {
         // uncertain-identity event lands in unknown generations.
         // Normal transform accounting (proved retires, joined
         // configs incl. errno verdicts) is truth — unmapped.
-        // (T07-R2-05: unbound destroys are inventory — the input
-        // below carries 10 and the bucket must EXCLUDE them.)
+        // (T07-R2-05, narrowed T07-R3-02: UNOCCUPIED unbound
+        // destroys are inventory — the input below carries 10 and
+        // the bucket must EXCLUDE them — while the 15 colliding
+        // ones (live occupant) MUST land in the bucket.)
         use crate::kcrypto_lifecycle::tfm::TfmStats;
         let mut ledger = ledger_with([0; 5]);
         ledger.tfm_stats = TfmStats {
@@ -925,6 +931,7 @@ mod tests {
             config_unlinked: 12,
             unobserved_boundary: 13,
             tombstone_evictions: 14,
+            colliding_releases: 15,
             retired: 100,
             configs_joined: 200,
             configs_failed: 300,
@@ -937,8 +944,8 @@ mod tests {
         assert_eq!(integrity.correlation_overflows, 6 + 7);
         assert_eq!(
             integrity.unknown_generation_events,
-            8 + 9 + 11 + 12 + 13 + 14,
-            "unbound destroys excluded from the loss bucket"
+            8 + 9 + 11 + 12 + 13 + 14 + 15,
+            "unoccupied unbound destroys excluded, colliding included"
         );
         // Truth-only transform traffic keeps every loss bucket at
         // zero (a busy-but-clean session reports clean).

@@ -114,6 +114,30 @@ pub enum BtfError {
         /// Incompatibility detail.
         reason: String,
     },
+    /// Duplicate BTF definitions of one name with a chain linking a
+    /// DIFFERENT def than the bound entry def (T07-R3-09): offsets
+    /// from one def cannot be mixed with a chase rooted in another.
+    IncompatibleDefinitions {
+        /// Duplicated type name.
+        type_name: String,
+        /// Entry def id the offsets were bound to.
+        entry_id: u32,
+        /// Rival def id the chain links.
+        linked_id: u32,
+        /// Chain that links the rival def (e.g. `crypto_skcipher.base`).
+        via: String,
+    },
+    /// Member/type search hit a traversal limit or a type cycle
+    /// (T07-R3-10): the search is INCOMPLETE — never a proven
+    /// absence. Mapping this to `MissingMember`/`MissingType` would
+    /// let an unreachable `refcnt` select always-final mode and
+    /// retire retained releases unconditionally.
+    TraversalIncomplete {
+        /// What was sought (member or type name).
+        sought: String,
+        /// Limit detail (cap depth or cycle id).
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BtfError {
@@ -138,6 +162,20 @@ impl std::fmt::Display for BtfError {
             }
             Self::BadPrototype { name, reason } => {
                 write!(f, "BTF FUNC '{name}' prototype refused: {reason}")
+            }
+            Self::IncompatibleDefinitions {
+                type_name,
+                entry_id,
+                linked_id,
+                via,
+            } => {
+                write!(
+                    f,
+                    "BTF '{type_name}' has rival definitions: offsets bound to id {entry_id} but {via} links id {linked_id}"
+                )
+            }
+            Self::TraversalIncomplete { sought, detail } => {
+                write!(f, "BTF search for '{sought}' incomplete: {detail}")
             }
         }
     }
@@ -888,22 +926,78 @@ const LIFECYCLE_NAME_BOUND: u32 = 64;
 /// a present-but-misshapen `refcnt`, or any other gap, fails the
 /// arm (fail closed: a half-proven chase mis-chases in BPF).
 fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
-    let tfm_alg = btf.member_ptr_to_struct("crypto_tfm", "__crt_alg", "crypto_alg")?;
-    let alg_drv = btf.member_bytes("crypto_alg", "cra_driver_name", LIFECYCLE_NAME_BOUND)?;
-    let sk_base = btf.member_embedded_struct("crypto_skcipher", "base", "crypto_tfm")?;
-    let req_base =
-        btf.member_embedded_struct("skcipher_request", "base", "crypto_async_request")?;
-    let req_tfm = btf.member_ptr_to_struct("crypto_async_request", "tfm", "crypto_tfm")?;
-    let (refcnt_off, refcnt_present) = match btf.member_counter("crypto_tfm", "refcnt") {
-        Ok(off) => (off, true),
-        // Soft absence: the whole TYPE missing means the BTF is too
-        // old for the lifecycle sensor at all (the hard members
-        // above already proved `crypto_tfm` exists, so a missing
-        // TYPE here is unreachable — but match it soft anyway: it
-        // can only mean "no refcount to read", never "sensor-safe").
-        Err(BtfError::MissingMember { .. } | BtfError::MissingType { .. }) => (0, false),
-        Err(other) => return Err(other),
-    };
+    // T07-R3-09 single-definition threading: each entry name binds
+    // ONCE (in the same consultation order as before, so missing-type
+    // precedence is unchanged); every later consultation of the same
+    // name resolves THROUGH the bound id, and every chained reference
+    // must land on that SAME id — a chain linking a rival duplicate
+    // def refuses instead of mixing offsets across defs.
+    let tfm_entry = btf.find_struct("crypto_tfm")?;
+    let alg_entry = btf.find_struct("crypto_alg")?;
+    let sk_entry = btf.find_struct("crypto_skcipher")?;
+    let sreq_entry = btf.find_struct("skcipher_request")?;
+    let areq_entry = btf.find_struct("crypto_async_request")?;
+    let (tfm_alg, alg_id) =
+        btf.member_ptr_target_in(tfm_entry, "crypto_tfm", "__crt_alg", "crypto_alg")?;
+    if alg_id != alg_entry {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: "crypto_alg".to_owned(),
+            entry_id: alg_entry,
+            linked_id: alg_id,
+            via: "crypto_tfm.__crt_alg".to_owned(),
+        });
+    }
+    let alg_drv = btf.member_bytes_in(
+        alg_entry,
+        "crypto_alg",
+        "cra_driver_name",
+        LIFECYCLE_NAME_BOUND,
+    )?;
+    let (sk_base, sk_tfm_id) =
+        btf.member_embedded_target_in(sk_entry, "crypto_skcipher", "base", "crypto_tfm")?;
+    if sk_tfm_id != tfm_entry {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: "crypto_tfm".to_owned(),
+            entry_id: tfm_entry,
+            linked_id: sk_tfm_id,
+            via: "crypto_skcipher.base".to_owned(),
+        });
+    }
+    let (req_base, req_areq_id) = btf.member_embedded_target_in(
+        sreq_entry,
+        "skcipher_request",
+        "base",
+        "crypto_async_request",
+    )?;
+    if req_areq_id != areq_entry {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: "crypto_async_request".to_owned(),
+            entry_id: areq_entry,
+            linked_id: req_areq_id,
+            via: "skcipher_request.base".to_owned(),
+        });
+    }
+    let (req_tfm, req_tfm_id) =
+        btf.member_ptr_target_in(areq_entry, "crypto_async_request", "tfm", "crypto_tfm")?;
+    if req_tfm_id != tfm_entry {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: "crypto_tfm".to_owned(),
+            entry_id: tfm_entry,
+            linked_id: req_tfm_id,
+            via: "crypto_async_request.tfm".to_owned(),
+        });
+    }
+    let (refcnt_off, refcnt_present) =
+        match btf.member_counter_in(tfm_entry, "crypto_tfm", "refcnt") {
+            Ok(off) => (off, true),
+            // Soft absence: the whole TYPE missing means the BTF is too
+            // old for the lifecycle sensor at all (the hard members
+            // above already proved `crypto_tfm` exists, so a missing
+            // TYPE here is unreachable — but match it soft anyway: it
+            // can only mean "no refcount to read", never "sensor-safe").
+            Err(BtfError::MissingMember { .. } | BtfError::MissingType { .. }) => (0, false),
+            Err(other) => return Err(other),
+        };
     Ok(LifecycleOffsets {
         tfm_alg,
         alg_drv,
@@ -1470,6 +1564,261 @@ mod tests {
         // not absence: fail closed.
         let bytes = lifecycle_fixture(Some(("crypto_tfm", "refcnt", 6)), None);
         assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+    }
+
+    /// Duplicate-`crypto_tfm` fixture (T07-R3-09): a divergent DECOY
+    /// def (fully valid shape, `__crt_alg` @24) plus the REAL def (the
+    /// `lifecycle_fixture` [7] layout: `__crt_alg` @32, refcnt @40).
+    /// The `skcipher`/`async_request` chains ALWAYS link the REAL def
+    /// (id-resolved at build time); `decoy_first` orders the decoy
+    /// before the real def so first-match entry lookups hit the decoy
+    /// while the chains root in the real def.
+    fn lifecycle_dup_fixture(decoy_first: bool) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_PTR};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char.
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        // [3] STRUCT refcount_struct { refs: [1] @0 }.
+        let o_rc = b.str("refcount_struct");
+        let o_refs = b.str("refs");
+        b.rec(o_rc, KIND_STRUCT, 1, false, 4);
+        b.member(o_refs, 1, 0);
+        // [4] ARRAY char[64].
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [5] STRUCT crypto_alg { cra_driver_name: [4] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 4, 188 * 8);
+        // [6] PTR -> [5].
+        b.rec(0, KIND_PTR, 0, false, 5);
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        // Next emitted id is 7; the two `crypto_tfm` defs take the next
+        // two ids in `decoy_first` order.
+        let real_id = if decoy_first { 8 } else { 7 };
+        // REAL def: `__crt_alg` @32 (PTR -> crypto_alg), refcnt @40.
+        let emit_real = |b: &mut BtfBuild| {
+            b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+            b.member(o_crt, 6, 32 * 8);
+            b.member(o_refcnt, 3, 40 * 8);
+        };
+        // DECOY def: valid shape, divergent `__crt_alg` @24.
+        let emit_decoy = |b: &mut BtfBuild| {
+            b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+            b.member(o_crt, 6, 24 * 8);
+            b.member(o_refcnt, 3, 40 * 8);
+        };
+        if decoy_first {
+            emit_decoy(&mut b);
+            emit_real(&mut b);
+        } else {
+            emit_real(&mut b);
+        }
+        // PTR -> REAL def; async/sreq/sk chains root in the real def.
+        let ptr_id = if decoy_first { 9 } else { 8 };
+        b.rec(0, KIND_PTR, 0, false, real_id);
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, ptr_id, 32 * 8);
+        let async_id = ptr_id + 1;
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, async_id, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, real_id, 8 * 8);
+        if !decoy_first {
+            emit_decoy(&mut b);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_lifecycle_duplicate_tfm_divergent_chain_refuses() {
+        // T07-R3-09: entry lookups first-match the DECOY (`__crt_alg`
+        // @24) while the alloc/invoke chains root in the REAL def
+        // (`__crt_alg` @32) — mixing the two would hand BPF a 24 the
+        // real chase never proves. Refuse, naming the rival defs.
+        let bytes = lifecycle_dup_fixture(true);
+        assert!(matches!(
+            resolve_lifecycle_offsets_from(&bytes),
+            Err(BtfError::IncompatibleDefinitions { .. })
+        ));
+    }
+
+    #[test]
+    fn synthetic_lifecycle_duplicate_tfm_unreferenced_resolves() {
+        // Mere duplication is NOT refusal: the divergent decoy sorts
+        // AFTER the real def, every chain links the bound (first) def,
+        // and resolution agrees with the single-def fixture exactly.
+        let bytes = lifecycle_dup_fixture(false);
+        let off = resolve_lifecycle_offsets_from(&bytes).expect("unreferenced dup resolves");
+        assert_eq!(
+            off,
+            LifecycleOffsets {
+                tfm_alg: 32,
+                alg_drv: 188,
+                sk_base: 8,
+                req_base: 32,
+                req_tfm: 32,
+                refcnt_off: 40,
+                refcnt_present: true,
+            }
+        );
+    }
+
+    /// Lifecycle image whose `crypto_tfm` carries NO direct `refcnt`:
+    /// the NAMED member sits `levels` anonymous carriers deep (T07-R3-10
+    /// — each carrier is a 4-byte STRUCT with one anonymous member @0;
+    /// the last level carries NAMED `refcnt: u32` @0). All other
+    /// lifecycle members resolve exactly like `lifecycle_fixture`.
+    fn lifecycle_deep_refcnt_fixture(levels: u32) -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_PTR};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char, [3] ARRAY char[64].
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [4] STRUCT crypto_alg { cra_driver_name: [3] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 3, 188 * 8);
+        // [5] PTR -> [4].
+        b.rec(0, KIND_PTR, 0, false, 4);
+        // [6] STRUCT crypto_tfm { __crt_alg: [5] @32, anon: [7] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        let o_refcnt = b.str("refcnt");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 5, 32 * 8);
+        b.member(0, 7, 40 * 8);
+        // [7..7+levels): the anonymous chain (4-byte carriers).
+        for i in 0..levels {
+            if i + 1 == levels {
+                b.rec(0, KIND_STRUCT, 1, false, 4);
+                b.member(o_refcnt, 1, 0);
+            } else {
+                b.rec(0, KIND_STRUCT, 1, false, 4);
+                b.member(0, 7 + i + 1, 0);
+            }
+        }
+        // Trailing chains root in the REAL lane types: PTR -> [6],
+        // async, sreq, sk (ids continue past the chain).
+        let mut next = 7 + levels;
+        b.rec(0, KIND_PTR, 0, false, 6);
+        let ptr_id = next;
+        next += 1;
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, ptr_id, 32 * 8);
+        let async_id = next;
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, async_id, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 6, 8 * 8);
+        b.finish()
+    }
+
+    /// Lifecycle image whose `crypto_tfm` hides `refcnt` behind a
+    /// SELF-CYCLIC anonymous carrier (T07-R3-10): carrier C's only
+    /// member is anonymous of type C — the search never terminates
+    /// with a proven answer.
+    fn lifecycle_cyclic_refcnt_fixture() -> Vec<u8> {
+        use crate::btf::{KIND_ARRAY, KIND_PTR};
+        let mut b = BtfBuild::new();
+        // [1] INT u32, [2] INT char, [3] ARRAY char[64].
+        b.rec(0, KIND_INT, 0, false, 4);
+        b.word(0x0100_0020);
+        b.rec(0, KIND_INT, 0, false, 1);
+        b.word(0x0100_0008);
+        b.rec(0, KIND_ARRAY, 0, false, 0);
+        b.word(2);
+        b.word(1);
+        b.word(64);
+        // [4] STRUCT crypto_alg { cra_driver_name: [3] @188 }.
+        let o_alg = b.str("crypto_alg");
+        let o_drv = b.str("cra_driver_name");
+        b.rec(o_alg, KIND_STRUCT, 1, false, 256);
+        b.member(o_drv, 3, 188 * 8);
+        // [5] PTR -> [4].
+        b.rec(0, KIND_PTR, 0, false, 4);
+        // [6] STRUCT crypto_tfm { __crt_alg: [5] @32, anon: [7] @40 }.
+        let o_tfm = b.str("crypto_tfm");
+        let o_crt = b.str("__crt_alg");
+        b.rec(o_tfm, KIND_STRUCT, 2, false, 64);
+        b.member(o_crt, 5, 32 * 8);
+        b.member(0, 7, 40 * 8);
+        // [7] STRUCT C { anon: [7] @0 } (self-cycle, 4 bytes).
+        b.rec(0, KIND_STRUCT, 1, false, 4);
+        b.member(0, 7, 0);
+        // [8] PTR -> [6], [9] async, [10] sreq, [11] sk.
+        b.rec(0, KIND_PTR, 0, false, 6);
+        let o_async = b.str("crypto_async_request");
+        let o_tfm_m = b.str("tfm");
+        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        b.member(o_tfm_m, 8, 32 * 8);
+        let o_req = b.str("skcipher_request");
+        let o_base = b.str("base");
+        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.member(o_base, 9, 32 * 8);
+        let o_sk = b.str("crypto_skcipher");
+        b.rec(o_sk, KIND_STRUCT, 1, false, 72);
+        b.member(o_base, 6, 8 * 8);
+        b.finish()
+    }
+
+    #[test]
+    fn synthetic_lifecycle_refcnt_behind_nine_anon_refuses_incomplete() {
+        // T07-R3-10: `refcnt` 9 anonymous levels deep EXCEEDS the
+        // 8-level search — an incomplete traversal must HARD-error,
+        // never soft-absent (soft absence would select always-final
+        // mode and retire retained releases unconditionally).
+        let bytes = lifecycle_deep_refcnt_fixture(9);
+        assert!(matches!(
+            resolve_lifecycle_offsets_from(&bytes),
+            Err(BtfError::TraversalIncomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn synthetic_lifecycle_refcnt_behind_eight_anon_resolves() {
+        // Boundary control: exactly 8 levels is the proven-searchable
+        // limit — resolves with `refcnt` found at tfm-relative 40.
+        let bytes = lifecycle_deep_refcnt_fixture(8);
+        let off = resolve_lifecycle_offsets_from(&bytes).expect("8-deep search completes");
+        assert!(off.refcnt_present);
+        assert_eq!(off.refcnt_off, 40);
+    }
+
+    #[test]
+    fn synthetic_lifecycle_refcnt_anon_cycle_refuses_incomplete() {
+        // T07-R3-10: a self-cyclic anonymous carrier never yields a
+        // proven answer — incomplete, not absent.
+        let bytes = lifecycle_cyclic_refcnt_fixture();
+        assert!(matches!(
+            resolve_lifecycle_offsets_from(&bytes),
+            Err(BtfError::TraversalIncomplete { .. })
+        ));
     }
 
     #[test]

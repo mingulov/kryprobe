@@ -511,6 +511,8 @@ fn lifecycle_coverage(
     // Duplicates repeat known state — no information lost, never
     // flipping. A loss-clean ledger is still `Unknown`: internal
     // pairing cannot prove kernel hook-delivery (S04/G9 twin).
+    // (T07-R3-02: an unbound destroy colliding with a live occupant
+    // votes here — indeterminate identity, never inventory.)
     let count_loss = ledger
         .kernel_loss
         .iter()
@@ -538,6 +540,7 @@ fn lifecycle_coverage(
         .saturating_add(ledger.tfm_stats.ambiguous_releases)
         .saturating_add(ledger.tfm_stats.forced_retires)
         .saturating_add(ledger.tfm_stats.stale_releases)
+        .saturating_add(ledger.tfm_stats.colliding_releases)
         .saturating_add(ledger.tfm_stats.config_unlinked)
         .saturating_add(ledger.tfm_stats.unobserved_boundary)
         .saturating_add(ledger.tfm_stats.tombstone_evictions);
@@ -559,10 +562,13 @@ fn lifecycle_coverage(
     aggregate_counts
         .counters
         .push(counter("count_loss", count_loss));
-    // T07-R2-05: unbound destroys stay VISIBLE as inventory
-    // (expected digest/shash releases share the counter with
-    // destroy-only missed identities) — verdict-neutral, never
-    // silent, never a loss vote.
+    // T07-R2-05, narrowed T07-R3-02: unbound destroys at
+    // UNOCCUPIED bases stay VISIBLE as inventory (expected
+    // digest/shash releases share the counter with destroy-only
+    // missed identities that never touched in-boundary state) —
+    // verdict-neutral, never silent, never a loss vote. Unbound
+    // destroys colliding with a live occupant vote loss via
+    // `colliding_releases` in the sums above, never here.
     aggregate_counts.counters.push(counter(
         "unbound_destroy_inventory",
         ledger.tfm_stats.unknown_releases,
@@ -690,9 +696,12 @@ fn lifecycle_coverage(
     // stale return. Only `tombstone_evictions` stays out: eviction
     // drops retired tombstones whose records already emitted; any
     // late edge for one surfaces via unknown/stale. Unbound
-    // destroys stay out too (T07-R2-05: expected digest/shash
-    // releases are unjoinable BY DESIGN — no identity exists to
-    // join — so they ride inventory, never the join claim).
+    // destroys at UNOCCUPIED bases stay out too (T07-R2-05,
+    // narrowed T07-R3-02: expected digest/shash releases are
+    // unjoinable BY DESIGN — no identity exists to join — so they
+    // ride inventory, never the join claim); an unbound destroy
+    // colliding with a live occupant JOINS (indeterminate identity
+    // AT an identity — the join claim cannot stand).
     let correlation_events = ledger
         .decode
         .gaps_synthesized
@@ -715,6 +724,7 @@ fn lifecycle_coverage(
         .saturating_add(ledger.tfm_stats.ambiguous_releases)
         .saturating_add(ledger.tfm_stats.forced_retires)
         .saturating_add(ledger.tfm_stats.stale_releases)
+        .saturating_add(ledger.tfm_stats.colliding_releases)
         .saturating_add(ledger.tfm_stats.config_unlinked)
         .saturating_add(ledger.tfm_stats.unobserved_boundary);
     let mut correlation = dim(if correlation_events == 0 {
@@ -1301,9 +1311,19 @@ fn drive_session_inner(
 }
 
 /// Per-tick ring-drain visit cap: 8192 covers a full ring (≈5461
-/// records at 48 B per frame) plus margin, still bounded — a tick
-/// never leaves routine backlog for the next one.
+/// records at 48 B per frame) plus margin, still bounded — one
+/// round consumes any backlog a quiet window can hold.
 const LIFECYCLE_DRAIN_BUDGET: usize = 8192;
+
+/// Sustained-drain rounds per tick (T07-R3-05): a tick re-polls
+/// while records flow (or the writer holds one open) instead of
+/// napping between single drains — a 1,000-lifetime burst emits
+/// past one ringful in a few ms, and one drain per second drops
+/// it. 8 rounds × 8192 visits absorb ≈12 ringfuls per window;
+/// past the cap the window still elapses (progress, omission cap,
+/// and deadline stay live under endless flood — the session's own
+/// guards, not the producer, bound the loop).
+const LIFECYCLE_DRAIN_ROUNDS_PER_TICK: u32 = 8;
 
 /// Session observation cap (design C12: configured bound, counted
 /// admission, deterministic stop): past 100K decoded records the
@@ -1351,10 +1371,12 @@ pub fn drive_lifecycle_session(
 }
 
 /// Lifecycle tick driver (T06 item 4 twin of [`drive_session_inner`]):
-/// per-tick ring drain → completed records → `decode` each (first
-/// error aborts `Internal`), then stop-time `finish` reconciliation,
+/// per-window SUSTAINED ring drain (rounds to quiet, capped —
+/// T07-R3-05) → completed records → `decode` each (first error
+/// aborts `Internal`), then stop-time `finish` reconciliation,
 /// then `finalize` ONCE and the shared feed ONCE, then coverage from
-/// the terminal ledger. NEVER finalizes per tick (D1/M1).
+/// the terminal ledger. NEVER finalizes per tick (D1/M1). Windows
+/// sleep only when quiet; busy windows chain immediately.
 ///
 /// Completed records are disjoint across ticks (each surfaces once
 /// from retention), so every decoded record is kept — memory is
@@ -1440,15 +1462,40 @@ fn drive_lifecycle_session_inner(
             first_wall = now;
             first_tick = false;
         }
-        let drained = sensor.drain_tick(LIFECYCLE_DRAIN_BUDGET)?;
-        let completed = sensor.take_completed()?;
-        let completed_this_tick = completed.len() as u64;
-        decode_records(completed, &mut observations)?;
-        interrupted |= SIGINT_SEEN.load(Ordering::Relaxed);
+        // Sustained drain (T07-R3-05, the canary pattern ported
+        // to production): re-poll IMMEDIATELY while records flow —
+        // a burst past one ringful must meet a draining consumer,
+        // not a napping one. Rounds stop at the first quiet round
+        // (nothing consumed, no busy writer), at the round cap (the
+        // window still elapses under endless flood), or promptly on
+        // stop/omission/deadline/SIGINT (same guards as the window
+        // edge below).
+        let mut window_completed = 0u64;
+        let mut window_records = 0u64;
+        let mut window_quiet = false;
+        for _ in 0..LIFECYCLE_DRAIN_ROUNDS_PER_TICK {
+            let drained = sensor.drain_tick(LIFECYCLE_DRAIN_BUDGET)?;
+            let completed = sensor.take_completed()?;
+            window_completed += completed.len() as u64;
+            window_records += drained.records as u64;
+            decode_records(completed, &mut observations)?;
+            interrupted |= SIGINT_SEEN.load(Ordering::Relaxed);
+            if drained.records == 0 && !drained.busy {
+                window_quiet = true;
+                break;
+            }
+            if stop.load(Ordering::Relaxed)
+                || interrupted
+                || omitted.get() > 0
+                || deadline.is_some_and(|end| Instant::now() >= end)
+            {
+                break;
+            }
+        }
         if let Some(report) = progress {
             // Human-only liveness (4B-M4): completions decoded this
-            // tick plus raw records consumed (drops ride the ledger).
-            report(barrier_id, completed_this_tick, drained.records as u64);
+            // window plus raw records consumed (drops ride the ledger).
+            report(barrier_id, window_completed, window_records);
         }
         let stopped = stop.load(Ordering::Relaxed)
             || interrupted
@@ -1457,7 +1504,12 @@ fn drive_lifecycle_session_inner(
         if stopped {
             break;
         }
-        sleep_tick(tick_ms, stop);
+        // Sleep only when quiet: a busy window chains into the next
+        // immediately (sustained draining across windows — the tick
+        // cadence paces idle sessions, never a chasing consumer).
+        if window_quiet {
+            sleep_tick(tick_ms, stop);
+        }
     }
     // Observing -> Quiescing: the loop stopped taking new work.
     hop(controller, SessionState::Quiescing, "lifecycle quiesce")?;
@@ -2518,6 +2570,42 @@ mod tests {
         let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
         assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn t07r302_colliding_destroys_vote_loss() {
+        // T07-R3-02 public coverage: an unbound destroy at a base
+        // WITH a live occupant is indeterminate identity evidence
+        // (never digest inventory) — it votes loss on both
+        // dimensions, exactly like the other uncertain-identity
+        // release classes.
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.tfm_stats.colliding_releases = 1;
+        let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(coverage.correlation.status, CoverageStatus::Partial);
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "count_loss" && c.value == 1),
+            "colliding votes loss: {:?}",
+            coverage.aggregate_counts.counters
+        );
+        assert!(
+            coverage
+                .correlation
+                .counters
+                .iter()
+                .any(|c| c.name == "correlation_events" && c.value == 1),
+            "colliding is a correlation event: {:?}",
+            coverage.correlation.counters
+        );
     }
 
     #[test]

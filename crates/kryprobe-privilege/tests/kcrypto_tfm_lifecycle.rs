@@ -455,6 +455,9 @@ fn first_seen_zero_link_counts_unlinked() {
     assert_eq!(tracker.admit_first_seen(0, "", false), None);
     assert_eq!(tracker.stats().unlinked_ops, 1);
     assert!(tracker.generations().is_empty());
+    // T07-R3-01: the zero-word op is an identity gap (a real
+    // operation with no admitted generation) — exactness voids.
+    assert!(!tracker.reuse_exact(), "unlinked op voids exact reuse");
 }
 
 #[test]
@@ -559,7 +562,12 @@ fn destroy_unknown_base_counts() {
     tracker.feed(&destroy_entry(2, 0xFFFF_8880_0000_1000, 1, 1));
     tracker.feed(&destroy_return(2));
     assert_eq!(tracker.stats().unknown_releases, 1);
+    assert_eq!(tracker.stats().colliding_releases, 0);
     assert!(tracker.generations().is_empty());
+    // T07-R3-02: the no-occupant case stays verdict-neutral
+    // inventory (consistent with out-of-boundary digest traffic) —
+    // exactness stands.
+    assert!(tracker.reuse_exact(), "plain inventory keeps exactness");
 }
 
 #[test]
@@ -832,16 +840,23 @@ fn destroy_entry_unmapped_then_live_refuses() {
     // The entry observed no live lifetime; a base that became live
     // between the halves leaves the destroy's true target
     // unknowable (ring order is not kernel order) — the return
-    // counts unknown and touches nothing.
+    // counts COLLIDING (T07-R3-02: indeterminate identity evidence
+    // at an in-boundary live base, never digest inventory) and
+    // touches nothing.
     let mut tracker = TransformTracker::new(16, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&destroy_entry(2, f1 + 8, 1, 1));
     tracker.feed(&alloc_entry(4, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(4, f1, b"drv"));
     tracker.feed(&destroy_return(2));
-    assert_eq!(tracker.stats().unknown_releases, 1);
+    assert_eq!(tracker.stats().colliding_releases, 1);
+    assert_eq!(tracker.stats().unknown_releases, 0);
     assert_eq!(tracker.stats().retired, 0);
     assert!(!tracker.generations()[0].retired, "newcomer untouched");
+    assert!(
+        !tracker.reuse_exact(),
+        "colliding destroy voids exact reuse"
+    );
 }
 
 #[test]
@@ -2024,8 +2039,10 @@ fn host_alloc_capture_assigns_generations() {
     let ambiguous = stats.ambiguous_releases - pre_stats.ambiguous_releases;
     let unknown = stats.unknown_releases - pre_stats.unknown_releases;
     let noop = stats.noop_releases - pre_stats.noop_releases;
+    let stale = stats.stale_releases - pre_stats.stale_releases;
+    let colliding = stats.colliding_releases - pre_stats.colliding_releases;
     assert_eq!(
-        retired + ambiguous + unknown + noop,
+        retired + ambiguous + unknown + noop + stale + colliding,
         releases,
         "every release lands on exactly one verdict"
     );
@@ -2181,6 +2198,16 @@ fn transport_carries_marker(data: &[u8]) -> bool {
     })
 }
 
+/// Scan tapped raw transport for secret markers (T07-R3-04): index
+/// of the first tripping record, or `None` when clean. Shared by
+/// the BPF privacy lane (pre-close tapped rounds + tapped close
+/// drain) and the close-tail negative control above.
+fn scan_raw_transport(raw_all: &[Vec<u8>]) -> Option<usize> {
+    raw_all
+        .iter()
+        .position(|record| transport_carries_marker(record))
+}
+
 #[test]
 fn canary_scanner_trips_on_marker_bytes() {
     // The tripwire proves itself: a synthetic 112B record with
@@ -2211,6 +2238,34 @@ fn canary_scanner_trips_on_marker_bytes() {
         b"cbc(aes)",
     );
     assert!(!transport_carries_marker(&clean), "clean record bytes pass");
+}
+
+#[test]
+fn raw_scan_trips_on_close_tail_marker() {
+    // T07-R3-04 negative control: a marker record arriving AFTER
+    // the eighth tapped round (the close-drain tail — the old
+    // untapped `drain_quiet` dropped these bytes) trips the factored
+    // scan at its tail index; the same head WITHOUT the tail passes.
+    // (The ignored BPF lane below feeds the real tapped close bytes
+    // through this same scan.)
+    let mut head: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..8 {
+        head.push(vec![0u8; 112]);
+    }
+    let mut tail = vec![0u8; 112];
+    tail[48..48 + 16].copy_from_slice(b"KPROBE-CANARY-K!");
+    let mut raw_all = head.clone();
+    raw_all.push(tail);
+    assert_eq!(
+        scan_raw_transport(&raw_all),
+        Some(8),
+        "close-tail marker trips at its index"
+    );
+    assert_eq!(
+        scan_raw_transport(&head),
+        None,
+        "head alone passes (control is the tail)"
+    );
 }
 
 /// Lifecycle secret-canary lane test (R6/R2-04): marked key, IV,
@@ -2274,7 +2329,11 @@ fn lifecycle_canary_no_secret_bytes_in_views() {
     assert_eq!((counts.enc, counts.dec), (1, 1), "AEAD legs ran");
     aead_decrypt_marker_tag("gcm(aes)").expect("marked tag must fail EBADMSG");
     // Drain with the raw tap: every walked record byte is scanned
-    // pre-decode (decode-refused records included).
+    // pre-decode (decode-refused records included) — INCLUDING the
+    // closing drain (T07-R3-04: the old untapped `drain_quiet` let a
+    // record past round eight escape the tripwire under a busy
+    // writer; the tapped close covers every consumed record, so no
+    // fail-unless-quiet assertion is needed and none is added).
     let mut raw_all: Vec<Vec<u8>> = Vec::new();
     for _ in 0..8 {
         let (drained, raw) = sensor.drain_once_raw(8192).expect("drain");
@@ -2285,7 +2344,8 @@ fn lifecycle_canary_no_secret_bytes_in_views() {
     }
     let completed = sensor.take_completed();
     sensor.close_input().expect("disarm+detach");
-    let quiet = sensor.drain_quiet().expect("quiet drain");
+    let (quiet, close_raw) = sensor.drain_quiet_raw().expect("tapped quiet drain");
+    raw_all.extend(close_raw);
     assert!(quiet.quiet, "close must reach a quiet round");
     let post = sensor.ledger().expect("post-canary ledger");
     let stats = sensor.tfm().stats();
@@ -2345,13 +2405,11 @@ fn lifecycle_canary_no_secret_bytes_in_views() {
         !raw_all.is_empty(),
         "raw tap captured records (non-vacuous scan)"
     );
-    for (i, record) in raw_all.iter().enumerate() {
-        assert!(
-            !transport_carries_marker(record),
-            "marker bytes in raw record {i} ({}B pre-decode)",
-            record.len()
-        );
-    }
+    assert_eq!(
+        scan_raw_transport(&raw_all),
+        None,
+        "marker bytes in tapped raw transport (pre-close + close drain)"
+    );
     let rendered = format!(
         "{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
         gens,

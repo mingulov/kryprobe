@@ -210,16 +210,29 @@ pub struct TfmStats {
     /// Releases of a null/ERR frontend (the kernel returns early —
     /// no dec-test, no free — counted, disturb nothing).
     pub noop_releases: u64,
-    /// Releases for a base with no live generation (T07-R2-05:
-    /// verdict-neutral INVENTORY, never loss — the destroy edge
-    /// carries no family, so an expected digest/shash release
-    /// (destroy-observed-only families) is indistinguishable from
-    /// a destroy-only missed identity. A missed identity that is
+    /// Unbound releases for a base with NO live generation at
+    /// EITHER half (T07-R2-05, narrowed T07-R3-02: verdict-neutral
+    /// INVENTORY, never loss — the destroy edge carries no family,
+    /// so an expected digest/shash release (destroy-observed-only
+    /// families, outside the declared boundary) is
+    /// indistinguishable from a destroy-only missed identity that
+    /// never touched in-boundary state. A missed identity that is
     /// USED or CONFIGURED still votes loss via
     /// `unobserved_boundary`/`config_unlinked`/D4 — only the
     /// never-observed-at-all lifetime stays silent here, honestly
-    /// unclassifiable).
+    /// unclassifiable, and consistent with out-of-boundary
+    /// traffic).
     pub unknown_releases: u64,
+    /// Unbound releases for a base WITH a live occupant at return
+    /// (T07-R3-02: INDETERMINATE identity evidence, never
+    /// inventory — the entry observed no live lifetime, but the
+    /// base has since become live, so the destroy collides with
+    /// in-boundary state: a lost destroy plus reuse, a pre-attach
+    /// lifetime surfacing under a new occupant, or cross-family
+    /// address confusion. No record distinguishes them, and
+    /// routine digest traffic never collides with a live skcipher
+    /// base — so this votes loss and voids exactness).
+    pub colliding_releases: u64,
     /// Generations forced-retired as ambiguous by a new alloc at
     /// their live base (the old lifetime ended unobserved).
     pub forced_retires: u64,
@@ -699,16 +712,26 @@ impl TransformTracker {
     /// forced retire, D4 refusal (`live_full`/`table_full` — a
     /// lifetime unadmitted is a boundary unobserved), unfinished
     /// close, first-seen admission (unobserved creation), corrupt
-    /// record, unpaired edge, unjoinable return, or cross-site
-    /// return (cumulative counters — tombstone eviction cannot
-    /// erase them) disables the claim that a base's lifetimes
-    /// chained exactly end-to-start. (R2-01: a corrupt/unpaired/
-    /// unjoinable/crossed record can hide a creation or
-    /// destruction boundary, so every identity-affecting refusal
-    /// voids — except `unknown_releases`, which post-R2-05 counts
-    /// expected destroy-only family traffic as inventory, and the
-    /// kept-attempt classes `submit_refused`/`stale_returns`/
+    /// record, unpaired edge, unjoinable return, cross-site
+    /// return, unlinked operation (a real op with an unreadable
+    /// request link admits no generation — the op may belong to a
+    /// lifetime this tracker never saw), or colliding release (an
+    /// unbound destroy at a live base — indeterminate identity
+    /// evidence) disables the claim that a base's lifetimes chained
+    /// exactly end-to-start. (R2-01: a
+    /// corrupt/unpaired/unjoinable/crossed record can hide a
+    /// creation or destruction boundary, so every identity-affecting
+    /// refusal voids — except `unknown_releases`, which post-R2-05
+    /// counts expected destroy-only family traffic as inventory, and
+    /// the kept-attempt classes `submit_refused`/`stale_returns`/
     /// `stale_releases`, whose first/true pairing still stands.)
+    /// Layering (astra R3-04): this predicate covers INGESTED
+    /// evidence only — transport loss and program misses that erase
+    /// BOTH halves of a boundary pair leave no tracker trace, so a
+    /// whole-session PASS additionally requires the canary verdict's
+    /// loss/miss gating (zero loss, zero miss delta). Ingest-level
+    /// exactness AND session-level transport validity together make
+    /// the release claim; neither alone does.
     #[must_use]
     pub fn reuse_exact(&self) -> bool {
         self.stats.ambiguous_releases == 0
@@ -721,6 +744,8 @@ impl TransformTracker {
             && self.stats.tainted_refused == 0
             && self.stats.unknown_returns == 0
             && self.stats.mismatched_returns == 0
+            && self.stats.unlinked_ops == 0
+            && self.stats.colliding_releases == 0
     }
 
     /// Admit the transform behind an op submit edge (first-seen):
@@ -1090,8 +1115,10 @@ impl TransformTracker {
     ///
     /// The key is the CANONICAL BASE, never normalized (T07-03: the
     /// BPF emits destroy arg1 — family-agnostic, so a shash destroy
-    /// can no longer misjoin through the skcipher-only word; digest
-    /// destroys without an admission path land `unknown_releases`).
+    /// can no longer misjoin through the skcipher-only word; unbound
+    /// destroys land `unknown_releases` when the base stays unoccupied
+    /// (digest-consistent inventory), `colliding_releases` when the
+    /// base has a live occupant (indeterminate — T07-R3-02).
     fn complete_destroy(&mut self, mem: u64, refcnt: u32, observed: bool, bound_id: Option<u64>) {
         self.stats.releases += 1;
         // IS_ERR_OR_NULL: the kernel's early return (no dec-test).
@@ -1116,8 +1143,18 @@ impl TransformTracker {
                 self.stats.stale_releases += 1;
                 return;
             }
-            (None, _) => {
+            // T07-R3-02 capture split: unbound at a base with NO
+            // live occupant stays digest-consistent inventory; unbound
+            // at a base WITH a live occupant collides with
+            // in-boundary state (indeterminate — lost destroy plus
+            // reuse, pre-attach surfacing, or cross-family
+            // confusion) and votes loss via its own counter.
+            (None, None) => {
                 self.stats.unknown_releases += 1;
+                return;
+            }
+            (None, Some(_)) => {
+                self.stats.colliding_releases += 1;
                 return;
             }
         };
