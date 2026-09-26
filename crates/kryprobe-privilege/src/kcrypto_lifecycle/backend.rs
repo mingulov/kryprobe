@@ -201,6 +201,22 @@ impl LifecycleBackend {
         })
     }
 
+    /// Wait for the single owned sensor's input, or yield for a pending
+    /// writer after a drain made no progress. Never waits past `max_wait`.
+    pub fn wait_for_activity(
+        &self,
+        max_wait: std::time::Duration,
+        pending_writer: bool,
+    ) -> Result<(), BackendError> {
+        self.with_sensor(|sensor| sensor.wait_for_activity(max_wait, pending_writer))?
+            .map_err(|err| {
+                BackendError::Internal(InternalError::with_detail(
+                    "lifecycle_wait",
+                    &err.to_string(),
+                ))
+            })
+    }
+
     /// Drain retained completions (decoded to observations by the tick).
     pub fn take_completed(&self) -> Result<Vec<RequestRecord>, BackendError> {
         self.with_sensor(|sensor| sensor.take_completed())

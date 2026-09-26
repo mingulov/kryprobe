@@ -1867,6 +1867,14 @@ struct ScriptedLifecycleSensor<'a> {
 }
 
 impl kryprobe_cli::live::LifecycleSessionSensor for ScriptedLifecycleSensor<'_> {
+    fn wait_for_activity(
+        &mut self,
+        _max_wait: std::time::Duration,
+        _pending_writer: bool,
+    ) -> Result<(), kryprobe_cli::live::LiveError> {
+        Ok(()) // The next scripted drain is already available.
+    }
+
     fn drain_tick(
         &mut self,
         _max_records: usize,
@@ -2393,9 +2401,34 @@ struct BurstLifecycleSensor<'a> {
     take_calls: std::sync::atomic::AtomicU64,
     stop_after_drains: u64,
     stop: &'a std::sync::atomic::AtomicBool,
+    quiet_gate: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    delivered: Option<std::sync::mpsc::SyncSender<()>>,
+    stop_on_wait: bool,
 }
 
 impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
+    fn wait_for_activity(
+        &mut self,
+        max_wait: std::time::Duration,
+        pending_writer: bool,
+    ) -> Result<(), kryprobe_cli::live::LiveError> {
+        if self.stop_on_wait {
+            assert!(
+                pending_writer,
+                "busy head needs a retry yield, not readable-fd spinning"
+            );
+            assert!(
+                max_wait <= std::time::Duration::from_millis(50),
+                "cancellation remains bounded"
+            );
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(()) // The producer gate has already made the next batch ready.
+    }
+
     fn drain_tick(
         &mut self,
         _max_records: usize,
@@ -2414,6 +2447,16 @@ impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
             .get(call as usize)
             .copied()
             .unwrap_or((0, false));
+        if records == 0 && !busy {
+            if let Some((quiet, resume)) = self.quiet_gate.take() {
+                quiet.send(()).expect("announce quiet snapshot");
+                resume.recv().expect("producer releases snapshot");
+            }
+        } else if records > 0
+            && let Some(delivered) = self.delivered.take()
+        {
+            delivered.send(()).expect("announce drain after idle");
+        }
         Ok(
             kryprobe_privilege::kcrypto_lifecycle::sensor::DrainOutcome {
                 records,
@@ -2505,6 +2548,9 @@ fn live_lifecycle_tick_drains_to_quiet() {
         take_calls: std::sync::atomic::AtomicU64::new(0),
         stop_after_drains: 3,
         stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: false,
     };
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let progress = {
@@ -2569,6 +2615,9 @@ fn live_lifecycle_drain_round_cap_bounds_flood() {
         take_calls: std::sync::atomic::AtomicU64::new(0),
         stop_after_drains: 9,
         stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: false,
     };
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let progress = {
@@ -2608,5 +2657,170 @@ fn live_lifecycle_drain_round_cap_bounds_flood() {
     assert_eq!(
         outcome.terminal_state,
         kryprobe_core::session::SessionState::Finalized
+    );
+}
+
+#[test]
+fn live_lifecycle_idle_burst_does_not_wait_for_display_tick() {
+    // Catch a driver that sleeps for the display cadence after an empty
+    // ring snapshot. Channels place the burst after that snapshot; no
+    // sleep guesses where the producer and consumer are. The receive
+    // timeout is a deadlock/response guard, not the synchronization.
+    use std::sync::{atomic::AtomicBool, mpsc::sync_channel};
+    use std::time::Duration;
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let stop = AtomicBool::new(false);
+    let (quiet_tx, quiet_rx) = sync_channel(1);
+    let (resume_tx, resume_rx) = sync_channel(1);
+    let (delivered_tx, delivered_rx) = sync_channel(1);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let mut sensor = BurstLifecycleSensor {
+                drains: vec![(0, false), (1, false)],
+                takes: vec![
+                    Vec::new(),
+                    vec![lifecycle_record(
+                        1,
+                        kryprobe_core::kcrypto::Terminal::Sync(0),
+                    )],
+                ],
+                finish_records: Vec::new(),
+                finish_staged: false,
+                ledger: lifecycle_test_ledger(1, 1, 0),
+                now: 555,
+                drain_calls: std::sync::atomic::AtomicU64::new(0),
+                take_calls: std::sync::atomic::AtomicU64::new(0),
+                stop_after_drains: 2,
+                stop: &stop,
+                quiet_gate: Some((quiet_tx, resume_rx)),
+                delivered: Some(delivered_tx),
+                stop_on_wait: false,
+            };
+            let mut cfg = lifecycle_live_config();
+            cfg.tick_ms = 30_000;
+            let mut controller = attached_controller();
+            kryprobe_cli::live::drive_lifecycle_session(
+                &cfg,
+                &kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new(),
+                &mut sensor,
+                &stop,
+                7,
+                kryprobe_core::ids::SessionId::new(1),
+                kryprobe_core::ids::PlanGeneration::new(1),
+                &kryprobe_core::ids::IdIssuer::default(),
+                &mut controller,
+                None,
+            )
+        });
+        let quiet = quiet_rx.recv_timeout(Duration::from_secs(2));
+        let released = resume_tx.send(());
+        let responsive = delivered_rx.recv_timeout(Duration::from_secs(2));
+        // Always stop and join, including the failing old implementation.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = worker
+            .join()
+            .expect("session worker")
+            .expect("session result");
+        assert!(quiet.is_ok(), "initial quiet snapshot reached: {quiet:?}");
+        assert!(released.is_ok(), "producer released the snapshot");
+        assert!(
+            responsive.is_ok(),
+            "ready burst waited for the display tick: {responsive:?}"
+        );
+        assert_eq!(outcome.observations.len(), 1, "owned completion preserved");
+    });
+}
+#[test]
+fn live_lifecycle_display_cadence_is_independent_of_drain_windows() {
+    // A backlog requires three service windows, all before the next
+    // display tick. Only the initial update and final pending totals
+    // should reach the output callback.
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(10, false); 17],
+        takes: Vec::new(),
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 555,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: 17,
+        stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: false,
+    };
+    let mut cfg = lifecycle_live_config();
+    cfg.tick_ms = 30_000;
+    let mut controller = attached_controller();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let report = {
+        let seen = std::sync::Arc::clone(&seen);
+        move |tick, rows, records| seen.lock().unwrap().push((tick, rows, records))
+    };
+    kryprobe_cli::live::drive_lifecycle_session(
+        &cfg,
+        &kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new(),
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        Some(&report),
+    )
+    .expect("session");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(1, 0, 80), (2, 0, 90)],
+        "busy drains must not turn display updates into a hot output loop"
+    );
+}
+
+#[test]
+fn live_lifecycle_busy_without_progress_services_wait_and_stop() {
+    // A pending producer can leave the oldest record busy. A bounded
+    // drain cap alone still spins between windows unless zero-progress
+    // windows yield. Cancellation arrives at that wait boundary.
+    kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut sensor = BurstLifecycleSensor {
+        drains: vec![(0, true); 17],
+        takes: Vec::new(),
+        finish_records: Vec::new(),
+        finish_staged: false,
+        ledger: lifecycle_test_ledger(0, 0, 0),
+        now: 555,
+        drain_calls: std::sync::atomic::AtomicU64::new(0),
+        take_calls: std::sync::atomic::AtomicU64::new(0),
+        stop_after_drains: 17, // watchdog bounds the broken spin path
+        stop: &stop,
+        quiet_gate: None,
+        delivered: None,
+        stop_on_wait: true,
+    };
+    let mut controller = attached_controller();
+    kryprobe_cli::live::drive_lifecycle_session(
+        &lifecycle_live_config(),
+        &kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new(),
+        &mut sensor,
+        &stop,
+        7,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        &mut controller,
+        None,
+    )
+    .expect("session");
+    assert!(
+        sensor
+            .drain_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+            <= 9,
+        "busy record spun through multiple windows instead of yielding"
     );
 }

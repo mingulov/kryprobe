@@ -37,6 +37,87 @@ use kryprobe_abi::kcrypto_lifecycle::{
 use kryprobe_core::kcrypto::{LifecycleReducer, ReducerStats, RequestRecord};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// Wait on the existing transport fd; neither duplicate it nor consume
+/// records here. EINTR returns control to the driver to handle stop.
+fn wait_readable(fd: RawFd, max_wait: Duration) -> std::io::Result<()> {
+    let timeout = max_wait.as_millis().min(i32::MAX as u128) as i32;
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd is live for the syscall, and the
+    // caller retains ownership of the fd throughout the bounded wait.
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod activity_wait_tests {
+    use super::wait_readable;
+    use std::io::{Read, Write};
+    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+    use std::time::Duration;
+
+    #[test]
+    fn activity_wait_wakes_on_arrival_without_consuming_transport() {
+        let (mut input, mut producer) = UnixStream::pair().unwrap();
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                entered_tx.send(()).unwrap();
+                done_tx
+                    .send(wait_readable(input.as_raw_fd(), Duration::from_secs(5)))
+                    .unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let before_data = done_rx.recv_timeout(Duration::from_millis(50));
+            producer.write_all(b"edge").unwrap();
+            let after_data = if before_data.is_err() {
+                Some(done_rx.recv_timeout(Duration::from_secs(2)))
+            } else {
+                None
+            };
+            waiter.join().unwrap();
+            assert!(
+                matches!(before_data, Err(RecvTimeoutError::Timeout)),
+                "empty transport must wait, not busy-loop: {before_data:?}"
+            );
+            after_data
+                .expect("wait still pending")
+                .expect("arrival wakes wait")
+                .unwrap();
+        });
+        let mut retained = [0; 4];
+        input.read_exact(&mut retained).unwrap();
+        assert_eq!(&retained, b"edge", "only the drain consumes transport");
+    }
+
+    #[test]
+    fn activity_wait_reports_broken_transport() {
+        let (input, producer) = UnixStream::pair().unwrap();
+        drop(producer);
+        assert!(
+            wait_readable(input.as_raw_fd(), Duration::ZERO).is_err(),
+            "hangup is an error, not a successful quiet wait"
+        );
+    }
+}
 
 /// Tally slot for a validated raw op edge: `[enc-submit, enc-return,
 /// dec-submit, dec-return]` (lanes 0–3 of the 16-wide tally).
@@ -494,12 +575,12 @@ pub struct DrainOutcome {
 }
 
 /// Quiet-drain visit budget per round: 8192 covers a full ring
-/// (262144 B / 48 B per frame ≈ 5461 records) plus margin, still
+/// (262144 B / (112 B v5 edge + 8 B header) ≈ 2184 records) plus margin, still
 /// bounded — one round plays any close backlog the ring can hold.
 pub const QUIET_DRAIN_BUDGET: usize = 8192;
 
 /// Quiet-drain round cap: post-detach arrivals are impossible, so 8
-/// rounds (≈43K records) can only exhaust on a corrupt ring — and
+/// rounds (at most 65536 visits) can only exhaust on a corrupt ring — and
 /// then the exact backlog, not silence, reaches the ledger.
 pub const CLOSE_DRAIN_ROUNDS: usize = 8;
 
@@ -774,6 +855,31 @@ impl LifecycleSensor {
     #[must_use]
     pub fn ring_positions(&self) -> (u64, u64) {
         (self.consumer, self.area.producer())
+    }
+
+    /// Wait for new ring activity while retaining the sensor's sole
+    /// ownership of its map fd. The caller bounds cancellation latency
+    /// with `max_wait` and drains again after either wakeup or timeout.
+    pub fn wait_for_activity(
+        &self,
+        max_wait: Duration,
+        pending_writer: bool,
+    ) -> std::io::Result<()> {
+        if self.state != SensorState::Admit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lifecycle wait requires an admitting sensor",
+            ));
+        }
+        if pending_writer {
+            // poll readiness includes reserved but uncommitted bytes. A
+            // busy head would therefore return immediately forever. Yield
+            // briefly, then retry the authoritative drain without skipping
+            // that head or surrendering a whole display interval.
+            std::thread::sleep(max_wait.min(Duration::from_millis(1)));
+            return Ok(());
+        }
+        wait_readable(self.configured.loaded.maps.ring.as_raw_fd(), max_wait)
     }
 
     /// Drain retained completions (the live tick's read path).

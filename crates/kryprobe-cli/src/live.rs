@@ -889,6 +889,16 @@ pub trait LifecycleSessionSensor {
     /// Drain newly produced ring records into the terminal ledger (at
     /// most `max_records` visits).
     fn drain_tick(&mut self, max_records: usize) -> Result<DrainOutcome, LiveError>;
+    /// Wait for transport activity, returning by `max_wait` so the
+    /// driver can service cancellation and its deadline. Readiness is
+    /// only a hint; the next bounded drain remains authoritative. A
+    /// `pending_writer` needs a bounded retry yield: reserved ring bytes
+    /// can be readable to poll before their record is committed.
+    fn wait_for_activity(
+        &mut self,
+        max_wait: Duration,
+        pending_writer: bool,
+    ) -> Result<(), LiveError>;
     /// Drain retained completions (each record surfaces once).
     fn take_completed(&mut self) -> Result<Vec<RequestRecord>, LiveError>;
     /// M2 read-after-ingest: re-verify sensor identity while attached
@@ -941,6 +951,16 @@ impl LifecycleSessionSensor for RealLifecycleSensor<'_> {
         self.backend
             .take_completed()
             .map_err(|err| backend_err("live lifecycle take", err))
+    }
+
+    fn wait_for_activity(
+        &mut self,
+        max_wait: Duration,
+        pending_writer: bool,
+    ) -> Result<(), LiveError> {
+        self.backend
+            .wait_for_activity(max_wait, pending_writer)
+            .map_err(|err| backend_err("live lifecycle wait", err))
     }
 
     fn verify_identity(&self) -> Result<(), LiveError> {
@@ -1319,8 +1339,8 @@ const LIFECYCLE_DRAIN_BUDGET: usize = 8192;
 /// while records flow (or the writer holds one open) instead of
 /// napping between single drains — a 1,000-lifetime burst emits
 /// past one ringful in a few ms, and one drain per second drops
-/// it. 8 rounds × 8192 visits absorb ≈12 ringfuls per window;
-/// past the cap the window still elapses (progress, omission cap,
+/// it. Each window is bounded to 8 rounds × 8192 visits;
+/// past the cap the driver still services progress, omission cap,
 /// and deadline stay live under endless flood — the session's own
 /// guards, not the producer, bound the loop).
 const LIFECYCLE_DRAIN_ROUNDS_PER_TICK: u32 = 8;
@@ -1376,7 +1396,8 @@ pub fn drive_lifecycle_session(
 /// aborts `Internal`), then stop-time `finish` reconciliation,
 /// then `finalize` ONCE and the shared feed ONCE, then coverage from
 /// the terminal ledger. NEVER finalizes per tick (D1/M1). Windows
-/// sleep only when quiet; busy windows chain immediately.
+/// wait on readiness when quiet; a busy record with no progress gets
+/// a bounded retry delay. Display cadence never sets transport cadence.
 ///
 /// Completed records are disjoint across ticks (each surfaces once
 /// from retention), so every decoded record is kept — memory is
@@ -1405,6 +1426,9 @@ fn drive_lifecycle_session_inner(
     let mut first_tick = true;
     let mut barrier_id = 0u64;
     let mut interrupted = false;
+    let mut last_display: Option<Instant> = None;
+    let mut display_completed = 0u64;
+    let mut display_records = 0u64;
     // `Unknown`-terminal records counted from the records
     // themselves: the ambiguous reducer branch emits `Unknown`
     // without touching `unfinished`, so the ledger alone cannot
@@ -1453,7 +1477,6 @@ fn drive_lifecycle_session_inner(
         Ok(())
     };
     loop {
-        barrier_id += 1;
         let now = sensor.now_ns()?;
         // Coverage interval walls come from the ring clock itself
         // (the snapshot precedent: measured `CLOCK_MONOTONIC`, no
@@ -1492,23 +1515,40 @@ fn drive_lifecycle_session_inner(
                 break;
             }
         }
-        if let Some(report) = progress {
-            // Human-only liveness (4B-M4): completions decoded this
-            // window plus raw records consumed (drops ride the ledger).
-            report(barrier_id, window_completed, window_records);
-        }
+        display_completed = display_completed.saturating_add(window_completed);
+        display_records = display_records.saturating_add(window_records);
         let stopped = stop.load(Ordering::Relaxed)
             || interrupted
             || omitted.get() > 0
             || deadline.is_some_and(|end| Instant::now() >= end);
+        let display_now = Instant::now();
+        if stopped
+            || last_display.is_none_or(|last| {
+                display_now.duration_since(last) >= Duration::from_millis(tick_ms)
+            })
+        {
+            barrier_id += 1;
+            if let Some(report) = progress {
+                // Human-only progress aggregates service windows between
+                // display updates; stopping flushes the pending totals.
+                report(barrier_id, display_completed, display_records);
+            }
+            display_completed = 0;
+            display_records = 0;
+            last_display = Some(display_now);
+        }
         if stopped {
             break;
         }
-        // Sleep only when quiet: a busy window chains into the next
-        // immediately (sustained draining across windows — the tick
-        // cadence paces idle sessions, never a chasing consumer).
-        if window_quiet {
-            sleep_tick(tick_ms, stop);
+        // A quiet snapshot is not a promise of an idle display interval.
+        // Wait on the owned ring so newly committed data wakes collection.
+        // Short bounded waits preserve cancellation/deadline service.
+        if window_quiet || window_records == 0 {
+            let max_wait = Duration::from_millis(STOP_POLL_MS.min(tick_ms));
+            let max_wait = deadline.map_or(max_wait, |end| {
+                max_wait.min(end.saturating_duration_since(Instant::now()))
+            });
+            sensor.wait_for_activity(max_wait, !window_quiet)?;
         }
     }
     // Observing -> Quiescing: the loop stopped taking new work.
