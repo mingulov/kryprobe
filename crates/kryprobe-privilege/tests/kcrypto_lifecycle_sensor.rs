@@ -65,7 +65,7 @@ fn edge_bytes_tfm(
 ) -> Vec<u8> {
     let mut out = vec![0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 6;
+    out[2] = 7;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -78,8 +78,8 @@ fn edge_bytes_tfm(
         out[52] = 1; // skcipher family
         out[53] = site as u8; // direction echoes the site
     }
-    let n = drv.len().min(55);
-    out[56..56 + n].copy_from_slice(&drv[..n]);
+    let n = drv.len().min(47);
+    out[64..64 + n].copy_from_slice(&drv[..n]);
     out
 }
 
@@ -107,7 +107,7 @@ fn ingest_paired_edges_complete_grounded_record() {
     assert!(rec.evidence_valid());
     assert_eq!(
         ledger.edge_hits,
-        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     assert_eq!(ledger.decode.admitted, 1);
     assert_eq!(ledger.reducer.admitted, 1);
@@ -138,7 +138,7 @@ fn ingest_queued_return_stays_pending() {
         core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .edge_hits,
-        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
 }
 
@@ -245,11 +245,11 @@ fn w8_ledger_carries_session_context() {
     let ledger = core
         .ledger(
             [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0, 1, 0, 0, 0],
-                agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 view_valid: false,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -262,12 +262,12 @@ fn w8_ledger_carries_session_context() {
     assert_eq!(ledger.kernel_loss, [1, 2, 3, 4, 5]);
     assert_eq!(
         ledger.agg_accepted,
-        [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     assert_eq!(ledger.loss_baseline, [0, 1, 0, 0, 0]);
     assert_eq!(
         ledger.agg_baseline,
-        [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     assert!(!ledger.view_valid);
 }
@@ -500,7 +500,7 @@ fn mixed_inventory_destroys_green_through_production_ingest() {
         baseline: SensorBaseline::default(),
         quiet_backlog_bytes: 0,
         view_valid: true,
-        attached_links: 7,
+        attached_links: 10,
         foreign_links: 0,
         prog_misses: Vec::new(),
         tfm: ledger.tfm_stats,

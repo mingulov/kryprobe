@@ -114,7 +114,7 @@ fn f8c_plan_requests_two_hooks_per_required_site() {
     assert_eq!(plan.backend, BackendId::KCrypto);
     // Entry + return hook per required site, manifest-derived (new
     // sites extend the plan — never a hardcoded count again).
-    assert_eq!(plan.probes.len(), 14, "7 sites × entry/return");
+    assert_eq!(plan.probes.len(), 20, "10 sites × entry/return");
     assert_eq!(
         plan.probes.len(),
         kryprobe_privilege::kcrypto_lifecycle::profile::manifest(

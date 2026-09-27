@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T06 decode suite: raw `LEdge` bytes → T05 `Edge` events + join rules.
 //!
-//! Pins the v6 record twin (magic/version/edge/site/flags/meta/invoc/tfm/drv/length),
+//! Pins the v7 record twin (magic/version/edge/site/flags/meta/invoc/tfm/drv/length),
 //! the invocation→opaque-id join (W8 fsession: fresh id per admission,
 //! bounded table, nested same-key calls pair exactly by cookie id),
 //! return classification (sync-terminal vs queued), and the named loss
@@ -21,7 +21,7 @@ use kryprobe_privilege::kcrypto_lifecycle::decode::{
 /// `LEDGE_TAINTED` flag bit (BPF nesting taint; mirrors the ABI const).
 const TAINTED: u16 = 0x0001;
 
-/// One 112-byte v6 `LEdge` (little-endian twin of the ABI struct).
+/// One 112-byte v7 `LEdge` (little-endian twin of the ABI struct).
 fn edge_bytes_invoc(
     edge: u8,
     site: u16,
@@ -39,7 +39,7 @@ fn edge_bytes_invoc(
 /// driver name (submit edges only — returns carry tfm 0 + empty
 /// name per the R2 twin). Metadata defaults to the unknown-chase
 /// shape (validity clear, skcipher family, site-echoing direction);
-/// tests pinning metadata use [`edge_v6`] explicitly.
+/// tests pinning metadata use [`edge_v7`] explicitly.
 #[allow(clippy::too_many_arguments)]
 fn edge_bytes_tfm(
     edge: u8,
@@ -54,7 +54,7 @@ fn edge_bytes_tfm(
 ) -> [u8; 112] {
     let mut out = [0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 6;
+    out[2] = 7;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -67,12 +67,12 @@ fn edge_bytes_tfm(
         out[52] = 1; // skcipher family
         out[53] = site as u8; // direction echoes the site
     }
-    let n = drv.len().min(55);
-    out[56..56 + n].copy_from_slice(&drv[..n]);
+    let n = drv.len().min(47);
+    out[64..64 + n].copy_from_slice(&drv[..n]);
     out
 }
 
-/// Realistic default builder: same v6 record with a VALID
+/// Realistic default builder: same v7 record with a VALID
 /// invocation (nonzero, reserved-bit clear — tests sharing one call
 /// use the default 0x4000 so the join hits; tests with two live
 /// calls pass distinct invocations via [`edge_bytes_invoc`]
@@ -106,10 +106,10 @@ fn decode_record_rejects_twin_drift() {
     let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
     bad[0] = 0;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMagic));
-    // v1..v5 records refuse (fail closed across versions: an old
-    // decoder would misread the reshaped v6 record, so versions
+    // v1..v6 records refuse (fail closed across versions: an old
+    // decoder would misread the reshaped v7 record, so versions
     // never mix).
-    for version in [1u8, 2, 3, 4, 5] {
+    for version in [1u8, 2, 3, 4, 5, 6] {
         let mut bad = edge_bytes(1, 1, 9, 1, 0, 0);
         bad[2] = version;
         assert_eq!(
@@ -186,9 +186,10 @@ fn decode_record_carries_transform_word() {
 }
 
 #[test]
-fn decode_record_v6_return_carries_no_chase() {
+fn decode_record_v7_return_carries_no_chase() {
     // R2: honest BPF never chases at exit — a return-side transform
-    // word or driver name is twin drift, refused loudly.
+    // word, metadata word (AEAD words included), or driver name is
+    // twin drift, refused loudly.
     let mut bad = edge_bytes(2, 1, 0xabc, 150, 0, 0);
     bad[40] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadReturnTfm));
@@ -196,12 +197,15 @@ fn decode_record_v6_return_carries_no_chase() {
     bad[48] = b'x';
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
     let mut bad = edge_bytes(2, 1, 0xabc, 150, 0, 0);
-    bad[56] = b'x';
+    bad[56] = 1;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    let mut bad = edge_bytes(2, 1, 0xabc, 150, 0, 0);
+    bad[64] = b'x';
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
 }
 
 #[test]
-fn decode_record_v6_submit_carries_driver() {
+fn decode_record_v7_submit_carries_driver() {
     // T07-04/F05: the submit's driver word decodes verbatim (empty
     // when the chase was unreadable); a missing NUL or invalid
     // UTF-8 is drift.
@@ -222,11 +226,11 @@ fn decode_record_v6_submit_carries_driver() {
     let raw = decode_record(&edge_bytes(1, 1, 0xabc, 100, 0, 0)).expect("empty driver parses");
     assert!(raw.drv.is_empty());
     let mut bad = edge_bytes(1, 1, 0xabc, 100, 0, 0);
-    bad[56..112].fill(b'x');
+    bad[64..112].fill(b'x');
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
     let mut bad = edge_bytes(1, 1, 0xabc, 100, 0, 0);
-    bad[56] = 0xFF;
-    bad[57] = 0;
+    bad[64] = 0xFF;
+    bad[65] = 0;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
 }
 
@@ -713,10 +717,11 @@ fn w8_resubmit_gaps_and_readmits_return_joins_current() {
     );
 }
 
-/// One 112-byte v6 `LEdge` (P3 twin: `cryptlen@28`, `req_flags@48`,
-/// `fam@52`, `dir@53`, `mflags@54`, `drv@56` 55+NUL).
+/// One 112-byte v7 `LEdge` (P3+P5 twin: `cryptlen@28`,
+/// `req_flags@48`, `fam@52`, `dir@53`, `mflags@54`,
+/// `assoclen@56`, `authsize@60`, `drv@64` 47+NUL).
 #[allow(clippy::too_many_arguments)]
-fn edge_v6(
+fn edge_v7(
     edge: u8,
     site: u16,
     key: u64,
@@ -727,9 +732,30 @@ fn edge_v6(
     req_flags: Option<u32>,
     drv: &[u8],
 ) -> [u8; 112] {
+    edge_v7_aead(edge, site, key, ts_ns, status, invoc, cryptlen, req_flags, None, None, drv)
+}
+
+/// Full v7 builder with the AEAD words: `assoclen`/`authsize` ride
+/// AEAD submits only (`site` 5/6 — the family byte follows the
+/// site); on skcipher submits they must stay `None` (populations
+/// stay labeled — a `Some` there builds twin drift on purpose).
+#[allow(clippy::too_many_arguments)]
+fn edge_v7_aead(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    invoc: u64,
+    cryptlen: Option<u32>,
+    req_flags: Option<u32>,
+    assoclen: Option<u32>,
+    authsize: Option<u32>,
+    drv: &[u8],
+) -> [u8; 112] {
     let mut out = [0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 6;
+    out[2] = 7;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[8..16].copy_from_slice(&key.to_le_bytes());
@@ -745,19 +771,28 @@ fn edge_v6(
             out[48..52].copy_from_slice(&f.to_le_bytes());
             mflags |= 0x02;
         }
-        out[52] = 1;
-        out[53] = site as u8;
+        if let Some(a) = assoclen {
+            out[56..60].copy_from_slice(&a.to_le_bytes());
+            mflags |= 0x04;
+        }
+        if let Some(a) = authsize {
+            out[60..64].copy_from_slice(&a.to_le_bytes());
+            mflags |= 0x08;
+        }
+        let aead = site == 5 || site == 6;
+        out[52] = u8::from(aead) + 1;
+        out[53] = if site == 1 || site == 5 { 1 } else { 2 };
         out[54..56].copy_from_slice(&mflags.to_le_bytes());
-        let n = drv.len().min(55);
-        out[56..56 + n].copy_from_slice(&drv[..n]);
+        let n = drv.len().min(47);
+        out[64..64 + n].copy_from_slice(&drv[..n]);
     }
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out
 }
 
 #[test]
-fn v6_accepts_valid_submit_and_return_with_metadata() {
-    let raw = decode_record(&edge_v6(
+fn v7_accepts_valid_submit_and_return_with_metadata() {
+    let raw = decode_record(&edge_v7(
         1,
         1,
         0xabc,
@@ -768,26 +803,28 @@ fn v6_accepts_valid_submit_and_return_with_metadata() {
         Some(0),
         b"drv",
     ))
-    .expect("valid v6 submit parses");
+    .expect("valid v7 submit parses");
     assert_eq!(
         (raw.edge, raw.site, raw.key, raw.ts_ns, raw.invoc),
         (1, 1, 0xabc, 100, 0x4000)
     );
     assert_eq!((raw.cryptlen, raw.req_flags), (Some(16), Some(0)));
     // Unknown chase (validity clear, value zero) decodes to None, never 0-as-data.
-    let raw = decode_record(&edge_v6(1, 1, 0xabc, 100, 0, 0x4000, None, None, b""))
+    let raw = decode_record(&edge_v7(1, 1, 0xabc, 100, 0, 0x4000, None, None, b""))
         .expect("unknown-chase submit parses");
     assert_eq!((raw.cryptlen, raw.req_flags), (None, None));
-    let raw = decode_record(&edge_v6(2, 1, 0xabc, 150, -5, 0x4000, None, None, b""))
-        .expect("valid v6 return parses");
+    let raw = decode_record(&edge_v7(2, 1, 0xabc, 150, -5, 0x4000, None, None, b""))
+        .expect("valid v7 return parses");
     assert_eq!((raw.edge, raw.status), (2, -5));
     assert_eq!((raw.cryptlen, raw.req_flags), (None, None));
 }
 
 #[test]
-fn v6_refuses_old_and_future_versions() {
-    for version in [1u8, 2, 3, 4, 5, 7, 0xff] {
-        let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+fn v7_refuses_old_and_future_versions() {
+    // v6 is the retired skcipher-only shape: versions never mix, so
+    // the v7 twin refuses it exactly like older/future versions.
+    for version in [1u8, 2, 3, 4, 5, 6, 8, 0xff] {
+        let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
         bad[2] = version;
         assert_eq!(
             decode_record(&bad),
@@ -798,56 +835,73 @@ fn v6_refuses_old_and_future_versions() {
 }
 
 #[test]
-fn v6_return_side_metadata_refuses() {
-    // R2 extended: returns carry all-zero metadata (never chased).
-    let mut bad = edge_v6(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+fn v7_return_side_metadata_refuses() {
+    // R2 extended: returns carry all-zero metadata (never chased —
+    // the AEAD words included).
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
     bad[28] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    let mut bad = edge_v6(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
     bad[48] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    let mut bad = edge_v6(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
     bad[52] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    let mut bad = edge_v6(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
     bad[54] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    let mut bad = edge_v6(2, 1, 9, 1, 0, 0x4000, None, None, b"");
-    bad[56] = b'x';
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+    bad[56] = 1;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+    bad[60] = 1;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    let mut bad = edge_v7(2, 1, 9, 1, 0, 0x4000, None, None, b"");
+    bad[64] = b'x';
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
 }
 
 #[test]
-fn v6_bad_meta_shapes_refuse() {
-    // Defined mflags bits only.
-    let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
-    bad[54] = 0x04;
+fn v7_bad_meta_shapes_refuse() {
+    // Defined mflags bits only (bit 4+ is undefined).
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+    bad[54] = 0x10;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
     // Nonzero value without its validity bit is twin drift.
-    let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, None, Some(0), b"");
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, None, Some(0), b"");
     bad[28] = 7;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, Some(1), None, b"");
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), None, b"");
     bad[48] = 7;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    // Family is skcipher-only; dir echoes the site.
-    let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+    // Family matches the site (AEAD byte on a skcipher site is twin
+    // drift, never a relabel); dir echoes the site's class.
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
     bad[52] = 2;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
     bad[53] = 2;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
-    // No NUL within the 56-byte driver word refuses.
-    let mut bad = edge_v6(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
-    bad[56..112].fill(b'x');
+    // AEAD lengths never ride a skcipher submit: a nonzero AEAD word
+    // or AEAD validity bit there is twin drift.
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+    bad[56] = 3;
+    bad[54] = 0x07;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+    bad[54] = 0x0b;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    // No NUL within the 48-byte driver word refuses.
+    let mut bad = edge_v7(1, 1, 9, 1, 0, 0x4000, Some(1), Some(0), b"");
+    bad[64..112].fill(b'x');
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadDrv));
 }
 
 #[test]
-fn v6_join_with_tfm_binds_submit_lifetime() {
+fn v7_join_with_tfm_binds_submit_lifetime() {
     use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection};
     let mut dec = LifecycleDecoder::new(16);
-    let raw = decode_record(&edge_v6(
+    let raw = decode_record(&edge_v7(
         1,
         1,
         0xabc,
@@ -858,7 +912,7 @@ fn v6_join_with_tfm_binds_submit_lifetime() {
         Some(0),
         b"drv",
     ))
-    .expect("valid v6 submit");
+    .expect("valid v7 submit");
     let out = dec.join_with_tfm(raw, Some(7), Some(3));
     assert!(
         matches!(
@@ -881,15 +935,16 @@ fn v6_join_with_tfm_binds_submit_lifetime() {
         (meta.cryptlen, meta.req_flags, meta.epoch),
         (Some(16), Some(0), Some(3))
     );
+    assert_eq!(meta.aead, None, "skcipher submits carry no AEAD extension");
     // The return joins the bound id; compat join stays unbound.
-    let raw = decode_record(&edge_v6(2, 1, 0xabc, 150, 0, 0x4000, None, None, b""))
-        .expect("valid v6 return");
+    let raw = decode_record(&edge_v7(2, 1, 0xabc, 150, 0, 0x4000, None, None, b""))
+        .expect("valid v7 return");
     assert!(
         matches!(dec.join(raw).as_slice(), [Edge::Return { id: 1, .. }]),
         "return joins its submit"
     );
-    let raw = decode_record(&edge_v6(1, 1, 0xabc, 200, 0, 0x4002, Some(8), Some(0), b""))
-        .expect("valid v6 submit");
+    let raw = decode_record(&edge_v7(1, 1, 0xabc, 200, 0, 0x4002, Some(8), Some(0), b""))
+        .expect("valid v7 submit");
     let out = dec.join(raw);
     assert!(
         matches!(out.as_slice(), [Edge::Submit { tfm_id: None, .. }]),
@@ -901,12 +956,85 @@ fn v6_join_with_tfm_binds_submit_lifetime() {
     assert_eq!((meta.cryptlen, meta.epoch), (Some(8), None));
     // An epoch without a generation is not expressible: coerced to None,
     // and the invocation still admits (never destroyed by a caller slip).
-    let raw = decode_record(&edge_v6(1, 1, 0xabc, 300, 0, 0x4004, Some(8), Some(0), b""))
-        .expect("valid v6 submit");
+    let raw = decode_record(&edge_v7(1, 1, 0xabc, 300, 0, 0x4004, Some(8), Some(0), b""))
+        .expect("valid v7 submit");
     let out = dec.join_with_tfm(raw, None, Some(9));
     let Edge::Submit { meta, tfm_id, .. } = &out[0] else {
         panic!("submit edge: {out:?}");
     };
     assert_eq!((*tfm_id, meta.epoch), (None, None));
     assert_eq!(dec.stats().admitted, 3);
+}
+
+#[test]
+fn v7_aead_submit_carries_aead_scalars() {
+    // P5: an AEAD decrypt submit validates with the AEAD family,
+    // the site-class-echoing direction, and validity-gated AEAD
+    // words (cryptlen 1040 / assoclen 32 / authsize 16 — the A01
+    // shape); unknown AEAD chases decode to None, never 0-as-data.
+    let raw = decode_record(&edge_v7_aead(
+        1, 6, 0xabc, 100, 0, 0x4000, Some(1040), Some(0), Some(32), Some(16), b"gcm-aesni",
+    ))
+    .expect("valid AEAD submit parses");
+    assert_eq!(raw.site, 6);
+    assert_eq!(
+        (raw.cryptlen, raw.req_flags, raw.assoclen, raw.authsize),
+        (Some(1040), Some(0), Some(32), Some(16))
+    );
+    let raw = decode_record(&edge_v7_aead(
+        1, 5, 0xabc, 100, 0, 0x4000, Some(1024), None, None, None, b"",
+    ))
+    .expect("unknown-chase AEAD submit parses");
+    assert_eq!((raw.assoclen, raw.authsize), (None, None));
+}
+
+#[test]
+fn v7_aead_meta_shapes_refuse() {
+    // Skcipher byte on an AEAD site is twin drift (both directions
+    // of the family/site cross refuse).
+    let mut bad = edge_v7_aead(
+        1, 5, 9, 1, 0, 0x4000, Some(1), Some(0), Some(2), Some(16), b"",
+    );
+    bad[52] = 1;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    // Direction echoes the site's class (decrypt on the
+    // AEAD-encrypt site refuses).
+    let mut bad = edge_v7_aead(
+        1, 5, 9, 1, 0, 0x4000, Some(1), Some(0), Some(2), Some(16), b"",
+    );
+    bad[53] = 2;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    // Nonzero AEAD value without its validity bit is twin drift.
+    let mut bad = edge_v7_aead(1, 6, 9, 1, 0, 0x4000, Some(1), None, None, Some(16), b"");
+    bad[56] = 7;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    let mut bad = edge_v7_aead(1, 6, 9, 1, 0, 0x4000, Some(1), None, Some(32), None, b"");
+    bad[60] = 7;
+    assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
+    // A valid zero stays Some(0) (empty AAD is data, not unknown).
+    let raw = decode_record(&edge_v7_aead(
+        1, 6, 9, 1, 0, 0x4000, Some(16), Some(0), Some(0), Some(16), b"",
+    ))
+    .expect("zero-AAD submit parses");
+    assert_eq!((raw.assoclen, raw.authsize), (Some(0), Some(16)));
+}
+
+#[test]
+fn v7_aead_join_binds_aead_extension() {
+    // P5 contract v2: the AEAD extension rides the submit's meta
+    // (Some ⟺ AEAD family) through the bound join.
+    use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection};
+    let mut dec = LifecycleDecoder::new(16);
+    let raw = decode_record(&edge_v7_aead(
+        1, 6, 0xabc, 100, 0, 0x4000, Some(1040), Some(0), Some(32), Some(16), b"gcm-aesni",
+    ))
+    .expect("valid AEAD submit");
+    let out = dec.join_with_tfm(raw, Some(7), Some(1));
+    let Edge::Submit { meta, .. } = &out[0] else {
+        panic!("submit edge: {out:?}");
+    };
+    assert_eq!(meta.family, LifecycleFamily::Aead);
+    assert_eq!(meta.direction, OpDirection::Decrypt);
+    let aead = meta.aead.expect("AEAD submit carries the extension");
+    assert_eq!((aead.assoclen, aead.authsize), (Some(32), Some(16)));
 }

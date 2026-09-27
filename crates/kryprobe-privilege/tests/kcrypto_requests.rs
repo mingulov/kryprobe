@@ -29,12 +29,12 @@ const ALLOC_SK: u16 = 1;
 const DESTROY: u16 = 2;
 const SETKEY_SK: u16 = 3;
 
-/// One 112-byte v6 `LEdge` (little-endian twin of the ABI struct):
+/// One 112-byte v7 `LEdge` (little-endian twin of the ABI struct):
 /// `cryptlen@28`, `invoc@32`, `tfm@40`, `req_flags@48`, `fam@52`, `dir@53`,
 /// `mflags@54` (bit0 cryptlen-valid, bit1 req-flags-valid), `drv@56` (55+NUL).
 /// Submits carry metadata; returns carry all-zero metadata (R2 extended).
 #[allow(clippy::too_many_arguments)]
-fn edge_v6(
+fn edge_v7(
     edge: u8,
     site: u16,
     key: u64,
@@ -48,7 +48,7 @@ fn edge_v6(
 ) -> Vec<u8> {
     let mut out = vec![0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 6;
+    out[2] = 7;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[8..16].copy_from_slice(&key.to_le_bytes());
@@ -67,8 +67,8 @@ fn edge_v6(
         out[52] = 1; // LFAM_SK
         out[53] = site as u8; // dir == site
         out[54..56].copy_from_slice(&mflags.to_le_bytes());
-        let n = drv.len().min(55);
-        out[56..56 + n].copy_from_slice(&drv[..n]);
+        let n = drv.len().min(47);
+        out[64..64 + n].copy_from_slice(&drv[..n]);
     }
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out[40..48].copy_from_slice(&tfm.to_le_bytes());
@@ -77,7 +77,7 @@ fn edge_v6(
 
 /// Default submit: encrypt, valid cryptlen + flags, selected driver.
 fn op_submit(key: u64, ts: u64, invoc: u64, frontend: u64) -> Vec<u8> {
-    edge_v6(
+    edge_v7(
         SUBMIT,
         ENC,
         key,
@@ -93,7 +93,7 @@ fn op_submit(key: u64, ts: u64, invoc: u64, frontend: u64) -> Vec<u8> {
 
 /// Default return: exact native status, zero metadata.
 fn op_return(key: u64, ts: u64, invoc: u64, status: i32) -> Vec<u8> {
-    edge_v6(RETURN, ENC, key, ts, status, invoc, 0, None, None, b"")
+    edge_v7(RETURN, ENC, key, ts, status, invoc, 0, None, None, b"")
 }
 
 /// One 112-byte v1 `LTfm` (alloc/destroy/config halves for the tracker).
@@ -234,7 +234,7 @@ fn migration_preserves_invocation() {
     // return carries the SAME invocation even if the thread migrated, so it
     // joins. The entry chase was unreadable here (cryptlen None) — unknown
     // metadata stays explicit and never destroys the identity.
-    let submit = edge_v6(
+    let submit = edge_v7(
         SUBMIT,
         ENC,
         key,

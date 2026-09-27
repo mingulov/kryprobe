@@ -1207,7 +1207,7 @@ fn sensor_routes_tfm_records_to_tracker() {
     // An `LC`-magic op record still routes to the op decoder (magic-routed).
     let mut op = vec![0u8; 112];
     op[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    op[2] = 6;
+    op[2] = 7;
     op[3] = 1;
     op[4..6].copy_from_slice(&1u16.to_le_bytes());
     op[8..16].copy_from_slice(&0xabcdu64.to_le_bytes());

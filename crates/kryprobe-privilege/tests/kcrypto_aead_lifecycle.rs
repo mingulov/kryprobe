@@ -97,8 +97,7 @@ fn short_cryptlen_does_not_underflow() {
 /// Contract v2 shape: the AEAD family exists, and skcipher submits
 /// carry NO AEAD extension (the extension rides AEAD submits only —
 /// a skcipher record with AEAD lengths would be a mislabeled
-/// population). Built over v6 bytes: the decoder still speaks v6
-/// until the wire slice lands; only the contract types are new.
+/// population).
 #[test]
 fn skcipher_submits_carry_no_aead_extension() {
     assert_ne!(
@@ -111,7 +110,7 @@ fn skcipher_submits_carry_no_aead_extension() {
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let mut submit = vec![0u8; 112];
     submit[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    submit[2] = 6;
+    submit[2] = 7;
     submit[3] = 1;
     submit[4..6].copy_from_slice(&1u16.to_le_bytes());
     submit[8..16].copy_from_slice(&key.to_le_bytes());
@@ -125,7 +124,7 @@ fn skcipher_submits_carry_no_aead_extension() {
     submit[54..56].copy_from_slice(&0x03u16.to_le_bytes());
     let mut ret = vec![0u8; 112];
     ret[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    ret[2] = 6;
+    ret[2] = 7;
     ret[3] = 2;
     ret[4..6].copy_from_slice(&1u16.to_le_bytes());
     ret[8..16].copy_from_slice(&key.to_le_bytes());

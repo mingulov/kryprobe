@@ -778,9 +778,9 @@ const ENC: u16 = 1;
 const CB_CRYPTD: u16 = 3;
 const CB_KXC: u16 = 4;
 
-/// One 112-byte v6 `LEdge` submit/return (twin of the T08 builder).
+/// One 112-byte v7 `LEdge` submit/return (twin of the T08 builder).
 #[allow(clippy::too_many_arguments)]
-fn edge_v6(
+fn edge_v7(
     edge: u8,
     site: u16,
     key: u64,
@@ -794,7 +794,7 @@ fn edge_v6(
 ) -> Vec<u8> {
     let mut out = vec![0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 6;
+    out[2] = 7;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[8..16].copy_from_slice(&key.to_le_bytes());
@@ -813,21 +813,21 @@ fn edge_v6(
         out[52] = 1;
         out[53] = site as u8;
         out[54..56].copy_from_slice(&mflags.to_le_bytes());
-        let n = drv.len().min(55);
-        out[56..56 + n].copy_from_slice(&drv[..n]);
+        let n = drv.len().min(47);
+        out[64..64 + n].copy_from_slice(&drv[..n]);
     }
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out[40..48].copy_from_slice(&tfm.to_le_bytes());
     out
 }
 
-/// One 112-byte v6 `LEdge` callback half (contract §11): key +
+/// One 112-byte v7 `LEdge` callback half (contract §11): key +
 /// status + ts; invoc 0 (names no fsession invocation); zero
 /// metadata/tfm/drv (submit owns those facts); flags 0.
-fn cb_v6(site: u16, key: u64, ts_ns: u64, status: i32) -> Vec<u8> {
+fn cb_v7(site: u16, key: u64, ts_ns: u64, status: i32) -> Vec<u8> {
     let mut out = vec![0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 6;
+    out[2] = 7;
     out[3] = CALLBACK;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[8..16].copy_from_slice(&key.to_le_bytes());
@@ -837,7 +837,7 @@ fn cb_v6(site: u16, key: u64, ts_ns: u64, status: i32) -> Vec<u8> {
 }
 
 fn op_submit(key: u64, ts: u64, invoc: u64, frontend: u64, flags: Option<u32>) -> Vec<u8> {
-    edge_v6(
+    edge_v7(
         SUBMIT,
         ENC,
         key,
@@ -852,7 +852,7 @@ fn op_submit(key: u64, ts: u64, invoc: u64, frontend: u64, flags: Option<u32>) -
 }
 
 fn op_return(key: u64, ts: u64, invoc: u64, status: i32) -> Vec<u8> {
-    edge_v6(RETURN, ENC, key, ts, status, invoc, 0, None, None, b"")
+    edge_v7(RETURN, ENC, key, ts, status, invoc, 0, None, None, b"")
 }
 
 use kryprobe_privilege::kcrypto_lifecycle::decode::{DecodeDrop, LifecycleDecoder, decode_record};
@@ -875,7 +875,7 @@ fn ctx() -> SessionContext {
 fn decode_accepts_callback_halves() {
     // Both qualified sites validate with key + status + ts.
     for site in [CB_CRYPTD, CB_KXC] {
-        let raw = decode_record(&cb_v6(site, 0xAAA, 150, 0)).expect("callback validates");
+        let raw = decode_record(&cb_v7(site, 0xAAA, 150, 0)).expect("callback validates");
         assert_eq!(raw.edge, CALLBACK);
         assert_eq!(raw.site, site);
         assert_eq!(raw.key, 0xAAA);
@@ -887,26 +887,26 @@ fn decode_accepts_callback_halves() {
     // Any status validates (classification is the adapter's job —
     // twin validation never judges errno values).
     for status in [-libc::EINPROGRESS, -libc::ENOSPC, 7, i32::MIN] {
-        decode_record(&cb_v6(CB_CRYPTD, 0xAAA, 150, status)).expect("any status validates");
+        decode_record(&cb_v7(CB_CRYPTD, 0xAAA, 150, status)).expect("any status validates");
     }
 }
 
 #[test]
 fn decode_refuses_callback_twin_drift() {
     // (mutator, want-drop) — every callback-half invariant pinned.
-    let mut bad_site = cb_v6(ENC, 0xAAA, 150, 0);
+    let mut bad_site = cb_v7(ENC, 0xAAA, 150, 0);
     bad_site[3] = CALLBACK;
-    let mut bad_invoc = cb_v6(CB_CRYPTD, 0xAAA, 150, 0);
+    let mut bad_invoc = cb_v7(CB_CRYPTD, 0xAAA, 150, 0);
     bad_invoc[32] = 9; // invoc != 0 names a phantom invocation
-    let mut bad_flags = cb_v6(CB_CRYPTD, 0xAAA, 150, 0);
+    let mut bad_flags = cb_v7(CB_CRYPTD, 0xAAA, 150, 0);
     bad_flags[6] = 1; // tainted: callbacks never taint (no cookie)
-    let mut bad_meta = cb_v6(CB_CRYPTD, 0xAAA, 150, 0);
+    let mut bad_meta = cb_v7(CB_CRYPTD, 0xAAA, 150, 0);
     bad_meta[28] = 3; // nonzero cryptlen without validity
-    let mut bad_tfm = cb_v6(CB_CRYPTD, 0xAAA, 150, 0);
+    let mut bad_tfm = cb_v7(CB_CRYPTD, 0xAAA, 150, 0);
     bad_tfm[40] = 8; // return-side word discipline extended
-    let mut bad_drv = cb_v6(CB_CRYPTD, 0xAAA, 150, 0);
-    bad_drv[56] = b'x'; // callbacks carry no name
-    let mut null_key = cb_v6(CB_CRYPTD, 0, 150, 0);
+    let mut bad_drv = cb_v7(CB_CRYPTD, 0xAAA, 150, 0);
+    bad_drv[64] = b'x'; // callbacks carry no name
+    let mut null_key = cb_v7(CB_CRYPTD, 0, 150, 0);
     null_key[8..16].copy_from_slice(&0u64.to_le_bytes());
     let table: &[(&[u8], DecodeDrop)] = &[
         (&bad_site, DecodeDrop::BadSite),
@@ -945,7 +945,7 @@ fn decode_callback_joins_token() {
             ..
         }
     ));
-    let cb = decode_record(&cb_v6(CB_CRYPTD, 0xAAA, 150, 0)).unwrap();
+    let cb = decode_record(&cb_v7(CB_CRYPTD, 0xAAA, 150, 0)).unwrap();
     let edges = d.join(cb);
     assert_eq!(
         edges,
@@ -965,7 +965,7 @@ fn sensor_async_terminal_end_to_end() {
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
         op_return(0xAAA, 110, 0x4000, -libc::EINPROGRESS),
-        cb_v6(CB_CRYPTD, 0xAAA, 150, 0),
+        cb_v7(CB_CRYPTD, 0xAAA, 150, 0),
     ];
     assert_eq!(core.ingest_records(&recs), 1, "one terminal record");
     let done = core.take_completed();
@@ -1023,7 +1023,7 @@ fn sensor_ebusy_queues_only_with_backlog_consent() {
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(MAY_BACKLOG)),
         op_return(0xAAA, 105, 0x4000, -libc::EBUSY),
-        cb_v6(CB_KXC, 0xAAA, 150, 0),
+        cb_v7(CB_KXC, 0xAAA, 150, 0),
     ];
     assert_eq!(
         core.ingest_records(&recs),
@@ -1081,8 +1081,8 @@ fn sensor_backlog_progress_shape() {
         recs.push(op_return(*key, 110 + i as u64, invoc, want_ret));
     }
     // Cryptd drain order: P1,T0,P2,T1,P3,T2,T3.
-    let prog = |key: u64, ts: u64| cb_v6(CB_KXC, key, ts, -libc::EINPROGRESS);
-    let term = |key: u64, ts: u64| cb_v6(CB_KXC, key, ts, 0);
+    let prog = |key: u64, ts: u64| cb_v7(CB_KXC, key, ts, -libc::EINPROGRESS);
+    let term = |key: u64, ts: u64| cb_v7(CB_KXC, key, ts, 0);
     recs.push(prog(0xA1, 200));
     recs.push(term(0xA0, 201));
     recs.push(prog(0xA2, 202));
@@ -1113,7 +1113,7 @@ fn sensor_callback_before_return_with_reuse() {
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
-        cb_v6(CB_CRYPTD, 0xAAA, 105, 0),
+        cb_v7(CB_CRYPTD, 0xAAA, 105, 0),
         op_submit(0xAAA, 108, 0x4002, frontend, Some(0)),
         op_return(0xAAA, 110, 0x4000, -libc::EINPROGRESS),
         op_return(0xAAA, 120, 0x4002, 0),
@@ -1222,7 +1222,7 @@ fn sensor_refused_same_key_reuse_cannot_complete_old_token() {
         op_return(0xBBB, 110, 0x5000, -libc::EINPROGRESS),
         op_submit(0xBBB, 200, 0x5002, frontend, Some(0)),
         op_return(0xBBB, 210, 0x5002, -libc::EINPROGRESS),
-        cb_v6(CB_CRYPTD, 0xBBB, 250, 0),
+        cb_v7(CB_CRYPTD, 0xBBB, 250, 0),
     ]);
     core.finish(5000);
     let done = core.take_completed();
@@ -1253,7 +1253,7 @@ fn sensor_refused_sync_reuse_clears_contention() {
         op_submit(0xCCC, 200, 0x6002, frontend, Some(0)),
         op_return(0xCCC, 210, 0x6002, 0),
         // A's own terminal: joins (contention cleared).
-        cb_v6(CB_CRYPTD, 0xCCC, 250, 0),
+        cb_v7(CB_CRYPTD, 0xCCC, 250, 0),
     ]);
     core.finish(5000);
     let done = core.take_completed();
@@ -1344,7 +1344,7 @@ fn sensor_decoder_refusal_cannot_complete_old_token() {
         op_submit(0xE10, 200, 0x9004, frontend, Some(0)),
         op_return(0xE10, 210, 0x9004, -libc::EINPROGRESS),
         // B's real terminal: unattributable under contention.
-        cb_v6(CB_CRYPTD, 0xE10, 250, 0),
+        cb_v7(CB_CRYPTD, 0xE10, 250, 0),
         op_return(0xE20, 300, 0x9002, 0),
     ]);
     core.finish(5000);
@@ -1387,7 +1387,7 @@ fn sensor_decoder_refusal_production_bounds_cannot_complete_old_token() {
     core.ingest_records(&[
         op_submit(0xE10, 200, 0x60000, frontend, Some(0)),
         op_return(0xE10, 210, 0x60000, -libc::EINPROGRESS),
-        cb_v6(CB_CRYPTD, 0xE10, 250, 0),
+        cb_v7(CB_CRYPTD, 0xE10, 250, 0),
     ]);
     core.finish(5000);
     let done = core.take_completed();

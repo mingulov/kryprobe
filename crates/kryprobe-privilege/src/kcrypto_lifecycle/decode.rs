@@ -968,6 +968,8 @@ mod tests {
             req_flags: if edge == LEDGE_SUBMIT { Some(0) } else { None },
             family: LifecycleFamily::Skcipher,
             direction: OpDirection::Encrypt,
+            assoclen: None,
+            authsize: None,
         }
     }
 

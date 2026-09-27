@@ -2061,7 +2061,7 @@ fn lifecycle_test_ledger(
 ) -> kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
     kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
         completed: Vec::new(),
-        edge_hits: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        edge_hits: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         adapter: kryprobe_privilege::kcrypto_lifecycle::async_adapter::AdapterStats::default(),
         decode: kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats {
             admitted,
@@ -2074,7 +2074,7 @@ fn lifecycle_test_ledger(
             ..kryprobe_core::kcrypto::ReducerStats::default()
         },
         kernel_loss: [0; 5],
-        agg_accepted: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        agg_accepted: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         retained_dropped: 0,
         view_valid: true,
         loss_baseline: [0; 5],
