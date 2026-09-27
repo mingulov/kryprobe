@@ -26,9 +26,9 @@
 //! (a live edge observes a live transform, op or config alike).
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LEDGE_INVOC_POISON, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LTFM_MAGIC, LTFM_SITE_ALLOC_SK,
-    LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
-    LTFM_TRUNCATED, LTFM_VERSION,
+    LEDGE_INVOC_POISON, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LTFM_MAGIC,
+    LTFM_SITE_ALLOC_AEAD, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE,
+    LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK, LTFM_TRUNCATED, LTFM_VERSION,
 };
 use std::collections::HashMap;
 
@@ -54,7 +54,8 @@ const MIN_ERRNO: i32 = -4095;
 pub struct RawTfm {
     /// [`LEDGE_SUBMIT`] or [`LEDGE_RETURN`] (validated).
     pub edge: u8,
-    /// [`LTFM_SITE_ALLOC_SK`] or [`LTFM_SITE_DESTROY`] (validated;
+    /// [`LTFM_SITE_ALLOC_SK`], [`LTFM_SITE_ALLOC_AEAD`] (P5), or
+    /// [`LTFM_SITE_DESTROY`] (validated;
     /// later sites join as their halves land).
     pub site: u16,
     /// [`LEDGE_TAINTED`] was set (BPF could not pair this edge).
@@ -339,7 +340,8 @@ pub fn decode_tfm_record(bytes: &[u8]) -> Result<RawTfm, TfmDrop> {
     let is_config_site = site == LTFM_SITE_SETKEY_SK
         || site == LTFM_SITE_SETAUTHSIZE
         || site == LTFM_SITE_SETKEY_AEAD;
-    if site != LTFM_SITE_ALLOC_SK && site != LTFM_SITE_DESTROY && !is_config_site {
+    let is_alloc_site = site == LTFM_SITE_ALLOC_SK || site == LTFM_SITE_ALLOC_AEAD;
+    if !is_alloc_site && site != LTFM_SITE_DESTROY && !is_config_site {
         return Err(TfmDrop::BadSite);
     }
     let flags = u16le(6);
@@ -551,6 +553,9 @@ enum PendingAttempt {
         truncated: bool,
         /// Entry edge timestamp (stale returns refuse against it).
         ts_ns: u64,
+        /// Entry site (skcipher vs AEAD alloc — the completion
+        /// normalizes the frontend with the family's word).
+        site: u16,
     },
     /// Destroy entry parked.
     Destroy {
@@ -605,7 +610,7 @@ impl PendingAttempt {
     /// Entry site (cross-site returns refuse as mismatched).
     fn site(&self) -> u16 {
         match self {
-            PendingAttempt::Alloc { .. } => LTFM_SITE_ALLOC_SK,
+            PendingAttempt::Alloc { site, .. } => *site,
             PendingAttempt::Destroy { .. } => LTFM_SITE_DESTROY,
             PendingAttempt::Config { site, .. } => *site,
         }
@@ -637,6 +642,12 @@ pub struct TransformTracker {
     /// normalization adds this (the same `sk_base` word the BPF
     /// chase adds — resolved per kernel at arm, never hardcoded).
     frontend_off: u64,
+    /// BTF-resolved `crypto_aead.base` offset (P5): the AEAD
+    /// frontend→base normalization word (the same `aead_base` word
+    /// the AEAD BPF chases add — skcipher and AEAD frontends are
+    /// different structs, so each family normalizes with its own
+    /// word, never a shared guess).
+    aead_frontend_off: u64,
     /// The kernel carries `crypto_tfm.refcnt` (arm-time verdict).
     /// False (7.2+) means unconditional destroy: every observed
     /// destroy retires, and the refcount snapshot is ignored.
@@ -681,10 +692,16 @@ impl TransformTracker {
     /// `refcnt_present` is the arm's kernel verdict (false on 7.2+:
     /// always-final mode).
     #[must_use]
-    pub fn new(capacity: usize, frontend_off: u32, refcnt_present: bool) -> Self {
+    pub fn new(
+        capacity: usize,
+        frontend_off: u32,
+        aead_frontend_off: u32,
+        refcnt_present: bool,
+    ) -> Self {
         Self {
             capacity,
             frontend_off: u64::from(frontend_off),
+            aead_frontend_off: u64::from(aead_frontend_off),
             refcnt_present,
             next_id: 1,
             pending: HashMap::new(),
@@ -748,35 +765,49 @@ impl TransformTracker {
             && self.stats.colliding_releases == 0
     }
 
+    /// Family frontend→base normalization word: the skcipher word
+    /// or the AEAD word (P5) — every normalization in this tracker
+    /// routes through here, so a frontend is never normalized with
+    /// the other family's word.
+    fn front_word(&self, aead: bool) -> u64 {
+        if aead {
+            self.aead_frontend_off
+        } else {
+            self.frontend_off
+        }
+    }
+
     /// Admit the transform behind an op submit edge (first-seen):
-    /// `frontend` normalizes to the canonical base; an already-live
-    /// base admits nothing (one lifetime, one id — first admission
-    /// wins, a later name never backfills: the admitting edge owns
-    /// the provenance). A fresh admission carries the submit's
-    /// runtime-selected driver (`drv`, empty when the chase was
-    /// unreadable — F05: selected metadata captured, allocation /
-    /// requested name / previous configuration stay unknown) with
-    /// its truncation bit (`drv_truncated` — D9: clipped names read
-    /// as partial), flagged `first_seen` — AND counts
-    /// `unobserved_boundary` (R2-01: the creation boundary is
-    /// unobserved AT admission, so exactness voids from the
-    /// admitting edge, never from a later config). A 0 frontend
-    /// (unreadable request link) admits nothing and counts
-    /// `unlinked_ops`. Past the live bound the admission refuses
-    /// (`live_full`) — D4, no silent LRU. Issues the next opaque
-    /// id (id exhaustion refuses like the submit path — the
-    /// `u64::MAX` sentinel is never issued).
+    /// `frontend` normalizes to the canonical base with the family's
+    /// word (`aead` selects it — skcipher and AEAD frontends are
+    /// different structs); an already-live base admits nothing (one
+    /// lifetime, one id — first admission wins, a later name never
+    /// backfills: the admitting edge owns the provenance). A fresh
+    /// admission carries the submit's runtime-selected driver (`drv`,
+    /// empty when the chase was unreadable — F05: selected metadata
+    /// captured, allocation / requested name / previous
+    /// configuration stay unknown) with its truncation bit
+    /// (`drv_truncated` — D9: clipped names read as partial),
+    /// flagged `first_seen` — AND counts `unobserved_boundary`
+    /// (R2-01: the creation boundary is unobserved AT admission, so
+    /// exactness voids from the admitting edge, never from a later
+    /// config). A 0 frontend (unreadable request link) admits
+    /// nothing and counts `unlinked_ops`. Past the live bound the
+    /// admission refuses (`live_full`) — D4, no silent LRU. Issues
+    /// the next opaque id (id exhaustion refuses like the submit
+    /// path — the `u64::MAX` sentinel is never issued).
     pub fn admit_first_seen(
         &mut self,
         frontend: u64,
         drv: &str,
         drv_truncated: bool,
+        aead: bool,
     ) -> Option<u64> {
         if frontend == 0 {
             self.stats.unlinked_ops += 1;
             return None;
         }
-        let base = match normalize_frontend(frontend, self.frontend_off) {
+        let base = match normalize_frontend(frontend, self.front_word(aead)) {
             Some(base) => base,
             None => {
                 self.count_bad_record();
@@ -818,22 +849,23 @@ impl TransformTracker {
 
     /// Resolve the LIVE generation behind an op frontend (P3
     /// submit-lifetime binding): the frontend normalizes to the
-    /// canonical base exactly like admission, and the base's live
-    /// occupant (if any) donates its opaque id. Pure (`&self` — a
-    /// query, never an admission): a 0 frontend, a wrapping offset,
-    /// an unmapped base, or a retired tombstone all resolve `None`
-    /// (unknown binding stays explicit — the sensor admits
-    /// first-seen BEFORE resolving, so `None` here means the
-    /// admission refused or never ran, never a missed lookup).
-    /// Retired generations never rebind (the live map holds live
-    /// occupants only — binding a tombstone id to a new op would
-    /// donate a dead lifetime's identity to live traffic).
+    /// canonical base exactly like admission (with the family's
+    /// word — `aead` selects it), and the base's live occupant (if
+    /// any) donates its opaque id. Pure (`&self` — a query, never
+    /// an admission): a 0 frontend, a wrapping offset, an unmapped
+    /// base, or a retired tombstone all resolve `None` (unknown
+    /// binding stays explicit — the sensor admits first-seen
+    /// BEFORE resolving, so `None` here means the admission refused
+    /// or never ran, never a missed lookup). Retired generations
+    /// never rebind (the live map holds live occupants only —
+    /// binding a tombstone id to a new op would donate a dead
+    /// lifetime's identity to live traffic).
     #[must_use]
-    pub fn generation_for_frontend(&self, frontend: u64) -> Option<u64> {
+    pub fn generation_for_frontend(&self, frontend: u64, aead: bool) -> Option<u64> {
         if frontend == 0 {
             return None;
         }
-        let base = normalize_frontend(frontend, self.frontend_off)?;
+        let base = normalize_frontend(frontend, self.front_word(aead))?;
         self.live
             .get(&base)
             .map(|&idx| self.generations[idx].info.id)
@@ -841,17 +873,18 @@ impl TransformTracker {
 
     /// Resolve the configuration epoch of the LIVE generation behind
     /// an op frontend (P3 submit pin): same live-occupant lookup as
-    /// [`Self::generation_for_frontend`], donating the epoch instead
-    /// of the id. The sensor pins this AT SUBMIT — the keying era
-    /// the op ran under — so later rekeys never rewrite history. A
-    /// bound-but-unconfigured generation pins `Some(0)` (a real
-    /// era); `None` pairs with an unbound submit exactly.
+    /// [`Self::generation_for_frontend`] (with the family's word),
+    /// donating the epoch instead of the id. The sensor pins this AT
+    /// SUBMIT — the keying era the op ran under — so later rekeys
+    /// never rewrite history. A bound-but-unconfigured generation
+    /// pins `Some(0)` (a real era); `None` pairs with an unbound
+    /// submit exactly.
     #[must_use]
-    pub fn epoch_for_frontend(&self, frontend: u64) -> Option<u64> {
+    pub fn epoch_for_frontend(&self, frontend: u64, aead: bool) -> Option<u64> {
         if frontend == 0 {
             return None;
         }
-        let base = normalize_frontend(frontend, self.frontend_off)?;
+        let base = normalize_frontend(frontend, self.front_word(aead))?;
         self.live
             .get(&base)
             .map(|&idx| self.generations[idx].info.epoch)
@@ -953,9 +986,9 @@ impl TransformTracker {
         // occupant. Destroy keys are ALREADY the canonical base
         // (T07-03: the BPF emits destroy arg1, family-agnostic —
         // never normalized); config keys are frontends (normalized
-        // with the skcipher word, exactly as before). Null/ERR keys
-        // and unmapped bases bind `None` (classified at completion,
-        // exactly as before).
+        // with the site's family word). Null/ERR keys and unmapped
+        // bases bind `None` (classified at completion, exactly as
+        // before).
         // Destroy keys bind WITHOUT normalization (the match arms
         // below branch per site — the destroy arm looks the base up
         // directly, the config arm normalizes its frontend first).
@@ -973,7 +1006,11 @@ impl TransformTracker {
                 ts_ns: raw.ts_ns,
             },
             LTFM_SITE_SETKEY_SK | LTFM_SITE_SETAUTHSIZE | LTFM_SITE_SETKEY_AEAD => {
-                let bound_id = normalize_frontend(raw.key, self.frontend_off)
+                // Config keys are frontends — normalized with the
+                // SITE's family word (skcipher setkey with the
+                // skcipher word, AEAD sites with the AEAD word).
+                let aead = raw.site != LTFM_SITE_SETKEY_SK;
+                let bound_id = normalize_frontend(raw.key, self.front_word(aead))
                     .and_then(|base| self.live.get(&base))
                     .map(|&idx| self.generations[idx].info.id);
                 PendingAttempt::Config {
@@ -985,7 +1022,8 @@ impl TransformTracker {
                 }
             }
             // Only alloc + destroy + config sites decode (anything
-            // else refused as `BadSite` pre-join — this arm is alloc).
+            // else refused as `BadSite` pre-join — this arm is alloc,
+            // skcipher or AEAD).
             _ => {
                 // Infallible: `decode_tfm_record` validated the name
                 // before the join (empty is unknown, never a
@@ -997,6 +1035,7 @@ impl TransformTracker {
                     alg_mask: raw.aux2,
                     truncated: raw.truncated,
                     ts_ns: raw.ts_ns,
+                    site: raw.site,
                 }
             }
         };
@@ -1039,8 +1078,9 @@ impl TransformTracker {
                 alg_type,
                 alg_mask,
                 truncated,
+                site,
                 ..
-            } => self.complete_alloc(raw, req_name, alg_type, alg_mask, truncated),
+            } => self.complete_alloc(raw, req_name, alg_type, alg_mask, truncated, site),
             PendingAttempt::Destroy {
                 mem,
                 refcnt,
@@ -1066,12 +1106,14 @@ impl TransformTracker {
 
     /// Complete an allocation attempt: a failure classifies without
     /// a generation; a success normalizes the frontend to the
-    /// canonical base and assigns a fresh opaque id. A success at an
-    /// already-LIVE base forced-retires the old lifetime as
-    /// ambiguous first (its free went unobserved — keeping it live
-    /// would let a stale destroy merge lifetimes; the new lifetime
-    /// takes the base fresh). Past the live bound the completion
-    /// consumes the attempt but assigns nothing (`live_full`).
+    /// canonical base (with the ENTRY's family word — skcipher vs
+    /// AEAD alloc frontends are different structs) and assigns a
+    /// fresh opaque id. A success at an already-LIVE base
+    /// forced-retires the old lifetime as ambiguous first (its free
+    /// went unobserved — keeping it live would let a stale destroy
+    /// merge lifetimes; the new lifetime takes the base fresh).
+    /// Past the live bound the completion consumes the attempt but
+    /// assigns nothing (`live_full`).
     fn complete_alloc(
         &mut self,
         raw: RawTfm,
@@ -1079,13 +1121,15 @@ impl TransformTracker {
         alg_type: u32,
         alg_mask: u32,
         truncated: bool,
+        site: u16,
     ) -> Vec<u64> {
         self.stats.completed += 1;
         if raw.status != 0 {
             self.stats.failed_allocs += 1;
             return Vec::new();
         }
-        let base = match normalize_frontend(raw.key, self.frontend_off) {
+        let aead = site == LTFM_SITE_ALLOC_AEAD;
+        let base = match normalize_frontend(raw.key, self.front_word(aead)) {
             Some(base) => base,
             None => {
                 self.count_bad_record();
@@ -1239,7 +1283,11 @@ impl TransformTracker {
             self.stats.config_unlinked += 1;
             return;
         }
-        let base = match normalize_frontend(key, self.frontend_off) {
+        // Config keys are frontends — normalized with the SITE's
+        // family word (AEAD sites with the AEAD word, like the entry
+        // binding in `submit`).
+        let aead = site != LTFM_SITE_SETKEY_SK;
+        let base = match normalize_frontend(key, self.front_word(aead)) {
             Some(base) => base,
             None => {
                 self.count_bad_record();
@@ -1263,7 +1311,7 @@ impl TransformTracker {
                 self.stats.config_unlinked += 1;
                 return;
             }
-            (None, None) => match self.admit_first_seen(key, "", false) {
+            (None, None) => match self.admit_first_seen(key, "", false, aead) {
                 Some(_) => match self.live.get(&base) {
                     // Admission just inserted this base (total
                     // lookup — no indexing panics on this path).

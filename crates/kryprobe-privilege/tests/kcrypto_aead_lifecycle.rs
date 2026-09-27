@@ -106,7 +106,7 @@ fn skcipher_submits_carry_no_aead_extension() {
         LifecycleFamily::Skcipher,
         "AEAD is its own family, never a relabeled skcipher"
     );
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let key = 0xabc_u64;
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let mut submit = vec![0u8; 112];

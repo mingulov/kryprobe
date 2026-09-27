@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Raw-edge decode: v6 `LEdge` bytes → T05 `Edge` events (P3: the v5
+//! Raw-edge decode: v7 `LEdge` bytes → T05 `Edge` events (P3: the v5
 //! submit-side driver word (F05) + return-side no-chase twin (R2) +
 //! entry-side scalar request metadata with submit-lifetime binding;
 //! P4: callback halves — `edge = LEDGE_CALLBACK` with a qualified
 //! site — validated by the twin and joined through the decoder-owned
 //! [`AsyncAdapter`](crate::kcrypto_lifecycle::async_adapter::AsyncAdapter)
-//! identity relation).
+//! identity relation; P5: AEAD op sites with entry-side `assoclen` /
+//! `authsize` words on AEAD submits — validity-gated, submit-pinned,
+//! skcipher submits carry zero).
 //!
 //! The op join is keyed by the BPF invocation id alone (W8 fsession:
 //! the entry run mints one id per call and stores it in the
@@ -43,22 +45,24 @@
 use crate::kcrypto_lifecycle::async_adapter::{AdapterStats, AsyncAdapter, classify_return};
 use kryprobe_abi::kcrypto_lifecycle::{
     LDIR_DEC, LDIR_ENC, LEDGE_CALLBACK, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN,
-    LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_TRUNCATED, LEDGE_VERSION, LFAM_SK, LMETA_CRYPTLEN_OK,
-    LMETA_REQFLAGS_OK, LSITE_CB_CRYPTD, LSITE_CB_KXC, LSITE_DEC, LSITE_ENC,
+    LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_TRUNCATED, LEDGE_VERSION, LFAM_AEAD, LFAM_SK,
+    LMETA_ASSOCLEN_OK, LMETA_AUTHSIZE_OK, LMETA_CRYPTLEN_OK, LMETA_REQFLAGS_OK, LSITE_AEAD_DEC,
+    LSITE_AEAD_ENC, LSITE_CB_CRYPTD, LSITE_CB_KXC, LSITE_DEC, LSITE_ENC,
 };
 use kryprobe_core::kcrypto::{
-    Edge, GapReason, LifecycleFamily, OpDirection, RequestMeta, ReturnDisposition,
+    AeadMeta, Edge, GapReason, LifecycleFamily, OpDirection, RequestMeta, ReturnDisposition,
 };
 use std::collections::{HashMap, VecDeque};
 
-/// Record twin size: `LEdge` is 112 bytes on the ring (v6: the API
+/// Record twin size: `LEdge` is 112 bytes on the ring (v7: the API
 /// input length rides at 28..32, the transform word at 40..48, the
-/// request flags at 48..52, family/dir/validity at 52..56, and the
-/// driver name at 56..112).
+/// request flags at 48..52, family/dir/validity at 52..56, the AEAD
+/// words (`assoclen`/`authsize`) at 56..64, and the driver name at
+/// 64..112).
 const RECORD_LEN: usize = 112;
 
-/// Driver-name field length (v6 `LEdge::drv`: 55 bytes max + NUL).
-const DRV_LEN: usize = 56;
+/// Driver-name field length (v7 `LEdge::drv`: 47 bytes max + NUL).
+const DRV_LEN: usize = 48;
 
 /// Token-space partition floor (contract §8, P4r4): issued ids live
 /// BELOW this line (`1..REFUSED_FLOOR`); decoder-refusal contention
@@ -119,10 +123,22 @@ pub struct RawEdge {
     /// Request flags chased at entry (`None` when unreadable — a
     /// valid zero stays `Some(0)`; `None` on returns).
     pub req_flags: Option<u32>,
-    /// Crypto family behind the op (wire-pinned; skcipher-only in v6).
+    /// Crypto family behind the op (wire-pinned; must match the
+    /// site's family — a skcipher site with the AEAD byte is twin
+    /// drift, never a relabel).
     pub family: LifecycleFamily,
-    /// Operation direction behind the op (wire-pinned, echoes the site).
+    /// Operation direction behind the op (wire-pinned, echoes the
+    /// site's class).
     pub direction: OpDirection,
+    /// Associated-data length chased at entry (AEAD submits only —
+    /// `None` when the chase was unreadable; a valid zero stays
+    /// `Some(0)`; `None` on skcipher submits and returns, which
+    /// carry no AEAD words).
+    pub assoclen: Option<u32>,
+    /// Tag width chased at entry off the submit's frontend (AEAD
+    /// submits only — `None` when unreadable; `None` on skcipher
+    /// submits and returns).
+    pub authsize: Option<u32>,
 }
 
 impl std::fmt::Debug for RawEdge {
@@ -141,6 +157,8 @@ impl std::fmt::Debug for RawEdge {
             .field("req_flags", &self.req_flags)
             .field("family", &self.family)
             .field("direction", &self.direction)
+            .field("assoclen", &self.assoclen)
+            .field("authsize", &self.authsize)
             .finish()
     }
 }
@@ -156,17 +174,21 @@ pub enum DecodeDrop {
     BadVersion,
     /// Edge kind is neither submit, return, nor callback.
     BadEdge,
-    /// Site is neither encrypt/decrypt (op edges) nor a qualified
-    /// callback site (callback halves).
+    /// Site is neither a skcipher/AEAD op site (op edges) nor a
+    /// qualified callback site (callback halves).
     BadSite,
     /// Flags carry bits outside tainted/truncated.
     BadFlags,
-    /// v6 metadata word violates the contract: nonzero metadata on
+    /// v7 metadata word violates the contract: nonzero metadata on
     /// a return edge (R2 extended — returns are never chased) or a
     /// callback half (callback halves never chase submit-owned
-    /// facts), `mflags` bits outside cryptlen/req-flags-valid, a
-    /// nonzero value word without its validity bit, a non-skcipher
-    /// family, or a direction that does not echo the site.
+    /// facts), `mflags` bits outside the four validity bits, a
+    /// nonzero value word without its validity bit, a family that is
+    /// neither skcipher nor AEAD or that mismatches the site's
+    /// family, a direction that does not echo the site's class, or a
+    /// nonzero AEAD word / AEAD validity bit on a skcipher submit
+    /// (populations stay labeled — AEAD lengths never ride a
+    /// skcipher record).
     BadMeta,
     /// Null pairing key (the BPF `BADKEY` gate should have dropped it).
     NullKey,
@@ -215,7 +237,7 @@ pub struct DecodeStats {
     pub stale_returns: u64,
 }
 
-/// Validate one ring record against the v6 `LEdge` twin: exact length,
+/// Validate one ring record against the v7 `LEdge` twin: exact length,
 /// magic, version, edge kind, site, defined-only flags, non-null
 /// key, zero status on submit edges (ANY status on callback halves —
 /// classification is the adapter's job, never the twin's), the
@@ -225,10 +247,12 @@ pub struct DecodeStats {
 /// callback halves: 0 ONLY — R2, honest BPF never chases at exit,
 /// and callback halves never chase submit-owned facts), the
 /// entry-side metadata (submit edges: validity-gated `cryptlen` /
-/// `req_flags`, skcipher family, site-echoing direction; return
-/// edges and callback halves: all-zero ONLY), and the driver name
-/// (submit edges: NUL-terminated UTF-8 within 56 bytes, empty when
-/// unknown; return edges and callback halves: empty ONLY).
+/// `req_flags`, the site-matching family, the site-class-echoing
+/// direction, and validity-gated `assoclen` / `authsize` on AEAD
+/// submits (zero on skcipher submits); return edges and callback
+/// halves: all-zero ONLY), and the driver name (submit edges:
+/// NUL-terminated UTF-8 within 48 bytes, empty when unknown; return
+/// edges and callback halves: empty ONLY).
 pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeDrop::BadLength);
@@ -262,7 +286,10 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     let site_ok = if is_callback {
         site == LSITE_CB_CRYPTD || site == LSITE_CB_KXC
     } else {
-        site == LSITE_ENC || site == LSITE_DEC
+        site == LSITE_ENC
+            || site == LSITE_DEC
+            || site == LSITE_AEAD_ENC
+            || site == LSITE_AEAD_DEC
     };
     if !site_ok {
         return Err(DecodeDrop::BadSite);
@@ -300,29 +327,46 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if edge != LEDGE_SUBMIT && tfm != 0 {
         return Err(DecodeDrop::BadReturnTfm);
     }
-    // Entry-side metadata (P3): returns carry all-zero words (R2
-    // extended — honest BPF never chases at exit); submits carry
-    // validity-gated scalars, the skcipher family, and the
-    // site-echoing direction. Callback halves carry all-zero words
-    // (P4: no chase, no cookie, no name).
+    // Entry-side metadata (P3 + P5): returns carry all-zero words
+    // (R2 extended — honest BPF never chases at exit); submits
+    // carry validity-gated scalars, the site-matching family, and
+    // the site-class-echoing direction. Callback halves carry
+    // all-zero words (P4: no chase, no cookie, no name).
     let cryptlen_word = u32le(28);
     let req_flags_word = u32le(48);
     let fam = bytes[52];
     let dir = bytes[53];
     let mflags = u16le(54);
-    let (cryptlen, req_flags) = if edge != LEDGE_SUBMIT {
-        if cryptlen_word != 0 || req_flags_word != 0 || fam != 0 || dir != 0 || mflags != 0 {
+    let assoclen_word = u32le(56);
+    let authsize_word = u32le(60);
+    let (cryptlen, req_flags, assoclen, authsize) = if edge != LEDGE_SUBMIT {
+        if cryptlen_word != 0
+            || req_flags_word != 0
+            || fam != 0
+            || dir != 0
+            || mflags != 0
+            || assoclen_word != 0
+            || authsize_word != 0
+        {
             return Err(DecodeDrop::BadMeta);
         }
-        (None, None)
+        (None, None, None, None)
     } else {
-        if mflags & !(LMETA_CRYPTLEN_OK | LMETA_REQFLAGS_OK) != 0 {
+        if mflags
+            & !(LMETA_CRYPTLEN_OK | LMETA_REQFLAGS_OK | LMETA_ASSOCLEN_OK | LMETA_AUTHSIZE_OK)
+            != 0
+        {
             return Err(DecodeDrop::BadMeta);
         }
-        if fam != LFAM_SK {
+        // Family must match the site's family (a skcipher site with
+        // the AEAD byte — or vice versa — is twin drift, never a
+        // relabel); direction echoes the site's class.
+        let site_aead = site == LSITE_AEAD_ENC || site == LSITE_AEAD_DEC;
+        let want_fam = if site_aead { LFAM_AEAD } else { LFAM_SK };
+        if fam != want_fam {
             return Err(DecodeDrop::BadMeta);
         }
-        let want_dir = if site == LSITE_ENC {
+        let want_dir = if site == LSITE_ENC || site == LSITE_AEAD_ENC {
             LDIR_ENC
         } else {
             LDIR_DEC
@@ -339,21 +383,50 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         if mflags & LMETA_REQFLAGS_OK == 0 && req_flags_word != 0 {
             return Err(DecodeDrop::BadMeta);
         }
+        // AEAD words ride AEAD submits only: a nonzero AEAD word or
+        // AEAD validity bit on a skcipher submit is twin drift
+        // (populations stay labeled); on AEAD submits the words are
+        // validity-gated like the P3 scalars.
+        if !site_aead {
+            if assoclen_word != 0
+                || authsize_word != 0
+                || mflags & (LMETA_ASSOCLEN_OK | LMETA_AUTHSIZE_OK) != 0
+            {
+                return Err(DecodeDrop::BadMeta);
+            }
+        } else {
+            if mflags & LMETA_ASSOCLEN_OK == 0 && assoclen_word != 0 {
+                return Err(DecodeDrop::BadMeta);
+            }
+            if mflags & LMETA_AUTHSIZE_OK == 0 && authsize_word != 0 {
+                return Err(DecodeDrop::BadMeta);
+            }
+        }
         (
             (mflags & LMETA_CRYPTLEN_OK != 0).then_some(cryptlen_word),
             (mflags & LMETA_REQFLAGS_OK != 0).then_some(req_flags_word),
+            (site_aead && mflags & LMETA_ASSOCLEN_OK != 0).then_some(assoclen_word),
+            (site_aead && mflags & LMETA_AUTHSIZE_OK != 0).then_some(authsize_word),
         )
     };
     // Callback halves take the else arm (Decrypt) — a placeholder
     // that never leaves decode: `Edge::Callback` carries no
     // direction, and op attribution is T07/T08 scope.
-    let direction = if site == LSITE_ENC {
+    let direction = if site == LSITE_ENC || site == LSITE_AEAD_ENC {
         OpDirection::Encrypt
     } else {
         OpDirection::Decrypt
     };
+    // Callback halves carry zero family (no submit-owned facts):
+    // the Skcipher value there never leaves decode (`Edge::Callback`
+    // carries no family), so it is a placeholder, never a claim.
+    let family = if site == LSITE_AEAD_ENC || site == LSITE_AEAD_DEC {
+        LifecycleFamily::Aead
+    } else {
+        LifecycleFamily::Skcipher
+    };
     let mut drv_field = [0u8; DRV_LEN];
-    drv_field.copy_from_slice(&bytes[56..56 + DRV_LEN]);
+    drv_field.copy_from_slice(&bytes[64..64 + DRV_LEN]);
     let drv_len = drv_field
         .iter()
         .position(|b| *b == 0)
@@ -375,8 +448,10 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         truncated,
         cryptlen,
         req_flags,
-        family: LifecycleFamily::Skcipher,
+        family,
         direction,
+        assoclen,
+        authsize,
     })
 }
 
@@ -785,10 +860,13 @@ impl LifecycleDecoder {
                 cryptlen: raw.cryptlen,
                 req_flags: raw.req_flags,
                 epoch,
-                // v6 submits are skcipher-only (the twin refuses any
-                // other family): no AEAD extension rides them. The v7
-                // wire slice carries `RawEdge` AEAD scalars here.
-                aead: None,
+                // Contract v2: the AEAD extension rides AEAD submits
+                // only (the twin pins `Some` ⟺ AEAD — skcipher
+                // submits carry `None`, never zeroed scalars).
+                aead: (raw.family == LifecycleFamily::Aead).then(|| AeadMeta {
+                    assoclen: raw.assoclen,
+                    authsize: raw.authsize,
+                }),
             },
         });
         out

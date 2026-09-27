@@ -861,7 +861,7 @@ use kryprobe_privilege::kcrypto_lifecycle::sensor::{EnrichmentStatus, SensorCore
 fn ctx() -> SessionContext {
     SessionContext {
         loss_baseline: [0; 5],
-        agg_baseline: [0; 18],
+        agg_baseline: [0; 22],
         view_valid: true,
         miss_baseline: Vec::new(),
         enrichment: EnrichmentStatus::Available {
@@ -960,7 +960,7 @@ fn decode_callback_joins_token() {
 
 #[test]
 fn sensor_async_terminal_end_to_end() {
-    let mut core = SensorCore::new(64, 64, 64, 8, true);
+    let mut core = SensorCore::new(64, 64, 64, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
@@ -975,7 +975,7 @@ fn sensor_async_terminal_end_to_end() {
     assert_eq!(done[0].tfm_id, Some(1));
     assert_eq!(done[0].meta.cryptlen, Some(16));
     assert!(done[0].evidence_valid());
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.admitted, 1);
     assert_eq!(ledger.decode.bad_records, 0);
     assert_eq!(ledger.reducer.emitted, 1);
@@ -983,7 +983,7 @@ fn sensor_async_terminal_end_to_end() {
 
 #[test]
 fn sensor_queued_without_callback_drains_unknown() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
@@ -1000,7 +1000,7 @@ fn sensor_queued_without_callback_drains_unknown() {
 
 #[test]
 fn sensor_enospc_is_sync_terminal_exact() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     // No MAY_BACKLOG at submit + full queue: the driver answers
     // -ENOSPC immediately — terminal, exact, no callback follows.
@@ -1019,7 +1019,7 @@ fn sensor_enospc_is_sync_terminal_exact() {
 fn sensor_ebusy_queues_only_with_backlog_consent() {
     let frontend = 0xFFFF_8880_0000_1000_u64;
     // WITH May-backlog: Queued (terminal via the later callback).
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(MAY_BACKLOG)),
         op_return(0xAAA, 105, 0x4000, -libc::EBUSY),
@@ -1033,7 +1033,7 @@ fn sensor_ebusy_queues_only_with_backlog_consent() {
     let done = core.take_completed();
     assert_eq!(done[0].terminal, Terminal::Callback(0));
     // WITHOUT consent: Unresolved (loud, never completes).
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
         op_return(0xAAA, 105, 0x4000, -libc::EBUSY),
@@ -1042,13 +1042,13 @@ fn sensor_ebusy_queues_only_with_backlog_consent() {
     core.finish(9999);
     let done = core.take_completed();
     assert_eq!(done[0].terminal, Terminal::Unknown);
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(
         ledger.reducer.ambiguous, 1,
         "unresolvable evidence stays loud"
     );
     // Unknown flags (entry chase unreadable): consent never assumed.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, None),
         op_return(0xAAA, 105, 0x4000, -libc::EBUSY),
@@ -1061,7 +1061,7 @@ fn sensor_backlog_progress_shape() {
     // Burst shape (fixture depth-1, MAY_BACKLOG): submit 0 queues,
     // submits 1..3 backlog; progress callbacks never complete; each
     // terminal lands exactly once with its callback span.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let mut recs = Vec::new();
     for (i, key) in [0xA0u64, 0xA1, 0xA2, 0xA3].iter().enumerate() {
@@ -1098,7 +1098,7 @@ fn sensor_backlog_progress_shape() {
         assert!(r.duration_ns.is_some(), "callback span present");
         assert!(r.evidence_valid());
     }
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.reducer.emitted, 4);
     assert_eq!(ledger.reducer.ambiguous, 0);
     assert_eq!(ledger.reducer.orphan, 0);
@@ -1109,7 +1109,7 @@ fn sensor_callback_before_return_with_reuse() {
     // Early terminal, then storage reuse for a new call, then the
     // old return: the old return joins the OLD id (by invocation),
     // never the new call.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
@@ -1134,7 +1134,7 @@ fn sensor_callback_before_return_with_reuse() {
 fn sensor_sync_on_async_capable_driver() {
     // An async-capable driver (MAY_BACKLOG submit) may still answer
     // synchronously: the RETURN classification decides, not flags.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(MAY_BACKLOG)),
@@ -1155,7 +1155,7 @@ fn sensor_unqualified_leaves_no_terminal_latency() {
     // AF_ALG-shaped traffic (unhooked completion): Queued return,
     // never a callback — Unknown with no duration, even though the
     // op really completed somewhere unobserved.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let frontend = 0xFFFF_8880_0000_1000_u64;
     let recs = vec![
         op_submit(0xAAA, 100, 0x4000, frontend, Some(0)),
@@ -1216,7 +1216,7 @@ fn sensor_refused_same_key_reuse_cannot_complete_old_token() {
     // (Unknown, no span); B drains truthless; the refusal and the
     // ambiguity both count.
     let frontend = 0xFFFF_8880_0000_2000_u64;
-    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    let mut core = SensorCore::new(1, 8, 8, 8, 8, true);
     core.ingest_records(&[
         op_submit(0xBBB, 100, 0x5000, frontend, Some(0)),
         op_return(0xBBB, 110, 0x5000, -libc::EINPROGRESS),
@@ -1226,7 +1226,7 @@ fn sensor_refused_same_key_reuse_cannot_complete_old_token() {
     ]);
     core.finish(5000);
     let done = core.take_completed();
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.adapter.cover_refused, 1);
     assert_eq!(ledger.adapter.ambiguous_keys, 1);
     assert!(
@@ -1245,7 +1245,7 @@ fn sensor_refused_sync_reuse_clears_contention() {
     // clears the contention, so the old token's own callback still
     // joins cleanly (no gap, no ambiguity).
     let frontend = 0xFFFF_8880_0000_3000_u64;
-    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    let mut core = SensorCore::new(1, 8, 8, 8, 8, true);
     core.ingest_records(&[
         op_submit(0xCCC, 100, 0x6000, frontend, Some(0)),
         op_return(0xCCC, 110, 0x6000, -libc::EINPROGRESS),
@@ -1257,7 +1257,7 @@ fn sensor_refused_sync_reuse_clears_contention() {
     ]);
     core.finish(5000);
     let done = core.take_completed();
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.adapter.cover_refused, 1);
     assert_eq!(ledger.adapter.ambiguous_keys, 0);
     let old = done.iter().find(|r| r.id == 1).expect("A completes");
@@ -1272,7 +1272,7 @@ fn sensor_refusal_contention_overflow_invalidates_loud() {
     // key's live tokens gap immediately) instead of growing
     // without bound or misjoining silently.
     let frontend = 0xFFFF_8880_0000_4000_u64;
-    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    let mut core = SensorCore::new(1, 8, 8, 8, 8, true);
     core.ingest_records(&[
         // A covered (live pool full).
         op_submit(0xD01, 100, 0x7000, frontend, Some(0)),
@@ -1287,7 +1287,7 @@ fn sensor_refusal_contention_overflow_invalidates_loud() {
     ]);
     core.finish(5000);
     let done = core.take_completed();
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.adapter.cover_refused, 2);
     assert_eq!(ledger.adapter.ambiguous_keys, 1);
     let old = done.iter().find(|r| r.id == 1).expect("A completes");
@@ -1334,7 +1334,7 @@ fn sensor_decoder_refusal_cannot_complete_old_token() {
     // callback gaps A loud (Unknown, no span) instead of joining
     // the old covered token; D still completes exactly.
     let frontend = 0xFFFF_8880_0000_9000_u64;
-    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    let mut core = SensorCore::new(1, 8, 8, 8, 8, true);
     core.ingest_records(&[
         op_submit(0xE10, 100, 0x9000, frontend, Some(0)),
         op_return(0xE10, 110, 0x9000, -libc::EINPROGRESS),
@@ -1349,7 +1349,7 @@ fn sensor_decoder_refusal_cannot_complete_old_token() {
     ]);
     core.finish(5000);
     let done = core.take_completed();
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.submit_refused, 1);
     assert_eq!(ledger.decode.bad_records, 0);
     assert_eq!(ledger.adapter.ambiguous_keys, 1);
@@ -1368,7 +1368,7 @@ fn sensor_decoder_refusal_production_bounds_cannot_complete_old_token() {
     // and the refused submit keeps contention — A gaps loud with
     // zero malformed records.
     let frontend = 0xFFFF_8880_0000_9100_u64;
-    let mut core = SensorCore::new(4096, 4096, 4096, 8, true);
+    let mut core = SensorCore::new(4096, 4096, 4096, 8, 8, true);
     core.ingest_records(&[
         op_submit(0xE10, 100, 0x9000, frontend, Some(0)),
         op_return(0xE10, 110, 0x9000, -libc::EINPROGRESS),
@@ -1391,7 +1391,7 @@ fn sensor_decoder_refusal_production_bounds_cannot_complete_old_token() {
     ]);
     core.finish(5000);
     let done = core.take_completed();
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.submit_refused, 1);
     assert_eq!(ledger.decode.bad_records, 0);
     assert_eq!(ledger.adapter.ambiguous_keys, 1);

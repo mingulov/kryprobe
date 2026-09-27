@@ -640,11 +640,11 @@ pub struct SensorBaseline {
     /// Per-hook consumed edges in `LAGG_*` lane order (lanes 0–3 are
     /// the op hooks `[enc-sub, enc-ret, dec-sub, dec-ret]`; lanes
     /// 16/17 are the P4 callback hooks).
-    pub edge_hits: [u64; 18],
+    pub edge_hits: [u64; 22],
     /// `LLOSS` per-class totals (5 classes).
     pub kernel_loss: [u64; 5],
     /// `LAGG` per-hook accepted totals.
-    pub agg_accepted: [u64; 18],
+    pub agg_accepted: [u64; 22],
     /// Retained completions surfaced so far.
     pub completed_len: u64,
     /// Decoder counters (quiescence + delta verdict; robust to
@@ -678,7 +678,7 @@ pub struct SensorView<'a> {
     /// Post-finish completions (every pending request reconciled).
     pub completed: &'a [RequestRecord],
     /// Final per-hook consumed edges (18 `LAGG_*` lanes).
-    pub edge_hits: [u64; 18],
+    pub edge_hits: [u64; 22],
     /// Final decode counters.
     pub decode: DecodeStats,
     /// Final reducer counters.
@@ -689,7 +689,7 @@ pub struct SensorView<'a> {
     /// Final kernel loss.
     pub kernel_loss: [u64; 5],
     /// Final accepted aggregate (18 `LAGG_*` lanes).
-    pub agg_accepted: [u64; 18],
+    pub agg_accepted: [u64; 22],
     /// Retention drops past the ledger bound.
     pub retained_dropped: u64,
     /// Quiescence-proven pre-GO baseline (deltas measure from here).
@@ -1056,9 +1056,9 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         a.checked_sub(b)
             .ok_or_else(|| format!("counter {what} ran backwards"))
     };
-    let mut hits_d = [0u64; 18];
+    let mut hits_d = [0u64; 22];
     let mut loss_d = [0u64; 5];
-    let mut agg_d = [0u64; 18];
+    let mut agg_d = [0u64; 22];
     for i in 0..LANE_COUNT as usize {
         hits_d[i] = sub(view.edge_hits[i], view.baseline.edge_hits[i], "edge_hits")?;
         agg_d[i] = sub(

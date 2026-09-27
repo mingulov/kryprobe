@@ -144,7 +144,7 @@ fn config_return(site: u16, token: u64, errno: i32) -> Vec<u8> {
 
 #[test]
 fn alloc_pair_assigns_generation_with_provenance() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     assert!(
         tracker
             .feed(&alloc_entry(2, b"kxcipher", 0x05, 0x8f))
@@ -173,7 +173,7 @@ fn alloc_pair_assigns_generation_with_provenance() {
 
 #[test]
 fn alloc_failure_records_no_generation() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher-no-such", 0, 0));
     tracker.feed(&alloc_return_err(2, -2));
     assert!(
@@ -189,7 +189,7 @@ fn alloc_failure_records_no_generation() {
 
 #[test]
 fn return_without_entry_refuses() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_return_ok(2, 0xFFFF_8880_0000_1000, b"drv"));
     assert!(tracker.generations().is_empty(), "no phantom generation");
     assert_eq!(tracker.stats().unknown_returns, 1, "unknown token counted");
@@ -197,7 +197,7 @@ fn return_without_entry_refuses() {
 
 #[test]
 fn resubmit_keeps_first() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"first", 0, 0));
     tracker.feed(&alloc_entry(2, b"second", 0, 0));
     assert_eq!(tracker.stats().submit_refused, 1, "resubmit refused");
@@ -209,7 +209,7 @@ fn resubmit_keeps_first() {
 
 #[test]
 fn tainted_edges_refuse_quietly() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let mut entry = alloc_entry(2, b"kxcipher", 0, 0);
     entry[6] = LEDGE_TAINTED as u8;
     tracker.feed(&entry);
@@ -224,7 +224,7 @@ fn tainted_edges_refuse_quietly() {
 
 #[test]
 fn pending_table_bound_refuses() {
-    let mut tracker = TransformTracker::new(1, 8, true);
+    let mut tracker = TransformTracker::new(1, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"first", 0, 0));
     tracker.feed(&alloc_entry(4, b"second", 0, 0));
     assert_eq!(tracker.stats().table_full, 1, "overflow counted");
@@ -236,7 +236,7 @@ fn pending_table_bound_refuses() {
 
 #[test]
 fn overlong_name_truncates_with_flag() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let mut long = vec![b'a'; 63];
     long.extend_from_slice(b"extra-that-does-not-fit");
     let mut entry = alloc_entry(2, &long, 0, 0);
@@ -264,7 +264,7 @@ fn normalize_frontend_adds_offset_checked() {
 
 #[test]
 fn twin_bad_magic_and_version_refuse() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let mut bad_magic = alloc_entry(2, b"kxcipher", 0, 0);
     bad_magic[0] = 0x00;
     tracker.feed(&bad_magic);
@@ -277,7 +277,7 @@ fn twin_bad_magic_and_version_refuse() {
 
 #[test]
 fn twin_bad_site_refuses() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&tfm_bytes(
         LEDGE_SUBMIT,
         99,
@@ -295,7 +295,7 @@ fn twin_bad_site_refuses() {
 
 #[test]
 fn twin_key_rules_refuse() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     // Entry carries no pointer yet: nonzero is drift.
     let mut entry_key = alloc_entry(2, b"kxcipher", 0, 0);
     entry_key[8..16].copy_from_slice(&0x1234u64.to_le_bytes());
@@ -429,11 +429,11 @@ fn first_seen_admits_unknown_generation() {
     // admits nothing (one lifetime, one id). T07-04/F05: the
     // submit's runtime-selected driver rides along (selected
     // metadata captured; allocation/requested name stay unknown).
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
-    assert_eq!(tracker.admit_first_seen(f1, "aes-generic", false), Some(1));
+    assert_eq!(tracker.admit_first_seen(f1, "aes-generic", false, false), Some(1));
     assert_eq!(
-        tracker.admit_first_seen(f1, "other", true),
+        tracker.admit_first_seen(f1, "other", true, false),
         None,
         "no duplicate"
     );
@@ -451,8 +451,8 @@ fn first_seen_admits_unknown_generation() {
 fn first_seen_zero_link_counts_unlinked() {
     // T07.3: a 0 tfm word (unreadable request link) admits nothing
     // and counts `unlinked_ops` — a sensor-truth gap, never silent.
-    let mut tracker = TransformTracker::new(16, 8, true);
-    assert_eq!(tracker.admit_first_seen(0, "", false), None);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
+    assert_eq!(tracker.admit_first_seen(0, "", false, false), None);
     assert_eq!(tracker.stats().unlinked_ops, 1);
     assert!(tracker.generations().is_empty());
     // T07-R3-01: the zero-word op is an identity gap (a real
@@ -465,7 +465,7 @@ fn destroy_final_free_retires() {
     // T07.3: refcount 1 + observed at destroy entry proves the dec
     // freed under EITHER historical semantic (observer rule) — the
     // generation retires and leaves the live table.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0x05, 0x8f));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -487,7 +487,7 @@ fn destroy_retained_refcount_marks_ambiguous() {
     // AND flags ambiguous (its eventual end is no longer exactly
     // knowable from this edge alone... it stays live so the final
     // destroy still joins and retires it).
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -510,7 +510,7 @@ fn destroy_retained_refcount_marks_ambiguous() {
 fn destroy_unobserved_refcount_marks_ambiguous() {
     // T07.3: unreadable refcount (faulted read, null tfm) proves
     // nothing — ambiguity, never a retire, never a no-op.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -526,7 +526,7 @@ fn destroy_zero_refcount_is_impossible_input() {
     // T07.3: refcount 0 at destroy entry is impossible on a live
     // transform (use-after-free already) — fail closed into
     // ambiguity, never a retire.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -540,7 +540,7 @@ fn destroy_zero_refcount_is_impossible_input() {
 fn destroy_null_and_err_mem_are_noop_releases() {
     // T07.3: `crypto_destroy_tfm` returns early on IS_ERR_OR_NULL
     // (no dec-test, no free) — counted, disturb nothing.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -558,7 +558,7 @@ fn destroy_unknown_base_counts() {
     // T07.3: a release for a never-admitted base (missed alloc AND
     // missed ops, or a foreign transform) counts — never a phantom
     // generation, never a retire of thin air.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&destroy_entry(2, 0xFFFF_8880_0000_1000, 1, 1));
     tracker.feed(&destroy_return(2));
     assert_eq!(tracker.stats().unknown_releases, 1);
@@ -575,7 +575,7 @@ fn destroy_always_final_mode_retires_unconditionally() {
     // T07.3: on kernels without `crypto_tfm.refcnt` (7.2+) every
     // observed destroy retires — the field's absence IS the proof
     // (unconditional destroy), not a gap.
-    let mut tracker = TransformTracker::new(16, 8, false);
+    let mut tracker = TransformTracker::new(16, 8, 8, false);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -591,7 +591,7 @@ fn alloc_after_proved_retire_assigns_fresh_id() {
     // Rapid address reuse must NOT merge object lifetimes (plan
     // line 29): same frontend after a proved final-free is a new
     // lifetime with a fresh id — exact, since both ends are proved.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0x05, 0x8f));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -612,7 +612,7 @@ fn alloc_for_live_base_forces_retire_as_ambiguous() {
     // unobserved (missed free): the old generation forced-retires
     // as ambiguous (never kept live — a stale destroy must not
     // merge lifetimes), the new one takes the base fresh.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"first", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -721,7 +721,7 @@ fn twin_config_unrecognized_status_is_truth_not_drift() {
 fn config_success_bumps_epoch_and_records() {
     // T07.4: a joined success records site/len/errno and bumps the
     // generation's epoch — one keying era per success.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0x05, 0x8f));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -744,7 +744,7 @@ fn config_success_bumps_epoch_and_records() {
 fn config_failure_records_without_bump() {
     // A failed rekey changes no kernel state: the attempt records
     // (site/len/errno) but the epoch stands — one era, not two.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -766,7 +766,7 @@ fn config_unknown_base_admits_first_seen() {
     // A config edge observes a live transform like an op edge:
     // unknown bases admit first-seen with EMPTY provenance, and
     // the success bumps the fresh generation's epoch.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&config_entry(LTFM_SITE_SETAUTHSIZE, 2, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETAUTHSIZE, 2, 0));
@@ -783,7 +783,7 @@ fn config_null_key_is_unlinked() {
     // A null frontend names no transform: the pair joins (the
     // attempt was real) but attributes nothing — counted, never
     // a phantom generation.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 2, 0, 32));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 2, 0));
     assert!(tracker.generations().is_empty());
@@ -796,7 +796,7 @@ fn config_cross_site_return_refuses_with_entry_kept() {
     // A setauthsize return for a parked setkey-sk token is twin-
     // valid halves with the wrong pairing: refused, entry kept,
     // and the true return still pairs.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -816,7 +816,7 @@ fn destroy_return_after_realloc_retires_nothing() {
     // the entry and the return. The old return must NOT retire the
     // new lifetime: it counts stale, the new id stays live, and
     // the forced retire on the realloc already voided reuse_exact.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -843,7 +843,7 @@ fn destroy_entry_unmapped_then_live_refuses() {
     // counts COLLIDING (T07-R3-02: indeterminate identity evidence
     // at an in-boundary live base, never digest inventory) and
     // touches nothing.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&destroy_entry(2, f1 + 8, 1, 1));
     tracker.feed(&alloc_entry(4, b"kxcipher", 0, 0));
@@ -865,7 +865,7 @@ fn overlapping_destroy_second_return_goes_stale() {
     // first return retires it proved; the second return finds its
     // bound generation gone and counts stale — never unknown (it
     // HAD entry evidence) and never a second retire.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -883,7 +883,7 @@ fn overlapping_destroy_second_return_goes_stale() {
 fn config_return_after_realloc_unlinks() {
     // Config twin of the destroy interleaving: a setkey straddling
     // a reuse must never bump the new lifetime's epoch.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -902,7 +902,7 @@ fn config_entry_unmapped_then_live_unlinks() {
     // Unbound config whose base became live between the halves:
     // first-seen admission is refused (the entry observed no live
     // lifetime and the base is taken) — unlinked, never merged.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 2, f1, 32));
     tracker.feed(&alloc_entry(4, b"kxcipher", 0, 0));
@@ -919,7 +919,7 @@ fn config_after_retire_admits_fresh_never_merges() {
     // same base is a NEW lifetime (base→single-live-id holds —
     // the tombstone keeps its epoch, the fresh id starts at 0
     // before its own success bumps it).
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -955,9 +955,9 @@ fn config_on_first_seen_flags_uncertain_identity() {
     // NEW lifetime all land on the OLD id. The epoch bump is
     // best-effort AND the uncertainty is counted — F06 partial,
     // never a confident old identity.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
-    tracker.admit_first_seen(f1, "", false);
+    tracker.admit_first_seen(f1, "", false, false);
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_AEAD, 2, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_AEAD, 2, 0));
     let gens = tracker.generations();
@@ -983,23 +983,23 @@ fn exactness_voids_at_admission_and_on_identity_refusals() {
     let f1 = 0xFFFF_8880_0000_1000u64;
     // Arm 1: op-only first-seen — no config, no destroy, just the
     // admitting op. Exactness voids at admission.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     assert!(tracker.reuse_exact(), "clean tracker starts exact");
-    tracker.admit_first_seen(f1, "aesni", false);
+    tracker.admit_first_seen(f1, "aesni", false, false);
     assert_eq!(tracker.stats().unobserved_boundary, 1);
     assert!(
         !tracker.reuse_exact(),
         "op-only admission voids exactness with no config"
     );
     // Arm 2: malformed destroy half (wire drift) voids.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let mut bad = destroy_entry(2, f1, 1, 1);
     bad[37] = 1;
     tracker.feed(&bad);
     assert_eq!(tracker.stats().bad_records, 1);
     assert!(!tracker.reuse_exact(), "corrupt record voids exactness");
     // Arm 3: unpaired (tainted) edge voids.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let mut entry = alloc_entry(2, b"kxcipher", 0, 0);
     entry[6] = LEDGE_TAINTED as u8;
     tracker.feed(&entry);
@@ -1007,13 +1007,13 @@ fn exactness_voids_at_admission_and_on_identity_refusals() {
     assert!(!tracker.reuse_exact(), "unpaired edge voids exactness");
     // Arm 4: return for an unknown token (missed/pre-attach entry)
     // voids — the attempt's start boundary went unobserved.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
     assert_eq!(tracker.stats().unknown_returns, 1);
     assert!(!tracker.reuse_exact(), "unjoinable return voids exactness");
     // Arm 5: cross-site return voids even though the true return
     // still pairs — the crossed half is corruption evidence.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 32));
@@ -1029,7 +1029,7 @@ fn finish_dangling_destroy_marks_live_bound_ambiguous() {
     // T07-06: a destroy entry whose return never arrives leaves
     // its end unknown — the still-live bound generation flags
     // ambiguous (stays live, end unproven) and exact reuse voids.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -1053,7 +1053,7 @@ fn finish_dangling_destroy_after_proved_end_counts_only() {
     // T07-06 mirror: a second overlapping destroy still pending
     // when the first already retired the generation — the proved
     // end stands (no ambiguity), the dangling attempt counts.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -1080,7 +1080,7 @@ fn finish_dangling_alloc_and_config_count_without_taint() {
     // outcomes — counted, but no generation exists to taint (alloc)
     // and lifetime boundaries are unaffected (config excludes the
     // unknown change from the epoch).
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
@@ -1101,7 +1101,7 @@ fn cross_site_halves_refuse_as_mismatched() {
     // Twin-valid halves from different sites never pair: a destroy
     // return for an alloc token (and vice versa) refuses WITHOUT
     // consuming the parked entry (the true return still pairs).
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&tfm_bytes(
         LEDGE_RETURN,
@@ -1127,7 +1127,7 @@ fn d4_live_cap_refuses_new_generations() {
     // D4: the live table is bounded — a success completion past the
     // cap consumes the attempt but assigns nothing (failures never
     // needed a slot, so the refusal lands at completion, not entry).
-    let mut tracker = TransformTracker::new(2, 8, true);
+    let mut tracker = TransformTracker::new(2, 8, 8, true);
     for (token, base) in [(2u64, 0x1000u64), (4, 0x2000)] {
         tracker.feed(&alloc_entry(token, b"k", 0, 0));
         tracker.feed(&alloc_return_ok(token, base, b"drv"));
@@ -1139,7 +1139,7 @@ fn d4_live_cap_refuses_new_generations() {
     assert_eq!(tracker.stats().live_full, 1);
     assert_eq!(tracker.stats().completed, 3, "attempt still consumed");
     // First-seen hits the same bound.
-    assert_eq!(tracker.admit_first_seen(0x4000, "", false), None);
+    assert_eq!(tracker.admit_first_seen(0x4000, "", false, false), None);
     assert_eq!(tracker.stats().live_full, 2);
 }
 
@@ -1148,7 +1148,7 @@ fn d4_retired_history_is_fifo_bounded() {
     // D4: retired generations become FIFO tombstones capped at the
     // bound — oldest history evicts (counted), live entries never
     // evict, total memory stays O(3 × capacity).
-    let mut tracker = TransformTracker::new(2, 8, true);
+    let mut tracker = TransformTracker::new(2, 8, 8, true);
     for (token, base) in [(2u64, 0x1000u64), (4, 0x2000)] {
         tracker.feed(&alloc_entry(token, b"k", 0, 0));
         tracker.feed(&alloc_return_ok(token, base, b"drv"));
@@ -1170,7 +1170,7 @@ fn d4_retired_history_is_fifo_bounded() {
 
 #[test]
 fn twin_bad_token_refuses() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     // Clean edge with a zero token names no attempt.
     tracker.feed(&alloc_entry(0, b"kxcipher", 0, 0));
     // Reserved bit set is no honest-BPF shape.
@@ -1180,7 +1180,7 @@ fn twin_bad_token_refuses() {
 
 #[test]
 fn twin_unterminated_name_refuses() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let entry = alloc_entry(2, &[b'z'; 64], 0, 0);
     // All 64 bytes filled, no NUL anywhere: undecodable.
     assert!(!entry[48..112].contains(&0));
@@ -1193,7 +1193,7 @@ fn sensor_routes_tfm_records_to_tracker() {
     use kryprobe_privilege::kcrypto_lifecycle::sensor::{
         EnrichmentStatus, SensorCore, SessionContext,
     };
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let records = vec![
         alloc_entry(2, b"kxcipher", 0, 0),
         alloc_return_ok(2, 0xFFFF_8880_0000_1000, b"kxcipher-sync-t07a"),
@@ -1220,11 +1220,11 @@ fn sensor_routes_tfm_records_to_tracker() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1247,7 +1247,7 @@ fn sensor_tallies_destroy_pair_on_lanes_6_7_and_retires() {
     use kryprobe_privilege::kcrypto_lifecycle::sensor::{
         EnrichmentStatus, SensorCore, SessionContext,
     };
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[
         alloc_entry(2, b"kxcipher", 0x05, 0x8f),
@@ -1260,11 +1260,11 @@ fn sensor_tallies_destroy_pair_on_lanes_6_7_and_retires() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1288,7 +1288,7 @@ fn ledger_carries_generations_and_tfm_stats() {
     use kryprobe_privilege::kcrypto_lifecycle::sensor::{
         EnrichmentStatus, SensorCore, SessionContext,
     };
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[
         alloc_entry(2, b"kxcipher", 0x05, 0x8f),
@@ -1299,11 +1299,11 @@ fn ledger_carries_generations_and_tfm_stats() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1329,7 +1329,7 @@ fn public_views_carry_no_kernel_addresses() {
     use kryprobe_privilege::kcrypto_lifecycle::sensor::{
         EnrichmentStatus, SensorCore, SessionContext,
     };
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[
         alloc_entry(2, b"kxcipher", 0x05, 0x8f),
@@ -1342,11 +1342,11 @@ fn public_views_carry_no_kernel_addresses() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1414,7 +1414,7 @@ fn sensor_tallies_config_pairs_on_lanes_8_11_14_15_and_bumps_epoch() {
     use kryprobe_privilege::kcrypto_lifecycle::sensor::{
         EnrichmentStatus, SensorCore, SessionContext,
     };
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     let f2 = 0xFFFF_8880_0000_2000u64;
     core.ingest_records(&[
@@ -1439,11 +1439,11 @@ fn sensor_tallies_config_pairs_on_lanes_8_11_14_15_and_bumps_epoch() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1465,7 +1465,7 @@ fn sensor_tallies_config_pairs_on_lanes_8_11_14_15_and_bumps_epoch() {
 
 #[test]
 fn twin_bad_edge_and_flags_refuse() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&tfm_bytes(
         9,
         LTFM_SITE_ALLOC_SK,
@@ -1495,7 +1495,7 @@ fn twin_bad_edge_and_flags_refuse() {
 
 #[test]
 fn twin_entry_status_and_return_aux_refuse() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     // Entry edges carry no status.
     tracker.feed(&tfm_bytes(
         LEDGE_SUBMIT,
@@ -1527,7 +1527,7 @@ fn twin_entry_status_and_return_aux_refuse() {
 
 #[test]
 fn twin_failure_name_and_bad_utf8_refuse() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     // Failure returns name nothing.
     let mut failure = alloc_return_err(2, -2);
     failure[48] = b'x';
@@ -1545,7 +1545,7 @@ fn twin_failure_name_and_bad_utf8_refuse() {
 
 #[test]
 fn wrapping_frontend_refuses_without_generation() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, u64::MAX, b"drv"));
     assert_eq!(tracker.stats().bad_records, 1, "wrap counted");
@@ -1554,7 +1554,7 @@ fn wrapping_frontend_refuses_without_generation() {
 
 #[test]
 fn stale_return_refuses_with_attempt_kept() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     // Entry stamped ts 100; a return at ts 50 predates it.
     let mut stale = alloc_return_ok(2, 0xFFFF_8880_0000_1000, b"drv");
@@ -1570,7 +1570,7 @@ fn stale_return_refuses_with_attempt_kept() {
 #[test]
 fn decode_drop_variants_pin() {
     // The drop taxonomy is exact: each twin rule names its variant.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let _ = tracker.feed(&alloc_entry(0, b"kxcipher", 0, 0));
     assert!(matches!(
         kryprobe_privilege::kcrypto_lifecycle::tfm::decode_tfm_record(&alloc_entry(
@@ -1611,7 +1611,7 @@ fn twin_out_of_range_failure_status_refuses() {
 fn twin_errno_floor_accepts_and_classifies() {
     // D8 boundary: -4095 is the floor the BPF can emit — a complete
     // attempt with it classifies as a failure (no generation).
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     assert!(decode_tfm_record(&alloc_return_err(2, -4095)).is_ok());
     tracker.feed(&alloc_return_err(2, -4095));
@@ -1647,7 +1647,7 @@ fn twin_sub_floor_key_on_success_accepts() {
 fn return_truncation_flag_survives_in_generation() {
     // D9: the halves carry independent truncation — a short request
     // with a flagged driver selection must not read as complete.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     let mut ret = alloc_return_ok(2, 0xFFFF_8880_0000_1000, b"drv");
     ret[6] = LTFM_TRUNCATED as u8;
@@ -1662,7 +1662,7 @@ fn return_truncation_flag_survives_in_generation() {
 fn entry_truncation_flag_survives_without_return_flag() {
     // D9 independence, other direction: a flagged request with a
     // clean driver selection keeps exactly the request flag.
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let mut long = vec![b'a'; 63];
     long.extend_from_slice(b"extra-that-does-not-fit");
     let mut entry = alloc_entry(2, &long, 0, 0);
@@ -2537,54 +2537,54 @@ fn host_op_first_seen_carries_selected_driver() {
 
 #[test]
 fn p3_generation_for_frontend_resolves_live_only() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000_u64;
-    assert_eq!(tracker.generation_for_frontend(f1), None, "unmapped → None");
-    assert_eq!(tracker.generation_for_frontend(0), None, "zero → None");
+    assert_eq!(tracker.generation_for_frontend(f1, false), None, "unmapped → None");
+    assert_eq!(tracker.generation_for_frontend(0, false), None, "zero → None");
     assert_eq!(
-        tracker.generation_for_frontend(u64::MAX),
+        tracker.generation_for_frontend(u64::MAX, false),
         None,
         "wrapping offset → None"
     );
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    assert_eq!(tracker.generation_for_frontend(f1), Some(1));
+    assert_eq!(tracker.generation_for_frontend(f1, false), Some(1));
     // First-seen admission resolves the same way.
     let f2 = 0xFFFF_8880_0000_2000_u64;
-    assert_eq!(tracker.admit_first_seen(f2, "sel", false), Some(2));
-    assert_eq!(tracker.generation_for_frontend(f2), Some(2));
+    assert_eq!(tracker.admit_first_seen(f2, "sel", false, false), Some(2));
+    assert_eq!(tracker.generation_for_frontend(f2, false), Some(2));
     // A proved final-free unbinds: the retired id never rebinds.
     tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
     tracker.feed(&destroy_return(4));
-    assert_eq!(tracker.generation_for_frontend(f1), None, "retired → None");
+    assert_eq!(tracker.generation_for_frontend(f1, false), None, "retired → None");
     assert_eq!(
-        tracker.generation_for_frontend(f2),
+        tracker.generation_for_frontend(f2, false),
         Some(2),
         "G2 undisturbed"
     );
     // Realloc at the freed base binds the NEW lifetime only.
     tracker.feed(&alloc_entry(6, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(6, f1, b"drv"));
-    assert_eq!(tracker.generation_for_frontend(f1), Some(3));
+    assert_eq!(tracker.generation_for_frontend(f1, false), Some(3));
 }
 
 #[test]
 fn p3_epoch_for_frontend_pins_success_eras() {
-    let mut tracker = TransformTracker::new(16, 8, true);
+    let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000_u64;
-    assert_eq!(tracker.epoch_for_frontend(f1), None, "unmapped → None");
+    assert_eq!(tracker.epoch_for_frontend(f1, false), None, "unmapped → None");
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    assert_eq!(tracker.epoch_for_frontend(f1), Some(0), "unconfigured era");
+    assert_eq!(tracker.epoch_for_frontend(f1, false), Some(0), "unconfigured era");
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 4, -22));
     assert_eq!(
-        tracker.epoch_for_frontend(f1),
+        tracker.epoch_for_frontend(f1, false),
         Some(0),
         "failed rekey moves nothing"
     );
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 6, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 6, 0));
-    assert_eq!(tracker.epoch_for_frontend(f1), Some(1), "success bumps");
-    assert_eq!(tracker.epoch_for_frontend(0), None);
+    assert_eq!(tracker.epoch_for_frontend(f1, false), Some(1), "success bumps");
+    assert_eq!(tracker.epoch_for_frontend(0, false), None);
 }

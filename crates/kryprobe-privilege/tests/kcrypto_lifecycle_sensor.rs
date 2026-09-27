@@ -24,7 +24,7 @@ use kryprobe_privilege::kcrypto_lifecycle::sensor::{
 fn ctx() -> SessionContext {
     SessionContext {
         loss_baseline: [0; 5],
-        agg_baseline: [0; 18],
+        agg_baseline: [0; 22],
         view_valid: true,
         miss_baseline: Vec::new(),
         enrichment: EnrichmentStatus::Available {
@@ -91,14 +91,14 @@ fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16
 
 #[test]
 fn ingest_paired_edges_complete_grounded_record() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let records = vec![
         edge_bytes(1, 1, 0xabc, 100, 0, 0),
         edge_bytes(2, 1, 0xabc, 150, 0, 0),
     ];
     assert_eq!(core.ingest_records(&records), 1);
     let ledger = core
-        .ledger([0; 5], [0; 18], Vec::new(), ctx())
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     let rec = &ledger.completed[0];
@@ -115,27 +115,27 @@ fn ingest_paired_edges_complete_grounded_record() {
 
 #[test]
 fn ingest_queued_return_stays_pending() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let records = vec![
         edge_bytes(1, 1, 0xabc, 100, 0, 0),
         edge_bytes(2, 1, 0xabc, 150, -115, 0),
     ];
     assert_eq!(core.ingest_records(&records), 0);
     assert!(
-        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .is_empty()
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .decode
             .admitted,
         1
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .edge_hits,
         [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -144,7 +144,7 @@ fn ingest_queued_return_stays_pending() {
 
 #[test]
 fn ingest_loss_counts_without_phantoms() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let records = vec![
         edge_bytes(2, 1, 0xabc, 150, 0, 0), // unknown-invocation return
         vec![0u8; 31],                      // short record
@@ -152,7 +152,7 @@ fn ingest_loss_counts_without_phantoms() {
     ];
     assert_eq!(core.ingest_records(&records), 0);
     let ledger = core
-        .ledger([7, 0, 0, 0, 0], [0; 18], Vec::new(), ctx())
+        .ledger([7, 0, 0, 0, 0], [0; 22], Vec::new(), ctx())
         .expect("empty miss join");
     assert!(ledger.completed.is_empty());
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
@@ -166,17 +166,17 @@ fn finish_drains_pending_truthless() {
     // `finish` reconciles into retention and returns nothing: the
     // take is the ONE read path (a returning finish double-surfaced
     // every reconciled record — round-3 async canary).
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     core.ingest_records(&[edge_bytes(1, 1, 0xabc, 100, 0, 0)]);
     assert!(
-        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .is_empty()
     );
     core.finish(200);
     assert_eq!(
-        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .len(),
@@ -195,7 +195,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
     // configured bound. Past the ledger cap, completions stop being
     // retained and count retained_dropped (explicit loss, never
     // silent growth).
-    let mut core = SensorCore::new(16, 16, 2, 8, true);
+    let mut core = SensorCore::new(16, 16, 2, 8, 8, true);
     for i in 0..3u64 {
         let key = 0x1000 + i;
         let records = vec![
@@ -205,7 +205,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
         assert_eq!(core.ingest_records(&records), 1);
     }
     let ledger = core
-        .ledger([0; 5], [0; 18], Vec::new(), ctx())
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 2);
     assert_eq!(ledger.retained_dropped, 1);
@@ -216,7 +216,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
 fn f7_take_completed_drains_and_releases_the_bound() {
     // The live tick drains retained completions; drained records
     // free retention for new ones (a draining reader never drops).
-    let mut core = SensorCore::new(16, 16, 1, 8, true);
+    let mut core = SensorCore::new(16, 16, 1, 8, 8, true);
     let one = vec![
         edge_bytes(1, 1, 0xabc, 100, 0, 0),
         edge_bytes(2, 1, 0xabc, 150, 0, 0),
@@ -230,7 +230,7 @@ fn f7_take_completed_drains_and_releases_the_bound() {
     ];
     assert_eq!(core.ingest_records(&two), 1);
     let ledger = core
-        .ledger([0; 5], [0; 18], Vec::new(), ctx())
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     assert_eq!(ledger.retained_dropped, 0);
@@ -241,7 +241,7 @@ fn w8_ledger_carries_session_context() {
     // M2/H2: the pre-arm counter baselines and the sticky identity
     // verdict land in the terminal ledger untouched (coverage and
     // integrity consult them; pairing never does).
-    let core = SensorCore::new(16, 16, 16, 8, true);
+    let core = SensorCore::new(16, 16, 16, 8, 8, true);
     let ledger = core
         .ledger(
             [1, 2, 3, 4, 5],
@@ -278,7 +278,7 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
     // per-program miss absolutes by section (the one join site) and
     // carries the final absolutes for the canary's GO-baselines.
     use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
-    let core = SensorCore::new(16, 16, 16, 8, true);
+    let core = SensorCore::new(16, 16, 16, 8, 8, true);
     let base = vec![
         ProgMisses {
             section: "fsession/a".to_owned(),
@@ -306,11 +306,11 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             cur.clone(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: base,
                 enrichment: EnrichmentStatus::Available {
@@ -333,7 +333,7 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
     // Round-10 astra-Major: a backwards miss join refuses the
     // terminal ledger (no ledger, no clean verdict — never zero).
     use kryprobe_privilege::kcrypto_lifecycle::view::ProgMisses;
-    let core = SensorCore::new(16, 16, 16, 8, true);
+    let core = SensorCore::new(16, 16, 16, 8, 8, true);
     let base = vec![ProgMisses {
         section: "fsession/a".to_owned(),
         id: 11,
@@ -347,11 +347,11 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
     let err = core
         .ledger(
             [0; 5],
-            [0; 18],
+            [0; 22],
             cur,
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 18],
+                agg_baseline: [0; 22],
                 view_valid: true,
                 miss_baseline: base,
                 enrichment: EnrichmentStatus::Available {
@@ -372,7 +372,7 @@ fn ingest_op_edge_admits_first_seen_transform() {
     // — F05). Returns never admit (R2: no exit-side chase — the
     // paired return joins by invocation only); a 0 submit word
     // counts unlinked.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
     core.ingest_records(&[edge_bytes_tfm(
         1,
@@ -471,12 +471,12 @@ fn mixed_inventory_destroys_green_through_production_ingest() {
         ),
         tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 550, 0, 0, 0, 10, b""),
     ];
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     core.ingest_records(&stream);
     core.finish(600);
     // Lossless ring: accepted == consumed on every lane.
     let probe = core
-        .ledger([0; 5], [0; 18], Vec::new(), ctx())
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
         .expect("probe ledger");
     let ledger = core
         .ledger([0; 5], probe.edge_hits, Vec::new(), ctx())
@@ -516,7 +516,7 @@ fn ingest_zero_word_op_voids_exact_reuse() {
     // zero-word op submit (no admission, no other refusal) still
     // voids exact reuse — the unidentified operation is an identity
     // gap, not a clean session.
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     core.ingest_records(&[edge_bytes(1, 1, 0xdef, 200, 0, 0)]);
     assert_eq!(core.tfm().stats().unlinked_ops, 1);
     assert!(
@@ -549,14 +549,14 @@ fn ledger_carries_enrichment_status_both_arms() {
     // registry snapshot from a failed one WITH its reason —
     // capture never refuses on enrichment, but the report never
     // stays silent about its absence either.
-    let core = SensorCore::new(16, 16, 16, 8, true);
+    let core = SensorCore::new(16, 16, 16, 8, 8, true);
     let mut available = ctx();
     available.enrichment = EnrichmentStatus::Available {
         entries: 41,
         truncated: true,
     };
     let ledger = core
-        .ledger([0; 5], [0; 18], Vec::new(), available)
+        .ledger([0; 5], [0; 22], Vec::new(), available)
         .expect("empty miss join");
     assert_eq!(
         ledger.enrichment,
@@ -570,7 +570,7 @@ fn ledger_carries_enrichment_status_both_arms() {
         reason: "No such file or directory (os error 2)".to_owned(),
     };
     let ledger = core
-        .ledger([0; 5], [0; 18], Vec::new(), missing)
+        .ledger([0; 5], [0; 22], Vec::new(), missing)
         .expect("empty miss join");
     assert_eq!(
         ledger.enrichment,
@@ -746,7 +746,7 @@ fn suppressed_free_forces_ambiguous_retire_at_ingest() {
             b"drv",
         ),
     ];
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     core.ingest_records(&stream);
     let tracker = core.tfm();
     let stats = tracker.stats();
@@ -820,7 +820,7 @@ fn shared_release_retained_then_final_at_ingest() {
         tfm_record(LEDGE_SUBMIT, LTFM_SITE_DESTROY, base, 300, 0, 1, 1, 6, b""),
         tfm_record(LEDGE_RETURN, LTFM_SITE_DESTROY, 0, 350, 0, 0, 0, 6, b""),
     ];
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     core.ingest_records(&stream);
     let tracker = core.tfm();
     let stats = tracker.stats();
@@ -902,7 +902,7 @@ fn invalid_authsize_records_failure_without_epoch_at_ingest() {
             b"",
         ),
     ];
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     core.ingest_records(&stream);
     let tracker = core.tfm();
     let stats = tracker.stats();

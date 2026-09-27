@@ -2078,7 +2078,7 @@ fn lifecycle_test_ledger(
         retained_dropped: 0,
         view_valid: true,
         loss_baseline: [0; 5],
-        agg_baseline: [0; 18],
+        agg_baseline: [0; 22],
         prog_misses: Vec::new(),
         miss_current: Vec::new(),
         tfm_stats: kryprobe_privilege::kcrypto_lifecycle::tfm::TfmStats::default(),

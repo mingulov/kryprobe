@@ -149,7 +149,7 @@ fn destroy_pair(token: u64, ts: u64, base: u64) -> Vec<Vec<u8>> {
 fn ctx() -> SessionContext {
     SessionContext {
         loss_baseline: [0; 5],
-        agg_baseline: [0; 18],
+        agg_baseline: [0; 22],
         view_valid: true,
         miss_baseline: Vec::new(),
         enrichment: EnrichmentStatus::Available {
@@ -161,7 +161,7 @@ fn ctx() -> SessionContext {
 
 #[test]
 fn request_storage_reused_1000_times_has_distinct_ids() {
-    let mut core = SensorCore::new(2048, 2048, 2048, 8, true);
+    let mut core = SensorCore::new(2048, 2048, 2048, 8, 8, true);
     let key = 0xabc_u64; // same request storage, reused 1,000 times
     let frontend = 0xFFFF_8880_0000_1000_u64; // one pre-attach transform
     let mut recs = Vec::with_capacity(2000);
@@ -198,7 +198,7 @@ fn request_storage_reused_1000_times_has_distinct_ids() {
 
 #[test]
 fn nested_same_storage_returns_pair_to_own_cookie() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let key = 0xabc_u64;
     let frontend = 0xFFFF_8880_0000_1000_u64;
     // Outer submit A, inner submit B (same storage, nested), B returns, A returns.
@@ -220,14 +220,14 @@ fn nested_same_storage_returns_pair_to_own_cookie() {
         assert_eq!(r.terminal, Terminal::Sync(0));
         assert_eq!(r.meta.cryptlen, Some(16));
     }
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.admitted, 2);
     assert_eq!(ledger.decode.unknown_invoc_returns, 0);
 }
 
 #[test]
 fn migration_preserves_invocation() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let key = 0xabc_u64;
     let frontend = 0xFFFF_8880_0000_1000_u64;
     // The exit run reads the per-call cookie, not a CPU-keyed slot: the
@@ -263,21 +263,21 @@ fn migration_preserves_invocation() {
         op_return(key, 250, 0x5002, 0),
     ]);
     assert_eq!(joined, 0, "flipped invocation never binds");
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
     assert_eq!(ledger.decode.admitted, 2);
 }
 
 #[test]
 fn missing_submit_never_binds_return() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let key = 0xabc_u64;
     // Return with no submit: counted, never joined, never admitted.
     assert_eq!(core.ingest_records(&[op_return(key, 150, 0x4000, 0)]), 0);
     assert!(core.take_completed().is_empty());
     assert!(core.tfm().generations().is_empty(), "returns never admit");
     assert_eq!(core.tfm().stats().unlinked_ops, 0);
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
     assert_eq!(ledger.decode.admitted, 0);
     // Submit with no return: binding happens AT SUBMIT, but the missing
@@ -297,13 +297,13 @@ fn missing_submit_never_binds_return() {
         "submit-side binding, return or not"
     );
     assert!(!done[0].evidence_valid());
-    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 22], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.reducer.unfinished, 1);
 }
 
 #[test]
 fn pre_attach_transform_keeps_creation_unknown() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     // No alloc observed: the op names a pre-attach transform.
     let recs = vec![
         op_submit(0xabc, 100, 0x4000, 0xFFFF_8880_0000_1000),
@@ -330,7 +330,7 @@ fn pre_attach_transform_keeps_creation_unknown() {
 
 #[test]
 fn early_enokey_does_not_claim_provider_entry() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000_u64;
     // Allocated transform, FAILED key setup: the wrapper failed, so the
     // generation records the failure and the epoch does not move.
@@ -373,7 +373,7 @@ fn early_enokey_does_not_claim_provider_entry() {
 
 #[test]
 fn tfm_binding_uses_submit_lifetime_not_later_reuse() {
-    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
     let f = 0xFFFF_8880_0000_1000_u64; // frontend; base is f+8
     let base = f + 8;
     // G1 allocated; op submits against G1; G1 destroyed (proved final);
