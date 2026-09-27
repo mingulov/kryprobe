@@ -17,7 +17,7 @@
 //! exact shape (see the oracle): the canary fails loudly on drift
 //! instead of pinning observations.
 
-use kryprobe_core::kcrypto::Terminal;
+use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection, Terminal};
 use kryprobe_privilege::btf_resolve::{AttachOutcome, resolve_kfunc_ids, resolve_lifecycle_ids};
 use kryprobe_privilege::host::monotonic_ns;
 use kryprobe_privilege::kcrypto_lifecycle::canary::{
@@ -526,14 +526,43 @@ fn main() {
                 Terminal::Callback(status) => ("callback", Some(status)),
                 Terminal::Unknown => ("unknown", None),
             };
+            // P5r2: per-request submit metadata (the verdict's join
+            // inputs — retained so reviewers can reconcile observed
+            // family/direction/lengths/flags/epoch/binding against
+            // the fixture ledger independently). Existing fields
+            // (`id`/`terminal`/`status`/`duration_ns`) keep their
+            // names, order, and types; the new keys append after
+            // them. Gen lines above are unchanged.
+            let family = match record.meta.family {
+                LifecycleFamily::Aead => "aead",
+                LifecycleFamily::Skcipher => "skcipher",
+            };
+            let direction = match record.meta.direction {
+                OpDirection::Encrypt => "encrypt",
+                OpDirection::Decrypt => "decrypt",
+            };
+            let opt = |v: Option<u32>| v.map_or("null".to_owned(), |n| n.to_string());
+            let opt64 = |v: Option<u64>| v.map_or("null".to_owned(), |n| n.to_string());
+            let (assoc, authsize) = match record.meta.aead {
+                Some(ext) => (opt(ext.assoclen), opt(ext.authsize)),
+                None => ("null".to_owned(), "null".to_owned()),
+            };
             text.push_str(&format!(
-                "{{\"id\":{},\"terminal\":\"{}\",\"status\":{},\"duration_ns\":{}}}\n",
+                "{{\"id\":{},\"terminal\":\"{}\",\"status\":{},\"duration_ns\":{},\"family\":\"{}\",\"direction\":\"{}\",\"cryptlen\":{},\"flags\":{},\"assoc\":{},\"authsize\":{},\"epoch\":{},\"tfm_id\":{}}}\n",
                 record.id,
                 terminal,
                 status.map_or("null".to_owned(), |s| s.to_string()),
                 record
                     .duration_ns
                     .map_or("null".to_owned(), |d| d.to_string()),
+                family,
+                direction,
+                opt(record.meta.cryptlen),
+                opt(record.meta.req_flags),
+                assoc,
+                authsize,
+                opt64(record.meta.epoch),
+                opt64(record.tfm_id),
             ));
         }
         if let Err(err) = std::fs::write(&path, &text) {

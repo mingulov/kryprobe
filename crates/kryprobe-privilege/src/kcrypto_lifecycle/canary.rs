@@ -32,7 +32,8 @@ use crate::kcrypto_lifecycle::view::ProgMisses;
 use kryprobe_abi::kcrypto_lifecycle::{
     LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
 };
-use kryprobe_core::kcrypto::{ReducerStats, RequestRecord, Terminal};
+use kryprobe_core::kcrypto::aead::{derive_attempt, qualify_success};
+use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection, ReducerStats, RequestRecord, Terminal};
 
 /// One fixture op (sequence order).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,13 @@ pub struct FixtureOp {
     pub seq: u64,
     /// `encrypt`/`decrypt` (sk flavors) or `aead-encrypt`/`aead-decrypt`.
     pub op: String,
+    /// API input length (`len` on the submit row — P5r2: required
+    /// on AEAD submits (workload truth for the metadata join),
+    /// optional on sk submits (retained when present, ignored by
+    /// the sk arms).
+    pub len: Option<u32>,
+    /// Request flags (`flags` on the submit row — same rule as `len`).
+    pub flags: Option<u32>,
     /// AEAD associated-data length (T10: `Some` iff the label is an
     /// AEAD label — the parser enforces `Some` ⟺ AEAD, mirroring
     /// the contract-v2 `AeadMeta` rule).
@@ -121,6 +129,12 @@ pub struct FixtureTruth {
     /// Row-order evidence (P4r2): `(seq, row_index)` for every
     /// terminal row in row order.
     pub terminal_lines: Vec<(u64, usize)>,
+    /// Row-order evidence (P5r2): `(alloc seq, row_index)` for every
+    /// config row in row order, parallel to [`FixtureTruth::configs`]
+    /// (same length, same order) — the metadata join derives each
+    /// submit's keying era from the successful configs that precede
+    /// its submit row, never timestamps or scenario constants.
+    pub config_lines: Vec<(u64, usize)>,
     /// Allocation rows in sequence order (T07-R2-04).
     pub allocs: Vec<FixtureAlloc>,
     /// Release rows in row order (T07-R2-04).
@@ -326,6 +340,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     let mut submit_lines: Vec<(u64, usize)> = Vec::new();
     let mut return_lines: Vec<(u64, usize)> = Vec::new();
     let mut terminal_lines: Vec<(u64, usize)> = Vec::new();
+    let mut config_lines: Vec<(u64, usize)> = Vec::new();
     let mut allocs: Vec<FixtureAlloc> = Vec::new();
     let mut frees: Vec<FixtureFree> = Vec::new();
     let mut configs: Vec<FixtureConfig> = Vec::new();
@@ -451,6 +466,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     errno: get_i32(obj, "errno", line_no, "config row lacks an errno")?,
                     len: get_u32(obj, "len", line_no, "config row lacks a len")?,
                 });
+                config_lines.push((seq, idx));
             }
             "progress" => {
                 let seq = get_u64(obj, "seq", line_no, "progress row lacks a sequence")?;
@@ -524,10 +540,17 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 // the contract-v2 `AeadMeta` rule — an AEAD submit
                 // without its widths, or an sk submit carrying
                 // them, is drift, never a default).
-                let (assoc, authsize) = if is_aead {
+                // P5r2: AEAD submits additionally carry required
+                // `len`/`flags` workload truth (the metadata join's
+                // input-length/flags expectations); sk submits retain
+                // them when present (exact-typed, never coerced) and
+                // stay `None` when absent (the sk arms ignore them).
+                let (len, flags, assoc, authsize) = if is_aead {
+                    let len = get_u32(obj, "len", line_no, "aead submit lacks len")?;
+                    let flags = get_u32(obj, "flags", line_no, "aead submit lacks flags")?;
                     let assoc = get_u32(obj, "assoc", line_no, "aead submit lacks assoc")?;
                     let authsize = get_u32(obj, "authsize", line_no, "aead submit lacks authsize")?;
-                    (Some(assoc), Some(authsize))
+                    (Some(len), Some(flags), Some(assoc), Some(authsize))
                 } else {
                     if obj.contains_key("assoc") || obj.contains_key("authsize") {
                         return Err(TranscriptError {
@@ -535,11 +558,31 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                             reason: "sk submit carries AEAD fields",
                         });
                     }
-                    (None, None)
+                    let len = match obj.get("len") {
+                        None => None,
+                        Some(v) => Some(v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(
+                            TranscriptError {
+                                line: line_no,
+                                reason: "sk submit len is not a u32",
+                            },
+                        )?),
+                    };
+                    let flags = match obj.get("flags") {
+                        None => None,
+                        Some(v) => Some(v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(
+                            TranscriptError {
+                                line: line_no,
+                                reason: "sk submit flags is not a u32",
+                            },
+                        )?),
+                    };
+                    (len, flags, None, None)
                 };
                 ops.push(FixtureOp {
                     seq,
                     op: op.to_owned(),
+                    len,
+                    flags,
                     assoc,
                     authsize,
                 });
@@ -692,6 +735,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         submit_lines,
         return_lines,
         terminal_lines,
+        config_lines,
         allocs,
         frees,
         configs,
@@ -1800,6 +1844,270 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     Ok(())
 }
 
+/// Expected submit keying era for one op (P5r2): the count of
+/// successful configs for the bound alloc whose rows precede the
+/// op's submit row (row order, never timestamps or scenario
+/// constants — a failed config never advances the era).
+fn expected_submit_epoch(
+    truth: &FixtureTruth,
+    op_seq: u64,
+    bound_alloc: u64,
+) -> Result<u64, String> {
+    let submit_row = row_line(&truth.submit_lines, op_seq)
+        .ok_or_else(|| format!("op seq {op_seq} lacks a submit row for the epoch check"))?;
+    // `config_lines` parallels `configs` (same length, same order —
+    // both pushed together in the config arm).
+    if truth.config_lines.len() != truth.configs.len() {
+        return Err("config row evidence desynced from configs".to_owned());
+    }
+    let mut epoch = 0u64;
+    for (cfg, (_, cfg_row)) in truth.configs.iter().zip(truth.config_lines.iter()) {
+        if cfg.seq != bound_alloc || cfg.errno != 0 {
+            continue;
+        }
+        if *cfg_row < submit_row {
+            epoch = epoch.saturating_add(1);
+        }
+    }
+    Ok(epoch)
+}
+
+/// AEAD per-request metadata reconciliation (P5r2 — closes P5-N1):
+/// join each sensor completion's submit-pinned metadata against
+/// independent fixture truth + fresh generation binding. Called from
+/// the AEAD sync/async arms after the terminal join. Checks family,
+/// direction, input length, flags, assoclen, authsize, submit epoch,
+/// and transform binding per request (pairwise by index — the
+/// fixture runs sequentially, so return order == op order), then
+/// independently joins the attempted vs terminal-success-qualified
+/// byte populations (per-op derivation equality + aggregate success
+/// totals — a failed op's bytes must never qualify).
+///
+/// AEAD-labeled ops carry full submit-row truth and join every
+/// field. The `authsize` legacy op (plain `encrypt` label, AEAD
+/// site) carries len/flags truth but no submit-row assoc/authsize —
+/// its extension must still be present (Aead family implies `Some`),
+/// its authsize joins the last successful setauthsize before its
+/// submit (ledger-derived, never a constant), and its assoc value is
+/// unchecked (no workload truth — documented residual; `aead-meta`
+/// covers nonzero assoc thoroughly).
+fn verdict_aead_metadata(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+) -> Result<(), String> {
+    // Single-lifetime binding: every AEAD scenario runs one alloc,
+    // so every op binds fresh[0]; anything else fails closed (no
+    // binding truth).
+    if truth.allocs.len() != 1 {
+        return Err(format!(
+            "{scenario}: AEAD metadata join needs 1 alloc, fixture ran {}",
+            truth.allocs.len()
+        ));
+    }
+    let bound_alloc = truth.allocs[0].seq;
+    let fresh = fresh_generations(truth, view)?;
+    let want_tfm = fresh[0].id;
+    if view.completed.len() != truth.ops.len() {
+        return Err(format!(
+            "{scenario}: metadata join needs {} completions, have {}",
+            truth.ops.len(),
+            view.completed.len()
+        ));
+    }
+    // Per-request field join.
+    for (i, op) in truth.ops.iter().enumerate() {
+        let record = &view.completed[i];
+        let tag = format!("{scenario} op seq {}", op.seq);
+        // Family: every AEAD-arm op hooks an AEAD site (including
+        // `authsize`'s plain-labeled op).
+        if record.meta.family != LifecycleFamily::Aead {
+            return Err(format!("{tag}: family {:?} != Aead", record.meta.family));
+        }
+        // Direction from the closed label set.
+        let want_dir = match op.op.as_str() {
+            "aead-encrypt" | "encrypt" => OpDirection::Encrypt,
+            "aead-decrypt" => OpDirection::Decrypt,
+            _ => {
+                return Err(format!("{tag}: label {:?} is not an AEAD-arm op", op.op));
+            }
+        };
+        if record.meta.direction != want_dir {
+            return Err(format!(
+                "{tag}: direction {:?} != {want_dir:?} for {:?}",
+                record.meta.direction, op.op
+            ));
+        }
+        // Input length + flags from the submit row.
+        let want_len = op
+            .len
+            .ok_or_else(|| format!("{tag}: submit row lacks len truth"))?;
+        if record.meta.cryptlen != Some(want_len) {
+            return Err(format!(
+                "{tag}: cryptlen {:?} != fixture {want_len}",
+                record.meta.cryptlen
+            ));
+        }
+        let want_flags = op
+            .flags
+            .ok_or_else(|| format!("{tag}: submit row lacks flags truth"))?;
+        if record.meta.req_flags != Some(want_flags) {
+            return Err(format!(
+                "{tag}: req_flags {:?} != fixture {want_flags}",
+                record.meta.req_flags
+            ));
+        }
+        // AEAD widths: full join on AEAD labels; presence +
+        // config-derived authsize on the legacy `authsize` label.
+        match (op.assoc, op.authsize) {
+            (Some(want_assoc), Some(want_auth)) => {
+                let ext = record
+                    .meta
+                    .aead
+                    .ok_or_else(|| format!("{tag}: missing AEAD extension"))?;
+                if ext.assoclen != Some(want_assoc) {
+                    return Err(format!(
+                        "{tag}: assoclen {:?} != fixture {want_assoc}",
+                        ext.assoclen
+                    ));
+                }
+                if ext.authsize != Some(want_auth) {
+                    return Err(format!(
+                        "{tag}: authsize {:?} != fixture {want_auth}",
+                        ext.authsize
+                    ));
+                }
+            }
+            _ => {
+                // Legacy `authsize` op: no submit-row widths. The
+                // extension must still be present (Aead family), and
+                // the authsize joins the last successful setauthsize
+                // before the submit (the keying truth); assoc has no
+                // workload truth and stays unchecked (residual).
+                let ext = record
+                    .meta
+                    .aead
+                    .ok_or_else(|| format!("{tag}: missing AEAD extension"))?;
+                let submit_row = row_line(&truth.submit_lines, op.seq)
+                    .ok_or_else(|| format!("{tag}: lacks a submit row for the authsize check"))?;
+                let mut want_auth: Option<u32> = None;
+                for (cfg, (_, cfg_row)) in truth.configs.iter().zip(truth.config_lines.iter()) {
+                    if cfg.seq != bound_alloc || cfg.op != "setauthsize" || cfg.errno != 0 {
+                        continue;
+                    }
+                    if *cfg_row < submit_row {
+                        want_auth = Some(cfg.len);
+                    }
+                }
+                let want_auth = want_auth
+                    .ok_or_else(|| format!("{tag}: no successful setauthsize before submit"))?;
+                if ext.authsize != Some(want_auth) {
+                    return Err(format!(
+                        "{tag}: authsize {:?} != last successful setauthsize {want_auth}",
+                        ext.authsize
+                    ));
+                }
+                let _ = ext.assoclen;
+            }
+        }
+        // Submit epoch: successful configs before the submit row.
+        let want_epoch = expected_submit_epoch(truth, op.seq, bound_alloc)?;
+        if record.meta.epoch != Some(want_epoch) {
+            return Err(format!(
+                "{tag}: submit epoch {:?} != {want_epoch} successful configs",
+                record.meta.epoch
+            ));
+        }
+        // Transform binding: the single fresh generation.
+        if record.tfm_id != Some(want_tfm) {
+            return Err(format!(
+                "{tag}: tfm_id {:?} != generation {want_tfm}",
+                record.tfm_id
+            ));
+        }
+    }
+    // Attempted vs success-qualified populations (independent join):
+    // per-op derivation equality plus per-op success equality plus
+    // aggregate success totals. AEAD-labeled ops only (the legacy
+    // `authsize` op lacks submit-row widths, so its attempt is
+    // underivable from workload truth — residual).
+    let mut sensor_totals = (0u32, 0u32, 0u32);
+    let mut fixture_totals = (0u32, 0u32, 0u32);
+    for (i, op) in truth.ops.iter().enumerate() {
+        let (Some(f_len), Some(f_assoc), Some(f_auth)) = (op.len, op.assoc, op.authsize) else {
+            continue;
+        };
+        let want_dir = match op.op.as_str() {
+            "aead-encrypt" => OpDirection::Encrypt,
+            "aead-decrypt" => OpDirection::Decrypt,
+            _ => continue,
+        };
+        let record = &view.completed[i];
+        // The field join above already pinned these `Some`; re-read
+        // them fail-closed (never unwrap — a `None` here is a join
+        // bug, and the message must name it).
+        let (Some(s_len), Some(s_ext)) = (record.meta.cryptlen, record.meta.aead) else {
+            return Err(format!(
+                "{scenario} op seq {}: sensor widths vanished after the field join",
+                op.seq
+            ));
+        };
+        let sensor_attempt =
+            derive_attempt(record.meta.direction, s_len, s_ext.assoclen, s_ext.authsize);
+        let fixture_attempt = derive_attempt(want_dir, f_len, Some(f_assoc), Some(f_auth));
+        if sensor_attempt != fixture_attempt {
+            return Err(format!(
+                "{scenario} op seq {}: sensor attempt {sensor_attempt:?} != fixture {fixture_attempt:?}",
+                op.seq
+            ));
+        }
+        // Fixture terminal: queued returns complete via callback,
+        // sync returns complete inline (mirrors the arm's terminal
+        // join — the sensor status already equals the fixture errno
+        // pairwise, and both `Sync(0)`/`Callback(0)` qualify).
+        let ret_errno = truth
+            .returns
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, e)| *e);
+        let term_errno = truth
+            .terminals
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, e)| *e);
+        let fixture_terminal = match (ret_errno, term_errno) {
+            (Some(-115) | Some(-16), Some(t)) => Terminal::Callback(t),
+            (Some(r), Some(t)) if r == t => Terminal::Sync(t),
+            _ => {
+                return Err(format!(
+                    "{scenario} op seq {}: fixture return/terminal unjoinable ({ret_errno:?}/{term_errno:?})",
+                    op.seq
+                ));
+            }
+        };
+        let sensor_ok = qualify_success(&sensor_attempt, record.terminal);
+        let fixture_ok = qualify_success(&fixture_attempt, fixture_terminal);
+        if sensor_ok != fixture_ok {
+            return Err(format!(
+                "{scenario} op seq {}: sensor qualified {sensor_ok:?} != fixture {fixture_ok:?}",
+                op.seq
+            ));
+        }
+        sensor_totals.0 = sensor_totals.0.saturating_add(sensor_ok.input);
+        sensor_totals.1 = sensor_totals.1.saturating_add(sensor_ok.payload);
+        sensor_totals.2 = sensor_totals.2.saturating_add(sensor_ok.aad);
+        fixture_totals.0 = fixture_totals.0.saturating_add(fixture_ok.input);
+        fixture_totals.1 = fixture_totals.1.saturating_add(fixture_ok.payload);
+        fixture_totals.2 = fixture_totals.2.saturating_add(fixture_ok.aad);
+    }
+    if sensor_totals != fixture_totals {
+        return Err(format!(
+            "{scenario}: sensor qualified totals {sensor_totals:?} != fixture {fixture_totals:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Sync op shape: grounded completions pairwise-joined to fixture
 /// errnos (shared by every scenario with synchronous sk ops).
 fn verdict_op_sync(
@@ -1898,6 +2206,12 @@ fn verdict_op_sync(
         if record.duration_ns.is_none() {
             return Err(format!("completion {i} (seq {seq}) lacks a duration"));
         }
+    }
+    // P5r2: AEAD per-request metadata join (family/direction/len/
+    // flags/assoc/authsize/epoch/binding + attempted-vs-qualified
+    // populations) — sk arms reconcile identity/counts only.
+    if matches!(scenario, "authsize" | "aead-meta" | "aead-live") {
+        verdict_aead_metadata(scenario, truth, view)?;
     }
     Ok(())
 }
@@ -2051,6 +2365,10 @@ fn verdict_op_async_aead(
             "async AEAD unfinished delta {unfinished_d} != 0 (expected-complete)"
         ));
     }
+    // P5r2: AEAD per-request metadata join (same contract as the
+    // sync AEAD arms — pairwise by index: sequential ops complete
+    // in submit order).
+    verdict_aead_metadata(scenario, truth, view)?;
     Ok(())
 }
 
@@ -2912,8 +3230,10 @@ mod tests {
     use super::*;
     use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection, RequestMeta};
 
-    /// P3 submit metadata for synthetic canary records (entry-side
-    /// scalars; the canary reconciles identity/counts, not metadata).
+    /// P3 submit metadata for synthetic SK canary records
+    /// (entry-side scalars; the sk arms reconcile identity/counts,
+    /// not metadata — the AEAD arms additionally reconcile metadata
+    /// via [`verdict_aead_metadata`], using [`aead_meta`] below).
     fn test_meta() -> RequestMeta {
         RequestMeta {
             family: LifecycleFamily::Skcipher,
@@ -2923,6 +3243,83 @@ mod tests {
             epoch: Some(0),
             aead: None,
         }
+    }
+
+    /// P5r2 AEAD submit metadata for synthetic canary records: the
+    /// entry-observed scalars the AEAD arms join against fixture
+    /// truth (family always Aead, extension always present).
+    fn aead_meta(
+        direction: OpDirection,
+        cryptlen: u32,
+        flags: u32,
+        assoc: u32,
+        authsize: u32,
+        epoch: u64,
+    ) -> RequestMeta {
+        RequestMeta {
+            family: LifecycleFamily::Aead,
+            direction,
+            cryptlen: Some(cryptlen),
+            req_flags: Some(flags),
+            epoch: Some(epoch),
+            aead: Some(kryprobe_core::kcrypto::AeadMeta {
+                assoclen: Some(assoc),
+                authsize: Some(authsize),
+            }),
+        }
+    }
+
+    /// P5r2 AEAD completion record for synthetic canary views: bound
+    /// to generation 1 at the given submit epoch, with an observed
+    /// span (the metadata join pins every scalar).
+    #[allow(clippy::too_many_arguments)]
+    fn aead_record(
+        id: u64,
+        terminal: Terminal,
+        direction: OpDirection,
+        cryptlen: u32,
+        flags: u32,
+        assoc: u32,
+        authsize: u32,
+        epoch: u64,
+    ) -> RequestRecord {
+        RequestRecord {
+            id,
+            tfm_id: Some(1),
+            terminal,
+            duration_ns: Some(100),
+            meta: aead_meta(direction, cryptlen, flags, assoc, authsize, epoch),
+        }
+    }
+
+    /// P5r2 view builder for the mutation controls (single alloc,
+    /// exact reuse, zero loss — the metadata join's surrounding
+    /// gates all green, so only the mutated field can fail).
+    fn p5r2_view<'a>(
+        completed: &'a [RequestRecord],
+        gens: &'a [GenerationInfo],
+        lanes: [u64; 22],
+        admitted: u64,
+        tfm_admitted: u64,
+        configs_joined: u64,
+        configs_failed: u64,
+    ) -> SensorView<'a> {
+        let mut view = sync_view(completed, gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = admitted;
+        view.reducer.admitted = admitted;
+        view.reducer.emitted = admitted;
+        view.reducer.unfinished = 0;
+        view.tfm.admitted = tfm_admitted;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = configs_joined;
+        view.tfm.configs_failed = configs_failed;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        view
     }
 
     /// Real sync transcript shape (alloc/config/submit/return/
@@ -3241,13 +3638,16 @@ mod tests {
         // provenance, no first-seen), the op hooked at the AEAD
         // enc site (lanes 18/19 — sk lanes 0/1 pin zero),
         // epochs/configs exact, and exactness intact (every
-        // boundary observed).
+        // boundary observed). P5r2: the op's submit row carries
+        // len/flags truth and the completion carries the observed
+        // AEAD metadata (assoc 0 — the fixture sets no AAD;
+        // authsize 16 — the last successful setauthsize).
         let run = "run-authsize";
         let text = [
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxc-aead-t07a","drv":"kxc-aead-t07a","type":0,"mask":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt","len":16,"flags":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":-22,"len":64}}"#),
@@ -3267,7 +3667,13 @@ mod tests {
             last_config_errno: -22,
             ..sync_gen()
         }];
-        let completed = [record(1, Terminal::Sync(0))];
+        let completed = [RequestRecord {
+            id: 1,
+            tfm_id: Some(1),
+            terminal: Terminal::Sync(0),
+            duration_ns: Some(100),
+            meta: aead_meta(OpDirection::Encrypt, 16, 0, 0, 16, 2),
+        }];
         // Widened-contract view: AEAD alloc halves on 12/13, the
         // op on 18/19, sk op lanes zero, one decode admission.
         let hooked: [u64; 22] = [
@@ -4576,16 +4982,17 @@ mod tests {
     fn transcript_aead_labels_carry_scalars() {
         // T10: the AEAD labels parse with their `assoc`/`authsize`
         // scalars (`Some` ⟺ AEAD); sk lanes skip them while the
-        // AEAD lanes count them.
+        // AEAD lanes count them. P5r2: AEAD submits additionally
+        // require `len`/`flags` workload truth.
         let run = "run-aead-labels";
         let rows = [
             format!(
-                r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"aead-encrypt","assoc":32,"authsize":16}}"#
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"aead-encrypt","len":1024,"flags":0,"assoc":32,"authsize":16}}"#
             ),
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"return","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"terminal","errno":0}}"#),
             format!(
-                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-decrypt","assoc":32,"authsize":8}}"#
+                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-decrypt","len":1032,"flags":0,"assoc":32,"authsize":8}}"#
             ),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
@@ -4593,20 +5000,25 @@ mod tests {
         ]
         .join("\n");
         let truth = parse_transcript(&rows, run).expect("aead labels parse");
+        assert_eq!(truth.ops[0].len, Some(1024));
+        assert_eq!(truth.ops[0].flags, Some(0));
         assert_eq!(truth.ops[0].assoc, Some(32));
         assert_eq!(truth.ops[0].authsize, Some(16));
+        assert_eq!(truth.ops[1].len, Some(1032));
+        assert_eq!(truth.ops[1].flags, Some(0));
         assert_eq!(truth.ops[1].assoc, Some(32));
         assert_eq!(truth.ops[1].authsize, Some(8));
         assert_eq!(truth.expected_hooks(), [0, 0, 0, 0]);
         assert_eq!(truth.expected_aead_hooks(), [1, 1, 1, 1]);
-        // An AEAD submit without its scalars refuses.
+        // An AEAD submit without its scalars refuses (len first —
+        // the parser pins workload truth before widths).
         let bad = [
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"aead-encrypt"}}"#),
             format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
         ]
         .join("\n");
         let err = parse_transcript(&bad, run).expect_err("scalarless AEAD must fail");
-        assert_eq!(err.reason, "aead submit lacks assoc");
+        assert_eq!(err.reason, "aead submit lacks len");
         // An sk submit carrying AEAD fields refuses.
         let bad = [
             format!(
@@ -4812,18 +5224,23 @@ mod tests {
         assert!(err.contains("order"), "names the ordering: {err}");
     }
 
-    /// One AEAD submit/return/terminal triple with its scalars.
+    /// One AEAD submit/return/terminal triple with its scalars
+    /// (P5r2: the submit row carries the full workload truth —
+    /// `len`/`flags`/`assoc`/`authsize` — the metadata join needs).
+    #[allow(clippy::too_many_arguments)]
     fn aead_rows(
         run: &str,
         seq: u64,
         op: &str,
+        len: u32,
+        flags: u32,
         assoc: u32,
         authsize: u32,
         errno: i32,
     ) -> Vec<String> {
         vec![
             format!(
-                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"submit","op":"{op}","assoc":{assoc},"authsize":{authsize}}}"#
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"submit","op":"{op}","len":{len},"flags":{flags},"assoc":{assoc},"authsize":{authsize}}}"#
             ),
             format!(r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"return","errno":{errno}}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"terminal","errno":{errno}}}"#),
@@ -4849,18 +5266,18 @@ mod tests {
                 r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#
             ),
         ];
-        rows.extend(aead_rows(run, 2, "aead-encrypt", 32, 16, 0));
-        rows.extend(aead_rows(run, 3, "aead-decrypt", 32, 16, 0));
-        rows.extend(aead_rows(run, 4, "aead-decrypt", 32, 16, -74));
-        rows.extend(aead_rows(run, 5, "aead-decrypt", 32, 16, -22));
+        rows.extend(aead_rows(run, 2, "aead-encrypt", 1024, 0, 32, 16, 0));
+        rows.extend(aead_rows(run, 3, "aead-decrypt", 1040, 0, 32, 16, 0));
+        rows.extend(aead_rows(run, 4, "aead-decrypt", 1040, 0, 32, 16, -74));
+        rows.extend(aead_rows(run, 5, "aead-decrypt", 8, 0, 32, 16, -22));
         rows.push(format!(
             r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":-22,"len":64}}"#
         ));
         rows.push(format!(
             r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":8}}"#
         ));
-        rows.extend(aead_rows(run, 6, "aead-encrypt", 32, 8, 0));
-        rows.extend(aead_rows(run, 7, "aead-decrypt", 32, 8, 0));
+        rows.extend(aead_rows(run, 6, "aead-encrypt", 1024, 0, 32, 8, 0));
+        rows.extend(aead_rows(run, 7, "aead-decrypt", 1032, 0, 32, 8, 0));
         rows.push(format!(
             r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#
         ));
@@ -4881,13 +5298,70 @@ mod tests {
             last_config_errno: 0,
             ..sync_gen()
         }];
+        // P5r2: completions carry the observed AEAD metadata
+        // (epochs 2,2,2,2,3,3 — the failed setauthsize advances
+        // nothing, the tag-8 success advances to 3).
         let completed = [
-            record(1, Terminal::Sync(0)),
-            record(2, Terminal::Sync(0)),
-            record(3, Terminal::Sync(-74)),
-            record(4, Terminal::Sync(-22)),
-            record(5, Terminal::Sync(0)),
-            record(6, Terminal::Sync(0)),
+            aead_record(
+                1,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                3,
+                Terminal::Sync(-74),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                4,
+                Terminal::Sync(-22),
+                OpDirection::Decrypt,
+                8,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                5,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                8,
+                3,
+            ),
+            aead_record(
+                6,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1032,
+                0,
+                32,
+                8,
+                3,
+            ),
         ];
         let lanes: [u64; 22] = [
             0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 3, 3, 1, 1, 1, 1, 0, 0, 2, 2, 4, 4,
@@ -4909,12 +5383,66 @@ mod tests {
         verdict("aead-meta", &truth, &view).expect("aead-meta green");
         // A bad-tag completion claiming success fails naming the errno.
         let completed = [
-            record(1, Terminal::Sync(0)),
-            record(2, Terminal::Sync(0)),
-            record(3, Terminal::Sync(0)),
-            record(4, Terminal::Sync(-22)),
-            record(5, Terminal::Sync(0)),
-            record(6, Terminal::Sync(0)),
+            aead_record(
+                1,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                3,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                4,
+                Terminal::Sync(-22),
+                OpDirection::Decrypt,
+                8,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                5,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                8,
+                3,
+            ),
+            aead_record(
+                6,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1032,
+                0,
+                32,
+                8,
+                3,
+            ),
         ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = lanes;
@@ -4946,12 +5474,12 @@ mod tests {
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
             format!(
-                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-encrypt","assoc":32,"authsize":16}}"#
+                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-encrypt","len":1024,"flags":0,"assoc":32,"authsize":16}}"#
             ),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
             format!(
-                r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"aead-decrypt","assoc":32,"authsize":16}}"#
+                r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"aead-decrypt","len":1040,"flags":0,"assoc":32,"authsize":16}}"#
             ),
             format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
             format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
@@ -4971,9 +5499,28 @@ mod tests {
             last_config_errno: 0,
             ..sync_gen()
         }];
+        // P5r2: completions carry the observed AEAD metadata.
         let completed = [
-            record(1, Terminal::Callback(0)),
-            record(2, Terminal::Callback(0)),
+            aead_record(
+                1,
+                Terminal::Callback(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Callback(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
         ];
         let lanes: [u64; 22] = [
             0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 1, 1, 1, 1,
@@ -4996,8 +5543,26 @@ mod tests {
         verdict("aead-async", &truth, &view).expect("aead-async green");
         // An unjoined (sync-claimed) completion fails.
         let completed = [
-            record(1, Terminal::Sync(0)),
-            record(2, Terminal::Callback(0)),
+            aead_record(
+                1,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Callback(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
         ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = lanes;
@@ -5023,6 +5588,7 @@ mod tests {
         // T10: `aead-live` runs the decrypt-1040 shape against real
         // gcm — the alloc row's selected driver compares exactly
         // (a driver lie fails), everything else the sync AEAD shape.
+        // P5r2: completions carry the observed AEAD metadata.
         let run = "run-aead-live";
         let mut rows = vec![
             format!(
@@ -5035,8 +5601,8 @@ mod tests {
                 r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#
             ),
         ];
-        rows.extend(aead_rows(run, 2, "aead-encrypt", 32, 16, 0));
-        rows.extend(aead_rows(run, 3, "aead-decrypt", 32, 16, 0));
+        rows.extend(aead_rows(run, 2, "aead-encrypt", 1024, 0, 32, 16, 0));
+        rows.extend(aead_rows(run, 3, "aead-decrypt", 1040, 0, 32, 16, 0));
         rows.push(format!(
             r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#
         ));
@@ -5055,7 +5621,28 @@ mod tests {
             last_config_errno: 0,
             ..sync_gen()
         }];
-        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let completed = [
+            aead_record(
+                1,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+        ];
         let lanes: [u64; 22] = [
             0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1,
         ];
@@ -5095,5 +5682,388 @@ mod tests {
         view.reuse_exact = true;
         let err = verdict("aead-live", &truth, &view).expect_err("driver lie must fail");
         assert!(err.contains("drv"), "names it: {err}");
+    }
+
+    /// P5r2 durable control: the sync AEAD join rejects every
+    /// per-request metadata corruption (own shape — live roundtrip
+    /// truth, decrypt leg mutated, positive + wrong-status controls).
+    #[test]
+    fn verdict_aead_live_rejects_metadata_corruption() {
+        let run = "p5r2-aead-live";
+        let mut rows = vec![
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"gcm(aes)","drv":"gcm-aesni","type":0,"mask":0}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#
+            ),
+        ];
+        rows.extend(aead_rows(run, 2, "aead-encrypt", 1024, 0, 32, 16, 0));
+        rows.extend(aead_rows(run, 3, "aead-decrypt", 1040, 0, 32, 16, 0));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#
+        ));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#
+        ));
+        let truth = parse_transcript(&rows.join("\n"), run).expect("p5r2 live parses");
+        let gens = [GenerationInfo {
+            req_name: "gcm(aes)".to_owned(),
+            drv_name: "gcm-aesni".to_owned(),
+            first_seen: false,
+            epoch: 2,
+            configs: 2,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 16,
+            last_config_errno: 0,
+            ..sync_gen()
+        }];
+        let lanes: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1,
+        ];
+        let green = [
+            aead_record(
+                1,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+        ];
+        verdict(
+            "aead-live",
+            &truth,
+            &p5r2_view(&green, &gens, lanes, 2, 4, 2, 0),
+        )
+        .expect("valid metadata passes");
+        // Each corruption names its field; the errno control names
+        // the status (terminal join still owns errno truth).
+        let cases: &[(&str, &str)] = &[
+            ("drop-aead-ext", "AEAD extension"),
+            ("family-sk", "family"),
+            ("direction-flip", "direction"),
+            ("cryptlen-unknown", "cryptlen"),
+            ("cryptlen-short", "cryptlen"),
+            ("flags-unknown", "req_flags"),
+            ("flags-noisy", "req_flags"),
+            ("assoc-unknown", "assoclen"),
+            ("assoc-huge", "assoclen"),
+            ("auth-unknown", "authsize"),
+            ("auth-wide", "authsize"),
+            ("epoch-unknown", "epoch"),
+            ("epoch-future", "epoch"),
+            ("tfm-unbound", "tfm_id"),
+        ];
+        for (name, needle) in cases {
+            let mut bad = green;
+            let rec = &mut bad[1];
+            match *name {
+                "drop-aead-ext" => rec.meta.aead = None,
+                "family-sk" => rec.meta.family = LifecycleFamily::Skcipher,
+                "direction-flip" => rec.meta.direction = OpDirection::Encrypt,
+                "cryptlen-unknown" => rec.meta.cryptlen = None,
+                "cryptlen-short" => rec.meta.cryptlen = Some(1),
+                "flags-unknown" => rec.meta.req_flags = None,
+                "flags-noisy" => rec.meta.req_flags = Some(u32::MAX),
+                "assoc-unknown" => rec.meta.aead.as_mut().unwrap().assoclen = None,
+                "assoc-huge" => rec.meta.aead.as_mut().unwrap().assoclen = Some(4096),
+                "auth-unknown" => rec.meta.aead.as_mut().unwrap().authsize = None,
+                "auth-wide" => rec.meta.aead.as_mut().unwrap().authsize = Some(64),
+                "epoch-unknown" => rec.meta.epoch = None,
+                "epoch-future" => rec.meta.epoch = Some(999),
+                "tfm-unbound" => rec.tfm_id = None,
+                _ => unreachable!("closed case list"),
+            }
+            let view = p5r2_view(&bad, &gens, lanes, 2, 4, 2, 0);
+            let Err(err) = verdict("aead-live", &truth, &view) else {
+                panic!("{name} must fail");
+            };
+            assert!(err.contains(needle), "{name} names {needle}: {err}");
+        }
+        let mut bad = green;
+        bad[1].terminal = Terminal::Sync(-74);
+        let view = p5r2_view(&bad, &gens, lanes, 2, 4, 2, 0);
+        let err = verdict("aead-live", &truth, &view).expect_err("errno lie must fail");
+        assert!(err.contains("status"), "errno control names status: {err}");
+    }
+
+    /// P5r2 durable control: the async AEAD join rejects the same
+    /// corruptions (callback-grounded shape — queued returns,
+    /// `Callback(0)` terminals, lane-17 attribution).
+    #[test]
+    fn verdict_aead_async_rejects_metadata_corruption() {
+        let run = "p5r2-aead-async";
+        let rows = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxaead-async-p5r2","drv":"kxaead-async-p5r2","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-encrypt","len":1024,"flags":0,"assoc":32,"authsize":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"aead-decrypt","len":1040,"flags":0,"assoc":32,"authsize":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&rows, run).expect("p5r2 async parses");
+        let gens = [GenerationInfo {
+            req_name: "kxaead-async-p5r2".to_owned(),
+            drv_name: "kxaead-async-p5r2".to_owned(),
+            first_seen: false,
+            epoch: 2,
+            configs: 2,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 16,
+            last_config_errno: 0,
+            ..sync_gen()
+        }];
+        let lanes: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 1, 1, 1, 1,
+        ];
+        let green = [
+            aead_record(
+                1,
+                Terminal::Callback(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Callback(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+        ];
+        verdict(
+            "aead-async",
+            &truth,
+            &p5r2_view(&green, &gens, lanes, 2, 4, 2, 0),
+        )
+        .expect("valid metadata passes");
+        let cases: &[(&str, &str)] = &[
+            ("drop-aead-ext", "AEAD extension"),
+            ("family-sk", "family"),
+            ("direction-flip", "direction"),
+            ("cryptlen-unknown", "cryptlen"),
+            ("cryptlen-short", "cryptlen"),
+            ("flags-unknown", "req_flags"),
+            ("flags-noisy", "req_flags"),
+            ("assoc-unknown", "assoclen"),
+            ("assoc-huge", "assoclen"),
+            ("auth-unknown", "authsize"),
+            ("auth-wide", "authsize"),
+            ("epoch-unknown", "epoch"),
+            ("epoch-future", "epoch"),
+            ("tfm-unbound", "tfm_id"),
+        ];
+        for (name, needle) in cases {
+            let mut bad = green;
+            let rec = &mut bad[0];
+            match *name {
+                "drop-aead-ext" => rec.meta.aead = None,
+                "family-sk" => rec.meta.family = LifecycleFamily::Skcipher,
+                "direction-flip" => rec.meta.direction = OpDirection::Decrypt,
+                "cryptlen-unknown" => rec.meta.cryptlen = None,
+                "cryptlen-short" => rec.meta.cryptlen = Some(7),
+                "flags-unknown" => rec.meta.req_flags = None,
+                "flags-noisy" => rec.meta.req_flags = Some(0xdead),
+                "assoc-unknown" => rec.meta.aead.as_mut().unwrap().assoclen = None,
+                "assoc-huge" => rec.meta.aead.as_mut().unwrap().assoclen = Some(511),
+                "auth-unknown" => rec.meta.aead.as_mut().unwrap().authsize = None,
+                "auth-wide" => rec.meta.aead.as_mut().unwrap().authsize = Some(24),
+                "epoch-unknown" => rec.meta.epoch = None,
+                "epoch-future" => rec.meta.epoch = Some(77),
+                "tfm-unbound" => rec.tfm_id = None,
+                _ => unreachable!("closed case list"),
+            }
+            let view = p5r2_view(&bad, &gens, lanes, 2, 4, 2, 0);
+            let Err(err) = verdict("aead-async", &truth, &view) else {
+                panic!("{name} must fail");
+            };
+            assert!(err.contains(needle), "{name} names {needle}: {err}");
+        }
+        let mut bad = green;
+        bad[0].terminal = Terminal::Sync(0);
+        let view = p5r2_view(&bad, &gens, lanes, 2, 4, 2, 0);
+        let err = verdict("aead-async", &truth, &view).expect_err("unjoined must fail");
+        assert!(err.contains("unjoined"), "names it: {err}");
+    }
+
+    /// P5r2 durable control: the mixed-errno schedule joins epochs
+    /// across reconfiguration (stale era/width fail) and still
+    /// rejects field corruption on the rekeyed leg.
+    #[test]
+    fn verdict_aead_meta_rejects_stale_era_and_corruption() {
+        let run = "p5r2-aead-meta";
+        let mut rows = vec![
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxaead-p5r2","drv":"kxaead-p5r2","type":0,"mask":0}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#
+            ),
+        ];
+        rows.extend(aead_rows(run, 2, "aead-encrypt", 1024, 0, 32, 16, 0));
+        rows.extend(aead_rows(run, 3, "aead-decrypt", 1040, 0, 32, 16, 0));
+        rows.extend(aead_rows(run, 4, "aead-decrypt", 1040, 0, 32, 16, -74));
+        rows.extend(aead_rows(run, 5, "aead-decrypt", 8, 0, 32, 16, -22));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":-22,"len":64}}"#
+        ));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":8}}"#
+        ));
+        rows.extend(aead_rows(run, 6, "aead-encrypt", 1024, 0, 32, 8, 0));
+        rows.extend(aead_rows(run, 7, "aead-decrypt", 1032, 0, 32, 8, 0));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#
+        ));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#
+        ));
+        let truth = parse_transcript(&rows.join("\n"), run).expect("p5r2 meta parses");
+        let gens = [GenerationInfo {
+            req_name: "kxaead-p5r2".to_owned(),
+            drv_name: "kxaead-p5r2".to_owned(),
+            first_seen: false,
+            epoch: 3,
+            configs: 4,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 8,
+            last_config_errno: 0,
+            ..sync_gen()
+        }];
+        let lanes: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 3, 3, 1, 1, 1, 1, 0, 0, 2, 2, 4, 4,
+        ];
+        let green = [
+            aead_record(
+                1,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                2,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                3,
+                Terminal::Sync(-74),
+                OpDirection::Decrypt,
+                1040,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                4,
+                Terminal::Sync(-22),
+                OpDirection::Decrypt,
+                8,
+                0,
+                32,
+                16,
+                2,
+            ),
+            aead_record(
+                5,
+                Terminal::Sync(0),
+                OpDirection::Encrypt,
+                1024,
+                0,
+                32,
+                8,
+                3,
+            ),
+            aead_record(
+                6,
+                Terminal::Sync(0),
+                OpDirection::Decrypt,
+                1032,
+                0,
+                32,
+                8,
+                3,
+            ),
+        ];
+        verdict(
+            "aead-meta",
+            &truth,
+            &p5r2_view(&green, &gens, lanes, 6, 6, 4, 1),
+        )
+        .expect("valid metadata passes");
+        // Stale era on the rekeyed leg (epoch 2 after the tag-8
+        // success moved to 3) fails naming the epoch.
+        let mut bad = green;
+        bad[4].meta.epoch = Some(2);
+        let view = p5r2_view(&bad, &gens, lanes, 6, 6, 4, 1);
+        let err = verdict("aead-meta", &truth, &view).expect_err("stale era must fail");
+        assert!(err.contains("epoch"), "names it: {err}");
+        // Stale width on the rekeyed leg (tag 16 after the
+        // reconfigure to 8) fails naming the authsize.
+        let mut bad = green;
+        bad[5].meta.aead.as_mut().unwrap().authsize = Some(16);
+        let view = p5r2_view(&bad, &gens, lanes, 6, 6, 4, 1);
+        let err = verdict("aead-meta", &truth, &view).expect_err("stale width must fail");
+        assert!(err.contains("authsize"), "names it: {err}");
+        // Field corruption on the rekeyed leg still fails (spot
+        // check — the live/async arms pin the full matrix).
+        let mut bad = green;
+        bad[5].meta.cryptlen = Some(11);
+        let view = p5r2_view(&bad, &gens, lanes, 6, 6, 4, 1);
+        let err = verdict("aead-meta", &truth, &view).expect_err("cryptlen lie must fail");
+        assert!(err.contains("cryptlen"), "names it: {err}");
+        // The bad-tag errno still owns terminal truth (a success
+        // claim fails naming -74, never the metadata).
+        let mut bad = green;
+        bad[2].terminal = Terminal::Sync(0);
+        let view = p5r2_view(&bad, &gens, lanes, 6, 6, 4, 1);
+        let err = verdict("aead-meta", &truth, &view).expect_err("errno lie must fail");
+        assert!(err.contains("-74"), "names the errno: {err}");
     }
 }
