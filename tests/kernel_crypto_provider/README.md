@@ -82,8 +82,17 @@ all reject).
   callback), submit 1 answers `-ENOSPC` immediately (terminal,
   exact, no callback follows). Any deviation fails the run
   (`-EPROTO`).
-- `early-callback`: pre-wait completion poll recorded as exactly one
-  progress row (hit or miss), then the terminal.
+- `early-callback` (P4r2, forced): the inline one-shot completes
+  the op INSIDE the submit call — the terminal row precedes the
+  return row deterministically (same thread), one notification, no
+  waiter-side progress marker. Any deviation fails the run.
+- `reuse-in-callback` (P4r2, forced): the outer submit completes
+  inline and the SAME terminal callback resubmits the request
+  storage — nested submit + return rows land before the outer
+  return row (reuse before unwind); the held drain releases only
+  after the outer return row, so the inner terminal lands last.
+  Forced full row order, both errnos pinned, any deviation fails
+  the run (`-EPROTO`).
 - `exact-driver`: generic-name alloc must resolve to exactly the
   async fixture driver (highest priority), else `-ENODEV`.
 - `failed-alloc`: unknown-name alloc; the probe triple carries the

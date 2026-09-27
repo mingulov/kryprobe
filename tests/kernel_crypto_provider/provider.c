@@ -289,6 +289,16 @@ static DEFINE_SPINLOCK(kxc_bq_lock);
 static struct work_struct kxc_drain_work;
 static atomic_t kxc_submit_hold;
 static atomic_t kxc_delay_ms;
+/*
+ * P4r2 one-shot inline completion: when set, the NEXT async submit
+ * completes synchronously inside the submit call (crypt + complete
+ * before the -EINPROGRESS return) instead of queueing. The
+ * scenario consumes it exactly once (cmpxchg); every exit path
+ * clears it, so a failed submit cannot arm a later scenario.
+ * Forced callback-before-return ordering, deterministic by
+ * construction (same thread — no worker race to win or lose).
+ */
+static atomic_t kxc_inline_once;
 
 static void kxc_async_fn(struct work_struct *work)
 {
@@ -359,10 +369,28 @@ void kxc_set_delay_ms(int ms)
 	atomic_set(&kxc_delay_ms, ms);
 }
 
+void kxc_set_inline_once(bool once)
+{
+	atomic_set(&kxc_inline_once, once ? 1 : 0);
+}
+
 static int kxc_async_crypt(struct skcipher_request *req)
 {
 	int err;
 
+	/*
+	 * P4r2 forced early completion: consume the one-shot and
+	 * complete inline (no queue, no worker, no lock held across
+	 * the completion — the nested resubmit path re-enters here
+	 * with the shot already spent, so it queues normally).
+	 * The -EINPROGRESS return still promises queued semantics:
+	 * the terminal callback simply fired first.
+	 */
+	if (atomic_cmpxchg(&kxc_inline_once, 1, 0) == 1) {
+		err = kxc_do_crypt(req);
+		crypto_request_complete(&req->base, err);
+		return -EINPROGRESS;
+	}
 	spin_lock_bh(&kxc_bq_lock);
 	err = crypto_enqueue_request(&kxc_bq, &req->base);
 	spin_unlock_bh(&kxc_bq_lock);

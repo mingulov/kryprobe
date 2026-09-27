@@ -1168,3 +1168,157 @@ fn sensor_unqualified_leaves_no_terminal_latency() {
     // The submit's metadata still rides (observed fact, not truth).
     assert_eq!(done[0].meta.cryptlen, Some(16));
 }
+
+#[test]
+fn adapter_note_submit_reports_cover_refusal() {
+    // P4-N2 (adapter level): `note_submit` reports whether the
+    // submit earned cover — the decoder retains contention for
+    // refused submits so no later callback can misjoin.
+    let mut a = AsyncAdapter::new(1);
+    assert!(a.note_submit(0xC01, 1, 100));
+    assert!(!a.note_submit(0xC01, 2, 200));
+    assert_eq!(a.stats().cover_refused, 1);
+}
+
+#[test]
+fn adapter_gap_key_invalidates_loud_or_orphans() {
+    // P4-N2 (adapter level): `gap_key` gaps EVERY live token under
+    // the key (counted ambiguity, edges for the reducer) — and
+    // when no live token remains, the unattributable evidence reads
+    // orphan (counted, never joined to a tombstone).
+    let mut a = AsyncAdapter::new(2);
+    a.note_submit(0xC02, 1, 100);
+    let edges = a.gap_key(0xC02);
+    assert_eq!(edges.len(), 1);
+    assert!(
+        matches!(
+            edges[0],
+            Edge::Gap {
+                id: 1,
+                reason: GapReason::IdentityAmbiguous
+            }
+        ),
+        "contended key must gap its live token, got {:?}",
+        edges[0]
+    );
+    assert_eq!(a.stats().ambiguous_keys, 1);
+    assert!(a.gap_key(0xC02).is_empty());
+    assert_eq!(a.stats().callback_orphans, 1);
+}
+
+#[test]
+fn sensor_refused_same_key_reuse_cannot_complete_old_token() {
+    // P4-N2 (sensor level): capacity 1; A submits/returns, its
+    // terminal unobserved; the caller legally reuses the completed
+    // storage for B (adapter cover refused — pool full); B's
+    // callback must NEVER terminally complete A. A gaps loud
+    // (Unknown, no span); B drains truthless; the refusal and the
+    // ambiguity both count.
+    let frontend = 0xFFFF_8880_0000_2000_u64;
+    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    core.ingest_records(&[
+        op_submit(0xBBB, 100, 0x5000, frontend, Some(0)),
+        op_return(0xBBB, 110, 0x5000, -libc::EINPROGRESS),
+        op_submit(0xBBB, 200, 0x5002, frontend, Some(0)),
+        op_return(0xBBB, 210, 0x5002, -libc::EINPROGRESS),
+        cb_v6(CB_CRYPTD, 0xBBB, 250, 0),
+    ]);
+    core.finish(5000);
+    let done = core.take_completed();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    assert_eq!(ledger.adapter.cover_refused, 1);
+    assert_eq!(ledger.adapter.ambiguous_keys, 1);
+    assert!(
+        !done.iter().any(|r| r.terminal == Terminal::Callback(0)),
+        "B's callback must never supply a terminal result: {done:?}"
+    );
+    let old = done.iter().find(|r| r.id == 1).expect("A completes");
+    assert_eq!(old.terminal, Terminal::Unknown);
+    assert_eq!(old.duration_ns, None);
+}
+
+#[test]
+fn sensor_refused_sync_reuse_clears_contention() {
+    // P4-N2 (precision): a refused same-key submit that completes
+    // SYNCHRONOUSLY never needs callback attribution — its return
+    // clears the contention, so the old token's own callback still
+    // joins cleanly (no gap, no ambiguity).
+    let frontend = 0xFFFF_8880_0000_3000_u64;
+    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    core.ingest_records(&[
+        op_submit(0xCCC, 100, 0x6000, frontend, Some(0)),
+        op_return(0xCCC, 110, 0x6000, -libc::EINPROGRESS),
+        // Same storage, refused cover — but a sync result.
+        op_submit(0xCCC, 200, 0x6002, frontend, Some(0)),
+        op_return(0xCCC, 210, 0x6002, 0),
+        // A's own terminal: joins (contention cleared).
+        cb_v6(CB_CRYPTD, 0xCCC, 250, 0),
+    ]);
+    core.finish(5000);
+    let done = core.take_completed();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    assert_eq!(ledger.adapter.cover_refused, 1);
+    assert_eq!(ledger.adapter.ambiguous_keys, 0);
+    let old = done.iter().find(|r| r.id == 1).expect("A completes");
+    assert_eq!(old.terminal, Terminal::Callback(0));
+    assert_eq!(old.duration_ns, Some(150));
+}
+
+#[test]
+fn sensor_refusal_contention_overflow_invalidates_loud() {
+    // P4-N2 (bound): refusal contention is decode-scale bounded —
+    // past capacity the oldest contention is forgotten LOUD (its
+    // key's live tokens gap immediately) instead of growing
+    // without bound or misjoining silently.
+    let frontend = 0xFFFF_8880_0000_4000_u64;
+    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    core.ingest_records(&[
+        // A covered (live pool full).
+        op_submit(0xD01, 100, 0x7000, frontend, Some(0)),
+        op_return(0xD01, 110, 0x7000, -libc::EINPROGRESS),
+        // B refused (first contention).
+        op_submit(0xD01, 200, 0x7002, frontend, Some(0)),
+        op_return(0xD01, 210, 0x7002, -libc::EINPROGRESS),
+        // C refused (overflow: B's contention forgotten loud —
+        // A gaps NOW, at C's submit).
+        op_submit(0xD02, 300, 0x7004, frontend, Some(0)),
+        op_return(0xD02, 310, 0x7004, -libc::EINPROGRESS),
+    ]);
+    core.finish(5000);
+    let done = core.take_completed();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    assert_eq!(ledger.adapter.cover_refused, 2);
+    assert_eq!(ledger.adapter.ambiguous_keys, 1);
+    let old = done.iter().find(|r| r.id == 1).expect("A completes");
+    assert_eq!(old.terminal, Terminal::Unknown);
+    assert_eq!(old.duration_ns, None);
+}
+
+#[test]
+fn adapter_debug_redacts_pairing_keys() {
+    // P4-N3: pairing keys render `<redacted>` at EVERY render —
+    // live AND tombstoned — per the allowlist redaction rule.
+    let key = 0xffff_8880_1234_5678_u64; // synthetic, never a real pointer
+    let mut a = AsyncAdapter::new(2);
+    a.note_submit(key, 1, 100);
+    let live = format!("{a:?}");
+    // Scan-visible renders (the P4r2 privacy scan re-checks these
+    // lines independently: key absent, marker present).
+    eprintln!("ADAPTER_RENDER live={live}");
+    assert!(
+        !live.contains(&key.to_string()),
+        "live render leaks pairing key: {live}"
+    );
+    a.note_sync_return(key, 1);
+    let dead = format!("{a:?}");
+    eprintln!("ADAPTER_RENDER dead={dead}");
+    eprintln!("ADAPTER_KEY {key}");
+    assert!(
+        !dead.contains(&key.to_string()),
+        "tombstone render leaks pairing key: {dead}"
+    );
+    assert!(
+        live.contains("<redacted>") && dead.contains("<redacted>"),
+        "renders must carry the redaction marker: {live} / {dead}"
+    );
+}

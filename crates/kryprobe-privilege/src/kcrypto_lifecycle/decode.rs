@@ -49,7 +49,7 @@ use kryprobe_abi::kcrypto_lifecycle::{
 use kryprobe_core::kcrypto::{
     Edge, GapReason, LifecycleFamily, OpDirection, RequestMeta, ReturnDisposition,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Record twin size: `LEdge` is 112 bytes on the ring (v6: the API
 /// input length rides at 28..32, the transform word at 40..48, the
@@ -425,6 +425,19 @@ pub struct LifecycleDecoder {
     /// same capacity scale as the outstanding table — one
     /// decode-bound scale for all decode tables).
     adapter: AsyncAdapter,
+    /// Refusal contention (P4r2, contract §8): refused token →
+    /// key for submits the adapter could not cover. A callback
+    /// naming a contended key gaps instead of joining — the
+    /// evidence is unattributable. Cleared when the refused token
+    /// completes by an adapter-visible path (sync-terminal return
+    /// or decoder gap); entries for queued-forever tokens linger
+    /// until the sensor drains (bounded below, never silent).
+    uncovered: HashMap<u64, u64>,
+    /// Contended key → outstanding refused count (drives the
+    /// callback branch; kept in sync with `uncovered`).
+    uncovered_keys: HashMap<u64, u64>,
+    /// Refused-token FIFO oldest-first (loud overflow eviction).
+    uncovered_order: VecDeque<u64>,
 }
 
 impl std::fmt::Debug for LifecycleDecoder {
@@ -448,6 +461,9 @@ impl LifecycleDecoder {
             outstanding: HashMap::new(),
             stats: DecodeStats::default(),
             adapter: AsyncAdapter::new(capacity),
+            uncovered: HashMap::new(),
+            uncovered_keys: HashMap::new(),
+            uncovered_order: VecDeque::new(),
         }
     }
 
@@ -543,24 +559,72 @@ impl LifecycleDecoder {
         self.stats.bad_records += 1;
     }
 
+    /// Retain refusal contention for a submit the adapter could
+    /// not cover (contract §8): past the decode-scale bound the
+    /// oldest contention is forgotten LOUD — its key gaps at this
+    /// submit (edges appended to `out`) instead of growing without
+    /// bound or misjoining silently.
+    fn retain_contention(&mut self, req_key: u64, token: u64, out: &mut Vec<Edge>) {
+        if self.uncovered.len() >= self.capacity
+            && let Some(old) = self.uncovered_order.pop_front()
+            && let Some(old_key) = self.uncovered.remove(&old)
+        {
+            Self::decrement_key(&mut self.uncovered_keys, old_key);
+            out.extend(self.adapter.gap_key(old_key));
+        }
+        self.uncovered.insert(token, req_key);
+        self.uncovered_keys
+            .entry(req_key)
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+        self.uncovered_order.push_back(token);
+    }
+
+    /// Clear refusal contention for `token` (its sync-terminal
+    /// return or decoder gap completed it — no callback
+    /// attribution outstanding). No-op for covered/unknown tokens.
+    fn clear_uncovered(&mut self, token: u64) {
+        if let Some(key) = self.uncovered.remove(&token) {
+            Self::decrement_key(&mut self.uncovered_keys, key);
+            if let Some(pos) = self.uncovered_order.iter().position(|t| *t == token) {
+                self.uncovered_order.remove(pos);
+            }
+        }
+    }
+
+    /// Decrement a contended key's refused count (drop at zero).
+    fn decrement_key(uncovered_keys: &mut HashMap<u64, u64>, key: u64) {
+        if let Some(n) = uncovered_keys.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                uncovered_keys.remove(&key);
+            }
+        }
+    }
+
     /// Admit a submit under a fresh opaque id, keyed by its BPF
     /// invocation. A same-invocation resubmit (BPF ids are unique —
     /// this is twin drift or a replay) gaps the old id
     /// (`IdentityAmbiguous` — its return never arrived) first, and
     /// the old token retires in the adapter relation (its callbacks,
-    /// if any, diagnose against the gap instead of misjoining). A
-    /// full table or an exhausted id space refuses (counted, no
-    /// phantom). Same-key submits with FRESH invocations admit
-    /// alongside (nested calls pair exactly — never gapped). The
-    /// submit-lifetime binding (`tfm_id` + submit-pinned `epoch`)
-    /// and the entry-side wire metadata ride the emitted edge; the
-    /// submit's key + timestamp cover it in the adapter relation
-    /// from admission (early callbacks must join).
+    /// if any, diagnose against the gap instead of misjoining; any
+    /// contention it held clears — a gapped token needs no
+    /// attribution). A full table or an exhausted id space refuses
+    /// (counted, no phantom). Same-key submits with FRESH
+    /// invocations admit alongside (nested calls pair exactly —
+    /// never gapped). The submit-lifetime binding (`tfm_id` +
+    /// submit-pinned `epoch`) and the entry-side wire metadata ride
+    /// the emitted edge; the submit's key + timestamp cover it in
+    /// the adapter relation from admission (early callbacks must
+    /// join) — or, past live capacity, retain refusal contention
+    /// (a later callback naming that key gaps instead of joining
+    /// the wrong token).
     fn submit(&mut self, raw: RawEdge, tfm_id: Option<u64>, epoch: Option<u64>) -> Vec<Edge> {
         let mut out = Vec::new();
         if let Some(old) = self.outstanding.remove(&raw.invoc) {
             self.stats.gaps_synthesized += 1;
             self.adapter.note_gap(old.key, old.id);
+            self.clear_uncovered(old.id);
             out.push(Edge::Gap {
                 id: old.id,
                 reason: GapReason::IdentityAmbiguous,
@@ -589,7 +653,9 @@ impl LifecycleDecoder {
                 req_flags: raw.req_flags,
             },
         );
-        self.adapter.note_submit(raw.key, id, raw.ts_ns);
+        if !self.adapter.note_submit(raw.key, id, raw.ts_ns) {
+            self.retain_contention(raw.key, id, &mut out);
+        }
         self.stats.admitted += 1;
         out.push(Edge::Submit {
             id,
@@ -615,8 +681,10 @@ impl LifecycleDecoder {
     /// The return classifies through the adapter contract (P4: the
     /// SUBMIT's flags gate `-EBUSY` backlog consent — unknown flags
     /// never imply it); a sync-terminal return retires its token in
-    /// the adapter relation, while `Queued`/`Unresolved` returns keep
-    /// cover (terminal truth may still arrive via callback).
+    /// the adapter relation (and clears any contention it held — a
+    /// sync result needs no callback attribution), while
+    /// `Queued`/`Unresolved` returns keep cover (terminal truth may
+    /// still arrive via callback).
     fn complete(&mut self, raw: RawEdge) -> Vec<Edge> {
         let open = match self.outstanding.get(&raw.invoc) {
             None => {
@@ -635,6 +703,7 @@ impl LifecycleDecoder {
         let disposition = classify_return(raw.status, open.req_flags);
         if disposition == ReturnDisposition::Terminal {
             self.adapter.note_sync_return(open.key, open.id);
+            self.clear_uncovered(open.id);
         }
         vec![Edge::Return {
             id: open.id,
@@ -645,7 +714,10 @@ impl LifecycleDecoder {
     }
 
     /// Join a callback half by key through the adapter identity
-    /// relation (contract §8 dispatch): exactly-one-live joins (a
+    /// relation (contract §8 dispatch): a CONTENDED key gaps every
+    /// live token under it first (unattributable evidence — a
+    /// refused submit is outstanding under that key — never joins
+    /// the wrong token); otherwise exactly-one-live joins (a
     /// terminal callback retires live → dead; progress never
     /// retires), multi-live gaps every live token loud, newest-dead
     /// re-joins for reducer diagnosis, else a counted orphan. The
@@ -654,6 +726,9 @@ impl LifecycleDecoder {
     /// joined. Emits zero or more edges (the callback edge and/or
     /// identity gaps).
     fn callback(&mut self, raw: RawEdge) -> Vec<Edge> {
+        if self.uncovered_keys.contains_key(&raw.key) {
+            return self.adapter.gap_key(raw.key);
+        }
         self.adapter
             .resolve_callback(raw.key, raw.ts_ns, raw.status)
     }

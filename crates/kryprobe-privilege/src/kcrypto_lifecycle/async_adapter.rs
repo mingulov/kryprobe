@@ -123,10 +123,21 @@
 //! already envelope-sized, and exhaustion is counted + loud when a
 //! burst exceeds it):
 //! - Live tokens are NEVER evicted: insert past capacity refuses
-//!   COVER for the new submit (counted `cover_refused`) — the submit
-//!   itself stays valid (sync completion still works); its future
-//!   callbacks arrive as counted orphans. Refusing cover is honest
-//!   backpressure; evicting live tokens would manufacture orphans.
+//!   COVER for the new submit (counted `cover_refused`, reported to
+//!   the decoder) — the submit itself stays valid (sync completion
+//!   still works). Refusing cover is honest backpressure; evicting
+//!   live tokens would manufacture orphans.
+//! - Refusal contention (P4r2): a refused submit keeps its key
+//!   CONTENDED in the decoder until the refused token completes by
+//!   an adapter-visible path (sync-terminal return, or a decoder
+//!   gap). A callback naming a contended key is unattributable —
+//!   it gaps EVERY live token under that key (`IdentityAmbiguous`,
+//!   counted `ambiguous_keys`), or reads orphan when no live token
+//!   remains (counted, never joined to a tombstone that may belong
+//!   to another invocation). The contention table is decode-scale
+//!   bounded; past capacity the oldest contention is forgotten
+//!   LOUD (its key gaps at the refusing submit — never silent,
+//!   never a misjoin).
 //! - Tombstones FIFO-evict past capacity (counted
 //!   `tombstone_evictions`); a late callback past eviction is a
 //!   counted orphan. At most one terminal record per invocation,
@@ -135,6 +146,9 @@
 //!   reads orphan — reducer contract, unchanged).
 //!
 //! Callback dispatch for key K naming token set S (live) / D (dead):
+//! - K contended (a refused submit is outstanding under it) → gap
+//!   every token in S (`IdentityAmbiguous`, counted), or a counted
+//!   orphan when S is empty — before any join is considered.
 //! - |S| == 1 → join it (emit `Edge::Callback` for the token; the
 //!   reducer decides emission vs diagnosis).
 //! - |S| > 1 → gap every token in S (`IdentityAmbiguous`), consume
@@ -319,7 +333,6 @@ pub struct AdapterStats {
 /// Bounded private identity relation between adapter keys (request
 /// pointers, pairing material — never rendered, never leaves
 /// privilege) and invocation tokens (contract §8).
-#[derive(Debug)]
 pub struct AsyncAdapter {
     /// Maximum live tokens (insert refuses cover past this).
     live_cap: usize,
@@ -340,6 +353,23 @@ pub struct AsyncAdapter {
     dead_count: usize,
     /// Loss counters.
     stats: AdapterStats,
+}
+
+impl std::fmt::Debug for AsyncAdapter {
+    /// Keyed relation state renders `<redacted>` (allowlist rule:
+    /// pairing pointers are `<redacted>` at every render) —
+    /// capacities, structural counts, and loss counters only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncAdapter")
+            .field("live_cap", &self.live_cap)
+            .field("dead_cap", &self.dead_cap)
+            .field("live", &"<redacted>")
+            .field("live_count", &self.live_count)
+            .field("dead", &"<redacted>")
+            .field("dead_count", &self.dead_count)
+            .field("stats", &self.stats)
+            .finish()
+    }
 }
 
 impl AsyncAdapter {
@@ -412,14 +442,50 @@ impl AsyncAdapter {
     /// Cover a fresh submit: push `token` onto key `req_key`'s live
     /// queue and pin its submit timestamp (refuse cover — counted —
     /// past live capacity; the submit itself is unaffected).
-    pub fn note_submit(&mut self, req_key: u64, token: u64, submit_ts: u64) {
+    /// Returns whether the submit earned cover: the decoder
+    /// retains contention for refused submits (contract §8), so a
+    /// later callback naming a contended key can never join the
+    /// wrong live token.
+    pub fn note_submit(&mut self, req_key: u64, token: u64, submit_ts: u64) -> bool {
         if self.live_count >= self.live_cap {
             self.stats.cover_refused += 1;
-            return;
+            return false;
         }
         self.live.entry(req_key).or_default().push_back(token);
         self.submit_ts.insert(token, submit_ts);
         self.live_count += 1;
+        true
+    }
+
+    /// Invalidate every live token under a contended key (contract
+    /// §8 refusal contention): gap-all with `IdentityAmbiguous`
+    /// (counted, edges for the reducer — the evidence is
+    /// unattributable, never guessed). When no live token remains,
+    /// the evidence reads orphan (counted, never joined to a
+    /// tombstone — the tombstone may belong to another invocation).
+    /// The caller (decoder) decides contention; this only executes.
+    pub fn gap_key(&mut self, req_key: u64) -> Vec<Edge> {
+        let live_len = self.live.get(&req_key).map_or(0, VecDeque::len);
+        if live_len == 0 {
+            self.stats.callback_orphans += 1;
+            return Vec::new();
+        }
+        let tokens: Vec<u64> = self.live.remove(&req_key).unwrap_or_default().into();
+        let mut out = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            self.live_count -= 1;
+            self.submit_ts.remove(&token);
+            self.dead.entry(req_key).or_default().push_back(token);
+            self.dead_order.push_back((req_key, token));
+            self.dead_count += 1;
+            out.push(Edge::Gap {
+                id: token,
+                reason: GapReason::IdentityAmbiguous,
+            });
+        }
+        self.evict_dead_if_over();
+        self.stats.ambiguous_keys += 1;
+        out
     }
 
     /// A sync-terminal return for `token` under `req_key`: tombstone
@@ -450,22 +516,9 @@ impl AsyncAdapter {
     pub fn resolve_callback(&mut self, req_key: u64, ts_ns: u64, status: i32) -> Vec<Edge> {
         let live_len = self.live.get(&req_key).map_or(0, VecDeque::len);
         if live_len > 1 {
-            let tokens: Vec<u64> = self.live.remove(&req_key).unwrap_or_default().into();
-            let mut out = Vec::with_capacity(tokens.len());
-            for token in tokens {
-                self.live_count -= 1;
-                self.submit_ts.remove(&token);
-                self.dead.entry(req_key).or_default().push_back(token);
-                self.dead_order.push_back((req_key, token));
-                self.dead_count += 1;
-                out.push(Edge::Gap {
-                    id: token,
-                    reason: GapReason::IdentityAmbiguous,
-                });
-            }
-            self.evict_dead_if_over();
-            self.stats.ambiguous_keys += 1;
-            return out;
+            // Multi-live ambiguity gaps exactly like contention
+            // (unattributable evidence, never guessed).
+            return self.gap_key(req_key);
         }
         if live_len == 1 {
             let token = self.live[&req_key][0];

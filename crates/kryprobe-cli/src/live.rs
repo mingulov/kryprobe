@@ -504,6 +504,9 @@ fn lifecycle_coverage(
     // sees it), any refused/corrupt/synthesized/stale decode
     // evidence, any reducer evidence that never became a
     // trustworthy record (orphans, ambiguous, admission failures),
+    // any callback-adapter loss (P4-N1: refused cover, orphans,
+    // ambiguity gaps, tombstone evictions, stale callbacks — all
+    // five vote, same as the backend buckets),
     // and any transform-lifetime loss (T07-05/R3: refused,
     // unadmitted, unjoined, or uncertain-identity transform
     // evidence corrupts the generations the report counts —
@@ -529,6 +532,11 @@ fn lifecycle_coverage(
         .saturating_add(ledger.reducer.orphan)
         .saturating_add(ledger.reducer.ambiguous)
         .saturating_add(ledger.reducer.admission_failed)
+        .saturating_add(ledger.adapter.cover_refused)
+        .saturating_add(ledger.adapter.callback_orphans)
+        .saturating_add(ledger.adapter.ambiguous_keys)
+        .saturating_add(ledger.adapter.tombstone_evictions)
+        .saturating_add(ledger.adapter.stale_callbacks)
         .saturating_add(ledger.tfm_stats.submit_refused)
         .saturating_add(ledger.tfm_stats.tainted_refused)
         .saturating_add(ledger.tfm_stats.table_full)
@@ -695,9 +703,13 @@ fn lifecycle_coverage(
     // (T07-R2-08: D4 bound refusals, tainted/unlinked edges, and
     // twin-validation refusals join as well — a refused identity
     // or unjoinable edge breaks the join claim exactly like a
-    // stale return. Only `tombstone_evictions` stays out: eviction
-    // drops retired tombstones whose records already emitted; any
-    // late edge for one surfaces via unknown/stale. Unbound
+    // stale return. Only the TRANSFORM `tombstone_evictions` stays
+    // out: eviction drops retired tombstones whose records already
+    // emitted; any late edge for one surfaces via unknown/stale.
+    // The ADAPTER's five counters all JOIN (P4-N1): refused cover,
+    // orphan/stale callbacks, and ambiguity gaps are unjoinable
+    // completion evidence, and adapter tombstone eviction voids
+    // the retention the join claim rests on. Unbound
     // destroys at UNOCCUPIED bases stay out too (T07-R2-05,
     // narrowed T07-R3-02: expected digest/shash releases are
     // unjoinable BY DESIGN — no identity exists to join — so they
@@ -713,6 +725,11 @@ fn lifecycle_coverage(
         .saturating_add(ledger.decode.bad_records)
         .saturating_add(ledger.reducer.ambiguous)
         .saturating_add(ledger.reducer.orphan)
+        .saturating_add(ledger.adapter.cover_refused)
+        .saturating_add(ledger.adapter.callback_orphans)
+        .saturating_add(ledger.adapter.ambiguous_keys)
+        .saturating_add(ledger.adapter.tombstone_evictions)
+        .saturating_add(ledger.adapter.stale_callbacks)
         .saturating_add(ledger.tfm_stats.unknown_returns)
         .saturating_add(ledger.tfm_stats.stale_returns)
         .saturating_add(ledger.tfm_stats.mismatched_returns)
@@ -2411,6 +2428,67 @@ mod tests {
             "grounded terminals kept: {:?}",
             coverage.completion.counters
         );
+    }
+
+    #[test]
+    fn p4r2_adapter_orphan_flips_count_correlation_and_commit() {
+        // P4-N1: an observed-but-unjoinable callback is measured
+        // loss — the count aggregate, the correlation join claim,
+        // and (via commit_clean) the completion verdict all flip
+        // Partial. Delivery-unmeasured is no longer the story.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.adapter.callback_orphans = 1;
+        let interval = ValidityInterval {
+            start_ns: 100,
+            end_ns: Some(200),
+        };
+        let got = lifecycle_coverage(&ledger, 9, 9, 6, &close_clean(), interval);
+        assert_eq!(got.aggregate_counts.status, CoverageStatus::Partial);
+        assert_eq!(got.correlation.status, CoverageStatus::Partial);
+        assert_eq!(got.completion.status, CoverageStatus::Partial);
+    }
+
+    #[test]
+    fn p4r2_every_adapter_counter_votes_count_loss() {
+        // P4-N1: each of the five adapter counters alone voids the
+        // loss-clean count (unknown→Partial), exactly like every
+        // other decode/reducer/tfm loss input.
+        use kryprobe_privilege::kcrypto_lifecycle::async_adapter::AdapterStats;
+        let names = [
+            "cover_refused",
+            "callback_orphans",
+            "ambiguous_keys",
+            "tombstone_evictions",
+            "stale_callbacks",
+        ];
+        let sets: [fn(&mut AdapterStats); 5] = [
+            |a| a.cover_refused = 1,
+            |a| a.callback_orphans = 1,
+            |a| a.ambiguous_keys = 1,
+            |a| a.tombstone_evictions = 1,
+            |a| a.stale_callbacks = 1,
+        ];
+        for (i, set) in sets.into_iter().enumerate() {
+            let mut ledger = lifecycle_ledger_clean();
+            set(&mut ledger.adapter);
+            let interval = ValidityInterval {
+                start_ns: 100,
+                end_ns: Some(200),
+            };
+            let got = lifecycle_coverage(&ledger, 9, 9, 6, &close_clean(), interval);
+            assert_eq!(
+                got.aggregate_counts.status,
+                CoverageStatus::Partial,
+                "{} must vote count loss",
+                names[i]
+            );
+            assert_eq!(
+                got.correlation.status,
+                CoverageStatus::Partial,
+                "{} must vote correlation events",
+                names[i]
+            );
+        }
     }
 
     #[test]

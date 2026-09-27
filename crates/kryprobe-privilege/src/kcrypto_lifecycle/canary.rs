@@ -103,6 +103,18 @@ pub struct FixtureTruth {
     /// the deterministic drain order the burst arm pins
     /// (`P1,T0,P2,T1,P3,T2,T3`).
     pub notify_order: Vec<(u64, bool)>,
+    /// Row-order evidence (P4r2): `(seq, row_index)` for every
+    /// submit row in row order — the race arms pin forced
+    /// orderings (terminal-before-return, reuse-before-unwind)
+    /// against THESE, never timestamps (coarse-clock ties) or
+    /// cross-phase vec positions (lost at parse).
+    pub submit_lines: Vec<(u64, usize)>,
+    /// Row-order evidence (P4r2): `(seq, row_index)` for every
+    /// return row in row order.
+    pub return_lines: Vec<(u64, usize)>,
+    /// Row-order evidence (P4r2): `(seq, row_index)` for every
+    /// terminal row in row order.
+    pub terminal_lines: Vec<(u64, usize)>,
     /// Allocation rows in sequence order (T07-R2-04).
     pub allocs: Vec<FixtureAlloc>,
     /// Release rows in row order (T07-R2-04).
@@ -135,7 +147,9 @@ impl FixtureTruth {
             // other flavor; only its COMPLETION lane differs).
             let (submit_lane, return_lane) = match op.op.as_str() {
                 "encrypt" | "encrypt-exact" | "encrypt-delayed" | "encrypt-burst"
-                | "encrypt-early" | "encrypt-cryptd" => (0, 1),
+                | "encrypt-early" | "encrypt-cryptd" | "encrypt-reuse" | "encrypt-reuse-cb" => {
+                    (0, 1)
+                }
                 "decrypt" => (2, 3),
                 _ => unreachable!("parser admits only the closed label set"),
             };
@@ -266,6 +280,9 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     let mut terminals: Vec<(u64, i32)> = Vec::new();
     let mut progresses: Vec<(u64, i32)> = Vec::new();
     let mut notify_order: Vec<(u64, bool)> = Vec::new();
+    let mut submit_lines: Vec<(u64, usize)> = Vec::new();
+    let mut return_lines: Vec<(u64, usize)> = Vec::new();
+    let mut terminal_lines: Vec<(u64, usize)> = Vec::new();
     let mut allocs: Vec<FixtureAlloc> = Vec::new();
     let mut frees: Vec<FixtureFree> = Vec::new();
     let mut configs: Vec<FixtureConfig> = Vec::new();
@@ -441,6 +458,8 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                         | "encrypt-burst"
                         | "encrypt-early"
                         | "encrypt-cryptd"
+                        | "encrypt-reuse"
+                        | "encrypt-reuse-cb"
                 ) {
                     return Err(TranscriptError {
                         line: line_no,
@@ -457,6 +476,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     seq,
                     op: op.to_owned(),
                 });
+                submit_lines.push((seq, idx));
             }
             "return" => {
                 let seq = get_u64(obj, "seq", line_no, "return row lacks a sequence")?;
@@ -474,6 +494,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     });
                 }
                 returns.push((seq, errno));
+                return_lines.push((seq, idx));
             }
             "terminal" => {
                 let seq = get_u64(obj, "seq", line_no, "terminal row lacks a sequence")?;
@@ -492,6 +513,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 }
                 terminals.push((seq, errno));
                 notify_order.push((seq, true));
+                terminal_lines.push((seq, idx));
             }
             "done" => {
                 let result = get_i32(obj, "fixture_result", line_no, "done row lacks a result")?;
@@ -600,6 +622,9 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         terminals,
         progresses,
         notify_order,
+        submit_lines,
+        return_lines,
+        terminal_lines,
         allocs,
         frees,
         configs,
@@ -1440,6 +1465,8 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             | "backlog-accepted"
             | "no-backlog-burst"
             | "cryptd-async"
+            | "early-callback"
+            | "reuse-in-callback"
     ) {
         return Err(format!("unknown scenario {scenario}"));
     }
@@ -1616,6 +1643,14 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         }
         "no-backlog-burst" => {
             verdict_op_no_backlog(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "early-callback" => {
+            verdict_op_early(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "reuse-in-callback" => {
+            verdict_op_reuse(scenario, truth, view, unfinished_d)?;
             verdict_tfm_sk(truth, view, false)?;
         }
         "cryptd-async" => {
@@ -1998,6 +2033,179 @@ fn verdict_op_no_backlog(
     if unfinished_d != 0 {
         return Err(format!(
             "no-backlog unfinished delta {unfinished_d} != 0 (expected-complete)"
+        ));
+    }
+    Ok(())
+}
+
+/// Row-order lookup (P4r2): the row index of `seq`'s row in a
+/// phase's line vec — `None` when the row is absent (the arm
+/// fails naming the phase).
+fn row_line(lines: &[(u64, usize)], seq: u64) -> Option<usize> {
+    lines.iter().find(|(s, _)| *s == seq).map(|(_, idx)| *idx)
+}
+
+/// Early-callback op shape (P4r2): one `encrypt-early` op whose
+/// terminal callback fires INLINE — before the submitter's return
+/// row lands (forced terminal-before-return row order: submit,
+/// terminal, return). The return still reads `-EINPROGRESS`
+/// (queued — the callback carries terminal truth, never the
+/// return), no progress row exists (single in-flight op: no
+/// backlog, no waiter-side marker), and the sensor joins exactly
+/// one `Callback(0)` with a span, nothing unfinished, zero loss.
+fn verdict_op_early(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    if truth.ops.len() != 1 || truth.ops[0].op != "encrypt-early" {
+        let got: Vec<&str> = truth.ops.iter().map(|op| op.op.as_str()).collect();
+        return Err(format!(
+            "{scenario} runs [`encrypt-early`], fixture ran {got:?}"
+        ));
+    }
+    let seq = truth.ops[0].seq;
+    if truth.returns.as_slice() != [(seq, -115)] {
+        return Err(format!(
+            "early fixture returns {:?} != [(seq, -EINPROGRESS)]",
+            truth.returns
+        ));
+    }
+    if truth.terminals.as_slice() != [(seq, 0)] {
+        return Err(format!(
+            "early fixture terminals {:?} != [(op seq, 0)]",
+            truth.terminals
+        ));
+    }
+    if !truth.progresses.is_empty() {
+        return Err(format!(
+            "early fixture progresses {:?} != [] (no backlog on one op)",
+            truth.progresses
+        ));
+    }
+    // The forced race: the terminal ROW precedes the return ROW
+    // (inline completion — a sequential transcript proves no race).
+    let submit = row_line(&truth.submit_lines, seq)
+        .ok_or_else(|| format!("early op seq {seq} lacks a submit row for the order check"))?;
+    let terminal = row_line(&truth.terminal_lines, seq)
+        .ok_or_else(|| format!("early op seq {seq} lacks a terminal row for the order check"))?;
+    let ret = row_line(&truth.return_lines, seq)
+        .ok_or_else(|| format!("early op seq {seq} lacks a return row for the order check"))?;
+    if !(submit < terminal && terminal < ret) {
+        return Err(format!(
+            "early row order (submit {submit}, terminal {terminal}, return {ret}) is not terminal-before-return"
+        ));
+    }
+    if view.completed.len() != 1 {
+        return Err(format!(
+            "early post-finish completed {} != 1",
+            view.completed.len()
+        ));
+    }
+    if view.completed[0].terminal != Terminal::Callback(0) {
+        return Err(format!(
+            "early post-finish terminal {:?} != Callback(0) (callback unjoined)",
+            view.completed[0].terminal
+        ));
+    }
+    if view.completed[0].duration_ns.is_none() {
+        return Err("early post-finish completion lacks a callback span".to_owned());
+    }
+    if unfinished_d != 0 {
+        return Err(format!(
+            "early unfinished delta {unfinished_d} != 0 (expected-complete)"
+        ));
+    }
+    Ok(())
+}
+
+/// Reuse-in-callback op shape (P4r2): the outer `encrypt-reuse`
+/// op completes inline (terminal before its return) and the SAME
+/// callback resubmits the request storage — the inner
+/// `encrypt-reuse-cb` submit lands before the outer return
+/// (nested reuse before unwind). Forced row order: submit_outer,
+/// terminal_outer, submit_inner, return_inner, return_outer,
+/// terminal_inner (the held drain releases only after the outer
+/// return row, so the inner terminal cannot land early). Both
+/// records join `Callback(0)` with spans — joined as a SET
+/// (completion order is cross-CPU arrival order, never
+/// positional) — nothing unfinished, zero loss, zero ambiguity
+/// (the all-zero gate above pins distinct pairing under
+/// same-key reuse: a misjoin would gap or orphan loudly).
+fn verdict_op_reuse(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    let got_ops: Vec<&str> = truth.ops.iter().map(|op| op.op.as_str()).collect();
+    if got_ops.as_slice() != ["encrypt-reuse", "encrypt-reuse-cb"] {
+        return Err(format!(
+            "{scenario} runs [`encrypt-reuse`, `encrypt-reuse-cb`], fixture ran {got_ops:?}"
+        ));
+    }
+    let outer = truth.ops[0].seq;
+    let inner = truth.ops[1].seq;
+    let mut rets: Vec<(u64, i32)> = truth.returns.clone();
+    rets.sort_unstable();
+    if rets != [(outer, -115), (inner, -115)] {
+        return Err(format!(
+            "reuse fixture returns {:?} != [(outer, -EINPROGRESS), (inner, -EINPROGRESS)]",
+            truth.returns
+        ));
+    }
+    let mut terms: Vec<(u64, i32)> = truth.terminals.clone();
+    terms.sort_unstable();
+    if terms != [(outer, 0), (inner, 0)] {
+        return Err(format!(
+            "reuse fixture terminals {:?} != [(outer, 0), (inner, 0)]",
+            truth.terminals
+        ));
+    }
+    if !truth.progresses.is_empty() {
+        return Err(format!(
+            "reuse fixture progresses {:?} != [] (no backlog engages)",
+            truth.progresses
+        ));
+    }
+    // The forced race: nested reuse before unwind, pinned in full
+    // row order (a sequential transcript proves no race).
+    let so = row_line(&truth.submit_lines, outer);
+    let to = row_line(&truth.terminal_lines, outer);
+    let si = row_line(&truth.submit_lines, inner);
+    let ri = row_line(&truth.return_lines, inner);
+    let ro = row_line(&truth.return_lines, outer);
+    let ti = row_line(&truth.terminal_lines, inner);
+    match (so, to, si, ri, ro, ti) {
+        (Some(so), Some(to), Some(si), Some(ri), Some(ro), Some(ti))
+            if so < to && to < si && si < ri && ri < ro && ro < ti => {}
+        _ => {
+            return Err(format!(
+                "reuse row order (submit {so:?}, terminal {to:?}, inner-submit {si:?}, inner-return {ri:?}, outer-return {ro:?}, inner-terminal {ti:?}) is not nested-reuse-before-unwind"
+            ));
+        }
+    }
+    if view.completed.len() != 2 {
+        return Err(format!(
+            "reuse post-finish completed {} != 2",
+            view.completed.len()
+        ));
+    }
+    for (i, record) in view.completed.iter().enumerate() {
+        if record.terminal != Terminal::Callback(0) {
+            return Err(format!(
+                "reuse completion {i} terminal {:?} != Callback(0)",
+                record.terminal
+            ));
+        }
+        if record.duration_ns.is_none() {
+            return Err(format!("reuse completion {i} lacks a callback span"));
+        }
+    }
+    if unfinished_d != 0 {
+        return Err(format!(
+            "reuse unfinished delta {unfinished_d} != 0 (expected-complete)"
         ));
     }
     Ok(())
@@ -3977,6 +4185,8 @@ mod tests {
             "encrypt-delayed",
             "encrypt-burst",
             "encrypt-early",
+            "encrypt-reuse",
+            "encrypt-reuse-cb",
         ]
         .iter()
         .enumerate()
@@ -4005,12 +4215,14 @@ mod tests {
                 "encrypt-exact",
                 "encrypt-delayed",
                 "encrypt-burst",
-                "encrypt-early"
+                "encrypt-early",
+                "encrypt-reuse",
+                "encrypt-reuse-cb"
             ]
         );
-        // Family classification: five encrypt flavors hit lanes
+        // Family classification: seven encrypt flavors hit lanes
         // 0/1, the decrypt hits 2/3.
-        assert_eq!(truth.expected_hooks(), [5, 5, 1, 1]);
+        assert_eq!(truth.expected_hooks(), [7, 7, 1, 1]);
         // An unknown label refuses (never a default family).
         let bad = [
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"splice"}}"#),
@@ -4082,5 +4294,120 @@ mod tests {
         view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("label lie must fail");
         assert!(err.contains("decrypt"), "names the label: {err}");
+    }
+
+    /// Async-flavored generation (fixture async driver, one setup
+    /// setkey, proved final retire) for the P4r2 race arms.
+    fn race_gen() -> GenerationInfo {
+        GenerationInfo {
+            req_name: "kxcipher-async-t09r".to_owned(),
+            drv_name: "kxcipher-async-t09r".to_owned(),
+            ..sync_gen()
+        }
+    }
+
+    #[test]
+    fn verdict_early_callback_forces_terminal_before_return() {
+        // P4-N4: `early-callback` is ACCEPTED, and its fixture
+        // FORCES terminal-before-return row order (inline
+        // completion): the terminal row precedes the return row.
+        // The sensor still joins exactly one Callback(0) with a
+        // span, zero loss. A sequential transcript (return row
+        // first) proves no race and must fail the arm.
+        let run = "run-early-callback";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t09r","drv":"kxcipher-async-t09r","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-early"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("early transcript parses");
+        let gens = [race_gen()];
+        let completed = [record(1, Terminal::Callback(0))];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.reducer.unfinished = 0;
+        verdict("early-callback", &truth, &view).expect("early-callback green");
+        // Sequential row order (return before terminal) is the
+        // unforced shape — the race arm must reject it.
+        let seq_text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t09r","drv":"kxcipher-async-t09r","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-early"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&seq_text, run).expect("sequential parses");
+        let err = verdict("early-callback", &truth, &view).expect_err("unforced order must fail");
+        assert!(err.contains("order"), "names the ordering: {err}");
+    }
+
+    #[test]
+    fn verdict_reuse_in_callback_pins_nested_reuse() {
+        // P4-N4: `reuse-in-callback` is ACCEPTED — the outer op's
+        // terminal lands inline (before its return) and the SAME
+        // callback resubmits the request storage (inner submit
+        // before the outer return): nested reuse before unwind,
+        // forced in row order. Both records join Callback(0) with
+        // spans, zero loss, zero ambiguity. An inner submit AFTER
+        // the outer return is sequential reuse, not the race.
+        let run = "run-reuse-in-callback";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t09r","drv":"kxcipher-async-t09r","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-reuse"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt-reuse-cb"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("reuse transcript parses");
+        let gens = [race_gen()];
+        let completed = [
+            record(1, Terminal::Callback(0)),
+            record(2, Terminal::Callback(0)),
+        ];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2];
+        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2];
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.reducer.unfinished = 0;
+        verdict("reuse-in-callback", &truth, &view).expect("reuse-in-callback green");
+        // Sequential reuse (inner submit after the outer return)
+        // is not the race — the arm must reject it.
+        let seq_text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t09r","drv":"kxcipher-async-t09r","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-reuse"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt-reuse-cb"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&seq_text, run).expect("sequential parses");
+        let err =
+            verdict("reuse-in-callback", &truth, &view).expect_err("unforced order must fail");
+        assert!(err.contains("order"), "names the ordering: {err}");
     }
 }

@@ -5,7 +5,7 @@
 //! Driven by environment (set by `scripts/kcrypto-lab.py`):
 //! - `KCRYPTO_LEDGER_PATH`: captured JSONL ledger file (required)
 //! - `KCRYPTO_RUN_ID`: run the ledger must belong to (required)
-//! - `KCRYPTO_SCENARIO`: one of the sixteen fixture scenarios (required)
+//! - `KCRYPTO_SCENARIO`: one of the seventeen fixture scenarios (required)
 //! - `KCRYPTO_SUFFIX`: fixture driver-name suffix, for `exact-driver`
 //!
 //! Truth comes from the fixture file; expectations come from the
@@ -214,23 +214,48 @@ fn guest_ledger_matches_scenario_contract() {
                 assert_eq!(req.notifications, 1, "one terminal notification");
             }
         }
-        // Pre-wait poll recorded as one progress row either way:
-        // 0 if the callback already landed, EINPROGRESS if still
-        // in flight. Both are truthful poll results.
+        // P4r2 forced callback-before-return: the inline one-shot
+        // completes the op inside the submit call (terminal row
+        // before the return row — order pinned by the sensor
+        // canary's row-order join, which retains cross-phase row
+        // order; this oracle pins per-request rows). One
+        // notification, no waiter-side marker.
         "early-callback" => {
             expect_single_lifetime(&ledger);
             expect_setup_configs(&ledger, 1);
-            assert_eq!(ledger.requests.len(), 1, "one polled invocation");
+            assert_eq!(ledger.requests.len(), 1, "one early invocation");
             let req = &ledger.requests[0];
             assert_eq!(req.submit_op, "encrypt-early", "submit op label");
             assert_eq!(req.return_errno, -EINPROGRESS, "async return");
-            assert!(
-                req.progress_errno == Some(0) || req.progress_errno == Some(-EINPROGRESS),
-                "truthful poll result, got {:?}",
-                req.progress_errno
-            );
+            assert_eq!(req.progress_errno, None, "no progress marker");
             assert_eq!(req.terminal_errno, 0, "terminal success");
-            assert_eq!(req.notifications, 2, "poll progress + terminal");
+            assert_eq!(req.notifications, 1, "one terminal notification");
+        }
+        // P4r2 forced callback-triggered reuse: the outer op
+        // completes inline and the same callback resubmits the
+        // request storage (nested rows before the outer return —
+        // full order pinned by the sensor canary; this oracle pins
+        // per-request rows). Two queued ops, both terminal 0.
+        "reuse-in-callback" => {
+            expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
+            assert_eq!(ledger.requests.len(), 2, "outer + nested reuse");
+            let ops: Vec<&str> = ledger
+                .requests
+                .iter()
+                .map(|req| req.submit_op.as_str())
+                .collect();
+            assert_eq!(
+                ops,
+                ["encrypt-reuse", "encrypt-reuse-cb"],
+                "submit op labels"
+            );
+            for req in &ledger.requests {
+                assert_eq!(req.return_errno, -EINPROGRESS, "async return");
+                assert_eq!(req.progress_errno, None, "no progress marker");
+                assert_eq!(req.terminal_errno, 0, "terminal success");
+                assert_eq!(req.notifications, 1, "one terminal notification");
+            }
         }
         // Generic-name request resolved to exactly the async driver.
         "exact-driver" => {

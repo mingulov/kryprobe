@@ -183,7 +183,7 @@ def main():
         args.scenario = [
             "sync-once", "async-once", "delayed-completion",
             "backlog-accepted", "early-callback", "exact-driver",
-            "failed-alloc", "refheld-release",
+            "failed-alloc", "refheld-release", "reuse-in-callback",
         ]
     for kernel in kernels:
         if kernel not in kos:

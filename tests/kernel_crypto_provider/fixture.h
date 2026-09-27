@@ -14,8 +14,8 @@
  *     skcipher only; extra field, unknown-field-tolerant readers
  *     ignore it)
  *   progress: {"v":1,"run":R,"seq":N,"phase":"progress","errno":E,...}
- *     (T09: EITHER a waiter-side in-flight marker (delayed/
- *     early scenarios) OR a kernel backlog-progress callback
+ *     (T09: EITHER a waiter-side in-flight marker (delayed
+ *     scenario) OR a kernel backlog-progress callback
  *     (kxc_complete(-EINPROGRESS) under the held burst — errno
  *     -EINPROGRESS, always before that seq's terminal))
  *   terminal: {"v":1,"run":R,"seq":N,"phase":"terminal","errno":E,...}
@@ -93,6 +93,7 @@ void kxc_flush_work(void);
 void kxc_drain_kick(void);
 void kxc_set_submit_hold(bool hold);
 void kxc_set_delay_ms(int ms);
+void kxc_set_inline_once(bool once);
 
 /* consumer.c: scenarios. */
 int kxc_scenario_run(struct kxc_run *run, const char *scenario);

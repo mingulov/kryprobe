@@ -56,6 +56,21 @@ struct kxc_op {
 	bool completed;
 	int err;
 	u64 seq;
+	/*
+	 * P4r2 callback-triggered reuse: when armed, the terminal
+	 * callback resubmits this op's request storage inline
+	 * (nested encrypt before the outer return lands) and
+	 * disarms. Set by the scenario before submit; consumed by
+	 * exactly one terminal callback (same-thread ordered on the
+	 * inline path, queue-synchronized on the worker path — no
+	 * lock needed). resubmit_seq/err record the nested submit
+	 * (0/unchanged when none); resubmit_async tells the waiter
+	 * a second terminal is owed.
+	 */
+	bool resubmit_armed;
+	bool resubmit_async;
+	u64 resubmit_seq;
+	int resubmit_err;
 };
 
 /* ------------------------------------------------------------------ */
@@ -136,6 +151,41 @@ static void kxc_emit_terminal(struct kxc_run *run, u64 seq, int errno_)
 /* operation setup/teardown                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * P4r2 nested resubmit (runs INSIDE the terminal callback, after
+ * the outer terminal row, before the outer wake): reuses this
+ * op's request storage for a fresh encrypt under a new seq. The
+ * nested call queues normally (the inline one-shot is already
+ * spent) and its return row lands before the outer return row —
+ * forced callback-triggered reuse before unwind. No locks held
+ * here (the mark lock is released above; the driver takes its
+ * queue lock fresh), and disarm-first means the nested submit's
+ * own terminal never resubmits again.
+ */
+static void kxc_resubmit_from_complete(struct kxc_op *op)
+{
+	struct kxc_run *run = op->run;
+	u64 seq = kxc_next_seq(run);
+	int err;
+
+	op->resubmit_seq = seq;
+	kxc_emit_submit(run, seq, "encrypt-reuse-cb", KXC_BLOCK, 0);
+	err = crypto_skcipher_encrypt(op->req);
+	kxc_emit_return(run, seq, err);
+	op->resubmit_err = err;
+	if (err == -EINPROGRESS || err == -EBUSY) {
+		/* Queued: the waiter owes this terminal a second wait. */
+		op->resubmit_async = true;
+		return;
+	}
+	/*
+	 * A sync answer inside the callback (not expected under the
+	 * held drain — the scenario pins -EINPROGRESS): its terminal
+	 * row lands here, no callback follows, no second wait owed.
+	 */
+	kxc_emit_terminal(run, seq, err);
+}
+
 static void kxc_complete(void *data, int err)
 {
 	struct kxc_op *op = data;
@@ -151,7 +201,9 @@ static void kxc_complete(void *data, int err)
 	 * concurrent progress sample observes true state.
 	 * completed is set and the lock released BEFORE complete():
 	 * op lives on the waiter's stack, and touching it after
-	 * the wake would race the waiter's teardown.
+	 * the wake would race the waiter's teardown. The P4r2
+	 * resubmit runs after the unlock, before the wake: still
+	 * the waiter's stack, still alive (nobody is woken yet).
 	 */
 	if (err == -EINPROGRESS) {
 		spin_lock_bh(&op->mark_lock);
@@ -164,6 +216,10 @@ static void kxc_complete(void *data, int err)
 	kxc_emit_terminal(op->run, op->seq, err);
 	op->completed = true;
 	spin_unlock_bh(&op->mark_lock);
+	if (op->resubmit_armed) {
+		op->resubmit_armed = false;
+		kxc_resubmit_from_complete(op);
+	}
 	complete(&op->done);
 }
 
@@ -339,7 +395,8 @@ static void kxc_op_release(struct kxc_run *run, struct kxc_op *op, u64 aseq)
 	kxc_tfm_release(run, tfm, aseq);
 }
 
-static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
+static int kxc_wait_done_as(struct kxc_run *run, struct kxc_op *op,
+			      u64 seq)
 {
 	int i;
 
@@ -357,7 +414,7 @@ static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
 			 */
 			kxc_flush_work();
 			if (!completion_done(&op->done))
-				kxc_emit_terminal(run, op->seq, -ECANCELED);
+				kxc_emit_terminal(run, seq, -ECANCELED);
 			return -ECANCELED;
 		}
 		if (wait_for_completion_timeout(&op->done,
@@ -366,8 +423,13 @@ static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
 	}
 	kxc_flush_work();
 	if (!completion_done(&op->done))
-		kxc_emit_terminal(run, op->seq, -ETIMEDOUT);
+		kxc_emit_terminal(run, seq, -ETIMEDOUT);
 	return -ETIMEDOUT;
+}
+
+static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
+{
+	return kxc_wait_done_as(run, op, op->seq);
 }
 
 /* ------------------------------------------------------------------ */
@@ -615,6 +677,14 @@ teardown:
 	return first_err;
 }
 
+/*
+ * P4r2 forced callback-before-return: the inline one-shot makes
+ * the terminal callback fire INSIDE the submit call — the
+ * terminal row precedes the return row deterministically (same
+ * thread, no race to win). No waiter-side progress marker: the
+ * kernel callback IS the evidence (one notification). Any
+ * deviation (no inline terminal, wrong errno) fails loudly.
+ */
 static int kxc_scenario_early_callback(struct kxc_run *run)
 {
 	struct kxc_op op;
@@ -627,7 +697,9 @@ static int kxc_scenario_early_callback(struct kxc_run *run)
 	seq = kxc_next_seq(run);
 	op.seq = seq;
 	kxc_emit_submit(run, seq, "encrypt-early", KXC_BLOCK, 0);
+	kxc_set_inline_once(true);
 	err = crypto_skcipher_encrypt(op.req);
+	kxc_set_inline_once(false);
 	kxc_emit_return(run, seq, err);
 	if (err != -EINPROGRESS) {
 		kxc_emit_terminal(run, seq, err);
@@ -635,14 +707,72 @@ static int kxc_scenario_early_callback(struct kxc_run *run)
 		return err;
 	}
 	/*
-	 * Poll before waiting: exactly one progress row lands (two
-	 * notifications total), truthful in either order via the
-	 * mark helper (0 iff the terminal already landed).
+	 * The terminal already landed inline: the wait consumes the
+	 * owed wake (a missing terminal is -ETIMEDOUT, never an
+	 * assumed success).
 	 */
-	kxc_mark_progress(run, &op, seq);
 	err = kxc_wait_done(run, &op);
 	kxc_op_release(run, &op, aseq);
 	return err;
+}
+
+/*
+ * P4r2 forced callback-triggered reuse: the outer submit
+ * completes inline, and the SAME terminal callback resubmits the
+ * request storage — the nested submit + return rows land before
+ * the outer return row (reuse before unwind, same thread). The
+ * held drain releases only after the outer return row, so the
+ * inner terminal cannot land early: forced full order
+ * submit_o, terminal_o, submit_i, return_i, return_o,
+ * terminal_i. Both errnos pin exactly; any deviation fails
+ * loudly. The waiter owes TWO terminals on the one completion
+ * (outer wake + inner wake — completion counting makes the
+ * second wait race-free).
+ */
+static int kxc_scenario_reuse_in_callback(struct kxc_run *run)
+{
+	struct kxc_op op;
+	u64 aseq, seq;
+	int err, first_err = 0;
+
+	err = kxc_op_prepare(run, &op, kxc_async_driver_name(), &aseq);
+	if (err)
+		return err;
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	op.resubmit_armed = true;
+	kxc_set_submit_hold(true);
+	kxc_emit_submit(run, seq, "encrypt-reuse", KXC_BLOCK, 0);
+	kxc_set_inline_once(true);
+	err = crypto_skcipher_encrypt(op.req);
+	kxc_set_inline_once(false);
+	kxc_emit_return(run, seq, err);
+	kxc_set_submit_hold(false);
+	kxc_drain_kick();
+	if (err != -EINPROGRESS) {
+		/*
+		 * Deviation: the inline terminal never fired
+		 * (inline always queues) — waiter-side terminal,
+		 * nothing owed, no waits.
+		 */
+		kxc_emit_terminal(run, seq, err);
+		kxc_op_release(run, &op, aseq);
+		return -EPROTO;
+	}
+	if (op.resubmit_err != -EINPROGRESS && !first_err)
+		first_err = -EPROTO;
+	if (!op.resubmit_async && !first_err)
+		first_err = -EPROTO;
+	err = kxc_wait_done(run, &op);
+	if (err && !first_err)
+		first_err = err;
+	if (op.resubmit_async) {
+		err = kxc_wait_done_as(run, &op, op.resubmit_seq);
+		if (err && !first_err)
+			first_err = err;
+	}
+	kxc_op_release(run, &op, aseq);
+	return first_err;
 }
 
 static int kxc_scenario_exact_driver(struct kxc_run *run)
@@ -1258,5 +1388,7 @@ int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 		return kxc_scenario_sync_enokey(run);
 	if (!strcmp(scenario, "cryptd-async"))
 		return kxc_scenario_cryptd_async(run);
+	if (!strcmp(scenario, "reuse-in-callback"))
+		return kxc_scenario_reuse_in_callback(run);
 	return -EINVAL;
 }

@@ -595,12 +595,17 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
 /// `colliding_releases`). Normal transform accounting
 /// (admissions, completions, classified failures, proved retires,
 /// joined configs incl. errno verdicts) is truth, not loss —
-/// unmapped by design. Evictions pin zero
-/// (HASH slots never evict, single generation driver);
+/// unmapped by design. Callback-adapter loss (P4-N1, contract
+/// §10) joins the same buckets: refused cover → state inserts;
+/// orphan callbacks → unmatched returns; ambiguity gaps + stale
+/// callbacks → correlation overflows; tombstone FIFO evictions →
+/// state evictions (the field's first input — transform HASH
+/// slots still never evict, single generation driver).
 /// `output_omissions` (driver-reported observation-cap drops) lands
 /// in `budget_omissions`.
 fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> IntegritySummary {
     let tfm = &ledger.tfm_stats;
+    let adapter = &ledger.adapter;
     IntegritySummary {
         ring_reservation_failures: ledger.kernel_loss[0],
         user_queue_drops: ledger.retained_dropped,
@@ -621,21 +626,34 @@ fn integrity_for_lifecycle(ledger: &LifecycleLedger, output_omissions: u64) -> I
             .saturating_add(tfm.table_full)
             .saturating_add(tfm.live_full)
             .saturating_add(tfm.bad_records)
-            .saturating_add(tfm.unlinked_ops),
-        state_evictions: 0,
+            .saturating_add(tfm.unlinked_ops)
+            // P4-N1 (adapter contract §10): refused cover is
+            // evidence that failed to enter join state.
+            .saturating_add(adapter.cover_refused),
+        // P4-N1 (adapter contract §10): bounded-table eviction
+        // finally has an input — adapter tombstone FIFO
+        // evictions (transform HASH slots still never evict).
+        state_evictions: adapter.tombstone_evictions,
         unmatched_entries: ledger.reducer.unfinished.saturating_add(tfm.unfinished),
         unmatched_returns: ledger
             .decode
             .unknown_invoc_returns
             .saturating_add(ledger.reducer.orphan)
             .saturating_add(ledger.kernel_loss[3])
-            .saturating_add(tfm.unknown_returns),
+            .saturating_add(tfm.unknown_returns)
+            // P4-N1 (adapter contract §10): a completion observed
+            // but joinable to nothing.
+            .saturating_add(adapter.callback_orphans),
         correlation_overflows: ledger
             .decode
             .gaps_synthesized
             .saturating_add(ledger.decode.stale_returns)
             .saturating_add(tfm.stale_returns)
-            .saturating_add(tfm.mismatched_returns),
+            .saturating_add(tfm.mismatched_returns)
+            // P4-N1 (adapter contract §10): ambiguity gaps and
+            // stale callbacks are correlation overflows.
+            .saturating_add(adapter.ambiguous_keys)
+            .saturating_add(adapter.stale_callbacks),
         unknown_generation_events: tfm
             .ambiguous_releases
             .saturating_add(tfm.forced_retires)
@@ -881,6 +899,29 @@ mod tests {
         assert_eq!(integrity.state_evictions, 0);
         assert_eq!(integrity.unknown_generation_events, 0);
         assert_eq!(integrity.budget_omissions, 0);
+    }
+
+    #[test]
+    fn p4r2_adapter_losses_map_into_frozen_integrity() {
+        // P4-N1 (contract §10): every adapter counter lands in the
+        // frozen summary — cover refusals are evidence that failed
+        // to enter join state, orphans are completions joinable to
+        // nothing, ambiguity + stale are correlation overflows,
+        // tombstone evictions are state evictions. Nothing silent.
+        use crate::kcrypto_lifecycle::async_adapter::AdapterStats;
+        let mut ledger = ledger_with([0; 5]);
+        ledger.adapter = AdapterStats {
+            cover_refused: 2,
+            callback_orphans: 3,
+            ambiguous_keys: 5,
+            tombstone_evictions: 7,
+            stale_callbacks: 11,
+        };
+        let integrity = integrity_for_lifecycle(&ledger, 0);
+        assert_eq!(integrity.state_insert_failures, 2);
+        assert_eq!(integrity.unmatched_returns, 3);
+        assert_eq!(integrity.correlation_overflows, 16);
+        assert_eq!(integrity.state_evictions, 7);
     }
 
     #[test]
