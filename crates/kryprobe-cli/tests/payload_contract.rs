@@ -209,6 +209,7 @@ fn payload_contract_producer_emits_pinned_shapes() {
                 cryptlen: Some(16),
                 req_flags: Some(0),
                 epoch: Some(0),
+                aead: None,
             },
         };
         let (header, payload) =

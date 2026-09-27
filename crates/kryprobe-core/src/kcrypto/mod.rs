@@ -5,6 +5,6 @@ pub mod aead;
 mod reducer;
 
 pub use reducer::{
-    CallbackDisposition, Edge, GapReason, LifecycleFamily, LifecycleReducer, OpDirection,
+    AeadMeta, CallbackDisposition, Edge, GapReason, LifecycleFamily, LifecycleReducer, OpDirection,
     ReducerStats, RequestMeta, RequestRecord, ReturnDisposition, Terminal,
 };

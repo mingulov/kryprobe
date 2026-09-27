@@ -35,10 +35,28 @@ pub enum CallbackDisposition {
 /// Crypto family behind a submitted operation (P3 submit metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleFamily {
-    /// `crypto_skcipher_*` sites (the only P3 op family; AEAD/hash
-    /// families arrive under their own wire versions, never by
-    /// relabeling this one).
+    /// `crypto_skcipher_*` sites.
     Skcipher,
+    /// `crypto_aead_*` sites (P5: its own family under wire v7,
+    /// never a relabeled skcipher — AEAD byte populations differ).
+    Aead,
+}
+
+/// AEAD submit extension (P5 internal metadata contract v2): the two
+/// entry-observed AEAD scalars. Present (`Some`) exactly on AEAD
+/// submits; skcipher submits carry `None` (no AEAD lengths ride a
+/// skcipher record — populations stay labeled). Each scalar is
+/// independently unknown-capable (`None` when its entry chase was
+/// unreadable — unknown, never 0-as-data; a valid zero stays
+/// `Some(0)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AeadMeta {
+    /// Associated-data length (`aead_request.assoclen` at entry).
+    pub assoclen: Option<u32>,
+    /// Tag width (submit-chased `crypto_aead.authsize` — the width
+    /// the op ran under, like `cryptlen`: current selected state,
+    /// not joined history).
+    pub authsize: Option<u32>,
 }
 
 /// Operation direction behind a submitted op (P3 submit metadata).
@@ -72,6 +90,9 @@ pub struct RequestMeta {
     /// keying era the op ran under — later rekeys never rewrite it);
     /// `None` when the submit bound no generation.
     pub epoch: Option<u64>,
+    /// AEAD submit extension (P5 contract v2): `Some` exactly when
+    /// `family` is [`LifecycleFamily::Aead`].
+    pub aead: Option<AeadMeta>,
 }
 
 /// One observed lifecycle edge, in per-source arrival order.

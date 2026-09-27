@@ -785,6 +785,10 @@ impl LifecycleDecoder {
                 cryptlen: raw.cryptlen,
                 req_flags: raw.req_flags,
                 epoch,
+                // v6 submits are skcipher-only (the twin refuses any
+                // other family): no AEAD extension rides them. The v7
+                // wire slice carries `RawEdge` AEAD scalars here.
+                aead: None,
             },
         });
         out

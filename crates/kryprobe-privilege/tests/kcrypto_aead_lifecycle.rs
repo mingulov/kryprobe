@@ -11,6 +11,8 @@
 use kryprobe_core::kcrypto::OpDirection;
 use kryprobe_core::kcrypto::Terminal;
 use kryprobe_core::kcrypto::aead::{AeadLen, derive_attempt, qualify_success};
+use kryprobe_core::kcrypto::{LifecycleFamily, RequestMeta};
+use kryprobe_privilege::kcrypto_lifecycle::sensor::SensorCore;
 
 /// A01: decrypt cryptlen 1040, authsize 16, assoclen 32 → raw input
 /// 1040, payload candidate 1024, AAD 32. The tag rides inside the
@@ -90,4 +92,63 @@ fn short_cryptlen_does_not_underflow() {
     let q = qualify_success(&short, Terminal::Sync(0));
     assert_eq!(q.payload, 0);
     assert_eq!(q.input, 8);
+}
+
+/// Contract v2 shape: the AEAD family exists, and skcipher submits
+/// carry NO AEAD extension (the extension rides AEAD submits only —
+/// a skcipher record with AEAD lengths would be a mislabeled
+/// population). Built over v6 bytes: the decoder still speaks v6
+/// until the wire slice lands; only the contract types are new.
+#[test]
+fn skcipher_submits_carry_no_aead_extension() {
+    assert_ne!(
+        LifecycleFamily::Aead,
+        LifecycleFamily::Skcipher,
+        "AEAD is its own family, never a relabeled skcipher"
+    );
+    let mut core = SensorCore::new(16, 16, 16, 8, true);
+    let key = 0xabc_u64;
+    let frontend = 0xFFFF_8880_0000_1000_u64;
+    let mut submit = vec![0u8; 112];
+    submit[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
+    submit[2] = 6;
+    submit[3] = 1;
+    submit[4..6].copy_from_slice(&1u16.to_le_bytes());
+    submit[8..16].copy_from_slice(&key.to_le_bytes());
+    submit[16..24].copy_from_slice(&100u64.to_le_bytes());
+    submit[28..32].copy_from_slice(&16u32.to_le_bytes());
+    submit[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+    submit[40..48].copy_from_slice(&frontend.to_le_bytes());
+    submit[48..52].copy_from_slice(&0u32.to_le_bytes());
+    submit[52] = 1;
+    submit[53] = 1;
+    submit[54..56].copy_from_slice(&0x03u16.to_le_bytes());
+    let mut ret = vec![0u8; 112];
+    ret[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
+    ret[2] = 6;
+    ret[3] = 2;
+    ret[4..6].copy_from_slice(&1u16.to_le_bytes());
+    ret[8..16].copy_from_slice(&key.to_le_bytes());
+    ret[16..24].copy_from_slice(&105u64.to_le_bytes());
+    ret[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+    assert_eq!(core.ingest_records(&[submit, ret]), 1);
+    let done = core.take_completed();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].meta.family, LifecycleFamily::Skcipher);
+    assert_eq!(done[0].meta.aead, None);
+    // The extension struct carries the two AEAD scalars, each
+    // independently unknown-capable.
+    let meta = RequestMeta {
+        family: LifecycleFamily::Aead,
+        direction: OpDirection::Decrypt,
+        cryptlen: Some(1040),
+        req_flags: Some(0),
+        epoch: Some(1),
+        aead: Some(kryprobe_core::kcrypto::AeadMeta {
+            assoclen: Some(32),
+            authsize: Some(16),
+        }),
+    };
+    assert_eq!(meta.aead.unwrap().assoclen, Some(32));
+    assert_eq!(meta.aead.unwrap().authsize, Some(16));
 }

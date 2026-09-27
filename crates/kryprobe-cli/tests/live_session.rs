@@ -2049,6 +2049,7 @@ fn lifecycle_record(
             cryptlen: Some(16),
             req_flags: Some(0),
             epoch: Some(0),
+            aead: None,
         },
     }
 }

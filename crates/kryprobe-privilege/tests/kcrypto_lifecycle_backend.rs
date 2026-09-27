@@ -385,6 +385,7 @@ fn f8c_lifecycle_event_builder_round_trips() {
             cryptlen: Some(16),
             req_flags: Some(0),
             epoch: Some(0),
+            aead: None,
         },
     };
     let (header, payload) = lifecycle_event(&record);
