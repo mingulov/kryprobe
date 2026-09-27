@@ -60,6 +60,16 @@ const RECORD_LEN: usize = 112;
 /// Driver-name field length (v6 `LEdge::drv`: 55 bytes max + NUL).
 const DRV_LEN: usize = 56;
 
+/// Token-space partition floor (contract §8, P4r4): issued ids live
+/// BELOW this line (`1..REFUSED_FLOOR`); decoder-refusal contention
+/// tokens live AT OR ABOVE it (`REFUSED_FLOOR..=u64::MAX`, top bit
+/// set). The two ranges can never meet however the allocators are
+/// driven — issuing stops at the floor (loud refusal) and refusal
+/// minting stops at the floor (loud slot recycle) — so
+/// `clear_uncovered` on an issued id can never erase another
+/// refusal's contention.
+const REFUSED_FLOOR: u64 = 1 << 63;
+
 /// One validated raw edge (post-twin-checks, pre-join).
 ///
 /// `Debug` is manual: [`RawEdge::key`] and [`RawEdge::tfm`] are raw
@@ -413,17 +423,23 @@ impl std::fmt::Debug for Outstanding {
 pub struct LifecycleDecoder {
     /// Maximum outstanding invocations (admission refuses past this).
     capacity: usize,
-    /// Next opaque id (starts at 1; 0 is never issued).
+    /// Next opaque id (starts at 1; 0 is never issued; stops at
+    /// [`REFUSED_FLOOR`] — the top-bit refusal range is never
+    /// issued, so issuing can never meet refusal tokens).
     next_id: u64,
-    /// Next refusal-contention token (counts DOWN from `u64::MAX`).
+    /// Next refusal-contention token (counts DOWN from `u64::MAX`,
+    /// stops at [`REFUSED_FLOOR`]).
     /// Decoder-admission refusals (full table, exhausted id space)
     /// never enter `outstanding`, so they mint no issued id — yet
     /// they keep contention (contract §8: a refused submit keeps
     /// its key contended) under one of these tokens, which live
-    /// ONLY in the `uncovered` map. Top-down so they can never
-    /// collide with issued ids (which count UP from 1): the ranges
-    /// meet only after 2^64 admissions. Saturates at 0 rather than
-    /// wrapping into the issued range.
+    /// ONLY in the `uncovered` map. Top-down within the
+    /// at-or-above-floor range so they can NEVER collide with
+    /// issued ids (which count UP from 1 below the floor): the
+    /// partition holds unconditionally, not after 2^64 admissions.
+    /// Parks below the floor rather than wrapping into the issued
+    /// range or silently reissuing (P4r4: parked refusals recycle
+    /// the oldest slot loud).
     next_refused: u64,
     /// Outstanding BPF invocation → submit facts. The invocation is
     /// the op-join identity: a return joins ONLY the id outstanding
@@ -578,11 +594,47 @@ impl LifecycleDecoder {
     /// `note_submit`, so without this the refused key keeps no
     /// contention and a later callback joins the wrong live token
     /// (P4R2-N1). Mints a contention-only token (never an issued
-    /// id — nothing is emitted for the refused submit).
+    /// id — nothing is emitted for the refused submit) while the
+    /// refusal range lasts; past the floor the allocator parks and
+    /// the refusal recycles loud instead (P4r4 — never below the
+    /// floor, never silent reuse).
     fn retain_refused(&mut self, req_key: u64, out: &mut Vec<Edge>) {
-        let token = self.next_refused;
-        self.next_refused = self.next_refused.saturating_sub(1);
-        self.retain_contention(req_key, token, out);
+        if self.next_refused >= REFUSED_FLOOR {
+            let token = self.next_refused;
+            // At or above the floor, hence nonzero: cannot underflow.
+            self.next_refused -= 1;
+            self.retain_contention(req_key, token, out);
+        } else {
+            self.retain_refused_exhausted(req_key, out);
+        }
+    }
+
+    /// Retain refusal contention after the refusal-token range is
+    /// exhausted (contract §8, P4r4): NEVER mint below the floor
+    /// (issued-id range) and NEVER silently reissue a resident
+    /// token. Instead recycle the oldest resident slot LOUD —
+    /// evict it with a key gap exactly like capacity overflow,
+    /// then reuse its (now unresident, still refusal-range) token
+    /// for the new entry. Net table size unchanged, so the map,
+    /// the key counts, and the FIFO all stay bounded. With no
+    /// resident slot to recycle (empty table at exhaustion), gap
+    /// the refused key now (loud) and retain nothing — the refusal
+    /// itself stays counted by the caller.
+    fn retain_refused_exhausted(&mut self, req_key: u64, out: &mut Vec<Edge>) {
+        while let Some(old) = self.uncovered_order.pop_front() {
+            if let Some(old_key) = self.uncovered.remove(&old) {
+                Self::decrement_key(&mut self.uncovered_keys, old_key);
+                out.extend(self.adapter.gap_key(old_key));
+                self.uncovered.insert(old, req_key);
+                self.uncovered_keys
+                    .entry(req_key)
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
+                self.uncovered_order.push_back(old);
+                return;
+            }
+        }
+        out.extend(self.adapter.gap_key(req_key));
     }
 
     /// Retain refusal contention for a submit the adapter could
@@ -665,10 +717,11 @@ impl LifecycleDecoder {
             self.retain_refused(raw.key, &mut out);
             return out;
         }
-        // `u64::MAX` is never issued (sentinel headroom): exhaustion
-        // refuses admission instead of wrapping ids (lifetime-unique
-        // ids are a T08 prerequisite).
-        if self.next_id == u64::MAX {
+        // The floor is never issued (partition headroom, P4r4):
+        // exhaustion refuses admission instead of minting into the
+        // refusal-token range (lifetime-unique ids are a T08
+        // prerequisite; disjoint ranges are a §8 prerequisite).
+        if self.next_id >= REFUSED_FLOOR {
             self.stats.submit_refused += 1;
             self.retain_refused(raw.key, &mut out);
             return out;
@@ -763,5 +816,154 @@ impl LifecycleDecoder {
         }
         self.adapter
             .resolve_callback(raw.key, raw.ts_ns, raw.status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kryprobe_core::kcrypto::{LifecycleReducer, Terminal};
+
+    /// Token-space partition pinned by these tests (P4r4): issued
+    /// ids below, refusal-contention tokens at/above. The boundary
+    /// value is asserted behaviorally on both sides (every issued
+    /// id `< PARTITION`, every refusal token `>= PARTITION`), so
+    /// the source constant cannot drift from this pin. Seeds skip
+    /// astronomically large valid prefixes; only boundary suffixes
+    /// run live.
+    const PARTITION: u64 = 1 << 63;
+
+    fn raw(edge: u8, key: u64, invoc: u64, ts_ns: u64, status: i32) -> RawEdge {
+        RawEdge {
+            edge,
+            site: if edge == LEDGE_CALLBACK {
+                LSITE_CB_CRYPTD
+            } else {
+                LSITE_ENC
+            },
+            tainted: false,
+            key,
+            ts_ns,
+            status,
+            invoc,
+            tfm: 0,
+            drv: String::new(),
+            truncated: false,
+            cryptlen: if edge == LEDGE_SUBMIT { Some(16) } else { None },
+            req_flags: if edge == LEDGE_SUBMIT { Some(0) } else { None },
+            family: LifecycleFamily::Skcipher,
+            direction: OpDirection::Encrypt,
+        }
+    }
+
+    #[test]
+    fn decoder_boundary_issued_refusal_ranges_never_meet() {
+        // P4R3-N1: forcing the issued allocator against the refusal
+        // range must refuse LOUD (never mint an issued id a refusal
+        // token could meet) and must never misjoin.
+        let mut d = LifecycleDecoder::new(4);
+        d.next_id = PARTITION - 2;
+        let mut reducer = LifecycleReducer::new(4);
+        let mut records = Vec::new();
+        for row in [
+            raw(LEDGE_SUBMIT, 0xA21, 0xA210, 100, 0), // A: id PARTITION-2
+            raw(LEDGE_RETURN, 0xA21, 0xA210, 110, -libc::EINPROGRESS),
+            raw(LEDGE_SUBMIT, 0xD21, 0xD210, 180, 0), // D: id PARTITION-1
+            raw(LEDGE_SUBMIT, 0xE21, 0xE210, 190, 0), // X: refused (floor)
+            raw(LEDGE_SUBMIT, 0xA21, 0xA212, 200, 0), // B: refused (floor)
+        ] {
+            for e in d.join(row) {
+                records.extend(reducer.apply(e));
+            }
+        }
+        // The issued allocator stops AT the floor: loud refusal,
+        // contention kept under refusal-range tokens.
+        assert_eq!(d.next_id, PARTITION);
+        assert_eq!(d.stats().submit_refused, 2);
+        assert_eq!(d.uncovered.get(&u64::MAX), Some(&0xE21));
+        assert_eq!(d.uncovered.get(&(u64::MAX - 1)), Some(&0xA21));
+        assert!(d.uncovered.keys().all(|t| *t >= PARTITION));
+        // D's sync return retires D's own issued token only — B's
+        // refusal contention survives (the ranges never meet).
+        for e in d.join(raw(LEDGE_RETURN, 0xD21, 0xD210, 230, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert!(d.uncovered_keys.contains_key(&0xA21));
+        let callback = d.join(raw(LEDGE_CALLBACK, 0xA21, 0, 250, 0));
+        for e in callback.iter().cloned() {
+            records.extend(reducer.apply(e));
+        }
+        assert_eq!(d.adapter_stats().ambiguous_keys, 1);
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.id == PARTITION - 2 && r.terminal == Terminal::Callback(0)),
+            "a forced meeting attempt must refuse loud, never join B's terminal to A"
+        );
+    }
+
+    #[test]
+    fn decoder_boundary_refusal_tokens_stop_at_floor() {
+        // P4R3-N1/N2 (floor): the last fresh refusal token is the
+        // floor itself (top bit set); past it the allocator parks
+        // — it never mints below the floor and never silently
+        // reuses. The parked refusal recycles the oldest slot LOUD
+        // (eviction gap), keeping every table bounded.
+        let mut d = LifecycleDecoder::new(2);
+        let _ = d.join(raw(LEDGE_SUBMIT, 0xB31, 0xB310, 100, 0));
+        let _ = d.join(raw(LEDGE_SUBMIT, 0xF31, 0xF311, 110, 0));
+        // Outstanding full (2/2); park the issued allocator past
+        // the floor too so every further submit refuses.
+        d.next_id = u64::MAX;
+        d.next_refused = PARTITION;
+        let before = d.adapter_stats();
+        d.join(raw(LEDGE_SUBMIT, 0xB31, 0xB312, 200, 0)); // R1: token PARTITION
+        assert_eq!(d.next_refused, PARTITION - 1);
+        assert_eq!(d.uncovered.get(&PARTITION), Some(&0xB31));
+        d.join(raw(LEDGE_SUBMIT, 0xC31, 0xC312, 210, 0)); // R2: parked, loud recycle
+        let after = d.adapter_stats();
+        // Every table bounded; every resident token refusal-range;
+        // the parked allocator never wrapped or re-minted.
+        assert!(d.uncovered.len() <= d.capacity);
+        assert!(d.uncovered_keys.len() <= d.capacity);
+        assert!(d.uncovered_order.len() <= d.capacity);
+        assert!(d.uncovered.keys().all(|t| *t >= PARTITION));
+        assert_eq!(d.next_refused, PARTITION - 1);
+        // Loud, exactly once: the evicted key's live cover gaps.
+        assert_eq!(d.stats().submit_refused, 2);
+        assert_eq!(after.ambiguous_keys, before.ambiguous_keys + 1);
+        assert_eq!(after.callback_orphans, before.callback_orphans);
+    }
+
+    #[test]
+    fn decoder_boundary_saturated_refusals_keep_every_table_bounded() {
+        // P4R3-N2: a parked (saturated) refusal allocator must keep
+        // EVERY contention table bounded — map, key counts, and FIFO
+        // alike — with loud per-refusal accounting and no silent
+        // token reuse. Seeded after prior refusals minted MAX-1 then
+        // MAX-2.
+        let mut d = LifecycleDecoder::new(2);
+        d.next_id = u64::MAX; // Issued allocator exhausted: every submit refuses.
+        d.next_refused = 1; // Refusal range fully spent: every refusal recycles.
+        let mut ignored = Vec::new();
+        d.retain_contention(0xF30, u64::MAX - 1, &mut ignored);
+        d.retain_contention(0xF31, u64::MAX - 2, &mut ignored);
+        assert!(ignored.is_empty());
+        for i in 0..8u64 {
+            d.join(raw(LEDGE_SUBMIT, 0xF40 + i, 0xF400 + 2 * i, 100 + i, 0));
+        }
+        assert_eq!(d.stats().submit_refused, 8);
+        assert!(d.uncovered.len() <= d.capacity);
+        assert!(d.uncovered_keys.len() <= d.capacity);
+        assert!(d.uncovered_order.len() <= d.capacity);
+        assert!(d.uncovered.keys().all(|t| *t >= PARTITION));
+        assert_eq!(
+            d.next_refused, 1,
+            "a parked allocator never wraps or re-mints"
+        );
+        // Loud, exactly once per refusal: no live cover exists, so
+        // each recycled eviction reads orphan (counted, never silent).
+        assert_eq!(d.adapter_stats().callback_orphans, 8);
+        assert_eq!(d.adapter_stats().ambiguous_keys, 0);
     }
 }
