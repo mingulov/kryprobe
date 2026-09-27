@@ -187,6 +187,7 @@ static char kxc_sync_name[KXC_DRV_NAME_MAX];
 static char kxc_async_name[KXC_DRV_NAME_MAX];
 static char kxc_fail_name[KXC_DRV_NAME_MAX];
 static char kxc_aead_name[KXC_DRV_NAME_MAX];
+static char kxc_aead_async_name[KXC_DRV_NAME_MAX];
 
 const char *kxc_sync_driver_name(void)
 {
@@ -206,6 +207,11 @@ const char *kxc_fail_driver_name(void)
 const char *kxc_aead_driver_name(void)
 {
 	return kxc_aead_name;
+}
+
+const char *kxc_aead_async_driver_name(void)
+{
+	return kxc_aead_async_name;
 }
 
 static int kxc_cra_init(struct crypto_tfm *tfm)
@@ -467,7 +473,7 @@ static struct skcipher_alg kxc_fail_alg = {
 };
 
 /* ------------------------------------------------------------------ */
-/* minimal AEAD driver (T07 F07 config shape; NOT T10 AEAD lifecycle)   */
+/* AEAD drivers (T10 request lifecycle + tag semantics)                 */
 /* ------------------------------------------------------------------ */
 
 #define KXC_AEAD_GENERIC_NAME "kxaead"
@@ -518,40 +524,142 @@ static int kxc_aead_setauthsize(struct crypto_aead *tfm,
 }
 
 /*
- * XOR "AEAD": encrypt/decrypt mirror the skcipher walk over
- * cryptlen bytes. There are deliberately NO tag semantics here
- * (no authentication, assoc ignored): T07 exercises the
- * setauthsize CONFIGURATION shape only; T10 owns AEAD request
- * lifecycle, tag checks and failure legs. Single-sg test
- * buffers only (the scenario pins one page).
+ * T10 AEAD request lifecycle: XOR-payload cipher with REAL tag
+ * semantics (deterministic test-only tag — NOT a MAC: a byte fold
+ * over key + AAD + plaintext + lengths, documented here so no one
+ * mistakes it for authentication).
+ *
+ * Request layout (kernel AEAD convention, single-sg test buffers
+ * only — the scenario sizes each sg): src = [AAD assoclen][data
+ * cryptlen]; for decrypt the data is [ciphertext][tag authsize].
+ * Encrypt writes dst = [AAD][ciphertext][tag]; decrypt verifies
+ * the trailing tag BEFORE returning (mismatch -> -EBADMSG, the
+ * native invalid-tag errno) and refuses cryptlen < authsize with
+ * -EINVAL (the input cannot contain a tag — explicit error, never
+ * an underflowed length).
+ *
+ * The tag folds PLAINTEXT (decrypt recovers it first, then folds):
+ * both directions fold identical bytes, so a good roundtrip
+ * verifies and any tag/AAD/plaintext/length corruption trips.
  */
-static int kxc_aead_do_crypt(struct aead_request *req)
+static u8 kxc_aead_fold(const struct kxc_aead_ctx *ctx, const u8 *aad,
+			unsigned int assoclen, const u8 *pt,
+			unsigned int ptlen)
+{
+	u8 f = 0;
+	unsigned int i;
+
+	for (i = 0; i < assoclen; i++)
+		f ^= aad[i];
+	for (i = 0; i < ptlen; i++)
+		f ^= pt[i];
+	/*
+	 * Lengths fold as PAYLOAD lengths (never the wire cryptlen:
+	 * decrypt cryptlen includes the tag while encrypt cryptlen
+	 * excludes it, so folding cryptlen would split the roundtrip
+	 * — payload length is identical both directions).
+	 */
+	f ^= (u8)(assoclen & 0xff) ^ (u8)((assoclen >> 8) & 0xff);
+	f ^= (u8)(ptlen & 0xff) ^ (u8)((ptlen >> 8) & 0xff);
+	f ^= (u8)(ctx->authsize & 0xff);
+	for (i = 0; i < ctx->keylen; i++)
+		f ^= ctx->key[i];
+	return f;
+}
+
+static void kxc_aead_tag(const struct kxc_aead_ctx *ctx, u8 fold, u8 *tag,
+			 unsigned int authsize)
+{
+	unsigned int j;
+
+	for (j = 0; j < authsize; j++)
+		tag[j] = fold ^ ctx->key[j % ctx->keylen] ^ (u8)j;
+}
+
+/*
+ * Raw cipher core (UNCHASED): both the sync alg entries below and
+ * the async worker drain through here, so each op chases exactly
+ * one submit/return pair at its alg entry point (mirrors
+ * kxc_do_crypt — the worker must never call a chased symbol).
+ */
+static int kxc_aead_do_encrypt(struct aead_request *req)
 {
 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
 	struct kxc_aead_ctx *ctx = crypto_aead_ctx(tfm);
 	u8 *dst;
 	const u8 *src;
-	unsigned int i;
+	unsigned int i, assoclen;
+	u8 fold;
+	u8 expect[KXC_AEAD_MAXAUTHSIZE];
 
+	atomic64_inc(&kxc_crypt_entries);
 	if (!ctx->keylen)
 		return -ENOKEY;
 	if (!ctx->authsize)
 		return -EINVAL;
+	assoclen = req->assoclen;
 	src = sg_virt(req->src);
 	dst = sg_virt(req->dst);
+	/* AAD copies verbatim (conventional dst layout). */
+	for (i = 0; i < assoclen; i++)
+		dst[i] = src[i];
 	for (i = 0; i < req->cryptlen; i++)
-		dst[i] = src[i] ^ ctx->key[i % ctx->keylen];
+		dst[assoclen + i] =
+			src[assoclen + i] ^ ctx->key[i % ctx->keylen];
+	fold = kxc_aead_fold(ctx, src, assoclen, src + assoclen,
+			     req->cryptlen);
+	kxc_aead_tag(ctx, fold, expect, ctx->authsize);
+	for (i = 0; i < ctx->authsize; i++)
+		dst[assoclen + req->cryptlen + i] = expect[i];
 	return 0;
 }
 
+static int kxc_aead_do_decrypt(struct aead_request *req)
+{
+	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+	struct kxc_aead_ctx *ctx = crypto_aead_ctx(tfm);
+	u8 *dst;
+	const u8 *src;
+	unsigned int i, assoclen, payload;
+	u8 fold;
+	u8 expect[KXC_AEAD_MAXAUTHSIZE];
+
+	atomic64_inc(&kxc_crypt_entries);
+	if (!ctx->keylen)
+		return -ENOKEY;
+	if (!ctx->authsize)
+		return -EINVAL;
+	/* Short input: the tag cannot fit — explicit error. */
+	if (req->cryptlen < ctx->authsize)
+		return -EINVAL;
+	assoclen = req->assoclen;
+	payload = req->cryptlen - ctx->authsize;
+	src = sg_virt(req->src);
+	dst = sg_virt(req->dst);
+	for (i = 0; i < assoclen; i++)
+		dst[i] = src[i];
+	for (i = 0; i < payload; i++)
+		dst[assoclen + i] =
+			src[assoclen + i] ^ ctx->key[i % ctx->keylen];
+	/* Fold over the RECOVERED plaintext (identical bytes to the
+	 * encrypt fold), then compare against the trailing tag. */
+	fold = kxc_aead_fold(ctx, src, assoclen, dst + assoclen,
+			     payload);
+	kxc_aead_tag(ctx, fold, expect, ctx->authsize);
+	if (memcmp(expect, src + assoclen + payload, ctx->authsize) != 0)
+		return -EBADMSG;
+	return 0;
+}
+
+/* Sync alg entries (CHASED submit/return sites): thin wrappers. */
 static int kxc_aead_encrypt(struct aead_request *req)
 {
-	return kxc_aead_do_crypt(req);
+	return kxc_aead_do_encrypt(req);
 }
 
 static int kxc_aead_decrypt(struct aead_request *req)
 {
-	return kxc_aead_do_crypt(req);
+	return kxc_aead_do_decrypt(req);
 }
 
 static struct aead_alg kxc_aead_alg = {
@@ -570,6 +678,120 @@ static struct aead_alg kxc_aead_alg = {
 	.setauthsize = kxc_aead_setauthsize,
 	.encrypt = kxc_aead_encrypt,
 	.decrypt = kxc_aead_decrypt,
+};
+
+/*
+ * Async AEAD driver (T10 accepted async schedule): depth-1 queue
+ * mirroring the skcipher async driver, with its own worker casting
+ * aead_request (the skcipher worker's skcipher_request_cast must
+ * never see an AEAD request). Deliberately the SIMPLE schedule
+ * only (queue + cross-CPU drain + terminal completion): no
+ * submit-hold, no delay, no inline-once, no backlog-burst legs —
+ * those stay skcipher-only. Completions funnel through the
+ * consumer's kxc_complete (the fixture callback site —
+ * family-agnostic key join), so the AEAD op struct mirrors the
+ * skcipher op's shared prefix (see consumer.c).
+ */
+/*
+ * One depth-1 queue per direction: a queued aead_request carries
+ * no direction tag, so encrypt and decrypt queue separately (the
+ * queue IS the direction record — never a shared flag, which
+ * would race under backlog).
+ */
+static struct crypto_queue kxc_aead_bq_enc;
+static struct crypto_queue kxc_aead_bq_dec;
+static DEFINE_SPINLOCK(kxc_aead_bq_lock);
+static struct work_struct kxc_aead_drain_work_enc;
+static struct work_struct kxc_aead_drain_work_dec;
+
+static void kxc_aead_drain_one(struct crypto_queue *q, bool encrypt)
+{
+	struct crypto_async_request *areq, *backlog;
+	struct aead_request *req;
+	int err;
+
+	for (;;) {
+		spin_lock_bh(&kxc_aead_bq_lock);
+		backlog = crypto_get_backlog(q);
+		areq = crypto_dequeue_request(q);
+		spin_unlock_bh(&kxc_aead_bq_lock);
+		if (!areq)
+			break;
+		if (backlog)
+			crypto_request_complete(backlog, -EINPROGRESS);
+		req = aead_request_cast(areq);
+		if (encrypt)
+			err = kxc_aead_do_encrypt(req);
+		else
+			err = kxc_aead_do_decrypt(req);
+		crypto_request_complete(areq, err);
+	}
+}
+
+static void kxc_aead_async_fn_enc(struct work_struct *work)
+{
+	kxc_aead_drain_one(&kxc_aead_bq_enc, true);
+}
+
+static void kxc_aead_async_fn_dec(struct work_struct *work)
+{
+	kxc_aead_drain_one(&kxc_aead_bq_dec, false);
+}
+
+static void kxc_aead_queue_drain(struct work_struct *work)
+{
+	int cpu, ncpu;
+
+	/* Cross-CPU completion: never the queueing CPU when one exists. */
+	ncpu = num_online_cpus();
+	cpu = ncpu > 1 ? (int)((smp_processor_id() + 1) % (unsigned int)ncpu) : 0;
+	queue_work_on(cpu, kxc_wq, work);
+}
+
+static int kxc_aead_async_crypt(struct aead_request *req, bool encrypt)
+{
+	struct crypto_queue *q = encrypt ? &kxc_aead_bq_enc : &kxc_aead_bq_dec;
+	struct work_struct *work = encrypt ? &kxc_aead_drain_work_enc :
+					     &kxc_aead_drain_work_dec;
+	int err;
+
+	spin_lock_bh(&kxc_aead_bq_lock);
+	err = crypto_enqueue_request(q, &req->base);
+	spin_unlock_bh(&kxc_aead_bq_lock);
+	if (err != -EINPROGRESS && err != -EBUSY)
+		return err;
+	kxc_aead_queue_drain(work);
+	return err;
+}
+
+static int kxc_aead_async_encrypt(struct aead_request *req)
+{
+	return kxc_aead_async_crypt(req, true);
+}
+
+static int kxc_aead_async_decrypt(struct aead_request *req)
+{
+	return kxc_aead_async_crypt(req, false);
+}
+
+#define KXC_AEAD_ASYNC_GENERIC_NAME "kxaead-async"
+
+static struct aead_alg kxc_aead_async_alg = {
+	.base = {
+		.cra_name = KXC_AEAD_ASYNC_GENERIC_NAME,
+		.cra_priority = 300,
+		.cra_blocksize = 16,
+		.cra_ctxsize = sizeof(struct kxc_aead_ctx),
+		.cra_module = THIS_MODULE,
+		.cra_init = kxc_aead_cra_init,
+		.cra_exit = kxc_aead_cra_exit,
+	},
+	.ivsize = 16,
+	.maxauthsize = KXC_AEAD_MAXAUTHSIZE,
+	.setkey = kxc_aead_setkey,
+	.setauthsize = kxc_aead_setauthsize,
+	.encrypt = kxc_aead_async_encrypt,
+	.decrypt = kxc_aead_async_decrypt,
 };
 
 /* ------------------------------------------------------------------ */
@@ -741,6 +963,8 @@ static int __init kxc_init(void)
 		  run_suffix);
 	scnprintf(kxc_aead_name, sizeof(kxc_aead_name), "kxaead-sync-%s",
 		  run_suffix);
+	scnprintf(kxc_aead_async_name, sizeof(kxc_aead_async_name),
+		  "kxaead-async-%s", run_suffix);
 	strscpy(kxc_sync_alg.base.cra_driver_name, kxc_sync_name,
 		sizeof(kxc_sync_alg.base.cra_driver_name));
 	strscpy(kxc_async_alg.base.cra_driver_name, kxc_async_name,
@@ -749,6 +973,8 @@ static int __init kxc_init(void)
 		sizeof(kxc_fail_alg.base.cra_driver_name));
 	strscpy(kxc_aead_alg.base.cra_driver_name, kxc_aead_name,
 		sizeof(kxc_aead_alg.base.cra_driver_name));
+	strscpy(kxc_aead_async_alg.base.cra_driver_name, kxc_aead_async_name,
+		sizeof(kxc_aead_async_alg.base.cra_driver_name));
 
 	kxc_log.rows = vmalloc(array_size(sizeof(*kxc_log.rows), KXC_ROWS_MAX));
 	if (!kxc_log.rows)
@@ -762,6 +988,10 @@ static int __init kxc_init(void)
 	}
 	crypto_init_queue(&kxc_bq, KXC_BQ_MAX_QLEN);
 	INIT_WORK(&kxc_drain_work, kxc_async_fn);
+	crypto_init_queue(&kxc_aead_bq_enc, KXC_BQ_MAX_QLEN);
+	crypto_init_queue(&kxc_aead_bq_dec, KXC_BQ_MAX_QLEN);
+	INIT_WORK(&kxc_aead_drain_work_enc, kxc_aead_async_fn_enc);
+	INIT_WORK(&kxc_aead_drain_work_dec, kxc_aead_async_fn_dec);
 	atomic_set(&kxc_submit_hold, 0);
 	atomic_set(&kxc_delay_ms, 0);
 
@@ -783,10 +1013,15 @@ static int __init kxc_init(void)
 	ret = crypto_register_aead(&kxc_aead_alg);
 	if (ret)
 		goto err_aead;
+	ret = crypto_register_aead(&kxc_aead_async_alg);
+	if (ret)
+		goto err_aead_async;
 
 	pr_info("kcrypto_fixture: loaded (suffix %s, TEST ONLY)\n", run_suffix);
 	return 0;
 
+err_aead_async:
+	crypto_unregister_aead(&kxc_aead_alg);
 err_aead:
 	crypto_unregister_skcipher(&kxc_fail_alg);
 err_fail:
@@ -802,6 +1037,7 @@ err_alg:
 
 static void __exit kxc_exit(void)
 {
+	crypto_unregister_aead(&kxc_aead_async_alg);
 	crypto_unregister_aead(&kxc_aead_alg);
 	crypto_unregister_skcipher(&kxc_fail_alg);
 	crypto_unregister_skcipher(&kxc_async_alg);

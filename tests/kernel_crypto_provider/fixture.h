@@ -89,6 +89,7 @@ const char *kxc_sync_driver_name(void);
 const char *kxc_async_driver_name(void);
 const char *kxc_fail_driver_name(void);
 const char *kxc_aead_driver_name(void);
+const char *kxc_aead_async_driver_name(void);
 void kxc_flush_work(void);
 void kxc_drain_kick(void);
 void kxc_set_submit_hold(bool hold);

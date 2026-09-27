@@ -73,6 +73,67 @@ struct kxc_op {
 	int resubmit_err;
 };
 
+/*
+ * T10 AEAD op: shares kxc_op's prefix through `iv` field-for-field
+ * (the BPF fixture-callback chase reads `req` at ONE arm-resolved
+ * offset, and kxc_complete touches only the shared tail), with the
+ * AEAD-only second sg/page + callback-private marker at the END
+ * (never between shared fields). Compile-proven below: any layout
+ * drift fails the build, and the deterministic async cell proves
+ * the join (a wrong `req` offset strands every async AEAD op).
+ */
+struct kxc_aead_op {
+	struct kxc_run *run;
+	struct crypto_aead *tfm;
+	struct aead_request *req;
+	struct scatterlist sg_src;
+	struct page *page_src;
+	u8 iv[KXC_IVLEN];
+	struct completion done;
+	spinlock_t mark_lock;
+	bool completed;
+	int err;
+	u64 seq;
+	bool resubmit_armed;
+	bool resubmit_async;
+	u64 resubmit_seq;
+	int resubmit_err;
+	struct scatterlist sg_dst;
+	struct page *page_dst;
+	/* Callback-private marker (privacy scan: never captured). */
+	u8 cb_priv[32];
+};
+
+_Static_assert(offsetof(struct kxc_aead_op, run) == offsetof(struct kxc_op, run),
+	       "aead op run prefix");
+_Static_assert(offsetof(struct kxc_aead_op, tfm) == offsetof(struct kxc_op, tfm),
+	       "aead op tfm prefix");
+_Static_assert(offsetof(struct kxc_aead_op, req) == offsetof(struct kxc_op, req),
+	       "aead op req offset (BPF op_req_off)");
+_Static_assert(offsetof(struct kxc_aead_op, done) == offsetof(struct kxc_op, done),
+	       "aead op done offset (kxc_complete)");
+_Static_assert(offsetof(struct kxc_aead_op, mark_lock) ==
+	       offsetof(struct kxc_op, mark_lock),
+	       "aead op mark_lock offset (kxc_complete)");
+_Static_assert(offsetof(struct kxc_aead_op, completed) ==
+	       offsetof(struct kxc_op, completed),
+	       "aead op completed offset (kxc_complete)");
+_Static_assert(offsetof(struct kxc_aead_op, err) == offsetof(struct kxc_op, err),
+	       "aead op err offset (kxc_complete)");
+_Static_assert(offsetof(struct kxc_aead_op, seq) == offsetof(struct kxc_op, seq),
+	       "aead op seq offset (kxc_complete)");
+_Static_assert(offsetof(struct kxc_aead_op, resubmit_armed) ==
+	       offsetof(struct kxc_op, resubmit_armed),
+	       "aead op resubmit prefix (kxc_complete)");
+
+/* Privacy markers (T10): AAD/tag/callback-private contents the
+ * observer must never capture (counts only). The guest privacy
+ * scan asserts these byte strings absent from raw ring bytes. */
+static const u8 kxc_canary_aad[] = "KPROBE-CANARY-AAD";
+/* 16 bytes exactly: the bad-tag leg writes it AS the corrupted tag. */
+static const u8 kxc_canary_tag[16] = "KPROBE-CANARY-T1";
+static const u8 kxc_canary_cb[] = "KPROBE-CANARY-CB-PRIVATE-01234567";
+
 /* ------------------------------------------------------------------ */
 /* row emission                                                        */
 /* ------------------------------------------------------------------ */
@@ -115,6 +176,26 @@ static void kxc_emit_submit(struct kxc_run *run, u64 seq, const char *op,
 		"\"op\":\"%s\",\"len\":%u,\"flags\":%u,\"ts\":%llu,\"cpu\":%u}",
 		run->id, seq, op, len, flags, ktime_get_ns(),
 		smp_processor_id());
+}
+
+/*
+ * T10 AEAD submit row: the skcipher fields plus the AEAD scalars
+ * (`assoc` = assoclen, `authsize` = tag width). Extra fields are
+ * ignored by older oracles (same rule as the trailer `entries`
+ * field); the op label carries the family (`aead-encrypt` /
+ * `aead-decrypt` — the closed label set).
+ */
+static void kxc_emit_submit_aead(struct kxc_run *run, u64 seq,
+				 const char *op, unsigned int len,
+				 u32 flags, unsigned int assoc,
+				 unsigned int authsize)
+{
+	kxc_ledger_emit(
+		"{\"v\":1,\"run\":\"%s\",\"seq\":%llu,\"phase\":\"submit\","
+		"\"op\":\"%s\",\"len\":%u,\"flags\":%u,\"assoc\":%u,"
+		"\"authsize\":%u,\"ts\":%llu,\"cpu\":%u}",
+		run->id, seq, op, len, flags, assoc, authsize,
+		ktime_get_ns(), smp_processor_id());
 }
 
 static void kxc_emit_return(struct kxc_run *run, u64 seq, int errno_)
@@ -315,20 +396,27 @@ static int kxc_tfm_acquire_raw(struct kxc_run *run, const char *req_name,
 }
 
 /* Raw AEAD acquisition: alloc + alloc row, no setkey/setauthsize. */
-static int kxc_aead_acquire(struct kxc_run *run, const char *req_name,
-			    struct crypto_aead **tfm, u64 *aseq)
+static int kxc_aead_acquire_typed(struct kxc_run *run, const char *req_name,
+					  u32 type, u32 mask,
+					  struct crypto_aead **tfm, u64 *aseq)
 {
 	struct crypto_aead *t;
 
-	t = crypto_alloc_aead(req_name, 0, 0);
+	t = crypto_alloc_aead(req_name, type, mask);
 	if (IS_ERR(t))
 		return PTR_ERR(t);
 	*aseq = kxc_next_seq(run);
 	kxc_emit_alloc(run, *aseq, req_name,
 		       crypto_tfm_alg_driver_name(crypto_aead_tfm(t)),
-		       0, 0);
+		       type, mask);
 	*tfm = t;
 	return 0;
+}
+
+static int kxc_aead_acquire(struct kxc_run *run, const char *req_name,
+			    struct crypto_aead **tfm, u64 *aseq)
+{
+	return kxc_aead_acquire_typed(run, req_name, 0, 0, tfm, aseq);
 }
 
 static void kxc_aead_release(struct kxc_run *run, struct crypto_aead *tfm,
@@ -446,6 +534,159 @@ static int kxc_wait_done_as(struct kxc_run *run, struct kxc_op *op,
 static int kxc_wait_done(struct kxc_run *run, struct kxc_op *op)
 {
 	return kxc_wait_done_as(run, op, op->seq);
+}
+
+/* ------------------------------------------------------------------ */
+/* T10 AEAD helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+#define KXC_AEAD_PT 1024u
+#define KXC_AEAD_AAD 32u
+#define KXC_AEAD_TAG 16u
+#define KXC_AEAD_TAG8 8u
+/*
+ * Wire-image stash: the decrypt legs must feed on ciphertext, but a
+ * decrypt overwrites the dst page with plaintext — so the scenario
+ * stashes the encrypt output in the UNUSED tail of the src page
+ * (sg spans cover [0, AAD+data) only; the driver never touches the
+ * stash). Keeps 1040B off the kernel stack.
+ */
+#define KXC_AEAD_WIRE_OFF 2048u
+
+/* Deterministic payload pattern (setup writes it; restore rewrites
+ * it; verify checks decrypt output byte-for-byte). */
+static void kxc_aead_fill_pt(u8 *buf)
+{
+	unsigned int i;
+
+	for (i = 0; i < KXC_AEAD_PT; i++)
+		buf[i] = (u8)(0x11 * (i & 0xf) + (i >> 4));
+}
+
+static int kxc_aead_verify_pt(const u8 *buf)
+{
+	unsigned int i;
+
+	for (i = 0; i < KXC_AEAD_PT; i++) {
+		if (buf[i] != (u8)(0x11 * (i & 0xf) + (i >> 4)))
+			return -EBADMSG;
+	}
+	return 0;
+}
+
+/*
+ * Two pages per AEAD op (src + dst, each 4096B). Caller supplies
+ * `datalen` = cryptlen (payload for encrypt, payload+tag for
+ * decrypt); the sg spans always cover AAD + datalen so the driver
+ * reads exactly the bytes the ledger claims.
+ */
+static int kxc_aead_req_setup(struct kxc_run *run, struct crypto_aead *tfm,
+			      struct kxc_aead_op *op, u32 cb_flags,
+			      unsigned int datalen)
+{
+	u8 *src, *dst;
+
+	memset(op, 0, sizeof(*op));
+	op->run = run;
+	op->tfm = tfm;
+	op->req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!op->req)
+		return -ENOMEM;
+	op->page_src = alloc_page(GFP_KERNEL);
+	if (!op->page_src) {
+		aead_request_free(op->req);
+		op->req = NULL;
+		return -ENOMEM;
+	}
+	op->page_dst = alloc_page(GFP_KERNEL);
+	if (!op->page_dst) {
+		aead_request_free(op->req);
+		op->req = NULL;
+		__free_page(op->page_src);
+		op->page_src = NULL;
+		return -ENOMEM;
+	}
+	src = page_address(op->page_src);
+	dst = page_address(op->page_dst);
+	/* AAD region carries the privacy-scan marker, payload is
+	 * deterministic; every buffer is sized exactly. */
+	memcpy(src, kxc_canary_aad, sizeof(kxc_canary_aad) - 1);
+	memset(src + sizeof(kxc_canary_aad) - 1, 'A',
+	       KXC_AEAD_AAD - (sizeof(kxc_canary_aad) - 1));
+	kxc_aead_fill_pt(src + KXC_AEAD_AAD);
+	memset(dst, 0, PAGE_SIZE);
+	sg_init_one(&op->sg_src, src, KXC_AEAD_AAD + datalen);
+	sg_init_one(&op->sg_dst, dst, KXC_AEAD_AAD + datalen);
+	aead_request_set_callback(op->req, cb_flags, kxc_complete, op);
+	memcpy(op->iv, kxc_iv, KXC_IVLEN);
+	memcpy(op->cb_priv, kxc_canary_cb, sizeof(op->cb_priv));
+	aead_request_set_ad(op->req, KXC_AEAD_AAD);
+	aead_request_set_crypt(op->req, &op->sg_src, &op->sg_dst,
+			       datalen, op->iv);
+	init_completion(&op->done);
+	spin_lock_init(&op->mark_lock);
+	op->completed = false;
+	op->err = -EINPROGRESS;
+	return 0;
+}
+
+static void kxc_aead_req_teardown(struct kxc_aead_op *op)
+{
+	aead_request_free(op->req);
+	op->req = NULL;
+	__free_page(op->page_src);
+	op->page_src = NULL;
+	__free_page(op->page_dst);
+	op->page_dst = NULL;
+}
+
+static int kxc_aead_op_prepare_masked(struct kxc_run *run,
+					 struct kxc_aead_op *op,
+					 const char *drv_name, u32 type,
+					 u32 mask, u64 *aseq,
+					 unsigned int datalen)
+{
+	struct crypto_aead *tfm;
+	int err;
+
+	err = kxc_aead_acquire_typed(run, drv_name, type, mask, &tfm,
+				     aseq);
+	if (err)
+		return err;
+	err = crypto_aead_setkey(tfm, kxc_key, KXC_KEYLEN);
+	kxc_emit_config(run, *aseq, "setkey", err, KXC_KEYLEN);
+	if (err) {
+		kxc_aead_release(run, tfm, *aseq);
+		return err;
+	}
+	err = kxc_aead_req_setup(run, tfm, op, 0, datalen);
+	if (err) {
+		kxc_aead_release(run, tfm, *aseq);
+		return err;
+	}
+	return 0;
+}
+
+static int kxc_aead_op_prepare(struct kxc_run *run, struct kxc_aead_op *op,
+			       const char *drv_name, u64 *aseq,
+			       unsigned int datalen)
+{
+	return kxc_aead_op_prepare_masked(run, op, drv_name, 0, 0, aseq,
+					  datalen);
+}
+
+static void kxc_aead_op_release(struct kxc_run *run, struct kxc_aead_op *op,
+				u64 aseq)
+{
+	struct crypto_aead *tfm = op->tfm;
+
+	kxc_aead_req_teardown(op);
+	kxc_aead_release(run, tfm, aseq);
+}
+
+static int kxc_aead_wait_done(struct kxc_run *run, struct kxc_aead_op *op)
+{
+	return kxc_wait_done_as(run, (struct kxc_op *)op, op->seq);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1371,6 +1612,310 @@ static int kxc_scenario_cryptd_async(struct kxc_run *run)
 	return 0;
 }
 
+/*
+ * T10 AEAD accepted schedule (sync): encrypt 1024/assoc 32/tag 16,
+ * decrypt the 1040-byte wire image, then the negative legs —
+ * bad tag (-EBADMSG, attempt intact), short input (-EINVAL),
+ * failed setauthsize (no epoch advance) — then reconfigure to
+ * tag 8 and roundtrip again (new epoch pins the new width).
+ * Every crypto call emits submit/return/terminal; every config
+ * emits its config row; the transform oracle derives eras from
+ * the config rows (no hardcoded epochs here).
+ */
+static int kxc_scenario_aead_meta(struct kxc_run *run)
+{
+	struct kxc_aead_op op;
+	struct crypto_aead *tfm;
+	u8 *src, *dst;
+	u64 aseq, seq;
+	unsigned int authsize;
+	int err;
+
+	authsize = KXC_AEAD_TAG;
+	err = kxc_aead_op_prepare(run, &op, kxc_aead_driver_name(), &aseq,
+				  KXC_AEAD_PT + authsize);
+	if (err)
+		return err;
+	tfm = op.tfm;
+	src = page_address(op.page_src);
+	dst = page_address(op.page_dst);
+
+	err = crypto_aead_setauthsize(tfm, authsize);
+	kxc_emit_config(run, aseq, "setauthsize", err, authsize);
+	if (err)
+		goto out;
+
+	/* Leg 1: encrypt 1024 payload + 32 AAD -> 1040 wire image. */
+	sg_init_one(&op.sg_src, src, KXC_AEAD_AAD + KXC_AEAD_PT);
+	sg_init_one(&op.sg_dst, dst,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst,
+			       KXC_AEAD_PT, op.iv);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-encrypt", KXC_AEAD_PT, 0,
+			     KXC_AEAD_AAD, authsize);
+	err = crypto_aead_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err)
+		goto out;
+	/* Stash the wire image for leg 3 (leg 2's decrypt destroys
+	 * the dst page contents). */
+	memcpy(src + KXC_AEAD_WIRE_OFF, dst + KXC_AEAD_AAD,
+	       KXC_AEAD_PT + authsize);
+
+	/* Leg 2: decrypt the 1040-byte image (1024 payload + 16 tag). */
+	memcpy(src + KXC_AEAD_AAD, dst + KXC_AEAD_AAD,
+	       KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_src, src,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_dst, dst,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst,
+			       KXC_AEAD_PT + authsize, op.iv);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-decrypt",
+			     KXC_AEAD_PT + authsize, 0, KXC_AEAD_AAD,
+			     authsize);
+	err = crypto_aead_decrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err)
+		goto out;
+	err = kxc_aead_verify_pt(dst + KXC_AEAD_AAD);
+	if (err)
+		goto out;
+
+	/* Leg 3: bad tag — the tag region carries the privacy marker. */
+	memcpy(src + KXC_AEAD_AAD, src + KXC_AEAD_WIRE_OFF,
+	       KXC_AEAD_PT + authsize);
+	memcpy(src + KXC_AEAD_AAD + KXC_AEAD_PT, kxc_canary_tag,
+	       authsize);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-decrypt",
+			     KXC_AEAD_PT + authsize, 0, KXC_AEAD_AAD,
+			     authsize);
+	err = crypto_aead_decrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err != -EBADMSG) {
+		err = err ? err : -EPROTO;
+		goto out;
+	}
+
+	/* Leg 4: short input — 8 bytes cannot contain a 16-byte tag. */
+	sg_init_one(&op.sg_src, src, KXC_AEAD_AAD + 8);
+	sg_init_one(&op.sg_dst, dst, KXC_AEAD_AAD + 8);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst, 8,
+			       op.iv);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-decrypt", 8, 0,
+			     KXC_AEAD_AAD, authsize);
+	err = crypto_aead_decrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err != -EINVAL) {
+		err = err ? err : -EPROTO;
+		goto out;
+	}
+
+	/* Leg 5: oversize authsize is rejected — epoch does NOT advance. */
+	err = crypto_aead_setauthsize(tfm, KXC_AEAD_AUTHSIZE_BIG);
+	kxc_emit_config(run, aseq, "setauthsize", err,
+			KXC_AEAD_AUTHSIZE_BIG);
+	if (err != -EINVAL) {
+		err = err ? err : -EPROTO;
+		goto out;
+	}
+
+	/* Leg 6: reconfigure to tag 8 — new epoch, new width. */
+	authsize = KXC_AEAD_TAG8;
+	err = crypto_aead_setauthsize(tfm, authsize);
+	kxc_emit_config(run, aseq, "setauthsize", err, authsize);
+	if (err)
+		goto out;
+	kxc_aead_fill_pt(src + KXC_AEAD_AAD);
+	sg_init_one(&op.sg_src, src, KXC_AEAD_AAD + KXC_AEAD_PT);
+	sg_init_one(&op.sg_dst, dst,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst,
+			       KXC_AEAD_PT, op.iv);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-encrypt", KXC_AEAD_PT, 0,
+			     KXC_AEAD_AAD, authsize);
+	err = crypto_aead_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err)
+		goto out;
+	memcpy(src + KXC_AEAD_AAD, dst + KXC_AEAD_AAD,
+	       KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_src, src,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_dst, dst,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst,
+			       KXC_AEAD_PT + authsize, op.iv);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-decrypt",
+			     KXC_AEAD_PT + authsize, 0, KXC_AEAD_AAD,
+			     authsize);
+	err = crypto_aead_decrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err)
+		goto out;
+	err = kxc_aead_verify_pt(dst + KXC_AEAD_AAD);
+out:
+	kxc_aead_op_release(run, &op, aseq);
+	return err;
+}
+
+/*
+ * T10 AEAD accepted schedule (async): encrypt then decrypt on the
+ * async driver, sequential with waits (the SIMPLE schedule only —
+ * no hold/delay/inline-once/burst legs, which stay skcipher-only).
+ * The terminal rows arrive via the shared kxc_complete (the
+ * fixture callback site — family-agnostic key join); the waits
+ * prove the callbacks ran.
+ */
+static int kxc_scenario_aead_async(struct kxc_run *run)
+{
+	struct kxc_aead_op op;
+	struct crypto_aead *tfm;
+	u8 *src, *dst;
+	u64 aseq, seq;
+	unsigned int authsize;
+	int err;
+
+	authsize = KXC_AEAD_TAG;
+	err = kxc_aead_op_prepare(run, &op, kxc_aead_async_driver_name(),
+				  &aseq, KXC_AEAD_PT);
+	if (err)
+		return err;
+	tfm = op.tfm;
+	src = page_address(op.page_src);
+	dst = page_address(op.page_dst);
+
+	err = crypto_aead_setauthsize(tfm, authsize);
+	kxc_emit_config(run, aseq, "setauthsize", err, authsize);
+	if (err)
+		goto out;
+
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	kxc_emit_submit_aead(run, seq, "aead-encrypt", KXC_AEAD_PT, 0,
+			     KXC_AEAD_AAD, authsize);
+	err = crypto_aead_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	if (err != -EINPROGRESS) {
+		kxc_emit_terminal(run, seq, err);
+		goto out;
+	}
+	err = kxc_aead_wait_done(run, &op);
+	if (err)
+		goto out;
+
+	memcpy(src + KXC_AEAD_AAD, dst + KXC_AEAD_AAD,
+	       KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_src, src,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_dst, dst,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst,
+			       KXC_AEAD_PT + authsize, op.iv);
+	init_completion(&op.done);
+	op.completed = false;
+	op.err = -EINPROGRESS;
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	kxc_emit_submit_aead(run, seq, "aead-decrypt",
+			     KXC_AEAD_PT + authsize, 0, KXC_AEAD_AAD,
+			     authsize);
+	err = crypto_aead_decrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	if (err != -EINPROGRESS) {
+		kxc_emit_terminal(run, seq, err);
+		goto out;
+	}
+	err = kxc_aead_wait_done(run, &op);
+	if (err)
+		goto out;
+	err = kxc_aead_verify_pt(dst + KXC_AEAD_AAD);
+out:
+	kxc_aead_op_release(run, &op, aseq);
+	return err;
+}
+
+/*
+ * T10 AEAD live leg: the same decrypt-1040 shape against the real
+ * kernel gcm(aes) (template name — portable, no per-kernel exact
+ * driver names; the alloc row records the selected driver as
+ * truth). Encrypt 1024/assoc 32/tag 16, decrypt the image back,
+ * verify. A missing gcm fails honestly (no fixture fallback:
+ * that would prove nothing about the live path).
+ */
+static int kxc_scenario_aead_live(struct kxc_run *run)
+{
+	struct kxc_aead_op op;
+	struct crypto_aead *tfm;
+	u8 *src, *dst;
+	u64 aseq, seq;
+	unsigned int authsize;
+	int err;
+
+	authsize = KXC_AEAD_TAG;
+	/*
+	 * Mask out async implementations: the live leg asserts the
+	 * sync schedule (direct return + terminal), so gcm(aes) must
+	 * resolve to a synchronous instantiation. The alloc row
+	 * records type/mask + the selected driver as truth.
+	 */
+	err = kxc_aead_op_prepare_masked(run, &op, "gcm(aes)", 0,
+					 CRYPTO_ALG_ASYNC, &aseq,
+					 KXC_AEAD_PT);
+	if (err)
+		return err;
+	tfm = op.tfm;
+	src = page_address(op.page_src);
+	dst = page_address(op.page_dst);
+
+	err = crypto_aead_setauthsize(tfm, authsize);
+	kxc_emit_config(run, aseq, "setauthsize", err, authsize);
+	if (err)
+		goto out;
+
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-encrypt", KXC_AEAD_PT, 0,
+			     KXC_AEAD_AAD, authsize);
+	err = crypto_aead_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err)
+		goto out;
+	memcpy(src + KXC_AEAD_AAD, dst + KXC_AEAD_AAD,
+	       KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_src, src,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	sg_init_one(&op.sg_dst, dst,
+		    KXC_AEAD_AAD + KXC_AEAD_PT + authsize);
+	aead_request_set_crypt(op.req, &op.sg_src, &op.sg_dst,
+			       KXC_AEAD_PT + authsize, op.iv);
+	seq = kxc_next_seq(run);
+	kxc_emit_submit_aead(run, seq, "aead-decrypt",
+			     KXC_AEAD_PT + authsize, 0, KXC_AEAD_AAD,
+			     authsize);
+	err = crypto_aead_decrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	kxc_emit_terminal(run, seq, err);
+	if (err)
+		goto out;
+	err = kxc_aead_verify_pt(dst + KXC_AEAD_AAD);
+out:
+	kxc_aead_op_release(run, &op, aseq);
+	return err;
+}
+
 int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 {
 	if (!strcmp(scenario, "sync-once"))
@@ -1411,5 +1956,11 @@ int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 		return kxc_scenario_cryptd_async(run);
 	if (!strcmp(scenario, "reuse-in-callback"))
 		return kxc_scenario_reuse_in_callback(run);
+	if (!strcmp(scenario, "aead-meta"))
+		return kxc_scenario_aead_meta(run);
+	if (!strcmp(scenario, "aead-async"))
+		return kxc_scenario_aead_async(run);
+	if (!strcmp(scenario, "aead-live"))
+		return kxc_scenario_aead_live(run);
 	return -EINVAL;
 }
