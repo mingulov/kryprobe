@@ -54,6 +54,12 @@ pub const BPF_LINK_GET_NEXT_ID: u32 = 31;
 pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 /// `BPF_LINK_TYPE_TRACING` link type id (fentry/fexit/fsession links).
 pub const BPF_LINK_TYPE_TRACING: u32 = 2;
+/// `BPF_BTF_GET_FD_BY_ID` command id (P4 module-BTF object fd for
+/// `attach_btf_obj_fd`; 19 — counted in the UAPI `bpf_cmd` enum,
+/// never renumbered).
+pub const BPF_BTF_GET_FD_BY_ID: u32 = 19;
+/// `BPF_BTF_GET_NEXT_ID` command id (P4 module-BTF discovery).
+pub const BPF_BTF_GET_NEXT_ID: u32 = 23;
 
 /// Raw `bpf(cmd, attr, size)`; returns the fd or -1 (see [`last_errno`]).
 ///
@@ -306,4 +312,88 @@ pub fn link_get_fd_by_id(link_id: u32) -> Result<OwnedFd, i32> {
         )
     };
     fd_or_errno(ret)
+}
+
+/// Next BTF object id past `start_id`; `Ok(None)` at iteration end
+/// (`ENOENT` is the documented terminator, not an error).
+/// Privileged (module-BTF discovery for the P4 callback attach).
+pub fn btf_get_next_id(start_id: u32) -> Result<Option<u32>, i32> {
+    let mut attr = LinkNextIdAttr {
+        start_id,
+        next_id: 0,
+        open_flags: 0,
+        token_fd: 0,
+    };
+    // SAFETY: attr outlives the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_BTF_GET_NEXT_ID,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<LinkNextIdAttr>() as u32,
+        )
+    };
+    if ret < 0 {
+        let errno = last_errno();
+        if errno == libc::ENOENT {
+            Ok(None)
+        } else {
+            Err(errno)
+        }
+    } else {
+        Ok(Some(attr.next_id))
+    }
+}
+
+/// Open a BTF object fd by id (P4 module-BTF discovery;
+/// privileged). Returns the owned fd or the kernel errno
+/// (`ENOENT` = raced with unload).
+pub fn btf_get_fd_by_id(btf_id: u32) -> Result<OwnedFd, i32> {
+    let mut attr = LinkNextIdAttr {
+        start_id: btf_id,
+        next_id: 0,
+        open_flags: 0,
+        token_fd: 0,
+    };
+    // SAFETY: attr outlives the syscall.
+    let ret = unsafe {
+        bpf(
+            BPF_BTF_GET_FD_BY_ID,
+            (&raw mut attr).cast::<c_void>(),
+            size_of::<LinkNextIdAttr>() as u32,
+        )
+    };
+    fd_or_errno(ret)
+}
+
+/// `struct bpf_btf_info` the name read consumes whole (UAPI
+/// `linux/bpf.h`: `btf` u64 @0, `btf_size` u32 @8, `id` u32 @12,
+/// `name` u64 @16, `name_len` u32 @24, `kernel_btf` u32 @28 — 32
+/// bytes; only the `name` output is read, the rest is the honest
+/// full-struct shape so the kernel's name fill always applies).
+const BTF_INFO_LEN: usize = 32;
+
+/// Read a BTF object's kernel name (P4: module-BTF discovery
+/// matches `name` against the manifest module — `vmlinux` for the
+/// base image, the module name for module BTF). `name_buf` is the
+/// bounded name sink (module names fit 64; the caller sizes it).
+/// Fails closed on short info, a missing NUL, or invalid UTF-8 —
+/// never a truncated match.
+pub fn btf_kernel_name(fd: RawFd, name_buf: &mut [u8]) -> Result<String, i32> {
+    let mut info = [0u8; BTF_INFO_LEN];
+    info[16..24].copy_from_slice(&(name_buf.as_mut_ptr() as u64).to_le_bytes());
+    info[24..28].copy_from_slice(&(name_buf.len() as u32).to_le_bytes());
+    let got = obj_get_info(fd, &mut info)?;
+    if (got as usize) < BTF_INFO_LEN {
+        return Err(libc::EIO);
+    }
+    let name_len = u32::from_le_bytes([info[24], info[25], info[26], info[27]]) as usize;
+    if name_len == 0 || name_len > name_buf.len() {
+        return Err(libc::EIO);
+    }
+    let name = name_buf
+        .iter()
+        .position(|b| *b == 0)
+        .and_then(|nul| name_buf.get(..nul))
+        .ok_or(libc::EIO)?;
+    String::from_utf8(name.to_vec()).map_err(|_| libc::EIO)
 }

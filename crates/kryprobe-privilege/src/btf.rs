@@ -173,6 +173,18 @@ impl<'a> Btf<'a> {
         Ok(self.str_at(rec.name_off)? == want.as_bytes())
     }
 
+    /// Type-record count (P4: the split view's `start_id` is the
+    /// base count + 1 — module BTF ids relocate above the base).
+    pub(crate) fn type_count(&self) -> u32 {
+        self.types.len() as u32
+    }
+
+    /// String-table length (P4: the split view's string bias —
+    /// module name offsets live in base++module concatenated space).
+    pub(crate) fn str_len(&self) -> usize {
+        self.str_len
+    }
+
     /// First `FUNC` id with `name` (id order; our 9 are single-definition).
     pub(crate) fn func_id(&self, name: &str) -> Result<Option<u32>, BtfError> {
         for (i, rec) in self.types.iter().enumerate() {
@@ -1305,6 +1317,452 @@ impl<'a> Btf<'a> {
     }
 }
 
+/// Split-BTF view (P4): a module image resolved against its vmlinux
+/// base. Module images from `/sys/kernel/btf/<module>` carry GLOBAL
+/// (relocated) ids: ids below `start_id` address the base image, ids
+/// at/above it address the module image at `id - start_id + 1`.
+/// `start_id` is always `base.type_count() + 1`: module BTF is split
+/// by kernel construction (a module BTF object cannot exist without
+/// its vmlinux base).
+///
+/// String space is CONCATENATED (proven on live images: every named
+/// record in the exposed `cryptd` image carries an offset at/above
+/// the base `str_len`): offsets below the base `str_len` resolve in
+/// the base strtab (shared names), offsets at/above it resolve in
+/// the module strtab at `off - base_str_len`. Every name check
+/// below routes through [`SplitBtf::module_str`] — a full-BTF module
+/// (local offsets routed at the base) resolves DIFFERENT names and
+/// refuses on mismatch, never misvalidates.
+pub(crate) struct SplitBtf<'a, 'b, 'c, 'd> {
+    base: &'a Btf<'b>,
+    module: &'c Btf<'d>,
+    start_id: u32,
+}
+
+/// One routed type record: the record plus the image that owns its
+/// aux bytes and string references.
+enum Routed<'x> {
+    Base(&'x TypeRec),
+    Module(&'x TypeRec),
+}
+
+impl SplitBtf<'_, '_, '_, '_> {
+    /// New split view over an already-parsed base + module pair.
+    pub(crate) fn new<'a, 'b, 'c, 'd>(
+        base: &'a Btf<'b>,
+        module: &'c Btf<'d>,
+    ) -> SplitBtf<'a, 'b, 'c, 'd> {
+        SplitBtf {
+            base,
+            module,
+            start_id: base.type_count() + 1,
+        }
+    }
+
+    /// Route one global id to its owning record (dangling ids —
+    /// below 1 in either image, or past either image's end — are
+    /// corrupt, never guessed).
+    fn rec(&self, id: u32) -> Result<Routed<'_>, BtfError> {
+        if id == 0 {
+            return Err(bad("routed id 0 (VOID) names no record".to_owned()));
+        }
+        if id < self.start_id {
+            self.base.rec(id).map(Routed::Base)
+        } else {
+            let local = id - self.start_id + 1;
+            self.module.rec(local).map(Routed::Module)
+        }
+    }
+
+    /// Chase qualifier wrappers to the first unwrapped GLOBAL type id
+    /// (routed [`Btf::chase_wrappers`]: each step re-routes, since a
+    /// module typedef may wrap a base type and vice versa).
+    fn chase(&self, mut id: u32) -> Result<u32, BtfError> {
+        let mut seen = [0u32; DESCENT_CAP + 1];
+        for depth in 0..=DESCENT_CAP {
+            if id == 0 {
+                return Err(bad("wrapper chase reached VOID".to_owned()));
+            }
+            if seen[..depth].contains(&id) {
+                return Err(bad("wrapper chase cycles".to_owned()));
+            }
+            seen[depth] = id;
+            let (kind, size_or_type) = match self.rec(id)? {
+                Routed::Base(rec) | Routed::Module(rec) => (rec.kind, rec.size_or_type),
+            };
+            match kind {
+                KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT => {
+                    id = size_or_type;
+                }
+                _ => return Ok(id),
+            }
+        }
+        Err(bad("wrapper chase exceeds the descent cap".to_owned()))
+    }
+
+    /// One module-image string in concatenated space: offsets
+    /// below the base `str_len` resolve in the BASE strtab (shared
+    /// names — e.g. a module `INT "int"` reuses the base string),
+    /// offsets at/above it resolve in the MODULE strtab (proven on
+    /// the live `cryptd` image: all 75 named records sit at/above
+    /// the base length). Out-of-range either way is corrupt BTF.
+    fn module_str(&self, off: u32) -> Result<&[u8], BtfError> {
+        let base_len = self.base.str_len();
+        let off_usize = off as usize;
+        if off_usize < base_len {
+            self.base.str_at(off)
+        } else {
+            let local = off_usize - base_len;
+            let local_u32 = u32::try_from(local)
+                .map_err(|_| bad(format!("module string offset {off} out of range")))?;
+            self.module
+                .str_at(local_u32)
+                .map_err(|_| bad(format!("module string offset {off} out of range")))
+        }
+    }
+
+    /// Routed name check: base records resolve in the base strtab,
+    /// module records in concatenated space.
+    fn name_is(&self, id: u32, want: &str) -> Result<bool, BtfError> {
+        match self.rec(id)? {
+            Routed::Base(rec) => self.base.name_is(rec, want),
+            Routed::Module(rec) => Ok(self.module_str(rec.name_off)? == want.as_bytes()),
+        }
+    }
+
+    /// One aux word of a routed record, from the owning image.
+    fn aux_u32(&self, id: u32, word: usize) -> Result<u32, BtfError> {
+        match self.rec(id)? {
+            Routed::Base(rec) => read_u32(self.base.bytes, rec.aux_at + word * 4, "routed aux"),
+            Routed::Module(rec) => read_u32(self.module.bytes, rec.aux_at + word * 4, "routed aux"),
+        }
+    }
+
+    /// Prove the routed `id` is a full 32-bit INT value at bit offset
+    /// 0 (arg discipline mirrors [`Btf::int_arg_4` — bits + offset,
+    /// encoding unpinned: the BPF copies/compares the raw u32).
+    fn int_arg_4(&self, id: u32, arg: &str, name: &str) -> Result<(), BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self.chase(id)?;
+        let (kind, size, data) = match self.rec(id)? {
+            Routed::Base(rec) => (
+                rec.kind,
+                rec.size_or_type,
+                read_u32(self.base.bytes, rec.aux_at, "int data")?,
+            ),
+            Routed::Module(rec) => (
+                rec.kind,
+                rec.size_or_type,
+                read_u32(self.module.bytes, rec.aux_at, "int data")?,
+            ),
+        };
+        if kind != KIND_INT {
+            return Err(bad_proto(format!("{arg} is not an INT")));
+        }
+        if size != 4 {
+            return Err(bad_proto(format!("{arg} INT is {size} bytes, not 4")));
+        }
+        let (bits, offset) = (data & 0xff, (data >> 16) & 0xff);
+        if bits != 32 {
+            return Err(bad_proto(format!("{arg} INT is {bits} bits, not 32")));
+        }
+        if offset != 0 {
+            return Err(bad_proto(format!(
+                "{arg} INT has bit offset {offset}, not 0"
+            )));
+        }
+        Ok(())
+    }
+
+    /// First module-local `FUNC` id with `name`, globalized (module
+    /// functions live only in the module image — the base is never
+    /// scanned for them; names resolve in concatenated space, so the
+    /// base-image [`Btf::func_id`] scan (base strtab only) cannot
+    /// serve here).
+    pub(crate) fn module_func_id(&self, name: &str) -> Result<Option<u32>, BtfError> {
+        for (idx, rec) in self.module.types.iter().enumerate() {
+            if rec.kind == KIND_FUNC && self.module_str(rec.name_off)? == name.as_bytes() {
+                return Ok(Some(self.start_id + idx as u32));
+            }
+        }
+        Ok(None)
+    }
+
+    /// First module-local STRUCT/UNION id with `name`, as a LOCAL id
+    /// (module types live only in the module image; typedef-chased
+    /// like [`Btf::find_struct`] but WITHOUT cross-image drift — the
+    /// module image is scanned alone, names in concatenated space).
+    fn module_struct(&self, name: &str) -> Result<u32, BtfError> {
+        let mut found = None;
+        for (idx, rec) in self.module.types.iter().enumerate() {
+            let id = idx as u32 + 1;
+            if (rec.kind == KIND_STRUCT || rec.kind == KIND_UNION)
+                && self.module_str(rec.name_off)? == name.as_bytes()
+            {
+                found = Some(id);
+                break;
+            }
+            if rec.kind == KIND_TYPEDEF && self.module_str(rec.name_off)? == name.as_bytes() {
+                found = Some(id);
+                break;
+            }
+        }
+        match found {
+            None => Err(BtfError::MissingType {
+                name: name.to_owned(),
+            }),
+            Some(id) => {
+                // Chase module-local typedefs to the STRUCT/UNION
+                // (the chase stays module-local: a typedef at a base
+                // id would refuse below, never drift across).
+                let mut cur = id;
+                for _ in 0..=DESCENT_CAP {
+                    let rec = self.module.rec(cur)?;
+                    match rec.kind {
+                        KIND_TYPEDEF => {
+                            cur = rec.size_or_type;
+                        }
+                        KIND_STRUCT | KIND_UNION => return Ok(cur),
+                        _ => break,
+                    }
+                }
+                Err(BtfError::MissingType {
+                    name: name.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// Global FUNC id of `name` proven to be the cryptd shape `void
+    /// (struct skcipher_request *, int, crypto_completion_t)`: exactly
+    /// three arguments, arg0 a pointer at STRUCT `skcipher_request`
+    /// whose pointee IS the caller-bound base entry id (T07-R4-N2 —
+    /// the join keys on the same def the offsets resolver binds),
+    /// arg1 a 32-bit INT (the native status), arg2 a pointer (the
+    /// re-arm completion: pointer-ness pins the register shape, the
+    /// pointee is NEVER validated — opaque to the adapter, mirroring
+    /// setkey's key-buffer discipline), and a VOID return.
+    pub(crate) fn cryptd_proto_id(&self, name: &str, sreq_entry: u32) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self
+            .module_func_id(name)?
+            .ok_or_else(|| BtfError::MissingFunc {
+                name: name.to_owned(),
+            })?;
+        let target = match self.rec(id)? {
+            Routed::Base(rec) | Routed::Module(rec) => rec.size_or_type,
+        };
+        let vlen = match self.rec(target)? {
+            Routed::Base(rec) | Routed::Module(rec) => {
+                if rec.kind != KIND_FUNC_PROTO {
+                    return Err(bad_proto(format!(
+                        "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                        rec.kind
+                    )));
+                }
+                rec.vlen
+            }
+        };
+        if vlen != 3 {
+            return Err(bad_proto(format!(
+                "prototype takes {vlen} arguments, want exactly 3"
+            )));
+        }
+        let arg0 = self.aux_u32(target, 1)?;
+        let ptr = self.chase(arg0)?;
+        if !matches!(self.rec(ptr)?, Routed::Base(rec) | Routed::Module(rec) if rec.kind == KIND_PTR)
+        {
+            return Err(bad_proto("arg0 is not a pointer".to_owned()));
+        }
+        let pointee = match self.rec(ptr)? {
+            Routed::Base(rec) | Routed::Module(rec) => self.chase(rec.size_or_type)?,
+        };
+        if !matches!(self.rec(pointee)?, Routed::Base(rec) | Routed::Module(rec) if rec.kind == KIND_STRUCT)
+        {
+            return Err(bad_proto(
+                "arg0 points at a non-STRUCT, not skcipher_request".to_owned(),
+            ));
+        }
+        if !self.name_is(pointee, "skcipher_request")? {
+            return Err(bad_proto(
+                "arg0 points at the wrong STRUCT, not skcipher_request".to_owned(),
+            ));
+        }
+        if pointee != sreq_entry {
+            return Err(BtfError::IncompatibleDefinitions {
+                type_name: "skcipher_request".to_owned(),
+                entry_id: sreq_entry,
+                linked_id: pointee,
+                via: format!("{name}.arg0"),
+            });
+        }
+        self.int_arg_4(self.aux_u32(target, 3)?, "arg1", name)?;
+        let arg2 = self.aux_u32(target, 5)?;
+        let arg2_chased = self.chase(arg2)?;
+        if !matches!(self.rec(arg2_chased)?, Routed::Base(rec) | Routed::Module(rec) if rec.kind == KIND_PTR)
+        {
+            return Err(bad_proto("arg2 is not a pointer".to_owned()));
+        }
+        let ret = match self.rec(target)? {
+            Routed::Base(rec) | Routed::Module(rec) => rec.size_or_type,
+        };
+        if ret != 0 {
+            return Err(bad_proto("return is not VOID".to_owned()));
+        }
+        Ok(id)
+    }
+
+    /// Global FUNC id of `name` proven to be the fixture shape `void
+    /// (void *, int)`: exactly two arguments, arg0 EXACTLY `void *`
+    /// (a pointer at VOID — the consumer op; any typed pointer is
+    /// drift, refused, never chased as data), arg1 a 32-bit INT
+    /// (the native status), and a VOID return.
+    pub(crate) fn kxc_proto_id(&self, name: &str) -> Result<u32, BtfError> {
+        let bad_proto = |reason: String| BtfError::BadPrototype {
+            name: name.to_owned(),
+            reason,
+        };
+        let id = self
+            .module_func_id(name)?
+            .ok_or_else(|| BtfError::MissingFunc {
+                name: name.to_owned(),
+            })?;
+        let target = match self.rec(id)? {
+            Routed::Base(rec) | Routed::Module(rec) => rec.size_or_type,
+        };
+        let vlen = match self.rec(target)? {
+            Routed::Base(rec) | Routed::Module(rec) => {
+                if rec.kind != KIND_FUNC_PROTO {
+                    return Err(bad_proto(format!(
+                        "FUNC target id {target} is kind {}, not FUNC_PROTO",
+                        rec.kind
+                    )));
+                }
+                rec.vlen
+            }
+        };
+        if vlen != 2 {
+            return Err(bad_proto(format!(
+                "prototype takes {vlen} arguments, want exactly 2"
+            )));
+        }
+        let arg0 = self.aux_u32(target, 1)?;
+        let ptr = self.chase(arg0)?;
+        let pointee = match self.rec(ptr)? {
+            Routed::Base(rec) | Routed::Module(rec) => {
+                if rec.kind != KIND_PTR {
+                    return Err(bad_proto("arg0 is not a pointer".to_owned()));
+                }
+                rec.size_or_type
+            }
+        };
+        if pointee != 0 {
+            return Err(bad_proto(
+                "arg0 is not void * (typed op pointers are drift)".to_owned(),
+            ));
+        }
+        self.int_arg_4(self.aux_u32(target, 3)?, "arg1", name)?;
+        let ret = match self.rec(target)? {
+            Routed::Base(rec) | Routed::Module(rec) => rec.size_or_type,
+        };
+        if ret != 0 {
+            return Err(bad_proto("return is not VOID".to_owned()));
+        }
+        Ok(id)
+    }
+
+    /// Byte offset of the module STRUCT `kxc_op`'s DIRECT member `req`
+    /// (no anonymous descent — the fixture owns this struct, so any
+    /// nesting drift refuses): the member must prove a pointer at
+    /// STRUCT `skcipher_request` whose pointee IS the caller-bound
+    /// base entry id (T07-R4-N2), and the 8-byte pointer read must
+    /// sit inside the struct (R4 containment — the BPF target is
+    /// 64-bit, pointers read u64).
+    pub(crate) fn kxc_op_req(&self, sk_entry: u32) -> Result<u32, BtfError> {
+        let root = self.module_struct("kxc_op")?;
+        let root_rec = self.module.rec(root)?;
+        if !matches!(root_rec.kind, KIND_STRUCT | KIND_UNION) {
+            return Err(BtfError::MissingType {
+                name: "kxc_op".to_owned(),
+            });
+        }
+        for m in 0..root_rec.vlen as usize {
+            let at = root_rec.aux_at + m * 12;
+            let name_off = read_u32(self.module.bytes, at, "member name_off")?;
+            if name_off == 0 || self.module_str(name_off)? != b"req" {
+                continue;
+            }
+            let mtype = read_u32(self.module.bytes, at + 4, "member type")?;
+            let raw = read_u32(self.module.bytes, at + 8, "member offset")?;
+            let bits = if root_rec.kind_flag {
+                raw & 0x00ff_ffff
+            } else {
+                raw
+            };
+            let bitfield = root_rec.kind_flag && raw >> 24 != 0;
+            if bitfield || !bits.is_multiple_of(8) {
+                return Err(bad(format!(
+                    "kxc_op.req at {at:#x} is not byte-aligned ({bits} bits)"
+                )));
+            }
+            let off = bits / 8;
+            let ptr = self.chase(mtype)?;
+            let pointee = match self.rec(ptr)? {
+                Routed::Base(rec) | Routed::Module(rec) => {
+                    if rec.kind != KIND_PTR {
+                        return Err(BtfError::BadPrototype {
+                            name: "kxc_op.req".to_owned(),
+                            reason: "member is not a pointer".to_owned(),
+                        });
+                    }
+                    self.chase(rec.size_or_type)?
+                }
+            };
+            if !matches!(self.rec(pointee)?, Routed::Base(rec) | Routed::Module(rec) if rec.kind == KIND_STRUCT)
+            {
+                return Err(BtfError::BadPrototype {
+                    name: "kxc_op.req".to_owned(),
+                    reason: "member points at a non-STRUCT, not skcipher_request".to_owned(),
+                });
+            }
+            if !self.name_is(pointee, "skcipher_request")? {
+                return Err(BtfError::BadPrototype {
+                    name: "kxc_op.req".to_owned(),
+                    reason: "member points at the wrong STRUCT, not skcipher_request".to_owned(),
+                });
+            }
+            if pointee != sk_entry {
+                return Err(BtfError::IncompatibleDefinitions {
+                    type_name: "skcipher_request".to_owned(),
+                    entry_id: sk_entry,
+                    linked_id: pointee,
+                    via: "kxc_op.req".to_owned(),
+                });
+            }
+            let end = off
+                .checked_add(8)
+                .ok_or_else(|| bad("kxc_op.req read offset overflows".to_owned()))?;
+            if end > root_rec.size_or_type {
+                return Err(bad(format!(
+                    "kxc_op.req read [{off}..{end}) escapes the {}-byte parent",
+                    root_rec.size_or_type
+                )));
+            }
+            return Ok(off);
+        }
+        Err(BtfError::MissingMember {
+            type_name: "kxc_op".to_owned(),
+            member: "req".to_owned(),
+        })
+    }
+}
+
 /// Aux byte length for one type record: fixed shapes assert `vlen == 0`
 /// (anything else is malformed BTF); `FUNC`/`VAR` carry linkage
 /// (0 static, 1 global) in `vlen`, not a count.
@@ -1349,6 +1807,7 @@ mod tests {
         types: Vec<u8>,
         strs: Vec<u8>,
         next_id: u32,
+        str_bias: u32,
     }
 
     impl Img {
@@ -1357,14 +1816,32 @@ mod tests {
                 types: Vec::new(),
                 strs: vec![0],
                 next_id: 1,
+                str_bias: 0,
             }
+        }
+
+        /// Split-module image: emitted name offsets bias by the base
+        /// `str_len` (concatenated string space — the image's own
+        /// strtab section still starts at its local 0).
+        fn new_split(str_bias: u32) -> Self {
+            Self {
+                types: Vec::new(),
+                strs: vec![0],
+                next_id: 1,
+                str_bias,
+            }
+        }
+
+        /// Anonymous name offset (always literal 0, never biased).
+        fn anon(&self) -> u32 {
+            0
         }
 
         fn str(&mut self, s: &str) -> u32 {
             let off = self.strs.len() as u32;
             self.strs.extend_from_slice(s.as_bytes());
             self.strs.push(0);
-            off
+            self.str_bias + off
         }
 
         fn rec(
@@ -1810,6 +2287,215 @@ mod tests {
             )
             .is_err(),
             "embedded extent [8..24) escapes the 16-byte parent"
+        );
+    }
+
+    /// Split-BTF base: `skcipher_request` (id 1) + signed `int` (id
+    /// 2) — every module ref below `start_id` (= 3) routes here.
+    fn split_base() -> Vec<u8> {
+        let mut img = Img::new();
+        let sreq = img.str("skcipher_request");
+        img.rec(sreq, KIND_STRUCT, 0, 64, &[]);
+        img.int("int", 4);
+        img.image()
+    }
+
+    fn proto_aux(args: &[(u32, u32)]) -> Vec<u8> {
+        let mut aux = Vec::new();
+        for (name_off, ty) in args {
+            aux.extend_from_slice(&name_off.to_le_bytes());
+            aux.extend_from_slice(&ty.to_le_bytes());
+        }
+        aux
+    }
+
+    /// Module side of the cryptd shape: PTR→base-skcipher_request,
+    /// `crypto_completion_t` typedef→that PTR, the 3-arg proto, the
+    /// FUNC. Global ids assume the 2-record base above.
+    fn split_module_cryptd(bias: u32) -> Vec<u8> {
+        let mut img = Img::new_split(bias);
+        let anon = img.anon();
+        let ptr = img.rec(anon, KIND_PTR, 0, 1, &[]);
+        assert_eq!(ptr, 1);
+        let compl = img.str("crypto_completion_t");
+        img.rec(compl, KIND_TYPEDEF, 0, 3, &[]);
+        let proto = img.str("");
+        let aux = proto_aux(&[(0, 3), (0, 2), (0, 4)]);
+        img.rec(proto, KIND_FUNC_PROTO, 3, 0, &aux);
+        let func = img.str("cryptd_skcipher_complete");
+        img.rec(func, KIND_FUNC, 0, 5, &[]);
+        img.image()
+    }
+
+    /// Module side of the fixture shape: `void *`, the 2-arg proto,
+    /// the FUNC, PTR→base-skcipher_request, and `kxc_op` with
+    /// `(run, tfm, req)` at (0, 8, 16).
+    fn split_module_kxc(bias: u32) -> Vec<u8> {
+        let mut img = Img::new_split(bias);
+        let anon = img.anon();
+        let voidptr = img.rec(anon, KIND_PTR, 0, 0, &[]);
+        assert_eq!(voidptr, 1);
+        let aux = proto_aux(&[(0, 3), (0, 2)]);
+        img.rec(anon, KIND_FUNC_PROTO, 2, 0, &aux);
+        let func = img.str("kxc_complete");
+        img.rec(func, KIND_FUNC, 0, 4, &[]);
+        img.rec(anon, KIND_PTR, 0, 1, &[]);
+        let op = img.str("kxc_op");
+        let run = img.str("run");
+        let tfm = img.str("tfm");
+        let req = img.str("req");
+        let mut aux = Vec::new();
+        aux.extend_from_slice(&Img::member_aux(run, 6, 0));
+        aux.extend_from_slice(&Img::member_aux(tfm, 6, 8 * 8));
+        aux.extend_from_slice(&Img::member_aux(req, 6, 16 * 8));
+        img.rec(op, KIND_STRUCT, 3, 24, &aux);
+        img.image()
+    }
+
+    #[test]
+    fn split_cryptd_shape_validates_across_images() {
+        let base_bytes = split_base();
+        let base = Btf::parse(&base_bytes).expect("base parses");
+        let module = split_module_cryptd(base.str_len() as u32);
+        let module = Btf::parse(&module).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        // Module FUNC is local id 4 → global 3 + 4 - 1 = 6.
+        assert_eq!(
+            split
+                .cryptd_proto_id("cryptd_skcipher_complete", 1)
+                .expect("cryptd shape"),
+            6
+        );
+    }
+
+    #[test]
+    fn split_kxc_shape_and_op_req_validate() {
+        let base_bytes = split_base();
+        let base = Btf::parse(&base_bytes).expect("base parses");
+        let module = split_module_kxc(base.str_len() as u32);
+        let module = Btf::parse(&module).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        assert_eq!(split.kxc_proto_id("kxc_complete").expect("kxc shape"), 5);
+        assert_eq!(split.kxc_op_req(1).expect("op->req"), 16);
+    }
+
+    #[test]
+    fn split_rival_skcipher_request_refuses_r4n2() {
+        // A module-local STRUCT `skcipher_request` (dedup drift):
+        // arg0 resolving at the module def instead of the bound
+        // base entry refuses — the join must key on one def.
+        let base_bytes = split_base();
+        let base = Btf::parse(&base_bytes).expect("base parses");
+        let mut img = Img::new_split(base.str_len() as u32);
+        let anon = img.anon();
+        let rival = img.str("skcipher_request");
+        img.rec(rival, KIND_STRUCT, 0, 64, &[]);
+        img.rec(anon, KIND_PTR, 0, 3, &[]);
+        let compl = img.str("crypto_completion_t");
+        img.rec(compl, KIND_TYPEDEF, 0, 4, &[]);
+        let aux = proto_aux(&[(0, 4), (0, 2), (0, 5)]);
+        img.rec(anon, KIND_FUNC_PROTO, 3, 0, &aux);
+        let func = img.str("cryptd_skcipher_complete");
+        img.rec(func, KIND_FUNC, 0, 6, &[]);
+        let mbytes = img.image();
+        let module = Btf::parse(&mbytes).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        let err = split
+            .cryptd_proto_id("cryptd_skcipher_complete", 1)
+            .expect_err("rival def must refuse");
+        assert!(
+            matches!(err, BtfError::IncompatibleDefinitions { .. }),
+            "names the rival def: {err:?}"
+        );
+    }
+
+    #[test]
+    fn split_op_req_drift_refuses() {
+        let base_bytes = split_base();
+        let base = Btf::parse(&base_bytes).expect("base parses");
+        // Missing `req` member.
+        let mut img = Img::new_split(base.str_len() as u32);
+        let anon = img.anon();
+        let op = img.str("kxc_op");
+        let run = img.str("run");
+        img.rec(anon, KIND_PTR, 0, 1, &[]);
+        let aux = Img::member_aux(run, 3, 0);
+        img.rec(op, KIND_STRUCT, 1, 8, &aux);
+        let mbytes = img.image();
+        let module = Btf::parse(&mbytes).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        assert!(
+            matches!(split.kxc_op_req(1), Err(BtfError::MissingMember { .. })),
+            "missing req refuses"
+        );
+        // `req` at the wrong pointee (base INT, not a STRUCT).
+        let mut img = Img::new_split(base.str_len() as u32);
+        let anon = img.anon();
+        let op = img.str("kxc_op");
+        let req = img.str("req");
+        img.rec(anon, KIND_PTR, 0, 2, &[]);
+        let aux = Img::member_aux(req, 3, 0);
+        img.rec(op, KIND_STRUCT, 1, 8, &aux);
+        let mbytes = img.image();
+        let module = Btf::parse(&mbytes).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        assert!(
+            matches!(split.kxc_op_req(1), Err(BtfError::BadPrototype { .. })),
+            "wrong pointee refuses"
+        );
+    }
+
+    #[test]
+    fn split_strings_route_concatenated_space() {
+        // Offsets below the base length resolve in the BASE
+        // strtab (shared names); at/above it, in the MODULE
+        // strtab (live cryptd image: all 75 named records).
+        let base_bytes = split_base();
+        let base = Btf::parse(&base_bytes).expect("base parses");
+        let mbytes = split_module_kxc(base.str_len() as u32);
+        let module = Btf::parse(&mbytes).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        assert_eq!(
+            split.module_str(1).expect("base string"),
+            b"skcipher_request"
+        );
+        let bias = base.str_len() as u32;
+        assert_eq!(split.module_str(bias).expect("module empty"), b"");
+        assert!(split.module_str(u32::MAX).is_err(), "wild offset refuses");
+    }
+
+    #[test]
+    fn split_proto_drift_refuses() {
+        let base_bytes = split_base();
+        let base = Btf::parse(&base_bytes).expect("base parses");
+        // kxc arg0 retyped (PTR at base STRUCT, not void *).
+        let mut img = Img::new_split(base.str_len() as u32);
+        let anon = img.anon();
+        img.rec(anon, KIND_PTR, 0, 1, &[]);
+        let aux = proto_aux(&[(0, 3), (0, 2)]);
+        img.rec(anon, KIND_FUNC_PROTO, 2, 0, &aux);
+        let func = img.str("kxc_complete");
+        img.rec(func, KIND_FUNC, 0, 4, &[]);
+        let mbytes = img.image();
+        let module = Btf::parse(&mbytes).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        assert!(
+            matches!(
+                split.kxc_proto_id("kxc_complete"),
+                Err(BtfError::BadPrototype { .. })
+            ),
+            "typed arg0 refuses"
+        );
+        // Missing function.
+        let mbytes = split_module_kxc(base.str_len() as u32);
+        let module = Btf::parse(&mbytes).expect("module parses");
+        let split = SplitBtf::new(&base, &module);
+        assert!(
+            matches!(
+                split.kxc_proto_id("kxc_nope"),
+                Err(BtfError::MissingFunc { .. })
+            ),
+            "missing func refuses"
         );
     }
 }

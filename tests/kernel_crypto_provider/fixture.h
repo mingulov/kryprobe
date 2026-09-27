@@ -14,7 +14,10 @@
  *     skcipher only; extra field, unknown-field-tolerant readers
  *     ignore it)
  *   progress: {"v":1,"run":R,"seq":N,"phase":"progress","errno":E,...}
- *     (waiter-side in-flight marker, never a kernel callback)
+ *     (T09: EITHER a waiter-side in-flight marker (delayed/
+ *     early scenarios) OR a kernel backlog-progress callback
+ *     (kxc_complete(-EINPROGRESS) under the held burst — errno
+ *     -EINPROGRESS, always before that seq's terminal))
  *   terminal: {"v":1,"run":R,"seq":N,"phase":"terminal","errno":E,...}
  *   config:   {"v":1,"run":R,"seq":N,"phase":"config","op":O,
  *              "errno":E,"len":L,...}

@@ -442,7 +442,13 @@ pub fn parse_lifecycle_object(bytes: &[u8]) -> Result<ParsedKcrypto, LoaderError
     let mut programs: Vec<ParsedProg> = Vec::with_capacity(sections.len());
     let mut bases: Vec<(usize, usize)> = Vec::new();
     for (sec_idx, sec_name) in &sections {
-        let symbol = sec_name.strip_prefix("fsession/").unwrap_or_default();
+        // P4: `fentry/<sym>` callback sections parse like
+        // `fsession/<sym>` (target after the prefix — the allowlist
+        // above already pinned the exact callback names).
+        let symbol = sec_name
+            .strip_prefix("fsession/")
+            .or_else(|| sec_name.strip_prefix("fentry/"))
+            .unwrap_or_default();
         if symbol.is_empty() {
             return Err(bad(format!(
                 "section '{sec_name}' has an empty target symbol"

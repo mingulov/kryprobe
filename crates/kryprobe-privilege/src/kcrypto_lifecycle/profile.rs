@@ -178,6 +178,32 @@ pub struct RequiredSite {
     pub shape: ProtoShape,
 }
 
+/// One optional callback site (P4): a module function with a single
+/// `fentry` program (entry args only — no session cookie, no return
+/// run). Attach-if-present: a missing module never fails bring-up
+/// (the sensor runs submit/return-only and queued invocations drain
+/// `Unknown` honestly); attachment is recorded in `points`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallbackSite {
+    /// Module function name (section suffix after `fentry/`).
+    pub symbol: &'static str,
+    /// Owning kernel module (module-BTF-qualified attach).
+    pub module: &'static str,
+    /// Prototype shape the validator pins for this symbol.
+    pub shape: CallbackShape,
+}
+
+/// Prototype shapes for the optional callback sites (P4): the
+/// resolver pins the exact signature per shape and refuses drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackShape {
+    /// `void (struct skcipher_request *, int,
+    /// crypto_completion_t)` (cryptd completion site).
+    Cryptd,
+    /// `void (void *, int)` (fixture completion site).
+    FixtureOp,
+}
+
 /// The profile contract: name, required sites, frozen map table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileManifest {
@@ -186,21 +212,31 @@ pub struct ProfileManifest {
     /// Attach sites the object AND the kernel must supply; a missing
     /// required site refuses lifecycle startup (no per-point degrade).
     pub required: &'static [RequiredSite],
+    /// Optional callback sites (P4): attach-if-present, never gating.
+    pub callbacks: &'static [CallbackSite],
     /// Exact map table the object must carry (no missing, no extra).
     pub maps: &'static [(&'static str, MapDims)],
 }
 
-/// Program lanes per `LLOSS` class (BPF hook order: the 16
-/// `LAGG_*` hooks, enc-sub first; class `c` occupies entries
-/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 16`).
-pub const LLOSS_LANES_PER_CLASS: u32 = 16;
+/// Program lanes per `LLOSS` class (BPF hook order: the 18
+/// `LAGG_*` hooks, enc-sub first, the two P4 callback hooks last;
+/// class `c` occupies entries
+/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 18`).
+pub const LLOSS_LANES_PER_CLASS: u32 = 18;
 /// `LLOSS` entries: 5 classes × [`LLOSS_LANES_PER_CLASS`].
 pub const LLOSS_ENTRIES: u32 = 5 * LLOSS_LANES_PER_CLASS;
 
+/// Hook lanes (userspace tally width): 18 — the 16 T07 lanes plus
+/// the two P4 callback lanes (16/17). Lanes 12/13 stay T10's
+/// aead-alloc reservation; no headroom past 17.
+pub const LANE_COUNT: u32 = 18;
+
 /// Frozen lifecycle map table (W8 fsession grown to the T07-final
-/// counter shape): config, edge ringbuf, per-CPU loss (5 classes ×
-/// 16 hook lanes), the 16-lane per-CPU accepted-edge aggregate, and
-/// the per-CPU per-program mint sequences (8 site-program lanes).
+/// counter shape, P4-grown to 18 lanes): config, edge ringbuf,
+/// per-CPU loss (5 classes × 18 hook lanes), the 18-lane per-CPU
+/// accepted-edge aggregate, and the per-CPU per-program mint
+/// sequences (8 site-program lanes — callbacks don't mint, so
+/// `LCTR` keeps its width).
 /// `LCTR` issues the per-program per-CPU sequences (one lane per
 /// site program — an interrupt can run a different program on the
 /// same CPU, so per-CPU alone lost updates); `LLOSS` lanes fold per
@@ -242,7 +278,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 16,
+            max_entries: LANE_COUNT,
         },
     ),
     (
@@ -294,6 +330,23 @@ const LIFECYCLE_REQUIRED: &[RequiredSite] = &[
     },
 ];
 
+/// Optional callback sites for `RequestLifecycle` (P4): the
+/// source/alias/lifetime-qualified completion functions (audit note
+/// §3–§4: arg0 identity proven per site; BTF prototype pinned at
+/// resolve; attach-if-present, never gating).
+const LIFECYCLE_CALLBACKS: &[CallbackSite] = &[
+    CallbackSite {
+        symbol: "cryptd_skcipher_complete",
+        module: "cryptd",
+        shape: CallbackShape::Cryptd,
+    },
+    CallbackSite {
+        symbol: "kxc_complete",
+        module: "kcrypto_fixture",
+        shape: CallbackShape::FixtureOp,
+    },
+];
+
 /// The manifest for a profile.
 #[must_use]
 pub fn manifest(profile: LifecycleProfile) -> ProfileManifest {
@@ -301,29 +354,33 @@ pub fn manifest(profile: LifecycleProfile) -> ProfileManifest {
         LifecycleProfile::ApiReturns => ProfileManifest {
             name: "api-returns",
             required: &[],
+            callbacks: &[],
             maps: crate::bpfloader::KCRYPTO_MAPS,
         },
         LifecycleProfile::RequestLifecycle => ProfileManifest {
             name: "request-lifecycle",
             required: LIFECYCLE_REQUIRED,
+            callbacks: LIFECYCLE_CALLBACKS,
             maps: LIFECYCLE_MAPS,
         },
     }
 }
 
 /// Program limit derived from the profile's own manifest: one program
-/// per required site (T07.4 fsession: 7; `ApiReturns` keeps its frozen 16).
+/// per required site plus one per callback site (P4: 7 fsession + 2
+/// fentry = 9; `ApiReturns` keeps its frozen 16).
 #[must_use]
 pub fn max_programs(manifest: &ProfileManifest) -> usize {
     if manifest.required.is_empty() {
         return 16;
     }
-    manifest.required.len()
+    manifest.required.len() + manifest.callbacks.len()
 }
 
 /// Section allowlist for a profile: `fsession/X` (nonempty target)
-/// for lifecycle (W8: fentry/fexit objects refuse here, fail-closed);
-/// fexit-only for api-returns (C1 frozen).
+/// plus the two EXACT `fentry/` callback sections for lifecycle (no
+/// open `fentry/` prefix — a new attach class admits named sections
+/// only); fexit-only for api-returns (C1 frozen).
 #[must_use]
 pub fn section_allowed(profile: LifecycleProfile, section: &str) -> bool {
     let target = |prefix: &str| {
@@ -333,7 +390,11 @@ pub fn section_allowed(profile: LifecycleProfile, section: &str) -> bool {
     };
     match profile {
         LifecycleProfile::ApiReturns => target("fexit/"),
-        LifecycleProfile::RequestLifecycle => target("fsession/"),
+        LifecycleProfile::RequestLifecycle => {
+            target("fsession/")
+                || section == "fentry/cryptd_skcipher_complete"
+                || section == "fentry/kxc_complete"
+        }
     }
 }
 
@@ -396,14 +457,20 @@ pub fn required_gate_error(
 /// at 20, `crypto_tfm.refcnt` at 24 + its presence word at 28,
 /// `skcipher_request.base` at 32, `crypto_async_request.tfm` at 36,
 /// `skcipher_request.cryptlen` at 40, `crypto_async_request.flags`
-/// at 44); the reserved tail stays zero. The arm refuses before
-/// writing when resolution fails — these words are never zeroed
-/// guesses (a zero offset is only written when BTF resolved zero,
-/// and `refcnt_present` 0 is the honest 7.2 verdict, never a gap).
-/// The loader reads the map back after writing and refuses startup
-/// on mismatch (zeroed/unwritten configs fail closed).
+/// at 44, fixture `op->req` at 48 + its presence word at 52); the
+/// reserved tail stays zero. The arm refuses before writing when
+/// resolution fails — these words are never zeroed guesses (a zero
+/// offset is only written when BTF resolved zero, `refcnt_present`
+/// 0 is the honest 7.2 verdict, and `op_req_present` 0 is the
+/// honest fixture-absent verdict — never gaps). The loader reads
+/// the map back after writing and refuses startup on mismatch
+/// (zeroed/unwritten configs fail closed).
 #[must_use]
-pub fn lifecycle_config_bytes(off: &crate::btf_resolve::LifecycleOffsets) -> [u8; 64] {
+pub fn lifecycle_config_bytes(
+    off: &crate::btf_resolve::LifecycleOffsets,
+    op_req_off: u32,
+    op_req_present: bool,
+) -> [u8; 64] {
     let mut out = [0u8; 64];
     out[0..4].copy_from_slice(&LCONFIG_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&LCONFIG_VERSION.to_le_bytes());
@@ -416,6 +483,8 @@ pub fn lifecycle_config_bytes(off: &crate::btf_resolve::LifecycleOffsets) -> [u8
     out[36..40].copy_from_slice(&off.req_tfm.to_le_bytes());
     out[40..44].copy_from_slice(&off.req_cryptlen.to_le_bytes());
     out[44..48].copy_from_slice(&off.req_flags.to_le_bytes());
+    out[48..52].copy_from_slice(&op_req_off.to_le_bytes());
+    out[52..56].copy_from_slice(&u32::from(op_req_present).to_le_bytes());
     out
 }
 

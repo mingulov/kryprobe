@@ -1220,11 +1220,11 @@ fn sensor_routes_tfm_records_to_tracker() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1260,11 +1260,11 @@ fn sensor_tallies_destroy_pair_on_lanes_6_7_and_retires() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1299,11 +1299,11 @@ fn ledger_carries_generations_and_tfm_stats() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1342,11 +1342,11 @@ fn public_views_carry_no_kernel_addresses() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -1439,11 +1439,11 @@ fn sensor_tallies_config_pairs_on_lanes_8_11_14_15_and_bumps_epoch() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {

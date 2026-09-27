@@ -19,10 +19,14 @@
 //!   post-finish `Unknown` record + `unfinished == 1`.
 //! - The reconciliation equation must hold exactly over deltas:
 //!   `agg == hits + reserve + noslot` (post-quiet, empty close ring).
-//! - Every loss counter must read zero; any close backlog fails.
+//! - Every loss counter must read zero — except `cryptd-async`'s
+//!   `duplicate`, which pins one nested re-join per op (P4: the
+//!   cryptd completion synchronously invokes the nested owner
+//!   completion); any close backlog fails.
 
+use crate::kcrypto_lifecycle::async_adapter::AdapterStats;
 use crate::kcrypto_lifecycle::decode::DecodeStats;
-use crate::kcrypto_lifecycle::profile::{LifecycleProfile, manifest};
+use crate::kcrypto_lifecycle::profile::{LANE_COUNT, LifecycleProfile, manifest};
 use crate::kcrypto_lifecycle::tfm::{GenerationInfo, TfmStats};
 use crate::kcrypto_lifecycle::view::ProgMisses;
 use kryprobe_abi::kcrypto_lifecycle::{
@@ -90,6 +94,15 @@ pub struct FixtureTruth {
     pub returns: Vec<(u64, i32)>,
     /// `(seq, errno)` terminal (callback) rows in row order.
     pub terminals: Vec<(u64, i32)>,
+    /// `(seq, errno)` progress rows in row order (P4: waiter-side
+    /// markers AND kernel backlog-progress callbacks — the
+    /// scenario arm decides which shape each scenario runs).
+    pub progresses: Vec<(u64, i32)>,
+    /// Notification order (P4): `(seq, is_terminal)` for every
+    /// progress (`false`) and terminal (`true`) row, in row order —
+    /// the deterministic drain order the burst arm pins
+    /// (`P1,T0,P2,T1,P3,T2,T3`).
+    pub notify_order: Vec<(u64, bool)>,
     /// Allocation rows in sequence order (T07-R2-04).
     pub allocs: Vec<FixtureAlloc>,
     /// Release rows in row order (T07-R2-04).
@@ -117,10 +130,12 @@ impl FixtureTruth {
         let mut hooks = [0u64; 4];
         for op in &self.ops {
             // Family classification over the parser's closed
-            // label set (suffixed labels are encrypt flavors).
+            // label set (suffixed labels are encrypt flavors —
+            // `encrypt-cryptd` hooks the encrypt site like every
+            // other flavor; only its COMPLETION lane differs).
             let (submit_lane, return_lane) = match op.op.as_str() {
                 "encrypt" | "encrypt-exact" | "encrypt-delayed" | "encrypt-burst"
-                | "encrypt-early" => (0, 1),
+                | "encrypt-early" | "encrypt-cryptd" => (0, 1),
                 "decrypt" => (2, 3),
                 _ => unreachable!("parser admits only the closed label set"),
             };
@@ -249,6 +264,8 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
     let mut ops: Vec<FixtureOp> = Vec::new();
     let mut returns: Vec<(u64, i32)> = Vec::new();
     let mut terminals: Vec<(u64, i32)> = Vec::new();
+    let mut progresses: Vec<(u64, i32)> = Vec::new();
+    let mut notify_order: Vec<(u64, bool)> = Vec::new();
     let mut allocs: Vec<FixtureAlloc> = Vec::new();
     let mut frees: Vec<FixtureFree> = Vec::new();
     let mut configs: Vec<FixtureConfig> = Vec::new();
@@ -376,8 +393,22 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 });
             }
             "progress" => {
-                get_u64(obj, "seq", line_no, "progress row lacks a sequence")?;
-                get_i32(obj, "errno", line_no, "progress row lacks an errno")?;
+                let seq = get_u64(obj, "seq", line_no, "progress row lacks a sequence")?;
+                let errno = get_i32(obj, "errno", line_no, "progress row lacks an errno")?;
+                if !ops.iter().any(|o: &FixtureOp| o.seq == seq) && !probes.contains(&seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "progress for an unknown sequence",
+                    });
+                }
+                if progresses.iter().any(|(s, _)| *s == seq) {
+                    return Err(TranscriptError {
+                        line: line_no,
+                        reason: "duplicate progress sequence",
+                    });
+                }
+                progresses.push((seq, errno));
+                notify_order.push((seq, false));
             }
             "submit" => {
                 let seq = get_u64(obj, "seq", line_no, "submit row lacks a sequence")?;
@@ -398,9 +429,9 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 // Closed fixture label set (T07-R2-04: the suffixed
                 // labels are per-scenario encrypt flavors hooked at
                 // the encrypt site — `exact-driver` runs
-                // `encrypt-exact`, never plain `encrypt`; an
-                // unknown label is still drift, never a default
-                // family).
+                // `encrypt-exact`, never plain `encrypt`;
+                // `cryptd-async` runs `encrypt-cryptd`; an unknown
+                // label is still drift, never a default family).
                 if !matches!(
                     op,
                     "encrypt"
@@ -409,6 +440,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                         | "encrypt-delayed"
                         | "encrypt-burst"
                         | "encrypt-early"
+                        | "encrypt-cryptd"
                 ) {
                     return Err(TranscriptError {
                         line: line_no,
@@ -459,6 +491,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                     });
                 }
                 terminals.push((seq, errno));
+                notify_order.push((seq, true));
             }
             "done" => {
                 let result = get_i32(obj, "fixture_result", line_no, "done row lacks a result")?;
@@ -565,6 +598,8 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
         ops,
         returns,
         terminals,
+        progresses,
+        notify_order,
         allocs,
         frees,
         configs,
@@ -578,12 +613,13 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SensorBaseline {
     /// Per-hook consumed edges in `LAGG_*` lane order (lanes 0–3 are
-    /// the op hooks `[enc-sub, enc-ret, dec-sub, dec-ret]`).
-    pub edge_hits: [u64; 16],
+    /// the op hooks `[enc-sub, enc-ret, dec-sub, dec-ret]`; lanes
+    /// 16/17 are the P4 callback hooks).
+    pub edge_hits: [u64; 18],
     /// `LLOSS` per-class totals (5 classes).
     pub kernel_loss: [u64; 5],
     /// `LAGG` per-hook accepted totals.
-    pub agg_accepted: [u64; 16],
+    pub agg_accepted: [u64; 18],
     /// Retained completions surfaced so far.
     pub completed_len: u64,
     /// Decoder counters (quiescence + delta verdict; robust to
@@ -591,6 +627,9 @@ pub struct SensorBaseline {
     pub decode: DecodeStats,
     /// Reducer counters (same rationale).
     pub reducer: ReducerStats,
+    /// Callback-adapter counters (P4: same rationale — loss deltas
+    /// join the strict all-zero gate).
+    pub adapter: AdapterStats,
     /// Retention drops past the ledger bound.
     pub retained_dropped: u64,
     /// Per-program recursion-miss absolutes (H2 quiescence + delta
@@ -613,16 +652,19 @@ pub struct SensorBaseline {
 pub struct SensorView<'a> {
     /// Post-finish completions (every pending request reconciled).
     pub completed: &'a [RequestRecord],
-    /// Final per-hook consumed edges (16 `LAGG_*` lanes).
-    pub edge_hits: [u64; 16],
+    /// Final per-hook consumed edges (18 `LAGG_*` lanes).
+    pub edge_hits: [u64; 18],
     /// Final decode counters.
     pub decode: DecodeStats,
     /// Final reducer counters.
     pub reducer: ReducerStats,
+    /// Final callback-adapter counters (loss deltas join the
+    /// strict all-zero gate below).
+    pub adapter: AdapterStats,
     /// Final kernel loss.
     pub kernel_loss: [u64; 5],
-    /// Final accepted aggregate (16 `LAGG_*` lanes).
-    pub agg_accepted: [u64; 16],
+    /// Final accepted aggregate (18 `LAGG_*` lanes).
+    pub agg_accepted: [u64; 18],
     /// Retention drops past the ledger bound.
     pub retained_dropped: u64,
     /// Quiescence-proven pre-GO baseline (deltas measure from here).
@@ -989,10 +1031,10 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         a.checked_sub(b)
             .ok_or_else(|| format!("counter {what} ran backwards"))
     };
-    let mut hits_d = [0u64; 16];
+    let mut hits_d = [0u64; 18];
     let mut loss_d = [0u64; 5];
-    let mut agg_d = [0u64; 16];
-    for i in 0..16 {
+    let mut agg_d = [0u64; 18];
+    for i in 0..LANE_COUNT as usize {
         hits_d[i] = sub(view.edge_hits[i], view.baseline.edge_hits[i], "edge_hits")?;
         agg_d[i] = sub(
             view.agg_accepted[i],
@@ -1251,42 +1293,106 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 "tfm_tombstone_evictions",
             )?,
         ),
+        // Callback-adapter loss (P4: same strict all-zero gate —
+        // refused cover, orphans, ambiguity gaps, tombstone
+        // evictions, and stale callbacks all void exact counts).
+        (
+            "adapter_cover_refused",
+            sub(
+                view.adapter.cover_refused,
+                view.baseline.adapter.cover_refused,
+                "adapter_cover_refused",
+            )?,
+        ),
+        (
+            "adapter_callback_orphans",
+            sub(
+                view.adapter.callback_orphans,
+                view.baseline.adapter.callback_orphans,
+                "adapter_callback_orphans",
+            )?,
+        ),
+        (
+            "adapter_ambiguous_keys",
+            sub(
+                view.adapter.ambiguous_keys,
+                view.baseline.adapter.ambiguous_keys,
+                "adapter_ambiguous_keys",
+            )?,
+        ),
+        (
+            "adapter_tombstone_evictions",
+            sub(
+                view.adapter.tombstone_evictions,
+                view.baseline.adapter.tombstone_evictions,
+                "adapter_tombstone_evictions",
+            )?,
+        ),
+        (
+            "adapter_stale_callbacks",
+            sub(
+                view.adapter.stale_callbacks,
+                view.baseline.adapter.stale_callbacks,
+                "adapter_stale_callbacks",
+            )?,
+        ),
     ];
+    // P4 nested completions: real-cryptd traffic observes each
+    // outer op's completion TWICE (cryptd completion entry, then
+    // the nested owner completion it synchronously invokes —
+    // call-nesting guarantees cryptd-first). The first observation
+    // wins; each nested re-join counts exactly one `duplicate`
+    // (redundant terminal evidence dropped — the counter's
+    // documented meaning). Every other scenario pins zero: a
+    // duplicate outside nesting is corruption, and a missing
+    // nested duplicate means the owner completion never arrived.
+    let want_dup = if scenario == "cryptd-async" {
+        truth.ops.len() as u64
+    } else {
+        0
+    };
     for (name, value) in losses {
-        if value != 0 {
-            return Err(format!("loss counter {name} delta reads {value}"));
+        let want = if name == "duplicate" { want_dup } else { 0 };
+        if value != want {
+            return Err(format!(
+                "loss counter {name} delta reads {value} (want {want})"
+            ));
         }
     }
     // Ledger-derived ambiguity/admission (T07-R2-04): retained
     // fixture releases expect exactly that many ambiguous
     // releases, and the AEAD scenario expects one first-seen
     // admission per alloc — every other expectation is zero, so
-    // unexpected ambiguity still fails here, never hides.
-    let ambiguous_d = sub(
-        view.tfm.ambiguous_releases,
-        view.baseline.tfm.ambiguous_releases,
-        "tfm_ambiguous_releases",
-    )?;
-    let want_ambiguous = truth.frees.iter().filter(|f| !f.final_free).count() as u64;
-    if ambiguous_d != want_ambiguous {
-        return Err(format!(
-            "tfm ambiguous_releases delta {ambiguous_d} != {want_ambiguous} retained fixture releases"
-        ));
-    }
-    let unobserved_d = sub(
-        view.tfm.unobserved_boundary,
-        view.baseline.tfm.unobserved_boundary,
-        "tfm_unobserved_boundary",
-    )?;
-    let want_unobserved = if scenario == "authsize" {
-        truth.allocs.len() as u64
-    } else {
-        0
-    };
-    if unobserved_d != want_unobserved {
-        return Err(format!(
-            "tfm unobserved_boundary delta {unobserved_d} != {want_unobserved} (AEAD config admissions)"
-        ));
+    // unexpected ambiguity still fails here, never hides. P4:
+    // `cryptd-async` grades no transform shape (see its arm's
+    // contract note), so both tfm pins exempt it.
+    if scenario != "cryptd-async" {
+        let ambiguous_d = sub(
+            view.tfm.ambiguous_releases,
+            view.baseline.tfm.ambiguous_releases,
+            "tfm_ambiguous_releases",
+        )?;
+        let want_ambiguous = truth.frees.iter().filter(|f| !f.final_free).count() as u64;
+        if ambiguous_d != want_ambiguous {
+            return Err(format!(
+                "tfm ambiguous_releases delta {ambiguous_d} != {want_ambiguous} retained fixture releases"
+            ));
+        }
+        let unobserved_d = sub(
+            view.tfm.unobserved_boundary,
+            view.baseline.tfm.unobserved_boundary,
+            "tfm_unobserved_boundary",
+        )?;
+        let want_unobserved = if scenario == "authsize" {
+            truth.allocs.len() as u64
+        } else {
+            0
+        };
+        if unobserved_d != want_unobserved {
+            return Err(format!(
+                "tfm unobserved_boundary delta {unobserved_d} != {want_unobserved} (AEAD config admissions)"
+            ));
+        }
     }
     for (i, loss) in loss_d.iter().enumerate() {
         if *loss != 0 {
@@ -1331,6 +1437,9 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             | "exact-driver"
             | "failed-alloc"
             | "failed-init"
+            | "backlog-accepted"
+            | "no-backlog-burst"
+            | "cryptd-async"
     ) {
         return Err(format!("unknown scenario {scenario}"));
     }
@@ -1342,11 +1451,58 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     } else {
         truth.expected_hooks()
     };
-    let op_hits = [hits_d[0], hits_d[1], hits_d[2], hits_d[3]];
-    if op_hits != expected_hits {
-        return Err(format!(
-            "edge hits {op_hits:?} != fixture-derived {expected_hits:?}"
-        ));
+    // P4: `cryptd-async` carries transcript-invisible kernel
+    // traffic (one inner sync child submit per op — the audited
+    // single-child-call shape), so its op lanes pin in its own arm
+    // (2× the transcript ops), never here.
+    if scenario != "cryptd-async" {
+        let op_hits = [hits_d[0], hits_d[1], hits_d[2], hits_d[3]];
+        if op_hits != expected_hits {
+            return Err(format!(
+                "edge hits {op_hits:?} != fixture-derived {expected_hits:?}"
+            ));
+        }
+    }
+    // Callback lanes (P4): ledger-derived per op — an op whose
+    // return queued (`-EINPROGRESS`/`-EBUSY`, kernel UAPI) fired
+    // one kernel callback per progress + terminal row; a
+    // sync-completed op fired none (its terminal row is
+    // waiter-side). `encrypt-cryptd` completions land on lane 16
+    // (cryptd site), every other flavor on lane 17 (fixture
+    // site). No scenario switch: the return errnos decide.
+    let mut want_cb = [0u64, 0u64];
+    for op in &truth.ops {
+        let ret = truth
+            .returns
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, errno)| *errno);
+        if !matches!(ret, Some(-115) | Some(-16)) {
+            continue;
+        }
+        let notes = truth
+            .progresses
+            .iter()
+            .filter(|(seq, _)| *seq == op.seq)
+            .count() as u64
+            + truth
+                .terminals
+                .iter()
+                .filter(|(seq, _)| *seq == op.seq)
+                .count() as u64;
+        let lane = usize::from(op.op != "encrypt-cryptd");
+        want_cb[lane] = want_cb[lane].saturating_add(notes);
+    }
+    // P4: `cryptd-async` observes each completion twice (nested
+    // owner completion on lane 17), so its callback lanes pin in
+    // its own arm ([N, N]), never here.
+    if scenario != "cryptd-async" {
+        let got_cb = [hits_d[16], hits_d[17]];
+        if got_cb != want_cb {
+            return Err(format!(
+                "callback lanes {got_cb:?} != fixture-derived {want_cb:?}"
+            ));
+        }
     }
     // Transform lanes (T07-R2-04): ledger-derived per-lane
     // expectations — alloc/destroy/config halves counted from
@@ -1388,11 +1544,16 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         aead_setkey,                 // 14 setkey-aead sub
         aead_setkey,                 // 15 setkey-aead ret
     ];
-    let got_tfm: Vec<u64> = hits_d[4..16].to_vec();
-    if got_tfm.as_slice() != want_tfm {
-        return Err(format!(
-            "transform lanes {got_tfm:?} != fixture-derived {want_tfm:?}"
-        ));
+    // P4: `cryptd-async` grades no transform shape (see its
+    // arm's contract note), so its tfm lanes pin nowhere.
+    let cryptd = scenario == "cryptd-async";
+    if !cryptd {
+        let got_tfm: Vec<u64> = hits_d[4..16].to_vec();
+        if got_tfm.as_slice() != want_tfm {
+            return Err(format!(
+                "transform lanes {got_tfm:?} != fixture-derived {want_tfm:?}"
+            ));
+        }
     }
     let admitted_d = sub(
         view.decode.admitted,
@@ -1400,13 +1561,14 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         "decode.admitted",
     )?;
     // Decode admission: one per hooked op submit (`authsize` admits
-    // nothing — its op never reaches the decoder).
+    // nothing — its op never reaches the decoder; `cryptd-async`
+    // admits 2× — the arm pins its own lockstep).
     let expect_admitted = if scenario == "authsize" {
         0
     } else {
         truth.ops.len() as u64
     };
-    if admitted_d != expect_admitted {
+    if !cryptd && admitted_d != expect_admitted {
         return Err(format!(
             "admitted delta {admitted_d} != {expect_admitted} hooked ops",
         ));
@@ -1447,6 +1609,19 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         "async-once" => {
             verdict_op_async(scenario, truth, view, unfinished_d)?;
             verdict_tfm_sk(truth, view, false)?;
+        }
+        "backlog-accepted" => {
+            verdict_op_backlog(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "no-backlog-burst" => {
+            verdict_op_no_backlog(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_sk(truth, view, false)?;
+        }
+        "cryptd-async" => {
+            // Adapter-shape-strict only (no tfm grading — see the
+            // arm's contract note).
+            verdict_op_cryptd(scenario, truth, view, unfinished_d)?;
         }
         "rekey" => {
             verdict_op_sync(scenario, truth, view, unfinished_d)?;
@@ -1571,10 +1746,12 @@ fn verdict_op_sync(
     Ok(())
 }
 
-/// Async op shape: the pending shape T06 can observe (submit +
-/// queued return, completion invisible until T09 — post-finish the
-/// request truthless-drains as one `Unknown` record). Shared by
-/// every scenario with one async sk op.
+/// Async op shape (P4: callback-grounded — T06 graded the pending
+/// shape because completion was invisible; the qualified adapter
+/// completes it now): one queued submit, one terminal callback,
+/// post-finish one `Callback(0)` record with a submit→callback
+/// span, nothing unfinished. Shared by every scenario with one
+/// async fixture-completed sk op.
 fn verdict_op_async(
     scenario: &str,
     truth: &FixtureTruth,
@@ -1603,22 +1780,24 @@ fn verdict_op_async(
     }
     // Positive controls: the fixture queued exactly once
     // (`-EINPROGRESS`, kernel UAPI) AND observed async
-    // completion (errno 0) — the sensor legitimately sees
-    // neither the queue code's meaning nor the callback.
+    // completion (errno 0) with NO progress row (single
+    // in-flight op — no backlog engages).
     if truth.returns.as_slice() != [(truth.ops[0].seq, -115)] {
         return Err(format!(
             "async fixture returns {:?} != [(seq, -EINPROGRESS)]",
             truth.returns
         ));
     }
-    // The callback row must belong to THE op (seq match) and
-    // show clean completion (errno 0): the sensor
-    // legitimately sees neither, but the scenario must have
-    // run to grade the pending shape against.
     if truth.terminals.as_slice() != [(truth.ops[0].seq, 0)] {
         return Err(format!(
             "async fixture terminals {:?} != [(op seq, 0)]",
             truth.terminals
+        ));
+    }
+    if !truth.progresses.is_empty() {
+        return Err(format!(
+            "async fixture progresses {:?} != [] (no backlog on one op)",
+            truth.progresses
         ));
     }
     if view.completed.len() != 1 {
@@ -1627,15 +1806,343 @@ fn verdict_op_async(
             view.completed.len()
         ));
     }
-    if view.completed[0].terminal != Terminal::Unknown {
+    // The adapter joined the terminal callback: exact status,
+    // observed callback span, nothing truthless.
+    if view.completed[0].terminal != Terminal::Callback(0) {
         return Err(format!(
-            "async post-finish terminal {:?} != Unknown (unexpected sync completion)",
+            "async post-finish terminal {:?} != Callback(0) (callback unjoined)",
             view.completed[0].terminal
         ));
     }
-    if unfinished_d != 1 {
+    if view.completed[0].duration_ns.is_none() {
+        return Err("async post-finish completion lacks a callback span".to_owned());
+    }
+    if unfinished_d != 0 {
         return Err(format!(
-            "async unfinished delta {unfinished_d} != 1 (expected-pending)"
+            "async unfinished delta {unfinished_d} != 0 (expected-complete)"
+        ));
+    }
+    Ok(())
+}
+
+/// Backlog-burst op shape (P4): four `encrypt-burst` ops, returns
+/// `-EINPROGRESS, -EBUSY × 3`, kernel progress rows on reqs 1..3
+/// (`-EINPROGRESS`, always before their terminal), terminal 0
+/// everywhere, notification order exactly `P1,T0,P2,T1,P3,T2,T3`
+/// (the cryptd-worker drain shape), post-finish four `Callback(0)`
+/// records with spans, nothing unfinished.
+fn verdict_op_backlog(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    if truth.ops.len() != 4 {
+        return Err(format!(
+            "{scenario} runs 4 ops, fixture ran {}",
+            truth.ops.len()
+        ));
+    }
+    for op in &truth.ops {
+        if op.op != "encrypt-burst" {
+            return Err(format!(
+                "{scenario} runs `encrypt-burst`, fixture ran `{}`",
+                op.op
+            ));
+        }
+    }
+    let seqs: Vec<u64> = truth.ops.iter().map(|op| op.seq).collect();
+    let want_returns: Vec<(u64, i32)> = vec![
+        (seqs[0], -115),
+        (seqs[1], -16),
+        (seqs[2], -16),
+        (seqs[3], -16),
+    ];
+    if truth.returns != want_returns {
+        return Err(format!(
+            "backlog fixture returns {:?} != [-EINPROGRESS, -EBUSY × 3]",
+            truth.returns
+        ));
+    }
+    let want_terminals: Vec<(u64, i32)> = seqs.iter().map(|seq| (*seq, 0)).collect();
+    for (seq, errno) in &want_terminals {
+        if !truth.terminals.contains(&(*seq, *errno)) {
+            return Err(format!(
+                "backlog fixture terminals {:?} lack ({seq}, 0)",
+                truth.terminals
+            ));
+        }
+    }
+    let want_progress: Vec<(u64, i32)> = seqs[1..].iter().map(|seq| (*seq, -115)).collect();
+    if truth.progresses != want_progress {
+        return Err(format!(
+            "backlog fixture progresses {:?} != [(reqs 1..3, -EINPROGRESS)]",
+            truth.progresses
+        ));
+    }
+    // Deterministic drain order (derived from the op seqs, never
+    // positional constants): P1,T0,P2,T1,P3,T2,T3.
+    let want_notify = vec![
+        (seqs[1], false),
+        (seqs[0], true),
+        (seqs[2], false),
+        (seqs[1], true),
+        (seqs[3], false),
+        (seqs[2], true),
+        (seqs[3], true),
+    ];
+    if truth.notify_order != want_notify {
+        return Err(format!(
+            "backlog notify order {:?} != P1,T0,P2,T1,P3,T2,T3",
+            truth.notify_order
+        ));
+    }
+    if view.completed.len() != 4 {
+        return Err(format!(
+            "backlog post-finish completed {} != 4",
+            view.completed.len()
+        ));
+    }
+    for (i, record) in view.completed.iter().enumerate() {
+        if record.terminal != Terminal::Callback(0) {
+            return Err(format!(
+                "backlog completion {i} terminal {:?} != Callback(0)",
+                record.terminal
+            ));
+        }
+        if record.duration_ns.is_none() {
+            return Err(format!("backlog completion {i} lacks a callback span"));
+        }
+    }
+    if unfinished_d != 0 {
+        return Err(format!(
+            "backlog unfinished delta {unfinished_d} != 0 (expected-complete)"
+        ));
+    }
+    Ok(())
+}
+
+/// No-backlog-burst op shape (P4): two `encrypt-burst` ops without
+/// backlog consent — submit 0 queues (`-EINPROGRESS`, terminal via
+/// callback), submit 1 answers `-ENOSPC` immediately (waiter-side
+/// terminal row, no kernel callback). Post-finish: one
+/// `Callback(0)` + one `Sync(-ENOSPC)` (exact errno, never
+/// rewritten), both with spans, nothing unfinished. Completion
+/// ORDER is arrival order (the sync record may precede the
+/// callback): joined as a set, never positionally.
+fn verdict_op_no_backlog(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    if truth.ops.len() != 2 {
+        return Err(format!(
+            "{scenario} runs 2 ops, fixture ran {}",
+            truth.ops.len()
+        ));
+    }
+    for op in &truth.ops {
+        if op.op != "encrypt-burst" {
+            return Err(format!(
+                "{scenario} runs `encrypt-burst`, fixture ran `{}`",
+                op.op
+            ));
+        }
+    }
+    let seqs: Vec<u64> = truth.ops.iter().map(|op| op.seq).collect();
+    if truth.returns != vec![(seqs[0], -115), (seqs[1], -28)] {
+        return Err(format!(
+            "no-backlog fixture returns {:?} != [(seq0, -EINPROGRESS), (seq1, -ENOSPC)]",
+            truth.returns
+        ));
+    }
+    // Waiter-side terminal FIRST (submit 1's ENOSPC records
+    // synchronously in the submit loop), callback terminal SECOND
+    // (op 0 completes after the kick) — deterministic by
+    // construction, pinned in row order.
+    if truth.terminals != vec![(seqs[1], -28), (seqs[0], 0)] {
+        return Err(format!(
+            "no-backlog fixture terminals {:?} != [(seq1, -ENOSPC), (seq0, 0)]",
+            truth.terminals
+        ));
+    }
+    if !truth.progresses.is_empty() {
+        return Err(format!(
+            "no-backlog fixture progresses {:?} != [] (no backlog engages)",
+            truth.progresses
+        ));
+    }
+    if view.completed.len() != 2 {
+        return Err(format!(
+            "no-backlog post-finish completed {} != 2",
+            view.completed.len()
+        ));
+    }
+    let mut terms: Vec<Terminal> = view.completed.iter().map(|r| r.terminal).collect();
+    terms.sort_by_key(|t| match t {
+        Terminal::Sync(_) => 0,
+        Terminal::Callback(_) => 1,
+        Terminal::Unknown => 2,
+    });
+    if terms.as_slice() != [Terminal::Sync(-28), Terminal::Callback(0)] {
+        return Err(format!(
+            "no-backlog terminals {terms:?} != [Sync(-ENOSPC), Callback(0)]"
+        ));
+    }
+    for (i, record) in view.completed.iter().enumerate() {
+        if record.duration_ns.is_none() {
+            return Err(format!("no-backlog completion {i} lacks a span"));
+        }
+    }
+    if unfinished_d != 0 {
+        return Err(format!(
+            "no-backlog unfinished delta {unfinished_d} != 0 (expected-complete)"
+        ));
+    }
+    Ok(())
+}
+
+/// Real-cryptd op shape (P4 adapter-shape-strict): every traffic
+/// op is an `encrypt-cryptd` that queued (`-EINPROGRESS`) and
+/// completed clean (terminal 0, no progress — single in-flight, and
+/// the quiescence gate refuses a guest whose shared cryptd queue
+/// carries foreign backlog). At least one op ran (a refusal-only
+/// run proves no real path and must not pass vacuously).
+///
+/// Real cryptd wraps each op in transcript-invisible kernel
+/// traffic (audited `crypto/cryptd.c`, identical 7.0.14/7.2.6):
+/// one inner sync child submit per op (the single-child-call
+/// shape — op lanes pin 2× the transcript ops), and one NESTED
+/// owner completion per op (the cryptd completion synchronously
+/// invokes the owner's — callback lanes pin [N, N], cryptd-first
+/// by call nesting, and the loss gate pins `duplicate == N`).
+/// Post-finish: N `Callback(0)` (outer ids) + N `Sync(0)` (inner
+/// child ids), every record with a span, joined as a SET (arrival
+/// order across ids is not positional), nothing unfinished.
+///
+/// Transform lifetimes are NOT graded here: cryptd-instance
+/// internals (child/spawn allocs, free cascades) are invisible to
+/// the transcript, T07-sealed, and version-sensitive — the other
+/// canary cells gate tfm strictly, and this cell receipts the tfm
+/// counters for the record.
+fn verdict_op_cryptd(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    if truth.ops.is_empty() {
+        return Err(format!(
+            "{scenario} ran no traffic ops (refusal-only proves no real path)"
+        ));
+    }
+    for op in &truth.ops {
+        if op.op != "encrypt-cryptd" {
+            return Err(format!(
+                "{scenario} runs `encrypt-cryptd`, fixture ran `{}`",
+                op.op
+            ));
+        }
+        let ret = truth
+            .returns
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, errno)| *errno);
+        if ret != Some(-115) {
+            return Err(format!(
+                "cryptd op seq {} return {ret:?} != -EINPROGRESS",
+                op.seq
+            ));
+        }
+        let term = truth
+            .terminals
+            .iter()
+            .find(|(seq, _)| *seq == op.seq)
+            .map(|(_, errno)| *errno);
+        if term != Some(0) {
+            return Err(format!("cryptd op seq {} terminal {term:?} != 0", op.seq));
+        }
+    }
+    if !truth.progresses.is_empty() {
+        return Err(format!(
+            "cryptd fixture progresses {:?} != [] (foreign backlog voids the run)",
+            truth.progresses
+        ));
+    }
+    // Admission lockstep (arm-local — the generic pin counts
+    // transcript ops only): 2N decoded submits (outer + inner),
+    // one reducer id per decoded submit, all emitted post-finish.
+    let n = truth.ops.len() as u64;
+    let sub = |a: u64, b: u64| {
+        a.checked_sub(b)
+            .ok_or_else(|| "counter ran backwards".to_owned())
+    };
+    let admitted_d = sub(view.decode.admitted, view.baseline.decode.admitted)?;
+    if admitted_d != 2 * n {
+        return Err(format!("cryptd admitted delta {admitted_d} != 2× {n} ops"));
+    }
+    let reducer_admitted_d = sub(view.reducer.admitted, view.baseline.reducer.admitted)?;
+    if reducer_admitted_d != admitted_d {
+        return Err(format!(
+            "cryptd reducer admitted {reducer_admitted_d} != decode admitted {admitted_d}"
+        ));
+    }
+    let emitted_d = sub(view.reducer.emitted, view.baseline.reducer.emitted)?;
+    if emitted_d != admitted_d {
+        return Err(format!(
+            "cryptd emitted {emitted_d} != admitted {admitted_d}"
+        ));
+    }
+    // Op lanes: outer + inner-sync-child submits per op (the
+    // transcript counts outers only — the 2× is the audited
+    // kernel shape, and any drift (extra child calls, an async
+    // child queuing instead) breaks it loud).
+    let enc_sub = sub(view.edge_hits[0], view.baseline.edge_hits[0])?;
+    let enc_ret = sub(view.edge_hits[1], view.baseline.edge_hits[1])?;
+    if (enc_sub, enc_ret) != (2 * n, 2 * n) {
+        return Err(format!(
+            "cryptd op lanes ({enc_sub}, {enc_ret}) != (2N, 2N) for {n} ops"
+        ));
+    }
+    // Callback lanes: cryptd-first + nested-owner per op.
+    let cb_cryptd = sub(view.edge_hits[16], view.baseline.edge_hits[16])?;
+    let cb_kxc = sub(view.edge_hits[17], view.baseline.edge_hits[17])?;
+    if (cb_cryptd, cb_kxc) != (n, n) {
+        return Err(format!(
+            "cryptd callback lanes ({cb_cryptd}, {cb_kxc}) != ({n}, {n})"
+        ));
+    }
+    // Completions: outer callbacks + inner syncs, as a set.
+    if view.completed.len() != 2 * truth.ops.len() {
+        return Err(format!(
+            "cryptd post-finish completed {} != 2× {} ops",
+            view.completed.len(),
+            truth.ops.len()
+        ));
+    }
+    let mut terms: Vec<Terminal> = view.completed.iter().map(|r| r.terminal).collect();
+    terms.sort_by_key(|t| match t {
+        Terminal::Sync(_) => 0,
+        Terminal::Callback(_) => 1,
+        Terminal::Unknown => 2,
+    });
+    let mut want: Vec<Terminal> = Vec::with_capacity(2 * truth.ops.len());
+    want.extend(std::iter::repeat_n(Terminal::Sync(0), truth.ops.len()));
+    want.extend(std::iter::repeat_n(Terminal::Callback(0), truth.ops.len()));
+    if terms != want {
+        return Err(format!(
+            "cryptd terminals {terms:?} != [Sync(0)×{n}, Callback(0)×{n}]"
+        ));
+    }
+    for (i, record) in view.completed.iter().enumerate() {
+        if record.duration_ns.is_none() {
+            return Err(format!("cryptd completion {i} lacks a span"));
+        }
+    }
+    if unfinished_d != 0 {
+        return Err(format!(
+            "cryptd unfinished delta {unfinished_d} != 0 (expected-complete)"
         ));
     }
     Ok(())
@@ -1688,7 +2195,9 @@ fn verdict_op_negative(
 /// (provenance, retirement, ambiguity, config scalars) plus
 /// ledger-derived stat deltas. `expect_ambiguous` is true only
 /// for shared-release's retained-then-final lifetime.
-fn verdict_tfm_sk(
+/// Shared lifetime pairing: each fixture alloc joins one fresh
+/// sensor generation, checked pairwise (T07-R3).
+fn verdict_tfm_lifetimes(
     truth: &FixtureTruth,
     view: &SensorView<'_>,
     expect_ambiguous: bool,
@@ -1697,6 +2206,15 @@ fn verdict_tfm_sk(
     for (alloc, generation) in truth.allocs.iter().zip(fresh.iter()) {
         verdict_lifetime_sk(truth, alloc, generation, expect_ambiguous)?;
     }
+    Ok(())
+}
+
+fn verdict_tfm_sk(
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    expect_ambiguous: bool,
+) -> Result<(), String> {
+    verdict_tfm_lifetimes(truth, view, expect_ambiguous)?;
     let frees = truth.frees.len() as u64;
     let finals = truth.frees.iter().filter(|f| f.final_free).count() as u64;
     let configs = truth.configs.len() as u64;
@@ -2094,7 +2612,7 @@ mod tests {
         let misses = vec![miss_abs("fsession/a", 11, 3), miss_abs("fsession/b", 12, 0)];
         SensorView {
             completed,
-            edge_hits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+            edge_hits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
             decode: DecodeStats {
                 admitted: 2,
                 ..DecodeStats::default()
@@ -2104,8 +2622,9 @@ mod tests {
                 emitted: 2,
                 ..ReducerStats::default()
             },
+            adapter: AdapterStats::default(),
             kernel_loss: [0; 5],
-            agg_accepted: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+            agg_accepted: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
             retained_dropped: 0,
             baseline: SensorBaseline {
                 prog_misses: misses.clone(),
@@ -2173,8 +2692,8 @@ mod tests {
         let gens = sync_gens3(1, 2, 3);
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2188,8 +2707,8 @@ mod tests {
         let mut bad_gens = sync_gens3(1, 2, 3);
         bad_gens[2].drv_name = "wrong-driver".to_owned();
         let mut view = sync_view(&completed, &bad_gens);
-        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2210,8 +2729,8 @@ mod tests {
         ] {
             let gens = sync_gens3(ids.0, ids.1, ids.2);
             let mut view = sync_view(&completed, &gens);
-            view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
-            view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0];
+            view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0];
+            view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0];
             view.decode.admitted = 0;
             view.reducer.admitted = 0;
             view.reducer.emitted = 0;
@@ -2271,8 +2790,8 @@ mod tests {
         let gens = [shared];
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2287,8 +2806,8 @@ mod tests {
         // A non-ambiguous flag on the shared lifetime fails.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2336,8 +2855,8 @@ mod tests {
         }];
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2352,8 +2871,8 @@ mod tests {
         verdict("authsize", &truth, &view).expect("authsize green");
         // Claimed exactness on a first-seen admission fails.
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2372,8 +2891,8 @@ mod tests {
         let mut fb = gens.clone();
         fb[0].alg_type = 5;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2390,8 +2909,8 @@ mod tests {
         let mut fb = gens.clone();
         fb[0].alg_mask = 0x8f;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2407,8 +2926,8 @@ mod tests {
         let mut fb = gens.clone();
         fb[0].name_truncated = true;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2424,8 +2943,8 @@ mod tests {
         let mut fb = gens.clone();
         fb[0].drv_truncated = true;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1];
+        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2459,8 +2978,8 @@ mod tests {
         let gens: [GenerationInfo; 0] = [];
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2474,8 +2993,8 @@ mod tests {
         // A phantom generation from the ERR return fails.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -2519,8 +3038,8 @@ mod tests {
         }];
         let completed = [record(1, Terminal::Sync(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -2729,6 +3248,8 @@ mod tests {
 
     #[test]
     fn verdict_async_expects_pending() {
+        // P4: the async shape is callback-grounded now (T06 graded
+        // the pending shape because completion was invisible).
         let run = "run-async-once";
         let text = [
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t06a","drv":"kxcipher-async-t06a","type":0,"mask":0}}"#),
@@ -2746,26 +3267,273 @@ mod tests {
             drv_name: "kxcipher-async-t06a".to_owned(),
             ..sync_gen()
         }];
-        let completed = [record(1, Terminal::Unknown)];
+        let completed = [record(1, Terminal::Callback(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 1;
-        view.reducer.admitted = 1;
-        view.reducer.emitted = 1;
-        view.reducer.unfinished = 1;
-        verdict("async-once", &truth, &view).expect("async pending green");
-        // A grounded async completion fails: the scenario did not
-        // produce the async shape it exists to prove.
-        let completed = [record(1, Terminal::Sync(0))];
-        let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
         view.reducer.unfinished = 0;
-        verdict("async-once", &truth, &view).expect_err("grounded async must fail");
+        verdict("async-once", &truth, &view).expect("async callback green");
+        // An UNJOINED callback fails: the old pending shape no
+        // longer grades — the scenario exists to prove the
+        // adapter completes it.
+        let completed = [record(1, Terminal::Unknown)];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.reducer.unfinished = 1;
+        verdict("async-once", &truth, &view).expect_err("unjoined async must fail");
+    }
+
+    #[test]
+    fn verdict_backlog_burst_pins_progress_and_order() {
+        // P4: four encrypt-burst ops, EINPROGRESS + EBUSY × 3,
+        // kernel progress on reqs 1..3, drain order
+        // P1,T0,P2,T1,P3,T2,T3, four Callback(0) records.
+        let run = "run-backlog-accepted";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t06a","drv":"kxcipher-async-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-burst"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt-burst"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"submit","op":"encrypt-burst"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"submit","op":"encrypt-burst"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"return","errno":-16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"return","errno":-16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"progress","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"progress","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"progress","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("valid backlog transcript");
+        let gens = [GenerationInfo {
+            req_name: "kxcipher-async-t06a".to_owned(),
+            drv_name: "kxcipher-async-t06a".to_owned(),
+            ..sync_gen()
+        }];
+        let completed = [
+            record(1, Terminal::Callback(0)),
+            record(2, Terminal::Callback(0)),
+            record(3, Terminal::Callback(0)),
+            record(4, Terminal::Callback(0)),
+        ];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [4, 4, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7];
+        view.agg_accepted = [4, 4, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7];
+        view.decode.admitted = 4;
+        view.reducer.admitted = 4;
+        view.reducer.emitted = 4;
+        view.reducer.unfinished = 0;
+        verdict("backlog-accepted", &truth, &view).expect("backlog green");
+        // A reordered drain fails: swap the T0/T1 terminal rows
+        // (progresses/terminals-as-sets still pass — only the
+        // notify order breaks).
+        let mut rows: Vec<&str> = text.lines().collect();
+        rows.swap(11, 13);
+        let text = rows.join("\n");
+        let truth = parse_transcript(&text, run).expect("reordered parses");
+        let err = verdict("backlog-accepted", &truth, &view).expect_err("reorder must fail");
+        assert!(err.contains("notify order"), "names it: {err}");
+    }
+
+    #[test]
+    fn verdict_no_backlog_burst_pins_exact_enospc() {
+        // P4: submit 0 queues (callback terminal), submit 1
+        // answers -ENOSPC immediately (sync terminal, exact).
+        let run = "run-no-backlog-burst";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxcipher-async-t06a","drv":"kxcipher-async-t06a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"encrypt-burst"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt-burst"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-28}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":-28}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("valid no-backlog transcript");
+        let gens = [GenerationInfo {
+            req_name: "kxcipher-async-t06a".to_owned(),
+            drv_name: "kxcipher-async-t06a".to_owned(),
+            ..sync_gen()
+        }];
+        // Arrival order is NOT positional: the sync record may
+        // precede the callback — the join is a set. Prove both
+        // orders pass.
+        for completed in [
+            [
+                record(1, Terminal::Sync(-28)),
+                record(2, Terminal::Callback(0)),
+            ],
+            [
+                record(1, Terminal::Callback(0)),
+                record(2, Terminal::Sync(-28)),
+            ],
+        ] {
+            let mut view = sync_view(&completed, &gens);
+            view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+            view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+            view.decode.admitted = 2;
+            view.reducer.admitted = 2;
+            view.reducer.emitted = 2;
+            view.reducer.unfinished = 0;
+            verdict("no-backlog-burst", &truth, &view).expect("no-backlog green");
+        }
+        // A rewritten errno fails: ENOSPC is exact, never EBUSY.
+        let completed = [
+            record(1, Terminal::Sync(-16)),
+            record(2, Terminal::Callback(0)),
+        ];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.reducer.unfinished = 0;
+        verdict("no-backlog-burst", &truth, &view).expect_err("rewrite must fail");
+    }
+
+    #[test]
+    fn verdict_cryptd_async_pins_real_completions() {
+        // P4: the A3 live shape — control alloc (untrafficked),
+        // full-name cryptd alloc + op, async-masked alloc + op.
+        let run = "run-cryptd-async";
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"ecb(aes)","drv":"ecb-aes-aesni","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"alloc","req":"cryptd(ecb(aes-lib))","drv":"cryptd(ecb(aes-lib))","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt-cryptd"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"alloc","req":"ecb(aes)","drv":"cryptd(ecb(aes-lib))","type":133,"mask":143}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"submit","op":"encrypt-cryptd"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":5,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("valid cryptd transcript");
+        // Generations ungraded for cryptd (instance internals are
+        // transcript-invisible) — the empty slice documents that.
+        let gens: [GenerationInfo; 0] = [];
+        // Live arrival order (7.2.6 cell): inner Sync, then outer
+        // Callback, per op — the arm joins as a set, never
+        // positionally.
+        let completed = [
+            record(1, Terminal::Sync(0)),
+            record(2, Terminal::Callback(0)),
+            record(3, Terminal::Sync(0)),
+            record(4, Terminal::Callback(0)),
+        ];
+        let mut view = sync_view(&completed, &gens);
+        // Live lane vector (7.2.6 cell): 2× op lanes (inner child),
+        // [2, 2] callback lanes (nested), tfm lanes carry hidden
+        // instance traffic (ungraded — receipted for the record).
+        view.edge_hits = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2];
+        view.agg_accepted = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2];
+        view.decode.admitted = 4;
+        view.reducer.admitted = 4;
+        view.reducer.emitted = 4;
+        view.reducer.duplicate = 2;
+        view.reducer.unfinished = 0;
+        verdict("cryptd-async", &truth, &view).expect("cryptd green");
+        // A missing nested duplicate fails: the owner completion
+        // never arrived (or never joined) — the carve-out pins
+        // exactly N, never ≤N.
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2];
+        view.agg_accepted = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2];
+        view.decode.admitted = 4;
+        view.reducer.admitted = 4;
+        view.reducer.emitted = 4;
+        view.reducer.duplicate = 0;
+        view.reducer.unfinished = 0;
+        let err = verdict("cryptd-async", &truth, &view).expect_err("dup 0 must fail");
+        assert!(err.contains("duplicate"), "names it: {err}");
+        // Mixed bind + refusal (the 7.0 shape if the masked avenue
+        // refuses): one traffic op + one alloc probe — probes ride
+        // no op checks (parser-separated), the op pins 2×/dup 1.
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"ecb(aes)","drv":"ecb-aes-aesni","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"alloc","req":"cryptd(ecb(aes-lib))","drv":"cryptd(ecb(aes-lib))","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"encrypt-cryptd"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"submit","op":"alloc-probe"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"return","errno":-17}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":4,"phase":"terminal","errno":-17}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("mixed parses");
+        let gens: [GenerationInfo; 0] = [];
+        let completed = [
+            record(1, Terminal::Sync(0)),
+            record(2, Terminal::Callback(0)),
+        ];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [2, 2, 0, 0, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1];
+        view.agg_accepted = [2, 2, 0, 0, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1];
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.reducer.duplicate = 1;
+        view.reducer.unfinished = 0;
+        verdict("cryptd-async", &truth, &view).expect("mixed cryptd green");
+        // Refusal-only proves no real path: zero ops must fail,
+        // never pass vacuously.
+        let text = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"ecb(aes)","drv":"ecb-aes-aesni","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&text, run).expect("refusal-only parses");
+        let gens = [GenerationInfo {
+            id: 1,
+            req_name: "ecb(aes)".to_owned(),
+            drv_name: "ecb-aes-aesni".to_owned(),
+            epoch: 0,
+            configs: 0,
+            ..sync_gen()
+        }];
+        let completed: [RequestRecord; 0] = [];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.decode.admitted = 0;
+        view.reducer.admitted = 0;
+        view.reducer.emitted = 0;
+        view.tfm.admitted = 2;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 0;
+        verdict("cryptd-async", &truth, &view).expect_err("refusal-only must fail");
     }
 
     #[test]
@@ -2775,7 +3543,7 @@ mod tests {
         // Equation: agg 5 != hits 4 + reserve 0 + noslot 0.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.agg_accepted = [2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("equation must hold");
         assert!(err.contains("reconciliation"), "names it: {err}");
         // Any loss counter fails.
@@ -2795,7 +3563,7 @@ mod tests {
         // Backwards counters fail (no silent reset absorb).
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.baseline.edge_hits = [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.baseline.edge_hits = [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         verdict("sync-once", &truth, &view).expect_err("backwards must fail");
         // Fixture self-check failure fails.
         let mut truth = sync_truth();
@@ -2969,13 +3737,13 @@ mod tests {
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.baseline.edge_hits = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0];
-        view.baseline.agg_accepted = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0];
+        view.baseline.edge_hits = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.baseline.agg_accepted = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0];
         view.baseline.decode.admitted = 7;
         view.baseline.reducer.admitted = 7;
         view.baseline.reducer.emitted = 7;
-        view.edge_hits = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0];
         view.decode.admitted = 9;
         view.reducer.admitted = 9;
         view.reducer.emitted = 9;
@@ -3128,7 +3896,7 @@ mod tests {
         // when totals match ([4,0,0,0] vs [1,1,1,1]).
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.agg_accepted = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("permuted agg must fail");
         assert!(err.contains("per-lane"), "names it: {err}");
     }
@@ -3166,13 +3934,14 @@ mod tests {
         }];
         let view = SensorView {
             completed: &completed,
-            edge_hits: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            agg_accepted: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            edge_hits: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            agg_accepted: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             kernel_loss: [0; 5],
             decode: DecodeStats {
                 admitted: 1,
                 ..DecodeStats::default()
             },
+            adapter: AdapterStats::default(),
             reducer: ReducerStats {
                 admitted: 1,
                 emitted: 1,
@@ -3277,14 +4046,14 @@ mod tests {
             drv_name: "kxcipher-async-t06a".to_owned(),
             ..sync_gen()
         }];
-        let completed = [record(1, Terminal::Unknown)];
+        let completed = [record(1, Terminal::Callback(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
-        view.reducer.unfinished = 1;
+        view.reducer.unfinished = 0;
         verdict("exact-driver", &truth, &view).expect("exact-driver green");
         // Plain `encrypt` on this scenario is the wrong shape.
         let text = text.replace("encrypt-exact", "encrypt");
@@ -3309,8 +4078,8 @@ mod tests {
         // A sensor view matching the RELABELED lanes sails the
         // edge-hits gate — the label pin must still catch it.
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = verdict("sync-once", &truth, &view).expect_err("label lie must fail");
         assert!(err.contains("decrypt"), "names the label: {err}");
     }

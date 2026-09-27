@@ -11,7 +11,8 @@ use super::parse::{
     BpfInsn, insns_to_bytes, parse_kcrypto_object, parse_lifecycle_object, pseudo_map_fd,
 };
 use super::progload::{
-    attach_type_for_section, prog_load_fexit_raw, prog_load_fsession_raw, prog_load_raw,
+    attach_type_for_section, prog_load_fentry_raw, prog_load_fexit_raw, prog_load_fsession_raw,
+    prog_load_raw,
 };
 use crate::bpfloader::{
     KcryptoMaps, LifecycleMaps, LoadedKcrypto, LoadedLifecycle, LoadedSpine, LoaderError,
@@ -280,6 +281,35 @@ pub fn load_kcrypto(
     ))
 }
 
+/// One optional callback program's load input (P4): the resolve
+/// outcome for one `fentry/<symbol>` section. Absent sites are
+/// simply not listed (their sections load as `Missing` — quiet,
+/// never gating); listed-but-refused sites record `Unsupported`
+/// with the resolve detail (loud, never gating); ready sites load
+/// with their module BTF id + object fd.
+#[derive(Debug, Clone)]
+pub enum CallbackLoad {
+    /// Attachable: global module-BTF FUNC id + borrowed module BTF
+    /// object fd (must outlive the load call only — the loaded
+    /// program holds its own BTF reference).
+    Ready {
+        /// Program section (`fentry/<symbol>`).
+        section: String,
+        /// Global BTF FUNC id (split-image address).
+        func_id: u32,
+        /// Module BTF object fd (`attach_btf_obj_fd`).
+        obj_fd: RawFd,
+    },
+    /// Resolve refused this site (drift, unreadable BTF, no BTF
+    /// object): recorded, never loaded, never gating.
+    Refused {
+        /// Program section (`fentry/<symbol>`).
+        section: String,
+        /// Short refusal reason (resolve-shaped, no BTF bytes).
+        detail: String,
+    },
+}
+
 /// Shape-authenticated lifecycle entry (T06, no `ProgramId`
 /// allowlist): the manifest's `fsession/` sections + frozen
 /// [`LIFECYCLE_MAPS`](crate::kcrypto_lifecycle::profile::LIFECYCLE_MAPS)
@@ -289,14 +319,20 @@ pub fn load_kcrypto(
 /// load (one site alone cannot observe both operations).
 ///
 /// `attach_ids` maps kernel symbol → vmlinux BTF id (profile-scoped:
-/// exactly the manifest's symbols). Point names are SECTIONS (the
-/// attach dispatch routes on the `fsession/` prefix). Session-kfunc
-/// stubs rewrite against freshly resolved vmlinux FUNC ids (a kernel
-/// without the kfuncs refuses here, before any load; the 7.0+ floor
-/// itself is enforced by FSESSION attach acceptance at load).
+/// exactly the manifest's symbols). `callbacks` carries the P4
+/// optional-site outcomes (ready sites load with module BTF id +
+/// obj fd; refused sites record `Unsupported`; unlisted sites
+/// record `Missing` — neither gates). Point names are SECTIONS
+/// (the attach dispatch routes on the `fsession/`/`fentry/`
+/// prefixes). Session-kfunc stubs rewrite against freshly resolved
+/// vmlinux FUNC ids (a kernel without the kfuncs refuses here,
+/// before any load; the 7.0+ floor itself is enforced by FSESSION
+/// attach acceptance at load) — `fentry/` programs skip the rewrite
+/// (R4 call-free: no stubs to rewrite).
 pub fn load_lifecycle(
     bytes: &[u8],
     attach_ids: &[(String, u32)],
+    callbacks: &[CallbackLoad],
     token_fd: Option<RawFd>,
 ) -> Result<(LoadedLifecycle, Vec<PointStatus>), LoaderError> {
     let parsed = parse_lifecycle_object(bytes)?;
@@ -354,16 +390,61 @@ pub fn load_lifecycle(
     // (unprivileged BTF read; missing kfuncs refuse the whole load
     // fail-closed), then rewrite every sentinel `call imm` to
     // `BPF_PSEUDO_KFUNC_CALL` before any program loads.
+    // `fentry/` programs skip the rewrite (P4: R4 call-free, no
+    // session calls — rewriting them would refuse the load on
+    // "no kfunc stubs").
     let kfunc_ids = resolve_kfunc_ids().map_err(|err| LoaderError::BadObject {
         reason: format!("session kfunc BTF ids: {err}"),
     })?;
     for (prog, insns) in parsed.programs.iter().zip(streams.iter_mut()) {
-        rewrite_kfunc_stubs(insns, &prog.section, &kfunc_ids)?;
+        if prog.section.starts_with("fsession/") {
+            rewrite_kfunc_stubs(insns, &prog.section, &kfunc_ids)?;
+        }
     }
     let mut progs: Vec<(String, OwnedFd)> = Vec::with_capacity(parsed.programs.len());
     let mut statuses: Vec<PointStatus> = Vec::with_capacity(parsed.programs.len());
     let mut load_errors: Vec<(String, LoaderError)> = Vec::new();
     for (prog, insns) in parsed.programs.iter().zip(streams.iter()) {
+        // P4 callback arm: ready sites load with module BTF id +
+        // obj fd; refused sites record `Unsupported` with the
+        // resolve detail; unlisted (absent) sites record
+        // `Missing` — none of them gates (the required gate
+        // below checks required sites only).
+        if prog.section.starts_with("fentry/") {
+            match callbacks.iter().find(|c| match c {
+                CallbackLoad::Ready { section, .. } | CallbackLoad::Refused { section, .. } => {
+                    section == &prog.section
+                }
+            }) {
+                Some(CallbackLoad::Ready {
+                    func_id, obj_fd, ..
+                }) => match load_fentry_program(&prog.name, insns, *func_id, *obj_fd, token_fd) {
+                    Ok(fd) => {
+                        statuses.push(PointStatus::Loaded {
+                            name: prog.section.clone(),
+                        });
+                        progs.push((prog.section.clone(), fd));
+                    }
+                    Err(err) => {
+                        statuses.push(PointStatus::Unsupported {
+                            name: prog.section.clone(),
+                            detail: short_detail(&err),
+                        });
+                        load_errors.push((prog.section.clone(), err));
+                    }
+                },
+                Some(CallbackLoad::Refused { detail, .. }) => {
+                    statuses.push(PointStatus::Unsupported {
+                        name: prog.section.clone(),
+                        detail: detail.clone(),
+                    });
+                }
+                None => statuses.push(PointStatus::Missing {
+                    name: prog.section.clone(),
+                }),
+            }
+            continue;
+        }
         let symbol = prog.section.strip_prefix("fsession/").unwrap_or_default();
         let id = attach_ids.iter().find(|(name, _)| name == symbol);
         let attach_type = attach_type_for_section(&prog.section);
@@ -426,10 +507,48 @@ pub fn load_lifecycle(
     ))
 }
 
+/// Load one lifecycle callback program (P4): `fentry/` sections
+/// ride [`prog_load_fentry_raw`] with the module BTF id + object fd.
+/// A refused load records `Unsupported` at the call site (never
+/// gating — the required gate checks required sites only).
+fn load_fentry_program(
+    name: &str,
+    insns: &[BpfInsn],
+    attach_btf_id: u32,
+    attach_btf_obj_fd: RawFd,
+    token_fd: Option<RawFd>,
+) -> Result<OwnedFd, LoaderError> {
+    if insns.is_empty() {
+        return Err(LoaderError::BadObject {
+            reason: format!("program '{name}' has no insns"),
+        });
+    }
+    let bytes = insns_to_bytes(insns);
+    let mut log = vec![0u8; LOG_CAP];
+    let ret = prog_load_fentry_raw(
+        name,
+        &bytes,
+        insns.len() as u32,
+        attach_btf_id,
+        attach_btf_obj_fd,
+        &mut log,
+        token_fd,
+    );
+    match fd_or_errno(ret) {
+        Ok(fd) => Ok(fd),
+        Err(errno) => Err(LoaderError::LoadFailed {
+            stage: name.to_owned(),
+            errno,
+            log: log_tail(&log),
+        }),
+    }
+}
+
 /// Load one lifecycle session program (T06 W8): `FSESSION` sections
 /// ride [`prog_load_fsession_raw`]. Any other attach type refuses —
-/// the lifecycle allowlist admits `fsession/` only, so anything else
-/// here is a dispatch bug, never a stale object.
+/// the lifecycle allowlist admits `fsession/` (+ P4 `fentry/`,
+/// which routes to [`load_fentry_program`] above, never here), so
+/// anything else here is a dispatch bug, never a stale object.
 fn load_tracing_program(
     name: &str,
     insns: &[BpfInsn],

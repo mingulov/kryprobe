@@ -18,7 +18,7 @@
 //! instead of pinning observations.
 
 use kryprobe_core::kcrypto::Terminal;
-use kryprobe_privilege::btf_resolve::{resolve_kfunc_ids, resolve_lifecycle_ids};
+use kryprobe_privilege::btf_resolve::{AttachOutcome, resolve_kfunc_ids, resolve_lifecycle_ids};
 use kryprobe_privilege::host::monotonic_ns;
 use kryprobe_privilege::kcrypto_lifecycle::canary::{
     SensorBaseline, SensorView, count_foreign_links, parse_transcript, verdict,
@@ -58,6 +58,9 @@ fn main() {
         scenario.as_str(),
         "sync-once"
             | "async-once"
+            | "backlog-accepted"
+            | "no-backlog-burst"
+            | "cryptd-async"
             | "reuse-burst"
             | "refheld-release"
             | "shared-release"
@@ -131,15 +134,65 @@ fn main() {
             std::process::exit(2);
         });
     put(&mut out, "links", points.len().to_string());
-    let want_links = manifest(LifecycleProfile::RequestLifecycle).required.len();
-    if points.len() != want_links {
+    // P4: required session links all attached (all-or-nothing) +
+    // callback points RECORDED; the scenario class decides which
+    // callback must be ATTACHED (the verdict would grade
+    // callback-grounded shapes against a submit/return-only
+    // sensor otherwise — a vacuous mismatch, failed here with
+    // the cause named).
+    let table = manifest(LifecycleProfile::RequestLifecycle);
+    if points.len() != table.required.len() + table.callbacks.len() {
         fail(
             &out,
             &receipt,
-            &format!("want {want_links} session links, have {}", points.len()),
+            &format!(
+                "want {} required + {} callback points, have {}",
+                table.required.len(),
+                table.callbacks.len(),
+                points.len()
+            ),
         );
     }
-    let attached_links = sensor.attached_points();
+    let attached = |section: &str| {
+        points
+            .iter()
+            .any(|p| p.name == section && p.attach == Some(AttachOutcome::Attached))
+    };
+    for site in table.required {
+        let section = format!("fsession/{}", site.symbol);
+        if !attached(&section) {
+            fail(&out, &receipt, &format!("required {section} not attached"));
+        }
+    }
+    let want_callback: Option<&str> = match scenario.as_str() {
+        "async-once" | "exact-driver" | "backlog-accepted" | "no-backlog-burst" => {
+            Some("fentry/kxc_complete")
+        }
+        "cryptd-async" => Some("fentry/cryptd_skcipher_complete"),
+        _ => None,
+    };
+    if let Some(section) = want_callback
+        && !attached(section)
+    {
+        fail(
+            &out,
+            &receipt,
+            &format!("{scenario} needs {section} attached (have: {points:?})"),
+        );
+    }
+    // P4: the verdict's link gate counts REQUIRED session links
+    // only (callback links attach optionally and are proven by
+    // the per-scenario attach check above + the lane-16/17
+    // expectations — never by this count).
+    let attached_links = points
+        .iter()
+        .filter(|p| p.name.starts_with("fsession/") && p.attach == Some(AttachOutcome::Attached))
+        .count();
+    put(
+        &mut out,
+        "attached_total",
+        sensor.attached_points().to_string(),
+    );
     // M2 receipts: the session-kfunc BTF ids the loader rewrote, the
     // kernel prog/map/link ids from the pre-arm identity baseline,
     // and the ring positions at arm (abs snapshots; deltas below).
@@ -217,6 +270,7 @@ fn main() {
             completed_len: taken,
             decode: ledger.decode,
             reducer: ledger.reducer,
+            adapter: ledger.adapter,
             retained_dropped: ledger.retained_dropped,
             prog_misses: ledger.miss_current.clone(),
             tfm: ledger.tfm_stats,
@@ -718,6 +772,7 @@ fn main() {
         edge_hits: ledger.edge_hits,
         decode: ledger.decode,
         reducer: ledger.reducer,
+        adapter: ledger.adapter,
         kernel_loss: ledger.kernel_loss,
         agg_accepted: ledger.agg_accepted,
         retained_dropped: ledger.retained_dropped,

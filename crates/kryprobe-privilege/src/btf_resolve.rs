@@ -26,7 +26,8 @@
 
 use crate::attach::OwnedLink;
 use crate::bpfloader::{LoadedKcrypto, LoaderError, PointStatus, load_kcrypto};
-use crate::btf::Btf;
+use crate::btf::{Btf, SplitBtf};
+use crate::fd::OwnedFd;
 use crate::local::LocalPrivilegedAuthority;
 use crate::mapops::{MapOpsError, map_update_bytes};
 use kryprobe_abi::kcrypto_agg::KConfig;
@@ -42,6 +43,9 @@ use std::path::Path;
 
 /// vmlinux BTF image (world-readable on the K0 host and the 6.12 guest).
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
+/// Module BTF directory (world-readable; one file per BTF-carrying
+/// module — absent file = module not loaded or built without BTF).
+const MODULE_BTF_DIR: &str = "/sys/kernel/btf";
 
 /// `PF_KTHREAD` — "I am a kernel thread" task flag.
 ///
@@ -920,6 +924,173 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
         }
     }
     Ok(ids)
+}
+
+/// One optional callback site's resolve outcome (P4 contract §9):
+/// attach-if-present, never gating — absence is quiet, drift is
+/// loud, readiness carries the load inputs.
+#[derive(Debug)]
+pub enum CallbackSiteOutcome {
+    /// Module BTF parsed, prototype pinned, BTF object fd open:
+    /// the loader attaches `fentry/<symbol>` with this id + obj fd.
+    Ready {
+        /// Global BTF FUNC id (split-image address).
+        func_id: u32,
+        /// Module BTF object fd (`attach_btf_obj_fd` at load).
+        obj_fd: OwnedFd,
+    },
+    /// Module BTF file absent (module not loaded or built without
+    /// BTF): quiet skip — the sensor runs submit/return-only and
+    /// the point records `Missing`, never a refusal.
+    Absent,
+    /// Module present but unusable (unreadable/ unparseable BTF,
+    /// missing symbol, drifted prototype, rival def, or no BTF
+    /// object): loud — the point records `Unsupported` with this
+    /// detail, and bring-up continues without the site.
+    Refused {
+        /// Why the site refused (static-shaped, no BTF bytes).
+        detail: String,
+    },
+}
+
+/// Resolve the manifest's OPTIONAL callback sites (P4): per-site
+/// outcomes, never fail-closed across sites (a refused callback
+/// must not gate the sensor — only its own point records it).
+/// Unprivileged reads (sysfs BTF) + one privileged step (the BTF
+/// object fd, opened during bring-up): an `Err` here means the
+/// SHARED base (vmlinux BTF) is unreadable — the required resolve
+/// trips on that first in practice, so this `Err` is a diagnosed
+/// race, never a silent skip.
+pub fn resolve_callback_sites() -> Result<
+    Vec<(
+        crate::kcrypto_lifecycle::profile::CallbackSite,
+        CallbackSiteOutcome,
+    )>,
+    BtfError,
+> {
+    use crate::kcrypto_lifecycle::profile::{CallbackShape, LifecycleProfile, manifest};
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    let base = Btf::parse(bytes)?;
+    let sreq_entry = base.find_struct("skcipher_request")?;
+    let table = manifest(LifecycleProfile::RequestLifecycle);
+    let mut out = Vec::with_capacity(table.callbacks.len());
+    for site in table.callbacks {
+        let path = format!("{MODULE_BTF_DIR}/{}", site.module);
+        let module_bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                out.push((*site, CallbackSiteOutcome::Absent));
+                continue;
+            }
+            Err(err) => {
+                out.push((
+                    *site,
+                    CallbackSiteOutcome::Refused {
+                        detail: format!("{path}: {err}"),
+                    },
+                ));
+                continue;
+            }
+        };
+        let outcome = match Btf::parse(&module_bytes) {
+            Ok(module) => {
+                let split = SplitBtf::new(&base, &module);
+                let proto = match site.shape {
+                    CallbackShape::Cryptd => split.cryptd_proto_id(site.symbol, sreq_entry),
+                    CallbackShape::FixtureOp => split.kxc_proto_id(site.symbol),
+                };
+                match proto {
+                    Ok(func_id) => match find_module_btf(site.module) {
+                        Ok(Some(obj_fd)) => CallbackSiteOutcome::Ready { func_id, obj_fd },
+                        Ok(None) => CallbackSiteOutcome::Refused {
+                            detail: format!(
+                                "module BTF file present but no BTF object named '{}'",
+                                site.module
+                            ),
+                        },
+                        Err(errno) => CallbackSiteOutcome::Refused {
+                            detail: format!("BTF object discovery errno {errno}"),
+                        },
+                    },
+                    Err(err) => CallbackSiteOutcome::Refused {
+                        detail: err.to_string(),
+                    },
+                }
+            }
+            Err(err) => CallbackSiteOutcome::Refused {
+                detail: err.to_string(),
+            },
+        };
+        out.push((*site, outcome));
+    }
+    Ok(out)
+}
+
+/// BTF object discovery (P4, privileged): iterate kernel BTF objects
+/// and open the one whose kernel name is `module` (`vmlinux` for
+/// the base image, the module name for module BTF). `Ok(None)` when
+/// no object carries the name (raced unload, or a BTF file without
+/// a live object — the caller refuses loud, never attaches blind).
+/// Bounded (refuses past the cap instead of looping forever);
+/// `ENOENT` mid-walk is a raced unload (skip, not evidence).
+pub fn find_module_btf(module: &str) -> Result<Option<OwnedFd>, i32> {
+    use crate::probe::bpf_sys::{btf_get_fd_by_id, btf_get_next_id, btf_kernel_name};
+    const CAP: u32 = 65_536;
+    let mut id = 0u32;
+    let mut seen = 0u32;
+    let mut name_buf = [0u8; 128];
+    loop {
+        let Some(next) = btf_get_next_id(id)? else {
+            return Ok(None);
+        };
+        id = next;
+        seen += 1;
+        if seen > CAP {
+            return Err(libc::ELOOP);
+        }
+        let fd = match btf_get_fd_by_id(next) {
+            Ok(fd) => fd,
+            Err(libc::ENOENT) => continue,
+            Err(errno) => return Err(errno),
+        };
+        let name = match btf_kernel_name(fd.as_raw_fd(), &mut name_buf) {
+            Ok(name) => name,
+            // Raced unload (the fd's object vanished) — skip it.
+            Err(libc::ENOENT) => continue,
+            Err(errno) => return Err(errno),
+        };
+        if name == module {
+            return Ok(Some(fd));
+        }
+    }
+}
+
+/// Resolve the fixture `op->req` chase (P4 arm input): the
+/// `kxc_op.req` member byte offset plus the T08-`refcnt_present`
+/// -style presence word. Absent module BTF reads `(0, false)` —
+/// the honest fixture-absent verdict (the fixture program gates on
+/// it and the loader cannot attach it either). Present
+/// module BTF with an unresolvable member (missing struct/member,
+/// non-pointer, wrong pointee, rival def) FAILS the arm —
+/// absence is quiet, unreadability is loud (fail-closed twin
+/// drift: a zeroed guess would mis-chase).
+pub fn resolve_fixture_op_req() -> Result<(u32, bool), BtfError> {
+    let bytes = vmlinux_btf_bytes().map_err(|detail| BtfError::Io { detail })?;
+    let base = Btf::parse(bytes)?;
+    let path = format!("{MODULE_BTF_DIR}/kcrypto_fixture");
+    let module_bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, false)),
+        Err(err) => {
+            return Err(BtfError::Io {
+                detail: format!("{path}: {err}"),
+            });
+        }
+    };
+    let module = Btf::parse(&module_bytes)?;
+    let split = SplitBtf::new(&base, &module);
+    let sk_entry = base.find_struct("skcipher_request")?;
+    split.kxc_op_req(sk_entry).map(|off| (off, true))
 }
 
 /// C3 first-member links: struct/member pairs the BPF reads at

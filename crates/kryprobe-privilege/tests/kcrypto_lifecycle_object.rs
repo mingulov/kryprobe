@@ -67,27 +67,32 @@ fn h01_lifecycle_manifest_requires_both_sites() {
 
 #[test]
 fn h01_program_limit_derives_from_manifest_not_global_cap() {
-    // One fsession program per required site = 7; the api-returns
-    // 16-program cap is a different profile's limit and must not leak
-    // across.
+    // One fsession program per required site (7) plus one fentry
+    // program per callback site (2) = 9; the api-returns 16-program
+    // cap is a different profile's limit and must not leak across.
     let lc = manifest(LifecycleProfile::RequestLifecycle);
-    assert_eq!(max_programs(&lc), 7);
+    assert_eq!(max_programs(&lc), 9);
     let api = manifest(LifecycleProfile::ApiReturns);
     assert_eq!(max_programs(&api), 16);
     assert_ne!(max_programs(&lc), max_programs(&api));
 }
 
 #[test]
-fn h01_lifecycle_sections_accept_fsession_only() {
-    // W8: lifecycle objects carry `fsession/` programs only — stale
-    // fentry/fexit objects refuse here, fail-closed.
+fn h01_lifecycle_sections_accept_pinned_set() {
+    // W8: lifecycle objects carry `fsession/` programs; P4 adds the
+    // two EXACT `fentry/` callback sections (no open prefix — any
+    // other fentry/fexit object refuses here, fail-closed).
     let p = LifecycleProfile::RequestLifecycle;
     assert!(section_allowed(p, "fsession/crypto_skcipher_encrypt"));
     assert!(section_allowed(p, "fsession/crypto_skcipher_decrypt"));
+    assert!(section_allowed(p, "fentry/cryptd_skcipher_complete"));
+    assert!(section_allowed(p, "fentry/kxc_complete"));
     assert!(!section_allowed(p, "fentry/crypto_skcipher_encrypt"));
     assert!(!section_allowed(p, "fexit/crypto_skcipher_encrypt"));
     assert!(!section_allowed(p, "fentry/crypto_skcipher_decrypt"));
     assert!(!section_allowed(p, "fexit/crypto_skcipher_decrypt"));
+    assert!(!section_allowed(p, "fentry/crypto_request_complete"));
+    assert!(!section_allowed(p, "fentry/complete"));
     assert!(!section_allowed(p, "fsession/"));
     assert!(!section_allowed(p, "fsession"));
     assert!(!section_allowed(p, "kprobe/crypto_skcipher_encrypt"));
@@ -113,10 +118,11 @@ fn h01_api_returns_sections_stay_fexit_only() {
 #[test]
 fn h01_lifecycle_map_table_is_exact_and_dot_free() {
     // LCFG (config), LRING (edge ringbuf), LLOSS (per-CPU loss,
-    // 5 classes x 16 hook lanes), LAGG (per-CPU accepted aggregate,
-    // 16 lanes), LCTR (per-CPU per-program mint sequence, 8 lanes):
-    // the W8 T06 contract grown to the T07-final counter shape the
-    // BPF object must match byte-for-byte (pairing state is
+    // 5 classes x 18 hook lanes), LAGG (per-CPU accepted aggregate,
+    // 18 lanes), LCTR (per-CPU per-program mint sequence, 8 lanes —
+    // callbacks don't mint): the W8 T06 contract grown to the
+    // T07-final counter shape, P4-grown to 18 lanes, which the BPF
+    // object must match byte-for-byte (pairing state is
     // kernel-owned — no slot, quarantine, or overflow tables).
     assert_eq!(LIFECYCLE_MAPS.len(), 5);
     let names: Vec<&str> = LIFECYCLE_MAPS.iter().map(|(n, _)| *n).collect();
@@ -155,7 +161,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 80,
+            max_entries: 90,
         }
     );
     assert_eq!(
@@ -164,7 +170,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 16,
+            max_entries: 18,
         }
     );
     assert_eq!(
@@ -181,15 +187,16 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
 #[test]
 fn h01_zeroed_config_fails_closed() {
     // All-zero LCFG (unwritten map read-back) never arms the sensor;
-    // only the exact magic+version arms it (P3: version 4 — older
+    // only the exact magic+version arms it (P4: version 5 — older
     // bytes disarm, versions never mix).
     assert!(validate_lifecycle_config(0, 0, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 0, 0).is_err());
-    assert!(validate_lifecycle_config(0, 4, 0).is_err());
+    assert!(validate_lifecycle_config(0, 5, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 1, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 2, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 3, 0).is_err());
-    assert!(validate_lifecycle_config(0x31434c4b, 4, 0).is_ok());
+    assert!(validate_lifecycle_config(0x31434c4b, 4, 0).is_err());
+    assert!(validate_lifecycle_config(0x31434c4b, 5, 0).is_ok());
 }
 
 #[test]
@@ -212,8 +219,13 @@ fn f1_lcfg_readback_validates_full_64_bytes() {
         refcnt_off: 0,
         refcnt_present: false,
     };
-    let good = lifecycle_config_bytes(&off);
+    let good = lifecycle_config_bytes(&off, 16, true);
     assert_eq!(good.len(), 64);
+    // P4 v5: the fixture op words ride at 48/52 (offset 16 here is
+    // the test's arbitrary value — the live arm BTF-resolves it).
+    assert_eq!(u32::from_le_bytes(good[48..52].try_into().unwrap()), 16);
+    assert_eq!(u32::from_le_bytes(good[52..56].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(good[4..8].try_into().unwrap()), 5);
     assert!(verify_lifecycle_config_bytes(&good, &good).is_ok());
     assert!(matches!(
         verify_lifecycle_config_bytes(&good[..8], &good),
@@ -266,7 +278,7 @@ fn t07_lcfg_disarm_flips_flags_word_only() {
         refcnt_off: 0,
         refcnt_present: false,
     };
-    let armed = lifecycle_config_bytes(&off);
+    let armed = lifecycle_config_bytes(&off, 16, true);
     let disarmed = disarm_config_bytes(&armed);
     let diffs: Vec<usize> = (0..LCFG_VALUE_LEN)
         .filter(|&i| armed[i] != disarmed[i])
@@ -320,11 +332,11 @@ fn t07_lcfg_v3_carries_chase_offsets() {
         refcnt_off: 40,
         refcnt_present: true,
     };
-    let bytes = lifecycle_config_bytes(&off);
+    let bytes = lifecycle_config_bytes(&off, 0, false);
     assert_eq!(bytes.len(), 64);
     let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     assert_eq!(word(0), 0x31434c4b, "magic");
-    assert_eq!(word(4), 4, "version 4");
+    assert_eq!(word(4), 5, "version 5");
     assert_eq!(word(8), 0, "flags");
     assert_eq!(word(12), 32, "tfm_alg");
     assert_eq!(word(16), 188, "alg_drv");
@@ -355,7 +367,7 @@ fn t07_lcfg_verify_checks_tail_against_written() {
         refcnt_off: 0,
         refcnt_present: false,
     };
-    let good = lifecycle_config_bytes(&off);
+    let good = lifecycle_config_bytes(&off, 16, true);
     assert!(verify_lifecycle_config_bytes(&good, &good).is_ok());
     let mut bad_off = good;
     bad_off[12] ^= 0xff;
@@ -418,7 +430,7 @@ fn f1_lcfg_value_len_matches_manifest() {
         .expect("LCFG in manifest");
     assert_eq!(dims.value_size as usize, LCFG_VALUE_LEN);
     assert_eq!(
-        lifecycle_config_bytes(&test_offsets()).len(),
+        lifecycle_config_bytes(&test_offsets(), 16, true).len(),
         LCFG_VALUE_LEN
     );
 }
@@ -812,13 +824,15 @@ fn h02_too_many_programs_refused_at_manifest_limit() {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fentry/cryptd_skcipher_complete",
+            "fentry/kxc_complete",
             "fsession/crypto_skcipher_extra",
         ],
         &maps,
     );
-    let err = parse_lifecycle_object(&bytes).expect_err("8th program must refuse");
+    let err = parse_lifecycle_object(&bytes).expect_err("10th program must refuse");
     let msg = format!("{err:?}");
-    assert!(msg.contains('7'), "refusal names the manifest limit: {msg}");
+    assert!(msg.contains('9'), "refusal names the manifest limit: {msg}");
 }
 
 /// Workspace-relative path of the built lifecycle object.
@@ -850,6 +864,8 @@ fn h02_built_object_matches_manifest() {
     assert_eq!(
         sections,
         [
+            "fentry/cryptd_skcipher_complete",
+            "fentry/kxc_complete",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
             "fsession/crypto_alloc_skcipher",
@@ -920,7 +936,7 @@ fn w8_built_object_codegen_pins_kfunc_stubs() {
     assert_eq!(call_relocs, 0, "kfunc stubs must carry no relocations");
     // Pinned sentinel sites + helper-only remainder, per program.
     let parsed = parse_lifecycle_object(&bytes).expect("built object must parse");
-    assert_eq!(parsed.programs.len(), 7);
+    assert_eq!(parsed.programs.len(), 9);
     for prog in &parsed.programs {
         let mut is_return = 0usize;
         let mut cookie = 0usize;
@@ -938,10 +954,18 @@ fn w8_built_object_codegen_pins_kfunc_stubs() {
                 ),
             }
         }
+        // P4: fsession programs pin 1 is_return + 2 cookie sites;
+        // fentry callback programs pin NONE (plain entry args — no
+        // session kfuncs exist for callbacks).
+        let want = if prog.section.starts_with("fentry/") {
+            (0, 0)
+        } else {
+            (1, 2)
+        };
         assert_eq!(
             (is_return, cookie),
-            (1, 2),
-            "{}: want 1 is_return + 2 cookie sites",
+            want,
+            "{}: want {want:?} session sites",
             prog.section
         );
     }
@@ -1027,13 +1051,13 @@ fn bringup_config_bytes_carry_exact_magic_version() {
     // zero flags + the chase/refcount/request-link/request-metadata
     // words (P3 v4) + zero reserved tail — the exact words the BPF
     // gate checks.
-    let bytes = lifecycle_config_bytes(&test_offsets());
+    let bytes = lifecycle_config_bytes(&test_offsets(), 0, false);
     assert_eq!(bytes.len(), 64);
     assert_eq!(
         u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
         0x3143_4c4b
     );
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
     assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 32);
     assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 188);

@@ -140,16 +140,26 @@ static void kxc_complete(void *data, int err)
 {
 	struct kxc_op *op = data;
 
-	op->err = err;
 	/*
-	 * Terminal truth is recorded HERE (completion context), never
-	 * inferred by the observer: CPU proves cross-CPU delivery.
-	 * Under the mark lock, so a concurrent progress sample
-	 * observes true state. completed is set and the lock
-	 * released BEFORE complete(): op lives on the waiter's
-	 * stack, and touching it after the wake would race the
-	 * waiter's teardown.
+	 * T09 progress/terminal split (kernel truth, never waiter
+	 * inference): -EINPROGRESS is a backlog-progress
+	 * notification — a progress row, never a wake, never
+	 * touching op->err (the terminal overwrites it). Anything
+	 * else is terminal: the terminal row + completed + wake.
+	 * Terminal truth is recorded HERE (completion context):
+	 * CPU proves cross-CPU delivery. Under the mark lock, so a
+	 * concurrent progress sample observes true state.
+	 * completed is set and the lock released BEFORE complete():
+	 * op lives on the waiter's stack, and touching it after
+	 * the wake would race the waiter's teardown.
 	 */
+	if (err == -EINPROGRESS) {
+		spin_lock_bh(&op->mark_lock);
+		kxc_emit_progress(op->run, op->seq, err);
+		spin_unlock_bh(&op->mark_lock);
+		return;
+	}
+	op->err = err;
 	spin_lock_bh(&op->mark_lock);
 	kxc_emit_terminal(op->run, op->seq, err);
 	op->completed = true;
@@ -528,6 +538,71 @@ teardown:
 	kxc_set_submit_hold(false);
 	kxc_drain_kick();
 	for (i = 0; i < KXC_BURST_NREQS; i++) {
+		if (!pending[i])
+			continue;
+		err = kxc_wait_done(run, &ops[i]);
+		if (err && !first_err)
+			first_err = err;
+	}
+	for (i = 0; i < nsetup; i++)
+		kxc_req_teardown(&ops[i]);
+	kxc_tfm_release(run, tfm, aseq);
+	return first_err;
+}
+
+/*
+ * T09: held queue + 2 submits WITHOUT MAY_BACKLOG. Submit 0
+ * queues (-EINPROGRESS, terminal via callback); submit 1 sees the
+ * full depth-1 queue without backlog consent and the driver
+ * answers -ENOSPC immediately — terminal, exact, no callback
+ * follows (the live ENOSPC proof for the adapter contract §4:
+ * never rewritten, never queued). Any deviation fails loudly.
+ */
+static int kxc_scenario_no_backlog_burst(struct kxc_run *run)
+{
+	struct crypto_skcipher *tfm;
+	struct kxc_op ops[2];
+	u64 aseq, seqs[2];
+	bool pending[2] = { false };
+	int err, first_err = 0;
+	int i, nsetup = 0;
+	static const int expected[2] = { -EINPROGRESS, -ENOSPC };
+
+	err = kxc_tfm_acquire(run, kxc_async_driver_name(), &tfm, &aseq);
+	if (err)
+		return err;
+	kxc_set_submit_hold(true);
+	for (i = 0; i < 2; i++) {
+		err = kxc_req_setup(run, tfm, &ops[i], 0, KXC_BLOCK);
+		if (err) {
+			if (!first_err)
+				first_err = err;
+			goto teardown;
+		}
+		nsetup++;
+		seqs[i] = kxc_next_seq(run);
+		ops[i].seq = seqs[i];
+	}
+	for (i = 0; i < 2; i++) {
+		kxc_emit_submit(run, seqs[i], "encrypt-burst", KXC_BLOCK, 0);
+		err = crypto_skcipher_encrypt(ops[i].req);
+		kxc_emit_return(run, seqs[i], err);
+		if (err != expected[i] && !first_err)
+			first_err = -EPROTO;
+		if (err == -EINPROGRESS || err == -EBUSY) {
+			pending[i] = true;
+		} else {
+			/* Immediate answer (ENOSPC here): the waiter
+			 * records the terminal row — no callback
+			 * follows, so nothing to wait for. */
+			kxc_emit_terminal(run, seqs[i], err);
+		}
+	}
+teardown:
+	/* Always release the hold and kick the drain: no stuck queue. */
+	kxc_set_submit_hold(false);
+	kxc_drain_kick();
+	for (i = 0; i < 2; i++) {
 		if (!pending[i])
 			continue;
 		err = kxc_wait_done(run, &ops[i]);
@@ -1044,6 +1119,107 @@ out_free:
 	return err;
 }
 
+/*
+ * T09 real-cryptd scenario: in-kernel cryptd allocation + traffic.
+ * ALWAYS returns 0 — the rows ARE the verdict (bound driver name
+ * or native errno): on 7.2 the AF_ALG path EEXISTs (A2) while
+ * in-kernel allocs bind live instances (A3), so this scenario is
+ * the 7.2 real-path driver (7.0 uses AF_ALG, A1 recipe).
+ *
+ * Steps: (1) generic untyped alloc control (expect OK sync);
+ * (2) in-kernel full-name cryptd alloc + traffic iff bound;
+ * (3) async-masked alloc (type SKCIPHER|ASYNC, mask
+ * TYPE_MASK|ASYNC) + traffic iff a cryptd instance binds.
+ * Refusals land as alloc-probe triples (native errno), never as
+ * run failure — a refused avenue is data, not a broken fixture.
+ */
+static int kxc_probe_traffic(struct kxc_run *run, struct crypto_skcipher *tfm,
+			     const char *op_label)
+{
+	struct kxc_op op;
+	u64 seq;
+	int err;
+
+	err = kxc_req_setup(run, tfm, &op, 0, KXC_BLOCK);
+	if (err)
+		return err;
+	seq = kxc_next_seq(run);
+	op.seq = seq;
+	kxc_emit_submit(run, seq, op_label, KXC_BLOCK, 0);
+	err = crypto_skcipher_encrypt(op.req);
+	kxc_emit_return(run, seq, err);
+	if (err != -EINPROGRESS)
+		kxc_emit_terminal(run, seq, err);
+	else
+		err = kxc_wait_done(run, &op);
+	kxc_req_teardown(&op);
+	return err;
+}
+
+static int kxc_scenario_cryptd_async(struct kxc_run *run)
+{
+	struct crypto_skcipher *t;
+	const char *drv;
+	u64 seq;
+	int err;
+
+	/* Step 1 (control): generic untyped alloc, expect OK sync. */
+	t = crypto_alloc_skcipher("ecb(aes)", 0, 0);
+	seq = kxc_next_seq(run);
+	if (IS_ERR(t)) {
+		err = PTR_ERR(t);
+		kxc_emit_submit(run, seq, "alloc-probe", 0, 0);
+		kxc_emit_return(run, seq, err);
+		kxc_emit_terminal(run, seq, err);
+	} else {
+		drv = crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t));
+		kxc_emit_alloc(run, seq, "ecb(aes)", drv, 0, 0);
+		crypto_free_skcipher(t);
+		kxc_emit_free(run, seq, true);
+	}
+	/* Step 2 (parity): in-kernel full-name cryptd alloc. */
+	t = crypto_alloc_skcipher("cryptd(ecb(aes-lib))", 0, 0);
+	seq = kxc_next_seq(run);
+	if (IS_ERR(t)) {
+		err = PTR_ERR(t);
+		kxc_emit_submit(run, seq, "alloc-probe", 0, 0);
+		kxc_emit_return(run, seq, err);
+		kxc_emit_terminal(run, seq, err);
+	} else {
+		drv = crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t));
+		kxc_emit_alloc(run, seq, "cryptd(ecb(aes-lib))", drv, 0, 0);
+		err = crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN);
+		kxc_emit_config(run, seq, "setkey", err, KXC_KEYLEN);
+		if (!err)
+			kxc_probe_traffic(run, t, "encrypt-cryptd");
+		crypto_free_skcipher(t);
+		kxc_emit_free(run, seq, true);
+	}
+	/* Step 3 (avenue): async-masked alloc. */
+	t = crypto_alloc_skcipher("ecb(aes)",
+				  CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC,
+				  CRYPTO_ALG_TYPE_MASK | CRYPTO_ALG_ASYNC);
+	seq = kxc_next_seq(run);
+	if (IS_ERR(t)) {
+		err = PTR_ERR(t);
+		kxc_emit_submit(run, seq, "alloc-probe", 0, 0);
+		kxc_emit_return(run, seq, err);
+		kxc_emit_terminal(run, seq, err);
+		return 0;
+	}
+	drv = crypto_tfm_alg_driver_name(crypto_skcipher_tfm(t));
+	kxc_emit_alloc(run, seq, "ecb(aes)", drv,
+		       CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC,
+		       CRYPTO_ALG_TYPE_MASK | CRYPTO_ALG_ASYNC);
+	err = crypto_skcipher_setkey(t, kxc_key, KXC_KEYLEN);
+	kxc_emit_config(run, seq, "setkey", err, KXC_KEYLEN);
+	if (!err && !strncmp(drv, "cryptd(", 7))
+		kxc_probe_traffic(run, t, "encrypt-cryptd");
+	crypto_free_skcipher(t);
+	kxc_emit_free(run, seq, true);
+	return 0;
+}
+
 int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 {
 	if (!strcmp(scenario, "sync-once"))
@@ -1054,6 +1230,8 @@ int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 		return kxc_scenario_delayed_completion(run);
 	if (!strcmp(scenario, "backlog-accepted"))
 		return kxc_scenario_backlog_accepted(run);
+	if (!strcmp(scenario, "no-backlog-burst"))
+		return kxc_scenario_no_backlog_burst(run);
 	if (!strcmp(scenario, "early-callback"))
 		return kxc_scenario_early_callback(run);
 	if (!strcmp(scenario, "exact-driver"))
@@ -1078,5 +1256,7 @@ int kxc_scenario_run(struct kxc_run *run, const char *scenario)
 		return kxc_scenario_sync_meta(run);
 	if (!strcmp(scenario, "sync-enokey"))
 		return kxc_scenario_sync_enokey(run);
+	if (!strcmp(scenario, "cryptd-async"))
+		return kxc_scenario_cryptd_async(run);
 	return -EINVAL;
 }

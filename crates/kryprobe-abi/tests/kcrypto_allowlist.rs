@@ -81,6 +81,8 @@ const LCONFIG_WANT: &[&str] = &[
     "req_tfm",
     "req_cryptlen",
     "req_flags",
+    "op_req_off",
+    "op_req_present",
     "reserved",
 ];
 
@@ -342,6 +344,8 @@ fn field_lists_match_declarations() {
         req_tfm,
         req_cryptlen,
         req_flags,
+        op_req_off,
+        op_req_present,
         reserved,
     } = LConfig {
         magic: 0,
@@ -356,7 +360,9 @@ fn field_lists_match_declarations() {
         req_tfm: 0,
         req_cryptlen: 0,
         req_flags: 0,
-        reserved: [0; 16],
+        op_req_off: 0,
+        op_req_present: 0,
+        reserved: [0; 8],
     };
     let _ = (
         magic,
@@ -371,6 +377,8 @@ fn field_lists_match_declarations() {
         req_tfm,
         req_cryptlen,
         req_flags,
+        op_req_off,
+        op_req_present,
         reserved,
     );
 }

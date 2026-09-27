@@ -39,11 +39,22 @@ pub const LEDGE_VERSION: u8 = 6;
 pub const LEDGE_SUBMIT: u8 = 1;
 /// `LEdge.edge`: function return (return-side observation).
 pub const LEDGE_RETURN: u8 = 2;
+/// `LEdge.edge`: adapter callback (P4: completion-side observation
+/// from a qualified callback site — same 112-byte shape, no version
+/// bump: old decoders refuse kind 3 as `BadEdge`, fail-closed).
+pub const LEDGE_CALLBACK: u8 = 3;
 
 /// `LEdge.site`: `crypto_skcipher_encrypt`.
 pub const LSITE_ENC: u16 = 1;
 /// `LEdge.site`: `crypto_skcipher_decrypt`.
 pub const LSITE_DEC: u16 = 2;
+/// `LEdge.site` (callback halves only): `cryptd_skcipher_complete`
+/// (module `cryptd`) — arg0 IS the submit-time request.
+pub const LSITE_CB_CRYPTD: u16 = 3;
+/// `LEdge.site` (callback halves only): `kxc_complete` (module
+/// `kcrypto_fixture`) — request chased BPF-side at the arm-resolved
+/// `op_req_off`.
+pub const LSITE_CB_KXC: u16 = 4;
 
 /// v6 `LEdge.fam`: skcipher family (the only P3 op family — every v6
 /// submit carries this; any other value is twin drift and refuses).
@@ -102,11 +113,12 @@ pub const LEDGE_TRUNCATED: u16 = 0x0002;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
 pub const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
-/// `LConfig.version` the P3 sensor understands (v4: the v3 chase
-/// words plus the op request-metadata words `req_cryptlen` /
-/// `req_flags`; older versions refuse — versions never mix, so a v6
-/// BPF never chases metadata through a v3 config's zeroed tail).
-pub const LCONFIG_VERSION: u32 = 4;
+/// `LConfig.version` the P4 sensor understands (v5: the v4 chase
+/// words plus the fixture `op->req` words `op_req_off` /
+/// `op_req_present`; older versions refuse — versions never mix, so
+/// a v5 BPF never chases callbacks through a v4 config's zeroed
+/// tail — the presence word would read 0 and gate the hook anyway).
+pub const LCONFIG_VERSION: u32 = 5;
 /// `LConfig.flags` bit 0: disarmed (D1). The disarm writes the armed
 /// value back with ONLY this bit set — magic, version, offsets and
 /// tail preserved bit-for-bit — so a hook racing the disarm reads
@@ -168,6 +180,11 @@ pub const LAGG_ALLOCAEAD_RET: u32 = 13;
 pub const LAGG_SETKEYAEAD_SUB: u32 = 14;
 /// `LAGG[15]`: accepted aead-setkey-return edges (T07.4).
 pub const LAGG_SETKEYAEAD_RET: u32 = 15;
+/// `LAGG[16]`: accepted cryptd-callback edges (P4 — lanes 12/13 stay
+/// T10's aead-alloc reservation; no headroom past 17).
+pub const LAGG_CB_CRYPTD: u32 = 16;
+/// `LAGG[17]`: accepted fixture-callback edges (P4).
+pub const LAGG_CB_KXC: u32 = 17;
 
 // ---------------------------------------------------------------------------
 // Structs (twinned in kcrypto_lifecycle.rs; pinned by layout tests)
@@ -235,9 +252,12 @@ pub struct LEdge {
     pub magic: u16,
     /// Must be [`LEDGE_VERSION`].
     pub version: u8,
-    /// [`LEDGE_SUBMIT`] or [`LEDGE_RETURN`].
+    /// [`LEDGE_SUBMIT`], [`LEDGE_RETURN`], or [`LEDGE_CALLBACK`]
+    /// (P4: callback halves name no invocation and carry no
+    /// metadata — key + status + ts only).
     pub edge: u8,
-    /// [`LSITE_ENC`] or [`LSITE_DEC`].
+    /// [`LSITE_ENC`] / [`LSITE_DEC`] (submit/return halves) or
+    /// [`LSITE_CB_CRYPTD`] / [`LSITE_CB_KXC`] (callback halves).
     pub site: u16,
     /// Flag bits ([`LEDGE_TAINTED`] + [`LEDGE_TRUNCATED`] defined;
     /// BPF writes 0 for clean untruncated edges).
@@ -464,8 +484,18 @@ pub struct LConfig {
     /// the op programs' request-flags read for v6 metadata — added
     /// to the chased base address, like `req_tfm`).
     pub req_flags: u32,
+    /// `struct kxc_op.req` byte offset (fixture-module-BTF-resolved
+    /// at arm; the fixture-callback program's `op->req` chase —
+    /// meaningful only when `op_req_present` is 1).
+    pub op_req_off: u32,
+    /// 1 when the fixture module is present and its `op->req`
+    /// member resolved (the fixture-callback program chases), 0
+    /// otherwise (fixture absent at arm — the program drops to
+    /// `LLOSS_DISABLED`, never chases; present-but-unresolvable
+    /// refuses the arm instead — fail-closed twin drift).
+    pub op_req_present: u32,
     /// Reserved (loader writes 0).
-    pub reserved: [u8; 16],
+    pub reserved: [u8; 8],
 }
 
 impl LConfig {
@@ -484,6 +514,8 @@ impl LConfig {
         "req_tfm",
         "req_cryptlen",
         "req_flags",
+        "op_req_off",
+        "op_req_present",
         "reserved",
     ];
 }

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Raw-edge decode: v6 `LEdge` bytes → T05 `Edge` events (P3: the v5
 //! submit-side driver word (F05) + return-side no-chase twin (R2) +
-//! entry-side scalar request metadata with submit-lifetime binding).
+//! entry-side scalar request metadata with submit-lifetime binding;
+//! P4: callback halves — `edge = LEDGE_CALLBACK` with a qualified
+//! site — validated by the twin and joined through the decoder-owned
+//! [`AsyncAdapter`](crate::kcrypto_lifecycle::async_adapter::AsyncAdapter)
+//! identity relation).
 //!
-//! The join is keyed by the BPF invocation id alone (W8 fsession: the
-//! entry run mints one id per call and stores it in the kernel-zeroed
-//! per-call session cookie; the exit run of the SAME call reads the
-//! SAME cookie back). A submit admits a fresh opaque id under its
-//! invocation, and a return joins the outstanding id for its
-//! invocation — nested same-key calls pair exactly, since distinct
-//! calls carry distinct cookies whatever request pointer they share.
+//! The op join is keyed by the BPF invocation id alone (W8 fsession:
+//! the entry run mints one id per call and stores it in the
+//! kernel-zeroed per-call session cookie; the exit run of the SAME
+//! call reads the SAME cookie back). A submit admits a fresh opaque
+//! id under its invocation, and a return joins the outstanding id
+//! for its invocation — nested same-key calls pair exactly, since
+//! distinct calls carry distinct cookies whatever request pointer
+//! they share. Callback halves name NO invocation (`invoc == 0`)
+//! and join by key through the adapter relation (every submit is
+//! covered from admission, so early callbacks join; the relation
+//! retires tokens on sync returns, terminal callbacks, and gaps).
 //! Raw keys never leave this module (only opaque ids reach `Edge`);
 //! every refusal is counted, never silent.
 //!
@@ -32,10 +40,11 @@
 //! Site is stored per submit and checked per return (one call, one
 //! function — cross-site returns refuse stale).
 
+use crate::kcrypto_lifecycle::async_adapter::{AdapterStats, AsyncAdapter, classify_return};
 use kryprobe_abi::kcrypto_lifecycle::{
-    LDIR_DEC, LDIR_ENC, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED,
-    LEDGE_TRUNCATED, LEDGE_VERSION, LFAM_SK, LMETA_CRYPTLEN_OK, LMETA_REQFLAGS_OK, LSITE_DEC,
-    LSITE_ENC,
+    LDIR_DEC, LDIR_ENC, LEDGE_CALLBACK, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN,
+    LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_TRUNCATED, LEDGE_VERSION, LFAM_SK, LMETA_CRYPTLEN_OK,
+    LMETA_REQFLAGS_OK, LSITE_CB_CRYPTD, LSITE_CB_KXC, LSITE_DEC, LSITE_ENC,
 };
 use kryprobe_core::kcrypto::{
     Edge, GapReason, LifecycleFamily, OpDirection, RequestMeta, ReturnDisposition,
@@ -58,10 +67,12 @@ const DRV_LEN: usize = 56;
 /// sol-m9/astra-m9); [`RawEdge::drv`] renders (public inventory).
 #[derive(Clone, PartialEq, Eq)]
 pub struct RawEdge {
-    /// [`LEDGE_SUBMIT`] or [`LEDGE_RETURN`] (validated).
+    /// [`LEDGE_SUBMIT`], [`LEDGE_RETURN`], or [`LEDGE_CALLBACK`]
+    /// (validated).
     pub edge: u8,
-    /// [`LSITE_ENC`] or [`LSITE_DEC`] (validated; op attribution is
-    /// T07/T08 scope — T06 validates the twin but carries no op).
+    /// [`LSITE_ENC`] / [`LSITE_DEC`] on op edges, [`LSITE_CB_CRYPTD`] /
+    /// [`LSITE_CB_KXC`] on callback halves (validated; op attribution
+    /// is T07/T08 scope — T06 validates the twin but carries no op).
     pub site: u16,
     /// [`LEDGE_TAINTED`] was set (BPF could not pair this edge).
     pub tainted: bool,
@@ -72,8 +83,9 @@ pub struct RawEdge {
     pub ts_ns: u64,
     /// Native return status (return edges) or 0 (submit edges).
     pub status: i32,
-    /// BPF invocation id (the join identity; 0 on tainted edges,
-    /// which name no invocation).
+    /// BPF invocation id (the op-join identity; 0 on tainted
+    /// edges, which name no invocation, and 0 on callback halves,
+    /// which join by key through the adapter relation).
     pub invoc: u64,
     /// Frontend transform pointer behind the op (0 when the request
     /// link was unreadable — unknown, feeds first-seen admission;
@@ -132,35 +144,40 @@ pub enum DecodeDrop {
     BadMagic,
     /// Version is not [`LEDGE_VERSION`].
     BadVersion,
-    /// Edge kind is neither submit nor return.
+    /// Edge kind is neither submit, return, nor callback.
     BadEdge,
-    /// Site is neither encrypt nor decrypt.
+    /// Site is neither encrypt/decrypt (op edges) nor a qualified
+    /// callback site (callback halves).
     BadSite,
     /// Flags carry bits outside tainted/truncated.
     BadFlags,
     /// v6 metadata word violates the contract: nonzero metadata on
-    /// a return edge (R2 extended — returns are never chased),
-    /// `mflags` bits outside cryptlen/req-flags-valid, a nonzero
-    /// value word without its validity bit, a non-skcipher family,
-    /// or a direction that does not echo the site.
+    /// a return edge (R2 extended — returns are never chased) or a
+    /// callback half (callback halves never chase submit-owned
+    /// facts), `mflags` bits outside cryptlen/req-flags-valid, a
+    /// nonzero value word without its validity bit, a non-skcipher
+    /// family, or a direction that does not echo the site.
     BadMeta,
     /// Null pairing key (the BPF `BADKEY` gate should have dropped it).
     NullKey,
     /// Submit edge with a nonzero status (ABI: submit edges carry 0 —
     /// a status here is twin drift, silently discarded before).
     BadSubmitStatus,
-    /// Clean (untainted) edge with a malformed invocation id: 0
+    /// Clean (untainted) op edge with a malformed invocation id: 0
     /// ("no invocation", tainted edges only) or the reserved bit set
     /// (no honest-BPF path sets it — W8 mints cookie ids with bit 0
-    /// clear). Honest BPF never emits either shape — fail closed,
-    /// never join.
+    /// clear); or a callback half with a NONZERO id (callback halves
+    /// name no fsession invocation — the relation joins by key).
+    /// Honest BPF never emits either shape — fail closed, never join.
     BadInvoc,
-    /// Return edge with a nonzero transform word (R2: honest BPF
-    /// never chases at exit — a return-side word is twin drift).
+    /// Return edge or callback half with a nonzero transform word
+    /// (R2: honest BPF never chases at exit, and callback halves
+    /// never chase submit-owned facts — a word here is twin drift).
     BadReturnTfm,
     /// Driver-name field violates the contract: no NUL within 56
-    /// bytes, invalid UTF-8, or a name on a return edge (returns
-    /// carry no name — the submit's admission owns the provenance).
+    /// bytes, invalid UTF-8, or a name on a return edge or callback
+    /// half (returns carry no name — the submit's admission owns the
+    /// provenance; callbacks carry no name — no chase, no cookie).
     BadDrv,
 }
 
@@ -190,14 +207,18 @@ pub struct DecodeStats {
 
 /// Validate one ring record against the v6 `LEdge` twin: exact length,
 /// magic, version, edge kind, site, defined-only flags, non-null
-/// key, zero status on submit edges, the invocation id, the
-/// transform word (submit edges: ANY u64 — 0 is unknown, never
-/// refused; return edges: 0 ONLY — R2, honest BPF never chases at
-/// exit), the entry-side metadata (submit edges: validity-gated
-/// `cryptlen` / `req_flags`, skcipher family, site-echoing
-/// direction; return edges: all-zero ONLY), and the driver name
+/// key, zero status on submit edges (ANY status on callback halves —
+/// classification is the adapter's job, never the twin's), the
+/// invocation id (nonzero unpoisoned on clean op edges; 0 ONLY on
+/// callback halves, which join by key), the transform word (submit
+/// edges: ANY u64 — 0 is unknown, never refused; return edges and
+/// callback halves: 0 ONLY — R2, honest BPF never chases at exit,
+/// and callback halves never chase submit-owned facts), the
+/// entry-side metadata (submit edges: validity-gated `cryptlen` /
+/// `req_flags`, skcipher family, site-echoing direction; return
+/// edges and callback halves: all-zero ONLY), and the driver name
 /// (submit edges: NUL-terminated UTF-8 within 56 bytes, empty when
-/// unknown; return edges: empty ONLY).
+/// unknown; return edges and callback halves: empty ONLY).
 pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeDrop::BadLength);
@@ -223,15 +244,27 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         return Err(DecodeDrop::BadVersion);
     }
     let edge = bytes[3];
-    if edge != LEDGE_SUBMIT && edge != LEDGE_RETURN {
+    if edge != LEDGE_SUBMIT && edge != LEDGE_RETURN && edge != LEDGE_CALLBACK {
         return Err(DecodeDrop::BadEdge);
     }
+    let is_callback = edge == LEDGE_CALLBACK;
     let site = u16le(4);
-    if site != LSITE_ENC && site != LSITE_DEC {
+    let site_ok = if is_callback {
+        site == LSITE_CB_CRYPTD || site == LSITE_CB_KXC
+    } else {
+        site == LSITE_ENC || site == LSITE_DEC
+    };
+    if !site_ok {
         return Err(DecodeDrop::BadSite);
     }
     let flags = u16le(6);
-    if flags & !(LEDGE_TAINTED | LEDGE_TRUNCATED) != 0 {
+    // Callback halves carry NO flags (never tainted — no cookie to
+    // lose; never truncated — no name): any bit is twin drift.
+    if is_callback {
+        if flags != 0 {
+            return Err(DecodeDrop::BadFlags);
+        }
+    } else if flags & !(LEDGE_TAINTED | LEDGE_TRUNCATED) != 0 {
         return Err(DecodeDrop::BadFlags);
     }
     let key = u64le(8);
@@ -246,23 +279,28 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     let invoc = u64le(32);
     let tainted = flags & LEDGE_TAINTED != 0;
     let truncated = flags & LEDGE_TRUNCATED != 0;
-    if !tainted && (invoc == 0 || invoc & LEDGE_INVOC_POISON != 0) {
+    if is_callback {
+        if invoc != 0 {
+            return Err(DecodeDrop::BadInvoc);
+        }
+    } else if !tainted && (invoc == 0 || invoc & LEDGE_INVOC_POISON != 0) {
         return Err(DecodeDrop::BadInvoc);
     }
     let tfm = u64le(40);
-    if edge == LEDGE_RETURN && tfm != 0 {
+    if edge != LEDGE_SUBMIT && tfm != 0 {
         return Err(DecodeDrop::BadReturnTfm);
     }
     // Entry-side metadata (P3): returns carry all-zero words (R2
     // extended — honest BPF never chases at exit); submits carry
     // validity-gated scalars, the skcipher family, and the
-    // site-echoing direction.
+    // site-echoing direction. Callback halves carry all-zero words
+    // (P4: no chase, no cookie, no name).
     let cryptlen_word = u32le(28);
     let req_flags_word = u32le(48);
     let fam = bytes[52];
     let dir = bytes[53];
     let mflags = u16le(54);
-    let (cryptlen, req_flags) = if edge == LEDGE_RETURN {
+    let (cryptlen, req_flags) = if edge != LEDGE_SUBMIT {
         if cryptlen_word != 0 || req_flags_word != 0 || fam != 0 || dir != 0 || mflags != 0 {
             return Err(DecodeDrop::BadMeta);
         }
@@ -296,6 +334,9 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
             (mflags & LMETA_REQFLAGS_OK != 0).then_some(req_flags_word),
         )
     };
+    // Callback halves take the else arm (Decrypt) — a placeholder
+    // that never leaves decode: `Edge::Callback` carries no
+    // direction, and op attribution is T07/T08 scope.
     let direction = if site == LSITE_ENC {
         OpDirection::Encrypt
     } else {
@@ -308,7 +349,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         .position(|b| *b == 0)
         .ok_or(DecodeDrop::BadDrv)?;
     let drv = std::str::from_utf8(&drv_field[..drv_len]).map_err(|_| DecodeDrop::BadDrv)?;
-    if edge == LEDGE_RETURN && (!drv.is_empty() || truncated) {
+    if edge != LEDGE_SUBMIT && (!drv.is_empty() || truncated) {
         return Err(DecodeDrop::BadDrv);
     }
     Ok(RawEdge {
@@ -329,24 +370,43 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     })
 }
 
-/// Classify a native return status per the T06 adapter contract:
-/// `-EINPROGRESS` queues for async completion; `-EBUSY` is
-/// [`ReturnDisposition::Unresolved`] (design:71 — accepted backlog
-/// only when the path/flags contract establishes it, and this edge
-/// carries no flags); every other status — 0, positive, or a sync
-/// error — is terminal with that status.
-fn classify_return(status: i32) -> ReturnDisposition {
-    if status == -libc::EINPROGRESS {
-        ReturnDisposition::Queued
-    } else if status == -libc::EBUSY {
-        ReturnDisposition::Unresolved
-    } else {
-        ReturnDisposition::Terminal
+/// One outstanding invocation: the opaque id plus the submit facts
+/// the joining return needs (its site for the staleness check, its
+/// key for adapter retirement, its flags for backlog consent).
+///
+/// `Debug` is manual: [`Outstanding::key`] is a raw kernel pointer
+/// and renders as `<redacted>` (round-1 sol-m9/astra-m9).
+#[derive(Clone, Copy)]
+struct Outstanding {
+    /// Opaque id issued at submit.
+    id: u64,
+    /// Submit timestamp (returns predating it are stale).
+    submit_ts: u64,
+    /// Submit site (one call, one function).
+    submit_site: u16,
+    /// Submit key (raw pairing material — adapter retirement only,
+    /// never rendered, never leaves decode).
+    key: u64,
+    /// Submit-time request flags (`None` when the entry chase was
+    /// unreadable — unknown flags never imply backlog consent).
+    req_flags: Option<u32>,
+}
+
+impl std::fmt::Debug for Outstanding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outstanding")
+            .field("id", &self.id)
+            .field("submit_ts", &self.submit_ts)
+            .field("submit_site", &self.submit_site)
+            .field("key", &"<redacted>")
+            .field("req_flags", &self.req_flags)
+            .finish()
     }
 }
 
 /// Bounded invocation→id join: submits admit fresh opaque ids,
-/// returns join the outstanding id for their invocation.
+/// returns join the outstanding id for their invocation, callback
+/// halves join by key through the adapter relation.
 ///
 /// `Debug` is manual: the outstanding table holds kernel-issued call
 /// identities, so only its length renders (round-1 sol-m9/astra-m9).
@@ -355,12 +415,16 @@ pub struct LifecycleDecoder {
     capacity: usize,
     /// Next opaque id (starts at 1; 0 is never issued).
     next_id: u64,
-    /// Outstanding BPF invocation → (opaque id, submit ts, submit
-    /// site). The invocation is the join identity: a return joins
-    /// ONLY the id outstanding under its own invocation.
-    outstanding: HashMap<u64, (u64, u64, u16)>,
+    /// Outstanding BPF invocation → submit facts. The invocation is
+    /// the op-join identity: a return joins ONLY the id outstanding
+    /// under its own invocation.
+    outstanding: HashMap<u64, Outstanding>,
     /// Loss counters.
     stats: DecodeStats,
+    /// Callback-adapter identity relation (P4: key → token cover;
+    /// same capacity scale as the outstanding table — one
+    /// decode-bound scale for all decode tables).
+    adapter: AsyncAdapter,
 }
 
 impl std::fmt::Debug for LifecycleDecoder {
@@ -383,6 +447,7 @@ impl LifecycleDecoder {
             next_id: 1,
             outstanding: HashMap::new(),
             stats: DecodeStats::default(),
+            adapter: AsyncAdapter::new(capacity),
         }
     }
 
@@ -390,6 +455,14 @@ impl LifecycleDecoder {
     #[must_use]
     pub fn stats(&self) -> DecodeStats {
         self.stats
+    }
+
+    /// Current callback-adapter loss counters (the P4 feed:
+    /// submits cover, sync returns and gaps retire, callbacks
+    /// resolve through the relation).
+    #[must_use]
+    pub fn adapter_stats(&self) -> AdapterStats {
+        self.adapter.stats()
     }
 
     /// Feed one ring record: validate, join, and emit zero or more
@@ -441,9 +514,13 @@ impl LifecycleDecoder {
         self.join_inner(raw, tfm_id, epoch)
     }
 
-    /// Shared join body: taint refusal, then submit/complete dispatch.
+    /// Shared join body: taint refusal, then
+    /// submit/complete/callback dispatch.
     fn join_inner(&mut self, raw: RawEdge, tfm_id: Option<u64>, epoch: Option<u64>) -> Vec<Edge> {
         if raw.tainted {
+            // Callback halves from bytes are never tainted (the twin
+            // pins `flags == 0`); a hand-built tainted callback lands
+            // here and counts without joining, like a return.
             if raw.edge == LEDGE_SUBMIT {
                 self.stats.submit_refused += 1;
             } else {
@@ -453,6 +530,8 @@ impl LifecycleDecoder {
         }
         if raw.edge == LEDGE_SUBMIT {
             self.submit(raw, tfm_id, epoch)
+        } else if raw.edge == LEDGE_CALLBACK {
+            self.callback(raw)
         } else {
             self.complete(raw)
         }
@@ -467,18 +546,23 @@ impl LifecycleDecoder {
     /// Admit a submit under a fresh opaque id, keyed by its BPF
     /// invocation. A same-invocation resubmit (BPF ids are unique —
     /// this is twin drift or a replay) gaps the old id
-    /// (`IdentityAmbiguous` — its return never arrived) first. A
+    /// (`IdentityAmbiguous` — its return never arrived) first, and
+    /// the old token retires in the adapter relation (its callbacks,
+    /// if any, diagnose against the gap instead of misjoining). A
     /// full table or an exhausted id space refuses (counted, no
     /// phantom). Same-key submits with FRESH invocations admit
     /// alongside (nested calls pair exactly — never gapped). The
     /// submit-lifetime binding (`tfm_id` + submit-pinned `epoch`)
-    /// and the entry-side wire metadata ride the emitted edge.
+    /// and the entry-side wire metadata ride the emitted edge; the
+    /// submit's key + timestamp cover it in the adapter relation
+    /// from admission (early callbacks must join).
     fn submit(&mut self, raw: RawEdge, tfm_id: Option<u64>, epoch: Option<u64>) -> Vec<Edge> {
         let mut out = Vec::new();
-        if let Some((old_id, _, _)) = self.outstanding.remove(&raw.invoc) {
+        if let Some(old) = self.outstanding.remove(&raw.invoc) {
             self.stats.gaps_synthesized += 1;
+            self.adapter.note_gap(old.key, old.id);
             out.push(Edge::Gap {
-                id: old_id,
+                id: old.id,
                 reason: GapReason::IdentityAmbiguous,
             });
         }
@@ -495,8 +579,17 @@ impl LifecycleDecoder {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.outstanding
-            .insert(raw.invoc, (id, raw.ts_ns, raw.site));
+        self.outstanding.insert(
+            raw.invoc,
+            Outstanding {
+                id,
+                submit_ts: raw.ts_ns,
+                submit_site: raw.site,
+                key: raw.key,
+                req_flags: raw.req_flags,
+            },
+        );
+        self.adapter.note_submit(raw.key, id, raw.ts_ns);
         self.stats.admitted += 1;
         out.push(Edge::Submit {
             id,
@@ -519,26 +612,49 @@ impl LifecycleDecoder {
     /// (one call, one function — a cross-site return cannot be this
     /// invocation's), is stale and is refused without disturbing the
     /// outstanding id. Ties join (coarse-clock ambiguity, pinned).
+    /// The return classifies through the adapter contract (P4: the
+    /// SUBMIT's flags gate `-EBUSY` backlog consent — unknown flags
+    /// never imply it); a sync-terminal return retires its token in
+    /// the adapter relation, while `Queued`/`Unresolved` returns keep
+    /// cover (terminal truth may still arrive via callback).
     fn complete(&mut self, raw: RawEdge) -> Vec<Edge> {
-        let id = match self.outstanding.get(&raw.invoc) {
+        let open = match self.outstanding.get(&raw.invoc) {
             None => {
                 self.stats.unknown_invoc_returns += 1;
                 return Vec::new();
             }
-            Some(&(id, submit_ts, submit_site)) => {
-                if raw.ts_ns < submit_ts || raw.site != submit_site {
+            Some(open) => {
+                if raw.ts_ns < open.submit_ts || raw.site != open.submit_site {
                     self.stats.stale_returns += 1;
                     return Vec::new();
                 }
-                id
+                *open
             }
         };
         self.outstanding.remove(&raw.invoc);
+        let disposition = classify_return(raw.status, open.req_flags);
+        if disposition == ReturnDisposition::Terminal {
+            self.adapter.note_sync_return(open.key, open.id);
+        }
         vec![Edge::Return {
-            id,
+            id: open.id,
             ts_ns: raw.ts_ns,
             status: raw.status,
-            disposition: classify_return(raw.status),
+            disposition,
         }]
+    }
+
+    /// Join a callback half by key through the adapter identity
+    /// relation (contract §8 dispatch): exactly-one-live joins (a
+    /// terminal callback retires live → dead; progress never
+    /// retires), multi-live gaps every live token loud, newest-dead
+    /// re-joins for reducer diagnosis, else a counted orphan. The
+    /// adapter pins each live token's submit timestamp, so a
+    /// callback predating its submit is consumed stale, never
+    /// joined. Emits zero or more edges (the callback edge and/or
+    /// identity gaps).
+    fn callback(&mut self, raw: RawEdge) -> Vec<Edge> {
+        self.adapter
+            .resolve_callback(raw.key, raw.ts_ns, raw.status)
     }
 }

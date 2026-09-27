@@ -2060,7 +2060,8 @@ fn lifecycle_test_ledger(
 ) -> kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
     kryprobe_privilege::kcrypto_lifecycle::sensor::LifecycleLedger {
         completed: Vec::new(),
-        edge_hits: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        edge_hits: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        adapter: kryprobe_privilege::kcrypto_lifecycle::async_adapter::AdapterStats::default(),
         decode: kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats {
             admitted,
             ..kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats::default()
@@ -2072,11 +2073,11 @@ fn lifecycle_test_ledger(
             ..kryprobe_core::kcrypto::ReducerStats::default()
         },
         kernel_loss: [0; 5],
-        agg_accepted: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        agg_accepted: [2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         retained_dropped: 0,
         view_valid: true,
         loss_baseline: [0; 5],
-        agg_baseline: [0; 16],
+        agg_baseline: [0; 18],
         prog_misses: Vec::new(),
         miss_current: Vec::new(),
         tfm_stats: kryprobe_privilege::kcrypto_lifecycle::tfm::TfmStats::default(),
@@ -2128,12 +2129,20 @@ fn live_lifecycle_scripted_session_drives_green() {
     };
     let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
     let cfg = lifecycle_live_config();
+    // Fully-attached scripted session: the attached count tracks the
+    // manifest's program boundary (P4 adds the two fentry callbacks,
+    // 7 -> 9) so attachment stays Complete.
+    let attached_points = kryprobe_privilege::kcrypto_lifecycle::profile::max_programs(
+        &kryprobe_privilege::kcrypto_lifecycle::profile::manifest(
+            kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::RequestLifecycle,
+        ),
+    );
     let outcome = kryprobe_cli::live::drive_lifecycle_session(
         &cfg,
         &backend,
         &mut sensor,
         &stop,
-        7,
+        attached_points,
         kryprobe_core::ids::SessionId::new(1),
         kryprobe_core::ids::PlanGeneration::new(1),
         &kryprobe_core::ids::IdIssuer::default(),

@@ -15,6 +15,7 @@
 //! bring-up (no per-point degrade: one site alone cannot observe both
 //! operations).
 
+pub mod async_adapter;
 pub mod backend;
 pub mod canary;
 pub mod decode;
@@ -26,10 +27,10 @@ pub mod view;
 
 use crate::attach::{OwnedLink, attach_group_tracing};
 use crate::bpfloader::progload::attach_type_for_section;
-use crate::bpfloader::{LoadedLifecycle, PointStatus, load_lifecycle};
+use crate::bpfloader::{CallbackLoad, LoadedLifecycle, PointStatus, load_lifecycle};
 use crate::btf_resolve::{
-    AttachOutcome, ConfiguredError, ConfiguredPoint, resolve_lifecycle_ids,
-    resolve_lifecycle_offsets, system_object,
+    AttachOutcome, CallbackSiteOutcome, ConfiguredError, ConfiguredPoint, resolve_callback_sites,
+    resolve_fixture_op_req, resolve_lifecycle_ids, resolve_lifecycle_offsets, system_object,
 };
 use crate::kcrypto_lifecycle::profile::{
     LCFG_VALUE_LEN, LifecycleProfile, disarm_config_bytes, lifecycle_config_bytes, manifest,
@@ -78,8 +79,34 @@ pub fn load_lifecycle_configured(
         .iter()
         .map(|site| (site.symbol.to_owned(), ids[site.symbol]))
         .collect();
-    let (loaded, statuses) =
-        load_lifecycle(object_bytes, &entries, token_fd).map_err(ConfiguredError::Load)?;
+    // P4 optional sites: per-site outcomes (ready/absent/refused) —
+    // a refused callback never gates (its point records it). The
+    // loads borrow the module-BTF fds owned here (`cb_sites`
+    // outlives the load — the fd must survive `PROG_LOAD` only,
+    // since the loaded program holds its own BTF reference).
+    let cb_sites = resolve_callback_sites().map_err(ConfiguredError::Resolve)?;
+    let mut cb_loads = Vec::new();
+    for (site, outcome) in &cb_sites {
+        let section = format!("fentry/{}", site.symbol);
+        match outcome {
+            CallbackSiteOutcome::Ready { func_id, obj_fd } => {
+                cb_loads.push(CallbackLoad::Ready {
+                    section,
+                    func_id: *func_id,
+                    obj_fd: obj_fd.as_raw_fd(),
+                });
+            }
+            CallbackSiteOutcome::Refused { detail } => {
+                cb_loads.push(CallbackLoad::Refused {
+                    section,
+                    detail: detail.clone(),
+                });
+            }
+            CallbackSiteOutcome::Absent => {}
+        }
+    }
+    let (loaded, statuses) = load_lifecycle(object_bytes, &entries, &cb_loads, token_fd)
+        .map_err(ConfiguredError::Load)?;
     let guard = GenerationGuard {
         generation: PlanGeneration::new(1),
     };
@@ -143,6 +170,12 @@ pub fn load_lifecycle_configured(
         .collect();
     let mut failed: Vec<String> = missing_required_points(&refs);
     for (section, _) in &loaded.progs {
+        // P4: only `fsession/` programs gate (a loaded-but-unlinked
+        // callback records its outcome in `points` but never fails
+        // bring-up — attach-if-present).
+        if !section.starts_with("fsession/") {
+            continue;
+        }
         let attached = outcomes
             .iter()
             .any(|(s, o)| s == section && matches!(o, AttachOutcome::Attached));
@@ -182,7 +215,13 @@ pub fn arm_lifecycle_config(
     loaded: &LoadedLifecycle,
 ) -> Result<crate::btf_resolve::LifecycleOffsets, ConfiguredError> {
     let offsets = resolve_lifecycle_offsets().map_err(ConfiguredError::Resolve)?;
-    let bytes = lifecycle_config_bytes(&offsets);
+    // P4: the fixture `op->req` offset resolves from module BTF
+    // (absent → (0, false), the honest fixture-absent verdict —
+    // the fixture program presence-gates on it; present-but-
+    // unresolvable → arm refusal, fail-closed twin drift).
+    let (op_req_off, op_req_present) =
+        resolve_fixture_op_req().map_err(ConfiguredError::Resolve)?;
+    let bytes = lifecycle_config_bytes(&offsets, op_req_off, op_req_present);
     map_update_bytes(
         &loaded.maps.config,
         &0u32.to_le_bytes(),

@@ -24,7 +24,7 @@ pub(crate) mod mapcreate;
 pub mod parse;
 pub(crate) mod progload;
 
-pub use instantiate::{check_pin_name, load_kcrypto, load_lifecycle, pin_fd};
+pub use instantiate::{CallbackLoad, check_pin_name, load_kcrypto, load_lifecycle, pin_fd};
 pub use parse::{
     BpfInsn, MapReloc, ParsedKcrypto, ParsedSpine, insns_to_bytes, parse_kcrypto_object,
     parse_spine_object, valid_kcrypto_dims, valid_kcrypto_section,

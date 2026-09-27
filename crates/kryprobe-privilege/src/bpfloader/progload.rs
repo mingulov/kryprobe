@@ -171,7 +171,9 @@ fn prog_name16(name: &str) -> [u8; 16] {
 
 /// One program load's attr inputs: the values both the plain and the
 /// token constructors project (pointers as `u64`, exactly as the attrs
-/// carry them; `attach_btf_id` is 0 unless fexit).
+/// carry them; `attach_btf_id` is 0 unless tracing; `attach_union`
+/// is 0 unless module-fentry (P4: the module BTF object fd rides
+/// the `attach_prog_fd`/`attach_btf_obj_fd` union word)).
 pub(crate) struct ProgSpec<'a> {
     pub(crate) prog_type: u32,
     pub(crate) name: &'a str,
@@ -182,6 +184,7 @@ pub(crate) struct ProgSpec<'a> {
     pub(crate) log_len: u32,
     pub(crate) expected_attach_type: u32,
     pub(crate) attach_btf_id: u32,
+    pub(crate) attach_union: u32,
 }
 
 /// Plain 72-byte spine attr (the `None` path: privilege, today's bytes).
@@ -228,7 +231,7 @@ pub(crate) fn token_prog_attr(spec: &ProgSpec<'_>, token_fd: RawFd) -> TokenProg
         line_info: 0,
         line_info_cnt: 0,
         attach_btf_id: spec.attach_btf_id,
-        attach_union: 0,
+        attach_union: spec.attach_union,
         core_relo_cnt: 0,
         fd_array: 0,
         core_relos: 0,
@@ -262,7 +265,7 @@ pub(crate) fn plain_fexit_attr(spec: &ProgSpec<'_>) -> FexitProgAttr {
         line_info: 0,
         line_info_cnt: 0,
         attach_btf_id: spec.attach_btf_id,
-        attach_union: 0,
+        attach_union: spec.attach_union,
     }
 }
 
@@ -290,6 +293,7 @@ pub(crate) fn prog_load_raw(
                     log_len: log.len() as u32,
                     expected_attach_type: BPF_TRACE_UPROBE_MULTI,
                     attach_btf_id: 0,
+                    attach_union: 0,
                 },
                 token_fd,
             );
@@ -309,6 +313,7 @@ pub(crate) fn prog_load_raw(
                 log_len: log.len() as u32,
                 expected_attach_type: BPF_TRACE_UPROBE_MULTI,
                 attach_btf_id: 0,
+                attach_union: 0,
             });
             bpf(
                 BPF_PROG_LOAD,
@@ -349,6 +354,7 @@ pub(crate) fn prog_load_fexit_raw(
                     log_len: log.len() as u32,
                     expected_attach_type: BPF_TRACE_FEXIT,
                     attach_btf_id,
+                    attach_union: 0,
                 },
                 token_fd,
             );
@@ -368,6 +374,68 @@ pub(crate) fn prog_load_fexit_raw(
                 log_len: log.len() as u32,
                 expected_attach_type: BPF_TRACE_FEXIT,
                 attach_btf_id,
+                attach_union: 0,
+            });
+            bpf(
+                BPF_PROG_LOAD,
+                (&raw mut attr).cast::<c_void>(),
+                FEXIT_PROG_ATTR_LEN,
+            )
+        }
+    }
+}
+
+/// Raw `BPF_PROG_LOAD` for a module-fentry program (P4): the same
+/// 116-byte UAPI shape as fexit, `expected_attach_type = FENTRY`,
+/// `attach_btf_id` = the target module function's BTF id (global —
+/// module BTF ids address the split image), `attach_union` = the
+/// module BTF object fd (`attach_btf_obj_fd`, found by kernel-name
+/// discovery; the fd must outlive this call only — the loaded
+/// program holds its own BTF reference).
+pub(crate) fn prog_load_fentry_raw(
+    name: &str,
+    insn_bytes: &[u8],
+    insn_cnt: u32,
+    attach_btf_id: u32,
+    attach_btf_obj_fd: RawFd,
+    log: &mut [u8],
+    token: Option<RawFd>,
+) -> c_long {
+    // SAFETY: attr + pointees (insns, license, log) outlive the syscall.
+    unsafe {
+        if let Some(token_fd) = token {
+            let mut attr = token_prog_attr(
+                &ProgSpec {
+                    prog_type: BPF_PROG_TYPE_TRACING,
+                    name,
+                    insns_ptr: insn_bytes.as_ptr() as u64,
+                    insn_cnt,
+                    log_level: KCRYPTO_LOG_LEVEL,
+                    log_ptr: log.as_mut_ptr() as u64,
+                    log_len: log.len() as u32,
+                    expected_attach_type: BPF_TRACE_FENTRY,
+                    attach_btf_id,
+                    attach_union: attach_btf_obj_fd as u32,
+                },
+                token_fd,
+            );
+            bpf(
+                BPF_PROG_LOAD,
+                (&raw mut attr).cast::<c_void>(),
+                TOKEN_PROG_ATTR_LEN,
+            )
+        } else {
+            let mut attr = plain_fexit_attr(&ProgSpec {
+                prog_type: BPF_PROG_TYPE_TRACING,
+                name,
+                insns_ptr: insn_bytes.as_ptr() as u64,
+                insn_cnt,
+                log_level: KCRYPTO_LOG_LEVEL,
+                log_ptr: log.as_mut_ptr() as u64,
+                log_len: log.len() as u32,
+                expected_attach_type: BPF_TRACE_FENTRY,
+                attach_btf_id,
+                attach_union: attach_btf_obj_fd as u32,
             });
             bpf(
                 BPF_PROG_LOAD,
@@ -406,6 +474,7 @@ pub(crate) fn prog_load_fsession_raw(
                     log_len: log.len() as u32,
                     expected_attach_type: BPF_TRACE_FSESSION,
                     attach_btf_id,
+                    attach_union: 0,
                 },
                 token_fd,
             );
@@ -425,6 +494,7 @@ pub(crate) fn prog_load_fsession_raw(
                 log_len: log.len() as u32,
                 expected_attach_type: BPF_TRACE_FSESSION,
                 attach_btf_id,
+                attach_union: 0,
             });
             bpf(
                 BPF_PROG_LOAD,
@@ -454,6 +524,7 @@ mod tests {
             log_len: 1024,
             expected_attach_type: BPF_TRACE_UPROBE_MULTI,
             attach_btf_id: 0,
+            attach_union: 0,
         }
     }
 
@@ -468,6 +539,7 @@ mod tests {
             log_len: 2048,
             expected_attach_type: BPF_TRACE_FEXIT,
             attach_btf_id: 4242,
+            attach_union: 0,
         }
     }
 
@@ -510,7 +582,24 @@ mod tests {
             log_len: 2048,
             expected_attach_type: BPF_TRACE_FSESSION,
             attach_btf_id: 5150,
+            attach_union: 0,
         }
+    }
+
+    #[test]
+    fn module_fentry_attr_carries_obj_fd_in_union() {
+        // P4: the module BTF object fd rides the attach union
+        // word on both the plain and token paths (0 everywhere
+        // else — the specs above pin the zero).
+        let mut spec = fsession_spec();
+        spec.expected_attach_type = BPF_TRACE_FENTRY;
+        spec.attach_union = FAKE_FD as u32;
+        let plain = plain_fexit_attr(&spec);
+        assert_eq!(plain.attach_btf_id, 5150);
+        assert_eq!(plain.attach_union, FAKE_FD as u32);
+        let tokened = token_prog_attr(&spec, FAKE_FD);
+        assert_eq!(tokened.attach_btf_id, 5150);
+        assert_eq!(tokened.attach_union, FAKE_FD as u32);
     }
 
     #[test]

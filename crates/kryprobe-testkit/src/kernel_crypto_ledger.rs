@@ -11,10 +11,12 @@ use std::collections::HashSet;
 /// One parsed request: its fixture sequence, submitted operation
 /// label, recorded errnos and progress/terminal notification count.
 ///
-/// A progress row is a waiter-side in-flight marker, never a kernel
-/// callback; only the terminal row is the completion notification.
-/// Every recorded errno is surfaced: altering any of them changes
-/// the parsed result, so corrupted truth cannot validate unchanged.
+/// A progress row is EITHER a waiter-side in-flight marker
+/// (delayed/early scenarios) OR a kernel backlog-progress callback
+/// (T09 held burst: errno -EINPROGRESS, always before that seq's
+/// terminal); only the terminal row completes. Every recorded errno
+/// is surfaced: altering any of them changes the parsed result, so
+/// corrupted truth cannot validate unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerRequest {
     /// Fixture invocation sequence.

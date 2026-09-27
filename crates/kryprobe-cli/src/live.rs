@@ -2306,7 +2306,8 @@ mod tests {
         use kryprobe_privilege::kcrypto_lifecycle::decode::DecodeStats;
         LifecycleLedger {
             completed: Vec::new(),
-            edge_hits: [4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            edge_hits: [4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            adapter: kryprobe_privilege::kcrypto_lifecycle::async_adapter::AdapterStats::default(),
             decode: DecodeStats {
                 admitted: 6,
                 ..DecodeStats::default()
@@ -2317,11 +2318,11 @@ mod tests {
                 ..ReducerStats::default()
             },
             kernel_loss: [0; 5],
-            agg_accepted: [4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            agg_accepted: [4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             retained_dropped: 0,
             view_valid: true,
             loss_baseline: [0; 5],
-            agg_baseline: [0; 16],
+            agg_baseline: [0; 18],
             prog_misses: Vec::new(),
             miss_current: Vec::new(),
             tfm_stats: kryprobe_privilege::kcrypto_lifecycle::tfm::TfmStats::default(),
@@ -2512,7 +2513,7 @@ mod tests {
         // reserve, and noslot, with an empty close ring) flips
         // transport: the accounting equation broke.
         let mut ledger = lifecycle_ledger_clean();
-        ledger.agg_accepted = [5, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        ledger.agg_accepted = [5, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let coverage = lifecycle_coverage(&ledger, 2, 2, 6, &close_clean(), interval);
         assert_eq!(coverage.detailed_events.status, CoverageStatus::Partial);
     }

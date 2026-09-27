@@ -72,7 +72,16 @@ all reject).
   against a depth-1 driver queue with the drain held: submit 0
   returns `-EINPROGRESS`, submits 1-3 genuinely return `-EBUSY`
   (queued as backlog); all four complete via callback after the
-  kick. Any deviation fails the run (`-EPROTO`).
+  kick. The worker mirrors `cryptd_queue_worker` (backlog sampled
+  before dequeue, `complete(backlog, -EINPROGRESS)` before the head
+  terminal): reqs 1-3 each record one kernel progress row, drain
+  order `P1,T0,P2,T1,P3,T2,T3`. Any deviation fails the run
+  (`-EPROTO`).
+- `no-backlog-burst` (P4): held queue + 2 submits WITHOUT
+  `MAY_BACKLOG`: submit 0 queues (`-EINPROGRESS`, terminal via
+  callback), submit 1 answers `-ENOSPC` immediately (terminal,
+  exact, no callback follows). Any deviation fails the run
+  (`-EPROTO`).
 - `early-callback`: pre-wait completion poll recorded as exactly one
   progress row (hit or miss), then the terminal.
 - `exact-driver`: generic-name alloc must resolve to exactly the
@@ -81,5 +90,11 @@ all reject).
   native `ENOENT`, no alloc row, run result 0 (expected failure).
 - `refheld-release`: transform held across the run with zero
   invocations, then released: alloc/free rows only.
+- `cryptd-async` (P4): in-kernel real-cryptd driver (the 7.2
+  real-path; 7.0 uses AF_ALG): generic control alloc, full-name
+  cryptd alloc, async-masked alloc — each binding drives one op
+  (submit/return/terminal rows), each refusal an alloc-probe
+  triple with the native errno. Always result 0 (rows are the
+  verdict, read by the T09 oracle, not lab.py).
 
 Planned (matrix F/Q/H): rapid reuse.

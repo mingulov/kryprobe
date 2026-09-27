@@ -118,9 +118,15 @@ fn decode_record_rejects_twin_drift() {
             "version {version} refuses"
         );
     }
+    // P4 (adapter contract §11): kind 3 is the callback half now —
+    // an op site on it is BadSite; unknown kinds still refuse BadEdge.
+    assert_eq!(
+        decode_record(&edge_bytes(9, 1, 9, 1, 0, 0)),
+        Err(DecodeDrop::BadEdge)
+    );
     assert_eq!(
         decode_record(&edge_bytes(3, 1, 9, 1, 0, 0)),
-        Err(DecodeDrop::BadEdge)
+        Err(DecodeDrop::BadSite)
     );
     assert_eq!(
         decode_record(&edge_bytes(1, 9, 9, 1, 0, 0)),

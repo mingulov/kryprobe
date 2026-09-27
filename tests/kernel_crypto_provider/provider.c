@@ -292,16 +292,27 @@ static atomic_t kxc_delay_ms;
 
 static void kxc_async_fn(struct work_struct *work)
 {
-	struct crypto_async_request *areq;
+	struct crypto_async_request *areq, *backlog;
 	struct skcipher_request *req;
 	int delay_ms, err;
 
 	for (;;) {
 		spin_lock_bh(&kxc_bq_lock);
+		/*
+		 * T09 cryptd-worker shape (crypto/cryptd.c
+		 * cryptd_queue_worker, byte-identical 7.0.14/7.2.6):
+		 * sample the backlog BEFORE dequeuing, then
+		 * progress-notify it before completing the head.
+		 * With the depth-1 held queue the burst order is
+		 * deterministic: P1,T0,P2,T1,P3,T2,T3.
+		 */
+		backlog = crypto_get_backlog(&kxc_bq);
 		areq = crypto_dequeue_request(&kxc_bq);
 		spin_unlock_bh(&kxc_bq_lock);
 		if (!areq)
 			break;
+		if (backlog)
+			crypto_request_complete(backlog, -EINPROGRESS);
 		delay_ms = atomic_read(&kxc_delay_ms);
 		if (delay_ms > 0)
 			msleep((unsigned int)delay_ms);

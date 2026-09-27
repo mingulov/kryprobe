@@ -12,6 +12,7 @@ use kryprobe_abi::kcrypto_lifecycle::{
     LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_SK, LTFM_VERSION,
 };
 use kryprobe_core::kcrypto::Terminal;
+use kryprobe_privilege::kcrypto_lifecycle::async_adapter::AdapterStats;
 use kryprobe_privilege::kcrypto_lifecycle::canary::{
     SensorBaseline, SensorView, parse_transcript, verdict,
 };
@@ -23,7 +24,7 @@ use kryprobe_privilege::kcrypto_lifecycle::sensor::{
 fn ctx() -> SessionContext {
     SessionContext {
         loss_baseline: [0; 5],
-        agg_baseline: [0; 16],
+        agg_baseline: [0; 18],
         view_valid: true,
         miss_baseline: Vec::new(),
         enrichment: EnrichmentStatus::Available {
@@ -97,7 +98,7 @@ fn ingest_paired_edges_complete_grounded_record() {
     ];
     assert_eq!(core.ingest_records(&records), 1);
     let ledger = core
-        .ledger([0; 5], [0; 16], Vec::new(), ctx())
+        .ledger([0; 5], [0; 18], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     let rec = &ledger.completed[0];
@@ -106,7 +107,7 @@ fn ingest_paired_edges_complete_grounded_record() {
     assert!(rec.evidence_valid());
     assert_eq!(
         ledger.edge_hits,
-        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     assert_eq!(ledger.decode.admitted, 1);
     assert_eq!(ledger.reducer.admitted, 1);
@@ -121,23 +122,23 @@ fn ingest_queued_return_stays_pending() {
     ];
     assert_eq!(core.ingest_records(&records), 0);
     assert!(
-        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .is_empty()
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
             .expect("empty miss join")
             .decode
             .admitted,
         1
     );
     assert_eq!(
-        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
             .expect("empty miss join")
             .edge_hits,
-        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
 }
 
@@ -151,7 +152,7 @@ fn ingest_loss_counts_without_phantoms() {
     ];
     assert_eq!(core.ingest_records(&records), 0);
     let ledger = core
-        .ledger([7, 0, 0, 0, 0], [0; 16], Vec::new(), ctx())
+        .ledger([7, 0, 0, 0, 0], [0; 18], Vec::new(), ctx())
         .expect("empty miss join");
     assert!(ledger.completed.is_empty());
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
@@ -168,14 +169,14 @@ fn finish_drains_pending_truthless() {
     let mut core = SensorCore::new(16, 16, 16, 8, true);
     core.ingest_records(&[edge_bytes(1, 1, 0xabc, 100, 0, 0)]);
     assert!(
-        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .is_empty()
     );
     core.finish(200);
     assert_eq!(
-        core.ledger([0; 5], [0; 16], Vec::new(), ctx())
+        core.ledger([0; 5], [0; 18], Vec::new(), ctx())
             .expect("empty miss join")
             .completed
             .len(),
@@ -204,7 +205,7 @@ fn f7_completed_retention_is_bounded_and_counted() {
         assert_eq!(core.ingest_records(&records), 1);
     }
     let ledger = core
-        .ledger([0; 5], [0; 16], Vec::new(), ctx())
+        .ledger([0; 5], [0; 18], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 2);
     assert_eq!(ledger.retained_dropped, 1);
@@ -229,7 +230,7 @@ fn f7_take_completed_drains_and_releases_the_bound() {
     ];
     assert_eq!(core.ingest_records(&two), 1);
     let ledger = core
-        .ledger([0; 5], [0; 16], Vec::new(), ctx())
+        .ledger([0; 5], [0; 18], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.completed.len(), 1);
     assert_eq!(ledger.retained_dropped, 0);
@@ -244,11 +245,11 @@ fn w8_ledger_carries_session_context() {
     let ledger = core
         .ledger(
             [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0, 1, 0, 0, 0],
-                agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 view_valid: false,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -261,12 +262,12 @@ fn w8_ledger_carries_session_context() {
     assert_eq!(ledger.kernel_loss, [1, 2, 3, 4, 5]);
     assert_eq!(
         ledger.agg_accepted,
-        [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     assert_eq!(ledger.loss_baseline, [0, 1, 0, 0, 0]);
     assert_eq!(
         ledger.agg_baseline,
-        [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     );
     assert!(!ledger.view_valid);
 }
@@ -305,11 +306,11 @@ fn w9_ledger_joins_prog_miss_deltas_from_absolutes() {
     let ledger = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             cur.clone(),
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: base,
                 enrichment: EnrichmentStatus::Available {
@@ -346,11 +347,11 @@ fn w10_ledger_refuses_untrustworthy_miss_join() {
     let err = core
         .ledger(
             [0; 5],
-            [0; 16],
+            [0; 18],
             cur,
             SessionContext {
                 loss_baseline: [0; 5],
-                agg_baseline: [0; 16],
+                agg_baseline: [0; 18],
                 view_valid: true,
                 miss_baseline: base,
                 enrichment: EnrichmentStatus::Available {
@@ -475,7 +476,7 @@ fn mixed_inventory_destroys_green_through_production_ingest() {
     core.finish(600);
     // Lossless ring: accepted == consumed on every lane.
     let probe = core
-        .ledger([0; 5], [0; 16], Vec::new(), ctx())
+        .ledger([0; 5], [0; 18], Vec::new(), ctx())
         .expect("probe ledger");
     let ledger = core
         .ledger([0; 5], probe.edge_hits, Vec::new(), ctx())
@@ -492,6 +493,7 @@ fn mixed_inventory_destroys_green_through_production_ingest() {
         edge_hits: ledger.edge_hits,
         decode: ledger.decode,
         reducer: ledger.reducer,
+        adapter: AdapterStats::default(),
         kernel_loss: [0; 5],
         agg_accepted: ledger.edge_hits,
         retained_dropped: 0,
@@ -527,17 +529,17 @@ fn ingest_zero_word_op_voids_exact_reuse() {
 fn w7_fold_loss_lanes_sums_per_class_saturating() {
     // Round-7: one `LLOSS` lane per program per class (an interrupt
     // can run a different program on the same CPU mid-bump, so
-    // per-CPU alone lost updates). The fold sums the sixteen hook
+    // per-CPU alone lost updates). The fold sums the eighteen hook
     // lanes class-major, saturating — a saturated lane must not
     // wrap the ledger.
-    let mut lanes = [0u64; 80];
+    let mut lanes = [0u64; 90];
     lanes[0] = 1;
     lanes[1] = 2;
     lanes[2] = 3;
     lanes[3] = 4;
-    lanes[17] = 7;
-    lanes[64] = u64::MAX;
-    lanes[79] = u64::MAX;
+    lanes[18] = 7;
+    lanes[72] = u64::MAX;
+    lanes[89] = u64::MAX;
     assert_eq!(fold_loss_lanes(lanes), [10, 7, 0, 0, u64::MAX]);
 }
 
@@ -554,7 +556,7 @@ fn ledger_carries_enrichment_status_both_arms() {
         truncated: true,
     };
     let ledger = core
-        .ledger([0; 5], [0; 16], Vec::new(), available)
+        .ledger([0; 5], [0; 18], Vec::new(), available)
         .expect("empty miss join");
     assert_eq!(
         ledger.enrichment,
@@ -568,7 +570,7 @@ fn ledger_carries_enrichment_status_both_arms() {
         reason: "No such file or directory (os error 2)".to_owned(),
     };
     let ledger = core
-        .ledger([0; 5], [0; 16], Vec::new(), missing)
+        .ledger([0; 5], [0; 18], Vec::new(), missing)
         .expect("empty miss join");
     assert_eq!(
         ledger.enrichment,

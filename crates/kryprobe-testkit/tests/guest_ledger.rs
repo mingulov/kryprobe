@@ -5,7 +5,7 @@
 //! Driven by environment (set by `scripts/kcrypto-lab.py`):
 //! - `KCRYPTO_LEDGER_PATH`: captured JSONL ledger file (required)
 //! - `KCRYPTO_RUN_ID`: run the ledger must belong to (required)
-//! - `KCRYPTO_SCENARIO`: one of the fourteen fixture scenarios (required)
+//! - `KCRYPTO_SCENARIO`: one of the sixteen fixture scenarios (required)
 //! - `KCRYPTO_SUFFIX`: fixture driver-name suffix, for `exact-driver`
 //!
 //! Truth comes from the fixture file; expectations come from the
@@ -22,6 +22,9 @@ const ENOENT: i32 = 2;
 const EINPROGRESS: i32 = 115;
 /// Native EBUSY: MAY_BACKLOG submit queued as backlog.
 const EBUSY: i32 = 16;
+/// Native ENOSPC: queue full without backlog consent (immediate,
+/// terminal — never queued, never rewritten).
+const ENOSPC: i32 = 28;
 /// Native EINVAL: failing provider init / rejected key length.
 const EINVAL: i32 = 22;
 /// Typed-sync restriction: CRYPTO_ALG_TYPE_SKCIPHER with
@@ -127,6 +130,12 @@ fn guest_ledger_matches_scenario_contract() {
         }
         // Four MAY_BACKLOG submits on one transform against the
         // depth-1 held queue: exactly EINPROGRESS then EBUSY x3.
+        // T09: the worker mirrors cryptd_queue_worker, so reqs 1-3
+        // each record one KERNEL progress row (-EINPROGRESS,
+        // always before their terminal) while req 0 goes straight
+        // to terminal (drain order P1,T0,P2,T1,P3,T2,T3 — pinned
+        // by the sensor canary's row-order join, which retains
+        // notification order; this oracle pins per-request rows).
         "backlog-accepted" => {
             expect_single_lifetime(&ledger);
             expect_setup_configs(&ledger, 1);
@@ -137,11 +146,72 @@ fn guest_ledger_matches_scenario_contract() {
                 [-EINPROGRESS, -EBUSY, -EBUSY, -EBUSY],
                 "exact backlog return script"
             );
-            for req in &ledger.requests {
+            for (i, req) in ledger.requests.iter().enumerate() {
                 assert_eq!(req.submit_op, "encrypt-burst", "submit op label");
-                assert_eq!(req.progress_errno, None, "no progress marker");
                 assert_eq!(req.terminal_errno, 0, "burst terminal success");
-                assert_eq!(req.notifications, 1, "one terminal notification each");
+                if i == 0 {
+                    assert_eq!(req.progress_errno, None, "head goes straight to terminal");
+                    assert_eq!(req.notifications, 1, "one terminal notification");
+                } else {
+                    assert_eq!(
+                        req.progress_errno,
+                        Some(-EINPROGRESS),
+                        "backlogged req {i} progress row"
+                    );
+                    assert_eq!(req.notifications, 2, "progress + terminal");
+                }
+            }
+        }
+        // T09: held queue + 2 submits WITHOUT MAY_BACKLOG: submit
+        // 0 queues (terminal via callback), submit 1 answers
+        // -ENOSPC immediately — terminal, exact, no callback
+        // follows (the live ENOSPC proof: never rewritten, never
+        // queued).
+        "no-backlog-burst" => {
+            expect_single_lifetime(&ledger);
+            expect_setup_configs(&ledger, 1);
+            assert_eq!(ledger.requests.len(), 2, "burst of two");
+            let returns: Vec<i32> = ledger.requests.iter().map(|req| req.return_errno).collect();
+            assert_eq!(returns, [-EINPROGRESS, -ENOSPC], "exact no-backlog script");
+            let head = &ledger.requests[0];
+            assert_eq!(head.submit_op, "encrypt-burst", "submit op label");
+            assert_eq!(head.progress_errno, None, "no backlog, no progress");
+            assert_eq!(head.terminal_errno, 0, "terminal success");
+            assert_eq!(head.notifications, 1, "one terminal notification");
+            let refused = &ledger.requests[1];
+            assert_eq!(refused.submit_op, "encrypt-burst", "submit op label");
+            assert_eq!(refused.progress_errno, None, "no progress marker");
+            assert_eq!(refused.terminal_errno, -ENOSPC, "exact ENOSPC carried");
+            assert_eq!(refused.notifications, 1, "waiter terminal only");
+        }
+        // T09 real-cryptd driver: generic control alloc (freed,
+        // untrafficked), full-name cryptd alloc + op, async-masked
+        // alloc + op. Each binding drives one encrypt-cryptd op
+        // (queued -EINPROGRESS, terminal 0); each refusal is an
+        // alloc-probe triple, never a run failure. The 7.2.6 cell
+        // binds both (A3: drv cryptd(ecb(aes-lib)) twice); the
+        // oracle pins shape per row, never the bind outcome —
+        // rows ARE the verdict.
+        "cryptd-async" => {
+            assert!(
+                ledger.allocs.len() <= 3,
+                "at most control + 2 cryptd allocs, got {}",
+                ledger.allocs.len()
+            );
+            for alloc in &ledger.allocs {
+                assert!(alloc.freed && alloc.final_free, "alloc finally freed");
+            }
+            for req in &ledger.requests {
+                if req.submit_op == "alloc-probe" {
+                    assert_eq!(req.progress_errno, None, "probe has no progress");
+                    assert_eq!(req.notifications, 1, "probe terminal only");
+                    continue;
+                }
+                assert_eq!(req.submit_op, "encrypt-cryptd", "traffic op label");
+                assert_eq!(req.return_errno, -EINPROGRESS, "cryptd queues");
+                assert_eq!(req.progress_errno, None, "single in-flight, no backlog");
+                assert_eq!(req.terminal_errno, 0, "terminal success");
+                assert_eq!(req.notifications, 1, "one terminal notification");
             }
         }
         // Pre-wait poll recorded as one progress row either way:

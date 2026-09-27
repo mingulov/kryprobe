@@ -292,9 +292,20 @@ aggregate structs.
 
 | Struct | Fields | WHY (kp2 §9) |
 |---|---|---|
-| `LEdge` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `cryptlen`, `invoc`, `tfm`, `req_flags`, `fam`, `dir`, `mflags`, `drv` | wire tags + pairing pointers (`key`, `tfm` — kernel pairing material, `<redacted>` at every render) + timestamp + native errno + entry-side scalar request metadata (`cryptlen` API input length, `req_flags` request flags — validity-gated by `mflags`, unknown when the entry chase was unreadable — plus wire-pinned `fam`/`dir`) + invocation id + submit-side selected driver (`drv` — public inventory, 55+NUL); returns carry `tfm` 0 + zero metadata + empty `drv` (R2 extended: never chased) |
+| `LEdge` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `cryptlen`, `invoc`, `tfm`, `req_flags`, `fam`, `dir`, `mflags`, `drv` | wire tags + pairing pointers (`key`, `tfm` — kernel pairing material, `<redacted>` at every render) + timestamp + native errno + entry-side scalar request metadata (`cryptlen` API input length, `req_flags` request flags — validity-gated by `mflags`, unknown when the entry chase was unreadable — plus wire-pinned `fam`/`dir`) + invocation id + submit-side selected driver (`drv` — public inventory, 55+NUL); returns carry `tfm` 0 + zero metadata + empty `drv` (R2 extended: never chased); P4 callback halves (`edge` 3, `site` 3/4) carry `key` + `status` + `ts_ns` only (`invoc` 0 — names no fsession invocation — zero metadata/`tfm`/`drv`, `flags` 0 — callbacks never taint) |
 | `LTfm` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `aux`, `aux2`, `token`, `name` | wire tags + pairing pointer (`key`, redacted) + timestamp + native errno + site scalars (alg type/mask, refcount snapshot, key length/authsize — sizes, not contents) + attempt token + bounded algorithm/driver name (public inventory) |
-| `LConfig` | `magic`, `version`, `flags`, `tfm_alg`, `alg_drv`, `sk_base`, `refcnt_off`, `refcnt_present`, `req_base`, `req_tfm`, `req_cryptlen`, `req_flags`, `reserved` | arm tags + BTF-resolved struct offsets (loader-computed, no kernel reads — v4 adds the op metadata reads `req_cryptlen`/`req_flags`) + disarm gate |
+| `LConfig` | `magic`, `version`, `flags`, `tfm_alg`, `alg_drv`, `sk_base`, `refcnt_off`, `refcnt_present`, `req_base`, `req_tfm`, `req_cryptlen`, `req_flags`, `op_req_off`, `op_req_present`, `reserved` | arm tags + BTF-resolved struct offsets (loader-computed, no kernel reads — v4 adds the op metadata reads `req_cryptlen`/`req_flags`; v5 adds the fixture `op->req` chase `op_req_off` + `op_req_present`) + disarm gate |
+
+P4 callback-site reads (the two `fentry` programs): the cryptd
+site reads arg0 (the request pointer — the half's `key`) and arg1
+(the native status) and chases nothing; the fixture site reads
+arg1 (status) plus ONE `probe_read` at `arg0 + op_req_off` (the
+consumer op's `req` member — the half's `key`; the op pointer
+itself is never stored, a fault reads `LLOSS_BADKEY`, never a
+wild key). Both are pairing material + errno only — no request
+contents, no callback private data beyond the qualified `req`
+member (BTF-resolved, pointer-to-`skcipher_request`-checked at
+arm, or the arm refuses).
 
 No lifecycle field carries key material, IVs, plaintext,
 ciphertext, or buffer contents: `cryptlen`/`aux`/`aux2`/`len`

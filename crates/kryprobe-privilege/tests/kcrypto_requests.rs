@@ -149,7 +149,7 @@ fn destroy_pair(token: u64, ts: u64, base: u64) -> Vec<Vec<u8>> {
 fn ctx() -> SessionContext {
     SessionContext {
         loss_baseline: [0; 5],
-        agg_baseline: [0; 16],
+        agg_baseline: [0; 18],
         view_valid: true,
         miss_baseline: Vec::new(),
         enrichment: EnrichmentStatus::Available {
@@ -220,7 +220,7 @@ fn nested_same_storage_returns_pair_to_own_cookie() {
         assert_eq!(r.terminal, Terminal::Sync(0));
         assert_eq!(r.meta.cryptlen, Some(16));
     }
-    let ledger = core.ledger([0; 5], [0; 16], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.admitted, 2);
     assert_eq!(ledger.decode.unknown_invoc_returns, 0);
 }
@@ -263,7 +263,7 @@ fn migration_preserves_invocation() {
         op_return(key, 250, 0x5002, 0),
     ]);
     assert_eq!(joined, 0, "flipped invocation never binds");
-    let ledger = core.ledger([0; 5], [0; 16], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
     assert_eq!(ledger.decode.admitted, 2);
 }
@@ -277,7 +277,7 @@ fn missing_submit_never_binds_return() {
     assert!(core.take_completed().is_empty());
     assert!(core.tfm().generations().is_empty(), "returns never admit");
     assert_eq!(core.tfm().stats().unlinked_ops, 0);
-    let ledger = core.ledger([0; 5], [0; 16], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.decode.unknown_invoc_returns, 1);
     assert_eq!(ledger.decode.admitted, 0);
     // Submit with no return: binding happens AT SUBMIT, but the missing
@@ -297,7 +297,7 @@ fn missing_submit_never_binds_return() {
         "submit-side binding, return or not"
     );
     assert!(!done[0].evidence_valid());
-    let ledger = core.ledger([0; 5], [0; 16], Vec::new(), ctx()).unwrap();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
     assert_eq!(ledger.reducer.unfinished, 1);
 }
 

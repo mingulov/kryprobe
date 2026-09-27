@@ -12,6 +12,7 @@
 use crate::btf_resolve::{ConfiguredError, ConfiguredPoint};
 use crate::drain::DrainError;
 use crate::drain::area::RingArea;
+use crate::kcrypto_lifecycle::async_adapter::AdapterStats;
 use crate::kcrypto_lifecycle::decode::{DecodeStats, LifecycleDecoder, decode_record};
 use crate::kcrypto_lifecycle::proc_crypto::{ProcCryptoSnapshot, snapshot_proc_crypto};
 use crate::kcrypto_lifecycle::profile::{
@@ -29,10 +30,11 @@ use crate::kcrypto_lifecycle::{
 };
 use crate::mapops::{MapOpsError, map_lookup_percpu_sum};
 use kryprobe_abi::kcrypto_lifecycle::{
-    LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_SETAUTH_RET,
-    LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB, LAGG_SETKEYSK_RET,
-    LAGG_SETKEYSK_SUB, LEDGE_RETURN, LEDGE_SUBMIT, LSITE_DEC, LTFM_SITE_ALLOC_SK,
-    LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK,
+    LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_CB_CRYPTD, LAGG_CB_KXC, LAGG_DESTROY_RET,
+    LAGG_DESTROY_SUB, LAGG_SETAUTH_RET, LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB,
+    LAGG_SETKEYSK_RET, LAGG_SETKEYSK_SUB, LEDGE_CALLBACK, LEDGE_RETURN, LEDGE_SUBMIT, LSITE_CB_KXC,
+    LSITE_DEC, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD,
+    LTFM_SITE_SETKEY_SK,
 };
 use kryprobe_core::kcrypto::{LifecycleReducer, ReducerStats, RequestRecord};
 use std::os::fd::RawFd;
@@ -124,6 +126,17 @@ mod activity_wait_tests {
 /// Validated inputs only (`decode_record` guarantees site ∈ {enc,
 /// dec} and edge ∈ {submit, return}).
 fn edge_slot(site: u16, edge: u8) -> usize {
+    if edge == LEDGE_CALLBACK {
+        // Twin validation admits only the two qualified callback
+        // sites; anything else folds to the cryptd lane (unreachable
+        // from bytes — the same total-fold discipline as the op
+        // lanes below, which twin validation likewise constrains).
+        return if site == LSITE_CB_KXC {
+            LAGG_CB_KXC as usize
+        } else {
+            LAGG_CB_CRYPTD as usize
+        };
+    }
     let site_idx = u16::from(site == LSITE_DEC);
     let edge_idx = u16::from(edge == LEDGE_RETURN);
     (site_idx * 2 + edge_idx) as usize
@@ -206,7 +219,7 @@ pub fn fold_loss_lanes(lanes: [u64; LLOSS_ENTRIES as usize]) -> [u64; 5] {
 /// (shared by the pre-arm baseline and every ledger snapshot).
 fn read_kernel_counters(
     configured: &ConfiguredLifecycle,
-) -> Result<([u64; 5], [u64; 16]), MapOpsError> {
+) -> Result<([u64; 5], [u64; 18]), MapOpsError> {
     let mut lanes = [0u64; LLOSS_ENTRIES as usize];
     for (idx, slot) in lanes.iter_mut().enumerate() {
         *slot = map_lookup_percpu_sum(
@@ -215,7 +228,7 @@ fn read_kernel_counters(
             "lifecycle_sensor/lloss",
         )?;
     }
-    let mut agg_accepted = [0u64; 16];
+    let mut agg_accepted = [0u64; 18];
     for (idx, slot) in agg_accepted.iter_mut().enumerate() {
         *slot = map_lookup_percpu_sum(
             &configured.loaded.maps.agg,
@@ -294,12 +307,18 @@ pub struct LifecycleLedger {
     /// Per-hook raw-edge hits in `LAGG_*` lane order (lanes 0–3
     /// are the op hooks `[enc-submit, enc-return, dec-submit,
     /// dec-return]` — the VM gate's "post-GO event per required
-    /// hook"; lanes 4+ are the transform hooks as their halves land).
-    pub edge_hits: [u64; 16],
+    /// hook"; lanes 4–15 are the transform hooks as their halves
+    /// land; lanes 16/17 are the P4 callback hooks
+    /// `[cryptd-callback, fixture-callback]`).
+    pub edge_hits: [u64; 18],
     /// Decode loss counters.
     pub decode: DecodeStats,
     /// Reducer counters.
     pub reducer: ReducerStats,
+    /// Callback-adapter loss counters (P4: cover refusals, orphans,
+    /// ambiguity gaps, tombstone evictions, stale callbacks — the
+    /// backend maps them into the frozen integrity summary).
+    pub adapter: AdapterStats,
     /// Kernel `LLOSS` per-class totals
     /// (reserve/disabled/badkey/fret/noslot).
     pub kernel_loss: [u64; 5],
@@ -310,7 +329,7 @@ pub struct LifecycleLedger {
     /// reconciliation equation (the canary asserts it; `LAGG` bumps
     /// before the invocation issue, so NOSLOT drops count as
     /// accepted-but-untransported).
-    pub agg_accepted: [u64; 16],
+    pub agg_accepted: [u64; 18],
     /// Completions dropped from retention past the ledger bound
     /// (explicit loss; a draining reader never drops).
     pub retained_dropped: u64,
@@ -322,7 +341,7 @@ pub struct LifecycleLedger {
     /// abs+delta; the oracle's own GO-baseline still owns the verdict).
     pub loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
-    pub agg_baseline: [u64; 16],
+    pub agg_baseline: [u64; 18],
     /// Per-program recursion-miss abs+delta (H2 coverage: a wholly
     /// skipped call leaves no edge and no `LLOSS` — only the kernel
     /// miss counter sees it, so any nonzero delta voids exact
@@ -376,7 +395,7 @@ pub struct SessionContext {
     /// Pre-arm `LLOSS` per-class totals.
     pub loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals.
-    pub agg_baseline: [u64; 16],
+    pub agg_baseline: [u64; 18],
     /// Sticky identity verdict at ledger time.
     pub view_valid: bool,
     /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
@@ -393,7 +412,7 @@ pub struct SensorCore {
     decoder: LifecycleDecoder,
     reducer: LifecycleReducer,
     completed: Vec<RequestRecord>,
-    edge_hits: [u64; 16],
+    edge_hits: [u64; 18],
     ledger_capacity: usize,
     retained_dropped: u64,
     tfm: TransformTracker,
@@ -426,7 +445,7 @@ impl SensorCore {
             decoder: LifecycleDecoder::new(decode_capacity),
             reducer: LifecycleReducer::new(reducer_capacity),
             completed: Vec::new(),
-            edge_hits: [0; 16],
+            edge_hits: [0; 18],
             ledger_capacity,
             retained_dropped: 0,
             tfm: TransformTracker::new(decode_capacity, frontend_off, refcnt_present),
@@ -550,7 +569,7 @@ impl SensorCore {
     pub fn ledger(
         &self,
         kernel_loss: [u64; 5],
-        agg_accepted: [u64; 16],
+        agg_accepted: [u64; 18],
         miss_current: Vec<ProgMisses>,
         ctx: SessionContext,
     ) -> Result<LifecycleLedger, crate::kcrypto_lifecycle::view::ViewError> {
@@ -559,6 +578,7 @@ impl SensorCore {
             completed: self.completed.clone(),
             edge_hits: self.edge_hits,
             decode: self.decoder.stats(),
+            adapter: self.decoder.adapter_stats(),
             reducer: self.reducer.stats(),
             kernel_loss,
             agg_accepted,
@@ -641,7 +661,7 @@ pub struct LifecycleSensor {
     /// Pre-arm `LLOSS` per-class totals (M2 baseline).
     loss_baseline: [u64; 5],
     /// Pre-arm `LAGG` per-hook accepted totals (M2 baseline).
-    agg_baseline: [u64; 16],
+    agg_baseline: [u64; 18],
     /// Pre-arm per-program recursion-miss absolutes (H2 baseline).
     miss_baseline: Vec<ProgMisses>,
     /// Bounded startup `/proc/crypto` snapshot (T07.5 registry

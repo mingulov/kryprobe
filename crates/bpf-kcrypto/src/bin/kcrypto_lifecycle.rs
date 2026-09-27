@@ -151,12 +151,15 @@ const LEDGE_VERSION: u8 = 6;
 
 const LEDGE_SUBMIT: u8 = 1;
 const LEDGE_RETURN: u8 = 2;
+const LEDGE_CALLBACK: u8 = 3;
 
 const LEDGE_TAINTED: u16 = 0x0001;
 const LEDGE_TRUNCATED: u16 = 0x0002;
 
 const LSITE_ENC: u16 = 1;
 const LSITE_DEC: u16 = 2;
+const LSITE_CB_CRYPTD: u16 = 3;
+const LSITE_CB_KXC: u16 = 4;
 
 const LFAM_SK: u8 = 1;
 const LDIR_ENC: u8 = 1;
@@ -174,18 +177,18 @@ const LTFM_SITE_SETKEY_AEAD: u16 = 6;
 const LTFM_TRUNCATED: u16 = 0x0002;
 
 const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
-const LCONFIG_VERSION: u32 = 4;
+const LCONFIG_VERSION: u32 = 5;
 
 const LLOSS_RESERVE: u32 = 0;
 const LLOSS_DISABLED: u32 = 1;
 const LLOSS_BADKEY: u32 = 2;
 const LLOSS_FRET: u32 = 3;
 const LLOSS_NOSLOT: u32 = 4;
-/// `LLOSS` lanes per class: one per hook (BPF hook order: the 16
-/// `LAGG_*` hooks, enc-sub first); the lane index doubles as the
-/// hook id. Entry `class * LLOSS_LANES + hook`; userspace folds the
-/// sixteen.
-const LLOSS_LANES: u32 = 16;
+/// `LLOSS` lanes per class: one per hook (BPF hook order: the 18
+/// `LAGG_*` hooks, enc-sub first, the two P4 callback hooks last);
+/// the lane index doubles as the hook id. Entry
+/// `class * LLOSS_LANES + hook`; userspace folds all eighteen.
+const LLOSS_LANES: u32 = 18;
 
 const LAGG_ENC_SUB: u32 = 0;
 const LAGG_ENC_RET: u32 = 1;
@@ -201,6 +204,8 @@ const LAGG_SETAUTH_SUB: u32 = 10;
 const LAGG_SETAUTH_RET: u32 = 11;
 const LAGG_SETKEYAEAD_SUB: u32 = 14;
 const LAGG_SETKEYAEAD_RET: u32 = 15;
+const LAGG_CB_CRYPTD: u32 = 16;
+const LAGG_CB_KXC: u32 = 17;
 
 /// `LCTR` lane per site program: encrypt takes lane zero, decrypt
 /// lane one, alloc-sk lane two, destroy lane three, setkey-sk lane
@@ -266,7 +271,8 @@ struct LEdge {
 
 /// Sensor config (64 bytes, `LCFG` key 0): v4 adds the op
 /// request-metadata words (`req_cryptlen`/`req_flags`) to the v3
-/// chase offsets. Word order pinned by ABI tests.
+/// chase offsets; v5 adds the fixture `op->req` words
+/// (`op_req_off`/`op_req_present`). Word order pinned by ABI tests.
 #[repr(C)]
 struct LConfig {
     magic: u32,
@@ -281,7 +287,9 @@ struct LConfig {
     req_tfm: u32,
     req_cryptlen: u32,
     req_flags: u32,
-    reserved: [u8; 16],
+    op_req_off: u32,
+    op_req_present: u32,
+    reserved: [u8; 8],
 }
 
 /// Raw transform edge (112 bytes; field order pinned by ABI tests).
@@ -315,7 +323,7 @@ static LRING: RingBuf = RingBuf::with_byte_size(262_144, 0);
 #[map]
 static LLOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(5 * LLOSS_LANES, 0);
 #[map]
-static LAGG: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
+static LAGG: PerCpuArray<u64> = PerCpuArray::with_max_entries(18, 0);
 #[map]
 static LCTR: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
 
@@ -1492,6 +1500,124 @@ pub fn lc_setkey_aead(ctx: *mut c_void) -> i32 {
         LAGG_SETKEYAEAD_RET,
         2,
     )
+}
+
+/// Fixture `op->req` words (`LCFG` words 48/52 — volatile reads,
+/// copied once like [`chase_offsets`]): the BTF-resolved member
+/// offset plus the T08-`refcnt_present`-style presence word. Only
+/// read on armed runs (the fixture prologue gates first).
+#[inline(always)]
+fn op_words() -> (u32, u32) {
+    let Some(cfg) = LCFG.get(0) else {
+        return (0, 0);
+    };
+    let off = unsafe { core::ptr::addr_of!(cfg.op_req_off).read_volatile() };
+    let present = unsafe { core::ptr::addr_of!(cfg.op_req_present).read_volatile() };
+    (off, present)
+}
+
+/// Emit one callback half: prologue-gated (disarmed → DISABLED, null
+/// key → BADKEY, both pre-accept), accepted, then the 112-byte
+/// record with key + status + ts only (`invoc` 0 — names no fsession
+/// invocation; zero metadata/`tfm`/`drv` — the submit owns those
+/// facts; `flags` 0 — callbacks never taint). Reserve failure feeds
+/// `LLOSS_RESERVE` via the shared emitter (never silent).
+#[inline(always)]
+fn cb_emit(key: u64, err: i32, site: u16, hook: u32) {
+    let Some(now) = run_prologue(key, hook) else {
+        return;
+    };
+    agg_inc(hook);
+    let mut slot = MaybeUninit::<NameSlot>::uninit();
+    let raw_slot = slot.as_mut_ptr();
+    zero_name(raw_slot);
+    // SAFETY: volatile-zeroed above; exclusive stack slot.
+    let empty = unsafe { &*raw_slot };
+    emit_edge(
+        site,
+        LEDGE_CALLBACK,
+        key,
+        now,
+        err,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        empty,
+        false,
+        hook,
+    );
+}
+
+/// `cryptd_skcipher_complete(req, err, complete)` (module `cryptd`,
+/// P4 real path): arg0 IS the submit-time `struct skcipher_request *`
+/// (enqueue sets `req->base.data = req`; the worker's complete call
+/// reaches here with the original pointer — audit note §3.1), arg1
+/// the native terminal status (`-EINPROGRESS` = backlog progress,
+/// re-armed by cryptd itself — never terminal). Plain `fentry`: no
+/// session cookie exists for callbacks (the adapter joins by key),
+/// no return run (nothing to pair), no LCTR mint. Cross-CPU vs the
+/// submitter by construction (cryptd workqueue context).
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "fentry/cryptd_skcipher_complete")]
+pub fn lc_cb_cryptd(ctx: *mut c_void) -> i32 {
+    let ctx = FEntryContext::new(ctx);
+    let req: u64 = ctx.arg(0);
+    // Low 32 bits are the `int` whatever the caller extension did
+    // (same truncation as the fsession exit run's `ret as i32`).
+    let err_raw: u64 = ctx.arg(1);
+    let err: i32 = err_raw as i32;
+    cb_emit(req, err, LSITE_CB_CRYPTD, LAGG_CB_CRYPTD);
+    0
+}
+
+/// `kxc_complete(op, err)` (module `kcrypto_fixture`, P4
+/// deterministic control): arg0 is the consumer's `struct kxc_op *`,
+/// and `op->req` (chased here at the arm-resolved `op_req_off`) is
+/// the submit-time request. The presence word gates the chase:
+/// fixture absent at arm → every firing drops pre-accept to
+/// `LLOSS_DISABLED` (counted, never chased); present-but-stale
+/// offsets refuse the arm instead (fail-closed twin drift — the BPF
+/// never validates what the arm refused to resolve).
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "fentry/kxc_complete")]
+pub fn lc_cb_kxc(ctx: *mut c_void) -> i32 {
+    let ctx = FEntryContext::new(ctx);
+    if !cfg_armed() {
+        loss_inc(LLOSS_DISABLED, LAGG_CB_KXC);
+        return 0;
+    }
+    let op: u64 = ctx.arg(0);
+    // Low 32 bits are the `int` (same truncation as above).
+    let err_raw: u64 = ctx.arg(1);
+    let err: i32 = err_raw as i32;
+    let (off, present) = op_words();
+    if present != 1 {
+        loss_inc(LLOSS_DISABLED, LAGG_CB_KXC);
+        return 0;
+    }
+    if op == 0 {
+        loss_inc(LLOSS_BADKEY, LAGG_CB_KXC);
+        return 0;
+    }
+    let Some(at) = op.checked_add(u64::from(off)) else {
+        loss_inc(LLOSS_BADKEY, LAGG_CB_KXC);
+        return 0;
+    };
+    let mut req: u64 = 0;
+    if !probe_read(core::ptr::addr_of_mut!(req).cast(), 8, at as *const c_void) || req == 0 {
+        // Unreadable/null request link: unusable key input
+        // (BADKEY extended — pre-accept, unagg'd, like FRET:
+        // unreadable input never counts as accepted).
+        loss_inc(LLOSS_BADKEY, LAGG_CB_KXC);
+        return 0;
+    }
+    cb_emit(req, err, LSITE_CB_KXC, LAGG_CB_KXC);
+    0
 }
 
 #[panic_handler]
