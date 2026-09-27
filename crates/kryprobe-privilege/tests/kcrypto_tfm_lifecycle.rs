@@ -2272,15 +2272,18 @@ fn raw_scan_trips_on_close_tail_marker() {
 
 /// Lifecycle secret-canary lane test (R6/R2-04): marked key, IV,
 /// plaintext, and tag bytes traverse every hooked lifecycle path
-/// (skcipher setkey + encrypt + decrypt, AEAD setkey + encrypt +
-/// marker-tag decrypt) while the sensor captures — then the test
-/// scans the RAW pre-decode transport (every walked ring record,
-/// including decode-refused bytes the views never render) AND
-/// every public view for the markers. Positive controls prove the
-/// marked traffic actually ran (per-lane submit/return pairing,
-/// completed records, joined config scalars, the EBADMSG
-/// marker-tag leg, the decrypt roundtrip) — a silent sensor or
-/// an untraversed path fails here, never passes vacuously.
+/// (skcipher setkey + encrypt + decrypt, AEAD alloc + setkey +
+/// encrypt + decrypt + marker-tag decrypt) while the sensor
+/// captures — then the test scans the RAW pre-decode transport
+/// (every walked ring record, including decode-refused bytes the
+/// views never render) AND every public view for the markers.
+/// Positive controls prove the marked traffic actually ran
+/// (per-lane submit/return pairing, completed records, joined
+/// config scalars, the EBADMSG marker-tag leg, the decrypt
+/// roundtrip) — a silent sensor or an untraversed path fails
+/// here, never passes vacuously. (T10: AAD and callback-private
+/// markers traverse the guest fixture paths — the guest cells
+/// scan those; this host lane pins key/IV/plaintext/tag.)
 #[test]
 #[ignore = "BPF lane: run with scripts/sudo-lane.sh (needs root + BTF + built BPF object)"]
 fn lifecycle_canary_no_secret_bytes_in_views() {
@@ -2380,10 +2383,26 @@ fn lifecycle_canary_no_secret_bytes_in_views() {
         "marked aead setkey pairs: {:?}",
         post.edge_hits
     );
-    assert_eq!(d(12), 0, "aead-alloc lane stays dark (unhooked)");
-    assert_eq!(d(13), 0, "aead-alloc lane stays dark (unhooked)");
+    // T10: AEAD alloc is hooked (two binds: roundtrip + marker-tag).
     assert!(
-        completed.len() >= 2,
+        d(12) >= 2 && d(12) == d(13),
+        "marked aead-alloc pairs: {:?}",
+        post.edge_hits
+    );
+    // T10: AEAD op lanes carry the roundtrip pair + the marker-tag
+    // pair (two encrypts, two decrypts, submit/return paired).
+    assert!(
+        d(18) >= 2 && d(18) == d(19),
+        "marked aead-encrypt pairs: {:?}",
+        post.edge_hits
+    );
+    assert!(
+        d(20) >= 2 && d(20) == d(21),
+        "marked aead-decrypt pairs: {:?}",
+        post.edge_hits
+    );
+    assert!(
+        completed.len() >= 5,
         "marked ops completed records: {}",
         completed.len()
     );
@@ -2393,9 +2412,13 @@ fn lifecycle_canary_no_secret_bytes_in_views() {
         fresh.iter().any(|g| !g.first_seen && g.configs >= 1),
         "marked sk setkey joined its alloc-observed gen: {fresh:?}"
     );
+    // T10: AEAD gens are alloc-observed (authsize last — the
+    // fixture keys then widths each transform).
     assert!(
-        fresh.iter().any(|g| g.first_seen && g.configs >= 1),
-        "marked aead setkey joined a first-seen gen: {fresh:?}"
+        fresh.iter().any(|g| !g.first_seen
+            && g.configs >= 2
+            && g.last_config_site == LTFM_SITE_SETAUTHSIZE),
+        "marked aead configs joined an alloc-observed gen: {fresh:?}"
     );
     assert!(
         fresh.iter().any(|g| g.last_config_len == 16),

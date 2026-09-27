@@ -5,7 +5,7 @@
 //! Driven by environment (set by `scripts/kcrypto-lab.py`):
 //! - `KCRYPTO_LEDGER_PATH`: captured JSONL ledger file (required)
 //! - `KCRYPTO_RUN_ID`: run the ledger must belong to (required)
-//! - `KCRYPTO_SCENARIO`: one of the seventeen fixture scenarios (required)
+//! - `KCRYPTO_SCENARIO`: one of the twenty fixture scenarios (required)
 //! - `KCRYPTO_SUFFIX`: fixture driver-name suffix, for `exact-driver`
 //!
 //! Truth comes from the fixture file; expectations come from the
@@ -27,6 +27,8 @@ const EBUSY: i32 = 16;
 const ENOSPC: i32 = 28;
 /// Native EINVAL: failing provider init / rejected key length.
 const EINVAL: i32 = 22;
+/// Native EBADMSG: AEAD tag verification failure.
+const EBADMSG: i32 = 74;
 /// Typed-sync restriction: CRYPTO_ALG_TYPE_SKCIPHER with
 /// CRYPTO_ALG_TYPE_MASK|CRYPTO_ALG_ASYNC — "skcipher and sync",
 /// nonzero provenance that still selects the sync driver.
@@ -416,6 +418,114 @@ fn guest_ledger_matches_scenario_contract() {
             assert_eq!(ledger.configs[2].len, 64, "rejected authsize kept");
             assert_eq!(ledger.requests.len(), 1, "one op between changes");
             assert_eq!(ledger.requests[0].terminal_errno, 0, "op succeeded");
+        }
+        // T10 (AEAD accepted sync schedule): good roundtrip, bad
+        // tag, short input, failed setauthsize (no epoch), tag-8
+        // roundtrip. Every op carries its len + AEAD scalars for
+        // byte accounting; every terminal equals its return.
+        "aead-meta" => {
+            expect_single_lifetime(&ledger);
+            assert_eq!(ledger.configs.len(), 4, "setkey + three setauthsize rows");
+            assert_eq!(ledger.configs[0].op, "setkey");
+            assert_eq!(ledger.configs[0].result_errno, 0, "setkey ok");
+            assert_eq!(ledger.configs[0].len, 16, "accepted key length");
+            assert_eq!(ledger.configs[1].op, "setauthsize");
+            assert_eq!(ledger.configs[1].result_errno, 0, "valid authsize ok");
+            assert_eq!(ledger.configs[1].len, 16, "accepted authsize");
+            assert_eq!(ledger.configs[2].op, "setauthsize");
+            assert_eq!(
+                ledger.configs[2].result_errno, -EINVAL,
+                "oversize authsize rejected"
+            );
+            assert_eq!(ledger.configs[2].len, 64, "rejected authsize kept");
+            assert_eq!(ledger.configs[3].op, "setauthsize");
+            assert_eq!(ledger.configs[3].result_errno, 0, "tag-8 reconfig ok");
+            assert_eq!(ledger.configs[3].len, 8, "reconfigured authsize");
+            // (label, len, assoc, authsize, errno).
+            let want = [
+                ("aead-encrypt", 1024u32, 32u32, 16u32, 0),
+                ("aead-decrypt", 1040, 32, 16, 0),
+                ("aead-decrypt", 1040, 32, 16, -EBADMSG),
+                ("aead-decrypt", 8, 32, 16, -EINVAL),
+                ("aead-encrypt", 1024, 32, 8, 0),
+                ("aead-decrypt", 1032, 32, 8, 0),
+            ];
+            assert_eq!(ledger.requests.len(), want.len(), "six AEAD ops");
+            for (req, (op, len, assoc, authsize, errno)) in
+                ledger.requests.iter().zip(want.iter())
+            {
+                assert_eq!(req.submit_op, *op, "submit op label");
+                assert_eq!(req.len, Some(*len), "submitted input length");
+                assert_eq!(req.assoc, Some(*assoc), "assoclen scalar");
+                assert_eq!(req.authsize, Some(*authsize), "authsize scalar");
+                assert_eq!(req.return_errno, *errno, "sync return");
+                assert_eq!(req.progress_errno, None, "no progress marker");
+                assert_eq!(req.terminal_errno, *errno, "terminal equals return");
+                assert_eq!(req.notifications, 1, "one terminal notification");
+            }
+        }
+        // T10 (AEAD accepted async schedule): encrypt then decrypt,
+        // each queued once and completed via the shared fixture
+        // callback — the simple schedule only (no backlog legs).
+        "aead-async" => {
+            expect_single_lifetime(&ledger);
+            assert_eq!(ledger.configs.len(), 2, "setkey + setauthsize rows");
+            assert_eq!(ledger.configs[0].op, "setkey");
+            assert_eq!(ledger.configs[0].result_errno, 0, "setkey ok");
+            assert_eq!(ledger.configs[1].op, "setauthsize");
+            assert_eq!(ledger.configs[1].result_errno, 0, "valid authsize ok");
+            assert_eq!(ledger.configs[1].len, 16, "accepted authsize");
+            let want = [
+                ("aead-encrypt", 1024u32, 32u32, 16u32),
+                ("aead-decrypt", 1040, 32, 16),
+            ];
+            assert_eq!(ledger.requests.len(), want.len(), "two AEAD ops");
+            for (req, (op, len, assoc, authsize)) in ledger.requests.iter().zip(want.iter()) {
+                assert_eq!(req.submit_op, *op, "submit op label");
+                assert_eq!(req.len, Some(*len), "submitted input length");
+                assert_eq!(req.assoc, Some(*assoc), "assoclen scalar");
+                assert_eq!(req.authsize, Some(*authsize), "authsize scalar");
+                assert_eq!(req.return_errno, -EINPROGRESS, "async return");
+                assert_eq!(req.progress_errno, None, "no progress marker");
+                assert_eq!(req.terminal_errno, 0, "terminal success");
+                assert_eq!(req.notifications, 1, "one terminal notification");
+            }
+        }
+        // T10 (AEAD live leg): the decrypt-1040 shape against real
+        // gcm(aes) (sync instantiation — the alloc row records the
+        // mask + the selected driver as truth).
+        "aead-live" => {
+            expect_single_lifetime(&ledger);
+            assert_eq!(
+                ledger.allocs[0].req_name, "gcm(aes)",
+                "live leg requests gcm(aes)"
+            );
+            assert!(
+                !ledger.allocs[0].drv_name.is_empty(),
+                "selected driver recorded"
+            );
+            assert_eq!(ledger.configs.len(), 2, "setkey + setauthsize rows");
+            assert_eq!(ledger.configs[0].op, "setkey");
+            assert_eq!(ledger.configs[0].result_errno, 0, "setkey ok");
+            assert_eq!(ledger.configs[0].len, 16, "accepted key length");
+            assert_eq!(ledger.configs[1].op, "setauthsize");
+            assert_eq!(ledger.configs[1].result_errno, 0, "valid authsize ok");
+            assert_eq!(ledger.configs[1].len, 16, "accepted authsize");
+            let want = [
+                ("aead-encrypt", 1024u32, 32u32, 16u32),
+                ("aead-decrypt", 1040, 32, 16),
+            ];
+            assert_eq!(ledger.requests.len(), want.len(), "two AEAD ops");
+            for (req, (op, len, assoc, authsize)) in ledger.requests.iter().zip(want.iter()) {
+                assert_eq!(req.submit_op, *op, "submit op label");
+                assert_eq!(req.len, Some(*len), "submitted input length");
+                assert_eq!(req.assoc, Some(*assoc), "assoclen scalar");
+                assert_eq!(req.authsize, Some(*authsize), "authsize scalar");
+                assert_eq!(req.return_errno, 0, "sync return");
+                assert_eq!(req.progress_errno, None, "no progress marker");
+                assert_eq!(req.terminal_errno, 0, "sync success");
+                assert_eq!(req.notifications, 1, "one terminal notification");
+            }
         }
         other => panic!("unknown KCRYPTO_SCENARIO: {other}"),
     }

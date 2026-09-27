@@ -31,6 +31,16 @@ pub struct LedgerRequest {
     pub terminal_errno: i32,
     /// Progress + terminal rows observed for this sequence.
     pub notifications: u32,
+    /// Submitted input length (`len` on the submit row; `None`
+    /// when the row predates it — unknown, never zero).
+    pub len: Option<u32>,
+    /// AEAD associated-data length (`assoc` on AEAD submit rows;
+    /// T10 byte accounting — `None` on sk rows, unknown when the
+    /// row predates it, never zero).
+    pub assoc: Option<u32>,
+    /// AEAD tag width (`authsize` on AEAD submit rows; `None` on
+    /// sk rows, unknown when the row predates it, never zero).
+    pub authsize: Option<u32>,
 }
 
 /// One transform lifetime: allocation sequence, requested and
@@ -136,6 +146,12 @@ struct Build {
     submitted: bool,
     /// Operation label from the submit row.
     submit_op: Option<String>,
+    /// Submitted input length (`len` on the submit row, if present).
+    submit_len: Option<u32>,
+    /// AEAD associated-data length (`assoc`, if present).
+    submit_assoc: Option<u32>,
+    /// AEAD tag width (`authsize`, if present).
+    submit_authsize: Option<u32>,
     /// Submit-return errno once the return row arrives.
     return_errno: Option<i32>,
     /// Progress errno once the progress row arrives, if ever.
@@ -417,6 +433,9 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                             seq,
                             submitted: false,
                             submit_op: None,
+                            submit_len: None,
+                            submit_assoc: None,
+                            submit_authsize: None,
                             return_errno: None,
                             progress_errno: None,
                             terminal_errno: None,
@@ -428,6 +447,9 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 if phase == "submit" {
                     let op = nonempty_str(&row, lineno, "submit", "op")?;
                     reqs[idx].submit_op = Some(op.to_owned());
+                    reqs[idx].submit_len = row_opt_u32(&row, lineno, "submit", "len")?;
+                    reqs[idx].submit_assoc = row_opt_u32(&row, lineno, "submit", "assoc")?;
+                    reqs[idx].submit_authsize = row_opt_u32(&row, lineno, "submit", "authsize")?;
                     reqs[idx].submitted = true;
                 } else if !reqs[idx].submitted {
                     return Err(LedgerError::PhaseInconsistency(format!(
@@ -508,6 +530,9 @@ pub fn parse_ledger(expected_run: &str, text: &str) -> Result<ParsedLedger, Ledg
                 progress_errno: r.progress_errno,
                 terminal_errno: errno,
                 notifications: r.notifications,
+                len: r.submit_len,
+                assoc: r.submit_assoc,
+                authsize: r.submit_authsize,
             }),
             (None, _, _) => {
                 return Err(LedgerError::PhaseInconsistency(format!(

@@ -228,6 +228,41 @@ fn payload_contract_producer_emits_pinned_shapes() {
         );
         assert_eq!(obs.backend_payload[K::STATUS], status);
     }
+    // Lifecycle AEAD rows (T10): an AEAD-meta record emits EXACTLY
+    // the same pinned set — the v2 scalars ride the reducer as
+    // opaque facts, and the report boundary (P6) versions any
+    // public emission. No AEAD key leaks early.
+    let aead_record = kryprobe_core::kcrypto::RequestRecord {
+        id: 2,
+        tfm_id: None,
+        terminal: kryprobe_core::kcrypto::Terminal::Sync(0),
+        duration_ns: Some(60u64),
+        meta: kryprobe_core::kcrypto::RequestMeta {
+            family: kryprobe_core::kcrypto::LifecycleFamily::Aead,
+            direction: kryprobe_core::kcrypto::OpDirection::Decrypt,
+            cryptlen: Some(1040),
+            req_flags: Some(0),
+            epoch: Some(2),
+            aead: Some(kryprobe_core::kcrypto::AeadMeta {
+                assoclen: Some(32),
+                authsize: Some(16),
+            }),
+        },
+    };
+    let (header, payload) =
+        kryprobe_privilege::kcrypto_lifecycle::backend::lifecycle_event(&aead_record);
+    let obs = decode_lifecycle(
+        &lifecycle,
+        kryprobe_core::backend::RawEvent {
+            header,
+            payload: &payload,
+        },
+    );
+    assert_eq!(
+        keys(&obs.backend_payload),
+        sorted(K::LIFECYCLE_KEYS),
+        "AEAD lifecycle rows emit exactly the pinned set (no early keys)"
+    );
 }
 
 #[test]
