@@ -438,8 +438,10 @@ pub struct LifecycleDecoder {
     /// issued ids (which count UP from 1 below the floor): the
     /// partition holds unconditionally, not after 2^64 admissions.
     /// Parks below the floor rather than wrapping into the issued
-    /// range or silently reissuing (P4r4: parked refusals recycle
-    /// the oldest slot loud).
+    /// range or silently reissuing (P4r4/P4r5: parked refusals
+    /// recycle the oldest refusal-range slot loud — never a
+    /// still-issued slot — or gap the refused key now when none
+    /// is recyclable).
     next_refused: u64,
     /// Outstanding BPF invocation → submit facts. The invocation is
     /// the op-join identity: a return joins ONLY the id outstanding
@@ -596,8 +598,8 @@ impl LifecycleDecoder {
     /// (P4R2-N1). Mints a contention-only token (never an issued
     /// id — nothing is emitted for the refused submit) while the
     /// refusal range lasts; past the floor the allocator parks and
-    /// the refusal recycles loud instead (P4r4 — never below the
-    /// floor, never silent reuse).
+    /// the refusal recycles loud instead (P4r4/P4r5 — never below
+    /// the floor, never silent reuse, never a still-issued slot).
     fn retain_refused(&mut self, req_key: u64, out: &mut Vec<Edge>) {
         if self.next_refused >= REFUSED_FLOOR {
             let token = self.next_refused;
@@ -610,31 +612,62 @@ impl LifecycleDecoder {
     }
 
     /// Retain refusal contention after the refusal-token range is
-    /// exhausted (contract §8, P4r4): NEVER mint below the floor
-    /// (issued-id range) and NEVER silently reissue a resident
-    /// token. Instead recycle the oldest resident slot LOUD —
-    /// evict it with a key gap exactly like capacity overflow,
-    /// then reuse its (now unresident, still refusal-range) token
-    /// for the new entry. Net table size unchanged, so the map,
-    /// the key counts, and the FIFO all stay bounded. With no
-    /// resident slot to recycle (empty table at exhaustion), gap
-    /// the refused key now (loud) and retain nothing — the refusal
-    /// itself stays counted by the caller.
+    /// exhausted (contract §8, P4r4/P4r5): NEVER mint below the
+    /// floor (issued-id range) and NEVER silently reissue a
+    /// resident token. The contention table is SHARED — adapter
+    /// cover-refusals retain under the submit's issued id (below
+    /// the floor, possibly still outstanding) while decoder
+    /// refusals retain under refusal-range tokens — so recycle
+    /// the oldest REFUSAL-RANGE slot only, LOUD: evict it with a
+    /// key gap exactly like capacity overflow, then reuse its
+    /// (now unresident, still refusal-range) token for the new
+    /// entry. Still-issued slots are skipped, never recycled:
+    /// reusing one would alias the new refusal to another
+    /// request's id, whose later retirement (`clear_uncovered`
+    /// on sync-terminal return or same-invocation replacement)
+    /// would silently erase this refusal's contention and misjoin
+    /// a callback (P4R4-N1). Net table size unchanged, so the
+    /// map, the key counts, and the FIFO all stay bounded. With
+    /// no refusal-range slot to recycle (empty table, or only
+    /// still-issued slots, at exhaustion), gap the refused key
+    /// now (loud) and retain nothing — the refusal itself stays
+    /// counted by the caller.
     fn retain_refused_exhausted(&mut self, req_key: u64, out: &mut Vec<Edge>) {
+        let mut skipped: Vec<u64> = Vec::new();
+        let mut slot: Option<(u64, u64)> = None;
         while let Some(old) = self.uncovered_order.pop_front() {
-            if let Some(old_key) = self.uncovered.remove(&old) {
-                Self::decrement_key(&mut self.uncovered_keys, old_key);
-                out.extend(self.adapter.gap_key(old_key));
-                self.uncovered.insert(old, req_key);
-                self.uncovered_keys
-                    .entry(req_key)
-                    .and_modify(|n| *n += 1)
-                    .or_insert(1);
-                self.uncovered_order.push_back(old);
-                return;
+            if old < REFUSED_FLOOR {
+                // Still-issued slot — an adapter-refused submit's
+                // own id, possibly still outstanding: never
+                // recycle (P4R4-N1). Hold it aside and scan on.
+                skipped.push(old);
+            } else if let Some(old_key) = self.uncovered.remove(&old) {
+                slot = Some((old, old_key));
+                break;
             }
         }
-        out.extend(self.adapter.gap_key(req_key));
+        // Skipped issued slots keep their FIFO places (oldest
+        // first; anything no longer resident drops).
+        for tok in skipped.into_iter().rev() {
+            if self.uncovered.contains_key(&tok) {
+                self.uncovered_order.push_front(tok);
+            }
+        }
+        let Some((old, old_key)) = slot else {
+            // No refusal-range slot to recycle: gap the refused
+            // key now (loud) and retain nothing — the refusal
+            // itself stays counted by the caller.
+            out.extend(self.adapter.gap_key(req_key));
+            return;
+        };
+        Self::decrement_key(&mut self.uncovered_keys, old_key);
+        out.extend(self.adapter.gap_key(old_key));
+        self.uncovered.insert(old, req_key);
+        self.uncovered_keys
+            .entry(req_key)
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+        self.uncovered_order.push_back(old);
     }
 
     /// Retain refusal contention for a submit the adapter could
@@ -965,5 +998,268 @@ mod tests {
         // each recycled eviction reads orphan (counted, never silent).
         assert_eq!(d.adapter_stats().callback_orphans, 8);
         assert_eq!(d.adapter_stats().ambiguous_keys, 0);
+    }
+
+    /// Assert every contention table stays bounded and mutually
+    /// consistent (map, key counts, and FIFO within capacity;
+    /// FIFO tokens exactly the map keys, unique; key counts
+    /// exactly the map multiplicities).
+    fn assert_contention_bounded(d: &LifecycleDecoder) {
+        assert!(d.uncovered.len() <= d.capacity);
+        assert!(d.uncovered_keys.len() <= d.capacity);
+        assert!(d.uncovered_order.len() <= d.capacity);
+        assert_eq!(d.uncovered.len(), d.uncovered_order.len());
+        let mut counts = HashMap::new();
+        for key in d.uncovered.values() {
+            *counts.entry(*key).or_insert(0_u64) += 1;
+        }
+        assert_eq!(counts, d.uncovered_keys);
+        let tokens: std::collections::HashSet<_> = d.uncovered_order.iter().copied().collect();
+        assert_eq!(tokens.len(), d.uncovered_order.len());
+        assert_eq!(tokens, d.uncovered.keys().copied().collect());
+    }
+
+    /// Mixed-table exhaustion setup (P4R4-N1): capacity two; two
+    /// covered queued submits fill adapter cover; two further
+    /// admitted submits lose cover and retain contention under
+    /// their still-issued ids; then two decoder refusals (X, then
+    /// B reusing A's key) join with the refusal allocator seeded
+    /// at `refused_seed`. Returns the decoder, a reducer, and the
+    /// records emitted so far.
+    fn mixed_issued_refusal_table(
+        refused_seed: u64,
+    ) -> (
+        LifecycleDecoder,
+        LifecycleReducer,
+        Vec<kryprobe_core::kcrypto::RequestRecord>,
+    ) {
+        const A_KEY: u64 = 0x71;
+        let mut d = LifecycleDecoder::new(2);
+        let mut reducer = LifecycleReducer::new(8);
+        let mut records = Vec::new();
+        for row in [
+            raw(LEDGE_SUBMIT, 0x71, 0x710, 1000, 0), // A: id 1, covered
+            raw(LEDGE_RETURN, 0x71, 0x710, 1010, -libc::EINPROGRESS),
+            raw(LEDGE_SUBMIT, 0x72, 0x720, 1020, 0), // Q: id 2, covered
+            raw(LEDGE_RETURN, 0x72, 0x720, 1030, -libc::EINPROGRESS),
+            raw(LEDGE_SUBMIT, 0x73, 0x730, 1040, 0), // D: id 3, cover refused
+            raw(LEDGE_SUBMIT, 0x74, 0x740, 1050, 0), // E: id 4, cover refused
+        ] {
+            for e in d.join(row) {
+                records.extend(reducer.apply(e));
+            }
+            assert_contention_bounded(&d);
+        }
+        assert_eq!(d.uncovered.get(&3), Some(&0x73));
+        assert_eq!(d.uncovered.get(&4), Some(&0x74));
+        d.next_refused = refused_seed; // skip the astronomical refusal prefix only
+        for row in [
+            raw(LEDGE_SUBMIT, 0x75, 0x750, 1090, 0), // X: last fresh token
+            raw(LEDGE_SUBMIT, A_KEY, 0x711, 1100, 0), // B: A's key, exhausted
+        ] {
+            for e in d.join(row) {
+                records.extend(reducer.apply(e));
+            }
+            assert_contention_bounded(&d);
+        }
+        assert_eq!(d.stats().admitted, 4);
+        assert_eq!(d.stats().submit_refused, 2);
+        assert!(
+            d.uncovered_keys.contains_key(&A_KEY),
+            "B must keep A's key contended"
+        );
+        (d, reducer, records)
+    }
+
+    #[test]
+    fn decoder_boundary_exhausted_recycle_skips_issued_sync_return() {
+        // P4R4-N1 (sync-return retirement): the exhausted recycle
+        // must reuse a refusal-range slot ONLY — never E's
+        // still-issued id — so E's sync return retires E alone
+        // and B's contention survives to gap A (never misjoin).
+        let (mut d, mut reducer, mut records) = mixed_issued_refusal_table(PARTITION);
+        // B recycled X's refusal-range token; E's issued slot is untouched.
+        assert_eq!(d.uncovered.get(&PARTITION), Some(&0x71));
+        assert_eq!(d.uncovered.get(&4), Some(&0x74));
+        assert_eq!(d.next_refused, PARTITION - 1);
+        for e in d.join(raw(LEDGE_RETURN, 0x74, 0x740, 1130, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == 4 && r.terminal == Terminal::Sync(0) && r.duration_ns == Some(80)),
+            "E keeps its own sync terminal"
+        );
+        assert!(
+            d.uncovered_keys.contains_key(&0x71),
+            "E's retirement must clear E only, never decoder-refused B"
+        );
+        for e in d.join(raw(LEDGE_CALLBACK, 0x71, 0, 1200, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert_contention_bounded(&d);
+        assert_eq!(d.adapter_stats().ambiguous_keys, 1);
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Callback(0)),
+            "recycling a still-issued token must not let its retirement erase B and give B's terminal to A"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Unknown && r.duration_ns.is_none()),
+            "A gaps on its contended key"
+        );
+    }
+
+    #[test]
+    fn decoder_boundary_exhausted_recycle_skips_issued_duplicate_invoc() {
+        // P4R4-N1 (same-invocation retirement): the duplicate-submit
+        // path retires through the same `clear_uncovered` — it must
+        // likewise clear E alone and leave B's contention intact.
+        let (mut d, mut reducer, mut records) = mixed_issued_refusal_table(PARTITION);
+        assert_eq!(d.uncovered.get(&PARTITION), Some(&0x71));
+        assert_eq!(d.uncovered.get(&4), Some(&0x74));
+        // E's invocation resubmits: the old id gaps ambiguous and
+        // retires; the resubmit admits fresh (E left room).
+        for e in d.join(raw(LEDGE_SUBMIT, 0x79, 0x740, 1130, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert_eq!(d.stats().gaps_synthesized, 1);
+        assert_eq!(d.stats().admitted, 5);
+        assert!(
+            d.uncovered_keys.contains_key(&0x71),
+            "duplicate-invocation retirement must clear E only, never B"
+        );
+        for e in d.join(raw(LEDGE_CALLBACK, 0x71, 0, 1200, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert_contention_bounded(&d);
+        assert_eq!(d.adapter_stats().ambiguous_keys, 1);
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Callback(0)),
+            "duplicate-invocation retirement must not erase B and misjoin A"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Unknown && r.duration_ns.is_none()),
+            "A gaps on its contended key"
+        );
+    }
+
+    #[test]
+    fn decoder_boundary_post_exhaustion_admits_gap_now_loud() {
+        // P4R4-N1 (post-exhaustion admission): adapter-refused D/E
+        // admitted AFTER refusal exhaustion leave a table with NO
+        // refusal-range slot — the next decoder refusal must gap
+        // the refused key NOW (loud) and retain nothing, never
+        // borrow a still-issued id. Every earlier eviction is a
+        // counted orphan (no live cover under those keys); the
+        // gap-now hits live cover (ambiguous).
+        let mut d = LifecycleDecoder::new(2);
+        d.next_refused = PARTITION + 2; // skip the astronomical prefix only
+        let mut reducer = LifecycleReducer::new(8);
+        let mut records = Vec::new();
+        for row in [
+            raw(LEDGE_SUBMIT, 0x61, 0x610, 2000, 0), // A: id 1, covered
+            raw(LEDGE_SUBMIT, 0x62, 0x620, 2010, 0), // Q: id 2, covered
+            raw(LEDGE_SUBMIT, 0x6A, 0x6A0, 2020, 0), // F0: token PARTITION+2
+            raw(LEDGE_SUBMIT, 0x6B, 0x6B0, 2021, 0), // F1: token PARTITION+1
+            raw(LEDGE_SUBMIT, 0x6C, 0x6C0, 2022, 0), // F2: token PARTITION
+            raw(LEDGE_RETURN, 0x61, 0x610, 2030, -libc::EINPROGRESS),
+            raw(LEDGE_RETURN, 0x62, 0x620, 2031, -libc::EINPROGRESS),
+            raw(LEDGE_SUBMIT, 0x63, 0x630, 2040, 0), // D: id 3, cover refused
+            raw(LEDGE_SUBMIT, 0x64, 0x640, 2050, 0), // E: id 4, cover refused
+        ] {
+            for e in d.join(row) {
+                records.extend(reducer.apply(e));
+            }
+            assert_contention_bounded(&d);
+        }
+        assert_eq!(d.next_refused, PARTITION - 1);
+        assert_eq!(d.uncovered.get(&3), Some(&0x63));
+        assert_eq!(d.uncovered.get(&4), Some(&0x64));
+        assert!(d.uncovered.keys().all(|t| *t < PARTITION));
+        // B reuses A's key at exhaustion: no refusal-range slot —
+        // gap A's live cover now (loud), retain nothing.
+        for e in d.join(raw(LEDGE_SUBMIT, 0x61, 0x611, 2100, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert_eq!(d.stats().submit_refused, 4);
+        assert_eq!(d.adapter_stats().callback_orphans, 3);
+        assert_eq!(d.adapter_stats().ambiguous_keys, 1);
+        assert!(!d.uncovered_keys.contains_key(&0x61));
+        assert_eq!(d.uncovered.get(&3), Some(&0x63));
+        assert_eq!(d.uncovered.get(&4), Some(&0x64));
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Unknown && r.duration_ns.is_none()),
+            "the gap-now refusal gaps A loud at the refusing submit"
+        );
+        // D's sync return retires D alone; E's issued slot is intact.
+        for e in d.join(raw(LEDGE_RETURN, 0x63, 0x630, 2130, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == 3 && r.terminal == Terminal::Sync(0) && r.duration_ns == Some(90)),
+            "D keeps its own sync terminal"
+        );
+        assert_eq!(d.uncovered.get(&4), Some(&0x64));
+        // The late callback rejoins A's tombstone for reducer
+        // diagnosis: counted, never a second terminal for A.
+        for e in d.join(raw(LEDGE_CALLBACK, 0x61, 0, 2150, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert_contention_bounded(&d);
+        assert_eq!(
+            records.iter().filter(|r| r.id == 1).count(),
+            1,
+            "A completes exactly once, as Unknown"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Callback(0)),
+            "post-exhaustion admits must not reintroduce issued tokens as reusable refusal identities"
+        );
+    }
+
+    #[test]
+    fn decoder_boundary_mixed_fresh_token_control() {
+        // Positive control for the mixed-table shape: with one
+        // fresh refusal token left, B needs no recycle — E's
+        // retirement is trivially safe and A still gaps (the
+        // setup itself never misjoins).
+        let (mut d, mut reducer, mut records) = mixed_issued_refusal_table(PARTITION + 1);
+        assert!(d.uncovered.keys().all(|t| *t >= PARTITION));
+        assert_eq!(d.uncovered.get(&PARTITION), Some(&0x71));
+        assert_eq!(d.next_refused, PARTITION - 1);
+        for e in d.join(raw(LEDGE_RETURN, 0x74, 0x740, 1130, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert!(d.uncovered_keys.contains_key(&0x71));
+        for e in d.join(raw(LEDGE_CALLBACK, 0x71, 0, 1200, 0)) {
+            records.extend(reducer.apply(e));
+        }
+        assert_contention_bounded(&d);
+        assert_eq!(d.adapter_stats().ambiguous_keys, 1);
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Callback(0))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == 1 && r.terminal == Terminal::Unknown && r.duration_ns.is_none())
+        );
     }
 }

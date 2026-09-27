@@ -139,11 +139,15 @@
 //!   LOUD (its key gaps at the refusing submit — never silent,
 //!   never a misjoin). Decoder-admission refusals (full table,
 //!   exhausted id space) retain contention identically under a
-//!   contention-only token (P4r3; P4r4: top-bit-partitioned above
-//!   the issued-id range, never an issued id — and at refusal-range
-//!   exhaustion the oldest slot recycles LOUD, never silent reuse)
-//!   — EVERY refusal path contends, so no callback can join the
-//!   wrong invocation.
+//!   contention-only token (P4r3; P4r4/P4r5: fresh decoder-refusal
+//!   tokens are top-bit-partitioned above the issued-id range —
+//!   while the table itself is SHARED (adapter cover-refusals
+//!   retain under the submit's own issued id, retired with it),
+//!   the exhausted recycle reuses a refusal-range slot ONLY,
+//!   never a still-issued one, and gaps the refused key now when
+//!   none is recyclable — LOUD in every case, never silent reuse)
+//!   — EVERY refusal path contends LOUD, so no callback can join
+//!   the wrong invocation.
 //! - Tombstones FIFO-evict past capacity (counted
 //!   `tombstone_evictions`); a late callback past eviction is a
 //!   counted orphan. At most one terminal record per invocation,
