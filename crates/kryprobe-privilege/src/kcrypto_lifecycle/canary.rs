@@ -39,8 +39,14 @@ use kryprobe_core::kcrypto::{ReducerStats, RequestRecord, Terminal};
 pub struct FixtureOp {
     /// Sequence number (unique per run among submits).
     pub seq: u64,
-    /// `encrypt` or `decrypt`.
+    /// `encrypt`/`decrypt` (sk flavors) or `aead-encrypt`/`aead-decrypt`.
     pub op: String,
+    /// AEAD associated-data length (T10: `Some` iff the label is an
+    /// AEAD label — the parser enforces `Some` ⟺ AEAD, mirroring
+    /// the contract-v2 `AeadMeta` rule).
+    pub assoc: Option<u32>,
+    /// AEAD tag width (`Some` iff the label is an AEAD label).
+    pub authsize: Option<u32>,
 }
 
 /// One fixture allocation (T07-R2-04: retained transform truth —
@@ -131,12 +137,14 @@ pub struct FixtureTruth {
 }
 
 impl FixtureTruth {
-    /// Fixture-derived per-hook expectations
+    /// Fixture-derived per-hook expectations for the SK op lanes
     /// `[enc_sub, enc_ret, dec_sub, dec_ret]` : submits counted from
     /// submit rows by op, returns counted from return rows joined to
     /// their submit's op. The verdict compares sensor deltas against
     /// THIS (ledger data), never scenario-name constants — a fixture
     /// running two encrypts must fail against a 1+1 sensor view.
+    /// AEAD labels are SKIPPED here (they hook lanes 18-21 —
+    /// [`FixtureTruth::expected_aead_hooks`]).
     #[must_use]
     pub fn expected_hooks(&self) -> [u64; 4] {
         let mut hooks = [0u64; 4];
@@ -145,13 +153,48 @@ impl FixtureTruth {
             // label set (suffixed labels are encrypt flavors —
             // `encrypt-cryptd` hooks the encrypt site like every
             // other flavor; only its COMPLETION lane differs).
-            let (submit_lane, return_lane) = match op.op.as_str() {
+            let lanes: Option<(usize, usize)> = match op.op.as_str() {
                 "encrypt" | "encrypt-exact" | "encrypt-delayed" | "encrypt-burst"
                 | "encrypt-early" | "encrypt-cryptd" | "encrypt-reuse" | "encrypt-reuse-cb" => {
-                    (0, 1)
+                    Some((0, 1))
                 }
-                "decrypt" => (2, 3),
+                "decrypt" => Some((2, 3)),
+                "aead-encrypt" | "aead-decrypt" => None,
                 _ => unreachable!("parser admits only the closed label set"),
+            };
+            let Some((submit_lane, return_lane)) = lanes else {
+                continue;
+            };
+            hooks[submit_lane] = hooks[submit_lane].saturating_add(1);
+            let returns = self
+                .returns
+                .iter()
+                .filter(|(seq, _)| *seq == op.seq)
+                .count() as u64;
+            hooks[return_lane] = hooks[return_lane].saturating_add(returns);
+        }
+        hooks
+    }
+
+    /// Fixture-derived per-hook expectations for the AEAD op lanes
+    /// `[aead_enc_sub, aead_enc_ret, aead_dec_sub, aead_dec_ret]`
+    /// (T10: sensor lanes 18-21): `aead-encrypt`/`aead-decrypt`
+    /// submits counted from submit rows, returns joined from
+    /// return rows — sk labels skipped (the mirror negative
+    /// control of [`FixtureTruth::expected_hooks`]).
+    #[must_use]
+    pub fn expected_aead_hooks(&self) -> [u64; 4] {
+        let mut hooks = [0u64; 4];
+        for op in &self.ops {
+            let lanes: Option<(usize, usize)> = match op.op.as_str() {
+                "aead-encrypt" => Some((0, 1)),
+                "aead-decrypt" => Some((2, 3)),
+                "encrypt" | "decrypt" | "encrypt-exact" | "encrypt-delayed" | "encrypt-burst"
+                | "encrypt-early" | "encrypt-cryptd" | "encrypt-reuse" | "encrypt-reuse-cb" => None,
+                _ => unreachable!("parser admits only the closed label set"),
+            };
+            let Some((submit_lane, return_lane)) = lanes else {
+                continue;
             };
             hooks[submit_lane] = hooks[submit_lane].saturating_add(1);
             let returns = self
@@ -449,18 +492,23 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 // `encrypt-exact`, never plain `encrypt`;
                 // `cryptd-async` runs `encrypt-cryptd`; an unknown
                 // label is still drift, never a default family).
-                if !matches!(
-                    op,
-                    "encrypt"
-                        | "decrypt"
-                        | "encrypt-exact"
-                        | "encrypt-delayed"
-                        | "encrypt-burst"
-                        | "encrypt-early"
-                        | "encrypt-cryptd"
-                        | "encrypt-reuse"
-                        | "encrypt-reuse-cb"
-                ) {
+                // T10 extends the set with the AEAD labels (hooked
+                // at the AEAD sites, lanes 18-21).
+                let is_aead = matches!(op, "aead-encrypt" | "aead-decrypt");
+                if !is_aead
+                    && !matches!(
+                        op,
+                        "encrypt"
+                            | "decrypt"
+                            | "encrypt-exact"
+                            | "encrypt-delayed"
+                            | "encrypt-burst"
+                            | "encrypt-early"
+                            | "encrypt-cryptd"
+                            | "encrypt-reuse"
+                            | "encrypt-reuse-cb"
+                    )
+                {
                     return Err(TranscriptError {
                         line: line_no,
                         reason: "unknown op name",
@@ -472,9 +520,29 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                         reason: "duplicate submit sequence",
                     });
                 }
+                // T10 AEAD scalars: `Some` ⟺ AEAD label (mirrors
+                // the contract-v2 `AeadMeta` rule — an AEAD submit
+                // without its widths, or an sk submit carrying
+                // them, is drift, never a default).
+                let (assoc, authsize) = if is_aead {
+                    let assoc = get_u32(obj, "assoc", line_no, "aead submit lacks assoc")?;
+                    let authsize =
+                        get_u32(obj, "authsize", line_no, "aead submit lacks authsize")?;
+                    (Some(assoc), Some(authsize))
+                } else {
+                    if obj.contains_key("assoc") || obj.contains_key("authsize") {
+                        return Err(TranscriptError {
+                            line: line_no,
+                            reason: "sk submit carries AEAD fields",
+                        });
+                    }
+                    (None, None)
+                };
                 ops.push(FixtureOp {
                     seq,
                     op: op.to_owned(),
+                    assoc,
+                    authsize,
                 });
                 submit_lines.push((seq, idx));
             }
@@ -906,41 +974,44 @@ fn verdict_lifetime_sk(
     Ok(())
 }
 
-/// One config-admitted (AEAD) lifetime vs its generation
-/// (T07-R2-04): the narrowed contract — allocation unhooked, so
-/// the generation is first-seen with EMPTY provenance (honest
-/// unknown, never a fabricated name), while retirement, epochs,
-/// and config scalars still compare exactly.
+/// One alloc-observed (AEAD) lifetime vs its generation (T10):
+/// the widened contract — allocation hooked (`ALLOC_AEAD`
+/// admission), so provenance, retirement, and config scalars
+/// compare exactly like the sk arm (with the AEAD setkey site);
+/// ambiguity stays pinned clear (no AEAD scenario retires
+/// ambiguously).
 fn verdict_lifetime_aead(
     truth: &FixtureTruth,
     alloc: &FixtureAlloc,
     generation: &GenerationInfo,
 ) -> Result<(), String> {
     let tag = format!("aead alloc seq {}", alloc.seq);
-    if !generation.first_seen {
+    if generation.req_name != alloc.req {
         return Err(format!(
-            "{tag}: AEAD lifetime must be first-seen (alloc unhooked)"
+            "{tag}: req {:?} != fixture {:?}",
+            generation.req_name, alloc.req
         ));
     }
-    if !generation.req_name.is_empty() || !generation.drv_name.is_empty() {
+    if generation.drv_name != alloc.drv {
         return Err(format!(
-            "{tag}: AEAD provenance must be empty (got {:?}/{:?})",
-            generation.req_name, generation.drv_name
+            "{tag}: drv {:?} != fixture {:?}",
+            generation.drv_name, alloc.drv
         ));
     }
-    // T07-R3-07: unknown creation provenance pins the WHOLE
-    // creation record — a fabricated nonzero type/mask, or a
-    // truncation claim on names that were never read, fails the
-    // verdict exactly like a fabricated name.
-    if generation.alg_type != 0 || generation.alg_mask != 0 {
+    if generation.alg_type != alloc.alg_type || generation.alg_mask != alloc.alg_mask {
         return Err(format!(
-            "{tag}: AEAD type/mask {}/{} must stay unknown (0/0 — alloc unhooked)",
-            generation.alg_type, generation.alg_mask
+            "{tag}: type/mask {}/{} != fixture {}/{}",
+            generation.alg_type, generation.alg_mask, alloc.alg_type, alloc.alg_mask
         ));
     }
     if generation.name_truncated || generation.drv_truncated {
         return Err(format!(
-            "{tag}: AEAD truncation flags must be clear (no names were read)"
+            "{tag}: fixture names are short — truncation is drift"
+        ));
+    }
+    if generation.first_seen {
+        return Err(format!(
+            "{tag}: alloc-observed lifetime must not be first-seen"
         ));
     }
     let frees: Vec<&FixtureFree> = truth.frees.iter().filter(|f| f.seq == alloc.seq).collect();
@@ -1386,11 +1457,12 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     }
     // Ledger-derived ambiguity/admission (T07-R2-04): retained
     // fixture releases expect exactly that many ambiguous
-    // releases, and the AEAD scenario expects one first-seen
-    // admission per alloc — every other expectation is zero, so
-    // unexpected ambiguity still fails here, never hides. P4:
-    // `cryptd-async` grades no transform shape (see its arm's
-    // contract note), so both tfm pins exempt it.
+    // releases; unobserved boundaries pin zero everywhere (T10:
+    // AEAD allocation is hooked, so no config admission crosses
+    // an unobserved boundary — the T07 narrowed-contract
+    // expectation is gone). P4: `cryptd-async` grades no
+    // transform shape (see its arm's contract note), so both tfm
+    // pins exempt it.
     if scenario != "cryptd-async" {
         let ambiguous_d = sub(
             view.tfm.ambiguous_releases,
@@ -1408,14 +1480,9 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             view.baseline.tfm.unobserved_boundary,
             "tfm_unobserved_boundary",
         )?;
-        let want_unobserved = if scenario == "authsize" {
-            truth.allocs.len() as u64
-        } else {
-            0
-        };
-        if unobserved_d != want_unobserved {
+        if unobserved_d != 0 {
             return Err(format!(
-                "tfm unobserved_boundary delta {unobserved_d} != {want_unobserved} (AEAD config admissions)"
+                "tfm unobserved_boundary delta {unobserved_d} != 0 (every alloc is hooked)"
             ));
         }
     }
@@ -1467,13 +1534,23 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             | "cryptd-async"
             | "early-callback"
             | "reuse-in-callback"
+            | "aead-meta"
+            | "aead-async"
+            | "aead-live"
     ) {
         return Err(format!("unknown scenario {scenario}"));
     }
-    // Op lanes: ledger-derived — EXCEPT `authsize`, whose op is an
-    // AEAD encrypt (unhooked by design): the sensor must observe
-    // NOTHING there (negative control — a phantom AEAD op fails).
-    let expected_hits = if scenario == "authsize" {
+    // T10: AEAD scenarios hook the AEAD sites (lanes 12-15 + 18-21,
+    // never the sk sites) — `authsize` (whose T07 plain `encrypt`
+    // op IS the AEAD op) grades with them.
+    let is_aead = matches!(
+        scenario,
+        "authsize" | "aead-meta" | "aead-async" | "aead-live"
+    );
+    // Sk op lanes: ledger-derived — EXCEPT AEAD scenarios, whose
+    // ops hook the AEAD sites: the sensor must observe NOTHING on
+    // lanes 0-3 (negative control — sk-family cross-talk fails).
+    let expected_hits = if is_aead {
         [0, 0, 0, 0]
     } else {
         truth.expected_hooks()
@@ -1489,6 +1566,24 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
                 "edge hits {op_hits:?} != fixture-derived {expected_hits:?}"
             ));
         }
+    }
+    // AEAD op lanes (T10: 18-21): ledger-derived — AEAD scenarios
+    // pin their hooked submits/returns here (`authsize` predates
+    // AEAD labels, so its plain-label counts map onto these lanes;
+    // every other line pins zero, `cryptd-async` included — its
+    // inner child is sk, never AEAD).
+    let expected_aead = if scenario == "authsize" {
+        truth.expected_hooks()
+    } else if is_aead {
+        truth.expected_aead_hooks()
+    } else {
+        [0, 0, 0, 0]
+    };
+    let got_aead = [hits_d[18], hits_d[19], hits_d[20], hits_d[21]];
+    if got_aead != expected_aead {
+        return Err(format!(
+            "aead edge hits {got_aead:?} != fixture-derived {expected_aead:?}"
+        ));
     }
     // Callback lanes (P4): ledger-derived per op — an op whose
     // return queued (`-EINPROGRESS`/`-EBUSY`, kernel UAPI) fired
@@ -1534,12 +1629,20 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
     // Transform lanes (T07-R2-04): ledger-derived per-lane
     // expectations — alloc/destroy/config halves counted from
     // fixture rows (the scenario selects only the FAMILY shape:
-    // sk scenarios observe alloc halves, the AEAD scenario must
-    // not, failed probes observe the attempt but admit nothing).
-    let alloc_halves = if scenario == "authsize" {
+    // sk scenarios observe sk halves, AEAD scenarios the AEAD
+    // halves, failed probes observe the attempt but admit
+    // nothing).
+    let alloc_halves = if is_aead {
         0
     } else {
         truth.allocs.len() as u64
+    };
+    // T10: AEAD allocation is hooked — alloc-aead halves ride
+    // lanes 12/13 exactly (the T07 "unhooked" zero is gone).
+    let aead_halves = if is_aead {
+        truth.allocs.len() as u64
+    } else {
+        0
     };
     let setkey_rows = truth.configs.iter().filter(|c| c.op == "setkey").count() as u64;
     let authsize_rows = truth
@@ -1547,7 +1650,7 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         .iter()
         .filter(|c| c.op == "setauthsize")
         .count() as u64;
-    let (sk_setkey, aead_setkey) = if scenario == "authsize" {
+    let (sk_setkey, aead_setkey) = if is_aead {
         (0, setkey_rows)
     } else {
         (setkey_rows, 0)
@@ -1566,8 +1669,8 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         sk_setkey,                   // 9 setkey-sk ret
         authsize_rows,               // 10 setauthsize sub
         authsize_rows,               // 11 setauthsize ret
-        0,                           // 12 alloc-aead sub (unhooked)
-        0,                           // 13 alloc-aead ret (unhooked)
+        aead_halves,                 // 12 alloc-aead sub
+        aead_halves,                 // 13 alloc-aead ret
         aead_setkey,                 // 14 setkey-aead sub
         aead_setkey,                 // 15 setkey-aead ret
     ];
@@ -1587,14 +1690,11 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
         view.baseline.decode.admitted,
         "decode.admitted",
     )?;
-    // Decode admission: one per hooked op submit (`authsize` admits
-    // nothing — its op never reaches the decoder; `cryptd-async`
-    // admits 2× — the arm pins its own lockstep).
-    let expect_admitted = if scenario == "authsize" {
-        0
-    } else {
-        truth.ops.len() as u64
-    };
+    // Decode admission: one per hooked op submit (T10: every
+    // scenario's ops are hooked — `authsize` admits its AEAD op
+    // like any other; `cryptd-async` admits 2× — the arm pins
+    // its own lockstep).
+    let expect_admitted = truth.ops.len() as u64;
     if !cryptd && admitted_d != expect_admitted {
         return Err(format!(
             "admitted delta {admitted_d} != {expect_admitted} hooked ops",
@@ -1667,7 +1767,15 @@ pub fn verdict(scenario: &str, truth: &FixtureTruth, view: &SensorView<'_>) -> R
             verdict_tfm_sk(truth, view, false)?;
         }
         "authsize" => {
-            verdict_op_negative(scenario, truth, view)?;
+            verdict_op_sync(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_aead(truth, view)?;
+        }
+        "aead-meta" | "aead-live" => {
+            verdict_op_sync(scenario, truth, view, unfinished_d)?;
+            verdict_tfm_aead(truth, view)?;
+        }
+        "aead-async" => {
+            verdict_op_async_aead(scenario, truth, view, unfinished_d)?;
             verdict_tfm_aead(truth, view)?;
         }
         "reuse-burst" | "refheld-release" | "typed-sync" => {
@@ -1707,7 +1815,21 @@ fn verdict_op_sync(
     let want_ops: &[&str] = match scenario {
         "sync-once" => &["encrypt", "decrypt"],
         "rekey" => &["encrypt"],
-        _ => unreachable!("sync shape covers sync-once + rekey"),
+        // T10: `authsize` predates AEAD labels (its plain
+        // `encrypt` IS the AEAD op); `aead-meta` runs the full
+        // accepted sync schedule (good roundtrip, bad tag, short
+        // input, tag-8 roundtrip); `aead-live` the live roundtrip.
+        "authsize" => &["encrypt"],
+        "aead-meta" => &[
+            "aead-encrypt",
+            "aead-decrypt",
+            "aead-decrypt",
+            "aead-decrypt",
+            "aead-encrypt",
+            "aead-decrypt",
+        ],
+        "aead-live" => &["aead-encrypt", "aead-decrypt"],
+        _ => unreachable!("sync shape covers sync-once + rekey + AEAD sync legs"),
     };
     let got_ops: Vec<&str> = truth.ops.iter().map(|op| op.op.as_str()).collect();
     if got_ops.as_slice() != want_ops {
@@ -1855,6 +1977,79 @@ fn verdict_op_async(
     if unfinished_d != 0 {
         return Err(format!(
             "async unfinished delta {unfinished_d} != 0 (expected-complete)"
+        ));
+    }
+    Ok(())
+}
+
+/// Async AEAD op shape (T10: callback-grounded — the simple
+/// schedule only): two sequential ops (encrypt then decrypt),
+/// each queued once (`-EINPROGRESS`, kernel UAPI) and completed
+/// via the shared fixture callback (errno 0, NO progress rows —
+/// sequential single in-flight ops never engage backlog),
+/// post-finish two `Callback(0)` records with submit→callback
+/// spans, nothing unfinished.
+fn verdict_op_async_aead(
+    scenario: &str,
+    truth: &FixtureTruth,
+    view: &SensorView<'_>,
+    unfinished_d: u64,
+) -> Result<(), String> {
+    // Exact submit labels (T07-R2-04: the labels pin WHICH
+    // fixture path ran).
+    let got_ops: Vec<&str> = truth.ops.iter().map(|op| op.op.as_str()).collect();
+    if got_ops.as_slice() != ["aead-encrypt", "aead-decrypt"] {
+        return Err(format!(
+            "{scenario} runs [aead-encrypt, aead-decrypt], fixture ran {got_ops:?}"
+        ));
+    }
+    let op_seqs: Vec<u64> = truth.ops.iter().map(|op| op.seq).collect();
+    // Positive controls: each op queued exactly once AND
+    // observed async completion, with NO progress rows.
+    let want_returns: Vec<(u64, i32)> = op_seqs.iter().map(|seq| (*seq, -115)).collect();
+    if truth.returns != want_returns {
+        return Err(format!(
+            "async AEAD fixture returns {:?} != {want_returns:?} (queue each once)",
+            truth.returns
+        ));
+    }
+    let want_terminals: Vec<(u64, i32)> = op_seqs.iter().map(|seq| (*seq, 0)).collect();
+    if truth.terminals != want_terminals {
+        return Err(format!(
+            "async AEAD fixture terminals {:?} != {want_terminals:?} (complete each once)",
+            truth.terminals
+        ));
+    }
+    if !truth.progresses.is_empty() {
+        return Err(format!(
+            "async AEAD fixture progresses {:?} != [] (no backlog on sequential ops)",
+            truth.progresses
+        ));
+    }
+    if view.completed.len() != 2 {
+        return Err(format!(
+            "async AEAD post-finish completed {} != 2",
+            view.completed.len()
+        ));
+    }
+    // The adapter joined both terminal callbacks: exact status,
+    // observed callback spans, nothing truthless.
+    for (i, record) in view.completed.iter().enumerate() {
+        if record.terminal != Terminal::Callback(0) {
+            return Err(format!(
+                "async AEAD post-finish terminal {:?} != Callback(0) (callback unjoined)",
+                record.terminal
+            ));
+        }
+        if record.duration_ns.is_none() {
+            return Err(format!(
+                "async AEAD post-finish completion {i} lacks a callback span"
+            ));
+        }
+    }
+    if unfinished_d != 0 {
+        return Err(format!(
+            "async AEAD unfinished delta {unfinished_d} != 0 (expected-complete)"
         ));
     }
     Ok(())
@@ -2364,23 +2559,7 @@ fn verdict_op_negative(
     truth: &FixtureTruth,
     view: &SensorView<'_>,
 ) -> Result<(), String> {
-    if scenario == "authsize" {
-        if truth.ops.len() != 1 {
-            return Err(format!(
-                "authsize runs 1 (unhooked) op, fixture ran {}",
-                truth.ops.len()
-            ));
-        }
-        // Exact label (T07-R2-04: the AEAD leg encrypts — a
-        // mislabeled transcript never grades the negative
-        // control).
-        if truth.ops[0].op != "encrypt" {
-            return Err(format!(
-                "authsize runs `encrypt`, fixture ran `{}`",
-                truth.ops[0].op
-            ));
-        }
-    } else if scenario == "failed-alloc" || scenario == "failed-init" {
+    if scenario == "failed-alloc" || scenario == "failed-init" {
         if !truth.ops.is_empty() {
             return Err(format!("{scenario}: failed scenario ran ops"));
         }
@@ -2484,11 +2663,10 @@ fn verdict_tfm_sk(
     Ok(())
 }
 
-/// AEAD transform shape (T07-R2-04): the narrowed contract —
-/// allocation unhooked (no alloc halves, config admission shapes
-/// the generations), everything else ledger-derived. The
-/// first-seen admission is EXPECTED truth here (asserted
-/// exactly), never gated loss.
+/// AEAD transform shape (T10): the widened contract —
+/// allocation hooked (`ALLOC_AEAD` admission shapes the
+/// generations), every boundary observed, everything
+/// ledger-derived. Clean AEAD lifetimes chain exactly.
 fn verdict_tfm_aead(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), String> {
     let fresh = fresh_generations(truth, view)?;
     for (alloc, generation) in truth.allocs.iter().zip(fresh.iter()) {
@@ -2506,11 +2684,11 @@ fn verdict_tfm_aead(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), S
     let expect = [
         (
             "admitted",
-            frees + configs + unknown_d,
+            allocs + frees + configs + unknown_d,
             tfm.admitted,
             base.admitted,
         ),
-        ("completed", 0, tfm.completed, base.completed),
+        ("completed", allocs, tfm.completed, base.completed),
         ("releases", frees + unknown_d, tfm.releases, base.releases),
         ("retired", finals, tfm.retired, base.retired),
         (
@@ -2528,13 +2706,13 @@ fn verdict_tfm_aead(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), S
         ("failed_allocs", 0, tfm.failed_allocs, base.failed_allocs),
         (
             "ambiguous_releases",
-            0,
+            frees - finals,
             tfm.ambiguous_releases,
             base.ambiguous_releases,
         ),
         (
             "unobserved_boundary",
-            allocs,
+            0,
             tfm.unobserved_boundary,
             base.unobserved_boundary,
         ),
@@ -2545,8 +2723,11 @@ fn verdict_tfm_aead(truth: &FixtureTruth, view: &SensorView<'_>) -> Result<(), S
             return Err(format!("tfm {name} delta {d} != {want} (fixture-derived)"));
         }
     }
-    if view.reuse_exact {
-        return Err("authsize: first-seen admission must void exactness".to_owned());
+    // Clean AEAD lifetimes chain exactly (every boundary
+    // observed — the T07 narrowed-contract void no longer
+    // applies: allocation is hooked).
+    if !view.reuse_exact {
+        return Err("clean AEAD lifetimes must chain exactly".to_owned());
     }
     Ok(())
 }
@@ -3032,11 +3213,12 @@ mod tests {
     }
 
     #[test]
-    fn verdict_authsize_pins_narrowed_contract() {
-        // T07-R2-04: the AEAD lifetime is first-seen with EMPTY
-        // provenance (alloc unhooked — honest unknown), the op
-        // unobserved (negative control), epochs/configs exact, and
-        // exactness void (the admission says so).
+    fn verdict_authsize_pins_hooked_aead_contract() {
+        // T10: the AEAD lifetime is alloc-observed (exact
+        // provenance, no first-seen), the op hooked at the AEAD
+        // enc site (lanes 18/19 — sk lanes 0/1 pin zero),
+        // epochs/configs exact, and exactness intact (every
+        // boundary observed).
         let run = "run-authsize";
         let text = [
             format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxc-aead-t07a","drv":"kxc-aead-t07a","type":0,"mask":0}}"#),
@@ -3052,9 +3234,9 @@ mod tests {
         .join("\n");
         let truth = parse_transcript(&text, run).expect("authsize parses");
         let gens = [GenerationInfo {
-            req_name: String::new(),
-            drv_name: String::new(),
-            first_seen: true,
+            req_name: "kxc-aead-t07a".to_owned(),
+            drv_name: "kxc-aead-t07a".to_owned(),
+            first_seen: false,
             epoch: 2,
             configs: 3,
             last_config_site: LTFM_SITE_SETAUTHSIZE,
@@ -3062,110 +3244,174 @@ mod tests {
             last_config_errno: -22,
             ..sync_gen()
         }];
-        let completed: [RequestRecord; 0] = [];
+        let completed = [record(1, Terminal::Sync(0))];
+        // Widened-contract view: AEAD alloc halves on 12/13, the
+        // op on 18/19, sk op lanes zero, one decode admission.
+        let hooked: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 0;
-        view.reducer.admitted = 0;
-        view.reducer.emitted = 0;
-        view.tfm.admitted = 4;
-        view.tfm.completed = 0;
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
         view.tfm.releases = 1;
         view.tfm.retired = 1;
         view.tfm.configs_joined = 3;
         view.tfm.configs_failed = 1;
-        view.tfm.unobserved_boundary = 1;
-        view.reuse_exact = false;
-        verdict("authsize", &truth, &view).expect("authsize green");
-        // Claimed exactness on a first-seen admission fails.
-        let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 0;
-        view.reducer.admitted = 0;
-        view.reducer.emitted = 0;
-        view.tfm.admitted = 4;
-        view.tfm.completed = 0;
-        view.tfm.releases = 1;
-        view.tfm.retired = 1;
-        view.tfm.configs_joined = 3;
-        view.tfm.configs_failed = 1;
-        view.tfm.unobserved_boundary = 1;
+        view.tfm.unobserved_boundary = 0;
         view.reuse_exact = true;
-        verdict("authsize", &truth, &view).expect_err("false exactness must fail");
-        // T07-R3-07: fabricated creation metadata on a first-seen
-        // AEAD generation fails — unknown provenance means the
-        // type/mask stay zero and neither truncation bit is set.
+        verdict("authsize", &truth, &view).expect("authsize green");
+        // Claimed inexactness on clean alloc-observed lifetimes fails.
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = false;
+        let err = verdict("authsize", &truth, &view).expect_err("false inexactness must fail");
+        assert!(err.contains("chain exactly"), "names it: {err}");
+        // Fabricated creation metadata fails — widened provenance
+        // compares the WHOLE creation record exactly.
         let mut fb = gens.clone();
         fb[0].alg_type = 5;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 0;
-        view.reducer.admitted = 0;
-        view.reducer.emitted = 0;
-        view.tfm.admitted = 4;
-        view.tfm.completed = 0;
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
         view.tfm.releases = 1;
         view.tfm.retired = 1;
         view.tfm.configs_joined = 3;
         view.tfm.configs_failed = 1;
-        view.tfm.unobserved_boundary = 1;
-        view.reuse_exact = false;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
         let err = verdict("authsize", &truth, &view).expect_err("fabricated type must fail");
         assert!(err.contains("type/mask"), "names it: {err}");
         let mut fb = gens.clone();
         fb[0].alg_mask = 0x8f;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 0;
-        view.reducer.admitted = 0;
-        view.reducer.emitted = 0;
-        view.tfm.admitted = 4;
-        view.tfm.completed = 0;
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
         view.tfm.releases = 1;
         view.tfm.retired = 1;
         view.tfm.configs_joined = 3;
         view.tfm.configs_failed = 1;
-        view.tfm.unobserved_boundary = 1;
-        view.reuse_exact = false;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
         verdict("authsize", &truth, &view).expect_err("fabricated mask must fail");
         let mut fb = gens.clone();
         fb[0].name_truncated = true;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 0;
-        view.reducer.admitted = 0;
-        view.reducer.emitted = 0;
-        view.tfm.admitted = 4;
-        view.tfm.completed = 0;
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
         view.tfm.releases = 1;
         view.tfm.retired = 1;
         view.tfm.configs_joined = 3;
         view.tfm.configs_failed = 1;
-        view.tfm.unobserved_boundary = 1;
-        view.reuse_exact = false;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
         verdict("authsize", &truth, &view).expect_err("truncation claim must fail");
         let mut fb = gens.clone();
         fb[0].drv_truncated = true;
         let mut view = sync_view(&completed, &fb);
-        view.edge_hits = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
-        view.decode.admitted = 0;
-        view.reducer.admitted = 0;
-        view.reducer.emitted = 0;
-        view.tfm.admitted = 4;
-        view.tfm.completed = 0;
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
         view.tfm.releases = 1;
         view.tfm.retired = 1;
         view.tfm.configs_joined = 3;
         view.tfm.configs_failed = 1;
-        view.tfm.unobserved_boundary = 1;
-        view.reuse_exact = false;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
         verdict("authsize", &truth, &view).expect_err("drv truncation claim must fail");
+        // A first-seen claim on an alloc-observed lifetime fails.
+        let mut fb = gens.clone();
+        fb[0].first_seen = true;
+        let mut view = sync_view(&completed, &fb);
+        view.edge_hits = hooked;
+        view.agg_accepted = hooked;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        let err = verdict("authsize", &truth, &view).expect_err("first-seen claim must fail");
+        assert!(err.contains("first-seen"), "names it: {err}");
+        // Negative controls: a phantom sk-lane hit fails, and a
+        // missing AEAD-lane hit fails.
+        let mut skewed = hooked;
+        skewed[0] = 1;
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = skewed;
+        view.agg_accepted = skewed;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        let err = verdict("authsize", &truth, &view).expect_err("sk cross-talk must fail");
+        assert!(
+            err.contains("edge hits [1, 0, 0, 0]"),
+            "names the sk pin: {err}"
+        );
+        let mut dark = hooked;
+        dark[18] = 0;
+        dark[19] = 0;
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = dark;
+        view.agg_accepted = dark;
+        view.decode.admitted = 1;
+        view.reducer.admitted = 1;
+        view.reducer.emitted = 1;
+        view.tfm.admitted = 5;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 3;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        let err = verdict("authsize", &truth, &view).expect_err("dark AEAD lane must fail");
+        assert!(err.contains("aead edge hits"), "names it: {err}");
     }
 
     #[test]
@@ -4236,6 +4482,53 @@ mod tests {
     }
 
     #[test]
+    fn transcript_aead_labels_carry_scalars() {
+        // T10: the AEAD labels parse with their `assoc`/`authsize`
+        // scalars (`Some` ⟺ AEAD); sk lanes skip them while the
+        // AEAD lanes count them.
+        let run = "run-aead-labels";
+        let rows = [
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"aead-encrypt","assoc":32,"authsize":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"return","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"terminal","errno":0}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-decrypt","assoc":32,"authsize":8}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&rows, run).expect("aead labels parse");
+        assert_eq!(truth.ops[0].assoc, Some(32));
+        assert_eq!(truth.ops[0].authsize, Some(16));
+        assert_eq!(truth.ops[1].assoc, Some(32));
+        assert_eq!(truth.ops[1].authsize, Some(8));
+        assert_eq!(truth.expected_hooks(), [0, 0, 0, 0]);
+        assert_eq!(truth.expected_aead_hooks(), [1, 1, 1, 1]);
+        // An AEAD submit without its scalars refuses.
+        let bad = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"aead-encrypt"}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let err = parse_transcript(&bad, run).expect_err("scalarless AEAD must fail");
+        assert_eq!(err.reason, "aead submit lacks assoc");
+        // An sk submit carrying AEAD fields refuses.
+        let bad = [
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"submit","op":"encrypt","assoc":32,"authsize":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let err = parse_transcript(&bad, run).expect_err("scalar-carrying sk must fail");
+        assert_eq!(err.reason, "sk submit carries AEAD fields");
+    }
+
+    #[test]
     fn verdict_exact_driver_pins_encrypt_exact() {
         // T07-R2-04: `exact-driver` runs ONE `encrypt-exact` op on
         // the generically requested transform (the sensor sees the
@@ -4410,5 +4703,251 @@ mod tests {
         let err =
             verdict("reuse-in-callback", &truth, &view).expect_err("unforced order must fail");
         assert!(err.contains("order"), "names the ordering: {err}");
+    }
+
+    /// One AEAD submit/return/terminal triple with its scalars.
+    fn aead_rows(run: &str, seq: u64, op: &str, assoc: u32, authsize: u32, errno: i32) -> Vec<String> {
+        vec![
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"submit","op":"{op}","assoc":{assoc},"authsize":{authsize}}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"return","errno":{errno}}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"terminal","errno":{errno}}}"#),
+        ]
+    }
+
+    #[test]
+    fn verdict_aead_meta_grounds_mixed_errnos() {
+        // T10: `aead-meta` runs the full accepted sync schedule —
+        // good roundtrip, bad tag (-EBADMSG), short input
+        // (-EINVAL), failed setauthsize (no epoch), tag-8
+        // roundtrip (new epoch) — all six grounded pairwise with
+        // exact errnos, AEAD lanes only.
+        let run = "run-aead-meta";
+        let mut rows = vec![
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxaead-t10a","drv":"kxaead-t10a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+        ];
+        rows.extend(aead_rows(run, 2, "aead-encrypt", 32, 16, 0));
+        rows.extend(aead_rows(run, 3, "aead-decrypt", 32, 16, 0));
+        rows.extend(aead_rows(run, 4, "aead-decrypt", 32, 16, -74));
+        rows.extend(aead_rows(run, 5, "aead-decrypt", 32, 16, -22));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":-22,"len":64}}"#
+        ));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":8}}"#
+        ));
+        rows.extend(aead_rows(run, 6, "aead-encrypt", 32, 8, 0));
+        rows.extend(aead_rows(run, 7, "aead-decrypt", 32, 8, 0));
+        rows.push(format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#));
+        rows.push(format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#));
+        let truth = parse_transcript(&rows.join("\n"), run).expect("aead-meta parses");
+        assert_eq!(truth.expected_hooks(), [0, 0, 0, 0]);
+        assert_eq!(truth.expected_aead_hooks(), [2, 2, 4, 4]);
+        let gens = [GenerationInfo {
+            req_name: "kxaead-t10a".to_owned(),
+            drv_name: "kxaead-t10a".to_owned(),
+            first_seen: false,
+            epoch: 3,
+            configs: 4,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 8,
+            last_config_errno: 0,
+            ..sync_gen()
+        }];
+        let completed = [
+            record(1, Terminal::Sync(0)),
+            record(2, Terminal::Sync(0)),
+            record(3, Terminal::Sync(-74)),
+            record(4, Terminal::Sync(-22)),
+            record(5, Terminal::Sync(0)),
+            record(6, Terminal::Sync(0)),
+        ];
+        let lanes: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 3, 3, 1, 1, 1, 1, 0, 0, 2, 2, 4, 4];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = 6;
+        view.reducer.admitted = 6;
+        view.reducer.emitted = 6;
+        view.tfm.admitted = 6;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 4;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        verdict("aead-meta", &truth, &view).expect("aead-meta green");
+        // A bad-tag completion claiming success fails naming the errno.
+        let completed = [
+            record(1, Terminal::Sync(0)),
+            record(2, Terminal::Sync(0)),
+            record(3, Terminal::Sync(0)),
+            record(4, Terminal::Sync(-22)),
+            record(5, Terminal::Sync(0)),
+            record(6, Terminal::Sync(0)),
+        ];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = 6;
+        view.reducer.admitted = 6;
+        view.reducer.emitted = 6;
+        view.tfm.admitted = 6;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 4;
+        view.tfm.configs_failed = 1;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        let err = verdict("aead-meta", &truth, &view).expect_err("errno lie must fail");
+        assert!(err.contains("-74"), "names the errno: {err}");
+    }
+
+    #[test]
+    fn verdict_aead_async_joins_two_callbacks() {
+        // T10: `aead-async` queues encrypt then decrypt, each
+        // completed via the shared fixture callback — two
+        // `Callback(0)` records with spans, lane 17 carrying both
+        // terminals, nothing unfinished.
+        let run = "run-aead-async";
+        let rows = [
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxaead-async-t10a","drv":"kxaead-async-t10a","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":2,"phase":"submit","op":"aead-encrypt","assoc":32,"authsize":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":2,"phase":"terminal","errno":0}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":3,"phase":"submit","op":"aead-decrypt","assoc":32,"authsize":16}}"#
+            ),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"return","errno":-115}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":3,"phase":"terminal","errno":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#),
+            format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#),
+        ]
+        .join("\n");
+        let truth = parse_transcript(&rows, run).expect("aead-async parses");
+        let gens = [GenerationInfo {
+            req_name: "kxaead-async-t10a".to_owned(),
+            drv_name: "kxaead-async-t10a".to_owned(),
+            first_seen: false,
+            epoch: 2,
+            configs: 2,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 16,
+            last_config_errno: 0,
+            ..sync_gen()
+        }];
+        let completed = [record(1, Terminal::Callback(0)), record(2, Terminal::Callback(0))];
+        let lanes: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 1, 1, 1, 1];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.reducer.unfinished = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 2;
+        view.tfm.configs_failed = 0;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        verdict("aead-async", &truth, &view).expect("aead-async green");
+        // An unjoined (sync-claimed) completion fails.
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Callback(0))];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.reducer.unfinished = 0;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 2;
+        view.tfm.configs_failed = 0;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        let err = verdict("aead-async", &truth, &view).expect_err("unjoined must fail");
+        assert!(err.contains("unjoined"), "names it: {err}");
+    }
+
+    #[test]
+    fn verdict_aead_live_grades_live_provenance() {
+        // T10: `aead-live` runs the decrypt-1040 shape against real
+        // gcm — the alloc row's selected driver compares exactly
+        // (a driver lie fails), everything else the sync AEAD shape.
+        let run = "run-aead-live";
+        let mut rows = vec![
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"gcm(aes)","drv":"gcm-aesni","type":0,"mask":0}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
+            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+        ];
+        rows.extend(aead_rows(run, 2, "aead-encrypt", 32, 16, 0));
+        rows.extend(aead_rows(run, 3, "aead-decrypt", 32, 16, 0));
+        rows.push(format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#));
+        rows.push(format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#));
+        let truth = parse_transcript(&rows.join("\n"), run).expect("aead-live parses");
+        let gens = [GenerationInfo {
+            req_name: "gcm(aes)".to_owned(),
+            drv_name: "gcm-aesni".to_owned(),
+            first_seen: false,
+            epoch: 2,
+            configs: 2,
+            last_config_site: LTFM_SITE_SETAUTHSIZE,
+            last_config_len: 16,
+            last_config_errno: 0,
+            ..sync_gen()
+        }];
+        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
+        let lanes: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 2;
+        view.tfm.configs_failed = 0;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        verdict("aead-live", &truth, &view).expect("aead-live green");
+        // A driver lie fails naming the provenance.
+        let gens = [GenerationInfo {
+            drv_name: "gcm-base".to_owned(),
+            ..gens[0].clone()
+        }];
+        let mut view = sync_view(&completed, &gens);
+        view.edge_hits = lanes;
+        view.agg_accepted = lanes;
+        view.decode.admitted = 2;
+        view.reducer.admitted = 2;
+        view.reducer.emitted = 2;
+        view.tfm.admitted = 4;
+        view.tfm.completed = 1;
+        view.tfm.releases = 1;
+        view.tfm.retired = 1;
+        view.tfm.configs_joined = 2;
+        view.tfm.configs_failed = 0;
+        view.tfm.unobserved_boundary = 0;
+        view.reuse_exact = true;
+        let err = verdict("aead-live", &truth, &view).expect_err("driver lie must fail");
+        assert!(err.contains("drv"), "names it: {err}");
     }
 }
