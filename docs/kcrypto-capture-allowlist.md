@@ -280,21 +280,21 @@ validation cannot prove that.)
 
 ## `LRING`/`LCFG` lifecycle transport (T07, R6 pin)
 
-Lifecycle edges ride the `LRING` ring as 112B `LEdge` v6 (op
-submit/return — the v5 shape is retired: the API input length
+Lifecycle edges ride the `LRING` ring as 112B `LEdge` v7 (op
+submit/return — the v6 shape is retired: the API input length
 rides at 28..32, the transform word at 40..48, the request flags
-at 48..52, family/direction/validity at 52..56, the driver name
-at 56..112) and 112B `LTfm` (transform alloc/destroy/config
-halves); the 64B `LCFG` row is loader-written config like `KCFG`.
-All three carry `FIELDS` lists pinned by
-`allowlist_field_set_matches_docs` — same tripwire as the
-aggregate structs.
+at 48..52, family/direction/validity at 52..56, the AEAD words
+(`assoclen`/`authsize`) at 56..64, the driver name at 64..112)
+and 112B `LTfm` (transform alloc/destroy/config halves); the 80B
+`LCFG` row is loader-written config like `KCFG`. All three carry
+`FIELDS` lists pinned by `allowlist_field_set_matches_docs` —
+same tripwire as the aggregate structs.
 
 | Struct | Fields | WHY (kp2 §9) |
 |---|---|---|
-| `LEdge` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `cryptlen`, `invoc`, `tfm`, `req_flags`, `fam`, `dir`, `mflags`, `drv` | wire tags + pairing pointers (`key`, `tfm` — kernel pairing material, `<redacted>` at every render) + timestamp + native errno + entry-side scalar request metadata (`cryptlen` API input length, `req_flags` request flags — validity-gated by `mflags`, unknown when the entry chase was unreadable — plus wire-pinned `fam`/`dir`) + invocation id + submit-side selected driver (`drv` — public inventory, 55+NUL); returns carry `tfm` 0 + zero metadata + empty `drv` (R2 extended: never chased); P4 callback halves (`edge` 3, `site` 3/4) carry `key` + `status` + `ts_ns` only (`invoc` 0 — names no fsession invocation — zero metadata/`tfm`/`drv`, `flags` 0 — callbacks never taint) |
+| `LEdge` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `cryptlen`, `invoc`, `tfm`, `req_flags`, `fam`, `dir`, `mflags`, `assoclen`, `authsize`, `drv` | wire tags + pairing pointers (`key`, `tfm` — kernel pairing material, `<redacted>` at every render) + timestamp + native errno + entry-side scalar request metadata (`cryptlen` API input length, `req_flags` request flags — validity-gated by `mflags`, unknown when the entry chase was unreadable — plus wire-pinned `fam`/`dir`; P5 AEAD submits add `assoclen` associated-data length + `authsize` tag width, same validity discipline, skcipher submits carry zero) + invocation id + submit-side selected driver (`drv` — public inventory, 47+NUL); returns carry `tfm` 0 + zero metadata + empty `drv` (R2 extended: never chased); P4 callback halves (`edge` 3, `site` 3/4) carry `key` + `status` + `ts_ns` only (`invoc` 0 — names no fsession invocation — zero metadata/`tfm`/`drv`, `flags` 0 — callbacks never taint) |
 | `LTfm` | `magic`, `version`, `edge`, `site`, `flags`, `key`, `ts_ns`, `status`, `aux`, `aux2`, `token`, `name` | wire tags + pairing pointer (`key`, redacted) + timestamp + native errno + site scalars (alg type/mask, refcount snapshot, key length/authsize — sizes, not contents) + attempt token + bounded algorithm/driver name (public inventory) |
-| `LConfig` | `magic`, `version`, `flags`, `tfm_alg`, `alg_drv`, `sk_base`, `refcnt_off`, `refcnt_present`, `req_base`, `req_tfm`, `req_cryptlen`, `req_flags`, `op_req_off`, `op_req_present`, `reserved` | arm tags + BTF-resolved struct offsets (loader-computed, no kernel reads — v4 adds the op metadata reads `req_cryptlen`/`req_flags`; v5 adds the fixture `op->req` chase `op_req_off` + `op_req_present`) + disarm gate |
+| `LConfig` | `magic`, `version`, `flags`, `tfm_alg`, `alg_drv`, `sk_base`, `refcnt_off`, `refcnt_present`, `req_base`, `req_tfm`, `req_cryptlen`, `req_flags`, `op_req_off`, `op_req_present`, `aead_req_base`, `aead_req_cryptlen`, `aead_req_assoclen`, `aead_base`, `aead_authsize`, `reserved` | arm tags + BTF-resolved struct offsets (loader-computed, no kernel reads — v4 adds the op metadata reads `req_cryptlen`/`req_flags`; v5 adds the fixture `op->req` chase `op_req_off` + `op_req_present`; v6 adds the AEAD chase words `aead_req_base`/`aead_req_cryptlen`/`aead_req_assoclen`/`aead_base`/`aead_authsize`, each shape-proven like the skcipher words) + disarm gate |
 
 P4 callback-site reads (the two `fentry` programs): the cryptd
 site reads arg0 (the request pointer — the half's `key`) and arg1
@@ -308,10 +308,12 @@ member (BTF-resolved, pointer-to-`skcipher_request`-checked at
 arm, or the arm refuses).
 
 No lifecycle field carries key material, IVs, plaintext,
-ciphertext, or buffer contents: `cryptlen`/`aux`/`aux2`/`len`
-words are length/type/flag scalars, `name` is a bounded
-algorithm/driver name, and the two pairing pointers never render
-(manual `Debug` redaction, pinned by
+ciphertext, AAD/tag contents, or buffer contents:
+`cryptlen`/`assoclen`/`authsize`/`aux`/`aux2`/`len` words are
+length/type/flag scalars (sizes, never contents — the NEVER list's
+AAD/tag ban covers bytes, while the counts ride the wire),
+`name` is a bounded algorithm/driver name, and the two pairing
+pointers never render (manual `Debug` redaction, pinned by
 `public_views_carry_no_kernel_addresses` in decimal AND hex).
 The privileged `lifecycle_canary_no_secret_bytes_in_views` lane
 test keys a live transform with a `KPROBE-CANARY-*` marker and

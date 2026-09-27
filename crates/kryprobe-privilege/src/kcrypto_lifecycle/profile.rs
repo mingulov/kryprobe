@@ -152,10 +152,16 @@ pub fn acquire_kcrypto_session(profile: LifecycleProfile) -> Result<SessionGuard
 /// reads `(aead *, authsize) -> int`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtoShape {
-    /// `int (struct skcipher_request *)` (op sites).
+    /// `int (struct skcipher_request *)` (skcipher op sites).
     Op,
-    /// `struct crypto_skcipher *(const char *, u32, u32)` (alloc sites).
+    /// `int (struct aead_request *)` (AEAD op sites — P5).
+    OpAead,
+    /// `struct crypto_skcipher *(const char *, u32, u32)`
+    /// (skcipher alloc site).
     Alloc,
+    /// `struct crypto_aead *(const char *, u32, u32)` (AEAD alloc
+    /// site — P5).
+    AllocAead,
     /// `void (void *, struct crypto_tfm *)` (destroy site).
     Destroy,
     /// `int (struct crypto_skcipher *, const u8 *, unsigned int)`
@@ -218,25 +224,27 @@ pub struct ProfileManifest {
     pub maps: &'static [(&'static str, MapDims)],
 }
 
-/// Program lanes per `LLOSS` class (BPF hook order: the 18
-/// `LAGG_*` hooks, enc-sub first, the two P4 callback hooks last;
-/// class `c` occupies entries
-/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 18`).
-pub const LLOSS_LANES_PER_CLASS: u32 = 18;
+/// Program lanes per `LLOSS` class (BPF hook order: the 22
+/// `LAGG_*` hooks, enc-sub first, the P4 callback hooks at 16–17,
+/// the P5 AEAD op hooks last; class `c` occupies entries
+/// `c * LLOSS_LANES_PER_CLASS..c * LLOSS_LANES_PER_CLASS + 22`).
+pub const LLOSS_LANES_PER_CLASS: u32 = 22;
 /// `LLOSS` entries: 5 classes × [`LLOSS_LANES_PER_CLASS`].
 pub const LLOSS_ENTRIES: u32 = 5 * LLOSS_LANES_PER_CLASS;
 
-/// Hook lanes (userspace tally width): 18 — the 16 T07 lanes plus
-/// the two P4 callback lanes (16/17). Lanes 12/13 stay T10's
-/// aead-alloc reservation; no headroom past 17.
-pub const LANE_COUNT: u32 = 18;
+/// Hook lanes (userspace tally width): 22 — the 16 T07 lanes (with
+/// 12/13 the live aead-alloc pair) plus the two P4 callback lanes
+/// (16/17) plus the four P5 AEAD op lanes (18–21). No headroom
+/// past 21.
+pub const LANE_COUNT: u32 = 22;
 
 /// Frozen lifecycle map table (W8 fsession grown to the T07-final
-/// counter shape, P4-grown to 18 lanes): config, edge ringbuf,
-/// per-CPU loss (5 classes × 18 hook lanes), the 18-lane per-CPU
-/// accepted-edge aggregate, and the per-CPU per-program mint
-/// sequences (8 site-program lanes — callbacks don't mint, so
-/// `LCTR` keeps its width).
+/// counter shape, P4-grown to 18 lanes, P5-grown to 22): config,
+/// edge ringbuf, per-CPU loss (5 classes × 22 hook lanes), the
+/// 22-lane per-CPU accepted-edge aggregate, and the per-CPU
+/// per-program mint sequences (10 site-program lanes — callbacks
+/// don't mint, so `LCTR` grows only by the three P5 fsession
+/// programs).
 /// `LCTR` issues the per-program per-CPU sequences (one lane per
 /// site program — an interrupt can run a different program on the
 /// same CPU, so per-CPU alone lost updates); `LLOSS` lanes fold per
@@ -250,7 +258,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 64,
+            value_size: 80,
             max_entries: 1,
         },
     ),
@@ -287,7 +295,7 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 8,
+            max_entries: 10,
         },
     ),
 ];
@@ -298,7 +306,10 @@ pub const LIFECYCLE_MAPS: &[(&str, MapDims)] = &[
 /// destroy site (retire needs destroy entry/return capture —
 /// final-free proof, not inference) plus the T07.4 configuration
 /// sites (epochs need setkey/setauthsize entry/return capture —
-/// scalar lengths + errno, never key bytes).
+/// scalar lengths + errno, never key bytes) plus the P5 AEAD
+/// sites (AEAD alloc + op entry/return capture — the AEAD
+/// lifetime observations the config-only support must not
+/// masquerade as).
 const LIFECYCLE_REQUIRED: &[RequiredSite] = &[
     RequiredSite {
         symbol: "crypto_skcipher_encrypt",
@@ -327,6 +338,18 @@ const LIFECYCLE_REQUIRED: &[RequiredSite] = &[
     RequiredSite {
         symbol: "crypto_aead_setkey",
         shape: ProtoShape::SetkeyAead,
+    },
+    RequiredSite {
+        symbol: "crypto_aead_encrypt",
+        shape: ProtoShape::OpAead,
+    },
+    RequiredSite {
+        symbol: "crypto_aead_decrypt",
+        shape: ProtoShape::OpAead,
+    },
+    RequiredSite {
+        symbol: "crypto_alloc_aead",
+        shape: ProtoShape::AllocAead,
     },
 ];
 
@@ -367,8 +390,8 @@ pub fn manifest(profile: LifecycleProfile) -> ProfileManifest {
 }
 
 /// Program limit derived from the profile's own manifest: one program
-/// per required site plus one per callback site (P4: 7 fsession + 2
-/// fentry = 9; `ApiReturns` keeps its frozen 16).
+/// per required site plus one per callback site (P5: 10 fsession +
+/// 2 fentry = 12; `ApiReturns` keeps its frozen 16).
 #[must_use]
 pub fn max_programs(manifest: &ProfileManifest) -> usize {
     if manifest.required.is_empty() {
@@ -451,27 +474,29 @@ pub fn required_gate_error(
     }
 }
 
-/// LCFG v4 arm bytes: magic/version/flags plus the BTF-resolved
+/// LCFG v6 arm bytes: magic/version/flags plus the BTF-resolved
 /// chase offsets the transform programs need (`crypto_tfm.__crt_alg`
 /// at 12, `crypto_alg.cra_driver_name` at 16, `crypto_skcipher.base`
 /// at 20, `crypto_tfm.refcnt` at 24 + its presence word at 28,
 /// `skcipher_request.base` at 32, `crypto_async_request.tfm` at 36,
 /// `skcipher_request.cryptlen` at 40, `crypto_async_request.flags`
-/// at 44, fixture `op->req` at 48 + its presence word at 52); the
-/// reserved tail stays zero. The arm refuses before writing when
-/// resolution fails — these words are never zeroed guesses (a zero
-/// offset is only written when BTF resolved zero, `refcnt_present`
-/// 0 is the honest 7.2 verdict, and `op_req_present` 0 is the
-/// honest fixture-absent verdict — never gaps). The loader reads
-/// the map back after writing and refuses startup on mismatch
-/// (zeroed/unwritten configs fail closed).
+/// at 44, fixture `op->req` at 48 + its presence word at 52,
+/// `aead_request.base` at 56, `aead_request.cryptlen` at 60,
+/// `aead_request.assoclen` at 64, `crypto_aead.base` at 68,
+/// `crypto_aead.authsize` at 72); the reserved tail stays zero. The
+/// arm refuses before writing when resolution fails — these words
+/// are never zeroed guesses (a zero offset is only written when BTF
+/// resolved zero, `refcnt_present` 0 is the honest 7.2 verdict, and
+/// `op_req_present` 0 is the honest fixture-absent verdict — never
+/// gaps). The loader reads the map back after writing and refuses
+/// startup on mismatch (zeroed/unwritten configs fail closed).
 #[must_use]
 pub fn lifecycle_config_bytes(
     off: &crate::btf_resolve::LifecycleOffsets,
     op_req_off: u32,
     op_req_present: bool,
-) -> [u8; 64] {
-    let mut out = [0u8; 64];
+) -> [u8; 80] {
+    let mut out = [0u8; 80];
     out[0..4].copy_from_slice(&LCONFIG_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&LCONFIG_VERSION.to_le_bytes());
     out[12..16].copy_from_slice(&off.tfm_alg.to_le_bytes());
@@ -485,6 +510,11 @@ pub fn lifecycle_config_bytes(
     out[44..48].copy_from_slice(&off.req_flags.to_le_bytes());
     out[48..52].copy_from_slice(&op_req_off.to_le_bytes());
     out[52..56].copy_from_slice(&u32::from(op_req_present).to_le_bytes());
+    out[56..60].copy_from_slice(&off.aead_req_base.to_le_bytes());
+    out[60..64].copy_from_slice(&off.aead_req_cryptlen.to_le_bytes());
+    out[64..68].copy_from_slice(&off.aead_req_assoclen.to_le_bytes());
+    out[68..72].copy_from_slice(&off.aead_base.to_le_bytes());
+    out[72..76].copy_from_slice(&off.aead_authsize.to_le_bytes());
     out
 }
 
@@ -537,7 +567,7 @@ pub fn validate_lifecycle_config(magic: u32, version: u32, flags: u32) -> Result
 /// LCFG value width: the read-back buffer must hold exactly this many
 /// bytes (the manifest `LCFG.value_size`; a short buffer is a kernel
 /// overwrite of the stack tail — round-1 sol-M1/astra-M1).
-pub const LCFG_VALUE_LEN: usize = 64;
+pub const LCFG_VALUE_LEN: usize = 80;
 
 /// Full read-back refusal: length plus every config word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,7 +594,7 @@ pub enum ConfigVerifyError {
 
 /// Validate a full LCFG read-back against the bytes the arm wrote:
 /// exact length, magic, version, zero flags, then byte equality
-/// from 12..64 (offset words plus reserved tail). Any deviation
+/// from 12..80 (offset words plus reserved tail). Any deviation
 /// fails closed — the offsets steer BPF chases, so a shape-only
 /// check would certify a mis-chasing sensor.
 pub fn verify_lifecycle_config_bytes(

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! KryProbe BPF lifecycle sensor (T06 grown by the T07.2 alloc site
-//! and the T07.3 destroy site): 4 fsession programs + edge ring +
-//! per-CPU aggregate/loss counters + config gate.
+//! KryProbe BPF lifecycle sensor (T06 grown by the T07.2 alloc site,
+//! the T07.3 destroy site, the T07.4 config sites, the P4 callback
+//! sites, and the P5 AEAD sites): 10 fsession programs + 2 fentry
+//! programs + edge ring + per-CPU aggregate/loss counters + config
+//! gate.
 //!
 //! Each program observes one required site through ONE
 //! `BPF_TRACE_FSESSION` link (floor 7.0+, attach value 58): the same
@@ -10,26 +12,27 @@
 //! `bpf_session_is_return` kfunc. The op programs read the request
 //! pointer (`arg0`); the exit runs additionally read the return
 //! value (`bpf_get_func_ret`). Every run stamps `bpf_ktime_get_ns`
-//! and the op programs emit one 112-byte v6 [`LEdge`] record on
+//! and the op programs emit one 112-byte v7 [`LEdge`] record on
 //! `LRING` per observed half — the record names the frontend
-//! transform behind the op (`req->base->tfm` chased at the `LCFG`
-//! request-link words, minus `sk_base` to the frontend; 0 when the
-//! link was unreadable) plus the entry-side request scalars
-//! (`cryptlen`/`req_flags` with validity bits, P3), so op-first
+//! transform behind the op (`req->base->tfm` chased at the family's
+//! `LCFG` request-link words, minus the family frontend-base word to
+//! the frontend; 0 when the link was unreadable) plus the entry-side
+//! request scalars (`cryptlen`/`req_flags` with validity bits, P3;
+//! `assoclen`/`authsize` on AEAD submits, P5), so op-first
 //! observations admit their transform (T07.3 first-seen) and
 //! attribute to it (P3 submit-lifetime binding).
 //!
-//! The alloc program observes `crypto_alloc_skcipher(alg_name, type,
-//! mask)`: the entry run bounded-copies the requested name (63-byte
-//! bound plus NUL, `TRUNCATED` when the bound fills — a
-//! null/unreadable name admits as empty/unknown, never dropped,
-//! since the attempt token, not the name, is the pairing key) plus
-//! the type/mask words, and the exit run classifies the return
-//! BEFORE dereference (ERR_PTR = errno failure with a zeroed name,
-//! never chased; NULL = unclassifiable, `LLOSS_FRET`-dropped, never
-//! a fabricated errno). Success emits the raw frontend pointer plus
-//! the resolved driver name chased through
-//! `(frontend + sk_base)->__crt_alg->cra_driver_name` at the
+//! The alloc programs observe `crypto_alloc_skcipher` /
+//! `crypto_alloc_aead` (`alg_name, type, mask`): the entry run
+//! bounded-copies the requested name (63-byte bound plus NUL,
+//! `TRUNCATED` when the bound fills — a null/unreadable name admits
+//! as empty/unknown, never dropped, since the attempt token, not the
+//! name, is the pairing key) plus the type/mask words, and the exit
+//! run classifies the return BEFORE dereference (ERR_PTR = errno
+//! failure with a zeroed name, never chased; NULL = unclassifiable,
+//! `LLOSS_FRET`-dropped, never a fabricated errno). Success emits the
+//! raw frontend pointer plus the resolved driver name chased through
+//! `(frontend + family_base)->__crt_alg->cra_driver_name` at the
 //! `LCFG`-pinned offsets (an unreadable chase admits as
 //! empty/unknown — missing provenance is unknown, never fabricated).
 //! Each half emits one 112-byte v1 [`LTfm`] record carrying the
@@ -47,7 +50,7 @@
 //! per-call session cookie (`bpf_session_cookie`, zeroed by the
 //! kernel before the entry run) carries the invocation id: the entry
 //! run issues one id from its CPU's `LCTR` lane FOR ITS OWN PROGRAM
-//! (`(seq << 17) | (lane << 14) | (cpu << 1)`, bit 0 reserved +
+//! (`(seq << 18) | (lane << 14) | (cpu << 1)`, bit 0 reserved +
 //! always clear — distinct across CPUs AND site programs without
 //! atomics) and stores it into the cookie; the exit run of the SAME
 //! call reads the SAME cookie back. There are no slots, no
@@ -58,7 +61,7 @@
 //! invocation with the SAME id, so transport loss can strand an id
 //! but never misjoin one. The alloc and destroy programs mint
 //! attempt tokens from their own `LCTR` lanes with the same layout
-//! (the 3-bit lane field keeps every program's ids disjoint — the
+//! (the 4-bit lane field keeps every program's ids disjoint — the
 //! token namespace can never alias an invocation id).
 //!
 //! Cookie discipline: the pointer is re-fetched in every run via the
@@ -85,10 +88,12 @@
 //! duplication across workspaces; the layout pins + privileged decode
 //! suite fail on drift).
 //!
-//! Honest limitations (P3 profile scope):
-//! - skcipher op family only (`crypto_skcipher_encrypt/decrypt`);
-//!   AEAD/hash op sites arrive under their own wire versions.
-//! - No callback/completion observation (T09 adapters).
+//! Honest limitations (P5 profile scope):
+//! - skcipher + AEAD op families only (`crypto_skcipher_*`,
+//!   `crypto_aead_*`); hash/akcipher op sites stay out of scope.
+//! - Callback/completion observation covers the two P4-qualified
+//!   sites (`cryptd_skcipher_complete`, `kxc_complete`) —
+//!   family-agnostic key joins, no AEAD-specific completion site.
 //! - Floor 7.0+: fsession attach refuses typed below it (no 6.x
 //!   lifecycle; `api-returns` keeps its own contract).
 //!
@@ -147,7 +152,7 @@ use core::mem::MaybeUninit;
 // ---------------------------------------------------------------------------
 
 const LEDGE_MAGIC: u16 = 0x434c;
-const LEDGE_VERSION: u8 = 6;
+const LEDGE_VERSION: u8 = 7;
 
 const LEDGE_SUBMIT: u8 = 1;
 const LEDGE_RETURN: u8 = 2;
@@ -160,12 +165,17 @@ const LSITE_ENC: u16 = 1;
 const LSITE_DEC: u16 = 2;
 const LSITE_CB_CRYPTD: u16 = 3;
 const LSITE_CB_KXC: u16 = 4;
+const LSITE_AEAD_ENC: u16 = 5;
+const LSITE_AEAD_DEC: u16 = 6;
 
 const LFAM_SK: u8 = 1;
+const LFAM_AEAD: u8 = 2;
 const LDIR_ENC: u8 = 1;
 const LDIR_DEC: u8 = 2;
 const LMETA_CRYPTLEN_OK: u16 = 0x0001;
 const LMETA_REQFLAGS_OK: u16 = 0x0002;
+const LMETA_ASSOCLEN_OK: u16 = 0x0004;
+const LMETA_AUTHSIZE_OK: u16 = 0x0008;
 
 const LTFM_MAGIC: u16 = 0x544c;
 const LTFM_VERSION: u8 = 1;
@@ -173,22 +183,24 @@ const LTFM_SITE_ALLOC_SK: u16 = 1;
 const LTFM_SITE_DESTROY: u16 = 2;
 const LTFM_SITE_SETKEY_SK: u16 = 3;
 const LTFM_SITE_SETAUTHSIZE: u16 = 4;
+const LTFM_SITE_ALLOC_AEAD: u16 = 5;
 const LTFM_SITE_SETKEY_AEAD: u16 = 6;
 const LTFM_TRUNCATED: u16 = 0x0002;
 
 const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
-const LCONFIG_VERSION: u32 = 5;
+const LCONFIG_VERSION: u32 = 6;
 
 const LLOSS_RESERVE: u32 = 0;
 const LLOSS_DISABLED: u32 = 1;
 const LLOSS_BADKEY: u32 = 2;
 const LLOSS_FRET: u32 = 3;
 const LLOSS_NOSLOT: u32 = 4;
-/// `LLOSS` lanes per class: one per hook (BPF hook order: the 18
-/// `LAGG_*` hooks, enc-sub first, the two P4 callback hooks last);
-/// the lane index doubles as the hook id. Entry
-/// `class * LLOSS_LANES + hook`; userspace folds all eighteen.
-const LLOSS_LANES: u32 = 18;
+/// `LLOSS` lanes per class: one per hook (BPF hook order: the 22
+/// `LAGG_*` hooks, enc-sub first, the P4 callback hooks at 16–17,
+/// the P5 AEAD op hooks last); the lane index doubles as the hook
+/// id. Entry `class * LLOSS_LANES + hook`; userspace folds all
+/// twenty-two.
+const LLOSS_LANES: u32 = 22;
 
 const LAGG_ENC_SUB: u32 = 0;
 const LAGG_ENC_RET: u32 = 1;
@@ -202,17 +214,24 @@ const LAGG_SETKEYSK_SUB: u32 = 8;
 const LAGG_SETKEYSK_RET: u32 = 9;
 const LAGG_SETAUTH_SUB: u32 = 10;
 const LAGG_SETAUTH_RET: u32 = 11;
+const LAGG_ALLOCAEAD_SUB: u32 = 12;
+const LAGG_ALLOCAEAD_RET: u32 = 13;
 const LAGG_SETKEYAEAD_SUB: u32 = 14;
 const LAGG_SETKEYAEAD_RET: u32 = 15;
 const LAGG_CB_CRYPTD: u32 = 16;
 const LAGG_CB_KXC: u32 = 17;
+const LAGG_AEADENC_SUB: u32 = 18;
+const LAGG_AEADENC_RET: u32 = 19;
+const LAGG_AEADDEC_SUB: u32 = 20;
+const LAGG_AEADDEC_RET: u32 = 21;
 
 /// `LCTR` lane per site program: encrypt takes lane zero, decrypt
 /// lane one, alloc-sk lane two, destroy lane three, setkey-sk lane
-/// four, setauthsize lane five, setkey-aead lane six (lane seven
-/// stays spare). The 3-bit lane field rides invocation bits 14–16,
-/// so the independent sequences can never alias (a one-bit lane
-/// would alias lane two onto the op lanes' sequence space).
+/// four, setauthsize lane five, setkey-aead lane six, alloc-aead
+/// lane seven, AEAD-encrypt lane eight, AEAD-decrypt lane nine. The
+/// 4-bit lane field rides invocation bits 14–17 (P5: ten programs
+/// outgrew the 3-bit field), so the independent sequences can never
+/// alias.
 const LCTR_ENC: u32 = 0;
 const LCTR_DEC: u32 = 1;
 const LCTR_ALLOCSK: u32 = 2;
@@ -220,6 +239,9 @@ const LCTR_DESTROY: u32 = 3;
 const LCTR_SETKEYSK: u32 = 4;
 const LCTR_SETAUTH: u32 = 5;
 const LCTR_SETKEYAEAD: u32 = 6;
+const LCTR_ALLOCAEAD: u32 = 7;
+const LCTR_AEADENC: u32 = 8;
+const LCTR_AEADDEC: u32 = 9;
 
 /// `ERR_PTR` floor: returns at or above `-4095` are errno failures
 /// (`IS_ERR_VALUE` — never dereferenced, never chased).
@@ -241,10 +263,12 @@ const KFUNC_COOKIE_SENTINEL: usize = 0x5F4B_0002;
 /// Raw lifecycle edge (112 bytes; field order pinned by ABI tests).
 /// `tfm` is the frontend transform pointer behind the op
 /// (`req->base->tfm` chased at the `LCFG` request-link words, minus
-/// `sk_base` to the frontend — the tracker normalizes every pairing
-/// pointer uniformly), 0 when the link was unreadable. `cryptlen` /
-/// `req_flags` are the entry-side request scalars (validity-gated by
-/// `mflags`), `fam`/`dir` the wire-pinned family/direction, and `drv`
+/// the family frontend-base word to the frontend — the tracker
+/// normalizes every pairing pointer per family), 0 when the link was
+/// unreadable. `cryptlen` / `req_flags` are the entry-side request
+/// scalars (validity-gated by `mflags`), `assoclen` / `authsize`
+/// the AEAD entry-side scalars (AEAD submits only),
+/// `fam`/`dir` the wire-pinned family/direction, and `drv`
 /// the runtime-selected driver behind the submit's transform (F05).
 /// Submit edges only: returns carry `tfm` 0 + zero metadata + empty
 /// `drv` (R2 extended: the exit run never chases — the request may be
@@ -266,13 +290,17 @@ struct LEdge {
     fam: u8,
     dir: u8,
     mflags: u16,
+    assoclen: u32,
+    authsize: u32,
     drv: [u8; DRV_LEN],
 }
 
-/// Sensor config (64 bytes, `LCFG` key 0): v4 adds the op
+/// Sensor config (80 bytes, `LCFG` key 0): v4 adds the op
 /// request-metadata words (`req_cryptlen`/`req_flags`) to the v3
 /// chase offsets; v5 adds the fixture `op->req` words
-/// (`op_req_off`/`op_req_present`). Word order pinned by ABI tests.
+/// (`op_req_off`/`op_req_present`); v6 adds the AEAD chase words
+/// (`aead_req_base`/`aead_req_cryptlen`/`aead_req_assoclen`/
+/// `aead_base`/`aead_authsize`). Word order pinned by ABI tests.
 #[repr(C)]
 struct LConfig {
     magic: u32,
@@ -289,7 +317,12 @@ struct LConfig {
     req_flags: u32,
     op_req_off: u32,
     op_req_present: u32,
-    reserved: [u8; 8],
+    aead_req_base: u32,
+    aead_req_cryptlen: u32,
+    aead_req_assoclen: u32,
+    aead_base: u32,
+    aead_authsize: u32,
+    reserved: [u8; 4],
 }
 
 /// Raw transform edge (112 bytes; field order pinned by ABI tests).
@@ -313,7 +346,7 @@ struct LTfm {
     name: [u8; 64],
 }
 const _: () = assert!(size_of::<LEdge>() == 112);
-const _: () = assert!(size_of::<LConfig>() == 64);
+const _: () = assert!(size_of::<LConfig>() == 80);
 const _: () = assert!(size_of::<LTfm>() == 112);
 
 #[map]
@@ -323,9 +356,9 @@ static LRING: RingBuf = RingBuf::with_byte_size(262_144, 0);
 #[map]
 static LLOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(5 * LLOSS_LANES, 0);
 #[map]
-static LAGG: PerCpuArray<u64> = PerCpuArray::with_max_entries(18, 0);
+static LAGG: PerCpuArray<u64> = PerCpuArray::with_max_entries(22, 0);
 #[map]
-static LCTR: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
+static LCTR: PerCpuArray<u64> = PerCpuArray::with_max_entries(10, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers (all #[inline(always)]: R4 call-free)
@@ -410,10 +443,10 @@ fn probe_read(dst: *mut u8, size: u32, src: *const c_void) -> bool {
 /// Name field width: 63 bytes + NUL (the wire bound).
 const NAME_LEN: usize = 64;
 
-/// v6 op driver word width: 55 bytes + NUL (the metadata words took
-/// the first 8 bytes of the old 64-byte word; the `LTfm` name keeps
-/// the full 64).
-const DRV_LEN: usize = 56;
+/// v7 op driver word width: 47 bytes + NUL (the AEAD words took
+/// 8 more bytes off the v6 56-byte word; the `LTfm` name keeps the
+/// full 64).
+const DRV_LEN: usize = 48;
 
 /// 8-aligned stack name slot: `zero_name` and the emitter's copy
 /// loop use `u64` volatile accesses, which require 8-byte alignment
@@ -474,41 +507,56 @@ fn copy_name(slot: *mut NameSlot, src: u64, bound: usize) -> bool {
     false
 }
 
-/// Chase offsets for the driver-name read (`LCFG` words 12/16/20 —
+/// Chase offsets for the driver-name read (`LCFG` words 12/16 —
 /// volatile reads, copied once like [`cfg_armed`]).
 #[inline(always)]
-fn chase_offsets() -> (u32, u32, u32) {
+fn chase_offsets() -> (u32, u32) {
     let Some(cfg) = LCFG.get(0) else {
-        return (0, 0, 0);
+        return (0, 0);
     };
     let tfm_alg = unsafe { core::ptr::addr_of!(cfg.tfm_alg).read_volatile() };
     let alg_drv = unsafe { core::ptr::addr_of!(cfg.alg_drv).read_volatile() };
-    let sk_base = unsafe { core::ptr::addr_of!(cfg.sk_base).read_volatile() };
-    (tfm_alg, alg_drv, sk_base)
+    (tfm_alg, alg_drv)
+}
+
+/// Family frontend-base word (`sk_base` / `aead_base` — volatile
+/// read, copied once): the embedded-`base` offset the driver chase
+/// and the op request-link chase add to reach the base from the
+/// frontend (and subtract to invert). Only read on armed runs.
+#[inline(always)]
+fn front_base_word(aead: bool) -> u32 {
+    let Some(cfg) = LCFG.get(0) else {
+        return 0;
+    };
+    if aead {
+        unsafe { core::ptr::addr_of!(cfg.aead_base).read_volatile() }
+    } else {
+        unsafe { core::ptr::addr_of!(cfg.sk_base).read_volatile() }
+    }
 }
 
 /// Resolve the driver name for a freshly allocated frontend `tfm`:
-/// `(tfm + sk_base)->__crt_alg->cra_driver_name` at the
+/// `(tfm + base_off)->__crt_alg->cra_driver_name` at the
 /// `LCFG`-pinned offsets, bounded-copied into `slot` (at most
 /// `bound` bytes — the op word takes `DRV_LEN`, the alloc word
-/// `NAME_LEN`). The frontend is a `struct crypto_skcipher *`, NOT a
-/// `struct crypto_tfm *` — the embedded base sits at `sk_base` (8
-/// on 64-bit: `reqsize` + alignment padding), and `__crt_alg` is
-/// relative to THAT (T07.2d: chasing `tfm + tfm_alg` reads the
-/// `exit` callback slot and copies kernel code bytes as the
-/// "name"). Any unreadable link (null/out-of-range pointer,
-/// faulted read) leaves the slot empty/unknown: missing provenance
-/// is unknown, never fabricated. Returns the truncation flag for
-/// the resolved name.
+/// `NAME_LEN`). The frontend is a family frontend pointer, NOT a
+/// `struct crypto_tfm *` — the embedded base sits at the family's
+/// base word (`base_off`: `sk_base` or `aead_base`, BTF-resolved),
+/// and `__crt_alg` is relative to THAT (T07.2d: chasing
+/// `tfm + tfm_alg` reads the `exit` callback slot and copies kernel
+/// code bytes as the "name"). Any unreadable link (null/out-of-range
+/// pointer, faulted read) leaves the slot empty/unknown: missing
+/// provenance is unknown, never fabricated. Returns the truncation
+/// flag for the resolved name.
 #[inline(always)]
-fn chase_drv_name(slot: *mut NameSlot, tfm: u64, bound: usize) -> bool {
+fn chase_drv_name(slot: *mut NameSlot, tfm: u64, bound: usize, base_off: u32) -> bool {
     // Pre-zero: every early return below must leave empty/unknown.
     zero_name(slot);
     if tfm == 0 {
         return false;
     }
-    let (tfm_alg, alg_drv, sk_base) = chase_offsets();
-    let Some(base_at) = tfm.checked_add(u64::from(sk_base)) else {
+    let (tfm_alg, alg_drv) = chase_offsets();
+    let Some(base_at) = tfm.checked_add(u64::from(base_off)) else {
         return false;
     };
     let Some(alg_at) = base_at.checked_add(u64::from(tfm_alg)) else {
@@ -529,36 +577,42 @@ fn chase_drv_name(slot: *mut NameSlot, tfm: u64, bound: usize) -> bool {
     copy_name(slot, name_at, bound)
 }
 
-/// Request-link offsets (`LCFG` words 32/36 + `sk_base` — volatile
-/// reads, copied once like [`chase_offsets`]). Only read on armed
-/// runs (the prologues gate first): on a missing map the zeros
-/// would fabricate a chase, so callers never run disarmed.
+/// Request-link offsets (the family request→base word + the
+/// family-independent `req_tfm` word + the family frontend-base
+/// word — volatile reads, copied once like [`chase_offsets`]).
+/// Only read on armed runs (the prologues gate first): on a missing
+/// map the zeros would fabricate a chase, so callers never run
+/// disarmed.
 #[inline(always)]
-fn req_link_offsets() -> (u32, u32, u32) {
+fn req_link_offsets(aead: bool) -> (u32, u32, u32) {
     let Some(cfg) = LCFG.get(0) else {
         return (0, 0, 0);
     };
-    let req_base = unsafe { core::ptr::addr_of!(cfg.req_base).read_volatile() };
+    let req_base = if aead {
+        unsafe { core::ptr::addr_of!(cfg.aead_req_base).read_volatile() }
+    } else {
+        unsafe { core::ptr::addr_of!(cfg.req_base).read_volatile() }
+    };
     let req_tfm = unsafe { core::ptr::addr_of!(cfg.req_tfm).read_volatile() };
-    let sk_base = unsafe { core::ptr::addr_of!(cfg.sk_base).read_volatile() };
-    (req_base, req_tfm, sk_base)
+    (req_base, req_tfm, front_base_word(aead))
 }
 
 /// Resolve the frontend transform behind an op request: `req` +
-/// `req_base` is the embedded `crypto_async_request`, whose `tfm`
-/// member names the BASE (`__crypto_skcipher_cast` inverts it) —
-/// subtract `sk_base` to the frontend so EVERY pairing pointer the
-/// tracker sees is a frontend (uniform normalization: op-first and
-/// alloc-first observations of one transform meet at one identity).
-/// Any unreadable link (null request, overflowed arithmetic, faulted
+/// the family request→base word is the embedded
+/// `crypto_async_request`, whose `tfm` member names the BASE (the
+/// `__crypto_*_cast` inverts it) — subtract the family frontend-base
+/// word to the frontend so EVERY pairing pointer the tracker sees is
+/// a frontend (per-family normalization: op-first and alloc-first
+/// observations of one transform meet at one identity). Any
+/// unreadable link (null request, overflowed arithmetic, faulted
 /// read, null tfm, underflowed subtraction) yields 0: unknown, never
 /// fabricated — the op still joins by invocation.
 #[inline(always)]
-fn chase_req_tfm(req: u64) -> u64 {
+fn chase_req_tfm(req: u64, aead: bool) -> u64 {
     if req == 0 {
         return 0;
     }
-    let (req_base, req_tfm, sk_base) = req_link_offsets();
+    let (req_base, req_tfm, front_base) = req_link_offsets(aead);
     let Some(base_at) = req.checked_add(u64::from(req_base)) else {
         return 0;
     };
@@ -574,7 +628,7 @@ fn chase_req_tfm(req: u64) -> u64 {
     {
         return 0;
     }
-    base.saturating_sub(u64::from(sk_base))
+    base.saturating_sub(u64::from(front_base))
 }
 
 /// Request-metadata offsets (`LCFG` words 32/40/44 — volatile
@@ -629,6 +683,83 @@ fn chase_req_meta(req: u64) -> (u32, u32, u16) {
         }
     }
     (cryptlen, req_flags, mflags)
+}
+
+/// AEAD request-metadata offsets (the `aead_*` words — volatile
+/// reads, copied once like [`req_meta_offsets`]): `aead_req_base`
+/// for the request→base link, `aead_req_cryptlen` for the API input
+/// length, `aead_req_assoclen` for the associated-data length, the
+/// shared `req_flags` word for the base-relative flags, and
+/// `aead_authsize` for the frontend-relative tag width. Only read on
+/// armed runs (the prologues gate first).
+#[inline(always)]
+fn aead_meta_offsets() -> (u32, u32, u32, u32, u32) {
+    let Some(cfg) = LCFG.get(0) else {
+        return (0, 0, 0, 0, 0);
+    };
+    let req_base = unsafe { core::ptr::addr_of!(cfg.aead_req_base).read_volatile() };
+    let cryptlen = unsafe { core::ptr::addr_of!(cfg.aead_req_cryptlen).read_volatile() };
+    let assoclen = unsafe { core::ptr::addr_of!(cfg.aead_req_assoclen).read_volatile() };
+    let flags = unsafe { core::ptr::addr_of!(cfg.req_flags).read_volatile() };
+    let authsize = unsafe { core::ptr::addr_of!(cfg.aead_authsize).read_volatile() };
+    (req_base, cryptlen, assoclen, flags, authsize)
+}
+
+/// Chase the entry-side request scalars for an AEAD op submit: the
+/// API input length, the request flags, the associated-data length,
+/// and the tag width (`frontend + aead_authsize` off the submit's
+/// chased frontend — the width the op runs under). Returns
+/// (cryptlen, req_flags, assoclen, authsize, mflags) under the same
+/// validity discipline as [`chase_req_meta`]: each value word is 0
+/// unless its chase fully landed, and the validity bit is set
+/// exactly then. A null frontend skips the authsize chase (unknown,
+/// never chased off null); a faulted tag read is unknown-with-zero
+/// (the transform link, not the tag, owns the failure).
+#[inline(always)]
+fn chase_req_meta_aead(req: u64, frontend: u64) -> (u32, u32, u32, u32, u16) {
+    if req == 0 {
+        return (0, 0, 0, 0, 0);
+    }
+    let (req_base, cryptlen_off, assoclen_off, flags_off, authsize_off) = aead_meta_offsets();
+    let mut mflags: u16 = 0;
+    let mut cryptlen: u32 = 0;
+    if let Some(at) = req.checked_add(u64::from(cryptlen_off)) {
+        let mut tmp: u32 = 0;
+        if probe_read(core::ptr::addr_of_mut!(tmp).cast(), 4, at as *const c_void) {
+            cryptlen = tmp;
+            mflags |= LMETA_CRYPTLEN_OK;
+        }
+    }
+    let mut req_flags: u32 = 0;
+    if let Some(at) = req
+        .checked_add(u64::from(req_base))
+        .and_then(|base| base.checked_add(u64::from(flags_off)))
+    {
+        let mut tmp: u32 = 0;
+        if probe_read(core::ptr::addr_of_mut!(tmp).cast(), 4, at as *const c_void) {
+            req_flags = tmp;
+            mflags |= LMETA_REQFLAGS_OK;
+        }
+    }
+    let mut assoclen: u32 = 0;
+    if let Some(at) = req.checked_add(u64::from(assoclen_off)) {
+        let mut tmp: u32 = 0;
+        if probe_read(core::ptr::addr_of_mut!(tmp).cast(), 4, at as *const c_void) {
+            assoclen = tmp;
+            mflags |= LMETA_ASSOCLEN_OK;
+        }
+    }
+    let mut authsize: u32 = 0;
+    if frontend != 0
+        && let Some(at) = frontend.checked_add(u64::from(authsize_off))
+    {
+        let mut tmp: u32 = 0;
+        if probe_read(core::ptr::addr_of_mut!(tmp).cast(), 4, at as *const c_void) {
+            authsize = tmp;
+            mflags |= LMETA_AUTHSIZE_OK;
+        }
+    }
+    (cryptlen, req_flags, assoclen, authsize, mflags)
 }
 
 /// Refcount words (`LCFG` 24/28 — volatile reads, copied once).
@@ -710,7 +841,8 @@ fn agg_inc(idx: u32) {
 /// the first `DRV_LEN` bytes from the caller's 8-aligned `NameSlot`
 /// (entry: the chased driver; exit: a zeroed slot — returns carry
 /// no name). Metadata rides the submit's words (`cryptlen` /
-/// `req_flags` / `fam` / `dir` / `mflags`); the exit run passes all
+/// `req_flags` / `fam` / `dir` / `mflags` / `assoclen` / `authsize`
+/// — the AEAD words ride AEAD submits only); the exit run passes all
 /// zeros (R2 extended — never chased).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -728,6 +860,8 @@ fn emit_edge(
     fam: u8,
     dir: u8,
     mflags: u16,
+    assoclen: u32,
+    authsize: u32,
     drv: &NameSlot,
     truncated: bool,
     hook: u32,
@@ -766,6 +900,8 @@ fn emit_edge(
         core::ptr::addr_of_mut!((*ptr).fam).write_volatile(fam);
         core::ptr::addr_of_mut!((*ptr).dir).write_volatile(dir);
         core::ptr::addr_of_mut!((*ptr).mflags).write_volatile(mflags);
+        core::ptr::addr_of_mut!((*ptr).assoclen).write_volatile(assoclen);
+        core::ptr::addr_of_mut!((*ptr).authsize).write_volatile(authsize);
         // Volatile loads (same R4 rationale as `emit_tfm_edge`'s
         // name copy: the stack source may be known-zero, and plain
         // loads fuse the copy into a `memset` call).
@@ -866,21 +1002,22 @@ fn cpu_id() -> u32 {
 const INVOC_CPU_BITS: u32 = 13;
 /// CPUs covered by the tag (`1 << 13`).
 const INVOC_CPU_MAX: u32 = 1 << INVOC_CPU_BITS;
-/// Program-lane field width: 3 bits cover the 8 site-program lanes
-/// (op lanes 0–1, alloc-sk lane 2, T07.3/T07.4 lanes 3–7).
-const INVOC_LANE_BITS: u32 = 3;
+/// Program-lane field width: 4 bits cover the 10 site-program
+/// lanes (P5: op lanes 0–1, alloc-sk lane 2, T07.3/T07.4 lanes 3–6,
+/// alloc-aead lane 7, AEAD op lanes 8–9).
+const INVOC_LANE_BITS: u32 = 4;
 /// Highest lane the field covers.
 const INVOC_LANE_MAX: u32 = 1 << INVOC_LANE_BITS;
 /// Lane-field shift: past the reserved bit 0 + the cpu tag.
 const INVOC_LANE_SHIFT: u32 = 1 + INVOC_CPU_BITS;
 /// Sequence shift: past reserved bit + cpu tag + lane field.
 const INVOC_SEQ_SHIFT: u32 = 1 + INVOC_CPU_BITS + INVOC_LANE_BITS;
-/// Per-program per-CPU sequence ceiling: 47 bits (ids stay in 64
+/// Per-program per-CPU sequence ceiling: 46 bits (ids stay in 64
 /// bits with tag + lane field + reserved bit).
 const INVOC_SEQ_MAX: u64 = (1 << (64 - INVOC_SEQ_SHIFT)) - 1;
 
 /// Take the next invocation id: `(per-program per-CPU sequence <<
-/// 17) | (lane << 14) | (cpu << 1)` (bit 0 reserved + always
+/// 18) | (lane << 14) | (cpu << 1)` (bit 0 reserved + always
 /// clear). The sequence lane is this CPU's cell FOR THIS PROGRAM
 /// (non-atomic bump, exclusive: per-CPU via `migrate_disable`,
 /// per-program via the kernel per-program recursion guard, which
@@ -934,15 +1071,27 @@ fn run_prologue(key: u64, hook: u32) -> Option<u64> {
     Some(unsafe { bpf_ktime_get_ns() })
 }
 
-/// One site's session program (shared by encrypt/decrypt bodies):
-/// entry run issues the invocation into the cookie and emits the
-/// submit (live entry chase: transform word + driver); exit run
-/// reads the cookie back and emits the return (NO chase — R2: the
-/// request may be freed already after an async completion, so a
-/// return without submit evidence leaves the association unknown).
-/// `lane`/`site`/`sub_hook`/`ret_hook` pin the caller's identity.
+/// One site's session program (shared by the encrypt/decrypt
+/// bodies of one family): entry run issues the invocation into the
+/// cookie and emits the submit (live entry chase: transform word +
+/// driver); exit run reads the cookie back and emits the return (NO
+/// chase — R2: the request may be freed already after an async
+/// completion, so a return without submit evidence leaves the
+/// association unknown). `lane`/`site`/`sub_hook`/`ret_hook` pin the
+/// caller's identity; `fam`/`aead` pin its family (the chase words
+/// and the emitted family byte follow the family's `LCFG` words —
+/// skcipher and AEAD programs never share chase offsets).
 #[inline(always)]
-fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: u32) -> i32 {
+#[allow(clippy::too_many_arguments)]
+fn site_run(
+    ctx: &FEntryContext,
+    lane: u32,
+    site: u16,
+    sub_hook: u32,
+    ret_hook: u32,
+    fam: u8,
+    aead: bool,
+) -> i32 {
     let raw = ctx.as_ptr();
     let key: u64 = ctx.arg(0);
     if session_is_return(raw) {
@@ -971,6 +1120,8 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
                 now,
                 0,
                 true,
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -1007,6 +1158,8 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
             0,
             0,
             0,
+            0,
+            0,
             empty,
             false,
             ret_hook,
@@ -1032,20 +1185,26 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
     }
     // Live entry chase (the request is ours for the call's duration):
     // the transform word, the request scalars (cryptlen/flags with
-    // validity bits — unknown when unreadable, never fabricated),
+    // validity bits — unknown when unreadable, never fabricated;
+    // AEAD submits add assoclen/authsize off the family's words),
     // and the runtime-selected driver (F05 — empty when unreadable,
     // never fabricated; clipped names flag TRUNCATED, never read
     // as complete).
-    let tfm = chase_req_tfm(key);
-    let (cryptlen, req_flags, mflags) = chase_req_meta(key);
+    let tfm = chase_req_tfm(key, aead);
+    let (cryptlen, req_flags, assoclen, authsize, mflags) = if aead {
+        chase_req_meta_aead(key, tfm)
+    } else {
+        let (cryptlen, req_flags, mflags) = chase_req_meta(key);
+        (cryptlen, req_flags, 0, 0, mflags)
+    };
     let mut slot = MaybeUninit::<NameSlot>::uninit();
     let raw_slot = slot.as_mut_ptr();
     zero_name(raw_slot);
-    let truncated = chase_drv_name(raw_slot, tfm, DRV_LEN);
+    let truncated = chase_drv_name(raw_slot, tfm, DRV_LEN, front_base_word(aead));
     // SAFETY: `chase_drv_name` keeps the slot fully initialized on
     // every path (pre-zeroed, then helper-overwritten in part).
     let drv = unsafe { &*raw_slot };
-    let dir = if site == LSITE_ENC {
+    let dir = if site == LSITE_ENC || site == LSITE_AEAD_ENC {
         LDIR_ENC
     } else {
         LDIR_DEC
@@ -1061,9 +1220,11 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
         tfm,
         cryptlen,
         req_flags,
-        LFAM_SK,
+        fam,
         dir,
         mflags,
+        assoclen,
+        authsize,
         drv,
         truncated,
         sub_hook,
@@ -1087,37 +1248,40 @@ fn alloc_prologue(hook: u32) -> Option<u64> {
     Some(unsafe { bpf_ktime_get_ns() })
 }
 
-/// The `crypto_alloc_skcipher` session program: entry run mints the
-/// attempt token into the cookie and emits the submit (requested
-/// name + type + mask); exit run classifies the return BEFORE
-/// dereference and emits the return (frontend pointer + resolved
-/// driver name on success, errno + empty name on ERR_PTR failure).
-/// A zero cookie (skipped entry) emits TAINTED with token 0 and the
-/// real classification — twin-valid shapes the tracker refuses
-/// quietly, so an unpaired exit disturbs no outstanding attempt.
+/// The allocation session program (shared by the skcipher/AEAD
+/// alloc bodies): entry run mints the attempt token into the cookie
+/// and emits the submit (requested name + type + mask); exit run
+/// classifies the return BEFORE dereference and emits the return
+/// (frontend pointer + resolved driver name on success, errno +
+/// empty name on ERR_PTR failure). A zero cookie (skipped entry)
+/// emits TAINTED with token 0 and the real classification —
+/// twin-valid shapes the tracker refuses quietly, so an unpaired
+/// exit disturbs no outstanding attempt. `site`/`lane`/`sub`/`ret`
+/// pin the caller's identity; `aead` selects the family's
+/// frontend-base word for the success driver chase.
 #[inline(always)]
-fn alloc_run(ctx: &FEntryContext) -> i32 {
+fn alloc_run(ctx: &FEntryContext, site: u16, lane: u32, sub: u32, ret: u32, aead: bool) -> i32 {
     let raw = ctx.as_ptr();
     if session_is_return(raw) {
         // ---- exit run: classify, then pair by cookie ----
-        let Some(now) = alloc_prologue(LAGG_ALLOCSK_RET) else {
+        let Some(now) = alloc_prologue(ret) else {
             return 0;
         };
-        let Some(ret) = func_ret(raw) else {
-            loss_inc(LLOSS_FRET, LAGG_ALLOCSK_RET);
+        let Some(retval) = func_ret(raw) else {
+            loss_inc(LLOSS_FRET, ret);
             return 0;
         };
         // Re-fetch the cookie in this run (never stored).
         let token = unsafe { *session_cookie(raw) };
-        if ret == 0 {
+        if retval == 0 {
             // Neither success-ptr nor ERR_PTR: unclassifiable (no
             // honest kernel produces it) — a pre-accept drop
             // (unagg'd, like BADKEY), never a fabricated errno.
-            loss_inc(LLOSS_FRET, LAGG_ALLOCSK_RET);
+            loss_inc(LLOSS_FRET, ret);
             return 0;
         }
-        agg_inc(LAGG_ALLOCSK_RET);
-        if ret >= ERR_PTR_MIN {
+        agg_inc(ret);
+        if retval >= ERR_PTR_MIN {
             // ERR_PTR failure: errno status, zero key, zeroed name —
             // classified, never dereferenced, never chased.
             let mut slot = MaybeUninit::<NameSlot>::uninit();
@@ -1128,18 +1292,18 @@ fn alloc_run(ctx: &FEntryContext) -> i32 {
             // SAFETY: volatile-zeroed above; exclusive stack slot.
             let name = unsafe { &*raw_slot };
             emit_tfm_edge(
-                LTFM_SITE_ALLOC_SK,
+                site,
                 LEDGE_RETURN,
                 0,
                 now,
-                ret as i32,
+                retval as i32,
                 0,
                 0,
                 token == 0,
                 false,
                 token,
                 name,
-                LAGG_ALLOCSK_RET,
+                ret,
             );
             return 0;
         }
@@ -1149,36 +1313,25 @@ fn alloc_run(ctx: &FEntryContext) -> i32 {
         // The pointer stays typed as *mut NameSlot, so word
         // accesses keep their 8-alignment by construction (D2).
         let raw_slot = slot.as_mut_ptr();
-        let truncated = chase_drv_name(raw_slot, ret, NAME_LEN);
+        let truncated = chase_drv_name(raw_slot, retval, NAME_LEN, front_base_word(aead));
         // SAFETY: `chase_drv_name` leaves the slot fully initialized
         // on every path (zeroed, then helper-overwritten in part).
         let name = unsafe { &*raw_slot };
         emit_tfm_edge(
-            LTFM_SITE_ALLOC_SK,
-            LEDGE_RETURN,
-            ret,
-            now,
-            0,
-            0,
-            0,
-            token == 0,
-            truncated,
-            token,
-            name,
-            LAGG_ALLOCSK_RET,
+            site, LEDGE_RETURN, retval, now, 0, 0, 0, token == 0, truncated, token, name, ret,
         );
         return 0;
     }
     // ---- entry run: mint the token, copy the request ----
-    let Some(now) = alloc_prologue(LAGG_ALLOCSK_SUB) else {
+    let Some(now) = alloc_prologue(sub) else {
         return 0;
     };
-    agg_inc(LAGG_ALLOCSK_SUB);
-    let Some(token) = invoc_next(LCTR_ALLOCSK) else {
+    agg_inc(sub);
+    let Some(token) = invoc_next(lane) else {
         // No attempt token: post-accept drop (agg'd NOSLOT — the
         // cookie stays zero and nothing emits, so the exit taints
         // by construction, exactly like the op path).
-        loss_inc(LLOSS_NOSLOT, LAGG_ALLOCSK_SUB);
+        loss_inc(LLOSS_NOSLOT, sub);
         return 0;
     };
     unsafe {
@@ -1195,7 +1348,7 @@ fn alloc_run(ctx: &FEntryContext) -> i32 {
     // helper-overwritten in part).
     let name = unsafe { &*raw_slot };
     emit_tfm_edge(
-        LTFM_SITE_ALLOC_SK,
+        site,
         LEDGE_SUBMIT,
         0,
         now,
@@ -1206,7 +1359,7 @@ fn alloc_run(ctx: &FEntryContext) -> i32 {
         truncated,
         token,
         name,
-        LAGG_ALLOCSK_SUB,
+        sub,
     );
     0
 }
@@ -1415,7 +1568,15 @@ fn config_run(
 #[unsafe(link_section = "fsession/crypto_skcipher_encrypt")]
 pub fn lc_enc(ctx: *mut c_void) -> i32 {
     let ctx = FEntryContext::new(ctx);
-    site_run(&ctx, LCTR_ENC, LSITE_ENC, LAGG_ENC_SUB, LAGG_ENC_RET)
+    site_run(
+        &ctx,
+        LCTR_ENC,
+        LSITE_ENC,
+        LAGG_ENC_SUB,
+        LAGG_ENC_RET,
+        LFAM_SK,
+        false,
+    )
 }
 
 /// `crypto_skcipher_decrypt(req)` session: submit at entry, paired
@@ -1424,7 +1585,51 @@ pub fn lc_enc(ctx: *mut c_void) -> i32 {
 #[unsafe(link_section = "fsession/crypto_skcipher_decrypt")]
 pub fn lc_dec(ctx: *mut c_void) -> i32 {
     let ctx = FEntryContext::new(ctx);
-    site_run(&ctx, LCTR_DEC, LSITE_DEC, LAGG_DEC_SUB, LAGG_DEC_RET)
+    site_run(
+        &ctx,
+        LCTR_DEC,
+        LSITE_DEC,
+        LAGG_DEC_SUB,
+        LAGG_DEC_RET,
+        LFAM_SK,
+        false,
+    )
+}
+
+/// `crypto_aead_encrypt(req)` session (P5): submit at entry (AEAD
+/// chase words + AEAD family byte), paired return at exit, joined by
+/// the kernel-zeroed cookie.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "fsession/crypto_aead_encrypt")]
+pub fn lc_aead_enc(ctx: *mut c_void) -> i32 {
+    let ctx = FEntryContext::new(ctx);
+    site_run(
+        &ctx,
+        LCTR_AEADENC,
+        LSITE_AEAD_ENC,
+        LAGG_AEADENC_SUB,
+        LAGG_AEADENC_RET,
+        LFAM_AEAD,
+        true,
+    )
+}
+
+/// `crypto_aead_decrypt(req)` session (P5): submit at entry (AEAD
+/// chase words + AEAD family byte), paired return at exit, joined by
+/// the kernel-zeroed cookie.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "fsession/crypto_aead_decrypt")]
+pub fn lc_aead_dec(ctx: *mut c_void) -> i32 {
+    let ctx = FEntryContext::new(ctx);
+    site_run(
+        &ctx,
+        LCTR_AEADDEC,
+        LSITE_AEAD_DEC,
+        LAGG_AEADDEC_SUB,
+        LAGG_AEADDEC_RET,
+        LFAM_AEAD,
+        true,
+    )
 }
 
 /// `crypto_alloc_skcipher(alg_name, type, mask)` session: submit at
@@ -1435,7 +1640,33 @@ pub fn lc_dec(ctx: *mut c_void) -> i32 {
 #[unsafe(link_section = "fsession/crypto_alloc_skcipher")]
 pub fn lc_alloc(ctx: *mut c_void) -> i32 {
     let ctx = FEntryContext::new(ctx);
-    alloc_run(&ctx)
+    alloc_run(
+        &ctx,
+        LTFM_SITE_ALLOC_SK,
+        LCTR_ALLOCSK,
+        LAGG_ALLOCSK_SUB,
+        LAGG_ALLOCSK_RET,
+        false,
+    )
+}
+
+/// `crypto_alloc_aead(alg_name, type, mask)` session (P5): submit at
+/// entry (requested name + type + mask + fresh attempt token),
+/// classified return at exit (AEAD frontend pointer + driver name
+/// chased through the AEAD base word, or errno), joined by the
+/// kernel-zeroed cookie.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "fsession/crypto_alloc_aead")]
+pub fn lc_alloc_aead(ctx: *mut c_void) -> i32 {
+    let ctx = FEntryContext::new(ctx);
+    alloc_run(
+        &ctx,
+        LTFM_SITE_ALLOC_AEAD,
+        LCTR_ALLOCAEAD,
+        LAGG_ALLOCAEAD_SUB,
+        LAGG_ALLOCAEAD_RET,
+        true,
+    )
 }
 
 /// `crypto_destroy_tfm(mem, tfm)` session: submit at entry
@@ -1540,6 +1771,8 @@ fn cb_emit(key: u64, err: i32, site: u16, hook: u32) {
         now,
         err,
         false,
+        0,
+        0,
         0,
         0,
         0,

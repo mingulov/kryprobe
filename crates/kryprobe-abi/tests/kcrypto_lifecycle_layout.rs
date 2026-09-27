@@ -4,13 +4,15 @@
 //! Any drift between BPF bytes and these mirrors must fail here.
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LAGG_ALLOCAEAD_RET, LAGG_ALLOCAEAD_SUB, LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_CB_CRYPTD,
-    LAGG_CB_KXC, LAGG_DEC_RET, LAGG_DEC_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_ENC_RET,
-    LAGG_ENC_SUB, LAGG_SETAUTH_RET, LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB,
+    LAGG_AEADDEC_RET, LAGG_AEADDEC_SUB, LAGG_AEADENC_RET, LAGG_AEADENC_SUB, LAGG_ALLOCAEAD_RET,
+    LAGG_ALLOCAEAD_SUB, LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_CB_CRYPTD, LAGG_CB_KXC,
+    LAGG_DEC_RET, LAGG_DEC_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_ENC_RET, LAGG_ENC_SUB,
+    LAGG_SETAUTH_RET, LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB,
     LAGG_SETKEYSK_RET, LAGG_SETKEYSK_SUB, LCONFIG_MAGIC, LCONFIG_VERSION, LConfig, LDIR_DEC,
     LDIR_ENC, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED,
-    LEDGE_VERSION, LEdge, LFAM_SK, LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_NOSLOT,
-    LLOSS_RESERVE, LMETA_CRYPTLEN_OK, LMETA_REQFLAGS_OK, LSITE_DEC, LSITE_ENC, LTFM_MAGIC,
+    LEDGE_VERSION, LEdge, LFAM_AEAD, LFAM_SK, LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET,
+    LLOSS_NOSLOT, LLOSS_RESERVE, LMETA_ASSOCLEN_OK, LMETA_AUTHSIZE_OK, LMETA_CRYPTLEN_OK,
+    LMETA_REQFLAGS_OK, LSITE_AEAD_DEC, LSITE_AEAD_ENC, LSITE_DEC, LSITE_ENC, LTFM_MAGIC,
     LTFM_SITE_ALLOC_AEAD, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE,
     LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK, LTFM_TRUNCATED, LTFM_VERSION, LTfm,
 };
@@ -34,24 +36,31 @@ fn ledge_is_112_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LEdge, fam), 52);
     assert_eq!(offset_of!(LEdge, dir), 53);
     assert_eq!(offset_of!(LEdge, mflags), 54);
-    assert_eq!(offset_of!(LEdge, drv), 56);
+    assert_eq!(offset_of!(LEdge, assoclen), 56);
+    assert_eq!(offset_of!(LEdge, authsize), 60);
+    assert_eq!(offset_of!(LEdge, drv), 64);
 }
 
 #[test]
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
-    assert_eq!(LEDGE_VERSION, 6);
+    assert_eq!(LEDGE_VERSION, 7);
     assert_eq!(LEDGE_INVOC_POISON, 1);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
     assert_eq!(LEDGE_TAINTED, 0x0001);
     assert_eq!(LSITE_ENC, 1);
     assert_eq!(LSITE_DEC, 2);
+    assert_eq!(LSITE_AEAD_ENC, 5);
+    assert_eq!(LSITE_AEAD_DEC, 6);
     assert_eq!(LFAM_SK, 1);
+    assert_eq!(LFAM_AEAD, 2);
     assert_eq!(LDIR_ENC, 1);
     assert_eq!(LDIR_DEC, 2);
     assert_eq!(LMETA_CRYPTLEN_OK, 0x0001);
     assert_eq!(LMETA_REQFLAGS_OK, 0x0002);
+    assert_eq!(LMETA_ASSOCLEN_OK, 0x0004);
+    assert_eq!(LMETA_AUTHSIZE_OK, 0x0008);
 }
 
 #[test]
@@ -118,8 +127,8 @@ fn ltfm_debug_redacts_kernel_key_but_shows_name() {
 }
 
 #[test]
-fn lconfig_is_64_bytes_with_pinned_offsets() {
-    assert_eq!(size_of::<LConfig>(), 64);
+fn lconfig_is_80_bytes_with_pinned_offsets() {
+    assert_eq!(size_of::<LConfig>(), 80);
     assert_eq!(offset_of!(LConfig, magic), 0);
     assert_eq!(offset_of!(LConfig, version), 4);
     assert_eq!(offset_of!(LConfig, flags), 8);
@@ -134,13 +143,18 @@ fn lconfig_is_64_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LConfig, req_flags), 44);
     assert_eq!(offset_of!(LConfig, op_req_off), 48);
     assert_eq!(offset_of!(LConfig, op_req_present), 52);
-    assert_eq!(offset_of!(LConfig, reserved), 56);
+    assert_eq!(offset_of!(LConfig, aead_req_base), 56);
+    assert_eq!(offset_of!(LConfig, aead_req_cryptlen), 60);
+    assert_eq!(offset_of!(LConfig, aead_req_assoclen), 64);
+    assert_eq!(offset_of!(LConfig, aead_base), 68);
+    assert_eq!(offset_of!(LConfig, aead_authsize), 72);
+    assert_eq!(offset_of!(LConfig, reserved), 76);
 }
 
 #[test]
 fn lconfig_magic_version_are_frozen() {
     assert_eq!(LCONFIG_MAGIC, 0x3143_4c4b);
-    assert_eq!(LCONFIG_VERSION, 5);
+    assert_eq!(LCONFIG_VERSION, 6);
 }
 
 #[test]
@@ -174,6 +188,10 @@ fn lagg_hook_indices_are_frozen() {
     assert_eq!(LAGG_SETKEYAEAD_RET, 15);
     assert_eq!(LAGG_CB_CRYPTD, 16);
     assert_eq!(LAGG_CB_KXC, 17);
+    assert_eq!(LAGG_AEADENC_SUB, 18);
+    assert_eq!(LAGG_AEADENC_RET, 19);
+    assert_eq!(LAGG_AEADDEC_SUB, 20);
+    assert_eq!(LAGG_AEADDEC_RET, 21);
 }
 
 #[test]
@@ -197,7 +215,9 @@ fn f9_ledge_debug_redacts_kernel_key() {
         fam: LFAM_SK,
         dir: LDIR_ENC,
         mflags: LMETA_CRYPTLEN_OK,
-        drv: [0; 56],
+        assoclen: 0,
+        authsize: 0,
+        drv: [0; 48],
     };
     edge.drv[..11].copy_from_slice(b"aes-generic");
     let shown = format!("{edge:?}");

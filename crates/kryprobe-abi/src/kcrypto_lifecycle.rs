@@ -28,12 +28,12 @@
 
 /// `LEdge.magic`: `LC` (little-endian u16).
 pub const LEDGE_MAGIC: u16 = 0x434c;
-/// `LEdge.version` the P3 decoder understands (v6: entry-side scalar
-/// request metadata — `cryptlen`, `req_flags`, `fam`, `dir`, `mflags`
-/// — with the driver word narrowed to 56 bytes; v1–v5 records refuse
-/// — versions never mix, so an old decoder misreading the reshaped
-/// record is impossible).
-pub const LEDGE_VERSION: u8 = 6;
+/// `LEdge.version` the P5 decoder understands (v7: the v6
+/// entry-side scalars plus the AEAD words — `assoclen`, `authsize`
+/// — with the driver word narrowed to 48 bytes; v1–v6 records
+/// refuse — versions never mix, so an old decoder misreading the
+/// reshaped record is impossible).
+pub const LEDGE_VERSION: u8 = 7;
 
 /// `LEdge.edge`: function entry (submit-side observation).
 pub const LEDGE_SUBMIT: u8 = 1;
@@ -55,23 +55,41 @@ pub const LSITE_CB_CRYPTD: u16 = 3;
 /// `kcrypto_fixture`) — request chased BPF-side at the arm-resolved
 /// `op_req_off`.
 pub const LSITE_CB_KXC: u16 = 4;
+/// `LEdge.site`: `crypto_aead_encrypt` (P5).
+pub const LSITE_AEAD_ENC: u16 = 5;
+/// `LEdge.site`: `crypto_aead_decrypt` (P5).
+pub const LSITE_AEAD_DEC: u16 = 6;
 
-/// v6 `LEdge.fam`: skcipher family (the only P3 op family — every v6
-/// submit carries this; any other value is twin drift and refuses).
+/// v7 `LEdge.fam`: skcipher family (skcipher op sites only — any
+/// other site carrying this is twin drift and refuses).
 pub const LFAM_SK: u8 = 1;
+/// v7 `LEdge.fam`: AEAD family (AEAD op sites only — P5; a skcipher
+/// site carrying this is twin drift and refuses, never a relabel).
+pub const LFAM_AEAD: u8 = 2;
 
-/// v6 `LEdge.dir`: encrypt direction (echoes [`LSITE_ENC`]).
+/// v7 `LEdge.dir`: encrypt direction (echoes [`LSITE_ENC`] /
+/// [`LSITE_AEAD_ENC`]).
 pub const LDIR_ENC: u8 = 1;
-/// v6 `LEdge.dir`: decrypt direction (echoes [`LSITE_DEC`]).
+/// v7 `LEdge.dir`: decrypt direction (echoes [`LSITE_DEC`] /
+/// [`LSITE_AEAD_DEC`]).
 pub const LDIR_DEC: u8 = 2;
 
-/// v6 `LEdge.mflags` bit 0: `cryptlen` holds a chased API input
+/// v7 `LEdge.mflags` bit 0: `cryptlen` holds a chased API input
 /// length (clear means the entry chase was unreadable — unknown,
 /// with the value word zero).
 pub const LMETA_CRYPTLEN_OK: u16 = 0x0001;
-/// v6 `LEdge.mflags` bit 1: `req_flags` holds chased request flags
+/// v7 `LEdge.mflags` bit 1: `req_flags` holds chased request flags
 /// (clear means unreadable — unknown, with the value word zero).
 pub const LMETA_REQFLAGS_OK: u16 = 0x0002;
+/// v7 `LEdge.mflags` bit 2: `assoclen` holds a chased
+/// associated-data length (AEAD submits only — clear means
+/// unreadable — unknown, with the value word zero; skcipher
+/// submits never set this bit).
+pub const LMETA_ASSOCLEN_OK: u16 = 0x0004;
+/// v7 `LEdge.mflags` bit 3: `authsize` holds a chased tag width
+/// (AEAD submits only — clear means unreadable — unknown, with
+/// the value word zero; skcipher submits never set this bit).
+pub const LMETA_AUTHSIZE_OK: u16 = 0x0008;
 
 /// `LTfm.magic`: `LT` (little-endian u16).
 pub const LTFM_MAGIC: u16 = 0x544c;
@@ -113,12 +131,12 @@ pub const LEDGE_TRUNCATED: u16 = 0x0002;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
 pub const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
-/// `LConfig.version` the P4 sensor understands (v5: the v4 chase
-/// words plus the fixture `op->req` words `op_req_off` /
-/// `op_req_present`; older versions refuse — versions never mix, so
-/// a v5 BPF never chases callbacks through a v4 config's zeroed
-/// tail — the presence word would read 0 and gate the hook anyway).
-pub const LCONFIG_VERSION: u32 = 5;
+/// `LConfig.version` the P5 sensor understands (v6: the v5 chase
+/// words plus the AEAD words `aead_req_base` / `aead_req_cryptlen` /
+/// `aead_req_assoclen` / `aead_base` / `aead_authsize`, 80 bytes
+/// total; older versions refuse — versions never mix, so a v6 BPF
+/// never chases AEAD through a v5 config's zeroed tail).
+pub const LCONFIG_VERSION: u32 = 6;
 /// `LConfig.flags` bit 0: disarmed (D1). The disarm writes the armed
 /// value back with ONLY this bit set — magic, version, offsets and
 /// tail preserved bit-for-bit — so a hook racing the disarm reads
@@ -180,24 +198,32 @@ pub const LAGG_ALLOCAEAD_RET: u32 = 13;
 pub const LAGG_SETKEYAEAD_SUB: u32 = 14;
 /// `LAGG[15]`: accepted aead-setkey-return edges (T07.4).
 pub const LAGG_SETKEYAEAD_RET: u32 = 15;
-/// `LAGG[16]`: accepted cryptd-callback edges (P4 — lanes 12/13 stay
-/// T10's aead-alloc reservation; no headroom past 17).
+/// `LAGG[16]`: accepted cryptd-callback edges (P4).
 pub const LAGG_CB_CRYPTD: u32 = 16;
 /// `LAGG[17]`: accepted fixture-callback edges (P4).
 pub const LAGG_CB_KXC: u32 = 17;
+/// `LAGG[18]`: accepted AEAD-encrypt-submit edges (P5).
+pub const LAGG_AEADENC_SUB: u32 = 18;
+/// `LAGG[19]`: accepted AEAD-encrypt-return edges (P5).
+pub const LAGG_AEADENC_RET: u32 = 19;
+/// `LAGG[20]`: accepted AEAD-decrypt-submit edges (P5).
+pub const LAGG_AEADDEC_SUB: u32 = 20;
+/// `LAGG[21]`: accepted AEAD-decrypt-return edges (P5).
+pub const LAGG_AEADDEC_RET: u32 = 21;
 
 // ---------------------------------------------------------------------------
 // Structs (twinned in kcrypto_lifecycle.rs; pinned by layout tests)
 // ---------------------------------------------------------------------------
 
-/// One raw lifecycle edge on `LRING` (112 bytes, v6): site, edge
+/// One raw lifecycle edge on `LRING` (112 bytes, v7): site, edge
 /// kind, pairing key, timestamp, the return status (return edges
 /// only; submit edges carry 0), the entry-side scalar request
-/// metadata (P3: `cryptlen`, `req_flags`, `fam`, `dir`, `mflags` —
-/// submit edges only), the BPF invocation id, the frontend
-/// transform pointer behind the op (first-seen admission + submit
-/// attribution; 0 when the request link was unreadable), and the
-/// runtime-selected driver name (submit edges only).
+/// metadata (P3: `cryptlen`, `req_flags`, `fam`, `dir`, `mflags`;
+/// P5: `assoclen`, `authsize` on AEAD submits — submit edges only),
+/// the BPF invocation id, the frontend transform pointer behind the
+/// op (first-seen admission + submit attribution; 0 when the request
+/// link was unreadable), and the runtime-selected driver name
+/// (submit edges only).
 ///
 /// [`LEdge::tfm`] is the raw `crypto_skcipher` frontend pointer the
 /// op ran against (`req->base->tfm` chased BPF-side at the
@@ -220,9 +246,10 @@ pub const LAGG_CB_KXC: u32 = 17;
 ///
 /// [`LEdge::invoc`] is the return-carried invocation identity
 /// (round-4 W4, race-hardened round-6 W6, lane-split round-7 W7,
-/// cookie-carried round-8 W8, 3-bit lanes T07.2): every submit takes
-/// `(per-program per-CPU sequence << 17) | (lane << 14) | (cpu << 1)`
-/// from its own program's BPF `LCTR` lane (bit 0 reserved + always
+/// cookie-carried round-8 W8, 3-bit lanes T07.2, 4-bit lanes P5):
+/// every submit takes `(per-program per-CPU sequence << 18) |
+/// (lane << 14) | (cpu << 1)` from its own program's BPF `LCTR`
+/// lane (bit 0 reserved + always
 /// clear; 0 is never issued, it means "no invocation"); the entry
 /// run stores it in the kernel-zeroed per-call session cookie and
 /// the exit run of the SAME call reads the SAME cookie back. The
@@ -284,21 +311,33 @@ pub struct LEdge {
     /// meaningful only when [`LMETA_REQFLAGS_OK`] is set, otherwise
     /// 0 = unknown). Submit edges only (returns carry 0).
     pub req_flags: u32,
-    /// Crypto family ([`LFAM_SK`] — the only P3 value). Submit edges
-    /// only (returns carry 0).
+    /// Crypto family ([`LFAM_SK`] / [`LFAM_AEAD`] — must match the
+    /// site's family). Submit edges only (returns carry 0).
     pub fam: u8,
     /// Operation direction ([`LDIR_ENC`] / [`LDIR_DEC`] — echoes the
-    /// site). Submit edges only (returns carry 0).
+    /// site's class). Submit edges only (returns carry 0).
     pub dir: u8,
     /// Metadata validity ([`LMETA_CRYPTLEN_OK`] +
-    /// [`LMETA_REQFLAGS_OK`] defined; 0 when both chases were
+    /// [`LMETA_REQFLAGS_OK`] + [`LMETA_ASSOCLEN_OK`] +
+    /// [`LMETA_AUTHSIZE_OK`] defined; 0 when every chase was
     /// unreadable). Submit edges only (returns carry 0).
     pub mflags: u16,
+    /// Associated-data length (`aead_request.assoclen` chased at
+    /// entry; meaningful only when [`LMETA_ASSOCLEN_OK`] is set,
+    /// otherwise 0 = unknown). AEAD submit edges only (skcipher
+    /// submits, returns, and callback halves carry 0, never chased).
+    pub assoclen: u32,
+    /// Tag width (`crypto_aead.authsize` chased at entry through the
+    /// submit's transform link; meaningful only when
+    /// [`LMETA_AUTHSIZE_OK`] is set, otherwise 0 = unknown). AEAD
+    /// submit edges only (skcipher submits, returns, and callback
+    /// halves carry 0, never chased).
+    pub authsize: u32,
     /// Runtime-selected driver name behind the submit's transform
-    /// (NUL-terminated, 55 bytes max + NUL; empty when the driver
+    /// (NUL-terminated, 47 bytes max + NUL; empty when the driver
     /// chase was unreadable — unknown, never fabricated). Submit
     /// edges only (returns carry empty — the twin refuses a name).
-    pub drv: [u8; 56],
+    pub drv: [u8; 48],
 }
 
 impl core::fmt::Debug for LEdge {
@@ -319,6 +358,8 @@ impl core::fmt::Debug for LEdge {
             .field("fam", &self.fam)
             .field("dir", &self.dir)
             .field("mflags", &self.mflags)
+            .field("assoclen", &self.assoclen)
+            .field("authsize", &self.authsize)
             .field("drv", &self.drv)
             .finish()
     }
@@ -346,6 +387,8 @@ impl LEdge {
         "fam",
         "dir",
         "mflags",
+        "assoclen",
+        "authsize",
         "drv",
     ];
 }
@@ -374,12 +417,12 @@ impl LEdge {
 /// entry run mints one id per call from its own `LCTR` lane and
 /// stores it in the kernel-zeroed per-call session cookie; the
 /// exit run of the SAME call reads the SAME cookie back). The mint
-/// shares the invocation layout (`(seq << 17) | (lane << 14) |
-/// (cpu << 1)`, bit 0 reserved + always clear) with the alloc
-/// program's own lane value, so the namespace is separate from
-/// invocation ids (own counter lane, own tracker table — an attempt
-/// token can never alias an invocation id). 0 means "no attempt"
-/// (tainted edges only).
+/// shares the invocation layout (`(seq << 18) | (lane << 14) |
+/// (cpu << 1)`, bit 0 reserved + always clear, 4-bit lanes P5) with
+/// the alloc program's own lane value, so the namespace is separate
+/// from invocation ids (own counter lane, own tracker table — an
+/// attempt token can never alias an invocation id). 0 means "no
+/// attempt" (tainted edges only).
 ///
 /// `Debug` is manual: [`LTfm::key`] is a raw kernel pointer and
 /// renders as `<redacted>` (same promise as [`LEdge`]); `name`
@@ -444,7 +487,7 @@ impl LTfm {
     ];
 }
 
-/// Lifecycle sensor config in `LCFG` (64 bytes, key 0).
+/// Lifecycle sensor config in `LCFG` (80 bytes, key 0).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LConfig {
@@ -472,17 +515,20 @@ pub struct LConfig {
     /// retires; the tracker runs in always-final mode).
     pub refcnt_present: u32,
     /// `skcipher_request.base` byte offset (BTF-resolved at arm;
-    /// the op programs' request→base link for first-seen).
+    /// the skcipher op programs' request→base link for first-seen).
     pub req_base: u32,
     /// `crypto_async_request.tfm` byte offset (BTF-resolved at arm;
-    /// the op programs' base→frontend link for first-seen).
+    /// the op programs' base→frontend link for first-seen —
+    /// family-independent: both request structs embed the same
+    /// `crypto_async_request`).
     pub req_tfm: u32,
     /// `skcipher_request.cryptlen` byte offset (BTF-resolved at arm;
-    /// the op programs' API-input-length read for v6 metadata).
+    /// the skcipher op programs' API-input-length read).
     pub req_cryptlen: u32,
     /// `crypto_async_request.flags` byte offset (BTF-resolved at arm;
-    /// the op programs' request-flags read for v6 metadata — added
-    /// to the chased base address, like `req_tfm`).
+    /// the op programs' request-flags read — added to the chased
+    /// base address, like `req_tfm`; family-independent, same
+    /// embedded struct).
     pub req_flags: u32,
     /// `struct kxc_op.req` byte offset (fixture-module-BTF-resolved
     /// at arm; the fixture-callback program's `op->req` chase —
@@ -494,8 +540,25 @@ pub struct LConfig {
     /// `LLOSS_DISABLED`, never chases; present-but-unresolvable
     /// refuses the arm instead — fail-closed twin drift).
     pub op_req_present: u32,
+    /// `aead_request.base` byte offset (BTF-resolved at arm; the
+    /// AEAD op programs' request→base link — P5).
+    pub aead_req_base: u32,
+    /// `aead_request.cryptlen` byte offset (BTF-resolved at arm;
+    /// the AEAD op programs' API-input-length read — P5).
+    pub aead_req_cryptlen: u32,
+    /// `aead_request.assoclen` byte offset (BTF-resolved at arm;
+    /// the AEAD op programs' associated-data-length read — P5).
+    pub aead_req_assoclen: u32,
+    /// `crypto_aead.base` byte offset (BTF-resolved at arm; the AEAD
+    /// frontend→base normalization — P5, shared with the userspace
+    /// tracker like `sk_base`).
+    pub aead_base: u32,
+    /// `crypto_aead.authsize` byte offset (BTF-resolved at arm; the
+    /// AEAD op programs' tag-width read off the submit's frontend —
+    /// P5).
+    pub aead_authsize: u32,
     /// Reserved (loader writes 0).
-    pub reserved: [u8; 8],
+    pub reserved: [u8; 4],
 }
 
 impl LConfig {
@@ -516,6 +579,11 @@ impl LConfig {
         "req_flags",
         "op_req_off",
         "op_req_present",
+        "aead_req_base",
+        "aead_req_cryptlen",
+        "aead_req_assoclen",
+        "aead_base",
+        "aead_authsize",
         "reserved",
     ];
 }

@@ -221,16 +221,22 @@ impl<'a> Btf<'a> {
     }
 
     /// Validate that `name`'s prototype is EXACTLY the qualified
-    /// sensor read — `int (struct skcipher_request *)` — and return
-    /// its `FUNC` id plus the chased STRUCT pointee id (round-1
+    /// sensor read — `int (struct <expected> *)` — and return its
+    /// `FUNC` id plus the chased STRUCT pointee id (round-1
     /// sol-M2/astra-M2, hardened round-2 sol-M4/astra-M7, T07-R4-N2
     /// root binding): exactly one argument, arg0 a pointer (after
-    /// qualifier chase) to STRUCT `skcipher_request`, return a
-    /// signed 32-bit INT at offset 0. Any signature drift refuses
-    /// startup rather than mis-keying the join or misreading the
-    /// status. Corrupt images stay [`BtfError::BadBtf`]; well-formed
-    /// but incompatible prototypes are [`BtfError::BadPrototype`].
-    pub(crate) fn lifecycle_proto_id(&self, name: &str) -> Result<(u32, u32), BtfError> {
+    /// qualifier chase) to STRUCT `expected` (`skcipher_request` on
+    /// the skcipher op sites, `aead_request` on the P5 AEAD op
+    /// sites), return a signed 32-bit INT at offset 0. Any signature
+    /// drift refuses startup rather than mis-keying the join or
+    /// misreading the status. Corrupt images stay
+    /// [`BtfError::BadBtf`]; well-formed but incompatible prototypes
+    /// are [`BtfError::BadPrototype`].
+    pub(crate) fn lifecycle_proto_id(
+        &self,
+        name: &str,
+        expected: &str,
+    ) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -258,7 +264,7 @@ impl<'a> Btf<'a> {
             return Err(bad_proto("arg0 is not a pointer".to_owned()));
         }
         // The pointee IS the qualified request identity: arg0 must
-        // point at STRUCT `skcipher_request` (a pointer to any other
+        // point at STRUCT `expected` (a pointer to any other
         // type keys the join on a stranger's address).
         let pointee_id = self.chase_wrappers(ptr.size_or_type)?;
         let pointee = self.rec(pointee_id)?;

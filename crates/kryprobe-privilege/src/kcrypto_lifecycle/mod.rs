@@ -197,7 +197,7 @@ pub fn load_lifecycle_configured(
 
 /// Arm the sensor (M1: after links attach, after the pre-arm
 /// baseline): resolve the BTF chase offsets, write `LCFG` key 0, and
-/// read the full 64-byte value back. Unresolvable offsets refuse the
+/// read the full 80-byte value back. Unresolvable offsets refuse the
 /// arm BEFORE any write (T07: the transform programs chase through
 /// these words — zeroed guesses would mis-chase). Any readback
 /// mismatch (unwritten/zeroed map, short write, drifted word, offset
@@ -255,7 +255,7 @@ pub fn arm_lifecycle_config(
 
 /// Disarm the sensor (M1: before links detach): read `LCFG` key 0,
 /// write it back with ONLY the flags word set ([`disarm_config_bytes`]),
-/// and read the full 64-byte value back. The chase offsets are NEVER
+/// and read the full 80-byte value back. The chase offsets are NEVER
 /// rewritten by the disarm (D1: whole-value zeroing let a racing hook
 /// mix valid offsets with zeroed words — a one-word flags flip keeps
 /// every other word identical old-vs-new, so each racing aligned-word

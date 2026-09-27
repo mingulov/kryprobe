@@ -62,6 +62,8 @@ const LEDGE_WANT: &[&str] = &[
     "fam",
     "dir",
     "mflags",
+    "assoclen",
+    "authsize",
     "drv",
 ];
 const LTFM_WANT: &[&str] = &[
@@ -83,6 +85,11 @@ const LCONFIG_WANT: &[&str] = &[
     "req_flags",
     "op_req_off",
     "op_req_present",
+    "aead_req_base",
+    "aead_req_cryptlen",
+    "aead_req_assoclen",
+    "aead_base",
+    "aead_authsize",
     "reserved",
 ];
 
@@ -278,6 +285,8 @@ fn field_lists_match_declarations() {
         fam,
         dir,
         mflags,
+        assoclen,
+        authsize,
         drv,
     } = LEdge {
         magic: 0,
@@ -295,11 +304,13 @@ fn field_lists_match_declarations() {
         fam: 0,
         dir: 0,
         mflags: 0,
-        drv: [0; 56],
+        assoclen: 0,
+        authsize: 0,
+        drv: [0; 48],
     };
     let _ = (
         magic, version, edge, site, flags, key, ts_ns, status, cryptlen, invoc, tfm, req_flags,
-        fam, dir, mflags, drv,
+        fam, dir, mflags, assoclen, authsize, drv,
     );
     let LTfm {
         magic,
@@ -346,6 +357,11 @@ fn field_lists_match_declarations() {
         req_flags,
         op_req_off,
         op_req_present,
+        aead_req_base,
+        aead_req_cryptlen,
+        aead_req_assoclen,
+        aead_base,
+        aead_authsize,
         reserved,
     } = LConfig {
         magic: 0,
@@ -362,7 +378,12 @@ fn field_lists_match_declarations() {
         req_flags: 0,
         op_req_off: 0,
         op_req_present: 0,
-        reserved: [0; 8],
+        aead_req_base: 0,
+        aead_req_cryptlen: 0,
+        aead_req_assoclen: 0,
+        aead_base: 0,
+        aead_authsize: 0,
+        reserved: [0; 4],
     };
     let _ = (
         magic,
@@ -379,6 +400,11 @@ fn field_lists_match_declarations() {
         req_flags,
         op_req_off,
         op_req_present,
+        aead_req_base,
+        aead_req_cryptlen,
+        aead_req_assoclen,
+        aead_base,
+        aead_authsize,
         reserved,
     );
 }
