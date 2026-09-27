@@ -4,6 +4,6 @@
 mod reducer;
 
 pub use reducer::{
-    CallbackDisposition, Edge, GapReason, LifecycleReducer, ReducerStats, RequestRecord,
-    ReturnDisposition, Terminal,
+    CallbackDisposition, Edge, GapReason, LifecycleFamily, LifecycleReducer, OpDirection,
+    ReducerStats, RequestMeta, RequestRecord, ReturnDisposition, Terminal,
 };

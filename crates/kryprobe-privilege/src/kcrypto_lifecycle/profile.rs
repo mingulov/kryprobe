@@ -390,12 +390,13 @@ pub fn required_gate_error(
     }
 }
 
-/// LCFG v3 arm bytes: magic/version/flags plus the BTF-resolved
+/// LCFG v4 arm bytes: magic/version/flags plus the BTF-resolved
 /// chase offsets the transform programs need (`crypto_tfm.__crt_alg`
 /// at 12, `crypto_alg.cra_driver_name` at 16, `crypto_skcipher.base`
 /// at 20, `crypto_tfm.refcnt` at 24 + its presence word at 28,
-/// `skcipher_request.base` at 32, `crypto_async_request.tfm` at
-/// 36); the reserved tail stays zero. The arm refuses before
+/// `skcipher_request.base` at 32, `crypto_async_request.tfm` at 36,
+/// `skcipher_request.cryptlen` at 40, `crypto_async_request.flags`
+/// at 44); the reserved tail stays zero. The arm refuses before
 /// writing when resolution fails — these words are never zeroed
 /// guesses (a zero offset is only written when BTF resolved zero,
 /// and `refcnt_present` 0 is the honest 7.2 verdict, never a gap).
@@ -413,6 +414,8 @@ pub fn lifecycle_config_bytes(off: &crate::btf_resolve::LifecycleOffsets) -> [u8
     out[28..32].copy_from_slice(&u32::from(off.refcnt_present).to_le_bytes());
     out[32..36].copy_from_slice(&off.req_base.to_le_bytes());
     out[36..40].copy_from_slice(&off.req_tfm.to_le_bytes());
+    out[40..44].copy_from_slice(&off.req_cryptlen.to_le_bytes());
+    out[44..48].copy_from_slice(&off.req_flags.to_le_bytes());
     out
 }
 

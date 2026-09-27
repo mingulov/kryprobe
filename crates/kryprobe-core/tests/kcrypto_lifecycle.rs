@@ -7,8 +7,20 @@
 //! completion must emit nothing.
 
 use kryprobe_core::kcrypto::{
-    CallbackDisposition, Edge, GapReason, LifecycleReducer, ReturnDisposition, Terminal,
+    CallbackDisposition, Edge, GapReason, LifecycleFamily, LifecycleReducer, OpDirection,
+    RequestMeta, ReturnDisposition, Terminal,
 };
+
+/// P3 submit metadata: entry-side scalars pinned at submit (sync skcipher).
+fn meta() -> RequestMeta {
+    RequestMeta {
+        family: LifecycleFamily::Skcipher,
+        direction: OpDirection::Encrypt,
+        cryptlen: Some(16),
+        req_flags: Some(0),
+        epoch: Some(0),
+    }
+}
 
 #[test]
 fn callback_before_return_completes_once() {
@@ -17,7 +29,8 @@ fn callback_before_return_completes_once() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: Some(7),
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -59,7 +72,8 @@ fn capacity_refusal_drops_overflow_submit() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -68,7 +82,8 @@ fn capacity_refusal_drops_overflow_submit() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 11
+            ts_ns: 11,
+            meta: meta()
         })
         .is_empty()
     );
@@ -101,7 +116,8 @@ fn capacity_freed_on_completion() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -117,7 +133,8 @@ fn capacity_freed_on_completion() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 30
+            ts_ns: 30,
+            meta: meta()
         })
         .is_empty()
     );
@@ -142,7 +159,8 @@ fn stats_count_admitted_and_emitted() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -168,7 +186,8 @@ fn resubmit_of_completed_id_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -186,7 +205,8 @@ fn resubmit_of_completed_id_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 30
+            ts_ns: 30,
+            meta: meta()
         })
         .is_empty()
     );
@@ -202,7 +222,8 @@ fn stats_count_rejections() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -210,7 +231,8 @@ fn stats_count_rejections() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 11
+            ts_ns: 11,
+            meta: meta()
         })
         .is_empty()
     );
@@ -218,7 +240,8 @@ fn stats_count_rejections() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 12
+            ts_ns: 12,
+            meta: meta()
         })
         .is_empty()
     );
@@ -266,7 +289,8 @@ fn gap_completes_live_id_as_unknown() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: Some(7),
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -289,7 +313,8 @@ fn gap_with_retained_terminal_emits_it() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -320,7 +345,8 @@ fn identity_ambiguous_gap_invalidates() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -354,7 +380,8 @@ fn late_identity_gap_invalidates_emitted_record() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -392,7 +419,8 @@ fn repeat_live_identity_gap_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -423,7 +451,8 @@ fn repeat_late_identity_gap_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -465,7 +494,8 @@ fn is_invalidated_false_for_live_and_unknown() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -480,7 +510,8 @@ fn eviction_drops_invalidation_fact() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -508,7 +539,8 @@ fn eviction_drops_invalidation_fact() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 30
+            ts_ns: 30,
+            meta: meta()
         })
         .is_empty()
     );
@@ -535,7 +567,8 @@ fn late_edge_after_eviction_is_orphan() {
             r.apply(Edge::Submit {
                 id,
                 tfm_id: None,
-                ts_ns: base
+                ts_ns: base,
+                meta: meta()
             })
             .is_empty()
         );
@@ -570,7 +603,8 @@ fn deadline_gap_on_tombstone_does_not_invalidate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -603,7 +637,8 @@ fn evidence_valid_iff_terminal_truth() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -618,7 +653,8 @@ fn evidence_valid_iff_terminal_truth() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -636,7 +672,8 @@ fn edges_after_gap_completion_are_duplicates() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -702,7 +739,8 @@ fn pre_submit_terminal_is_orphan_not_joined() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -730,7 +768,8 @@ fn finish_reconciles_pending_deterministically() {
         r.apply(Edge::Submit {
             id: 3,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -747,7 +786,8 @@ fn finish_reconciles_pending_deterministically() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 12
+            ts_ns: 12,
+            meta: meta()
         })
         .is_empty()
     );
@@ -785,7 +825,8 @@ fn return_before_callback_completes_at_callback() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -820,7 +861,8 @@ fn conflicting_sync_return_keeps_first_terminal() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -855,7 +897,8 @@ fn conflicting_terminal_callback_status_counted() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -907,7 +950,8 @@ fn terminal_on_tombstone_compared_to_emitted() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -956,7 +1000,8 @@ fn terminal_on_tombstone_compared_to_emitted() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 40
+            ts_ns: 40,
+            meta: meta()
         })
         .is_empty()
     );
@@ -989,7 +1034,8 @@ fn repeat_queued_return_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1022,7 +1068,8 @@ fn terminal_return_after_queued_is_ambiguous() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1058,7 +1105,8 @@ fn counters_balance_after_full_drain() {
             r.apply(Edge::Submit {
                 id,
                 tfm_id: None,
-                ts_ns: base
+                ts_ns: base,
+                meta: meta()
             })
             .is_empty()
         );
@@ -1100,7 +1148,8 @@ fn queued_return_after_sync_is_ambiguous() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1137,7 +1186,8 @@ fn queued_return_after_callback_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1182,7 +1232,8 @@ fn queued_return_after_unknown_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1219,7 +1270,8 @@ fn unresolved_callback_counts_ambiguous_in_both_orders() {
         live.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1238,7 +1290,8 @@ fn unresolved_callback_counts_ambiguous_in_both_orders() {
         late.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1272,7 +1325,8 @@ fn unresolved_return_counts_ambiguous_in_both_orders() {
         live.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1291,7 +1345,8 @@ fn unresolved_return_counts_ambiguous_in_both_orders() {
         late.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1337,7 +1392,8 @@ fn progress_after_terminal_truth_is_duplicate() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1380,7 +1436,8 @@ fn progress_before_terminal_is_uncounted() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1421,7 +1478,8 @@ fn reversed_clock_yields_no_duration() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 100
+            ts_ns: 100,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1472,7 +1530,8 @@ fn cross_stream_permutations_reconcile_once() {
                 r.apply(Edge::Submit {
                     id: 1,
                     tfm_id: None,
-                    ts_ns: 10
+                    ts_ns: 10,
+                    meta: meta()
                 })
                 .is_empty()
             );
@@ -1541,7 +1600,8 @@ fn tombstones_evict_oldest_beyond_capacity() {
             r.apply(Edge::Submit {
                 id,
                 tfm_id: None,
-                ts_ns: base
+                ts_ns: base,
+                meta: meta()
             })
             .is_empty()
         );
@@ -1570,7 +1630,8 @@ fn tombstones_evict_oldest_beyond_capacity() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 100
+            ts_ns: 100,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1597,7 +1658,8 @@ fn q04_fresh_request_independent_of_pending_old() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1614,7 +1676,8 @@ fn q04_fresh_request_independent_of_pending_old() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 25
+            ts_ns: 25,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1657,7 +1720,8 @@ fn q05_backlog_progress_then_terminal() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 100
+            ts_ns: 100,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1697,7 +1761,8 @@ fn q05_backlog_progress_then_terminal() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 200
+            ts_ns: 200,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1741,7 +1806,8 @@ fn q08_terminal_at_most_once_across_paths() {
         r.apply(Edge::Submit {
             id: 1,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1760,7 +1826,8 @@ fn q08_terminal_at_most_once_across_paths() {
         r.apply(Edge::Submit {
             id: 2,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1788,7 +1855,8 @@ fn q08_terminal_at_most_once_across_paths() {
         r.apply(Edge::Submit {
             id: 3,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1816,7 +1884,8 @@ fn q08_terminal_at_most_once_across_paths() {
         r.apply(Edge::Submit {
             id: 4,
             tfm_id: None,
-            ts_ns: 10
+            ts_ns: 10,
+            meta: meta()
         })
         .is_empty()
     );
@@ -1865,4 +1934,49 @@ fn q08_terminal_at_most_once_across_paths() {
     assert_eq!(r.stats().duplicate, 9);
     assert_eq!(r.stats().ambiguous, 3);
     assert_eq!(r.stats().emitted, 4);
+}
+
+#[test]
+fn p3_submit_metadata_reaches_record_and_survives_gap() {
+    // Grounded path: submit metadata lands on the completed record.
+    let mut r = LifecycleReducer::new(4);
+    assert!(
+        r.apply(Edge::Submit {
+            id: 1,
+            tfm_id: Some(7),
+            ts_ns: 10,
+            meta: meta(),
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Return {
+        id: 1,
+        ts_ns: 30,
+        status: -22,
+        disposition: ReturnDisposition::Terminal,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].tfm_id, Some(7));
+    assert_eq!(out[0].terminal, Terminal::Sync(-22));
+    assert_eq!(out[0].duration_ns, Some(20));
+    assert_eq!(out[0].meta, meta());
+    // Truthless path: an identity-ambiguous gap emits Unknown but keeps
+    // the submit-observed metadata (observed fact, not terminal truth).
+    assert!(
+        r.apply(Edge::Submit {
+            id: 2,
+            tfm_id: Some(7),
+            ts_ns: 40,
+            meta: meta(),
+        })
+        .is_empty()
+    );
+    let out = r.apply(Edge::Gap {
+        id: 2,
+        reason: GapReason::IdentityAmbiguous,
+    });
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].terminal, Terminal::Unknown);
+    assert_eq!(out[0].meta, meta());
+    assert!(r.is_invalidated(2));
 }

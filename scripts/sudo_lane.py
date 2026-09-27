@@ -52,6 +52,9 @@ EXPECTED = {
         "compat_ring_matches_canary_twin", "session_drain_serves_many_windows_with_one_spawn",
         "snapshot_byte_exactness_against_fixture", "captured_row_matches_canonical_layout",
         "drain_start_stop_cycle_leaks_nothing"],
+    ("kryprobe-privilege", "kcrypto_requests"): [
+        "guest_below_floor_refuses_typed", "guest_enokey_leaves_provider_unentered",
+        "guest_sync_meta_matches_fixture_truth"],
     ("kryprobe-privilege", "kcrypto_tfm_lifecycle"): [
         "host_alloc_capture_assigns_generations", "lifecycle_canary_no_secret_bytes_in_views",
         "host_op_first_seen_carries_selected_driver"],
@@ -60,6 +63,10 @@ EXPECTED = {
     ("kryprobe-testkit", "guest_ledger"): ["guest_ledger_matches_scenario_contract"],
 }
 LAB_SUITE = ("kryprobe-testkit", "guest_ledger")
+# P3r narrowed (c): vng-only guest bodies are inventoried here (complete
+# accounting — reconcile stays exact) but routed to OTHER_LANE, never
+# executed on the host; the vng-lane guest cells run them instead.
+VNG_SUITE = ("kryprobe-privilege", "kcrypto_requests")
 LIFECYCLE_SUITE = ("kryprobe-privilege", "kcrypto_tfm_lifecycle")
 OBJECTS = ("spine.bpf.o", "kcrypto.bpf.o", "kcrypto-lifecycle.bpf.o")
 OBJECT_DIRS = ("stage/kryprobe-bpf", "stage/debug/kryprobe-bpf", "stage/debug/deps/kryprobe-bpf")
@@ -429,7 +436,7 @@ def prepare(root, out, cargo, traffic_generator):
                   "rustc": subprocess.check_output(["rustc", "--version"], cwd=root, env=env, text=True).strip()},
     }
     dump(out / "manifest.json", manifest)
-    print(f"sudo-lane: prepared 34 lane bodies (33 root, 1 non-root) and 1 separate lab body at {out}", flush=True)
+    print(f"sudo-lane: prepared 34 lane bodies (33 root, 1 non-root), 1 separate lab body and 3 vng-guest bodies at {out}", flush=True)
     return manifest
 
 
@@ -584,6 +591,9 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                           "features": row["features"], "executable_sha256": row["sha256"]}
                 if key == LAB_SUITE:
                     result.update(status="OTHER_LANE", reason="requires scenario ledger; run scripts/kcrypto-lab.py")
+                elif key == VNG_SUITE:
+                    result.update(status="OTHER_LANE",
+                                  reason="requires staged vng guest with fixture + BPF object; run the vng-lane guest cells")
                 elif key == LIFECYCLE_SUITE and support != "PASS":
                     result.update(status=support, reason="see lifecycle-support.log; body not executed")
                 else:
@@ -651,7 +661,8 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
     dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": 34,
-                                "root_bodies": 33, "nonroot_bodies": 1, "complete": True})
+                                "root_bodies": 33, "nonroot_bodies": 1, "other_lane_bodies": 4,
+                                "complete": True})
     print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
     return code
 

@@ -89,6 +89,19 @@ class BodyAccounting(unittest.TestCase):
                 self.assertEqual(lane.body_verdict(code, output), "FAIL")
 
 
+class GuestInventory(unittest.TestCase):
+    def test_vng_guest_suite_inventory_is_explicit(self):
+        # P3r narrowed (c): the vng-only suite stays inventoried
+        # (reconcile-exact) with all three guest bodies; any drift
+        # still aborts the lane via reconcile().
+        self.assertEqual(lane.VNG_SUITE, ("kryprobe-privilege", "kcrypto_requests"))
+        self.assertEqual(sorted(lane.EXPECTED[lane.VNG_SUITE]), [
+            "guest_below_floor_refuses_typed",
+            "guest_enokey_leaves_provider_unentered",
+            "guest_sync_meta_matches_fixture_truth",
+        ])
+
+
 class PreparedIntegrity(unittest.TestCase):
     def bundle(self, root):
         paths = ["stage/runner.py", "stage/kcrypto_gen.py", "stage/debug/test-current"]

@@ -1207,13 +1207,15 @@ fn sensor_routes_tfm_records_to_tracker() {
     // An `LC`-magic op record still routes to the op decoder (magic-routed).
     let mut op = vec![0u8; 112];
     op[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    op[2] = 5;
+    op[2] = 6;
     op[3] = 1;
     op[4..6].copy_from_slice(&1u16.to_le_bytes());
     op[8..16].copy_from_slice(&0xabcdu64.to_le_bytes());
     op[16..24].copy_from_slice(&100u64.to_le_bytes());
     op[32..40].copy_from_slice(&2u64.to_le_bytes());
     op[40..48].copy_from_slice(&0xf00du64.to_le_bytes());
+    op[52] = 1;
+    op[53] = 1;
     core.ingest_records(&[op]);
     let ledger = core
         .ledger(
@@ -2531,4 +2533,58 @@ fn host_op_first_seen_carries_selected_driver() {
             "close destroy retires exactly: {g:?}"
         );
     }
+}
+
+#[test]
+fn p3_generation_for_frontend_resolves_live_only() {
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000_u64;
+    assert_eq!(tracker.generation_for_frontend(f1), None, "unmapped → None");
+    assert_eq!(tracker.generation_for_frontend(0), None, "zero → None");
+    assert_eq!(
+        tracker.generation_for_frontend(u64::MAX),
+        None,
+        "wrapping offset → None"
+    );
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    assert_eq!(tracker.generation_for_frontend(f1), Some(1));
+    // First-seen admission resolves the same way.
+    let f2 = 0xFFFF_8880_0000_2000_u64;
+    assert_eq!(tracker.admit_first_seen(f2, "sel", false), Some(2));
+    assert_eq!(tracker.generation_for_frontend(f2), Some(2));
+    // A proved final-free unbinds: the retired id never rebinds.
+    tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
+    tracker.feed(&destroy_return(4));
+    assert_eq!(tracker.generation_for_frontend(f1), None, "retired → None");
+    assert_eq!(
+        tracker.generation_for_frontend(f2),
+        Some(2),
+        "G2 undisturbed"
+    );
+    // Realloc at the freed base binds the NEW lifetime only.
+    tracker.feed(&alloc_entry(6, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(6, f1, b"drv"));
+    assert_eq!(tracker.generation_for_frontend(f1), Some(3));
+}
+
+#[test]
+fn p3_epoch_for_frontend_pins_success_eras() {
+    let mut tracker = TransformTracker::new(16, 8, true);
+    let f1 = 0xFFFF_8880_0000_1000_u64;
+    assert_eq!(tracker.epoch_for_frontend(f1), None, "unmapped → None");
+    tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
+    tracker.feed(&alloc_return_ok(2, f1, b"drv"));
+    assert_eq!(tracker.epoch_for_frontend(f1), Some(0), "unconfigured era");
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 16));
+    tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 4, -22));
+    assert_eq!(
+        tracker.epoch_for_frontend(f1),
+        Some(0),
+        "failed rekey moves nothing"
+    );
+    tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 6, f1, 16));
+    tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 6, 0));
+    assert_eq!(tracker.epoch_for_frontend(f1), Some(1), "success bumps");
+    assert_eq!(tracker.epoch_for_frontend(0), None);
 }

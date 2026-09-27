@@ -28,12 +28,12 @@
 
 /// `LEdge.magic`: `LC` (little-endian u16).
 pub const LEDGE_MAGIC: u16 = 0x434c;
-/// `LEdge.version` the T07.3 decoder understands (v4: `tfm` carries
-/// the frontend transform pointer behind the op — first-seen
-/// admission + T08 attribution; v1/v2/v3 records refuse — versions
-/// never mix, so an old decoder misreading the longer record is
-/// impossible).
-pub const LEDGE_VERSION: u8 = 5;
+/// `LEdge.version` the P3 decoder understands (v6: entry-side scalar
+/// request metadata — `cryptlen`, `req_flags`, `fam`, `dir`, `mflags`
+/// — with the driver word narrowed to 56 bytes; v1–v5 records refuse
+/// — versions never mix, so an old decoder misreading the reshaped
+/// record is impossible).
+pub const LEDGE_VERSION: u8 = 6;
 
 /// `LEdge.edge`: function entry (submit-side observation).
 pub const LEDGE_SUBMIT: u8 = 1;
@@ -44,6 +44,23 @@ pub const LEDGE_RETURN: u8 = 2;
 pub const LSITE_ENC: u16 = 1;
 /// `LEdge.site`: `crypto_skcipher_decrypt`.
 pub const LSITE_DEC: u16 = 2;
+
+/// v6 `LEdge.fam`: skcipher family (the only P3 op family — every v6
+/// submit carries this; any other value is twin drift and refuses).
+pub const LFAM_SK: u8 = 1;
+
+/// v6 `LEdge.dir`: encrypt direction (echoes [`LSITE_ENC`]).
+pub const LDIR_ENC: u8 = 1;
+/// v6 `LEdge.dir`: decrypt direction (echoes [`LSITE_DEC`]).
+pub const LDIR_DEC: u8 = 2;
+
+/// v6 `LEdge.mflags` bit 0: `cryptlen` holds a chased API input
+/// length (clear means the entry chase was unreadable — unknown,
+/// with the value word zero).
+pub const LMETA_CRYPTLEN_OK: u16 = 0x0001;
+/// v6 `LEdge.mflags` bit 1: `req_flags` holds chased request flags
+/// (clear means unreadable — unknown, with the value word zero).
+pub const LMETA_REQFLAGS_OK: u16 = 0x0002;
 
 /// `LTfm.magic`: `LT` (little-endian u16).
 pub const LTFM_MAGIC: u16 = 0x544c;
@@ -85,11 +102,11 @@ pub const LEDGE_TRUNCATED: u16 = 0x0002;
 
 /// `LConfig.magic`: `KLC1` (little-endian u32).
 pub const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
-/// `LConfig.version` the T07.3 sensor understands (v3: the chase
-/// offsets ride in the config words, plus the destroy refcount
-/// words and the op request-link words; older versions refuse —
-/// versions never mix).
-pub const LCONFIG_VERSION: u32 = 3;
+/// `LConfig.version` the P3 sensor understands (v4: the v3 chase
+/// words plus the op request-metadata words `req_cryptlen` /
+/// `req_flags`; older versions refuse — versions never mix, so a v6
+/// BPF never chases metadata through a v3 config's zeroed tail).
+pub const LCONFIG_VERSION: u32 = 4;
 /// `LConfig.flags` bit 0: disarmed (D1). The disarm writes the armed
 /// value back with ONLY this bit set — magic, version, offsets and
 /// tail preserved bit-for-bit — so a hook racing the disarm reads
@@ -156,12 +173,14 @@ pub const LAGG_SETKEYAEAD_RET: u32 = 15;
 // Structs (twinned in kcrypto_lifecycle.rs; pinned by layout tests)
 // ---------------------------------------------------------------------------
 
-/// One raw lifecycle edge on `LRING` (112 bytes, v5): site, edge
+/// One raw lifecycle edge on `LRING` (112 bytes, v6): site, edge
 /// kind, pairing key, timestamp, the return status (return edges
-/// only; submit edges carry 0), the BPF invocation id, the frontend
-/// transform pointer behind the op (T07.3 first-seen admission +
-/// T08 attribution; 0 when the request link was unreadable), and the
-/// runtime-selected driver name (T07-04/F05: submit edges only).
+/// only; submit edges carry 0), the entry-side scalar request
+/// metadata (P3: `cryptlen`, `req_flags`, `fam`, `dir`, `mflags` —
+/// submit edges only), the BPF invocation id, the frontend
+/// transform pointer behind the op (first-seen admission + submit
+/// attribution; 0 when the request link was unreadable), and the
+/// runtime-selected driver name (submit edges only).
 ///
 /// [`LEdge::tfm`] is the raw `crypto_skcipher` frontend pointer the
 /// op ran against (`req->base->tfm` chased BPF-side at the
@@ -207,7 +226,8 @@ pub const LEDGE_INVOC_POISON: u64 = 1;
 /// sol-m9/astra-m9 — Debug output is a log surface and must keep
 /// the module's no-render promise).
 /// `invoc` is a counter, not an address, and renders plainly;
-/// `drv` renders (driver names are public inventory, not secrets).
+/// `drv` renders (driver names are public inventory, not secrets);
+/// the metadata scalars render (lengths/flags/enums, never contents).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LEdge {
@@ -228,8 +248,11 @@ pub struct LEdge {
     pub ts_ns: u64,
     /// Native return status (return edges) or 0 (submit edges).
     pub status: i32,
-    /// Reserved auxiliary word (BPF writes 0).
-    pub aux: u32,
+    /// API input length (`skcipher_request.cryptlen` chased at entry;
+    /// meaningful only when [`LMETA_CRYPTLEN_OK`] is set in
+    /// [`LEdge::mflags`], otherwise 0 = unknown). Submit edges only
+    /// (returns carry 0, never chased — R2 extended).
+    pub cryptlen: u32,
     /// BPF invocation id (≥1 on cookie-carrying edges; 0 with taint
     /// when the return's session cookie reads zero).
     pub invoc: u64,
@@ -237,11 +260,25 @@ pub struct LEdge {
     /// the request link was unreadable — unknown, see struct docs).
     /// Submit edges only (R2: returns carry 0, never chased).
     pub tfm: u64,
+    /// Request flags (`crypto_async_request.flags` chased at entry;
+    /// meaningful only when [`LMETA_REQFLAGS_OK`] is set, otherwise
+    /// 0 = unknown). Submit edges only (returns carry 0).
+    pub req_flags: u32,
+    /// Crypto family ([`LFAM_SK`] — the only P3 value). Submit edges
+    /// only (returns carry 0).
+    pub fam: u8,
+    /// Operation direction ([`LDIR_ENC`] / [`LDIR_DEC`] — echoes the
+    /// site). Submit edges only (returns carry 0).
+    pub dir: u8,
+    /// Metadata validity ([`LMETA_CRYPTLEN_OK`] +
+    /// [`LMETA_REQFLAGS_OK`] defined; 0 when both chases were
+    /// unreadable). Submit edges only (returns carry 0).
+    pub mflags: u16,
     /// Runtime-selected driver name behind the submit's transform
-    /// (NUL-terminated, 63 bytes max + NUL; empty when the driver
+    /// (NUL-terminated, 55 bytes max + NUL; empty when the driver
     /// chase was unreadable — unknown, never fabricated). Submit
     /// edges only (returns carry empty — the twin refuses a name).
-    pub drv: [u8; 64],
+    pub drv: [u8; 56],
 }
 
 impl core::fmt::Debug for LEdge {
@@ -255,9 +292,13 @@ impl core::fmt::Debug for LEdge {
             .field("key", &"<redacted>")
             .field("ts_ns", &self.ts_ns)
             .field("status", &self.status)
-            .field("aux", &self.aux)
+            .field("cryptlen", &self.cryptlen)
             .field("invoc", &self.invoc)
             .field("tfm", &"<redacted>")
+            .field("req_flags", &self.req_flags)
+            .field("fam", &self.fam)
+            .field("dir", &self.dir)
+            .field("mflags", &self.mflags)
             .field("drv", &self.drv)
             .finish()
     }
@@ -270,8 +311,22 @@ impl LEdge {
     /// without updating this list + the test + the doc fails the
     /// build — deliberate friction, same as `KConfig::FIELDS`).
     pub const FIELDS: &[&str] = &[
-        "magic", "version", "edge", "site", "flags", "key", "ts_ns", "status", "aux", "invoc",
-        "tfm", "drv",
+        "magic",
+        "version",
+        "edge",
+        "site",
+        "flags",
+        "key",
+        "ts_ns",
+        "status",
+        "cryptlen",
+        "invoc",
+        "tfm",
+        "req_flags",
+        "fam",
+        "dir",
+        "mflags",
+        "drv",
     ];
 }
 
@@ -402,8 +457,15 @@ pub struct LConfig {
     /// `crypto_async_request.tfm` byte offset (BTF-resolved at arm;
     /// the op programs' base→frontend link for first-seen).
     pub req_tfm: u32,
+    /// `skcipher_request.cryptlen` byte offset (BTF-resolved at arm;
+    /// the op programs' API-input-length read for v6 metadata).
+    pub req_cryptlen: u32,
+    /// `crypto_async_request.flags` byte offset (BTF-resolved at arm;
+    /// the op programs' request-flags read for v6 metadata — added
+    /// to the chased base address, like `req_tfm`).
+    pub req_flags: u32,
     /// Reserved (loader writes 0).
-    pub reserved: [u8; 24],
+    pub reserved: [u8; 16],
 }
 
 impl LConfig {
@@ -420,6 +482,8 @@ impl LConfig {
         "refcnt_present",
         "req_base",
         "req_tfm",
+        "req_cryptlen",
+        "req_flags",
         "reserved",
     ];
 }

@@ -32,6 +32,48 @@ pub enum CallbackDisposition {
     Unresolved,
 }
 
+/// Crypto family behind a submitted operation (P3 submit metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleFamily {
+    /// `crypto_skcipher_*` sites (the only P3 op family; AEAD/hash
+    /// families arrive under their own wire versions, never by
+    /// relabeling this one).
+    Skcipher,
+}
+
+/// Operation direction behind a submitted op (P3 submit metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpDirection {
+    /// `crypto_skcipher_encrypt` site.
+    Encrypt,
+    /// `crypto_skcipher_decrypt` site.
+    Decrypt,
+}
+
+/// Entry-side scalar metadata pinned at submit (P3 internal metadata
+/// contract v1): every field is observed at the submit edge (or
+/// explicitly unknown), never chased at return, never inferred from
+/// timing. Internal-only: the report boundary (P6) versions any
+/// public emission; until then these fields ride the reducer as
+/// opaque facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestMeta {
+    /// Crypto family behind the op (wire-pinned per site program).
+    pub family: LifecycleFamily,
+    /// Operation direction (wire-pinned, echoes the site).
+    pub direction: OpDirection,
+    /// API input length (`skcipher_request.cryptlen` at entry;
+    /// `None` when the entry chase was unreadable — unknown, never 0-as-data).
+    pub cryptlen: Option<u32>,
+    /// Request flags (`crypto_async_request.flags` at entry;
+    /// `None` when unreadable — a valid zero stays `Some(0)`).
+    pub req_flags: Option<u32>,
+    /// Configuration epoch of the bound generation AT SUBMIT (the
+    /// keying era the op ran under — later rekeys never rewrite it);
+    /// `None` when the submit bound no generation.
+    pub epoch: Option<u64>,
+}
+
 /// One observed lifecycle edge, in per-source arrival order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
@@ -46,6 +88,8 @@ pub enum Edge {
         tfm_id: Option<u64>,
         /// Submit timestamp (ns).
         ts_ns: u64,
+        /// Entry-side scalar metadata pinned at submit.
+        meta: RequestMeta,
     },
     /// Function returned for a submitted id.
     Return {
@@ -127,6 +171,11 @@ pub struct RequestRecord {
     /// Submit-to-terminal-edge span; `None` when either endpoint is
     /// missing or the clock ran backwards.
     pub duration_ns: Option<u64>,
+    /// Entry-side scalar metadata pinned at submit (P3 internal
+    /// contract — carried on grounded AND truthless records alike:
+    /// submit-observed fact, not terminal truth; public emission
+    /// waits for the P6 versioned schema).
+    pub meta: RequestMeta,
 }
 
 impl RequestRecord {
@@ -172,6 +221,7 @@ pub struct ReducerStats {
 struct Pending {
     submit_ts: u64,
     tfm_id: Option<u64>,
+    meta: RequestMeta,
     terminal: Option<(Terminal, u64)>,
     return_queued: bool,
 }
@@ -275,6 +325,7 @@ impl LifecycleReducer {
                     tfm_id: p.tfm_id,
                     terminal,
                     duration_ns: terminal_ts.checked_sub(p.submit_ts),
+                    meta: p.meta,
                 },
                 true,
             ),
@@ -284,6 +335,7 @@ impl LifecycleReducer {
                     tfm_id: p.tfm_id,
                     terminal: Terminal::Unknown,
                     duration_ns: None,
+                    meta: p.meta,
                 },
                 false,
             ),
@@ -294,7 +346,12 @@ impl LifecycleReducer {
     /// zero or one). Duplicate terminals after completion emit nothing.
     pub fn apply(&mut self, edge: Edge) -> Vec<RequestRecord> {
         match edge {
-            Edge::Submit { id, tfm_id, ts_ns } => {
+            Edge::Submit {
+                id,
+                tfm_id,
+                ts_ns,
+                meta,
+            } => {
                 if self.completed.contains_key(&id) || self.pending.contains_key(&id) {
                     self.stats.duplicate += 1;
                     return Vec::new();
@@ -308,6 +365,7 @@ impl LifecycleReducer {
                     Pending {
                         submit_ts: ts_ns,
                         tfm_id,
+                        meta,
                         terminal: None,
                         return_queued: false,
                     },
@@ -336,8 +394,8 @@ impl LifecycleReducer {
                 let snap = self
                     .pending
                     .get(&id)
-                    .map(|p| (p.terminal, p.return_queued, p.submit_ts, p.tfm_id));
-                let Some((retained, return_queued, submit_ts, tfm_id)) = snap else {
+                    .map(|p| (p.terminal, p.return_queued, p.submit_ts, p.tfm_id, p.meta));
+                let Some((retained, return_queued, submit_ts, tfm_id, meta)) = snap else {
                     self.stats.orphan += 1;
                     return Vec::new();
                 };
@@ -372,6 +430,7 @@ impl LifecycleReducer {
                                 tfm_id,
                                 terminal: Terminal::Callback(status),
                                 duration_ns: ts_ns.checked_sub(submit_ts),
+                                meta,
                             }];
                         }
                         if let Some(p) = self.pending.get_mut(&id) {
@@ -424,10 +483,12 @@ impl LifecycleReducer {
                 // first terminal wins and the conflict is counted.
                 if disposition == ReturnDisposition::Terminal {
                     let conflict = match self.pending.get(&id) {
-                        Some(p) => p.terminal.map(|(t, tts)| (t, tts, p.tfm_id, p.submit_ts)),
+                        Some(p) => p
+                            .terminal
+                            .map(|(t, tts)| (t, tts, p.tfm_id, p.submit_ts, p.meta)),
                         None => None,
                     };
-                    if let Some((terminal, terminal_ts, tfm_id, submit_ts)) = conflict {
+                    if let Some((terminal, terminal_ts, tfm_id, submit_ts, meta)) = conflict {
                         self.pending.remove(&id);
                         self.tombstone(id, terminal, false);
                         self.stats.emitted += 1;
@@ -437,6 +498,7 @@ impl LifecycleReducer {
                             tfm_id,
                             terminal,
                             duration_ns: terminal_ts.checked_sub(submit_ts),
+                            meta,
                         }];
                     }
                 }
@@ -447,10 +509,11 @@ impl LifecycleReducer {
                             Terminal::Sync(status),
                             ts_ns.checked_sub(p.submit_ts),
                             p.return_queued,
+                            p.meta,
                         )),
-                        ReturnDisposition::Queued => p
-                            .terminal
-                            .map(|(t, tts)| (p.tfm_id, t, tts.checked_sub(p.submit_ts), false)),
+                        ReturnDisposition::Queued => p.terminal.map(|(t, tts)| {
+                            (p.tfm_id, t, tts.checked_sub(p.submit_ts), false, p.meta)
+                        }),
                         ReturnDisposition::Unresolved => None,
                     },
                     None => None,
@@ -462,7 +525,7 @@ impl LifecycleReducer {
                 // first marks the return observed for the joining
                 // callback, a repeat is a duplicate.
                 match ready {
-                    Some((tfm_id, terminal, duration_ns, queued_before)) => {
+                    Some((tfm_id, terminal, duration_ns, queued_before, meta)) => {
                         self.pending.remove(&id);
                         self.tombstone(id, terminal, false);
                         self.stats.emitted += 1;
@@ -477,6 +540,7 @@ impl LifecycleReducer {
                             tfm_id,
                             terminal,
                             duration_ns,
+                            meta,
                         }]
                     }
                     None => {
@@ -531,6 +595,7 @@ impl LifecycleReducer {
                         tfm_id: p.tfm_id,
                         terminal: Terminal::Unknown,
                         duration_ns: None,
+                        meta: p.meta,
                     }];
                 }
                 let (record, _) = Self::reconcile(id, &p);

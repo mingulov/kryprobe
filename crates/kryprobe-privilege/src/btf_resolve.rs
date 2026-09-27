@@ -289,15 +289,18 @@ pub struct AggregateOffsets {
 /// offsets): the transform chase (`tfm_alg`/`alg_drv`), the
 /// frontend→base normalization (`sk_base`, shared with the
 /// userspace tracker), the op request link (`req_base`/`req_tfm`,
-/// first-seen admission), and the destroy refcount word
-/// (`refcnt_off`, meaningful only when `refcnt_present`).
+/// first-seen admission), the op request-metadata reads
+/// (`req_cryptlen`/`req_flags`, P3 entry-side scalars), and the
+/// destroy refcount word (`refcnt_off`, meaningful only when
+/// `refcnt_present`).
 ///
 /// D3: the LIFECYCLE consumer's own set — arming no longer requires
 /// the aggregate's legacy fields (`task_flags`, AEAD/hash lengths,
 /// shash link), and every member is SHAPE-validated, not just
 /// offset-resolved: pointers prove their pointee struct, embedded
-/// bases prove their struct, the name proves its array extent, and
-/// the refcount proves its counter width. `refcnt_present` is soft
+/// bases prove their struct, the name proves its array extent, the
+/// metadata words prove exact 4-byte scalars, and the refcount
+/// proves its counter width. `refcnt_present` is soft
 /// (7.2 dropped the field — absence means always-final mode, never
 /// a refusal); every other member is fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +316,12 @@ pub struct LifecycleOffsets {
     pub req_base: u32,
     /// `crypto_async_request.tfm` (PTR at STRUCT `crypto_tfm`).
     pub req_tfm: u32,
+    /// `skcipher_request.cryptlen` (exact 4-byte scalar — the API
+    /// input length the op programs chase at entry).
+    pub req_cryptlen: u32,
+    /// `crypto_async_request.flags` (exact 4-byte scalar — added to
+    /// the chased base address, like `req_tfm`).
+    pub req_flags: u32,
     /// `crypto_tfm.refcnt` (4-byte counter; 0 when absent).
     pub refcnt_off: u32,
     /// The kernel carries `crypto_tfm.refcnt` (false on 7.2+:
@@ -1036,6 +1045,12 @@ fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
             via: "crypto_async_request.tfm".to_owned(),
         });
     }
+    // P3 entry-side scalars (hard members — a missing/misshapen
+    // length or flags word refuses the arm, never zero-chases):
+    // `member_counter_in`'s INT path proves exact 4-byte value
+    // width, which is the whole proof a u32 scalar needs.
+    let req_cryptlen = btf.member_counter_in(sreq_entry, "skcipher_request", "cryptlen")?;
+    let req_flags = btf.member_counter_in(areq_entry, "crypto_async_request", "flags")?;
     let (refcnt_off, refcnt_present) =
         match btf.member_counter_in(tfm_entry, "crypto_tfm", "refcnt") {
             Ok(off) => (off, true),
@@ -1053,6 +1068,8 @@ fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
         sk_base,
         req_base,
         req_tfm,
+        req_cryptlen,
+        req_flags,
         refcnt_off,
         refcnt_present,
     })
@@ -1525,21 +1542,29 @@ mod tests {
         }
         // [8] PTR -> [7].
         b.rec(0, KIND_PTR, 0, false, 7);
-        // [9] STRUCT crypto_async_request { tfm: [8] @32 }.
+        // [9] STRUCT crypto_async_request { tfm: [8] @32, flags: [1] @40 }.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
+        let o_flags = b.str("flags");
         let mut asy: Vec<(u32, u32, u32)> = Vec::new();
         if let Some(ty) = shape("crypto_async_request", "tfm", 8) {
             asy.push((o_tfm_m, ty, 32 * 8));
+        }
+        if let Some(ty) = shape("crypto_async_request", "flags", 1) {
+            asy.push((o_flags, ty, 40 * 8));
         }
         b.rec(o_async, KIND_STRUCT, asy.len() as u32, false, 64);
         for (name, ty, bits) in asy {
             b.member(name, ty, bits);
         }
-        // [10] STRUCT skcipher_request { base: [9] @32 }.
+        // [10] STRUCT skcipher_request { cryptlen: [1] @0, base: [9] @32 }.
         let o_req = b.str("skcipher_request");
         let o_base = b.str("base");
+        let o_cryptlen = b.str("cryptlen");
         let mut req: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("skcipher_request", "cryptlen", 1) {
+            req.push((o_cryptlen, ty, 0));
+        }
         if let Some(ty) = shape("skcipher_request", "base", 9) {
             req.push((o_base, ty, 32 * 8));
         }
@@ -1583,6 +1608,8 @@ mod tests {
                 sk_base: 8,
                 req_base: 32,
                 req_tfm: 32,
+                req_cryptlen: 0,
+                req_flags: 40,
                 refcnt_off: 40,
                 refcnt_present: true,
             }
@@ -1611,6 +1638,27 @@ mod tests {
             resolve_lifecycle_offsets_from(&bytes),
             Err(BtfError::MissingMember { .. })
         ));
+    }
+
+    #[test]
+    fn synthetic_lifecycle_metadata_members_fail_closed() {
+        // P3 entry-side scalars are hard members: a missing length
+        // or flags word refuses the arm (never a zero-chase).
+        let bytes = lifecycle_fixture(None, Some(("skcipher_request", "cryptlen")));
+        assert!(matches!(
+            resolve_lifecycle_offsets_from(&bytes),
+            Err(BtfError::MissingMember { .. })
+        ));
+        let bytes = lifecycle_fixture(None, Some(("crypto_async_request", "flags")));
+        assert!(matches!(
+            resolve_lifecycle_offsets_from(&bytes),
+            Err(BtfError::MissingMember { .. })
+        ));
+        // A PTR where the chase reads a u32 scalar refuses (lying type
+        // with a valid offset would mis-chase exactly like the link
+        // members above).
+        let bytes = lifecycle_fixture(Some(("crypto_async_request", "flags", 8)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
     }
 
     #[test]
@@ -1688,12 +1736,16 @@ mod tests {
         b.rec(0, KIND_PTR, 0, false, real_id);
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, ptr_id, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let async_id = ptr_id + 1;
         let o_req = b.str("skcipher_request");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        let o_cryptlen = b.str("cryptlen");
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, async_id, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -1732,6 +1784,8 @@ mod tests {
                 sk_base: 8,
                 req_base: 32,
                 req_tfm: 32,
+                req_cryptlen: 0,
+                req_flags: 40,
                 refcnt_off: 40,
                 refcnt_present: true,
             }
@@ -1787,12 +1841,16 @@ mod tests {
         next += 1;
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, ptr_id, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let async_id = next;
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, async_id, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -1836,11 +1894,15 @@ mod tests {
         b.rec(0, KIND_PTR, 0, false, 6);
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 8, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 9, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -2244,11 +2306,15 @@ mod tests {
         // [9] async, [10] sreq, [11] sk.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 8, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 9, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -2306,11 +2372,15 @@ mod tests {
         // [10] async, [11] sreq, [12] sk.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 9, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 10, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -2408,11 +2478,15 @@ mod tests {
         // [9] async, [10] sreq, [11] sk.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 8, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 9, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -2484,15 +2558,19 @@ mod tests {
         b.member(o_pad, 1, 0);
         // [9] PTR -> [7].
         b.rec(0, KIND_PTR, 0, false, 7);
-        // [10] STRUCT crypto_async_request { tfm: [9] @32 }.
+        // [10] STRUCT crypto_async_request { tfm: [9] @32, flags: [1] @40 }.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 9, 32 * 8);
-        // [11] STRUCT skcipher_request { base: [10] @32 }.
+        b.member(o_flags, 1, 40 * 8);
+        // [11] STRUCT skcipher_request { cryptlen: [1] @0, base: [10] @32 }.
         let o_req = b.str("skcipher_request");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        let o_cryptlen = b.str("cryptlen");
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 10, 32 * 8);
         // [12] STRUCT crypto_skcipher { base: [7] @8 }.
         let o_sk = b.str("crypto_skcipher");
@@ -2607,6 +2685,8 @@ mod tests {
                 sk_base: 8,
                 req_base: 32,
                 req_tfm: 32,
+                req_cryptlen: 0,
+                req_flags: 40,
                 refcnt_off: 40,
                 refcnt_present: true,
             }
@@ -2665,11 +2745,15 @@ mod tests {
         // [10] async, [11] sreq, [12] sk.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 9, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 10, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
@@ -2721,11 +2805,15 @@ mod tests {
         // [9] async, [10] sreq, [11] sk.
         let o_async = b.str("crypto_async_request");
         let o_tfm_m = b.str("tfm");
-        b.rec(o_async, KIND_STRUCT, 1, false, 64);
+        let o_flags = b.str("flags");
+        b.rec(o_async, KIND_STRUCT, 2, false, 64);
         b.member(o_tfm_m, 8, 32 * 8);
+        b.member(o_flags, 1, 40 * 8);
         let o_req = b.str("skcipher_request");
+        let o_cryptlen = b.str("cryptlen");
         let o_base = b.str("base");
-        b.rec(o_req, KIND_STRUCT, 1, false, 128);
+        b.rec(o_req, KIND_STRUCT, 2, false, 128);
+        b.member(o_cryptlen, 1, 0);
         b.member(o_base, 9, 32 * 8);
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);

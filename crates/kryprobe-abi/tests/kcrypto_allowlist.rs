@@ -47,7 +47,21 @@ const VWHO_WANT: &[&str] = &[
 ];
 const VPARAMS_WANT: &[&str] = &["blocksize", "ivsize", "min_keysize", "max_keysize"];
 const LEDGE_WANT: &[&str] = &[
-    "magic", "version", "edge", "site", "flags", "key", "ts_ns", "status", "aux", "invoc", "tfm",
+    "magic",
+    "version",
+    "edge",
+    "site",
+    "flags",
+    "key",
+    "ts_ns",
+    "status",
+    "cryptlen",
+    "invoc",
+    "tfm",
+    "req_flags",
+    "fam",
+    "dir",
+    "mflags",
     "drv",
 ];
 const LTFM_WANT: &[&str] = &[
@@ -65,6 +79,8 @@ const LCONFIG_WANT: &[&str] = &[
     "refcnt_present",
     "req_base",
     "req_tfm",
+    "req_cryptlen",
+    "req_flags",
     "reserved",
 ];
 
@@ -253,9 +269,13 @@ fn field_lists_match_declarations() {
         key,
         ts_ns,
         status,
-        aux,
+        cryptlen,
         invoc,
         tfm,
+        req_flags,
+        fam,
+        dir,
+        mflags,
         drv,
     } = LEdge {
         magic: 0,
@@ -266,13 +286,18 @@ fn field_lists_match_declarations() {
         key: 0,
         ts_ns: 0,
         status: 0,
-        aux: 0,
+        cryptlen: 0,
         invoc: 0,
         tfm: 0,
-        drv: [0; 64],
+        req_flags: 0,
+        fam: 0,
+        dir: 0,
+        mflags: 0,
+        drv: [0; 56],
     };
     let _ = (
-        magic, version, edge, site, flags, key, ts_ns, status, aux, invoc, tfm, drv,
+        magic, version, edge, site, flags, key, ts_ns, status, cryptlen, invoc, tfm, req_flags,
+        fam, dir, mflags, drv,
     );
     let LTfm {
         magic,
@@ -315,6 +340,8 @@ fn field_lists_match_declarations() {
         refcnt_present,
         req_base,
         req_tfm,
+        req_cryptlen,
+        req_flags,
         reserved,
     } = LConfig {
         magic: 0,
@@ -327,7 +354,9 @@ fn field_lists_match_declarations() {
         refcnt_present: 0,
         req_base: 0,
         req_tfm: 0,
-        reserved: [0; 24],
+        req_cryptlen: 0,
+        req_flags: 0,
+        reserved: [0; 16],
     };
     let _ = (
         magic,
@@ -340,6 +369,8 @@ fn field_lists_match_declarations() {
         refcnt_present,
         req_base,
         req_tfm,
+        req_cryptlen,
+        req_flags,
         reserved,
     );
 }

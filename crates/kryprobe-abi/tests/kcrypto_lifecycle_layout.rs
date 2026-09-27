@@ -7,11 +7,12 @@ use kryprobe_abi::kcrypto_lifecycle::{
     LAGG_ALLOCAEAD_RET, LAGG_ALLOCAEAD_SUB, LAGG_ALLOCSK_RET, LAGG_ALLOCSK_SUB, LAGG_DEC_RET,
     LAGG_DEC_SUB, LAGG_DESTROY_RET, LAGG_DESTROY_SUB, LAGG_ENC_RET, LAGG_ENC_SUB, LAGG_SETAUTH_RET,
     LAGG_SETAUTH_SUB, LAGG_SETKEYAEAD_RET, LAGG_SETKEYAEAD_SUB, LAGG_SETKEYSK_RET,
-    LAGG_SETKEYSK_SUB, LCONFIG_MAGIC, LCONFIG_VERSION, LConfig, LEDGE_INVOC_POISON, LEDGE_MAGIC,
-    LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION, LEdge, LLOSS_BADKEY, LLOSS_DISABLED,
-    LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE, LSITE_DEC, LSITE_ENC, LTFM_MAGIC,
-    LTFM_SITE_ALLOC_AEAD, LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE,
-    LTFM_SITE_SETKEY_AEAD, LTFM_SITE_SETKEY_SK, LTFM_TRUNCATED, LTFM_VERSION, LTfm,
+    LAGG_SETKEYSK_SUB, LCONFIG_MAGIC, LCONFIG_VERSION, LConfig, LDIR_DEC, LDIR_ENC,
+    LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_VERSION,
+    LEdge, LFAM_SK, LLOSS_BADKEY, LLOSS_DISABLED, LLOSS_FRET, LLOSS_NOSLOT, LLOSS_RESERVE,
+    LMETA_CRYPTLEN_OK, LMETA_REQFLAGS_OK, LSITE_DEC, LSITE_ENC, LTFM_MAGIC, LTFM_SITE_ALLOC_AEAD,
+    LTFM_SITE_ALLOC_SK, LTFM_SITE_DESTROY, LTFM_SITE_SETAUTHSIZE, LTFM_SITE_SETKEY_AEAD,
+    LTFM_SITE_SETKEY_SK, LTFM_TRUNCATED, LTFM_VERSION, LTfm,
 };
 use std::mem::{offset_of, size_of};
 
@@ -26,22 +27,31 @@ fn ledge_is_112_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LEdge, key), 8);
     assert_eq!(offset_of!(LEdge, ts_ns), 16);
     assert_eq!(offset_of!(LEdge, status), 24);
-    assert_eq!(offset_of!(LEdge, aux), 28);
+    assert_eq!(offset_of!(LEdge, cryptlen), 28);
     assert_eq!(offset_of!(LEdge, invoc), 32);
     assert_eq!(offset_of!(LEdge, tfm), 40);
-    assert_eq!(offset_of!(LEdge, drv), 48);
+    assert_eq!(offset_of!(LEdge, req_flags), 48);
+    assert_eq!(offset_of!(LEdge, fam), 52);
+    assert_eq!(offset_of!(LEdge, dir), 53);
+    assert_eq!(offset_of!(LEdge, mflags), 54);
+    assert_eq!(offset_of!(LEdge, drv), 56);
 }
 
 #[test]
 fn ledge_enum_values_are_frozen() {
     assert_eq!(LEDGE_MAGIC, 0x434c);
-    assert_eq!(LEDGE_VERSION, 5);
+    assert_eq!(LEDGE_VERSION, 6);
     assert_eq!(LEDGE_INVOC_POISON, 1);
     assert_eq!(LEDGE_SUBMIT, 1);
     assert_eq!(LEDGE_RETURN, 2);
     assert_eq!(LEDGE_TAINTED, 0x0001);
     assert_eq!(LSITE_ENC, 1);
     assert_eq!(LSITE_DEC, 2);
+    assert_eq!(LFAM_SK, 1);
+    assert_eq!(LDIR_ENC, 1);
+    assert_eq!(LDIR_DEC, 2);
+    assert_eq!(LMETA_CRYPTLEN_OK, 0x0001);
+    assert_eq!(LMETA_REQFLAGS_OK, 0x0002);
 }
 
 #[test]
@@ -120,13 +130,15 @@ fn lconfig_is_64_bytes_with_pinned_offsets() {
     assert_eq!(offset_of!(LConfig, refcnt_present), 28);
     assert_eq!(offset_of!(LConfig, req_base), 32);
     assert_eq!(offset_of!(LConfig, req_tfm), 36);
-    assert_eq!(offset_of!(LConfig, reserved), 40);
+    assert_eq!(offset_of!(LConfig, req_cryptlen), 40);
+    assert_eq!(offset_of!(LConfig, req_flags), 44);
+    assert_eq!(offset_of!(LConfig, reserved), 48);
 }
 
 #[test]
 fn lconfig_magic_version_are_frozen() {
     assert_eq!(LCONFIG_MAGIC, 0x3143_4c4b);
-    assert_eq!(LCONFIG_VERSION, 3);
+    assert_eq!(LCONFIG_VERSION, 4);
 }
 
 #[test]
@@ -174,10 +186,14 @@ fn f9_ledge_debug_redacts_kernel_key() {
         key: 0xdead_beef_1234_5678,
         ts_ns: 7,
         status: 0,
-        aux: 0,
+        cryptlen: 16,
         invoc: 41,
         tfm: 0xcafe_f00d_2468_1357,
-        drv: [0; 64],
+        req_flags: 0,
+        fam: LFAM_SK,
+        dir: LDIR_ENC,
+        mflags: LMETA_CRYPTLEN_OK,
+        drv: [0; 56],
     };
     edge.drv[..11].copy_from_slice(b"aes-generic");
     let shown = format!("{edge:?}");

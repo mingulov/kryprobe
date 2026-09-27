@@ -2004,6 +2004,19 @@ impl std::error::Error for ForeignLinksError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection, RequestMeta};
+
+    /// P3 submit metadata for synthetic canary records (entry-side
+    /// scalars; the canary reconciles identity/counts, not metadata).
+    fn test_meta() -> RequestMeta {
+        RequestMeta {
+            family: LifecycleFamily::Skcipher,
+            direction: OpDirection::Encrypt,
+            cryptlen: Some(16),
+            req_flags: Some(0),
+            epoch: Some(0),
+        }
+    }
 
     /// Real sync transcript shape (alloc/config/submit/return/
     /// terminal/free/done — the setup setkey rides its own config
@@ -2122,6 +2135,7 @@ mod tests {
             tfm_id: None,
             terminal,
             duration_ns: Some(100),
+            meta: test_meta(),
         }
     }
 
@@ -3148,6 +3162,7 @@ mod tests {
             tfm_id: None,
             terminal: Terminal::Unknown,
             duration_ns: None,
+            meta: test_meta(),
         }];
         let view = SensorView {
             completed: &completed,

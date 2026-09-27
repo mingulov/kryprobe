@@ -203,6 +203,13 @@ fn payload_contract_producer_emits_pinned_shapes() {
             tfm_id: None,
             terminal,
             duration_ns: duration,
+            meta: kryprobe_core::kcrypto::RequestMeta {
+                family: kryprobe_core::kcrypto::LifecycleFamily::Skcipher,
+                direction: kryprobe_core::kcrypto::OpDirection::Encrypt,
+                cryptlen: Some(16),
+                req_flags: Some(0),
+                epoch: Some(0),
+            },
         };
         let (header, payload) =
             kryprobe_privilege::kcrypto_lifecycle::backend::lifecycle_event(&record);

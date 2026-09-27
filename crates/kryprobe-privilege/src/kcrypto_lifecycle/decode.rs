@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Raw-edge decode: v5 `LEdge` bytes → T05 `Edge` events (T06, v5 at T07.7:
-//! the submit-side driver word (F05) + return-side no-chase twin (R2)).
+//! Raw-edge decode: v6 `LEdge` bytes → T05 `Edge` events (P3: the v5
+//! submit-side driver word (F05) + return-side no-chase twin (R2) +
+//! entry-side scalar request metadata with submit-lifetime binding).
 //!
 //! The join is keyed by the BPF invocation id alone (W8 fsession: the
 //! entry run mints one id per call and stores it in the kernel-zeroed
@@ -32,18 +33,23 @@
 //! function — cross-site returns refuse stale).
 
 use kryprobe_abi::kcrypto_lifecycle::{
-    LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED, LEDGE_TRUNCATED,
-    LEDGE_VERSION, LSITE_DEC, LSITE_ENC,
+    LDIR_DEC, LDIR_ENC, LEDGE_INVOC_POISON, LEDGE_MAGIC, LEDGE_RETURN, LEDGE_SUBMIT, LEDGE_TAINTED,
+    LEDGE_TRUNCATED, LEDGE_VERSION, LFAM_SK, LMETA_CRYPTLEN_OK, LMETA_REQFLAGS_OK, LSITE_DEC,
+    LSITE_ENC,
 };
-use kryprobe_core::kcrypto::{Edge, GapReason, ReturnDisposition};
+use kryprobe_core::kcrypto::{
+    Edge, GapReason, LifecycleFamily, OpDirection, RequestMeta, ReturnDisposition,
+};
 use std::collections::HashMap;
 
-/// Record twin size: `LEdge` is 112 bytes on the ring (v5: the
-/// transform word rides at 40..48, the driver name at 48..112).
+/// Record twin size: `LEdge` is 112 bytes on the ring (v6: the API
+/// input length rides at 28..32, the transform word at 40..48, the
+/// request flags at 48..52, family/dir/validity at 52..56, and the
+/// driver name at 56..112).
 const RECORD_LEN: usize = 112;
 
-/// Driver-name field length (v5 `LEdge::drv`: 63 bytes max + NUL).
-const DRV_LEN: usize = 64;
+/// Driver-name field length (v6 `LEdge::drv`: 55 bytes max + NUL).
+const DRV_LEN: usize = 56;
 
 /// One validated raw edge (post-twin-checks, pre-join).
 ///
@@ -84,6 +90,17 @@ pub struct RawEdge {
     /// The driver word filled the bound (D9: clipped names read as
     /// partial, never complete — carried into the generation).
     pub truncated: bool,
+    /// API input length chased at entry (`None` when the chase was
+    /// unreadable — unknown, never 0-as-data; `None` on returns,
+    /// which carry no metadata).
+    pub cryptlen: Option<u32>,
+    /// Request flags chased at entry (`None` when unreadable — a
+    /// valid zero stays `Some(0)`; `None` on returns).
+    pub req_flags: Option<u32>,
+    /// Crypto family behind the op (wire-pinned; skcipher-only in v6).
+    pub family: LifecycleFamily,
+    /// Operation direction behind the op (wire-pinned, echoes the site).
+    pub direction: OpDirection,
 }
 
 impl std::fmt::Debug for RawEdge {
@@ -98,6 +115,10 @@ impl std::fmt::Debug for RawEdge {
             .field("invoc", &self.invoc)
             .field("tfm", &"<redacted>")
             .field("drv", &self.drv)
+            .field("cryptlen", &self.cryptlen)
+            .field("req_flags", &self.req_flags)
+            .field("family", &self.family)
+            .field("direction", &self.direction)
             .finish()
     }
 }
@@ -117,8 +138,12 @@ pub enum DecodeDrop {
     BadSite,
     /// Flags carry bits outside tainted/truncated.
     BadFlags,
-    /// The twin defines no aux; nonzero is twin drift.
-    BadAux,
+    /// v6 metadata word violates the contract: nonzero metadata on
+    /// a return edge (R2 extended — returns are never chased),
+    /// `mflags` bits outside cryptlen/req-flags-valid, a nonzero
+    /// value word without its validity bit, a non-skcipher family,
+    /// or a direction that does not echo the site.
+    BadMeta,
     /// Null pairing key (the BPF `BADKEY` gate should have dropped it).
     NullKey,
     /// Submit edge with a nonzero status (ABI: submit edges carry 0 —
@@ -133,7 +158,7 @@ pub enum DecodeDrop {
     /// Return edge with a nonzero transform word (R2: honest BPF
     /// never chases at exit — a return-side word is twin drift).
     BadReturnTfm,
-    /// Driver-name field violates the contract: no NUL within 64
+    /// Driver-name field violates the contract: no NUL within 56
     /// bytes, invalid UTF-8, or a name on a return edge (returns
     /// carry no name — the submit's admission owns the provenance).
     BadDrv,
@@ -163,18 +188,22 @@ pub struct DecodeStats {
     pub stale_returns: u64,
 }
 
-/// Validate one ring record against the v5 `LEdge` twin: exact length,
-/// magic, version, edge kind, site, defined-only flags, zero aux,
-/// non-null key, zero status on submit edges, the invocation id, the
+/// Validate one ring record against the v6 `LEdge` twin: exact length,
+/// magic, version, edge kind, site, defined-only flags, non-null
+/// key, zero status on submit edges, the invocation id, the
 /// transform word (submit edges: ANY u64 — 0 is unknown, never
 /// refused; return edges: 0 ONLY — R2, honest BPF never chases at
-/// exit), and the driver name (submit edges: NUL-terminated UTF-8,
-/// empty when unknown; return edges: empty ONLY).
+/// exit), the entry-side metadata (submit edges: validity-gated
+/// `cryptlen` / `req_flags`, skcipher family, site-echoing
+/// direction; return edges: all-zero ONLY), and the driver name
+/// (submit edges: NUL-terminated UTF-8 within 56 bytes, empty when
+/// unknown; return edges: empty ONLY).
 pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeDrop::BadLength);
     }
     let u16le = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    let u32le = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     let u64le = |i: usize| {
         u64::from_le_bytes([
             bytes[i],
@@ -211,9 +240,6 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     }
     let ts_ns = u64le(16);
     let status = i32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
-    if u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) != 0 {
-        return Err(DecodeDrop::BadAux);
-    }
     if edge == LEDGE_SUBMIT && status != 0 {
         return Err(DecodeDrop::BadSubmitStatus);
     }
@@ -227,8 +253,56 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     if edge == LEDGE_RETURN && tfm != 0 {
         return Err(DecodeDrop::BadReturnTfm);
     }
+    // Entry-side metadata (P3): returns carry all-zero words (R2
+    // extended — honest BPF never chases at exit); submits carry
+    // validity-gated scalars, the skcipher family, and the
+    // site-echoing direction.
+    let cryptlen_word = u32le(28);
+    let req_flags_word = u32le(48);
+    let fam = bytes[52];
+    let dir = bytes[53];
+    let mflags = u16le(54);
+    let (cryptlen, req_flags) = if edge == LEDGE_RETURN {
+        if cryptlen_word != 0 || req_flags_word != 0 || fam != 0 || dir != 0 || mflags != 0 {
+            return Err(DecodeDrop::BadMeta);
+        }
+        (None, None)
+    } else {
+        if mflags & !(LMETA_CRYPTLEN_OK | LMETA_REQFLAGS_OK) != 0 {
+            return Err(DecodeDrop::BadMeta);
+        }
+        if fam != LFAM_SK {
+            return Err(DecodeDrop::BadMeta);
+        }
+        let want_dir = if site == LSITE_ENC {
+            LDIR_ENC
+        } else {
+            LDIR_DEC
+        };
+        if dir != want_dir {
+            return Err(DecodeDrop::BadMeta);
+        }
+        // A nonzero value without its validity bit is twin drift
+        // (honest BPF zeroes the word when the chase is unreadable);
+        // a valid zero stays `Some(0)`, never confused with unknown.
+        if mflags & LMETA_CRYPTLEN_OK == 0 && cryptlen_word != 0 {
+            return Err(DecodeDrop::BadMeta);
+        }
+        if mflags & LMETA_REQFLAGS_OK == 0 && req_flags_word != 0 {
+            return Err(DecodeDrop::BadMeta);
+        }
+        (
+            (mflags & LMETA_CRYPTLEN_OK != 0).then_some(cryptlen_word),
+            (mflags & LMETA_REQFLAGS_OK != 0).then_some(req_flags_word),
+        )
+    };
+    let direction = if site == LSITE_ENC {
+        OpDirection::Encrypt
+    } else {
+        OpDirection::Decrypt
+    };
     let mut drv_field = [0u8; DRV_LEN];
-    drv_field.copy_from_slice(&bytes[48..48 + DRV_LEN]);
+    drv_field.copy_from_slice(&bytes[56..56 + DRV_LEN]);
     let drv_len = drv_field
         .iter()
         .position(|b| *b == 0)
@@ -248,6 +322,10 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         tfm,
         drv: drv.to_owned(),
         truncated,
+        cryptlen,
+        req_flags,
+        family: LifecycleFamily::Skcipher,
+        direction,
     })
 }
 
@@ -337,7 +415,34 @@ impl LifecycleDecoder {
     /// per-call cookies isolate invocations, so a tainted edge (which
     /// names no invocation) disturbs no outstanding id — the paired
     /// exit of a live call still arrives under its own cookie.
+    ///
+    /// Compatibility entry (P3): carries no transform binding — the
+    /// sensor resolves submit lifetimes through [`Self::join_with_tfm`].
     pub fn join(&mut self, raw: RawEdge) -> Vec<Edge> {
+        self.join_inner(raw, None, None)
+    }
+
+    /// Join one validated raw edge with its submit-lifetime binding
+    /// (P3): `tfm_id` is the live generation behind the submit's
+    /// frontend (resolved by the sensor AFTER first-seen admission),
+    /// `epoch` that generation's configuration era AT SUBMIT.
+    /// Unknown/ambiguous binding stays explicit (`None`) and never
+    /// destroys the invocation identity; an epoch without a
+    /// generation is not expressible and coerces to `None` (a caller
+    /// slip must not mint phantom keying eras). Returns ignore both
+    /// (the binding rode the submit).
+    pub fn join_with_tfm(
+        &mut self,
+        raw: RawEdge,
+        tfm_id: Option<u64>,
+        epoch: Option<u64>,
+    ) -> Vec<Edge> {
+        let epoch = if tfm_id.is_none() { None } else { epoch };
+        self.join_inner(raw, tfm_id, epoch)
+    }
+
+    /// Shared join body: taint refusal, then submit/complete dispatch.
+    fn join_inner(&mut self, raw: RawEdge, tfm_id: Option<u64>, epoch: Option<u64>) -> Vec<Edge> {
         if raw.tainted {
             if raw.edge == LEDGE_SUBMIT {
                 self.stats.submit_refused += 1;
@@ -347,7 +452,7 @@ impl LifecycleDecoder {
             return Vec::new();
         }
         if raw.edge == LEDGE_SUBMIT {
-            self.submit(raw)
+            self.submit(raw, tfm_id, epoch)
         } else {
             self.complete(raw)
         }
@@ -365,8 +470,10 @@ impl LifecycleDecoder {
     /// (`IdentityAmbiguous` — its return never arrived) first. A
     /// full table or an exhausted id space refuses (counted, no
     /// phantom). Same-key submits with FRESH invocations admit
-    /// alongside (nested calls pair exactly — never gapped).
-    fn submit(&mut self, raw: RawEdge) -> Vec<Edge> {
+    /// alongside (nested calls pair exactly — never gapped). The
+    /// submit-lifetime binding (`tfm_id` + submit-pinned `epoch`)
+    /// and the entry-side wire metadata ride the emitted edge.
+    fn submit(&mut self, raw: RawEdge, tfm_id: Option<u64>, epoch: Option<u64>) -> Vec<Edge> {
         let mut out = Vec::new();
         if let Some((old_id, _, _)) = self.outstanding.remove(&raw.invoc) {
             self.stats.gaps_synthesized += 1;
@@ -393,8 +500,15 @@ impl LifecycleDecoder {
         self.stats.admitted += 1;
         out.push(Edge::Submit {
             id,
-            tfm_id: None,
+            tfm_id,
             ts_ns: raw.ts_ns,
+            meta: RequestMeta {
+                family: raw.family,
+                direction: raw.direction,
+                cryptlen: raw.cryptlen,
+                req_flags: raw.req_flags,
+                epoch,
+            },
         });
         out
     }

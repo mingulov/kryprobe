@@ -816,6 +816,47 @@ impl TransformTracker {
         Some(id)
     }
 
+    /// Resolve the LIVE generation behind an op frontend (P3
+    /// submit-lifetime binding): the frontend normalizes to the
+    /// canonical base exactly like admission, and the base's live
+    /// occupant (if any) donates its opaque id. Pure (`&self` — a
+    /// query, never an admission): a 0 frontend, a wrapping offset,
+    /// an unmapped base, or a retired tombstone all resolve `None`
+    /// (unknown binding stays explicit — the sensor admits
+    /// first-seen BEFORE resolving, so `None` here means the
+    /// admission refused or never ran, never a missed lookup).
+    /// Retired generations never rebind (the live map holds live
+    /// occupants only — binding a tombstone id to a new op would
+    /// donate a dead lifetime's identity to live traffic).
+    #[must_use]
+    pub fn generation_for_frontend(&self, frontend: u64) -> Option<u64> {
+        if frontend == 0 {
+            return None;
+        }
+        let base = normalize_frontend(frontend, self.frontend_off)?;
+        self.live
+            .get(&base)
+            .map(|&idx| self.generations[idx].info.id)
+    }
+
+    /// Resolve the configuration epoch of the LIVE generation behind
+    /// an op frontend (P3 submit pin): same live-occupant lookup as
+    /// [`Self::generation_for_frontend`], donating the epoch instead
+    /// of the id. The sensor pins this AT SUBMIT — the keying era
+    /// the op ran under — so later rekeys never rewrite history. A
+    /// bound-but-unconfigured generation pins `Some(0)` (a real
+    /// era); `None` pairs with an unbound submit exactly.
+    #[must_use]
+    pub fn epoch_for_frontend(&self, frontend: u64) -> Option<u64> {
+        if frontend == 0 {
+            return None;
+        }
+        let base = normalize_frontend(frontend, self.frontend_off)?;
+        self.live
+            .get(&base)
+            .map(|&idx| self.generations[idx].info.epoch)
+    }
+
     /// Feed one ring record: validate, join, and report newly
     /// assigned generation ids (empty unless a success return paired).
     /// Invalid records count `bad_records` and emit nothing.

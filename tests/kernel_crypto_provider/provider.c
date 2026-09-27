@@ -104,6 +104,17 @@ static DEFINE_MUTEX(kxc_run_lock);
  */
 static DEFINE_MUTEX(kxc_stop_lock);
 
+/*
+ * Provider-body entry marker (P3r): counts kxc_do_crypt entries since
+ * PREPARE (reset in kxc_run_begin). Incremented FIRST on body entry —
+ * entry means entry, including the keyless early return. Read by the
+ * return rows + done trailer as independent truth: a refused op with
+ * an unchanged marker never entered the provider, which errno alone
+ * cannot prove (the body itself returns -ENOKEY when keyless).
+ * Skcipher only; the AEAD body is out of T08 scope.
+ */
+static atomic64_t kxc_crypt_entries;
+
 u64 kxc_next_seq(struct kxc_run *run)
 {
 	return (u64)atomic64_inc_return(&run->seq);
@@ -142,6 +153,7 @@ int kxc_run_begin(struct kxc_run *run, const char *id,
 	/* WRITE_ONCE: STOP may store concurrently under kxc_stop_lock. */
 	WRITE_ONCE(run->stop, false);
 	kxc_ledger_reset();
+	atomic64_set(&kxc_crypt_entries, 0);
 	return 0;
 }
 
@@ -223,6 +235,11 @@ static int kxc_setkey(struct crypto_skcipher *tfm, const u8 *key,
 	return 0;
 }
 
+u64 kxc_crypt_entries_count(void)
+{
+	return (u64)atomic64_read(&kxc_crypt_entries);
+}
+
 static int kxc_do_crypt(struct skcipher_request *req)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -231,6 +248,7 @@ static int kxc_do_crypt(struct skcipher_request *req)
 	unsigned int i;
 	int err;
 
+	atomic64_inc(&kxc_crypt_entries);
 	if (!ctx->keylen)
 		return -ENOKEY;
 	{
@@ -566,9 +584,11 @@ static ssize_t kxc_control_write(struct file *file, const char __user *buf,
 			ret = kxc_scenario_run(&kxc_run, kxc_run.scenario);
 			kxc_ledger_emit(
 				"{\"v\":1,\"run\":\"%s\",\"phase\":\"done\","
-				"\"fixture_result\":%d,\"overflow\":%llu,\"ts\":%llu}",
+				"\"fixture_result\":%d,\"overflow\":%llu,\"ts\":%llu,"
+				"\"entries\":%llu}",
 				kxc_run.id, ret < 0 ? ret : 0,
-				kxc_ledger_dropped(), ktime_get_ns());
+				kxc_ledger_dropped(), ktime_get_ns(),
+				(u64)atomic64_read(&kxc_crypt_entries));
 			kxc_run_finish(&kxc_run, ret < 0 ? ret : 0);
 			ret = ret < 0 ? ret : (int)len;
 		}
@@ -596,12 +616,13 @@ static ssize_t kxc_control_read(struct file *file, char __user *buf,
 	mutex_lock(&kxc_run_lock);
 	n = scnprintf(status, sizeof(status),
 		      "run=%s scenario=%s prepared=%d done=%d "
-		      "fixture_result=%d rows=%d overflow=%llu\n",
+		      "fixture_result=%d rows=%d overflow=%llu entries=%llu\n",
 		      kxc_run.prepared ? kxc_run.id : "-",
 		      kxc_run.prepared ? kxc_run.scenario : "-",
 		      kxc_run.prepared ? 1 : 0, kxc_run.done ? 1 : 0,
 		      kxc_run.fixture_result, atomic_read(&kxc_log.count),
-		      kxc_ledger_dropped());
+		      kxc_ledger_dropped(),
+		      (u64)atomic64_read(&kxc_crypt_entries));
 	mutex_unlock(&kxc_run_lock);
 	return simple_read_from_buffer(buf, len, ppos, status, n);
 }

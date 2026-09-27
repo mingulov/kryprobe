@@ -379,6 +379,13 @@ fn f8c_lifecycle_event_builder_round_trips() {
         tfm_id: None,
         terminal: kryprobe_core::kcrypto::Terminal::Callback(-5),
         duration_ns: Some(70),
+        meta: kryprobe_core::kcrypto::RequestMeta {
+            family: kryprobe_core::kcrypto::LifecycleFamily::Skcipher,
+            direction: kryprobe_core::kcrypto::OpDirection::Encrypt,
+            cryptlen: Some(16),
+            req_flags: Some(0),
+            epoch: Some(0),
+        },
     };
     let (header, payload) = lifecycle_event(&record);
     assert_eq!(header.backend_id, BACKEND_KCRYPTO);

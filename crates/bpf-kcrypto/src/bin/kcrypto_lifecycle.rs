@@ -10,12 +10,14 @@
 //! `bpf_session_is_return` kfunc. The op programs read the request
 //! pointer (`arg0`); the exit runs additionally read the return
 //! value (`bpf_get_func_ret`). Every run stamps `bpf_ktime_get_ns`
-//! and the op programs emit one 48-byte v4 [`LEdge`] record on
+//! and the op programs emit one 112-byte v6 [`LEdge`] record on
 //! `LRING` per observed half — the record names the frontend
 //! transform behind the op (`req->base->tfm` chased at the `LCFG`
 //! request-link words, minus `sk_base` to the frontend; 0 when the
-//! link was unreadable), so op-first observations admit their
-//! transform (T07.3 first-seen) and attribute to it (T08).
+//! link was unreadable) plus the entry-side request scalars
+//! (`cryptlen`/`req_flags` with validity bits, P3), so op-first
+//! observations admit their transform (T07.3 first-seen) and
+//! attribute to it (P3 submit-lifetime binding).
 //!
 //! The alloc program observes `crypto_alloc_skcipher(alg_name, type,
 //! mask)`: the entry run bounded-copies the requested name (63-byte
@@ -83,20 +85,18 @@
 //! duplication across workspaces; the layout pins + privileged decode
 //! suite fail on drift).
 //!
-//! Honest limitations (T07.2 profile scope):
-//! - skcipher allocation only: `crypto_alloc_skcipher` entry/return
-//!   is captured; release (`tfm_release`/final-free, T07.3) and
-//!   aead/setkey/config (T07.4) are not.
-//! - No lengths/flags capture (T08); op `aux` stays 0.
+//! Honest limitations (P3 profile scope):
+//! - skcipher op family only (`crypto_skcipher_encrypt/decrypt`);
+//!   AEAD/hash op sites arrive under their own wire versions.
 //! - No callback/completion observation (T09 adapters).
 //! - Floor 7.0+: fsession attach refuses typed below it (no 6.x
 //!   lifecycle; `api-returns` keeps its own contract).
 //!
-//! Privacy: the sensor reads argument pointers (pairing keys and
-//! public algorithm/driver names only), the return register, the
-//! config word, and the per-call cookie. It never touches keys, IVs,
-//! plaintext, ciphertext, digests, request buffers, or cookie
-//! addresses.
+//! Privacy: the sensor reads argument pointers (pairing keys,
+//! entry-side request scalars, and public algorithm/driver names
+//! only), the return register, the config word, and the per-call
+//! cookie. It never touches keys, IVs, plaintext, ciphertext,
+//! digests, request buffers, or cookie addresses.
 //!
 //! Fail-closed gates: a wrong/missing `LCFG` magic disarms every
 //! program (`LLOSS_DISABLED`, never silent); null keys feed
@@ -147,7 +147,7 @@ use core::mem::MaybeUninit;
 // ---------------------------------------------------------------------------
 
 const LEDGE_MAGIC: u16 = 0x434c;
-const LEDGE_VERSION: u8 = 5;
+const LEDGE_VERSION: u8 = 6;
 
 const LEDGE_SUBMIT: u8 = 1;
 const LEDGE_RETURN: u8 = 2;
@@ -157,6 +157,12 @@ const LEDGE_TRUNCATED: u16 = 0x0002;
 
 const LSITE_ENC: u16 = 1;
 const LSITE_DEC: u16 = 2;
+
+const LFAM_SK: u8 = 1;
+const LDIR_ENC: u8 = 1;
+const LDIR_DEC: u8 = 2;
+const LMETA_CRYPTLEN_OK: u16 = 0x0001;
+const LMETA_REQFLAGS_OK: u16 = 0x0002;
 
 const LTFM_MAGIC: u16 = 0x544c;
 const LTFM_VERSION: u8 = 1;
@@ -168,7 +174,7 @@ const LTFM_SITE_SETKEY_AEAD: u16 = 6;
 const LTFM_TRUNCATED: u16 = 0x0002;
 
 const LCONFIG_MAGIC: u32 = 0x3143_4c4b;
-const LCONFIG_VERSION: u32 = 3;
+const LCONFIG_VERSION: u32 = 4;
 
 const LLOSS_RESERVE: u32 = 0;
 const LLOSS_DISABLED: u32 = 1;
@@ -231,10 +237,13 @@ const KFUNC_COOKIE_SENTINEL: usize = 0x5F4B_0002;
 /// `tfm` is the frontend transform pointer behind the op
 /// (`req->base->tfm` chased at the `LCFG` request-link words, minus
 /// `sk_base` to the frontend — the tracker normalizes every pairing
-/// pointer uniformly), 0 when the link was unreadable. `drv` is the
-/// runtime-selected driver behind the submit's transform (F05).
-/// Submit edges only: returns carry `tfm` 0 + empty `drv` (R2: the
-/// exit run never chases — the request may be freed already).
+/// pointer uniformly), 0 when the link was unreadable. `cryptlen` /
+/// `req_flags` are the entry-side request scalars (validity-gated by
+/// `mflags`), `fam`/`dir` the wire-pinned family/direction, and `drv`
+/// the runtime-selected driver behind the submit's transform (F05).
+/// Submit edges only: returns carry `tfm` 0 + zero metadata + empty
+/// `drv` (R2 extended: the exit run never chases — the request may be
+/// freed already).
 #[repr(C)]
 struct LEdge {
     magic: u16,
@@ -245,15 +254,19 @@ struct LEdge {
     key: u64,
     ts_ns: u64,
     status: i32,
-    aux: u32,
+    cryptlen: u32,
     invoc: u64,
     tfm: u64,
-    drv: [u8; NAME_LEN],
+    req_flags: u32,
+    fam: u8,
+    dir: u8,
+    mflags: u16,
+    drv: [u8; DRV_LEN],
 }
 
-/// Sensor config (64 bytes, `LCFG` key 0): v3 adds the destroy
-/// refcount words and the op request-link words to the v2 chase
-/// offsets. Word order pinned by ABI tests.
+/// Sensor config (64 bytes, `LCFG` key 0): v4 adds the op
+/// request-metadata words (`req_cryptlen`/`req_flags`) to the v3
+/// chase offsets. Word order pinned by ABI tests.
 #[repr(C)]
 struct LConfig {
     magic: u32,
@@ -266,7 +279,9 @@ struct LConfig {
     refcnt_present: u32,
     req_base: u32,
     req_tfm: u32,
-    reserved: [u8; 24],
+    req_cryptlen: u32,
+    req_flags: u32,
+    reserved: [u8; 16],
 }
 
 /// Raw transform edge (112 bytes; field order pinned by ABI tests).
@@ -387,6 +402,11 @@ fn probe_read(dst: *mut u8, size: u32, src: *const c_void) -> bool {
 /// Name field width: 63 bytes + NUL (the wire bound).
 const NAME_LEN: usize = 64;
 
+/// v6 op driver word width: 55 bytes + NUL (the metadata words took
+/// the first 8 bytes of the old 64-byte word; the `LTfm` name keeps
+/// the full 64).
+const DRV_LEN: usize = 56;
+
 /// 8-aligned stack name slot: `zero_name` and the emitter's copy
 /// loop use `u64` volatile accesses, which require 8-byte alignment
 /// a bare `[u8; 64]` does not guarantee (D2: byte-aligned storage +
@@ -416,30 +436,31 @@ fn zero_name(slot: *mut NameSlot) {
 
 /// Bounded-copy the kernel string at `src` into `slot` (pre-zeroed
 /// by the caller — a fault must leave empty/unknown, never stack
-/// garbage). Returns true when the bound filled (`TRUNCATED` —
-/// conservatively set even for an exact-63 fit, which is
-/// indistinguishable from a longer string; the flag claims less
-/// certainty, never more). A null `src` or a fault re-zeroes the
-/// slot and reports untruncated: missing provenance is unknown,
-/// never fabricated, never dropped.
+/// garbage), filling at most `bound` bytes. Returns true when the
+/// bound filled (`TRUNCATED` — conservatively set even for an
+/// exact fit, which is indistinguishable from a longer string; the
+/// flag claims less certainty, never more). A null `src` or a fault
+/// re-zeroes the slot and reports untruncated: missing provenance
+/// is unknown, never fabricated, never dropped.
 #[inline(always)]
-fn copy_name(slot: *mut NameSlot, src: u64) -> bool {
+fn copy_name(slot: *mut NameSlot, src: u64, bound: usize) -> bool {
     // SAFETY: pre-zeroed by contract (fully initialized); exclusive
-    // stack slot.
+    // stack slot. `bound` never exceeds the slot (callers pass
+    // NAME_LEN or DRV_LEN — both ≤ 64 by construction).
     let buf = unsafe { &mut (*slot).0 };
     if src == 0 {
         zero_name(slot);
         return false;
     }
-    let ret = probe_read_str(buf.as_mut_ptr(), NAME_LEN as u32, src as *const c_void);
-    if ret < 0 || ret > NAME_LEN as i64 {
+    let ret = probe_read_str(buf.as_mut_ptr(), bound as u32, src as *const c_void);
+    if ret < 0 || ret > bound as i64 {
         zero_name(slot);
         return false;
     }
-    if ret == NAME_LEN as i64 {
+    if ret == bound as i64 {
         // The bound filled: force the terminator (the copy may not
         // have written one) and flag truncation.
-        buf[NAME_LEN - 1] = 0;
+        buf[bound - 1] = 0;
         return true;
     }
     false
@@ -460,17 +481,19 @@ fn chase_offsets() -> (u32, u32, u32) {
 
 /// Resolve the driver name for a freshly allocated frontend `tfm`:
 /// `(tfm + sk_base)->__crt_alg->cra_driver_name` at the
-/// `LCFG`-pinned offsets, bounded-copied into `slot`. The frontend
-/// is a `struct crypto_skcipher *`, NOT a `struct crypto_tfm *` —
-/// the embedded base sits at `sk_base` (8 on 64-bit: `reqsize` +
-/// alignment padding), and `__crt_alg` is relative to THAT (T07.2d:
-/// chasing `tfm + tfm_alg` reads the `exit` callback slot and copies
-/// kernel code bytes as the "name"). Any unreadable link
-/// (null/out-of-range pointer, faulted read) leaves the slot
-/// empty/unknown: missing provenance is unknown, never fabricated.
-/// Returns the truncation flag for the resolved name.
+/// `LCFG`-pinned offsets, bounded-copied into `slot` (at most
+/// `bound` bytes — the op word takes `DRV_LEN`, the alloc word
+/// `NAME_LEN`). The frontend is a `struct crypto_skcipher *`, NOT a
+/// `struct crypto_tfm *` — the embedded base sits at `sk_base` (8
+/// on 64-bit: `reqsize` + alignment padding), and `__crt_alg` is
+/// relative to THAT (T07.2d: chasing `tfm + tfm_alg` reads the
+/// `exit` callback slot and copies kernel code bytes as the
+/// "name"). Any unreadable link (null/out-of-range pointer,
+/// faulted read) leaves the slot empty/unknown: missing provenance
+/// is unknown, never fabricated. Returns the truncation flag for
+/// the resolved name.
 #[inline(always)]
-fn chase_drv_name(slot: *mut NameSlot, tfm: u64) -> bool {
+fn chase_drv_name(slot: *mut NameSlot, tfm: u64, bound: usize) -> bool {
     // Pre-zero: every early return below must leave empty/unknown.
     zero_name(slot);
     if tfm == 0 {
@@ -495,7 +518,7 @@ fn chase_drv_name(slot: *mut NameSlot, tfm: u64) -> bool {
     let Some(name_at) = alg.checked_add(u64::from(alg_drv)) else {
         return false;
     };
-    copy_name(slot, name_at)
+    copy_name(slot, name_at, bound)
 }
 
 /// Request-link offsets (`LCFG` words 32/36 + `sk_base` — volatile
@@ -544,6 +567,60 @@ fn chase_req_tfm(req: u64) -> u64 {
         return 0;
     }
     base.saturating_sub(u64::from(sk_base))
+}
+
+/// Request-metadata offsets (`LCFG` words 32/40/44 — volatile
+/// reads, copied once like [`req_link_offsets`]): `req_base` for
+/// the request→base link, `req_cryptlen` for the API input length,
+/// `req_flags` for the base-relative flags word. Only read on armed
+/// runs (the prologues gate first).
+#[inline(always)]
+fn req_meta_offsets() -> (u32, u32, u32) {
+    let Some(cfg) = LCFG.get(0) else {
+        return (0, 0, 0);
+    };
+    let req_base = unsafe { core::ptr::addr_of!(cfg.req_base).read_volatile() };
+    let req_cryptlen = unsafe { core::ptr::addr_of!(cfg.req_cryptlen).read_volatile() };
+    let req_flags = unsafe { core::ptr::addr_of!(cfg.req_flags).read_volatile() };
+    (req_base, req_cryptlen, req_flags)
+}
+
+/// Chase the entry-side request scalars for an op submit: the API
+/// input length at `req + req_cryptlen` and the request flags at
+/// `req + req_base + req_flags`. Returns (cryptlen, req_flags,
+/// mflags): each value word is 0 unless its chase fully landed, and
+/// the validity bit is set exactly then (a faulted read, null
+/// request, or overflowed address yields unknown-with-zero — never
+/// stack garbage, never a fabricated scalar). Failed reads assign
+/// nothing (the temp may hold a partial word — only a successful
+/// read donates its value).
+#[inline(always)]
+fn chase_req_meta(req: u64) -> (u32, u32, u16) {
+    if req == 0 {
+        return (0, 0, 0);
+    }
+    let (req_base, cryptlen_off, flags_off) = req_meta_offsets();
+    let mut mflags: u16 = 0;
+    let mut cryptlen: u32 = 0;
+    if let Some(at) = req.checked_add(u64::from(cryptlen_off)) {
+        let mut tmp: u32 = 0;
+        if probe_read(core::ptr::addr_of_mut!(tmp).cast(), 4, at as *const c_void) {
+            cryptlen = tmp;
+            mflags |= LMETA_CRYPTLEN_OK;
+        }
+    }
+    let mut req_flags: u32 = 0;
+    if let Some(at) = req
+        .checked_add(u64::from(req_base))
+        .and_then(|base| base.checked_add(u64::from(flags_off)))
+    {
+        let mut tmp: u32 = 0;
+        if probe_read(core::ptr::addr_of_mut!(tmp).cast(), 4, at as *const c_void) {
+            req_flags = tmp;
+            mflags |= LMETA_REQFLAGS_OK;
+        }
+    }
+    (cryptlen, req_flags, mflags)
 }
 
 /// Refcount words (`LCFG` 24/28 — volatile reads, copied once).
@@ -622,8 +699,11 @@ fn agg_inc(idx: u32) {
 
 /// Emit one edge record: reserve 112 bytes, fill every field, submit.
 /// Reserve failure feeds `LLOSS_RESERVE` (never silent). `drv` copies
-/// from the caller's 8-aligned `NameSlot` (entry: the chased driver;
-/// exit: a zeroed slot — returns carry no name).
+/// the first `DRV_LEN` bytes from the caller's 8-aligned `NameSlot`
+/// (entry: the chased driver; exit: a zeroed slot — returns carry
+/// no name). Metadata rides the submit's words (`cryptlen` /
+/// `req_flags` / `fam` / `dir` / `mflags`); the exit run passes all
+/// zeros (R2 extended — never chased).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn emit_edge(
@@ -635,6 +715,11 @@ fn emit_edge(
     tainted: bool,
     invoc: u64,
     tfm: u64,
+    cryptlen: u32,
+    req_flags: u32,
+    fam: u8,
+    dir: u8,
+    mflags: u16,
     drv: &NameSlot,
     truncated: bool,
     hook: u32,
@@ -661,18 +746,23 @@ fn emit_edge(
         core::ptr::addr_of_mut!((*ptr).key).write(key);
         core::ptr::addr_of_mut!((*ptr).ts_ns).write(now);
         core::ptr::addr_of_mut!((*ptr).status).write(status);
-        core::ptr::addr_of_mut!((*ptr).aux).write_volatile(0);
+        // Volatile: the chased scalars are data-dependent but
+        // zero-heavy (unreadable links, null requests) — a plain
+        // store here fuses into a `memset` call under inlining
+        // (T07.2d R4 lesson); volatile never fuses. Same for the
+        // small tag words (the exit run passes literal zeros).
+        core::ptr::addr_of_mut!((*ptr).cryptlen).write_volatile(cryptlen);
         core::ptr::addr_of_mut!((*ptr).invoc).write(invoc);
-        // Volatile: the chased frontend is data-dependent but
-        // zero-heavy (unreadable links, null tfms) at the record
-        // tail — a plain store here fuses into a `memset` call
-        // under inlining (T07.2d R4 lesson); volatile never fuses.
         core::ptr::addr_of_mut!((*ptr).tfm).write_volatile(tfm);
+        core::ptr::addr_of_mut!((*ptr).req_flags).write_volatile(req_flags);
+        core::ptr::addr_of_mut!((*ptr).fam).write_volatile(fam);
+        core::ptr::addr_of_mut!((*ptr).dir).write_volatile(dir);
+        core::ptr::addr_of_mut!((*ptr).mflags).write_volatile(mflags);
         // Volatile loads (same R4 rationale as `emit_tfm_edge`'s
         // name copy: the stack source may be known-zero, and plain
         // loads fuse the copy into a `memset` call).
         let mut i = 0usize;
-        while i < NAME_LEN {
+        while i < DRV_LEN {
             let word = (drv.0.as_ptr().add(i) as *const u64).read_volatile();
             (core::ptr::addr_of_mut!((*ptr).drv).cast::<u8>().add(i) as *mut u64).write(word);
             i += 8;
@@ -875,6 +965,11 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
                 true,
                 0,
                 0,
+                0,
+                0,
+                0,
+                0,
+                0,
                 empty,
                 false,
                 ret_hook,
@@ -898,6 +993,11 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
             ret as i32,
             false,
             invoc,
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             empty,
             false,
@@ -923,17 +1023,25 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
         *session_cookie(raw) = invoc;
     }
     // Live entry chase (the request is ours for the call's duration):
-    // the transform word plus the runtime-selected driver (F05 —
-    // empty when unreadable, never fabricated; clipped names flag
-    // TRUNCATED, never read as complete).
+    // the transform word, the request scalars (cryptlen/flags with
+    // validity bits — unknown when unreadable, never fabricated),
+    // and the runtime-selected driver (F05 — empty when unreadable,
+    // never fabricated; clipped names flag TRUNCATED, never read
+    // as complete).
     let tfm = chase_req_tfm(key);
+    let (cryptlen, req_flags, mflags) = chase_req_meta(key);
     let mut slot = MaybeUninit::<NameSlot>::uninit();
     let raw_slot = slot.as_mut_ptr();
     zero_name(raw_slot);
-    let truncated = chase_drv_name(raw_slot, tfm);
+    let truncated = chase_drv_name(raw_slot, tfm, DRV_LEN);
     // SAFETY: `chase_drv_name` keeps the slot fully initialized on
     // every path (pre-zeroed, then helper-overwritten in part).
     let drv = unsafe { &*raw_slot };
+    let dir = if site == LSITE_ENC {
+        LDIR_ENC
+    } else {
+        LDIR_DEC
+    };
     emit_edge(
         site,
         LEDGE_SUBMIT,
@@ -943,6 +1051,11 @@ fn site_run(ctx: &FEntryContext, lane: u32, site: u16, sub_hook: u32, ret_hook: 
         false,
         invoc,
         tfm,
+        cryptlen,
+        req_flags,
+        LFAM_SK,
+        dir,
+        mflags,
         drv,
         truncated,
         sub_hook,
@@ -1028,7 +1141,7 @@ fn alloc_run(ctx: &FEntryContext) -> i32 {
         // The pointer stays typed as *mut NameSlot, so word
         // accesses keep their 8-alignment by construction (D2).
         let raw_slot = slot.as_mut_ptr();
-        let truncated = chase_drv_name(raw_slot, ret);
+        let truncated = chase_drv_name(raw_slot, ret, NAME_LEN);
         // SAFETY: `chase_drv_name` leaves the slot fully initialized
         // on every path (zeroed, then helper-overwritten in part).
         let name = unsafe { &*raw_slot };
@@ -1068,7 +1181,7 @@ fn alloc_run(ctx: &FEntryContext) -> i32 {
     // accesses keep their 8-alignment by construction (D2).
     let raw_slot = slot.as_mut_ptr();
     zero_name(raw_slot);
-    let truncated = copy_name(raw_slot, ctx.arg(0));
+    let truncated = copy_name(raw_slot, ctx.arg(0), NAME_LEN);
     // SAFETY: volatile-zeroed above; `copy_name` keeps the slot
     // fully initialized on every path (zeroed, then
     // helper-overwritten in part).

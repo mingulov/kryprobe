@@ -52,6 +52,16 @@ all reject).
 - `sync-once`: exact-driver sync alloc, encrypt+decrypt roundtrip,
   verified bytes, free. Every invocation still records a terminal
   row (a sync return IS its terminal result).
+- `sync-meta` (P3): exact-driver sync alloc + setkey (epoch 1), 3
+  encrypt+decrypt roundtrips with varied cryptlen (16/64/256) and
+  request flags (0/`MAY_BACKLOG`), a mid-run rekey (epoch 2), then
+  3 more roundtrips (12 ops total). Submit rows carry `len` +
+  `flags` truth for the T08 metadata/epoch/errno/duration oracle.
+- `sync-enokey` (P3r): raw sync alloc, 2 ops with no key (early
+  `-ENOKEY` refusal), a rejected short setkey (failed config, epoch
+  stays 0), then 2 more refused ops (4 ops total). Return rows +
+  done trailer carry the provider-entry marker (0 throughout):
+  the failed wrapper claims no provider entry.
 - `async-once`: exact-driver async alloc, EINPROGRESS submit,
   workqueue completion on another CPU, free.
 - `delayed-completion`: provider delays the async completion by

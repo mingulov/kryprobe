@@ -501,12 +501,24 @@ impl SensorCore {
             // the orphan, never a phantom admission). 0 admits
             // nothing and counts `unlinked_ops` inside; known
             // bases no-op.
-            if raw.edge == LEDGE_SUBMIT {
-                self.tfm.admit_first_seen(raw.tfm, &raw.drv, raw.truncated);
-            }
+            //
+            // P3 submit-lifetime binding: AFTER first-seen
+            // admission, the submit resolves its live generation +
+            // submit-pinned epoch and joins WITH that binding (a
+            // later destroy/realloc never rewrites it — the binding
+            // rode the submit edge, not timing proximity). Returns
+            // join compat (their binding rode their submit).
             let slot = edge_slot(raw.site, raw.edge);
+            let edges = if raw.edge == LEDGE_SUBMIT {
+                self.tfm.admit_first_seen(raw.tfm, &raw.drv, raw.truncated);
+                let tfm_id = self.tfm.generation_for_frontend(raw.tfm);
+                let epoch = self.tfm.epoch_for_frontend(raw.tfm);
+                self.decoder.join_with_tfm(raw, tfm_id, epoch)
+            } else {
+                self.decoder.join(raw)
+            };
             self.edge_hits[slot] += 1;
-            for edge in self.decoder.join(raw) {
+            for edge in edges {
                 let done = self.reducer.apply(edge);
                 newly += done.len();
                 self.retain(done);
@@ -575,7 +587,7 @@ pub struct DrainOutcome {
 }
 
 /// Quiet-drain visit budget per round: 8192 covers a full ring
-/// (262144 B / (112 B v5 edge + 8 B header) ≈ 2184 records) plus margin, still
+/// (262144 B / (112 B v6 edge + 8 B header) ≈ 2184 records) plus margin, still
 /// bounded — one round plays any close backlog the ring can hold.
 pub const QUIET_DRAIN_BUDGET: usize = 8192;
 

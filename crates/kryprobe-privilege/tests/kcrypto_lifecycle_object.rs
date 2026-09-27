@@ -14,9 +14,10 @@ use kryprobe_privilege::btf_resolve::{
     BtfError, LifecycleOffsets, resolve_lifecycle_ids, resolve_lifecycle_ids_from,
 };
 
-/// Canned chase offsets for LCFG v3 byte tests (values mirror the
+/// Canned chase offsets for LCFG v4 byte tests (values mirror the
 /// typed lifecycle fixture: tfm_alg 32, alg_drv 188, sk_base 8,
-/// req_base 32, req_tfm 32, refcnt 40 + present).
+/// req_base 32, req_tfm 32, req_cryptlen 0, req_flags 40, refcnt 40 +
+/// present).
 fn test_offsets() -> LifecycleOffsets {
     LifecycleOffsets {
         tfm_alg: 32,
@@ -24,6 +25,8 @@ fn test_offsets() -> LifecycleOffsets {
         sk_base: 8,
         req_base: 32,
         req_tfm: 32,
+        req_cryptlen: 0,
+        req_flags: 40,
         refcnt_off: 40,
         refcnt_present: true,
     }
@@ -178,14 +181,15 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
 #[test]
 fn h01_zeroed_config_fails_closed() {
     // All-zero LCFG (unwritten map read-back) never arms the sensor;
-    // only the exact magic+version arms it (T07.3: version 3 — older
+    // only the exact magic+version arms it (P3: version 4 — older
     // bytes disarm, versions never mix).
     assert!(validate_lifecycle_config(0, 0, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 0, 0).is_err());
-    assert!(validate_lifecycle_config(0, 3, 0).is_err());
+    assert!(validate_lifecycle_config(0, 4, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 1, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 2, 0).is_err());
-    assert!(validate_lifecycle_config(0x31434c4b, 3, 0).is_ok());
+    assert!(validate_lifecycle_config(0x31434c4b, 3, 0).is_err());
+    assert!(validate_lifecycle_config(0x31434c4b, 4, 0).is_ok());
 }
 
 #[test]
@@ -203,6 +207,8 @@ fn f1_lcfg_readback_validates_full_64_bytes() {
         sk_base: 8,
         req_base: 0,
         req_tfm: 0,
+        req_cryptlen: 0,
+        req_flags: 0,
         refcnt_off: 0,
         refcnt_present: false,
     };
@@ -255,6 +261,8 @@ fn t07_lcfg_disarm_flips_flags_word_only() {
         sk_base: 8,
         req_base: 0,
         req_tfm: 0,
+        req_cryptlen: 0,
+        req_flags: 0,
         refcnt_off: 0,
         refcnt_present: false,
     };
@@ -298,8 +306,8 @@ fn t07_lcfg_disarm_flips_flags_word_only() {
 #[test]
 fn t07_lcfg_v3_carries_chase_offsets() {
     // T07.3: the arm writes the BTF-resolved chase offsets into the
-    // config words (version 3: chase + refcount + request-link
-    // words); the reserved tail stays zero.
+    // config words (version 4: chase + refcount + request-link +
+    // request-metadata words); the reserved tail stays zero.
     use kryprobe_privilege::btf_resolve::LifecycleOffsets;
     let off = LifecycleOffsets {
         tfm_alg: 32,
@@ -307,6 +315,8 @@ fn t07_lcfg_v3_carries_chase_offsets() {
         sk_base: 8,
         req_base: 48,
         req_tfm: 52,
+        req_cryptlen: 0,
+        req_flags: 40,
         refcnt_off: 40,
         refcnt_present: true,
     };
@@ -314,7 +324,7 @@ fn t07_lcfg_v3_carries_chase_offsets() {
     assert_eq!(bytes.len(), 64);
     let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     assert_eq!(word(0), 0x31434c4b, "magic");
-    assert_eq!(word(4), 3, "version 3");
+    assert_eq!(word(4), 4, "version 4");
     assert_eq!(word(8), 0, "flags");
     assert_eq!(word(12), 32, "tfm_alg");
     assert_eq!(word(16), 188, "alg_drv");
@@ -323,7 +333,9 @@ fn t07_lcfg_v3_carries_chase_offsets() {
     assert_eq!(word(28), 1, "refcnt_present");
     assert_eq!(word(32), 48, "req_base");
     assert_eq!(word(36), 52, "req_tfm");
-    assert!(bytes[40..].iter().all(|b| *b == 0), "reserved tail zero");
+    assert_eq!(word(40), 0, "req_cryptlen");
+    assert_eq!(word(44), 40, "req_flags");
+    assert!(bytes[48..].iter().all(|b| *b == 0), "reserved tail zero");
 }
 
 #[test]
@@ -338,6 +350,8 @@ fn t07_lcfg_verify_checks_tail_against_written() {
         sk_base: 8,
         req_base: 0,
         req_tfm: 0,
+        req_cryptlen: 0,
+        req_flags: 0,
         refcnt_off: 0,
         refcnt_present: false,
     };
@@ -1010,15 +1024,16 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
 #[test]
 fn bringup_config_bytes_carry_exact_magic_version() {
     // The 64 bytes the loader writes to LCFG key 0: magic + version +
-    // zero flags + the chase/refcount/request-link words (T07.3 v3) +
-    // zero reserved tail — the exact words the BPF gate checks.
+    // zero flags + the chase/refcount/request-link/request-metadata
+    // words (P3 v4) + zero reserved tail — the exact words the BPF
+    // gate checks.
     let bytes = lifecycle_config_bytes(&test_offsets());
     assert_eq!(bytes.len(), 64);
     assert_eq!(
         u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
         0x3143_4c4b
     );
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 4);
     assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 32);
     assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 188);
@@ -1027,7 +1042,9 @@ fn bringup_config_bytes_carry_exact_magic_version() {
     assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 1);
     assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 32);
     assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 32);
-    assert!(bytes[40..].iter().all(|b| *b == 0));
+    assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 40);
+    assert!(bytes[48..].iter().all(|b| *b == 0));
 }
 
 #[test]

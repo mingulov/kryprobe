@@ -33,7 +33,7 @@ fn ctx() -> SessionContext {
     }
 }
 
-/// One 112-byte v5 `LEdge` (little-endian twin of the ABI struct;
+/// One 112-byte v6 `LEdge` (little-endian twin of the ABI struct;
 /// the transform word defaults to 0 = unknown link).
 fn edge_bytes_invoc(
     edge: u8,
@@ -64,7 +64,7 @@ fn edge_bytes_tfm(
 ) -> Vec<u8> {
     let mut out = vec![0u8; 112];
     out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
-    out[2] = 5;
+    out[2] = 6;
     out[3] = edge;
     out[4..6].copy_from_slice(&site.to_le_bytes());
     out[6..8].copy_from_slice(&flags.to_le_bytes());
@@ -73,12 +73,16 @@ fn edge_bytes_tfm(
     out[24..28].copy_from_slice(&status.to_le_bytes());
     out[32..40].copy_from_slice(&invoc.to_le_bytes());
     out[40..48].copy_from_slice(&tfm.to_le_bytes());
-    let n = drv.len().min(63);
-    out[48..48 + n].copy_from_slice(&drv[..n]);
+    if edge == LEDGE_SUBMIT {
+        out[52] = 1; // skcipher family
+        out[53] = site as u8; // direction echoes the site
+    }
+    let n = drv.len().min(55);
+    out[56..56 + n].copy_from_slice(&drv[..n]);
     out
 }
 
-/// Realistic default builder: same v5 record with a VALID
+/// Realistic default builder: same v6 record with a VALID
 /// invocation (see the decode-suite twin).
 fn edge_bytes(edge: u8, site: u16, key: u64, ts_ns: u64, status: i32, flags: u16) -> Vec<u8> {
     edge_bytes_invoc(edge, site, key, ts_ns, status, flags, 0x4000)

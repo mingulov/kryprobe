@@ -6,8 +6,13 @@
  * kernel_crypto_ledger; unknown fields ignored):
  *   alloc:    {"v":1,"run":R,"seq":N,"phase":"alloc","req":R,"drv":D,
  *              "type":T,"mask":M,...}
- *   submit:   {"v":1,"run":R,"seq":N,"phase":"submit","op":O,"len":L,...}
- *   return:   {"v":1,"run":R,"seq":N,"phase":"return","errno":E,...}
+ *   submit:   {"v":1,"run":R,"seq":N,"phase":"submit","op":O,"len":L,
+ *              "flags":F,...} (F: request base.flags at submit)
+ *   return:   {"v":1,"run":R,"seq":N,"phase":"return","errno":E,...,
+ *              "entries":N}
+ *     ("entries": provider-body entries at emit time — P3r marker,
+ *     skcipher only; extra field, unknown-field-tolerant readers
+ *     ignore it)
  *   progress: {"v":1,"run":R,"seq":N,"phase":"progress","errno":E,...}
  *     (waiter-side in-flight marker, never a kernel callback)
  *   terminal: {"v":1,"run":R,"seq":N,"phase":"terminal","errno":E,...}
@@ -20,7 +25,7 @@
  *     (one row per put: a shared transform lands several; the
  *     last final flag decides finality)
  *   done:     {"v":1,"run":R,"phase":"done","fixture_result":F,
- *              "overflow":C,...}
+ *              "overflow":C,"entries":N,...}
  * Every row also carries "ts" (ktime ns) and, where meaningful,
  * "cpu". All interpolated strings are validated [A-Za-z0-9_-]
  * (run_id at PREPARE, suffix at load, the rest are constants), so
@@ -69,6 +74,7 @@ struct kxc_run {
 /* provider.c: ledger + debugfs + drivers. */
 int kxc_ledger_emit(const char *fmt, ...) __printf(1, 2);
 u64 kxc_ledger_dropped(void);
+u64 kxc_crypt_entries_count(void);
 void kxc_ledger_reset(void);
 u64 kxc_next_seq(struct kxc_run *run);
 int kxc_run_begin(struct kxc_run *run, const char *id,

@@ -9,10 +9,13 @@
 use std::path::{Path, PathBuf};
 
 /// Pinned ignored-test total: bump only when a lane test is added or
-/// removed, with its `BPF lane:` reason in place (34 at T07.7:
-/// +`lifecycle_canary_no_secret_bytes_in_views`,
-/// +`host_op_first_seen_carries_selected_driver` — both sudo-lane).
-const PINNED_IGNORED: usize = 34;
+/// removed, with its `BPF lane:` reason in place (37 at P3r:
+/// +`guest_sync_meta_matches_fixture_truth`,
+/// +`guest_below_floor_refuses_typed`,
+/// +`guest_enokey_leaves_provider_unentered` — all vng-lane,
+/// staged-guest only; the sudo-lane EXPECTED inventory enrolls the
+/// suite with OTHER_LANE routing under its explicit lane decision).
+const PINNED_IGNORED: usize = 37;
 
 /// Reason prefix every ignored test must carry.
 const LANE_PREFIX: &str = "BPF lane: ";
