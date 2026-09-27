@@ -167,8 +167,8 @@ fn main() {
         }
     }
     let want_callback: Option<&str> = match scenario.as_str() {
-        "async-once" | "exact-driver" | "backlog-accepted" | "no-backlog-burst" | "early-callback"
-        | "reuse-in-callback" => Some("fentry/kxc_complete"),
+        "async-once" | "exact-driver" | "backlog-accepted" | "no-backlog-burst"
+        | "early-callback" | "reuse-in-callback" => Some("fentry/kxc_complete"),
         "cryptd-async" => Some("fentry/cryptd_skcipher_complete"),
         _ => None,
     };
