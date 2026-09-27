@@ -1322,3 +1322,79 @@ fn adapter_debug_redacts_pairing_keys() {
         "renders must carry the redaction marker: {live} / {dead}"
     );
 }
+
+#[test]
+fn sensor_decoder_refusal_cannot_complete_old_token() {
+    // P4R2-N1 (sensor level): capacity 1; A submits/returns, its
+    // terminal unobserved; an unrelated D occupies the decoder;
+    // the caller legally reuses A's completed storage for B and the
+    // DECODER refuses B (full table — before adapter cover is even
+    // attempted). The refused submit keeps contention, so B's
+    // callback gaps A loud (Unknown, no span) instead of joining
+    // the old covered token; D still completes exactly.
+    let frontend = 0xFFFF_8880_0000_9000_u64;
+    let mut core = SensorCore::new(1, 8, 8, 8, true);
+    core.ingest_records(&[
+        op_submit(0xE10, 100, 0x9000, frontend, Some(0)),
+        op_return(0xE10, 110, 0x9000, -libc::EINPROGRESS),
+        // Unrelated invocation occupies the decoder table.
+        op_submit(0xE20, 180, 0x9002, frontend, Some(0)),
+        // Legal reuse of A's storage; the full decoder refuses B.
+        op_submit(0xE10, 200, 0x9004, frontend, Some(0)),
+        op_return(0xE10, 210, 0x9004, -libc::EINPROGRESS),
+        // B's real terminal: unattributable under contention.
+        cb_v6(CB_CRYPTD, 0xE10, 250, 0),
+        op_return(0xE20, 300, 0x9002, 0),
+    ]);
+    core.finish(5000);
+    let done = core.take_completed();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    assert_eq!(ledger.decode.submit_refused, 1);
+    assert_eq!(ledger.decode.bad_records, 0);
+    assert_eq!(ledger.adapter.ambiguous_keys, 1);
+    let old = done.iter().find(|r| r.id == 1).expect("A completes");
+    assert_eq!(old.terminal, Terminal::Unknown);
+    assert_eq!(old.duration_ns, None);
+    let other = done.iter().find(|r| r.id == 2).expect("D completes");
+    assert_eq!(other.terminal, Terminal::Sync(0));
+    assert_eq!(other.duration_ns, Some(120));
+}
+
+#[test]
+fn sensor_decoder_refusal_production_bounds_cannot_complete_old_token() {
+    // P4R2-N1 at the production 4096/4096/4096 bounds (sensor
+    // arm scale): the decoder still refuses the same-key reuse,
+    // and the refused submit keeps contention — A gaps loud with
+    // zero malformed records.
+    let frontend = 0xFFFF_8880_0000_9100_u64;
+    let mut core = SensorCore::new(4096, 4096, 4096, 8, true);
+    core.ingest_records(&[
+        op_submit(0xE10, 100, 0x9000, frontend, Some(0)),
+        op_return(0xE10, 110, 0x9000, -libc::EINPROGRESS),
+    ]);
+    // A's terminal is unavailable. Fill the outstanding table
+    // with distinct calls whose returns are not yet observed.
+    for i in 0..4096_u64 {
+        core.ingest_records(&[op_submit(
+            0x20000 + 2 * i,
+            120,
+            0x40000 + 2 * i,
+            frontend,
+            Some(0),
+        )]);
+    }
+    core.ingest_records(&[
+        op_submit(0xE10, 200, 0x60000, frontend, Some(0)),
+        op_return(0xE10, 210, 0x60000, -libc::EINPROGRESS),
+        cb_v6(CB_CRYPTD, 0xE10, 250, 0),
+    ]);
+    core.finish(5000);
+    let done = core.take_completed();
+    let ledger = core.ledger([0; 5], [0; 18], Vec::new(), ctx()).unwrap();
+    assert_eq!(ledger.decode.submit_refused, 1);
+    assert_eq!(ledger.decode.bad_records, 0);
+    assert_eq!(ledger.adapter.ambiguous_keys, 1);
+    let old = done.iter().find(|r| r.id == 1).expect("A completes");
+    assert_eq!(old.terminal, Terminal::Unknown);
+    assert_eq!(old.duration_ns, None);
+}

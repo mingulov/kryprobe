@@ -415,6 +415,16 @@ pub struct LifecycleDecoder {
     capacity: usize,
     /// Next opaque id (starts at 1; 0 is never issued).
     next_id: u64,
+    /// Next refusal-contention token (counts DOWN from `u64::MAX`).
+    /// Decoder-admission refusals (full table, exhausted id space)
+    /// never enter `outstanding`, so they mint no issued id — yet
+    /// they keep contention (contract §8: a refused submit keeps
+    /// its key contended) under one of these tokens, which live
+    /// ONLY in the `uncovered` map. Top-down so they can never
+    /// collide with issued ids (which count UP from 1): the ranges
+    /// meet only after 2^64 admissions. Saturates at 0 rather than
+    /// wrapping into the issued range.
+    next_refused: u64,
     /// Outstanding BPF invocation → submit facts. The invocation is
     /// the op-join identity: a return joins ONLY the id outstanding
     /// under its own invocation.
@@ -425,8 +435,11 @@ pub struct LifecycleDecoder {
     /// same capacity scale as the outstanding table — one
     /// decode-bound scale for all decode tables).
     adapter: AsyncAdapter,
-    /// Refusal contention (P4r2, contract §8): refused token →
-    /// key for submits the adapter could not cover. A callback
+    /// Refusal contention (P4r2, contract §8; P4r3: decoder
+    /// refusals included): refused token → key for submits the
+    /// adapter could not cover AND submits the decoder could not
+    /// admit (P4R2-N1: an admitted-but-uncovered token and a
+    /// never-admitted submit are equally unattributable). A callback
     /// naming a contended key gaps instead of joining — the
     /// evidence is unattributable. Cleared when the refused token
     /// completes by an adapter-visible path (sync-terminal return
@@ -458,6 +471,7 @@ impl LifecycleDecoder {
         Self {
             capacity,
             next_id: 1,
+            next_refused: u64::MAX,
             outstanding: HashMap::new(),
             stats: DecodeStats::default(),
             adapter: AsyncAdapter::new(capacity),
@@ -559,6 +573,18 @@ impl LifecycleDecoder {
         self.stats.bad_records += 1;
     }
 
+    /// Retain refusal contention for a DECODER-refused submit
+    /// (contract §8, P4r3): admission refusals never reach
+    /// `note_submit`, so without this the refused key keeps no
+    /// contention and a later callback joins the wrong live token
+    /// (P4R2-N1). Mints a contention-only token (never an issued
+    /// id — nothing is emitted for the refused submit).
+    fn retain_refused(&mut self, req_key: u64, out: &mut Vec<Edge>) {
+        let token = self.next_refused;
+        self.next_refused = self.next_refused.saturating_sub(1);
+        self.retain_contention(req_key, token, out);
+    }
+
     /// Retain refusal contention for a submit the adapter could
     /// not cover (contract §8): past the decode-scale bound the
     /// oldest contention is forgotten LOUD — its key gaps at this
@@ -610,7 +636,11 @@ impl LifecycleDecoder {
     /// if any, diagnose against the gap instead of misjoining; any
     /// contention it held clears — a gapped token needs no
     /// attribution). A full table or an exhausted id space refuses
-    /// (counted, no phantom). Same-key submits with FRESH
+    /// (counted, no phantom) — and retains refusal contention under
+    /// a contention-only token (P4r3: a refused submit keeps its
+    /// key contended on EVERY refusal path, so a later callback
+    /// naming that key gaps instead of joining the wrong token).
+    /// Same-key submits with FRESH
     /// invocations admit alongside (nested calls pair exactly —
     /// never gapped). The submit-lifetime binding (`tfm_id` +
     /// submit-pinned `epoch`) and the entry-side wire metadata ride
@@ -632,6 +662,7 @@ impl LifecycleDecoder {
         }
         if self.outstanding.len() >= self.capacity {
             self.stats.submit_refused += 1;
+            self.retain_refused(raw.key, &mut out);
             return out;
         }
         // `u64::MAX` is never issued (sentinel headroom): exhaustion
@@ -639,6 +670,7 @@ impl LifecycleDecoder {
         // ids are a T08 prerequisite).
         if self.next_id == u64::MAX {
             self.stats.submit_refused += 1;
+            self.retain_refused(raw.key, &mut out);
             return out;
         }
         let id = self.next_id;

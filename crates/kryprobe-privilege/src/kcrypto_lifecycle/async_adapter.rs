@@ -137,7 +137,10 @@
 //!   to another invocation). The contention table is decode-scale
 //!   bounded; past capacity the oldest contention is forgotten
 //!   LOUD (its key gaps at the refusing submit — never silent,
-//!   never a misjoin).
+//!   never a misjoin). Decoder-admission refusals (full table,
+//!   exhausted id space) retain contention identically under a
+//!   contention-only token (P4r3) — EVERY refusal path contends,
+//!   so no callback can join the wrong invocation.
 //! - Tombstones FIFO-evict past capacity (counted
 //!   `tombstone_evictions`); a late callback past eviction is a
 //!   counted orphan. At most one terminal record per invocation,
