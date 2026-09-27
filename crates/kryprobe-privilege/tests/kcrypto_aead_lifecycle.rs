@@ -1,18 +1,138 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! AEAD lifecycle without ambiguous byte totals (P5/T10).
 //!
-//! RED phase (A01–A03, before capture changes): direction-specific
-//! attempted vs terminal-success-qualified input/payload/AAD/tag-size
-//! metadata. These tests drive the AEAD metadata contract v2
-//! derivation (`kryprobe_core::kcrypto::aead`) fed by submit-pinned
-//! scalars; the capture slices (wire v7, tracker, sensor, fixture)
-//! land after this RED checkpoint.
+//! Contract v2 derivation (A01–A03: direction-specific attempted vs
+//! terminal-success-qualified input/payload/AAD/tag-size metadata)
+//! plus the capture integration: failed-authsize epoch retention,
+//! unknown-authsize payload, sync/async schedule parity, and
+//! reconfiguration — all over v7 bytes through the production
+//! [`SensorCore`] ingest.
 
 use kryprobe_core::kcrypto::OpDirection;
 use kryprobe_core::kcrypto::Terminal;
 use kryprobe_core::kcrypto::aead::{AeadLen, derive_attempt, qualify_success};
 use kryprobe_core::kcrypto::{LifecycleFamily, RequestMeta};
 use kryprobe_privilege::kcrypto_lifecycle::sensor::SensorCore;
+
+const SUBMIT: u8 = 1;
+const RETURN: u8 = 2;
+const CALLBACK: u8 = 3;
+const AEAD_ENC: u16 = 5;
+const AEAD_DEC: u16 = 6;
+const CB_KXC: u16 = 4;
+const TFM_ALLOCAEAD: u16 = 5;
+const TFM_SETAUTHSIZE: u16 = 4;
+
+/// One 112-byte v7 `LEdge` AEAD op edge (submit pins validity-gated
+/// scalars + family + class-echoing direction; returns carry the
+/// status only).
+#[allow(clippy::too_many_arguments)]
+fn aead_op(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    invoc: u64,
+    tfm: u64,
+    cryptlen: Option<u32>,
+    req_flags: Option<u32>,
+    assoclen: Option<u32>,
+    authsize: Option<u32>,
+    drv: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0u8; 112];
+    out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
+    out[2] = 7;
+    out[3] = edge;
+    out[4..6].copy_from_slice(&site.to_le_bytes());
+    out[8..16].copy_from_slice(&key.to_le_bytes());
+    out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
+    out[24..28].copy_from_slice(&status.to_le_bytes());
+    if edge == SUBMIT {
+        let mut mflags = 0u16;
+        if let Some(c) = cryptlen {
+            out[28..32].copy_from_slice(&c.to_le_bytes());
+            mflags |= 0x01;
+        }
+        if let Some(f) = req_flags {
+            out[48..52].copy_from_slice(&f.to_le_bytes());
+            mflags |= 0x02;
+        }
+        if let Some(a) = assoclen {
+            out[56..60].copy_from_slice(&a.to_le_bytes());
+            mflags |= 0x04;
+        }
+        if let Some(a) = authsize {
+            out[60..64].copy_from_slice(&a.to_le_bytes());
+            mflags |= 0x08;
+        }
+        out[52] = 2;
+        out[53] = if site == AEAD_ENC { 1 } else { 2 };
+        out[54..56].copy_from_slice(&mflags.to_le_bytes());
+        let n = drv.len().min(47);
+        out[64..64 + n].copy_from_slice(&drv[..n]);
+    }
+    out[32..40].copy_from_slice(&invoc.to_le_bytes());
+    out[40..48].copy_from_slice(&tfm.to_le_bytes());
+    out
+}
+
+/// One 112-byte v1 `LTfm` edge (alloc-aead submit/return or
+/// setauthsize submit/return twin).
+#[allow(clippy::too_many_arguments)]
+fn tfm_edge(
+    edge: u8,
+    site: u16,
+    key: u64,
+    ts_ns: u64,
+    status: i32,
+    aux: u32,
+    aux2: u32,
+    token: u64,
+    name: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0u8; 112];
+    out[0..2].copy_from_slice(&0x544cu16.to_le_bytes());
+    out[2] = 1;
+    out[3] = edge;
+    out[4..6].copy_from_slice(&site.to_le_bytes());
+    out[8..16].copy_from_slice(&key.to_le_bytes());
+    out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
+    out[24..28].copy_from_slice(&status.to_le_bytes());
+    out[28..32].copy_from_slice(&aux.to_le_bytes());
+    out[32..36].copy_from_slice(&aux2.to_le_bytes());
+    out[40..48].copy_from_slice(&token.to_le_bytes());
+    let n = name.len().min(63);
+    out[48..48 + n].copy_from_slice(&name[..n]);
+    out
+}
+
+/// One 112-byte v7 `LEdge` fixture-callback half (accepted async
+/// schedule: key + status + ts, invoc 0, zero metadata).
+fn cb_kxc(key: u64, ts_ns: u64, status: i32) -> Vec<u8> {
+    let mut out = vec![0u8; 112];
+    out[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
+    out[2] = 7;
+    out[3] = CALLBACK;
+    out[4..6].copy_from_slice(&CB_KXC.to_le_bytes());
+    out[8..16].copy_from_slice(&key.to_le_bytes());
+    out[16..24].copy_from_slice(&ts_ns.to_le_bytes());
+    out[24..28].copy_from_slice(&status.to_le_bytes());
+    out
+}
+
+/// Ingest an alloc-aead + successful setauthsize(16) on `frontend`
+/// (the configured-generation preamble every byte test shares).
+fn configure_aead(core: &mut SensorCore, frontend: u64) {
+    let records = vec![
+        tfm_edge(SUBMIT, TFM_ALLOCAEAD, 0, 10, 0, 0, 0, 0x5000, b"gcm(aes)"),
+        tfm_edge(RETURN, TFM_ALLOCAEAD, frontend, 20, 0, 0, 0, 0x5000, b"gcm-aesni"),
+        tfm_edge(SUBMIT, TFM_SETAUTHSIZE, frontend, 30, 0, 16, 0, 0x5002, b""),
+        tfm_edge(RETURN, TFM_SETAUTHSIZE, 0, 40, 0, 0, 0, 0x5002, b""),
+    ];
+    core.ingest_records(&records);
+}
 
 /// A01: decrypt cryptlen 1040, authsize 16, assoclen 32 → raw input
 /// 1040, payload candidate 1024, AAD 32. The tag rides inside the
@@ -150,4 +270,201 @@ fn skcipher_submits_carry_no_aead_extension() {
     };
     assert_eq!(meta.aead.unwrap().assoclen, Some(32));
     assert_eq!(meta.aead.unwrap().authsize, Some(16));
+}
+
+/// A failed setauthsize never replaces the prior successful epoch:
+/// alloc-aead + setauthsize(16) ok pins epoch 1; a failing
+/// setauthsize(64) records (configs + errno) without bumping; the
+/// next AEAD op pins epoch 1 with the submit-chased authsize 16.
+#[test]
+fn failed_authsize_retains_prior_epoch() {
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
+    let frontend = 0xFFFF_8880_0000_1000_u64;
+    configure_aead(&mut core, frontend);
+    // Failing reconfig (EINVAL): records, never bumps.
+    let records = vec![
+        tfm_edge(SUBMIT, TFM_SETAUTHSIZE, frontend, 50, 0, 64, 0, 0x5004, b""),
+        tfm_edge(RETURN, TFM_SETAUTHSIZE, 0, 60, -22, 0, 0, 0x5004, b""),
+    ];
+    core.ingest_records(&records);
+    let gens = core.tfm().generations();
+    assert_eq!(gens.len(), 1);
+    assert_eq!(gens[0].epoch, 1, "failed config never bumps the epoch");
+    assert_eq!(gens[0].configs, 2);
+    assert_eq!(gens[0].last_config_errno, -22);
+    // The next op pins the retained epoch + the submit-chased tag width.
+    let key = 0xabc_u64;
+    let records = vec![
+        aead_op(
+            SUBMIT, AEAD_DEC, key, 100, 0, 0x4000, frontend, Some(1040), Some(0), Some(32),
+            Some(16), b"gcm-aesni",
+        ),
+        aead_op(RETURN, AEAD_DEC, key, 150, 0, 0x4000, 0, None, None, None, None, b""),
+    ];
+    assert_eq!(core.ingest_records(&records), 1);
+    let done = core.take_completed();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].meta.family, LifecycleFamily::Aead);
+    assert_eq!(done[0].meta.epoch, Some(1));
+    let aead = done[0].meta.aead.expect("AEAD submit carries the extension");
+    assert_eq!((aead.assoclen, aead.authsize), (Some(32), Some(16)));
+}
+
+/// Missing authsize makes the derived payload unknown: the submit
+/// chased cryptlen + assoclen but the tag-width chase was
+/// unreadable, so the record carries `authsize: None` and the
+/// derivation yields an explicit unknown — never a guessed split.
+#[test]
+fn unknown_authsize_has_unknown_payload() {
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
+    let frontend = 0xFFFF_8880_0000_1000_u64;
+    configure_aead(&mut core, frontend);
+    let key = 0xabc_u64;
+    let records = vec![
+        aead_op(
+            SUBMIT, AEAD_DEC, key, 100, 0, 0x4000, frontend, Some(1040), Some(0), Some(32),
+            None, b"gcm-aesni",
+        ),
+        aead_op(RETURN, AEAD_DEC, key, 150, 0, 0x4000, 0, None, None, None, None, b""),
+    ];
+    assert_eq!(core.ingest_records(&records), 1);
+    let done = core.take_completed();
+    assert_eq!(done.len(), 1);
+    let aead = done[0].meta.aead.expect("AEAD submit carries the extension");
+    assert_eq!(aead.assoclen, Some(32));
+    assert_eq!(aead.authsize, None);
+    let attempt = derive_attempt(
+        done[0].meta.direction,
+        done[0].meta.cryptlen.expect("cryptlen pinned"),
+        aead.assoclen,
+        aead.authsize,
+    );
+    assert!(matches!(attempt.payload, AeadLen::Unknown(_)));
+    // Even terminal success qualifies zero payload (the split was
+    // never expressible) while the known input still qualifies.
+    let ok = qualify_success(&attempt, done[0].terminal);
+    assert_eq!((ok.input, ok.payload, ok.aad), (1040, 0, 32));
+}
+
+/// The A01 shape end to end over sync bytes: decrypt 1040/32/16 →
+/// attempted payload 1024 qualified in full on terminal success;
+/// the EBADMSG leg qualifies zero with the attempt untouched.
+#[test]
+fn aead_decrypt_1040_flow_qualifies_success_bytes() {
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
+    let frontend = 0xFFFF_8880_0000_1000_u64;
+    configure_aead(&mut core, frontend);
+    let submit = |key: u64, ts: u64, invoc: u64| {
+        aead_op(
+            SUBMIT, AEAD_DEC, key, ts, 0, invoc, frontend, Some(1040), Some(0), Some(32),
+            Some(16), b"gcm-aesni",
+        )
+    };
+    let records = vec![
+        submit(0xabc, 100, 0x4000),
+        aead_op(RETURN, AEAD_DEC, 0xabc, 150, 0, 0x4000, 0, None, None, None, None, b""),
+        submit(0xabd, 200, 0x4002),
+        aead_op(
+            RETURN, AEAD_DEC, 0xabd, 250, -libc::EBADMSG, 0x4002, 0, None, None, None,
+            None, b"",
+        ),
+    ];
+    assert_eq!(core.ingest_records(&records), 2);
+    let done = core.take_completed();
+    assert_eq!(done.len(), 2);
+    for rec in &done {
+        assert_eq!(rec.meta.family, LifecycleFamily::Aead);
+        assert_eq!(rec.meta.epoch, Some(1));
+    }
+    let attempt_of = |rec: &kryprobe_core::kcrypto::RequestRecord| {
+        let aead = rec.meta.aead.expect("AEAD extension");
+        derive_attempt(
+            rec.meta.direction,
+            rec.meta.cryptlen.expect("cryptlen"),
+            aead.assoclen,
+            aead.authsize,
+        )
+    };
+    // Success leg: full qualification.
+    assert_eq!(done[0].terminal, Terminal::Sync(0));
+    let ok = qualify_success(&attempt_of(&done[0]), done[0].terminal);
+    assert_eq!((ok.input, ok.payload, ok.aad), (1040, 1024, 32));
+    // Bad-tag leg: zero success, attempt intact.
+    assert_eq!(done[1].terminal, Terminal::Sync(-libc::EBADMSG));
+    let failed = qualify_success(&attempt_of(&done[1]), done[1].terminal);
+    assert_eq!((failed.input, failed.payload, failed.aad), (0, 0, 0));
+    assert_eq!(attempt_of(&done[1]).payload, AeadLen::Known(1024));
+}
+
+/// Accepted async schedule parity: the same AEAD decrypt through
+/// submit + `-EINPROGRESS` + fixture callback(0) completes
+/// `Callback(0)` with byte-identical meta to the sync leg (native
+/// results agree across schedules — the derivation never sees
+/// which schedule ran).
+#[test]
+fn aead_async_schedule_matches_sync() {
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
+    let frontend = 0xFFFF_8880_0000_1000_u64;
+    configure_aead(&mut core, frontend);
+    let submit = aead_op(
+        SUBMIT, AEAD_DEC, 0xabc, 100, 0, 0x4000, frontend, Some(1040), Some(0), Some(32),
+        Some(16), b"gcm-aesni",
+    );
+    let records = vec![
+        submit,
+        aead_op(RETURN, AEAD_DEC, 0xabc, 150, -115, 0x4000, 0, None, None, None, None, b""),
+        cb_kxc(0xabc, 200, 0),
+    ];
+    assert_eq!(core.ingest_records(&records), 1);
+    let done = core.take_completed();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].terminal, Terminal::Callback(0));
+    assert_eq!(done[0].meta.family, LifecycleFamily::Aead);
+    assert_eq!(done[0].meta.epoch, Some(1));
+    assert_eq!(done[0].meta.cryptlen, Some(1040));
+    let aead = done[0].meta.aead.expect("AEAD extension");
+    assert_eq!((aead.assoclen, aead.authsize), (Some(32), Some(16)));
+    let attempt = derive_attempt(
+        done[0].meta.direction,
+        done[0].meta.cryptlen.expect("cryptlen"),
+        aead.assoclen,
+        aead.authsize,
+    );
+    let ok = qualify_success(&attempt, done[0].terminal);
+    assert_eq!((ok.input, ok.payload, ok.aad), (1040, 1024, 32));
+}
+
+/// Reconfiguration pins the new epoch on later ops only: ops under
+/// epoch 1 keep epoch 1 after a successful setauthsize(8) bumps to
+/// epoch 2; later ops pin epoch 2 (submit-pinned eras, never
+/// rewritten history).
+#[test]
+fn aead_reconfiguration_pins_new_epoch() {
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
+    let frontend = 0xFFFF_8880_0000_1000_u64;
+    configure_aead(&mut core, frontend);
+    let submit = |key: u64, ts: u64, invoc: u64, authsize: Option<u32>| {
+        aead_op(
+            SUBMIT, AEAD_DEC, key, ts, 0, invoc, frontend, Some(1040), Some(0), Some(32),
+            authsize, b"gcm-aesni",
+        )
+    };
+    let ret = |key: u64, ts: u64, invoc: u64| {
+        aead_op(RETURN, AEAD_DEC, key, ts, 0, invoc, 0, None, None, None, None, b"")
+    };
+    // Op under epoch 1 (width 16), then a successful reconfig to
+    // authsize 8, then an op under epoch 2 (submit chases the new
+    // width 8 off the live frontend).
+    core.ingest_records(&[submit(0xabc, 100, 0x4000, Some(16)), ret(0xabc, 150, 0x4000)]);
+    core.ingest_records(&[
+        tfm_edge(SUBMIT, TFM_SETAUTHSIZE, frontend, 160, 0, 8, 0, 0x5004, b""),
+        tfm_edge(RETURN, TFM_SETAUTHSIZE, 0, 170, 0, 0, 0, 0x5004, b""),
+    ]);
+    core.ingest_records(&[submit(0xabd, 200, 0x4002, Some(8)), ret(0xabd, 250, 0x4002)]);
+    let done = core.take_completed();
+    assert_eq!(done.len(), 2);
+    assert_eq!(done[0].meta.epoch, Some(1));
+    assert_eq!(done[0].meta.aead.expect("extension").authsize, Some(16));
+    assert_eq!(done[1].meta.epoch, Some(2));
+    assert_eq!(done[1].meta.aead.expect("extension").authsize, Some(8));
 }
