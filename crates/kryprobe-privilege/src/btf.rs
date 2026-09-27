@@ -270,14 +270,14 @@ impl<'a> Btf<'a> {
         let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
-                "arg0 points at kind {}, not STRUCT skcipher_request",
+                "arg0 points at kind {}, not STRUCT {expected}",
                 pointee.kind
             )));
         }
-        if !self.name_is(pointee, "skcipher_request")? {
-            return Err(bad_proto(
-                "arg0 points at the wrong STRUCT, not skcipher_request".to_owned(),
-            ));
+        if !self.name_is(pointee, expected)? {
+            return Err(bad_proto(format!(
+                "arg0 points at the wrong STRUCT, not {expected}"
+            )));
         }
         let ret = proto.size_or_type;
         if ret == 0 {
@@ -317,21 +317,26 @@ impl<'a> Btf<'a> {
     }
 
     /// Validate that `name`'s prototype is EXACTLY the qualified
-    /// allocation-sensor read — `struct crypto_skcipher *(const char
-    /// *, u32, u32)` — and return its `FUNC` id plus the chased
-    /// STRUCT pointee id (T07.2, same
-    /// refuse-on-drift discipline as [`Btf::lifecycle_proto_id`]):
-    /// exactly three arguments, arg0 a pointer (after qualifier
-    /// chase) to 1-byte INT (`char` — the bounded name copy reads
-    /// raw bytes, so the width pins but the signedness does not),
-    /// arg1/arg2 4-byte INTs (the type/mask words travel as unshifted
-    /// `u32` copies — the width pins, the encoding does not), return
-    /// a pointer to STRUCT `crypto_skcipher` (the success chase reads
-    /// `__crt_alg` at the resolved offset — a pointer to any other
+    /// allocation-sensor read — `struct <expected> *(const char *,
+    /// u32, u32)` — and return its `FUNC` id plus the chased STRUCT
+    /// pointee id (T07.2, same refuse-on-drift discipline as
+    /// [`Btf::lifecycle_proto_id`]): exactly three arguments, arg0 a
+    /// pointer (after qualifier chase) to 1-byte INT (`char` — the
+    /// bounded name copy reads raw bytes, so the width pins but the
+    /// signedness does not), arg1/arg2 4-byte INTs (the type/mask
+    /// words travel as unshifted `u32` copies — the width pins, the
+    /// encoding does not), return a pointer to STRUCT `expected`
+    /// (`crypto_skcipher` on the skcipher alloc site, `crypto_aead`
+    /// on the P5 AEAD alloc site — the success chase reads
+    /// `__crt_alg` at the resolved offset, so a pointer to any other
     /// type would mis-chase). Corrupt images stay
     /// [`BtfError::BadBtf`]; well-formed but incompatible prototypes
     /// are [`BtfError::BadPrototype`].
-    pub(crate) fn alloc_proto_id(&self, name: &str) -> Result<(u32, u32), BtfError> {
+    pub(crate) fn alloc_proto_id(
+        &self,
+        name: &str,
+        expected: &str,
+    ) -> Result<(u32, u32), BtfError> {
         let bad_proto = |reason: String| BtfError::BadPrototype {
             name: name.to_owned(),
             reason,
@@ -391,7 +396,7 @@ impl<'a> Btf<'a> {
             }
         }
         // The success value is a frontend pointer the exit run
-        // chases: it must point at STRUCT `crypto_skcipher`.
+        // chases: it must point at STRUCT `expected`.
         let ret = proto.size_or_type;
         if ret == 0 {
             return Err(bad_proto("return is VOID, not a tfm pointer".to_owned()));
@@ -404,14 +409,14 @@ impl<'a> Btf<'a> {
         let pointee = self.rec(pointee_id)?;
         if pointee.kind != KIND_STRUCT {
             return Err(bad_proto(format!(
-                "return points at kind {}, not STRUCT crypto_skcipher",
+                "return points at kind {}, not STRUCT {expected}",
                 pointee.kind
             )));
         }
-        if !self.name_is(pointee, "crypto_skcipher")? {
-            return Err(bad_proto(
-                "return points at the wrong STRUCT, not crypto_skcipher".to_owned(),
-            ));
+        if !self.name_is(pointee, expected)? {
+            return Err(bad_proto(format!(
+                "return points at the wrong STRUCT, not {expected}"
+            )));
         }
         Ok((id, pointee_id))
     }

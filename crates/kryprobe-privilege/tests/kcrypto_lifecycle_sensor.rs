@@ -529,17 +529,17 @@ fn ingest_zero_word_op_voids_exact_reuse() {
 fn w7_fold_loss_lanes_sums_per_class_saturating() {
     // Round-7: one `LLOSS` lane per program per class (an interrupt
     // can run a different program on the same CPU mid-bump, so
-    // per-CPU alone lost updates). The fold sums the eighteen hook
-    // lanes class-major, saturating — a saturated lane must not
-    // wrap the ledger.
-    let mut lanes = [0u64; 90];
+    // per-CPU alone lost updates). The fold sums the twenty-two
+    // hook lanes class-major, saturating — a saturated lane must
+    // not wrap the ledger.
+    let mut lanes = [0u64; 110];
     lanes[0] = 1;
     lanes[1] = 2;
     lanes[2] = 3;
     lanes[3] = 4;
-    lanes[18] = 7;
-    lanes[72] = u64::MAX;
-    lanes[89] = u64::MAX;
+    lanes[22] = 7;
+    lanes[88] = u64::MAX;
+    lanes[109] = u64::MAX;
     assert_eq!(fold_loss_lanes(lanes), [10, 7, 0, 0, u64::MAX]);
 }
 

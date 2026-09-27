@@ -291,12 +291,14 @@ pub struct AggregateOffsets {
 
 /// Explicit-offset reads for the lifecycle BPF (all u32 byte
 /// offsets): the transform chase (`tfm_alg`/`alg_drv`), the
-/// frontend→base normalization (`sk_base`, shared with the
-/// userspace tracker), the op request link (`req_base`/`req_tfm`,
-/// first-seen admission), the op request-metadata reads
-/// (`req_cryptlen`/`req_flags`, P3 entry-side scalars), and the
-/// destroy refcount word (`refcnt_off`, meaningful only when
-/// `refcnt_present`).
+/// frontend→base normalization (`sk_base`/`aead_base`, shared with
+/// the userspace tracker), the op request link
+/// (`req_base`/`req_tfm`, first-seen admission), the op
+/// request-metadata reads (`req_cryptlen`/`req_flags`, P3
+/// entry-side scalars), the AEAD op reads (`aead_req_base`/
+/// `aead_req_cryptlen`/`aead_req_assoclen`/`aead_authsize`, P5
+/// entry-side scalars), and the destroy refcount word
+/// (`refcnt_off`, meaningful only when `refcnt_present`).
 ///
 /// D3: the LIFECYCLE consumer's own set — arming no longer requires
 /// the aggregate's legacy fields (`task_flags`, AEAD/hash lengths,
@@ -332,6 +334,22 @@ pub struct LifecycleOffsets {
     /// unconditional destroy — the tracker retires every observed
     /// destroy).
     pub refcnt_present: bool,
+    /// `aead_request.base` (embedded STRUCT `crypto_async_request`
+    /// — the AEAD op programs' request→base link).
+    pub aead_req_base: u32,
+    /// `aead_request.cryptlen` (exact 4-byte scalar — the AEAD API
+    /// input length the op programs chase at entry).
+    pub aead_req_cryptlen: u32,
+    /// `aead_request.assoclen` (exact 4-byte scalar — the
+    /// associated-data length the AEAD op programs chase at entry).
+    pub aead_req_assoclen: u32,
+    /// `crypto_aead.base` (embedded STRUCT `crypto_tfm` — the AEAD
+    /// frontend→base normalization, shared with the userspace
+    /// tracker like `sk_base`).
+    pub aead_base: u32,
+    /// `crypto_aead.authsize` (exact 4-byte scalar — the tag width
+    /// the AEAD op programs chase off the submit's frontend).
+    pub aead_authsize: u32,
 }
 
 /// Process-lifetime vmlinux BTF image (H1(a)): the sysfs image is
@@ -884,11 +902,12 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
     let sk_entry = btf.find_struct("crypto_skcipher")?;
     let sreq_entry = btf.find_struct("skcipher_request")?;
     let aead_entry = btf.find_struct("crypto_aead")?;
+    let adreq_entry = btf.find_struct("aead_request")?;
     for site in table.required {
         let sym = site.symbol;
         match site.shape {
             ProtoShape::Op => {
-                let (_, pointee) = btf.lifecycle_proto_id(site.symbol)?;
+                let (_, pointee) = btf.lifecycle_proto_id(site.symbol, "skcipher_request")?;
                 require_proto_root(
                     "skcipher_request",
                     sreq_entry,
@@ -896,11 +915,29 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
                     &format!("{sym}.arg0"),
                 )?;
             }
+            ProtoShape::OpAead => {
+                let (_, pointee) = btf.lifecycle_proto_id(site.symbol, "aead_request")?;
+                require_proto_root(
+                    "aead_request",
+                    adreq_entry,
+                    pointee,
+                    &format!("{sym}.arg0"),
+                )?;
+            }
             ProtoShape::Alloc => {
-                let (_, pointee) = btf.alloc_proto_id(site.symbol)?;
+                let (_, pointee) = btf.alloc_proto_id(site.symbol, "crypto_skcipher")?;
                 require_proto_root(
                     "crypto_skcipher",
                     sk_entry,
+                    pointee,
+                    &format!("{sym}.return"),
+                )?;
+            }
+            ProtoShape::AllocAead => {
+                let (_, pointee) = btf.alloc_proto_id(site.symbol, "crypto_aead")?;
+                require_proto_root(
+                    "crypto_aead",
+                    aead_entry,
                     pointee,
                     &format!("{sym}.return"),
                 )?;
@@ -1166,6 +1203,8 @@ fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
     let sk_entry = btf.find_struct("crypto_skcipher")?;
     let sreq_entry = btf.find_struct("skcipher_request")?;
     let areq_entry = btf.find_struct("crypto_async_request")?;
+    let aead_entry = btf.find_struct("crypto_aead")?;
+    let adreq_entry = btf.find_struct("aead_request")?;
     let (tfm_alg, alg_id) =
         btf.member_ptr_target_in(tfm_entry, "crypto_tfm", "__crt_alg", "crypto_alg")?;
     if alg_id != alg_entry {
@@ -1222,6 +1261,38 @@ fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
     // width, which is the whole proof a u32 scalar needs.
     let req_cryptlen = btf.member_counter_in(sreq_entry, "skcipher_request", "cryptlen")?;
     let req_flags = btf.member_counter_in(areq_entry, "crypto_async_request", "flags")?;
+    // P5 AEAD entry-side words (hard members, same shape proof):
+    // the AEAD request→base link proves its embedded struct AND its
+    // bound root (rival-def refusal, like the skcipher link); the
+    // AEAD frontend base proves its struct AND root; the three
+    // scalars prove exact 4-byte width.
+    let (aead_req_base, aead_areq_id) = btf.member_embedded_target_in(
+        adreq_entry,
+        "aead_request",
+        "base",
+        "crypto_async_request",
+    )?;
+    if aead_areq_id != areq_entry {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: "crypto_async_request".to_owned(),
+            entry_id: areq_entry,
+            linked_id: aead_areq_id,
+            via: "aead_request.base".to_owned(),
+        });
+    }
+    let (aead_base, aead_tfm_id) =
+        btf.member_embedded_target_in(aead_entry, "crypto_aead", "base", "crypto_tfm")?;
+    if aead_tfm_id != tfm_entry {
+        return Err(BtfError::IncompatibleDefinitions {
+            type_name: "crypto_tfm".to_owned(),
+            entry_id: tfm_entry,
+            linked_id: aead_tfm_id,
+            via: "crypto_aead.base".to_owned(),
+        });
+    }
+    let aead_req_cryptlen = btf.member_counter_in(adreq_entry, "aead_request", "cryptlen")?;
+    let aead_req_assoclen = btf.member_counter_in(adreq_entry, "aead_request", "assoclen")?;
+    let aead_authsize = btf.member_counter_in(aead_entry, "crypto_aead", "authsize")?;
     let (refcnt_off, refcnt_present) =
         match btf.member_counter_in(tfm_entry, "crypto_tfm", "refcnt") {
             Ok(off) => (off, true),
@@ -1243,6 +1314,11 @@ fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
         req_flags,
         refcnt_off,
         refcnt_present,
+        aead_req_base,
+        aead_req_cryptlen,
+        aead_req_assoclen,
+        aead_base,
+        aead_authsize,
     })
 }
 
@@ -1764,6 +1840,40 @@ mod tests {
         b.word(2);
         b.word(1);
         b.word(8);
+        // [13] STRUCT crypto_aead { authsize: [1] @0, base: [7] @8 }
+        // (72 bytes — the embedded `base` sits INSIDE the parent,
+        // like the skcipher def above).
+        let o_aead = b.str("crypto_aead");
+        let o_authsize = b.str("authsize");
+        let mut aead: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("crypto_aead", "authsize", 1) {
+            aead.push((o_authsize, ty, 0));
+        }
+        if let Some(ty) = shape("crypto_aead", "base", 7) {
+            aead.push((o_sk_base, ty, 8 * 8));
+        }
+        b.rec(o_aead, KIND_STRUCT, aead.len() as u32, false, 72);
+        for (name, ty, bits) in aead {
+            b.member(name, ty, bits);
+        }
+        // [14] STRUCT aead_request { cryptlen: [1] @0, assoclen: [1]
+        // @4, base: [9] @32 }.
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        let mut adreq: Vec<(u32, u32, u32)> = Vec::new();
+        if let Some(ty) = shape("aead_request", "cryptlen", 1) {
+            adreq.push((o_cryptlen, ty, 0));
+        }
+        if let Some(ty) = shape("aead_request", "assoclen", 1) {
+            adreq.push((o_assoclen, ty, 4 * 8));
+        }
+        if let Some(ty) = shape("aead_request", "base", 9) {
+            adreq.push((o_base, ty, 32 * 8));
+        }
+        b.rec(o_adreq, KIND_STRUCT, adreq.len() as u32, false, 128);
+        for (name, ty, bits) in adreq {
+            b.member(name, ty, bits);
+        }
         b.finish()
     }
 
@@ -1783,6 +1893,11 @@ mod tests {
                 req_flags: 40,
                 refcnt_off: 40,
                 refcnt_present: true,
+                aead_req_base: 32,
+                aead_req_cryptlen: 0,
+                aead_req_assoclen: 4,
+                aead_base: 8,
+                aead_authsize: 0,
             }
         );
     }
@@ -1829,6 +1944,35 @@ mod tests {
         // with a valid offset would mis-chase exactly like the link
         // members above).
         let bytes = lifecycle_fixture(Some(("crypto_async_request", "flags", 8)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+    }
+
+    #[test]
+    fn synthetic_lifecycle_aead_members_fail_closed() {
+        // P5 AEAD words are hard members, like the P3 scalars: a
+        // missing length/tag/base word refuses the arm (never a
+        // zero-chase into AEAD offsets).
+        for member in [
+            ("aead_request", "cryptlen"),
+            ("aead_request", "assoclen"),
+            ("aead_request", "base"),
+            ("crypto_aead", "base"),
+            ("crypto_aead", "authsize"),
+        ] {
+            let bytes = lifecycle_fixture(None, Some(member));
+            assert!(
+                matches!(
+                    resolve_lifecycle_offsets_from(&bytes),
+                    Err(BtfError::MissingMember { .. })
+                ),
+                "{member:?} absence must refuse"
+            );
+        }
+        // A PTR where the chase reads a u32 scalar refuses.
+        let bytes = lifecycle_fixture(Some(("aead_request", "assoclen", 8)), None);
+        assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
+        // An INT where the chase reads an embedded STRUCT base refuses.
+        let bytes = lifecycle_fixture(Some(("crypto_aead", "base", 1)), None);
         assert!(resolve_lifecycle_offsets_from(&bytes).is_err());
     }
 
@@ -1924,6 +2068,19 @@ mod tests {
         if !decoy_first {
             emit_decoy(&mut b);
         }
+        // AEAD lanes root in the REAL defs (plain defs — the decoy
+        // game covers `crypto_tfm` only, and these names are unique).
+        let o_aead = b.str("crypto_aead");
+        let o_authsize = b.str("authsize");
+        b.rec(o_aead, KIND_STRUCT, 2, false, 72);
+        b.member(o_authsize, 1, 0);
+        b.member(o_base, real_id, 8 * 8);
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        b.rec(o_adreq, KIND_STRUCT, 3, false, 128);
+        b.member(o_cryptlen, 1, 0);
+        b.member(o_assoclen, 1, 4 * 8);
+        b.member(o_base, async_id, 32 * 8);
         b.finish()
     }
 
@@ -1959,6 +2116,11 @@ mod tests {
                 req_flags: 40,
                 refcnt_off: 40,
                 refcnt_present: true,
+                aead_req_base: 32,
+                aead_req_cryptlen: 0,
+                aead_req_assoclen: 4,
+                aead_base: 8,
+                aead_authsize: 0,
             }
         );
     }
@@ -2026,6 +2188,18 @@ mod tests {
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
         b.member(o_base, 6, 8 * 8);
+        // AEAD lanes (plain defs — the depth game covers `refcnt` only).
+        let o_aead = b.str("crypto_aead");
+        let o_authsize = b.str("authsize");
+        b.rec(o_aead, KIND_STRUCT, 2, false, 72);
+        b.member(o_authsize, 1, 0);
+        b.member(o_base, 6, 8 * 8);
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        b.rec(o_adreq, KIND_STRUCT, 3, false, 128);
+        b.member(o_cryptlen, 1, 0);
+        b.member(o_assoclen, 1, 4 * 8);
+        b.member(o_base, async_id, 32 * 8);
         b.finish()
     }
 
@@ -2078,6 +2252,18 @@ mod tests {
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
         b.member(o_base, 6, 8 * 8);
+        // AEAD lanes (plain defs — the cycle game covers `refcnt` only).
+        let o_aead = b.str("crypto_aead");
+        let o_authsize = b.str("authsize");
+        b.rec(o_aead, KIND_STRUCT, 2, false, 72);
+        b.member(o_authsize, 1, 0);
+        b.member(o_base, 6, 8 * 8);
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        b.rec(o_adreq, KIND_STRUCT, 3, false, 128);
+        b.member(o_cryptlen, 1, 0);
+        b.member(o_assoclen, 1, 4 * 8);
+        b.member(o_base, 9, 32 * 8);
         b.finish()
     }
 
@@ -2691,7 +2877,7 @@ mod tests {
     /// `destroy_rival` is set, `crypto_destroy_tfm`'s arg1 points at
     /// `B` while every layout chain references the entry def `A`
     /// ([7]); otherwise all roots agree on `A` (positive control).
-    fn lifecycle_proto_rival_fixture(destroy_rival: bool) -> Vec<u8> {
+    fn lifecycle_proto_rival_fixture(destroy_rival: bool, swap_aead_op: bool) -> Vec<u8> {
         use crate::btf::{KIND_ARRAY, KIND_PTR};
         let mut b = BtfBuild::new();
         // [1] INT u32, [2] INT char.
@@ -2747,67 +2933,98 @@ mod tests {
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
         b.member(o_base, 7, 8 * 8);
-        // [13] STRUCT crypto_aead {} (prototype root only).
+        // [13] STRUCT crypto_aead { authsize: [1] @0, base: [7] @8 }
+        // (prototype root AND offsets lane — the P5 resolver proves
+        // both members).
         let o_aead = b.str("crypto_aead");
-        b.rec(o_aead, KIND_STRUCT, 0, false, 64);
-        // [14] PTR -> [11] (op arg0), [15] PTR -> [12] (alloc
-        // return, setkey-sk arg0), [16] PTR -> destroy target ([8]
-        // rival or [7] entry), [17] PTR -> [13] (aead roots),
-        // [18] PTR -> [2] (char/key/mem pointers).
+        let o_authsize = b.str("authsize");
+        b.rec(o_aead, KIND_STRUCT, 2, false, 72);
+        b.member(o_authsize, 1, 0);
+        b.member(o_base, 7, 8 * 8);
+        // [14] STRUCT aead_request { cryptlen: [1] @0, assoclen: [1]
+        // @4, base: [10] @32 }.
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        b.rec(o_adreq, KIND_STRUCT, 3, false, 128);
+        b.member(o_cryptlen, 1, 0);
+        b.member(o_assoclen, 1, 4 * 8);
+        b.member(o_base, 10, 32 * 8);
+        // [15] PTR -> [11] (sk op arg0), [16] PTR -> [12] (sk
+        // alloc return, setkey-sk arg0), [17] PTR -> destroy target
+        // ([8] rival or [7] entry), [18] PTR -> [13] (aead roots),
+        // [19] PTR -> [2] (char/key/mem pointers), [20] PTR -> [14]
+        // (aead op arg0 — or [11] when `swap_aead_op` proves the
+        // AEAD-expected-name gate refuses a skcipher-shaped proto).
         b.rec(0, KIND_PTR, 0, false, 11);
         b.rec(0, KIND_PTR, 0, false, 12);
         b.rec(0, KIND_PTR, 0, false, if destroy_rival { 8 } else { 7 });
         b.rec(0, KIND_PTR, 0, false, 13);
         b.rec(0, KIND_PTR, 0, false, 2);
-        // [19] PROTO op (sreq *) -> s32.
+        b.rec(0, KIND_PTR, 0, false, if swap_aead_op { 11 } else { 14 });
+        // [21] PROTO op-sk (sreq *) -> s32.
         b.rec(0, KIND_FUNC_PROTO, 1, false, 1);
         b.word(0);
-        b.word(14);
-        // [20] PROTO alloc (char *, u32, u32) -> sk *.
-        b.rec(0, KIND_FUNC_PROTO, 3, false, 15);
+        b.word(15);
+        // [22] PROTO op-aead (adreq *) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 1, false, 1);
         b.word(0);
-        b.word(18);
+        b.word(20);
+        // [23] PROTO alloc-sk (char *, u32, u32) -> sk *.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 16);
+        b.word(0);
+        b.word(19);
         b.word(0);
         b.word(1);
         b.word(0);
         b.word(1);
-        // [21] PROTO destroy (mem *, tfm *) -> void.
+        // [24] PROTO destroy (mem *, tfm *) -> void.
         b.rec(0, KIND_FUNC_PROTO, 2, false, 0);
         b.word(0);
-        b.word(18);
+        b.word(19);
+        b.word(0);
+        b.word(17);
+        // [25] PROTO setkey-sk (sk *, key *, u32) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 1);
         b.word(0);
         b.word(16);
-        // [22] PROTO setkey-sk (sk *, key *, u32) -> s32.
-        b.rec(0, KIND_FUNC_PROTO, 3, false, 1);
         b.word(0);
-        b.word(15);
-        b.word(0);
-        b.word(18);
+        b.word(19);
         b.word(0);
         b.word(1);
-        // [23] PROTO setauthsize (aead *, u32) -> s32.
+        // [26] PROTO setauthsize (aead *, u32) -> s32.
         b.rec(0, KIND_FUNC_PROTO, 2, false, 1);
         b.word(0);
-        b.word(17);
-        b.word(0);
-        b.word(1);
-        // [24] PROTO setkey-aead (aead *, key *, u32) -> s32.
-        b.rec(0, KIND_FUNC_PROTO, 3, false, 1);
-        b.word(0);
-        b.word(17);
-        b.word(0);
         b.word(18);
         b.word(0);
         b.word(1);
-        // [25..31] the 7 manifest FUNCs.
+        // [27] PROTO setkey-aead (aead *, key *, u32) -> s32.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 1);
+        b.word(0);
+        b.word(18);
+        b.word(0);
+        b.word(19);
+        b.word(0);
+        b.word(1);
+        // [28] PROTO alloc-aead (char *, u32, u32) -> aead *.
+        b.rec(0, KIND_FUNC_PROTO, 3, false, 18);
+        b.word(0);
+        b.word(19);
+        b.word(0);
+        b.word(1);
+        b.word(0);
+        b.word(1);
+        // [29..38] the 10 manifest FUNCs.
         for (name, proto) in [
-            ("crypto_skcipher_encrypt", 19),
-            ("crypto_skcipher_decrypt", 19),
-            ("crypto_alloc_skcipher", 20),
-            ("crypto_destroy_tfm", 21),
-            ("crypto_skcipher_setkey", 22),
-            ("crypto_aead_setauthsize", 23),
-            ("crypto_aead_setkey", 24),
+            ("crypto_skcipher_encrypt", 21),
+            ("crypto_skcipher_decrypt", 21),
+            ("crypto_alloc_skcipher", 23),
+            ("crypto_destroy_tfm", 24),
+            ("crypto_skcipher_setkey", 25),
+            ("crypto_aead_setauthsize", 26),
+            ("crypto_aead_setkey", 27),
+            ("crypto_aead_encrypt", 22),
+            ("crypto_aead_decrypt", 22),
+            ("crypto_alloc_aead", 28),
         ] {
             let o_name = b.str(name);
             b.rec(o_name, KIND_FUNC, 1, false, proto);
@@ -2821,7 +3038,7 @@ mod tests {
         // resolver passes — the refusal must come from the prototype
         // root binding (ids resolver), which sees destroy point at
         // the rival def.
-        let bytes = lifecycle_proto_rival_fixture(true);
+        let bytes = lifecycle_proto_rival_fixture(true, false);
         let off = resolve_lifecycle_offsets_from(&bytes).expect("chains agree on A");
         assert_eq!(off.refcnt_off, 40);
         assert!(off.refcnt_present);
@@ -2841,13 +3058,29 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_lifecycle_ids_swapped_aead_op_refuses() {
+        // P5: an AEAD op site with a skcipher-shaped prototype (arg0
+        // at `skcipher_request`, not `aead_request`) refuses startup
+        // — the AEAD attach pins AEAD shapes, never family confusion.
+        let bytes = lifecycle_proto_rival_fixture(false, true);
+        let err = resolve_lifecycle_ids_from(&bytes)
+            .expect_err("skcipher-shaped AEAD op proto must refuse");
+        assert!(
+            matches!(err, BtfError::BadPrototype { .. }),
+            "swapped AEAD op must refuse as bad prototype, got {err:?}"
+        );
+    }
+
+    #[test]
     fn synthetic_lifecycle_ids_all_entry_roots_resolve() {
         // Positive control: every prototype root points at the bound
         // entry def — both resolvers agree with exact offsets.
-        let bytes = lifecycle_proto_rival_fixture(false);
+        let bytes = lifecycle_proto_rival_fixture(false, false);
         let ids = resolve_lifecycle_ids_from(&bytes).expect("all-A roots resolve");
-        assert_eq!(ids.len(), 7);
-        assert_eq!(ids["crypto_destroy_tfm"], 28);
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids["crypto_destroy_tfm"], 32);
+        assert_eq!(ids["crypto_aead_encrypt"], 36);
+        assert_eq!(ids["crypto_alloc_aead"], 38);
         assert_eq!(
             resolve_lifecycle_offsets_from(&bytes).expect("all-A chains resolve"),
             LifecycleOffsets {
@@ -2860,6 +3093,11 @@ mod tests {
                 req_flags: 40,
                 refcnt_off: 40,
                 refcnt_present: true,
+                aead_req_base: 32,
+                aead_req_cryptlen: 0,
+                aead_req_assoclen: 4,
+                aead_base: 8,
+                aead_authsize: 0,
             }
         );
     }
@@ -2929,6 +3167,19 @@ mod tests {
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
         b.member(o_base, 8, 8 * 8);
+        // AEAD lanes (plain defs — the malformation game covers the
+        // counter leaf only).
+        let o_aead = b.str("crypto_aead");
+        let o_authsize = b.str("authsize");
+        b.rec(o_aead, KIND_STRUCT, 2, false, 72);
+        b.member(o_authsize, 1, 0);
+        b.member(o_base, 8, 8 * 8);
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        b.rec(o_adreq, KIND_STRUCT, 3, false, 128);
+        b.member(o_cryptlen, 1, 0);
+        b.member(o_assoclen, 1, 4 * 8);
+        b.member(o_base, 10, 32 * 8);
         b.finish()
     }
 
@@ -2989,6 +3240,19 @@ mod tests {
         let o_sk = b.str("crypto_skcipher");
         b.rec(o_sk, KIND_STRUCT, 1, false, 72);
         b.member(o_base, 7, 8 * 8);
+        // AEAD lanes (plain defs — the malformation game covers the
+        // name element only).
+        let o_aead = b.str("crypto_aead");
+        let o_authsize = b.str("authsize");
+        b.rec(o_aead, KIND_STRUCT, 2, false, 72);
+        b.member(o_authsize, 1, 0);
+        b.member(o_base, 7, 8 * 8);
+        let o_adreq = b.str("aead_request");
+        let o_assoclen = b.str("assoclen");
+        b.rec(o_adreq, KIND_STRUCT, 3, false, 128);
+        b.member(o_cryptlen, 1, 0);
+        b.member(o_assoclen, 1, 4 * 8);
+        b.member(o_base, 9, 32 * 8);
         b.finish()
     }
 

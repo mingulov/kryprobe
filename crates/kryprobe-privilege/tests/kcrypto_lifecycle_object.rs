@@ -14,10 +14,11 @@ use kryprobe_privilege::btf_resolve::{
     BtfError, LifecycleOffsets, resolve_lifecycle_ids, resolve_lifecycle_ids_from,
 };
 
-/// Canned chase offsets for LCFG v4 byte tests (values mirror the
+/// Canned chase offsets for LCFG v6 byte tests (values mirror the
 /// typed lifecycle fixture: tfm_alg 32, alg_drv 188, sk_base 8,
 /// req_base 32, req_tfm 32, req_cryptlen 0, req_flags 40, refcnt 40 +
-/// present).
+/// present, aead_req_base 32, aead_req_cryptlen 0, aead_req_assoclen
+/// 4, aead_base 8, aead_authsize 0).
 fn test_offsets() -> LifecycleOffsets {
     LifecycleOffsets {
         tfm_alg: 32,
@@ -29,6 +30,11 @@ fn test_offsets() -> LifecycleOffsets {
         req_flags: 40,
         refcnt_off: 40,
         refcnt_present: true,
+        aead_req_base: 32,
+        aead_req_cryptlen: 0,
+        aead_req_assoclen: 4,
+        aead_base: 8,
+        aead_authsize: 0,
     }
 }
 use kryprobe_privilege::kcrypto_lifecycle::profile::{
@@ -47,7 +53,9 @@ fn h01_lifecycle_manifest_requires_both_sites() {
     // needs alloc entry/return capture). T07.3 adds the destroy site
     // (retire needs destroy entry/return capture). T07.4 adds the
     // three configuration sites (epochs need setkey/setauthsize
-    // entry/return capture).
+    // entry/return capture). P5 adds the AEAD op sites plus the AEAD
+    // allocation site (the AEAD lifetime observations the
+    // config-only support must not masquerade as).
     let m = manifest(LifecycleProfile::RequestLifecycle);
     assert_eq!(m.name, "request-lifecycle");
     let sites: Vec<&str> = m.required.iter().map(|s| s.symbol).collect();
@@ -60,18 +68,21 @@ fn h01_lifecycle_manifest_requires_both_sites() {
             "crypto_destroy_tfm",
             "crypto_skcipher_setkey",
             "crypto_aead_setauthsize",
-            "crypto_aead_setkey"
+            "crypto_aead_setkey",
+            "crypto_aead_encrypt",
+            "crypto_aead_decrypt",
+            "crypto_alloc_aead"
         ]
     );
 }
 
 #[test]
 fn h01_program_limit_derives_from_manifest_not_global_cap() {
-    // One fsession program per required site (7) plus one fentry
-    // program per callback site (2) = 9; the api-returns 16-program
+    // One fsession program per required site (10) plus one fentry
+    // program per callback site (2) = 12; the api-returns 16-program
     // cap is a different profile's limit and must not leak across.
     let lc = manifest(LifecycleProfile::RequestLifecycle);
-    assert_eq!(max_programs(&lc), 9);
+    assert_eq!(max_programs(&lc), 12);
     let api = manifest(LifecycleProfile::ApiReturns);
     assert_eq!(max_programs(&api), 16);
     assert_ne!(max_programs(&lc), max_programs(&api));
@@ -85,6 +96,9 @@ fn h01_lifecycle_sections_accept_pinned_set() {
     let p = LifecycleProfile::RequestLifecycle;
     assert!(section_allowed(p, "fsession/crypto_skcipher_encrypt"));
     assert!(section_allowed(p, "fsession/crypto_skcipher_decrypt"));
+    assert!(section_allowed(p, "fsession/crypto_aead_encrypt"));
+    assert!(section_allowed(p, "fsession/crypto_aead_decrypt"));
+    assert!(section_allowed(p, "fsession/crypto_alloc_aead"));
     assert!(section_allowed(p, "fentry/cryptd_skcipher_complete"));
     assert!(section_allowed(p, "fentry/kxc_complete"));
     assert!(!section_allowed(p, "fentry/crypto_skcipher_encrypt"));
@@ -142,7 +156,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 64,
+            value_size: 80,
             max_entries: 1,
         }
     );
@@ -161,7 +175,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 90,
+            max_entries: 110,
         }
     );
     assert_eq!(
@@ -170,7 +184,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 18,
+            max_entries: 22,
         }
     );
     assert_eq!(
@@ -179,7 +193,7 @@ fn h01_lifecycle_map_table_is_exact_and_dot_free() {
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 8,
+            max_entries: 10,
         }
     );
 }
@@ -196,17 +210,18 @@ fn h01_zeroed_config_fails_closed() {
     assert!(validate_lifecycle_config(0x31434c4b, 2, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 3, 0).is_err());
     assert!(validate_lifecycle_config(0x31434c4b, 4, 0).is_err());
-    assert!(validate_lifecycle_config(0x31434c4b, 5, 0).is_ok());
+    assert!(validate_lifecycle_config(0x31434c4b, 6, 0).is_ok());
 }
 
 #[test]
-fn f1_lcfg_readback_validates_full_64_bytes() {
+fn f1_lcfg_readback_validates_full_80_bytes() {
     // Round-1 finding (sol-M1/astra-M1): the verify path read the
-    // 64-byte LCFG value into an 8-byte u64 (56-byte stack overwrite).
-    // The read-back verifier takes the full 64 bytes: short reads fail
-    // closed, and every word (magic/version/flags/tail) must match.
-    // T07: the tail verifies against the WRITTEN bytes (offset words
-    // ride there now — shape-only would certify a mis-chaser).
+    // LCFG value into an 8-byte u64 (72-byte stack overwrite at the
+    // v6 80-byte width). The read-back verifier takes the full 80
+    // bytes: short reads fail closed, and every word
+    // (magic/version/flags/tail) must match. T07: the tail verifies
+    // against the WRITTEN bytes (offset words ride there now —
+    // shape-only would certify a mis-chaser).
     use kryprobe_privilege::btf_resolve::LifecycleOffsets;
     let off = LifecycleOffsets {
         tfm_alg: 32,
@@ -218,21 +233,26 @@ fn f1_lcfg_readback_validates_full_64_bytes() {
         req_flags: 0,
         refcnt_off: 0,
         refcnt_present: false,
+        aead_req_base: 0,
+        aead_req_cryptlen: 0,
+        aead_req_assoclen: 0,
+        aead_base: 0,
+        aead_authsize: 0,
     };
     let good = lifecycle_config_bytes(&off, 16, true);
-    assert_eq!(good.len(), 64);
+    assert_eq!(good.len(), 80);
     // P4 v5: the fixture op words ride at 48/52 (offset 16 here is
     // the test's arbitrary value — the live arm BTF-resolves it).
     assert_eq!(u32::from_le_bytes(good[48..52].try_into().unwrap()), 16);
     assert_eq!(u32::from_le_bytes(good[52..56].try_into().unwrap()), 1);
-    assert_eq!(u32::from_le_bytes(good[4..8].try_into().unwrap()), 5);
+    assert_eq!(u32::from_le_bytes(good[4..8].try_into().unwrap()), 6);
     assert!(verify_lifecycle_config_bytes(&good, &good).is_ok());
     assert!(matches!(
         verify_lifecycle_config_bytes(&good[..8], &good),
         Err(ConfigVerifyError::BadLength { got: 8 })
     ));
     assert!(matches!(
-        verify_lifecycle_config_bytes(&[0u8; 64], &good),
+        verify_lifecycle_config_bytes(&[0u8; 80], &good),
         Err(ConfigVerifyError::BadMagic)
     ));
     let mut bad_version = good;
@@ -250,10 +270,10 @@ fn f1_lcfg_readback_validates_full_64_bytes() {
         Err(ConfigVerifyError::BadFlags)
     ));
     let mut bad_reserved = good;
-    bad_reserved[63] = 1;
+    bad_reserved[79] = 1;
     assert!(matches!(
         verify_lifecycle_config_bytes(&bad_reserved, &good),
-        Err(ConfigVerifyError::BadReserved { offset: 63 })
+        Err(ConfigVerifyError::BadReserved { offset: 79 })
     ));
 }
 
@@ -277,6 +297,11 @@ fn t07_lcfg_disarm_flips_flags_word_only() {
         req_flags: 0,
         refcnt_off: 0,
         refcnt_present: false,
+        aead_req_base: 0,
+        aead_req_cryptlen: 0,
+        aead_req_assoclen: 0,
+        aead_base: 0,
+        aead_authsize: 0,
     };
     let armed = lifecycle_config_bytes(&off, 16, true);
     let disarmed = disarm_config_bytes(&armed);
@@ -318,8 +343,9 @@ fn t07_lcfg_disarm_flips_flags_word_only() {
 #[test]
 fn t07_lcfg_v3_carries_chase_offsets() {
     // T07.3: the arm writes the BTF-resolved chase offsets into the
-    // config words (version 4: chase + refcount + request-link +
-    // request-metadata words); the reserved tail stays zero.
+    // config words (version 6: chase + refcount + request-link +
+    // request-metadata + fixture-op + AEAD words); the reserved tail
+    // stays zero.
     use kryprobe_privilege::btf_resolve::LifecycleOffsets;
     let off = LifecycleOffsets {
         tfm_alg: 32,
@@ -331,12 +357,17 @@ fn t07_lcfg_v3_carries_chase_offsets() {
         req_flags: 40,
         refcnt_off: 40,
         refcnt_present: true,
+        aead_req_base: 56,
+        aead_req_cryptlen: 60,
+        aead_req_assoclen: 64,
+        aead_base: 68,
+        aead_authsize: 72,
     };
     let bytes = lifecycle_config_bytes(&off, 0, false);
-    assert_eq!(bytes.len(), 64);
+    assert_eq!(bytes.len(), 80);
     let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     assert_eq!(word(0), 0x31434c4b, "magic");
-    assert_eq!(word(4), 5, "version 5");
+    assert_eq!(word(4), 6, "version 6");
     assert_eq!(word(8), 0, "flags");
     assert_eq!(word(12), 32, "tfm_alg");
     assert_eq!(word(16), 188, "alg_drv");
@@ -347,7 +378,12 @@ fn t07_lcfg_v3_carries_chase_offsets() {
     assert_eq!(word(36), 52, "req_tfm");
     assert_eq!(word(40), 0, "req_cryptlen");
     assert_eq!(word(44), 40, "req_flags");
-    assert!(bytes[48..].iter().all(|b| *b == 0), "reserved tail zero");
+    assert_eq!(word(56), 56, "aead_req_base");
+    assert_eq!(word(60), 60, "aead_req_cryptlen");
+    assert_eq!(word(64), 64, "aead_req_assoclen");
+    assert_eq!(word(68), 68, "aead_base");
+    assert_eq!(word(72), 72, "aead_authsize");
+    assert!(bytes[76..].iter().all(|b| *b == 0), "reserved tail zero");
 }
 
 #[test]
@@ -366,6 +402,11 @@ fn t07_lcfg_verify_checks_tail_against_written() {
         req_flags: 0,
         refcnt_off: 0,
         refcnt_present: false,
+        aead_req_base: 0,
+        aead_req_cryptlen: 0,
+        aead_req_assoclen: 0,
+        aead_base: 0,
+        aead_authsize: 0,
     };
     let good = lifecycle_config_bytes(&off, 16, true);
     assert!(verify_lifecycle_config_bytes(&good, &good).is_ok());
@@ -376,10 +417,10 @@ fn t07_lcfg_verify_checks_tail_against_written() {
         Err(ConfigVerifyError::BadReserved { offset: 12 })
     ));
     let mut bad_tail = good;
-    bad_tail[63] = 1;
+    bad_tail[79] = 1;
     assert!(matches!(
         verify_lifecycle_config_bytes(&bad_tail, &good),
-        Err(ConfigVerifyError::BadReserved { offset: 63 })
+        Err(ConfigVerifyError::BadReserved { offset: 79 })
     ));
 }
 
@@ -604,7 +645,7 @@ fn build_lifecycle_fixture(prog_sections: &[&str], maps: &[(&str, MapDims)]) -> 
     out
 }
 
-/// The T07 contract as a fixture: one fsession program per required
+/// The P5 contract as a fixture: one fsession program per required
 /// site plus the exact frozen map table.
 fn valid_lifecycle_fixture() -> Vec<u8> {
     let maps: Vec<(&str, MapDims)> = LIFECYCLE_MAPS.to_vec();
@@ -617,6 +658,9 @@ fn valid_lifecycle_fixture() -> Vec<u8> {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_aead_encrypt",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_alloc_aead",
         ],
         &maps,
     )
@@ -627,7 +671,7 @@ fn h02_valid_session_object_parses() {
     let bytes = valid_lifecycle_fixture();
     let parsed = parse_lifecycle_object(&bytes).expect("valid fixture must parse");
     assert_eq!(parsed.maps.len(), 5);
-    assert_eq!(parsed.programs.len(), 7);
+    assert_eq!(parsed.programs.len(), 10);
     for prog in &parsed.programs {
         assert_eq!(prog.insns.len(), 1, "{} stream drifted", prog.name);
     }
@@ -730,6 +774,9 @@ fn h02_extra_map_refused() {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_aead_encrypt",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_alloc_aead",
         ],
         &maps,
     );
@@ -757,6 +804,9 @@ fn h02_duplicate_map_refused_typed() {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_aead_encrypt",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_alloc_aead",
         ],
         &maps,
     );
@@ -784,6 +834,9 @@ fn h02_bad_dims_refused() {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_aead_encrypt",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_alloc_aead",
         ],
         &maps,
     );
@@ -805,6 +858,9 @@ fn h02_missing_map_refused() {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_aead_encrypt",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_alloc_aead",
         ],
         &maps,
     );
@@ -824,15 +880,18 @@ fn h02_too_many_programs_refused_at_manifest_limit() {
             "fsession/crypto_skcipher_setkey",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_aead_encrypt",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_alloc_aead",
             "fentry/cryptd_skcipher_complete",
             "fentry/kxc_complete",
             "fsession/crypto_skcipher_extra",
         ],
         &maps,
     );
-    let err = parse_lifecycle_object(&bytes).expect_err("10th program must refuse");
+    let err = parse_lifecycle_object(&bytes).expect_err("13th program must refuse");
     let msg = format!("{err:?}");
-    assert!(msg.contains('9'), "refusal names the manifest limit: {msg}");
+    assert!(msg.contains("12"), "refusal names the manifest limit: {msg}");
 }
 
 /// Workspace-relative path of the built lifecycle object.
@@ -866,8 +925,11 @@ fn h02_built_object_matches_manifest() {
         [
             "fentry/cryptd_skcipher_complete",
             "fentry/kxc_complete",
+            "fsession/crypto_aead_decrypt",
+            "fsession/crypto_aead_encrypt",
             "fsession/crypto_aead_setauthsize",
             "fsession/crypto_aead_setkey",
+            "fsession/crypto_alloc_aead",
             "fsession/crypto_alloc_skcipher",
             "fsession/crypto_destroy_tfm",
             "fsession/crypto_skcipher_decrypt",
@@ -936,7 +998,7 @@ fn w8_built_object_codegen_pins_kfunc_stubs() {
     assert_eq!(call_relocs, 0, "kfunc stubs must carry no relocations");
     // Pinned sentinel sites + helper-only remainder, per program.
     let parsed = parse_lifecycle_object(&bytes).expect("built object must parse");
-    assert_eq!(parsed.programs.len(), 9);
+    assert_eq!(parsed.programs.len(), 12);
     for prog in &parsed.programs {
         let mut is_return = 0usize;
         let mut cookie = 0usize;
@@ -980,7 +1042,7 @@ fn bringup_resolve_finds_manifest_symbols() {
         return;
     }
     let ids = resolve_lifecycle_ids().expect("manifest symbols must resolve");
-    assert_eq!(ids.len(), 7);
+    assert_eq!(ids.len(), 10);
     assert!(ids.contains_key("crypto_skcipher_encrypt"));
     assert!(ids.contains_key("crypto_skcipher_decrypt"));
     assert!(ids.contains_key("crypto_alloc_skcipher"));
@@ -988,6 +1050,9 @@ fn bringup_resolve_finds_manifest_symbols() {
     assert!(ids.contains_key("crypto_skcipher_setkey"));
     assert!(ids.contains_key("crypto_aead_setauthsize"));
     assert!(ids.contains_key("crypto_aead_setkey"));
+    assert!(ids.contains_key("crypto_aead_encrypt"));
+    assert!(ids.contains_key("crypto_aead_decrypt"));
+    assert!(ids.contains_key("crypto_alloc_aead"));
     for (name, id) in &ids {
         assert_ne!(*id, 0, "{name} resolved to null id");
     }
@@ -1019,14 +1084,17 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
         loaded("fsession/crypto_skcipher_setkey"),
         loaded("fsession/crypto_aead_setauthsize"),
         loaded("fsession/crypto_aead_setkey"),
+        loaded("fsession/crypto_aead_encrypt"),
+        loaded("fsession/crypto_aead_decrypt"),
+        loaded("fsession/crypto_alloc_aead"),
     ];
     let refs: Vec<(&str, &PointStatus)> = all.iter().map(|(s, st)| (s.as_str(), st)).collect();
     assert!(missing_required_points(&refs).is_empty());
     // One site missing → named.
-    let refs: Vec<(&str, &PointStatus)> = refs[..6].to_vec();
+    let refs: Vec<(&str, &PointStatus)> = refs[..9].to_vec();
     assert_eq!(
         missing_required_points(&refs),
-        ["fsession/crypto_aead_setkey"]
+        ["fsession/crypto_alloc_aead"]
     );
     // Unsupported counts as missing (refused load ≠ loaded point).
     let bad = [
@@ -1037,6 +1105,9 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
         loaded("fsession/crypto_skcipher_setkey"),
         loaded("fsession/crypto_aead_setauthsize"),
         loaded("fsession/crypto_aead_setkey"),
+        loaded("fsession/crypto_aead_encrypt"),
+        loaded("fsession/crypto_aead_decrypt"),
+        loaded("fsession/crypto_alloc_aead"),
     ];
     let refs: Vec<(&str, &PointStatus)> = bad.iter().map(|(s, st)| (s.as_str(), st)).collect();
     assert_eq!(
@@ -1047,17 +1118,17 @@ fn bringup_gate_passes_only_when_every_required_edge_loaded() {
 
 #[test]
 fn bringup_config_bytes_carry_exact_magic_version() {
-    // The 64 bytes the loader writes to LCFG key 0: magic + version +
+    // The 80 bytes the loader writes to LCFG key 0: magic + version +
     // zero flags + the chase/refcount/request-link/request-metadata
-    // words (P3 v4) + zero reserved tail — the exact words the BPF
-    // gate checks.
+    // words (P3 v4) + fixture-op words (P4 v5) + AEAD words (P5 v6)
+    // + zero reserved tail — the exact words the BPF gate checks.
     let bytes = lifecycle_config_bytes(&test_offsets(), 0, false);
-    assert_eq!(bytes.len(), 64);
+    assert_eq!(bytes.len(), 80);
     assert_eq!(
         u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
         0x3143_4c4b
     );
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 5);
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 6);
     assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 32);
     assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 188);
@@ -1068,7 +1139,12 @@ fn bringup_config_bytes_carry_exact_magic_version() {
     assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 32);
     assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 40);
-    assert!(bytes[48..].iter().all(|b| *b == 0));
+    assert_eq!(u32::from_le_bytes(bytes[56..60].try_into().unwrap()), 32);
+    assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(bytes[64..68].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(bytes[68..72].try_into().unwrap()), 8);
+    assert_eq!(u32::from_le_bytes(bytes[72..76].try_into().unwrap()), 0);
+    assert!(bytes[76..].iter().all(|b| *b == 0));
 }
 
 #[test]
@@ -1183,6 +1259,57 @@ fn append_config_sides(
     next + 14
 }
 
+/// Append the well-formed P5 AEAD sides (hermetic: every type the
+/// three FUNC_PROTOs name is defined inside this block, so
+/// op/alloc/config-side mutations in the host builder never disturb
+/// AEAD validation — and AEAD validation never depends on
+/// host-builder type ids). `next` is the incoming next type id.
+/// Layout (offsets from `next`): +0 TYPEDEF crypto_aead →
+/// `aead_target` (T07-R4-N2: alias the caller's FIRST `crypto_aead`
+/// STRUCT, never a rival def), +1 STRUCT aead_request (prototype
+/// root only), +2 PTR→+1, +3 PTR→+0, +4 INT int (4 bytes, SIGNED —
+/// the errno return), +5 INT char (1 byte), +6 PTR→+5, +7 INT u32
+/// (4 bytes, unsigned), +8 op-aead FUNC_PROTO, +9 aead-encrypt
+/// FUNC, +10 aead-decrypt FUNC, +11 alloc-aead FUNC_PROTO, +12
+/// alloc-aead FUNC. Returns the outgoing next id.
+fn append_aead_sides(
+    types: &mut Vec<u8>,
+    strtab: &mut Vec<u8>,
+    next: u32,
+    aead_target: u32,
+) -> u32 {
+    let aead_off = btf_push_str(strtab, "crypto_aead");
+    let adreq_off = btf_push_str(strtab, "aead_request");
+    let int_off = btf_push_str(strtab, "int");
+    let char_off = btf_push_str(strtab, "char");
+    let u32_off = btf_push_str(strtab, "u32");
+    let enc_off = btf_push_str(strtab, "crypto_aead_encrypt");
+    let dec_off = btf_push_str(strtab, "crypto_aead_decrypt");
+    let alloc_off = btf_push_str(strtab, "crypto_alloc_aead");
+    btf_rec(types, aead_off, 8, 0, aead_target, &[]);
+    btf_rec(types, adreq_off, 4, 0, 0, &[]);
+    btf_rec(types, 0, 2, 0, next + 1, &[]);
+    btf_rec(types, 0, 2, 0, next, &[]);
+    btf_rec(types, int_off, 1, 0, 4, &0x0100_0020u32.to_le_bytes());
+    btf_rec(types, char_off, 1, 0, 1, &0x0100_0008u32.to_le_bytes());
+    btf_rec(types, 0, 2, 0, next + 5, &[]);
+    btf_rec(types, u32_off, 1, 0, 4, &0x0000_0020u32.to_le_bytes());
+    let mut aux = Vec::new();
+    aux.extend_from_slice(&0u32.to_le_bytes());
+    aux.extend_from_slice(&(next + 2).to_le_bytes());
+    btf_rec(types, 0, 13, 1, next + 4, &aux);
+    btf_rec(types, enc_off, 12, 1, next + 8, &[]);
+    btf_rec(types, dec_off, 12, 1, next + 8, &[]);
+    let mut aux = Vec::new();
+    for param in [next + 6, next + 7, next + 7] {
+        aux.extend_from_slice(&0u32.to_le_bytes());
+        aux.extend_from_slice(&param.to_le_bytes());
+    }
+    btf_rec(types, 0, 13, 3, next + 3, &aux);
+    btf_rec(types, alloc_off, 12, 1, next + 11, &[]);
+    next + 13
+}
+
 /// Minimal vmlinux-shaped BTF with the three lifecycle FUNCs. The
 /// decrypt proto is always well-formed
 /// (`int (struct skcipher_request *)`), and the alloc chain is always
@@ -1267,7 +1394,12 @@ fn lifecycle_btf(
     // setauthsize, and setkey-aead FUNCs (hermetic block — op-side
     // mutations above never disturb config validation; the block
     // aliases STRUCT crypto_skcipher id 13).
-    append_config_sides(&mut types, &mut strtab, 22, 13);
+    let next = append_config_sides(&mut types, &mut strtab, 22, 13);
+    // P5 AEAD sides (ids 36-48): well-formed aead-encrypt/decrypt
+    // and alloc-aead FUNCs (hermetic block — op-side mutations
+    // above never disturb AEAD validation; the block aliases the
+    // config block's STRUCT crypto_aead id 23).
+    let _ = append_aead_sides(&mut types, &mut strtab, next, 23);
     btf_image(&types, &strtab)
 }
 
@@ -1360,7 +1492,11 @@ fn lifecycle_btf_alloc(
     // setauthsize, and setkey-aead FUNCs (hermetic block — alloc-side
     // mutations above never disturb config validation; the block
     // aliases STRUCT crypto_skcipher id 13).
-    append_config_sides(&mut types, &mut strtab, 23, 13);
+    let next = append_config_sides(&mut types, &mut strtab, 23, 13);
+    // P5 AEAD sides (ids 37-49): well-formed aead-encrypt/decrypt
+    // and alloc-aead FUNCs (hermetic block — aliases the config
+    // block's STRUCT crypto_aead id 24).
+    let _ = append_aead_sides(&mut types, &mut strtab, next, 24);
     btf_image(&types, &strtab)
 }
 
@@ -1531,6 +1667,11 @@ fn lifecycle_btf_config(
         4,
         &0x0010_0010u32.to_le_bytes(),
     );
+    // P5 AEAD sides (ids 41-53): well-formed aead-encrypt/decrypt
+    // and alloc-aead FUNCs (hermetic block — config-side mutations
+    // above never disturb AEAD validation; the block aliases the
+    // config block's STRUCT crypto_aead id 23).
+    let _ = append_aead_sides(&mut types, &mut strtab, 41, 23);
     btf_image(&types, &strtab)
 }
 
@@ -1577,9 +1718,11 @@ fn assert_alloc_bad_proto(image: &[u8], why: &str) {
 fn f2_alloc_wellformed_proto_resolves() {
     // Control: the alloc shape resolves alongside the op sites.
     let ids = resolve_lifecycle_ids_from(&lifecycle_btf_alloc_good()).expect("good alloc proto");
-    assert_eq!(ids.len(), 7);
+    assert_eq!(ids.len(), 10);
     assert_eq!(ids["crypto_alloc_skcipher"], 16);
     assert_eq!(ids["crypto_destroy_tfm"], 22);
+    assert_eq!(ids["crypto_aead_encrypt"], 46);
+    assert_eq!(ids["crypto_alloc_aead"], 49);
 }
 
 #[test]
@@ -1643,11 +1786,13 @@ fn f2_wellformed_protos_resolve_all_ids() {
     // Control: int (struct skcipher_request *) on both op sites plus
     // the alloc shape resolves.
     let ids = resolve_lifecycle_ids_from(&lifecycle_btf_good()).expect("good protos");
-    assert_eq!(ids.len(), 7);
+    assert_eq!(ids.len(), 10);
     assert_eq!(ids["crypto_skcipher_encrypt"], 5);
     assert_eq!(ids["crypto_skcipher_decrypt"], 7);
     assert_eq!(ids["crypto_alloc_skcipher"], 16);
     assert_eq!(ids["crypto_destroy_tfm"], 21);
+    assert_eq!(ids["crypto_aead_encrypt"], 45);
+    assert_eq!(ids["crypto_alloc_aead"], 48);
 }
 
 #[test]
@@ -1758,14 +1903,20 @@ fn f2_typedef_wrapped_pointer_arg_accepted() {
     // T07.4 configuration sides (ids 21-34): well-formed setkey-sk,
     // setauthsize, and setkey-aead FUNCs (hermetic block aliasing
     // STRUCT crypto_skcipher id 12).
-    append_config_sides(&mut types, &mut strtab, 21, 12);
+    let next = append_config_sides(&mut types, &mut strtab, 21, 12);
+    // P5 AEAD sides (ids 35-47): well-formed aead-encrypt/decrypt
+    // and alloc-aead FUNCs (hermetic block aliasing STRUCT
+    // crypto_aead id 22).
+    let _ = append_aead_sides(&mut types, &mut strtab, next, 22);
     let ids = resolve_lifecycle_ids_from(&btf_image(&types, &strtab)).expect("chased proto");
-    assert_eq!(ids.len(), 7);
+    assert_eq!(ids.len(), 10);
     assert_eq!(ids["crypto_alloc_skcipher"], 15);
     assert_eq!(ids["crypto_destroy_tfm"], 20);
     assert_eq!(ids["crypto_skcipher_setkey"], 30);
     assert_eq!(ids["crypto_aead_setauthsize"], 32);
     assert_eq!(ids["crypto_aead_setkey"], 34);
+    assert_eq!(ids["crypto_aead_encrypt"], 44);
+    assert_eq!(ids["crypto_alloc_aead"], 47);
 }
 
 /// Assert the encrypt side refuses with `BadPrototype` naming it.
@@ -1849,10 +2000,12 @@ fn t74_wellformed_config_protos_resolve_all_ids() {
     // Control: the three configuration shapes resolve alongside
     // the op/alloc/destroy sites.
     let ids = resolve_lifecycle_ids_from(&lifecycle_btf_config_good()).expect("good config protos");
-    assert_eq!(ids.len(), 7);
+    assert_eq!(ids.len(), 10);
     assert_eq!(ids["crypto_skcipher_setkey"], 35);
     assert_eq!(ids["crypto_aead_setauthsize"], 37);
     assert_eq!(ids["crypto_aead_setkey"], 39);
+    assert_eq!(ids["crypto_aead_encrypt"], 50);
+    assert_eq!(ids["crypto_alloc_aead"], 53);
 }
 
 #[test]

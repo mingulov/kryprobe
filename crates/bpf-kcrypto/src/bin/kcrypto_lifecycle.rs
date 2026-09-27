@@ -1318,7 +1318,18 @@ fn alloc_run(ctx: &FEntryContext, site: u16, lane: u32, sub: u32, ret: u32, aead
         // on every path (zeroed, then helper-overwritten in part).
         let name = unsafe { &*raw_slot };
         emit_tfm_edge(
-            site, LEDGE_RETURN, retval, now, 0, 0, 0, token == 0, truncated, token, name, ret,
+            site,
+            LEDGE_RETURN,
+            retval,
+            now,
+            0,
+            0,
+            0,
+            token == 0,
+            truncated,
+            token,
+            name,
+            ret,
         );
         return 0;
     }
