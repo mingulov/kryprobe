@@ -107,7 +107,9 @@ fn ingest_paired_edges_complete_grounded_record() {
     assert!(rec.evidence_valid());
     assert_eq!(
         ledger.edge_hits,
-        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]
     );
     assert_eq!(ledger.decode.admitted, 1);
     assert_eq!(ledger.reducer.admitted, 1);
@@ -138,7 +140,9 @@ fn ingest_queued_return_stays_pending() {
         core.ledger([0; 5], [0; 22], Vec::new(), ctx())
             .expect("empty miss join")
             .edge_hits,
-        [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]
     );
 }
 
@@ -245,11 +249,15 @@ fn w8_ledger_carries_session_context() {
     let ledger = core
         .ledger(
             [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [
+                6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
             Vec::new(),
             SessionContext {
                 loss_baseline: [0, 1, 0, 0, 0],
-                agg_baseline: [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                agg_baseline: [
+                    0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
                 view_valid: false,
                 miss_baseline: Vec::new(),
                 enrichment: EnrichmentStatus::Available {
@@ -262,12 +270,16 @@ fn w8_ledger_carries_session_context() {
     assert_eq!(ledger.kernel_loss, [1, 2, 3, 4, 5]);
     assert_eq!(
         ledger.agg_accepted,
-        [6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [
+            6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]
     );
     assert_eq!(ledger.loss_baseline, [0, 1, 0, 0, 0]);
     assert_eq!(
         ledger.agg_baseline,
-        [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [
+            0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]
     );
     assert!(!ledger.view_valid);
 }

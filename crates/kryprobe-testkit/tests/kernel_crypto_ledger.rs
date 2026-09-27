@@ -588,13 +588,20 @@ fn t10_aead_submit_carries_len_and_scalars() {
     // accounting; the open parser captures them when present and
     // reports None when the row predates them (unknown, never zero).
     let text = concat!(
-        r#"{"v":1,"run":"run-1","seq":2,"phase":"submit","op":"aead-decrypt","len":1040,"flags":0,"assoc":32,"authsize":16}"#, "\n",
-        r#"{"v":1,"run":"run-1","seq":2,"phase":"return","errno":0}"#, "\n",
-        r#"{"v":1,"run":"run-1","seq":2,"phase":"terminal","errno":0}"#, "\n",
-        r#"{"v":1,"run":"run-1","seq":3,"phase":"submit","op":"encrypt"}"#, "\n",
-        r#"{"v":1,"run":"run-1","seq":3,"phase":"return","errno":0}"#, "\n",
-        r#"{"v":1,"run":"run-1","seq":3,"phase":"terminal","errno":0}"#, "\n",
-        r#"{"v":1,"run":"run-1","phase":"done","fixture_result":0,"overflow":0}"#, "\n",
+        r#"{"v":1,"run":"run-1","seq":2,"phase":"submit","op":"aead-decrypt","len":1040,"flags":0,"assoc":32,"authsize":16}"#,
+        "\n",
+        r#"{"v":1,"run":"run-1","seq":2,"phase":"return","errno":0}"#,
+        "\n",
+        r#"{"v":1,"run":"run-1","seq":2,"phase":"terminal","errno":0}"#,
+        "\n",
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"submit","op":"encrypt"}"#,
+        "\n",
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"return","errno":0}"#,
+        "\n",
+        r#"{"v":1,"run":"run-1","seq":3,"phase":"terminal","errno":0}"#,
+        "\n",
+        r#"{"v":1,"run":"run-1","phase":"done","fixture_result":0,"overflow":0}"#,
+        "\n",
     );
     let ledger = parse_ledger("run-1", text).expect("aead ledger parses");
     assert_eq!(ledger.requests.len(), 2);

@@ -526,8 +526,7 @@ pub fn parse_transcript(text: &str, run_id: &str) -> Result<FixtureTruth, Transc
                 // them, is drift, never a default).
                 let (assoc, authsize) = if is_aead {
                     let assoc = get_u32(obj, "assoc", line_no, "aead submit lacks assoc")?;
-                    let authsize =
-                        get_u32(obj, "authsize", line_no, "aead submit lacks authsize")?;
+                    let authsize = get_u32(obj, "authsize", line_no, "aead submit lacks authsize")?;
                     (Some(assoc), Some(authsize))
                 } else {
                     if obj.contains_key("assoc") || obj.contains_key("authsize") {
@@ -3002,7 +3001,9 @@ mod tests {
         let misses = vec![miss_abs("fsession/a", 11, 3), miss_abs("fsession/b", 12, 0)];
         SensorView {
             completed,
-            edge_hits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            edge_hits: [
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
             decode: DecodeStats {
                 admitted: 2,
                 ..DecodeStats::default()
@@ -3014,7 +3015,9 @@ mod tests {
             },
             adapter: AdapterStats::default(),
             kernel_loss: [0; 5],
-            agg_accepted: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            agg_accepted: [
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
             retained_dropped: 0,
             baseline: SensorBaseline {
                 prog_misses: misses.clone(),
@@ -3082,8 +3085,12 @@ mod tests {
         let gens = sync_gens3(1, 2, 3);
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3097,8 +3104,12 @@ mod tests {
         let mut bad_gens = sync_gens3(1, 2, 3);
         bad_gens[2].drv_name = "wrong-driver".to_owned();
         let mut view = sync_view(&completed, &bad_gens);
-        view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3119,8 +3130,12 @@ mod tests {
         ] {
             let gens = sync_gens3(ids.0, ids.1, ids.2);
             let mut view = sync_view(&completed, &gens);
-            view.edge_hits = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            view.agg_accepted = [0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            view.edge_hits = [
+                0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            view.agg_accepted = [
+                0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
             view.decode.admitted = 0;
             view.reducer.admitted = 0;
             view.reducer.emitted = 0;
@@ -3180,8 +3195,12 @@ mod tests {
         let gens = [shared];
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3196,8 +3215,12 @@ mod tests {
         // A non-ambiguous flag on the shared lifetime fails.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3247,7 +3270,9 @@ mod tests {
         let completed = [record(1, Terminal::Sync(0))];
         // Widened-contract view: AEAD alloc halves on 12/13, the
         // op on 18/19, sk op lanes zero, one decode admission.
-        let hooked: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0];
+        let hooked: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0,
+        ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = hooked;
         view.agg_accepted = hooked;
@@ -3433,8 +3458,12 @@ mod tests {
         let gens: [GenerationInfo; 0] = [];
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3448,8 +3477,12 @@ mod tests {
         // A phantom generation from the ERR return fails.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3493,8 +3526,12 @@ mod tests {
         }];
         let completed = [record(1, Terminal::Sync(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            1, 1, 0, 0, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -3724,8 +3761,12 @@ mod tests {
         }];
         let completed = [record(1, Terminal::Callback(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        view.edge_hits = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -3736,8 +3777,12 @@ mod tests {
         // adapter completes it.
         let completed = [record(1, Terminal::Unknown)];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -3786,8 +3831,12 @@ mod tests {
             record(4, Terminal::Callback(0)),
         ];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [4, 4, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0];
-        view.agg_accepted = [4, 4, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0];
+        view.edge_hits = [
+            4, 4, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            4, 4, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 4;
         view.reducer.admitted = 4;
         view.reducer.emitted = 4;
@@ -3842,8 +3891,12 @@ mod tests {
             ],
         ] {
             let mut view = sync_view(&completed, &gens);
-            view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-            view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+            view.edge_hits = [
+                2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+            ];
+            view.agg_accepted = [
+                2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+            ];
             view.decode.admitted = 2;
             view.reducer.admitted = 2;
             view.reducer.emitted = 2;
@@ -3856,8 +3909,12 @@ mod tests {
             record(2, Terminal::Callback(0)),
         ];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        view.edge_hits = [
+            2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 2;
         view.reducer.admitted = 2;
         view.reducer.emitted = 2;
@@ -3905,8 +3962,12 @@ mod tests {
         // Live lane vector (7.2.6 cell): 2× op lanes (inner child),
         // [2, 2] callback lanes (nested), tfm lanes carry hidden
         // instance traffic (ungraded — receipted for the record).
-        view.edge_hits = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0];
-        view.agg_accepted = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0];
+        view.edge_hits = [
+            4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 4;
         view.reducer.admitted = 4;
         view.reducer.emitted = 4;
@@ -3917,8 +3978,12 @@ mod tests {
         // never arrived (or never joined) — the carve-out pins
         // exactly N, never ≤N.
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0];
-        view.agg_accepted = [4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0];
+        view.edge_hits = [
+            4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            4, 4, 0, 0, 3, 3, 9, 9, 4, 4, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 4;
         view.reducer.admitted = 4;
         view.reducer.emitted = 4;
@@ -3951,8 +4016,12 @@ mod tests {
             record(2, Terminal::Callback(0)),
         ];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [2, 2, 0, 0, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0];
-        view.agg_accepted = [2, 2, 0, 0, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0];
+        view.edge_hits = [
+            2, 2, 0, 0, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            2, 2, 0, 0, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 2;
         view.reducer.admitted = 2;
         view.reducer.emitted = 2;
@@ -3978,8 +4047,12 @@ mod tests {
         }];
         let completed: [RequestRecord; 0] = [];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 0;
         view.reducer.admitted = 0;
         view.reducer.emitted = 0;
@@ -3998,7 +4071,9 @@ mod tests {
         // Equation: agg 5 != hits 4 + reserve 0 + noslot 0.
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.agg_accepted = [2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [
+            2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let err = verdict("sync-once", &truth, &view).expect_err("equation must hold");
         assert!(err.contains("reconciliation"), "names it: {err}");
         // Any loss counter fails.
@@ -4018,7 +4093,9 @@ mod tests {
         // Backwards counters fail (no silent reset absorb).
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.baseline.edge_hits = [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.baseline.edge_hits = [
+            9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         verdict("sync-once", &truth, &view).expect_err("backwards must fail");
         // Fixture self-check failure fails.
         let mut truth = sync_truth();
@@ -4192,13 +4269,21 @@ mod tests {
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.baseline.edge_hits = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.baseline.agg_accepted = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.baseline.edge_hits = [
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.baseline.agg_accepted = [
+            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.baseline.decode.admitted = 7;
         view.baseline.reducer.admitted = 7;
         view.baseline.reducer.emitted = 7;
-        view.edge_hits = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 9;
         view.reducer.admitted = 9;
         view.reducer.emitted = 9;
@@ -4351,7 +4436,9 @@ mod tests {
         // when totals match ([4,0,0,0] vs [1,1,1,1]).
         let gens = [sync_gen()];
         let mut view = sync_view(&completed, &gens);
-        view.agg_accepted = [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.agg_accepted = [
+            4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let err = verdict("sync-once", &truth, &view).expect_err("permuted agg must fail");
         assert!(err.contains("per-lane"), "names it: {err}");
     }
@@ -4389,8 +4476,12 @@ mod tests {
         }];
         let view = SensorView {
             completed: &completed,
-            edge_hits: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            agg_accepted: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            edge_hits: [
+                1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            agg_accepted: [
+                1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
             kernel_loss: [0; 5],
             decode: DecodeStats {
                 admitted: 1,
@@ -4554,8 +4645,12 @@ mod tests {
         }];
         let completed = [record(1, Terminal::Callback(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        view.edge_hits = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -4584,8 +4679,12 @@ mod tests {
         // A sensor view matching the RELABELED lanes sails the
         // edge-hits gate — the label pin must still catch it.
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        view.edge_hits = [
+            2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let err = verdict("sync-once", &truth, &view).expect_err("label lie must fail");
         assert!(err.contains("decrypt"), "names the label: {err}");
     }
@@ -4623,8 +4722,12 @@ mod tests {
         let gens = [race_gen()];
         let completed = [record(1, Terminal::Callback(0))];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-        view.agg_accepted = [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        view.edge_hits = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 1;
         view.reducer.admitted = 1;
         view.reducer.emitted = 1;
@@ -4677,8 +4780,12 @@ mod tests {
             record(2, Terminal::Callback(0)),
         ];
         let mut view = sync_view(&completed, &gens);
-        view.edge_hits = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0];
-        view.agg_accepted = [2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0];
+        view.edge_hits = [
+            2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0,
+        ];
+        view.agg_accepted = [
+            2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0,
+        ];
         view.decode.admitted = 2;
         view.reducer.admitted = 2;
         view.reducer.emitted = 2;
@@ -4706,7 +4813,14 @@ mod tests {
     }
 
     /// One AEAD submit/return/terminal triple with its scalars.
-    fn aead_rows(run: &str, seq: u64, op: &str, assoc: u32, authsize: u32, errno: i32) -> Vec<String> {
+    fn aead_rows(
+        run: &str,
+        seq: u64,
+        op: &str,
+        assoc: u32,
+        authsize: u32,
+        errno: i32,
+    ) -> Vec<String> {
         vec![
             format!(
                 r#"{{"v":1,"run":"{run}","seq":{seq},"phase":"submit","op":"{op}","assoc":{assoc},"authsize":{authsize}}}"#
@@ -4725,9 +4839,15 @@ mod tests {
         // exact errnos, AEAD lanes only.
         let run = "run-aead-meta";
         let mut rows = vec![
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxaead-t10a","drv":"kxaead-t10a","type":0,"mask":0}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"kxaead-t10a","drv":"kxaead-t10a","type":0,"mask":0}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#
+            ),
         ];
         rows.extend(aead_rows(run, 2, "aead-encrypt", 32, 16, 0));
         rows.extend(aead_rows(run, 3, "aead-decrypt", 32, 16, 0));
@@ -4741,8 +4861,12 @@ mod tests {
         ));
         rows.extend(aead_rows(run, 6, "aead-encrypt", 32, 8, 0));
         rows.extend(aead_rows(run, 7, "aead-decrypt", 32, 8, 0));
-        rows.push(format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#));
-        rows.push(format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#
+        ));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#
+        ));
         let truth = parse_transcript(&rows.join("\n"), run).expect("aead-meta parses");
         assert_eq!(truth.expected_hooks(), [0, 0, 0, 0]);
         assert_eq!(truth.expected_aead_hooks(), [2, 2, 4, 4]);
@@ -4765,7 +4889,9 @@ mod tests {
             record(5, Terminal::Sync(0)),
             record(6, Terminal::Sync(0)),
         ];
-        let lanes: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 3, 3, 1, 1, 1, 1, 0, 0, 2, 2, 4, 4];
+        let lanes: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 3, 3, 1, 1, 1, 1, 0, 0, 2, 2, 4, 4,
+        ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = lanes;
         view.agg_accepted = lanes;
@@ -4845,8 +4971,13 @@ mod tests {
             last_config_errno: 0,
             ..sync_gen()
         }];
-        let completed = [record(1, Terminal::Callback(0)), record(2, Terminal::Callback(0))];
-        let lanes: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 1, 1, 1, 1];
+        let completed = [
+            record(1, Terminal::Callback(0)),
+            record(2, Terminal::Callback(0)),
+        ];
+        let lanes: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 1, 1, 1, 1,
+        ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = lanes;
         view.agg_accepted = lanes;
@@ -4864,7 +4995,10 @@ mod tests {
         view.reuse_exact = true;
         verdict("aead-async", &truth, &view).expect("aead-async green");
         // An unjoined (sync-claimed) completion fails.
-        let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Callback(0))];
+        let completed = [
+            record(1, Terminal::Sync(0)),
+            record(2, Terminal::Callback(0)),
+        ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = lanes;
         view.agg_accepted = lanes;
@@ -4891,14 +5025,24 @@ mod tests {
         // (a driver lie fails), everything else the sync AEAD shape.
         let run = "run-aead-live";
         let mut rows = vec![
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"gcm(aes)","drv":"gcm-aesni","type":0,"mask":0}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#),
-            format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"alloc","req":"gcm(aes)","drv":"gcm-aesni","type":0,"mask":0}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setkey","errno":0,"len":16}}"#
+            ),
+            format!(
+                r#"{{"v":1,"run":"{run}","seq":1,"phase":"config","op":"setauthsize","errno":0,"len":16}}"#
+            ),
         ];
         rows.extend(aead_rows(run, 2, "aead-encrypt", 32, 16, 0));
         rows.extend(aead_rows(run, 3, "aead-decrypt", 32, 16, 0));
-        rows.push(format!(r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#));
-        rows.push(format!(r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","seq":1,"phase":"free","final":true}}"#
+        ));
+        rows.push(format!(
+            r#"{{"v":1,"run":"{run}","phase":"done","fixture_result":0,"overflow":0}}"#
+        ));
         let truth = parse_transcript(&rows.join("\n"), run).expect("aead-live parses");
         let gens = [GenerationInfo {
             req_name: "gcm(aes)".to_owned(),
@@ -4912,7 +5056,9 @@ mod tests {
             ..sync_gen()
         }];
         let completed = [record(1, Terminal::Sync(0)), record(2, Terminal::Sync(0))];
-        let lanes: [u64; 22] = [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1];
+        let lanes: [u64; 22] = [
+            0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1,
+        ];
         let mut view = sync_view(&completed, &gens);
         view.edge_hits = lanes;
         view.agg_accepted = lanes;

@@ -114,7 +114,10 @@ pub fn derive_attempt(
             Some(0) => AeadLen::Unknown(AeadUnknown::InvalidAuthsize),
             Some(auth) => match cryptlen.checked_sub(auth) {
                 Some(rest) => AeadLen::Known(rest),
-                None => AeadLen::Unknown(AeadUnknown::ShortInput { cryptlen, authsize: auth }),
+                None => AeadLen::Unknown(AeadUnknown::ShortInput {
+                    cryptlen,
+                    authsize: auth,
+                }),
             },
         },
     };

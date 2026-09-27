@@ -891,7 +891,10 @@ fn h02_too_many_programs_refused_at_manifest_limit() {
     );
     let err = parse_lifecycle_object(&bytes).expect_err("13th program must refuse");
     let msg = format!("{err:?}");
-    assert!(msg.contains("12"), "refusal names the manifest limit: {msg}");
+    assert!(
+        msg.contains("12"),
+        "refusal names the manifest limit: {msg}"
+    );
 }
 
 /// Workspace-relative path of the built lifecycle object.

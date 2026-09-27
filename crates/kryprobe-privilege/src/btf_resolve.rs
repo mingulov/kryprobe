@@ -917,12 +917,7 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
             }
             ProtoShape::OpAead => {
                 let (_, pointee) = btf.lifecycle_proto_id(site.symbol, "aead_request")?;
-                require_proto_root(
-                    "aead_request",
-                    adreq_entry,
-                    pointee,
-                    &format!("{sym}.arg0"),
-                )?;
+                require_proto_root("aead_request", adreq_entry, pointee, &format!("{sym}.arg0"))?;
             }
             ProtoShape::Alloc => {
                 let (_, pointee) = btf.alloc_proto_id(site.symbol, "crypto_skcipher")?;
@@ -935,12 +930,7 @@ pub fn resolve_lifecycle_ids_from(bytes: &[u8]) -> Result<HashMap<String, u32>, 
             }
             ProtoShape::AllocAead => {
                 let (_, pointee) = btf.alloc_proto_id(site.symbol, "crypto_aead")?;
-                require_proto_root(
-                    "crypto_aead",
-                    aead_entry,
-                    pointee,
-                    &format!("{sym}.return"),
-                )?;
+                require_proto_root("crypto_aead", aead_entry, pointee, &format!("{sym}.return"))?;
             }
             ProtoShape::Destroy => {
                 let (_, pointee) = btf.destroy_proto_id(site.symbol)?;
@@ -1266,12 +1256,8 @@ fn lifecycle_offsets_from_btf(btf: &Btf) -> Result<LifecycleOffsets, BtfError> {
     // bound root (rival-def refusal, like the skcipher link); the
     // AEAD frontend base proves its struct AND root; the three
     // scalars prove exact 4-byte width.
-    let (aead_req_base, aead_areq_id) = btf.member_embedded_target_in(
-        adreq_entry,
-        "aead_request",
-        "base",
-        "crypto_async_request",
-    )?;
+    let (aead_req_base, aead_areq_id) =
+        btf.member_embedded_target_in(adreq_entry, "aead_request", "base", "crypto_async_request")?;
     if aead_areq_id != areq_entry {
         return Err(BtfError::IncompatibleDefinitions {
             type_name: "crypto_async_request".to_owned(),

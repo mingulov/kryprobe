@@ -732,7 +732,9 @@ fn edge_v7(
     req_flags: Option<u32>,
     drv: &[u8],
 ) -> [u8; 112] {
-    edge_v7_aead(edge, site, key, ts_ns, status, invoc, cryptlen, req_flags, None, None, drv)
+    edge_v7_aead(
+        edge, site, key, ts_ns, status, invoc, cryptlen, req_flags, None, None, drv,
+    )
 }
 
 /// Full v7 builder with the AEAD words: `assoclen`/`authsize` ride
@@ -973,7 +975,17 @@ fn v7_aead_submit_carries_aead_scalars() {
     // words (cryptlen 1040 / assoclen 32 / authsize 16 — the A01
     // shape); unknown AEAD chases decode to None, never 0-as-data.
     let raw = decode_record(&edge_v7_aead(
-        1, 6, 0xabc, 100, 0, 0x4000, Some(1040), Some(0), Some(32), Some(16), b"gcm-aesni",
+        1,
+        6,
+        0xabc,
+        100,
+        0,
+        0x4000,
+        Some(1040),
+        Some(0),
+        Some(32),
+        Some(16),
+        b"gcm-aesni",
     ))
     .expect("valid AEAD submit parses");
     assert_eq!(raw.site, 6);
@@ -982,7 +994,17 @@ fn v7_aead_submit_carries_aead_scalars() {
         (Some(1040), Some(0), Some(32), Some(16))
     );
     let raw = decode_record(&edge_v7_aead(
-        1, 5, 0xabc, 100, 0, 0x4000, Some(1024), None, None, None, b"",
+        1,
+        5,
+        0xabc,
+        100,
+        0,
+        0x4000,
+        Some(1024),
+        None,
+        None,
+        None,
+        b"",
     ))
     .expect("unknown-chase AEAD submit parses");
     assert_eq!((raw.assoclen, raw.authsize), (None, None));
@@ -993,14 +1015,34 @@ fn v7_aead_meta_shapes_refuse() {
     // Skcipher byte on an AEAD site is twin drift (both directions
     // of the family/site cross refuse).
     let mut bad = edge_v7_aead(
-        1, 5, 9, 1, 0, 0x4000, Some(1), Some(0), Some(2), Some(16), b"",
+        1,
+        5,
+        9,
+        1,
+        0,
+        0x4000,
+        Some(1),
+        Some(0),
+        Some(2),
+        Some(16),
+        b"",
     );
     bad[52] = 1;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
     // Direction echoes the site's class (decrypt on the
     // AEAD-encrypt site refuses).
     let mut bad = edge_v7_aead(
-        1, 5, 9, 1, 0, 0x4000, Some(1), Some(0), Some(2), Some(16), b"",
+        1,
+        5,
+        9,
+        1,
+        0,
+        0x4000,
+        Some(1),
+        Some(0),
+        Some(2),
+        Some(16),
+        b"",
     );
     bad[53] = 2;
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
@@ -1013,7 +1055,17 @@ fn v7_aead_meta_shapes_refuse() {
     assert_eq!(decode_record(&bad), Err(DecodeDrop::BadMeta));
     // A valid zero stays Some(0) (empty AAD is data, not unknown).
     let raw = decode_record(&edge_v7_aead(
-        1, 6, 9, 1, 0, 0x4000, Some(16), Some(0), Some(0), Some(16), b"",
+        1,
+        6,
+        9,
+        1,
+        0,
+        0x4000,
+        Some(16),
+        Some(0),
+        Some(0),
+        Some(16),
+        b"",
     ))
     .expect("zero-AAD submit parses");
     assert_eq!((raw.assoclen, raw.authsize), (Some(0), Some(16)));
@@ -1026,7 +1078,17 @@ fn v7_aead_join_binds_aead_extension() {
     use kryprobe_core::kcrypto::{LifecycleFamily, OpDirection};
     let mut dec = LifecycleDecoder::new(16);
     let raw = decode_record(&edge_v7_aead(
-        1, 6, 0xabc, 100, 0, 0x4000, Some(1040), Some(0), Some(32), Some(16), b"gcm-aesni",
+        1,
+        6,
+        0xabc,
+        100,
+        0,
+        0x4000,
+        Some(1040),
+        Some(0),
+        Some(32),
+        Some(16),
+        b"gcm-aesni",
     ))
     .expect("valid AEAD submit");
     let out = dec.join_with_tfm(raw, Some(7), Some(1));

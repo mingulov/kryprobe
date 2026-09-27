@@ -451,8 +451,7 @@ fn guest_ledger_matches_scenario_contract() {
                 ("aead-decrypt", 1032, 32, 8, 0),
             ];
             assert_eq!(ledger.requests.len(), want.len(), "six AEAD ops");
-            for (req, (op, len, assoc, authsize, errno)) in
-                ledger.requests.iter().zip(want.iter())
+            for (req, (op, len, assoc, authsize, errno)) in ledger.requests.iter().zip(want.iter())
             {
                 assert_eq!(req.submit_op, *op, "submit op label");
                 assert_eq!(req.len, Some(*len), "submitted input length");

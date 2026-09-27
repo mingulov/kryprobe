@@ -286,10 +286,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
     let site_ok = if is_callback {
         site == LSITE_CB_CRYPTD || site == LSITE_CB_KXC
     } else {
-        site == LSITE_ENC
-            || site == LSITE_DEC
-            || site == LSITE_AEAD_ENC
-            || site == LSITE_AEAD_DEC
+        site == LSITE_ENC || site == LSITE_DEC || site == LSITE_AEAD_ENC || site == LSITE_AEAD_DEC
     };
     if !site_ok {
         return Err(DecodeDrop::BadSite);
@@ -352,8 +349,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<RawEdge, DecodeDrop> {
         }
         (None, None, None, None)
     } else {
-        if mflags
-            & !(LMETA_CRYPTLEN_OK | LMETA_REQFLAGS_OK | LMETA_ASSOCLEN_OK | LMETA_AUTHSIZE_OK)
+        if mflags & !(LMETA_CRYPTLEN_OK | LMETA_REQFLAGS_OK | LMETA_ASSOCLEN_OK | LMETA_AUTHSIZE_OK)
             != 0
         {
             return Err(DecodeDrop::BadMeta);

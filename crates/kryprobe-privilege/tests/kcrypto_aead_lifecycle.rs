@@ -127,7 +127,17 @@ fn cb_kxc(key: u64, ts_ns: u64, status: i32) -> Vec<u8> {
 fn configure_aead(core: &mut SensorCore, frontend: u64) {
     let records = vec![
         tfm_edge(SUBMIT, TFM_ALLOCAEAD, 0, 10, 0, 0, 0, 0x5000, b"gcm(aes)"),
-        tfm_edge(RETURN, TFM_ALLOCAEAD, frontend, 20, 0, 0, 0, 0x5000, b"gcm-aesni"),
+        tfm_edge(
+            RETURN,
+            TFM_ALLOCAEAD,
+            frontend,
+            20,
+            0,
+            0,
+            0,
+            0x5000,
+            b"gcm-aesni",
+        ),
         tfm_edge(SUBMIT, TFM_SETAUTHSIZE, frontend, 30, 0, 16, 0, 0x5002, b""),
         tfm_edge(RETURN, TFM_SETAUTHSIZE, 0, 40, 0, 0, 0, 0x5002, b""),
     ];
@@ -296,17 +306,32 @@ fn failed_authsize_retains_prior_epoch() {
     let key = 0xabc_u64;
     let records = vec![
         aead_op(
-            SUBMIT, AEAD_DEC, key, 100, 0, 0x4000, frontend, Some(1040), Some(0), Some(32),
-            Some(16), b"gcm-aesni",
+            SUBMIT,
+            AEAD_DEC,
+            key,
+            100,
+            0,
+            0x4000,
+            frontend,
+            Some(1040),
+            Some(0),
+            Some(32),
+            Some(16),
+            b"gcm-aesni",
         ),
-        aead_op(RETURN, AEAD_DEC, key, 150, 0, 0x4000, 0, None, None, None, None, b""),
+        aead_op(
+            RETURN, AEAD_DEC, key, 150, 0, 0x4000, 0, None, None, None, None, b"",
+        ),
     ];
     assert_eq!(core.ingest_records(&records), 1);
     let done = core.take_completed();
     assert_eq!(done.len(), 1);
     assert_eq!(done[0].meta.family, LifecycleFamily::Aead);
     assert_eq!(done[0].meta.epoch, Some(1));
-    let aead = done[0].meta.aead.expect("AEAD submit carries the extension");
+    let aead = done[0]
+        .meta
+        .aead
+        .expect("AEAD submit carries the extension");
     assert_eq!((aead.assoclen, aead.authsize), (Some(32), Some(16)));
 }
 
@@ -322,15 +347,30 @@ fn unknown_authsize_has_unknown_payload() {
     let key = 0xabc_u64;
     let records = vec![
         aead_op(
-            SUBMIT, AEAD_DEC, key, 100, 0, 0x4000, frontend, Some(1040), Some(0), Some(32),
-            None, b"gcm-aesni",
+            SUBMIT,
+            AEAD_DEC,
+            key,
+            100,
+            0,
+            0x4000,
+            frontend,
+            Some(1040),
+            Some(0),
+            Some(32),
+            None,
+            b"gcm-aesni",
         ),
-        aead_op(RETURN, AEAD_DEC, key, 150, 0, 0x4000, 0, None, None, None, None, b""),
+        aead_op(
+            RETURN, AEAD_DEC, key, 150, 0, 0x4000, 0, None, None, None, None, b"",
+        ),
     ];
     assert_eq!(core.ingest_records(&records), 1);
     let done = core.take_completed();
     assert_eq!(done.len(), 1);
-    let aead = done[0].meta.aead.expect("AEAD submit carries the extension");
+    let aead = done[0]
+        .meta
+        .aead
+        .expect("AEAD submit carries the extension");
     assert_eq!(aead.assoclen, Some(32));
     assert_eq!(aead.authsize, None);
     let attempt = derive_attempt(
@@ -356,17 +396,39 @@ fn aead_decrypt_1040_flow_qualifies_success_bytes() {
     configure_aead(&mut core, frontend);
     let submit = |key: u64, ts: u64, invoc: u64| {
         aead_op(
-            SUBMIT, AEAD_DEC, key, ts, 0, invoc, frontend, Some(1040), Some(0), Some(32),
-            Some(16), b"gcm-aesni",
+            SUBMIT,
+            AEAD_DEC,
+            key,
+            ts,
+            0,
+            invoc,
+            frontend,
+            Some(1040),
+            Some(0),
+            Some(32),
+            Some(16),
+            b"gcm-aesni",
         )
     };
     let records = vec![
         submit(0xabc, 100, 0x4000),
-        aead_op(RETURN, AEAD_DEC, 0xabc, 150, 0, 0x4000, 0, None, None, None, None, b""),
+        aead_op(
+            RETURN, AEAD_DEC, 0xabc, 150, 0, 0x4000, 0, None, None, None, None, b"",
+        ),
         submit(0xabd, 200, 0x4002),
         aead_op(
-            RETURN, AEAD_DEC, 0xabd, 250, -libc::EBADMSG, 0x4002, 0, None, None, None,
-            None, b"",
+            RETURN,
+            AEAD_DEC,
+            0xabd,
+            250,
+            -libc::EBADMSG,
+            0x4002,
+            0,
+            None,
+            None,
+            None,
+            None,
+            b"",
         ),
     ];
     assert_eq!(core.ingest_records(&records), 2);
@@ -407,12 +469,24 @@ fn aead_async_schedule_matches_sync() {
     let frontend = 0xFFFF_8880_0000_1000_u64;
     configure_aead(&mut core, frontend);
     let submit = aead_op(
-        SUBMIT, AEAD_DEC, 0xabc, 100, 0, 0x4000, frontend, Some(1040), Some(0), Some(32),
-        Some(16), b"gcm-aesni",
+        SUBMIT,
+        AEAD_DEC,
+        0xabc,
+        100,
+        0,
+        0x4000,
+        frontend,
+        Some(1040),
+        Some(0),
+        Some(32),
+        Some(16),
+        b"gcm-aesni",
     );
     let records = vec![
         submit,
-        aead_op(RETURN, AEAD_DEC, 0xabc, 150, -115, 0x4000, 0, None, None, None, None, b""),
+        aead_op(
+            RETURN, AEAD_DEC, 0xabc, 150, -115, 0x4000, 0, None, None, None, None, b"",
+        ),
         cb_kxc(0xabc, 200, 0),
     ];
     assert_eq!(core.ingest_records(&records), 1);
@@ -445,17 +519,32 @@ fn aead_reconfiguration_pins_new_epoch() {
     configure_aead(&mut core, frontend);
     let submit = |key: u64, ts: u64, invoc: u64, authsize: Option<u32>| {
         aead_op(
-            SUBMIT, AEAD_DEC, key, ts, 0, invoc, frontend, Some(1040), Some(0), Some(32),
-            authsize, b"gcm-aesni",
+            SUBMIT,
+            AEAD_DEC,
+            key,
+            ts,
+            0,
+            invoc,
+            frontend,
+            Some(1040),
+            Some(0),
+            Some(32),
+            authsize,
+            b"gcm-aesni",
         )
     };
     let ret = |key: u64, ts: u64, invoc: u64| {
-        aead_op(RETURN, AEAD_DEC, key, ts, 0, invoc, 0, None, None, None, None, b"")
+        aead_op(
+            RETURN, AEAD_DEC, key, ts, 0, invoc, 0, None, None, None, None, b"",
+        )
     };
     // Op under epoch 1 (width 16), then a successful reconfig to
     // authsize 8, then an op under epoch 2 (submit chases the new
     // width 8 off the live frontend).
-    core.ingest_records(&[submit(0xabc, 100, 0x4000, Some(16)), ret(0xabc, 150, 0x4000)]);
+    core.ingest_records(&[
+        submit(0xabc, 100, 0x4000, Some(16)),
+        ret(0xabc, 150, 0x4000),
+    ]);
     core.ingest_records(&[
         tfm_edge(SUBMIT, TFM_SETAUTHSIZE, frontend, 160, 0, 8, 0, 0x5004, b""),
         tfm_edge(RETURN, TFM_SETAUTHSIZE, 0, 170, 0, 0, 0, 0x5004, b""),

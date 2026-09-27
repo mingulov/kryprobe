@@ -431,7 +431,10 @@ fn first_seen_admits_unknown_generation() {
     // metadata captured; allocation/requested name stay unknown).
     let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000u64;
-    assert_eq!(tracker.admit_first_seen(f1, "aes-generic", false, false), Some(1));
+    assert_eq!(
+        tracker.admit_first_seen(f1, "aes-generic", false, false),
+        Some(1)
+    );
     assert_eq!(
         tracker.admit_first_seen(f1, "other", true, false),
         None,
@@ -2562,8 +2565,16 @@ fn host_op_first_seen_carries_selected_driver() {
 fn p3_generation_for_frontend_resolves_live_only() {
     let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000_u64;
-    assert_eq!(tracker.generation_for_frontend(f1, false), None, "unmapped → None");
-    assert_eq!(tracker.generation_for_frontend(0, false), None, "zero → None");
+    assert_eq!(
+        tracker.generation_for_frontend(f1, false),
+        None,
+        "unmapped → None"
+    );
+    assert_eq!(
+        tracker.generation_for_frontend(0, false),
+        None,
+        "zero → None"
+    );
     assert_eq!(
         tracker.generation_for_frontend(u64::MAX, false),
         None,
@@ -2579,7 +2590,11 @@ fn p3_generation_for_frontend_resolves_live_only() {
     // A proved final-free unbinds: the retired id never rebinds.
     tracker.feed(&destroy_entry(4, f1 + 8, 1, 1));
     tracker.feed(&destroy_return(4));
-    assert_eq!(tracker.generation_for_frontend(f1, false), None, "retired → None");
+    assert_eq!(
+        tracker.generation_for_frontend(f1, false),
+        None,
+        "retired → None"
+    );
     assert_eq!(
         tracker.generation_for_frontend(f2, false),
         Some(2),
@@ -2595,10 +2610,18 @@ fn p3_generation_for_frontend_resolves_live_only() {
 fn p3_epoch_for_frontend_pins_success_eras() {
     let mut tracker = TransformTracker::new(16, 8, 8, true);
     let f1 = 0xFFFF_8880_0000_1000_u64;
-    assert_eq!(tracker.epoch_for_frontend(f1, false), None, "unmapped → None");
+    assert_eq!(
+        tracker.epoch_for_frontend(f1, false),
+        None,
+        "unmapped → None"
+    );
     tracker.feed(&alloc_entry(2, b"kxcipher", 0, 0));
     tracker.feed(&alloc_return_ok(2, f1, b"drv"));
-    assert_eq!(tracker.epoch_for_frontend(f1, false), Some(0), "unconfigured era");
+    assert_eq!(
+        tracker.epoch_for_frontend(f1, false),
+        Some(0),
+        "unconfigured era"
+    );
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 4, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 4, -22));
     assert_eq!(
@@ -2608,6 +2631,10 @@ fn p3_epoch_for_frontend_pins_success_eras() {
     );
     tracker.feed(&config_entry(LTFM_SITE_SETKEY_SK, 6, f1, 16));
     tracker.feed(&config_return(LTFM_SITE_SETKEY_SK, 6, 0));
-    assert_eq!(tracker.epoch_for_frontend(f1, false), Some(1), "success bumps");
+    assert_eq!(
+        tracker.epoch_for_frontend(f1, false),
+        Some(1),
+        "success bumps"
+    );
     assert_eq!(tracker.epoch_for_frontend(0, false), None);
 }
