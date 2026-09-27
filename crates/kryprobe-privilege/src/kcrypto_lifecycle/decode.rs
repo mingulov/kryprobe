@@ -859,7 +859,7 @@ impl LifecycleDecoder {
                 // Contract v2: the AEAD extension rides AEAD submits
                 // only (the twin pins `Some` ⟺ AEAD — skcipher
                 // submits carry `None`, never zeroed scalars).
-                aead: (raw.family == LifecycleFamily::Aead).then(|| AeadMeta {
+                aead: (raw.family == LifecycleFamily::Aead).then_some(AeadMeta {
                     assoclen: raw.assoclen,
                     authsize: raw.authsize,
                 }),
