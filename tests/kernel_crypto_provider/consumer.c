@@ -211,6 +211,22 @@ static void kxc_complete(void *data, int err)
 		spin_unlock_bh(&op->mark_lock);
 		return;
 	}
+	/*
+	 * P4r2 terminal routing: after a resubmit, the next terminal
+	 * closes the NESTED submit (its own seq — the parser rejects
+	 * a duplicate outer seq), consumed exactly once. Ordered:
+	 * the outer terminal runs before the resubmit arms the
+	 * route, the inner terminal after (worker, post-kick).
+	 */
+	if (!op->resubmit_armed && op->resubmit_seq != 0) {
+		op->err = err;
+		spin_lock_bh(&op->mark_lock);
+		kxc_emit_terminal(op->run, op->resubmit_seq, err);
+		spin_unlock_bh(&op->mark_lock);
+		op->resubmit_seq = 0;
+		complete(&op->done);
+		return;
+	}
 	op->err = err;
 	spin_lock_bh(&op->mark_lock);
 	kxc_emit_terminal(op->run, op->seq, err);
@@ -732,7 +748,7 @@ static int kxc_scenario_early_callback(struct kxc_run *run)
 static int kxc_scenario_reuse_in_callback(struct kxc_run *run)
 {
 	struct kxc_op op;
-	u64 aseq, seq;
+	u64 aseq, seq, inner_seq;
 	int err, first_err = 0;
 
 	err = kxc_op_prepare(run, &op, kxc_async_driver_name(), &aseq);
@@ -763,11 +779,16 @@ static int kxc_scenario_reuse_in_callback(struct kxc_run *run)
 		first_err = -EPROTO;
 	if (!op.resubmit_async && !first_err)
 		first_err = -EPROTO;
+	/*
+	 * Capture the nested seq before waiting: the inner terminal
+	 * consumes op->resubmit_seq when it lands.
+	 */
+	inner_seq = op.resubmit_seq;
 	err = kxc_wait_done(run, &op);
 	if (err && !first_err)
 		first_err = err;
 	if (op.resubmit_async) {
-		err = kxc_wait_done_as(run, &op, op.resubmit_seq);
+		err = kxc_wait_done_as(run, &op, inner_seq);
 		if (err && !first_err)
 			first_err = err;
 	}
