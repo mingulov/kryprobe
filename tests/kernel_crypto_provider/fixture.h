@@ -56,6 +56,11 @@
 /* driver.cra_name shared by both fixture drivers. */
 #define KXC_GENERIC_NAME "kxcipher"
 
+/* Widest tag any scenario selects (16): the consumer sizes AEAD
+ * dst spans with this headroom (an encrypt writes cryptlen +
+ * tag), and the provider rejects anything wider. */
+#define KXC_AEAD_MAXAUTHSIZE 16
+
 /* Ledger ring capacity. */
 #define KXC_ROW_LEN 512
 #define KXC_ROWS_MAX 4096

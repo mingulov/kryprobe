@@ -616,7 +616,15 @@ static int kxc_aead_req_setup(struct kxc_run *run, struct crypto_aead *tfm,
 	kxc_aead_fill_pt(src + KXC_AEAD_AAD);
 	memset(dst, 0, PAGE_SIZE);
 	sg_init_one(&op->sg_src, src, KXC_AEAD_AAD + datalen);
-	sg_init_one(&op->sg_dst, dst, KXC_AEAD_AAD + datalen);
+	/*
+	 * Dst carries tag headroom: an encrypt writes cryptlen +
+	 * tag, and real drivers (scatterwalk) honor sg spans — a
+	 * dst span sized like the src walks off the end (GPF). The
+	 * fixture driver ignores spans, which is why only the
+	 * live leg tripped this.
+	 */
+	sg_init_one(&op->sg_dst, dst,
+		    KXC_AEAD_AAD + datalen + KXC_AEAD_MAXAUTHSIZE);
 	aead_request_set_callback(op->req, cb_flags, kxc_complete, op);
 	memcpy(op->iv, kxc_iv, KXC_IVLEN);
 	memcpy(op->cb_priv, kxc_canary_cb, sizeof(op->cb_priv));

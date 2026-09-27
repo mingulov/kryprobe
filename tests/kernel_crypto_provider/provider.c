@@ -477,7 +477,6 @@ static struct skcipher_alg kxc_fail_alg = {
 /* ------------------------------------------------------------------ */
 
 #define KXC_AEAD_GENERIC_NAME "kxaead"
-#define KXC_AEAD_MAXAUTHSIZE 16
 
 struct kxc_aead_ctx {
 	u8 key[32];
