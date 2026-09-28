@@ -194,7 +194,8 @@ def stage_run_dir(args, portion: dict, manifest_sha: str, vng: str) -> tuple[Pat
         shutil.copyfile(SCENARIOS / helper, run_dir / helper)
         pins[helper] = sha256_file(run_dir / helper)
     oracle_src = HERE / "kcrypto_campaign" / "oracles.py"
-    pins["oracles.py"] = sha256_file(oracle_src)
+    shutil.copyfile(oracle_src, run_dir / "oracles.py")
+    pins["oracles.py"] = sha256_file(run_dir / "oracles.py")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE.parent,
                           capture_output=True, text=True, check=True).stdout.strip()
     (run_dir / "head-sha.txt").write_text(head + "\n")
@@ -205,8 +206,8 @@ def stage_run_dir(args, portion: dict, manifest_sha: str, vng: str) -> tuple[Pat
     (run_dir / "stage.json").write_text(json.dumps(stage, indent=2) + "\n")
     (run_dir / "pins.env").write_text(
         f"ORACLE_SHA={pins['oracles.py']}\nCLI_SHA={pins['kryprobe']}\n"
-        f"BPF_AGG_SHA={pins['kcrypto-bpf/kcrypto.bpf.o']}\n"
-        f"BPF_LC_SHA={pins['kcrypto-bpf/kcrypto-lifecycle.bpf.o']}\n"
+        f"BPF_AGG_SHA={pins['kryprobe-bpf/kcrypto.bpf.o']}\n"
+        f"BPF_LC_SHA={pins['kryprobe-bpf/kcrypto-lifecycle.bpf.o']}\n"
         f"MODULE_SHA={pins['kcrypto_fixture.ko']}\n"
         f"FIXTURE_SHA={pins['kcrypto_gen.py']}\n"
         f"PORTION={args.portion}\n")
@@ -469,11 +470,51 @@ def load_report(cell_dir: Path, name: str) -> dict:
 
 
 def transport_closed(*parsed_reports: dict) -> bool:
-    return all(
-        value == "0"
-        for parsed in parsed_reports
-        for value in parsed["loss"].values()
-    )
+    """Zero-loss gate over the parsed loss counters (fail-closed).
+
+    Every counter in KNOWN_ZERO must read exactly "0". Counters in
+    KNOWN_RECORDED (declared-boundary markers and the by-design
+    C7 destroy skip) are recorded, never gated. Any UNKNOWN
+    nonzero counter fails: new loss taxonomy must be classified
+    deliberately, never absorbed.
+    """
+    for parsed in parsed_reports:
+        for name, value in parsed["loss"].items():
+            if name in KNOWN_RECORDED:
+                continue
+            if name in KNOWN_ZERO:
+                if value != "0":
+                    return False
+            elif value != "0":
+                return False
+    return True
+
+
+KNOWN_ZERO = frozenset({
+    "ktot_gap",
+    "ring_drops",
+    "overflow_identities",
+    "ring_reservation_failures",
+    "user_queue_drops",
+    "state_insert_failures",
+    "budget_omissions",
+    "predrop_cfg_fail",
+    "predrop_fret_fail",
+    "predrop_arg_null",
+    "predrop_chase_fail",
+    "predrop_name_fail",
+    "predrop_spare_6",
+    "predrop_spare_7",
+})
+
+KNOWN_RECORDED = frozenset({
+    # Declared api-returns boundary (docs/kcrypto-evidence.md):
+    # kernel delivery is unmeasured by design.
+    "uncovered:kernel_delivery_unmeasured",
+    # C7 by design (docs/kcrypto-support.md): destroy counted as
+    # skip only (no exit-edge read).
+    "predrop_destroy_skip",
+})
 
 
 def parse_fixture_stdout(text: str, op: str, count: int) -> bool:
