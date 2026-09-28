@@ -114,7 +114,9 @@ finish_capture product-read
 
 # Wrong-key leg on the same owned mapping (expect checksum mismatch).
 dmsetup remove "$MAP" 2>> "$OUT/loop.log" || FAIL=1
+shred -u "$OUT/map.key" 2>/dev/null || rm -f "$OUT/map.key"
 head -c 64 /dev/urandom > "$OUT/map.key"
+chmod 600 "$OUT/map.key"
 KEY2=$(od -A n -t x1 "$OUT/map.key" | tr -d ' \n')
 echo "0 $SECTORS crypt aes-xts-plain64 $KEY2 0 $LOOP 0" | dmsetup create "$MAP" \
   2>> "$OUT/loop.log" || FAIL=1

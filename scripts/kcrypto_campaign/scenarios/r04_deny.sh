@@ -58,10 +58,15 @@ cp "$OUT/kryprobe-bpf/kcrypto.bpf.o" "$OUT/unpriv/kryprobe-bpf/kcrypto.bpf.o"
 cp "$OUT/kryprobe-bpf/kcrypto-lifecycle.bpf.o" "$OUT/unpriv/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
 chmod -R a+rX "$OUT/unpriv"
 echo "unpriv_sha=$(sha256sum "$OUT/unpriv/kryprobe" | cut -d' ' -f1)" > "$OUT/unpriv-sha.txt"
+# --out points at world-writable /tmp: the staged dir is root-only
+# and an --out precheck failure (exit 1) would mask the capability
+# refusal (exit 4) under test.
 KRYPROBE_BPF_DIR="$OUT/unpriv/kryprobe-bpf" setpriv --reuid=65534 --regid=65534 --clear-groups \
   "$OUT/unpriv/kryprobe" report --system --duration 5 --format json \
-  --out "$OUT/refusal.json" 2> "$OUT/refusal-stderr.log"
+  --out /tmp/t13-refusal.json 2> "$OUT/refusal-stderr.log"
 echo "refusal_rc=$?" > "$OUT/refusal-rc.txt"
+cp /tmp/t13-refusal.json "$OUT/refusal.json" 2>/dev/null || echo "no refusal.json (bring-up refused)" > "$OUT/refusal.json"
+rm -f /tmp/t13-refusal.json
 
 # Control leg: privileged capture + ftrace window + fixture traffic.
 "$KP" report --system --format json --duration 60 --out "$OUT/control.json" \
