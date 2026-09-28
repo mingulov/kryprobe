@@ -254,7 +254,13 @@ fn libc_calls(code: &str) -> Vec<&str> {
             }
             i = j;
         } else {
-            i += 1;
+            // T11: advance one CHAR, not one byte — a multibyte char
+            // in scanned code (e.g. on a multi-line-string
+            // continuation line, which the scrubber reads as code)
+            // panicked the old byte-walking slice mid-char. `i` is
+            // always a boundary here (start 0, `j`/`k` consume ASCII
+            // only), so this indexing cannot panic.
+            i += code[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
         }
     }
     out
@@ -508,5 +514,25 @@ mod tests {
         assert!(
             violations_in_source("crates/kryprobe-privilege/src/drain/worker.rs", text).is_empty()
         );
+    }
+
+    #[test]
+    fn scan_survives_multibyte_chars() {
+        // T11: the scrubber ends strings at raw newlines, so a
+        // multi-line const's third+ lines read as code — a multibyte
+        // char there reaches the call scan, and the old byte-walking
+        // `libc_calls` sliced mid-char and panicked. The scan must
+        // survive AND still find a real call after the multibyte char.
+        let text = "const H: &str = \"\\\nline two\nusage \u{2014} here\n\";\n";
+        assert!(
+            violations_in_source("crates/kryprobe-core/src/x.rs", text).is_empty(),
+            "multibyte chars must not panic the scan"
+        );
+        let text =
+            "const H: &str = \"\\\nline two\nusage \u{2014} here\n\";\nunsafe { libc::fork() };\n";
+        let found = violations_in_source("crates/kryprobe-core/src/x.rs", text);
+        assert_eq!(found.len(), 1, "the real call is still found");
+        assert_eq!(found[0].rule, 'B');
+        assert_eq!(found[0].line, 5);
     }
 }
