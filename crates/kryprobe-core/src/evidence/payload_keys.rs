@@ -137,6 +137,16 @@ pub const DURATION_NS: &str = "duration_ns";
 pub const EVIDENCE: &str = "evidence";
 /// Opaque transform id (number; null until transform attribution).
 pub const TFM_ID: &str = "tfm_id";
+/// API input length chased at entry (`skcipher_request`/`aead_request`
+/// `.cryptlen`; number; null when the chase was unreadable — unknown,
+/// never 0-as-data).
+pub const CRYPTLEN: &str = "cryptlen";
+/// AEAD associated-data length chased at entry (number; null on
+/// skcipher rows — populations stay labeled — and when unreadable).
+pub const ASSOCLEN: &str = "assoclen";
+/// AEAD tag width chased at entry off the submit's frontend (number;
+/// null on skcipher rows and when unreadable).
+pub const AUTHSIZE: &str = "authsize";
 
 /// Agg rows: always emitted.
 pub const AGG_KEYS: &[&str] = &[
@@ -214,7 +224,8 @@ pub const WHO_OPTIONAL_KEYS: &[&str] = &[
     FIRST_ERRNO,
 ];
 
-/// Lifecycle rows: always emitted, nothing optional (T06).
+/// Lifecycle rows: always emitted, nothing optional (T06; P6r2/N9
+/// adds the family + qualified length words — null when unknown).
 pub const LIFECYCLE_KEYS: &[&str] = &[
     ROW,
     CAPTURE_PROFILE,
@@ -226,6 +237,10 @@ pub const LIFECYCLE_KEYS: &[&str] = &[
     EVIDENCE,
     COUNT_UNIT,
     COMPLETION_COVERAGE,
+    FAMILY,
+    CRYPTLEN,
+    ASSOCLEN,
+    AUTHSIZE,
 ];
 
 /// `counts` block keys.
@@ -298,4 +313,7 @@ pub const VOCAB: &[&str] = &[
     DURATION_NS,
     EVIDENCE,
     TFM_ID,
+    CRYPTLEN,
+    ASSOCLEN,
+    AUTHSIZE,
 ];

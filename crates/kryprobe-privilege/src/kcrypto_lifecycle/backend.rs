@@ -35,7 +35,7 @@ use kryprobe_core::error::{
 use kryprobe_core::evidence::payload_keys as K;
 use kryprobe_core::evidence::{IntegrityRef, IntegritySummary, NativeObservation, NativeResult};
 use kryprobe_core::ids::{ObservationId, PlanGeneration};
-use kryprobe_core::kcrypto::{RequestRecord, Terminal};
+use kryprobe_core::kcrypto::{LifecycleFamily, RequestRecord, Terminal};
 use kryprobe_core::plan::{CapabilityRequirements, OffsetProbe};
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -349,12 +349,18 @@ pub fn register_lifecycle_shared(
 
 /// Strict decode envelope: one completed request lifecycle as JSON
 /// (manual `Value` walk — privilege takes no serde derive; the key
-/// set is closed: unknown fields refuse, never skimmed).
+/// set is closed: unknown fields refuse, never skimmed). The four
+/// size words (P6-N9) are OPTIONAL — pre-N9 5-key envelopes still
+/// decode, with sizes unknown.
 struct LifecycleEnvelope {
     request_id: u64,
     terminal: ValidTerminal,
     duration_ns: Option<String>,
     tfm_id: Option<u64>,
+    family: Option<String>,
+    cryptlen: Option<u32>,
+    assoclen: Option<u32>,
+    authsize: Option<u32>,
 }
 
 /// Validated terminal kind plus the exact status.
@@ -378,7 +384,8 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
         .ok_or_else(|| input("envelope is not an object".to_owned()))?;
     for key in obj.keys() {
         match key.as_str() {
-            "request_id" | "terminal" | "status" | "duration_ns" | "tfm_id" => {}
+            "request_id" | "terminal" | "status" | "duration_ns" | "tfm_id" | "family"
+            | "cryptlen" | "assoclen" | "authsize" => {}
             // Input-free (T05 `UnknownKey` precedent): the name is
             // untrusted input and could smuggle key material.
             _ => return Err(input("unknown envelope key present".to_owned())),
@@ -445,11 +452,39 @@ fn parse_lifecycle_envelope(payload: &[u8]) -> Result<LifecycleEnvelope, Backend
             "terminal 'unknown' must not carry a duration".to_owned(),
         ));
     }
+    // P6-N9 size words: optional (absent on pre-N9 envelopes),
+    // validated when present (closed family word, u32|null lengths).
+    let family = match obj.get("family") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(family)) if family == "skcipher" || family == "aead" => {
+            Some(family.clone())
+        }
+        _ => return Err(input("family is not skcipher|aead|null".to_owned())),
+    };
+    let mut lengths = [None, None, None];
+    for (slot, key) in lengths.iter_mut().zip(["cryptlen", "assoclen", "authsize"]) {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(value) => {
+                *slot = Some(
+                    value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| input(format!("{key} is not a u32|null")))?,
+                );
+            }
+        }
+    }
+    let [cryptlen, assoclen, authsize] = lengths;
     Ok(LifecycleEnvelope {
         request_id,
         terminal,
         duration_ns,
         tfm_id,
+        family,
+        cryptlen,
+        assoclen,
+        authsize,
     })
 }
 
@@ -499,6 +534,10 @@ fn observation_for_lifecycle(env: &LifecycleEnvelope, id: ObservationId) -> Nati
         K::EVIDENCE: !matches!(terminal, ValidTerminal::Unknown),
         K::COUNT_UNIT: K::COUNT_REQUEST_LIFECYCLE,
         K::COMPLETION_COVERAGE: coverage,
+        K::FAMILY: env.family,
+        K::CRYPTLEN: env.cryptlen,
+        K::ASSOCLEN: env.assoclen,
+        K::AUTHSIZE: env.authsize,
     });
     NativeObservation {
         id,
@@ -536,12 +575,28 @@ pub fn lifecycle_event(record: &RequestRecord) -> (RawEventHeader, Vec<u8>) {
         Terminal::Callback(status) => ("callback", Some(status)),
         Terminal::Unknown => ("unknown", None),
     };
+    // P6-N9: the qualified submit-side lengths ride the (userspace-
+    // synthesized, unfrozen) envelope — each word separately, null
+    // when unknown. AEAD words ride AEAD records only (skcipher
+    // records carry null — populations stay labeled, P5 twin rule).
+    let family = match record.meta.family {
+        LifecycleFamily::Skcipher => "skcipher",
+        LifecycleFamily::Aead => "aead",
+    };
+    let (assoclen, authsize) = match record.meta.aead {
+        Some(aead) => (aead.assoclen, aead.authsize),
+        None => (None, None),
+    };
     let payload = serde_json::json!({
         "request_id": record.id,
         "terminal": terminal,
         "status": status,
         "duration_ns": record.duration_ns.map(|ns| ns.to_string()),
         "tfm_id": record.tfm_id,
+        "family": family,
+        "cryptlen": record.meta.cryptlen,
+        "assoclen": assoclen,
+        "authsize": authsize,
     });
     let payload = serde_json::to_vec(&payload).unwrap_or_default();
     let header = RawEventHeader {

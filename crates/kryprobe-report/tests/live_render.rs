@@ -148,6 +148,142 @@ fn lifecycle_obs(
     }
 }
 
+/// Sized lifecycle row (P6-N9): the backend's 14-key envelope plus
+/// explicit size words (`serde_json::Value` — numbers or null).
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_obs_sized(
+    id: u64,
+    terminal: &str,
+    status: serde_json::Value,
+    duration_ns: serde_json::Value,
+    family: &str,
+    cryptlen: serde_json::Value,
+    assoclen: serde_json::Value,
+    authsize: serde_json::Value,
+) -> NativeObservation {
+    let mut obs = lifecycle_obs(id, terminal, status, duration_ns);
+    let payload = obs.backend_payload.as_object_mut().expect("object");
+    payload.insert("family".to_owned(), serde_json::json!(family));
+    payload.insert("cryptlen".to_owned(), cryptlen);
+    payload.insert("assoclen".to_owned(), assoclen);
+    payload.insert("authsize".to_owned(), authsize);
+    obs
+}
+
+#[test]
+fn size_histogram_folds_qualified_cryptlen() {
+    // P6-N9 RED: the size histogram folds qualified per-request
+    // cryptlen bytes (named population/units/bounds/counts):
+    // skcipher rows fold their cryptlen; AEAD rows fold theirs only
+    // with a known authsize; everything else counts unknown.
+    let obs = [
+        lifecycle_obs_sized(
+            1,
+            "sync",
+            serde_json::json!(0),
+            serde_json::json!("50"),
+            "skcipher",
+            serde_json::json!(16),
+            serde_json::json!(null),
+            serde_json::json!(null),
+        ),
+        lifecycle_obs_sized(
+            2,
+            "sync",
+            serde_json::json!(0),
+            serde_json::json!("60"),
+            "skcipher",
+            serde_json::json!(5000),
+            serde_json::json!(null),
+            serde_json::json!(null),
+        ),
+        lifecycle_obs_sized(
+            3,
+            "callback",
+            serde_json::json!(0),
+            serde_json::json!("70"),
+            "aead",
+            serde_json::json!(1040),
+            serde_json::json!(32),
+            serde_json::json!(16),
+        ),
+        // AEAD without authsize: cryptlen uninterpretable as payload.
+        lifecycle_obs_sized(
+            4,
+            "sync",
+            serde_json::json!(0),
+            serde_json::json!("80"),
+            "aead",
+            serde_json::json!(2000),
+            serde_json::json!(8),
+            serde_json::json!(null),
+        ),
+        // Unknown cryptlen stays unknown (never 0-as-data).
+        lifecycle_obs_sized(
+            5,
+            "sync",
+            serde_json::json!(0),
+            serde_json::json!("90"),
+            "skcipher",
+            serde_json::json!(null),
+            serde_json::json!(null),
+            serde_json::json!(null),
+        ),
+        lifecycle_obs_sized(
+            6,
+            "unknown",
+            serde_json::json!(null),
+            serde_json::json!(null),
+            "skcipher",
+            serde_json::json!(null),
+            serde_json::json!(null),
+            serde_json::json!(null),
+        ),
+    ];
+    let text = render_lifecycle_histograms(&obs);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "latency + sizes lines:\n{text}");
+    let sizes = lines[1];
+    assert!(
+        sizes.starts_with("HISTOGRAM population=request_cryptlen_bytes unit=bytes "),
+        "named population + units: {sizes}"
+    );
+    assert!(sizes.contains("samples=3"), "exact samples: {sizes}");
+    assert!(sizes.contains("unknown=3"), "exact unknown: {sizes}");
+    assert!(
+        sizes.contains("bounds=[64, 512, 4096, 65536, 1048576]"),
+        "explicit bounds: {sizes}"
+    );
+    assert!(
+        sizes.contains("counts=[1, 0, 1, 1, 0, 0]"),
+        "16/1040/5000 land in buckets 0/2/3: {sizes}"
+    );
+    assert!(
+        !sizes.contains("mode=sampled"),
+        "no announcement under the cap: {sizes}"
+    );
+}
+
+#[test]
+fn authsize_less_aead_contributes_no_payload_bytes() {
+    // P6-N9 constraint pin: an AEAD row with known cryptlen but
+    // unknown authsize contributes NOTHING (no ambiguous totals).
+    let obs = [lifecycle_obs_sized(
+        1,
+        "sync",
+        serde_json::json!(0),
+        serde_json::json!("50"),
+        "aead",
+        serde_json::json!(100),
+        serde_json::json!(16),
+        serde_json::json!(null),
+    )];
+    let text = render_lifecycle_histograms(&obs);
+    let sizes = text.lines().nth(1).expect("sizes line");
+    assert!(sizes.contains("samples=0"), "no payload bytes: {sizes}");
+    assert!(sizes.contains("unknown=1"), "counted unknown: {sizes}");
+}
+
 #[test]
 fn lifecycle_projection_emits_valid_v1() {
     // Grounded + unknown rows project to exactly the six schema keys
@@ -312,9 +448,12 @@ fn histograms_fold_every_row_with_named_populations() {
         "no announcement under the cap: {}",
         lines[0]
     );
+    // P6-N9: the sizes line is a real histogram now — these rows
+    // carry no size words, so all three count unknown (never folded,
+    // never zero-filled).
     assert_eq!(
         lines[1],
-        "HISTOGRAM population=submit_bytes unit=bytes status=unavailable (no per-request sizes in lifecycle rows)"
+        "HISTOGRAM population=request_cryptlen_bytes unit=bytes samples=0 unknown=3 bounds=[64, 512, 4096, 65536, 1048576] counts=[0, 0, 0, 0, 0, 0]"
     );
     // Empty renders nothing (agg sessions keep exact bytes).
     assert_eq!(render_lifecycle_histograms(&[]), "");

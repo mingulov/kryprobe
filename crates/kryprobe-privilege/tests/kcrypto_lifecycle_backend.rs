@@ -429,3 +429,98 @@ fn register_lifecycle_shared_for_test() -> (
     let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
     (backend, shared)
 }
+
+fn n9_record(meta: kryprobe_core::kcrypto::RequestMeta) -> kryprobe_core::kcrypto::RequestRecord {
+    kryprobe_core::kcrypto::RequestRecord {
+        id: 1,
+        tfm_id: None,
+        terminal: kryprobe_core::kcrypto::Terminal::Sync(0),
+        duration_ns: Some(50u64),
+        meta,
+    }
+}
+
+fn n9_decode(payload: &[u8]) -> serde_json::Value {
+    let (backend, _shared) = register_lifecycle_shared_for_test();
+    let integrity = IntegritySummary::default();
+    let issuer = issuer();
+    let ctx = decode_ctx(&integrity, &issuer);
+    let header = header_for(payload.len());
+    backend
+        .decode(&ctx, RawEvent { header, payload })
+        .expect("decode")
+        .backend_payload
+}
+
+#[test]
+fn n9_skcipher_lengths_project_to_row() {
+    // P6-N9 RED: a skcipher record's cryptlen projects onto the row;
+    // AEAD words stay null (populations stay labeled).
+    let (_, payload) = lifecycle_event(&n9_record(kryprobe_core::kcrypto::RequestMeta {
+        family: kryprobe_core::kcrypto::LifecycleFamily::Skcipher,
+        direction: kryprobe_core::kcrypto::OpDirection::Encrypt,
+        cryptlen: Some(16),
+        req_flags: Some(0),
+        epoch: Some(0),
+        aead: None,
+    }));
+    let p = n9_decode(&payload);
+    assert_eq!(p[K::FAMILY], serde_json::json!("skcipher"));
+    assert_eq!(p[K::CRYPTLEN], serde_json::json!(16));
+    assert_eq!(p[K::ASSOCLEN], serde_json::json!(null));
+    assert_eq!(p[K::AUTHSIZE], serde_json::json!(null));
+}
+
+#[test]
+fn n9_aead_lengths_project_to_row() {
+    // P6-N9 RED: an AEAD record's cryptlen + assoclen + authsize all
+    // project (no ambiguous totals — each word rides separately).
+    let (_, payload) = lifecycle_event(&n9_record(kryprobe_core::kcrypto::RequestMeta {
+        family: kryprobe_core::kcrypto::LifecycleFamily::Aead,
+        direction: kryprobe_core::kcrypto::OpDirection::Decrypt,
+        cryptlen: Some(1040),
+        req_flags: Some(0),
+        epoch: Some(2),
+        aead: Some(kryprobe_core::kcrypto::AeadMeta {
+            assoclen: Some(32),
+            authsize: Some(16),
+        }),
+    }));
+    let p = n9_decode(&payload);
+    assert_eq!(p[K::FAMILY], serde_json::json!("aead"));
+    assert_eq!(p[K::CRYPTLEN], serde_json::json!(1040));
+    assert_eq!(p[K::ASSOCLEN], serde_json::json!(32));
+    assert_eq!(p[K::AUTHSIZE], serde_json::json!(16));
+}
+
+#[test]
+fn n9_unknown_lengths_stay_null() {
+    // Unknown stays unknown: unreadable chases ride null, never 0.
+    let (_, payload) = lifecycle_event(&n9_record(kryprobe_core::kcrypto::RequestMeta {
+        family: kryprobe_core::kcrypto::LifecycleFamily::Skcipher,
+        direction: kryprobe_core::kcrypto::OpDirection::Encrypt,
+        cryptlen: None,
+        req_flags: None,
+        epoch: None,
+        aead: None,
+    }));
+    let p = n9_decode(&payload);
+    assert_eq!(p[K::FAMILY], serde_json::json!("skcipher"));
+    assert_eq!(p[K::CRYPTLEN], serde_json::json!(null));
+    assert_eq!(p[K::ASSOCLEN], serde_json::json!(null));
+    assert_eq!(p[K::AUTHSIZE], serde_json::json!(null));
+}
+
+#[test]
+fn n9_legacy_envelope_decodes_sizes_unknown() {
+    // Backward compat: the pre-N9 5-key envelope still decodes —
+    // sizes read unknown (null), never refused, never zero-filled.
+    let payload =
+        br#"{"request_id":9,"terminal":"sync","status":0,"duration_ns":"50","tfm_id":null}"#
+            .to_vec();
+    let p = n9_decode(&payload);
+    assert_eq!(p[K::TERMINAL], serde_json::json!("sync"));
+    assert_eq!(p[K::CRYPTLEN], serde_json::json!(null));
+    assert_eq!(p[K::ASSOCLEN], serde_json::json!(null));
+    assert_eq!(p[K::AUTHSIZE], serde_json::json!(null));
+}

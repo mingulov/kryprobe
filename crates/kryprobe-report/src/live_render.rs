@@ -43,6 +43,10 @@ pub const WATCH_READ_KEYS: &[&str] = &[
     K::TERMINAL,
     K::STATUS,
     K::DURATION_NS,
+    K::FAMILY,
+    K::CRYPTLEN,
+    K::ASSOCLEN,
+    K::AUTHSIZE,
 ];
 
 /// Exact table header (brief-exact column set).
@@ -404,25 +408,58 @@ pub fn render_lifecycle_block(obs: &[NativeObservation]) -> String {
 /// 100ns..10ms, overflow beyond — fixed, documented, never data-fit).
 const LATENCY_BOUNDS_NS: &[u64] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 
+/// Per-request cryptlen bucket bounds in bytes (display buckets:
+/// sub-cache-line, sub-page steps, page, huge-page, overflow beyond —
+/// fixed, documented, never data-fit).
+const CRYPTLEN_BOUNDS_BYTES: &[u64] = &[64, 512, 4096, 65536, 1_048_576];
+
+/// One row's qualified payload length (P6-N9): a skcipher row folds
+/// its cryptlen when known; an AEAD row folds its cryptlen only with
+/// a KNOWN authsize (without the tag width the cryptlen cannot be
+/// interpreted as payload bytes — tag inclusion unknown — so an
+/// authsize-less AEAD row contributes nothing); anything else is
+/// unknown (counted, never zero). `assoclen` never joins this
+/// population (associated data is a separate population — no
+/// ambiguous byte totals, P5 AEAD semantics).
+fn qualified_cryptlen(payload: &serde_json::Value) -> Option<u64> {
+    let cryptlen = payload.get(K::CRYPTLEN)?.as_u64()?;
+    match payload.get(K::FAMILY).and_then(serde_json::Value::as_str) {
+        Some("skcipher") => Some(cryptlen),
+        Some("aead")
+            if payload
+                .get(K::AUTHSIZE)
+                .and_then(serde_json::Value::as_u64)
+                .is_some() =>
+        {
+            Some(cryptlen)
+        }
+        _ => None,
+    }
+}
+
 /// Renders the lifecycle histogram block: the exact terminal-latency
 /// distribution over EVERY lifecycle row (the aggregate folds all
 /// rows, never just the [`LIFECYCLE_MAX_ROWS`] rendered details) plus
-/// the explicit sizes-unavailability line (frozen lifecycle rows
-/// carry no per-request sizes — unknown, never fabricated or
-/// averaged into a fake distribution).
+/// the exact per-request-cryptlen distribution over the qualified
+/// rows (P6-N9: skcipher cryptlen when known, AEAD cryptlen only with
+/// known authsize — unqualified rows count `unknown`, never fold).
 ///
 /// Format: `HISTOGRAM population=<name> unit=<unit> samples=<n>
 /// bounds=[...] counts=[...]`, with `unparsed=<m>` when duration
-/// strings fail to parse and `mode=sampled` when the detail rows
-/// collapsed under the cap (the mode change is announced, never
-/// silent). Empty (no lifecycle rows) renders nothing, so agg
-/// sessions keep their exact existing bytes.
+/// strings fail to parse, `unknown=<m>` when sizes stay unknown, and
+/// `mode=sampled` when the detail rows collapsed under the cap (the
+/// mode change is announced, never silent). Empty (no lifecycle
+/// rows) renders nothing, so agg sessions keep their exact existing
+/// bytes.
 #[must_use]
 pub fn render_lifecycle_histograms(obs: &[NativeObservation]) -> String {
     let mut any = false;
     let mut samples = 0u64;
     let mut unparsed = 0u64;
     let mut counts = vec![0u64; LATENCY_BOUNDS_NS.len() + 1];
+    let mut size_samples = 0u64;
+    let mut size_unknown = 0u64;
+    let mut size_counts = vec![0u64; CRYPTLEN_BOUNDS_BYTES.len() + 1];
     for ob in obs {
         let payload = &ob.backend_payload;
         if payload.get(K::ROW).and_then(serde_json::Value::as_str) != Some("lifecycle") {
@@ -453,6 +490,21 @@ pub fn render_lifecycle_histograms(obs: &[NativeObservation]) -> String {
                 }
             }
         }
+        match qualified_cryptlen(payload) {
+            Some(value) => {
+                let bucket = CRYPTLEN_BOUNDS_BYTES
+                    .iter()
+                    .position(|bound| value <= *bound)
+                    .unwrap_or(CRYPTLEN_BOUNDS_BYTES.len());
+                if let Some(count) = size_counts.get_mut(bucket) {
+                    *count = count.saturating_add(1);
+                }
+                size_samples = size_samples.saturating_add(1);
+            }
+            None => {
+                size_unknown = size_unknown.saturating_add(1);
+            }
+        }
     }
     if !any {
         return String::new();
@@ -473,9 +525,14 @@ pub fn render_lifecycle_histograms(obs: &[NativeObservation]) -> String {
         text.push_str(" mode=sampled");
     }
     text.push('\n');
-    text.push_str(
-        "HISTOGRAM population=submit_bytes unit=bytes status=unavailable (no per-request sizes in lifecycle rows)\n",
+    let mut sizes = format!(
+        "HISTOGRAM population=request_cryptlen_bytes unit=bytes samples={size_samples} unknown={size_unknown} bounds={CRYPTLEN_BOUNDS_BYTES:?} counts={size_counts:?}"
     );
+    if rows > LIFECYCLE_MAX_ROWS {
+        sizes.push_str(" mode=sampled");
+    }
+    sizes.push('\n');
+    text.push_str(&sizes);
     text
 }
 
