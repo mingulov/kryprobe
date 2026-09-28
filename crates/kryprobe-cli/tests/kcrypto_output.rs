@@ -359,6 +359,84 @@ fn output_spurious_interrupted_retries() {
     assert!(stderr.is_empty(), "no stderr on success");
 }
 
+/// P7-N1 — production wiring pin: the REAL fd writer (the same
+/// `InterruptibleWriter` `main` installs on stdout) under the REAL
+/// emit seam, pushing 1 MiB into a stalled pipe (the sink sips
+/// 4 KiB, then holds the pipe open unread): a fresh witness arrival
+/// aborts within the stop budget with the torn-stream status — never
+/// the pre-fix hang. (Real-signal delivery into this writer is proved
+/// in the privilege suite; here the witness is stored directly for
+/// determinism under the suite guard, re-raised until the abort
+/// lands so a late emitter start cannot miss it.)
+#[test]
+fn output_production_writer_aborts_stalled_pipe() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let _sigint = reset_sigint();
+    let (mut reader, writer) = std::io::pipe().expect("pipe creates");
+    let (sink_tx, sink_rx) = std::sync::mpsc::channel::<()>();
+    let sink = std::thread::spawn(move || {
+        let mut sip = vec![0u8; 4096];
+        let mut got = 0usize;
+        while got < sip.len() {
+            match reader.read(&mut sip[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        // Stalled: hold the pipe open unread until released (30 s
+        // cap so a harness failure still terminates the thread).
+        let _ = sink_rx.recv_timeout(std::time::Duration::from_secs(30));
+        got
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let emitter = std::thread::spawn(move || {
+        let mut fd_writer = kryprobe_privilege::host::InterruptibleWriter::new(writer.as_raw_fd())
+            .expect("fd wraps");
+        let text = "z".repeat(1024 * 1024);
+        let mut stderr = Vec::new();
+        let code = emit_stdout_text(&mut fd_writer, &mut stderr, "report", &text, 0);
+        drop(fd_writer);
+        drop(writer);
+        let _ = tx.send((code, stderr));
+    });
+    // Let the emitter reach its stall (1 MiB >> 64 KiB buffer —
+    // the stall is structural, not timing), then raise the witness
+    // until the abort lands.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let armed = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(10);
+    let outcome = loop {
+        SIGINT_SEEN.store(true, Ordering::Relaxed);
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(outcome) => break outcome,
+            Err(_) if armed.elapsed() < budget => continue,
+            Err(_) => panic!(
+                "emit still stalled {:?} after fresh witness (pre-fix hang)",
+                armed.elapsed()
+            ),
+        }
+    };
+    let latency = armed.elapsed();
+    SIGINT_SEEN.store(false, Ordering::Relaxed);
+    let (code, stderr) = outcome;
+    emitter.join().expect("emitter reaped");
+    let _ = sink_tx.send(());
+    let sipped = sink.join().expect("sink reaped");
+    assert_eq!(sipped, 4096, "sink stalled after its sip");
+    assert!(
+        latency < budget,
+        "abort within the stop budget: {latency:?}"
+    );
+    assert_eq!(code, 1, "torn stream never reports success");
+    let stderr = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        stderr.contains("report: stdout emit interrupted (") && stderr.contains("/1048576 bytes)"),
+        "explicit torn-stream status: {stderr}"
+    );
+}
+
 /// Stale SIGINT (the capture's own interruption, already latched
 /// into the outcome) never aborts the render: the emit re-arms
 /// first, so the full text lands with the capture code preserved.
