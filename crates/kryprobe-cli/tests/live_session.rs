@@ -2368,6 +2368,77 @@ fn live_lifecycle_close_backlog_flips_transport() {
 }
 
 #[test]
+fn live_lifecycle_backlog_never_hides_transport_residual() {
+    // P6r2-N1 (reviewer's exact driver scenario): 73 accepted,
+    // 0 consumed, no kernel losses, quiet-close backlog 128 bytes —
+    // driven through the REAL `drive_lifecycle_session` + the
+    // production session exporter. The residual rides UNEXPLAINED
+    // in BOTH backlog branches (0 control + 128), and the backlog
+    // measurement exports visibly with honest labeling (never a
+    // silent `loss: {}`).
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    for backlog in [0u64, 128u64] {
+        let mut controller = attached_controller();
+        let stop = AtomicBool::new(false);
+        let mut ledger = lifecycle_test_ledger(0, 0, 0);
+        ledger.edge_hits = [0; 22];
+        ledger.agg_accepted = [0; 22];
+        ledger.agg_accepted[0] = 73;
+        let mut sensor = ScriptedLifecycleSensor {
+            ticks: vec![Vec::new()],
+            finish_records: Vec::new(),
+            finish_staged: false,
+            ledger,
+            now: 173,
+            drains: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            quiets: AtomicU64::new(0),
+            quiet_backlog: backlog,
+            stop: &stop,
+        };
+        let backend = kryprobe_privilege::kcrypto_lifecycle::backend::LifecycleBackend::new();
+        let cfg = lifecycle_live_config();
+        let outcome = kryprobe_cli::live::drive_lifecycle_session(
+            &cfg,
+            &backend,
+            &mut sensor,
+            &stop,
+            12,
+            kryprobe_core::ids::SessionId::new(1),
+            kryprobe_core::ids::PlanGeneration::new(1),
+            &kryprobe_core::ids::IdIssuer::default(),
+            &mut controller,
+            None,
+        )
+        .expect("backlogged close still finalizes");
+        let totals = outcome.lifecycle_totals.as_ref().expect("totals ride");
+        assert_eq!(
+            totals.transport_residual, 73,
+            "backlog {backlog}: residual never suppressed"
+        );
+        let text = kryprobe_cli::cmd_report::render_lifecycle_session(&outcome, cfg.profile)
+            .expect("session exports");
+        assert!(
+            text.contains("\"transport.agg_residual_unexplained\":73"),
+            "backlog {backlog}: residual exports: {text}"
+        );
+        assert!(
+            !text.contains("\"loss\":{}"),
+            "backlog {backlog}: no silent empty loss: {text}"
+        );
+        if backlog == 0 {
+            assert_eq!(totals.loss_total(), 73, "0-branch: residual only");
+        } else {
+            assert!(
+                text.contains("\"transport.close_backlog_bytes\":128"),
+                "backlog {backlog}: measurement exports honestly: {text}"
+            );
+        }
+    }
+}
+
+#[test]
 fn live_lifecycle_registry_backend_drives_same_decoder() {
     // T06 item 4 core: the backend reached through the REAL registry
     // (registered via `register_lifecycle_shared`) decodes and

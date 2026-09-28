@@ -302,12 +302,19 @@ pub struct LifecycleTotals {
     /// Session per-program recursion-miss delta sum (H2: the kernel
     /// skipped whole runs — the miss counter is the only witness).
     pub prog_miss_delta: u64,
-    /// Accepted-but-unconsumed aggregate residual with an EMPTY
-    /// close ring (the accounting equation broke — unexplained).
-    /// Zero whenever the close ring held backlog bytes (backlog
-    /// explains accepted-but-unconsumed edges — the coverage flip
-    /// rule, mirrored here).
+    /// Accepted-but-unconsumed aggregate residual (accepted minus
+    /// consumed, reserve, and noslot — the accounting equation
+    /// broke). UNEXPLAINED unconditionally: backlog bytes can never
+    /// exonerate edge counts (byte and edge units do not convert,
+    /// and ring framing is unobservable from userspace) — so no
+    /// backlog value zeroes this field.
     pub transport_residual: u64,
+    /// Close-ring backlog in BYTES at quiet verdict (the measured
+    /// close backlog, not an edge count — honestly labeled as bytes
+    /// everywhere it rides). Nonzero voids clean exactly like any
+    /// counted stage loss: backlog is unmeasured-at-close evidence,
+    /// never an exoneration.
+    pub close_backlog_bytes: u64,
     /// Driver-side observation-cap omissions (decoded records the
     /// session kept no observation for — counted, never silent).
     pub omitted: u64,
@@ -322,8 +329,10 @@ impl LifecycleTotals {
     /// driver's own close stats. `kernel_loss` takes session DELTAS
     /// (post minus pre-arm baseline), never absolutes. Every loss
     /// counter the coverage path counts rides along (P6-N5):
-    /// program-miss deltas, all transform loss fields, and the
-    /// transport residual — the envelope's global loss evidence.
+    /// program-miss deltas, all transform loss fields, the
+    /// transport residual, and the close-backlog byte measurement
+    /// (P6r2-N1: its own honestly-labeled stage) — the envelope's
+    /// global loss evidence.
     #[must_use]
     pub fn from_ledger(
         ledger: &LifecycleLedger,
@@ -333,10 +342,12 @@ impl LifecycleTotals {
         backlog_bytes: u64,
     ) -> Self {
         // The transport residual, exactly as the coverage path
-        // computes it (accepted minus consumed, reserve, and noslot
-        // with an empty close ring — the accounting equation broke).
-        // With backlog bytes the residual is EXPLAINED (backlog
-        // holds the unconsumed edges) and rides zero.
+        // computes it (accepted minus consumed, reserve, and noslot —
+        // the accounting equation broke) — UNEXPLAINED under ANY
+        // backlog (P6r2-N1: bytes can never exonerate edge counts).
+        // The backlog measurement rides alongside as its own
+        // honestly-labeled bytes stage, never folded into the
+        // residual and never zeroing it.
         let agg_sum: u64 = ledger
             .agg_accepted
             .iter()
@@ -387,7 +398,8 @@ impl LifecycleTotals {
             tfm_unobserved_boundary: ledger.tfm_stats.unobserved_boundary,
             tfm_tombstone_evictions: ledger.tfm_stats.tombstone_evictions,
             prog_miss_delta: prog_miss_delta_sum(&ledger.prog_misses),
-            transport_residual: if backlog_bytes == 0 { residual } else { 0 },
+            transport_residual: residual,
+            close_backlog_bytes: backlog_bytes,
             omitted,
             unknown_terminals,
         }
@@ -442,6 +454,7 @@ impl LifecycleTotals {
                 "transport.agg_residual_unexplained",
                 self.transport_residual,
             ),
+            ("transport.close_backlog_bytes", self.close_backlog_bytes),
             ("driver.omitted", self.omitted),
         ]
         .into_iter()
@@ -857,9 +870,10 @@ fn lifecycle_coverage(
         .saturating_sub(hits_sum)
         .saturating_sub(ledger.kernel_loss[0])
         .saturating_sub(ledger.kernel_loss[4]);
-    // The residual flips only with an empty close ring (backlog
-    // bytes explain accepted-but-unconsumed edges — roughly, a byte
-    // count, not a record count, so the equation stays descriptive).
+    // A clean transport needs BOTH a zero residual and an empty
+    // close ring (P6r2-N1: backlog bytes never explain edge counts —
+    // the two ride as separate honest counters below, and either
+    // nonzero flips `Partial`).
     let transport_clean = ring_drops == 0
         && ledger.retained_dropped == 0
         && close.backlog_bytes == 0
@@ -2721,15 +2735,67 @@ mod tests {
     }
 
     #[test]
-    fn from_ledger_explained_residual_rides_zero() {
-        // The backlog gate (P6-N5): with backlog bytes the residual
-        // is EXPLAINED (the close ring holds the unconsumed edges),
-        // so it rides zero — mirroring the coverage flip rule.
+    fn from_ledger_backlog_never_exonerates_residual() {
+        // P6r2-N1 (coordinator-authorized pin update): backlog bytes
+        // can never exonerate edge counts (128 bytes cannot explain
+        // 73 112-byte edges, and framing is unobservable from
+        // userspace) — the residual rides UNEXPLAINED under ANY
+        // backlog, and the backlog measurement rides alongside as
+        // its own honestly-labeled stage (both count toward the
+        // clean rule, keeping `loss_total() == 0` honest).
         let mut ledger = lifecycle_ledger_clean();
         ledger.agg_accepted[0] = ledger.agg_accepted[0].saturating_add(9);
         let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 128);
+        assert_eq!(totals.transport_residual, 9, "residual never suppressed");
+        assert_eq!(totals.close_backlog_bytes, 128, "backlog rides");
+        assert!(
+            totals
+                .loss_stages()
+                .contains(&("transport.agg_residual_unexplained", 9)),
+            "residual exports under backlog: {:?}",
+            totals.loss_stages()
+        );
+        assert!(
+            totals
+                .loss_stages()
+                .contains(&("transport.close_backlog_bytes", 128)),
+            "backlog exports honestly labeled: {:?}",
+            totals.loss_stages()
+        );
+        assert_eq!(totals.loss_total(), 137, "both stages count");
+    }
+
+    #[test]
+    fn from_ledger_backlog_zero_branch_carries_residual_only() {
+        // P6r2-N1: the empty-ring branch — the residual rides alone
+        // and no backlog stage appears (zero stages stay absent).
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.agg_accepted[0] = ledger.agg_accepted[0].saturating_add(9);
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 0);
+        assert_eq!(totals.transport_residual, 9);
+        assert_eq!(totals.close_backlog_bytes, 0);
+        assert!(
+            !totals
+                .loss_stages()
+                .iter()
+                .any(|(stage, _)| *stage == "transport.close_backlog_bytes"),
+            "zero backlog stays absent: {:?}",
+            totals.loss_stages()
+        );
+        assert_eq!(totals.loss_total(), 9, "residual only");
+    }
+
+    #[test]
+    fn from_ledger_lone_backlog_voids_clean() {
+        // P6r2-N1: backlog WITHOUT residual is still counted loss
+        // evidence (unmeasured-at-close bytes) — a lone nonzero
+        // backlog voids `loss_total() == 0`, matching the coverage
+        // flip (either nonzero flips `Partial`).
+        let ledger = lifecycle_ledger_clean();
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 128);
         assert_eq!(totals.transport_residual, 0);
-        assert_eq!(totals.loss_total(), 0);
+        assert_eq!(totals.close_backlog_bytes, 128);
+        assert_eq!(totals.loss_total(), 128, "lone backlog counts");
     }
 
     #[test]
