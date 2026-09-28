@@ -395,7 +395,7 @@ examples:
 
 exits: 0 session complete (read the coverage trailer: exit 0 is NOT
   proof of complete coverage); 1 internal failure; 2 usage/invalid
-  input; 3 PARTIAL (SIGINT-cut window — tables are the preserved
+  input; 3 PARTIAL (SIGINT-cut window - tables are the preserved
   evidence); 4 environment-unusable.
 ";
 
@@ -436,7 +436,7 @@ examples:
       # exit 2: unsupported profile (names api-returns|request-lifecycle)
 
 exits: 0 verdict clean/complete; 1 internal failure; 2 usage/invalid
-  input; 3 PARTIAL/inconclusive (coverage gaps — the report names
+  input; 3 PARTIAL/inconclusive (coverage gaps - the report names
   them); 4 environment-unusable.
 ";
 
