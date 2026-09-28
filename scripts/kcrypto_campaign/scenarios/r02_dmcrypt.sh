@@ -78,6 +78,12 @@ KEY=$(od -A n -t x1 "$OUT/map.key" | tr -d ' \n')
 SECTORS=$((1024 * 1024 * 1024 / 512))
 echo "0 $SECTORS crypt aes-xts-plain64 $KEY 0 $LOOP 0" | dmsetup create "$MAP" \
   2>> "$OUT/loop.log" || FAIL=1
+# systemd-udevd probes the new mapping asynchronously (blkid
+# reads land seconds-to-minutes after creation and would fall
+# inside the measurement windows): drain the queue first, fail
+# closed when settle is unavailable (R02-7014 attempt 3).
+command -v udevadm >/dev/null 2>&1 || FAIL=1
+udevadm settle --timeout=120 2>> "$OUT/loop.log" || FAIL=1
 dmsetup table "$MAP" 2>/dev/null | sed -E 's/ [0-9a-f]{64,} / <key-redacted> /' \
   > "$OUT/dm-table.txt" 2>&1
 dmsetup status "$MAP" > "$OUT/dm-status.txt" 2>&1
@@ -120,6 +126,9 @@ chmod 600 "$OUT/map.key"
 KEY2=$(od -A n -t x1 "$OUT/map.key" | tr -d ' \n')
 echo "0 $SECTORS crypt aes-xts-plain64 $KEY2 0 $LOOP 0" | dmsetup create "$MAP" \
   2>> "$OUT/loop.log" || FAIL=1
+# Re-created mapping: another async udev probe; settle so the
+# quiet-after window stays provably empty (see above).
+udevadm settle --timeout=120 2>> "$OUT/loop.log" || FAIL=1
 python3 "$OUT/r02_io.py" wrongkey-read "/dev/mapper/$MAP" "$WRITE_SHA" \
   > "$OUT/io-wrongkey.log" 2>&1
 echo "wrongkey_rc=$?" > "$OUT/io-wrongkey-rc.txt"

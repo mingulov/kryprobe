@@ -159,5 +159,45 @@ class GuestStageMatchTests(unittest.TestCase):
             self.assertFalse(CLI.guest_matches_stage(Path(tmp), {"pins": {}}))
 
 
+class ExpectedFilesProducibleTests(unittest.TestCase):
+    """Every EXPECTED_FILES entry must be producible by its scenario.
+
+    Regression test for the R02 stale-name bug (the custody gate
+    demanded ``capture-write.stderr.log`` while the scenario only
+    ever wrote ``capture-product-write.stderr.log``, failing the
+    terminal-flush gate on a healthy cell). An expected file is
+    producible when it appears literally in the scenario text, is
+    a ``capture <name>`` output (``<name>.json`` /
+    ``capture-<name>.stderr.log`` via the shared helper), or
+    matches a ``$leg`` template instantiated by ``run_leg``
+    invocations (r01_det.sh per-leg files).
+    """
+
+    def test_expected_files_producible(self):
+        import re
+        scenarios = ROOT / "scripts" / "kcrypto_campaign" / "scenarios"
+        for name, expected in CLI.EXPECTED_FILES.items():
+            text = (scenarios / name).read_text()
+            captured = set(re.findall(r"^capture (\S+)", text, re.M))
+            legs = set(re.findall(r"^run_leg (\S+)", text, re.M))
+            templates = set(re.findall(
+                r"\$OUT/([A-Za-z0-9_.$-]*\$leg[A-Za-z0-9_.$-]*)", text))
+            expanded = {t.replace("$leg", leg)
+                        for t in templates for leg in legs}
+            for want in expected:
+                if want in text or want in expanded:
+                    continue
+                stem = want.removesuffix(".json")
+                cap = want.removeprefix("capture-").removesuffix(
+                    ".stderr.log")
+                produced = (want.endswith(".json") and stem in captured) or (
+                    want.startswith("capture-")
+                    and want.endswith(".stderr.log") and cap in captured)
+                self.assertTrue(
+                    produced,
+                    f"{name}: expected file {want!r} is never produced "
+                    f"(captures: {sorted(captured)})")
+
+
 if __name__ == "__main__":
     unittest.main()
