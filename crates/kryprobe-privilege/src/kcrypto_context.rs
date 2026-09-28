@@ -165,6 +165,32 @@ pub struct Drift {
     pub cgroup_changed: bool,
 }
 
+/// A decoded api-returns who row for filter-time identity rebuild:
+/// every scalar [`SubmitterContext::from_who`] maps, with `comm`
+/// carried as the FULL decoded display string. The capture path
+/// keeps decoding frozen `[u8; 16]` kernel bytes through `from_who`;
+/// this sibling exists because a decoded row's comm is already a
+/// string — routing it back through a byte array would re-truncate
+/// multi-byte content and change exact-filter identity (P6r2-N2).
+/// `pcomm` is display-only and never enters filter identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedWhoRow<'a> {
+    /// Calling thread id (lifetime pid).
+    pub tid: u32,
+    /// Thread-group id (lifetime tgid).
+    pub tgid: u32,
+    /// Full decoded display comm (never re-truncated).
+    pub comm: &'a str,
+    /// Calling uid at first sight.
+    pub uid: u32,
+    /// Calling cgroup id at first sight.
+    pub cgroup: u64,
+    /// Parent thread-group id (0 = chase failed).
+    pub ppid: u32,
+    /// Raw stack word (negative = missing).
+    pub stack: i32,
+}
+
 impl SubmitterContext {
     /// Builds a submitter from an api-returns who row: the key's tgid
     /// plus the value's last-writer tid/comm and first-seen
@@ -197,6 +223,36 @@ impl SubmitterContext {
             cgroup: Some(val.cgroup),
             ppid: if val.ppid == 0 { None } else { Some(val.ppid) },
             stack: if val.stack < 0 {
+                StackMarker::Missing
+            } else {
+                StackMarker::Sampled
+            },
+        }
+    }
+
+    /// Builds a submitter from a DECODED who row (filter-time sibling
+    /// of [`from_who`](Self::from_who)): the identical scalar mapping
+    /// (ppid 0 unqualifies, negative stack is missing, non-negative
+    /// sampled), except `comm` is the row's FULL decoded display
+    /// string — never re-encoded through a byte array (P6r2-N2:
+    /// re-truncating decoded text to 16 bytes changes exact-filter
+    /// identity). Byte-distinct kernel names that decode identically
+    /// match identically — defined behavior (the filter compares
+    /// rendered identity; the lossy decode already happened at
+    /// capture), never a silent mismatch.
+    #[must_use]
+    pub fn from_decoded_who(row: &DecodedWhoRow, start_marker: Option<u64>) -> Self {
+        Self {
+            lifetime: TaskLifetime {
+                pid: row.tid,
+                tgid: row.tgid,
+                start_marker,
+            },
+            comm: Some(row.comm.to_owned()),
+            uid: Some(row.uid),
+            cgroup: Some(row.cgroup),
+            ppid: if row.ppid == 0 { None } else { Some(row.ppid) },
+            stack: if row.stack < 0 {
                 StackMarker::Missing
             } else {
                 StackMarker::Sampled
@@ -648,6 +704,55 @@ mod tests {
             sub.lifetime.verdict_against(&sub.lifetime),
             LifetimeVerdict::Unknown,
             "a markerless lifetime never joins, even with itself"
+        );
+    }
+
+    #[test]
+    fn from_decoded_who_matches_from_who_on_byte_safe_input() {
+        // P6r2-N2: on ASCII/short input the sibling equals `from_who`
+        // exactly (same lifetime, scalars, stack mapping) — the
+        // sibling only differs by never re-truncating decoded text.
+        let via_bytes = SubmitterContext::from_who(&who_key(), &who_val(), Some(50_000));
+        let row = DecodedWhoRow {
+            tid: 101,
+            tgid: 100,
+            comm: "bash",
+            uid: 1000,
+            cgroup: 7,
+            ppid: 1,
+            stack: 3,
+        };
+        let via_decoded = SubmitterContext::from_decoded_who(&row, Some(50_000));
+        assert_eq!(via_decoded, via_bytes, "sibling parity on ASCII");
+    }
+
+    #[test]
+    fn from_decoded_who_preserves_full_decoded_comm() {
+        // P6r2-N2: fifteen U+FFFD (45 bytes — the 15x0xff decode)
+        // ride whole, far past the old 16-byte re-truncation; ppid
+        // and stack map exactly like `from_who`.
+        let visible = "\u{fffd}".repeat(15);
+        let row = DecodedWhoRow {
+            tid: 101,
+            tgid: 100,
+            comm: &visible,
+            uid: 1000,
+            cgroup: 45,
+            ppid: 0,
+            stack: -1,
+        };
+        let sub = SubmitterContext::from_decoded_who(&row, Some(1));
+        assert_eq!(sub.comm.as_deref(), Some(visible.as_str()));
+        assert_eq!(sub.comm.as_deref().map(str::len), Some(45));
+        assert_eq!(sub.ppid, None, "ppid 0 is chase failure, not init");
+        assert_eq!(sub.stack, StackMarker::Missing);
+        assert_eq!(
+            sub.lifetime,
+            TaskLifetime {
+                pid: 101,
+                tgid: 100,
+                start_marker: Some(1),
+            }
         );
     }
 

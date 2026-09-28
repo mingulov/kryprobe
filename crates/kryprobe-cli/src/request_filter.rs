@@ -7,9 +7,11 @@
 //! paths (CLI `--filter-pid`/`--filter-uid`/`--filter-comm`):
 //!
 //! - api-returns who rows (the qualifiable path): the submitter is
-//!   rebuilt from the row's own scalars through
-//!   [`SubmitterContext::from_who`](kryprobe_privilege::kcrypto_context::SubmitterContext::from_who)
-//!   plus a userspace start-marker read. `Admitted` rows render,
+//!   rebuilt from the row's own decoded scalars through
+//!   [`SubmitterContext::from_decoded_who`](kryprobe_privilege::kcrypto_context::SubmitterContext::from_decoded_who)
+//!   plus a userspace start-marker read (the comm is the row's full
+//!   decoded display string — filter identity IS rendered identity).
+//!   `Admitted` rows render,
 //!   `FilteredOut` rows hide, `Unknown` rows render (filters hide
 //!   only PROVED mismatches — unevaluable rows stay visible and
 //!   count `unknown`, never admitted-by-default).
@@ -27,13 +29,12 @@
 //! FILTER line, and (lifecycle) the session envelope.
 
 use crate::args::FilterArgs;
-use kryprobe_abi::kcrypto_agg::{KWhoKey, VWho};
 use kryprobe_core::evidence::{
     CoverageSummary, DimensionCounter, NativeObservation, payload_keys as K,
 };
 use kryprobe_privilege::kcrypto_context::{
-    CompletionContext, ContextFilter, ExecutionContext, FilterTally, FilterVerdict, RequestContext,
-    SubmitterContext, UnknownPolicy, apply_filter, read_start_marker,
+    CompletionContext, ContextFilter, DecodedWhoRow, ExecutionContext, FilterTally, FilterVerdict,
+    RequestContext, SubmitterContext, UnknownPolicy, apply_filter, read_start_marker,
 };
 use serde_json::Value;
 
@@ -84,61 +85,40 @@ fn u64_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
     obj.get(key).and_then(serde_json::Value::as_u64)
 }
 
-/// Copies a comm string into `TASK_COMM_LEN` bytes (truncate on a
-/// char boundary, NUL-pad — the kernel shape `from_who` decodes).
-fn comm_bytes(comm: &str) -> [u8; 16] {
-    let bytes = comm.as_bytes();
-    let mut len = bytes.len().min(16);
-    while len > 0 && !comm.is_char_boundary(len) {
-        len -= 1;
-    }
-    let mut out = [0u8; 16];
-    out[..len].copy_from_slice(&bytes[..len]);
-    out
-}
-
-/// Rebuilds the ABI who structs from a decoded who payload, then
-/// qualifies the submitter through [`SubmitterContext::from_who`]
-/// (the JSON carries every scalar the ABI row had, so the rebuilt
-/// context equals the decode-time one for the same marker — ASCII
-/// comms round-trip exactly; lossy-decoded comms match what the row
-/// visibly carries, truncated to `TASK_COMM_LEN`). Returns `None`
-/// when a required scalar is missing or misshaped: the submitter is
-/// unavailable then, never guessed. Display-only words (`calls`,
-/// `first_ns`, `last_ns`, unparseable `stack.id`) degrade without
-/// voiding the row — they never gate a filter.
+/// Rebuilds the submitter from a decoded who payload through
+/// [`SubmitterContext::from_decoded_who`] (the JSON carries every
+/// scalar the ABI row had, so the rebuilt context equals the
+/// decode-time one for the same marker — and the comm is the row's
+/// FULL decoded display string, never re-encoded through a byte
+/// array: filter identity IS rendered identity, P6r2-N2). Returns
+/// `None` when a required scalar is missing or misshaped: the
+/// submitter is unavailable then, never guessed. Display-only words
+/// (`pcomm`, `calls`, `first_ns`, `last_ns`, unparseable `stack.id`)
+/// degrade without voiding the row — they never gate a filter.
 fn submitter_from_who_payload(
     payload: &serde_json::Value,
     marker: Option<u64>,
 ) -> Option<SubmitterContext> {
     let obj = payload.as_object()?;
-    let key = KWhoKey {
-        kh: u64_field(obj, K::KEY_HASH)?,
-        tgid: u32_field(obj, K::TGID)?,
-        _pad: 0,
-    };
-    let val = VWho {
-        comm: comm_bytes(obj.get(K::COMM)?.as_str()?),
+    // Shape gate, exactly as before: the key hash + identity words
+    // must all be present (the hash still keys the request id
+    // downstream — it never enters the lifetime).
+    let _key_hash = u64_field(obj, K::KEY_HASH)?;
+    let row = DecodedWhoRow {
         tid: u32_field(obj, K::TID)?,
+        tgid: u32_field(obj, K::TGID)?,
+        comm: obj.get(K::COMM)?.as_str()?,
         uid: u32_field(obj, K::UID)?,
         cgroup: u64_field(obj, K::CGROUP)?,
         ppid: u32_field(obj, K::PPID).unwrap_or(0),
-        pcomm: obj
-            .get(K::PCOMM)
-            .and_then(serde_json::Value::as_str)
-            .map(comm_bytes)
-            .unwrap_or([0u8; 16]),
         stack: obj
             .get(K::STACK)
             .and_then(|stack| stack.get(K::ID))
             .and_then(serde_json::Value::as_i64)
             .and_then(|id| i32::try_from(id).ok())
             .unwrap_or(-1),
-        calls: u64_field(obj, K::CALLS).unwrap_or(0),
-        first_ns: u64_field(obj, K::FIRST_NS).unwrap_or(0),
-        last_ns: u64_field(obj, K::LAST_NS).unwrap_or(0),
     };
-    Some(SubmitterContext::from_who(&key, &val, marker))
+    Some(SubmitterContext::from_decoded_who(&row, marker))
 }
 
 /// One who row's request contexts: submitter qualified from the row
@@ -272,6 +252,7 @@ pub fn push_filter_counters(coverage: &mut CoverageSummary, tally: &FilterTally)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kryprobe_abi::kcrypto_agg::{KWhoKey, VWho};
     use kryprobe_core::enums::{BackendId, CallKind, EvidencePhase, OperationClass};
     use kryprobe_core::evidence::{IntegrityRef, NativeResult};
     use kryprobe_core::ids::ObservationId;
@@ -457,5 +438,98 @@ mod tests {
         assert_eq!(view.observations.len(), 1);
         assert_eq!(view.tally.admitted, 1);
         assert_eq!(view.tally.filtered_out, 1);
+    }
+
+    #[test]
+    fn comm_filter_matches_full_decoded_nonutf8_name() {
+        // P6r2-N2: fifteen legal non-UTF-8 comm bytes + NUL
+        // decode (through the production `from_who` boundary) to
+        // fifteen U+FFFD (45 UTF-8 bytes). The filter identity must
+        // BE the rendered comm: the visible name admits, and the
+        // 5-char re-truncation alias (a DIFFERENT name) hides.
+        let mut raw = [0xffu8; 16];
+        raw[15] = 0;
+        let key = KWhoKey {
+            kh: 71,
+            tgid: 100,
+            _pad: 0,
+        };
+        let val = VWho {
+            comm: raw,
+            tid: 101,
+            uid: 1000,
+            cgroup: 45,
+            ppid: 1,
+            pcomm: [0u8; 16],
+            stack: -1,
+            calls: 7,
+            first_ns: 1,
+            last_ns: 2,
+        };
+        let visible = SubmitterContext::from_who(&key, &val, Some(1))
+            .comm
+            .expect("decoded comm");
+        assert_eq!(visible.chars().count(), 15, "fifteen replacements");
+        assert_eq!(visible.len(), 45, "45 UTF-8 bytes");
+        // Visible-name filter admits the row it names.
+        let filter = ContextFilter {
+            submitter_comm: Some(visible.clone()),
+            ..ContextFilter::default()
+        };
+        let view = apply_request_filter(
+            &[who_obs(101, 100, &visible, 1000)],
+            &filter,
+            "evidence:v1",
+            "rule:v1",
+        );
+        assert_eq!(view.tally.admitted, 1, "visible name admits");
+        assert_eq!(view.tally.filtered_out, 0);
+        // The 5-char truncation alias is a different name: hides.
+        let alias = "\u{fffd}".repeat(5);
+        assert_ne!(alias, visible, "alias differs from the row");
+        let filter = ContextFilter {
+            submitter_comm: Some(alias),
+            ..ContextFilter::default()
+        };
+        let view = apply_request_filter(
+            &[who_obs(101, 100, &visible, 1000)],
+            &filter,
+            "evidence:v1",
+            "rule:v1",
+        );
+        assert_eq!(view.tally.admitted, 0, "truncation alias hides");
+        assert_eq!(view.tally.filtered_out, 1);
+    }
+
+    #[test]
+    fn pcomm_content_never_gates_admission() {
+        // P6r2-N2 same-class variant: `pcomm` shared the old byte
+        // re-truncation — with the roundtrip gone it is never even
+        // read (display-only, not filter identity). A 15x0xff-decoded
+        // pcomm changes nothing: the ASCII comm admits, and verdicts
+        // match the pcomm-less row exactly.
+        let weird_pcomm = "\u{fffd}".repeat(15);
+        let mut obs = who_obs(101, 100, "bash", 1000);
+        obs.backend_payload
+            .as_object_mut()
+            .expect("object")
+            .insert("pcomm".to_owned(), serde_json::json!(weird_pcomm));
+        let plain = who_obs(101, 100, "bash", 1000);
+        for rows in [&[obs.clone()] as &[_], &[plain]] {
+            let filter = ContextFilter {
+                submitter_comm: Some("bash".to_owned()),
+                ..ContextFilter::default()
+            };
+            let view = apply_request_filter(rows, &filter, "evidence:v1", "rule:v1");
+            assert_eq!(view.tally.admitted, 1, "comm admits either way");
+            assert_eq!(view.tally.filtered_out, 0);
+            let filter = ContextFilter {
+                submitter_comm: Some("sh".to_owned()),
+                ..ContextFilter::default()
+            };
+            let view = apply_request_filter(rows, &filter, "evidence:v1", "rule:v1");
+            assert_eq!(view.tally.admitted, 0, "mismatch hides either way");
+            assert_eq!(view.tally.filtered_out, 1);
+        }
     }
 }

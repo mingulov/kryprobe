@@ -402,7 +402,7 @@ flags:
   --kcrypto-profile P    api-returns (default) | request-lifecycle
   --filter-pid N         admit only submitter pid N (exact; post-ingestion)
   --filter-uid N         admit only submitter uid N (exact; post-ingestion)
-  --filter-comm S        admit only submitter comm S (exact; post-ingestion)
+  --filter-comm S        admit only submitter comm S (exact decoded display name; post-ingestion)
 
 filters (--filter-*): constrain the submitter identity AFTER capture
 ingestion, per request — capture is unfiltered, views filter. Rows
@@ -455,7 +455,7 @@ flags (live mode):
   --kcrypto-profile P    api-returns (default) | request-lifecycle
   --filter-pid N         admit only submitter pid N (exact; post-ingestion)
   --filter-uid N         admit only submitter uid N (exact; post-ingestion)
-  --filter-comm S        admit only submitter comm S (exact; post-ingestion)
+  --filter-comm S        admit only submitter comm S (exact decoded display name; post-ingestion)
 
 filters (--filter-*): constrain the submitter identity AFTER capture
 ingestion, per request — capture is unfiltered, views filter. Rows
