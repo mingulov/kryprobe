@@ -90,16 +90,16 @@ chmod 600 "$OUT"/sa-*.key "$OUT"/sa-*.salt
 KAB=$(cat "$OUT/sa-ab.key" "$OUT/sa-ab.salt" | od -A n -t x1 | tr -d ' \n')
 KBA=$(cat "$OUT/sa-ba.key" "$OUT/sa-ba.salt" | od -A n -t x1 | tr -d ' \n')
 {
-  echo "state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc 'rfc4106(gcm(aes))' 0x$KAB"
-  echo "state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc 'rfc4106(gcm(aes))' 0x$KBA"
-  echo "policy add src 10.13.0.1 dst 10.13.0.2 dir out tmpl src 10.13.0.1 dst 10.13.0.2 proto esp mode transport"
-  echo "policy add src 10.13.0.2 dst 10.13.0.1 dir in tmpl src 10.13.0.2 dst 10.13.0.1 proto esp mode transport"
+  echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc rfc4106(gcm(aes)) 0x$KAB"
+  echo "xfrm state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc rfc4106(gcm(aes)) 0x$KBA"
+  echo "xfrm policy add src 10.13.0.1 dst 10.13.0.2 dir out tmpl src 10.13.0.1 dst 10.13.0.2 proto esp mode transport"
+  echo "xfrm policy add src 10.13.0.2 dst 10.13.0.1 dir in tmpl src 10.13.0.2 dst 10.13.0.1 proto esp mode transport"
 } > "$OUT/batch-a.txt"
 {
-  echo "state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc 'rfc4106(gcm(aes))' 0x$KBA"
-  echo "state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc 'rfc4106(gcm(aes))' 0x$KAB"
-  echo "policy add src 10.13.0.2 dst 10.13.0.1 dir out tmpl src 10.13.0.2 dst 10.13.0.1 proto esp mode transport"
-  echo "policy add src 10.13.0.1 dst 10.13.0.2 dir in tmpl src 10.13.0.1 dst 10.13.0.2 proto esp mode transport"
+  echo "xfrm state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc rfc4106(gcm(aes)) 0x$KBA"
+  echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc rfc4106(gcm(aes)) 0x$KAB"
+  echo "xfrm policy add src 10.13.0.2 dst 10.13.0.1 dir out tmpl src 10.13.0.2 dst 10.13.0.1 proto esp mode transport"
+  echo "xfrm policy add src 10.13.0.1 dst 10.13.0.2 dir in tmpl src 10.13.0.1 dst 10.13.0.2 proto esp mode transport"
 } > "$OUT/batch-b.txt"
 chmod 600 "$OUT"/batch-*.txt
 ip -n "$NSA" -b "$OUT/batch-a.txt" 2>> "$OUT/netns.log" || FAIL=1
@@ -141,7 +141,7 @@ finish_capture product-main
 # Auth-fail phase: receiver B's inbound SA gets a wrong key.
 head -c 20 /dev/urandom | od -A n -t x1 | tr -d ' \n' > "$OUT/sa-wrong.hex"
 KW=$(cat "$OUT/sa-wrong.hex")
-echo "state update src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc 'rfc4106(gcm(aes))' 0x$KW" \
+echo "xfrm state update src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc rfc4106(gcm(aes)) 0x$KW" \
   > "$OUT/batch-wrong.txt"
 chmod 600 "$OUT/batch-wrong.txt"
 ip -n "$NSB" -b "$OUT/batch-wrong.txt" 2>> "$OUT/netns.log" || FAIL=1
