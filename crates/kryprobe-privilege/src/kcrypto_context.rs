@@ -137,7 +137,10 @@ impl StackMarker {
 pub struct SubmitterContext {
     /// Issuing lifetime (marker may be `None` — unqualified then).
     pub lifetime: TaskLifetime,
-    /// Calling thread comm at first sight (rename drifts, never re-keys).
+    /// Calling thread comm at first sight (rename drifts, never
+    /// re-keys). Kernel bytes, lossy-decoded: may carry control
+    /// characters — renderers must route it through
+    /// `kryprobe_report::sanitize_cell`, never raw.
     pub comm: Option<String>,
     /// Calling uid at first sight.
     pub uid: Option<u32>,
