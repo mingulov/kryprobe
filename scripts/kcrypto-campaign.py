@@ -111,6 +111,14 @@ KEY_PATTERNS = [re.compile(r"[0-9a-f]{100,}"), re.compile(r"0x[0-9a-f]{32,}")]
 
 AGG_OK = "ok"
 
+# Cross-portion artifacts that must be byte-identical in every
+# sealed cell (campaign pin-uniformity gate). Per-portion
+# artifacts (guest-config, kcrypto_fixture.ko, inner.sh, helpers)
+# are pinned within each cell instead.
+UNIFORM_PINS = ["kryprobe", "kryprobe-bpf/kcrypto.bpf.o",
+                "kryprobe-bpf/kcrypto-lifecycle.bpf.o",
+                "kcrypto_gen.py", "oracles.py"]
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -845,7 +853,8 @@ def cmd_verify(args) -> int:
         for reason in full["_judgment"]["reasons"]:
             print(f"  - {reason}")
         judged.append(full)
-    summary = reconcile.reconcile_campaign(required, judged)
+    summary = reconcile.reconcile_campaign(required, judged,
+                                           uniform_pins=UNIFORM_PINS)
     print(f"campaign: {summary['verdict']}")
     for reason in summary["reasons"]:
         print(f"  - {reason}")

@@ -203,6 +203,35 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(summary["verdict"], "FAIL")
         self.assertTrue(any("R02-726" in r for r in summary["reasons"]))
 
+    def test_campaign_reconcile_uniform_subset(self):
+        # Per-portion artifacts (guest config, per-kernel module)
+        # legitimately vary; the uniform CLI/BPF/fixture/oracle
+        # pins must still match exactly.
+        first, second = passing_receipt(), passing_receipt()
+        second["portion_id"] = "R02-726"
+        first["pins"]["guest-config"] = "cfg7014"
+        first["executed"]["guest-config"] = "cfg7014"
+        second["pins"]["guest-config"] = "cfg726"
+        second["executed"]["guest-config"] = "cfg726"
+        summary = reconcile.reconcile_campaign(
+            required_portions=["R02-7014", "R02-726"],
+            receipts=[first, second],
+            uniform_pins=["kryprobe", "kcrypto.bpf.o", "oracle"],
+        )
+        self.assertEqual(summary["verdict"], "PASS")
+        # A consistent-but-different CLI build across portions:
+        # each receipt is internally consistent, the campaign
+        # uniformity gate must still refuse.
+        second["pins"]["kryprobe"] = "different-bytes"
+        second["executed"]["kryprobe"] = "different-bytes"
+        summary = reconcile.reconcile_campaign(
+            required_portions=["R02-7014", "R02-726"],
+            receipts=[first, second],
+            uniform_pins=["kryprobe", "kcrypto.bpf.o", "oracle"],
+        )
+        self.assertEqual(summary["verdict"], "FAIL")
+        self.assertTrue(any("mixed pins" in r for r in summary["reasons"]))
+
     def test_campaign_reconcile_propagates_failing_portion(self):
         rec = passing_receipt()
         rec["process"]["exit"] = 1

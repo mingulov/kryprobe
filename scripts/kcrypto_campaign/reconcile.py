@@ -112,7 +112,8 @@ def verify_receipt_file(path: Path) -> dict:
     return verify_receipt(json.loads(Path(path).read_text()))
 
 
-def reconcile_campaign(required_portions: list[str], receipts: list[dict]) -> dict:
+def reconcile_campaign(required_portions: list[str], receipts: list[dict],
+                       uniform_pins: list[str] | None = None) -> dict:
     """Judge a campaign: every required portion exactly once, pins uniform.
 
     Returns ``{"verdict": ..., "per_portion": {portion_id:
@@ -123,6 +124,14 @@ def reconcile_campaign(required_portions: list[str], receipts: list[dict]) -> di
     portion explicitly declares them — they still fail a
     ``required_portions`` campaign, since a required portion that
     did not run is not a pass).
+
+    ``uniform_pins`` names the cross-portion artifacts that must
+    be byte-identical everywhere (CLI, BPF objects, fixture,
+    oracle). Per-portion artifacts (guest kernel config,
+    per-kernel fixture module, scenario script) are pinned
+    within each portion (staged == executed) but legitimately
+    vary across portions; ``None`` (default) compares every pin
+    strictly.
     """
     reasons: list[str] = []
     per_portion: dict[str, str] = {}
@@ -146,11 +155,16 @@ def reconcile_campaign(required_portions: list[str], receipts: list[dict]) -> di
             reasons.append(f"required portion {portion_id!r} has no receipt")
     pinned = sorted(pin_sets)
     if len(pinned) > 1:
-        first = pin_sets[pinned[0]]
+        def projection(pin_map: dict) -> dict:
+            if uniform_pins is None:
+                return pin_map
+            return {name: pin_map.get(name) for name in uniform_pins}
+        first = projection(pin_sets[pinned[0]])
         for portion_id in pinned[1:]:
-            if pin_sets[portion_id] != first:
+            if projection(pin_sets[portion_id]) != first:
                 reasons.append(
-                    f"mixed pins: {portion_id} executed {pin_sets[portion_id]!r} "
+                    f"mixed pins: {portion_id} executed "
+                    f"{projection(pin_sets[portion_id])!r} "
                     f"!= {pinned[0]} {first!r}"
                 )
     return {
