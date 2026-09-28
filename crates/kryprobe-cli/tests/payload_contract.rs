@@ -231,7 +231,7 @@ fn payload_contract_producer_emits_pinned_shapes() {
     // Lifecycle AEAD rows (T10): an AEAD-meta record emits EXACTLY
     // the same pinned set — the v2 scalars ride the reducer as
     // opaque facts, and the report boundary (P6) versions any
-    // public emission. No AEAD key leaks early.
+    // public emission. No unpinned keys surface early.
     let aead_record = kryprobe_core::kcrypto::RequestRecord {
         id: 2,
         tfm_id: None,
