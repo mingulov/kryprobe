@@ -39,10 +39,13 @@ pub fn run(stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
         return 4;
     };
     match run_smoke_roundtrip(&worker, &object) {
-        Ok(_) => {
-            let _ = writeln!(stdout, "token-smoke: pass");
-            0
-        }
+        Ok(_) => crate::live::emit_stdout_text(
+            stdout,
+            stderr,
+            "selftest token-smoke",
+            "token-smoke: pass\n",
+            0,
+        ),
         // Refusal classification lives behind the boundary (1B-M7).
         Err(TokenError::Denied { errno, .. }) if priv_host::errno_is_refused(errno) => {
             let _ = writeln!(

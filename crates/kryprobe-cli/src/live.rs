@@ -96,6 +96,7 @@ use kryprobe_privilege::kcrypto_snapshot::{
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -521,6 +522,60 @@ impl LiveError {
             Self::Internal(_) => 1,
         }
     }
+}
+
+/// Emit chunk: 8 KiB bounds one blocking write's worst case
+/// against a slow sink (~0.8 s at the E04 1 KiB/100 ms stimulus),
+/// so a fresh SIGINT aborts promptly instead of hanging teardown.
+const EMIT_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Finalizes one stdout report (P7/T12 terminal-output seam): the
+/// full text lands in bounded chunks with a stop check between
+/// chunks (a fresh SIGINT aborts promptly instead of blocking a
+/// slow sink forever), then a checked flush. Any write or flush
+/// failure — or an interrupt mid-emit — reports the explicit
+/// terminal output status on stderr and exits 1: a torn stream is
+/// never a silent `code`. Healthy emits pass `code` through
+/// untouched (success stays success, partial stays partial).
+///
+/// The SIGINT witness re-arms FIRST: the capture's own
+/// interruption already latched into the outcome (`interrupted`,
+/// exit 3) — a stale set must never abort the partial-window
+/// render. Only a FRESH arrival after the re-arm aborts (a second
+/// Ctrl-C during a slow emit).
+pub fn emit_stdout_text(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    tool: &str,
+    text: &str,
+    code: i32,
+) -> i32 {
+    SIGINT_SEEN.store(false, Ordering::Relaxed);
+    let bytes = text.as_bytes();
+    let mut written = 0usize;
+    for chunk in bytes.chunks(EMIT_CHUNK_BYTES) {
+        // Capture already ended: only a FRESH SIGINT can arrive
+        // during emit (a second Ctrl-C) — abort promptly with the
+        // torn-stream status instead of blocking a slow sink.
+        if SIGINT_SEEN.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                stderr,
+                "{tool}: stdout emit interrupted ({written}/{} bytes)",
+                bytes.len()
+            );
+            return 1;
+        }
+        if let Err(err) = stdout.write_all(chunk) {
+            let _ = writeln!(stderr, "{tool}: cannot write stdout: {err}");
+            return 1;
+        }
+        written += chunk.len();
+    }
+    if let Err(err) = stdout.flush() {
+        let _ = writeln!(stderr, "{tool}: cannot flush stdout: {err}");
+        return 1;
+    }
+    code
 }
 
 /// Gate check: every required capability must have probed present, else

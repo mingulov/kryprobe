@@ -264,7 +264,7 @@ fn i02_decode_rejection_counts_without_edges() {
         }),
         Err(DecodeDrop::BadMagic)
     );
-    assert_eq!(decode_record(&vec![0u8; 64]), Err(DecodeDrop::BadLength));
+    assert_eq!(decode_record(&[0u8; 64]), Err(DecodeDrop::BadLength));
 }
 
 /// I03 — retention bound: completions past the ledger bound drop but
@@ -367,21 +367,17 @@ fn p02_cookie_allocator_exhaustion_refuses_typed() {
     let last = alloc.allocate(1).expect("one slot free");
     assert_eq!(last.base(), 63, "ranges disjoint by construction");
     assert_ne!(first.base(), last.base());
-    assert_eq!(alloc.used(), u32::from(COUNT_SLOTS));
+    assert_eq!(alloc.used(), COUNT_SLOTS);
     assert_eq!(alloc.remaining(), 0);
     let err = alloc.allocate(1).expect_err("exhausted refuses");
     assert_eq!(err.requested, 1, "refusal names the request");
     assert_eq!(err.remaining, 0, "refusal names the remainder");
-    assert_eq!(
-        alloc.used(),
-        u32::from(COUNT_SLOTS),
-        "refusal consumes nothing"
-    );
+    assert_eq!(alloc.used(), COUNT_SLOTS, "refusal consumes nothing");
     assert!(
         alloc.allocate(0).is_err(),
         "empty requests refuse without consuming"
     );
-    assert_eq!(alloc.used(), u32::from(COUNT_SLOTS));
+    assert_eq!(alloc.used(), COUNT_SLOTS);
 }
 
 /// Q09 — user-queue pressure: drain queue drops ride the shared

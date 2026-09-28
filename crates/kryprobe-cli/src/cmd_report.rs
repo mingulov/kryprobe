@@ -5,7 +5,8 @@
 
 use crate::args::{FilterArgs, ReportFormat};
 use crate::live::{
-    DEFAULT_TICK_MS, LIVE_SOURCE, LiveConfig, LiveError, LiveOutcome, run_live_capture,
+    DEFAULT_TICK_MS, LIVE_SOURCE, LiveConfig, LiveError, LiveOutcome, emit_stdout_text,
+    run_live_capture,
 };
 use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
@@ -42,10 +43,7 @@ pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
         return 2;
     }
     match summary {
-        Some(summary) => {
-            let _ = write!(stdout, "{summary}");
-            0
-        }
+        Some(summary) => emit_stdout_text(stdout, stderr, "report", &summary, 0),
         // Unreachable in practice (`None` always rides an `Unreadable`
         // finding, handled above); fail closed without rendering.
         None => {
@@ -387,10 +385,7 @@ fn finish_report_live(
                 1
             }
         },
-        None => {
-            let _ = write!(stdout, "{text}");
-            code
-        }
+        None => emit_stdout_text(stdout, stderr, "report", &text, code),
     }
 }
 
@@ -888,6 +883,48 @@ mod tests {
         assert!(
             !kryprobe_report::validate_lifecycle_session(&spliced).is_empty(),
             "cross-run splice must refuse"
+        );
+    }
+
+    /// P7/T12: the emit seam owns stdout finalization — a writer
+    /// failing after 10 bytes reports 1 with the explicit status,
+    /// never the capture code over a torn stream.
+    #[test]
+    fn finish_partial_stdout_reports_terminal_failure() {
+        struct FailAfterTen {
+            buf: Vec<u8>,
+        }
+        impl std::io::Write for FailAfterTen {
+            fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+                let room = 10usize.saturating_sub(self.buf.len());
+                if room == 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE"));
+                }
+                let take = room.min(chunk.len());
+                self.buf.extend_from_slice(&chunk[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stdout = FailAfterTen { buf: Vec::new() };
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(json_fixture()),
+            ReportFormat::Human,
+            None,
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(stdout.buf.len(), 10, "exactly the accepted prefix lands");
+        assert_eq!(code, 1, "torn stream never reports the capture code");
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("report: cannot write stdout"),
+            "explicit terminal output status"
         );
     }
 

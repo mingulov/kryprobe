@@ -13,7 +13,9 @@
 //! facts + test fixtures.
 
 use crate::args::FilterArgs;
-use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use crate::live::{
+    DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, emit_stdout_text, run_live_capture,
+};
 use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
 };
@@ -52,29 +54,26 @@ fn finish_watch(
                     unknown: view.tally.unknown,
                 });
             }
-            let _ = write!(
-                stdout,
-                "{}",
-                kryprobe_report::live_render::render_watch_tables_filtered(
-                    &outcome.observations,
-                    &outcome.coverage,
-                    filter_counts,
-                )
+            // One emit (P7/T12): the tables + enrichment line
+            // finalize together — a torn stream reports 1, never a
+            // silent capture code. Bytes identical to the two-write
+            // form on success.
+            let mut text = kryprobe_report::live_render::render_watch_tables_filtered(
+                &outcome.observations,
+                &outcome.coverage,
+                filter_counts,
             );
-            let _ = write!(
-                stdout,
-                "{}",
-                crate::live::render_enrichment_line(&outcome.enrichment)
-            );
+            text.push_str(&crate::live::render_enrichment_line(&outcome.enrichment));
             // 4B-M5: an interrupted window is partial evidence even
             // when every measured dimension held — exit 3, with the
             // tables above as the preserved evidence.
-            if outcome.interrupted {
+            let code = if outcome.interrupted {
                 let _ = writeln!(stderr, "watch: interrupted by SIGINT — partial window");
                 3
             } else {
                 0
-            }
+            };
+            emit_stdout_text(stdout, stderr, "watch", &text, code)
         }
         Err(err) => {
             let _ = writeln!(stderr, "watch: {err}");
@@ -609,6 +608,37 @@ mod tests {
         assert!(
             String::from_utf8(stderr).expect("utf-8").contains("boom"),
             "internal reason surfaces"
+        );
+    }
+
+    /// P7/T12: the emit seam owns stdout finalization — a broken
+    /// pipe reports 1 with the explicit status, never the capture
+    /// code over a torn stream.
+    #[test]
+    fn finish_broken_stdout_reports_terminal_failure() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _chunk: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stdout = BrokenPipe;
+        let mut stderr = Vec::new();
+        let code = finish_watch(
+            Ok(watch_fixture()),
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1, "torn stream never reports the capture code");
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("watch: cannot write stdout"),
+            "explicit terminal output status"
         );
     }
 

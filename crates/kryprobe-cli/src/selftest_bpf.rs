@@ -182,10 +182,7 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
                 1
             }
         },
-        None => {
-            let _ = write!(stdout, "{text}");
-            code
-        }
+        None => crate::live::emit_stdout_text(stdout, stderr, "selftest bpf", &text, code),
     }
 }
 

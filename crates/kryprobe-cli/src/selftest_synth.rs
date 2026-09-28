@@ -67,10 +67,7 @@ fn run_with_schema(
                 1
             }
         },
-        None => {
-            let _ = write!(stdout, "{text}");
-            0
-        }
+        None => crate::live::emit_stdout_text(stdout, stderr, "selftest synthetic", &text, 0),
     }
 }
 
