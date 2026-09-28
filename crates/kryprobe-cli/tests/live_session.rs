@@ -3255,31 +3255,35 @@ fn selftest_out_write_failure_cannot_be_clean() {
 
 #[test]
 fn report_live_unwritable_out_reaches_live_handler() {
-    // P2r2/R2(a): the run()-level proof on the LIVE report path
-    // (ReportLive argv -> cmd_report::run_report_live, not the
-    // selftest writer). T11/P6 contract flip (approved): jsonl +
+    // P2r2/R2(a) + P6-N8: the run()-level proof on the LIVE report
+    // path (ReportLive argv -> cmd_report::run_report_live through
+    // REAL dispatch). T11/P6 contract flip (approved): jsonl +
     // request-lifecycle runs the capture (session-envelope export)
-    // instead of refusing — a valid live argv would execute a real
-    // window where capable, so determinism splits by seam: argv legs
-    // pin the parse boundary (bogus --source stops at parse, exit
-    // 2, no write), and crate-public run_report_live legs pin the
-    // live handler (bogus source bypassing parse fails typed at
-    // capture, exit 4 naming the source — source validation
-    // precedes BPF use, deterministic on every host, never a
-    // selftest verdict). Both legs pin the failure-before-write
-    // order and the --out plumbing.
+    // instead of refusing. The legs pin, without gaps: the parse
+    // boundary (bogus --source stops at parse, exit 2, no write);
+    // the run()-level live dispatch via a deterministic
+    // handler-internal pre-write failure (valid argv + --out under a
+    // missing parent dir -> exit 1 through run() — kills the
+    // return-42 dispatch mutation); argv→handler --out plumbing;
+    // failure-before-write (no file, no capture); the live-handler
+    // verdict prefix; and the request-lifecycle profile end to end
+    // (parsed into the handler in every leg — P6-N8 closes the
+    // ApiReturns gap the direct legs had).
     //
-    // Residual, stated not claimed: the --out write-failure branch
-    // itself (cmd_report.rs finish) needs a completed capture to
-    // reach at run() level (privilege); it stays covered by the
-    // direct unit test.
+    // N8 lead rejected (verified in run_live_capture): a nonexistent
+    // --token is NOT deterministic — token resolution precedes BPF
+    // but falls back to process capabilities, so a capable host
+    // would proceed to a real capture. The --out precheck is a pure
+    // filesystem precondition: deterministic on every host.
     //
     // Old-vs-new assertion mapping (MSG-01a flip, MSG-03): exit 1
     // refusal -> exit 4 typed live failure (argv leg: exit 2, parse
     // owns source spelling); "cannot export request-lifecycle rows"
     // -> "bogus-source" named by the handler; "report:" live verdict
-    // kept; no-stdout kept; no-file-before-failure kept (both legs);
-    // "no cannot write" kept; "not selftest" kept. No property dropped.
+    // kept; no-stdout kept; no-file-before-failure kept (every leg);
+    // "no cannot write" kept on live failure; "not selftest" kept.
+    // No property dropped: the run()-level leg pins live dispatch +
+    // --out plumbing + failure-before-write + verdict + profile.
     let dir = scratch("report-live-out");
     let good = dir.path().join("report.jsonl");
     let argv: Vec<String> = [
@@ -3314,13 +3318,97 @@ fn report_live_unwritable_out_reaches_live_handler() {
     );
     assert!(stdout.is_empty(), "no capture output past parse");
     assert!(!good.exists(), "parse failure precedes any --out write");
+    // Run()-level leg (P6-N8): VALID argv — request-lifecycle profile
+    // included — plus an --out whose parent directory does not
+    // exist. Dispatch reaches the live handler, which refuses BEFORE
+    // any capture or write (exit 1, handler verdict, no file).
+    let missing = dir.path().join("no-such-dir").join("report.jsonl");
+    let argv: Vec<String> = [
+        "kryprobe",
+        "report",
+        "--system",
+        "--source",
+        "kernel-crypto",
+        "--format",
+        "jsonl",
+        "--kcrypto-profile",
+        "request-lifecycle",
+        "--out",
+        missing.to_str().expect("utf-8 scratch path"),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    // The same argv parses to ReportLive carrying the request-lifecycle
+    // profile + the --out path (argv→Command pins the profile end;
+    // the run below pins the dispatch end).
+    let command = kryprobe_cli::args::parse(&argv)
+        .expect("valid argv parses")
+        .command;
+    match &command {
+        kryprobe_cli::args::Command::ReportLive { profile, out, .. } => {
+            assert_eq!(
+                *out,
+                Some(missing.clone()),
+                "argv --out reaches the command: {out:?}"
+            );
+            let parsed = ["kryprobe", "report", "--system"]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let default = match kryprobe_cli::args::parse(&parsed)
+                .expect("default argv parses")
+                .command
+            {
+                kryprobe_cli::args::Command::ReportLive { profile, .. } => profile,
+                other => panic!("expected ReportLive, got {other:?}"),
+            };
+            assert_ne!(
+                *profile, default,
+                "request-lifecycle argv must not parse to the default profile"
+            );
+        }
+        other => panic!("expected ReportLive, got {other:?}"),
+    }
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = kryprobe_cli::run(&argv, &mut stdout, &mut stderr);
+    assert_eq!(
+        code,
+        1,
+        "pre-write failure exits 1 through run(): stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stdout.is_empty(), "no stdout on pre-write failure");
+    let text = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        text.contains("report: cannot write"),
+        "live-handler verdict refuses the write: {text}"
+    );
+    assert!(
+        text.contains(missing.to_str().expect("utf-8 scratch path")),
+        "verdict names the argv --out path: {text}"
+    );
+    assert!(
+        !text.contains("selftest"),
+        "verdict is the live handler's, not selftest's: {text}"
+    );
+    assert!(!missing.exists(), "failure precedes any --out write");
     // Live-handler legs through the crate-public entry: the profile
-    // comes from parsing a valid argv (no privilege-crate import —
-    // integration tests see kryprobe_cli only).
-    let parsed = ["kryprobe", "report", "--system", "--format", "jsonl"]
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    // comes from parsing a VALID request-lifecycle argv (P6-N8: the
+    // direct legs run request-lifecycle, not the ApiReturns default).
+    let parsed = [
+        "kryprobe",
+        "report",
+        "--system",
+        "--format",
+        "jsonl",
+        "--kcrypto-profile",
+        "request-lifecycle",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
     let profile = match kryprobe_cli::args::parse(&parsed)
         .expect("valid argv parses")
         .command

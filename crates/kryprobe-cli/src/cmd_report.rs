@@ -4,7 +4,9 @@
 //! (exit 0 complete, 3 partial, 4 unusable, 1 internal).
 
 use crate::args::{FilterArgs, ReportFormat};
-use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use crate::live::{
+    DEFAULT_TICK_MS, LIVE_SOURCE, LiveConfig, LiveError, LiveOutcome, run_live_capture,
+};
 use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
 };
@@ -392,6 +394,33 @@ fn finish_report_live(
     }
 }
 
+/// Pre-flight `--out` check (P6-N8): the parent directory must
+/// exist and be a directory BEFORE any capture — a write that is
+/// certain to fail refuses here (exit 1, the write seam's own
+/// message family), deterministically on every host, instead of
+/// burning a capture first. Bare filenames (no parent) and existing
+/// parents pass through to the write seam, which reports real
+/// failures (TOCTOU-safe: the seam still owns the write). Returns
+/// the refusal detail, if any.
+fn preflight_out_writable(out: &Path) -> Option<String> {
+    let parent = out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(meta) if meta.is_dir() => None,
+        Ok(_) => Some(format!(
+            "cannot write {}: parent {} is not a directory",
+            out.display(),
+            parent.display()
+        )),
+        Err(_) => Some(format!(
+            "cannot write {}: no such parent directory {}",
+            out.display(),
+            parent.display()
+        )),
+    }
+}
+
 /// Runs `report --system`: one bounded capture (default 60s), rendered
 /// human (same tables as `watch`, plus the verdict exit) or JSON.
 #[allow(clippy::too_many_arguments)]
@@ -406,6 +435,30 @@ pub fn run_report_live(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    // P6-N8: the source spelling refuses FIRST (hoisted ahead of the
+    // --out precheck and the capture — a live failure precedes any
+    // write attempt, and direct-handler probes keep their exact
+    // typed verdict).
+    if source != LIVE_SOURCE {
+        return finish_report_live(
+            Err(LiveError::Unusable(format!(
+                "unsupported live source '{source}': only '{LIVE_SOURCE}' is captured live"
+            ))),
+            format,
+            out,
+            filter,
+            stdout,
+            stderr,
+        );
+    }
+    // P6-N8: the --out precheck refuses BEFORE any capture (exit 1,
+    // handler verdict — deterministic on every host).
+    if let Some(path) = out
+        && let Some(detail) = preflight_out_writable(path)
+    {
+        let _ = writeln!(stderr, "report: {detail}");
+        return 1;
+    }
     // T11/P6: the versioned-envelope ADR decided — lifecycle
     // outcomes export the session envelope (validated observations
     // + coverage + receipt), so jsonl + request-lifecycle runs the
@@ -1170,5 +1223,91 @@ mod tests {
         let record: serde_json::Value = serde_json::from_str(coverage).expect("coverage parses");
         assert_eq!(record["unknown"], 2, "exact union:\n{text}");
         assert_eq!(record["filtered"], 0, "nothing known-mismatched:\n{text}");
+    }
+
+    #[test]
+    fn preflight_out_refuses_before_capture() {
+        // P6-N8: a valid source + an --out under a missing parent
+        // refuses exit 1 with the handler verdict (deterministic on
+        // every host — no capture runs, no file appears).
+        let scratch = kryprobe_testkit::TempDir::named("k3-2-preflight").expect("scratch dir");
+        let missing = scratch.path().join("no-such-dir").join("report.jsonl");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_report_live(
+            "kernel-crypto",
+            Some(60),
+            ReportFormat::Jsonl,
+            Some(&missing),
+            None,
+            LifecycleProfile::RequestLifecycle,
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        let detail = String::from_utf8(stderr).expect("utf-8");
+        assert!(
+            detail.contains("report: cannot write"),
+            "handler verdict: {detail}"
+        );
+        assert!(detail.contains("no-such-dir"), "names the path: {detail}");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn preflight_out_passes_writable_shapes() {
+        // P6-N8: bare filenames and existing parents pass the
+        // precheck (the write seam owns real failures); a
+        // parent-that-is-a-file refuses (a write certain to fail).
+        assert_eq!(preflight_out_writable(Path::new("report.jsonl")), None);
+        let scratch = kryprobe_testkit::TempDir::named("k3-2-preflight-ok").expect("scratch dir");
+        assert_eq!(
+            preflight_out_writable(&scratch.path().join("report.jsonl")),
+            None
+        );
+        let file = scratch.path().join("plain");
+        std::fs::write(&file, b"x").expect("seed file");
+        assert!(
+            preflight_out_writable(&file.join("report.jsonl"))
+                .is_some_and(|detail| detail.contains("not a directory")),
+            "parent file refuses"
+        );
+        assert!(
+            preflight_out_writable(&scratch.path().join("absent").join("r.jsonl"))
+                .is_some_and(|detail| detail.contains("no such parent directory")),
+            "missing parent refuses"
+        );
+    }
+
+    #[test]
+    fn hoisted_source_check_keeps_typed_verdict() {
+        // P6-N8: the hoisted source check keeps the exact typed
+        // verdict (good --out + bogus source -> exit 4, no write
+        // seam, no file) — failure precedes the write attempt.
+        let scratch = kryprobe_testkit::TempDir::named("k3-2-source").expect("scratch dir");
+        let good = scratch.path().join("should-not-exist.jsonl");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_report_live(
+            "bogus-source",
+            Some(0),
+            ReportFormat::Jsonl,
+            Some(&good),
+            None,
+            LifecycleProfile::RequestLifecycle,
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 4);
+        assert!(stdout.is_empty());
+        let detail = String::from_utf8(stderr).expect("utf-8");
+        assert_eq!(
+            detail,
+            "report: live session unusable: unsupported live source 'bogus-source': only 'kernel-crypto' is captured live\n"
+        );
+        assert!(!good.exists());
     }
 }
