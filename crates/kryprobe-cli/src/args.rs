@@ -1113,4 +1113,128 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn subcommand_help_wins_anywhere_in_tail() {
+        // P6 discovery path: `--help` after any flags is an early
+        // exit naming the subcommand — never "unexpected".
+        for tail in [
+            vec!["watch", "--help"],
+            vec!["watch", "--system", "--help"],
+            vec!["report", "--help"],
+            vec!["check", "--system", "--policy", "p", "--help"],
+            vec!["doctor", "--help"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&tail)), Err(ArgsError::SubHelp { .. })),
+                "args {tail:?} must request subcommand help"
+            );
+        }
+        assert_eq!(
+            parse(&argv(&["watch", "--help"])),
+            Err(ArgsError::SubHelp {
+                command: "watch".to_owned()
+            })
+        );
+        // Unknown subcommands still report unknown (the help
+        // request carries the name; dispatch rejects it, exit 2).
+        assert_eq!(
+            parse(&argv(&["frobnicate", "--help"])),
+            Err(ArgsError::SubHelp {
+                command: "frobnicate".to_owned()
+            })
+        );
+        assert_eq!(subcommand_help("frobnicate"), None);
+    }
+
+    #[test]
+    fn every_subcommand_has_help() {
+        for sub in [
+            "doctor", "backends", "inspect", "selftest", "token", "watch", "report", "check",
+            "plan", "observe", "run",
+        ] {
+            assert!(
+                subcommand_help(sub)
+                    .is_some_and(|text| text.contains("usage:") || text.contains("unsupported")),
+                "{sub} has help text"
+            );
+        }
+    }
+
+    #[test]
+    fn live_capture_helps_name_profile_floor() {
+        // The three live-capture helps pin the same contract: both
+        // profiles, the 7.0+ lifecycle floor, and their own exits.
+        for sub in ["watch", "report", "check"] {
+            let text = subcommand_help(sub).expect("help exists");
+            assert!(text.contains("api-returns"), "{sub} names api-returns");
+            assert!(
+                text.contains("request-lifecycle"),
+                "{sub} names request-lifecycle"
+            );
+            assert!(text.contains("7.0"), "{sub} names the kernel floor");
+            assert!(text.contains("unsupported profile"), "{sub} shows one");
+        }
+        let watch = subcommand_help("watch").expect("watch help");
+        assert!(
+            watch.contains("is NOT") && watch.contains("proof of complete coverage"),
+            "watch exit 0 is never coverage proof: {watch}"
+        );
+    }
+
+    #[test]
+    fn kcrypto_profile_parses_per_subcommand() {
+        use LifecycleProfile::{ApiReturns, RequestLifecycle};
+        // Default is api-returns everywhere.
+        for tail in [
+            vec!["watch", "--system"],
+            vec!["report", "--system"],
+            vec!["check", "--system", "--policy", "p"],
+        ] {
+            let command = parse(&argv(&tail)).unwrap().command;
+            let profile = match command {
+                Command::Watch { profile, .. }
+                | Command::ReportLive { profile, .. }
+                | Command::Check { profile, .. } => profile,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(profile, ApiReturns, "default for {tail:?}");
+        }
+        // Explicit request-lifecycle selects per subcommand.
+        assert!(matches!(
+            parse(&argv(&[
+                "watch",
+                "--system",
+                "--kcrypto-profile",
+                "request-lifecycle"
+            ]))
+            .unwrap()
+            .command,
+            Command::Watch {
+                profile: RequestLifecycle,
+                ..
+            }
+        ));
+        // Unsupported profiles are usage errors naming the supported set.
+        for tail in [
+            vec!["watch", "--system", "--kcrypto-profile", "frobnicate"],
+            vec!["report", "--system", "--kcrypto-profile", "frobnicate"],
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p",
+                "--kcrypto-profile",
+                "frobnicate",
+            ],
+        ] {
+            match parse(&argv(&tail)) {
+                Err(ArgsError::Usage(reason)) => assert!(
+                    reason.contains("api-returns|request-lifecycle"),
+                    "names supported profiles: {reason}"
+                ),
+                other => panic!("args {tail:?} must be a usage error, got {other:?}"),
+            }
+        }
+    }
 }

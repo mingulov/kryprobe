@@ -437,3 +437,70 @@ fn subcommand_help_succeeds_and_names_profile_floor() {
         Err(ArgsError::Usage(_))
     ));
 }
+
+#[test]
+fn check_help_names_own_exits() {
+    // `check` documents its own exit family: 0 clean, 3
+    // inconclusive, 10 violation — distinct from watch/report.
+    let (code, stdout, _) = run(&["check", "--help"]);
+    assert_eq!(code, 0, "check --help must succeed");
+    assert!(stdout.contains("10 policy violation"), "exit 10: {stdout}");
+    assert!(stdout.contains("3 inconclusive"), "exit 3: {stdout}");
+    assert!(stdout.contains("--policy"), "policy flag: {stdout}");
+    // Unknown subcommand help stays a usage error (exit 2), never a
+    // silent empty page.
+    let (code, _, stderr) = run(&["frobnicate", "--help"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unknown subcommand"), "names it: {stderr}");
+}
+
+#[test]
+fn watch_exit_zero_is_never_coverage_proof() {
+    // The completed-watch contract, pinned in help text: exit 0 ends
+    // the session, the coverage trailer judges completeness.
+    let (_, stdout, _) = run(&["watch", "--help"]);
+    assert!(
+        stdout.contains("0 session complete") && stdout.contains("exit 0 is NOT"),
+        "watch help states the contract: {stdout}"
+    );
+    // Report owns its own exits: 0 verdict clean/complete, 3 gaps.
+    let (_, stdout, _) = run(&["report", "--help"]);
+    assert!(
+        stdout.contains("0 verdict clean/complete") && stdout.contains("3 PARTIAL"),
+        "report help states its exits: {stdout}"
+    );
+}
+
+#[test]
+fn policy_surface_rejects_loudly() {
+    // Unknown policy versions refuse (exit 2 at the CLI), never parse.
+    assert!(
+        kryprobe_policy::parse_policy("version: 2\nrules: []").is_err(),
+        "version 2 must refuse"
+    );
+    // Unknown match keys refuse — a typo never becomes a wildcard.
+    assert!(
+        kryprobe_policy::parse_rule(
+            "id: x\nsource: kernel-crypto\nmatch: {bogus_key: 1}\ndecision: deny"
+        )
+        .is_err(),
+        "unknown match key must refuse"
+    );
+    // Unknown decisions refuse.
+    assert!(
+        kryprobe_policy::parse_rule("id: x\nsource: kernel-crypto\nmatch: {}\ndecision: maybe")
+            .is_err(),
+        "unknown decision must refuse"
+    );
+    // Control: the documented keys parse, including an empty match
+    // (vacuous AND over the rule's source).
+    let rule = kryprobe_policy::parse_rule(
+        "id: x\nsource: kernel-crypto\nmatch: {context: softirq, uid: 0}\ndecision: report",
+    )
+    .expect("documented keys parse");
+    assert!(!rule.match_spec.is_empty());
+    let rule =
+        kryprobe_policy::parse_rule("id: y\nsource: kernel-crypto\nmatch: {}\ndecision: deny")
+            .expect("empty match parses");
+    assert!(rule.match_spec.is_empty());
+}
