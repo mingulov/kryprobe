@@ -279,16 +279,22 @@ impl ExecutionContext {
 
     /// The origin this execution may claim. Only a process execution
     /// names itself, and only a worker WITH a proved handoff names its
-    /// originator; softirq and unknown never name an origin.
+    /// originator; softirq and unknown never name an origin. A claimed
+    /// lifetime WITHOUT a start marker is unqualified (P6-N7: a
+    /// missing lifetime marker stays unavailable, never proved —
+    /// the same qualification the lifetime join applies).
     #[must_use]
     pub fn origin(&self) -> OriginClaim {
         match self.kind {
-            ExecutionKind::Process(lifetime) => OriginClaim::Proved(lifetime),
+            ExecutionKind::Process(lifetime) if lifetime.start_marker.is_some() => {
+                OriginClaim::Proved(lifetime)
+            }
             ExecutionKind::Worker {
                 handoff: Some(origin),
                 ..
-            } => OriginClaim::Proved(origin),
-            ExecutionKind::Worker { handoff: None, .. }
+            } if origin.start_marker.is_some() => OriginClaim::Proved(origin),
+            ExecutionKind::Process(_)
+            | ExecutionKind::Worker { .. }
             | ExecutionKind::SoftIrq { .. }
             | ExecutionKind::Unknown => OriginClaim::Unavailable,
         }
@@ -427,38 +433,48 @@ pub enum FilterVerdict {
     Unknown,
 }
 
-/// Applies `filter` to one request's contexts. `None` submitter (or a
-/// `None` constrained scalar) resolves through the filter's
-/// [`UnknownPolicy`]. The completion is never evaluated separately:
-/// admission is per request, so an admitted completion follows.
+/// Applies `filter` to one request's contexts. EVERY set constraint
+/// is evaluated (P6-N6): a known mismatch on ANY constrained field
+/// decides [`FilterVerdict::FilteredOut`] immediately — an
+/// included unknown satisfies ONLY its own field and never
+/// short-circuits a later mismatch. Fields the request cannot
+/// answer (`None` submitter, `None` constrained scalar) resolve
+/// through the filter's [`UnknownPolicy`] ONLY when no known
+/// mismatch decided first. The completion is never evaluated
+/// separately: admission is per request, so an admitted completion
+/// follows.
 #[must_use]
 pub fn apply_filter(req: &RequestContext, filter: &ContextFilter) -> FilterVerdict {
-    let unknown = match filter.unknown_policy {
-        UnknownPolicy::Exclude => FilterVerdict::Unknown,
-        UnknownPolicy::Include => FilterVerdict::Admitted,
-    };
+    let mut saw_unknown = false;
     if let Some(want) = filter.submitter_pid {
         match req.submitter.as_ref() {
-            None => return unknown,
+            None => saw_unknown = true,
             Some(sub) if sub.lifetime.pid != want => return FilterVerdict::FilteredOut,
             Some(_) => {}
         }
     }
     if let Some(want) = filter.submitter_uid {
         match req.submitter.as_ref().and_then(|sub| sub.uid) {
-            None => return unknown,
+            None => saw_unknown = true,
             Some(got) if got != want => return FilterVerdict::FilteredOut,
             Some(_) => {}
         }
     }
     if let Some(want) = filter.submitter_comm.as_deref() {
         match req.submitter.as_ref().and_then(|sub| sub.comm.as_deref()) {
-            None => return unknown,
+            None => saw_unknown = true,
             Some(got) if got != want => return FilterVerdict::FilteredOut,
             Some(_) => {}
         }
     }
-    FilterVerdict::Admitted
+    if saw_unknown {
+        match filter.unknown_policy {
+            UnknownPolicy::Exclude => FilterVerdict::Unknown,
+            UnknownPolicy::Include => FilterVerdict::Admitted,
+        }
+    } else {
+        FilterVerdict::Admitted
+    }
 }
 
 /// Separate tallies for the three verdict populations. Every evaluated
@@ -670,5 +686,144 @@ mod tests {
         let completion = CompletionContext::follows(ExecutionContext::process(lifetime));
         assert!(completion.follows_request);
         assert_eq!(completion.landed.origin(), OriginClaim::Proved(lifetime));
+    }
+
+    fn filtered_request() -> RequestContext {
+        // Matching pid, MISSING uid, KNOWN comm mismatch: the comm
+        // mismatch is decisive whatever the unknown policy says.
+        let sub = SubmitterContext {
+            lifetime: TaskLifetime {
+                pid: 101,
+                tgid: 100,
+                start_marker: Some(50_000),
+            },
+            comm: Some("different".to_owned()),
+            uid: None,
+            cgroup: Some(7),
+            ppid: Some(1),
+            stack: StackMarker::Missing,
+        };
+        RequestContext {
+            request_id: "req:filter".to_owned(),
+            submitter: Some(sub),
+            execution: ExecutionContext::unknown(),
+            completion: None,
+            evidence_version: "evidence:v1".to_owned(),
+            rule_version: "rule:v1".to_owned(),
+            consumer_label: None,
+        }
+    }
+
+    #[test]
+    fn known_mismatch_dominates_included_unknown() {
+        // P6-N6 RED: include-unknown must satisfy ONLY its own field
+        // — a known comm mismatch still filters out.
+        let req = filtered_request();
+        let filter = ContextFilter {
+            submitter_pid: Some(101),
+            submitter_uid: Some(1000),
+            submitter_comm: Some("wanted".to_owned()),
+            unknown_policy: UnknownPolicy::Include,
+        };
+        assert_eq!(apply_filter(&req, &filter), FilterVerdict::FilteredOut);
+    }
+
+    #[test]
+    fn known_mismatch_dominates_excluded_unknown() {
+        // Same decisive mismatch under Exclude (unknown would ALSO
+        // refuse — but the verdict is FilteredOut, never Unknown).
+        let req = filtered_request();
+        let filter = ContextFilter {
+            submitter_pid: Some(101),
+            submitter_uid: Some(1000),
+            submitter_comm: Some("wanted".to_owned()),
+            unknown_policy: UnknownPolicy::Exclude,
+        };
+        assert_eq!(apply_filter(&req, &filter), FilterVerdict::FilteredOut);
+    }
+
+    #[test]
+    fn unknown_resolves_via_policy_absent_mismatch() {
+        // No known mismatch: the missing uid resolves through the
+        // policy (Include admits, Exclude counts unknown).
+        let req = filtered_request();
+        let include = ContextFilter {
+            submitter_pid: Some(101),
+            submitter_uid: Some(1000),
+            submitter_comm: Some("different".to_owned()),
+            unknown_policy: UnknownPolicy::Include,
+        };
+        assert_eq!(apply_filter(&req, &include), FilterVerdict::Admitted);
+        let exclude = ContextFilter {
+            unknown_policy: UnknownPolicy::Exclude,
+            ..include
+        };
+        assert_eq!(apply_filter(&req, &exclude), FilterVerdict::Unknown);
+    }
+
+    #[test]
+    fn markerless_process_origin_is_unavailable() {
+        // P6-N7 RED: a claimed process lifetime without a start
+        // marker proves nothing (task: missing lifetime marker
+        // stays unavailable).
+        let lifetime = TaskLifetime {
+            pid: 100,
+            tgid: 100,
+            start_marker: None,
+        };
+        assert_eq!(
+            ExecutionContext::process(lifetime).origin(),
+            OriginClaim::Unavailable
+        );
+    }
+
+    #[test]
+    fn markerless_handoff_origin_is_unavailable() {
+        // Same rule for worker handoffs: a markerless originator is
+        // unavailable, never proved.
+        let worker = TaskLifetime {
+            pid: 7,
+            tgid: 7,
+            start_marker: Some(11),
+        };
+        let origin = TaskLifetime {
+            pid: 100,
+            tgid: 100,
+            start_marker: None,
+        };
+        let exec = ExecutionContext {
+            kind: ExecutionKind::Worker {
+                worker,
+                handoff: Some(origin),
+            },
+        };
+        assert_eq!(exec.origin(), OriginClaim::Unavailable);
+    }
+
+    #[test]
+    fn marked_origins_stay_proved() {
+        // The qualification keeps every honestly-marked claim: a
+        // marked process proves itself, a marked handoff proves its
+        // originator.
+        let lifetime = TaskLifetime {
+            pid: 100,
+            tgid: 100,
+            start_marker: Some(50_000),
+        };
+        assert_eq!(
+            ExecutionContext::process(lifetime).origin(),
+            OriginClaim::Proved(lifetime)
+        );
+        let exec = ExecutionContext {
+            kind: ExecutionKind::Worker {
+                worker: TaskLifetime {
+                    pid: 7,
+                    tgid: 7,
+                    start_marker: Some(11),
+                },
+                handoff: Some(lifetime),
+            },
+        };
+        assert_eq!(exec.origin(), OriginClaim::Proved(lifetime));
     }
 }
