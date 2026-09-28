@@ -142,6 +142,19 @@ impl InterruptibleWriter {
         Self::new(libc::STDOUT_FILENO)
     }
 
+    /// Reads an fd's file-status flags (`F_GETFL`) — the CLI-side
+    /// flag pins observe restoration through this instead of
+    /// touching `libc` themselves (ADR-0002 Rule B).
+    pub fn fd_status_flags(fd: std::os::fd::RawFd) -> std::io::Result<libc::c_int> {
+        // SAFETY: `fcntl` with valid args reports failure via its
+        // return; the fd is caller-owned and open.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(flags)
+    }
+
     /// Restores the fd's saved file-status flags (P7-N7: `main`
     /// calls this explicitly before `process::exit`, which skips
     /// `Drop` — otherwise the installed `O_NONBLOCK` leaks to the

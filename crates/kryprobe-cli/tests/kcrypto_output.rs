@@ -378,9 +378,10 @@ fn output_production_writer_aborts_stalled_pipe() {
     use std::os::fd::AsRawFd as _;
     let _sigint = reset_sigint();
     let (mut reader, writer) = std::io::pipe().expect("pipe creates");
-    // SAFETY: fresh pipe end; `F_GETFL` reports failure via return.
-    let saved = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-    assert!(saved >= 0, "pre-wrap flags read");
+    // Flags observed through the privilege helper (ADR-0002 Rule B:
+    // the CLI never touches `libc`, not even in tests).
+    let saved = kryprobe_privilege::host::InterruptibleWriter::fd_status_flags(writer.as_raw_fd())
+        .expect("pre-wrap flags read");
     let (sink_tx, sink_rx) = std::sync::mpsc::channel::<()>();
     let sink = std::thread::spawn(move || {
         let mut sip = vec![0u8; 4096];
@@ -408,8 +409,9 @@ fn output_production_writer_aborts_stalled_pipe() {
         // (here simulated) `process::exit`, then read the flags back
         // while the fd is still open.
         fd_writer.restore();
-        // SAFETY: write end still owned here; `F_GETFL` via return.
-        let restored = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let restored =
+            kryprobe_privilege::host::InterruptibleWriter::fd_status_flags(writer.as_raw_fd())
+                .expect("post-restore flags read");
         drop(fd_writer);
         drop(writer);
         let _ = tx.send((code, stderr, restored));
