@@ -31,6 +31,16 @@ impl<W: Write> StdoutGuard<W> {
     }
 }
 
+impl StdoutGuard<kryprobe_privilege::host::InterruptibleWriter> {
+    /// P7-N7: restores production stdout's saved flags before
+    /// `process::exit` (which skips `Drop` — without this the
+    /// installed `O_NONBLOCK` leaks to the caller's open-file
+    /// description on every success/torn-abort/error exit).
+    fn restore_stdout_flags(&self) {
+        self.inner.restore();
+    }
+}
+
 impl<W: Write> Write for StdoutGuard<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.inner.write(buf) {
@@ -109,6 +119,13 @@ fn main() {
         &mut stderr as &mut dyn Write,
     );
     let code = finish(code, &mut stdout, &mut stderr);
+    // P7-N7: `process::exit` skips destructors, so the writer's
+    // restoring `Drop` never runs here — restore stdout's flags
+    // explicitly on this one final exit (success, torn-abort and
+    // every subcommand error code flow through it; the
+    // constructor-failure exit above installed no writer, so
+    // there is nothing to undo there).
+    stdout.restore_stdout_flags();
     std::process::exit(code);
 }
 

@@ -142,6 +142,18 @@ impl InterruptibleWriter {
         Self::new(libc::STDOUT_FILENO)
     }
 
+    /// Restores the fd's saved file-status flags (P7-N7: `main`
+    /// calls this explicitly before `process::exit`, which skips
+    /// `Drop` — otherwise the installed `O_NONBLOCK` leaks to the
+    /// caller's open-file description). Idempotent (a second
+    /// restore rewrites the same flags) and best-effort, like the
+    /// `Drop` below which delegates here.
+    pub fn restore(&self) {
+        // SAFETY: same fd as construction; best-effort restore (a
+        // drop cannot fail — the emit window owns the fd anyway).
+        let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.saved_flags) };
+    }
+
     /// One stalled-sink wait: polls the fd writable for a single
     /// slice, then reports whether a fresh SIGINT arrived during it.
     fn poll_slice(&self) -> bool {
@@ -220,9 +232,7 @@ impl std::io::Write for InterruptibleWriter {
 
 impl Drop for InterruptibleWriter {
     fn drop(&mut self) {
-        // SAFETY: same fd as construction; best-effort restore (a
-        // drop cannot fail — the emit window owns the fd anyway).
-        let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.saved_flags) };
+        self.restore();
     }
 }
 
@@ -419,6 +429,51 @@ mod tests {
             libc::close(read_fd);
         }
         assert_eq!(drained, 65_536, "exactly the pre-fill drains");
+    }
+
+    /// P7-N7: explicit `restore` returns the fd's flags to the
+    /// pre-construction value (the `process::exit` path cannot
+    /// rely on `Drop`); restore-then-drop is harmless
+    /// (idempotent — the same flags rewritten).
+    #[test]
+    fn restore_returns_saved_flags_before_drop() {
+        // SAFETY: `pipe2` with a valid out-pointer; fds closed below.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe creates"
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: valid fd; `F_GETFL` reports failure via its return.
+        let saved = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        assert!(saved >= 0, "flags read");
+        assert_eq!(
+            saved & libc::O_NONBLOCK,
+            0,
+            "pipe starts blocking (precondition)"
+        );
+        let writer = super::InterruptibleWriter::new(write_fd).expect("wraps");
+        // SAFETY: same fd as construction.
+        let installed = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        assert_ne!(
+            installed & libc::O_NONBLOCK,
+            0,
+            "construction installs O_NONBLOCK"
+        );
+        writer.restore();
+        // SAFETY: same fd as construction.
+        let restored = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        assert_eq!(restored, saved, "explicit restore returns saved flags");
+        drop(writer);
+        // SAFETY: same fd as construction.
+        let after_drop = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        assert_eq!(after_drop, saved, "restore-then-drop keeps the saved flags");
+        // SAFETY: both ends owned here.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 
     #[test]
