@@ -552,3 +552,89 @@ fn sol04_misaligned_record_error_carries_no_address() {
         );
     }
 }
+
+/// P7-N5 — fence-window semantics on the real ingest core: two
+/// submits admit pre-fence (in-flight reads 4 = 2 decoder
+/// outstanding + 2 reducer pending — the guard double-counts by
+/// design, since either half alone can hold unfinished work); after
+/// the fence a fresh submit refuses counted (`submit_refused`, never
+/// admitted), the in-flight return still joins and completes
+/// (newly == 1), and an unknown-invocation return counts
+/// `unknown_invoc_returns` without admitting anything. The rest
+/// drains truthless via `finish` with the equation exact
+/// (`admitted == emitted`, `unfinished ⊆ emitted`).
+#[test]
+fn n5_fence_window_refuses_fresh_keeps_inflight() {
+    let mut core = SensorCore::new(8, 8, 8, 8, 8, true);
+    assert_eq!(
+        core.ingest_records(&[submit_bytes(1, 100), submit_bytes(2, 101)]),
+        0,
+        "submits emit nothing"
+    );
+    assert!(!core.admission_fenced(), "unfenced before the stop");
+    assert_eq!(core.in_flight(), 4, "2 outstanding + 2 pending");
+    core.set_admission_fenced(true);
+    assert!(core.admission_fenced(), "fence raised");
+    // Fence window: fresh submit (refuses), in-flight return
+    // (joins + completes), unknown-invocation return (counts only).
+    assert_eq!(
+        core.ingest_records(&[
+            submit_bytes(3, 160),
+            return_bytes(1, 170, 0),
+            return_bytes(99, 180, 0),
+        ]),
+        1,
+        "only the in-flight return completes"
+    );
+    let ledger = core
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
+        .expect("empty miss join");
+    assert_eq!(ledger.decode.admitted, 2, "nothing new admitted");
+    assert_eq!(ledger.decode.submit_refused, 1, "fresh submit fenced");
+    assert_eq!(
+        ledger.decode.unknown_invoc_returns, 1,
+        "unknown return counted, never admitted"
+    );
+    assert_eq!(ledger.reducer.admitted, 2, "fenced submit mints no id");
+    assert_eq!(ledger.reducer.emitted, 1, "in-flight completion emits");
+    assert_eq!(core.in_flight(), 2, "call 2 still outstanding + pending");
+    let done = core.take_completed();
+    assert_eq!(done.len(), 1, "one completion retained");
+    assert_eq!(done[0].terminal, Terminal::Sync(0), "grounded terminal");
+    // Budget-exhausted remainder drains truthless (counted
+    // `unfinished`, never silent); the equation holds exactly.
+    core.finish(999);
+    let rest = core.take_completed();
+    assert_eq!(rest.len(), 1, "pending drains at finish");
+    assert_eq!(rest[0].terminal, Terminal::Unknown, "explicit unknown");
+    let ledger = core
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
+        .expect("empty miss join");
+    assert_eq!((ledger.reducer.admitted, ledger.reducer.emitted), (2, 2));
+    assert_eq!(ledger.reducer.unfinished, 1, "truthless finish counted");
+    assert!(
+        ledger.reducer.unfinished <= ledger.reducer.emitted,
+        "unfinished ⊆ emitted"
+    );
+}
+
+/// P7-N5 — a same-invocation resubmit under the fence still gaps
+/// the OLD in-flight id (in-flight handling — the gap truths the
+/// id whose return never arrived) while the NEW submit refuses:
+/// `gaps_synthesized == 1`, `submit_refused == 1`, admitted holds.
+#[test]
+fn n5_fenced_resubmit_gaps_old_refuses_new() {
+    let mut core = SensorCore::new(8, 8, 8, 8, 8, true);
+    assert_eq!(core.ingest_records(&[submit_bytes(1, 100)]), 0);
+    core.set_admission_fenced(true);
+    core.ingest_records(&[submit_bytes(1, 200)]);
+    let ledger = core
+        .ledger([0; 5], [0; 22], Vec::new(), ctx())
+        .expect("empty miss join");
+    assert_eq!(ledger.decode.admitted, 1, "no new admission");
+    assert_eq!(ledger.decode.submit_refused, 1, "resubmit refuses");
+    assert_eq!(
+        ledger.decode.gaps_synthesized, 1,
+        "old id gapped (in-flight handling)"
+    );
+}

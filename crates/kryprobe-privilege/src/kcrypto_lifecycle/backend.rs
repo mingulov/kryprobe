@@ -169,9 +169,29 @@ impl LifecycleBackend {
         })
     }
 
-    /// Disarm-then-detach, step 1 (M1): the sensor proves the
+    /// Admission fence, stop phase 1 (P7-N5): the sensor stops
+    /// admitting fresh submits (counted refusals) while staying
+    /// attached + ARMED for the bounded in-flight drain.
+    pub fn fence_admissions(&self) -> Result<(), BackendError> {
+        let fenced = self.with_sensor(|sensor| sensor.fence_admissions())?;
+        fenced.map_err(|err| {
+            BackendError::Internal(InternalError::with_detail(
+                "lifecycle_fence",
+                &err.to_string(),
+            ))
+        })
+    }
+
+    /// Stop-phase in-flight (decoder outstanding + reducer
+    /// pending); the bounded drain exits early at zero.
+    pub fn in_flight(&self) -> Result<u64, BackendError> {
+        self.with_sensor(|sensor| sensor.in_flight())
+    }
+
+    /// Disarm-then-detach (M1): the sensor proves the
     /// disarmed config before dropping links; a disarm failure still
-    /// detaches but surfaces typed here.
+    /// detaches but surfaces typed here. Runs after the bounded
+    /// in-flight drain (the stop-phase close).
     pub fn close_input(&self) -> Result<(), BackendError> {
         let disarm = self.with_sensor(|sensor| sensor.close_input())?;
         disarm.map_err(configured_error_to_backend)

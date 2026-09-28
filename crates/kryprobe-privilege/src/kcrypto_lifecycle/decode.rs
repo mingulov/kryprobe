@@ -218,9 +218,10 @@ pub enum DecodeDrop {
 pub struct DecodeStats {
     /// Submits admitted (fresh opaque ids issued).
     pub admitted: u64,
-    /// Submits refused (table full, id space exhausted, or BPF
-    /// [`LEDGE_TAINTED`] — never admitted, never disturbing: a
-    /// tainted edge names no invocation, so there is nothing to gap).
+    /// Submits refused (table full, id space exhausted, BPF
+    /// [`LEDGE_TAINTED`], or the P7-N5 stop-phase admission fence —
+    /// never admitted, never disturbing: a tainted edge names no
+    /// invocation, so there is nothing to gap).
     pub submit_refused: u64,
     /// Returns for invocations with no outstanding submit (lost
     /// submit, pre-attach call, or BPF taint — never joined, never
@@ -540,6 +541,13 @@ pub struct LifecycleDecoder {
     uncovered_keys: HashMap<u64, u64>,
     /// Refused-token FIFO oldest-first (loud overflow eviction).
     uncovered_order: VecDeque<u64>,
+    /// Admission fence (P7-N5): when set, fresh submits refuse
+    /// (counted `submit_refused`, contention retained — the normal
+    /// refusal path) while returns and callbacks for outstanding
+    /// ids keep joining. The stop sequence raises this BEFORE the
+    /// bounded in-flight drain, so no NEW request admits after the
+    /// fence while in-flight ones still complete.
+    admission_fenced: bool,
 }
 
 impl std::fmt::Debug for LifecycleDecoder {
@@ -567,6 +575,7 @@ impl LifecycleDecoder {
             uncovered: HashMap::new(),
             uncovered_keys: HashMap::new(),
             uncovered_order: VecDeque::new(),
+            admission_fenced: false,
         }
     }
 
@@ -574,6 +583,27 @@ impl LifecycleDecoder {
     #[must_use]
     pub fn stats(&self) -> DecodeStats {
         self.stats
+    }
+
+    /// Raises or lowers the admission fence (P7-N5 stop phase 1).
+    /// Lowering is a test-only affordance (production raises once
+    /// and proceeds to detach — the fence never drops mid-session).
+    pub fn set_admission_fenced(&mut self, fenced: bool) {
+        self.admission_fenced = fenced;
+    }
+
+    /// Whether fresh submits currently refuse at the fence.
+    #[must_use]
+    pub fn admission_fenced(&self) -> bool {
+        self.admission_fenced
+    }
+
+    /// Outstanding invocations awaiting their return (the decoder
+    /// half of stop-phase in-flight — the other half is the
+    /// reducer's pending set).
+    #[must_use]
+    pub fn outstanding_len(&self) -> usize {
+        self.outstanding.len()
     }
 
     /// Current callback-adapter loss counters (the P4 feed:
@@ -815,6 +845,19 @@ impl LifecycleDecoder {
                 id: old.id,
                 reason: GapReason::IdentityAmbiguous,
             });
+        }
+        // P7-N5 fence: fresh submits refuse through the NORMAL
+        // refusal path (counted + contention retained, exactly like
+        // capacity exhaustion — a fenced key stays contended, so a
+        // later callback naming it gaps instead of misjoining).
+        // Placed AFTER the resubmit gap: the gap truths an OLD
+        // in-flight id (in-flight handling, which the fence phase
+        // wants), while the NEW submit still refuses. Returns and
+        // callbacks bypass this entirely (separate dispatch arms).
+        if self.admission_fenced {
+            self.stats.submit_refused += 1;
+            self.retain_refused(raw.key, &mut out);
+            return out;
         }
         if self.outstanding.len() >= self.capacity {
             self.stats.submit_refused += 1;

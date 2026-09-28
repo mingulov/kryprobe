@@ -448,19 +448,26 @@ fn output_ledger(admitted: u64, emitted: u64, unfinished: u64) -> LifecycleLedge
 }
 
 /// Scripted lifecycle sensor with a call-order tape: teardown calls
-/// (`verify_identity` → `close_input` → `drain_quiet` →
-/// `take_close` → `finish_stop` → `take_close` → `ledger`) record
-/// in order (per-tick takes stay off the tape). Optional SIGINT
-/// injection on a chosen `drain_tick` (E05 mid-burst) or in
-/// `drain_quiet` (E05 closing drain).
+/// (`fence_admissions` → `drain_fenced`/`take_fenced` (only when the
+/// script stages fence records — otherwise in-flight reads zero and
+/// no round runs) → `verify_identity` → `close_input` →
+/// `drain_quiet` → `take_close` → `finish_stop` → `take_close` →
+/// `ledger`) record in order (per-tick takes stay off the tape).
+/// Structural pins (beyond string equality): `close_input` refuses
+/// unless fenced, `drain_quiet`/`finish_stop` refuse unless
+/// detached. Optional SIGINT injection on a chosen `drain_tick`
+/// (E05 mid-burst) or in `drain_quiet` (E05 closing drain).
 struct ScriptedOutputSensor<'a> {
     ticks: Vec<Vec<RequestRecord>>,
+    fence_records: Vec<RequestRecord>,
     finish_records: Vec<RequestRecord>,
     finish_staged: bool,
     ledger: LifecycleLedger,
     now: u64,
     drains: AtomicU64,
     taken: AtomicU64,
+    fenced: bool,
+    fence_served: AtomicBool,
     teardown: bool,
     order: Mutex<Vec<&'static str>>,
     quiet_backlog: u64,
@@ -485,6 +492,18 @@ impl LifecycleSessionSensor for ScriptedOutputSensor<'_> {
     }
 
     fn drain_tick(&mut self, _max_records: usize) -> Result<DrainOutcome, LiveError> {
+        if self.fenced && !self.teardown {
+            // Stop-phase in-flight round (never a tick drain — the
+            // tick counters stay untouched, and SIGINT injection
+            // targets ticks only).
+            self.tape("drain_fenced");
+            let completed = self.fence_records.len();
+            return Ok(DrainOutcome {
+                records: completed,
+                completed,
+                busy: false,
+            });
+        }
         let call = self.drains.fetch_add(1, Ordering::Relaxed);
         if Some(call) == self.sigint_on_drain {
             SIGINT_SEEN.store(true, Ordering::Relaxed);
@@ -506,6 +525,11 @@ impl LifecycleSessionSensor for ScriptedOutputSensor<'_> {
             self.tape("take_close");
             return Ok(self.finish_records.clone());
         }
+        if self.fenced && !self.teardown && !self.fence_served.load(Ordering::Relaxed) {
+            self.fence_served.store(true, Ordering::Relaxed);
+            self.tape("take_fenced");
+            return Ok(self.fence_records.clone());
+        }
         let call = self.taken.fetch_add(1, Ordering::Relaxed);
         if self.teardown {
             self.tape("take_close");
@@ -522,13 +546,35 @@ impl LifecycleSessionSensor for ScriptedOutputSensor<'_> {
         Ok(())
     }
 
+    fn fence_admissions(&mut self) -> Result<(), LiveError> {
+        self.fenced = true;
+        self.tape("fence_admissions");
+        Ok(())
+    }
+
+    fn in_flight(&self) -> Result<u64, LiveError> {
+        // Scripted in-flight: nonzero until the staged fence batch
+        // is served once (an empty script reads zero — no round
+        // runs, exactly like a drained production sensor).
+        if self.fenced
+            && !self.fence_served.load(Ordering::Relaxed)
+            && !self.fence_records.is_empty()
+        {
+            Ok(self.fence_records.len() as u64)
+        } else {
+            Ok(0)
+        }
+    }
+
     fn close_input(&mut self) -> Result<(), LiveError> {
+        assert!(self.fenced, "fence precedes detach (P7-N5 order)");
         self.teardown = true;
         self.tape("close_input");
         Ok(())
     }
 
     fn drain_quiet(&mut self) -> Result<QuietOutcome, LiveError> {
+        assert!(self.teardown, "detach precedes the remaining drain");
         self.tape("drain_quiet");
         if self.sigint_on_quiet {
             SIGINT_SEEN.store(true, Ordering::Relaxed);
@@ -543,6 +589,7 @@ impl LifecycleSessionSensor for ScriptedOutputSensor<'_> {
 
     fn finish_stop(&mut self, stop_ns: u64) -> Result<(), LiveError> {
         assert_eq!(stop_ns, self.now, "finish stamps the closing wall");
+        assert!(self.teardown, "detach precedes truthless finish");
         self.tape("finish_stop");
         self.finish_staged = true;
         Ok(())
@@ -616,12 +663,15 @@ fn new_sensor<'a>(
 ) -> ScriptedOutputSensor<'a> {
     ScriptedOutputSensor {
         ticks,
+        fence_records: Vec::new(),
         finish_records,
         finish_staged: false,
         ledger,
         now: 555,
         drains: AtomicU64::new(0),
         taken: AtomicU64::new(0),
+        fenced: false,
+        fence_served: AtomicBool::new(false),
         teardown: false,
         order: Mutex::new(Vec::new()),
         quiet_backlog: 0,
@@ -631,13 +681,15 @@ fn new_sensor<'a>(
     }
 }
 
-/// Item 2 — stop ordering: admission fence → in-flight →
-/// snapshot → detach/drain → writer finalize → verdict, read off
-/// the call tape: `verify_identity` (attached snapshot) →
-/// `close_input` (fence+detach) → `drain_quiet` (remaining drain)
-/// → `take_close` (in-flight completions) → `finish_stop`
-/// (truthless reconciliation) → `take_close` → `ledger` (terminal
-/// snapshot, LAST). The equation holds exactly
+/// Item 2 — stop ordering: admission fence → bounded in-flight
+/// → snapshot → detach/drain → writer finalize → verdict, read off
+/// the call tape: `fence_admissions` (no new admits; links stay up)
+/// → `drain_fenced` + `take_fenced` (the staged in-flight batch
+/// completes BEFORE detach) → `verify_identity` (attached
+/// snapshot, links still up) → `close_input` (disarm+detach) →
+/// `drain_quiet` (remaining drain) → `take_close` →
+/// `finish_stop` (truthless reconciliation) → `take_close` →
+/// `ledger` (terminal snapshot, LAST). The equation holds exactly
 /// (`admitted == emitted`, `unfinished ⊆ emitted`), the machine
 /// finalizes, and the unfinished record forces a partial receipt —
 /// all without any global-machine idle (the scripted transport is
@@ -648,14 +700,15 @@ fn stop_ordering_fence_then_drain_then_verdict() {
     let _sigint = reset_sigint();
     let stop = AtomicBool::new(false);
     let mut sensor = new_sensor(
-        vec![
-            vec![output_record(1, Terminal::Sync(0))],
-            vec![output_record(2, Terminal::Callback(-5))],
-        ],
+        vec![vec![output_record(1, Terminal::Sync(0))]],
         vec![output_record(3, Terminal::Unknown)],
         output_ledger(3, 3, 1),
         &stop,
     );
+    // The staged in-flight batch: completes in the fence window
+    // (before detach), proving the phase is real handling, not a
+    // relabelled detach-first tape.
+    sensor.fence_records = vec![output_record(2, Terminal::Callback(-5))];
     let start = std::time::Instant::now();
     let outcome = drive_scripted(&mut sensor, &stop);
     assert!(
@@ -666,6 +719,9 @@ fn stop_ordering_fence_then_drain_then_verdict() {
     assert_eq!(
         tape,
         vec![
+            "fence_admissions",
+            "drain_fenced",
+            "take_fenced",
             "verify_identity",
             "close_input",
             "drain_quiet",
@@ -719,6 +775,7 @@ fn e05_sigint_before_go_interrupts_deterministically() {
     assert_eq!(
         tape,
         vec![
+            "fence_admissions",
             "verify_identity",
             "close_input",
             "drain_quiet",

@@ -1306,11 +1306,22 @@ pub trait LifecycleSessionSensor {
     /// bit, and coverage consults it — a void verdict never aborts
     /// teardown, it flips the report).
     fn verify_identity(&self) -> Result<(), LiveError>;
-    /// Detach-then-drain, step 1: drop the attach links (no hook
-    /// fires after; the closing drain converges).
+    /// Stop phase 1 (P7-N5): raise the admission fence — fresh
+    /// submits refuse counted from here on, while the sensor stays
+    /// attached + ARMED so in-flight returns/callbacks keep joining.
+    fn fence_admissions(&mut self) -> Result<(), LiveError>;
+    /// Stop-phase in-flight (decoder outstanding + reducer pending):
+    /// the bounded in-flight drain exits early at zero; anything
+    /// left when the budget exhausts drains `Unknown` via
+    /// [`Self::finish_stop`] (counted, never silent).
+    fn in_flight(&self) -> Result<u64, LiveError>;
+    /// Stop phase 4 (P7-N5): disarm + drop the attach links (no hook
+    /// fires after; the closing drain converges). Runs AFTER the
+    /// bounded in-flight drain + attached snapshot.
     fn close_input(&mut self) -> Result<(), LiveError>;
-    /// Detach-then-drain, step 2: bounded quiet loop; the exact
-    /// close backlog reaches the ledger (coverage flips on it).
+    /// Stop phase 5 (P7-N5): bounded quiet loop over the detached
+    /// ring; the exact close backlog reaches the ledger (coverage
+    /// flips on it).
     fn drain_quiet(&mut self) -> Result<QuietOutcome, LiveError>;
     /// Drain pending truthless into retention (stop-the-world): the
     /// final reconciliation at `stop_ns` (ring-clock domain).
@@ -1367,6 +1378,18 @@ impl LifecycleSessionSensor for RealLifecycleSensor<'_> {
         self.backend
             .verify_identity()
             .map_err(|err| backend_err("live lifecycle identity", err))
+    }
+
+    fn fence_admissions(&mut self) -> Result<(), LiveError> {
+        self.backend
+            .fence_admissions()
+            .map_err(|err| backend_err("live lifecycle fence", err))
+    }
+
+    fn in_flight(&self) -> Result<u64, LiveError> {
+        self.backend
+            .in_flight()
+            .map_err(|err| backend_err("live lifecycle in-flight", err))
     }
 
     fn close_input(&mut self) -> Result<(), LiveError> {
@@ -1780,6 +1803,17 @@ const LIFECYCLE_DRAIN_ROUNDS_PER_TICK: u32 = 8;
 /// O(flood).
 const LIFECYCLE_OBSERVATION_CAP: usize = 100_000;
 
+/// Stop-phase in-flight drain budget (P7-N5 phase 2): at most 8
+/// immediate rounds × 8192 visits over the still-attached ring —
+/// the same scale as one tick window and the detached quiet drain
+/// (one round plays any backlog the ring can hold). Exits early
+/// when in-flight hits zero; anything left when the budget
+/// exhausts drains `Unknown` via `finish` (counted, never silent).
+/// Immediate rounds only (no readiness wait — the loop must
+/// converge to detach, not nap on an idle ring).
+const STOP_IN_FLIGHT_ROUNDS: u32 = 8;
+const STOP_IN_FLIGHT_BUDGET: usize = 8192;
+
 /// Governed lifecycle tick driver (T06 item 4 twin of [`drive_session`]):
 /// the same ARCH §4.1 tail — `Observing -> Quiescing -> Draining ->
 /// Finalized` on success, `FailedPartial` on any failure after
@@ -1981,12 +2015,36 @@ fn drive_lifecycle_session_inner(
     }
     // Observing -> Quiescing: the loop stopped taking new work.
     hop(controller, SessionState::Quiescing, "lifecycle quiesce")?;
-    // Stop-time reconciliation, detach-then-drain: links drop first
-    // (no hook fires after, so the close converges), then the quiet
-    // loop plays every landed edge — its verdict's backlog reaches
-    // the ledger and flips coverage, never ignored — then truthless
-    // `finish` at the closing wall turns every pending request into
-    // a record (grounded or explicit-unknown).
+    // Stop-time reconciliation, P7-N5 contracted phase order
+    // (fence FIRST, detach LAST — never detach-first):
+    // 1. admission fence: no NEW request admits from here on (fresh
+    //    submits refuse counted); links stay attached + ARMED so
+    //    in-flight returns/callbacks keep firing and joining;
+    // 2. bounded in-flight drain: immediate rounds until in-flight
+    //    empties OR the budget exhausts (no readiness wait — the
+    //    loop converges to detach, never naps; already-stopped, so
+    //    no stop re-check — the round cap alone bounds it);
+    // 3. attached snapshot (identity re-verified while links are up);
+    // 4. disarm + detach (no hook fires after, so the close
+    //    converges);
+    // 5. remaining detached drain + truthless `finish` at the
+    //    closing wall (every pending request becomes a record —
+    //    grounded or explicit-unknown) + terminal ledger.
+    // A ring-resident-but-unread submit at fence time refuses
+    // post-fence (the fence sits in the INGEST stream — downstream
+    // is post-fence, counted `submit_refused`, never admitted);
+    // its return then counts `unknown_invoc_returns` (counted,
+    // never admitted as a new request). The equation holds
+    // exactly: refused never admits, unfinished ⊆ emitted.
+    sensor.fence_admissions()?;
+    for _ in 0..STOP_IN_FLIGHT_ROUNDS {
+        if sensor.in_flight()? == 0 {
+            break;
+        }
+        let _drained = sensor.drain_tick(STOP_IN_FLIGHT_BUDGET)?;
+        let completed = sensor.take_completed()?;
+        decode_records(completed, &mut observations)?;
+    }
     let end_ns = sensor.now_ns()?;
     // M2 read-after-ingest (full, while attached): a void verdict
     // must NOT abort teardown — the sticky bit carries it into the

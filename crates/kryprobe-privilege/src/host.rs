@@ -110,6 +110,7 @@ const INTERRUPT_POLL_MS: i32 = 50;
 /// CLI's terminal stdout emission — its only stdout writer).
 /// `flush` is a no-op (unbuffered — every accepted byte reached the
 /// fd).
+#[derive(Debug)]
 pub struct InterruptibleWriter {
     fd: std::os::fd::RawFd,
     saved_flags: libc::c_int,
@@ -166,13 +167,8 @@ impl std::io::Write for InterruptibleWriter {
             // SAFETY: the fd is open (caller contract); `buf` is a
             // valid read of `len` bytes; the return is trusted only
             // for progress/errno classification.
-            let wrote = unsafe {
-                libc::write(
-                    self.fd,
-                    buf.as_ptr().cast::<libc::c_void>(),
-                    buf.len(),
-                )
-            };
+            let wrote =
+                unsafe { libc::write(self.fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
             if wrote > 0 {
                 return Ok(wrote as usize);
             }
@@ -303,11 +299,7 @@ mod tests {
         loop {
             // SAFETY: write end open; chunk is a valid read.
             let wrote = unsafe {
-                libc::write(
-                    write_fd,
-                    chunk.as_ptr().cast::<libc::c_void>(),
-                    chunk.len(),
-                )
+                libc::write(write_fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len())
             };
             if wrote > 0 {
                 filled += wrote as usize;
@@ -395,7 +387,9 @@ mod tests {
                 detail.starts_with("Interrupted:"),
                 "fresh SIGINT maps to Interrupted, got {detail}"
             ),
-            Ok(off) => panic!("emitter completed {off} bytes into a full pipe (expected the stall abort)"),
+            Ok(off) => {
+                panic!("emitter completed {off} bytes into a full pipe (expected the stall abort)")
+            }
         }
         // The abort is real: drain holds exactly the pre-fill (zero
         // post-fill bytes moved — the writer was truly stalled).

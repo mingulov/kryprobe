@@ -1981,6 +1981,18 @@ impl kryprobe_cli::live::LifecycleSessionSensor for ScriptedLifecycleSensor<'_> 
         Ok(())
     }
 
+    fn fence_admissions(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {
+        // Scripted sensor: no admission table to fence (P7-N5 seam
+        // addition — the ordered phase is pinned in `kcrypto_output`).
+        Ok(())
+    }
+
+    fn in_flight(&self) -> Result<u64, kryprobe_cli::live::LiveError> {
+        // Scripted sensor: nothing in flight (no fence rounds run —
+        // this suite's scripted counts stay exactly as scripted).
+        Ok(0)
+    }
+
     fn close_input(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2629,6 +2641,18 @@ impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
 
     fn verify_identity(&self) -> Result<(), kryprobe_cli::live::LiveError> {
         Ok(())
+    }
+
+    fn fence_admissions(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {
+        // Burst sensor: no admission table to fence (P7-N5 seam
+        // addition — the ordered phase is pinned in `kcrypto_output`).
+        Ok(())
+    }
+
+    fn in_flight(&self) -> Result<u64, kryprobe_cli::live::LiveError> {
+        // Burst sensor: nothing in flight (no fence rounds run —
+        // this suite's scripted counts stay exactly as scripted).
+        Ok(0)
     }
 
     fn close_input(&mut self) -> Result<(), kryprobe_cli::live::LiveError> {

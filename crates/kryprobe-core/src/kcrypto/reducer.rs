@@ -286,6 +286,14 @@ impl LifecycleReducer {
         self.stats
     }
 
+    /// Live requests awaiting completion (the reducer half of
+    /// stop-phase in-flight — the P7-N5 bounded drain exits early
+    /// when this AND the decoder's outstanding set are both empty).
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Whether a completed id was invalidated by identity
     /// ambiguity — at completion (live gap) or after (later gap).
     /// False for live, never-admitted, and evicted ids: eviction

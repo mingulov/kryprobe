@@ -510,6 +510,30 @@ impl SensorCore {
         std::mem::take(&mut self.completed)
     }
 
+    /// Raises or lowers the admission fence (P7-N5 stop phase 1):
+    /// fresh submits refuse from here on while returns and
+    /// callbacks for outstanding ids keep joining.
+    pub fn set_admission_fenced(&mut self, fenced: bool) {
+        self.decoder.set_admission_fenced(fenced);
+    }
+
+    /// Whether fresh submits currently refuse at the fence.
+    #[must_use]
+    pub fn admission_fenced(&self) -> bool {
+        self.decoder.admission_fenced()
+    }
+
+    /// Stop-phase in-flight: decoder outstanding invocations plus
+    /// reducer pending requests. The bounded in-flight drain exits
+    /// early at zero; anything left when the budget exhausts drains
+    /// `Unknown` via [`Self::finish`] (counted, never silent).
+    #[must_use]
+    pub fn in_flight(&self) -> u64 {
+        self.decoder
+            .outstanding_len()
+            .saturating_add(self.reducer.pending_len()) as u64
+    }
+
     /// Ingest raw ring records: validate once, tally the per-hook hit,
     /// join to edges, apply to the reducer, append completions to the
     /// ledger. Returns the newly completed record count.
@@ -564,12 +588,21 @@ impl SensorCore {
                 // First-seen admission + binding normalize with the
                 // SUBMIT's family word (the twin pins family ⟺ site,
                 // so the word always matches the frontend's struct).
-                let aead = raw.family == LifecycleFamily::Aead;
-                self.tfm
-                    .admit_first_seen(raw.tfm, &raw.drv, raw.truncated, aead);
-                let tfm_id = self.tfm.generation_for_frontend(raw.tfm, aead);
-                let epoch = self.tfm.epoch_for_frontend(raw.tfm, aead);
-                self.decoder.join_with_tfm(raw, tfm_id, epoch)
+                if self.decoder.admission_fenced() {
+                    // P7-N5 fence: NO transform first-seen admission
+                    // for a submit that refuses below (it would mint
+                    // a generation for a never-admitted request);
+                    // the decoder still gaps a resubmitted OLD id
+                    // (in-flight handling) and counts the refusal.
+                    self.decoder.join(raw)
+                } else {
+                    let aead = raw.family == LifecycleFamily::Aead;
+                    self.tfm
+                        .admit_first_seen(raw.tfm, &raw.drv, raw.truncated, aead);
+                    let tfm_id = self.tfm.generation_for_frontend(raw.tfm, aead);
+                    let epoch = self.tfm.epoch_for_frontend(raw.tfm, aead);
+                    self.decoder.join_with_tfm(raw, tfm_id, epoch)
+                }
             } else {
                 self.decoder.join(raw)
             };
@@ -663,15 +696,29 @@ pub const QUIET_DRAIN_BUDGET: usize = 8192;
 /// then the exact backlog, not silence, reaches the ledger.
 pub const CLOSE_DRAIN_ROUNDS: usize = 8;
 
-/// Sensor lifecycle state (M1: explicit ADMIT/DRAIN/CLOSED —
-/// arm-after-links, disarm-before-detach, never `Vec::clear` drop
+/// Sensor lifecycle state (M1: explicit ADMIT/FENCED/DRAIN/CLOSED —
+/// arm-after-links, fence-then-disarm-before-detach, never `Vec::clear` drop
 /// order). Transitions run one way: [`SensorState::Admit`] →
+/// [`SensorState::Fenced`] (via [`LifecycleSensor::fence_admissions`]) →
 /// [`SensorState::Draining`] (via [`LifecycleSensor::close_input`])
 /// → [`SensorState::Closed`] (via [`LifecycleSensor::drain_quiet`]).
+///
+/// Why a userspace fence (P7-N5): the BPF lane is one `fsession`
+/// link per site — entry (submit) and exit (return) ride the SAME
+/// link, so no phased LINK detach can keep returns while dropping
+/// submits (detaching a site kills both edges). The fence therefore
+/// lives in the ingest core: links stay attached + ARMED through
+/// the bounded in-flight drain (returns/callbacks keep firing and
+/// joining), fresh submits refuse counted, and only then does the
+/// sensor disarm + detach. No BPF change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensorState {
     /// Armed and admitting: live ticks drain here.
     Admit,
+    /// Admission fenced, still attached + ARMED: the bounded
+    /// in-flight drain runs here (returns/callbacks join, fresh
+    /// submits refuse counted).
+    Fenced,
     /// Disarmed and detached: the closing drain runs here.
     Draining,
     /// Quiet-drained and reported: drains refuse, reads stay open.
@@ -684,6 +731,7 @@ impl SensorState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Admit => "Admit",
+            Self::Fenced => "Fenced",
             Self::Draining => "Draining",
             Self::Closed => "Closed",
         }
@@ -857,7 +905,7 @@ impl LifecycleSensor {
     ) -> Result<(DrainOutcome, Vec<Vec<u8>>), DrainError> {
         if self.state == SensorState::Closed {
             return Err(DrainError::StateInvalid {
-                expected: "Admit|Draining",
+                expected: "Admit|Fenced|Draining",
                 actual: self.state.as_str(),
             });
         }
@@ -1005,16 +1053,52 @@ impl LifecycleSensor {
         self.core.finish(stop_ns);
     }
 
-    /// Disarm-then-detach, step 1 (M1): prove the disarmed `LCFG`
+    /// Admission fence, stop phase 1 (P7-N5): fresh submits refuse
+    /// counted from here on; links stay attached + ARMED so returns
+    /// and callbacks for in-flight requests keep firing and joining
+    /// through the bounded in-flight drain. `Admit` → `Fenced`;
+    /// re-fencing is a no-op `Ok`; fencing a detached sensor is a
+    /// loud state refusal (there is nothing left to fence — the
+    /// in-flight window already closed).
+    pub fn fence_admissions(&mut self) -> Result<(), DrainError> {
+        match self.state {
+            SensorState::Admit => {
+                self.core.set_admission_fenced(true);
+                self.state = SensorState::Fenced;
+                Ok(())
+            }
+            SensorState::Fenced => Ok(()),
+            _ => Err(DrainError::StateInvalid {
+                expected: "Admit|Fenced",
+                actual: self.state.as_str(),
+            }),
+        }
+    }
+
+    /// Stop-phase in-flight (decoder outstanding + reducer pending);
+    /// the bounded drain exits early at zero.
+    #[must_use]
+    pub fn in_flight(&self) -> u64 {
+        self.core.in_flight()
+    }
+
+    /// Whether fresh submits currently refuse at the fence.
+    #[must_use]
+    pub fn admission_fenced(&self) -> bool {
+        self.core.admission_fenced()
+    }
+
+    /// Disarm-then-detach (M1): prove the disarmed `LCFG`
     /// value FIRST, then drop every attach link (explicit order —
     /// never `Vec::clear` drop order). Idempotent (a second call is a
     /// no-op `Ok`). A failed disarm still detaches — a detached
     /// sensor fires nothing, so the config value is moot — but the
     /// error attests the disarm was never proven. No hook fires after
     /// this returns, so the closing drain converges instead of chasing
-    /// arrivals.
+    /// arrivals. Accepts `Admit` (legacy direct close) and `Fenced`
+    /// (the stop-phase close after the bounded in-flight drain).
     pub fn close_input(&mut self) -> Result<(), ConfiguredError> {
-        if self.state != SensorState::Admit {
+        if self.state == SensorState::Draining || self.state == SensorState::Closed {
             return Ok(());
         }
         let disarm = disarm_lifecycle_config(&self.configured.loaded);
