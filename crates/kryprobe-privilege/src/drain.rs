@@ -230,6 +230,25 @@ impl DrainThread {
             None => DrainStats::default(),
         }
     }
+
+    /// Signal stop, join the worker, THEN sweep the channel to empty:
+    /// records the worker forwarded after the collector's last
+    /// `try_recv` (the drain-stop race window) are collected in
+    /// channel order, never dropped with the channel. The join
+    /// happens-before the sweep, so the tail is complete without any
+    /// sleep or retry. Returns the worker counters plus the tail.
+    pub fn stop_and_drain(mut self) -> (DrainStats, Vec<DrainEvent>) {
+        self.stop.store(true, Ordering::Release);
+        let stats = match self.join.take() {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => DrainStats::default(),
+        };
+        let mut tail = Vec::new();
+        while let Ok(event) = self.rx.try_recv() {
+            tail.push(event);
+        }
+        (stats, tail)
+    }
 }
 
 impl Drop for DrainThread {
@@ -242,10 +261,12 @@ impl Drop for DrainThread {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrainStats, DrainThread, drain_spawns};
+    use super::{DrainEvent, DrainStats, DrainThread, drain_spawns};
     use crate::fd::OwnedFd;
     use kryprobe_core::DrainConfig;
     use kryprobe_core::evidence::SharedLosses;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// Live epoll fds in this process (drain-specific leak signal —
     /// no other unprivileged lib test creates epoll instances, so an
@@ -288,6 +309,54 @@ mod tests {
         }
         assert_eq!(drain_spawns(), spawns_before, "no worker spawned");
         assert_eq!(epoll_fds(), epoll_before, "no epoll leaked");
+    }
+
+    /// P7/T12 drain-stop regression (deterministic, no BPF, no
+    /// sleeps): the fake worker forwards records only AFTER
+    /// observing stop — the race window a sweep-then-join collector
+    /// misses. Join-then-sweep collects all four in order plus the
+    /// worker counters. The worker cannot send before stop (it spins
+    /// on the flag) and the join happens-before the sweep, so the
+    /// outcome is timing-independent.
+    #[test]
+    fn stop_and_drain_collects_records_sent_after_stop() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DrainEvent>(16);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            for i in 0..4u8 {
+                tx.try_send(DrainEvent::Record(vec![i]))
+                    .expect("bounded tail fits the queue");
+            }
+            DrainStats {
+                records: 4,
+                queue_drops: 0,
+            }
+        });
+        let drain = DrainThread {
+            join: Some(join),
+            rx,
+            stop,
+            barrier: Arc::new(AtomicU64::new(0)),
+        };
+        let (stats, tail) = drain.stop_and_drain();
+        assert_eq!(stats.records, 4, "worker counters join");
+        assert_eq!(stats.queue_drops, 0, "no queue pressure");
+        let records: Vec<Vec<u8>> = tail
+            .into_iter()
+            .filter_map(|event| match event {
+                DrainEvent::Record(bytes) => Some(bytes),
+                DrainEvent::Barrier(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            records,
+            vec![vec![0], vec![1], vec![2], vec![3]],
+            "in-flight tail collected in order"
+        );
     }
 
     #[test]

@@ -385,7 +385,10 @@ fn drain_config() -> DrainConfig {
 }
 
 /// DONE+2s grace drain: collects records until the deadline, then
-/// anything left queued, and stops the drain thread.
+/// join-then-sweeps the drain thread (P7/T12): the worker is joined
+/// BEFORE the final channel sweep, so records forwarded after the
+/// collector's last receive are collected, never dropped with the
+/// channel.
 fn grace_drain(drain: DrainThread) -> (Vec<Vec<u8>>, u64) {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut records: Vec<Vec<u8>> = Vec::new();
@@ -396,10 +399,12 @@ fn grace_drain(drain: DrainThread) -> (Vec<Vec<u8>>, u64) {
             Err(_) => {}
         }
     }
-    while let Ok(DrainEvent::Record(bytes)) = drain.receiver().try_recv() {
-        records.push(bytes);
+    let (stats, tail) = drain.stop_and_drain();
+    for event in tail {
+        if let DrainEvent::Record(bytes) = event {
+            records.push(bytes);
+        }
     }
-    let stats = drain.stop();
     (records, stats.queue_drops)
 }
 

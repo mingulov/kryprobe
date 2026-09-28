@@ -643,29 +643,30 @@ fn drain_idents_with(
 /// `finalize`. Live ticks share a [`session_drain`] instead (2B-C1).
 /// Drain stats are discarded (see the module docs).
 ///
-/// Tail-race warning (ACCEPTED v0.1 limitation of the one-shot path
-/// only): records pushed in the microsecond window between the
-/// post-barrier tail sweep (see `collect_until_barrier`) and `stop()`
-/// are consumed from the ring but undelivered — lost, not re-readable
-/// on a later call. The session path cannot hit this window (the drain
-/// stays open across ticks); only session-end records arriving after
-/// the closing window are at risk.
+/// Tail race CLOSED (P7/T12 — was an ACCEPTED v0.1 limitation):
+/// records the worker forwarded after the post-barrier tail sweep
+/// (see `collect_until_barrier`) now join this window through
+/// join-then-sweep (`stop_and_drain`): the worker is joined BEFORE
+/// the final channel sweep, and its own final ring sweep forwards
+/// stop-time ring residue first — so the microsecond window between
+/// the sweep and `stop()` no longer loses records.
 ///
-/// Scope: quiescent-ring runs are unaffected; only sustained
-/// new-identity/overflow traffic landing in that microsecond window is
-/// at risk. Counts/bytes/totals are unaffected — `KAGG` rows still
-/// decode with full identity in-row; only first-seen `EVENT` timing /
-/// `OVERFLOW` signals are at risk.
-///
-/// Caller rule: treat unjoined hashes (ident never seen for a row) as
-/// unknown (`coverage_gap`/`unknown`) — never misattribute, crash, or
+/// Caller rule (retained defense-in-depth): treat unjoined hashes
+/// (ident never seen for a row) as unknown
+/// (`coverage_gap`/`unknown`) — never misattribute, crash, or
 /// silently drop.
 fn drain_idents(sensor: &ConfiguredKcrypto) -> Result<(Vec<IdentBytes>, u64), MapOpsError> {
     let drain = session_drain(sensor)?;
     let result = drain_idents_with(&drain, 1);
     // Always joined (even on collect failure) so the thread never escapes.
-    let _stats = drain.stop();
-    result
+    let (_stats, tail) = drain.stop_and_drain();
+    let (mut idents, mut overflow_identities) = result?;
+    for event in tail {
+        if let DrainEvent::Record(record) = event {
+            push_ident_record(record, &mut idents, &mut overflow_identities)?;
+        }
+    }
+    Ok((idents, overflow_identities))
 }
 
 /// Snapshot every kcrypto map through a session drain: same walk as

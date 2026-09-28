@@ -42,6 +42,54 @@ fn emit_jsonl(
     Ok(writer.into_string())
 }
 
+/// Terminal marker for one selftest run: the stderr `reconcile:`
+/// word, the session verdict, and the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelftestMarker {
+    /// Every call observed exactly (exit 0).
+    Clean,
+    /// Ran with receipted coverage gaps (exit 3).
+    Partial {
+        /// Ground truth minus delivered records.
+        missing: u64,
+    },
+    /// Over-accounted or unaccounted evidence (exit 1).
+    Defect,
+}
+
+/// Maps the loss-ledger verdict + per-kind counts to the terminal
+/// marker. Fully-accounted loss (a `Clean` ledger with drops > 0 —
+/// every missing record receipted by a ring/guard/truncation
+/// counter) is PARTIAL: the run is short evidence, not corrupt
+/// evidence. Only over-accounting (`Defect`) or a kind split wrong
+/// with nothing accounted (drops == 0 — duplication or corruption,
+/// since genuine loss always lands in a counter) is a defect.
+fn classify_selftest(
+    verdict: &ReconcileVerdict,
+    entries: u64,
+    returns: u64,
+    calls: u64,
+    drops: u64,
+) -> SelftestMarker {
+    let counts_ok = entries == calls && returns == calls;
+    match (verdict, counts_ok) {
+        (ReconcileVerdict::Clean, true) => SelftestMarker::Clean,
+        (ReconcileVerdict::Partial { missing }, _) => SelftestMarker::Partial { missing: *missing },
+        (ReconcileVerdict::Clean, false) if drops > 0 => {
+            // A `Clean` ledger reconciles exactly
+            // (received + drops == 2·calls), so the shortfall IS the
+            // accounted drops — short evidence, never corrupt.
+            let received = entries.saturating_add(returns);
+            SelftestMarker::Partial {
+                missing: calls.saturating_mul(2).saturating_sub(received),
+            }
+        }
+        (ReconcileVerdict::Clean, false) | (ReconcileVerdict::Defect { .. }, _) => {
+            SelftestMarker::Defect
+        }
+    }
+}
+
 /// Runs `selftest bpf`: 0 clean, 3 partial, 4 denied/missing, 1 failure.
 pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     let Some(object) = locate_bpf_object() else {
@@ -77,10 +125,19 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
             return 1;
         }
     };
-    let counts_ok = outcome.entries == calls && outcome.returns == calls;
-    let (marker, verdict, code) = match (&outcome.verdict, counts_ok) {
-        (ReconcileVerdict::Clean, true) => ("clean", SessionVerdict::Observed, 0),
-        (ReconcileVerdict::Partial { missing }, _) => {
+    let drops = outcome
+        .ring
+        .saturating_add(outcome.dropped)
+        .saturating_add(outcome.truncated);
+    let (marker, verdict, code) = match classify_selftest(
+        &outcome.verdict,
+        outcome.entries,
+        outcome.returns,
+        calls,
+        drops,
+    ) {
+        SelftestMarker::Clean => ("clean", SessionVerdict::Observed, 0),
+        SelftestMarker::Partial { missing } => {
             let _ = writeln!(
                 stderr,
                 "selftest bpf: partial ({missing} missing; ring={} drop={} trunc={} queue={})",
@@ -88,9 +145,7 @@ pub fn run(calls: u64, out: Option<&Path>, stdout: &mut dyn Write, stderr: &mut 
             );
             ("partial", SessionVerdict::Partial, 3)
         }
-        (ReconcileVerdict::Clean, false) | (ReconcileVerdict::Defect { .. }, _) => {
-            ("defect", SessionVerdict::Failed, 1)
-        }
+        SelftestMarker::Defect => ("defect", SessionVerdict::Failed, 1),
     };
     let text = match emit_jsonl(calls, verdict, outcome.exit_code, outcome.signal) {
         Ok(text) => text,
@@ -155,6 +210,53 @@ mod tests {
         assert_eq!(
             emit_jsonl(2, SessionVerdict::Observed, None, Some(0)),
             Err(ReportError::SignalOutOfRange(0))
+        );
+    }
+
+    /// P7/T12 verdict table (item 5 root cause, second leg):
+    /// fully-accounted loss is PARTIAL, not a defect. The historical
+    /// row replays `evidence/0-4/priv-cli_bpf_e2e.txt` (entries=18716
+    /// returns=18717 ring=2567 over 20000 calls — ledger Clean, kind
+    /// split asymmetric): every missing record is receipted by the
+    /// ring counter, so the honest marker is partial with missing ==
+    /// 2567. A wrong kind split with NOTHING accounted (drops == 0)
+    /// stays a defect — genuine loss always lands in a counter, so
+    /// that shape means duplication or corruption.
+    #[test]
+    fn classify_selftest_table() {
+        use ReconcileVerdict::{Clean, Defect, Partial};
+        // Healthy run: exact counts, no loss.
+        assert_eq!(
+            classify_selftest(&Clean, 20000, 20000, 20000, 0),
+            SelftestMarker::Clean
+        );
+        // Historical 2026-09-19 row: accounted ring loss with a
+        // boundary-asymmetric kind split → partial, missing == drops.
+        assert_eq!(
+            classify_selftest(&Clean, 18716, 18717, 20000, 2567),
+            SelftestMarker::Partial { missing: 2567 }
+        );
+        // Single pressured record: one return ring-dropped.
+        assert_eq!(
+            classify_selftest(&Clean, 20000, 19999, 20000, 1),
+            SelftestMarker::Partial { missing: 1 }
+        );
+        // Unaccounted shortfall (silent loss): the ledger's own
+        // missing rides through.
+        assert_eq!(
+            classify_selftest(&Partial { missing: 5 }, 19995, 20000, 20000, 0),
+            SelftestMarker::Partial { missing: 5 }
+        );
+        // Wrong kind split with nothing accounted: duplication or
+        // corruption, still a defect.
+        assert_eq!(
+            classify_selftest(&Clean, 20001, 19999, 20000, 0),
+            SelftestMarker::Defect
+        );
+        // Over-accounted ledger: always a defect.
+        assert_eq!(
+            classify_selftest(&Defect { excess: 2 }, 20000, 20000, 20000, 2),
+            SelftestMarker::Defect
         );
     }
 

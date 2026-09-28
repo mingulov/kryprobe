@@ -201,6 +201,90 @@ impl Drop for RingArea {
     }
 }
 
+/// Test-only ring construction + kernel-protocol producer writes
+/// (P7/T12 drain-stop regression): anonymous mappings in the kernel
+/// layout (consumer page + producer word + a linear data span
+/// standing in for the double map — reads within the span behave
+/// identically). Shared by the area walk tests and the worker
+/// final-sweep test so both pin the same protocol.
+#[cfg(test)]
+impl RingArea {
+    pub(crate) fn test_area(max: usize) -> Self {
+        let page = 4096usize;
+        // SAFETY: anonymous mappings, checked; `RingArea::drop`
+        // munmaps both. Writable here — the test plays the kernel
+        // producer; production maps the data side read-only.
+        let cons = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(cons, libc::MAP_FAILED, "cons maps");
+        let prod = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page + 2 * max,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(prod, libc::MAP_FAILED, "prod maps");
+        Self {
+            cons: cons as *mut u8,
+            prod: prod as *mut u8,
+            page,
+            max,
+        }
+    }
+
+    pub(crate) fn test_set_producer(&self, value: u64) {
+        unsafe {
+            (*(self.prod as *const AtomicU64)).store(value, Ordering::Release);
+        }
+    }
+
+    /// Reserve write (Relaxed: the reserve carries no ordering —
+    /// the kernel's plain BUSY store is exactly this honest).
+    pub(crate) fn test_write_hdr(&self, off: usize, word: u32) {
+        debug_assert_eq!(off % 4, 0, "sim headers stay aligned");
+        unsafe {
+            (*(self.prod.add(self.page + off) as *const AtomicU32)).store(word, Ordering::Relaxed);
+        }
+    }
+
+    /// Commit through an atomic swap (AcqRel: the kernel's `xchg`
+    /// — the reader's Acquire pairs HERE).
+    pub(crate) fn test_swap_hdr(&self, off: usize, word: u32) {
+        debug_assert_eq!(off % 4, 0, "sim headers stay aligned");
+        unsafe {
+            (*(self.prod.add(self.page + off) as *const AtomicU32)).swap(word, Ordering::AcqRel);
+        }
+    }
+
+    /// Reserve→write→commit one record at absolute `pos` (BUSY
+    /// reserve, payload bytes, atomic-swap commit); returns the
+    /// next position. The caller advances the producer past it.
+    pub(crate) fn test_commit(&self, pos: u64, payload: &[u8]) -> u64 {
+        use super::frame::BUSY_BIT;
+        let off = (pos & (self.max as u64 - 1)) as usize;
+        self.test_write_hdr(off, BUSY_BIT | payload.len() as u32);
+        unsafe {
+            self.prod
+                .add(self.page + off + super::frame::HDR_SZ)
+                .copy_from_nonoverlapping(payload.as_ptr(), payload.len());
+        }
+        self.test_swap_hdr(off, payload.len() as u32);
+        pos + super::frame::HDR_SZ as u64 + ((payload.len() as u64 + 7) & !7)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::RingArea;
@@ -223,66 +307,19 @@ mod tests {
 
     impl Sim {
         fn new(max: usize) -> Self {
-            let page = 4096usize;
-            // SAFETY: anonymous mappings, checked; `RingArea::drop`
-            // munmaps both. Writable here — the sim plays the kernel
-            // producer; production maps the data side read-only.
-            let cons = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    page,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(cons, libc::MAP_FAILED, "cons maps");
-            let prod = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    page + 2 * max,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(prod, libc::MAP_FAILED, "prod maps");
             Self {
-                area: RingArea {
-                    cons: cons as *mut u8,
-                    prod: prod as *mut u8,
-                    page,
-                    max,
-                },
+                area: RingArea::test_area(max),
             }
         }
 
         fn set_producer(&self, value: u64) {
-            unsafe {
-                (*(self.area.prod as *const AtomicU64)).store(value, Ordering::Release);
-            }
+            self.area.test_set_producer(value);
         }
 
         /// Reserve write (Relaxed: the reserve carries no ordering —
         /// the kernel's plain BUSY store is exactly this honest).
         fn write_hdr(&self, off: usize, word: u32) {
-            debug_assert_eq!(off % 4, 0, "sim headers stay aligned");
-            unsafe {
-                (*(self.area.prod.add(self.area.page + off) as *const AtomicU32))
-                    .store(word, Ordering::Relaxed);
-            }
-        }
-
-        /// Commit through an atomic swap (AcqRel: the kernel's `xchg`
-        /// — the reader's Acquire pairs HERE).
-        fn swap_hdr(&self, off: usize, word: u32) {
-            debug_assert_eq!(off % 4, 0, "sim headers stay aligned");
-            unsafe {
-                (*(self.area.prod.add(self.area.page + off) as *const AtomicU32))
-                    .swap(word, Ordering::AcqRel);
-            }
+            self.area.test_write_hdr(off, word);
         }
 
         /// Reserve→write→commit one record at absolute `pos` (BUSY
@@ -291,16 +328,7 @@ mod tests {
         /// (committed records only — the concurrent test publishes at
         /// reserve instead, per the kernel protocol).
         fn commit(&self, pos: u64, payload: &[u8]) -> u64 {
-            let off = (pos & (self.area.max as u64 - 1)) as usize;
-            self.write_hdr(off, BUSY_BIT | payload.len() as u32);
-            unsafe {
-                self.area
-                    .prod
-                    .add(self.area.page + off + super::frame::HDR_SZ)
-                    .copy_from_nonoverlapping(payload.as_ptr(), payload.len());
-            }
-            self.swap_hdr(off, payload.len() as u32);
-            pos + super::frame::HDR_SZ as u64 + ((payload.len() as u64 + 7) & !7)
+            self.area.test_commit(pos, payload)
         }
     }
 

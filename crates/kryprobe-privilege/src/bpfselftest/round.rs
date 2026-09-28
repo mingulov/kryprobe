@@ -140,10 +140,14 @@ fn attach_entry_ret(
 }
 
 /// GO the fixture, then drain records until the DONE watcher settles
-/// the ring (plus a final non-blocking sweep). Records collect
+/// the ring, then join-then-sweep the drain. Records collect
 /// CONCURRENTLY with the fixture run, so bursts larger than the
 /// queue survive; the flag is set on every path (including fixture
-/// errors) so the collector always terminates.
+/// errors) so the collector always terminates. The worker is joined
+/// BEFORE the final channel sweep (P7/T12 `stop_and_drain`), so
+/// records forwarded after the collector's last receive are
+/// collected, never dropped with the channel — no sleep length can
+/// substitute for the join.
 fn drain_until_settled(
     child: &mut Child,
     lines: std::sync::mpsc::Receiver<String>,
@@ -180,13 +184,20 @@ fn drain_until_settled(
             Err(_) => {}
         }
     }
-    while let Ok(DrainEvent::Record(bytes)) = drain.receiver().try_recv() {
-        records.push(bytes);
-    }
-    watcher
+    let watcher_outcome = watcher
         .join()
-        .map_err(|_| BpfSelftestError::Fixture("DONE watcher panicked".to_owned()))??;
-    Ok((records, drain.stop()))
+        .map_err(|_| BpfSelftestError::Fixture("DONE watcher panicked".to_owned()));
+    // Joined even when the watcher failed (bounded: the stop flag
+    // releases the worker within one poll slice plus one final
+    // sweep), so the drain thread never escapes on an error path.
+    let (stats, tail) = drain.stop_and_drain();
+    for event in tail {
+        if let DrainEvent::Record(bytes) = event {
+            records.push(bytes);
+        }
+    }
+    watcher_outcome??;
+    Ok((records, stats))
 }
 
 /// Tally drained records into the outcome: generation + flag checks,
