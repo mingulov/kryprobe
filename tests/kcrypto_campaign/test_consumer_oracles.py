@@ -217,14 +217,24 @@ def r03_kernel(enc=2000, dec=2000):
     return {"aead_encrypt": enc, "aead_decrypt": dec}
 
 
-def r03_product(enc=2000, dec=2000, dec_errors=0, errnos=None):
+def r03_product(enc=2000, dec=2000, dec_errors=0, errnos=None,
+               kenc=None, kdec=None):
     return {
         "aead_encrypt": enc,
         "aead_decrypt": dec,
         "aead_decrypt_errors": dec_errors,
+        "kernel_encrypt": enc if kenc is None else kenc,
+        "kernel_decrypt": dec if kdec is None else kdec,
         "error_errnos": errnos or [],
         "ring_drops": "0",
     }
+
+
+def r03_authfail_ok():
+    # Nested failure: both echainiv levels error (200 errors for
+    # 100 packets), zero ok-decrypts, encrypts kernel-equal.
+    return r03_product(enc=200, dec=0, dec_errors=200, errnos=[-74],
+                       kenc=200, kdec=200)
 
 
 class R03Tests(unittest.TestCase):
@@ -232,7 +242,7 @@ class R03Tests(unittest.TestCase):
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
             {"sent": 100, "received": 0},
-            r03_product(enc=100, dec=100, dec_errors=100, errnos=[-74]),
+            r03_authfail_ok(),
             quiet(), quiet(),
         )
         self.assertTrue(all(checks.values()), checks)
@@ -242,7 +252,7 @@ class R03Tests(unittest.TestCase):
             r03_ledgers(received=999), r03_ledgers(), r03_kernel(dec=1999),
             r03_product(dec=1999),
             {"sent": 100, "received": 0},
-            r03_product(enc=100, dec=100, dec_errors=100, errnos=[-74]),
+            r03_authfail_ok(),
             quiet(), quiet(),
         )
         self.assertFalse(checks["ledgers_lossless"])
@@ -255,21 +265,44 @@ class R03Tests(unittest.TestCase):
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), prod,
             {"sent": 100, "received": 0},
-            r03_product(enc=100, dec=100, dec_errors=100, errnos=[-74]),
+            r03_authfail_ok(),
             quiet(), quiet(),
         )
         self.assertFalse(checks["calls_equal_kernel"])
 
     def test_authfail_success_bytes_fail(self):
-        bad = r03_product(enc=100, dec=100, dec_errors=99, errnos=[-74])
+        bad = r03_product(enc=200, dec=1, dec_errors=199, errnos=[-74],
+                          kenc=200, kdec=200)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
             {"sent": 100, "received": 1}, bad, quiet(), quiet(),
         )
         self.assertFalse(checks["authfail_exact"])
+        self.assertFalse(checks["authfail_counts_equal"])
+
+    def test_authfail_partial_errors_fail(self):
+        # One nesting level unobserved: errors below kernel decrypts.
+        bad = r03_product(enc=200, dec=0, dec_errors=100, errnos=[-74],
+                          kenc=200, kdec=200)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            {"sent": 100, "received": 0}, bad, quiet(), quiet(),
+        )
+        self.assertFalse(checks["authfail_counts_equal"])
+
+    def test_authfail_ok_decrypts_fail(self):
+        # Phantom ok-decrypts alongside kernel-equal errors.
+        bad = r03_product(enc=200, dec=50, dec_errors=200, errnos=[-74],
+                          kenc=200, kdec=200)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            {"sent": 100, "received": 0}, bad, quiet(), quiet(),
+        )
+        self.assertFalse(checks["authfail_counts_equal"])
 
     def test_swallowed_errno_fails(self):
-        bad = r03_product(enc=100, dec=100, dec_errors=100, errnos=[])
+        bad = r03_product(enc=200, dec=0, dec_errors=200, errnos=[],
+                          kenc=200, kdec=200)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
             {"sent": 100, "received": 0}, bad, quiet(), quiet(),

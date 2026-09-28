@@ -792,6 +792,8 @@ def judge_r03(oracle_spec, cell_dir):
         "aead_encrypt": agg_calls(parsed_auth, "aead", "encrypt"),
         "aead_decrypt": agg_calls(parsed_auth, "aead", "decrypt"),
         "aead_decrypt_errors": agg_calls(parsed_auth, "aead", "decrypt", "error"),
+        "kernel_encrypt": kernel["authfail"].get("crypto_aead_encrypt", 0),
+        "kernel_decrypt": kernel["authfail"].get("crypto_aead_decrypt", 0),
         "error_errnos": [row["first_errno"] for row in parsed_auth["who"]
                          if row.get("first_errno") is not None],
         "ring_drops": parsed_auth["loss"].get("ring_drops", "?"),

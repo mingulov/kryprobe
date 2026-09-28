@@ -297,10 +297,13 @@ def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
     ``ledger_a``/``ledger_b`` carry per-direction ``sent``/
     ``received``; ``kernel_ref`` the ftrace AEAD counts;
     ``product`` the observed AEAD counts; the authfail pair
-    carries the controlled-failure phase (100 sent, 0 received,
-    exact decrypt errors with native errnos). Packet totals are
-    contextual: product calls must equal the KERNEL reference,
-    never the packet ledger.
+    carries the controlled-failure phase (100 sent, 0 received)
+    plus its own kernel counts. Packet totals are contextual:
+    product calls must equal the KERNEL reference, never the
+    packet ledger -- including the failure phase, where the
+    ESP echainiv nesting fails at both levels (200 errors for
+    100 packets): observed errors must equal kernel decrypts,
+    observed ok-decrypts must be zero, encrypts kernel-equal.
     """
     checks = {}
     sent = (ledger_a.get("sent") or 0) + (ledger_b.get("sent") or 0)
@@ -315,7 +318,14 @@ def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
     checks["authfail_exact"] = (
         (authfail_ledger.get("sent") or 0) == 100
         and (authfail_ledger.get("received") or 0) == 0
-        and (authfail_product.get("aead_decrypt_errors") or 0) == 100
+    )
+    auth_kdec = authfail_product.get("kernel_decrypt")
+    auth_kenc = authfail_product.get("kernel_encrypt")
+    checks["authfail_counts_equal"] = (
+        (auth_kdec or 0) > 0
+        and (authfail_product.get("aead_decrypt_errors") or 0) == auth_kdec
+        and (authfail_product.get("aead_decrypt") or 0) == 0
+        and (authfail_product.get("aead_encrypt") or 0) == (auth_kenc or -1)
     )
     errnos = authfail_product.get("error_errnos") or []
     checks["authfail_errno_native"] = len(errnos) > 0 and all(
