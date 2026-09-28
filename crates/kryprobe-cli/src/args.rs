@@ -35,6 +35,8 @@ globals:
 
 exit codes: 0 clean/ok; 1 internal failure; 2 usage/invalid input;
   3 inconclusive/PARTIAL; 4 environment-unusable; 10 policy violation.
+
+`<command> --help` prints per-command help with examples (exit 0).
 ";
 
 /// Early exits plus usage errors (exit 2; reason + [`USAGE`]).
@@ -44,6 +46,11 @@ pub enum ArgsError {
     Help,
     /// `--version`: print version, exit 0.
     Version,
+    /// `<command> --help`: print that command's help, exit 0.
+    SubHelp {
+        /// Subcommand the help was requested for.
+        command: String,
+    },
     /// Usage/input error reason.
     Usage(String),
 }
@@ -198,6 +205,14 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
     let Some((sub, args)) = rest.split_first() else {
         return Err(usage("missing subcommand"));
     };
+    // P6 discovery path: `<command> --help` wins anywhere in the tail
+    // (early exit, no capture, exit 0) — uniformly, one site, so no
+    // subcommand grammar can strand it as "unexpected".
+    if args.iter().any(|arg| arg == "--help") {
+        return Err(ArgsError::SubHelp {
+            command: sub.clone(),
+        });
+    }
     // Global `--json` is threaded through only where a command speaks
     // it; anywhere else it is a usage error (exit 2), never silently
     // discarded.
@@ -277,6 +292,195 @@ fn parse_simple(
     }
     Ok(build(json))
 }
+
+/// Per-command help (`<command> --help`, exit 0). `None` for unknown
+/// names (the caller then reports unknown-subcommand, exit 2).
+#[must_use]
+pub fn subcommand_help(command: &str) -> Option<&'static str> {
+    match command {
+        "doctor" => Some(DOCTOR_HELP),
+        "backends" => Some(BACKENDS_HELP),
+        "inspect" => Some(INSPECT_HELP),
+        "selftest" => Some(SELFTEST_HELP),
+        "token" => Some(TOKEN_HELP),
+        "watch" => Some(WATCH_HELP),
+        "report" => Some(REPORT_HELP),
+        "check" => Some(CHECK_HELP),
+        "plan" | "observe" | "run" => Some(STUB_HELP),
+        _ => None,
+    }
+}
+
+const DOCTOR_HELP: &str = "\
+usage: kryprobe doctor [--json] [--versions]
+
+Probe matrix + backend rows (--versions: artifact versions instead).
+
+exits: 0 ok; 1 internal failure; 2 usage/invalid input.
+";
+
+const BACKENDS_HELP: &str = "\
+usage: kryprobe backends [--json]
+
+Backend registry + states.
+
+exits: 0 ok; 1 internal failure; 2 usage/invalid input.
+";
+
+const INSPECT_HELP: &str = "\
+usage: kryprobe inspect --pid N [--json]
+
+Snapshot one process (--pid exactly once).
+
+exits: 0 ok; 1 internal failure; 2 usage/invalid input.
+";
+
+const SELFTEST_HELP: &str = "\
+usage: kryprobe selftest synthetic [--out F]
+       kryprobe selftest bpf [--calls N] [--out F]
+       kryprobe selftest token-smoke      (needs root)
+
+Deterministic scripted session (synthetic), BPF pipeline against
+spine_fixture (bpf, default 200 calls), or root token roundtrip.
+
+exits: 0 ok; 1 internal failure; 2 usage/invalid input.
+";
+
+const TOKEN_HELP: &str = "\
+usage: kryprobe token mint [--bin PATH] [--receipt PATH] [--force]
+       kryprobe token status [--bin PATH]
+
+Root one-shot file-cap grant + receipt (mint), or file caps +
+token-pin usability, never privileged (status).
+
+setup:
+  install:    sudo packaging/install.sh   # mint is a step inside
+  privilege:  kryprobe token status       # verify effective caps
+
+exits: 0 ok; 1 internal failure; 2 usage/invalid input.
+";
+
+const WATCH_HELP: &str = "\
+usage: kryprobe watch --system [--source kernel-crypto] [--duration N] [--token PATH] [--kcrypto-profile P]
+
+Continuous system-wide observe (live kcrypto capture), rendered as
+aggregated human tables. --system is required (system scope only).
+
+flags:
+  --system               select-all scope (required)
+  --source S             only 'kernel-crypto' in v0.1
+  --duration N           capture window in seconds (>= 1; default: until stdin closes)
+  --token PATH           explicit BPF token path (overrides env + default pin)
+  --kcrypto-profile P    api-returns (default) | request-lifecycle
+
+capture profiles (--kcrypto-profile):
+  api-returns        per-API return tallies + caller contexts (default;
+                     kernel 6.12+ with BTF, bpf(), ringbuf)
+  request-lifecycle  per-request submit/terminal lifecycles (needs
+                     kernel 7.0+ fsession attach, type 58; pre-7.0
+                     kernels refuse it typed, never a silent no-op)
+
+setup:
+  install:    sudo packaging/install.sh
+              (install -> token mint -> token status + doctor verify;
+              re-mint after every binary swap)
+  privilege:  kryprobe token status   # file caps + usability, unprivileged
+              kryprobe doctor         # probe matrix must pass first
+
+examples:
+  kryprobe watch --system --duration 30
+  kryprobe watch --system --duration 30 --kcrypto-profile request-lifecycle
+  kryprobe watch --system --kcrypto-profile frobnicate
+      # exit 2: unsupported profile (names api-returns|request-lifecycle)
+
+exits: 0 session complete (read the coverage trailer: exit 0 is NOT
+  proof of complete coverage); 1 internal failure; 2 usage/invalid
+  input; 3 PARTIAL (SIGINT-cut window — tables are the preserved
+  evidence); 4 environment-unusable.
+";
+
+const REPORT_HELP: &str = "\
+usage: kryprobe report FILE
+       kryprobe report --system [--duration N] [--format human|json|jsonl] [--out F] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P]
+
+Validate + render a JSONL stream (FILE), or bounded system-wide
+capture + render (live mode needs --system; default window 60s).
+
+flags (live mode):
+  --system               select-all scope (required for live capture)
+  --duration N           capture window in seconds (>= 1)
+  --format F             human (default) | json | jsonl
+  --out F                output file (default: stdout)
+  --source S             only 'kernel-crypto' in v0.1
+  --token PATH           explicit BPF token path (overrides env + default pin)
+  --kcrypto-profile P    api-returns (default) | request-lifecycle
+
+capture profiles (--kcrypto-profile):
+  api-returns        per-API return tallies + caller contexts (default;
+                     kernel 6.12+ with BTF, bpf(), ringbuf)
+  request-lifecycle  per-request submit/terminal lifecycles (needs
+                     kernel 7.0+ fsession attach, type 58; pre-7.0
+                     kernels refuse it typed, never a silent no-op)
+
+setup:
+  install:    sudo packaging/install.sh
+              (install -> token mint -> token status + doctor verify;
+              re-mint after every binary swap)
+  privilege:  kryprobe token status   # file caps + usability, unprivileged
+              kryprobe doctor         # probe matrix must pass first
+
+examples:
+  kryprobe report session.jsonl
+  kryprobe report --system --duration 10 --format json
+  kryprobe report --system --duration 10 --format json --kcrypto-profile frobnicate
+      # exit 2: unsupported profile (names api-returns|request-lifecycle)
+
+exits: 0 verdict clean/complete; 1 internal failure; 2 usage/invalid
+  input; 3 PARTIAL/inconclusive (coverage gaps — the report names
+  them); 4 environment-unusable.
+";
+
+const CHECK_HELP: &str = "\
+usage: kryprobe check --system --policy F [--duration N] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P]
+
+System-wide policy check: live kcrypto capture evaluated against
+the policy (--policy required: v0.1 has no default policy).
+
+flags:
+  --system               select-all scope (required)
+  --policy F             policy file (required)
+  --duration N           capture window in seconds (>= 1)
+  --source S             only 'kernel-crypto' in v0.1
+  --token PATH           explicit BPF token path (overrides env + default pin)
+  --kcrypto-profile P    api-returns (default) | request-lifecycle
+
+capture profiles (--kcrypto-profile):
+  api-returns        per-API return tallies + caller contexts (default;
+                     kernel 6.12+ with BTF, bpf(), ringbuf)
+  request-lifecycle  per-request submit/terminal lifecycles (needs
+                     kernel 7.0+ fsession attach, type 58; pre-7.0
+                     kernels refuse it typed, never a silent no-op)
+
+setup:
+  install:    sudo packaging/install.sh
+              (install -> token mint -> token status + doctor verify;
+              re-mint after every binary swap)
+  privilege:  kryprobe token status   # file caps + usability, unprivileged
+              kryprobe doctor         # probe matrix must pass first
+
+examples:
+  kryprobe check --system --policy policy/kcrypto-baseline.yaml --duration 30
+  kryprobe check --system --policy policy/kcrypto-baseline.yaml --kcrypto-profile frobnicate
+      # exit 2: unsupported profile (names api-returns|request-lifecycle)
+
+exits: 0 clean (no confirmed violation); 1 internal failure;
+  2 usage/invalid input; 3 inconclusive (gaps void the verdict);
+  4 environment-unusable; 10 policy violation.
+";
+
+const STUB_HELP: &str = "\
+plan|observe|run are unsupported in the thin spine (exit 4).
+";
 
 #[cfg(test)]
 mod tests {

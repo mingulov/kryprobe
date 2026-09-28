@@ -6,8 +6,10 @@
 //! order (`schema` first, like the pack example), not sorted keys.
 
 use crate::EVENT_SCHEMA_V0;
+use crate::{KCRYPTO_LIFECYCLE_SESSION_V1, KCRYPTO_LIFECYCLE_V1};
 use kryprobe_core::synthetic::STEP_NS;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -181,6 +183,330 @@ impl JsonlWriter {
     }
 
     /// Commits the stream atomically: temp file + fsync + rename + dir fsync.
+    pub fn write_file_atomic(&self, path: &Path) -> anyhow::Result<()> {
+        write_str_atomic(path, &self.out)
+    }
+}
+
+/// Session-envelope write defects: Rust-only values, never wire bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionWriteError {
+    /// A record was emitted before `session_start` (the envelope opens
+    /// with start, always).
+    NotStarted,
+    /// `session_start` was called twice (one start per stream).
+    AlreadyStarted,
+    /// A record was emitted after the receipt (the receipt is last).
+    Finished,
+    /// An observation's `record` fails payload-v1 validation (nested
+    /// finding count only — findings themselves are input-free, but the
+    /// count is all the writer needs to refuse).
+    InvalidObservation {
+        /// Nested payload-v1 finding count.
+        nested: usize,
+    },
+    /// A record body failed to serialize (a harness defect: every
+    /// shipped body serializes; only a future non-serializable body
+    /// can trip this).
+    SerializeFailed {
+        /// Record kind that failed to serialize.
+        kind: &'static str,
+        /// The underlying serialization failure.
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for SessionWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted => write!(f, "session record before session_start"),
+            Self::AlreadyStarted => write!(f, "duplicate session_start"),
+            Self::Finished => write!(f, "session record after the receipt"),
+            Self::InvalidObservation { nested } => write!(
+                f,
+                "observation record fails payload-v1 ({nested} findings)"
+            ),
+            Self::SerializeFailed { kind, detail } => {
+                write!(f, "cannot serialize {kind} record: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionWriteError {}
+
+/// Session-envelope record: fixed header, then the kind body
+/// (flattened — header order first, like the event-v0 `Record`).
+#[derive(Serialize)]
+struct SessionRecord<'a, P: Serialize> {
+    schema: &'a str,
+    kind: &'a str,
+    session: &'a str,
+    seq: u64,
+    #[serde(flatten)]
+    body: P,
+}
+
+/// `session_start` body (struct order is the wire order).
+#[derive(Serialize)]
+struct StartBody<'a> {
+    profile: &'a str,
+    source: &'a str,
+    evidence_version: &'a str,
+    rule_version: &'a str,
+    payload_schema: &'a str,
+}
+
+/// `observation` body: the validated payload-v1 record, verbatim.
+#[derive(Serialize)]
+struct ObservationBody<'a> {
+    record: &'a serde_json::Value,
+}
+
+/// `coverage` body: u64 populations + the stage→count loss map
+/// (`BTreeMap` wire order is sorted — byte-deterministic).
+#[derive(Serialize)]
+struct CoverageBody {
+    admitted: u64,
+    emitted: u64,
+    unfinished: u64,
+    loss: BTreeMap<String, u64>,
+    unknown: u64,
+    filtered: u64,
+}
+
+/// `session_receipt` body.
+#[derive(Serialize)]
+struct ReceiptBody {
+    verdict: &'static str,
+    admitted: u64,
+    emitted: u64,
+    unfinished: u64,
+    loss: BTreeMap<String, u64>,
+    truncated: bool,
+}
+
+/// Deterministic lifecycle session-envelope writer (T11/P6: the ADR
+/// session envelope — distinct from event-v0, which stays frozen).
+///
+/// A fixed call sequence is byte-deterministic: dense 1-based `seq`,
+/// struct-ordered keys, sorted loss maps. Observations validate against
+/// payload-v1 BEFORE the envelope admits them; a failed emit appends
+/// nothing, so the stream stays well-formed.
+///
+/// # Example
+///
+/// ```
+/// use kryprobe_report::{SessionWriter, validate_lifecycle_session};
+///
+/// let mut writer = SessionWriter::new("session:demo");
+/// writer
+///     .session_start("request-lifecycle", "evidence:v1", "rule:v1")
+///     .expect("start emits");
+/// writer
+///     .observation(&serde_json::json!({
+///         "schema": "kryprobe.kcrypto.lifecycle/v1",
+///         "request_id": "fixture:req-1",
+///         "tfm_id": null,
+///         "terminal": "sync",
+///         "status": 0,
+///         "duration_ns": "120",
+///     }))
+///     .expect("valid observation emits");
+/// writer.receipt(true, 1, 1, 0).expect("receipt emits");
+/// assert!(validate_lifecycle_session(&writer.into_string()).is_empty());
+/// ```
+#[derive(Debug)]
+pub struct SessionWriter {
+    session: String,
+    next_seq: u64,
+    started: bool,
+    finished: bool,
+    out: String,
+}
+
+impl SessionWriter {
+    /// New writer for `session_id` (e.g. `"session:demo"`); the first
+    /// record (`session_start`) takes seq 1.
+    #[must_use]
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            session: session_id.to_owned(),
+            next_seq: 1,
+            started: false,
+            finished: false,
+            out: String::new(),
+        }
+    }
+
+    /// Finished stream text.
+    #[must_use]
+    pub fn finish(&self) -> &str {
+        &self.out
+    }
+
+    /// Finished stream text, owned.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.out
+    }
+
+    /// Appends one envelope record; `seq` advances densely from 1. A
+    /// failed emit appends nothing.
+    fn emit<P: Serialize>(&mut self, kind: &'static str, body: P) -> Result<(), SessionWriteError> {
+        if !self.started {
+            return Err(SessionWriteError::NotStarted);
+        }
+        if self.finished {
+            return Err(SessionWriteError::Finished);
+        }
+        let record = SessionRecord {
+            schema: KCRYPTO_LIFECYCLE_SESSION_V1,
+            kind,
+            session: &self.session,
+            seq: self.next_seq,
+            body,
+        };
+        let text = serde_json::to_string(&record).map_err(|err| {
+            SessionWriteError::SerializeFailed {
+                kind,
+                detail: err.to_string(),
+            }
+        })?;
+        self.out.push_str(&text);
+        self.out.push('\n');
+        self.next_seq += 1;
+        Ok(())
+    }
+
+    /// Opens the stream: session identity + capture config at seq 1.
+    /// `source` pins to `kernel-crypto` (the only v0.1 source — the CLI
+    /// refuses any other spelling, so the writer states the constant
+    /// rather than taking a caller string it cannot verify).
+    pub fn session_start(
+        &mut self,
+        profile: &str,
+        evidence_version: &str,
+        rule_version: &str,
+    ) -> Result<(), SessionWriteError> {
+        if self.started {
+            return Err(SessionWriteError::AlreadyStarted);
+        }
+        self.started = true;
+        self.emit(
+            "session_start",
+            StartBody {
+                profile,
+                source: "kernel-crypto",
+                evidence_version,
+                rule_version,
+                payload_schema: KCRYPTO_LIFECYCLE_V1,
+            },
+        )
+    }
+
+    /// Appends one validated observation. The `record` MUST validate
+    /// against payload-v1 first — an invalid record refuses (nothing
+    /// appended), never a silent skip.
+    pub fn observation(
+        &mut self,
+        record: &serde_json::Value,
+    ) -> Result<(), SessionWriteError> {
+        let nested = crate::validate::validate_lifecycle_v1(record);
+        if !nested.is_empty() {
+            return Err(SessionWriteError::InvalidObservation {
+                nested: nested.len(),
+            });
+        }
+        self.emit("observation", ObservationBody { record })
+    }
+
+    /// Appends a coverage update: exact populations plus per-stage loss
+    /// (`loss` stage→count pairs; empty means no counted stage loss).
+    /// Global loss evidence is retained here even when filters drop
+    /// every detail row.
+    pub fn coverage(
+        &mut self,
+        admitted: u64,
+        emitted: u64,
+        unfinished: u64,
+        loss: Vec<(&str, u64)>,
+        unknown: u64,
+        filtered: u64,
+    ) -> Result<(), SessionWriteError> {
+        self.emit(
+            "coverage",
+            CoverageBody {
+                admitted,
+                emitted,
+                unfinished,
+                loss: loss
+                    .into_iter()
+                    .map(|(stage, count)| (stage.to_owned(), count))
+                    .collect(),
+                unknown,
+                filtered,
+            },
+        )
+    }
+
+    /// Appends the terminal receipt: `clean` selects the `clean` vs
+    /// `partial` verdict (a partial receipt here means unfinished work
+    /// with no counted stage loss — counted loss needs
+    /// [`SessionWriter::receipt_partial`]). `truncated` is always false:
+    /// truncation is a reader-side verdict over a receiptless stream,
+    /// never a writer claim.
+    pub fn receipt(
+        &mut self,
+        clean: bool,
+        admitted: u64,
+        emitted: u64,
+        unfinished: u64,
+    ) -> Result<(), SessionWriteError> {
+        let verdict = if clean { "clean" } else { "partial" };
+        self.emit(
+            "session_receipt",
+            ReceiptBody {
+                verdict,
+                admitted,
+                emitted,
+                unfinished,
+                loss: BTreeMap::new(),
+                truncated: false,
+            },
+        )?;
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Appends a partial terminal receipt WITH counted stage loss.
+    pub fn receipt_partial(
+        &mut self,
+        admitted: u64,
+        emitted: u64,
+        unfinished: u64,
+        loss: Vec<(&str, u64)>,
+    ) -> Result<(), SessionWriteError> {
+        self.emit(
+            "session_receipt",
+            ReceiptBody {
+                verdict: "partial",
+                admitted,
+                emitted,
+                unfinished,
+                loss: loss
+                    .into_iter()
+                    .map(|(stage, count)| (stage.to_owned(), count))
+                    .collect(),
+                truncated: false,
+            },
+        )?;
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Commits the stream atomically (same temp + fsync + rename path
+    /// as [`JsonlWriter::write_file_atomic`]).
     pub fn write_file_atomic(&self, path: &Path) -> anyhow::Result<()> {
         write_str_atomic(path, &self.out)
     }

@@ -41,6 +41,18 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             let _ = writeln!(stdout, "kryprobe {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
+        Err(ArgsError::SubHelp { command }) => {
+            match args::subcommand_help(&command) {
+                Some(text) => {
+                    let _ = writeln!(stdout, "{text}");
+                    return 0;
+                }
+                None => {
+                    let _ = writeln!(stderr, "unknown subcommand '{command}'\n{USAGE}");
+                    return 2;
+                }
+            }
+        }
         Err(ArgsError::Usage(reason)) => {
             let _ = writeln!(stderr, "{reason}\n{USAGE}");
             return 2;

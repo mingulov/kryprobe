@@ -24,12 +24,12 @@ pub use render::{render_summary, render_summary_reader, sanitize_cell};
 pub use session::{FinalBarrier, SessionEnd, SessionStart, SessionVerdict};
 pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
 pub use validate::{
-    LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, ValidationFinding,
+    LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, SessionFinding, ValidationFinding,
     lifecycle_v1_payload, resolve_schema, resolve_schema_at, schema_fnv1a_hex,
     validate_and_render_file, validate_and_render_reader, validate_file, validate_lifecycle_v1,
-    validate_reader, validate_str,
+    validate_lifecycle_session, validate_reader, validate_str,
 };
-pub use writer::{JsonlWriter, ReportError, write_str_atomic};
+pub use writer::{JsonlWriter, ReportError, SessionWriteError, SessionWriter, write_str_atomic};
 
 /// Frozen event-envelope schema const; every record must carry exactly this.
 pub const EVENT_SCHEMA_V0: &str = "kryprobe.event/v0";
@@ -43,3 +43,9 @@ pub const CONTRACT_VERSION_V0: &str = "v0-proposed";
 /// `schema` field (no v0 envelope carriage; see ADR-0005).
 /// Draft: bytes freeze only after review (see T05).
 pub const KCRYPTO_LIFECYCLE_V1: &str = "kryprobe.kcrypto.lifecycle/v1";
+
+/// kcrypto lifecycle session-envelope version (T11/P6 ADR: the distinct
+/// versioned envelope carrying start/config, validated observations,
+/// coverage updates, and the terminal receipt — never event-v0).
+/// Draft: bytes freeze only after review (no compiled-in pin yet).
+pub const KCRYPTO_LIFECYCLE_SESSION_V1: &str = "kryprobe.kcrypto.lifecycle-session/v1";
