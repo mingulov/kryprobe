@@ -188,7 +188,7 @@
           "profile": "api-returns",
           "stimulus": {
             "scenario": "r03_xfrm.sh",
-            "topology": "2 netns + veth, ESP transport chacha20poly1305 (vng kernels lack RFC4106/RFC4309)",
+            "topology": "2 netns + veth, ESP transport rfc4106(gcm(aes))",
             "traffic": "1000 seq packets each direction + 100-packet auth-fail phase",
             "kernel_ref": "ftrace crypto_aead_encrypt/decrypt"
           },
@@ -209,7 +209,7 @@
           "profile": "api-returns",
           "stimulus": {
             "scenario": "r03_xfrm.sh",
-            "topology": "2 netns + veth, ESP transport chacha20poly1305 (vng kernels lack RFC4106/RFC4309)",
+            "topology": "2 netns + veth, ESP transport rfc4106(gcm(aes))",
             "traffic": "1000 seq packets each direction + 100-packet auth-fail phase",
             "kernel_ref": "ftrace crypto_aead_encrypt/decrypt"
           },

@@ -71,9 +71,11 @@ ls /sys/kernel/btf/ > "$OUT/btf-objs.txt" 2>&1
 
 modprobe esp4 2>/dev/null
 ip netns add "$NSA" 2> "$OUT/netns.log" || FAIL=1
-modprobe chacha20poly1305 2>> "$OUT/netns.log" || FAIL=1
-if ! grep -q "^name.*chacha20poly1305" /proc/crypto 2>/dev/null; then
-  echo "AEAD chacha20poly1305 unavailable" >> "$OUT/netns.log"
+for m in aesni_intel ghash_clmulni_intel; do
+  modprobe "$m" 2>> "$OUT/netns.log" || FAIL=1
+done
+if ! grep -q "^name.*rfc4106(gcm(aes))" /proc/crypto 2>/dev/null; then
+  echo "AEAD rfc4106(gcm(aes)) unavailable" >> "$OUT/netns.log"
   FAIL=1
 fi
 ip netns add "$NSB" 2>> "$OUT/netns.log" || FAIL=1
@@ -87,22 +89,26 @@ ip -n "$NSB" link set v13b up 2>> "$OUT/netns.log" || FAIL=1
 ip -n "$NSA" link set lo up 2>> "$OUT/netns.log" || FAIL=1
 ip -n "$NSB" link set lo up 2>> "$OUT/netns.log" || FAIL=1
 
-# Chacha20-Poly1305 keys: 32 bytes per direction (RFC 7634 ESP;
-# no salt). Batch files only, shredded after use.
-head -c 32 /dev/urandom > "$OUT/sa-ab.key"
-head -c 32 /dev/urandom > "$OUT/sa-ba.key"
-chmod 600 "$OUT"/sa-*.key
-KAB=$(od -A n -t x1 "$OUT/sa-ab.key" | tr -d ' \n')
-KBA=$(od -A n -t x1 "$OUT/sa-ba.key" | tr -d ' \n')
+# GCM-128 keys: 16-byte key + 4-byte salt per direction (RFC 4106
+# ESP; the rfc4106(gcm(aes)) AEAD comes from aesni_intel, loaded
+# explicitly above because in-guest crypto autoload is unreliable).
+# Batch files only, shredded after use.
+head -c 16 /dev/urandom > "$OUT/sa-ab.key"
+head -c 4 /dev/urandom > "$OUT/sa-ab.salt"
+head -c 16 /dev/urandom > "$OUT/sa-ba.key"
+head -c 4 /dev/urandom > "$OUT/sa-ba.salt"
+chmod 600 "$OUT"/sa-*.key "$OUT"/sa-*.salt
+KAB=$(cat "$OUT/sa-ab.key" "$OUT/sa-ab.salt" | od -A n -t x1 | tr -d ' \n')
+KBA=$(cat "$OUT/sa-ba.key" "$OUT/sa-ba.salt" | od -A n -t x1 | tr -d ' \n')
 {
-  echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc chacha20poly1305 0x$KAB"
-  echo "xfrm state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc chacha20poly1305 0x$KBA"
+  echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc rfc4106(gcm(aes)) 0x$KAB"
+  echo "xfrm state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc rfc4106(gcm(aes)) 0x$KBA"
   echo "xfrm policy add src 10.13.0.1 dst 10.13.0.2 dir out tmpl src 10.13.0.1 dst 10.13.0.2 proto esp mode transport"
   echo "xfrm policy add src 10.13.0.2 dst 10.13.0.1 dir in tmpl src 10.13.0.2 dst 10.13.0.1 proto esp mode transport"
 } > "$OUT/batch-a.txt"
 {
-  echo "xfrm state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc chacha20poly1305 0x$KBA"
-  echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc chacha20poly1305 0x$KAB"
+  echo "xfrm state add src 10.13.0.2 dst 10.13.0.1 proto esp spi 0x1002 mode transport enc rfc4106(gcm(aes)) 0x$KBA"
+  echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc rfc4106(gcm(aes)) 0x$KAB"
   echo "xfrm policy add src 10.13.0.2 dst 10.13.0.1 dir out tmpl src 10.13.0.2 dst 10.13.0.1 proto esp mode transport"
   echo "xfrm policy add src 10.13.0.1 dst 10.13.0.2 dir in tmpl src 10.13.0.1 dst 10.13.0.2 proto esp mode transport"
 } > "$OUT/batch-b.txt"
@@ -148,9 +154,9 @@ ftrace_end $FNS > "$OUT/kernel-main.txt" 2>&1 || FAIL=1
 finish_capture product-main
 
 # Auth-fail phase: receiver B's inbound SA gets a wrong key.
-head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n' > "$OUT/sa-wrong.hex"
+head -c 20 /dev/urandom | od -A n -t x1 | tr -d ' \n' > "$OUT/sa-wrong.hex"
 KW=$(cat "$OUT/sa-wrong.hex")
-echo "xfrm state update src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc chacha20poly1305 0x$KW" \
+echo "xfrm state update src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport enc rfc4106(gcm(aes)) 0x$KW" \
   > "$OUT/batch-wrong.txt"
 chmod 600 "$OUT/batch-wrong.txt"
 ip -n "$NSB" -b "$OUT/batch-wrong.txt" 2>> "$OUT/netns.log" || FAIL=1
@@ -201,9 +207,9 @@ merge('$OUT/sent-authfail.json', '$OUT/recv-authfail.json', '$OUT/authfail-ledge
 # Cleanup: namespaces (drops veth + SAs + policies), key shredding.
 ip netns del "$NSB" 2>> "$OUT/netns.log" || FAIL=1
 ip netns del "$NSA" 2>> "$OUT/netns.log" || FAIL=1
-shred -u "$OUT"/sa-ab.key "$OUT"/sa-ba.key \
+shred -u "$OUT"/sa-ab.key "$OUT"/sa-ab.salt "$OUT"/sa-ba.key "$OUT"/sa-ba.salt \
   "$OUT"/batch-a.txt "$OUT"/batch-b.txt "$OUT"/batch-wrong.txt "$OUT"/sa-wrong.hex \
-  2>/dev/null || rm -f "$OUT"/sa-*.key "$OUT"/batch-*.txt "$OUT"/sa-wrong.hex
+  2>/dev/null || rm -f "$OUT"/sa-*.key "$OUT"/sa-*.salt "$OUT"/batch-*.txt "$OUT"/sa-wrong.hex
 dmesg | tail -5 > "$OUT/dmesg-tail.txt" 2>&1
 {
   echo "kernel=$(uname -r)"
