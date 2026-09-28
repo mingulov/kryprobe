@@ -821,12 +821,13 @@ def judge_r03(oracle_spec, cell_dir):
     return checks, detail, expected_body, actual_body
 
 
-def judge_r04_deny(oracle_spec, cell_dir):
-    refusal = {"exit": parse_rc(cell_dir, "refusal-rc.txt"),
-               "stderr": (cell_dir / "refusal-stderr.log").read_text()}
-    stdout = (cell_dir / "control-stdout.log").read_text()
-    kernel_ref = json.loads((cell_dir / "kernel-ref.json").read_text())["main"]
-    parsed = load_report(cell_dir, "control.json")
+def observed_digest_counts(parsed: dict, kernel_ref: dict) -> dict:
+    """Per-kernel-function observed digest counts (full-identity sum).
+
+    Each kernel function name maps to its digest family; counts sum
+    across algorithms/drivers/contexts (a short-key lookup would
+    silently miss every row and read all zeros).
+    """
     observed = {}
     for name in kernel_ref:
         _before, _sep, func = name.partition("crypto_")
@@ -834,8 +835,17 @@ def judge_r04_deny(oracle_spec, cell_dir):
             "shash" if func.startswith("shash") else None)
         if fam is None:
             raise oracles.OracleError(f"kernel_ref names unexpected {name!r}")
-        entry = parsed["agg"].get((fam, "digest", AGG_OK))
-        observed[name] = entry["calls"] if entry else 0
+        observed[name] = agg_calls(parsed, fam, "digest")
+    return observed
+
+
+def judge_r04_deny(oracle_spec, cell_dir):
+    refusal = {"exit": parse_rc(cell_dir, "refusal-rc.txt"),
+               "stderr": (cell_dir / "refusal-stderr.log").read_text()}
+    stdout = (cell_dir / "control-stdout.log").read_text()
+    kernel_ref = json.loads((cell_dir / "kernel-ref.json").read_text())["main"]
+    parsed = load_report(cell_dir, "control.json")
+    observed = observed_digest_counts(parsed, kernel_ref)
     control = {
         "hash_issued": oracle_spec["control_issued"],
         "hash_done": oracle_spec["control_issued"] if parse_fixture_stdout(

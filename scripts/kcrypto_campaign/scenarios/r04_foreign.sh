@@ -50,7 +50,10 @@ ls /sys/kernel/btf/ > "$OUT/btf-objs.txt" 2>&1
 
 modprobe algif_hash 2>/dev/null
 
-"$KP" report --system --format json --duration 60 --out "$OUT/product.json" \
+# 30 s window: the two bursts take ~5 s; the attribution proof
+# has no kernel reference, so a shorter window minimizes
+# background-digest exposure (any unattributed who row fails).
+"$KP" report --system --format json --duration 30 --out "$OUT/product.json" \
   2> "$OUT/capture.stderr.log" &
 CAP=$!
 wait_attach "$OUT/capture.stderr.log" "$OUT/capture-attach.txt" || FAIL=1
@@ -93,6 +96,8 @@ def pidfile(path):
     return int(pid), ticks.strip()
 opid, oticks = pidfile('$OUT/owned-pid.txt')
 fpid, fticks = pidfile('$OUT/foreign-pid.txt')
+if not oticks or not fticks or not oticks.isdigit() or not fticks.isdigit():
+    raise SystemExit('empty pid start-ticks (no-reuse proof void)')
 json.dump({'pids': [opid], 'start_ticks': [oticks]},
           open('$OUT/owned-pids.json', 'w'))
 json.dump({'pids': [fpid], 'start_ticks': [fticks]},

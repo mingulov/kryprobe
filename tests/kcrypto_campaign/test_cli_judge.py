@@ -91,6 +91,28 @@ class AggSummingTests(unittest.TestCase):
             CLI.agg_bytes({"agg": {}}, "skcipher", "encrypt"), 0)
 
 
+class ObservedDigestCountsTests(unittest.TestCase):
+    def test_sums_full_identity_rows(self):
+        # Regression: a short-key lookup silently reads zero for
+        # every function; counts must sum across the full
+        # (family, op, result, algorithm, driver, context) rows.
+        parsed = {"agg": {
+            ("ahash", "digest", "ok", "sha256", "d1", "process"):
+                {"calls": 7, "bytes": 0},
+            ("ahash", "digest", "ok", "sha256", "d2", "process"):
+                {"calls": 3, "bytes": 0},
+        }}
+        observed = CLI.observed_digest_counts(
+            parsed, {"crypto_ahash_digest": 10, "crypto_shash_digest": 0})
+        self.assertEqual(observed["crypto_ahash_digest"], 10)
+        self.assertEqual(observed["crypto_shash_digest"], 0)
+
+    def test_unexpected_function_raises(self):
+        with self.assertRaises(CLI.oracles.OracleError):
+            CLI.observed_digest_counts(
+                {"agg": {}}, {"crypto_skcipher_encrypt": 1})
+
+
 class FixtureStdoutTests(unittest.TestCase):
     def test_hash_markers(self):
         text = "hash: 20 digests done\ngenerator finished\n"
