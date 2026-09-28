@@ -476,3 +476,256 @@ fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Ve
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionFinding, validate_lifecycle_session};
+    use crate::SessionWriter;
+    use serde_json::{Value, json};
+
+    fn observation_record() -> Value {
+        json!({
+            "schema": "kryprobe.kcrypto.lifecycle/v1",
+            "request_id": "fixture:req-1",
+            "tfm_id": null,
+            "terminal": "sync",
+            "status": 0,
+            "duration_ns": "120",
+        })
+    }
+
+    fn clean_stream() -> String {
+        let mut writer = SessionWriter::new("session:unit");
+        writer
+            .session_start("request-lifecycle", "evidence:v1", "rule:v1")
+            .expect("start emits");
+        writer
+            .coverage(2, 2, 0, vec![], 0, 0)
+            .expect("coverage emits");
+        writer
+            .observation(&observation_record())
+            .expect("observation emits");
+        writer.receipt(true, 2, 2, 0).expect("receipt emits");
+        writer.into_string()
+    }
+
+    #[test]
+    fn schema_file_pins_envelope_contract() {
+        // The standalone contract doc stays parseable and keeps the
+        // header keys, kind/verdict vocabularies, and version consts
+        // the validator enforces (bytes freeze only after review;
+        // this pins the doc against rot).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/kcrypto-lifecycle-session-v1.schema.json");
+        let text = std::fs::read_to_string(&path).expect("schema file readable");
+        let schema: Value = serde_json::from_str(&text).expect("schema file parses");
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required array");
+        for key in ["schema", "kind", "session", "seq"] {
+            assert!(
+                required.iter().any(|k| k.as_str() == Some(key)),
+                "header key {key}"
+            );
+        }
+        let properties = schema.get("properties").expect("properties");
+        assert_eq!(
+            properties.get("schema").and_then(|s| s.get("const")),
+            Some(&json!("kryprobe.kcrypto.lifecycle-session/v1")),
+            "envelope version const"
+        );
+        assert_eq!(
+            properties
+                .get("payload_schema")
+                .and_then(|s| s.get("const")),
+            Some(&json!("kryprobe.kcrypto.lifecycle/v1")),
+            "payload version pin"
+        );
+        let kinds = properties
+            .get("kind")
+            .and_then(|k| k.get("enum"))
+            .and_then(Value::as_array)
+            .expect("kind enum");
+        for kind in [
+            "session_start",
+            "observation",
+            "context",
+            "coverage",
+            "session_receipt",
+        ] {
+            assert!(
+                kinds.iter().any(|k| k.as_str() == Some(kind)),
+                "kind {kind}"
+            );
+        }
+        let verdicts = properties
+            .get("verdict")
+            .and_then(|v| v.get("enum"))
+            .and_then(Value::as_array)
+            .expect("verdict enum");
+        for verdict in ["clean", "partial", "truncated"] {
+            assert!(
+                verdicts.iter().any(|v| v.as_str() == Some(verdict)),
+                "verdict {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_round_trip_validates_clean() {
+        assert!(validate_lifecycle_session(&clean_stream()).is_empty());
+    }
+
+    #[test]
+    fn writer_is_byte_deterministic() {
+        assert_eq!(clean_stream(), clean_stream());
+    }
+
+    #[test]
+    fn invalid_observation_refuses_at_writer() {
+        let mut writer = SessionWriter::new("session:refuse");
+        writer
+            .session_start("request-lifecycle", "evidence:v1", "rule:v1")
+            .expect("start emits");
+        let before = writer.finish().to_owned();
+        let mut bad = observation_record();
+        bad.as_object_mut().expect("object").remove("status");
+        let err = writer
+            .observation(&bad)
+            .expect_err("invalid record must refuse");
+        assert!(
+            matches!(
+                err,
+                crate::SessionWriteError::InvalidObservation { nested } if nested > 0
+            ),
+            "typed refusal: {err}"
+        );
+        assert_eq!(writer.finish(), before, "failed emit appends nothing");
+    }
+
+    #[test]
+    fn seq_gap_and_session_change_refuse() {
+        let gapped = clean_stream().replacen("\"seq\":2", "\"seq\":3", 1);
+        assert!(
+            validate_lifecycle_session(&gapped)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::SeqGap { .. })),
+            "seq gap: {gapped}"
+        );
+        let moved = clean_stream().replacen("session:unit", "session:other", 1);
+        assert!(
+            validate_lifecycle_session(&moved)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::SessionMismatch { .. })),
+            "session change must refuse"
+        );
+    }
+
+    fn start_line(seq: u64) -> String {
+        format!(
+            "{{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"session_start\",\
+             \"session\":\"session:place\",\"seq\":{seq},\"profile\":\"request-lifecycle\",\
+             \"source\":\"kernel-crypto\",\"evidence_version\":\"evidence:v1\",\
+             \"rule_version\":\"rule:v1\",\
+             \"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\"}}"
+        )
+    }
+
+    fn receipt_line(seq: u64) -> String {
+        format!(
+            "{{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"session_receipt\",\
+             \"session\":\"session:place\",\"seq\":{seq},\"verdict\":\"clean\",\
+             \"admitted\":0,\"emitted\":0,\"unfinished\":0,\"loss\":{{}},\"truncated\":false}}"
+        )
+    }
+
+    fn coverage_line(seq: u64) -> String {
+        format!(
+            "{{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"coverage\",\
+             \"session\":\"session:place\",\"seq\":{seq},\"admitted\":0,\"emitted\":0,\
+             \"unfinished\":0,\"loss\":{{}},\"unknown\":0,\"filtered\":0}}"
+        )
+    }
+
+    #[test]
+    fn receipt_placement_is_unique_and_last() {
+        // Control: start + receipt validates clean.
+        let clean = format!("{}\n{}\n", start_line(1), receipt_line(2));
+        assert!(validate_lifecycle_session(&clean).is_empty());
+        // A record after the receipt: receipt is not last.
+        let stray = format!(
+            "{}\n{}\n{}\n",
+            start_line(1),
+            receipt_line(2),
+            coverage_line(3)
+        );
+        assert!(
+            validate_lifecycle_session(&stray)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::ReceiptNotLast { line: 2 })),
+            "receipt must be last"
+        );
+        // Two receipts: the repeat is named.
+        let dupla = format!(
+            "{}\n{}\n{}\n",
+            start_line(1),
+            receipt_line(2),
+            receipt_line(3)
+        );
+        assert!(
+            validate_lifecycle_session(&dupla)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::DuplicateReceipt { line: 3 })),
+            "duplicate receipt must refuse"
+        );
+    }
+
+    #[test]
+    fn clean_verdict_requires_zero_loss_and_no_unfinished() {
+        let mut writer = SessionWriter::new("session:lossy");
+        writer
+            .session_start("request-lifecycle", "evidence:v1", "rule:v1")
+            .expect("start emits");
+        writer
+            .receipt_partial(2, 1, 1, vec![("reserve", 3)])
+            .expect("partial receipt emits");
+        let text = writer.into_string();
+        assert!(
+            validate_lifecycle_session(&text).is_empty(),
+            "honest partial receipt validates: {text}"
+        );
+        // Rewrite the verdict to clean: the validator must refuse a
+        // clean claim over loss + unfinished work.
+        let lied = text.replacen("\"partial\"", "\"clean\"", 1);
+        let findings = validate_lifecycle_session(&lied);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
+            "clean over loss/unfinished must refuse: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_lines_refuse_input_free() {
+        assert_eq!(
+            validate_lifecycle_session(""),
+            vec![SessionFinding::EmptyStream]
+        );
+        let garbage = "{not json}\n";
+        assert!(
+            validate_lifecycle_session(garbage)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::Unparseable { line: 1 })),
+            "unparseable line refuses"
+        );
+        // Findings never echo rejected bytes.
+        for finding in validate_lifecycle_session(garbage) {
+            assert!(
+                !finding.to_string().contains("not json"),
+                "input-free: {finding}"
+            );
+        }
+    }
+}

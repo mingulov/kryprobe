@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kryprobe:design:kcrypto-lifecycle-session:v1",
+  "title": "KryProbe kcrypto lifecycle session envelope v1",
+  "description": "One record of a lifecycle session stream (schema kryprobe.kcrypto.lifecycle-session/v1): session_start, observation, context, coverage, or session_receipt. A stream carries dense 1-based seq, constant session, session_start first, exactly one session_receipt last; a receiptless stream is truncated, never clean. NOT carried in the v0 event envelope (frozen v0 bytes are untouched). Draft: bytes freeze only after review (no compiled-in pin yet). Structural validation never establishes evidence truth; see docs/kcrypto-evidence.md.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "kryprobe.kcrypto.lifecycle-session/v1"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "session_start",
+        "observation",
+        "context",
+        "coverage",
+        "session_receipt"
+      ]
+    },
+    "session": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+(?![\\s\\S])",
+      "maxLength": 96
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "profile": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    },
+    "evidence_version": {
+      "type": "string"
+    },
+    "rule_version": {
+      "type": "string"
+    },
+    "payload_schema": {
+      "const": "kryprobe.kcrypto.lifecycle/v1"
+    },
+    "record": {
+      "description": "One validated lifecycle payload-v1 object (validated by the payload-v1 validator before the envelope admits it).",
+      "type": "object"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "submitter": {
+      "description": "Submitter context object, or null when explicitly unavailable."
+    },
+    "execution": {
+      "description": "Execution context object."
+    },
+    "completion": {
+      "description": "Completion context object, or null until the terminal edge lands."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "clean",
+        "partial",
+        "truncated"
+      ]
+    },
+    "admitted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "emitted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "unfinished": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "loss": {
+      "description": "Per-stage loss evidence: stage name to u64 count. Empty means no counted stage loss.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "unknown": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "filtered": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema",
+    "kind",
+    "session",
+    "seq"
+  ],
+  "allOf": [
+    {
+      "description": "session_start carries identity + capture config.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "session_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "profile",
+          "source",
+          "evidence_version",
+          "rule_version",
+          "payload_schema"
+        ]
+      }
+    },
+    {
+      "description": "observation carries one validated payload-v1 record.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "observation"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "record"
+        ]
+      }
+    },
+    {
+      "description": "context carries one request's three contexts.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "context"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "request_id",
+          "submitter",
+          "execution",
+          "completion"
+        ]
+      }
+    },
+    {
+      "description": "coverage carries populations + loss evidence.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "coverage"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "admitted",
+          "emitted",
+          "unfinished",
+          "loss",
+          "unknown",
+          "filtered"
+        ]
+      }
+    },
+    {
+      "description": "session_receipt carries the terminal verdict + populations.",
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "session_receipt"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "verdict",
+          "admitted",
+          "emitted",
+          "unfinished",
+          "loss",
+          "truncated"
+        ]
+      }
+    },
+    {
+      "description": "A clean verdict carries no truncation flag.",
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "clean"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "truncated": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "description": "A truncated verdict always sets the truncation flag.",
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "truncated"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "truncated": {
+            "const": true
+          }
+        }
+      }
+    }
+  ]
+}
