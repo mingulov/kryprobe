@@ -84,29 +84,19 @@ class AfAlgBehaviorTests(unittest.TestCase):
 
     def test_skcipher_burst_roundtrip(self):
         # Asserts inside skcipher_burst verify decrypt(encrypt(m)) == m.
-        # The one-cmsg OP+IV form hangs this host kernel's recv (a
-        # host-only quirk: all three guest kernels answer); run it in
-        # a bounded child so the host check can never wedge, and let
-        # the R01-floor guest cell carry the skcipher proof.
+        # Bounded child so a kernel regression fails fast instead of
+        # wedging the suite; the two-cmsg ABI form must answer.
         try:
             proc = subprocess.run(
                 [sys.executable, "-c",
                  "import sys; sys.path.insert(0, %r);"
                  "import kcrypto_gen; kcrypto_gen.skcipher_burst(n=1)"
                  % str(ROOT / "tests" / "fixtures")],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=30,
             )
-        except subprocess.TimeoutExpired:
-            self.skipTest(
-                "host kernel does not answer one-cmsg skcipher recv "
-                "(R01-floor guest cell proves this path)"
-            )
-            return
-        if proc.returncode != 0:
-            self.skipTest(
-                "host kernel does not answer one-cmsg skcipher recv "
-                "(R01-floor guest cell proves this path; rc=%d)" % proc.returncode
-            )
+        except subprocess.TimeoutExpired as err:
+            self.fail(f"repaired skcipher recv hung on host: {err}")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("skcipher: 2 ops done", proc.stdout)
 
     def test_main_zero_rounds_finishes(self):

@@ -13,9 +13,10 @@ delivery-bundle generator
 SHA256
 `82325c72d469b30c55604730e8e8c35cde614cfb8580f5d6b9d27f6d58ffc3eb`
 (verified at promotion; the ambient `/tmp` copy hashed
-identical). Delta vs the parent is the 6-line header only
-(SPDX + provenance marker); the traffic core is byte-identical
-(`diff` proved at promotion, see the T13 handoff).
+identical). Delta vs the parent is the header (SPDX +
+provenance marker) plus the two repairs below; everything else
+is byte-identical (`diff` at promotion + repair commit, see
+the T13 handoff).
 
 ## License
 
@@ -39,12 +40,26 @@ No root needed to *generate* traffic; only the observer needs
 privileges. No keys/IVs/plaintext leave the process except into
 the kernel crypto API under test (fixed synthetic test vectors).
 
-## Known host quirk (not a fixture defect)
+## Repairs vs the parent
 
-`skcipher_burst` uses the single-cmsg OP+IV form. That form is
-answered on all three campaign guest kernels (6.12.111, 7.0.14,
-7.2.6 — probed 2026-09-28) but the T13 build host
-(7.0.0-31-generic) never completes the encrypt `recv`. The host
-behavior check therefore runs skcipher in a bounded child and
-skips with an explicit reason on this host; the sealed
-R01-floor guest cell carries the skcipher proof.
+1. **Two-cmsg OP+IV form.** The parent's single-cmsg form (op
+   + IV bytes concatenated in one `ALG_SET_OP` cmsg) is
+   replaced by the standard ABI two-cmsg form (`ALG_SET_OP` +
+   `ALG_SET_IV`), matching the repo's Rust AF_ALG fixture
+   (`kryprobe-testkit::alg_fixture`).
+2. **Bounded skcipher wait.** Blocking AF_ALG skcipher
+   `recvmsg` misses the completion wakeup on the campaign
+   kernels and the build host: the call is observed
+   kernel-side but userspace sleeps in `af_alg_wait_for_data`
+   forever, while the timeout/select path observes the ready
+   result immediately (bisected 2026-09-28: blocking hangs
+   deterministically, timeout succeeds deterministically, on
+   6.12.111/7.0.14/7.2.6 guests and the 7.0.0 host, for both
+   cmsg forms). `skcipher_burst` therefore sets a 30 s op
+   timeout: genuine non-delivery raises `TimeoutError`
+   (honest nonzero exit), never a wedge.
+
+These two repairs are the only functional deltas vs the
+parent; the host behavior check requires the repaired
+skcipher path to answer, and the sealed R01-floor cell proves
+it in-guest against the ftrace kernel reference.

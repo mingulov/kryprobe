@@ -17,15 +17,22 @@ import struct
 import sys
 
 ALG_SET_KEY = 1
+ALG_SET_IV = 2
 ALG_SET_OP = 3
 ALG_OP_DECRYPT = 0
 ALG_OP_ENCRYPT = 1
 
 
 def _op_cmsg(op, iv):
-    # cmsg data for ALG_SET_OP: u32 op + struct af_alg_iv { u32 ivlen; u8 iv[] }
-    return [(socket.SOL_ALG, ALG_SET_OP,
-             struct.pack("=II", op, len(iv)) + iv)]
+    # Two-cmsg form (kernel ABI, as the repo's Rust AF_ALG
+    # fixture sends): ALG_SET_OP carries u32 op alone;
+    # ALG_SET_IV carries struct af_alg_iv { u32 ivlen; u8 iv[] }.
+    # The parent's single-cmsg OP+IV form misses the recv
+    # wakeup on blocking sockets (af_alg_wait_for_data sleeps
+    # forever); see kcrypto-gen-README.md.
+    return [(socket.SOL_ALG, ALG_SET_OP, struct.pack("=I", op)),
+            (socket.SOL_ALG, ALG_SET_IV,
+             struct.pack("=I", len(iv)) + iv)]
 
 
 def skcipher_burst(n=50):
@@ -33,6 +40,13 @@ def skcipher_burst(n=50):
     s.bind(("skcipher", "cbc(aes)"))
     s.setsockopt(socket.SOL_ALG, ALG_SET_KEY, bytes(range(16)))
     op, _ = s.accept()
+    # Bounded wait (never a wedge): blocking AF_ALG skcipher
+    # recvmsg misses the completion wakeup on the campaign
+    # kernels (sleeps in af_alg_wait_for_data forever) while
+    # the timeout/select path observes the ready result; see
+    # kcrypto-gen-README.md. Genuine non-delivery raises
+    # TimeoutError (honest failure, nonzero exit).
+    op.settimeout(30)
     iv = bytes(16)
     msg = b"0123456789abcdef" * 4
     for _ in range(n):
