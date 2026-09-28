@@ -49,14 +49,47 @@
     "request_id": {
       "type": "string"
     },
+    "context_schema": {
+      "const": "kryprobe.kcrypto.context/v1"
+    },
     "submitter": {
-      "description": "Submitter context object, or null when explicitly unavailable."
+      "description": "Submitter context-v1 object, or null when explicitly unavailable. Closed key set (P6r2/N2): pid/tgid u32 words, nullable start_marker/comm/uid/cgroup/ppid scalars, closed stack marker.",
+      "type": ["object", "null"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "tgid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "start_marker": {"type": ["integer", "null"], "minimum": 0},
+        "comm": {"type": ["string", "null"]},
+        "uid": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+        "cgroup": {"type": ["integer", "null"], "minimum": 0},
+        "ppid": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+        "stack": {"enum": ["missing", "sampled", "full", null]}
+      },
+      "required": ["pid", "tgid", "start_marker", "comm", "uid", "cgroup", "ppid", "stack"],
+      "additionalProperties": false
     },
     "execution": {
-      "description": "Execution context object."
+      "description": "Execution context-v1 object (closed key set: kind + nullable proving lifetimes; an unknown site names nothing).",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "enum": ["process", "worker", "softirq", "unknown"]},
+        "lifetime": {"$ref": "#/$defs/lifetime"},
+        "handoff": {"$ref": "#/$defs/lifetime"}
+      },
+      "required": ["kind", "lifetime", "handoff"],
+      "additionalProperties": false
     },
     "completion": {
-      "description": "Completion context object, or null until the terminal edge lands."
+      "description": "Completion context-v1 object, or null until the terminal edge lands (closed key set: site shape plus follows_request true — an admitted completion follows its request).",
+      "type": ["object", "null"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["process", "worker", "softirq", "unknown"]},
+        "lifetime": {"$ref": "#/$defs/lifetime"},
+        "handoff": {"$ref": "#/$defs/lifetime"},
+        "follows_request": {"const": true}
+      },
+      "required": ["kind", "lifetime", "handoff", "follows_request"],
+      "additionalProperties": false
     },
     "verdict": {
       "type": "string",
@@ -104,6 +137,19 @@
     "session",
     "seq"
   ],
+  "$defs": {
+    "lifetime": {
+      "description": "One task lifetime: u32 pid/tgid plus the nullable /proc start-time marker (a pid without a marker is unqualified, never joined).",
+      "type": ["object", "null"],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "tgid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "start_marker": {"type": ["integer", "null"], "minimum": 0}
+      },
+      "required": ["pid", "tgid", "start_marker"],
+      "additionalProperties": false
+    }
+  },
   "allOf": [
     {
       "description": "session_start carries identity + capture config.",
@@ -150,6 +196,7 @@
       },
       "then": {
         "required": [
+          "context_schema",
           "request_id",
           "submitter",
           "execution",

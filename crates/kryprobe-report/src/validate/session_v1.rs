@@ -15,9 +15,9 @@
 //! so no property value, unknown key name, or embedded payload detail is
 //! ever echoed.
 
-use crate::KCRYPTO_LIFECYCLE_SESSION_V1;
 use crate::validate::MAX_VALIDATE_LINE_BYTES;
 use crate::validate::lifecycle_v1::validate_lifecycle_v1;
+use crate::{KCRYPTO_CONTEXT_V1, KCRYPTO_LIFECYCLE_SESSION_V1};
 use serde_json::Value;
 
 /// Closed record-kind vocabulary.
@@ -31,6 +31,28 @@ const KINDS: &[&str] = &[
 
 /// Closed receipt-verdict vocabulary.
 const VERDICTS: &[&str] = &["clean", "partial", "truncated"];
+
+/// Closed execution-kind vocabulary (context-v1).
+const EXECUTION_KINDS: &[&str] = &["process", "worker", "softirq", "unknown"];
+
+/// Closed stack-marker vocabulary (context-v1).
+const STACK_MARKERS: &[&str] = &["missing", "sampled", "full"];
+
+/// Closed context-v1 object key sets (extra keys refuse — the
+/// shapes are closed; only the ENVELOPE stays open to extra keys).
+const SUBMITTER_KEYS: &[&str] = &[
+    "pid",
+    "tgid",
+    "start_marker",
+    "comm",
+    "uid",
+    "cgroup",
+    "ppid",
+    "stack",
+];
+const EXECUTION_KEYS: &[&str] = &["kind", "lifetime", "handoff"];
+const COMPLETION_KEYS: &[&str] = &["kind", "lifetime", "handoff", "follows_request"];
+const LIFETIME_KEYS: &[&str] = &["pid", "tgid", "start_marker"];
 
 /// One session-stream defect; empty means the stream validates clean.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +215,13 @@ fn required_for(kind: &str) -> &'static [&'static str] {
             "payload_schema",
         ],
         "observation" => &["record"],
-        "context" => &["request_id", "submitter", "execution", "completion"],
+        "context" => &[
+            "context_schema",
+            "request_id",
+            "submitter",
+            "execution",
+            "completion",
+        ],
         "coverage" => &[
             "admitted",
             "emitted",
@@ -267,14 +295,26 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
             }
         };
         match obj.get("session").and_then(Value::as_str) {
-            Some(got) => match session.as_deref() {
-                None => session = Some(got.to_owned()),
-                Some(first) if first == got => {}
-                Some(_) => {
-                    out.push(SessionFinding::SessionMismatch { line: no });
-                    continue;
+            Some(got) => {
+                // P6-N2: the header session is non-empty and matches
+                // the schema pattern on EVERY record (a malformed id
+                // is a stream defect even when constant).
+                if !session_shape_ok(got) {
+                    out.push(SessionFinding::BadShape {
+                        line: no,
+                        key: "session".to_owned(),
+                        expected: "prefixed session id".to_owned(),
+                    });
                 }
-            },
+                match session.as_deref() {
+                    None => session = Some(got.to_owned()),
+                    Some(first) if first == got => {}
+                    Some(_) => {
+                        out.push(SessionFinding::SessionMismatch { line: no });
+                        continue;
+                    }
+                }
+            }
             None => {
                 out.push(SessionFinding::MissingKey {
                     line: no,
@@ -336,6 +376,20 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
                         expected: "kryprobe.kcrypto.lifecycle/v1".to_owned(),
                     });
                 }
+                // P6-N2: start identity/config fields are typed
+                // strings (never numbers, nulls, or arrays).
+                for key in ["profile", "source", "evidence_version", "rule_version"] {
+                    if !obj.get(key).is_some_and(Value::is_string) {
+                        out.push(SessionFinding::BadShape {
+                            line: no,
+                            key: key.to_owned(),
+                            expected: "string".to_owned(),
+                        });
+                    }
+                }
+            }
+            "context" => {
+                check_context(obj, no, &mut out);
             }
             "observation" => {
                 let record = &obj["record"];
@@ -368,6 +422,234 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
         Some(_) => {}
     }
     out
+}
+
+/// Header `session` shape (P6-N2): non-empty and matching the
+/// schema pattern `^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$` (hand-rolled —
+/// the report crate takes no regex dependency).
+fn session_shape_ok(session: &str) -> bool {
+    let Some((prefix, rest)) = session.split_once(':') else {
+        return false;
+    };
+    let mut prefix_chars = prefix.chars();
+    if !prefix_chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    if !prefix_chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        return false;
+    }
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Pushes a [`SessionFinding::BadShape`] (closed key + static
+/// expectation — input-free by construction).
+fn bad_shape(out: &mut Vec<SessionFinding>, line: usize, key: &str, expected: &str) {
+    out.push(SessionFinding::BadShape {
+        line,
+        key: key.to_owned(),
+        expected: expected.to_owned(),
+    });
+}
+
+/// Requires the closed key set of a context-v1 object: every
+/// required key present, no extras. Returns false when any defect
+/// was pushed (callers skip field checks then — one defect per
+/// object, never a cascade over untrusted shapes).
+fn require_closed_keys(
+    obj: &serde_json::Map<String, Value>,
+    line: usize,
+    key: &str,
+    required: &[&str],
+    out: &mut Vec<SessionFinding>,
+) -> bool {
+    let mut ok = true;
+    for want in required {
+        if !obj.contains_key(*want) {
+            out.push(SessionFinding::MissingKey {
+                line,
+                key: (*want).to_owned(),
+            });
+            ok = false;
+        }
+    }
+    if obj.keys().any(|got| !required.contains(&got.as_str())) {
+        // Input-free: the foreign key NAME is untrusted input and
+        // could smuggle key material — name our key, never theirs.
+        bad_shape(out, line, key, "closed context-v1 object");
+        ok = false;
+    }
+    ok
+}
+
+/// JSON u32 (a u64 that fits — pid/tgid/uid/ppid words).
+fn as_u32(value: &Value) -> Option<u32> {
+    value.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+/// One task-lifetime shape: closed keys, u32 pid/tgid, nullable
+/// u64 start marker. `key` is OUR vocabulary word for findings.
+fn check_lifetime(value: &Value, line: usize, key: &str, out: &mut Vec<SessionFinding>) {
+    let Some(obj) = value.as_object() else {
+        bad_shape(out, line, key, "lifetime object|null");
+        return;
+    };
+    if !require_closed_keys(obj, line, key, LIFETIME_KEYS, out) {
+        return;
+    }
+    for word in ["pid", "tgid"] {
+        if obj.get(word).and_then(as_u32).is_none() {
+            bad_shape(out, line, word, "u32");
+        }
+    }
+    if !matches!(obj.get("start_marker"), Some(Value::Null) | None)
+        && obj.get("start_marker").and_then(Value::as_u64).is_none()
+    {
+        bad_shape(out, line, "start_marker", "u64|null");
+    }
+}
+
+/// Nullable lifetime (explicit-unavailable is null, never guessed).
+fn check_lifetime_or_null(value: &Value, line: usize, key: &str, out: &mut Vec<SessionFinding>) {
+    if value.is_null() {
+        return;
+    }
+    check_lifetime(value, line, key, out);
+}
+
+/// One execution/completion site shape: closed keys, closed kind,
+/// nullable proving lifetimes. `completion` additionally requires
+/// `follows_request: true`.
+fn check_site(
+    value: &Value,
+    line: usize,
+    key: &str,
+    completion: bool,
+    out: &mut Vec<SessionFinding>,
+) {
+    let Some(obj) = value.as_object() else {
+        bad_shape(
+            out,
+            line,
+            key,
+            if completion {
+                "completion object|null"
+            } else {
+                "execution object"
+            },
+        );
+        return;
+    };
+    let required: &[&str] = if completion {
+        COMPLETION_KEYS
+    } else {
+        EXECUTION_KEYS
+    };
+    if !require_closed_keys(obj, line, key, required, out) {
+        return;
+    }
+    let kind = obj.get("kind").and_then(Value::as_str);
+    if kind.is_none_or(|k| !EXECUTION_KINDS.contains(&k)) {
+        bad_shape(out, line, "kind", "process|worker|softirq|unknown");
+        return;
+    }
+    check_lifetime_or_null(&obj["lifetime"], line, "lifetime", out);
+    check_lifetime_or_null(&obj["handoff"], line, "handoff", out);
+    // An unknown site names NOTHING: a lifetime beside `unknown`
+    // contradicts the kind (closed detail — input-free).
+    if kind == Some("unknown") && (!obj["lifetime"].is_null() || !obj["handoff"].is_null()) {
+        out.push(SessionFinding::InvalidCombination {
+            line,
+            detail: "unknown execution names a lifetime".to_owned(),
+        });
+    }
+    if completion && obj.get("follows_request") != Some(&Value::Bool(true)) {
+        bad_shape(out, line, "follows_request", "true");
+    }
+}
+
+/// Context-record shapes (P6-N2, replacing the accept-all fallthrough):
+/// pinned context-v1 marker, string request id, and the three closed
+/// context shapes (submitter nullable, execution required, completion
+/// nullable — each independently unavailable, never guessed).
+fn check_context(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Vec<SessionFinding>) {
+    if obj
+        .get("context_schema")
+        .and_then(Value::as_str)
+        .is_none_or(|schema| schema != KCRYPTO_CONTEXT_V1)
+    {
+        bad_shape(out, line, "context_schema", "kryprobe.kcrypto.context/v1");
+    }
+    if !obj.get("request_id").is_some_and(Value::is_string) {
+        bad_shape(out, line, "request_id", "string");
+    }
+    if let Some(value) = obj.get("submitter") {
+        check_submitter(value, line, out);
+    }
+    match obj.get("execution") {
+        Some(value) => check_site(value, line, "execution", false, out),
+        None => bad_shape(out, line, "execution", "execution object"),
+    }
+    // A null completion means the terminal edge has not landed
+    // yet — valid, never a guess at a landing site.
+    if let Some(value) = obj.get("completion")
+        && !value.is_null()
+    {
+        check_site(value, line, "completion", true, out);
+    }
+}
+
+/// One submitter shape: null (explicitly unavailable) or the closed
+/// 8-key object with typed words (nullable scalars stay null, never
+/// zero-filled).
+fn check_submitter(value: &Value, line: usize, out: &mut Vec<SessionFinding>) {
+    if value.is_null() {
+        return;
+    }
+    let Some(sub) = value.as_object() else {
+        bad_shape(out, line, "submitter", "submitter object|null");
+        return;
+    };
+    if !require_closed_keys(sub, line, "submitter", SUBMITTER_KEYS, out) {
+        return;
+    }
+    for word in ["pid", "tgid"] {
+        if sub.get(word).and_then(as_u32).is_none() {
+            bad_shape(out, line, word, "u32");
+        }
+    }
+    if !matches!(sub.get("start_marker"), Some(Value::Null) | None)
+        && sub.get("start_marker").and_then(Value::as_u64).is_none()
+    {
+        bad_shape(out, line, "start_marker", "u64|null");
+    }
+    if !matches!(sub.get("comm"), Some(Value::Null) | None)
+        && !sub.get("comm").is_some_and(Value::is_string)
+    {
+        bad_shape(out, line, "comm", "string|null");
+    }
+    for word in ["uid", "ppid"] {
+        if !matches!(sub.get(word), Some(Value::Null) | None)
+            && sub.get(word).and_then(as_u32).is_none()
+        {
+            bad_shape(out, line, word, "u32|null");
+        }
+    }
+    if !matches!(sub.get("cgroup"), Some(Value::Null) | None)
+        && sub.get("cgroup").and_then(Value::as_u64).is_none()
+    {
+        bad_shape(out, line, "cgroup", "u64|null");
+    }
+    if !matches!(sub.get("stack"), Some(Value::Null) | None)
+        && sub
+            .get("stack")
+            .and_then(Value::as_str)
+            .is_none_or(|marker| !STACK_MARKERS.contains(&marker))
+    {
+        bad_shape(out, line, "stack", "missing|sampled|full|null");
+    }
 }
 
 /// Coverage-record counter shapes: u64 counts, `loss` a stage→u64 map.
@@ -570,6 +852,74 @@ mod tests {
                 "verdict {verdict}"
             );
         }
+        // P6-N2: the context-v1 wire pin — marker const, closed
+        // submitter/execution/completion shapes (additionalProperties
+        // false INSIDE the context objects; the envelope itself
+        // stays open), and the lifetime def.
+        assert_eq!(
+            properties
+                .get("context_schema")
+                .and_then(|s| s.get("const")),
+            Some(&json!("kryprobe.kcrypto.context/v1")),
+            "context-v1 marker const"
+        );
+        for key in ["submitter", "execution", "completion"] {
+            let shape = properties.get(key).expect("context shape");
+            assert_eq!(
+                shape.get("additionalProperties"),
+                Some(&json!(false)),
+                "{key} is closed"
+            );
+            assert!(
+                shape
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| !required.is_empty()),
+                "{key} pins required keys"
+            );
+        }
+        let stacks = properties
+            .get("submitter")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("stack"))
+            .and_then(|s| s.get("enum"))
+            .and_then(Value::as_array)
+            .expect("stack enum");
+        for marker in ["missing", "sampled", "full"] {
+            assert!(
+                stacks.iter().any(|m| m.as_str() == Some(marker)),
+                "stack marker {marker}"
+            );
+        }
+        let kinds = properties
+            .get("execution")
+            .and_then(|e| e.get("properties"))
+            .and_then(|p| p.get("kind"))
+            .and_then(|k| k.get("enum"))
+            .and_then(Value::as_array)
+            .expect("execution kind enum");
+        for kind in ["process", "worker", "softirq", "unknown"] {
+            assert!(
+                kinds.iter().any(|k| k.as_str() == Some(kind)),
+                "execution kind {kind}"
+            );
+        }
+        assert_eq!(
+            properties
+                .get("completion")
+                .and_then(|c| c.get("properties"))
+                .and_then(|p| p.get("follows_request"))
+                .and_then(|f| f.get("const")),
+            Some(&json!(true)),
+            "completion follows its request"
+        );
+        assert!(
+            schema
+                .get("$defs")
+                .and_then(|defs| defs.get("lifetime"))
+                .is_some(),
+            "lifetime def"
+        );
     }
 
     #[test]
@@ -704,6 +1054,168 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
             "clean over loss/unfinished must refuse: {findings:?}"
+        );
+    }
+
+    /// Reviewer round-1 bad-context probe, byte-exact: numeric
+    /// request_id, v99 context marker, sentinel keys in submitter,
+    /// string execution, array completion. Must refuse (P6-N2).
+    const BAD_CONTEXT_PROBE: &str = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\"}\n{\"completion\":[1,2,3],\"context_schema\":\"kryprobe.kcrypto.context/v99\",\"execution\":\"unversioned-garbage\",\"kind\":\"context\",\"request_id\":42,\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"submitter\":{\"arbitrary_buffer\":\"REVIEW_SENTINEL\",\"raw_kernel_pointer\":\"REVIEW_SENTINEL\"}}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":5,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+
+    #[test]
+    fn reviewer_bad_context_profile_refuses() {
+        let findings = validate_lifecycle_session(BAD_CONTEXT_PROBE);
+        assert!(
+            !findings.is_empty(),
+            "garbage context profile must refuse (P6-N2)"
+        );
+        // Input-free: the sentinel bytes never echo.
+        for finding in &findings {
+            assert!(
+                !finding.to_string().contains("REVIEW_SENTINEL"),
+                "input-free: {finding}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_start_field_types_refuse() {
+        // Reviewer probe: numeric profile, null source, array
+        // evidence_version. Start fields are typed strings (P6-N2).
+        let probe = "{\"evidence_version\":[],\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":42,\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":null}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        assert!(
+            !validate_lifecycle_session(probe).is_empty(),
+            "mistyped start fields must refuse (P6-N2)"
+        );
+    }
+
+    #[test]
+    fn empty_session_refuses() {
+        // Reviewer probe: constant-but-empty session. The header
+        // session is non-empty and matches the schema pattern (P6-N2).
+        let probe = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        assert!(
+            !validate_lifecycle_session(probe).is_empty(),
+            "empty session must refuse (P6-N2)"
+        );
+    }
+
+    #[test]
+    fn session_shape_matches_schema_pattern() {
+        // The header session matches the schema pattern
+        // `^[a-z][a-z0-9_-]*:[A-Za-z0-9_.-]+$` (P6-N2): prefixed ids
+        // pass, unprefixed/empty/malformed refuse.
+        let stream_with = |session: &str| {
+            format!(
+                "{{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"session_start\",\"session\":\"{session}\",\"seq\":1,\"profile\":\"request-lifecycle\",\"source\":\"kernel-crypto\",\"evidence_version\":\"evidence:v1\",\"rule_version\":\"rule:v1\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\"}}\n{}",
+                receipt_line(2).replace("session:place", session)
+            )
+        };
+        for good in ["session:review", "live:run", "a:b", "s9:x-y_z.0"] {
+            assert!(
+                validate_lifecycle_session(&stream_with(good)).is_empty(),
+                "session {good} validates"
+            );
+        }
+        for bad in [
+            "",
+            "nosuchcolon",
+            "SESSION:x",
+            "1x:y",
+            "a:",
+            "a:b c",
+            "a:b/c",
+        ] {
+            assert!(
+                !validate_lifecycle_session(&stream_with(bad)).is_empty(),
+                "session {bad:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_extra_envelope_keys_stay_permitted() {
+        // Coordinator-rejected sub-leg, pinned PERMITTED (P6-N2):
+        // unknown EXTRA envelope keys refuse nothing — the schema
+        // sets no additionalProperties at the envelope level.
+        let probe = "{\"arbitrary_buffer\":\"REVIEW_SENTINEL\",\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        assert!(
+            validate_lifecycle_session(probe).is_empty(),
+            "extra envelope keys stay permitted (rejected sub-leg, pinned)"
+        );
+    }
+
+    fn honest_context_line() -> String {
+        "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"context\",\"session\":\"session:ctx\",\"seq\":3,\"context_schema\":\"kryprobe.kcrypto.context/v1\",\"request_id\":\"req:ctx-1\",\"submitter\":{\"pid\":101,\"tgid\":100,\"start_marker\":50000,\"comm\":\"bash\",\"uid\":1000,\"cgroup\":7,\"ppid\":1,\"stack\":\"sampled\"},\"execution\":{\"kind\":\"process\",\"lifetime\":{\"pid\":101,\"tgid\":100,\"start_marker\":50000},\"handoff\":null},\"completion\":{\"kind\":\"process\",\"lifetime\":{\"pid\":101,\"tgid\":100,\"start_marker\":50000},\"handoff\":null,\"follows_request\":true}}".to_owned()
+    }
+
+    #[test]
+    fn honest_context_record_validates() {
+        // Positive control (P6-N2): a fully-shaped context-v1 record
+        // rides a clean stream.
+        let stream = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            start_line(1).replace("session:place", "session:ctx"),
+            "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"observation\",\"session\":\"session:ctx\",\"seq\":2,\"record\":{\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"request_id\":\"req:ctx-1\",\"tfm_id\":null,\"terminal\":\"sync\",\"status\":0,\"duration_ns\":\"10\"}}",
+            honest_context_line(),
+            coverage_line(4).replace("session:place", "session:ctx"),
+            receipt_line(5).replace("session:place", "session:ctx"),
+        );
+        assert!(
+            validate_lifecycle_session(&stream).is_empty(),
+            "honest context validates: {}",
+            validate_lifecycle_session(&stream)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    fn unobserved_context_line() -> String {
+        "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"context\",\"session\":\"session:ctx\",\"seq\":3,\"context_schema\":\"kryprobe.kcrypto.context/v1\",\"request_id\":\"req:ctx-9\",\"submitter\":null,\"execution\":{\"kind\":\"unknown\",\"lifetime\":null,\"handoff\":null},\"completion\":null}".to_owned()
+    }
+
+    #[test]
+    fn unobserved_contexts_validate_explicitly() {
+        // Positive control (P6-N2): null submitter, unknown
+        // execution, null completion — the explicit-unavailable
+        // wire shape validates.
+        let stream = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            start_line(1).replace("session:place", "session:ctx"),
+            "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"observation\",\"session\":\"session:ctx\",\"seq\":2,\"record\":{\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"request_id\":\"req:ctx-9\",\"tfm_id\":null,\"terminal\":\"unknown\",\"status\":null,\"duration_ns\":null}}",
+            unobserved_context_line(),
+            coverage_line(4).replace("session:place", "session:ctx"),
+            receipt_line(5).replace("session:place", "session:ctx"),
+        );
+        assert!(
+            validate_lifecycle_session(&stream).is_empty(),
+            "unobserved context validates"
+        );
+    }
+
+    #[test]
+    fn unknown_execution_naming_a_lifetime_refuses() {
+        // An `unknown` site beside a non-null lifetime contradicts
+        // the kind (P6-N2).
+        let line = unobserved_context_line().replace(
+            "\"execution\":{\"kind\":\"unknown\",\"lifetime\":null,\"handoff\":null}",
+            "\"execution\":{\"kind\":\"unknown\",\"lifetime\":{\"pid\":1,\"tgid\":1,\"start_marker\":null},\"handoff\":null}",
+        );
+        let stream = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            start_line(1).replace("session:place", "session:ctx"),
+            "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"observation\",\"session\":\"session:ctx\",\"seq\":2,\"record\":{\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"request_id\":\"req:ctx-9\",\"tfm_id\":null,\"terminal\":\"unknown\",\"status\":null,\"duration_ns\":null}}",
+            line,
+            coverage_line(4).replace("session:place", "session:ctx"),
+            receipt_line(5).replace("session:place", "session:ctx"),
+        );
+        assert!(
+            validate_lifecycle_session(&stream)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
+            "unknown site naming a lifetime must refuse"
         );
     }
 

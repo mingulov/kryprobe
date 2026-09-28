@@ -49,3 +49,9 @@ pub const KCRYPTO_LIFECYCLE_V1: &str = "kryprobe.kcrypto.lifecycle/v1";
 /// coverage updates, and the terminal receipt — never event-v0).
 /// Draft: bytes freeze only after review (no compiled-in pin yet).
 pub const KCRYPTO_LIFECYCLE_SESSION_V1: &str = "kryprobe.kcrypto.lifecycle-session/v1";
+
+/// kcrypto context record-profile version (P6r2/N2 ADR amendment:
+/// the closed wire shapes of one request's submitter, execution,
+/// and completion contexts — every `context` record pins this).
+/// Draft: bytes freeze only after review (no compiled-in pin yet).
+pub const KCRYPTO_CONTEXT_V1: &str = "kryprobe.kcrypto.context/v1";
