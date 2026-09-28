@@ -530,9 +530,9 @@ impl LiveError {
 const EMIT_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Finalizes one stdout report (P7/T12 terminal-output seam): the
-/// full text lands in bounded chunks with a stop check between
-/// chunks (a fresh SIGINT aborts promptly instead of blocking a
-/// slow sink forever), then a checked flush. Any write or flush
+/// full text lands in bounded chunks with a stop check between AND
+/// inside chunks (a fresh SIGINT aborts promptly instead of blocking
+/// a slow sink forever), then a checked flush. Any write or flush
 /// failure — or an interrupt mid-emit — reports the explicit
 /// terminal output status on stderr and exits 1: a torn stream is
 /// never a silent `code`. Healthy emits pass `code` through
@@ -543,6 +543,18 @@ const EMIT_CHUNK_BYTES: usize = 8 * 1024;
 /// exit 3) — a stale set must never abort the partial-window
 /// render. Only a FRESH arrival after the re-arm aborts (a second
 /// Ctrl-C during a slow emit).
+///
+/// P7-N1: the chunk body is a manual `write` loop, never `write_all`
+/// (which retries `Interrupted` — exactly the hang: a blocked write
+/// into a full pipe under `SA_RESTART` never surfaces the fresh
+/// SIGINT). A witness-set `Interrupted` aborts with the torn-stream
+/// status; a spurious `Interrupted` (foreign signal, witness clear)
+/// retries; `WouldBlock` (a nonblocking sink momentarily full)
+/// waits one poll slice and retries, so a stalled sink stays
+/// interruptible rather than spinning. Production stdout is the
+/// privilege [`InterruptibleWriter`](kryprobe_privilege::host::InterruptibleWriter)
+/// (fd-level nonblocking + poll slices), so a fresh SIGINT aborts a
+/// stalled emit within ~50 ms.
 pub fn emit_stdout_text(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -565,11 +577,61 @@ pub fn emit_stdout_text(
             );
             return 1;
         }
-        if let Err(err) = stdout.write_all(chunk) {
-            let _ = writeln!(stderr, "{tool}: cannot write stdout: {err}");
-            return 1;
+        let mut off = 0usize;
+        while off < chunk.len() {
+            // Inside-chunk stop check (P7-N1): a slow sink paces a
+            // single chunk over many paced writes — each one stays
+            // interruptible, not just the chunk boundary.
+            if SIGINT_SEEN.load(Ordering::Relaxed) {
+                let _ = writeln!(
+                    stderr,
+                    "{tool}: stdout emit interrupted ({written}/{} bytes)",
+                    bytes.len()
+                );
+                return 1;
+            }
+            match stdout.write(&chunk[off..]) {
+                Ok(0) => {
+                    // No progress without an error (`write_all`
+                    // maps this to WriteZero): fail closed — a
+                    // zero-write sink never completes the chunk.
+                    let _ = writeln!(
+                        stderr,
+                        "{tool}: cannot write stdout: failed to write whole buffer"
+                    );
+                    return 1;
+                }
+                Ok(n) => {
+                    off += n;
+                    written += n;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    if SIGINT_SEEN.load(Ordering::Relaxed) {
+                        let _ = writeln!(
+                            stderr,
+                            "{tool}: stdout emit interrupted ({written}/{} bytes)",
+                            bytes.len()
+                        );
+                        return 1;
+                    }
+                    // Spurious (a foreign signal cut the write, the
+                    // witness is clear): retry — never abort on a
+                    // signal that is not ours.
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    // A nonblocking sink momentarily full: wait one
+                    // slice and retry (the witness check above keeps
+                    // the stall interruptible — a blocked-forever
+                    // stall reads exactly like the old blocking
+                    // write, except a fresh SIGINT aborts it).
+                    std::thread::sleep(Duration::from_millis(STOP_POLL_MS));
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "{tool}: cannot write stdout: {err}");
+                    return 1;
+                }
+            }
         }
-        written += chunk.len();
     }
     if let Err(err) = stdout.flush() {
         let _ = writeln!(stderr, "{tool}: cannot flush stdout: {err}");

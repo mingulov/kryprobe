@@ -87,7 +87,21 @@ fn main() {
     let argv: Vec<String> = std::env::args_os()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let mut stdout = StdoutGuard::new(std::io::stdout().lock());
+    // P7-N1: production stdout is the interruptible fd writer (a
+    // fresh SIGINT aborts a stalled terminal emit within ~50 ms
+    // instead of hanging a blocked write under `SA_RESTART`).
+    // Unbuffered by design — every accepted byte reached fd 1, so
+    // the terminal flush below is a no-op and bytes are identical
+    // to the old line-buffered path on success. A wrap failure
+    // means stdout's flags are already broken: fail closed before
+    // running anything (no evidence can leave anyway).
+    let mut stdout = match kryprobe_privilege::host::InterruptibleWriter::stdout() {
+        Ok(writer) => StdoutGuard::new(writer),
+        Err(err) => {
+            eprintln!("kryprobe: stdout unusable: {err}");
+            std::process::exit(STDOUT_FAILED);
+        }
+    };
     let mut stderr = std::io::stderr().lock();
     let code = kryprobe_cli::run(
         &argv,

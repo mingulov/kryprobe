@@ -264,6 +264,101 @@ fn output_fresh_sigint_mid_emit_aborts_promptly() {
     SIGINT_SEEN.store(false, Ordering::Relaxed);
 }
 
+/// Writer failing its first `write` with `Interrupted` while the
+/// witness is SET (the privilege fd writer's fresh-SIGINT shape —
+/// a stalled sink aborted mid-chunk): the emit maps it to the
+/// torn-stream status (exit 1), never a silent code and never a
+/// retry of an aborted stall.
+struct InterruptedWithWitness {
+    buf: Vec<u8>,
+    failed: bool,
+}
+
+impl Write for InterruptedWithWitness {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if !self.failed {
+            self.failed = true;
+            SIGINT_SEEN.store(true, Ordering::Relaxed);
+            return Err(Error::new(
+                ErrorKind::Interrupted,
+                "stdout emit interrupted by SIGINT",
+            ));
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// P7-N1 — witness-set `Interrupted` mid-chunk aborts with the
+/// torn-stream status: nothing lands (the stall aborted the first
+/// write), exit 1, stderr names the torn byte counts.
+#[test]
+fn output_interrupted_with_witness_aborts_torn() {
+    let _sigint = reset_sigint();
+    let mut stdout = InterruptedWithWitness {
+        buf: Vec::new(),
+        failed: false,
+    };
+    let mut stderr = Vec::new();
+    let code = emit_stdout_text(&mut stdout, &mut stderr, "report", "evidence\n", 0);
+    assert!(stdout.buf.is_empty(), "stalled write lands nothing");
+    assert_eq!(code, 1, "torn stream never reports success");
+    let stderr = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        stderr.contains("report: stdout emit interrupted (0/9 bytes)"),
+        "explicit torn-stream status: {stderr}"
+    );
+    SIGINT_SEEN.store(false, Ordering::Relaxed);
+}
+
+/// Writer failing its first `write` with a SPURIOUS `Interrupted`
+/// (witness clear — a foreign signal cut the write, not ours): the
+/// emit retries and the full text lands with the code preserved —
+/// never an abort on a signal that is not ours.
+struct SpuriousInterrupted {
+    buf: Vec<u8>,
+    failed: bool,
+}
+
+impl Write for SpuriousInterrupted {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if !self.failed {
+            self.failed = true;
+            assert!(
+                !SIGINT_SEEN.load(Ordering::Relaxed),
+                "witness clear on the spurious cut"
+            );
+            return Err(Error::new(ErrorKind::Interrupted, "foreign signal"));
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// P7-N1 — spurious `Interrupted` (witness clear) retries: the full
+/// text lands verbatim with the capture code preserved.
+#[test]
+fn output_spurious_interrupted_retries() {
+    let _sigint = reset_sigint();
+    let mut stdout = SpuriousInterrupted {
+        buf: Vec::new(),
+        failed: false,
+    };
+    let mut stderr = Vec::new();
+    let code = emit_stdout_text(&mut stdout, &mut stderr, "report", "evidence\n", 3);
+    assert_eq!(stdout.buf, b"evidence\n", "verbatim bytes after retry");
+    assert_eq!(code, 3, "capture code preserved");
+    assert!(stderr.is_empty(), "no stderr on success");
+}
+
 /// Stale SIGINT (the capture's own interruption, already latched
 /// into the outcome) never aborts the render: the emit re-arms
 /// first, so the full text lands with the capture code preserved.
