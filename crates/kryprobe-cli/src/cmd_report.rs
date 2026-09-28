@@ -400,13 +400,15 @@ fn finish_report_live(
 /// message family), deterministically on every host, instead of
 /// burning a capture first. Bare filenames (no parent) and existing
 /// parents pass through to the write seam, which reports real
-/// failures (TOCTOU-safe: the seam still owns the write). Returns
-/// the refusal detail, if any.
+/// failures (TOCTOU-safe: the seam still owns the write). Links
+/// resolve: a parent symlinking to a directory passes (the seam
+/// would succeed), anything else refuses. Returns the refusal
+/// detail, if any.
 fn preflight_out_writable(out: &Path) -> Option<String> {
     let parent = out
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())?;
-    match std::fs::symlink_metadata(parent) {
+    match std::fs::metadata(parent) {
         Ok(meta) if meta.is_dir() => None,
         Ok(_) => Some(format!(
             "cannot write {}: parent {} is not a directory",
@@ -1279,6 +1281,29 @@ mod tests {
                 .is_some_and(|detail| detail.contains("no such parent directory")),
             "missing parent refuses"
         );
+        // A parent symlinking to a directory passes (the write seam
+        // would succeed); a dangling link refuses like a missing
+        // parent.
+        #[cfg(unix)]
+        {
+            let target = scratch.path().join("real");
+            std::fs::create_dir(&target).expect("seed dir");
+            let link = scratch.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).expect("seed link");
+            assert_eq!(
+                preflight_out_writable(&link.join("report.jsonl")),
+                None,
+                "symlink-to-dir parent passes"
+            );
+            let dangling = scratch.path().join("dangling");
+            std::os::unix::fs::symlink(scratch.path().join("absent"), &dangling)
+                .expect("seed dangling link");
+            assert!(
+                preflight_out_writable(&dangling.join("r.jsonl"))
+                    .is_some_and(|detail| detail.contains("no such parent directory")),
+                "dangling parent refuses"
+            );
+        }
     }
 
     #[test]
