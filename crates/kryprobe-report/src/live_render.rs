@@ -564,6 +564,26 @@ pub fn render_watch_tables(
 /// `live:run` spelling satisfies the checker's prefixed-id shape.
 pub const LIVE_SESSION_ID: &str = "live:run";
 
+/// Mints a run-unique session id for one session-envelope export
+/// (P6-N4: `session:live-<pid>-<nanos>-<counter>` — every live run
+/// gets its own identity, so a cross-run observation splice refuses
+/// on session constancy). Process id + wall nanos separate runs; a
+/// process-wide counter separates mints within one run even when the
+/// clock repeats. Matches the schema session pattern and stays far
+/// under the 96-char cap. The frozen event-v0 export keeps
+/// [`LIVE_SESSION_ID`] — v0 bytes never mint.
+#[must_use]
+pub fn mint_live_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MINTS: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_nanos())
+        .unwrap_or(0);
+    let seq = MINTS.fetch_add(1, Ordering::Relaxed);
+    format!("session:live-{}-{nanos}-{seq}", std::process::id())
+}
+
 /// Fixed qualification label for live JSONL export: a live capture
 /// carries no qualification stamp — a qualification harness stamps
 /// its own id when it adopts the stream.
@@ -793,5 +813,30 @@ mod tests {
         assert_eq!(base, base);
         assert!(WhoKey { kh: 1, tgid: 9 } < WhoKey { kh: 2, tgid: 0 });
         assert!(WhoKey { kh: 1, tgid: 1 } < WhoKey { kh: 1, tgid: 2 });
+    }
+
+    #[test]
+    fn minted_session_ids_are_unique_and_shaped() {
+        // P6-N4: every mint differs (counter-separated even when the
+        // clock repeats) and matches the schema session shape
+        // (`session:` prefix, pattern charset, under the 96 cap).
+        let first = super::mint_live_session_id();
+        let second = super::mint_live_session_id();
+        assert_ne!(first, second, "mints never repeat");
+        for minted in [&first, &second] {
+            assert!(
+                minted.starts_with("session:live-"),
+                "run-unique prefix: {minted}"
+            );
+            assert!(minted.len() <= 96, "under the schema cap: {minted}");
+            let rest = minted.split_once(':').expect("colon").1;
+            assert!(
+                !rest.is_empty()
+                    && rest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+                "pattern charset: {minted}"
+            );
+        }
     }
 }

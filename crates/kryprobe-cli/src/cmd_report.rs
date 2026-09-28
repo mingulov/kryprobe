@@ -7,7 +7,6 @@ use crate::args::ReportFormat;
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
-use kryprobe_report::live_render::LIVE_SESSION_ID;
 use kryprobe_report::{
     KCRYPTO_LIFECYCLE_SESSION_V1, ReportError, SessionWriteError, SessionWriter,
     lifecycle_v1_payload, validate_and_render_file, write_str_atomic,
@@ -155,6 +154,23 @@ pub fn render_lifecycle_session(
     outcome: &LiveOutcome,
     profile: LifecycleProfile,
 ) -> Result<String, ReportError> {
+    render_lifecycle_session_with_id(
+        outcome,
+        profile,
+        &kryprobe_report::live_render::mint_live_session_id(),
+    )
+}
+
+/// Session-envelope export under a caller-chosen session id: the
+/// production path ([`render_lifecycle_session`]) mints a run-unique
+/// id per export (P6-N4); tests and goldens pin a fixed id here so
+/// the golden bytes stay deterministic while production never
+/// repeats an identity.
+pub fn render_lifecycle_session_with_id(
+    outcome: &LiveOutcome,
+    profile: LifecycleProfile,
+    session_id: &str,
+) -> Result<String, ReportError> {
     let totals = outcome
         .lifecycle_totals
         .as_ref()
@@ -172,7 +188,7 @@ pub fn render_lifecycle_session(
             detail: other.to_string(),
         },
     };
-    let mut writer = SessionWriter::new(LIVE_SESSION_ID);
+    let mut writer = SessionWriter::new(session_id);
     writer
         .session_start(
             profile.as_str(),
@@ -695,11 +711,69 @@ mod tests {
 
     #[test]
     fn session_golden_pins_stream() {
+        // P6-N4: the golden keeps its fixed `live:run` id via direct
+        // writer-path construction (fixed id passed in) while the
+        // production exporter mints run-unique ids.
         assert_golden(
             &golden("lifecycle_session.jsonl"),
+            render_lifecycle_session_with_id(
+                &lifecycle_fixture(),
+                LifecycleProfile::RequestLifecycle,
+                kryprobe_report::live_render::LIVE_SESSION_ID,
+            )
+            .expect("fixture exports")
+            .as_bytes(),
+        );
+    }
+
+    fn export_session_id(text: &str) -> String {
+        let start: serde_json::Value =
+            serde_json::from_str(text.lines().next().expect("export opens with start"))
+                .expect("start parses");
+        start
+            .get("session")
+            .and_then(serde_json::Value::as_str)
+            .expect("start carries session")
+            .to_owned()
+    }
+
+    #[test]
+    fn live_exports_mint_run_unique_sessions() {
+        // P6-N4 RED: every live export mints its own session id
+        // (constant `live:run` let a cross-kernel observation splice
+        // validate). Two exports must differ.
+        let first =
             render_lifecycle_session(&lifecycle_fixture(), LifecycleProfile::RequestLifecycle)
-                .expect("fixture exports")
-                .as_bytes(),
+                .expect("first exports");
+        let second =
+            render_lifecycle_session(&lifecycle_fixture(), LifecycleProfile::RequestLifecycle)
+                .expect("second exports");
+        assert_ne!(
+            export_session_id(&first),
+            export_session_id(&second),
+            "live exports must not share a session id"
+        );
+    }
+
+    #[test]
+    fn cross_run_observation_splice_refuses() {
+        // P6-N4 RED: an observation spliced from another run's
+        // export (same seq, foreign session) refuses on the session
+        // constancy check — run identity defeats the splice.
+        let first =
+            render_lifecycle_session(&lifecycle_fixture(), LifecycleProfile::RequestLifecycle)
+                .expect("first exports");
+        let second =
+            render_lifecycle_session(&lifecycle_fixture(), LifecycleProfile::RequestLifecycle)
+                .expect("second exports");
+        let mut first_lines: Vec<&str> = first.lines().collect();
+        let second_lines: Vec<&str> = second.lines().collect();
+        assert!(first_lines.len() > 2 && second_lines.len() > 2);
+        first_lines[1] = second_lines[1];
+        let spliced = first_lines.join("\n") + "\n";
+        assert!(
+            !kryprobe_report::validate_lifecycle_session(&spliced).is_empty(),
+            "cross-run splice must refuse"
         );
     }
 
