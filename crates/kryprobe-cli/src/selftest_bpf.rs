@@ -213,7 +213,9 @@ mod tests {
         );
     }
 
-    /// P7/T12 verdict table (item 5 root cause, second leg):
+    /// P7/T12 verdict table (item 5 root cause, first leg — the
+    /// historical `defect` was this mislabel; the drain-stop race is
+    /// the second, latent leg):
     /// fully-accounted loss is PARTIAL, not a defect. The historical
     /// row replays `evidence/0-4/priv-cli_bpf_e2e.txt` (entries=18716
     /// returns=18717 ring=2567 over 20000 calls — ledger Clean, kind
