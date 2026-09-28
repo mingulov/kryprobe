@@ -104,6 +104,30 @@ class FixtureStdoutTests(unittest.TestCase):
                                                   "hash", 20))
 
 
+class ParseRcTests(unittest.TestCase):
+    def test_key_value_form(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = Path(tmp)
+            (cell / "refusal-rc.txt").write_text("refusal_rc=4\n")
+            self.assertEqual(CLI.parse_rc(cell, "refusal-rc.txt"), 4)
+
+    def test_bare_form(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = Path(tmp)
+            (cell / "refusal-rc.txt").write_text("4\n")
+            self.assertEqual(CLI.parse_rc(cell, "refusal-rc.txt"), 4)
+
+    def test_garbage_raises(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = Path(tmp)
+            (cell / "refusal-rc.txt").write_text("nope\n")
+            with self.assertRaises(ValueError):
+                CLI.parse_rc(cell, "refusal-rc.txt")
+
+
 class GuestStageMatchTests(unittest.TestCase):
     def test_match_passes(self):
         import tempfile

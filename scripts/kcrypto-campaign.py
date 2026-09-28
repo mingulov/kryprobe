@@ -483,6 +483,12 @@ def load_report(cell_dir: Path, name: str) -> dict:
         json.loads((cell_dir / name).read_text()))
 
 
+def parse_rc(cell_dir: Path, name: str) -> int:
+    """Parse a scenario rc file (`KEY=N` or bare `N`)."""
+    text = (cell_dir / name).read_text().strip()
+    return int(text.rsplit("=", 1)[-1])
+
+
 def transport_closed(*parsed_reports: dict) -> bool:
     """Zero-loss gate over the parsed loss counters (fail-closed).
 
@@ -670,7 +676,7 @@ def judge_r01_floor(oracle_spec, cell_dir):
         "skcipher_decrypt": agg_calls(parsed, "skcipher", "decrypt"),
         "ring_drops": parsed["loss"].get("ring_drops", "?"),
     }
-    refusal = {"exit": int((cell_dir / "refusal-rc.txt").read_text().strip()),
+    refusal = {"exit": parse_rc(cell_dir, "refusal-rc.txt"),
                "stderr": (cell_dir / "refusal-stderr.log").read_text()}
     checks, detail = oracles.check_r01_floor(workload, kernel_ref, product, refusal)
     checks["transport_closed"] = transport_closed(parsed)
@@ -787,7 +793,7 @@ def judge_r03(oracle_spec, cell_dir):
 
 
 def judge_r04_deny(oracle_spec, cell_dir):
-    refusal = {"exit": int((cell_dir / "refusal-rc.txt").read_text().strip()),
+    refusal = {"exit": parse_rc(cell_dir, "refusal-rc.txt"),
                "stderr": (cell_dir / "refusal-stderr.log").read_text()}
     stdout = (cell_dir / "control-stdout.log").read_text()
     kernel_ref = json.loads((cell_dir / "kernel-ref.json").read_text())["main"]
