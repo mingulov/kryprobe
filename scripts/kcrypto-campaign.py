@@ -667,7 +667,9 @@ def judge_r01_floor(oracle_spec, cell_dir):
         "skc_done": oracle_spec["skcipher_issued"] if parse_fixture_stdout(
             stdout, "skcipher", oracle_spec["skcipher_issued"]) else -1,
     }
-    kernel_ref = json.loads((cell_dir / "kernel-ref.json").read_text())["main"]
+    raw_ref = json.loads((cell_dir / "kernel-ref.json").read_text())["main"]
+    kernel_ref = {name.removeprefix("crypto_"): value
+                  for name, value in raw_ref.items()}
     parsed = load_report(cell_dir, "aggregate.json")
     product = {
         "ahash_digest": agg_calls(parsed, "ahash", "digest"),
