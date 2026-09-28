@@ -534,7 +534,7 @@ fn sol04_misaligned_record_error_carries_no_address() {
     // addresses (exactly one is 8-aligned) — no ASLR luck.
     let base = aligned.0.as_ptr() as usize;
     let off = (1..=8)
-        .find(|o| (base + o) % 8 != 0)
+        .find(|o| !(base + o).is_multiple_of(8))
         .expect("a misaligned offset exists");
     let bytes = &aligned.0[off..];
     let residue = bytes.as_ptr() as usize % 8;
