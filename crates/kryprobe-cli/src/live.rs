@@ -260,8 +260,54 @@ pub struct LifecycleTotals {
     pub kernel_loss: [u64; 5],
     /// Completions dropped from retention past the ledger bound.
     pub retained_dropped: u64,
-    /// Transform entries refused (resubmit/table-full) + tainted.
-    pub tfm_refused: u64,
+    /// Transform-lifetime loss, one counter per loss field the
+    /// coverage path counts (P6-N5: no folding — each rides its own
+    /// `tfm.*` stage so the export names the cause). Verdict-neutral
+    /// inventory (`unknown_releases`) and truth accounting
+    /// (admissions, completions, joined configs) stay out, exactly
+    /// as in `count_loss`.
+    pub tfm_submit_refused: u64,
+    /// Tainted transform edges refused quietly.
+    pub tfm_tainted_refused: u64,
+    /// Transform entries refused past the pending table bound.
+    pub tfm_table_full: u64,
+    /// Success completions/admissions refused past the live bound.
+    pub tfm_live_full: u64,
+    /// Transform records failing twin validation.
+    pub tfm_bad_records: u64,
+    /// First-seen attempts with a zero transform word.
+    pub tfm_unlinked_ops: u64,
+    /// Transform returns for no outstanding attempt.
+    pub tfm_unknown_returns: u64,
+    /// Transform returns predating their entry.
+    pub tfm_stale_returns: u64,
+    /// Twin-valid returns for a parked entry of the other site.
+    pub tfm_mismatched_returns: u64,
+    /// Pending transform attempts finalized without return.
+    pub tfm_unfinished: u64,
+    /// Releases that proved nothing (generation stays live).
+    pub tfm_ambiguous_releases: u64,
+    /// Generations forced-retired by a new alloc at their base.
+    pub tfm_forced_retires: u64,
+    /// Destroy returns whose generation no longer holds the base.
+    pub tfm_stale_releases: u64,
+    /// Unbound destroys colliding with a live occupant.
+    pub tfm_colliding_releases: u64,
+    /// Joined configs with no attributable generation.
+    pub tfm_config_unlinked: u64,
+    /// First-seen admissions (creation boundary never observed).
+    pub tfm_unobserved_boundary: u64,
+    /// Retired transform tombstones evicted past the history bound.
+    pub tfm_tombstone_evictions: u64,
+    /// Session per-program recursion-miss delta sum (H2: the kernel
+    /// skipped whole runs — the miss counter is the only witness).
+    pub prog_miss_delta: u64,
+    /// Accepted-but-unconsumed aggregate residual with an EMPTY
+    /// close ring (the accounting equation broke — unexplained).
+    /// Zero whenever the close ring held backlog bytes (backlog
+    /// explains accepted-but-unconsumed edges — the coverage flip
+    /// rule, mirrored here).
+    pub transport_residual: u64,
     /// Driver-side observation-cap omissions (decoded records the
     /// session kept no observation for — counted, never silent).
     pub omitted: u64,
@@ -274,14 +320,35 @@ pub struct LifecycleTotals {
 impl LifecycleTotals {
     /// Copies terminal totals out of the session ledger plus the
     /// driver's own close stats. `kernel_loss` takes session DELTAS
-    /// (post minus pre-arm baseline), never absolutes.
+    /// (post minus pre-arm baseline), never absolutes. Every loss
+    /// counter the coverage path counts rides along (P6-N5):
+    /// program-miss deltas, all transform loss fields, and the
+    /// transport residual — the envelope's global loss evidence.
     #[must_use]
     pub fn from_ledger(
         ledger: &LifecycleLedger,
         kernel_loss_delta: [u64; 5],
         omitted: u64,
         unknown_terminals: u64,
+        backlog_bytes: u64,
     ) -> Self {
+        // The transport residual, exactly as the coverage path
+        // computes it (accepted minus consumed, reserve, and noslot
+        // with an empty close ring — the accounting equation broke).
+        // With backlog bytes the residual is EXPLAINED (backlog
+        // holds the unconsumed edges) and rides zero.
+        let agg_sum: u64 = ledger
+            .agg_accepted
+            .iter()
+            .fold(0, |sum, accepted| sum.saturating_add(*accepted));
+        let hits_sum: u64 = ledger
+            .edge_hits
+            .iter()
+            .fold(0, |sum, hits| sum.saturating_add(*hits));
+        let residual = agg_sum
+            .saturating_sub(hits_sum)
+            .saturating_sub(ledger.kernel_loss[0])
+            .saturating_sub(ledger.kernel_loss[4]);
         Self {
             admitted: ledger.reducer.admitted,
             emitted: ledger.reducer.emitted,
@@ -302,11 +369,25 @@ impl LifecycleTotals {
             stale_callbacks: ledger.adapter.stale_callbacks,
             kernel_loss: kernel_loss_delta,
             retained_dropped: ledger.retained_dropped,
-            tfm_refused: ledger
-                .tfm_stats
-                .submit_refused
-                .saturating_add(ledger.tfm_stats.tainted_refused)
-                .saturating_add(ledger.tfm_stats.table_full),
+            tfm_submit_refused: ledger.tfm_stats.submit_refused,
+            tfm_tainted_refused: ledger.tfm_stats.tainted_refused,
+            tfm_table_full: ledger.tfm_stats.table_full,
+            tfm_live_full: ledger.tfm_stats.live_full,
+            tfm_bad_records: ledger.tfm_stats.bad_records,
+            tfm_unlinked_ops: ledger.tfm_stats.unlinked_ops,
+            tfm_unknown_returns: ledger.tfm_stats.unknown_returns,
+            tfm_stale_returns: ledger.tfm_stats.stale_returns,
+            tfm_mismatched_returns: ledger.tfm_stats.mismatched_returns,
+            tfm_unfinished: ledger.tfm_stats.unfinished,
+            tfm_ambiguous_releases: ledger.tfm_stats.ambiguous_releases,
+            tfm_forced_retires: ledger.tfm_stats.forced_retires,
+            tfm_stale_releases: ledger.tfm_stats.stale_releases,
+            tfm_colliding_releases: ledger.tfm_stats.colliding_releases,
+            tfm_config_unlinked: ledger.tfm_stats.config_unlinked,
+            tfm_unobserved_boundary: ledger.tfm_stats.unobserved_boundary,
+            tfm_tombstone_evictions: ledger.tfm_stats.tombstone_evictions,
+            prog_miss_delta: prog_miss_delta_sum(&ledger.prog_misses),
+            transport_residual: if backlog_bytes == 0 { residual } else { 0 },
             omitted,
             unknown_terminals,
         }
@@ -338,8 +419,29 @@ impl LifecycleTotals {
             ("kernel.badkey", self.kernel_loss[2]),
             ("kernel.fret", self.kernel_loss[3]),
             ("kernel.noslot", self.kernel_loss[4]),
+            ("kernel.prog_miss_delta", self.prog_miss_delta),
             ("retained_dropped", self.retained_dropped),
-            ("tfm.refused", self.tfm_refused),
+            ("tfm.submit_refused", self.tfm_submit_refused),
+            ("tfm.tainted_refused", self.tfm_tainted_refused),
+            ("tfm.table_full", self.tfm_table_full),
+            ("tfm.live_full", self.tfm_live_full),
+            ("tfm.bad_records", self.tfm_bad_records),
+            ("tfm.unlinked_ops", self.tfm_unlinked_ops),
+            ("tfm.unknown_returns", self.tfm_unknown_returns),
+            ("tfm.stale_returns", self.tfm_stale_returns),
+            ("tfm.mismatched_returns", self.tfm_mismatched_returns),
+            ("tfm.unfinished", self.tfm_unfinished),
+            ("tfm.ambiguous_releases", self.tfm_ambiguous_releases),
+            ("tfm.forced_retires", self.tfm_forced_retires),
+            ("tfm.stale_releases", self.tfm_stale_releases),
+            ("tfm.colliding_releases", self.tfm_colliding_releases),
+            ("tfm.config_unlinked", self.tfm_config_unlinked),
+            ("tfm.unobserved_boundary", self.tfm_unobserved_boundary),
+            ("tfm.tombstone_evictions", self.tfm_tombstone_evictions),
+            (
+                "transport.agg_residual_unexplained",
+                self.transport_residual,
+            ),
             ("driver.omitted", self.omitted),
         ]
         .into_iter()
@@ -1829,8 +1931,13 @@ fn drive_lifecycle_session_inner(
     {
         *slot = post.saturating_sub(*pre);
     }
-    let lifecycle_totals =
-        LifecycleTotals::from_ledger(&ledger, kernel_loss_delta, omitted.get(), unknown_terminals);
+    let lifecycle_totals = LifecycleTotals::from_ledger(
+        &ledger,
+        kernel_loss_delta,
+        omitted.get(),
+        unknown_terminals,
+        close.backlog_bytes,
+    );
     Ok(LiveOutcome {
         observations: report.take_observations(),
         summary,
@@ -2526,6 +2633,114 @@ mod tests {
             omitted: 0,
             backlog_bytes: 0,
         }
+    }
+
+    #[test]
+    fn from_ledger_carries_prog_miss_deltas() {
+        // P6-N5 RED: per-program recursion-miss deltas vote in
+        // count_loss — the envelope must carry them (reviewer loss
+        // probe: delta 7 exported 0).
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.prog_misses = vec![kryprobe_privilege::kcrypto_lifecycle::view::ProgMissDelta {
+            section: "fsession/crypto_skcipher_encrypt".to_owned(),
+            baseline: 0,
+            current: 7,
+        }];
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 0);
+        assert_eq!(totals.loss_total(), 7, "prog-miss delta rides the export");
+    }
+
+    #[test]
+    fn from_ledger_carries_every_tfm_loss_field() {
+        // P6-N5 RED: every tfm loss field the coverage path counts
+        // rides its own stage (reviewer probe: config_unlinked=3
+        // exported 0; only 3 of 17 fields folded before).
+        let mut ledger = lifecycle_ledger_clean();
+        let tfm = &mut ledger.tfm_stats;
+        tfm.submit_refused = 1;
+        tfm.tainted_refused = 2;
+        tfm.table_full = 3;
+        tfm.live_full = 4;
+        tfm.bad_records = 5;
+        tfm.unlinked_ops = 6;
+        tfm.unknown_returns = 7;
+        tfm.stale_returns = 8;
+        tfm.mismatched_returns = 9;
+        tfm.unfinished = 10;
+        tfm.ambiguous_releases = 11;
+        tfm.forced_retires = 12;
+        tfm.stale_releases = 13;
+        tfm.colliding_releases = 14;
+        tfm.config_unlinked = 15;
+        tfm.unobserved_boundary = 16;
+        tfm.tombstone_evictions = 17;
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 0);
+        let stages = totals.loss_stages();
+        for (stage, want) in [
+            ("tfm.submit_refused", 1),
+            ("tfm.tainted_refused", 2),
+            ("tfm.table_full", 3),
+            ("tfm.live_full", 4),
+            ("tfm.bad_records", 5),
+            ("tfm.unlinked_ops", 6),
+            ("tfm.unknown_returns", 7),
+            ("tfm.stale_returns", 8),
+            ("tfm.mismatched_returns", 9),
+            ("tfm.unfinished", 10),
+            ("tfm.ambiguous_releases", 11),
+            ("tfm.forced_retires", 12),
+            ("tfm.stale_releases", 13),
+            ("tfm.colliding_releases", 14),
+            ("tfm.config_unlinked", 15),
+            ("tfm.unobserved_boundary", 16),
+            ("tfm.tombstone_evictions", 17),
+        ] {
+            assert!(
+                stages.contains(&(stage, want)),
+                "stage {stage}={want} rides: {stages:?}"
+            );
+        }
+        assert_eq!(totals.loss_total(), 153, "every field sums");
+    }
+
+    #[test]
+    fn from_ledger_carries_unexplained_transport_residual() {
+        // P6-N5 RED: accepted-but-unconsumed edges with an empty
+        // close ring are unexplained loss (reviewer probe: residual
+        // 9 exported 0).
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.agg_accepted[0] = ledger.agg_accepted[0].saturating_add(9);
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 0);
+        assert!(
+            totals
+                .loss_stages()
+                .contains(&("transport.agg_residual_unexplained", 9)),
+            "residual rides: {:?}",
+            totals.loss_stages()
+        );
+    }
+
+    #[test]
+    fn from_ledger_explained_residual_rides_zero() {
+        // The backlog gate (P6-N5): with backlog bytes the residual
+        // is EXPLAINED (the close ring holds the unconsumed edges),
+        // so it rides zero — mirroring the coverage flip rule.
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.agg_accepted[0] = ledger.agg_accepted[0].saturating_add(9);
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 128);
+        assert_eq!(totals.transport_residual, 0);
+        assert_eq!(totals.loss_total(), 0);
+    }
+
+    #[test]
+    fn from_ledger_bad_records_positive_control() {
+        // Pins the already-working path the reviewer used as the
+        // positive control (bad_records=4 exports 4).
+        let mut ledger = lifecycle_ledger_clean();
+        ledger.decode.bad_records = 4;
+        let totals = LifecycleTotals::from_ledger(&ledger, [0; 5], 0, 0, 0);
+        assert_eq!(totals.loss_total(), 4);
+        assert!(totals.loss_stages().contains(&("decode.bad_records", 4)));
     }
 
     #[test]
