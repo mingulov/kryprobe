@@ -207,6 +207,154 @@ pub struct LiveOutcome {
     /// never snapshots the registry, rendered as not-attempted,
     /// never silent).
     pub enrichment: Option<EnrichmentStatus>,
+    /// Lifecycle request totals + per-stage loss (T11/P6: `Some` on
+    /// the request-lifecycle profile — feeds the session-envelope
+    /// coverage record and receipt; `None` where the profile runs no
+    /// lifecycle reducer).
+    pub lifecycle_totals: Option<LifecycleTotals>,
+}
+
+/// Request-lifecycle terminal totals: the reducer equation plus every
+/// per-stage loss counter, copied out of the [`LifecycleLedger`] at
+/// session end. Feeds the session-envelope `coverage` record and the
+/// terminal receipt — the envelope's global loss evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LifecycleTotals {
+    /// Reducer admits (submit lifecycles opened — the equation owner:
+    /// `admitted == emitted + live`, `unfinished ⊆ emitted`).
+    pub admitted: u64,
+    /// Reducer emits (records produced via apply/finish).
+    pub emitted: u64,
+    /// Emitted records drained truthless by finish (subset of emitted).
+    pub unfinished: u64,
+    /// Reducer orphans/duplicates/ambiguity/admission failures.
+    pub orphan: u64,
+    /// Reducer duplicate edges.
+    pub duplicate: u64,
+    /// Reducer ambiguous edges.
+    pub ambiguous: u64,
+    /// Reducer fresh submits refused (live set full).
+    pub admission_failed: u64,
+    /// Decode submits refused (table full, id exhaustion, BPF taint).
+    pub submit_refused: u64,
+    /// Returns for invocations with no outstanding submit.
+    pub unknown_invoc_returns: u64,
+    /// Records failing twin validation.
+    pub bad_records: u64,
+    /// Gaps synthesized for same-invocation resubmits.
+    pub gaps_synthesized: u64,
+    /// Returns refused against an outstanding submit.
+    pub stale_returns: u64,
+    /// Adapter submits admitted without relation cover.
+    pub cover_refused: u64,
+    /// Callbacks naming no live or tombstoned token.
+    pub callback_orphans: u64,
+    /// Callbacks naming an ambiguous key.
+    pub ambiguous_keys: u64,
+    /// Tombstone FIFO evictions past capacity.
+    pub tombstone_evictions: u64,
+    /// Callbacks predating their submit.
+    pub stale_callbacks: u64,
+    /// Kernel `LLOSS` per-class deltas
+    /// (reserve/disabled/badkey/fret/noslot).
+    pub kernel_loss: [u64; 5],
+    /// Completions dropped from retention past the ledger bound.
+    pub retained_dropped: u64,
+    /// Transform entries refused (resubmit/table-full) + tainted.
+    pub tfm_refused: u64,
+    /// Driver-side observation-cap omissions (decoded records the
+    /// session kept no observation for — counted, never silent).
+    pub omitted: u64,
+    /// Records whose terminal is `Unknown` (counted from the records
+    /// themselves — the ambiguous branch emits `Unknown` without
+    /// touching `unfinished`).
+    pub unknown_terminals: u64,
+}
+
+impl LifecycleTotals {
+    /// Copies terminal totals out of the session ledger plus the
+    /// driver's own close stats. `kernel_loss` takes session DELTAS
+    /// (post minus pre-arm baseline), never absolutes.
+    #[must_use]
+    pub fn from_ledger(
+        ledger: &LifecycleLedger,
+        kernel_loss_delta: [u64; 5],
+        omitted: u64,
+        unknown_terminals: u64,
+    ) -> Self {
+        Self {
+            admitted: ledger.reducer.admitted,
+            emitted: ledger.reducer.emitted,
+            unfinished: ledger.reducer.unfinished,
+            orphan: ledger.reducer.orphan,
+            duplicate: ledger.reducer.duplicate,
+            ambiguous: ledger.reducer.ambiguous,
+            admission_failed: ledger.reducer.admission_failed,
+            submit_refused: ledger.decode.submit_refused,
+            unknown_invoc_returns: ledger.decode.unknown_invoc_returns,
+            bad_records: ledger.decode.bad_records,
+            gaps_synthesized: ledger.decode.gaps_synthesized,
+            stale_returns: ledger.decode.stale_returns,
+            cover_refused: ledger.adapter.cover_refused,
+            callback_orphans: ledger.adapter.callback_orphans,
+            ambiguous_keys: ledger.adapter.ambiguous_keys,
+            tombstone_evictions: ledger.adapter.tombstone_evictions,
+            stale_callbacks: ledger.adapter.stale_callbacks,
+            kernel_loss: kernel_loss_delta,
+            retained_dropped: ledger.retained_dropped,
+            tfm_refused: ledger
+                .tfm_stats
+                .submit_refused
+                .saturating_add(ledger.tfm_stats.tainted_refused)
+                .saturating_add(ledger.tfm_stats.table_full),
+            omitted,
+            unknown_terminals,
+        }
+    }
+
+    /// Nonzero loss stages in fixed order (stage name + count) for the
+    /// envelope loss map. Zero stages are ABSENT (empty map = no
+    /// counted stage loss); every counter above that can witness loss
+    /// appears here when nonzero — none are folded away silently.
+    #[must_use]
+    pub fn loss_stages(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("reducer.orphan", self.orphan),
+            ("reducer.duplicate", self.duplicate),
+            ("reducer.ambiguous", self.ambiguous),
+            ("reducer.admission_failed", self.admission_failed),
+            ("decode.submit_refused", self.submit_refused),
+            ("decode.unknown_invoc_returns", self.unknown_invoc_returns),
+            ("decode.bad_records", self.bad_records),
+            ("decode.gaps_synthesized", self.gaps_synthesized),
+            ("decode.stale_returns", self.stale_returns),
+            ("adapter.cover_refused", self.cover_refused),
+            ("adapter.callback_orphans", self.callback_orphans),
+            ("adapter.ambiguous_keys", self.ambiguous_keys),
+            ("adapter.tombstone_evictions", self.tombstone_evictions),
+            ("adapter.stale_callbacks", self.stale_callbacks),
+            ("kernel.reserve", self.kernel_loss[0]),
+            ("kernel.disabled", self.kernel_loss[1]),
+            ("kernel.badkey", self.kernel_loss[2]),
+            ("kernel.fret", self.kernel_loss[3]),
+            ("kernel.noslot", self.kernel_loss[4]),
+            ("retained_dropped", self.retained_dropped),
+            ("tfm.refused", self.tfm_refused),
+            ("driver.omitted", self.omitted),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect()
+    }
+
+    /// Total counted stage loss (saturating — an overflowed total reads
+    /// huge, never wraps to a clean-looking zero).
+    #[must_use]
+    pub fn loss_total(&self) -> u64 {
+        self.loss_stages()
+            .iter()
+            .fold(0u64, |sum, (_, count)| sum.saturating_add(*count))
+    }
 }
 
 /// One human-report trailer line for the enrichment verdict
@@ -1346,6 +1494,8 @@ fn drive_session_inner(
         interrupted,
         // The aggregate profile never snapshots the registry.
         enrichment: None,
+        // The aggregate profile runs no lifecycle reducer.
+        lifecycle_totals: None,
     })
 }
 
@@ -1667,6 +1817,20 @@ fn drive_lifecycle_session_inner(
         },
     );
     hop(controller, SessionState::Finalized, "lifecycle finalize")?;
+    // T11/P6: session-attributable kernel loss is the post-session
+    // absolute minus the pre-arm baseline (saturating — a backwards
+    // counter reads zero here AND voids coverage through the miss
+    // join; the envelope carries this session's loss, not the
+    // machine's lifetime totals).
+    let mut kernel_loss_delta = [0u64; 5];
+    for (slot, (post, pre)) in kernel_loss_delta
+        .iter_mut()
+        .zip(ledger.kernel_loss.iter().zip(ledger.loss_baseline.iter()))
+    {
+        *slot = post.saturating_sub(*pre);
+    }
+    let lifecycle_totals =
+        LifecycleTotals::from_ledger(&ledger, kernel_loss_delta, omitted.get(), unknown_terminals);
     Ok(LiveOutcome {
         observations: report.take_observations(),
         summary,
@@ -1678,6 +1842,7 @@ fn drive_lifecycle_session_inner(
         // outcome to the user report (available/unavailable —
         // never dropped between sensor and render).
         enrichment: Some(ledger.enrichment.clone()),
+        lifecycle_totals: Some(lifecycle_totals),
     })
 }
 

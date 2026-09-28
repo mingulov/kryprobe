@@ -47,6 +47,18 @@ pub enum ReportError {
     /// An unobserved lifecycle terminal has no status, hence no wire
     /// outcome spelling (a zero-fill would fabricate success).
     UnknownNativeResult,
+    /// A session-envelope export needs the outcome's lifecycle
+    /// totals (coverage populations + loss evidence); the outcome
+    /// carries none (wrong profile for this export).
+    MissingLifecycleTotals,
+    /// A session-envelope export met a row it cannot project: not a
+    /// lifecycle row, or a lifecycle row failing payload-v1. Loud,
+    /// never a silent skip.
+    UnprojectableRow {
+        /// Why the row cannot ride the envelope (static or
+        /// validator-quoted detail — never raw payload bytes).
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ReportError {
@@ -67,6 +79,12 @@ impl std::fmt::Display for ReportError {
             }
             Self::UnknownNativeResult => {
                 write!(f, "unobserved terminal has no wire spelling")
+            }
+            Self::MissingLifecycleTotals => {
+                write!(f, "session export needs lifecycle totals")
+            }
+            Self::UnprojectableRow { detail } => {
+                write!(f, "row cannot ride the session envelope: {detail}")
             }
         }
     }

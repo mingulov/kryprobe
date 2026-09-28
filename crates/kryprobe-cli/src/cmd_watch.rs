@@ -360,6 +360,8 @@ pub(crate) mod fixtures {
             interrupted: false,
             // Aggregate-profile fixture: no registry snapshot.
             enrichment: None,
+            // Aggregate-profile fixture: no lifecycle reducer.
+            lifecycle_totals: None,
         }
     }
 
