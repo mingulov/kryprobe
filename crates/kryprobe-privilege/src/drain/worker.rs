@@ -118,11 +118,17 @@ mod tests {
 
     /// Test worker over a simulated ring (the fds are never polled:
     /// every test here pre-sets stop, so only the final sweep runs).
+    /// Holds the epoll serial lock for the worker's lifetime
+    /// (P7-N4): the `drain.rs` exact-count test cannot run while a
+    /// worker epoll exists, so parallel lib tests never skew it.
     fn worker_with(
         area: RingArea,
         tx: std::sync::mpsc::SyncSender<DrainEvent>,
         stop: Arc<AtomicBool>,
-    ) -> Worker {
+    ) -> (Worker, std::sync::MutexGuard<'static, ()>) {
+        // Serial first (P7-N4): the lock precedes fd creation, so
+        // no worker epoll can exist inside the exact-count window.
+        let guard = crate::drain::EPOLL_TEST_LOCK.lock().expect("epoll serial");
         // SAFETY: fresh fds, owned by the wrappers from here.
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(null >= 0, "null opens");
@@ -130,16 +136,19 @@ mod tests {
         let raw_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         assert!(raw_epoll >= 0, "epoll creates");
         let epoll = unsafe { OwnedFd::from_raw_fd(raw_epoll) };
-        Worker {
-            _owned: owned,
-            area,
-            _epoll: epoll,
-            tx,
-            stop,
-            barrier: Arc::new(AtomicU64::new(0)),
-            budget: 64,
-            timeout_ms: 1,
-        }
+        (
+            Worker {
+                _owned: owned,
+                area,
+                _epoll: epoll,
+                tx,
+                stop,
+                barrier: Arc::new(AtomicU64::new(0)),
+                budget: 64,
+                timeout_ms: 1,
+            },
+            guard,
+        )
     }
 
     /// P7/T12 drain-stop regression (deterministic, no BPF, no
@@ -158,7 +167,7 @@ mod tests {
         area.set_consumer(0);
         let (tx, rx) = std::sync::mpsc::sync_channel::<DrainEvent>(16);
         let stop = Arc::new(AtomicBool::new(true));
-        let worker = worker_with(area, tx, stop);
+        let (worker, _epoll) = worker_with(area, tx, stop);
         let stats = worker.run();
         assert_eq!(stats.records, 3, "final sweep delivers committed records");
         assert_eq!(stats.queue_drops, 0, "no queue pressure");
@@ -193,7 +202,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DrainEvent>(1);
         tx.try_send(DrainEvent::Barrier(9)).expect("prefill fits");
         let stop = Arc::new(AtomicBool::new(true));
-        let worker = worker_with(area, tx, stop);
+        let (worker, _epoll) = worker_with(area, tx, stop);
         let stats = worker.run();
         assert_eq!(stats.records, 2, "both records walked");
         assert_eq!(stats.queue_drops, 2, "both counted as queue drops");

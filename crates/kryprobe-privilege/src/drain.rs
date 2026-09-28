@@ -259,9 +259,17 @@ impl Drop for DrainThread {
     }
 }
 
+/// Serializes the process-global epoll assertions (P7-N4):
+/// lib tests run in parallel threads, so the exact before/after
+/// epoll count below and every test that creates epoll instances
+/// ([`worker`](crate::drain::worker) tests) hold this lock — the
+/// assertion is unchanged, only scoped against concurrent creators.
+#[cfg(test)]
+pub(crate) static EPOLL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
-    use super::{DrainEvent, DrainStats, DrainThread, drain_spawns};
+    use super::{DrainEvent, DrainStats, DrainThread, EPOLL_TEST_LOCK, drain_spawns};
     use crate::fd::OwnedFd;
     use kryprobe_core::DrainConfig;
     use kryprobe_core::evidence::SharedLosses;
@@ -269,8 +277,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// Live epoll fds in this process (drain-specific leak signal —
-    /// no other unprivileged lib test creates epoll instances, so an
-    /// exact delta is meaningful where a raw fd count would be noise).
+    /// measured under [`EPOLL_TEST_LOCK`], so concurrent epoll
+    /// creators in this binary cannot skew the exact delta where a
+    /// raw fd count would be noise).
     fn epoll_fds() -> usize {
         std::fs::read_dir("/proc/self/fd")
             .expect("fd dir reads")
@@ -286,7 +295,11 @@ mod tests {
     fn failed_spawn_leaks_no_thread_no_epoll() {
         // M-T4: spawn over a non-map fd fails closed at mmap with no
         // worker thread (spawn counter holds) and no epoll instance
-        // left behind, over repeated failures.
+        // left behind, over repeated failures. Holds the epoll
+        // serial lock (P7-N4): the before/after count is exact only
+        // when no other test thread creates epoll instances inside
+        // the window.
+        let _epoll = EPOLL_TEST_LOCK.lock().expect("epoll serial");
         let config = DrainConfig {
             max_events_per_iter: 64,
             queue_depth: 16,
