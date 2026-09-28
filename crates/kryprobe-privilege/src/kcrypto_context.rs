@@ -168,8 +168,7 @@ impl SubmitterContext {
     #[must_use]
     pub fn drift_against(&self, other: &Self) -> Drift {
         Drift {
-            same_lifetime: self.lifetime.verdict_against(&other.lifetime)
-                == LifetimeVerdict::Same,
+            same_lifetime: self.lifetime.verdict_against(&other.lifetime) == LifetimeVerdict::Same,
             comm_changed: self.comm != other.comm,
             uid_changed: self.uid != other.uid,
             cgroup_changed: self.cgroup != other.cgroup,
@@ -428,7 +427,11 @@ impl Histogram {
 
     /// Folds one observation into its bucket (exact: every call counts).
     pub fn observe(&mut self, value: u64) {
-        let bucket = self.bounds.iter().position(|b| value <= *b).unwrap_or(self.bounds.len());
+        let bucket = self
+            .bounds
+            .iter()
+            .position(|b| value <= *b)
+            .unwrap_or(self.bounds.len());
         if let Some(count) = self.counts.get_mut(bucket) {
             *count = count.saturating_add(1);
         }

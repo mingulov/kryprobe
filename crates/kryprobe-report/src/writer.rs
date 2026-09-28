@@ -222,10 +222,9 @@ impl std::fmt::Display for SessionWriteError {
             Self::NotStarted => write!(f, "session record before session_start"),
             Self::AlreadyStarted => write!(f, "duplicate session_start"),
             Self::Finished => write!(f, "session record after the receipt"),
-            Self::InvalidObservation { nested } => write!(
-                f,
-                "observation record fails payload-v1 ({nested} findings)"
-            ),
+            Self::InvalidObservation { nested } => {
+                write!(f, "observation record fails payload-v1 ({nested} findings)")
+            }
             Self::SerializeFailed { kind, detail } => {
                 write!(f, "cannot serialize {kind} record: {detail}")
             }
@@ -367,12 +366,11 @@ impl SessionWriter {
             seq: self.next_seq,
             body,
         };
-        let text = serde_json::to_string(&record).map_err(|err| {
-            SessionWriteError::SerializeFailed {
+        let text =
+            serde_json::to_string(&record).map_err(|err| SessionWriteError::SerializeFailed {
                 kind,
                 detail: err.to_string(),
-            }
-        })?;
+            })?;
         self.out.push_str(&text);
         self.out.push('\n');
         self.next_seq += 1;
@@ -408,10 +406,7 @@ impl SessionWriter {
     /// Appends one validated observation. The `record` MUST validate
     /// against payload-v1 first — an invalid record refuses (nothing
     /// appended), never a silent skip.
-    pub fn observation(
-        &mut self,
-        record: &serde_json::Value,
-    ) -> Result<(), SessionWriteError> {
+    pub fn observation(&mut self, record: &serde_json::Value) -> Result<(), SessionWriteError> {
         let nested = crate::validate::validate_lifecycle_v1(record);
         if !nested.is_empty() {
             return Err(SessionWriteError::InvalidObservation {

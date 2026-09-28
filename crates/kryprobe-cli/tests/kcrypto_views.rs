@@ -9,7 +9,7 @@
 
 use kryprobe_cli::args::{ArgsError, parse};
 use kryprobe_privilege::kcrypto_context::{
-    CompletionContext, ExecutionKind, ExecutionContext, FilterVerdict, Histogram, LifetimeVerdict,
+    CompletionContext, ExecutionContext, ExecutionKind, FilterVerdict, Histogram, LifetimeVerdict,
     OriginClaim, RequestContext, StackMarker, SubmitterContext, TaskLifetime, UnknownPolicy,
     apply_filter, read_start_marker,
 };
@@ -200,10 +200,7 @@ fn missing_and_sampled_stacks_stay_explicit() {
 
     let mut sampled = submitter(100, Some(50_000));
     sampled.stack = StackMarker::Sampled;
-    assert!(
-        sampled.stack.has_frames(),
-        "sampled stack may carry frames"
-    );
+    assert!(sampled.stack.has_frames(), "sampled stack may carry frames");
     assert_eq!(sampled.stack.label(), "sampled");
     assert_ne!(
         missing.stack.label(),
@@ -286,7 +283,10 @@ fn unknown_consumer_is_not_dropped_silently() {
     tally.record(FilterVerdict::Admitted);
     tally.record(FilterVerdict::FilteredOut);
     tally.record(FilterVerdict::Unknown);
-    assert_eq!((tally.admitted, tally.filtered_out, tally.unknown), (1, 1, 1));
+    assert_eq!(
+        (tally.admitted, tally.filtered_out, tally.unknown),
+        (1, 1, 1)
+    );
     assert_eq!(tally.total(), 3, "every verdict is accounted");
 }
 
@@ -322,7 +322,10 @@ fn sampled_detail_keeps_exact_aggregate_population() {
         "no announcement without sampling: {full}"
     );
     // Named population, units, bounds, and counts all render.
-    assert!(rendered.contains("submit_bytes"), "population name: {rendered}");
+    assert!(
+        rendered.contains("submit_bytes"),
+        "population name: {rendered}"
+    );
     assert!(rendered.contains("bytes"), "units: {rendered}");
 }
 
@@ -345,9 +348,7 @@ fn session_fixture() -> String {
             "duration_ns": "120",
         }))
         .expect("valid observation emits");
-    writer
-        .receipt(true, 1, 1, 0)
-        .expect("receipt emits");
+    writer.receipt(true, 1, 1, 0).expect("receipt emits");
     writer.into_string()
 }
 
@@ -370,11 +371,17 @@ fn unknown_stream_version_refuses() {
         "foreign stream version must refuse, not parse"
     );
     // An embedded observation with a foreign payload version is a
-    // stream defect too, not a silent skip.
+    // stream defect too, not a silent skip. (Target the observation's
+    // record: the bare version string also appears in the start
+    // record's pinned payload_schema declaration.)
     let evil_payload = session_fixture().replacen(
-        "kryprobe.kcrypto.lifecycle/v1",
-        "kryprobe.kcrypto.lifecycle/v9",
+        "\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\"",
+        "\"schema\":\"kryprobe.kcrypto.lifecycle/v9\",\"status\"",
         1,
+    );
+    assert!(
+        evil_payload.contains("lifecycle/v9"),
+        "mutation must land inside the embedded record"
     );
     assert!(
         !validate_lifecycle_session(&evil_payload).is_empty(),
@@ -386,7 +393,8 @@ fn unknown_stream_version_refuses() {
 fn missing_terminal_trailer_cannot_be_clean() {
     // Strip the receipt: the stream is truncated — findings are nonempty
     // and no clean verdict is reachable.
-    let mut lines: Vec<&str> = session_fixture().lines().collect();
+    let fixture = session_fixture();
+    let mut lines: Vec<&str> = fixture.lines().collect();
     assert!(lines.len() >= 2, "fixture needs start + receipt");
     lines.pop();
     let truncated = lines.join("\n") + "\n";

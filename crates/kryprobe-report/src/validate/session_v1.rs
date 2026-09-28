@@ -144,14 +144,21 @@ impl std::fmt::Display for SessionFinding {
             ),
             Self::BadKind { line } => write!(f, "line {line}: kind outside the closed vocabulary"),
             Self::MissingKey { line, key } => write!(f, "line {line}: missing key '{key}'"),
-            Self::BadShape { line, key, expected } => {
+            Self::BadShape {
+                line,
+                key,
+                expected,
+            } => {
                 write!(f, "line {line}: key '{key}' must hold {expected}")
             }
             Self::SessionMismatch { line } => {
                 write!(f, "line {line}: session differs from the stream")
             }
             Self::SeqGap { line, want, got } => {
-                write!(f, "line {line}: seq {got} breaks the dense run (want {want})")
+                write!(
+                    f,
+                    "line {line}: seq {got} breaks the dense run (want {want})"
+                )
             }
             Self::FirstNotStart { line } => {
                 write!(f, "line {line}: first record is not session_start")
@@ -314,6 +321,22 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
             continue;
         }
         match kind {
+            "session_start" => {
+                // The envelope validates observations against payload-v1
+                // and nothing else: a start record declaring any other
+                // payload schema contradicts the envelope's own check.
+                let pinned = obj
+                    .get("payload_schema")
+                    .and_then(Value::as_str)
+                    .is_some_and(|schema| schema == crate::KCRYPTO_LIFECYCLE_V1);
+                if !pinned {
+                    out.push(SessionFinding::BadShape {
+                        line: no,
+                        key: "payload_schema".to_owned(),
+                        expected: "kryprobe.kcrypto.lifecycle/v1".to_owned(),
+                    });
+                }
+            }
             "observation" => {
                 let record = &obj["record"];
                 let nested = validate_lifecycle_v1(record);
@@ -348,11 +371,7 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
 }
 
 /// Coverage-record counter shapes: u64 counts, `loss` a stage→u64 map.
-fn check_counts(
-    obj: &serde_json::Map<String, Value>,
-    line: usize,
-    out: &mut Vec<SessionFinding>,
-) {
+fn check_counts(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Vec<SessionFinding>) {
     for key in ["admitted", "emitted", "unfinished", "unknown", "filtered"] {
         if obj.get(key).and_then(Value::as_u64).is_none() {
             out.push(SessionFinding::BadShape {
@@ -386,11 +405,7 @@ fn check_loss_map(obj: &serde_json::Map<String, Value>) -> Option<u64> {
 /// Receipt shapes + combinations: closed verdict, u64 counters, bool
 /// truncated flag, and the clean-verdict rules (no truncation, zero
 /// loss, no unfinished work).
-fn check_receipt(
-    obj: &serde_json::Map<String, Value>,
-    line: usize,
-    out: &mut Vec<SessionFinding>,
-) {
+fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Vec<SessionFinding>) {
     let verdict = match obj.get("verdict").and_then(Value::as_str) {
         Some(verdict) if VERDICTS.contains(&verdict) => verdict,
         _ => {

@@ -26,8 +26,8 @@ pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
 pub use validate::{
     LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, SessionFinding, ValidationFinding,
     lifecycle_v1_payload, resolve_schema, resolve_schema_at, schema_fnv1a_hex,
-    validate_and_render_file, validate_and_render_reader, validate_file, validate_lifecycle_v1,
-    validate_lifecycle_session, validate_reader, validate_str,
+    validate_and_render_file, validate_and_render_reader, validate_file,
+    validate_lifecycle_session, validate_lifecycle_v1, validate_reader, validate_str,
 };
 pub use writer::{JsonlWriter, ReportError, SessionWriteError, SessionWriter, write_str_atomic};
 
