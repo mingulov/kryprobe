@@ -98,7 +98,7 @@ json.dump({'pids': [opid], 'start_ticks': [oticks]},
 json.dump({'pids': [fpid], 'start_ticks': [fticks]},
           open('$OUT/foreign-pids.json', 'w'))
 print('owned=%d foreign=%d' % (opid, fpid))
-"
+" || FAIL=1
 
 dmesg | tail -5 > "$OUT/dmesg-tail.txt" 2>&1
 {

@@ -674,10 +674,20 @@ def judge_r01_floor(oracle_spec, cell_dir):
                "stderr": (cell_dir / "refusal-stderr.log").read_text()}
     checks, detail = oracles.check_r01_floor(workload, kernel_ref, product, refusal)
     checks["transport_closed"] = transport_closed(parsed)
+    split = {}
+    for key, entry in parsed["agg"].items():
+        if key[0] == "skcipher" and key[2] == AGG_OK:
+            split.setdefault(key[1], {})[key[3]] = entry["calls"]
+    detail["skcipher_nesting_split"] = split
+    checks["skcipher_nesting_split"] = (
+        split.get("encrypt", {}).get("cbc(aes)") == workload["skc_issued"]
+        and split.get("encrypt", {}).get("__cbc(aes)") == workload["skc_issued"]
+        and split.get("decrypt", {}).get("cbc(aes)") == workload["skc_issued"]
+        and split.get("decrypt", {}).get("__cbc(aes)") == workload["skc_issued"])
     expected_body = {"ahash_digest": workload["hash_issued"],
                      "shash_digest": workload["hash_issued"],
-                     "skcipher_encrypt": workload["skc_issued"],
-                     "skcipher_decrypt": workload["skc_issued"]}
+                     "skcipher_encrypt": 2 * workload["skc_issued"],
+                     "skcipher_decrypt": 2 * workload["skc_issued"]}
     actual_body = {k: kernel_ref[k] for k in expected_body}
     return checks, detail, expected_body, actual_body
 

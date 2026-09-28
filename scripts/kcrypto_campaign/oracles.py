@@ -198,10 +198,11 @@ def check_r01_floor(workload: dict, kernel_ref: dict, product: dict,
     the ftrace per-function counts; ``product`` the observed
     per-function counts + ``ring_drops``; ``refusal`` carries
     ``exit``/``stderr`` (gate: stable exit-4 Unusable). Product
-    must equal the KERNEL reference exactly; the T07-documented
-    6.12 route (one ahash + one shash per digest) is gated
-    separately at the kernel level. The aggregate leg is the
-    refusal leg's positive control.
+    must equal the KERNEL reference exactly; the documented
+    6.12 routes are gated separately at the kernel level: one
+    ahash + one shash per digest (T07 precedent), and one outer
+    + one cryptd-nested inner call per skcipher op (2x issued).
+    The aggregate leg is the refusal leg's positive control.
     """
     checks = {}
     checks["workload_proved"] = (
@@ -227,8 +228,8 @@ def check_r01_floor(workload: dict, kernel_ref: dict, product: dict,
         and kernel_ref.get("shash_digest") == workload.get("hash_issued")
     )
     checks["skcipher_route_documented"] = (
-        kernel_ref.get("skcipher_encrypt") == workload.get("skc_issued")
-        and kernel_ref.get("skcipher_decrypt") == workload.get("skc_issued")
+        kernel_ref.get("skcipher_encrypt") == 2 * (workload.get("skc_issued") or 0)
+        and kernel_ref.get("skcipher_decrypt") == 2 * (workload.get("skc_issued") or 0)
     )
     checks["product_lossless"] = product.get("ring_drops") == "0"
     checks["refusal_exit_unusable"] = refusal.get("exit") == EXIT_UNUSABLE

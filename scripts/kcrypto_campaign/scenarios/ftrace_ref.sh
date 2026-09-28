@@ -33,8 +33,23 @@ ftrace_begin() {
 
 ftrace_end() {
   echo 0 > "$FTRACE/tracing_on" 2>/dev/null || return 1
+  # Profile hits: combined trace_stat/functions where present,
+  # else summed over the per-CPU trace_stat/functionN files
+  # (6.12+ splits per CPU; never sum both).
+  stat_files="$FTRACE/trace_stat/functions"
+  if [ ! -f "$stat_files" ]; then
+    # Fail closed when no per-CPU file exists either (a zero
+    # from unreadable inputs would be a lie).
+    have_stat=0
+    for candidate in "$FTRACE"/trace_stat/function[0-9]*; do
+      if [ -f "$candidate" ]; then have_stat=1; break; fi
+    done
+    if [ "$have_stat" -ne 1 ]; then return 1; fi
+    stat_files="$FTRACE/trace_stat/function[0-9]*"
+  fi
+  # shellcheck disable=SC2086
   for fn in "$@"; do
-    hits=$(awk -v f="$fn" '$1 == f {print $2}' "$FTRACE/trace_stat/functions" 2>/dev/null)
+    hits=$(awk -v f="$fn" '$1 == f {t += $2} END {print t + 0}' $stat_files 2>/dev/null)
     case "$hits" in ''|*[!0-9]*) hits="MISSING";; esac
     echo "$fn $hits"
   done

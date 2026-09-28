@@ -83,7 +83,7 @@ for line in open('$OUT/kernel-counts.txt'):
     counts[name.strip()] = int(value.strip())
 json.dump({'method': 'trace_stat/functions', 'main': counts},
           open('$OUT/kernel-ref.json', 'w'), indent=2)
-"
+" || FAIL=1
 
 # Refusal leg: request-lifecycle must refuse typed (exit 4).
 "$KP" report --system --kcrypto-profile request-lifecycle --duration 5 \

@@ -96,7 +96,7 @@ for line in open('$OUT/kernel-counts.txt'):
     counts[name.strip()] = int(value.strip())
 json.dump({'method': 'trace_stat/functions', 'main': counts},
           open('$OUT/kernel-ref.json', 'w'), indent=2)
-"
+" || FAIL=1
 
 dmesg | tail -5 > "$OUT/dmesg-tail.txt" 2>&1
 {

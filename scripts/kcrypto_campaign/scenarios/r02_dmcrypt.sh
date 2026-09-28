@@ -153,7 +153,7 @@ json.dump({'bytes_written': write['bytes_written'],
            'checksums_match': read['checksums_match'],
            'wrongkey_checksum_mismatch': wrongkey},
           open('$OUT/workload.json', 'w'), indent=2)
-"
+" || FAIL=1
 
 # Cleanup: loop detach + key shred + backing removal.
 losetup -d "$LOOP" 2>> "$OUT/loop.log"; echo "undetach_rc=$?" >> "$OUT/loop.log"

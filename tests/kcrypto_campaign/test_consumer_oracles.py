@@ -58,12 +58,12 @@ def floor_workload(hash_issued=20, hash_done=20, skc_issued=10, skc_done=10):
             "skc_issued": skc_issued, "skc_done": skc_done}
 
 
-def floor_kernel(ahash=20, shash=20, enc=10, dec=10):
+def floor_kernel(ahash=20, shash=20, enc=20, dec=20):
     return {"ahash_digest": ahash, "shash_digest": shash,
             "skcipher_encrypt": enc, "skcipher_decrypt": dec}
 
 
-def floor_product(ahash=20, shash=20, enc=10, dec=10, drops="0"):
+def floor_product(ahash=20, shash=20, enc=20, dec=20, drops="0"):
     return {"ahash_digest": ahash, "shash_digest": shash,
             "skcipher_encrypt": enc, "skcipher_decrypt": dec,
             "ring_drops": drops}
@@ -95,8 +95,18 @@ class R01FloorTests(unittest.TestCase):
 
     def test_skcipher_divergence_fails(self):
         checks, _detail = oracles.check_r01_floor(
-            floor_workload(), floor_kernel(), floor_product(dec=9), floor_refusal())
+            floor_workload(), floor_kernel(), floor_product(dec=19), floor_refusal())
         self.assertFalse(checks["skcipher_kernel_equal"])
+
+    def test_missing_nesting_fails_route(self):
+        # Kernel shows no cryptd nesting (1x issued): equality
+        # still holds (product matches kernel) but the documented
+        # 6.12 route does not.
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(enc=10, dec=10),
+            floor_product(enc=10, dec=10), floor_refusal())
+        self.assertTrue(checks["skcipher_kernel_equal"])
+        self.assertFalse(checks["skcipher_route_documented"])
 
     def test_undocumented_route_fails(self):
         checks, _detail = oracles.check_r01_floor(

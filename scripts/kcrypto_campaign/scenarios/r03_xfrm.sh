@@ -187,7 +187,7 @@ def merge(sent_path, recv_path, out_path):
 merge('$OUT/sent-a.json', '$OUT/recv-b.json', '$OUT/ledger-a.json')
 merge('$OUT/sent-b.json', '$OUT/recv-a.json', '$OUT/ledger-b.json')
 merge('$OUT/sent-authfail.json', '$OUT/recv-authfail.json', '$OUT/authfail-ledger.json')
-"
+" || FAIL=1
 
 # Cleanup: namespaces (drops veth + SAs + policies), key shredding.
 ip netns del "$NSB" 2>> "$OUT/netns.log" || FAIL=1
