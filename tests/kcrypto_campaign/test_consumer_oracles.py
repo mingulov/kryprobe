@@ -53,11 +53,20 @@ class R01DetTests(unittest.TestCase):
         self.assertFalse(checks["attach_proved"])
 
 
-def floor_agg(hash_issued=20, hash_observed=20, skc_issued=10,
-              skc_enc=10, skc_dec=10, drops="0"):
-    return {"hash_issued": hash_issued, "hash_observed": hash_observed,
-            "skc_issued": skc_issued, "skc_enc_observed": skc_enc,
-            "skc_dec_observed": skc_dec, "ring_drops": drops}
+def floor_workload(hash_issued=20, hash_done=20, skc_issued=10, skc_done=10):
+    return {"hash_issued": hash_issued, "hash_done": hash_done,
+            "skc_issued": skc_issued, "skc_done": skc_done}
+
+
+def floor_kernel(ahash=20, shash=20, enc=10, dec=10):
+    return {"ahash_digest": ahash, "shash_digest": shash,
+            "skcipher_encrypt": enc, "skcipher_decrypt": dec}
+
+
+def floor_product(ahash=20, shash=20, enc=10, dec=10, drops="0"):
+    return {"ahash_digest": ahash, "shash_digest": shash,
+            "skcipher_encrypt": enc, "skcipher_decrypt": dec,
+            "ring_drops": drops}
 
 
 def floor_refusal(exit_code=4, stderr="live session unusable: fsession attach failed"):
@@ -69,29 +78,48 @@ def floor_refusal(exit_code=4, stderr="live session unusable: fsession attach fa
 
 class R01FloorTests(unittest.TestCase):
     def test_aggregate_plus_refusal_passes(self):
-        checks, _detail = oracles.check_r01_floor(floor_agg(), floor_refusal())
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(), floor_product(), floor_refusal())
         self.assertTrue(all(checks.values()), checks)
 
-    def test_short_hash_fails(self):
-        checks, _detail = oracles.check_r01_floor(floor_agg(hash_observed=19), floor_refusal())
-        self.assertFalse(checks["hash_exact"])
+    def test_unproved_workload_fails(self):
+        bad = floor_workload(hash_done=19)
+        checks, _detail = oracles.check_r01_floor(
+            bad, floor_kernel(), floor_product(), floor_refusal())
+        self.assertFalse(checks["workload_proved"])
 
-    def test_short_skcipher_fails(self):
-        checks, _detail = oracles.check_r01_floor(floor_agg(skc_dec=9), floor_refusal())
-        self.assertFalse(checks["skcipher_exact"])
+    def test_product_kernel_divergence_fails(self):
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(), floor_product(shash=19), floor_refusal())
+        self.assertFalse(checks["hash_kernel_equal"])
 
-    def test_dropped_aggregate_fails(self):
-        checks, _detail = oracles.check_r01_floor(floor_agg(drops="1"), floor_refusal())
-        self.assertFalse(checks["aggregate_lossless"])
+    def test_skcipher_divergence_fails(self):
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(), floor_product(dec=9), floor_refusal())
+        self.assertFalse(checks["skcipher_kernel_equal"])
+
+    def test_undocumented_route_fails(self):
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(shash=40),
+            floor_product(shash=40), floor_refusal())
+        self.assertTrue(checks["hash_kernel_equal"])
+        self.assertFalse(checks["hash_route_documented"])
+
+    def test_dropped_product_fails(self):
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(), floor_product(drops="1"), floor_refusal())
+        self.assertFalse(checks["product_lossless"])
 
     def test_zero_exit_refusal_fails(self):
         bad = floor_refusal(exit_code=0, stderr="ok")
-        checks, _detail = oracles.check_r01_floor(floor_agg(), bad)
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(), floor_product(), bad)
         self.assertFalse(checks["refusal_exit_unusable"])
 
     def test_internal_defect_exit_fails(self):
         bad = floor_refusal(exit_code=1, stderr="live session internal error: x")
-        checks, _detail = oracles.check_r01_floor(floor_agg(), bad)
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(), floor_product(), bad)
         self.assertFalse(checks["refusal_exit_unusable"])
 
 
@@ -239,67 +267,110 @@ class R03Tests(unittest.TestCase):
         self.assertFalse(checks["authfail_errno_native"])
 
 
+def deny_control(issued=10, done=10, observed=None, drops="0"):
+    return {"hash_issued": issued, "hash_done": done,
+            "observed": observed if observed is not None else {"ahash_digest": 10},
+            "ring_drops": drops}
+
+
 class R04Tests(unittest.TestCase):
     def test_deny_plus_control_passes(self):
         checks, _d = oracles.check_r04_deny(
             {"exit": 4, "stderr": "live session unusable: missing CAP_BPF"},
-            {"issued": 10, "observed": 10, "ring_drops": "0"},
+            deny_control(),
+            {"ahash_digest": 10},
         )
         self.assertTrue(all(checks.values()), checks)
 
     def test_zero_exit_deny_fails(self):
         checks, _d = oracles.check_r04_deny(
             {"exit": 0, "stderr": ""},
-            {"issued": 10, "observed": 10, "ring_drops": "0"},
+            deny_control(),
+            {"ahash_digest": 10},
         )
         self.assertFalse(checks["refusal_exit_unusable"])
 
-    def test_failed_control_fails(self):
+    def test_failed_control_workload_fails(self):
         checks, _d = oracles.check_r04_deny(
             {"exit": 4, "stderr": "live session unusable: missing CAP_BPF"},
-            {"issued": 10, "observed": 9, "ring_drops": "0"},
+            deny_control(done=9),
+            {"ahash_digest": 10},
         )
-        self.assertFalse(checks["control_exact"])
+        self.assertFalse(checks["control_workload_proved"])
 
-    def test_foreign_correspondence_passes(self):
-        rows = [{"tgid": 101, "calls": 1}] * 20 + [{"tgid": 202, "calls": 1}] * 6
-        checks, detail = oracles.check_r04_foreign(
-            owned={"pids": [101], "expected": 20},
-            foreign={"pids": [202], "expected": 6},
-            product_rows=rows,
+    def test_control_kernel_divergence_fails(self):
+        bad = deny_control(observed={"ahash_digest": 9})
+        checks, _d = oracles.check_r04_deny(
+            {"exit": 4, "stderr": "live session unusable: missing CAP_BPF"},
+            bad,
+            {"ahash_digest": 10},
+        )
+        self.assertFalse(checks["control_kernel_equal"])
+
+    def test_unused_function_reads_zero_both_sides(self):
+        # A genuinely unused route function (kernel 0, product 0)
+        # is an explicit recorded zero, not a skip: equality holds
+        # while traffic elsewhere proves the window ran.
+        control = deny_control(observed={"ahash_digest": 10, "shash_digest": 0})
+        checks, _d = oracles.check_r04_deny(
+            {"exit": 4, "stderr": "live session unusable: x"},
+            control,
+            {"ahash_digest": 10, "shash_digest": 0},
         )
         self.assertTrue(all(checks.values()), checks)
-        self.assertEqual(detail["owned_matched"], 20)
-        self.assertEqual(detail["foreign_matched"], 6)
+
+    def test_empty_kernel_window_fails(self):
+        control = deny_control(observed={"ahash_digest": 0})
+        checks, _d = oracles.check_r04_deny(
+            {"exit": 4, "stderr": "live session unusable: x"},
+            control,
+            {"ahash_digest": 0},
+        )
+        self.assertFalse(checks["control_nonempty"])
+
+    def test_foreign_correspondence_passes(self):
+        # Route-shaped multiplier (2 observations per digest: ahash
+        # + nested shash): the proof is the 20:6 ratio plus exact
+        # agg coverage, never the absolute 40/12.
+        rows = [{"tgid": 101, "calls": 20}] * 2 + [{"tgid": 202, "calls": 6}] * 2
+        checks, detail = oracles.check_r04_foreign(
+            [101], [202], 20, 6, rows, 52)
+        self.assertTrue(all(checks.values()), checks)
+        self.assertEqual(detail["owned_matched"], 40)
+        self.assertEqual(detail["foreign_matched"], 12)
 
     def test_foreign_absorbed_fails(self):
-        # 26 owned-claimed rows where only 20 are owned: the oracle
-        # must not let foreign traffic satisfy the owned count.
+        # Foreign rows claimed as owned: the ratio breaks (26:0
+        # over disjoint sets is unprovable) and the empty foreign
+        # set fails the disjointness gate.
         rows = [{"tgid": 101, "calls": 1}] * 20 + [{"tgid": 202, "calls": 1}] * 6
-        checks, _d = oracles.check_r04_foreign(
-            owned={"pids": [101, 202], "expected": 26},
-            foreign={"pids": [], "expected": 0},
-            product_rows=rows,
-        )
-        self.assertFalse(checks["foreign_excluded"])
+        checks, _d = oracles.check_r04_foreign([101, 202], [], 26, 0, rows, 26)
+        self.assertFalse(checks["pid_sets_disjoint"])
+
+    def test_skewed_ratio_fails(self):
+        # 39:13 is not 20:6 — one owned observation leaked to the
+        # foreign set (or vice versa); the correspondence is broken.
+        rows = [{"tgid": 101, "calls": 39}, {"tgid": 202, "calls": 13}]
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 52)
+        self.assertFalse(checks["ratio_exact"])
+
+    def test_uncovered_agg_fails(self):
+        # Who attribution (40+12) misses 2 agg observations: the
+        # coverage equation fails even though the ratio holds.
+        rows = [{"tgid": 101, "calls": 20}] * 2 + [{"tgid": 202, "calls": 6}] * 2
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 54)
+        self.assertFalse(checks["coverage_exact"])
 
     def test_unattributed_rows_fail(self):
-        rows = [{"tgid": 101, "calls": 1}] * 20 + [{"tgid": 999, "calls": 1}] * 1
-        checks, _d = oracles.check_r04_foreign(
-            owned={"pids": [101], "expected": 20},
-            foreign={"pids": [], "expected": 0},
-            product_rows=rows,
-        )
+        rows = ([{"tgid": 101, "calls": 20}] * 2 + [{"tgid": 202, "calls": 6}] * 2
+                + [{"tgid": 999, "calls": 2}])
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 54)
         self.assertFalse(checks["no_unattributed_rows"])
 
-    def test_missing_owned_rows_fail(self):
-        rows = [{"tgid": 101, "calls": 1}] * 19
-        checks, _d = oracles.check_r04_foreign(
-            owned={"pids": [101], "expected": 20},
-            foreign={"pids": [], "expected": 0},
-            product_rows=rows,
-        )
-        self.assertFalse(checks["owned_exact"])
+    def test_missing_foreign_decoy_fails(self):
+        rows = [{"tgid": 101, "calls": 20}] * 2
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 40)
+        self.assertFalse(checks["foreign_present"])
 
 
 def agg_obs(family="skcipher", op="encrypt", result="ok", calls=20,
@@ -336,6 +407,9 @@ def report_doc(*observations, ring_drops="0", ktot_gap="0"):
                 {"name": "ktot_gap", "value": ktot_gap}]},
             "detailed_events": {"status": "s", "counters": [
                 {"name": "ring_drops", "value": ring_drops}]},
+            "attachment": {"status": "s", "counters": [
+                {"name": "probes_attached", "value": "9"},
+                {"name": "probes_expected", "value": "9"}]},
             "completion": {"status": "s", "counters": []},
         },
         "integrity": {"ring_reservation_failures": "0",
@@ -357,6 +431,8 @@ class ReportParserTests(unittest.TestCase):
                                           "calls": 20, "first_errno": None}])
         self.assertEqual(parsed["loss"]["ring_drops"], "0")
         self.assertEqual(parsed["loss"]["ktot_gap"], "0")
+        self.assertEqual(parsed["attach"]["probes_attached"], "9")
+        self.assertEqual(parsed["attach"]["probes_expected"], "9")
 
     def test_parse_collapses_exact_duplicates(self):
         first, second = agg_obs(), agg_obs()

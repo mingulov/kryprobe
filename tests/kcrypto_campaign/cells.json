@@ -5,14 +5,33 @@
   "frozen_utc": "2026-09-28T18:30:00Z",
   "freeze_rule": "frozen before the first T13 guest boot; any stimulus/oracle/bounds edit changes _manifest_sha256 and invalidates sealed receipts",
   "global": {
-    "kernels": ["6.12.111", "7.0.14", "7.2.6"],
-    "vng": {"6.12.111": "v6.12.111", "7.0.14": "v7.0.14", "7.2.6": "v7.2.6"},
-    "profiles": ["api-returns"],
+    "kernels": [
+      "6.12.111",
+      "7.0.14",
+      "7.2.6"
+    ],
+    "vng": {
+      "6.12.111": "v6.12.111",
+      "7.0.14": "v7.0.14",
+      "7.2.6": "v7.2.6"
+    },
+    "profiles": [
+      "api-returns"
+    ],
     "guest_user": "root",
     "guest_cpus": 4,
     "guest_memory": "4G",
     "quiet_window_s": 2,
-    "identity_keys": ["kernel", "config_sha", "btf_sha", "module_sha", "cli_sha", "bpf_agg_sha", "bpf_lc_sha", "oracle_sha"]
+    "identity_keys": [
+      "kernel",
+      "config_sha",
+      "btf_sha",
+      "module_sha",
+      "cli_sha",
+      "bpf_agg_sha",
+      "bpf_lc_sha",
+      "oracle_sha"
+    ]
   },
   "mode_decision": "api-returns for every consumer cell (works on all three kernels incl. the 6.12 floor); request-lifecycle appears only as the typed-refusal leg on 6.12.111 (R01-floor) where fsession predates the kernel",
   "cells": [
@@ -26,18 +45,48 @@
           "status": "T13",
           "kernel": "7.0.14",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r01_det.sh", "fixture_scenarios": ["sync-once", "sync-once"], "legs": 2, "capture": "report --system --format json"},
-          "oracle": {"predicate": "check_r01_det", "ledger_rc": 0, "determinism": "exact"},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r01_det.sh",
+            "fixture_scenarios": [
+              "sync-once",
+              "sync-once"
+            ],
+            "legs": 2,
+            "capture": "report --system --format json"
+          },
+          "oracle": {
+            "predicate": "check_r01_det",
+            "ledger_rc": 0,
+            "determinism": "exact"
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         },
         {
           "id": "R01-det-726",
           "status": "T13",
           "kernel": "7.2.6",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r01_det.sh", "fixture_scenarios": ["sync-once", "sync-once"], "legs": 2, "capture": "report --system --format json"},
-          "oracle": {"predicate": "check_r01_det", "ledger_rc": 0, "determinism": "exact"},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r01_det.sh",
+            "fixture_scenarios": [
+              "sync-once",
+              "sync-once"
+            ],
+            "legs": 2,
+            "capture": "report --system --format json"
+          },
+          "oracle": {
+            "predicate": "check_r01_det",
+            "ledger_rc": 0,
+            "determinism": "exact"
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         }
       ]
     },
@@ -51,9 +100,28 @@
           "status": "T13",
           "kernel": "6.12.111",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r01_floor.sh", "aggregate": "hash_burst n=20 + skcipher_burst n=10 via repo fixture", "refusal": "report --system --kcrypto-profile request-lifecycle"},
-          "oracle": {"predicate": "check_r01_floor", "hash_issued": 20, "skcipher_issued": 10, "refusal_exit": 4},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r01_floor.sh",
+            "aggregate": "hash_burst n=20 + skcipher_burst n=10 via repo fixture",
+            "refusal": "report --system --kcrypto-profile request-lifecycle",
+            "kernel_ref": "ftrace ahash/shash digest + skcipher enc/dec"
+          },
+          "oracle": {
+            "predicate": "check_r01_floor",
+            "hash_issued": 20,
+            "skcipher_issued": 10,
+            "refusal_exit": 4,
+            "kernel_ref": [
+              "ahash_digest",
+              "shash_digest",
+              "skcipher_encrypt",
+              "skcipher_decrypt"
+            ]
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         }
       ]
     },
@@ -67,18 +135,44 @@
           "status": "T13",
           "kernel": "7.0.14",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r02_dmcrypt.sh", "backing": "1 GiB sparse file + loop", "cipher": "aes-xts-plain64", "io": "64 MiB in 4 KiB blocks each direction + fsync + checksums", "kernel_ref": "ftrace crypto_skcipher_encrypt/decrypt"},
-          "oracle": {"predicate": "check_r02", "bytes_each_direction": 67108864, "block_bytes": 4096},
-          "bounds": {"timeout_s": 900, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r02_dmcrypt.sh",
+            "backing": "1 GiB sparse file + loop",
+            "cipher": "aes-xts-plain64",
+            "io": "64 MiB in 4 KiB blocks each direction + fsync + checksums",
+            "kernel_ref": "ftrace crypto_skcipher_encrypt/decrypt"
+          },
+          "oracle": {
+            "predicate": "check_r02",
+            "bytes_each_direction": 67108864,
+            "block_bytes": 4096
+          },
+          "bounds": {
+            "timeout_s": 900,
+            "guest_rss_mb": 512
+          }
         },
         {
           "id": "R02-726",
           "status": "T13",
           "kernel": "7.2.6",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r02_dmcrypt.sh", "backing": "1 GiB sparse file + loop", "cipher": "aes-xts-plain64", "io": "64 MiB in 4 KiB blocks each direction + fsync + checksums", "kernel_ref": "ftrace crypto_skcipher_encrypt/decrypt"},
-          "oracle": {"predicate": "check_r02", "bytes_each_direction": 67108864, "block_bytes": 4096},
-          "bounds": {"timeout_s": 900, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r02_dmcrypt.sh",
+            "backing": "1 GiB sparse file + loop",
+            "cipher": "aes-xts-plain64",
+            "io": "64 MiB in 4 KiB blocks each direction + fsync + checksums",
+            "kernel_ref": "ftrace crypto_skcipher_encrypt/decrypt"
+          },
+          "oracle": {
+            "predicate": "check_r02",
+            "bytes_each_direction": 67108864,
+            "block_bytes": 4096
+          },
+          "bounds": {
+            "timeout_s": 900,
+            "guest_rss_mb": 512
+          }
         }
       ]
     },
@@ -92,18 +186,42 @@
           "status": "T13",
           "kernel": "7.0.14",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r03_xfrm.sh", "topology": "2 netns + veth, ESP transport rfc4106(gcm(aes))", "traffic": "1000 seq packets each direction + 100-packet auth-fail phase", "kernel_ref": "ftrace crypto_aead_encrypt/decrypt"},
-          "oracle": {"predicate": "check_r03", "packets_each_direction": 1000, "authfail_packets": 100},
-          "bounds": {"timeout_s": 900, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r03_xfrm.sh",
+            "topology": "2 netns + veth, ESP transport rfc4106(gcm(aes))",
+            "traffic": "1000 seq packets each direction + 100-packet auth-fail phase",
+            "kernel_ref": "ftrace crypto_aead_encrypt/decrypt"
+          },
+          "oracle": {
+            "predicate": "check_r03",
+            "packets_each_direction": 1000,
+            "authfail_packets": 100
+          },
+          "bounds": {
+            "timeout_s": 900,
+            "guest_rss_mb": 512
+          }
         },
         {
           "id": "R03-726",
           "status": "T13",
           "kernel": "7.2.6",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r03_xfrm.sh", "topology": "2 netns + veth, ESP transport rfc4106(gcm(aes))", "traffic": "1000 seq packets each direction + 100-packet auth-fail phase", "kernel_ref": "ftrace crypto_aead_encrypt/decrypt"},
-          "oracle": {"predicate": "check_r03", "packets_each_direction": 1000, "authfail_packets": 100},
-          "bounds": {"timeout_s": 900, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r03_xfrm.sh",
+            "topology": "2 netns + veth, ESP transport rfc4106(gcm(aes))",
+            "traffic": "1000 seq packets each direction + 100-packet auth-fail phase",
+            "kernel_ref": "ftrace crypto_aead_encrypt/decrypt"
+          },
+          "oracle": {
+            "predicate": "check_r03",
+            "packets_each_direction": 1000,
+            "authfail_packets": 100
+          },
+          "bounds": {
+            "timeout_s": 900,
+            "guest_rss_mb": 512
+          }
         }
       ]
     },
@@ -117,18 +235,50 @@
           "status": "T13",
           "kernel": "7.0.14",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r04_deny.sh", "refusal": "report --system as uid 65534 (no caps)", "control": "privileged aggregate + hash_burst n=10 via repo fixture"},
-          "oracle": {"predicate": "check_r04_deny", "refusal_exit": 4, "control_issued": 10},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r04_deny.sh",
+            "refusal": "report --system as uid 65534 (no caps)",
+            "control": "privileged aggregate + hash_burst n=10 via repo fixture",
+            "kernel_ref": "ftrace ahash/shash digest (control leg)"
+          },
+          "oracle": {
+            "predicate": "check_r04_deny",
+            "refusal_exit": 4,
+            "control_issued": 10,
+            "kernel_ref": [
+              "ahash_digest",
+              "shash_digest"
+            ]
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         },
         {
           "id": "R04-deny-726",
           "status": "T13",
           "kernel": "7.2.6",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r04_deny.sh", "refusal": "report --system as uid 65534 (no caps)", "control": "privileged aggregate + hash_burst n=10 via repo fixture"},
-          "oracle": {"predicate": "check_r04_deny", "refusal_exit": 4, "control_issued": 10},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r04_deny.sh",
+            "refusal": "report --system as uid 65534 (no caps)",
+            "control": "privileged aggregate + hash_burst n=10 via repo fixture",
+            "kernel_ref": "ftrace ahash/shash digest (control leg)"
+          },
+          "oracle": {
+            "predicate": "check_r04_deny",
+            "refusal_exit": 4,
+            "control_issued": 10,
+            "kernel_ref": [
+              "ahash_digest",
+              "shash_digest"
+            ]
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         }
       ]
     },
@@ -142,18 +292,42 @@
           "status": "T13",
           "kernel": "7.0.14",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r04_foreign.sh", "owned": "hash_burst n=20 (owned pids recorded)", "foreign": "hash_burst n=6 (foreign pids recorded)", "join": "who-row tgid over recorded pid sets + start-time no-reuse proof"},
-          "oracle": {"predicate": "check_r04_foreign", "owned_expected": 20, "foreign_expected": 6},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r04_foreign.sh",
+            "owned": "hash_burst n=20 (owned pids recorded)",
+            "foreign": "hash_burst n=6 (foreign pids recorded)",
+            "join": "who-row tgid over recorded pid sets + start-time no-reuse proof"
+          },
+          "oracle": {
+            "predicate": "check_r04_foreign",
+            "owned_issued": 20,
+            "foreign_issued": 6
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         },
         {
           "id": "R04-foreign-726",
           "status": "T13",
           "kernel": "7.2.6",
           "profile": "api-returns",
-          "stimulus": {"scenario": "r04_foreign.sh", "owned": "hash_burst n=20 (owned pids recorded)", "foreign": "hash_burst n=6 (foreign pids recorded)", "join": "who-row tgid over recorded pid sets + start-time no-reuse proof"},
-          "oracle": {"predicate": "check_r04_foreign", "owned_expected": 20, "foreign_expected": 6},
-          "bounds": {"timeout_s": 600, "guest_rss_mb": 512}
+          "stimulus": {
+            "scenario": "r04_foreign.sh",
+            "owned": "hash_burst n=20 (owned pids recorded)",
+            "foreign": "hash_burst n=6 (foreign pids recorded)",
+            "join": "who-row tgid over recorded pid sets + start-time no-reuse proof"
+          },
+          "oracle": {
+            "predicate": "check_r04_foreign",
+            "owned_issued": 20,
+            "foreign_issued": 6
+          },
+          "bounds": {
+            "timeout_s": 600,
+            "guest_rss_mb": 512
+          }
         }
       ]
     }

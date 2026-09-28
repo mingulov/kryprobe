@@ -47,7 +47,8 @@ def parse_api_returns_report(doc: dict) -> dict:
     "ok", "queued", "bytes", "drivers", "algorithms"}}, "who":
     [{tgid, tid, comm, uid, calls, first_errno}], "totals":
     {...}, "loss": {"ring_drops", "ktot_gap", ...integrity
-    counters}, "verdict": {...}, "duplicates_collapsed": n}``.
+    counters}, "attach": {"probes_attached", "probes_expected"},
+    "verdict": {...}, "duplicates_collapsed": n}``.
     Raises :class:`OracleError` on missing keys, unknown rows,
     conflicting same-key agg rows, or who rows without identity.
     """
@@ -123,14 +124,18 @@ def parse_api_returns_report(doc: dict) -> dict:
         else:
             raise OracleError(f"unknown row {row!r} in observation {obs.get('id', '?')!r}")
     loss: dict[str, str] = {}
+    attach: dict[str, str] = {}
     coverage = doc["coverage"]
     if not isinstance(coverage, dict):
         raise OracleError("report 'coverage' must be an object")
-    for dim in ("aggregate_counts", "detailed_events"):
+    for dim in ("aggregate_counts", "detailed_events", "attachment"):
         counters = coverage.get(dim, {}).get("counters", [])
         for counter in counters:
             if isinstance(counter, dict) and "name" in counter:
-                loss[counter["name"]] = counter.get("value")
+                if dim == "attachment":
+                    attach[counter["name"]] = counter.get("value")
+                else:
+                    loss[counter["name"]] = counter.get("value")
     integrity = doc["integrity"]
     if not isinstance(integrity, dict):
         raise OracleError("report 'integrity' must be an object")
@@ -147,6 +152,7 @@ def parse_api_returns_report(doc: dict) -> dict:
         "who": who,
         "totals": totals,
         "loss": loss,
+        "attach": attach,
         "verdict": doc["verdict"],
         "duplicates_collapsed": duplicates,
     }
@@ -179,32 +185,52 @@ def check_r01_det(leg_a: dict, leg_b: dict) -> tuple[dict, dict]:
     return checks, detail
 
 
-def check_r01_floor(aggregate: dict, refusal: dict) -> tuple[dict, dict]:
+def check_r01_floor(workload: dict, kernel_ref: dict, product: dict,
+                   refusal: dict) -> tuple[dict, dict]:
     """R01 6.12 floor: supported aggregate exact + lifecycle refusal typed.
 
-    ``aggregate`` carries ``hash_issued``/``hash_observed``,
-    ``skc_issued``/``skc_enc_observed``/``skc_dec_observed`` and
-    ``ring_drops``; ``refusal`` carries ``exit``/``stderr``
-    (stderr archived, the gate is the stable exit-4 Unusable
-    contract). The aggregate leg is the refusal leg's positive
-    control; its skcipher half also proves the promoted
-    fixture's skcipher path on the floor kernel.
+    ``workload`` carries ``hash_issued``/``hash_done``/
+    ``skc_issued``/``skc_done`` (fixture truth); ``kernel_ref``
+    the ftrace per-function counts; ``product`` the observed
+    per-function counts + ``ring_drops``; ``refusal`` carries
+    ``exit``/``stderr`` (gate: stable exit-4 Unusable). Product
+    must equal the KERNEL reference exactly; the T07-documented
+    6.12 route (one ahash + one shash per digest) is gated
+    separately at the kernel level. The aggregate leg is the
+    refusal leg's positive control.
     """
     checks = {}
-    checks["hash_exact"] = (
-        aggregate.get("hash_observed") == aggregate.get("hash_issued")
+    checks["workload_proved"] = (
+        workload.get("hash_done") == workload.get("hash_issued")
+        and workload.get("skc_done") == workload.get("skc_issued")
+        and (workload.get("hash_issued") or 0) > 0
     )
-    checks["skcipher_exact"] = (
-        aggregate.get("skc_enc_observed") == aggregate.get("skc_issued")
-        and aggregate.get("skc_dec_observed") == aggregate.get("skc_issued")
+    checks["hash_kernel_equal"] = (
+        product.get("ahash_digest") == kernel_ref.get("ahash_digest")
+        and product.get("shash_digest") == kernel_ref.get("shash_digest")
     )
-    checks["aggregate_lossless"] = aggregate.get("ring_drops") == "0"
-    checks["aggregate_nonempty"] = (aggregate.get("hash_issued") or 0) > 0
+    checks["skcipher_kernel_equal"] = (
+        product.get("skcipher_encrypt") == kernel_ref.get("skcipher_encrypt")
+        and product.get("skcipher_decrypt") == kernel_ref.get("skcipher_decrypt")
+    )
+    checks["kernel_nonempty"] = all(
+        (kernel_ref.get(name) or 0) > 0
+        for name in ("ahash_digest", "shash_digest",
+                     "skcipher_encrypt", "skcipher_decrypt")
+    )
+    checks["hash_route_documented"] = (
+        kernel_ref.get("ahash_digest") == workload.get("hash_issued")
+        and kernel_ref.get("shash_digest") == workload.get("hash_issued")
+    )
+    checks["skcipher_route_documented"] = (
+        kernel_ref.get("skcipher_encrypt") == workload.get("skc_issued")
+        and kernel_ref.get("skcipher_decrypt") == workload.get("skc_issued")
+    )
+    checks["product_lossless"] = product.get("ring_drops") == "0"
     checks["refusal_exit_unusable"] = refusal.get("exit") == EXIT_UNUSABLE
     detail = {
-        "hash": aggregate.get("hash_observed"),
-        "skc_enc": aggregate.get("skc_enc_observed"),
-        "skc_dec": aggregate.get("skc_dec_observed"),
+        "kernel": dict(kernel_ref),
+        "product": {k: product.get(k) for k in kernel_ref},
         "refusal_exit": refusal.get("exit"),
     }
     return checks, detail
@@ -298,55 +324,85 @@ def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
     return checks, detail
 
 
-def check_r04_deny(refusal: dict, control: dict) -> tuple[dict, dict]:
+def check_r04_deny(refusal: dict, control: dict, kernel_ref: dict) -> tuple[dict, dict]:
     """R04 denied-attach: typed refusal + exact positive control.
 
     ``refusal`` carries ``exit``/``stderr`` (gate: stable exit-4
-    Unusable); ``control`` carries ``issued``/``observed``/
-    ``ring_drops`` of the privileged aggregate leg on the same
-    kernel.
+    Unusable); ``control`` carries the privileged aggregate
+    leg's ``hash_issued``/``hash_done``/per-function observed
+    counts + ``ring_drops``; ``kernel_ref`` the ftrace
+    per-function counts. Control product must equal the kernel
+    reference exactly (no route assumption: the 7.x per-digest
+    shape is RECORDED, supporting the support-table row — a
+    genuinely unused function reads 0 on both sides, never a
+    silent skip).
     """
     checks = {}
     checks["refusal_exit_unusable"] = refusal.get("exit") == EXIT_UNUSABLE
-    checks["control_exact"] = control.get("observed") == control.get("issued")
+    checks["control_workload_proved"] = (
+        control.get("hash_done") == control.get("hash_issued")
+        and (control.get("hash_issued") or 0) > 0
+    )
+    checks["control_kernel_equal"] = all(
+        control.get("observed", {}).get(name) == kernel_ref.get(name)
+        for name in kernel_ref
+    ) and bool(kernel_ref)
+    checks["control_nonempty"] = any(
+        (kernel_ref.get(name) or 0) > 0 for name in kernel_ref
+    ) and bool(kernel_ref)
     checks["control_lossless"] = control.get("ring_drops") == "0"
-    checks["control_nonempty"] = (control.get("issued") or 0) > 0
     detail = {
         "refusal_exit": refusal.get("exit"),
-        "control": control.get("observed"),
+        "kernel": dict(kernel_ref),
+        "observed": dict(control.get("observed", {})),
     }
     return checks, detail
 
 
-def check_r04_foreign(owned: dict, foreign: dict, product_rows: list) -> tuple[dict, dict]:
+def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
+                      foreign_issued: int, product_rows: list,
+                      agg_digest_total: int) -> tuple[dict, dict]:
     """R04 foreign traffic: unique owned correspondence, no absorption.
 
-    ``owned``/``foreign`` carry ``pids`` + ``expected`` counts;
-    ``product_rows`` are who rows (``tgid`` + ``calls``). Owned
-    rows must match exactly over owned PIDs only; foreign rows
-    must exist (the decoy ran) and stay excluded; any
-    unattributed row fails.
+    Who rows (``tgid`` + ``calls``) must attribute every digest
+    observation to exactly the recorded owned/foreign PID sets;
+    owned/foreign who totals must stand in the exact issued
+    ratio (20:6); and who attribution must cover the agg digest
+    total exactly (nothing unattributed, nothing absorbed). No
+    per-digest route assumption: the absolute multiplier is
+    ROUTE-SHAPED (nested shash), so the proof is ratio +
+    coverage, never an absolute who total.
     """
     checks = {}
-    owned_pids = set(owned.get("pids") or [])
-    foreign_pids = set(foreign.get("pids") or [])
+    owned_set, foreign_set = set(owned_pids or []), set(foreign_pids or [])
     owned_matched = sum(
-        row.get("calls", 0) for row in product_rows if row.get("tgid") in owned_pids
+        row.get("calls", 0) for row in product_rows if row.get("tgid") in owned_set
     )
     foreign_matched = sum(
-        row.get("calls", 0) for row in product_rows if row.get("tgid") in foreign_pids
+        row.get("calls", 0) for row in product_rows if row.get("tgid") in foreign_set
     )
     unattributed = [
         row for row in product_rows
-        if row.get("tgid") not in owned_pids and row.get("tgid") not in foreign_pids
+        if row.get("tgid") not in owned_set and row.get("tgid") not in foreign_set
     ]
-    checks["owned_exact"] = owned_matched == owned.get("expected")
-    checks["foreign_present"] = foreign_matched == foreign.get("expected")
-    checks["foreign_excluded"] = bool(foreign_pids) and not (owned_pids & foreign_pids)
+    checks["pid_sets_disjoint"] = bool(owned_set) and bool(foreign_set) and not (
+        owned_set & foreign_set
+    )
+    checks["ratio_exact"] = (
+        owned_matched * (foreign_issued or 0) == foreign_matched * (owned_issued or 0)
+        and (owned_issued or 0) > 0
+        and (foreign_issued or 0) > 0
+    )
+    checks["foreign_present"] = foreign_matched > 0
+    checks["coverage_exact"] = (
+        owned_matched + foreign_matched == agg_digest_total
+        and (agg_digest_total or 0) > 0
+    )
     checks["no_unattributed_rows"] = not unattributed
     detail = {
         "owned_matched": owned_matched,
         "foreign_matched": foreign_matched,
+        "agg_digest_total": agg_digest_total,
         "unattributed": len(unattributed),
     }
     return checks, detail
