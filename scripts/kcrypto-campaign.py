@@ -262,20 +262,26 @@ def ledger_semantics(ledger_path: Path) -> dict:
     return {"rows": total, "phases": phases}
 
 
+def agg_entries(parsed: dict, family: str, op: str, result: str = AGG_OK) -> list:
+    """All agg rows sharing (family, op, result) across algorithms/drivers."""
+    return [entry for key, entry in parsed["agg"].items()
+            if key[0] == family and key[1] == op and key[2] == result]
+
+
 def agg_calls(parsed: dict, family: str, op: str, result: str = AGG_OK) -> int:
-    entry = parsed["agg"].get((family, op, result))
-    if entry is None:
+    entries = agg_entries(parsed, family, op, result)
+    if not entries:
         raise oracles.OracleError(
             f"report has no agg row ({family}, {op}, {result})")
-    return entry["calls"]
+    return sum(entry["calls"] for entry in entries)
 
 
 def agg_bytes(parsed: dict, family: str, op: str, result: str = AGG_OK) -> int:
-    entry = parsed["agg"].get((family, op, result))
-    if entry is None:
+    entries = agg_entries(parsed, family, op, result)
+    if not entries:
         raise oracles.OracleError(
             f"report has no agg row ({family}, {op}, {result})")
-    return entry["bytes"]
+    return sum(entry["bytes"] for entry in entries)
 
 
 def key_leak_scan(cell_dir: Path) -> list[str]:
@@ -613,8 +619,8 @@ def judge_r01_det(oracle_spec, cell_dir, host_receipt):
     for leg, _run_id in (("legA", "t13r01a"), ("legB", "t13r01b")):
         sem = ledger_semantics(cell_dir / f"ledger-{leg}.jsonl")
         parsed = load_report(cell_dir, f"report-{leg}.json")
-        product = {f"{f}/{o}/{r}": entry["calls"]
-                   for (f, o, r), entry in parsed["agg"].items()}
+        product = {"/".join(str(part) for part in key): entry["calls"]
+                   for key, entry in parsed["agg"].items()}
         legs[leg] = {
             "ledger_ops": sem["rows"],
             "ledger_phases": sem["phases"],
@@ -806,16 +812,16 @@ def judge_r04_foreign(oracle_spec, cell_dir):
     foreign = json.loads((cell_dir / "foreign-pids.json").read_text())
     parsed = load_report(cell_dir, "product.json")
     agg_digest_total = sum(
-        entry["calls"] for (family, _op, result), entry in parsed["agg"].items()
-        if family in ("ahash", "shash") and result == AGG_OK)
+        entry["calls"] for key, entry in parsed["agg"].items()
+        if key[0] in ("ahash", "shash") and key[2] == AGG_OK)
     checks, detail = oracles.check_r04_foreign(
         owned["pids"], foreign["pids"],
         oracle_spec["owned_issued"], oracle_spec["foreign_issued"],
         parsed["who"], agg_digest_total)
     checks["transport_closed"] = transport_closed(parsed)
     checks["no_unexpected_results"] = all(
-        result == AGG_OK for (family, _op, result) in parsed["agg"]
-        if family in ("ahash", "shash"))
+        key[2] == AGG_OK for key in parsed["agg"]
+        if key[0] in ("ahash", "shash"))
     owned_done = "hash: %d digests done" % oracle_spec["owned_issued"] in (
         cell_dir / "owned-stdout.log").read_text()
     foreign_done = "hash: %d digests done" % oracle_spec["foreign_issued"] in (

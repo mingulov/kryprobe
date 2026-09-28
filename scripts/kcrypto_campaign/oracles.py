@@ -43,12 +43,16 @@ class OracleError(ValueError):
 def parse_api_returns_report(doc: dict) -> dict:
     """Parse a pinned ``report --system --format json`` document.
 
-    Returns ``{"agg": {(family, op, result): {"calls", "errors",
-    "ok", "queued", "bytes", "drivers", "algorithms"}}, "who":
-    [{tgid, tid, comm, uid, calls, first_errno}], "totals":
-    {...}, "loss": {"ring_drops", "ktot_gap", ...integrity
-    counters}, "attach": {"probes_attached", "probes_expected"},
-    "verdict": {...}, "duplicates_collapsed": n}``.
+    Returns ``{"agg": {(family, op, result, algorithm, driver,
+    context): {"calls", "errors", "ok", "queued", "bytes"}},
+    "who": [{tgid, tid, comm, uid, calls, first_errno}],
+    "totals": {...}, "loss": {"ring_drops", "ktot_gap",
+    ...integrity counters}, "attach": {"probes_attached",
+    "probes_expected"}, "verdict": {...},
+    "duplicates_collapsed": n}``. The agg key carries the full
+    row identity: the same (family, op, result) legitimately
+    repeats per algorithm/driver (e.g. three ``any/alloc/ok``
+    rows for cbc(aes), cryptd and sha256).
     Raises :class:`OracleError` on missing keys, unknown rows,
     conflicting same-key agg rows, or who rows without identity.
     """
@@ -75,7 +79,9 @@ def parse_api_returns_report(doc: dict) -> dict:
             raise OracleError(f"observation {obs.get('id', '?')!r} has no backend_payload")
         row = payload.get("row")
         if row == "agg":
-            key = (payload.get("family"), payload.get("op"), payload.get("result"))
+            key = (payload.get("family"), payload.get("op"), payload.get("result"),
+                   payload.get("algorithm"), payload.get("driver"),
+                   payload.get("context"))
             counts = payload.get("counts")
             if not isinstance(counts, dict):
                 raise OracleError(f"agg row {key!r} has no counts mapping")
@@ -92,8 +98,6 @@ def parse_api_returns_report(doc: dict) -> dict:
                 "ok": counts.get("ok"),
                 "queued": counts.get("queued"),
                 "bytes": payload.get("bytes"),
-                "drivers": payload.get("driver"),
-                "algorithms": payload.get("algorithm"),
             }
         elif row == "who":
             missing_who = REQUIRED_WHO_KEYS - payload.keys()

@@ -71,6 +71,22 @@ class TransportClosedTests(unittest.TestCase):
             parsed_with({**ZERO_LOSS, "budget_omissions": "1"})))
 
 
+class AggSummingTests(unittest.TestCase):
+    def test_sums_across_algorithms(self):
+        parsed = {"agg": {
+            ("skcipher", "encrypt", "ok", "cbc(aes)", "", "process"):
+                {"calls": 1, "bytes": 64},
+            ("skcipher", "encrypt", "ok", "__cbc(aes)", "", "process"):
+                {"calls": 1, "bytes": 64},
+        }}
+        self.assertEqual(CLI.agg_calls(parsed, "skcipher", "encrypt"), 2)
+        self.assertEqual(CLI.agg_bytes(parsed, "skcipher", "encrypt"), 128)
+
+    def test_missing_row_raises(self):
+        with self.assertRaisesRegex(CLI.oracles.OracleError, "no agg row"):
+            CLI.agg_calls({"agg": {}}, "skcipher", "encrypt")
+
+
 class FixtureStdoutTests(unittest.TestCase):
     def test_hash_markers(self):
         text = "hash: 20 digests done\ngenerator finished\n"

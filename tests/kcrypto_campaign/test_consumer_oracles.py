@@ -424,8 +424,8 @@ class ReportParserTests(unittest.TestCase):
     def test_parse_counts_rows_and_who(self):
         doc = report_doc(agg_obs(), who_obs())
         parsed = oracles.parse_api_returns_report(doc)
-        self.assertEqual(
-            parsed["agg"][("skcipher", "encrypt", "ok")]["calls"], 20)
+        key = ("skcipher", "encrypt", "ok", "cbc(aes)", "cbc-aes-aesni", "process")
+        self.assertEqual(parsed["agg"][key]["calls"], 20)
         self.assertEqual(parsed["who"], [{"tgid": 101, "tid": 101,
                                           "comm": "kcrypto_gen", "uid": 0,
                                           "calls": 20, "first_errno": None}])
@@ -438,9 +438,19 @@ class ReportParserTests(unittest.TestCase):
         first, second = agg_obs(), agg_obs()
         second["id"] = "observation:26"
         parsed = oracles.parse_api_returns_report(report_doc(first, second))
-        self.assertEqual(
-            parsed["agg"][("skcipher", "encrypt", "ok")]["calls"], 20)
+        key = ("skcipher", "encrypt", "ok", "cbc(aes)", "cbc-aes-aesni", "process")
+        self.assertEqual(parsed["agg"][key]["calls"], 20)
         self.assertEqual(parsed["duplicates_collapsed"], 1)
+
+    def test_parse_keeps_algorithm_split_rows(self):
+        # Same (family, op, result), different algorithms: three
+        # alloc rows coexist (the 6.12 floor shape).
+        rows = [agg_obs(family="any", op="alloc", calls=1, name="crypto_alloc_tfm_node",
+                         extra={"algorithm": algo, "driver": "", "context": "process"})
+                for algo in ("cbc(aes)", "cryptd(__cbc-aes-aesni)", "sha256")]
+        parsed = oracles.parse_api_returns_report(report_doc(*rows))
+        self.assertEqual(len(parsed["agg"]), 3)
+        self.assertEqual(parsed["duplicates_collapsed"], 0)
 
     def test_parse_rejects_conflicting_agg_rows(self):
         with self.assertRaisesRegex(oracles.OracleError, "conflicting"):
