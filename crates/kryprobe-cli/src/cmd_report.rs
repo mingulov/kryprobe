@@ -7,7 +7,11 @@ use crate::args::ReportFormat;
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
-use kryprobe_report::{validate_and_render_file, write_str_atomic};
+use kryprobe_report::live_render::LIVE_SESSION_ID;
+use kryprobe_report::{
+    KCRYPTO_LIFECYCLE_SESSION_V1, ReportError, SessionWriteError, SessionWriter,
+    lifecycle_v1_payload, validate_and_render_file, write_str_atomic,
+};
 use std::io::Write;
 use std::path::Path;
 
@@ -129,10 +133,108 @@ fn report_window_secs(duration: Option<u64>) -> u64 {
     duration.unwrap_or(DEFAULT_REPORT_SECS)
 }
 
+/// Evidence version stamped in session-envelope starts: the producing
+/// binary + workspace version (names what produced the bytes — the
+/// CLI and report crates share one workspace version, so this is
+/// true for the binary too).
+const EVIDENCE_VERSION: &str = concat!("kryprobe/", env!("CARGO_PKG_VERSION"));
+
+/// Renders one lifecycle outcome as a versioned session-envelope
+/// stream (T11/P6: start/config, validated observations, coverage,
+/// terminal receipt — the validated replacement for the refused
+/// lifecycle JSONL). Every row MUST project to payload-v1 (a
+/// non-lifecycle row or an invalid projection refuses LOUD, never a
+/// silent skip); the coverage record carries the outcome's exact
+/// populations plus per-stage loss; the receipt is `clean` only when
+/// the window was uninterrupted, the coverage contract held, and no
+/// loss or unfinished work was counted.
+///
+/// Serialization failure is a defect `Err` (the caller exits 1),
+/// never a panic — same contract as [`render_report_json`].
+pub fn render_lifecycle_session(
+    outcome: &LiveOutcome,
+    profile: LifecycleProfile,
+) -> Result<String, ReportError> {
+    let totals = outcome
+        .lifecycle_totals
+        .as_ref()
+        .ok_or(ReportError::MissingLifecycleTotals)?;
+    let session = |err: SessionWriteError| match err {
+        SessionWriteError::SerializeFailed { kind, detail } => {
+            ReportError::SerializeFailed { kind, detail }
+        }
+        // Unreachable by construction: the call sequence below is
+        // fixed (one start, observations, one coverage, one
+        // receipt) and every projection pre-validates — but a
+        // corrupt future must fail LOUD, never emit a torn stream.
+        other => ReportError::SerializeFailed {
+            kind: "session",
+            detail: other.to_string(),
+        },
+    };
+    let mut writer = SessionWriter::new(LIVE_SESSION_ID);
+    writer
+        .session_start(
+            profile.as_str(),
+            EVIDENCE_VERSION,
+            KCRYPTO_LIFECYCLE_SESSION_V1,
+        )
+        .map_err(session)?;
+    for obs in &outcome.observations {
+        let projected = match lifecycle_v1_payload(obs) {
+            Some(Ok(record)) => record,
+            Some(Err(defect)) => {
+                return Err(ReportError::UnprojectableRow { detail: defect });
+            }
+            None => {
+                return Err(ReportError::UnprojectableRow {
+                    detail: "not a lifecycle row".to_owned(),
+                });
+            }
+        };
+        writer.observation(&projected).map_err(session)?;
+    }
+    // The export carries no consumer filter (filtering happens in
+    // views): `filtered` is honestly 0, and the unknown population
+    // is the driver's own unknown-terminal count.
+    writer
+        .coverage(
+            totals.admitted,
+            totals.emitted,
+            totals.unfinished,
+            totals.loss_stages(),
+            totals.unknown_terminals,
+            0,
+        )
+        .map_err(session)?;
+    let clean = !outcome.interrupted
+        && kryprobe_report::live_render::trailer_dims(&outcome.coverage).is_empty()
+        && totals.loss_total() == 0
+        && totals.unfinished == 0;
+    if clean {
+        writer
+            .receipt(true, totals.admitted, totals.emitted, totals.unfinished)
+            .map_err(session)?;
+    } else {
+        writer
+            .receipt_partial(
+                totals.admitted,
+                totals.emitted,
+                totals.unfinished,
+                totals.loss_stages(),
+            )
+            .map_err(session)?;
+    }
+    Ok(writer.into_string())
+}
+
 /// Finishes a live capture: human tables, the JSON doc, or the
-/// validated event-v0 JSONL stream to `--out` (atomic) or stdout; 0
-/// when the coverage contract held, 3 on gaps, 4/1 on [`LiveError`]
-/// via [`LiveError::exit_code`], 1 when the JSONL export refuses a
+/// validated JSONL stream to `--out` (atomic) or stdout — the frozen
+/// event-v0 envelope for aggregate outcomes, the versioned
+/// lifecycle session envelope for lifecycle outcomes (the outcome
+/// selects the envelope, never the caller); 0 when the coverage
+/// contract held, 3 on gaps, 4/1 on [`LiveError`] via
+/// [`LiveError::exit_code`], 1 when a JSONL export refuses a
 /// non-wire-spellable row.
 fn finish_report_live(
     result: Result<LiveOutcome, LiveError>,
@@ -179,11 +281,20 @@ fn finish_report_live(
             }
         },
         ReportFormat::Jsonl => {
-            match kryprobe_report::live_render::render_live_jsonl(
-                &outcome.observations,
-                &outcome.coverage,
-                outcome.interrupted,
-            ) {
+            // T11/P6: lifecycle outcomes export the versioned
+            // session envelope (validated observations + coverage
+            // + receipt); aggregate outcomes keep the frozen
+            // event-v0 stream, byte-untouched.
+            let text = if outcome.lifecycle_totals.is_some() {
+                render_lifecycle_session(&outcome, LifecycleProfile::RequestLifecycle)
+            } else {
+                kryprobe_report::live_render::render_live_jsonl(
+                    &outcome.observations,
+                    &outcome.coverage,
+                    outcome.interrupted,
+                )
+            };
+            match text {
                 Ok(text) => text,
                 Err(err) => {
                     let _ = writeln!(stderr, "report: cannot export JSONL: {err}");
@@ -223,20 +334,12 @@ pub fn run_report_live(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    // Presentation gate: the frozen event-v0 envelope has no
-    // `backend_payload` and forbids additional properties, so a
-    // request-lifecycle capture can never export to JSONL (envelope
-    // carriage awaits a versioned-envelope ADR). Refuse BEFORE the
-    // capture — a bounded window that can only end in an export error
-    // must not run. Human and JSON reports carry lifecycle rows.
-    if profile == LifecycleProfile::RequestLifecycle && matches!(format, ReportFormat::Jsonl) {
-        let _ = writeln!(
-            stderr,
-            "report: --format jsonl cannot export request-lifecycle rows \
-             (event-v0 carries no lifecycle payload); use human or json"
-        );
-        return 1;
-    }
+    // T11/P6: the versioned-envelope ADR decided — lifecycle
+    // outcomes export the session envelope (validated observations
+    // + coverage + receipt), so jsonl + request-lifecycle runs the
+    // capture instead of refusing. The frozen event-v0 envelope
+    // still carries no lifecycle payload and stays byte-untouched;
+    // the outcome selects the envelope at render time.
     // 4B-M5: SIGINT finalizes and renders the partial window (exit 3),
     // with a per-tick stderr progress line while the capture runs.
     let cfg = LiveConfig {
@@ -466,12 +569,75 @@ mod tests {
         );
     }
 
+    /// Lifecycle outcome fixture: one sync + one unknown row, exact
+    /// reducer totals, healthy coverage (mirrors
+    /// `tests/goldens/lifecycle_session.jsonl`).
+    fn lifecycle_fixture() -> LiveOutcome {
+        use kryprobe_core::enums::{BackendId, CallKind, EvidencePhase, OperationClass};
+        use kryprobe_core::evidence::{IntegrityRef, NativeObservation, NativeResult};
+        use kryprobe_core::ids::ObservationId;
+        let row = |id: u64,
+                   terminal: &str,
+                   status: serde_json::Value,
+                   duration: serde_json::Value| {
+            NativeObservation {
+                id: ObservationId::new(id),
+                backend: BackendId::KCrypto,
+                target: None,
+                object: None,
+                implementation: None,
+                phase: EvidencePhase::Completed,
+                call_kind: CallKind::Operation,
+                operation_class: OperationClass::Unknown,
+                native_name: None,
+                native_code: None,
+                native_result: NativeResult::KCrypto { status: 0 },
+                started_ns: None,
+                ended_ns: None,
+                correlation: None,
+                integrity: IntegrityRef::new(0),
+                backend_payload: serde_json::json!({
+                    "row": "lifecycle",
+                    "capture_profile": "request-lifecycle",
+                    "id": format!("lc:{id}"),
+                    "tfm_id": null,
+                    "terminal": terminal,
+                    "status": status,
+                    "duration_ns": duration,
+                    "evidence": terminal != "unknown",
+                    "count_unit": "request_lifecycle",
+                    "completion_coverage": if terminal == "unknown" { "unobserved" } else { "observed" },
+                }),
+            }
+        };
+        let mut outcome = outcome_with(
+            vec![
+                row(1, "sync", serde_json::json!(0), serde_json::json!("50")),
+                row(
+                    2,
+                    "unknown",
+                    serde_json::json!(null),
+                    serde_json::json!(null),
+                ),
+            ],
+            healthy_coverage(2),
+        );
+        outcome.lifecycle_totals = Some(crate::live::LifecycleTotals {
+            admitted: 2,
+            emitted: 2,
+            unfinished: 1,
+            unknown_terminals: 1,
+            ..Default::default()
+        });
+        outcome
+    }
+
     #[test]
-    fn jsonl_lifecycle_gate_refuses_before_capture() {
-        // The frozen event-v0 envelope cannot carry lifecycle rows:
-        // jsonl + request-lifecycle refuses (exit 1) before any
-        // capture runs — the bogus source proves it (a capture would
-        // exit 4 naming the source instead).
+    fn jsonl_lifecycle_runs_capture_and_exports_session() {
+        // T11/P6 contract flip (approved): jsonl + request-lifecycle
+        // runs the capture (no pre-capture refusal) and exports the
+        // versioned session envelope. The bogus source proves the
+        // capture runs (exit 4 naming the source, like human).
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run_report_live(
@@ -484,32 +650,56 @@ mod tests {
             &mut stdout,
             &mut stderr,
         );
-        assert_eq!(code, 1);
-        let detail = String::from_utf8(stderr).expect("stderr is UTF-8");
-        assert!(
-            detail.contains("cannot export request-lifecycle rows"),
-            "gate names the refusal: {detail}"
-        );
-        assert!(stdout.is_empty(), "no capture output past the gate");
-        // Control: human + lifecycle reaches the capture (bogus
-        // source exits 4) — the gate only fires for jsonl.
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let code = run_report_live(
-            "bogus-source",
-            Some(0),
-            ReportFormat::Human,
-            None,
-            None,
-            LifecycleProfile::RequestLifecycle,
-            &mut stdout,
-            &mut stderr,
-        );
         assert_eq!(code, 4);
         let detail = String::from_utf8(stderr).expect("stderr is UTF-8");
         assert!(
             detail.contains("bogus-source"),
             "capture names the source: {detail}"
+        );
+    }
+
+    #[test]
+    fn jsonl_lifecycle_session_validates_clean() {
+        // The exported session stream validates clean under the
+        // session validator: start, both observations, coverage,
+        // receipt — with the unfinished row forcing a partial
+        // receipt (never a clean claim over unfinished work).
+        let text =
+            render_lifecycle_session(&lifecycle_fixture(), LifecycleProfile::RequestLifecycle)
+                .expect("fixture exports");
+        assert!(
+            kryprobe_report::validate_lifecycle_session(&text).is_empty(),
+            "session validates clean:\n{text}"
+        );
+        assert!(
+            text.contains("\"verdict\":\"partial\""),
+            "unfinished work forces partial:\n{text}"
+        );
+        assert!(
+            text.contains("\"unfinished\":1"),
+            "unfinished population rides the receipt:\n{text}"
+        );
+        // A non-lifecycle row in a lifecycle export refuses LOUD
+        // (exit 1 at the CLI), never a silent skip.
+        let mut mixed = lifecycle_fixture();
+        mixed
+            .observations
+            .push(json_fixture().observations[0].clone());
+        let err = render_lifecycle_session(&mixed, LifecycleProfile::RequestLifecycle)
+            .expect_err("mixed rows must refuse");
+        assert!(
+            matches!(err, kryprobe_report::ReportError::UnprojectableRow { .. }),
+            "typed refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn session_golden_pins_stream() {
+        assert_golden(
+            &golden("lifecycle_session.jsonl"),
+            render_lifecycle_session(&lifecycle_fixture(), LifecycleProfile::RequestLifecycle)
+                .expect("fixture exports")
+                .as_bytes(),
         );
     }
 
