@@ -275,19 +275,17 @@ def agg_entries(parsed: dict, family: str, op: str, result: str = AGG_OK) -> lis
 
 
 def agg_calls(parsed: dict, family: str, op: str, result: str = AGG_OK) -> int:
-    entries = agg_entries(parsed, family, op, result)
-    if not entries:
-        raise oracles.OracleError(
-            f"report has no agg row ({family}, {op}, {result})")
-    return sum(entry["calls"] for entry in entries)
+    # A missing row means zero observations (the backend omits
+    # empty rows; quiet reports aggregate empty), never an
+    # unjudgeable report: callers fail closed by comparing
+    # against expected nonzero counts.
+    return sum(entry["calls"]
+               for entry in agg_entries(parsed, family, op, result))
 
 
 def agg_bytes(parsed: dict, family: str, op: str, result: str = AGG_OK) -> int:
-    entries = agg_entries(parsed, family, op, result)
-    if not entries:
-        raise oracles.OracleError(
-            f"report has no agg row ({family}, {op}, {result})")
-    return sum(entry["bytes"] for entry in entries)
+    return sum(entry["bytes"]
+               for entry in agg_entries(parsed, family, op, result))
 
 
 def key_leak_scan(cell_dir: Path) -> list[str]:

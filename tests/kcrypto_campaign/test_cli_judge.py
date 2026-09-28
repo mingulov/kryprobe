@@ -82,9 +82,13 @@ class AggSummingTests(unittest.TestCase):
         self.assertEqual(CLI.agg_calls(parsed, "skcipher", "encrypt"), 2)
         self.assertEqual(CLI.agg_bytes(parsed, "skcipher", "encrypt"), 128)
 
-    def test_missing_row_raises(self):
-        with self.assertRaisesRegex(CLI.oracles.OracleError, "no agg row"):
-            CLI.agg_calls({"agg": {}}, "skcipher", "encrypt")
+    def test_missing_row_reads_zero(self):
+        # Absent row = zero observations (backends omit empty
+        # rows); judges fail closed against expected counts.
+        self.assertEqual(
+            CLI.agg_calls({"agg": {}}, "skcipher", "encrypt"), 0)
+        self.assertEqual(
+            CLI.agg_bytes({"agg": {}}, "skcipher", "encrypt"), 0)
 
 
 class FixtureStdoutTests(unittest.TestCase):

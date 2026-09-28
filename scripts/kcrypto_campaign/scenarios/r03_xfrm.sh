@@ -147,15 +147,21 @@ echo "recva_rc=$?" >> "$OUT/traffic-rc.txt"
 ftrace_end $FNS > "$OUT/kernel-main.txt" 2>&1 || FAIL=1
 finish_capture product-main
 
-# Auth-fail phase: receiver B's inbound SA gets a wrong AUTH key
-# (enc key unchanged): every decrypt runs, then HMAC verify fails.
+# Auth-fail phase: receiver B's inbound SA is deleted and re-added
+# with a wrong AUTH key (enc key unchanged): every decrypt runs,
+# then HMAC verify fails. Delete+add, not `state update`: update
+# returns 0 yet leaves the effective SA unchanged (attempt 5
+# delivered 100/100 with all decrypts ok).
 head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n' > "$OUT/sa-wrong.hex"
 KW=$(cat "$OUT/sa-wrong.hex")
 EAB2=$(od -A n -t x1 "$OUT/sa-ab.enc" | tr -d ' \n')
-echo "xfrm state update src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport auth hmac(sha256) 0x$KW enc cbc(aes) 0x$EAB2" \
+ip -n "$NSB" xfrm state delete src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 \
+  2>> "$OUT/netns.log" || FAIL=1
+echo "xfrm state add src 10.13.0.1 dst 10.13.0.2 proto esp spi 0x1001 mode transport auth hmac(sha256) 0x$KW enc cbc(aes) 0x$EAB2" \
   > "$OUT/batch-wrong.txt"
 chmod 600 "$OUT/batch-wrong.txt"
 ip -n "$NSB" -b "$OUT/batch-wrong.txt" 2>> "$OUT/netns.log" || FAIL=1
+if [ "$(ip -n "$NSB" xfrm state 2>/dev/null | grep -c "spi 0x")" != "2" ]; then FAIL=1; fi
 capture product-authfail 60
 ftrace_begin "$FNS" || FAIL=1
 ip netns exec "$NSB" python3 "$OUT/r03_traffic.py" recv 10.13.0.2 5003 100 "$OUT/recv-authfail.json" 15 \
