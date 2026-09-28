@@ -7,7 +7,10 @@ use kryprobe_core::evidence::{
     ValidityInterval,
 };
 use kryprobe_core::ids::ObservationId;
-use kryprobe_report::live_render::{render_lifecycle_block, render_watch_tables, trailer_dims};
+use kryprobe_report::live_render::{
+    LIFECYCLE_MAX_ROWS, render_lifecycle_block, render_lifecycle_histograms, render_watch_tables,
+    trailer_dims,
+};
 use kryprobe_report::{lifecycle_v1_payload, validate_lifecycle_v1};
 
 fn complete_dim() -> DimensionCoverage {
@@ -256,4 +259,101 @@ fn watch_tables_carry_lifecycle_sessions() {
         "lifecycle activity reported:\n{text}"
     );
     assert!(text.ends_with("COMPLETE\n"), "trailer intact:\n{text}");
+}
+
+#[test]
+fn histograms_fold_every_row_with_named_populations() {
+    // Two grounded rows (50ns, 70ns) + one unknown: the latency
+    // histogram names its population/units/bounds/counts and folds
+    // exactly the two latencies; the unknown's null duration is
+    // absent (not zero, not extrapolated); sizes stay explicit
+    // unavailable.
+    let obs = [
+        lifecycle_obs(2, "sync", serde_json::json!(0), serde_json::json!("50")),
+        lifecycle_obs(
+            1,
+            "unknown",
+            serde_json::json!(null),
+            serde_json::json!(null),
+        ),
+        lifecycle_obs(
+            3,
+            "callback",
+            serde_json::json!(-5),
+            serde_json::json!("70"),
+        ),
+    ];
+    let text = render_lifecycle_histograms(&obs);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "latency + sizes lines:\n{text}");
+    assert!(
+        lines[0].starts_with("HISTOGRAM population=terminal_latency_ns unit=ns "),
+        "named population + units: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("samples=2"),
+        "exact samples: {}",
+        lines[0]
+    );
+    assert!(lines[0].contains("unparsed=0"), "no unparsed: {}", lines[0]);
+    assert!(
+        lines[0].contains("bounds=[100, 1000, 10000, 100000, 1000000, 10000000]"),
+        "explicit bounds: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("counts=[2, 0, 0, 0, 0, 0, 0]"),
+        "both latencies in the first bucket: {}",
+        lines[0]
+    );
+    assert!(
+        !lines[0].contains("mode=sampled"),
+        "no announcement under the cap: {}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1],
+        "HISTOGRAM population=submit_bytes unit=bytes status=unavailable (no per-request sizes in lifecycle rows)"
+    );
+    // Empty renders nothing (agg sessions keep exact bytes).
+    assert_eq!(render_lifecycle_histograms(&[]), "");
+}
+
+#[test]
+fn histograms_cover_collapsed_details_and_announce_sampling() {
+    // LIFECYCLE_MAX_ROWS + 5 rows: details collapse in the block but
+    // the histogram still folds every latency, and announces the
+    // mode change.
+    let obs: Vec<NativeObservation> = (0..LIFECYCLE_MAX_ROWS + 5)
+        .map(|i| {
+            lifecycle_obs(
+                i as u64,
+                "sync",
+                serde_json::json!(0),
+                serde_json::json!("5000"),
+            )
+        })
+        .collect();
+    let block = render_lifecycle_block(&obs);
+    assert!(
+        block.contains(&format!("+{} more", 5)),
+        "details collapse:\n{block}"
+    );
+    let text = render_lifecycle_histograms(&obs);
+    assert!(
+        text.contains(&format!("samples={}", LIFECYCLE_MAX_ROWS + 5)),
+        "aggregate independent of sampled details:\n{text}"
+    );
+    assert!(
+        text.contains("mode=sampled"),
+        "mode change announced:\n{text}"
+    );
+    // And the tables carry the block ahead of the trailer.
+    let tables = render_watch_tables(&obs, &healthy_coverage());
+    assert!(
+        tables.contains("HISTOGRAM population=terminal_latency_ns"),
+        "tables publish histograms:\n{tables}"
+    );
+    assert!(tables.ends_with("COMPLETE\n"), "trailer intact");
 }

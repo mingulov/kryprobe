@@ -400,11 +400,92 @@ pub fn render_lifecycle_block(obs: &[NativeObservation]) -> String {
     text
 }
 
+/// Latency histogram bucket bounds in nanoseconds (display buckets:
+/// 100ns..10ms, overflow beyond — fixed, documented, never data-fit).
+const LATENCY_BOUNDS_NS: &[u64] = &[100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+
+/// Renders the lifecycle histogram block: the exact terminal-latency
+/// distribution over EVERY lifecycle row (the aggregate folds all
+/// rows, never just the [`LIFECYCLE_MAX_ROWS`] rendered details) plus
+/// the explicit sizes-unavailability line (frozen lifecycle rows
+/// carry no per-request sizes — unknown, never fabricated or
+/// averaged into a fake distribution).
+///
+/// Format: `HISTOGRAM population=<name> unit=<unit> samples=<n>
+/// bounds=[...] counts=[...]`, with `unparsed=<m>` when duration
+/// strings fail to parse and `mode=sampled` when the detail rows
+/// collapsed under the cap (the mode change is announced, never
+/// silent). Empty (no lifecycle rows) renders nothing, so agg
+/// sessions keep their exact existing bytes.
+#[must_use]
+pub fn render_lifecycle_histograms(obs: &[NativeObservation]) -> String {
+    let mut any = false;
+    let mut samples = 0u64;
+    let mut unparsed = 0u64;
+    let mut counts = vec![0u64; LATENCY_BOUNDS_NS.len() + 1];
+    for ob in obs {
+        let payload = &ob.backend_payload;
+        if payload.get(K::ROW).and_then(serde_json::Value::as_str) != Some("lifecycle") {
+            continue;
+        }
+        any = true;
+        match payload
+            .get(K::DURATION_NS)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse::<u64>().ok())
+        {
+            Some(value) => {
+                let bucket = LATENCY_BOUNDS_NS
+                    .iter()
+                    .position(|bound| value <= *bound)
+                    .unwrap_or(LATENCY_BOUNDS_NS.len());
+                if let Some(count) = counts.get_mut(bucket) {
+                    *count = count.saturating_add(1);
+                }
+                samples = samples.saturating_add(1);
+            }
+            None => {
+                // Unknown terminals carry null durations (no latency
+                // to fold — NOT extrapolated); anything else
+                // unparseable is counted unparsed, never dropped.
+                if payload.get(K::TERMINAL).and_then(serde_json::Value::as_str) != Some("unknown") {
+                    unparsed = unparsed.saturating_add(1);
+                }
+            }
+        }
+    }
+    if !any {
+        return String::new();
+    }
+    let mut text = format!(
+        "HISTOGRAM population=terminal_latency_ns unit=ns samples={samples} unparsed={unparsed} bounds={LATENCY_BOUNDS_NS:?} counts={counts:?}"
+    );
+    let rows = obs
+        .iter()
+        .filter(|ob| {
+            ob.backend_payload
+                .get(K::ROW)
+                .and_then(serde_json::Value::as_str)
+                == Some("lifecycle")
+        })
+        .count();
+    if rows > LIFECYCLE_MAX_ROWS {
+        text.push_str(" mode=sampled");
+    }
+    text.push('\n');
+    text.push_str(
+        "HISTOGRAM population=submit_bytes unit=bytes status=unavailable (no per-request sizes in lifecycle rows)\n",
+    );
+    text
+}
+
 /// Renders observations + coverage: header + one row per
 /// (family, op, algorithm, driver) + `TOTAL` + the WHO attribution
 /// block + the lifecycle block (request-lifecycle rows only; empty
-/// when the session captured none) + the `COMPLETE` / `PARTIAL:
-/// <dims>` trailer. Latest wins per full row key (cumulative
+/// when the session captured none) + the lifecycle histogram block
+/// (latency distribution over every row + the explicit sizes
+/// unknown; empty when the session captured none) + the `COMPLETE`
+/// / `PARTIAL: <dims>` trailer. Latest wins per full row key (cumulative
 /// snapshots), then classes/contexts sum; idents never render as rows;
 /// `TOTAL` comes from the latest totals carrier (column sums when totals
 /// are absent — the coverage trailer separately attests the gap).
@@ -468,6 +549,7 @@ pub fn render_watch_tables(
     ));
     text.push_str(&render_who_block(observations));
     text.push_str(&render_lifecycle_block(observations));
+    text.push_str(&render_lifecycle_histograms(observations));
     let dims = trailer_dims(coverage);
     if dims.is_empty() {
         text.push_str("COMPLETE\n");
