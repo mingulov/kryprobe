@@ -496,3 +496,43 @@ fn histograms_cover_collapsed_details_and_announce_sampling() {
     );
     assert!(tables.ends_with("COMPLETE\n"), "trailer intact");
 }
+
+#[test]
+fn filtered_tables_carry_exact_filter_line() {
+    // P6-N3: an active filter adds the exact FILTER line ahead of
+    // the trailer; None renders byte-identical unfiltered tables.
+    use kryprobe_report::live_render::{FilterCounts, render_watch_tables_filtered};
+    let obs = [lifecycle_obs(
+        1,
+        "sync",
+        serde_json::json!(0),
+        serde_json::json!("50"),
+    )];
+    let plain = render_watch_tables(&obs, &healthy_coverage());
+    assert!(
+        !plain.contains("FILTER admitted="),
+        "unfiltered tables carry no FILTER line:\n{plain}"
+    );
+    assert_eq!(
+        render_watch_tables_filtered(&obs, &healthy_coverage(), None),
+        plain,
+        "None is byte-identical"
+    );
+    let filtered = render_watch_tables_filtered(
+        &obs,
+        &healthy_coverage(),
+        Some(FilterCounts {
+            admitted: 1,
+            filtered: 2,
+            unknown: 3,
+        }),
+    );
+    assert!(
+        filtered.contains("FILTER admitted=1 filtered=2 unknown=3\n"),
+        "exact FILTER line:\n{filtered}"
+    );
+    assert!(
+        filtered.ends_with("FILTER admitted=1 filtered=2 unknown=3\nCOMPLETE\n"),
+        "FILTER line sits ahead of the trailer:\n{filtered}"
+    );
+}

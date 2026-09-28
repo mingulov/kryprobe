@@ -504,3 +504,29 @@ fn policy_surface_rejects_loudly() {
             .expect("empty match parses");
     assert!(rule.match_spec.is_empty());
 }
+
+#[test]
+fn filter_surface_is_discoverable_and_typed() {
+    // P6-N3: watch/report help name the three filter flags, and
+    // mistyped filter values are usage errors (exit 2 at parse —
+    // no capture runs, deterministic on every host).
+    for sub in ["watch", "report"] {
+        let (code, stdout, _) = run(&[sub, "--help"]);
+        assert_eq!(code, 0, "{sub} --help must succeed");
+        for flag in ["--filter-pid", "--filter-uid", "--filter-comm"] {
+            assert!(stdout.contains(flag), "{sub} --help names {flag}: {stdout}");
+        }
+    }
+    for argv in [
+        vec!["watch", "--system", "--filter-pid", "nope"],
+        vec!["watch", "--system", "--filter-uid", "-1"],
+        vec!["report", "--system", "--filter-uid", "x"],
+    ] {
+        let (code, _, stderr) = run(&argv);
+        assert_eq!(code, 2, "args {argv:?} must be a usage error");
+        assert!(
+            stderr.contains("invalid --filter-") || stderr.contains("needs a value"),
+            "typed filter refusal: {stderr}"
+        );
+    }
+}

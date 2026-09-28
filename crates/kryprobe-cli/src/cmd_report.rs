@@ -3,8 +3,11 @@
 //! plus `report --system`: one live capture rendered human or JSON
 //! (exit 0 complete, 3 partial, 4 unusable, 1 internal).
 
-use crate::args::ReportFormat;
+use crate::args::{FilterArgs, ReportFormat};
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use crate::request_filter::{
+    EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
+};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
 use kryprobe_report::{
@@ -132,11 +135,20 @@ fn report_window_secs(duration: Option<u64>) -> u64 {
     duration.unwrap_or(DEFAULT_REPORT_SECS)
 }
 
-/// Evidence version stamped in session-envelope starts: the producing
-/// binary + workspace version (names what produced the bytes — the
-/// CLI and report crates share one workspace version, so this is
-/// true for the binary too).
-const EVIDENCE_VERSION: &str = concat!("kryprobe/", env!("CARGO_PKG_VERSION"));
+/// Envelope filter populations (P6-N3): the session-envelope
+/// coverage record's `unknown`/`filtered` under an active filter
+/// (the CLI computes them from the filtered view; the exporter
+/// stamps them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvelopeFilter {
+    /// Unknown population: lifecycle rows with an unknown terminal
+    /// OR an unknown filter verdict (exact union — a row in both
+    /// counts once).
+    pub unknown: u64,
+    /// Filtered population: requests failing a constraint on a
+    /// known field (hidden from the rendered rows).
+    pub filtered: u64,
+}
 
 /// Renders one lifecycle outcome as a versioned session-envelope
 /// stream (T11/P6: start/config, validated observations, coverage,
@@ -146,7 +158,9 @@ const EVIDENCE_VERSION: &str = concat!("kryprobe/", env!("CARGO_PKG_VERSION"));
 /// silent skip); the coverage record carries the outcome's exact
 /// populations plus per-stage loss; the receipt is `clean` only when
 /// the window was uninterrupted, the coverage contract held, and no
-/// loss or unfinished work was counted.
+/// loss or unfinished work was counted. Without a filter the
+/// coverage `unknown` is the driver's unknown-terminal count and
+/// `filtered` is 0; under a filter both ride the envelope tallies.
 ///
 /// Serialization failure is a defect `Err` (the caller exits 1),
 /// never a panic — same contract as [`render_report_json`].
@@ -158,6 +172,7 @@ pub fn render_lifecycle_session(
         outcome,
         profile,
         &kryprobe_report::live_render::mint_live_session_id(),
+        None,
     )
 }
 
@@ -165,11 +180,14 @@ pub fn render_lifecycle_session(
 /// production path ([`render_lifecycle_session`]) mints a run-unique
 /// id per export (P6-N4); tests and goldens pin a fixed id here so
 /// the golden bytes stay deterministic while production never
-/// repeats an identity.
+/// repeats an identity. `envelope_filter` carries the filter
+/// tallies when a CLI filter is active (`None` keeps the unfiltered
+/// populations).
 pub fn render_lifecycle_session_with_id(
     outcome: &LiveOutcome,
     profile: LifecycleProfile,
     session_id: &str,
+    envelope_filter: Option<EnvelopeFilter>,
 ) -> Result<String, ReportError> {
     let totals = outcome
         .lifecycle_totals
@@ -210,17 +228,22 @@ pub fn render_lifecycle_session_with_id(
         };
         writer.observation(&projected).map_err(session)?;
     }
-    // The export carries no consumer filter (filtering happens in
-    // views): `filtered` is honestly 0, and the unknown population
-    // is the driver's own unknown-terminal count.
+    // P6-N3: without a filter the unknown population is the
+    // driver's own unknown-terminal count and `filtered` is honestly
+    // 0; under a filter both ride the envelope tallies (exact union
+    // + exact filtered-out count from the filtered view).
+    let (unknown, filtered) = match envelope_filter {
+        Some(counts) => (counts.unknown, counts.filtered),
+        None => (totals.unknown_terminals, 0),
+    };
     writer
         .coverage(
             totals.admitted,
             totals.emitted,
             totals.unfinished,
             totals.loss_stages(),
-            totals.unknown_terminals,
-            0,
+            unknown,
+            filtered,
         )
         .map_err(session)?;
     let clean = !outcome.interrupted
@@ -251,21 +274,47 @@ pub fn render_lifecycle_session_with_id(
 /// selects the envelope, never the caller); 0 when the coverage
 /// contract held, 3 on gaps, 4/1 on [`LiveError`] via
 /// [`LiveError::exit_code`], 1 when a JSONL export refuses a
-/// non-wire-spellable row.
+/// non-wire-spellable row. An active CLI filter applies
+/// post-ingestion first (P6-N3): filtered-out rows hide from every
+/// format, tallies ride coverage + the FILTER line + the envelope.
 fn finish_report_live(
     result: Result<LiveOutcome, LiveError>,
     format: ReportFormat,
     out: Option<&Path>,
+    filter: &FilterArgs,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
-    let outcome = match result {
+    let mut outcome = match result {
         Ok(outcome) => outcome,
         Err(err) => {
             let _ = writeln!(stderr, "report: {err}");
             return err.exit_code();
         }
     };
+    // P6-N3: post-ingestion filter (inactive filters skip entirely —
+    // unfiltered sessions keep their exact existing bytes).
+    let mut filter_counts = None;
+    let mut envelope_filter = None;
+    if filter.is_active() {
+        let view = apply_request_filter(
+            &outcome.observations,
+            &context_filter(filter),
+            EVIDENCE_VERSION,
+            KCRYPTO_LIFECYCLE_SESSION_V1,
+        );
+        outcome.observations = view.observations;
+        push_filter_counters(&mut outcome.coverage, &view.tally);
+        filter_counts = Some(kryprobe_report::live_render::FilterCounts {
+            admitted: view.tally.admitted,
+            filtered: view.tally.filtered_out,
+            unknown: view.tally.unknown,
+        });
+        envelope_filter = Some(EnvelopeFilter {
+            unknown: view.unknown_union,
+            filtered: view.tally.filtered_out,
+        });
+    }
     // 4B-M5: an interrupted window is partial evidence even when
     // every measured dimension held.
     if outcome.interrupted {
@@ -280,9 +329,10 @@ fn finish_report_live(
     };
     let text = match format {
         ReportFormat::Human => {
-            let mut text = kryprobe_report::live_render::render_watch_tables(
+            let mut text = kryprobe_report::live_render::render_watch_tables_filtered(
                 &outcome.observations,
                 &outcome.coverage,
+                filter_counts,
             );
             // T07-R2-09: the enrichment verdict trailers the human
             // report (same line as `watch` — one shared renderer).
@@ -302,7 +352,12 @@ fn finish_report_live(
             // + receipt); aggregate outcomes keep the frozen
             // event-v0 stream, byte-untouched.
             let text = if outcome.lifecycle_totals.is_some() {
-                render_lifecycle_session(&outcome, LifecycleProfile::RequestLifecycle)
+                render_lifecycle_session_with_id(
+                    &outcome,
+                    LifecycleProfile::RequestLifecycle,
+                    &kryprobe_report::live_render::mint_live_session_id(),
+                    envelope_filter,
+                )
             } else {
                 kryprobe_report::live_render::render_live_jsonl(
                     &outcome.observations,
@@ -347,6 +402,7 @@ pub fn run_report_live(
     out: Option<&Path>,
     token: Option<&Path>,
     profile: LifecycleProfile,
+    filter: &FilterArgs,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -372,6 +428,7 @@ pub fn run_report_live(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
         format,
         out,
+        filter,
         stdout,
         stderr,
     )
@@ -663,6 +720,7 @@ mod tests {
             None,
             None,
             LifecycleProfile::RequestLifecycle,
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -720,6 +778,7 @@ mod tests {
                 &lifecycle_fixture(),
                 LifecycleProfile::RequestLifecycle,
                 kryprobe_report::live_render::LIVE_SESSION_ID,
+                None,
             )
             .expect("fixture exports")
             .as_bytes(),
@@ -786,6 +845,7 @@ mod tests {
             Ok(json_fixture()),
             ReportFormat::Human,
             None,
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -805,6 +865,7 @@ mod tests {
             Ok(partial_fixture()),
             ReportFormat::Human,
             None,
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -821,6 +882,7 @@ mod tests {
             Ok(json_fixture()),
             ReportFormat::Json,
             None,
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -842,6 +904,7 @@ mod tests {
                     Err(err),
                     ReportFormat::Human,
                     None,
+                    &FilterArgs::default(),
                     &mut stdout,
                     &mut stderr
                 ),
@@ -866,6 +929,7 @@ mod tests {
             Ok(json_fixture()),
             ReportFormat::Json,
             Some(&file),
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -889,6 +953,7 @@ mod tests {
             Ok(json_fixture()),
             ReportFormat::Human,
             Some(&human),
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -913,6 +978,7 @@ mod tests {
             Ok(json_fixture()),
             ReportFormat::Json,
             Some(&missing),
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -934,8 +1000,14 @@ mod tests {
         for format in [ReportFormat::Human, ReportFormat::Json, ReportFormat::Jsonl] {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let code =
-                finish_report_live(Ok(outcome.clone()), format, None, &mut stdout, &mut stderr);
+            let code = finish_report_live(
+                Ok(outcome.clone()),
+                format,
+                None,
+                &FilterArgs::default(),
+                &mut stdout,
+                &mut stderr,
+            );
             assert_eq!(code, 3, "interrupted exits 3 in {format:?}");
             assert!(
                 String::from_utf8(stderr)
@@ -956,6 +1028,7 @@ mod tests {
             Ok(outcome),
             ReportFormat::Jsonl,
             None,
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -980,6 +1053,7 @@ mod tests {
             Ok(json_fixture()),
             ReportFormat::Jsonl,
             None,
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -988,5 +1062,113 @@ mod tests {
         assert_eq!(kryprobe_report::check_stream(&text, KINDS), Vec::new());
         assert!(text.contains("\"session_start\""));
         assert!(text.contains("\"session_end\""));
+    }
+
+    #[test]
+    fn finish_json_with_filter_carries_tallies_and_hides() {
+        // P6-N3: the JSON report carries the filtered view — the
+        // mismatched who row hides from observations, exact tallies
+        // ride the attribution counters. Fixture: 1 agg + 1 who (tid
+        // 4243); the stranger pid filters the who row out.
+        let filter = FilterArgs {
+            pid: Some(999),
+            uid: None,
+            comm: None,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(json_fixture()),
+            ReportFormat::Json,
+            None,
+            &filter,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        let doc: serde_json::Value =
+            serde_json::from_str(String::from_utf8(stdout).expect("utf-8").trim_end())
+                .expect("json parses");
+        let rows = doc["observations"].as_array().expect("observations");
+        assert_eq!(rows.len(), 1, "agg passes, who hides: {doc}");
+        assert_eq!(rows[0]["backend_payload"]["row"], "agg");
+        let counters = doc["coverage"]["attribution"]["counters"]
+            .as_array()
+            .expect("attribution counters");
+        let value = |name: &str| {
+            counters
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap_or_else(|| panic!("counter {name}: {counters:?}"))["value"]
+                .clone()
+        };
+        assert_eq!(value("filter_admitted"), serde_json::json!("0"));
+        assert_eq!(value("filter_filtered"), serde_json::json!("1"));
+        assert_eq!(value("filter_unknown"), serde_json::json!("0"));
+    }
+
+    #[test]
+    fn lifecycle_export_with_filter_carries_envelope_tallies() {
+        // P6-N3: under a filter the envelope coverage record rides
+        // the exact tallies (union unknown + filtered-out) instead
+        // of the unfiltered populations.
+        let text = render_lifecycle_session_with_id(
+            &lifecycle_fixture(),
+            LifecycleProfile::RequestLifecycle,
+            "session:filtered",
+            Some(EnvelopeFilter {
+                unknown: 2,
+                filtered: 1,
+            }),
+        )
+        .expect("filtered export");
+        let coverage = text
+            .lines()
+            .find(|line| line.contains("\"kind\":\"coverage\""))
+            .expect("coverage record");
+        let record: serde_json::Value = serde_json::from_str(coverage).expect("coverage parses");
+        assert_eq!(record["unknown"], 2);
+        assert_eq!(record["filtered"], 1);
+        assert!(
+            kryprobe_report::validate_lifecycle_session(&text).is_empty(),
+            "filtered export validates:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_finish_with_filter_unions_unknown() {
+        // P6-N3 end to end: the lifecycle fixture (one sync + one
+        // unknown row) under a pid filter exports unknown=2 (both
+        // verdict-unknown, one also terminal-unknown — counted once)
+        // and filtered=0, and every row still renders.
+        let filter = FilterArgs {
+            pid: Some(101),
+            uid: None,
+            comm: None,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(lifecycle_fixture()),
+            ReportFormat::Jsonl,
+            None,
+            &filter,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).expect("utf-8");
+        let observations = text
+            .lines()
+            .filter(|line| line.contains("\"kind\":\"observation\""))
+            .count();
+        assert_eq!(observations, 2, "lifecycle never gates rows:\n{text}");
+        let coverage = text
+            .lines()
+            .find(|line| line.contains("\"kind\":\"coverage\""))
+            .expect("coverage record");
+        let record: serde_json::Value = serde_json::from_str(coverage).expect("coverage parses");
+        assert_eq!(record["unknown"], 2, "exact union:\n{text}");
+        assert_eq!(record["filtered"], 0, "nothing known-mismatched:\n{text}");
     }
 }

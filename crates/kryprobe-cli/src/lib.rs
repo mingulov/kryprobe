@@ -19,6 +19,7 @@ pub mod cmd_stub;
 pub mod cmd_token;
 pub mod cmd_watch;
 pub mod live;
+pub mod request_filter;
 pub mod runtime_facts;
 pub mod selftest_bpf;
 pub mod selftest_synth;
@@ -76,7 +77,16 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             duration,
             token,
             profile,
-        } => cmd_watch::run_watch(&source, duration, token.as_deref(), profile, stdout, stderr),
+            filter,
+        } => cmd_watch::run_watch(
+            &source,
+            duration,
+            token.as_deref(),
+            profile,
+            &filter,
+            stdout,
+            stderr,
+        ),
         Command::Report { file } => cmd_report::run(&file, stdout, stderr),
         Command::ReportLive {
             source,
@@ -85,6 +95,7 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             out,
             token,
             profile,
+            filter,
         } => cmd_report::run_report_live(
             &source,
             duration,
@@ -92,6 +103,7 @@ pub fn run(argv: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i
             out.as_deref(),
             token.as_deref(),
             profile,
+            &filter,
             stdout,
             stderr,
         ),

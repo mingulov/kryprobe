@@ -12,27 +12,53 @@
 //! `kryprobe-report` (1B-H2/1B-M8); this module is dispatch + runtime
 //! facts + test fixtures.
 
+use crate::args::FilterArgs;
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use crate::request_filter::{
+    EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
+};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use std::io::Write;
 use std::path::Path;
 
 /// Finishes a capture: tables to stdout (exit 0, or 3 when the window
 /// was SIGINT-cut) or the named failure to stderr (`Unusable` → 4,
-/// `Internal` → 1 via [`LiveError::exit_code`]).
+/// `Internal` → 1 via [`LiveError::exit_code`]). An active CLI filter
+/// applies post-ingestion first (P6-N3): filtered-out rows hide,
+/// tallies ride coverage + the FILTER line.
 fn finish_watch(
     result: Result<LiveOutcome, LiveError>,
+    filter: &FilterArgs,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
     match result {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            // P6-N3: post-ingestion filter (inactive filters skip
+            // entirely — unfiltered sessions keep exact bytes).
+            let mut filter_counts = None;
+            if filter.is_active() {
+                let view = apply_request_filter(
+                    &outcome.observations,
+                    &context_filter(filter),
+                    EVIDENCE_VERSION,
+                    kryprobe_report::KCRYPTO_LIFECYCLE_SESSION_V1,
+                );
+                outcome.observations = view.observations;
+                push_filter_counters(&mut outcome.coverage, &view.tally);
+                filter_counts = Some(kryprobe_report::live_render::FilterCounts {
+                    admitted: view.tally.admitted,
+                    filtered: view.tally.filtered_out,
+                    unknown: view.tally.unknown,
+                });
+            }
             let _ = write!(
                 stdout,
                 "{}",
-                kryprobe_report::live_render::render_watch_tables(
+                kryprobe_report::live_render::render_watch_tables_filtered(
                     &outcome.observations,
-                    &outcome.coverage
+                    &outcome.coverage,
+                    filter_counts,
                 )
             );
             let _ = write!(
@@ -64,6 +90,7 @@ pub fn run_watch(
     duration: Option<u64>,
     token: Option<&Path>,
     profile: LifecycleProfile,
+    filter: &FilterArgs,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -79,6 +106,7 @@ pub fn run_watch(
     };
     finish_watch(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
+        filter,
         stdout,
         stderr,
     )
@@ -539,7 +567,12 @@ mod tests {
     fn finish_maps_outcome_and_errors() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let code = finish_watch(Ok(watch_fixture()), &mut stdout, &mut stderr);
+        let code = finish_watch(
+            Ok(watch_fixture()),
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
         assert_eq!(code, 0);
         assert!(
             String::from_utf8(stdout)
@@ -551,6 +584,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = finish_watch(
             Err(LiveError::Unusable("btf gate".to_owned())),
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -566,6 +600,7 @@ mod tests {
         let mut stderr = Vec::new();
         let code = finish_watch(
             Err(LiveError::Internal("boom".to_owned())),
+            &FilterArgs::default(),
             &mut stdout,
             &mut stderr,
         );
@@ -585,7 +620,12 @@ mod tests {
         outcome.interrupted = true;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let code = finish_watch(Ok(outcome), &mut stdout, &mut stderr);
+        let code = finish_watch(
+            Ok(outcome),
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
         assert_eq!(code, 3);
         assert!(
             String::from_utf8(stdout)
@@ -598,6 +638,56 @@ mod tests {
                 .expect("utf-8")
                 .contains("interrupted by SIGINT"),
             "interruption named"
+        );
+    }
+
+    #[test]
+    fn finish_with_pid_filter_hides_mismatch_and_tallies() {
+        // P6-N3: the production watch path applies the submitter
+        // filter post-ingestion — the mismatched who row hides, the
+        // FILTER line tallies exactly. Fixture tids: 4243 (python3)
+        // and 13 (bash).
+        let filter = FilterArgs {
+            pid: Some(4243),
+            uid: None,
+            comm: None,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_watch(Ok(watch_fixture()), &filter, &mut stdout, &mut stderr);
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).expect("utf-8");
+        assert!(
+            text.contains("FILTER admitted=1 filtered=1 unknown=0"),
+            "exact FILTER line:\n{text}"
+        );
+        assert!(text.contains("python3"), "admitted row renders:\n{text}");
+        assert!(
+            !text.contains("bash"),
+            "filtered-out row hides (comm + pcomm):\n{text}"
+        );
+    }
+
+    #[test]
+    fn finish_without_filter_renders_everything() {
+        // Inactive filter: no FILTER line, both who rows render.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_watch(
+            Ok(watch_fixture()),
+            &FilterArgs::default(),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).expect("utf-8");
+        assert!(
+            !text.contains("FILTER admitted="),
+            "no FILTER line:\n{text}"
+        );
+        assert!(
+            text.contains("python3") && text.contains("bash"),
+            "both rows:\n{text}"
         );
     }
 }

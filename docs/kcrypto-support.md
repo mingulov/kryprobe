@@ -80,11 +80,11 @@ drift, never pinned. See ADR-0006 and `docs/deployment.md`.
 
 | Surface | api-returns | request-lifecycle |
 |---|---|---|
-| Submitter context | From who rows (tgid/tid/comm/uid/cgroup/ppid/sampled stack) + userspace start-marker lifetime reads; PID reuse is a new lifetime | Explicitly unavailable (frozen edges carry no task identity; never guessed) |
-| Execution context | Process (the observed API ran in the caller's context) | `Unknown`, unless a proved handoff exists |
-| Completion context | The observed return, in process context | Follows its admitted request; landing site as observed |
-| Filters | After ingestion, per request; unknown policy explicit per filter; filtered vs unknown tallied separately | Same engine; unobserved contexts land in `Unknown` under `Exclude` |
-| Session streaming | Event-v0 JSONL (unchanged, frozen) | Versioned session envelope (`lifecycle-session/v1`) with start/observations/coverage/receipt; receiptless streams are truncated, never clean |
+| Submitter context | From who rows (tgid/tid/comm/uid/cgroup/ppid/sampled stack) + userspace start-marker lifetime reads; PID reuse is a new lifetime; CLI `--filter-pid`/`--filter-uid`/`--filter-comm` constrain it post-ingestion | Explicitly unavailable (frozen edges carry no task identity; never guessed) |
+| Execution context | Process (the observed API ran in the caller's context) | `Unknown` (no proved handoff exists on this path) |
+| Completion context | The observed return, in process context | Follows its admitted request; rows never split by filter (landing site unobserved) |
+| Filters | After ingestion, per request (`Exclude` policy from the CLI); proved mismatches hide, unevaluable rows stay visible; admitted/filtered/unknown tallied on the FILTER line + `filter_*` coverage counters | Same engine; unobserved contexts land in `Unknown` under `Exclude` and still render; tallies additionally ride the envelope coverage record (exact unknown-union + filtered) |
+| Session streaming | Event-v0 JSONL (unchanged, frozen) | Versioned session envelope (`lifecycle-session/v1`) with run-unique `session:live-*` id, start/observations/coverage/receipt; receiptless streams are truncated, never clean |
 
 ## Explicit non-goals (both profiles)
 

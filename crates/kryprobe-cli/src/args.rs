@@ -19,9 +19,9 @@ commands:
   token mint [--bin PATH] [--receipt PATH] [--force]
                                root one-shot file-cap grant + receipt (setcap)
   token status [--bin PATH]     file caps + token-pin usability (never privileged)
-  watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P]
+  watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P] [--filter-* ...]
                                continuous system-wide observe (live kcrypto)
-  report --system [--duration N] [--format human|json|jsonl] [--out F] [--source S] [--token PATH] [--kcrypto-profile P]
+  report --system [--duration N] [--format human|json|jsonl] [--out F] [--source S] [--token PATH] [--kcrypto-profile P] [--filter-* ...]
                                bounded system-wide capture + render (live kcrypto)
   report FILE                  validate + render a JSONL stream
   check --system --policy F [--duration N] [--source S] [--token PATH] [--kcrypto-profile P]
@@ -65,6 +65,30 @@ pub enum ReportFormat {
     Json,
     /// Validated event-v0 JSONL stream (session envelope records).
     Jsonl,
+}
+
+/// Post-ingestion per-request submitter filter (P6-N3):
+/// `--filter-pid`/`--filter-uid`/`--filter-comm` constrain the
+/// submitter identity AFTER capture ingestion, per request. All
+/// `None` disables filtering (every row renders, no FILTER line).
+/// Unknown policy is always `Exclude` from the CLI (unresolvable
+/// requests count `unknown`, never admitted-by-default).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterArgs {
+    /// Constrain submitter pid (exact match).
+    pub pid: Option<u32>,
+    /// Constrain submitter uid (exact match).
+    pub uid: Option<u32>,
+    /// Constrain submitter comm (exact match).
+    pub comm: Option<String>,
+}
+
+impl FilterArgs {
+    /// True when at least one constraint is set (filtering active).
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.pid.is_some() || self.uid.is_some() || self.comm.is_some()
+    }
 }
 
 /// Parsed command with merged `--json`.
@@ -132,6 +156,8 @@ pub enum Command {
         token: Option<PathBuf>,
         /// Capture profile (`api-returns` default, `request-lifecycle`).
         profile: LifecycleProfile,
+        /// Post-ingestion submitter filter (all-`None` disables).
+        filter: FilterArgs,
     },
     /// Validate + render a stream.
     Report {
@@ -154,6 +180,8 @@ pub enum Command {
         token: Option<PathBuf>,
         /// Capture profile (`api-returns` default, `request-lifecycle`).
         profile: LifecycleProfile,
+        /// Post-ingestion submitter filter (all-`None` disables).
+        filter: FilterArgs,
     },
     /// System-wide policy check (live kcrypto capture evaluated
     /// against the policy; exit 10 on confirmed violation).
@@ -361,7 +389,7 @@ exits: 0 ok; 1 internal failure; 2 usage/invalid input.
 ";
 
 const WATCH_HELP: &str = "\
-usage: kryprobe watch --system [--source kernel-crypto] [--duration N] [--token PATH] [--kcrypto-profile P]
+usage: kryprobe watch --system [--source kernel-crypto] [--duration N] [--token PATH] [--kcrypto-profile P] [--filter-pid N] [--filter-uid N] [--filter-comm S]
 
 Continuous system-wide observe (live kcrypto capture), rendered as
 aggregated human tables. --system is required (system scope only).
@@ -372,6 +400,17 @@ flags:
   --duration N           capture window in seconds (>= 1; default: until stdin closes)
   --token PATH           explicit BPF token path (overrides env + default pin)
   --kcrypto-profile P    api-returns (default) | request-lifecycle
+  --filter-pid N         admit only submitter pid N (exact; post-ingestion)
+  --filter-uid N         admit only submitter uid N (exact; post-ingestion)
+  --filter-comm S        admit only submitter comm S (exact; post-ingestion)
+
+filters (--filter-*): constrain the submitter identity AFTER capture
+ingestion, per request — capture is unfiltered, views filter. Rows
+failing a constraint hide (FILTERED OUT); rows the filter cannot
+evaluate stay visible and count UNKNOWN (lifecycle rows always:
+frozen edges carry no task identity). Tallies ride the FILTER line
+plus coverage counters (filter_admitted/filter_filtered/
+filter_unknown); an admitted completion follows its request.
 
 capture profiles (--kcrypto-profile):
   api-returns        per-API return tallies + caller contexts (default;
@@ -401,7 +440,7 @@ exits: 0 session complete (read the coverage trailer: exit 0 is NOT
 
 const REPORT_HELP: &str = "\
 usage: kryprobe report FILE
-       kryprobe report --system [--duration N] [--format human|json|jsonl] [--out F] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P]
+       kryprobe report --system [--duration N] [--format human|json|jsonl] [--out F] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P] [--filter-pid N] [--filter-uid N] [--filter-comm S]
 
 Validate + render a JSONL stream (FILE), or bounded system-wide
 capture + render (live mode needs --system; default window 60s).
@@ -414,6 +453,17 @@ flags (live mode):
   --source S             only 'kernel-crypto' in v0.1
   --token PATH           explicit BPF token path (overrides env + default pin)
   --kcrypto-profile P    api-returns (default) | request-lifecycle
+  --filter-pid N         admit only submitter pid N (exact; post-ingestion)
+  --filter-uid N         admit only submitter uid N (exact; post-ingestion)
+  --filter-comm S        admit only submitter comm S (exact; post-ingestion)
+
+filters (--filter-*): constrain the submitter identity AFTER capture
+ingestion, per request — capture is unfiltered, views filter. Rows
+failing a constraint hide (FILTERED OUT); rows the filter cannot
+evaluate stay visible and count UNKNOWN (lifecycle rows always:
+frozen edges carry no task identity). Tallies ride the FILTER line,
+coverage counters, and the session envelope; an admitted completion
+follows its request.
 
 capture profiles (--kcrypto-profile):
   api-returns        per-API return tallies + caller contexts (default;
@@ -633,6 +683,7 @@ mod tests {
                 duration: None,
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -644,6 +695,7 @@ mod tests {
                 duration: Some(60),
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -655,6 +707,7 @@ mod tests {
                 duration: None,
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         for bad in [
@@ -690,6 +743,7 @@ mod tests {
                 out: None,
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -712,6 +766,7 @@ mod tests {
                 out: Some(PathBuf::from("o.json")),
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -725,6 +780,7 @@ mod tests {
                 out: None,
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         for bad in [
@@ -993,6 +1049,7 @@ mod tests {
                 duration: None,
                 token: None,
                 profile: LifecycleProfile::RequestLifecycle,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -1002,6 +1059,7 @@ mod tests {
                 duration: None,
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -1020,6 +1078,7 @@ mod tests {
                 out: None,
                 token: None,
                 profile: LifecycleProfile::RequestLifecycle,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -1072,6 +1131,7 @@ mod tests {
                 duration: None,
                 token: Some(PathBuf::from("t")),
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -1085,6 +1145,7 @@ mod tests {
                 out: None,
                 token: Some(PathBuf::from("t")),
                 profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
             }
         );
         assert_eq!(
@@ -1234,6 +1295,87 @@ mod tests {
                     "names supported profiles: {reason}"
                 ),
                 other => panic!("args {tail:?} must be a usage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn watch_accepts_request_filter_flags() {
+        // P6-N3 RED: post-ingestion per-request submitter filters
+        // (pid/uid/comm) on the watch path.
+        assert!(matches!(
+            parse(&argv(&["watch", "--system", "--filter-pid", "123"]))
+                .unwrap()
+                .command,
+            Command::Watch {
+                filter: FilterArgs {
+                    pid: Some(123),
+                    uid: None,
+                    comm: None,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&argv(&[
+                "watch",
+                "--system",
+                "--filter-uid",
+                "1000",
+                "--filter-comm",
+                "bash"
+            ]))
+            .unwrap()
+            .command,
+            Command::Watch {
+                filter: FilterArgs {
+                    pid: None,
+                    uid: Some(1000),
+                    comm: Some(_),
+                },
+                ..
+            }
+        ));
+        for bad in [
+            vec!["watch", "--system", "--filter-pid", "nope"],
+            vec!["watch", "--system", "--filter-uid", "-1"],
+            vec!["watch", "--system", "--filter-pid"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&bad)), Err(ArgsError::Usage(_))),
+                "args {bad:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn report_live_accepts_request_filter_flags() {
+        // P6-N3 RED: the same filter surface on report --system.
+        assert!(matches!(
+            parse(&argv(&["report", "--system", "--filter-comm", "crypt"]))
+                .unwrap()
+                .command,
+            Command::ReportLive {
+                filter: FilterArgs {
+                    pid: None,
+                    uid: None,
+                    comm: Some(_),
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&argv(&["report", "--system", "--filter-uid", "x"])),
+            Err(ArgsError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn watch_and_report_help_name_filter_flags() {
+        // P6-N3 RED: the discovery path documents the filter surface.
+        for help in [WATCH_HELP, REPORT_HELP] {
+            for flag in ["--filter-pid", "--filter-uid", "--filter-comm"] {
+                assert!(help.contains(flag), "help names {flag}");
             }
         }
     }

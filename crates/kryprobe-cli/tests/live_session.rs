@@ -3337,6 +3337,7 @@ fn report_live_unwritable_out_reaches_live_handler() {
         Some(&good),
         None,
         profile,
+        &kryprobe_cli::args::FilterArgs::default(),
         &mut stdout,
         &mut stderr,
     );
@@ -3369,6 +3370,7 @@ fn report_live_unwritable_out_reaches_live_handler() {
         Some(&bad),
         None,
         profile,
+        &kryprobe_cli::args::FilterArgs::default(),
         &mut stdout,
         &mut stderr,
     );

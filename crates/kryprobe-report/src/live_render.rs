@@ -61,6 +61,21 @@ pub const WHO_MAX_ROWS: usize = 32;
 /// Lifecycle block column header: `ID TERMINAL STATUS DURATION_NS`.
 pub const LIFECYCLE_HEADER: &str = "ID TERMINAL STATUS DURATION_NS";
 
+/// Exact post-ingestion filter tally for display (P6-N3): every
+/// evaluated request lands in exactly one population. Defined here
+/// (not in the privilege crate) so the report crate renders without
+/// a privilege dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FilterCounts {
+    /// Admitted requests (rendered).
+    pub admitted: u64,
+    /// Requests failing a constraint on a known field (hidden).
+    pub filtered: u64,
+    /// Requests unresolvable under the filter's unknown policy
+    /// (rendered — filters hide only proved mismatches).
+    pub unknown: u64,
+}
+
 /// Max lifecycle request rows rendered; the rest collapse into the
 /// `+N more` trailer (the terminal-count TOTAL below always covers
 /// every row — the cap bounds text, never the counts).
@@ -540,16 +555,32 @@ pub fn render_lifecycle_histograms(obs: &[NativeObservation]) -> String {
 /// (family, op, algorithm, driver) + `TOTAL` + the WHO attribution
 /// block + the lifecycle block (request-lifecycle rows only; empty
 /// when the session captured none) + the lifecycle histogram block
-/// (latency distribution over every row + the explicit sizes
-/// unknown; empty when the session captured none) + the `COMPLETE`
-/// / `PARTIAL: <dims>` trailer. Latest wins per full row key (cumulative
-/// snapshots), then classes/contexts sum; idents never render as rows;
-/// `TOTAL` comes from the latest totals carrier (column sums when totals
-/// are absent — the coverage trailer separately attests the gap).
+/// (latency + size distributions over every row; empty when the
+/// session captured none) + the `COMPLETE` / `PARTIAL: <dims>`
+/// trailer. Latest wins per full row key (cumulative snapshots),
+/// then classes/contexts sum; idents never render as rows; `TOTAL`
+/// comes from the latest totals carrier (column sums when totals are
+/// absent — the coverage trailer separately attests the gap). No
+/// filter line (unfiltered sessions keep their exact bytes — use
+/// [`render_watch_tables_filtered`] for filtered views).
 #[must_use]
 pub fn render_watch_tables(
     observations: &[NativeObservation],
     coverage: &CoverageSummary,
+) -> String {
+    render_watch_tables_filtered(observations, coverage, None)
+}
+
+/// Filtered watch tables (P6-N3): the same tables over the admitted
+/// observations, plus the exact `FILTER
+/// admitted=N filtered=M unknown=K` line ahead of the trailer when
+/// `filter` is `Some` (an active CLI filter). `None` renders the
+/// unfiltered tables byte-identically.
+#[must_use]
+pub fn render_watch_tables_filtered(
+    observations: &[NativeObservation],
+    coverage: &CoverageSummary,
+    filter: Option<FilterCounts>,
 ) -> String {
     // M4: one projection pass builds the agg latest-map AND the
     // totals slot (last totals in vec order wins — the `rev().find`
@@ -607,6 +638,12 @@ pub fn render_watch_tables(
     text.push_str(&render_who_block(observations));
     text.push_str(&render_lifecycle_block(observations));
     text.push_str(&render_lifecycle_histograms(observations));
+    if let Some(counts) = filter {
+        text.push_str(&format!(
+            "FILTER admitted={} filtered={} unknown={}\n",
+            counts.admitted, counts.filtered, counts.unknown
+        ));
+    }
     let dims = trailer_dims(coverage);
     if dims.is_empty() {
         text.push_str("COMPLETE\n");

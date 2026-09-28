@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Subcommand grammars: inspect, selftest, report, watch, check.
 
-use crate::args::{ArgsError, Command, ReportFormat, usage};
+use crate::args::{ArgsError, Command, FilterArgs, ReportFormat, usage};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use std::path::PathBuf;
 
@@ -185,6 +185,16 @@ fn parse_profile(value: &str, what: &str) -> Result<LifecycleProfile, ArgsError>
     })
 }
 
+/// Submitter id constraint (exact u32 — pid or uid); unparseable is
+/// a usage error (no silent default, no truncation).
+fn parse_filter_id(value: &str, flag: &str, what: &str) -> Result<u32, ArgsError> {
+    value.parse::<u32>().map_err(|_| {
+        usage(format!(
+            "{what}: invalid {flag} '{value}' (exact unsigned id)"
+        ))
+    })
+}
+
 /// `watch --system [--source S] [--duration N] [--token PATH]`:
 /// continuous system-wide observe. `--system` is required (select-all
 /// is the only v0.1 scope).
@@ -194,6 +204,7 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     let mut duration = None;
     let mut token = None;
     let mut profile = LifecycleProfile::default();
+    let mut filter = FilterArgs::default();
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -221,6 +232,21 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
                 profile = parse_profile(value, "watch")?;
                 rest = next;
             }
+            "--filter-pid" => {
+                let (value, next) = take_value(tail, "--filter-pid", "watch")?;
+                filter.pid = Some(parse_filter_id(value, "--filter-pid", "watch")?);
+                rest = next;
+            }
+            "--filter-uid" => {
+                let (value, next) = take_value(tail, "--filter-uid", "watch")?;
+                filter.uid = Some(parse_filter_id(value, "--filter-uid", "watch")?);
+                rest = next;
+            }
+            "--filter-comm" => {
+                let (value, next) = take_value(tail, "--filter-comm", "watch")?;
+                filter.comm = Some(value.to_owned());
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("watch", other)),
             other => return Err(usage(format!("watch: unexpected '{other}'"))),
         }
@@ -233,6 +259,7 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
         duration,
         token,
         profile,
+        filter,
     })
 }
 
@@ -246,6 +273,7 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     let mut out = None;
     let mut token = None;
     let mut profile = LifecycleProfile::default();
+    let mut filter = FilterArgs::default();
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -292,6 +320,21 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
                 profile = parse_profile(value, "report")?;
                 rest = next;
             }
+            "--filter-pid" => {
+                let (value, next) = take_value(tail, "--filter-pid", "report")?;
+                filter.pid = Some(parse_filter_id(value, "--filter-pid", "report")?);
+                rest = next;
+            }
+            "--filter-uid" => {
+                let (value, next) = take_value(tail, "--filter-uid", "report")?;
+                filter.uid = Some(parse_filter_id(value, "--filter-uid", "report")?);
+                rest = next;
+            }
+            "--filter-comm" => {
+                let (value, next) = take_value(tail, "--filter-comm", "report")?;
+                filter.comm = Some(value.to_owned());
+                rest = next;
+            }
             other if is_deferred_selector(other) => return Err(deferred("report", other)),
             other => return Err(usage(format!("report: unexpected '{other}'"))),
         }
@@ -308,6 +351,7 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
         out,
         token,
         profile,
+        filter,
     })
 }
 
