@@ -44,10 +44,11 @@ kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
 kryprobe token mint [--bin PATH] [--receipt PATH] [--force]
 kryprobe token status [--bin PATH]
-kryprobe watch --system [--source S] [--duration N] [--token PATH]
-kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH]
+kryprobe watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P]
+kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH] [--kcrypto-profile P]
 kryprobe report FILE
-kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH]
+kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH] [--kcrypto-profile P]
+kryprobe <command> --help   # per-command help with examples (exit 0)
 kryprobe plan|observe|run ...   # honest stub: exits 4, see below
 ```
 
@@ -74,6 +75,10 @@ capture (human, `json`, or validated event-v0 `jsonl`); `check`
 evaluates one capture against an explicit policy file.
 `--token PATH` overrides token discovery on all three
 (see `docs/commands.md` and `docs/deployment.md`).
+`--kcrypto-profile` selects `api-returns` (default, kernel 6.12+)
+or `request-lifecycle` (per-request lifecycles, needs kernel 7.0+);
+the profile × family × boundary × provider × kernel table lives in
+`docs/kcrypto-support.md`.
 
 ## Exit codes
 

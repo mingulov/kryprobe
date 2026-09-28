@@ -117,7 +117,8 @@ needs kernel 7.0+ (fsession attach, type 58 — see ADR-0006);
 pre-7.0 kernels refuse it typed (`Unsupported`, never a silent
 no-op). The authoritative gate is the runtime probe matrix
 (`doctor`), not the release string — deploy on what `doctor`
-passes, not on what `uname` prints.
+passes, not on what `uname` prints. The full profile × family ×
+boundary × provider × kernel table is `docs/kcrypto-support.md`.
 
 ## Privileged qualification
 
