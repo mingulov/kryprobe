@@ -199,5 +199,50 @@ class ExpectedFilesProducibleTests(unittest.TestCase):
                     f"(captures: {sorted(captured)})")
 
 
+class StimulusIdenticalTests(unittest.TestCase):
+    def _cell(self, tmp, ft, prod):
+        cell = Path(tmp)
+        (cell / "ft.json").write_text(ft)
+        (cell / "p.json").write_text(prod)
+        return cell
+
+    def test_identical_passes(self):
+        import tempfile
+        body = '{"write_sha256": "aa", "bytes_written": 64}'
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = self._cell(tmp, body, body)
+            self.assertTrue(CLI.stimulus_identical(
+                cell, "ft.json", "p.json", "write_sha256", "bytes_written"))
+
+    def test_sha_mismatch_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = self._cell(
+                tmp,
+                '{"write_sha256": "aa", "bytes_written": 64}',
+                '{"write_sha256": "bb", "bytes_written": 64}')
+            self.assertFalse(CLI.stimulus_identical(
+                cell, "ft.json", "p.json", "write_sha256", "bytes_written"))
+
+    def test_bytes_mismatch_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = self._cell(
+                tmp,
+                '{"write_sha256": "aa", "bytes_written": 64}',
+                '{"write_sha256": "aa", "bytes_written": 32}')
+            self.assertFalse(CLI.stimulus_identical(
+                cell, "ft.json", "p.json", "write_sha256", "bytes_written"))
+
+    def test_missing_file_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = Path(tmp)
+            (cell / "ft.json").write_text(
+                '{"write_sha256": "aa", "bytes_written": 64}')
+            self.assertFalse(CLI.stimulus_identical(
+                cell, "ft.json", "p.json", "write_sha256", "bytes_written"))
+
+
 if __name__ == "__main__":
     unittest.main()

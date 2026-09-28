@@ -706,6 +706,21 @@ def judge_r01_floor(oracle_spec, cell_dir):
     return checks, detail, expected_body, actual_body
 
 
+def stimulus_identical(cell_dir: Path, ft_name: str, p_name: str,
+                       sha_key: str, bytes_key: str) -> bool:
+    """Split-leg stimulus identity: the ftrace-only and product-only
+    sub-legs moved the same bytes with the same checksum."""
+    try:
+        ft = json.loads((cell_dir / ft_name).read_text())
+        prod = json.loads((cell_dir / p_name).read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    return (ft.get(sha_key) == prod.get(sha_key)
+            and ft.get(sha_key) is not None
+            and ft.get(bytes_key) == prod.get(bytes_key)
+            and (ft.get(bytes_key) or 0) > 0)
+
+
 def judge_r02(oracle_spec, cell_dir):
     workload = json.loads((cell_dir / "workload.json").read_text())
     kernel = json.loads((cell_dir / "kernel-ref.json").read_text())["windows"]
@@ -738,6 +753,12 @@ def judge_r02(oracle_spec, cell_dir):
         quiet(parsed_qb, kernel["quiet-before"]),
         quiet(parsed_qa, kernel["quiet-after"]))
     checks["wrongkey_mismatch"] = workload.get("wrongkey_checksum_mismatch") is True
+    checks["stimulus_write_identical"] = stimulus_identical(
+        cell_dir, "leg-write-ftrace.json", "leg-write.json",
+        "write_sha256", "bytes_written")
+    checks["stimulus_read_identical"] = stimulus_identical(
+        cell_dir, "leg-read-ftrace.json", "leg-read.json",
+        "read_sha256", "bytes_read")
     checks["transport_closed"] = transport_closed(
         parsed_write, parsed_read, parsed_qb, parsed_qa)
     detail["kernel_method"] = json.loads(

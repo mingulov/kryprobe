@@ -1,11 +1,16 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # T13 R02 dm-crypt guest cell: owned 1 GiB sparse file -> loop ->
-# aes-xts-plain64 mapping; 64 MiB in 4 KiB blocks each direction
-# with checksums under product captures + ftrace windows; quiet
-# windows before/after; wrong-key leg on the same owned mapping.
-# No key material in argv, traces or receipts (key file only,
-# shredded; tables redacted). $1 = staged out dir.
+# aes-xts-plain64 mapping; split legs per direction (ftrace-only
+# reference + product-only observation of the identical 64 MiB
+# O_DIRECT stimulus on disjoint regions, checksums proving
+# stimulus identity); quiet windows before/after; wrong-key leg
+# on the same owned mapping. Split because co-running the
+# ftrace profiler and the product fexit on crypto_skcipher_encrypt
+# loses 0-24% of completions above ~32K calls with no loss
+# signal (attempts 2/3/5; medium probe). No key material in
+# argv, traces or receipts (key file only, shredded; tables
+# redacted). $1 = staged out dir.
 set -u
 OUT="$1"
 . "$OUT/pins.env"
@@ -98,33 +103,47 @@ sleep 3
 ftrace_end $FNS > "$OUT/kernel-quiet-before.txt" 2>&1 || FAIL=1
 finish_capture product-quiet-before
 
-# Write leg. Closing the mapping after writes emits a kernel
-# `change` uevent EVERY time (not one-shot), and the ensuing
-# udev blkid probe (1304 decrypts) lands inside the 120 s
-# capture tail; settle cannot help because the event fires at
-# workload end. Freeze the udev exec queue for the leg: the
-# event queues but is processed only after the window closes
-# (delayed, never suppressed), then settle before the next leg.
-udevadm control --stop-exec-queue 2>> "$OUT/loop.log" || FAIL=1
-capture product-write 120
+# Write/ftrace leg: kernel reference only (region @0).
 ftrace_begin "$FNS" || FAIL=1
-python3 "$OUT/r02_io.py" write "/dev/mapper/$MAP" "$OUT/leg-write.json" \
-  > "$OUT/io-write.log" 2>&1 || FAIL=1
+python3 "$OUT/r02_io.py" write "/dev/mapper/$MAP" "$OUT/leg-write-ftrace.json" 0 \
+  > "$OUT/io-write-ftrace.log" 2>&1 || FAIL=1
 # shellcheck disable=SC2034
 ftrace_end $FNS > "$OUT/kernel-write.txt" 2>&1 || FAIL=1
+# Drain the close-change udev probe before the measured leg.
+udevadm settle --timeout=120 2>> "$OUT/loop.log" || FAIL=1
+
+# Write/product leg (region @64MiB). Closing the mapping after
+# writes emits a kernel `change` uevent EVERY time (not
+# one-shot), and the ensuing udev blkid probe (1304 decrypts)
+# lands inside the 120 s capture tail; settle cannot help
+# because the event fires at workload end. Freeze the udev exec
+# queue for the leg: the event queues but is processed only
+# after the window closes (delayed, never suppressed), then
+# settle before the next leg.
+udevadm control --stop-exec-queue 2>> "$OUT/loop.log" || FAIL=1
+capture product-write 120
+python3 "$OUT/r02_io.py" write "/dev/mapper/$MAP" "$OUT/leg-write.json" 67108864 \
+  > "$OUT/io-write.log" 2>&1 || FAIL=1
 finish_capture product-write
 udevadm control --start-exec-queue 2>> "$OUT/loop.log" || FAIL=1
 udevadm settle --timeout=120 2>> "$OUT/loop.log" || FAIL=1
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
 
-# Read leg.
-capture product-read 120
+# Read/ftrace leg: kernel reference only (region @0).
 ftrace_begin "$FNS" || FAIL=1
-WRITE_SHA=$(python3 -c "import json; print(json.load(open('$OUT/leg-write.json'))['write_sha256'])")
-python3 "$OUT/r02_io.py" read "/dev/mapper/$MAP" "$OUT/leg-read.json" "$WRITE_SHA" \
-  > "$OUT/io-read.log" 2>&1 || FAIL=1
+WRITE_SHA_FT=$(python3 -c "import json; print(json.load(open('$OUT/leg-write-ftrace.json'))['write_sha256'])")
+python3 "$OUT/r02_io.py" read "/dev/mapper/$MAP" "$OUT/leg-read-ftrace.json" "$WRITE_SHA_FT" 0 \
+  > "$OUT/io-read-ftrace.log" 2>&1 || FAIL=1
 # shellcheck disable=SC2034
 ftrace_end $FNS > "$OUT/kernel-read.txt" 2>&1 || FAIL=1
+udevadm settle --timeout=120 2>> "$OUT/loop.log" || FAIL=1
+
+# Read/product leg (region @64MiB; close-after-read emits no
+# change uevent, so no freeze: proven by attempts 3-5).
+capture product-read 120
+WRITE_SHA=$(python3 -c "import json; print(json.load(open('$OUT/leg-write.json'))['write_sha256'])")
+python3 "$OUT/r02_io.py" read "/dev/mapper/$MAP" "$OUT/leg-read.json" "$WRITE_SHA" 67108864 \
+  > "$OUT/io-read.log" 2>&1 || FAIL=1
 finish_capture product-read
 
 # Wrong-key leg on the same owned mapping (expect checksum mismatch).

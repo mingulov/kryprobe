@@ -14,10 +14,14 @@ short-counts (R02-7014 attempts 2-3), and buffered reads add
 (attempt 4).
 
 Usage:
-  r02_io.py write /dev/mapper/<name> <out.json>
-  r02_io.py read /dev/mapper/<name> <out.json> <expected-sha256>
+  r02_io.py write /dev/mapper/<name> <out.json> [offset]
+  r02_io.py read /dev/mapper/<name> <out.json> <expected-sha256> [offset]
   r02_io.py wrongkey-read /dev/mapper/<name> <expected-sha256>
     (exits 0 with MISMATCH printed iff the checksum differs)
+
+The optional byte offset (default 0, must be 4 KiB aligned)
+selects the 64 MiB region: split legs run the identical
+stimulus on disjoint regions (attempt 6).
 
 Writes one JSON leg file per invocation; the caller merges legs
 into workload.json. Never prints key material (there is none
@@ -57,13 +61,17 @@ def aligned_block() -> mmap.mmap:
     return buf
 
 
-def cmd_write(dev: str, out_path: str) -> int:
+def cmd_write(dev: str, out_path: str, offset: int = 0) -> int:
+    if offset % BLOCK != 0:
+        print(f"offset {offset} not 4 KiB aligned", file=sys.stderr)
+        return 2
     data = pattern(TOTAL_BYTES)
     digest = hashlib.sha256(data).hexdigest()
     written = 0
     burst = 0
     buf = aligned_block()
     fd = os.open(dev, os.O_WRONLY | os.O_DIRECT)
+    os.lseek(fd, offset, os.SEEK_SET)
     try:
         for offset in range(0, TOTAL_BYTES, BLOCK):
             buf.seek(0)
@@ -90,7 +98,10 @@ def cmd_write(dev: str, out_path: str) -> int:
     return 0
 
 
-def cmd_read(dev: str, out_path: str, expected: str) -> int:
+def cmd_read(dev: str, out_path: str, expected: str, offset: int = 0) -> int:
+    if offset % BLOCK != 0:
+        print(f"offset {offset} not 4 KiB aligned", file=sys.stderr)
+        return 2
     seen = hashlib.sha256()
     read = 0
     burst = 0
@@ -99,6 +110,7 @@ def cmd_read(dev: str, out_path: str, expected: str) -> int:
     # 64 MiB: stop after exactly TOTAL_BYTES.
     buf = aligned_block()
     fd = os.open(dev, os.O_RDONLY | os.O_DIRECT)
+    os.lseek(fd, offset, os.SEEK_SET)
     try:
         while read < TOTAL_BYTES:
             buf.seek(0)
@@ -143,10 +155,12 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print("usage: r02_io.py write|read|wrongkey-read ...", file=sys.stderr)
         return 2
-    if argv[1] == "write" and len(argv) == 4:
-        return cmd_write(argv[2], argv[3])
-    if argv[1] == "read" and len(argv) == 5:
-        return cmd_read(argv[2], argv[3], argv[4])
+    if argv[1] == "write" and len(argv) in (4, 5):
+        offset = int(argv[4]) if len(argv) == 5 else 0
+        return cmd_write(argv[2], argv[3], offset)
+    if argv[1] == "read" and len(argv) in (5, 6):
+        offset = int(argv[5]) if len(argv) == 6 else 0
+        return cmd_read(argv[2], argv[3], argv[4], offset)
     if argv[1] == "wrongkey-read" and len(argv) == 4:
         return cmd_wrongkey_read(argv[2], argv[3])
     print("usage: r02_io.py write|read|wrongkey-read ...", file=sys.stderr)
