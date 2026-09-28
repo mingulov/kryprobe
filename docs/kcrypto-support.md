@@ -91,7 +91,11 @@ drift, never pinned. See ADR-0006 and `docs/deployment.md`.
 - Keys, IVs, plaintext/ciphertext, AAD/tag bytes, digest outputs, RNG
   output, scatterlist contents, callback private data, raw kernel
   pointers — never read, stored, or emitted (NEVER list in
-  `docs/kcrypto-capture-allowlist.md`).
+  `docs/kcrypto-capture-allowlist.md`). Exception: first-seen
+  kernel-stack IPs ride the allowlisted api-returns `stack.frames`
+  path only (`docs/kcrypto-capture-allowlist.md`, `observe.rs`
+  `observation_for_who`) — sampled attribution frames, never raw
+  pairing pointers.
 - Softirq attribution: no stable in-BPF detector (api-returns `ctx`
   never writes `SOFTIRQ`; softirq execution never names a user origin).
 - Per-request caller identity under request-lifecycle (BPF frozen
