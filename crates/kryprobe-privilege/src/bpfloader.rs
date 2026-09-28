@@ -273,8 +273,12 @@ pub enum LoaderError {
     },
     /// Record buffer violates the 8-alignment precondition.
     MisalignedRecord {
-        /// Offending buffer address.
-        addr: usize,
+        /// Misalignment residue (`addr % 8`, nonzero by
+        /// construction): the same diagnostic value as the
+        /// address, without carrying a pointer through the
+        /// error (P7/T12 sol04 — no raw pointers in
+        /// errors/debug/logs, even for rejected data).
+        misalign: usize,
     },
     /// Pin name refused by the dot-free gate (R3): bpffs refuses dotted
     /// names with EPERM, so the loader rejects them typed, before any
@@ -303,8 +307,11 @@ impl std::fmt::Display for LoaderError {
             Self::LoadFailed { stage, errno, log } => {
                 write!(f, "prog load failed at {stage}: errno {errno}: {log}")
             }
-            Self::MisalignedRecord { addr } => {
-                write!(f, "record buffer {addr:#x} violates 8-alignment")
+            Self::MisalignedRecord { misalign } => {
+                write!(
+                    f,
+                    "record buffer misaligned by {misalign} (violates 8-alignment)"
+                )
             }
             Self::BadPinName { name } => {
                 write!(
@@ -500,6 +507,6 @@ pub fn check_record_align(bytes: &[u8]) -> Result<(), LoaderError> {
     if addr.is_multiple_of(8) {
         Ok(())
     } else {
-        Err(LoaderError::MisalignedRecord { addr })
+        Err(LoaderError::MisalignedRecord { misalign: addr % 8 })
     }
 }

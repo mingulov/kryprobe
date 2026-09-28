@@ -16,6 +16,7 @@ use kryprobe_core::kcrypto::{
     CallbackDisposition, Edge, LifecycleFamily, LifecycleReducer, OpDirection, RequestMeta,
     ReturnDisposition, Terminal,
 };
+use kryprobe_privilege::bpfloader::{LoaderError, check_record_align};
 use kryprobe_privilege::drain::DrainStats;
 use kryprobe_privilege::kcrypto_context::Histogram;
 use kryprobe_privilege::kcrypto_lifecycle::decode::{DecodeDrop, decode_record};
@@ -513,4 +514,41 @@ fn sol04_rejected_record_markers_found_by_scan() {
         .ledger([0; 5], [0; 22], Vec::new(), ctx())
         .expect("empty miss join");
     assert_eq!(ledger.decode.bad_records, 1, "refused, counted");
+}
+
+/// sol04 — no pointers through errors: a misaligned record buffer
+/// refuses with the misalignment RESIDUE (`addr % 8`, nonzero by
+/// construction — the same diagnostic value), never the buffer
+/// address. Both `Display` and `Debug` render address-free (no
+/// `0x` hex anywhere).
+#[test]
+fn sol04_misaligned_record_error_carries_no_address() {
+    // Guaranteed-aligned control (a plain `[u8; 64]` is only
+    // 1-aligned — stack luck, not a control).
+    #[repr(align(8))]
+    struct Aligned([u8; 64]);
+    let aligned = Aligned([0u8; 64]);
+    assert_eq!(aligned.0.as_ptr() as usize % 8, 0, "control aligned");
+    assert!(check_record_align(&aligned.0).is_ok(), "aligned passes");
+    // A misaligned offset always exists among 8 consecutive
+    // addresses (exactly one is 8-aligned) — no ASLR luck.
+    let base = aligned.0.as_ptr() as usize;
+    let off = (1..=8)
+        .find(|o| (base + o) % 8 != 0)
+        .expect("a misaligned offset exists");
+    let bytes = &aligned.0[off..];
+    let residue = bytes.as_ptr() as usize % 8;
+    assert_ne!(residue, 0, "residue nonzero by construction");
+    let err = check_record_align(bytes).expect_err("misaligned refuses");
+    assert_eq!(
+        err,
+        LoaderError::MisalignedRecord { misalign: residue },
+        "residue-only refusal"
+    );
+    for rendered in [format!("{err}"), format!("{err:?}")] {
+        assert!(
+            !rendered.contains("0x"),
+            "no address renders through errors: {rendered}"
+        );
+    }
 }
