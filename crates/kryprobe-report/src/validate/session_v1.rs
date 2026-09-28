@@ -19,6 +19,7 @@ use crate::validate::MAX_VALIDATE_LINE_BYTES;
 use crate::validate::lifecycle_v1::validate_lifecycle_v1;
 use crate::{KCRYPTO_CONTEXT_V1, KCRYPTO_LIFECYCLE_SESSION_V1};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Closed record-kind vocabulary.
 const KINDS: &[&str] = &[
@@ -136,6 +137,12 @@ pub enum SessionFinding {
         /// 1-based physical line number of the repeat receipt.
         line: usize,
     },
+    /// More than one `session_start` exists (honest producers emit
+    /// exactly one — a second start is a splice/corruption marker).
+    DuplicateStart {
+        /// 1-based physical line number of the repeat start.
+        line: usize,
+    },
     /// Individually well-shaped fields contradict each other (a clean
     /// verdict over loss, unfinished work, or a truncated flag).
     InvalidCombination {
@@ -194,6 +201,7 @@ impl std::fmt::Display for SessionFinding {
                 write!(f, "line {line}: receipt is not the last record")
             }
             Self::DuplicateReceipt { line } => write!(f, "line {line}: duplicate receipt"),
+            Self::DuplicateStart { line } => write!(f, "line {line}: duplicate session_start"),
             Self::InvalidCombination { line, detail } => {
                 write!(f, "line {line}: invalid combination ({detail})")
             }
@@ -258,6 +266,11 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
     let mut want_seq: u64 = 1;
     let mut receipt_line: Option<usize> = None;
     let mut receipt_count: usize = 0;
+    // P6-N1 whole-stream state: start uniqueness + receipt loss vs
+    // every coverage loss (monotonicity checked after the loop).
+    let mut start_count: usize = 0;
+    let mut coverage_losses: Vec<(usize, BTreeMap<String, u64>)> = Vec::new();
+    let mut receipt_loss: Option<BTreeMap<String, u64>> = None;
     for (index, line) in lines.iter().enumerate() {
         let no = index + 1;
         if line.len() > MAX_VALIDATE_LINE_BYTES {
@@ -362,6 +375,12 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
         }
         match kind {
             "session_start" => {
+                // P6-N1: honest producers emit exactly one start.
+                start_count += 1;
+                if start_count > 1 {
+                    out.push(SessionFinding::DuplicateStart { line: no });
+                    continue;
+                }
                 // The envelope validates observations against payload-v1
                 // and nothing else: a start record declaring any other
                 // payload schema contradicts the envelope's own check.
@@ -408,10 +427,16 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
                     continue;
                 }
                 receipt_line = Some(no);
-                check_receipt(obj, no, &mut out);
+                receipt_loss = check_receipt(obj, no, &mut out);
             }
             "coverage" => {
                 check_counts(obj, no, &mut out);
+                // P6-N1: keep well-shaped coverage loss maps for the
+                // receipt-monotonicity check (misshapen maps already
+                // reported above — never double-counted).
+                if let Some(map) = loss_map_of(obj) {
+                    coverage_losses.push((no, map));
+                }
             }
             _ => {}
         }
@@ -420,6 +445,23 @@ pub fn validate_lifecycle_session(text: &str) -> Vec<SessionFinding> {
         None => out.push(SessionFinding::MissingReceipt),
         Some(line) if line != lines.len() => out.push(SessionFinding::ReceiptNotLast { line }),
         Some(_) => {}
+    }
+    // P6-N1: receipt per-stage loss covers EVERY coverage per-stage
+    // loss (the honest producer emits identical maps from the same
+    // totals — a receipt below any coverage stage contradicts it).
+    // Input-free: stage names and counts never echo.
+    if let (Some(line), Some(receipt)) = (receipt_line, receipt_loss.as_ref()) {
+        for (_, coverage) in &coverage_losses {
+            let covered = coverage
+                .iter()
+                .all(|(stage, count)| receipt.get(stage).unwrap_or(&0) >= count);
+            if !covered {
+                out.push(SessionFinding::InvalidCombination {
+                    line,
+                    detail: "receipt loss below coverage loss".to_owned(),
+                });
+            }
+        }
     }
     out
 }
@@ -673,21 +715,39 @@ fn check_counts(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Vec
 }
 
 /// `loss` must be an object with u64 values (stage names are producer
-/// vocabulary — validated for shape, never echoed).
-fn check_loss_map(obj: &serde_json::Map<String, Value>) -> Option<u64> {
+/// vocabulary — validated for shape, never echoed). Returns the map
+/// itself (P6-N1 monotonicity compares per-stage counts).
+fn loss_map_of(obj: &serde_json::Map<String, Value>) -> Option<BTreeMap<String, u64>> {
     let loss = obj.get("loss")?;
     let map = loss.as_object()?;
-    let mut total: u64 = 0;
-    for value in map.values() {
-        total = total.saturating_add(value.as_u64()?);
+    let mut stages = BTreeMap::new();
+    for (stage, value) in map {
+        stages.insert(stage.clone(), value.as_u64()?);
     }
-    Some(total)
+    Some(stages)
+}
+
+/// `loss` total (saturating — an overflowed total reads huge, never
+/// wraps to a clean-looking zero).
+fn check_loss_map(obj: &serde_json::Map<String, Value>) -> Option<u64> {
+    loss_map_of(obj).map(|map| {
+        map.values()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    })
 }
 
 /// Receipt shapes + combinations: closed verdict, u64 counters, bool
-/// truncated flag, and the clean-verdict rules (no truncation, zero
-/// loss, no unfinished work).
-fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Vec<SessionFinding>) {
+/// truncated flag, the reducer equation (P6-N1: post-finish
+/// `admitted == emitted` exactly and `unfinished <= emitted` — the
+/// reducer drains all pending at finish and the live path runs
+/// `finish_stop` before `from_ledger`), and the clean-verdict rules
+/// (no truncation, zero loss, no unfinished work). Returns the loss
+/// map when the receipt is well-shaped (for monotonicity).
+fn check_receipt(
+    obj: &serde_json::Map<String, Value>,
+    line: usize,
+    out: &mut Vec<SessionFinding>,
+) -> Option<BTreeMap<String, u64>> {
     let verdict = match obj.get("verdict").and_then(Value::as_str) {
         Some(verdict) if VERDICTS.contains(&verdict) => verdict,
         _ => {
@@ -696,7 +756,7 @@ fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Ve
                 key: "verdict".to_owned(),
                 expected: "clean|partial|truncated".to_owned(),
             });
-            return;
+            return None;
         }
     };
     for key in ["admitted", "emitted", "unfinished"] {
@@ -706,20 +766,41 @@ fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Ve
                 key: key.to_owned(),
                 expected: "u64".to_owned(),
             });
-            return;
+            return None;
         }
     }
-    let loss_total = match check_loss_map(obj) {
-        Some(total) => total,
+    let admitted = obj.get("admitted").and_then(Value::as_u64).unwrap_or(0);
+    let emitted = obj.get("emitted").and_then(Value::as_u64).unwrap_or(0);
+    let unfinished = obj.get("unfinished").and_then(Value::as_u64).unwrap_or(0);
+    // The equation holds on EVERY verdict (it is reducer math, not a
+    // cleanliness claim): post-finish admitted == emitted exactly,
+    // and unfinished (finish-drained truthless) stays within emitted.
+    if admitted != emitted {
+        out.push(SessionFinding::InvalidCombination {
+            line,
+            detail: "receipt admitted != emitted".to_owned(),
+        });
+    }
+    if unfinished > emitted {
+        out.push(SessionFinding::InvalidCombination {
+            line,
+            detail: "receipt unfinished above emitted".to_owned(),
+        });
+    }
+    let loss_map = match loss_map_of(obj) {
+        Some(map) => map,
         None => {
             out.push(SessionFinding::BadShape {
                 line,
                 key: "loss".to_owned(),
                 expected: "stage->u64 map".to_owned(),
             });
-            return;
+            return None;
         }
     };
+    let loss_total: u64 = loss_map
+        .values()
+        .fold(0u64, |total, count| total.saturating_add(*count));
     let truncated = match obj.get("truncated").and_then(Value::as_bool) {
         Some(flag) => flag,
         None => {
@@ -728,7 +809,7 @@ fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Ve
                 key: "truncated".to_owned(),
                 expected: "bool".to_owned(),
             });
-            return;
+            return None;
         }
     };
     if verdict == "clean" {
@@ -757,6 +838,7 @@ fn check_receipt(obj: &serde_json::Map<String, Value>, line: usize, out: &mut Ve
             detail: "truncated verdict over truncated=false".to_owned(),
         });
     }
+    Some(loss_map)
 }
 
 #[cfg(test)]
@@ -1038,7 +1120,7 @@ mod tests {
             .session_start("request-lifecycle", "evidence:v1", "rule:v1")
             .expect("start emits");
         writer
-            .receipt_partial(2, 1, 1, vec![("reserve", 3)])
+            .receipt_partial(2, 2, 1, vec![("reserve", 3)])
             .expect("partial receipt emits");
         let text = writer.into_string();
         assert!(
@@ -1216,6 +1298,116 @@ mod tests {
                 .iter()
                 .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
             "unknown site naming a lifetime must refuse"
+        );
+    }
+
+    /// Reviewer round-1 broken-equation probe, byte-exact: receipt
+    /// admitted/emitted 500/0 over a clean claim. Must refuse (P6-N1).
+    const BROKEN_EQUATION_PROBE: &str = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":500,\"emitted\":0,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+
+    #[test]
+    fn broken_receipt_equation_refuses() {
+        let findings = validate_lifecycle_session(BROKEN_EQUATION_PROBE);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
+            "500/0 receipt must refuse the equation (P6-N1): {findings:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_session_start_refuses() {
+        // Reviewer probe: honest producers emit exactly one start —
+        // a second start is a splice/corruption marker (P6-N1).
+        let probe = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":5,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        assert!(
+            !validate_lifecycle_session(probe).is_empty(),
+            "duplicate session_start must refuse (P6-N1)"
+        );
+    }
+
+    #[test]
+    fn receipt_loss_below_coverage_refuses() {
+        // Reviewer probe: coverage counts kernel.reserve=9 while the
+        // receipt claims empty loss — the receipt per-stage loss must
+        // cover every coverage per-stage loss (P6-N1).
+        let probe = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":\"10\",\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":0,\"terminal\":\"sync\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{\"kernel.reserve\":9},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        let findings = validate_lifecycle_session(probe);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
+            "loss below coverage must refuse (P6-N1): {findings:?}"
+        );
+        for finding in &findings {
+            assert!(
+                !finding.to_string().contains("kernel.reserve"),
+                "stage names never echo: {finding}"
+            );
+        }
+    }
+
+    #[test]
+    fn unfinished_above_emitted_refuses() {
+        // `unfinished` is a subset of `emitted` (drained truthless by
+        // finish): unfinished > emitted contradicts the equation.
+        let stream = format!(
+            "{}\n{}\n",
+            start_line(1),
+            receipt_line(2)
+                .replacen("\"emitted\":0", "\"emitted\":1", 1)
+                .replacen("\"unfinished\":0", "\"unfinished\":2", 1)
+                .replacen("\"clean\"", "\"partial\"", 1),
+        );
+        assert!(
+            validate_lifecycle_session(&stream)
+                .iter()
+                .any(|f| matches!(f, SessionFinding::InvalidCombination { .. })),
+            "unfinished above emitted must refuse (P6-N1)"
+        );
+    }
+
+    #[test]
+    fn honest_partial_receipt_with_loss_superset_validates() {
+        // Positive control (P6-N1): honest 4/4/0 guest-shaped receipt
+        // over a coverage record with a per-stage loss the receipt
+        // covers validates.
+        let stream = format!(
+            "{}\n{}\n{}\n",
+            start_line(1),
+            "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"coverage\",\"session\":\"session:place\",\"seq\":2,\"admitted\":4,\"emitted\":4,\"unfinished\":0,\"loss\":{\"decode.bad_records\":2},\"unknown\":0,\"filtered\":0}",
+            "{\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"kind\":\"session_receipt\",\"session\":\"session:place\",\"seq\":3,\"verdict\":\"partial\",\"admitted\":4,\"emitted\":4,\"unfinished\":0,\"loss\":{\"decode.bad_records\":2},\"truncated\":false}",
+        );
+        assert!(
+            validate_lifecycle_session(&stream).is_empty(),
+            "honest loss-carrying partial validates"
+        );
+    }
+
+    #[test]
+    fn removed_observation_stays_permitted() {
+        // Coordinator-REJECTED leg, pinned PERMITTED (P6-N1): the
+        // equation is receipt-side (admitted == emitted); the
+        // observation COUNT is not reconciled against emitted (the
+        // pinned clean control itself emits 2 with one observation,
+        // and the omitted-counter design counts driver-side drops).
+        let probe = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":0}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        assert!(
+            validate_lifecycle_session(probe).is_empty(),
+            "observation-count reconciliation stays out (rejected leg, pinned)"
+        );
+    }
+
+    #[test]
+    fn unknown_terminal_clean_receipt_stays_permitted() {
+        // Coordinator-REJECTED leg, pinned PERMITTED (P6-N1): the ADR
+        // clean rule omits unknown — Unknown terminals are honest
+        // P4/P5 accounting and the receipt carries no unknown field.
+        let probe = "{\"evidence_version\":\"evidence:v1\",\"kind\":\"session_start\",\"payload_schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"profile\":\"request-lifecycle\",\"rule_version\":\"rule:v1\",\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":1,\"session\":\"session:review\",\"source\":\"kernel-crypto\"}\n{\"kind\":\"observation\",\"record\":{\"duration_ns\":null,\"request_id\":\"req:1\",\"schema\":\"kryprobe.kcrypto.lifecycle/v1\",\"status\":null,\"terminal\":\"unknown\",\"tfm_id\":null},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":2,\"session\":\"session:review\"}\n{\"admitted\":1,\"emitted\":1,\"filtered\":0,\"kind\":\"coverage\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":3,\"session\":\"session:review\",\"unfinished\":0,\"unknown\":1}\n{\"admitted\":1,\"emitted\":1,\"kind\":\"session_receipt\",\"loss\":{},\"schema\":\"kryprobe.kcrypto.lifecycle-session/v1\",\"seq\":4,\"session\":\"session:review\",\"truncated\":false,\"unfinished\":0,\"verdict\":\"clean\"}\n";
+        assert!(
+            validate_lifecycle_session(probe).is_empty(),
+            "unknown-terminal clean stays permitted (rejected leg, pinned)"
         );
     }
 
