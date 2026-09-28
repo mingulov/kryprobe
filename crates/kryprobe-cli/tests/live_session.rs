@@ -3257,25 +3257,37 @@ fn selftest_out_write_failure_cannot_be_clean() {
 fn report_live_unwritable_out_reaches_live_handler() {
     // P2r2/R2(a): the run()-level proof on the LIVE report path
     // (ReportLive argv -> cmd_report::run_report_live, not the
-    // selftest writer). The jsonl + request-lifecycle pre-gate refuses
-    // BEFORE any capture, so this runs deterministically on every
-    // host — a kernel-crypto capture would need privilege and would
-    // execute a real window where available. Control first: a good
-    // --out still refuses (exit 1, no file written — refusal precedes
-    // any write); then the unwritable --out reaches the same live
-    // refusal, never a selftest verdict.
+    // selftest writer). T11/P6 contract flip (approved): jsonl +
+    // request-lifecycle runs the capture (session-envelope export)
+    // instead of refusing — a valid live argv would execute a real
+    // window where capable, so determinism splits by seam: argv legs
+    // pin the parse boundary (bogus --source stops at parse, exit
+    // 2, no write), and crate-public run_report_live legs pin the
+    // live handler (bogus source bypassing parse fails typed at
+    // capture, exit 4 naming the source — source validation
+    // precedes BPF use, deterministic on every host, never a
+    // selftest verdict). Both legs pin the failure-before-write
+    // order and the --out plumbing.
     //
     // Residual, stated not claimed: the --out write-failure branch
     // itself (cmd_report.rs finish) needs a completed capture to
     // reach at run() level (privilege); it stays covered by the
-    // direct unit test. This test pins the live dispatch, the --out
-    // plumbing, and the refusal-before-write order.
+    // direct unit test.
+    //
+    // Old-vs-new assertion mapping (MSG-01a flip, MSG-03): exit 1
+    // refusal -> exit 4 typed live failure (argv leg: exit 2, parse
+    // owns source spelling); "cannot export request-lifecycle rows"
+    // -> "bogus-source" named by the handler; "report:" live verdict
+    // kept; no-stdout kept; no-file-before-failure kept (both legs);
+    // "no cannot write" kept; "not selftest" kept. No property dropped.
     let dir = scratch("report-live-out");
     let good = dir.path().join("report.jsonl");
-    let argv_good: Vec<String> = [
+    let argv: Vec<String> = [
         "kryprobe",
         "report",
         "--system",
+        "--source",
+        "bogus-source",
         "--format",
         "jsonl",
         "--kcrypto-profile",
@@ -3288,58 +3300,89 @@ fn report_live_unwritable_out_reaches_live_handler() {
     .collect();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let code = kryprobe_cli::run(&argv_good, &mut stdout, &mut stderr);
+    let code = kryprobe_cli::run(&argv, &mut stdout, &mut stderr);
     assert_eq!(
         code,
-        1,
-        "live pre-gate refuses: stderr={}",
+        2,
+        "bogus --source stops at parse: stderr={}",
         String::from_utf8_lossy(&stderr)
     );
     let text = String::from_utf8(stderr).expect("stderr utf-8");
     assert!(
-        text.contains("cannot export request-lifecycle rows"),
-        "live refusal named: {text}"
+        text.contains("bogus-source"),
+        "parse names the source: {text}"
+    );
+    assert!(stdout.is_empty(), "no capture output past parse");
+    assert!(!good.exists(), "parse failure precedes any --out write");
+    // Live-handler legs through the crate-public entry: the profile
+    // comes from parsing a valid argv (no privilege-crate import —
+    // integration tests see kryprobe_cli only).
+    let parsed = ["kryprobe", "report", "--system", "--format", "jsonl"]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let profile = match kryprobe_cli::args::parse(&parsed)
+        .expect("valid argv parses")
+        .command
+    {
+        kryprobe_cli::args::Command::ReportLive { profile, .. } => profile,
+        other => panic!("expected ReportLive, got {other:?}"),
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = kryprobe_cli::cmd_report::run_report_live(
+        "bogus-source",
+        Some(0),
+        kryprobe_cli::args::ReportFormat::Jsonl,
+        Some(&good),
+        None,
+        profile,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(
+        code,
+        4,
+        "live capture attempted: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let text = String::from_utf8(stderr).expect("stderr utf-8");
+    assert!(
+        text.contains("bogus-source"),
+        "live failure names the source: {text}"
     );
     assert!(
         text.contains("report:"),
         "verdict comes from the live report handler: {text}"
     );
-    assert!(stdout.is_empty(), "no capture output past the gate");
-    assert!(!good.exists(), "refusal precedes any --out write");
+    assert!(stdout.is_empty(), "no capture output past the failure");
+    assert!(!good.exists(), "failure precedes any --out write");
     // Fault: unwritable --out (missing parent dir) reaches the same
-    // live refusal — the failure mode is the gate's, not a write's.
+    // live failure — the failure mode is the capture's, not a write's.
     let bad = dir.path().join("no-such-dir").join("report.jsonl");
-    let argv_bad: Vec<String> = [
-        "kryprobe",
-        "report",
-        "--system",
-        "--format",
-        "jsonl",
-        "--kcrypto-profile",
-        "request-lifecycle",
-        "--out",
-        bad.to_str().expect("utf-8 scratch path"),
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let code = kryprobe_cli::run(&argv_bad, &mut stdout, &mut stderr);
+    let code = kryprobe_cli::cmd_report::run_report_live(
+        "bogus-source",
+        Some(0),
+        kryprobe_cli::args::ReportFormat::Jsonl,
+        Some(&bad),
+        None,
+        profile,
+        &mut stdout,
+        &mut stderr,
+    );
     assert_eq!(
         code,
-        1,
-        "unwritable --out keeps the live refusal: stderr={}",
+        4,
+        "unwritable --out keeps the live failure: stderr={}",
         String::from_utf8_lossy(&stderr)
     );
     let text = String::from_utf8(stderr).expect("stderr utf-8");
-    assert!(
-        text.contains("cannot export request-lifecycle rows"),
-        "live refusal named: {text}"
-    );
+    assert!(text.contains("bogus-source"), "live failure named: {text}");
     assert!(
         !text.contains("cannot write"),
-        "no write attempted past the gate: {text}"
+        "no write attempted past the failure: {text}"
     );
     assert!(
         !text.contains("selftest"),
