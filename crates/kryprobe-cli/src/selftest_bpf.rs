@@ -58,12 +58,15 @@ enum SelftestMarker {
 }
 
 /// Maps the loss-ledger verdict + per-kind counts to the terminal
-/// marker. Fully-accounted loss (a `Clean` ledger with drops > 0 —
-/// every missing record receipted by a ring/guard/truncation
-/// counter) is PARTIAL: the run is short evidence, not corrupt
-/// evidence. Only over-accounting (`Defect`) or a kind split wrong
-/// with nothing accounted (drops == 0 — duplication or corruption,
-/// since genuine loss always lands in a counter) is a defect.
+/// marker. Fully-accounted SHORTFALL (a `Clean` ledger with
+/// drops > 0 and neither kind over-counted — every missing record
+/// receipted by a ring/guard/truncation counter) is PARTIAL: the
+/// run is short evidence, not corrupt evidence. An over-count in
+/// either kind means duplication cancelled against loss (the
+/// fixture emits exactly `calls` of each — genuine loss only ever
+/// removes), so it stays a defect even with drops > 0; likewise
+/// over-accounting (`Defect`) and a wrong kind split with nothing
+/// accounted (drops == 0).
 fn classify_selftest(
     verdict: &ReconcileVerdict,
     entries: u64,
@@ -75,7 +78,7 @@ fn classify_selftest(
     match (verdict, counts_ok) {
         (ReconcileVerdict::Clean, true) => SelftestMarker::Clean,
         (ReconcileVerdict::Partial { missing }, _) => SelftestMarker::Partial { missing: *missing },
-        (ReconcileVerdict::Clean, false) if drops > 0 => {
+        (ReconcileVerdict::Clean, false) if drops > 0 && entries <= calls && returns <= calls => {
             // A `Clean` ledger reconciles exactly
             // (received + drops == 2·calls), so the shortfall IS the
             // accounted drops — short evidence, never corrupt.
@@ -248,6 +251,13 @@ mod tests {
         // corruption, still a defect.
         assert_eq!(
             classify_selftest(&Clean, 20001, 19999, 20000, 0),
+            SelftestMarker::Defect
+        );
+        // Over-count in either kind with drops > 0: duplication
+        // cancelled against loss (the fixture emits exactly
+        // `calls` of each) — still a defect, never partial.
+        assert_eq!(
+            classify_selftest(&Clean, 20005, 19990, 20000, 5),
             SelftestMarker::Defect
         );
         // Over-accounted ledger: always a defect.
