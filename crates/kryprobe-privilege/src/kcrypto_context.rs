@@ -28,6 +28,7 @@
 //! and stack *markers* (missing/sampled/full — never raw IPs, never raw
 //! kernel pointers).
 
+use kryprobe_abi::kcrypto_agg::{KWhoKey, VWho};
 use std::fmt::Write as _;
 
 /// One userspace task lifetime: a pid/tgid plus the `/proc` start-time
@@ -162,6 +163,44 @@ pub struct Drift {
 }
 
 impl SubmitterContext {
+    /// Builds a submitter from an api-returns who row: the key's tgid
+    /// plus the value's last-writer tid/comm and first-seen
+    /// uid/cgroup/ppid/stack. `start_marker` is the userspace
+    /// [`read_start_marker`] read for the tid (`None` when the task is
+    /// already gone — the lifetime is unqualified then, never guessed).
+    ///
+    /// Shape notes (frozen BPF, honest mapping): `comm` truncates at the
+    /// first NUL (lossy — kernel bytes, never trusted as UTF-8);
+    /// `ppid` 0 means the chase failed (`None`); `stack` negative is
+    /// the raw helper errno ([`StackMarker::Missing`]) while a
+    /// non-negative id is first-seen-only ([`StackMarker::Sampled`] —
+    /// one stack sampled for the row's whole population, never
+    /// per-observation).
+    #[must_use]
+    pub fn from_who(key: &KWhoKey, val: &VWho, start_marker: Option<u64>) -> Self {
+        let comm_len = val
+            .comm
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(val.comm.len());
+        Self {
+            lifetime: TaskLifetime {
+                pid: val.tid,
+                tgid: key.tgid,
+                start_marker,
+            },
+            comm: Some(String::from_utf8_lossy(&val.comm[..comm_len]).into_owned()),
+            uid: Some(val.uid),
+            cgroup: Some(val.cgroup),
+            ppid: if val.ppid == 0 { None } else { Some(val.ppid) },
+            stack: if val.stack < 0 {
+                StackMarker::Missing
+            } else {
+                StackMarker::Sampled
+            },
+        }
+    }
+
     /// Compares two snapshots: the lifetime key decides the join,
     /// mutable fields report drift. A reused or unqualified key sets
     /// `same_lifetime: false` — drift flags alone never re-key.
@@ -217,6 +256,24 @@ pub struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Process-context execution on `lifetime` (api-returns: the
+    /// observed API ran and returned in the caller's process context —
+    /// the tally row's own lifetime).
+    #[must_use]
+    pub fn process(lifetime: TaskLifetime) -> Self {
+        Self {
+            kind: ExecutionKind::Process(lifetime),
+        }
+    }
+
+    /// Explicitly unobserved execution.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            kind: ExecutionKind::Unknown,
+        }
+    }
+
     /// The origin this execution may claim. Only a process execution
     /// names itself, and only a worker WITH a proved handoff names its
     /// originator; softirq and unknown never name an origin.
@@ -257,6 +314,18 @@ pub struct CompletionContext {
     pub follows_request: bool,
 }
 
+impl CompletionContext {
+    /// Completion at `landed`: the terminal edge belongs to its
+    /// admitted request, unconditionally.
+    #[must_use]
+    pub fn follows(landed: ExecutionContext) -> Self {
+        Self {
+            landed,
+            follows_request: true,
+        }
+    }
+}
+
 /// One request's three independently captured contexts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestContext {
@@ -275,6 +344,40 @@ pub struct RequestContext {
     /// Consumer label, when a consumer view relabels this context.
     /// Informational only: the original versions above are preserved.
     pub consumer_label: Option<String>,
+}
+
+impl RequestContext {
+    /// Request-lifecycle contexts: explicitly unobserved. The frozen
+    /// lifecycle edges carry no task identity (no pid/tid/comm — see
+    /// `decode::RawEdge`), and BPF is frozen, so there is no proved
+    /// join to any task lifetime. The submitter is unavailable, the
+    /// execution is unknown, and no completion context is claimed —
+    /// never guessed from worker PIDs or stack text.
+    #[must_use]
+    pub fn lifecycle_unobserved(
+        request_id: &str,
+        evidence_version: &str,
+        rule_version: &str,
+    ) -> Self {
+        Self {
+            request_id: request_id.to_owned(),
+            submitter: None,
+            execution: ExecutionContext::unknown(),
+            completion: None,
+            evidence_version: evidence_version.to_owned(),
+            rule_version: rule_version.to_owned(),
+            consumer_label: None,
+        }
+    }
+
+    /// Relabels for a consumer view. The label is informational: the
+    /// original evidence/rule versions are preserved behind it, never
+    /// overwritten.
+    #[must_use]
+    pub fn with_consumer_label(mut self, label: &str) -> Self {
+        self.consumer_label = Some(label.to_owned());
+        self
+    }
 }
 
 /// Unknown-inclusion policy for ONE filter. Explicit per filter, never
@@ -462,5 +565,107 @@ impl Histogram {
             out.push_str(" mode=sampled");
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn who_key() -> KWhoKey {
+        KWhoKey {
+            kh: 0xc2,
+            tgid: 100,
+            _pad: 0,
+        }
+    }
+
+    fn who_val() -> VWho {
+        let mut comm = [0u8; 16];
+        comm[..4].copy_from_slice(b"bash");
+        VWho {
+            comm,
+            tid: 101,
+            uid: 1000,
+            cgroup: 7,
+            ppid: 1,
+            pcomm: [0u8; 16],
+            stack: 3,
+            calls: 9,
+            first_ns: 10,
+            last_ns: 20,
+        }
+    }
+
+    #[test]
+    fn from_who_maps_identity_honestly() {
+        let sub = SubmitterContext::from_who(&who_key(), &who_val(), Some(50_000));
+        assert_eq!(
+            sub.lifetime,
+            TaskLifetime {
+                pid: 101,
+                tgid: 100,
+                start_marker: Some(50_000),
+            }
+        );
+        assert_eq!(sub.comm.as_deref(), Some("bash"));
+        assert_eq!(sub.uid, Some(1000));
+        assert_eq!(sub.cgroup, Some(7));
+        assert_eq!(sub.ppid, Some(1));
+        // First-seen stack id: sampled, never per-observation full.
+        assert_eq!(sub.stack, StackMarker::Sampled);
+    }
+
+    #[test]
+    fn from_who_marks_absent_stack_and_failed_parent() {
+        let mut val = who_val();
+        val.stack = -22;
+        val.ppid = 0;
+        let sub = SubmitterContext::from_who(&who_key(), &val, None);
+        assert_eq!(sub.stack, StackMarker::Missing);
+        assert_eq!(sub.ppid, None, "ppid 0 is chase failure, not init");
+        assert_eq!(sub.lifetime.start_marker, None, "unqualified lifetime");
+        assert_eq!(
+            sub.lifetime.verdict_against(&sub.lifetime),
+            LifetimeVerdict::Unknown,
+            "a markerless lifetime never joins, even with itself"
+        );
+    }
+
+    #[test]
+    fn lifecycle_contexts_are_explicitly_unobserved() {
+        let req = RequestContext::lifecycle_unobserved("req:9", "evidence:v1", "rule:v1");
+        assert_eq!(req.submitter, None);
+        assert_eq!(req.execution, ExecutionContext::unknown());
+        assert_eq!(req.execution.origin(), OriginClaim::Unavailable);
+        assert_eq!(req.completion, None);
+        // Under an excluding filter the unobserved request lands in the
+        // unknown population — counted, never admitted-by-default.
+        let filter = ContextFilter {
+            submitter_pid: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(apply_filter(&req, &filter), FilterVerdict::Unknown);
+    }
+
+    #[test]
+    fn consumer_label_preserves_original_versions() {
+        let req = RequestContext::lifecycle_unobserved("req:9", "evidence:v1", "rule:v1")
+            .with_consumer_label("consumer:dashboard");
+        assert_eq!(req.consumer_label.as_deref(), Some("consumer:dashboard"));
+        assert_eq!(req.evidence_version, "evidence:v1");
+        assert_eq!(req.rule_version, "rule:v1");
+    }
+
+    #[test]
+    fn process_completion_follows_its_request() {
+        let lifetime = TaskLifetime {
+            pid: 101,
+            tgid: 100,
+            start_marker: Some(50_000),
+        };
+        let completion = CompletionContext::follows(ExecutionContext::process(lifetime));
+        assert!(completion.follows_request);
+        assert_eq!(completion.landed.origin(), OriginClaim::Proved(lifetime));
     }
 }
