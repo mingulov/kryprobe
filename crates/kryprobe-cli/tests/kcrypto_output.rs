@@ -38,6 +38,17 @@ fn reset_sigint() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
+/// Reads one fd's `flags:` word from fdinfo (P7-N7 pin helper —
+/// a plain file read, no C-library call, so the privilege seam
+/// stays clean).
+fn fd_flags(fd: std::os::fd::RawFd) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .map(|word| word.trim().to_owned())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "fdinfo lacks flags:"))
+}
+
 /// Writer failing with `EPIPE` after `limit` bytes (partial write,
 /// then broken pipe). Bytes already accepted stay in `buf`.
 struct FailAfter {
@@ -378,10 +389,9 @@ fn output_production_writer_aborts_stalled_pipe() {
     use std::os::fd::AsRawFd as _;
     let _sigint = reset_sigint();
     let (mut reader, writer) = std::io::pipe().expect("pipe creates");
-    // Flags observed through the privilege helper (ADR-0002 Rule B:
-    // the CLI never touches `libc`, not even in tests).
-    let saved = kryprobe_privilege::host::InterruptibleWriter::fd_status_flags(writer.as_raw_fd())
-        .expect("pre-wrap flags read");
+    // Flags observed through fdinfo (plain file read — ADR-0002
+    // Rule B forbids C-library calls here, even in tests).
+    let saved = fd_flags(writer.as_raw_fd()).expect("pre-wrap flags read");
     let (sink_tx, sink_rx) = std::sync::mpsc::channel::<()>();
     let sink = std::thread::spawn(move || {
         let mut sip = vec![0u8; 4096];
@@ -409,9 +419,7 @@ fn output_production_writer_aborts_stalled_pipe() {
         // (here simulated) `process::exit`, then read the flags back
         // while the fd is still open.
         fd_writer.restore();
-        let restored =
-            kryprobe_privilege::host::InterruptibleWriter::fd_status_flags(writer.as_raw_fd())
-                .expect("post-restore flags read");
+        let restored = fd_flags(writer.as_raw_fd()).expect("post-restore flags read");
         drop(fd_writer);
         drop(writer);
         let _ = tx.send((code, stderr, restored));
