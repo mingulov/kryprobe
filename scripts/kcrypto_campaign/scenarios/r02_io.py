@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """T13 R02 dm-crypt workload driver (runs in the guest as root).
 
-Writes (O_DIRECT)/reads (buffered) a fixed 64 MiB pattern in
-4 KiB blocks on the owned dm-crypt mapping with pacing (bounded
-IOPS so the observer never bursts), fsyncs, and compares
-in-memory checksums. Writes are O_DIRECT so every 4 KiB block
-completes its dm-crypt encrypt synchronously, mirroring the
-synchronous read leg: buffered writes defer all encrypts to
-background writeback plus one fsync burst, a concentration the
-observer demonstrably short-counts (R02-7014 attempts 2-3).
+Writes/reads a fixed 64 MiB pattern in 4 KiB O_DIRECT blocks
+on the owned dm-crypt mapping with pacing (bounded IOPS so the
+observer never bursts), fsyncs, and compares in-memory
+checksums. O_DIRECT in both directions so every block
+completes its dm-crypt transform synchronously: buffered
+writes defer all encrypts to background writeback plus one
+fsync burst, a concentration the observer demonstrably
+short-counts (R02-7014 attempts 2-3), and buffered reads add
+128 KiB of kernel readahead the byte proof cannot explain
+(attempt 4).
 
 Usage:
   r02_io.py write /dev/mapper/<name> <out.json>
@@ -92,19 +94,27 @@ def cmd_read(dev: str, out_path: str, expected: str) -> int:
     seen = hashlib.sha256()
     read = 0
     burst = 0
-    # A block device has no EOF at our 64 MiB: stop after exactly
-    # TOTAL_BYTES (reading the whole mapping would decrypt 1 GiB).
-    with open(dev, "rb") as fh:
+    # O_DIRECT: no page cache, no readahead; every 4 KiB block
+    # decrypts synchronously. A block device has no EOF at our
+    # 64 MiB: stop after exactly TOTAL_BYTES.
+    buf = aligned_block()
+    fd = os.open(dev, os.O_RDONLY | os.O_DIRECT)
+    try:
         while read < TOTAL_BYTES:
-            chunk = fh.read(min(BLOCK, TOTAL_BYTES - read))
-            if not chunk:
-                break
-            seen.update(chunk)
-            read += len(chunk)
+            buf.seek(0)
+            got = os.readinto(fd, buf)
+            if got != BLOCK:
+                print(f"short O_DIRECT read: {got} at {read}",
+                      file=sys.stderr)
+                return 1
+            seen.update(bytes(buf))
+            read += got
             burst += 1
             if burst >= BLOCKS_PER_BURST:
                 time.sleep(BURST_SLEEP_S)
                 burst = 0
+    finally:
+        os.close(fd)
     digest = seen.hexdigest()
     match = digest == expected
     with open(out_path, "w") as fh:

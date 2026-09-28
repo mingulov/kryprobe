@@ -98,7 +98,14 @@ sleep 3
 ftrace_end $FNS > "$OUT/kernel-quiet-before.txt" 2>&1 || FAIL=1
 finish_capture product-quiet-before
 
-# Write leg.
+# Write leg. Closing the mapping after writes emits a kernel
+# `change` uevent EVERY time (not one-shot), and the ensuing
+# udev blkid probe (1304 decrypts) lands inside the 120 s
+# capture tail; settle cannot help because the event fires at
+# workload end. Freeze the udev exec queue for the leg: the
+# event queues but is processed only after the window closes
+# (delayed, never suppressed), then settle before the next leg.
+udevadm control --stop-exec-queue 2>> "$OUT/loop.log" || FAIL=1
 capture product-write 120
 ftrace_begin "$FNS" || FAIL=1
 python3 "$OUT/r02_io.py" write "/dev/mapper/$MAP" "$OUT/leg-write.json" \
@@ -106,6 +113,8 @@ python3 "$OUT/r02_io.py" write "/dev/mapper/$MAP" "$OUT/leg-write.json" \
 # shellcheck disable=SC2034
 ftrace_end $FNS > "$OUT/kernel-write.txt" 2>&1 || FAIL=1
 finish_capture product-write
+udevadm control --start-exec-queue 2>> "$OUT/loop.log" || FAIL=1
+udevadm settle --timeout=120 2>> "$OUT/loop.log" || FAIL=1
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
 
 # Read leg.
