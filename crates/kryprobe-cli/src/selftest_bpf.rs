@@ -74,6 +74,13 @@ fn classify_selftest(
     calls: u64,
     drops: u64,
 ) -> SelftestMarker {
+    // P7-N2: an impossible over-count in either kind is a defect
+    // REGARDLESS of the aggregate ledger kind (the fixture emits
+    // exactly `calls` of each — genuine loss only ever removes, so
+    // no ledger shape can explain an 18th entry over 17 calls).
+    if entries > calls || returns > calls {
+        return SelftestMarker::Defect;
+    }
     let counts_ok = entries == calls && returns == calls;
     match (verdict, counts_ok) {
         (ReconcileVerdict::Clean, true) => SelftestMarker::Clean,
@@ -266,6 +273,20 @@ mod tests {
         assert_eq!(
             classify_selftest(&Defect { excess: 2 }, 20000, 20000, 20000, 2),
             SelftestMarker::Defect
+        );
+        // P7-N2: a Partial ledger must NOT mask an impossible
+        // over-count (17 calls, 18 entries, 14 returns, 1 drop —
+        // the 18th entry cannot exist, so defect, not partial).
+        assert_eq!(
+            classify_selftest(&Partial { missing: 1 }, 18, 14, 17, 1),
+            SelftestMarker::Defect
+        );
+        // A fully-accounted Partial shortfall with NEITHER kind
+        // over-counted stays partial (the guard above only fires
+        // on the impossible shape).
+        assert_eq!(
+            classify_selftest(&Partial { missing: 1 }, 17, 16, 17, 1),
+            SelftestMarker::Partial { missing: 1 }
         );
     }
 
