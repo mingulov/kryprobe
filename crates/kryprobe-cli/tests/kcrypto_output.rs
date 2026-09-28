@@ -368,12 +368,19 @@ fn output_spurious_interrupted_retries() {
 /// in the privilege suite; here the witness is stored directly for
 /// determinism under the suite guard, re-raised until the abort
 /// lands so a late emitter start cannot miss it.)
+/// P7-N7 — the same run also pins the abort-path flag restore: the
+/// emitter performs `main`'s explicit `restore()` after the torn
+/// abort (the `process::exit` path cannot rely on `Drop`), and the
+/// pipe's flags read back the pre-wrap value (no leaked O_NONBLOCK).
 #[test]
 fn output_production_writer_aborts_stalled_pipe() {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     let _sigint = reset_sigint();
     let (mut reader, writer) = std::io::pipe().expect("pipe creates");
+    // SAFETY: fresh pipe end; `F_GETFL` reports failure via return.
+    let saved = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert!(saved >= 0, "pre-wrap flags read");
     let (sink_tx, sink_rx) = std::sync::mpsc::channel::<()>();
     let sink = std::thread::spawn(move || {
         let mut sip = vec![0u8; 4096];
@@ -397,9 +404,15 @@ fn output_production_writer_aborts_stalled_pipe() {
         let text = "z".repeat(1024 * 1024);
         let mut stderr = Vec::new();
         let code = emit_stdout_text(&mut fd_writer, &mut stderr, "report", &text, 0);
+        // P7-N7: exactly `main`'s tail — explicit restore before the
+        // (here simulated) `process::exit`, then read the flags back
+        // while the fd is still open.
+        fd_writer.restore();
+        // SAFETY: write end still owned here; `F_GETFL` via return.
+        let restored = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
         drop(fd_writer);
         drop(writer);
-        let _ = tx.send((code, stderr));
+        let _ = tx.send((code, stderr, restored));
     });
     // Let the emitter reach its stall (1 MiB >> 64 KiB buffer —
     // the stall is structural, not timing), then raise the witness
@@ -420,11 +433,15 @@ fn output_production_writer_aborts_stalled_pipe() {
     };
     let latency = armed.elapsed();
     SIGINT_SEEN.store(false, Ordering::Relaxed);
-    let (code, stderr) = outcome;
+    let (code, stderr, restored) = outcome;
     emitter.join().expect("emitter reaped");
     let _ = sink_tx.send(());
     let sipped = sink.join().expect("sink reaped");
     assert_eq!(sipped, 4096, "sink stalled after its sip");
+    assert_eq!(
+        restored, saved,
+        "P7-N7: explicit restore returns pre-wrap flags after torn abort"
+    );
     assert!(
         latency < budget,
         "abort within the stop budget: {latency:?}"
