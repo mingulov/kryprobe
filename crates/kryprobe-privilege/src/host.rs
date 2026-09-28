@@ -230,6 +230,12 @@ impl Drop for InterruptibleWriter {
 mod tests {
     use super::*;
 
+    /// Serializes every test that installs the real SIGINT handler
+    /// (the disposition + witness are process-global — parallel
+    /// raisers would deliver SIGINT under another test's restored
+    /// default and kill the test binary).
+    static SIGINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn classifiers_partition_common_errnos() {
         // Each classifier fires on its own errnos and stays silent on
@@ -273,8 +279,7 @@ mod tests {
     fn interruptible_writer_aborts_full_pipe_on_fresh_sigint() {
         use std::io::Write as _;
         use std::sync::atomic::Ordering;
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = GUARD.lock().expect("sigint serial");
+        let _guard = SIGINT_TEST_LOCK.lock().expect("sigint serial");
         super::install_sigint_flag().expect("installs");
         // SAFETY: `pipe2` with a valid out-pointer; fds closed below.
         let mut fds = [0 as libc::c_int; 2];
@@ -420,7 +425,9 @@ mod tests {
     fn sigint_install_raise_sets_flag() {
         // 4B-M5: the installed handler records arrival; the test
         // restores the default disposition + clears the flag so no
-        // other test observes either.
+        // other test observes either. Serialized (see
+        // `SIGINT_TEST_LOCK`): a parallel raiser would kill us.
+        let _guard = SIGINT_TEST_LOCK.lock().expect("sigint serial");
         super::install_sigint_flag().expect("installs");
         assert!(!super::SIGINT_SEEN.load(std::sync::atomic::Ordering::Relaxed));
         // SAFETY: `raise` to self with a plain-flag handler installed.
