@@ -116,6 +116,32 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
+    /// Test worker over a simulated ring (the fds are never polled:
+    /// every test here pre-sets stop, so only the final sweep runs).
+    fn worker_with(
+        area: RingArea,
+        tx: std::sync::mpsc::SyncSender<DrainEvent>,
+        stop: Arc<AtomicBool>,
+    ) -> Worker {
+        // SAFETY: fresh fds, owned by the wrappers from here.
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(null >= 0, "null opens");
+        let owned = unsafe { OwnedFd::from_raw_fd(null) };
+        let raw_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(raw_epoll >= 0, "epoll creates");
+        let epoll = unsafe { OwnedFd::from_raw_fd(raw_epoll) };
+        Worker {
+            _owned: owned,
+            area,
+            _epoll: epoll,
+            tx,
+            stop,
+            barrier: Arc::new(AtomicU64::new(0)),
+            budget: 64,
+            timeout_ms: 1,
+        }
+    }
+
     /// P7/T12 drain-stop regression (deterministic, no BPF, no
     /// sleeps): stop pre-set before the first poll with three
     /// committed-but-never-polled records in the ring — the worker
@@ -132,24 +158,7 @@ mod tests {
         area.set_consumer(0);
         let (tx, rx) = std::sync::mpsc::sync_channel::<DrainEvent>(16);
         let stop = Arc::new(AtomicBool::new(true));
-        // SAFETY: fresh fds, owned by the wrappers from here; the
-        // pre-set stop means the worker never polls them.
-        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        assert!(null >= 0, "null opens");
-        let owned = unsafe { OwnedFd::from_raw_fd(null) };
-        let raw_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        assert!(raw_epoll >= 0, "epoll creates");
-        let epoll = unsafe { OwnedFd::from_raw_fd(raw_epoll) };
-        let worker = Worker {
-            _owned: owned,
-            area,
-            _epoll: epoll,
-            tx,
-            stop,
-            barrier: Arc::new(AtomicU64::new(0)),
-            budget: 64,
-            timeout_ms: 1,
-        };
+        let worker = worker_with(area, tx, stop);
         let stats = worker.run();
         assert_eq!(stats.records, 3, "final sweep delivers committed records");
         assert_eq!(stats.queue_drops, 0, "no queue pressure");
@@ -166,5 +175,32 @@ mod tests {
             rx.try_recv().is_err(),
             "no duplicate or phantom fourth record"
         );
+    }
+
+    /// Q09 mechanism pin (deterministic, no BPF, no sleeps): a
+    /// 1-deep channel, pre-filled — every swept record hits `Full`
+    /// and counts `queue_drops` (never blocks, never vanishes
+    /// silently). Only the prefill is receivable.
+    #[test]
+    fn stopped_worker_counts_full_queue_as_drops() {
+        let area = RingArea::test_area(4096);
+        let mut pos = 0u64;
+        for i in 0..2u8 {
+            pos = area.test_commit(pos, &[i; 8]);
+        }
+        area.test_set_producer(pos);
+        area.set_consumer(0);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DrainEvent>(1);
+        tx.try_send(DrainEvent::Barrier(9)).expect("prefill fits");
+        let stop = Arc::new(AtomicBool::new(true));
+        let worker = worker_with(area, tx, stop);
+        let stats = worker.run();
+        assert_eq!(stats.records, 2, "both records walked");
+        assert_eq!(stats.queue_drops, 2, "both counted as queue drops");
+        assert!(
+            matches!(rx.try_recv(), Ok(DrainEvent::Barrier(9))),
+            "only the prefill is receivable"
+        );
+        assert!(rx.try_recv().is_err(), "swept records never queued");
     }
 }

@@ -627,15 +627,34 @@ impl LifecycleReducer {
         }
     }
 
-    /// Drains every pending id in ascending id order: ids with
+    /// Expires pending ids older than the bound (P7/T12 injection
+    /// seam): every live id whose submit age (`now_ns - submit_ts`,
+    /// saturating — a clock running backwards never expires) strictly
+    /// exceeds `max_pending_ns` drains exactly like [`Self::finish`]
+    /// (retained truth emits when present, else
+    /// [`Terminal::Unknown`] + [`ReducerStats::unfinished`]),
+    /// tombstoned, in ascending id order. Ids at exactly the bound
+    /// stay live (the deadline is inclusive). The equation holds
+    /// across calls: `admitted == emitted + live`,
+    /// `unfinished ⊆ emitted`.
+    pub fn expire_before(&mut self, now_ns: u64, max_pending_ns: u64) -> Vec<RequestRecord> {
+        let stale: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| now_ns.saturating_sub(p.submit_ts) > max_pending_ns)
+            .map(|(id, _)| *id)
+            .collect();
+        self.drain_ids(stale)
+    }
+
+    /// Drains the given pending ids in ascending id order: ids with
     /// retained terminal truth emit it; the rest emit
     /// [`Terminal::Unknown`] with no duration and count as
-    /// [`ReducerStats::unfinished`]. `stop_ns` is currently unused
-    /// (reserved for future drain labeling); reconciliation depends
-    /// only on observed edges. Drained ids are tombstoned. A second
-    /// call emits nothing.
-    pub fn finish(&mut self, _stop_ns: u64) -> Vec<RequestRecord> {
-        let mut ids: Vec<u64> = self.pending.keys().copied().collect();
+    /// [`ReducerStats::unfinished`]. Drained ids are tombstoned.
+    /// Shared by [`Self::finish`] (all ids) and
+    /// [`Self::expire_before`] (stale ids) — one drain path, one
+    /// accounting rule.
+    fn drain_ids(&mut self, mut ids: Vec<u64>) -> Vec<RequestRecord> {
         ids.sort_unstable();
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
@@ -651,5 +670,17 @@ impl LifecycleReducer {
             out.push(record);
         }
         out
+    }
+
+    /// Drains every pending id in ascending id order: ids with
+    /// retained terminal truth emit it; the rest emit
+    /// [`Terminal::Unknown`] with no duration and count as
+    /// [`ReducerStats::unfinished`]. `stop_ns` is currently unused
+    /// (reserved for future drain labeling); reconciliation depends
+    /// only on observed edges. Drained ids are tombstoned. A second
+    /// call emits nothing.
+    pub fn finish(&mut self, _stop_ns: u64) -> Vec<RequestRecord> {
+        let ids: Vec<u64> = self.pending.keys().copied().collect();
+        self.drain_ids(ids)
     }
 }

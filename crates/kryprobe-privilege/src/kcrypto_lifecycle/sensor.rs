@@ -583,6 +583,16 @@ impl SensorCore {
         newly
     }
 
+    /// Expire stale pending ids into retention (P7/T12; see
+    /// reducer `expire_before`). Returns nothing by design, exactly
+    /// like [`Self::finish`]: the take below is the ONE read path.
+    /// Over-bound expirations count `retained_dropped`, never grow
+    /// retention past its bound.
+    pub fn expire_before(&mut self, now_ns: u64, max_pending_ns: u64) {
+        let done = self.reducer.expire_before(now_ns, max_pending_ns);
+        self.retain(done);
+    }
+
     /// Drain pending truthless into retention (stop-the-world; see
     /// reducer `finish`). Returns nothing by design: the take below is
     /// the ONE read path — a finish that both returned and retained
