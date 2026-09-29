@@ -145,6 +145,70 @@ kernel-referenced leg. Pinning any single nested shape (e.g.
 shash_digest == issued) is unprovable and must not be
 reintroduced.
 
+## P9 release-candidate promotion (T14)
+
+Wave head `task/kcrypto-t14` (final SHA + tree in
+`docs/release-ledger.md` and the T14 HANDOFF), budgets frozen
+before sampling (`docs/bench-thresholds.md` P9 section;
+manifest `tests/kcrypto_perf/cells.json`). Five workload
+classes (64 B,
+4 KiB, 1 MiB skcipher; high-rate AEAD; deliberately async) ×
+observer modes (disabled baseline, aggregation, full details)
+in 5 attempted alternating A/B pairs per set (10 s warm-up +
+30 s measurement; aggregate sets qualified 5/5, all det and
+floor sets 0/5 — see verdicts below), one vng guest per set
+on 7.0.14 + 7.2.6 with
+6.12.111 floor aggregate sets, plus attached-idle footprint
+legs, per-op reference-perturbation controls, and one
+many-submitter stack probe. Every observed leg reconciles
+exactly with its independent driver ledger (7.x flat 1 call
+per op per direction; 6.12 floor nested 1:1 outer+inner;
+async EINPROGRESS/queued with per-GO terminal coverage) with
+zero unexpected loss, or the pair is invalid with its reason
+preserved — never dropped, never averaged away.
+
+Budget verdicts (qualified 4 KiB / 1 MiB aggregate sets only;
+median plus ≥80% of pairs inside, else INCONCLUSIVE):
+
+- `perf-P-4K-agg-7014`: FAIL (B1 FAIL median 0.819,
+  B2 FAIL median 1.222; 5/5 pairs, all miss both)
+- `perf-P-1M-agg-7014`: INCONCLUSIVE (spread 0.84–1.13,
+  only 2/5 inside; medians 0.940/1.072)
+- `perf-P-4K-agg-726`: FAIL (B1 FAIL median 0.805,
+  B2 FAIL median 1.203; 5/5 pairs, all miss both)
+- `perf-P-1M-agg-726`: PASS (B1/B2 PASS; medians
+  0.967/1.050)
+
+Published envelopes (no budget; measured operating data, see
+the campaign report): 64 B + AEAD + async aggregate ratios.
+NO detail-mode ratio is published anywhere: every flat det
+set truncates at the 100,000-observation bound (offered
+28–44x the cap on sync classes), and every below-cap det leg
+(1 MiB flat-out both kernels; 64 B / 4 KiB / AEAD paced at
+1000 ops/s on 7.0.14) carries counted
+`adapter.tombstone_evictions`, failing the frozen `loss ==
+{}` detail rule — all 13 det sets INVALID with reasons
+preserved. Reported instead: truncation points, below-cap
+absolute operating data (never ratioed), async detail
+envelope-only (terminals `Unknown`, `unfinished` == offered),
+6.12 floor absolute operating data with pairs INVALID
+(`destroy_skip == 3` vs the flat pin `== 1`; see the report),
+attached-idle CPU/RSS per kernel, and first-seen stack
+attribution counts from the aggregation who rows. Lifecycle
+on the 6.12 floor refuses typed exit 4
+(`kcrypto_fsession_unavailable`).
+
+Mode resolutions: stack sampling is NOT_RUN as a standalone
+mode (no product toggle — R1 stacks are first-seen-only
+attribution inside api-returns; the lifecycle object captures
+no stacks), with stack observables reported from the
+aggregation cells plus the `diag-stack-7014` probe.
+Attached-idle is an observer-footprint leg, not a workload
+pair. The api-returns `lat[8]` array is unpopulated (zeros);
+workload latency comes only from the independent driver
+ledger. P7 E08 on 7.2.6 stays NOT_RUN (accepted P7 residual);
+X01–X03/D01–D08 remain the separate P10 demo scope.
+
 ## Explicit non-goals (both profiles)
 
 - Keys, IVs, plaintext/ciphertext, AAD/tag bytes, digest outputs, RNG

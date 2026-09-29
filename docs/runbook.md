@@ -115,3 +115,20 @@ Re-run `scripts/sudo-lane.sh` (with the lane lock) when:
 
 If the lane host is unavailable, record `NOT_RUN` per
 `AGENTS.md` — a skipped lane is data, never a pass.
+
+## Accepted release limitations (R1)
+
+Do not page on these — they are accepted, documented behavior:
+
+- A `partial` verdict with `missing: [capture-integrity,
+  completion]` is the declared honest state (completion is
+  unobserved by design), not an outage.
+- P7 E08 soak on 7.2.6 is NOT_RUN (single-kernel soak
+  accepted); unreferenced-finup observations stay residual
+  (see `docs/kcrypto-support.md` §P9 + route note 3).
+- Measurements with any nonzero unexpected-loss counter are
+  outside the qualified envelope — re-run quieter/shorter
+  rather than ratioing them (`docs/bench-thresholds.md` P9).
+- Pre-attach boot traffic is unobserved; request-lifecycle on
+  the 6.12 floor refuses typed exit 4 (floor limitation, not
+  a fault).
