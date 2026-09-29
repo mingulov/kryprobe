@@ -35,9 +35,35 @@ REQUIRED_REPORT_KEYS = frozenset({"observations", "coverage", "integrity", "verd
 
 REQUIRED_WHO_KEYS = frozenset({"tgid", "calls"})
 
+# Hash-only traffic contract for the R04 foreign cell: the only
+# submitter probes the scenario can legitimately produce (outer
+# ahash digest, nested shash digest/finup, one bind-alloc per
+# burst). Anything else fails closed in the oracle, never here.
+FOREIGN_PROBES = frozenset({"ahash", "shash", "finup", "alloc"})
+
 
 class OracleError(ValueError):
     """Oracle input refusal: the archived facts are not the pinned shape."""
+
+
+def who_probe_from_stack(payload: dict) -> str | None:
+    """Name the submitter probe family from a who row's stack.
+
+    The first ``bpf_prog_<hash>_kcrypto_<name>`` frame names the
+    probe (``ahash``/``shash``/``finup``/``alloc``). Rows without
+    a stack (or without a kcrypto frame) yield ``None``: the
+    parser stays total and the oracle fails closed.
+    """
+    stack = payload.get("stack") or {}
+    frames = stack.get("frames") or []
+    for frame in frames:
+        sym = (frame or {}).get("sym") or ""
+        if not sym.startswith("bpf_prog_"):
+            continue
+        _head, sep, tail = sym.partition("_kcrypto_")
+        if sep and tail:
+            return tail
+    return None
 
 
 def parse_api_returns_report(doc: dict) -> dict:
@@ -45,7 +71,7 @@ def parse_api_returns_report(doc: dict) -> dict:
 
     Returns ``{"agg": {(family, op, result, algorithm, driver,
     context): {"calls", "errors", "ok", "queued", "bytes"}},
-    "who": [{tgid, tid, comm, uid, calls, first_errno}],
+    "who": [{tgid, tid, comm, uid, calls, first_errno, probe}],
     "totals": {...}, "loss": {"ring_drops", "ktot_gap",
     ...integrity counters}, "attach": {"probes_attached",
     "probes_expected"}, "verdict": {...},
@@ -113,6 +139,7 @@ def parse_api_returns_report(doc: dict) -> dict:
                     "uid": payload.get("uid"),
                     "calls": payload["calls"],
                     "first_errno": payload.get("first_errno"),
+                    "probe": who_probe_from_stack(payload),
                 }
             )
         elif row == "totals":
@@ -376,26 +403,44 @@ def check_r04_deny(refusal: dict, control: dict, kernel_ref: dict) -> tuple[dict
 
 def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
                       foreign_issued: int, product_rows: list,
-                      agg_digest_total: int) -> tuple[dict, dict]:
+                      agg_all_total: int) -> tuple[dict, dict]:
     """R04 foreign traffic: unique owned correspondence, no absorption.
 
-    Who rows (``tgid`` + ``calls``) must attribute every digest
-    observation to exactly the recorded owned/foreign PID sets;
-    owned/foreign who totals must stand in the exact issued
-    ratio (20:6); and who attribution must cover the agg digest
-    total exactly (nothing unattributed, nothing absorbed). No
-    per-digest route assumption: the absolute multiplier is
-    ROUTE-SHAPED (nested shash), so the proof is ratio +
-    coverage, never an absolute who total.
+    Who rows (``tgid`` + ``probe`` + ``calls``) must attribute
+    every observation to exactly the recorded owned/foreign PID
+    sets. The issued ratio (20:6) is proved on the OUTER ahash
+    rows only: one sendmsg is one outer digest whatever the
+    kernel's nested route (digest vs finup nesting is
+    scatterlist-shaped and legitimately differs per burst), so a
+    summed-totals ratio is unprovable. Each burst binds exactly
+    once, so the bind-alloc rows are pinned 1:1. Coverage is who
+    over EVERY agg family (nested rows included, nothing
+    unattributed, nothing absorbed).
     """
     checks = {}
     owned_set, foreign_set = set(owned_pids or []), set(foreign_pids or [])
-    owned_matched = sum(
-        row.get("calls", 0) for row in product_rows if row.get("tgid") in owned_set
+
+    def matched(probe: str, pids: set) -> int:
+        return sum(
+            row.get("calls", 0) for row in product_rows
+            if row.get("tgid") in pids and row.get("probe") == probe
+        )
+
+    owned_outer = matched("ahash", owned_set)
+    foreign_outer = matched("ahash", foreign_set)
+    owned_alloc = matched("alloc", owned_set)
+    foreign_alloc = matched("alloc", foreign_set)
+    owned_nested = sum(
+        row.get("calls", 0) for row in product_rows
+        if row.get("tgid") in owned_set
+        and row.get("probe") in ("shash", "finup")
     )
-    foreign_matched = sum(
-        row.get("calls", 0) for row in product_rows if row.get("tgid") in foreign_set
+    foreign_nested = sum(
+        row.get("calls", 0) for row in product_rows
+        if row.get("tgid") in foreign_set
+        and row.get("probe") in ("shash", "finup")
     )
+    who_total = sum(row.get("calls", 0) for row in product_rows)
     unattributed = [
         row for row in product_rows
         if row.get("tgid") not in owned_set and row.get("tgid") not in foreign_set
@@ -403,21 +448,30 @@ def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
     checks["pid_sets_disjoint"] = bool(owned_set) and bool(foreign_set) and not (
         owned_set & foreign_set
     )
+    checks["probes_classified"] = all(
+        row.get("probe") in FOREIGN_PROBES for row in product_rows
+    ) and bool(product_rows)
     checks["ratio_exact"] = (
-        owned_matched * (foreign_issued or 0) == foreign_matched * (owned_issued or 0)
+        owned_outer * (foreign_issued or 0) == foreign_outer * (owned_issued or 0)
         and (owned_issued or 0) > 0
         and (foreign_issued or 0) > 0
     )
-    checks["foreign_present"] = foreign_matched > 0
+    checks["foreign_present"] = foreign_outer > 0
+    checks["alloc_exact"] = owned_alloc == 1 and foreign_alloc == 1
     checks["coverage_exact"] = (
-        owned_matched + foreign_matched == agg_digest_total
-        and (agg_digest_total or 0) > 0
+        who_total == agg_all_total
+        and (agg_all_total or 0) > 0
     )
     checks["no_unattributed_rows"] = not unattributed
     detail = {
-        "owned_matched": owned_matched,
-        "foreign_matched": foreign_matched,
-        "agg_digest_total": agg_digest_total,
+        "owned_outer": owned_outer,
+        "foreign_outer": foreign_outer,
+        "owned_alloc": owned_alloc,
+        "foreign_alloc": foreign_alloc,
+        "owned_nested": owned_nested,
+        "foreign_nested": foreign_nested,
+        "who_total": who_total,
+        "agg_all_total": agg_all_total,
         "unattributed": len(unattributed),
     }
     return checks, detail

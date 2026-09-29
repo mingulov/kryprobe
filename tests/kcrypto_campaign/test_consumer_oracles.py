@@ -316,6 +316,10 @@ def deny_control(issued=10, done=10, observed=None, drops="0"):
             "ring_drops": drops}
 
 
+def frow(tgid, probe, calls):
+    return [{"tgid": tgid, "probe": probe, "calls": calls}]
+
+
 class R04Tests(unittest.TestCase):
     def test_deny_plus_control_passes(self):
         checks, _d = oracles.check_r04_deny(
@@ -372,47 +376,104 @@ class R04Tests(unittest.TestCase):
         self.assertFalse(checks["control_nonempty"])
 
     def test_foreign_correspondence_passes(self):
-        # Route-shaped multiplier (2 observations per digest: ahash
-        # + nested shash): the proof is the 20:6 ratio plus exact
-        # agg coverage, never the absolute 40/12.
-        rows = [{"tgid": 101, "calls": 20}] * 2 + [{"tgid": 202, "calls": 6}] * 2
+        # Real 7.0.14 shape (R04-foreign-7014 seal): owned takes
+        # digest-nesting (20 outer + 20 shash + 1 bind-alloc) while
+        # foreign takes finup-nesting (6 outer + 12 finup + 1
+        # bind-alloc). Outer ratio is exactly 20:6, allocs are
+        # exactly 1:1, and who covers every agg call (60/60).
+        rows = (frow(101, "ahash", 20) + frow(101, "shash", 20)
+                + frow(101, "alloc", 1) + frow(202, "ahash", 6)
+                + frow(202, "finup", 12) + frow(202, "alloc", 1))
         checks, detail = oracles.check_r04_foreign(
-            [101], [202], 20, 6, rows, 52)
+            [101], [202], 20, 6, rows, 60)
         self.assertTrue(all(checks.values()), checks)
-        self.assertEqual(detail["owned_matched"], 40)
-        self.assertEqual(detail["foreign_matched"], 12)
+        self.assertEqual(detail["owned_outer"], 20)
+        self.assertEqual(detail["foreign_outer"], 6)
+        self.assertEqual(detail["who_total"], 60)
+
+    def test_foreign_totals_ratio_is_not_the_proof(self):
+        # Regression: summing every who row per set (41:19 here)
+        # can never equal the 20:6 issued ratio once bind-allocs
+        # are attributed, and digest-only coverage (58) can never
+        # cover alloc-bearing who totals (60). The proof is the
+        # outer-only ratio plus all-families coverage.
+        rows = (frow(101, "ahash", 20) + frow(101, "shash", 20)
+                + frow(101, "alloc", 1) + frow(202, "ahash", 6)
+                + frow(202, "finup", 12) + frow(202, "alloc", 1))
+        owned_total = sum(r["calls"] for r in rows if r["tgid"] == 101)
+        foreign_total = sum(r["calls"] for r in rows if r["tgid"] == 202)
+        self.assertEqual((owned_total, foreign_total), (41, 19))
+        self.assertNotEqual(owned_total * 6, foreign_total * 20)
+        checks, _d = oracles.check_r04_foreign(
+            [101], [202], 20, 6, rows, 58)
+        self.assertFalse(checks["coverage_exact"])
 
     def test_foreign_absorbed_fails(self):
         # Foreign rows claimed as owned: the ratio breaks (26:0
         # over disjoint sets is unprovable) and the empty foreign
         # set fails the disjointness gate.
-        rows = [{"tgid": 101, "calls": 1}] * 20 + [{"tgid": 202, "calls": 1}] * 6
+        rows = ([{"tgid": 101, "probe": "ahash", "calls": 1}] * 20
+                + [{"tgid": 202, "probe": "ahash", "calls": 1}] * 6)
         checks, _d = oracles.check_r04_foreign([101, 202], [], 26, 0, rows, 26)
         self.assertFalse(checks["pid_sets_disjoint"])
 
-    def test_skewed_ratio_fails(self):
-        # 39:13 is not 20:6 — one owned observation leaked to the
-        # foreign set (or vice versa); the correspondence is broken.
-        rows = [{"tgid": 101, "calls": 39}, {"tgid": 202, "calls": 13}]
-        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 52)
+    def test_skewed_outer_ratio_fails(self):
+        # 19:7 outer is not 20:6 — one owned outer observation
+        # leaked to the foreign set; the correspondence is broken
+        # even though the all-in totals still cover.
+        rows = (frow(101, "ahash", 19) + frow(101, "alloc", 1)
+                + frow(202, "ahash", 7) + frow(202, "alloc", 1))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 28)
         self.assertFalse(checks["ratio_exact"])
 
+    def test_foreign_alloc_misattributed_fails(self):
+        # The owned bind-alloc attributed to the foreign PID keeps
+        # the outer ratio and the coverage equation green while
+        # the per-burst alloc shape (1:1) breaks: alloc_exact
+        # catches the misattribution the totals cannot see.
+        rows = (frow(101, "ahash", 20) + frow(202, "ahash", 6)
+                + frow(202, "alloc", 2))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 28)
+        self.assertTrue(checks["ratio_exact"])
+        self.assertTrue(checks["coverage_exact"])
+        self.assertFalse(checks["alloc_exact"])
+
+    def test_unclassified_probe_fails(self):
+        # A who row the parser could not map to a scenario probe
+        # (or a probe outside the hash-only traffic contract)
+        # fails closed instead of joining a silent total.
+        rows = (frow(101, "ahash", 20) + frow(101, "alloc", 1)
+                + frow(202, "ahash", 6) + frow(202, "alloc", 1)
+                + [{"tgid": 101, "probe": None, "calls": 2}])
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 30)
+        self.assertFalse(checks["probes_classified"])
+
     def test_uncovered_agg_fails(self):
-        # Who attribution (40+12) misses 2 agg observations: the
-        # coverage equation fails even though the ratio holds.
-        rows = [{"tgid": 101, "calls": 20}] * 2 + [{"tgid": 202, "calls": 6}] * 2
-        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 54)
+        # Who attribution (26 outer + 2 alloc) misses 32 nested
+        # agg observations: the coverage equation fails even
+        # though the outer ratio holds.
+        rows = (frow(101, "ahash", 20) + frow(101, "alloc", 1)
+                + frow(202, "ahash", 6) + frow(202, "alloc", 1))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 60)
         self.assertFalse(checks["coverage_exact"])
 
     def test_unattributed_rows_fail(self):
-        rows = ([{"tgid": 101, "calls": 20}] * 2 + [{"tgid": 202, "calls": 6}] * 2
-                + [{"tgid": 999, "calls": 2}])
-        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 54)
+        rows = (frow(101, "ahash", 20) + frow(101, "alloc", 1)
+                + frow(202, "ahash", 6) + frow(202, "alloc", 1)
+                + frow(999, "ahash", 2))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 30)
         self.assertFalse(checks["no_unattributed_rows"])
 
     def test_missing_foreign_decoy_fails(self):
-        rows = [{"tgid": 101, "calls": 20}] * 2
-        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 40)
+        rows = frow(101, "ahash", 20) + frow(101, "alloc", 1)
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 21)
+        self.assertFalse(checks["foreign_present"])
+
+    def test_vacuous_zero_outer_fails(self):
+        # 0:0 outer satisfies the ratio equation trivially; the
+        # foreign-presence gate keeps the vacuous pass out.
+        rows = frow(101, "alloc", 1) + frow(202, "alloc", 1)
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 2)
         self.assertFalse(checks["foreign_present"])
 
 
@@ -471,7 +532,8 @@ class ReportParserTests(unittest.TestCase):
         self.assertEqual(parsed["agg"][key]["calls"], 20)
         self.assertEqual(parsed["who"], [{"tgid": 101, "tid": 101,
                                           "comm": "kcrypto_gen", "uid": 0,
-                                          "calls": 20, "first_errno": None}])
+                                          "calls": 20, "first_errno": None,
+                                          "probe": None}])
         self.assertEqual(parsed["loss"]["ring_drops"], "0")
         self.assertEqual(parsed["loss"]["ktot_gap"], "0")
         self.assertEqual(parsed["attach"]["probes_attached"], "9")
@@ -517,6 +579,28 @@ class ReportParserTests(unittest.TestCase):
         del bad["backend_payload"]["tgid"]
         with self.assertRaisesRegex(oracles.OracleError, "tgid"):
             oracles.parse_api_returns_report(report_doc(bad))
+
+    def test_parse_labels_who_probe_from_stack(self):
+        # The first kcrypto frame names the probe family; rows
+        # without a stack (or without a kcrypto frame) parse with
+        # probe None and let the oracle fail closed, never the
+        # parser.
+        ahash = who_obs(tgid=101, calls=20)
+        ahash["backend_payload"]["stack"] = {"id": 693, "frames": [
+            {"sym": "bpf_prog_927a780be69a1c52_kcrypto_ahash"},
+            {"sym": "bpf_trampoline_6442556524"},
+            {"sym": "hash_sendmsg"},
+        ]}
+        alloc = who_obs(tgid=101, calls=1)
+        alloc["backend_payload"]["stack"] = {"id": 725, "frames": [
+            {"sym": "bpf_prog_3a94273105c32b1b_kcrypto_alloc"},
+            {"sym": "crypto_alloc_ahash"},
+        ]}
+        parsed = oracles.parse_api_returns_report(
+            report_doc(ahash, alloc, who_obs(tgid=202, calls=6)))
+        probes = [(row["tgid"], row["probe"], row["calls"]) for row in parsed["who"]]
+        self.assertEqual(probes, [(101, "ahash", 20), (101, "alloc", 1),
+                                  (202, None, 6)])
 
 
 if __name__ == "__main__":

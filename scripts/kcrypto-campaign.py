@@ -866,13 +866,15 @@ def judge_r04_foreign(oracle_spec, cell_dir):
     owned = json.loads((cell_dir / "owned-pids.json").read_text())
     foreign = json.loads((cell_dir / "foreign-pids.json").read_text())
     parsed = load_report(cell_dir, "product.json")
-    agg_digest_total = sum(
-        entry["calls"] for key, entry in parsed["agg"].items()
-        if key[0] in ("ahash", "shash") and key[2] == AGG_OK)
+    # Coverage is who over EVERY agg family: the who rows carry
+    # the bind-alloc attributions too, so a digest-only total can
+    # never cover them (41:19 vs 58 in the first seal).
+    agg_all_total = sum(
+        entry["calls"] for _key, entry in parsed["agg"].items())
     checks, detail = oracles.check_r04_foreign(
         owned["pids"], foreign["pids"],
         oracle_spec["owned_issued"], oracle_spec["foreign_issued"],
-        parsed["who"], agg_digest_total)
+        parsed["who"], agg_all_total)
     checks["transport_closed"] = transport_closed(parsed)
     checks["no_unexpected_results"] = all(
         key[2] == AGG_OK for key in parsed["agg"]
