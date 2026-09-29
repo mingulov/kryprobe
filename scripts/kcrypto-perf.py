@@ -915,6 +915,11 @@ MANDATORY_STAGE_PINS = frozenset({
 # missing file fails, even with a consistent re-seal.
 HISTORICAL_UNSHIPPED_PINS = frozenset({"validity.py"})
 
+# P9R3A-N01: the ONLY pin that may carry the "none" value —
+# the optional fixture module on cells that need no module.
+# Any other "none" is a stage defect and fails closed.
+NONE_PIN_ALLOWED = frozenset({"kcrypto_fixture.ko"})
+
 
 def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     """Staged pins must equal the sealed bytes + guest hashes (P9R1A-N6).
@@ -922,7 +927,9 @@ def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     A corrupted-then-resealed artifact keeps a consistent seal;
     only the stage binding catches it. Mandatory pin rows must
     be present (P9R2A-N01) and every pinned file except the
-    named historical unshipped pin must exist and match.
+    named historical unshipped pin must exist and match. The
+    "none" value is allowed ONLY for kcrypto_fixture.ko
+    (P9R3A-N01); any other "none" fails closed.
     Returns (reasons, observed).
     """
     cell_dir = Path(cell_dir)
@@ -939,6 +946,10 @@ def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     for name in sorted(pins):
         pinned = pins[name]
         if pinned == "none":
+            if name not in NONE_PIN_ALLOWED:
+                reasons.append(
+                    f"pin {name}: unexpected \"none\" pin "
+                    f"value (fail closed)")
             continue
         target = cell_dir / name
         if not target.is_file():
