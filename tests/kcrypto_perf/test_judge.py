@@ -308,6 +308,56 @@ class PinGateTests(unittest.TestCase):
         self.assertIn("validity.py",
                       got.get("pin_check", {}).get("unverifiable", []))
 
+    def test_none_pin_on_mandatory_artifact_fails_cell(self):
+        # P9R3A-N01: "none" must not bypass the mandatory gate —
+        # a kryprobe pin of "none" with the binary removed must
+        # FAIL even when the remaining bytes re-seal consistently.
+        with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
+            cell = _sealed_cell(tmp)
+            stage = json.loads((cell / "stage.json").read_text())
+            stage["sha256"]["kryprobe"] = "none"
+            (cell / "stage.json").write_text(json.dumps(stage))
+            (cell / "kryprobe").unlink()
+            names = [name for name in _sealed_names(cell)
+                     if name != "kryprobe"]
+            CLI.krecept.seal_artifacts(cell, names, writers_done=True)
+            got = CLI.verify_cell(cell, _manifest())
+        self.assertTrue(got["seal_ok"], "re-seal must hold")
+        self.assertTrue(got["errors"],
+                        "mandatory pin set to none must fail")
+        self.assertTrue(any("kryprobe" in err
+                            for err in got["errors"]),
+                        got["errors"])
+
+    def test_none_pin_on_other_pin_fails_cell(self):
+        # P9R3A-N01: "none" is allowed ONLY for
+        # kcrypto_fixture.ko — any other "none" pin is a stage
+        # defect and fails closed.
+        with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
+            cell = _sealed_cell(tmp)
+            stage = json.loads((cell / "stage.json").read_text())
+            stage["sha256"]["validity.py"] = "none"
+            (cell / "stage.json").write_text(json.dumps(stage))
+            CLI.krecept.seal_artifacts(cell, _sealed_names(cell),
+                                       writers_done=True)
+            got = CLI.verify_cell(cell, _manifest())
+        self.assertTrue(got["seal_ok"], "re-seal must hold")
+        self.assertTrue(got["errors"],
+                        "unexpected none pin must fail")
+        self.assertTrue(any("validity.py" in err
+                            for err in got["errors"]),
+                        got["errors"])
+
+    def test_none_pin_on_fixture_module_still_verifies(self):
+        # P9R3A-N01 positive control: kcrypto_fixture.ko pinned
+        # "none" (no module needed) still verifies — sealed cells
+        # depend on this exception.
+        with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
+            cell = _sealed_cell(tmp)
+            self.assertFalse((cell / "kcrypto_fixture.ko").exists())
+            got = CLI.verify_cell(cell, _manifest())
+        self.assertEqual(got.get("errors"), [])
+
 
 class AlternationTests(unittest.TestCase):
     def _verdict(self, leg_id, side, order):
