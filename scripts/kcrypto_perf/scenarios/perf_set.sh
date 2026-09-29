@@ -42,9 +42,11 @@ sampler() {
     stats=$(sed 's/.*) //' /proc/"$pid"/stat 2>/dev/null)
     ut=$(echo "$stats" | awk '{print $12}')
     st=$(echo "$stats" | awk '{print $13}')
-    case "$rss" in ''|*[!0-9]*) rss=0;; esac
-    case "$ut" in ''|*[!0-9]*) ut=0;; esac
-    case "$st" in ''|*[!0-9]*) st=0;; esac
+    # Skip torn reads (exiting process): a zero sample would fake
+    # negative CPU deltas downstream. No sample beats a false one.
+    case "$rss" in ''|*[!0-9]*) sleep 1; continue;; esac
+    case "$ut" in ''|*[!0-9]*) sleep 1; continue;; esac
+    case "$st" in ''|*[!0-9]*) sleep 1; continue;; esac
     echo "t=$(date +%s) rss_kb=$rss utime=$ut stime=$st" >> "$out"
     sleep 1
   done
@@ -105,8 +107,12 @@ run_driver() {
   return 0
 }
 
+CAP_PID=""
 start_capture() {
-  # $1 = leg id, $2 = profile, $3 = format.
+  # $1 = leg id, $2 = profile, $3 = format. Sets $CAP_PID in the
+  # MAIN shell (never via $(...) — a substitution would hold the
+  # stdout pipe open and block until the capture ends, running the
+  # driver after the window instead of inside it).
   leg="$1"
   profile_args=""
   if [ "$2" = "request-lifecycle" ]; then
@@ -115,8 +121,9 @@ start_capture() {
   # shellcheck disable=SC2086
   "$KP" report --system $profile_args --duration "$CAPTURE_S" \
     --format "$3" --out "$OUT/legs/$leg-report.$3" \
+    > "$OUT/legs/$leg-capture.stdout.log" \
     2> "$OUT/legs/$leg-capture.stderr.log" &
-  echo $!
+  CAP_PID=$!
 }
 
 # Quiet leg: any ambient crypto traffic aborts the boot (fast fail —
@@ -158,7 +165,8 @@ while IFS="$(printf '\t')" read -r leg side mode cls driver size \
       run_driver "$leg" "$driver" "$size" "$MEASURE_S" "$WARMUP_S" $extra
       ;;
     attached-idle)
-      CAP=$(start_capture "$leg" "api-returns" "json")
+      start_capture "$leg" "api-returns" "json"
+      CAP=$CAP_PID
       sampler "$CAP" "$OUT/legs/$leg-sampler.log" &
       SAMPLER=$!
       if ! wait_attach "$OUT/legs/$leg-capture.stderr.log" \
@@ -180,7 +188,8 @@ while IFS="$(printf '\t')" read -r leg side mode cls driver size \
         prof="request-lifecycle"
         fmt="jsonl"
       fi
-      CAP=$(start_capture "$leg" "$prof" "$fmt")
+      start_capture "$leg" "$prof" "$fmt"
+      CAP=$CAP_PID
       sampler "$CAP" "$OUT/legs/$leg-sampler.log" &
       SAMPLER=$!
       if ! wait_attach "$OUT/legs/$leg-capture.stderr.log" \

@@ -435,7 +435,12 @@ def judge_leg(cell_dir: Path, leg: dict, kernel: str) -> dict:
                    outcome="invalid")
         return out
     if leg["bulk"]:
-        return judge_bulk_leg(summary, out)
+        judge_bulk_leg(summary, out)
+        if not out["valid"]:
+            return out
+        if leg["mode"] == "disabled":
+            return out
+        return judge_observed_leg(cell_dir, leg, kernel, summary, out)
     try:
         rows = kparsers.parse_ledger_csv(legs_dir / f"{leg_id}-driver.csv")
     except kparsers.ParseError as err:
