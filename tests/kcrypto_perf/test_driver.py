@@ -13,16 +13,25 @@ gates. Run from the product worktree root::
 """
 
 import csv
+import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 DRIVER = ROOT / "tests" / "fixtures" / "kcrypto_perf.py"
+
+_FIX_SPEC = importlib.util.spec_from_file_location(
+    "kcrypto_perf_fixture", str(DRIVER))
+FIXTURE = importlib.util.module_from_spec(_FIX_SPEC)
+_FIX_SPEC.loader.exec_module(FIXTURE)
 
 
 def run_driver(*args):
@@ -91,6 +100,68 @@ class DriverTests(unittest.TestCase):
         # 1.5 s at 200/s offers ~300 ops; allow scheduling slack.
         self.assertGreater(summary["ops_total"], 200)
         self.assertLess(summary["ops_total"], 400)
+
+    def test_bulk_skcipher_reads_no_timestamps(self):
+        # P9R1A-N8 repair: the sealed campaign's --bulk legs
+        # still paid three clock reads per op; future bulk
+        # legs must not read the clock at all.
+        worker = FIXTURE.Skcipher(64)
+        try:
+            with mock.patch.object(
+                    FIXTURE.time, "monotonic_ns",
+                    side_effect=AssertionError("clock read")):
+                calls = worker.roundtrip_bulk(7)
+        finally:
+            worker.close()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(t0 == 0 and t1 == 0
+                            for _, t0, t1, _ in calls))
+
+    def test_bulk_worker_loop_uses_notimestamp_path(self):
+        class Stub:
+            def __init__(self):
+                self.calls = 0
+                self.bulk_calls = 0
+
+            def roundtrip(self, seq):
+                self.calls += 1
+                return [("encrypt", 0, 1, 0), ("decrypt", 0, 1, 0)]
+
+            def roundtrip_bulk(self, seq):
+                self.bulk_calls += 1
+                return [("encrypt", 0, 0, 0), ("decrypt", 0, 0, 0)]
+
+        worker = Stub()
+        shared = FIXTURE.Shared()
+        now = time.monotonic_ns()
+        FIXTURE.worker_loop(
+            worker, {"paced": 0, "bulk": True}, shared,
+            io.StringIO(), now, now, now + 20_000_000)
+        self.assertGreater(worker.bulk_calls, 0)
+        self.assertEqual(worker.calls, 0)
+
+    def test_ledger_worker_loop_uses_timestamp_path(self):
+        class Stub:
+            def __init__(self):
+                self.calls = 0
+                self.bulk_calls = 0
+
+            def roundtrip(self, seq):
+                self.calls += 1
+                return [("encrypt", 0, 1, 0), ("decrypt", 0, 1, 0)]
+
+            def roundtrip_bulk(self, seq):
+                self.bulk_calls += 1
+                return [("encrypt", 0, 0, 0), ("decrypt", 0, 0, 0)]
+
+        worker = Stub()
+        shared = FIXTURE.Shared()
+        now = time.monotonic_ns()
+        FIXTURE.worker_loop(
+            worker, {"paced": 0, "bulk": False}, shared,
+            io.StringIO(), now, now, now + 20_000_000)
+        self.assertGreater(worker.calls, 0)
+        self.assertEqual(worker.bulk_calls, 0)
 
     def test_async_fake_control_format(self):
         tmp = Path(tempfile.mkdtemp(prefix="t14async"))

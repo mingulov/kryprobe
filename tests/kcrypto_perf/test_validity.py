@@ -182,6 +182,18 @@ class FloorValidityTests(unittest.TestCase):
             kernel="6.12.111", cls="P-4K", capture_rc=3)
         self.assertFalse(got["valid"])
 
+    def test_floor_destroy_skip_unpinned_per_manifest(self):
+        # The frozen manifest's floor equivalence names no
+        # destroy pin (cells.json equivalence.floor_afalg);
+        # the observed floor counter (3) is recorded, never
+        # judged. P9R1O-N2 harness-defect repair.
+        report = self._floor_report(100)
+        report["loss"] = zero_loss(destroy_skip=3)
+        got = VALIDITY.check_leg_agg(
+            report, driver_summary(100),
+            kernel="6.12.111", cls="P-4K", capture_rc=3)
+        self.assertTrue(got["valid"], got["reasons"])
+
 
 class AsyncValidityTests(unittest.TestCase):
     def _async_report(self, gos=30):
