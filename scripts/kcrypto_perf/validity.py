@@ -71,12 +71,19 @@ def check_leg_agg(parsed: dict, summary: dict, kernel: str, cls: str,
         family = AFALG_FAMILY[cls]
         if kernel == "6.12.111":
             reasons.extend(_check_floor_counts(parsed, ops, family))
+            # P9R1O-N2: the frozen manifest's floor
+            # equivalence names no destroy pin
+            # (equivalence.floor_afalg lists arms + allocs
+            # only; validity.unexpected_loss_zero excludes
+            # predrop_destroy_skip). The floor counter is
+            # recorded, never judged.
+            reasons.extend(_loss_reasons(parsed.get("loss", {}), None))
         else:
             reasons.extend(_check_flat_counts(parsed, ops, family,
                                               expected_alloc))
-        reasons.extend(_loss_reasons(
-            parsed.get("loss", {}),
-            expected_alloc if pin_destroy else None))
+            reasons.extend(_loss_reasons(
+                parsed.get("loss", {}),
+                expected_alloc if pin_destroy else None))
     else:
         reasons.append(f"unknown class {cls}")
     return {"valid": not reasons, "reasons": reasons,

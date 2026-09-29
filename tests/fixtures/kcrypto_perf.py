@@ -9,7 +9,8 @@ or kernel-fixture async GO loops (blocking GO <=> terminal covered).
 Usage:
     kcrypto_perf.py <class> <size> <meas_s> <warmup_s> [options] <ledger.csv>
     class: skcipher | aead | async
-    options: --bulk (no per-op rows: perturbation control),
+    options: --bulk (no per-op rows or timestamps:
+             perturbation control),
              --paced N (fixed N ops/s cadence),
              --threads T (T worker threads, own socket each; AF_ALG only),
              --control PATH (fixture control; async only,
@@ -115,6 +116,19 @@ class Skcipher:
         assert pt == self.msg, f"roundtrip mismatch seq={seq}"
         return [("encrypt", t0, t1, 0), ("decrypt", t1, t2, 0)]
 
+    def roundtrip_bulk(self, seq):
+        # P9R1A-N8: bulk perturbation control — identical
+        # crypto work and roundtrip assertion, but NO clock
+        # reads (the pre-repair bulk path still paid three
+        # timestamps per op, so it bounded row costs only).
+        iv = iv_for(seq)
+        send_all(self.op, self.msg, op_cmsg(ALG_OP_ENCRYPT, iv))
+        ct = self.op.recv(self.size + 64)
+        send_all(self.op, ct, op_cmsg(ALG_OP_DECRYPT, iv))
+        pt = self.op.recv(self.size + 64)
+        assert pt == self.msg, f"roundtrip mismatch seq={seq}"
+        return [("encrypt", 0, 0, 0), ("decrypt", 0, 0, 0)]
+
     def close(self):
         self.op.close()
         self.sock.close()
@@ -167,6 +181,24 @@ class Aead:
             f"aead roundtrip mismatch seq={seq}"
         return [("encrypt", t0, t1, 0), ("decrypt", t1, t2, 0)]
 
+    def roundtrip_bulk(self, seq):
+        # P9R1A-N8: bulk perturbation control — identical
+        # crypto work and assertions, but NO clock reads.
+        iv = bytes(12)
+        send_all(self.op, self.assoc + self.msg, self._cmsg(1, iv))
+        enc_out = self.op.recv(self.ASSOC + self.size + self.TAG + 64)
+        assert len(enc_out) == self.ASSOC + self.size + self.TAG, \
+            f"aead ct length {len(enc_out)} seq={seq}"
+        assert enc_out[:self.ASSOC] == self.assoc, \
+            f"aead assoc echo seq={seq}"
+        send_all(self.op, enc_out, self._cmsg(0, iv))
+        dec_out = self.op.recv(self.ASSOC + self.size + 64)
+        assert dec_out[:self.ASSOC] == self.assoc, \
+            f"aead dec assoc seq={seq}"
+        assert dec_out[self.ASSOC:] == self.msg, \
+            f"aead roundtrip mismatch seq={seq}"
+        return [("encrypt", 0, 0, 0), ("decrypt", 0, 0, 0)]
+
     def close(self):
         self.op.close()
         self.sock.close()
@@ -196,6 +228,20 @@ class AsyncFixture:
             rc = exc.errno or 1
         t1 = time.monotonic_ns()
         return [("go", t0, t1, rc)]
+
+    def roundtrip_bulk(self, seq):
+        # P9R1A-N8: bulk perturbation control — identical
+        # fixture work, but NO clock reads.
+        run_id = f"{self.tag}-{seq}"
+        with open(self.control, "w") as fh:
+            fh.write(f"PREPARE {run_id} async-once {1000 + seq}\n")
+        rc = 0
+        try:
+            with open(self.control, "w") as fh:
+                fh.write("GO\n")
+        except OSError as exc:
+            rc = exc.errno or 1
+        return [("go", 0, 0, rc)]
 
     def close(self):
         pass
@@ -299,7 +345,10 @@ def worker_loop(worker, opts, shared, fh, t_start, warm_end, end):
             deadline += period_ns
         phase = "warm" if now < warm_end else "meas"
         try:
-            calls = worker.roundtrip(seq)
+            if opts["bulk"]:
+                calls = worker.roundtrip_bulk(seq)
+            else:
+                calls = worker.roundtrip(seq)
         except (OSError, AssertionError):
             with shared.lock:
                 shared.fails += 1

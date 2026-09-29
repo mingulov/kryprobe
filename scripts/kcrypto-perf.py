@@ -199,8 +199,17 @@ def stage_run_dir(args, entry: dict, manifest: dict, kind: str,
         pins["kcrypto_fixture.ko"] = "none"
     shutil.copyfile(SCENARIOS / "perf_set.sh", run_dir / "inner.sh")
     pins["inner.sh"] = sha256_file(run_dir / "inner.sh")
-    judge_src = HERE / "kcrypto_perf" / "validity.py"
-    pins["validity.py"] = sha256_file(judge_src)
+    # P9R1A-N6/O-N10: ship the judge itself into the cell so its
+    # pins are verifiable post-hoc (the pre-repair validity.py
+    # pin named a file that was never staged).
+    judge_dir = run_dir / "judge"
+    judge_dir.mkdir()
+    for src, name in ((HERE / "kcrypto-perf.py", "kcrypto-perf.py"),
+                      (HERE / "kcrypto_perf" / "validity.py",
+                       "validity.py"),
+                      (HERE / "kcrypto_perf" / "stats.py", "stats.py")):
+        shutil.copyfile(src, judge_dir / name)
+        pins[f"judge/{name}"] = sha256_file(judge_dir / name)
     with (run_dir / "legs.tsv").open("w") as fh:
         for leg in legs:
             fh.write("\t".join(str(leg[key]) for key in
@@ -219,6 +228,14 @@ def stage_run_dir(args, entry: dict, manifest: dict, kind: str,
                           check=True).stdout.strip()
     (run_dir / "head-sha.txt").write_text(head + "\n")
     pins["head-sha.txt"] = sha256_file(run_dir / "head-sha.txt")
+    pins["set.env"] = sha256_file(run_dir / "set.env")
+    (run_dir / "pins.env").write_text(
+        f"ORACLE_SHA={pins['judge/validity.py']}\nCLI_SHA={pins['kryprobe']}\n"
+        f"BPF_AGG_SHA={pins['kryprobe-bpf/kcrypto.bpf.o']}\n"
+        f"BPF_LC_SHA={pins['kryprobe-bpf/kcrypto-lifecycle.bpf.o']}\n"
+        f"MODULE_SHA={pins['kcrypto_fixture.ko']}\n"
+        f"DRIVER_SHA={pins['kcrypto_perf.py']}\n")
+    pins["pins.env"] = sha256_file(run_dir / "pins.env")
     stage = {"schema": "kcrypto-t14-stage/v1", "cell": cell_id,
              "kind": kind,
              "set": entry["id"] if kind == "set" else None,
@@ -227,47 +244,177 @@ def stage_run_dir(args, entry: dict, manifest: dict, kind: str,
              "manifest_sha256": manifest_sha, "sha256": pins,
              "legs": [leg["leg_id"] for leg in legs]}
     (run_dir / "stage.json").write_text(json.dumps(stage, indent=2) + "\n")
-    (run_dir / "pins.env").write_text(
-        f"ORACLE_SHA={pins['validity.py']}\nCLI_SHA={pins['kryprobe']}\n"
-        f"BPF_AGG_SHA={pins['kryprobe-bpf/kcrypto.bpf.o']}\n"
-        f"BPF_LC_SHA={pins['kryprobe-bpf/kcrypto-lifecycle.bpf.o']}\n"
-        f"MODULE_SHA={pins['kcrypto_fixture.ko']}\n"
-        f"DRIVER_SHA={pins['kcrypto_perf.py']}\n")
     timeout_s = len(legs) * (glob["capture_s"] + 60) + 600
     return run_dir, stage, timeout_s
+
+
+RUN_ENV_ALLOWLIST = (
+    # Environment variables the runner honors (P9R1A-N10: the
+    # receipt-contract identity group requires the allowlist +
+    # values, not just argv/cwd).
+    "PATH", "KRYPROBE_REQUIRE_PINS", "KRYPROBE_BPF_DIR",
+    "CARGO_TEST_CMD", "PYTHONHASHSEED", "SUDO_USER",
+)
+
+
+def _dirty_manifest(worktree: Path) -> tuple:
+    """Dirty-file manifest with content hashes (P9R1A-N10).
+
+    Filenames alone prove nothing; each dirty worktree file is
+    hashed (deleted files are named as such). Returns (short,
+    manifest, unavailable_reason).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=worktree, capture_output=True, text=True,
+            check=True).stdout
+    except (subprocess.CalledProcessError, OSError) as err:
+        return "UNAVAILABLE", {}, f"git status failed: {err}"
+    manifest = {}
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip().strip('"')
+        target = worktree / path
+        if target.is_file():
+            try:
+                manifest[path] = sha256_file(target)
+            except OSError as err:
+                manifest[path] = f"UNREADABLE: {err}"
+        elif target.is_dir():
+            manifest[path] = "DIR"
+        else:
+            manifest[path] = "DELETED"
+        if len(manifest) >= 200:
+            manifest["..."] = "TRUNCATED at 200 entries"
+            break
+    short = out.strip()
+    return short if short else "clean", manifest, ""
+
+
+def _host_facts() -> tuple:
+    """Host kernel/config/BTF/CPU/load/governor/tracing facts.
+
+    Returns (facts, unavailable): every unreadable fact lands in
+    ``unavailable`` with its reason (P9R1A-N10, P9R1O-N7).
+    """
+    facts: dict = {"kernel": os.uname().release}
+    unavailable: dict = {}
+
+    def slurp(path, key, first_line=False, max_len=0):
+        try:
+            text = Path(path).read_text().strip()
+        except OSError as err:
+            unavailable[key] = f"{path}: {err}"
+            return
+        if first_line:
+            text = text.splitlines()[0] if text.splitlines() else ""
+        if max_len and len(text) > max_len:
+            text = text[:max_len] + "...[truncated]"
+        facts[key] = text
+
+    try:
+        flags = ""
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("flags"):
+                flags = line.partition(":")[2].strip()
+                break
+        if flags:
+            facts["cpu_flags"] = flags
+        else:
+            unavailable["cpu_flags"] = "no flags line in /proc/cpuinfo"
+    except OSError as err:
+        unavailable["cpu_flags"] = f"/proc/cpuinfo: {err}"
+    slurp("/proc/loadavg", "loadavg")
+    slurp("/proc/meminfo", "meminfo_head")
+    if "meminfo_head" in facts:
+        facts["meminfo_head"] = "\n".join(
+            facts["meminfo_head"].splitlines()[:3])
+    slurp("/proc/cmdline", "cmdline")
+    slurp("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+          "governor")
+    slurp("/sys/kernel/debug/tracing/tracing_on", "tracing_on")
+    try:
+        btf = sorted(p.name for p in Path("/sys/kernel/btf").iterdir())
+        facts["btf"] = btf
+    except OSError as err:
+        unavailable["btf"] = f"/sys/kernel/btf: {err}"
+    try:
+        facts["vmlinux_btf_sha256"] = sha256_file(
+            Path("/sys/kernel/btf/vmlinux"))
+    except OSError as err:
+        unavailable["vmlinux_btf_sha256"] = (
+            f"/sys/kernel/btf/vmlinux: {err}")
+    for cfg in (f"/boot/config-{os.uname().release}", "/proc/config.gz"):
+        try:
+            facts["kernel_config_sha256"] = sha256_file(Path(cfg))
+            facts["kernel_config_src"] = cfg
+            break
+        except OSError:
+            continue
+    else:
+        unavailable["kernel_config_sha256"] = "no readable kernel config"
+    return facts, unavailable
+
+
+def _attach_summary(run_dir: Path) -> dict:
+    """attach_ready_s min/max across legs (runtime attach results)."""
+    ready = []
+    timeouts = 0
+    for path in sorted((Path(run_dir) / "legs").glob("*-attach.txt")):
+        val = _read_attach(path)
+        if isinstance(val, int):
+            ready.append(val)
+        else:
+            timeouts += 1
+    quiet = _read_attach(Path(run_dir) / "quiet-attach.txt")
+    return {"legs": len(ready) + timeouts, "timeouts": timeouts,
+            "min_s": min(ready) if ready else None,
+            "max_s": max(ready) if ready else None,
+            "quiet_s": quiet}
 
 
 def build_host_receipt(args, entry: dict, manifest: dict, run_dir: Path,
                        stage: dict, result: dict, timeout_s: int) -> dict:
     worktree = HERE.parent
+    dirty_short, dirty_manifest, dirty_unavail = _dirty_manifest(worktree)
     try:
-        dirty = subprocess.run(
-            ["git", "status", "--short"], cwd=worktree, capture_output=True,
-            text=True, check=True).stdout.strip()
-    except subprocess.CalledProcessError:
-        dirty = "UNAVAILABLE: git status failed"
+        head_tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=worktree,
+            capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        head_tree = "UNAVAILABLE"
     try:
         rustc = subprocess.run(["rustc", "--version"], capture_output=True,
                                text=True, check=True).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
         rustc = "UNAVAILABLE"
+    host_facts, host_unavail = _host_facts()
     receipt = krecept.Receipt(
         schema="kcrypto-t14-receipt/v1", run_id=stage["cell"],
         cell_id=stage["cell"], portion_id=stage["cell"])
     receipt.identity = {
         "argv": sys.argv, "cwd": os.getcwd(),
-        "source_commit": stage["head"], "dirty": dirty,
+        "source_commit": stage["head"], "source_tree": head_tree,
+        "dirty": dirty_short, "dirty_manifest": dirty_manifest,
+        "env_allowlist": list(RUN_ENV_ALLOWLIST),
+        "env_values": {key: os.environ.get(key, "UNSET")
+                       for key in RUN_ENV_ALLOWLIST},
         "artifacts": stage["sha256"],
         "manifest_sha256": stage["manifest_sha256"],
         "toolchain": {"rustc": rustc, "python": sys.version.split()[0]},
     }
+    cpu_model = (run_dir / "cpu-model.txt").read_text().strip() \
+        if (run_dir / "cpu-model.txt").is_file() else "UNAVAILABLE"
     receipt.environment = {
         "host_kernel": os.uname().release,
+        "host": host_facts,
         "guest": _read_kv(run_dir / "environment.txt"),
-        "cpu_model": (run_dir / "cpu-model.txt").read_text().strip()
-        if (run_dir / "cpu-model.txt").is_file() else "UNAVAILABLE",
+        "cpu_model": cpu_model,
         "identity_before": _read_kv(run_dir / "identity-before.env"),
         "identity_after": _read_kv(run_dir / "identity-after.env"),
+        "attach": _attach_summary(run_dir),
     }
     receipt.input = {
         "set": stage["set"], "diag": stage["diag"],
@@ -296,9 +443,26 @@ def build_host_receipt(args, entry: dict, manifest: dict, run_dir: Path,
             "preexisting_qemu_unchanged"),
     }
     receipt.custody = {
-        "seal": "FILES-SHA256.txt (written after writers stop)",
+        # P9R1A-N10: name the real seal manifest (cells seal
+        # SHA256SUMS, not FILES-SHA256.txt).
+        "seal": "SHA256SUMS (written after writers stop)",
         "console": "console.log",
     }
+    # P9R1A-N10: no silent unavailable{} — every missing fact
+    # carries its reason.
+    if dirty_unavail:
+        receipt.unavailable["identity.dirty"] = dirty_unavail
+    if head_tree == "UNAVAILABLE":
+        receipt.unavailable["identity.source_tree"] = \
+            "git rev-parse HEAD^{tree} failed"
+    if rustc == "UNAVAILABLE":
+        receipt.unavailable["identity.toolchain.rustc"] = \
+            "rustc --version failed"
+    for key, reason in host_unavail.items():
+        receipt.unavailable[f"environment.host.{key}"] = reason
+    if cpu_model == "UNAVAILABLE":
+        receipt.unavailable["environment.cpu_model"] = \
+            "guest cpu-model.txt absent"
     return receipt.to_dict()
 
 
@@ -365,7 +529,7 @@ def cmd_run(args) -> int:
         if path.is_file():
             shutil.copyfile(path, cell_dir / path.name)
             seal_names.append(path.name)
-    for sub in ("legs", "kryprobe-bpf"):
+    for sub in ("legs", "kryprobe-bpf", "judge"):
         src = run_dir / sub
         if src.is_dir():
             (cell_dir / sub).mkdir(exist_ok=True)
@@ -389,8 +553,44 @@ def _read_int_kv(path: Path, key: str):
     return None
 
 
-def judge_leg(cell_dir: Path, leg: dict, kernel: str) -> dict:
-    """Judge one staged leg from sealed files (stats + validity)."""
+def check_leg_timing(summary: dict, warmup_s: float,
+                     measure_s: float) -> list:
+    """Enforce the frozen 10 s warm-up + 30 s measurement (P9R1A-N7).
+
+    ``warmup_s``/``measure_s`` come from the frozen manifest
+    (bound by sha before judging); the summary's own timestamps
+    must land within -1 s (scheduling slack) / +5 s (bounded
+    teardown overrun) of them. A zero-warmup/one-second window
+    is a protocol violation, never a valid leg.
+    """
+    try:
+        warm_s = (summary["t_meas_start_ns"]
+                  - summary["t_warm_start_ns"]) / 1e9
+    except (KeyError, TypeError, ArithmeticError):
+        return ["timing: driver summary lacks window timestamps"]
+    try:
+        meas_s = float(summary["meas_window_s"])
+    except (KeyError, TypeError, ValueError):
+        return ["timing: meas_window_s unreadable"]
+    reasons = []
+    if not warmup_s - 1.0 <= warm_s <= warmup_s + 5.0:
+        reasons.append(
+            f"timing: warm {warm_s:.3f}s outside frozen {warmup_s}s "
+            "(-1/+5)")
+    if not measure_s - 1.0 <= meas_s <= measure_s + 5.0:
+        reasons.append(
+            f"timing: measure window {meas_s:.3f}s outside frozen "
+            f"{measure_s}s (-1/+5)")
+    return reasons
+
+
+def judge_leg(cell_dir: Path, leg: dict, kernel: str,
+              windows: tuple) -> dict:
+    """Judge one staged leg from sealed files (stats + validity).
+
+    ``windows`` is the frozen (warmup_s, measure_s) pair from the
+    bound manifest; driver timing must match it (P9R1A-N7).
+    """
     legs_dir = cell_dir / "legs"
     leg_id = leg["leg_id"]
     out = {"leg_id": leg_id, "side": leg["side"], "mode": leg["mode"],
@@ -422,17 +622,26 @@ def judge_leg(cell_dir: Path, leg: dict, kernel: str) -> dict:
         out.update(valid=False, reasons=["driver-rc.txt missing/incomplete"],
                    outcome="invalid")
         return out
+    # P9R1A-N5: the ACTUAL driver exit (recorded by the shell
+    # wrapper) gates the leg — the summary's self-reported rc
+    # alone never passes a failed worker.
+    if out["driver_rc"] != 0 or summary.get("rc") != 0 or \
+            out["driver_timeout"]:
+        out.update(valid=False,
+                   reasons=[f"driver rc={summary.get('rc')} "
+                            f"driver_rc={out['driver_rc']} "
+                            f"timeout={out['driver_timeout']} "
+                            f"fails={summary.get('fails')}"],
+                   outcome="invalid")
+        return out
+    timing = check_leg_timing(summary, windows[0], windows[1])
+    if timing:
+        out.update(valid=False, reasons=timing, outcome="invalid")
+        return out
     if summary.get("threads", 1) != leg.get("threads", 1):
         out.update(valid=False, reasons=[
             f"threads summary={summary.get('threads')} spec="
             f"{leg.get('threads')}"], outcome="invalid")
-        return out
-    if summary.get("rc") != 0 or out["driver_timeout"]:
-        out.update(valid=False,
-                   reasons=[f"driver rc={summary.get('rc')} "
-                            f"timeout={out['driver_timeout']} "
-                            f"fails={summary.get('fails')}"],
-                   outcome="invalid")
         return out
     if leg["bulk"]:
         judge_bulk_leg(summary, out)
@@ -487,9 +696,12 @@ def judge_bulk_leg(summary: dict, out: dict) -> dict:
                                         summary["meas_window_s"]),
         "p50_ns": None, "p99_ns": None, "n": summary.get("ops_meas"),
     }
-    if out.get("driver_timeout") or summary.get("rc") != 0:
-        out.update(valid=False, reasons=["bulk driver failed"],
-                   outcome="invalid")
+    if out["driver_rc"] != 0 or out["driver_timeout"] or \
+            summary.get("rc") != 0:
+        out.update(valid=False, reasons=[
+            f"bulk driver rc={summary.get('rc')} "
+            f"driver_rc={out['driver_rc']} "
+            f"timeout={out['driver_timeout']}"], outcome="invalid")
         return out
     out.update(valid=True, reasons=[], outcome="valid")
     return out
@@ -621,8 +833,118 @@ def judge_observed_leg(cell_dir: Path, leg: dict, kernel: str,
     return out
 
 
+def check_run_receipts(cell_dir: Path) -> tuple:
+    """Host wait/reap/completion gates (P9R1A-N5).
+
+    A timed-out, nonzero-exit, or unreaped host run — or an
+    incomplete cell (done marker / leg count) — can never yield
+    valid legs. Returns (reasons, observed).
+    """
+    cell_dir = Path(cell_dir)
+    try:
+        receipt = json.loads(
+            (cell_dir / "host-receipt.json").read_text())
+    except (OSError, ValueError) as err:
+        return [f"host receipt unreadable: {err}"], {}
+    reasons = []
+    process = receipt.get("process", {})
+    cleanup = receipt.get("cleanup", {})
+    wait = process.get("wait", {})
+    observed = {"wait_exit": wait.get("exit"),
+                "timed_out": wait.get("timed_out"),
+                "reaped": process.get("reaped"),
+                "vng_exit": process.get("vng_exit")}
+    if wait.get("timed_out"):
+        reasons.append("host run timed out (a timeout cannot pass)")
+    if wait.get("exit") != 0:
+        reasons.append(f"host wait exit={wait.get('exit')} (want 0)")
+    if process.get("reaped") is not True:
+        reasons.append("host run was not reaped")
+    if process.get("vng_exit") != 0:
+        reasons.append(f"vng_exit={process.get('vng_exit')} (want 0)")
+    stop = process.get("stop", {})
+    if stop.get("remaining_owned_qemu"):
+        reasons.append(
+            f"remaining owned qemu: {stop.get('remaining_owned_qemu')}")
+    if cleanup.get("remaining_owned_qemu"):
+        reasons.append(
+            "cleanup left owned qemu: "
+            f"{cleanup.get('remaining_owned_qemu')}")
+    if cleanup.get("preexisting_qemu_unchanged") is not True:
+        reasons.append("preexisting qemu changed under the run")
+    try:
+        done = (cell_dir / "done.txt").read_text().strip()
+    except OSError:
+        done = "MISSING"
+    observed["done"] = done
+    if done != "step=done":
+        reasons.append(f"done.txt={done!r} (want step=done)")
+    try:
+        staged = len(parse_legs_tsv(cell_dir / "legs.tsv"))
+    except ValueError as err:
+        return reasons + [f"legs.tsv: {err}"], observed
+    try:
+        legs_done = (cell_dir / "legs-done.txt").read_text().strip()
+    except OSError:
+        legs_done = "MISSING"
+    observed["legs_done"] = legs_done
+    if legs_done != f"legs_done={staged}":
+        reasons.append(f"legs-done {legs_done!r} != staged {staged} legs")
+    return reasons, observed
+
+
+def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
+    """Staged pins must equal the sealed bytes + guest hashes (P9R1A-N6).
+
+    A corrupted-then-resealed artifact keeps a consistent seal;
+    only the stage binding catches it. Pins for files never
+    shipped into the cell (e.g. the pre-repair ``validity.py``
+    judge pin) are recorded as unverifiable, never silently
+    trusted. Returns (reasons, observed).
+    """
+    cell_dir = Path(cell_dir)
+    pins = stage.get("sha256", {}) or {}
+    if not pins:
+        return ["stage carries no artifact pins"], {}
+    reasons = []
+    checked = []
+    unverifiable = []
+    for name in sorted(pins):
+        pinned = pins[name]
+        if pinned == "none":
+            continue
+        target = cell_dir / name
+        if not target.is_file():
+            unverifiable.append(name)
+            continue
+        try:
+            actual = sha256_file(target)
+        except OSError as err:
+            reasons.append(f"pin {name}: unreadable: {err}")
+            continue
+        if actual != pinned:
+            reasons.append(
+                f"pin {name}: sealed bytes differ from staged pin")
+        else:
+            checked.append(name)
+    env = _read_kv(cell_dir / "environment.txt")
+    guest_dims = (("ko", "kcrypto_fixture.ko"),
+                  ("obj_agg", "kryprobe-bpf/kcrypto.bpf.o"),
+                  ("obj_lc", "kryprobe-bpf/kcrypto-lifecycle.bpf.o"),
+                  ("kryprobe", "kryprobe"),
+                  ("driver", "kcrypto_perf.py"))
+    for dim, pin_name in guest_dims:
+        pinned = pins.get(pin_name)
+        if pinned is None or pinned == "none":
+            continue
+        if env.get(dim) != pinned:
+            reasons.append(
+                f"guest {dim}: in-guest hash differs from staged pin")
+    return reasons, {"checked": checked, "unverifiable": unverifiable}
+
+
 def verify_cell(cell_dir: Path, manifest: dict) -> dict:
-    """Judge one sealed cell (legs, quiet, seal)."""
+    """Judge one sealed cell (legs, quiet, seal, receipts, pins)."""
     cell_dir = Path(cell_dir)
     verdict: dict = {"cell": cell_dir.name, "errors": []}
     seal_ok, seal_info = _CLI.verify_cell_seal(cell_dir)
@@ -645,6 +967,16 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         verdict["errors"].append("manifest drift: cell ran against "
                                 f"{stage.get('manifest_sha256')}")
         return verdict
+    receipt_reasons, receipt_obs = check_run_receipts(cell_dir)
+    verdict["receipt_check"] = receipt_obs
+    if receipt_reasons:
+        verdict["errors"].extend(receipt_reasons)
+        return verdict
+    pin_reasons, pin_obs = check_stage_pins(cell_dir, stage)
+    verdict["pin_check"] = pin_obs
+    if pin_reasons:
+        verdict["errors"].extend(pin_reasons)
+        return verdict
     kernel = stage.get("kernel")
     try:
         quiet = kparsers.parse_api_returns(cell_dir / "quiet-report.json")
@@ -661,9 +993,11 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         verdict["errors"].append(f"legs.tsv: {err}")
         return verdict
     verdict["spec_boot_invalid"] = not quiet_check["valid"]
+    windows = (manifest["global"]["warmup_s"],
+               manifest["global"]["measure_s"])
     legs = []
     for idx, leg in enumerate(spec):
-        judged = judge_leg(cell_dir, leg, kernel)
+        judged = judge_leg(cell_dir, leg, kernel, windows)
         judged["order"] = idx
         if not quiet_check["valid"]:
             judged["valid"] = False
@@ -700,6 +1034,19 @@ def parse_legs_tsv(path: Path) -> list:
     return legs
 
 
+def expected_first_side(pair_key: str):
+    """Frozen AB/BA alternation: even pairs start A, odd start B.
+
+    Pair numbers encode the global pair index (spares continue
+    the numbering), so parity holds across cells. Bulk pairs and
+    non-pair keys are exempt (None).
+    """
+    if len(pair_key) == 5 and pair_key.startswith("leg") and \
+            pair_key[3:].isdigit():
+        return "A" if int(pair_key[3:]) % 2 == 0 else "B"
+    return None
+
+
 def form_pairs(cell_verdicts: list) -> list:
     """Form ordered pairs across a set's cells (spares continue)."""
     by_pair: dict = {}
@@ -725,12 +1072,23 @@ def form_pairs(cell_verdicts: list) -> list:
             continue
         leg_a, leg_b = slot["A"], slot["B"]
         check = kvalidity.check_pair(leg_a["valid"], leg_b["valid"])
+        order = ("A", "B") if leg_a.get("order", 0) < leg_b.get(
+            "order", 0) else ("B", "A")
         pair = {"pair": key, "valid": check["valid"],
-                "reasons": check["reasons"],
+                "reasons": list(check["reasons"]),
                 "legs": {"A": leg_a["leg_id"], "B": leg_b["leg_id"]},
-                "order": ("A", "B") if leg_a.get("order", 0) < leg_b.get(
-                    "order", 0) else ("B", "A")}
-        if check["valid"] and not leg_a.get("bulk"):
+                "order": order}
+        if not leg_a.get("bulk"):
+            # P9R1A-N7: the frozen protocol runs alternating
+            # pairs; a non-alternating order is never a valid
+            # pair, however clean its legs.
+            want = expected_first_side(key)
+            if want is not None and order[0] != want:
+                pair["valid"] = False
+                pair["reasons"].append(
+                    f"order {order} violates frozen alternation: "
+                    f"pair {key} must start with {want}")
+        if pair["valid"] and not leg_a.get("bulk"):
             pair["ratios"] = {
                 "throughput": (leg_b["stats"]["throughput"] /
                                leg_a["stats"]["throughput"]),
@@ -806,9 +1164,13 @@ def judge_set(set_id: str, cell_verdicts: list, manifest: dict) -> dict:
 def perturbation_report(cell_verdicts: list, bulk: list) -> dict:
     """Reference-perturbation control: ledger-vs-bulk throughput.
 
-    Compares bulk-timing legs (no per-op timestamps) against the
-    ledger legs on the same side: a ratio near 1.0 bounds the
-    driver's own timestamping perturbation.
+    Compares bulk-mode legs against the ledger legs on the same
+    side. NOTE (P9R1A-N8): the sealed P9 campaign used the
+    pre-fix fixture whose bulk legs skipped ledger rows but
+    still read three timestamps per op — those ratios bound
+    row-materialization cost only, not timestamping cost. The
+    repaired fixture's bulk path reads no timestamps, so future
+    bulk legs bound the full driver-observation perturbation.
     """
     report: dict = {}
     for pair in bulk:
@@ -863,14 +1225,32 @@ def judge_diag(diag_id: str, cell_verdict: dict, manifest: dict) -> dict:
 
 
 def cmd_verify(args) -> int:
+    # P9R1O-N9: judging must not rewrite sealed evidence. The
+    # verdicts go to --out-dir; the legacy in-place path needs
+    # an explicit --in-place flag, and contradictory custody
+    # flags fail closed.
+    if args.out_dir is not None and args.in_place:
+        print("verify: pass exactly one of --out-dir / --in-place",
+              file=sys.stderr)
+        return 2
+    if args.out_dir is None and not args.in_place:
+        print("verify: refusing implicit in-place judging inside "
+              "sealed evidence; pass --out-dir <dir> (or --in-place "
+              "for the legacy path)", file=sys.stderr)
+        return 2
+    out_root = Path(args.out_dir) if args.out_dir else None
     manifest = kmanifest.load_manifest(Path(args.manifest))
     cells_dir = Path(args.evidence_dir)
     required_sets = [entry["id"] for entry in manifest["sets"]]
     required_diags = [entry["id"] for entry in manifest["diagnostics"]]
     errors: list = []
     set_cells: dict = {}
-    verdicts_dir = cells_dir / "verdicts"
-    verdicts_dir.mkdir(exist_ok=True)
+    verdicts_dir = (out_root if out_root else cells_dir) / "verdicts"
+    verdicts_dir.mkdir(parents=True, exist_ok=True)
+    if out_root is None:
+        print("verify: WARNING: judging in place inside sealed "
+              "evidence (--in-place); prefer --out-dir",
+              file=sys.stderr)
     for cell in sorted(cells_dir.iterdir()):
         if not cell.is_dir() or cell.name == "verdicts":
             continue
@@ -919,7 +1299,9 @@ def cmd_verify(args) -> int:
     print(f"locks: {locks['verdict']} common={locks['common']}")
     if locks["verdict"] != "PASS":
         errors.extend(locks["reasons"])
-    krecept.atomic_write_json(cells_dir / "campaign.json", campaign)
+    krecept.atomic_write_json(
+        (out_root if out_root else cells_dir) / "campaign.json", campaign)
+    print(f"verdicts: {verdicts_dir}")
     buds = {set_id: (judged.get("B1"), judged.get("B2"))
             for set_id, judged in campaign["sets"].items()
             if judged.get("budgeted")}
@@ -935,10 +1317,12 @@ def cmd_verify(args) -> int:
 
 def cmd_analyze(args) -> int:
     cells_dir = Path(args.evidence_dir)
+    campaign_path = Path(args.campaign) if args.campaign \
+        else cells_dir / "campaign.json"
     try:
-        campaign = json.loads((cells_dir / "campaign.json").read_text())
+        campaign = json.loads(campaign_path.read_text())
     except (OSError, ValueError) as err:
-        print(f"analyze: campaign.json unreadable: {err}")
+        print(f"analyze: {campaign_path} unreadable: {err}")
         return 2
     lines = ["# T14 P9 performance campaign report",
              "",
@@ -1007,8 +1391,17 @@ def main(argv=None) -> int:
     verify = sub.add_parser("verify", help="judge sealed cells")
     verify.add_argument("--manifest", default=str(PERF_MANIFEST))
     verify.add_argument("--evidence-dir", required=True)
+    verify.add_argument("--out-dir", default=None,
+                        help="write verdicts/ + campaign.json here "
+                        "(never inside --evidence-dir)")
+    verify.add_argument("--in-place", action="store_true",
+                        help="legacy: write verdicts/ + campaign.json "
+                        "inside --evidence-dir (disturbs seals)")
     analyze = sub.add_parser("analyze", help="campaign report")
     analyze.add_argument("--evidence-dir", required=True)
+    analyze.add_argument("--campaign", default=None,
+                         help="campaign.json to report (default: "
+                         "<evidence-dir>/campaign.json)")
     analyze.add_argument("--out", default=None)
     args = parser.parse_args(argv)
     if args.cmd == "plan":
