@@ -53,3 +53,65 @@ Specified, not yet wired: the privileged runner (4B-H2) does not
 exist, so no receipts are stored and no alerts fire. The attach
 and drain suites read `DENIED` without privilege — their
 thresholds activate on the runner's first green privileged run.
+
+## P9 frozen performance budgets (T14 release candidate)
+
+Frozen 2026-09-29, before the first T14 sampling boot (preflight
+mapping runs used a throwaway prototype driver and are not
+samples). These budgets are the P9 release decision recorded in
+advance; they are never moved after results. The campaign
+manifest (`tests/kcrypto_perf/cells.json`) carries the frozen
+cell list, equivalence relations, and validity rules; this page
+carries the budgets and verdict rules.
+
+### Budgets
+
+On every QUALIFIED 4 KiB / 1 MiB aggregate-mode pair-set:
+
+- B1 (throughput): median disabled→aggregation throughput ratio
+  ≥ 0.95 (at most 5% median throughput regression).
+- B2 (tail latency): median disabled→aggregation workload-p99
+  ratio ≤ 1.10 (at most 10% median workload-p99 regression),
+  where workload latency is the driver's per-op roundtrip
+  (submit→terminal), never the product's unpopulated `lat`
+  array and never an unobserved async percentile.
+
+A pair-set is QUALIFIED only if: ≥5 valid alternating pairs;
+every observed leg reconciles exactly with its driver ledger
+(per the manifest's pinned per-kernel equivalence: 7.x flat
+1 call per op per direction, 6.12 floor nested 1:1 outer+inner);
+loss sites 0–4 and spares are 0 with `ktot_gap`, `ring_drops`,
+and `overflow_identities` all 0; capture rc ∈ {0,3}; driver
+rc 0 with no timeout; the boot quiet leg shows 0 calls. Any
+measured rate with unexplained loss is outside the qualified
+envelope regardless of overhead.
+
+### Verdict rule (frozen)
+
+Per pair-set, with pair ratios in preserved run order:
+
+- PASS if the median pair ratio is inside the budget AND at
+  least 4 of 5 pairs are inside the budget.
+- FAIL if the median is outside the budget AND at least 4 of
+  5 pairs are outside.
+- INCONCLUSIVE otherwise (spread too wide for five samples —
+  reported, never upgraded by re-analysis).
+
+Outliers are preserved and reported; they are never dropped to
+reach a verdict. Spare pairs (up to 8 attempted per set) continue
+the alternating order in the same boot; all legs are sealed.
+
+### Non-budget modes (envelopes, not ratios)
+
+64 B, high-rate AEAD, deliberately-async, full-details
+(request-lifecycle), and paced-qualification sets publish
+measured operating envelopes and rate limits; no budget applies.
+A details-mode leg that truncates at the 100,000-observation
+bound is an envelope data point (explicit Partial, counted
+loss), never a valid overhead pair leg. Stack sampling has no
+standalone product toggle (R1 stacks are first-seen-only
+attribution inside api-returns): it is NOT_RUN as a mode, with
+stack-attribution observables reported from the aggregation
+cells plus one separately-named many-submitter diagnostic probe.
+Attached-idle is an observer-footprint leg (session live,
+workload idle), not a workload pair.
