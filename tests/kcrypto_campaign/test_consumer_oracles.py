@@ -335,9 +335,12 @@ SA_AB = ("10.13.0.1", "10.13.0.2", 4097)
 SA_BA = ("10.13.0.2", "10.13.0.1", 4098)
 
 
-def sa_facts(packets, failed=0, replay=0):
+def sa_facts(packets, failed=0, replay=0, window=0):
+    # R2 contract (P8-N11): SA facts carry the stats
+    # `replay-window` counter, gated zero like replay/failed.
     return {"packets": packets, "bytes": 520 * packets,
-            "replay": replay, "failed": failed}
+            "replay": replay, "failed": failed,
+            "replay_window": window}
 
 
 def xfrm_facts(state_count=2, main_pkts=1000, authfail_extra=100,
@@ -502,6 +505,36 @@ class R03Tests(unittest.TestCase):
             quiet(), quiet(), bad,
         )
         self.assertFalse(checks["xfrm_main_exact"])
+
+    def test_main_stats_replay_window_fails(self):
+        # P8-N11: a nonzero stats replay-window is an error
+        # counter like replay/failed — it must fail the gate.
+        bad = xfrm_facts()
+        bad["main_a"]["sas"][SA_AB] = sa_facts(1000, window=1)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), bad,
+        )
+        self.assertFalse(checks["xfrm_main_exact"])
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), xfrm_facts(),
+        )
+        self.assertTrue(checks["xfrm_main_exact"])
+
+    def test_authfail_stats_replay_window_fails(self):
+        # P8-N11: the window gate covers the authfail ledgers too.
+        bad = xfrm_facts()
+        bad["authfail_b"]["sas"][SA_AB] = sa_facts(
+            0, failed=100, window=1)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), bad,
+        )
+        self.assertFalse(checks["xfrm_authfail_exact"])
 
     def test_authfail_failed_count_exact(self):
         # The rekeyed inbound SA must show exactly the 100

@@ -372,12 +372,13 @@ def _xfrm_file_has_exact_sas(facts) -> bool:
 
 
 def _xfrm_sa_ok(sas, key, packets: int, failed: int = 0,
-               replay: int = 0) -> bool:
+               replay: int = 0, replay_window: int = 0) -> bool:
     sa = (sas or {}).get(key)
     if not isinstance(sa, dict):
         return False
     return (sa.get("packets") == packets and sa.get("failed") == failed
-            and sa.get("replay") == replay)
+            and sa.get("replay") == replay
+            and sa.get("replay_window") == replay_window)
 
 
 def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
@@ -404,7 +405,9 @@ def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
     duplicate substituting for a missing sequence fails), both
     SAs must exist, and the XFRM counters must show the
     delivered packets with zero main-phase errors and exactly
-    the 100 wrong-key failures on the rekeyed SA.
+    the 100 wrong-key failures on the rekeyed SA. The stats
+    ``replay-window`` error counter must read zero on every SA
+    (P8-N11), like ``replay``/``failed``.
     """
     checks = {}
     sent = (ledger_a.get("sent") or 0) + (ledger_b.get("sent") or 0)

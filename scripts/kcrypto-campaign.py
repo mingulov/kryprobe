@@ -532,11 +532,16 @@ def parse_xfrm_stats(text: str) -> dict:
     """Parse ``ip -s xfrm state list nokeys`` into per-SA facts.
 
     Returns ``{"sas": {(src, dst, spi): {"packets", "bytes",
-    "replay", "failed"}}}``. Raises :class:`OracleError` on
-    garbage or truncated SA blocks (timestamps and oseq values
-    are informational and never parsed).
+    "replay", "failed", "replay_window"}}}``. Raises
+    :class:`OracleError` on garbage or truncated SA blocks
+    (timestamps and oseq values are informational and never
+    parsed) and on ANY repeated ``(src, dst, spi)`` block:
+    ``ip`` emits each SA once, so a repeat — conflicting or
+    byte-identical — is malformed output and fails closed
+    (P8-N12; never silent overwrite).
     """
     sas: dict[tuple, dict] = {}
+    raw: dict[tuple, str] = {}
     blocks = re.split(r"(?m)^(?=src \S+ dst \S+$)", text)
     for block in blocks:
         if not block.strip():
@@ -550,13 +555,22 @@ def parse_xfrm_stats(text: str) -> dict:
         spi = re.search(r"proto esp spi 0x([0-9a-fA-F]+)", block)
         life = re.search(r"(?m)^\s*(\d+)\(bytes\), (\d+)\(packets\)\s*$", block)
         stats = re.search(
-            r"(?m)^\s*replay-window \d+ replay (\d+) failed (\d+)\s*$", block)
+            r"(?m)^\s*replay-window (\d+) replay (\d+) failed (\d+)\s*$", block)
         if not (spi and life and stats):
             raise oracles.OracleError(f"xfrm stats truncated SA: {block[:60]!r}")
-        sas[(src, dst, int(spi.group(1), 16))] = {
+        key = (src, dst, int(spi.group(1), 16))
+        entry = {
             "packets": int(life.group(2)), "bytes": int(life.group(1)),
-            "replay": int(stats.group(1)), "failed": int(stats.group(2)),
+            "replay": int(stats.group(2)), "failed": int(stats.group(3)),
+            "replay_window": int(stats.group(1)),
         }
+        if key in sas:
+            kind = ("exact-duplicate" if raw[key] == block
+                    else "conflicting-duplicate")
+            raise oracles.OracleError(
+                f"xfrm stats {kind} SA block for {key}")
+        sas[key] = entry
+        raw[key] = block
     if not sas:
         raise oracles.OracleError("xfrm stats contain no SA blocks")
     return {"sas": sas}
@@ -634,12 +648,16 @@ def verify_cell_seal(cell_dir: Path) -> tuple[bool, dict]:
     Recomputes sha256 over every file named by the sealed
     ``SHA256SUMS`` manifest and requires an exact match; a missing
     manifest, an unreadable/mismatched file, or an unmanifested
-    extra file fails. Returns ``(ok, info)`` with ``mismatched``,
-    ``missing`` and ``unmanifested`` name lists.
+    extra file fails. Any repeated filename fails too: a
+    conflicting digest never last-wins (P8-N13, exactly like
+    ``sha256sum -c``), and even a byte-identical repeat is
+    rejected fail-closed (same rule as P8-N12). Returns ``(ok,
+    info)`` with ``mismatched``, ``missing``, ``unmanifested``
+    and ``duplicated`` name lists.
     """
     cell_dir = Path(cell_dir)
     info: dict[str, list] = {"mismatched": [], "missing": [],
-                             "unmanifested": []}
+                             "unmanifested": [], "duplicated": []}
     try:
         lines = (cell_dir / "SHA256SUMS").read_text().splitlines()
     except OSError:
@@ -652,6 +670,9 @@ def verify_cell_seal(cell_dir: Path) -> tuple[bool, dict]:
         try:
             int(digest, 16)
         except ValueError:
+            return False, info
+        if name in sealed:
+            info["duplicated"].append(name)
             return False, info
         sealed[name] = digest
     if not sealed:
@@ -716,22 +737,42 @@ def resolve_lock_paths(lock_args) -> list:
 
     The shared host BPF lane lock plus the task VM lock are both
     required (a per-task lock alone is not mutual exclusion);
-    refuses fewer than two ``--lock`` values.
+    refuses fewer than two DISTINCT ``--lock`` values (P8-N10:
+    ``[task, task]`` is one lock, not two).
     """
     paths = [Path(p).resolve() for p in lock_args]
-    if len(paths) < 2:
+    distinct = {str(p) for p in paths}
+    if len(distinct) < 2:
         raise ValueError(
-            f"campaign run needs two locks (common + task), got {len(paths)}: "
+            f"campaign run needs two locks (common + task) on DISTINCT paths, "
+            f"got {len(paths)} with {len(distinct)} distinct: "
             "pass --lock <shared host BPF lock> --lock <task vm lock>")
     return paths
+
+
+def runner_bpf_lock_path() -> Path:
+    """Effective host-runner BPF lane lock (P8-N15).
+
+    Same resolution as ``scripts/sudo_lane.py --lock``: the
+    ``KRYPROBE_LANE_LOCK`` env override or the host-global
+    default ``/tmp/kryprobe-bpf-lane.lock``. The campaign gate
+    requires this lock OBJECT (by device/inode) in the
+    receipt intersection, so the campaign provably excludes
+    the default host runner instead of merely agreeing with
+    itself.
+    """
+    return Path(os.environ.get("KRYPROBE_LANE_LOCK",
+                               "/tmp/kryprobe-bpf-lane.lock"))
 
 
 def verify_campaign_locks(cells_dir: Path, required_ids: list) -> dict:
     """Prove common-plus-task exclusion from spawn receipts (P8-N8).
 
     Every required portion's ``spawn.json`` must record at least
-    two held locks, and the lock sets must share at least one
-    common lock across the whole campaign. Returns ``{"verdict",
+    two DISTINCT held locks (P8-N10), the lock sets must share
+    at least one common lock across the whole campaign, and
+    that common set must include the effective host-runner BPF
+    lock object by device/inode (P8-N15). Returns ``{"verdict",
     "reasons", "common"}``.
     """
     reasons: list[str] = []
@@ -743,14 +784,40 @@ def verify_campaign_locks(cells_dir: Path, required_ids: list) -> dict:
         except (OSError, ValueError) as err:
             reasons.append(f"portion {portion_id}: spawn receipt unreadable: {err}")
             continue
-        if len(locks) < 2:
+        distinct = set(locks)
+        if len(distinct) < 2:
             reasons.append(
                 f"portion {portion_id}: task-only lock {locks!r} "
-                "(common + task required)")
+                f"({len(distinct)} distinct, common + task required)")
         sets[portion_id] = set(locks)
     common = sorted(set.intersection(*sets.values())) if sets else []
     if sets and not common:
         reasons.append("no common lock shared across the campaign")
+    runner = runner_bpf_lock_path()
+    try:
+        runner_stat = runner.stat()
+        runner_id = (runner_stat.st_dev, runner_stat.st_ino)
+    except OSError as err:
+        runner_id = None
+        if sets:
+            reasons.append(
+                f"runner BPF lock {runner} unstatable: {err} "
+                "(cannot prove shared exclusion; reconciled lock required)")
+    if sets and common and runner_id is not None:
+        reconciled = False
+        for lock in common:
+            try:
+                ident = Path(lock).stat()
+            except OSError:
+                continue
+            if (ident.st_dev, ident.st_ino) == runner_id:
+                reconciled = True
+                break
+        if not reconciled:
+            reasons.append(
+                f"no reconciled host BPF lock in common {common!r} "
+                f"(runner effective lock {runner} "
+                f"dev/ino {runner_id[0]}/{runner_id[1]})")
     return {"verdict": "FAIL" if reasons else "PASS", "reasons": reasons,
             "common": common}
 

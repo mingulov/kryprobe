@@ -9,9 +9,11 @@ guests). Run from the product worktree root::
 """
 
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -394,6 +396,33 @@ class SealVerifyTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("evil.txt", info["unmanifested"])
 
+    def test_conflicting_duplicate_entry_fails(self):
+        # P8-N13: a repeated filename with a differing digest
+        # fails (never last-wins, exactly like `sha256sum -c`).
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = self._sealed(tmp)
+            target = cell / "a.txt"
+            target.write_bytes(target.read_bytes() + b"corruption\n")
+            with (cell / "SHA256SUMS").open("a") as fh:
+                fh.write(hashlib.sha256(target.read_bytes()).hexdigest()
+                         + "  a.txt\n")
+            ok, _info = CLI.verify_cell_seal(cell)
+            self.assertFalse(ok)
+
+    def test_byte_identical_repeat_fails(self):
+        # P8-N13 fail-closed (same rule as P8-N12): even a
+        # byte-identical repeat entry is rejected.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = self._sealed(tmp)
+            manifest = cell / "SHA256SUMS"
+            with manifest.open("a") as fh:
+                fh.write(manifest.read_text().splitlines()[0] + "\n")
+            ok, _info = CLI.verify_cell_seal(cell)
+            self.assertFalse(ok)
+
 
 class RederivedIdentityTests(unittest.TestCase):
     """P8-N6: identity stability re-derived from env files."""
@@ -532,15 +561,56 @@ class XfrmStatsParserTests(unittest.TestCase):
     )
 
     def test_parses_both_sas(self):
+        # R2 contract (P8-N11): the stats `replay-window` counter is
+        # captured per SA alongside replay/failed.
         facts = CLI.parse_xfrm_stats(self.STATS)
         sas = facts["sas"]
         self.assertEqual(
             sas[("10.13.0.2", "10.13.0.1", 4098)],
             {"packets": 1000, "bytes": 520000,
-             "replay": 0, "failed": 0})
+             "replay": 0, "failed": 0, "replay_window": 0})
         self.assertEqual(
             sas[("10.13.0.1", "10.13.0.2", 4097)],
-            {"packets": 0, "bytes": 0, "replay": 0, "failed": 100})
+            {"packets": 0, "bytes": 0, "replay": 0, "failed": 100,
+             "replay_window": 0})
+
+    def test_replay_window_captured(self):
+        # P8-N11: a nonzero stats window must be visible to the
+        # oracle (the old regex matched it without capturing).
+        facts = CLI.parse_xfrm_stats(self.STATS)
+        self.assertEqual(
+            facts["sas"][("10.13.0.2", "10.13.0.1", 4098)]
+            ["replay_window"], 0)
+        dirty = self.STATS.replace(
+            "replay-window 0 replay 0 failed 0",
+            "replay-window 1 replay 0 failed 0", 1)
+        facts = CLI.parse_xfrm_stats(dirty)
+        self.assertEqual(
+            facts["sas"][("10.13.0.2", "10.13.0.1", 4098)]
+            ["replay_window"], 1)
+
+    def _first_block(self):
+        # The complete first SA block: split at the second
+        # line-start `src` (a bare index('src ') would stop at
+        # the mid-block `sel src ...` line instead).
+        idx = self.STATS.index("\nsrc ", 1) + 1
+        return self.STATS[:idx]
+
+    def test_conflicting_duplicate_sa_raises(self):
+        # P8-N12: a repeated (src,dst,spi) block with differing
+        # counters must fail, never silently overwrite.
+        first = self._first_block()
+        self.assertIn("replay 0 failed 0", first)
+        dirty = (first.replace("replay 0 failed 0", "replay 0 failed 7")
+                 + self.STATS)
+        with self.assertRaises(CLI.oracles.OracleError):
+            CLI.parse_xfrm_stats(dirty)
+
+    def test_exact_duplicate_sa_raises(self):
+        # P8-N12 fail-closed: even a byte-identical repeat is not
+        # valid `ip -s xfrm` output shape (each SA appears once).
+        with self.assertRaises(CLI.oracles.OracleError):
+            CLI.parse_xfrm_stats(self._first_block() + self.STATS)
 
     def test_garbage_raises(self):
         with self.assertRaises(CLI.oracles.OracleError):
@@ -564,6 +634,16 @@ class DualLockTests(unittest.TestCase):
         self.assertEqual([str(p) for p in paths],
                          ["/tmp/common.lock", "/tmp/task.lock"])
 
+    def test_duplicated_lock_refuses(self):
+        # P8-N10: the run side operates on the distinct set —
+        # [task, task] is one lock, not two.
+        with self.assertRaisesRegex(ValueError, "two locks"):
+            CLI.resolve_lock_paths(
+                ["/tmp/task.lock", "/tmp/task.lock"])
+        with self.assertRaisesRegex(ValueError, "[Dd]istinct"):
+            CLI.resolve_lock_paths(
+                ["/tmp/task.lock", "/tmp/task.lock"])
+
     def _cells(self, tmp, mapping):
         root = Path(tmp)
         for portion, locks in mapping.items():
@@ -573,16 +653,78 @@ class DualLockTests(unittest.TestCase):
                 __import__("json").dumps({"lock_paths": locks}))
         return root
 
+    def _locks(self, tmp, *names):
+        paths = []
+        for name in names:
+            path = Path(tmp) / name
+            path.write_text("")
+            paths.append(str(path))
+        return paths
+
     def test_common_plus_task_passes(self):
+        # R2 contract (P8-N15): the campaign common set must
+        # include the effective host-runner BPF lock (same
+        # resolution as sudo_lane --lock: $KRYPROBE_LANE_LOCK or
+        # /tmp/kryprobe-bpf-lane.lock), proved by dev/inode.
         import tempfile
-        mapping = {"R01-det-7014": ["/l/common.lock", "/l/t13.lock"],
-                   "R02-7014": ["/l/common.lock", "/l/t13.lock"]}
         with tempfile.TemporaryDirectory() as tmp:
-            verdict = CLI.verify_campaign_locks(
-                self._cells(tmp, mapping), sorted(mapping))
+            runner, task = self._locks(tmp, "bpf-lane.lock", "t13.lock")
+            mapping = {"R01-det-7014": [runner, task],
+                       "R02-7014": [runner, task]}
+            with mock.patch.dict(os.environ,
+                                 {"KRYPROBE_LANE_LOCK": runner}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
             self.assertEqual(verdict["verdict"], "PASS")
-            self.assertEqual(verdict["common"],
-                             ["/l/common.lock", "/l/t13.lock"])
+            self.assertEqual(verdict["common"], sorted([runner, task]))
+
+    def test_duplicated_task_lock_cells_fail(self):
+        # P8-N10: [task, task] fails even when the single entry
+        # IS the runner lock (fewer than two DISTINCT locks).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (runner,) = self._locks(tmp, "bpf-lane.lock")
+            mapping = {"R01-det-7014": [runner, runner],
+                       "R02-7014": [runner, runner]}
+            with mock.patch.dict(os.environ,
+                                 {"KRYPROBE_LANE_LOCK": runner}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
+            self.assertEqual(verdict["verdict"], "FAIL")
+            self.assertTrue(any("istinct" in reason
+                                for reason in verdict["reasons"]))
+
+    def test_common_without_runner_lock_fails(self):
+        # P8-N15: receipts sharing only a non-runner lock fail
+        # the gate (two distinct locks, but neither reconciles
+        # with the host runner's effective lock).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            other, task, runner = self._locks(
+                tmp, "other.lock", "t13.lock", "runner.lock")
+            mapping = {"R01-det-7014": [other, task],
+                       "R02-7014": [other, task]}
+            with mock.patch.dict(os.environ,
+                                 {"KRYPROBE_LANE_LOCK": runner}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
+            self.assertEqual(verdict["verdict"], "FAIL")
+            self.assertTrue(any("conciled" in reason
+                                for reason in verdict["reasons"]))
+
+    def test_missing_runner_lock_file_fails_closed(self):
+        # P8-N15: an unstatable runner lock cannot prove shared
+        # exclusion — the gate fails closed.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            other, task = self._locks(tmp, "other.lock", "t13.lock")
+            mapping = {"R01-det-7014": [other, task],
+                       "R02-7014": [other, task]}
+            with mock.patch.dict(os.environ, {"KRYPROBE_LANE_LOCK":
+                                              str(Path(tmp) / "gone.lock")}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
+            self.assertEqual(verdict["verdict"], "FAIL")
 
     def test_single_lock_cells_fail(self):
         import tempfile
