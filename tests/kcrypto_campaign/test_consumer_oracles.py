@@ -318,8 +318,41 @@ class R02Tests(unittest.TestCase):
         self.assertFalse(checks["bytes_reconcile"])
 
 
-def r03_ledgers(sent=1000, received=1000):
-    return {"sent": sent, "received": received}
+def r03_ledgers(sent=1000, received=1000, missing_total=0,
+                duplicates_total=0):
+    return {"sent": sent, "received": received,
+            "missing": [], "missing_total": missing_total,
+            "duplicates": [], "duplicates_total": duplicates_total}
+
+
+def r03_auth_ledger(sent=100, received=0):
+    return {"sent": sent, "received": received,
+            "missing": list(range(16)), "missing_total": sent - received,
+            "duplicates": [], "duplicates_total": 0}
+
+
+SA_AB = ("10.13.0.1", "10.13.0.2", 4097)
+SA_BA = ("10.13.0.2", "10.13.0.1", 4098)
+
+
+def sa_facts(packets, failed=0, replay=0):
+    return {"packets": packets, "bytes": 520 * packets,
+            "replay": replay, "failed": failed}
+
+
+def xfrm_facts(state_count=2, main_pkts=1000, authfail_extra=100,
+               authfail_failed=100):
+    main = {"sas": {SA_AB: sa_facts(main_pkts),
+                    SA_BA: sa_facts(main_pkts)}}
+    return {
+        "state_count": state_count,
+        "main_a": {"sas": dict(main["sas"])},
+        "main_b": {"sas": dict(main["sas"])},
+        "authfail_a": {"sas": {SA_AB: sa_facts(main_pkts + authfail_extra),
+                               SA_BA: sa_facts(main_pkts)}},
+        "authfail_b": {"sas": {SA_AB: sa_facts(0, failed=authfail_failed),
+                               SA_BA: sa_facts(main_pkts)}},
+    }
 
 
 def r03_kernel(enc=2000, dec=2000):
@@ -350,19 +383,19 @@ class R03Tests(unittest.TestCase):
     def test_exact_match_passes(self):
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
-            {"sent": 100, "received": 0},
+            r03_auth_ledger(),
             r03_authfail_ok(),
-            quiet(), quiet(),
+            quiet(), quiet(), xfrm_facts(),
         )
         self.assertTrue(all(checks.values()), checks)
 
     def test_lost_packets_fail(self):
         checks, _d = oracles.check_r03(
-            r03_ledgers(received=999), r03_ledgers(), r03_kernel(dec=1999),
+            r03_ledgers(received=999, missing_total=1), r03_ledgers(), r03_kernel(dec=1999),
             r03_product(dec=1999),
-            {"sent": 100, "received": 0},
+            r03_auth_ledger(),
             r03_authfail_ok(),
-            quiet(), quiet(),
+            quiet(), quiet(), xfrm_facts(),
         )
         self.assertFalse(checks["ledgers_lossless"])
 
@@ -373,9 +406,9 @@ class R03Tests(unittest.TestCase):
         prod = r03_product(dec=2001)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), prod,
-            {"sent": 100, "received": 0},
+            r03_auth_ledger(),
             r03_authfail_ok(),
-            quiet(), quiet(),
+            quiet(), quiet(), xfrm_facts(),
         )
         self.assertFalse(checks["calls_equal_kernel"])
 
@@ -384,7 +417,8 @@ class R03Tests(unittest.TestCase):
                           kenc=200, kdec=200)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
-            {"sent": 100, "received": 1}, bad, quiet(), quiet(),
+            r03_auth_ledger(received=1), bad, quiet(), quiet(),
+            xfrm_facts(),
         )
         self.assertFalse(checks["authfail_exact"])
         self.assertFalse(checks["authfail_counts_equal"])
@@ -395,7 +429,7 @@ class R03Tests(unittest.TestCase):
                           kenc=200, kdec=200)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
-            {"sent": 100, "received": 0}, bad, quiet(), quiet(),
+            r03_auth_ledger(), bad, quiet(), quiet(), xfrm_facts(),
         )
         self.assertFalse(checks["authfail_counts_equal"])
 
@@ -405,7 +439,7 @@ class R03Tests(unittest.TestCase):
                           kenc=200, kdec=200)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
-            {"sent": 100, "received": 0}, bad, quiet(), quiet(),
+            r03_auth_ledger(), bad, quiet(), quiet(), xfrm_facts(),
         )
         self.assertFalse(checks["authfail_counts_equal"])
 
@@ -414,15 +448,117 @@ class R03Tests(unittest.TestCase):
                           kenc=200, kdec=200)
         checks, _d = oracles.check_r03(
             r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
-            {"sent": 100, "received": 0}, bad, quiet(), quiet(),
+            r03_auth_ledger(), bad, quiet(), quiet(), xfrm_facts(),
         )
         self.assertFalse(checks["authfail_errno_native"])
+
+    def test_duplicate_substitutes_missing_fails(self):
+        # P8-N4: one missing sequence replaced by a duplicate keeps
+        # sent == received while the sequence ledger is lossy.
+        bad = r03_ledgers(missing_total=1, duplicates_total=1)
+        checks, _d = oracles.check_r03(
+            bad, r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), xfrm_facts(),
+        )
+        self.assertTrue(checks["ledgers_lossless"])
+        self.assertFalse(checks["sequence_exact"])
+
+    def test_duplicates_only_fail(self):
+        bad = r03_ledgers(duplicates_total=1)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), bad, r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), xfrm_facts(),
+        )
+        self.assertFalse(checks["sequence_exact"])
+
+    def test_no_states_fails(self):
+        # P8-N4: the archived XFRM state count gates SA presence —
+        # traffic without states is unencrypted.
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), xfrm_facts(state_count=0),
+        )
+        self.assertFalse(checks["xfrm_state_exact"])
+
+    def test_main_stats_shortfall_fails(self):
+        bad = xfrm_facts()
+        bad["main_a"]["sas"][SA_AB] = sa_facts(999)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), bad,
+        )
+        self.assertFalse(checks["xfrm_main_exact"])
+
+    def test_main_stats_error_fails(self):
+        bad = xfrm_facts()
+        bad["main_b"]["sas"][SA_BA] = sa_facts(1000, failed=1)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), bad,
+        )
+        self.assertFalse(checks["xfrm_main_exact"])
+
+    def test_authfail_failed_count_exact(self):
+        # The rekeyed inbound SA must show exactly the 100
+        # wrong-key failures (and zero delivered packets).
+        bad = xfrm_facts(authfail_failed=0)
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), bad,
+        )
+        self.assertFalse(checks["xfrm_authfail_exact"])
+        checks, _d = oracles.check_r03(
+            r03_ledgers(), r03_ledgers(), r03_kernel(), r03_product(),
+            r03_auth_ledger(), r03_authfail_ok(),
+            quiet(), quiet(), xfrm_facts(),
+        )
+        self.assertTrue(checks["xfrm_authfail_exact"])
 
 
 def deny_control(issued=10, done=10, observed=None, drops="0"):
     return {"hash_issued": issued, "hash_done": done,
             "observed": observed if observed is not None else {"ahash_digest": 10},
             "ring_drops": drops}
+
+
+OBJ_SHA = "bd14e7147034668f3342560acfeb4c02057c3026529aea45361df8a7fb1cb3e8"
+
+# Verbatim shape of the R1 scratch guest refusal (uid 65534, readable
+# objects): past object load to the capability gate, typed exit 4.
+DENY_CAPABILITY_STDERR = (
+    "kryprobe: BPF object pin check SKIPPED (empty pins in dev build); "
+    "set KRYPROBE_PIN_OBJECTS at compile time or KRYPROBE_REQUIRE_PINS=1 "
+    "to fail closed\n"
+    '{"audit":"object-load","path":"/tmp/t13-unpriv-VPUTUC/kryprobe-bpf/kcrypto.bpf.o",'
+    '"sha256":"bd14e7147034668f3342560acfeb4c02057c3026529aea45361df8a7fb1cb3e8"}\n'
+    "report: live session unusable: no BPF capability: run 'kryprobe token mint' "
+    "once as root, or supply --token "
+    "(default pin /sys/fs/bpf/kryprobe/token absent)\n"
+)
+
+# Verbatim shape of the sealed wave refusal: object-missing BEFORE
+# attachment (the staged dir is root-only), typed exit 4.
+DENY_OBJECT_MISSING_STDERR = (
+    "kryprobe: BPF object pin check SKIPPED (empty pins in dev build); "
+    "set KRYPROBE_PIN_OBJECTS at compile time or KRYPROBE_REQUIRE_PINS=1 "
+    "to fail closed\n"
+    "report: live session unusable: kcrypto object: object missing (tried "
+    "KRYPROBE_BPF_DIR=/run/unpriv/kryprobe-bpf, "
+    "/run/unpriv/kryprobe-bpf/kcrypto.bpf.o: Permission denied (os error 13); "
+    "target/kryprobe-bpf/kcrypto.bpf.o: No such file or directory (os error 2))\n"
+)
+
+
+def deny_refusal(stderr=DENY_CAPABILITY_STDERR, exit_code=4,
+                 obj_sha=OBJ_SHA, read_sha=OBJ_SHA):
+    return {"exit": exit_code, "stderr": stderr,
+            "expected_obj_sha": obj_sha, "unpriv_read_sha": read_sha}
 
 
 def frow(tgid, probe, calls):
@@ -432,7 +568,7 @@ def frow(tgid, probe, calls):
 class R04Tests(unittest.TestCase):
     def test_deny_plus_control_passes(self):
         checks, _d = oracles.check_r04_deny(
-            {"exit": 4, "stderr": "live session unusable: missing CAP_BPF"},
+            deny_refusal(),
             deny_control(),
             {"ahash_digest": 10},
         )
@@ -440,7 +576,7 @@ class R04Tests(unittest.TestCase):
 
     def test_zero_exit_deny_fails(self):
         checks, _d = oracles.check_r04_deny(
-            {"exit": 0, "stderr": ""},
+            deny_refusal(exit_code=0, stderr=""),
             deny_control(),
             {"ahash_digest": 10},
         )
@@ -448,7 +584,7 @@ class R04Tests(unittest.TestCase):
 
     def test_failed_control_workload_fails(self):
         checks, _d = oracles.check_r04_deny(
-            {"exit": 4, "stderr": "live session unusable: missing CAP_BPF"},
+            deny_refusal(),
             deny_control(done=9),
             {"ahash_digest": 10},
         )
@@ -457,7 +593,7 @@ class R04Tests(unittest.TestCase):
     def test_control_kernel_divergence_fails(self):
         bad = deny_control(observed={"ahash_digest": 9})
         checks, _d = oracles.check_r04_deny(
-            {"exit": 4, "stderr": "live session unusable: missing CAP_BPF"},
+            deny_refusal(),
             bad,
             {"ahash_digest": 10},
         )
@@ -469,7 +605,7 @@ class R04Tests(unittest.TestCase):
         # while traffic elsewhere proves the window ran.
         control = deny_control(observed={"ahash_digest": 10, "shash_digest": 0})
         checks, _d = oracles.check_r04_deny(
-            {"exit": 4, "stderr": "live session unusable: x"},
+            deny_refusal(),
             control,
             {"ahash_digest": 10, "shash_digest": 0},
         )
@@ -478,11 +614,52 @@ class R04Tests(unittest.TestCase):
     def test_empty_kernel_window_fails(self):
         control = deny_control(observed={"ahash_digest": 0})
         checks, _d = oracles.check_r04_deny(
-            {"exit": 4, "stderr": "live session unusable: x"},
+            deny_refusal(),
             control,
             {"ahash_digest": 0},
         )
         self.assertFalse(checks["control_nonempty"])
+
+    def test_capability_denial_passes(self):
+        # P8-N2: the refusal reached the capability gate with the
+        # staged object loaded (audit sha binds the exact bytes)
+        # and the nobody readability proof matches the pin.
+        checks, _d = oracles.check_r04_deny(
+            deny_refusal(), deny_control(), {"ahash_digest": 10})
+        self.assertTrue(all(checks.values()), checks)
+
+    def test_object_missing_refusal_fails(self):
+        # P8-N2: the sealed wave shape — exit 4 but object-missing
+        # before attachment — is not the disabled-hook control.
+        checks, _d = oracles.check_r04_deny(
+            deny_refusal(stderr=DENY_OBJECT_MISSING_STDERR),
+            deny_control(), {"ahash_digest": 10})
+        self.assertTrue(checks["refusal_exit_unusable"])
+        self.assertFalse(checks["refusal_shows_object_load"])
+        self.assertFalse(checks["refusal_shows_capability_denial"])
+        self.assertFalse(checks["refusal_no_object_missing"])
+
+    def test_audit_sha_mismatch_fails(self):
+        bad = deny_refusal().copy()
+        bad["stderr"] = bad["stderr"].replace(OBJ_SHA, "0" * 64)
+        checks, _d = oracles.check_r04_deny(
+            bad, deny_control(), {"ahash_digest": 10})
+        self.assertFalse(checks["refusal_shows_object_load"])
+
+    def test_unpriv_read_mismatch_fails(self):
+        checks, _d = oracles.check_r04_deny(
+            deny_refusal(read_sha="1" * 64),
+            deny_control(), {"ahash_digest": 10})
+        self.assertFalse(checks["refusal_unpriv_read_proved"])
+
+    def test_missing_capability_line_fails(self):
+        stderr = DENY_CAPABILITY_STDERR.replace(
+            "no BPF capability", "something else")
+        checks, _d = oracles.check_r04_deny(
+            deny_refusal(stderr=stderr),
+            deny_control(), {"ahash_digest": 10})
+        self.assertTrue(checks["refusal_shows_object_load"])
+        self.assertFalse(checks["refusal_shows_capability_denial"])
 
     def test_foreign_correspondence_passes(self):
         # Real 7.0.14 shape (R04-foreign-7014 seal): owned takes

@@ -360,26 +360,62 @@ def check_r02(workload: dict, kernel_ref: dict, product: dict,
     return checks, detail
 
 
+# Scenario-fixed XFRM SA identities (r03_xfrm.sh installs exactly
+# these two SAs per namespace): (src, dst, spi).
+XFRM_SA_AB = ("10.13.0.1", "10.13.0.2", 4097)
+XFRM_SA_BA = ("10.13.0.2", "10.13.0.1", 4098)
+
+
+def _xfrm_file_has_exact_sas(facts) -> bool:
+    sas = (facts or {}).get("sas") or {}
+    return set(sas) == {XFRM_SA_AB, XFRM_SA_BA}
+
+
+def _xfrm_sa_ok(sas, key, packets: int, failed: int = 0,
+               replay: int = 0) -> bool:
+    sa = (sas or {}).get(key)
+    if not isinstance(sa, dict):
+        return False
+    return (sa.get("packets") == packets and sa.get("failed") == failed
+            and sa.get("replay") == replay)
+
+
 def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
               authfail_ledger: dict, authfail_product: dict,
-              quiet_before: dict, quiet_after: dict) -> tuple[dict, dict]:
+              quiet_before: dict, quiet_after: dict,
+              xfrm: dict) -> tuple[dict, dict]:
     """R03 XFRM ESP: packet ledgers + kernel-equality + auth-fail phase.
 
     ``ledger_a``/``ledger_b`` carry per-direction ``sent``/
-    ``received``; ``kernel_ref`` the ftrace AEAD counts;
-    ``product`` the observed AEAD counts; the authfail pair
-    carries the controlled-failure phase (100 sent, 0 received)
-    plus its own kernel counts. Packet totals are contextual:
-    product calls must equal the KERNEL reference, never the
-    packet ledger -- including the failure phase, where the
-    ESP echainiv nesting fails at both levels (200 errors for
-    100 packets): observed errors must equal kernel decrypts,
-    observed ok-decrypts must be zero, encrypts kernel-equal.
+    ``received`` plus the receiver sequence accounting
+    (``missing_total``/``duplicates_total``); ``kernel_ref`` the
+    ftrace AEAD counts; ``product`` the observed AEAD counts;
+    the authfail pair carries the controlled-failure phase (100
+    sent, 0 received) plus its own kernel counts; ``xfrm``
+    carries the archived state count plus the per-namespace
+    packet/error-counter ledgers (``main_a``/``main_b``/
+    ``authfail_a``/``authfail_b`` SA facts). Packet totals are
+    contextual: product calls must equal the KERNEL reference,
+    never the packet ledger -- including the failure phase,
+    where the ESP echainiv nesting fails at both levels (200
+    errors for 100 packets): observed errors must equal kernel
+    decrypts, observed ok-decrypts must be zero, encrypts
+    kernel-equal. Sequence totals must account exactly (a
+    duplicate substituting for a missing sequence fails), both
+    SAs must exist, and the XFRM counters must show the
+    delivered packets with zero main-phase errors and exactly
+    the 100 wrong-key failures on the rekeyed SA.
     """
     checks = {}
     sent = (ledger_a.get("sent") or 0) + (ledger_b.get("sent") or 0)
     received = (ledger_a.get("received") or 0) + (ledger_b.get("received") or 0)
     checks["ledgers_lossless"] = sent == received and sent > 0
+    checks["sequence_exact"] = all(
+        ledger.get("missing_total")
+        == (ledger.get("sent") or 0) - (ledger.get("received") or 0)
+        and ledger.get("duplicates_total") == 0
+        for ledger in (ledger_a, ledger_b)
+    )
     enc_k, dec_k = kernel_ref.get("aead_encrypt"), kernel_ref.get("aead_decrypt")
     checks["kernel_traffic_proved"] = (enc_k or 0) > 0 and (dec_k or 0) > 0
     checks["calls_equal_kernel"] = (
@@ -389,6 +425,41 @@ def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
     checks["authfail_exact"] = (
         (authfail_ledger.get("sent") or 0) == 100
         and (authfail_ledger.get("received") or 0) == 0
+    )
+    checks["authfail_sequence_exact"] = (
+        authfail_ledger.get("missing_total")
+        == (authfail_ledger.get("sent") or 0)
+        - (authfail_ledger.get("received") or 0)
+        and authfail_ledger.get("duplicates_total") == 0
+    )
+    xfrm = xfrm or {}
+    checks["xfrm_state_exact"] = xfrm.get("state_count") == 2
+    sent_a, sent_b = ledger_a.get("sent"), ledger_b.get("sent")
+    sent_f = authfail_ledger.get("sent")
+    main_a, main_b = xfrm.get("main_a"), xfrm.get("main_b")
+    checks["xfrm_main_exact"] = (
+        _xfrm_file_has_exact_sas(main_a)
+        and _xfrm_file_has_exact_sas(main_b)
+        and all(
+            _xfrm_sa_ok(facts.get("sas"), key, expected)
+            for facts, key, expected in (
+                (main_a, XFRM_SA_AB, sent_a),
+                (main_a, XFRM_SA_BA, sent_b),
+                (main_b, XFRM_SA_AB, sent_a),
+                (main_b, XFRM_SA_BA, sent_b),
+            )
+        )
+    )
+    auth_a, auth_b = xfrm.get("authfail_a"), xfrm.get("authfail_b")
+    checks["xfrm_authfail_exact"] = (
+        _xfrm_file_has_exact_sas(auth_a)
+        and _xfrm_file_has_exact_sas(auth_b)
+        and _xfrm_sa_ok(auth_a.get("sas"), XFRM_SA_AB,
+                        (sent_a or 0) + (sent_f or 0))
+        and _xfrm_sa_ok(auth_a.get("sas"), XFRM_SA_BA, sent_b)
+        and _xfrm_sa_ok(auth_b.get("sas"), XFRM_SA_AB, 0,
+                        failed=(sent_f or 0))
+        and _xfrm_sa_ok(auth_b.get("sas"), XFRM_SA_BA, sent_b)
     )
     auth_kdec = authfail_product.get("kernel_decrypt")
     auth_kenc = authfail_product.get("kernel_encrypt")
@@ -406,7 +477,8 @@ def check_r03(ledger_a: dict, ledger_b: dict, kernel_ref: dict, product: dict,
         window.get("product_rows") == 0 and window.get("kernel_hits") == 0
         for window in (quiet_before, quiet_after)
     )
-    detail = {"packets": sent, "aead_calls": (enc_k or 0) + (dec_k or 0)}
+    detail = {"packets": sent, "aead_calls": (enc_k or 0) + (dec_k or 0),
+              "xfrm_state_count": xfrm.get("state_count")}
     return checks, detail
 
 
@@ -414,17 +486,36 @@ def check_r04_deny(refusal: dict, control: dict, kernel_ref: dict) -> tuple[dict
     """R04 denied-attach: typed refusal + exact positive control.
 
     ``refusal`` carries ``exit``/``stderr`` (gate: stable exit-4
-    Unusable); ``control`` carries the privileged aggregate
-    leg's ``hash_issued``/``hash_done``/per-function observed
-    counts + ``ring_drops``; ``kernel_ref`` the ftrace
-    per-function counts. Control product must equal the kernel
-    reference exactly (no route assumption: the 7.x per-digest
-    shape is RECORDED, supporting the support-table row — a
-    genuinely unused function reads 0 on both sides, never a
-    silent skip).
+    Unusable), ``expected_obj_sha`` (the staged BPF object pin)
+    and ``unpriv_read_sha`` (the uid-65534 readability proof);
+    ``control`` carries the privileged aggregate leg's
+    ``hash_issued``/``hash_done``/per-function observed counts +
+    ``ring_drops``; ``kernel_ref`` the ftrace per-function
+    counts. The refusal must genuinely REACH the disabled hook:
+    bare exit 4 is insufficient — the log must show the staged
+    object loaded (audit line binding the exact staged bytes),
+    the capability-gate denial, and no object-missing short
+    circuit; the nobody readability proof must match the pin.
+    Control product must equal the kernel reference exactly (no
+    route assumption: the 7.x per-digest shape is RECORDED,
+    supporting the support-table row — a genuinely unused
+    function reads 0 on both sides, never a silent skip).
     """
     checks = {}
+    stderr = refusal.get("stderr") or ""
+    expected_sha = refusal.get("expected_obj_sha") or ""
     checks["refusal_exit_unusable"] = refusal.get("exit") == EXIT_UNUSABLE
+    checks["refusal_shows_object_load"] = (
+        '"audit":"object-load"' in stderr
+        and bool(expected_sha)
+        and f'"sha256":"{expected_sha}"' in stderr
+    )
+    checks["refusal_shows_capability_denial"] = "no BPF capability" in stderr
+    checks["refusal_no_object_missing"] = "object missing" not in stderr
+    checks["refusal_unpriv_read_proved"] = (
+        bool(expected_sha)
+        and (refusal.get("unpriv_read_sha") or "") == expected_sha
+    )
     checks["control_workload_proved"] = (
         control.get("hash_done") == control.get("hash_issued")
         and (control.get("hash_issued") or 0) > 0

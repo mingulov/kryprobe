@@ -462,6 +462,95 @@ class PinsMatchBytesTests(unittest.TestCase):
             self.assertFalse(CLI.verify_pins_match_bytes(cell, pins))
 
 
+class ShortCellFailsClosedTests(unittest.TestCase):
+    """A sealed cell missing judged files FAILs, never crashes."""
+
+    def test_missing_judged_file_fails(self):
+        import json as _json
+        import tempfile
+        manifest = CLI.kinputs.load_inputs(
+            ROOT / "tests/kcrypto_campaign/cells.json")
+        _cell, portion = CLI.find_portion(manifest, "R04-deny-7014")
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = Path(tmp)
+            (cell / "host-receipt.json").write_text(_json.dumps({
+                "portion_id": "R04-deny-7014",
+                "process": {"exit": 0, "timed_out": False, "reaped": True},
+                "cleanup": {"remaining_owned": {},
+                            "preexisting_unchanged": True},
+                "custody": {"hashes_unchanged": True, "flush_ok": True},
+                "manifest_sha256": manifest["_manifest_sha256"],
+                "required_bodies": ["refusal", "control"],
+                "actual_bodies": ["refusal", "control"],
+                "pins": {}, "executed": {},
+                "cleanup_required": [], "cleanup_done": [],
+            }))
+            full = CLI.judge_portion(manifest, portion, cell)
+            self.assertEqual(full["_judgment"]["verdict"], "FAIL")
+            self.assertIn("oracle_inputs_valid", full["oracle_failed"])
+
+
+class XfrmStatsParserTests(unittest.TestCase):
+    """P8-N4: parse the archived `ip -s xfrm state list nokeys`."""
+
+    STATS = (
+        "src 10.13.0.2 dst 10.13.0.1\n"
+        "\tproto esp spi 0x00001002(4098) reqid 0(0x00000000) mode transport\n"
+        "\treplay-window 0 seq 0x00000000 flag  (0x00000000)\n"
+        "\tauth-trunc hmac(sha256) <<Keys hidden>> 96\n"
+        "\tenc cbc(aes) <<Keys hidden>>\n"
+        "\tlastused 2026-09-29 07:43:58\n"
+        "\tanti-replay context: seq 0x0, oseq 0x0, bitmap 0x00000000\n"
+        "\tsel src 0.0.0.0/0 dst 0.0.0.0/0 uid 0\n"
+        "\tlifetime config:\n"
+        "\t  limit: soft (INF)(bytes), hard (INF)(bytes)\n"
+        "\t  limit: soft (INF)(packets), hard (INF)(packets)\n"
+        "\t  expire add: soft 0(sec), hard 0(sec)\n"
+        "\t  expire use: soft 0(sec), hard 0(sec)\n"
+        "\tlifetime current:\n"
+        "\t  520000(bytes), 1000(packets)\n"
+        "\t  add 2026-09-29 07:43:32 use 2026-09-29 07:43:56\n"
+        "\tstats:\n"
+        "\t  replay-window 0 replay 0 failed 0\n"
+        "src 10.13.0.1 dst 10.13.0.2\n"
+        "\tproto esp spi 0x00001001(4097) reqid 0(0x00000000) mode transport\n"
+        "\treplay-window 0 seq 0x00000000 flag  (0x00000000)\n"
+        "\tauth-trunc hmac(sha256) <<Keys hidden>> 96\n"
+        "\tenc cbc(aes) <<Keys hidden>>\n"
+        "\tanti-replay context: seq 0x0, oseq 0x3e8, bitmap 0x00000000\n"
+        "\tsel src 0.0.0.0/0 dst 0.0.0.0/0 uid 0\n"
+        "\tlifetime config:\n"
+        "\t  limit: soft (INF)(bytes), hard (INF)(bytes)\n"
+        "\t  limit: soft (INF)(packets), hard (INF)(packets)\n"
+        "\t  expire add: soft 0(sec), hard 0(sec)\n"
+        "\t  expire use: soft 0(sec), hard 0(sec)\n"
+        "\tlifetime current:\n"
+        "\t  0(bytes), 0(packets)\n"
+        "\t  add 2026-09-29 07:45:54 use 2026-09-29 07:46:17\n"
+        "\tstats:\n"
+        "\t  replay-window 0 replay 0 failed 100\n"
+    )
+
+    def test_parses_both_sas(self):
+        facts = CLI.parse_xfrm_stats(self.STATS)
+        sas = facts["sas"]
+        self.assertEqual(
+            sas[("10.13.0.2", "10.13.0.1", 4098)],
+            {"packets": 1000, "bytes": 520000,
+             "replay": 0, "failed": 0})
+        self.assertEqual(
+            sas[("10.13.0.1", "10.13.0.2", 4097)],
+            {"packets": 0, "bytes": 0, "replay": 0, "failed": 100})
+
+    def test_garbage_raises(self):
+        with self.assertRaises(CLI.oracles.OracleError):
+            CLI.parse_xfrm_stats("not xfrm output\n")
+
+    def test_truncated_sa_raises(self):
+        with self.assertRaises(CLI.oracles.OracleError):
+            CLI.parse_xfrm_stats("src 10.13.0.1 dst 10.13.0.2\n")
+
+
 class DualLockTests(unittest.TestCase):
     """P8-N8: common-plus-task mutual exclusion, proved by receipts."""
 

@@ -528,6 +528,40 @@ def load_report(cell_dir: Path, name: str) -> dict:
         json.loads((cell_dir / name).read_text()))
 
 
+def parse_xfrm_stats(text: str) -> dict:
+    """Parse ``ip -s xfrm state list nokeys`` into per-SA facts.
+
+    Returns ``{"sas": {(src, dst, spi): {"packets", "bytes",
+    "replay", "failed"}}}``. Raises :class:`OracleError` on
+    garbage or truncated SA blocks (timestamps and oseq values
+    are informational and never parsed).
+    """
+    sas: dict[tuple, dict] = {}
+    blocks = re.split(r"(?m)^(?=src \S+ dst \S+$)", text)
+    for block in blocks:
+        if not block.strip():
+            continue
+        header = block.splitlines()[0].strip().split()
+        try:
+            src = header[header.index("src") + 1]
+            dst = header[header.index("dst") + 1]
+        except (ValueError, IndexError):
+            raise oracles.OracleError(f"xfrm stats bad SA header: {block[:60]!r}")
+        spi = re.search(r"proto esp spi 0x([0-9a-fA-F]+)", block)
+        life = re.search(r"(?m)^\s*(\d+)\(bytes\), (\d+)\(packets\)\s*$", block)
+        stats = re.search(
+            r"(?m)^\s*replay-window \d+ replay (\d+) failed (\d+)\s*$", block)
+        if not (spi and life and stats):
+            raise oracles.OracleError(f"xfrm stats truncated SA: {block[:60]!r}")
+        sas[(src, dst, int(spi.group(1), 16))] = {
+            "packets": int(life.group(2)), "bytes": int(life.group(1)),
+            "replay": int(stats.group(1)), "failed": int(stats.group(2)),
+        }
+    if not sas:
+        raise oracles.OracleError("xfrm stats contain no SA blocks")
+    return {"sas": sas}
+
+
 def parse_rc(cell_dir: Path, name: str) -> int:
     """Parse a scenario rc file (`KEY=N` or bare `N`)."""
     text = (cell_dir / name).read_text().strip()
@@ -746,13 +780,16 @@ def judge_portion(manifest: dict, portion: dict, cell_dir: Path) -> dict:
                 oracle_spec, cell_dir)
         elif scenario == "r04_deny.sh":
             checks, detail, expected_body, actual_body = judge_r04_deny(
-                oracle_spec, cell_dir)
+                oracle_spec, cell_dir, host_receipt)
         elif scenario == "r04_foreign.sh":
             checks, detail, expected_body, actual_body = judge_r04_foreign(
                 oracle_spec, cell_dir)
         else:
             raise oracles.OracleError(f"unknown scenario {scenario!r}")
-    except (oracles.OracleError, KeyError, ValueError, json.JSONDecodeError) as err:
+    except (oracles.OracleError, KeyError, ValueError, json.JSONDecodeError,
+            OSError) as err:
+        # Missing/unreadable/malformed cell files are unjudgeable
+        # and fail closed (a short cell is never a pass).
         checks = {"oracle_inputs_valid": False}
         detail = {"oracle_error": f"{type(err).__name__}: {err}"}
         expected_body, actual_body = {"error": "unjudgeable"}, {"error": str(err)}
@@ -991,11 +1028,24 @@ def judge_r03(oracle_spec, cell_dir):
         return {"product_rows": rows,
                 "kernel_hits": sum(window.get(k, 0) for k in window)}
 
+    xfrm = {
+        "state_count": int(
+            (cell_dir / "xfrm-state-count.txt").read_text().strip()),
+        "main_a": parse_xfrm_stats(
+            (cell_dir / "xfrm-stats-main-a.txt").read_text()),
+        "main_b": parse_xfrm_stats(
+            (cell_dir / "xfrm-stats-main-b.txt").read_text()),
+        "authfail_a": parse_xfrm_stats(
+            (cell_dir / "xfrm-stats-authfail-a.txt").read_text()),
+        "authfail_b": parse_xfrm_stats(
+            (cell_dir / "xfrm-stats-authfail-b.txt").read_text()),
+    }
     checks, detail = oracles.check_r03(
         ledger_a, ledger_b, kernel_ref, product,
         authfail_ledger, authfail_product,
         quiet(parsed_qb, kernel["quiet-before"]),
-        quiet(parsed_qa, kernel["quiet-after"]))
+        quiet(parsed_qa, kernel["quiet-after"]),
+        xfrm)
     checks["transport_closed"] = transport_closed(
         parsed_main, parsed_auth, parsed_qb, parsed_qa)
     detail["kernel_method"] = json.loads(
@@ -1026,9 +1076,13 @@ def observed_digest_counts(parsed: dict, kernel_ref: dict) -> dict:
     return observed
 
 
-def judge_r04_deny(oracle_spec, cell_dir):
+def judge_r04_deny(oracle_spec, cell_dir, host_receipt):
     refusal = {"exit": parse_rc(cell_dir, "refusal-rc.txt"),
-               "stderr": (cell_dir / "refusal-stderr.log").read_text()}
+               "stderr": (cell_dir / "refusal-stderr.log").read_text(),
+               "expected_obj_sha": host_receipt["pins"][
+                   "kryprobe-bpf/kcrypto.bpf.o"],
+               "unpriv_read_sha": (
+                   cell_dir / "unpriv-read-sha.txt").read_text().strip()}
     stdout = (cell_dir / "control-stdout.log").read_text()
     kernel_ref = json.loads((cell_dir / "kernel-ref.json").read_text())["main"]
     parsed = load_report(cell_dir, "control.json")
