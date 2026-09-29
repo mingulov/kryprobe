@@ -123,8 +123,11 @@ Route note 3 (T13, all kernels): the nested hash route below
 the outer ahash call is scatterlist/page-layout-shaped PER
 BURST, not per kernel or per release: identical fixture bytes
 take digest-1x, finup-1x, or finup-2x arms on different runs
-(digest-1x on 6.12/7.0/7.2 seals, finup-1x on the 6.12
-floor seal, finup-2x on a 7.0.14 foreign seal). The T13
+(digest-1x on the 6.12 floor seal this wave, sealed 20/20/0
+kernel == product, and on both 7.x foreign seals, sealed
+26/26/0 product; finup-1x on the superseded 6.12 floor
+seals, sealed 20/0/20; finup-2x on a superseded 7.0.14
+foreign seal). The T13
 oracles admit exactly these arms. Simultaneous product ==
 kernel equality on `crypto_ahash_digest`, `crypto_shash_digest`,
 and `crypto_shash_finup` is claimed only where an ftrace
@@ -133,9 +136,11 @@ leg); each seal records its arm, so the taken arm never affects
 exactness there. R04-foreign cells carry no kernel reference
 (attribution proof only, never kernel equality). R04-deny
 controls trace the digest functions only: their finup
-observations (20 finups for 10 outer calls on the 7.2.6 deny
-control, no finup reference) are explicitly unqualified
-residuals, as is any finup-2x arm taken outside a
+observations (0 finups for 10 outer calls on both 7.x deny
+controls this wave, sealed 10/10/0 product with 10/10
+kernel-ref and no finup reference; 20 finups for 10 outer
+calls on the superseded 7.2.6 deny seals) are explicitly
+unqualified residuals, as is any finup-2x arm taken outside a
 kernel-referenced leg. Pinning any single nested shape (e.g.
 shash_digest == issued) is unprovable and must not be
 reintroduced.

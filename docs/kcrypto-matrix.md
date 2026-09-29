@@ -49,7 +49,7 @@ sealed `stage.json`; pins uniform across all 11 cells).
 | ID | Cell(s) | Result |
 |---|---|---|
 | task-R01 fixture determinism | R01-det-7014, R01-det-726 | PASS: 10-row ledgers identical across legs (validate rc 0/0), product agg identical, attach 9/9, declared-partial verdict |
-| task-R01 floor / matrix R03 kernel matrix | R01-floor-612 | PASS (finup-1x arm): hash 20 (20 ahash outer + 20 shash finup, kernel == product exactly on all three hash functions); skcipher 10 ops (20+20 cryptd-nested, split pinned cbc(aes)/\_\_cbc(aes) 10/10); lifecycle refuses exit 4 |
+| task-R01 floor / matrix R03 kernel matrix | R01-floor-612 | PASS (digest-1x arm): hash 20 (20 ahash outer + 20 shash digest + 0 finup, kernel == product exactly on all three hash functions); skcipher 10 ops (20+20 cryptd-nested, split pinned cbc(aes)/\_\_cbc(aes) 10/10); lifecycle refuses exit 4 |
 | task-R02 / matrix R01 dm-crypt | R02-7014, R02-726 | PASS: 64 MiB write + 64 MiB read, sha256 match both directions, wrong-key mismatch proved; product 131072/131072 exact (per-direction byte equality plus integral-average 512 B/call consistency, average-only, kernel == product); quiet windows 0/0 |
 | task-R03 / matrix R02 XFRM | R03-7014, R03-726 | PASS: ESP authenc(hmac(sha256),cbc(aes)) over netns/veth; main legs 1000/1000 delivered both directions; wrong-key leg 100/0 with kernel-equality on authfail counts; quiet windows clean |
 | task-R04 negatives / matrix R04 | R04-deny-7014, R04-deny-726, R04-foreign-7014, R04-foreign-726 | PASS: deny legs refuse exit 4 (`live session unusable`, control 10 digests kernel-proved 10/10); foreign legs prove unique owned correspondence (outer 20:6, alloc 1:1, who == agg 54/54, zero unattributed rows) |
@@ -67,9 +67,12 @@ T13 route notes (new findings, proved in-cell):
 - Hash nesting below the outer ahash call is
   scatterlist/page-layout-shaped per burst, not per kernel: the
   same fixture bytes take digest-1x, finup-1x, or finup-2x arms
-  on different runs (finup-1x on the 6.12 floor seal,
-  digest-1x on both 7.x foreign seals this wave, finup-2x on
-  the superseded 7.0.14 foreign seal). The oracles admit
+  on different runs (digest-1x on the 6.12 floor seal this
+  wave, sealed 20/20/0 kernel == product; digest-1x on both
+  7.x foreign seals this wave, sealed 26/26/0 product;
+  finup-1x on the superseded 6.12 floor seals, sealed 20/0/20;
+  finup-2x on the superseded 7.0.14 foreign seal). The
+  oracles admit
   exactly these arms and require product == kernel equality on
   every hash function, so the arm never affects exactness.
 - The foreign-cell proof is route-invariant by construction:
