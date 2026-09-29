@@ -106,9 +106,14 @@ def _receipt(wait_exit=0, timed_out=False, reaped=True, vng_exit=0,
 def _sealed_cell(tmp, name="cell-A", manifest_sha="MANIFEST",
                  receipt=None, kryprobe_bytes=b"fake-kryprobe",
                  kryprobe_pin=None, legs=2):
-    """Minimal sealed cell: quiet + N disabled legs, consistent pins."""
+    """Minimal sealed cell: quiet + N disabled legs, consistent pins.
+
+    Carries every MANDATORY_STAGE_PINS row (like a real staged
+    cell) plus the historical unshipped validity.py pin.
+    """
     cell = Path(tmp) / name
     (cell / "legs").mkdir(parents=True)
+    (cell / "kryprobe-bpf").mkdir(parents=True)
     (cell / "quiet-report.json").write_text(
         json.dumps(_quiet_report(0)))
     rows = []
@@ -122,21 +127,38 @@ def _sealed_cell(tmp, name="cell-A", manifest_sha="MANIFEST",
     (cell / "kryprobe").write_bytes(kryprobe_bytes)
     if kryprobe_pin is None:
         kryprobe_pin = hashlib.sha256(kryprobe_bytes).hexdigest()
+    staged = {
+        "kcrypto_perf.py": b"fake-driver",
+        "kryprobe-bpf/kcrypto.bpf.o": b"fake-obj-agg",
+        "kryprobe-bpf/kcrypto-lifecycle.bpf.o": b"fake-obj-lc",
+        "inner.sh": b"fake-inner",
+        "guest-config": b"fake-config",
+        "head-sha.txt": b"fake-head",
+    }
+    pins = {"kryprobe": kryprobe_pin,
+            "kcrypto_fixture.ko": "none",
+            "validity.py": "unshipped-judge-pin"}
+    for rel, blob in staged.items():
+        (cell / rel).write_bytes(blob)
+        pins[rel] = hashlib.sha256(blob).hexdigest()
+    pins["legs.tsv"] = hashlib.sha256(
+        (cell / "legs.tsv").read_bytes()).hexdigest()
     (cell / "stage.json").write_text(json.dumps(
         {"kind": "set", "set": "S", "diag": None, "kernel": "7.0.14",
-         "manifest_sha256": manifest_sha,
-         "sha256": {"kryprobe": kryprobe_pin,
-                    "kcrypto_fixture.ko": "none",
-                    "validity.py": "unshipped-judge-pin"}}))
+         "manifest_sha256": manifest_sha, "sha256": pins}))
     (cell / "environment.txt").write_text(
-        f"ko=\nkryprobe={hashlib.sha256(kryprobe_bytes).hexdigest()}\n")
+        "ko=\n"
+        f"kryprobe={hashlib.sha256(kryprobe_bytes).hexdigest()}\n"
+        f"driver={pins['kcrypto_perf.py']}\n"
+        f"obj_agg={pins['kryprobe-bpf/kcrypto.bpf.o']}\n"
+        f"obj_lc={pins['kryprobe-bpf/kcrypto-lifecycle.bpf.o']}\n")
     (cell / "host-receipt.json").write_text(
         json.dumps(receipt if receipt is not None else _receipt()))
     (cell / "done.txt").write_text("step=done\n")
     (cell / "legs-done.txt").write_text(f"legs_done={legs}\n")
     names = ["quiet-report.json", "legs.tsv", "kryprobe", "stage.json",
              "environment.txt", "host-receipt.json", "done.txt",
-             "legs-done.txt"]
+             "legs-done.txt"] + sorted(staged)
     for idx in range(legs):
         leg_id = f"leg{idx // 2:02d}{'A' if idx % 2 == 0 else 'B'}"
         names += [f"legs/{leg_id}-driver.csv.summary.json",

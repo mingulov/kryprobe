@@ -893,14 +893,37 @@ def check_run_receipts(cell_dir: Path) -> tuple:
     return reasons, observed
 
 
+# P9R2A-N01: every staged cell ships these artifacts, so their
+# pin rows are mandatory — a removed pin row fails exactly like
+# a removed file. ``kcrypto_fixture.ko`` may pin "none" on
+# cells that need no module (key present, no file expected).
+MANDATORY_STAGE_PINS = frozenset({
+    "kryprobe",
+    "kryprobe-bpf/kcrypto.bpf.o",
+    "kryprobe-bpf/kcrypto-lifecycle.bpf.o",
+    "kcrypto_perf.py",
+    "inner.sh",
+    "guest-config",
+    "legs.tsv",
+    "head-sha.txt",
+    "kcrypto_fixture.ko",
+})
+
+# P9R2A-N01: the ONLY pin whose file may be absent without
+# failing the cell — the pre-repair judge pin that named a
+# ``validity.py`` never shipped into sealed cells. Any other
+# missing file fails, even with a consistent re-seal.
+HISTORICAL_UNSHIPPED_PINS = frozenset({"validity.py"})
+
+
 def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     """Staged pins must equal the sealed bytes + guest hashes (P9R1A-N6).
 
     A corrupted-then-resealed artifact keeps a consistent seal;
-    only the stage binding catches it. Pins for files never
-    shipped into the cell (e.g. the pre-repair ``validity.py``
-    judge pin) are recorded as unverifiable, never silently
-    trusted. Returns (reasons, observed).
+    only the stage binding catches it. Mandatory pin rows must
+    be present (P9R2A-N01) and every pinned file except the
+    named historical unshipped pin must exist and match.
+    Returns (reasons, observed).
     """
     cell_dir = Path(cell_dir)
     pins = stage.get("sha256", {}) or {}
@@ -909,13 +932,21 @@ def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     reasons = []
     checked = []
     unverifiable = []
+    for name in sorted(MANDATORY_STAGE_PINS):
+        if name not in pins:
+            reasons.append(
+                f"pin {name}: mandatory pin key missing from stage")
     for name in sorted(pins):
         pinned = pins[name]
         if pinned == "none":
             continue
         target = cell_dir / name
         if not target.is_file():
-            unverifiable.append(name)
+            if name in HISTORICAL_UNSHIPPED_PINS:
+                unverifiable.append(name)
+                continue
+            reasons.append(
+                f"pin {name}: staged file missing from sealed cell")
             continue
         try:
             actual = sha256_file(target)
@@ -1169,8 +1200,12 @@ def perturbation_report(cell_verdicts: list, bulk: list) -> dict:
     pre-fix fixture whose bulk legs skipped ledger rows but
     still read three timestamps per op — those ratios bound
     row-materialization cost only, not timestamping cost. The
-    repaired fixture's bulk path reads no timestamps, so future
-    bulk legs bound the full driver-observation perturbation.
+    repaired fixture's roundtrip_bulk reads no timestamps (P9R2O-N6
+    scope note: worker_loop still reads the clock once per op
+    for pacing/phase, so the no-clock guarantee covers
+    roundtrip_bulk only), so future bulk legs bound the
+    driver-observation perturbation less that symmetric per-op
+    clock read.
     """
     report: dict = {}
     for pair in bulk:
@@ -1238,6 +1273,18 @@ def cmd_verify(args) -> int:
               "sealed evidence; pass --out-dir <dir> (or --in-place "
               "for the legacy path)", file=sys.stderr)
         return 2
+    if args.out_dir is not None:
+        # P9R2O-N6: an --out-dir inside --evidence-dir would
+        # write judgments into the sealed tree (and the next
+        # run would judge its own output as a cell). Fail
+        # closed instead of warning.
+        out_abs = os.path.realpath(args.out_dir)
+        ev_abs = os.path.realpath(args.evidence_dir)
+        if out_abs == ev_abs or out_abs.startswith(ev_abs + os.sep):
+            print("verify: refusing --out-dir inside --evidence-dir "
+                  "(judgments must not land in sealed evidence)",
+                  file=sys.stderr)
+            return 2
     out_root = Path(args.out_dir) if args.out_dir else None
     manifest = kmanifest.load_manifest(Path(args.manifest))
     cells_dir = Path(args.evidence_dir)
