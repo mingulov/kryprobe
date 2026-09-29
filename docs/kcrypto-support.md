@@ -124,12 +124,20 @@ BURST, not per kernel or per release: identical fixture bytes
 take digest-1x, finup-1x, or finup-2x arms on different runs
 (digest-1x on 6.12/7.0/7.2 seals, finup-1x on the 6.12
 floor seal, finup-2x on a 7.0.14 foreign seal). The T13
-oracles admit exactly these arms and require product ==
+oracles admit exactly these arms. Simultaneous product ==
 kernel equality on `crypto_ahash_digest`, `crypto_shash_digest`,
-and `crypto_shash_finup` simultaneously, so the taken arm never
-affects exactness; each seal records its arm. Pinning any
-single nested shape (e.g. shash_digest == issued) is
-unprovable and must not be reintroduced.
+and `crypto_shash_finup` is claimed only where an ftrace
+reference binds all three functions (the 6.12 floor aggregate
+leg); each seal records its arm, so the taken arm never affects
+exactness there. R04-foreign cells carry no kernel reference
+(attribution proof only, never kernel equality). R04-deny
+controls trace the digest functions only: their finup
+observations (20 finups for 10 outer calls on the 7.2.6 deny
+control, no finup reference) are explicitly unqualified
+residuals, as is any finup-2x arm taken outside a
+kernel-referenced leg. Pinning any single nested shape (e.g.
+shash_digest == issued) is unprovable and must not be
+reintroduced.
 
 ## Explicit non-goals (both profiles)
 
