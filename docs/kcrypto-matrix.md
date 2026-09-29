@@ -72,9 +72,17 @@ T13 route notes (new findings, proved in-cell):
   7.x foreign seals this wave, sealed 26/26/0 product;
   finup-1x on the superseded 6.12 floor seals, sealed 20/0/20;
   finup-2x on the superseded 7.0.14 foreign seal). The
-  oracles admit
-  exactly these arms and require product == kernel equality on
-  every hash function, so the arm never affects exactness.
+  oracles admit exactly these arms. Simultaneous product ==
+  kernel equality on `crypto_ahash_digest`,
+  `crypto_shash_digest`, and `crypto_shash_finup` is claimed
+  only where an ftrace reference binds all three functions
+  (the 6.12 floor aggregate leg, sealed 20/20/0 kernel ==
+  product); R04-foreign cells carry no kernel reference
+  (attribution proof only) and R04-deny controls trace only
+  the two digest functions, so finup outside a
+  kernel-referenced leg is the accepted unreferenced residual.
+  Each seal records its arm, so the taken arm never affects
+  exactness there.
 - The foreign-cell proof is route-invariant by construction:
   the 20:6 issued ratio is proved on outer ahash rows only
   (one sendmsg is one outer digest whatever the nested arm),
