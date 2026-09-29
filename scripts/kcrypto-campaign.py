@@ -268,6 +268,43 @@ def ledger_semantics(ledger_path: Path) -> dict:
     return {"rows": total, "phases": phases}
 
 
+def ledger_product_truth(ledger_path: Path) -> dict:
+    """Per-op counts the fixture ledger issues (R01-det truth).
+
+    Counts ``submit`` rows by op (``skcipher/encrypt``,
+    ``skcipher/decrypt``) and ``alloc`` rows (``any/alloc``) —
+    the operations the product must observe exactly once each.
+    """
+    truth: dict[str, int] = {}
+    for line in Path(ledger_path).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        phase = row.get("phase")
+        if phase == "submit":
+            key = f"skcipher/{row.get('op')}"
+            truth[key] = truth.get(key, 0) + 1
+        elif phase == "alloc":
+            truth["any/alloc"] = truth.get("any/alloc", 0) + 1
+    return truth
+
+
+def observed_by_op(parsed: dict) -> dict:
+    """Per-op observed counts over EVERY agg family.
+
+    Keys are ``family/op`` summed across algorithms/drivers/
+    results-contexts; a family the ledger never issued still
+    appears (so truth equality fails on phantoms instead of
+    silently uncounting them).
+    """
+    observed: dict[str, int] = {}
+    for key, entry in parsed["agg"].items():
+        name = f"{key[0]}/{key[1]}"
+        observed[name] = observed.get(name, 0) + entry["calls"]
+    return observed
+
+
 def agg_entries(parsed: dict, family: str, op: str, result: str = AGG_OK) -> list:
     """All agg rows sharing (family, op, result) across algorithms/drivers."""
     return [entry for key, entry in parsed["agg"].items()
@@ -316,8 +353,8 @@ def cmd_run(args) -> int:
     run_dir, stage = stage_run_dir(args, portion, manifest["_manifest_sha256"], vng)
     inner = str(run_dir / "inner.sh")
     name = f"t13-{args.portion}"
-    locks = [Path(args.lock).resolve()] if isinstance(args.lock, str) else [
-        Path(p).resolve() for p in args.lock]
+    locks = resolve_lock_paths(
+        [args.lock] if isinstance(args.lock, str) else args.lock)
     print(f"staged {run_dir} pins={stage['sha256']['kryprobe'][:12]}...")
     result = owned_guest.run_cell(
         portion_id=args.portion,
@@ -496,20 +533,23 @@ def parse_rc(cell_dir: Path, name: str) -> int:
 def transport_closed(*parsed_reports: dict) -> bool:
     """Zero-loss gate over the parsed loss counters (fail-closed).
 
-    Every counter in KNOWN_ZERO must read exactly "0". Counters in
+    Every counter in KNOWN_ZERO must be PRESENT in every report
+    and read exactly "0": a report that omits a declared loss
+    dimension fails closed (silence is not lossless). Counters in
     KNOWN_RECORDED (declared-boundary markers and the by-design
     C7 destroy skip) are recorded, never gated. Any UNKNOWN
     nonzero counter fails: new loss taxonomy must be classified
     deliberately, never absorbed.
     """
     for parsed in parsed_reports:
-        for name, value in parsed["loss"].items():
-            if name in KNOWN_RECORDED:
+        loss = parsed["loss"]
+        for name in KNOWN_ZERO:
+            if loss.get(name) != "0":
+                return False
+        for name, value in loss.items():
+            if name in KNOWN_RECORDED or name in KNOWN_ZERO:
                 continue
-            if name in KNOWN_ZERO:
-                if value != "0":
-                    return False
-            elif value != "0":
+            if value != "0":
                 return False
     return True
 
@@ -550,6 +590,133 @@ def parse_fixture_stdout(text: str, op: str, count: int) -> bool:
     return marker in text and "generator finished" in text
 
 
+def verify_cell_seal(cell_dir: Path) -> tuple[bool, dict]:
+    """Re-derive the cell seal from bytes on disk (P8-N6).
+
+    Recomputes sha256 over every file named by the sealed
+    ``SHA256SUMS`` manifest and requires an exact match; a missing
+    manifest, an unreadable/mismatched file, or an unmanifested
+    extra file fails. Returns ``(ok, info)`` with ``mismatched``,
+    ``missing`` and ``unmanifested`` name lists.
+    """
+    cell_dir = Path(cell_dir)
+    info: dict[str, list] = {"mismatched": [], "missing": [],
+                             "unmanifested": []}
+    try:
+        lines = (cell_dir / "SHA256SUMS").read_text().splitlines()
+    except OSError:
+        return False, info
+    sealed: dict[str, str] = {}
+    for line in lines:
+        digest, sep, name = line.partition("  ")
+        if not sep or len(digest) != 64:
+            return False, info
+        try:
+            int(digest, 16)
+        except ValueError:
+            return False, info
+        sealed[name] = digest
+    if not sealed:
+        return False, info
+    for name, pinned in sealed.items():
+        target = cell_dir / name
+        if not target.is_file():
+            info["missing"].append(name)
+            continue
+        try:
+            if sha256_file(target) != pinned:
+                info["mismatched"].append(name)
+        except OSError:
+            info["mismatched"].append(name)
+    on_disk = {p.relative_to(cell_dir).as_posix() for p in cell_dir.rglob("*")
+               if p.is_file() and p.name != "SHA256SUMS"}
+    info["unmanifested"] = sorted(on_disk - set(sealed))
+    ok = not info["mismatched"] and not info["missing"] and not info["unmanifested"]
+    return ok, info
+
+
+def rederive_identity(cell_dir: Path) -> dict:
+    """Re-derive identity stability from the sealed env files (P8-N6).
+
+    Parses ``identity-before.env``/``identity-after.env`` from the
+    cell bytes and compares them — the receipt's cached
+    ``stable`` flag is never trusted. Unreadable or malformed
+    files fail closed.
+    """
+    cell_dir = Path(cell_dir)
+    try:
+        before = kidentity.parse_identity_env(
+            (cell_dir / "identity-before.env").read_text())
+        after = kidentity.parse_identity_env(
+            (cell_dir / "identity-after.env").read_text())
+        return kidentity.compare_identities(before, after)
+    except (OSError, kidentity.IdentityError) as err:
+        return {"stable": False, "mismatches": [],
+                "missing": [f"identity unreadable: {err}"]}
+
+
+def verify_pins_match_bytes(cell_dir: Path, pins: dict) -> bool:
+    """Staged pins must equal the sealed bytes on disk (P8-N6).
+
+    A corrupted-then-resealed artifact keeps a consistent seal
+    but no longer matches the staged pins the receipt binds.
+    ``"none"`` pins (unstaged fixture module) are skipped.
+    """
+    for name, pinned in (pins or {}).items():
+        if pinned == "none":
+            continue
+        try:
+            if sha256_file(cell_dir / name) != pinned:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def resolve_lock_paths(lock_args) -> list:
+    """Resolve the campaign lock set: common + task, never one alone.
+
+    The shared host BPF lane lock plus the task VM lock are both
+    required (a per-task lock alone is not mutual exclusion);
+    refuses fewer than two ``--lock`` values.
+    """
+    paths = [Path(p).resolve() for p in lock_args]
+    if len(paths) < 2:
+        raise ValueError(
+            f"campaign run needs two locks (common + task), got {len(paths)}: "
+            "pass --lock <shared host BPF lock> --lock <task vm lock>")
+    return paths
+
+
+def verify_campaign_locks(cells_dir: Path, required_ids: list) -> dict:
+    """Prove common-plus-task exclusion from spawn receipts (P8-N8).
+
+    Every required portion's ``spawn.json`` must record at least
+    two held locks, and the lock sets must share at least one
+    common lock across the whole campaign. Returns ``{"verdict",
+    "reasons", "common"}``.
+    """
+    reasons: list[str] = []
+    sets: dict[str, set] = {}
+    for portion_id in required_ids:
+        spawn = cells_dir / portion_id / "spawn.json"
+        try:
+            locks = json.loads(spawn.read_text()).get("lock_paths", [])
+        except (OSError, ValueError) as err:
+            reasons.append(f"portion {portion_id}: spawn receipt unreadable: {err}")
+            continue
+        if len(locks) < 2:
+            reasons.append(
+                f"portion {portion_id}: task-only lock {locks!r} "
+                "(common + task required)")
+        sets[portion_id] = set(locks)
+    common = sorted(set.intersection(*sets.values())) if sets else []
+    if sets and not common:
+        reasons.append("no common lock shared across the campaign")
+    return {"verdict": "FAIL" if reasons else "PASS", "reasons": reasons,
+            "common": common}
+
+
 def judge_portion(manifest: dict, portion: dict, cell_dir: Path) -> dict:
     """Build oracle inputs from sealed files, run the predicate, reconcile.
 
@@ -585,11 +752,19 @@ def judge_portion(manifest: dict, portion: dict, cell_dir: Path) -> dict:
         checks = {"oracle_inputs_valid": False}
         detail = {"oracle_error": f"{type(err).__name__}: {err}"}
         expected_body, actual_body = {"error": "unjudgeable"}, {"error": str(err)}
-    checks["identity_stable"] = bool(
-        host_receipt.get("identity", {}).get("stable"))
+    rederived = rederive_identity(cell_dir)
+    checks["identity_stable"] = bool(rederived.get("stable"))
+    if not rederived.get("stable"):
+        detail["identity_rederived"] = rederived
     checks["manifest_bound"] = (
         host_receipt.get("manifest_sha256") == manifest["_manifest_sha256"])
     checks["guest_stage_match"] = guest_matches_stage(cell_dir, host_receipt)
+    seal_ok, seal_info = verify_cell_seal(cell_dir)
+    checks["seal_ok"] = seal_ok
+    if not seal_ok:
+        detail["seal_info"] = seal_info
+    checks["pins_match_bytes"] = verify_pins_match_bytes(
+        cell_dir, host_receipt.get("pins", {}))
     checks["no_key_leak"] = not leak_hits
     if leak_hits:
         detail["key_leak_hits"] = leak_hits
@@ -638,13 +813,18 @@ def judge_r01_det(oracle_spec, cell_dir, host_receipt):
             "attach_markers": int(parsed["attach"].get("probes_attached", "0")),
             "attach_expected": int(parsed["attach"].get("probes_expected", "0")),
             "product": product,
+            "fixture_truth": ledger_product_truth(
+                cell_dir / f"ledger-{leg}.jsonl"),
+            "observed_by_op": observed_by_op(parsed),
             "transport_closed": transport_closed(parsed),
         }
     checks, detail = oracles.check_r01_det(
         {k: legs["legA"][k] for k in
-         ("ledger_ops", "ledger_rc", "attach_markers", "product")},
+         ("ledger_ops", "ledger_rc", "attach_markers", "product",
+          "fixture_truth", "observed_by_op")},
         {k: legs["legB"][k] for k in
-         ("ledger_ops", "ledger_rc", "attach_markers", "product")})
+         ("ledger_ops", "ledger_rc", "attach_markers", "product",
+          "fixture_truth", "observed_by_op")})
     checks["ledger_phases_deterministic"] = (
         legs["legA"]["ledger_phases"] == legs["legB"]["ledger_phases"])
     checks["attach_full"] = all(
@@ -921,6 +1101,12 @@ def cmd_verify(args) -> int:
         judged.append(full)
     summary = reconcile.reconcile_campaign(required, judged,
                                            uniform_pins=UNIFORM_PINS)
+    lock_verdict = verify_campaign_locks(cells_dir, required)
+    summary["reasons"].extend(lock_verdict["reasons"])
+    if lock_verdict["verdict"] != "PASS":
+        summary["verdict"] = "FAIL"
+    else:
+        print(f"locks: common={lock_verdict['common']}")
     print(f"campaign: {summary['verdict']}")
     for reason in summary["reasons"]:
         print(f"  - {reason}")
@@ -943,7 +1129,8 @@ def main() -> int:
                      help="K=V prebuilt fixture .ko (r01_det only)")
     run.add_argument("--fixture", required=True)
     run.add_argument("--out-root", required=True)
-    run.add_argument("--lock", action="append", required=True)
+    run.add_argument("--lock", action="append", required=True,
+                     help="repeat twice: shared host BPF lock + task vm lock")
     run.add_argument("--evidence-dir", required=True)
     verify = sub.add_parser("verify", help="judge sealed cells (offline)")
     verify.add_argument("--manifest", required=True)

@@ -88,12 +88,15 @@ python3 -B scripts/kcrypto-campaign.py plan \
   --manifest tests/kcrypto_campaign/cells.json
 
 # Run one portion (all paths explicit; --ko only for r01_det).
+# Both locks are required: the shared host BPF lane lock plus the
+# task VM lock (a per-task lock alone is not mutual exclusion).
 python3 -B scripts/kcrypto-campaign.py run \
   --manifest tests/kcrypto_campaign/cells.json --portion R02-7014 \
   --kryprobe <release kryprobe> --bpf-dir target/kryprobe-bpf \
   --ko 7.0.14=<kcrypto_fixture.ko> \
   --fixture tests/fixtures/kcrypto_gen.py \
-  --out-root <fresh run root> --lock <task vm lock> \
+  --out-root <fresh run root> \
+  --lock <shared host BPF lock> --lock <task vm lock> \
   --evidence-dir <fresh evidence root>
 
 # Judge sealed cells offline (prints verdicts; writes nothing).
