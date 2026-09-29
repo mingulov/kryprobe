@@ -198,9 +198,14 @@ def check_r01_det(leg_a: dict, leg_b: dict) -> tuple[dict, dict]:
 
     Each leg carries ``ledger_ops`` (fixture truth), ``ledger_rc``
     (strict testkit validation exit), ``attach_markers`` (proven
-    observer attach count) and ``product`` (observed per-family
-    counts). Determinism = exact equality of every semantic
-    count across both legs with both ledgers valid.
+    observer attach count), ``product`` (observed per-family
+    counts), ``fixture_truth`` (per-op counts the ledger rows
+    issue) and ``observed_by_op`` (per-op counts the product
+    observed, every family reported). Determinism = exact
+    equality of every semantic count across both legs with both
+    ledgers valid — AND each leg's observation must equal the
+    fixture truth it was issued: repeatability alone would
+    certify two empty observations.
     """
     checks = {}
     checks["ledgers_valid"] = leg_a.get("ledger_rc") == 0 and leg_b.get("ledger_rc") == 0
@@ -209,9 +214,18 @@ def check_r01_det(leg_a: dict, leg_b: dict) -> tuple[dict, dict]:
     )
     checks["ledger_deterministic"] = leg_a.get("ledger_ops") == leg_b.get("ledger_ops")
     checks["deterministic_counts"] = leg_a.get("product") == leg_b.get("product")
+    checks["legA_matches_truth"] = (
+        leg_a.get("observed_by_op") == leg_a.get("fixture_truth")
+        and bool(leg_a.get("fixture_truth"))
+    )
+    checks["legB_matches_truth"] = (
+        leg_b.get("observed_by_op") == leg_b.get("fixture_truth")
+        and bool(leg_b.get("fixture_truth"))
+    )
     detail = {
         "ledger_ops": leg_a.get("ledger_ops"),
         "product": leg_a.get("product"),
+        "fixture_truth": leg_a.get("fixture_truth"),
     }
     return checks, detail
 
@@ -299,9 +313,15 @@ def check_r02(workload: dict, kernel_ref: dict, product: dict,
     encrypt/decrypt counts, observed ``enc_bytes``/``dec_bytes``
     totals and ``ring_drops``; quiet windows carry background
     ``product_rows``/``kernel_hits``. Bytes are NEVER equated to
-    calls: the relation needs exact bytes AND exact calls AND
-    the explained uniform chunking (both direction quotients
-    integral, equal, and dividing the 4 KiB block).
+    calls and NEVER pooled across directions: the relation needs
+    exact per-direction bytes (encrypt vs written, decrypt vs
+    read) AND exact calls AND the integral-average chunking
+    shape (both direction quotients integral, equal, and
+    dividing the 4 KiB block). The chunking gate proves the
+    average request size is consistent with uniform 512 B
+    chunking — an integral average alone proves nothing about
+    per-request uniformity, so the byte proof rests on the
+    per-direction equalities, never on the average.
     """
     checks = {}
     written = workload.get("bytes_written")
@@ -316,9 +336,10 @@ def check_r02(workload: dict, kernel_ref: dict, product: dict,
     enc_b, dec_b = product.get("enc_bytes"), product.get("dec_bytes")
     checks["bytes_reconcile"] = (
         enc_b is not None and dec_b is not None
-        and enc_b + dec_b == (written or 0) + (read or 0)
+        and enc_b == written and dec_b == read
     )
     chunk = 0
+    quotient_enc = quotient_dec = 0
     if (enc_p or 0) > 0 and (dec_p or 0) > 0 and enc_b is not None and dec_b is not None:
         if enc_b % enc_p == 0 and dec_b % dec_p == 0:
             quotient_enc, quotient_dec = enc_b // enc_p, dec_b // dec_p
@@ -333,6 +354,8 @@ def check_r02(workload: dict, kernel_ref: dict, product: dict,
         "bytes": (written or 0) + (read or 0),
         "calls": (enc_k or 0) + (dec_k or 0),
         "chunk_bytes": chunk,
+        "quotient_enc": quotient_enc,
+        "quotient_dec": quotient_dec,
     }
     return checks, detail
 
@@ -422,6 +445,25 @@ def check_r04_deny(refusal: dict, control: dict, kernel_ref: dict) -> tuple[dict
     return checks, detail
 
 
+def _nested_arm(outer: int, shash: int, finup: int) -> str:
+    """Name the admitted nested arm for one burst population.
+
+    One sendmsg nests exactly one admitted shape below the outer
+    ahash call (digest-1x, finup-1x, or finup-2x — the
+    scatterlist-shaped T13 arms); anything else (mixed arms,
+    absent nesting, digest-2x) is undocumented and fails.
+    """
+    if (outer or 0) <= 0:
+        return "undocumented"
+    if shash == outer and finup == 0:
+        return "digest-1x"
+    if shash == 0 and finup == outer:
+        return "finup-1x"
+    if shash == 0 and finup == 2 * outer:
+        return "finup-2x"
+    return "undocumented"
+
+
 def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
                       foreign_issued: int, product_rows: list,
                       agg_all_total: int) -> tuple[dict, dict]:
@@ -429,11 +471,16 @@ def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
 
     Who rows (``tgid`` + ``probe`` + ``calls``) must attribute
     every observation to exactly the recorded owned/foreign PID
-    sets. The issued ratio (20:6) is proved on the OUTER ahash
-    rows only: one sendmsg is one outer digest whatever the
-    kernel's nested route (digest vs finup nesting is
-    scatterlist-shaped and legitimately differs per burst), so a
-    summed-totals ratio is unprovable. Each burst binds exactly
+    sets. The issued counts (20 owned, 6 foreign) are proved as
+    ABSOLUTE outer-ahash equalities per population: one sendmsg
+    is one outer digest whatever the kernel's nested route, so a
+    ratio alone cannot catch proportional loss (10:3 keeps the
+    ratio against 20:6 receipts). The NESTED populations are
+    gated per probe per population too: each burst takes exactly
+    one admitted arm (digest-1x, finup-1x, finup-2x — the arms
+    may differ between the owned and foreign bursts, never
+    within one), so a nested call absorbed into the foreign
+    population breaks the owned arm. Each burst binds exactly
     once, so the bind-alloc rows are pinned 1:1. Coverage is who
     over EVERY agg family (nested rows included, nothing
     unattributed, nothing absorbed).
@@ -451,16 +498,14 @@ def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
     foreign_outer = matched("ahash", foreign_set)
     owned_alloc = matched("alloc", owned_set)
     foreign_alloc = matched("alloc", foreign_set)
-    owned_nested = sum(
-        row.get("calls", 0) for row in product_rows
-        if row.get("tgid") in owned_set
-        and row.get("probe") in ("shash", "finup")
-    )
-    foreign_nested = sum(
-        row.get("calls", 0) for row in product_rows
-        if row.get("tgid") in foreign_set
-        and row.get("probe") in ("shash", "finup")
-    )
+    owned_shash = matched("shash", owned_set)
+    owned_finup = matched("finup", owned_set)
+    foreign_shash = matched("shash", foreign_set)
+    foreign_finup = matched("finup", foreign_set)
+    owned_nested = owned_shash + owned_finup
+    foreign_nested = foreign_shash + foreign_finup
+    owned_arm = _nested_arm(owned_outer, owned_shash, owned_finup)
+    foreign_arm = _nested_arm(foreign_outer, foreign_shash, foreign_finup)
     who_total = sum(row.get("calls", 0) for row in product_rows)
     unattributed = [
         row for row in product_rows
@@ -477,6 +522,10 @@ def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
         and (owned_issued or 0) > 0
         and (foreign_issued or 0) > 0
     )
+    checks["owned_outer_exact"] = owned_outer == owned_issued
+    checks["foreign_outer_exact"] = foreign_outer == foreign_issued
+    checks["owned_nested_exact"] = owned_arm != "undocumented"
+    checks["foreign_nested_exact"] = foreign_arm != "undocumented"
     checks["foreign_present"] = foreign_outer > 0
     checks["alloc_exact"] = owned_alloc == 1 and foreign_alloc == 1
     checks["coverage_exact"] = (
@@ -491,6 +540,12 @@ def check_r04_foreign(owned_pids: list, foreign_pids: list, owned_issued: int,
         "foreign_alloc": foreign_alloc,
         "owned_nested": owned_nested,
         "foreign_nested": foreign_nested,
+        "owned_shash": owned_shash,
+        "owned_finup": owned_finup,
+        "foreign_shash": foreign_shash,
+        "foreign_finup": foreign_finup,
+        "owned_nested_arm": owned_arm,
+        "foreign_nested_arm": foreign_arm,
         "who_total": who_total,
         "agg_all_total": agg_all_total,
         "unattributed": len(unattributed),

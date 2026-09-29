@@ -27,6 +27,10 @@ def det_leg(ops=4, skcipher=8, alloc=4, destroy=4):
         "ledger_rc": 0,
         "attach_markers": 10,
         "product": {"skcipher": skcipher, "alloc": alloc, "destroy": destroy},
+        "fixture_truth": {"skcipher/encrypt": 1, "skcipher/decrypt": 1,
+                          "any/alloc": 1},
+        "observed_by_op": {"skcipher/encrypt": 1, "skcipher/decrypt": 1,
+                           "any/alloc": 1},
     }
 
 
@@ -51,6 +55,43 @@ class R01DetTests(unittest.TestCase):
         bad["attach_markers"] = 0
         checks, _detail = oracles.check_r01_det(det_leg(), bad)
         self.assertFalse(checks["attach_proved"])
+
+    def test_both_empty_observations_fail_truth(self):
+        # P8-N7: two identically EMPTY legs are "deterministic"
+        # but prove no observation against fixture truth (sync-once
+        # issues one encrypt, one decrypt, one alloc per leg).
+        empty = det_leg()
+        empty["product"] = {}
+        empty["observed_by_op"] = {}
+        checks, _detail = oracles.check_r01_det(empty, det_leg())
+        self.assertTrue(checks["deterministic_counts"] is False)
+        checks, _detail = oracles.check_r01_det(empty, dict(empty))
+        self.assertTrue(checks["deterministic_counts"])
+        self.assertFalse(checks["legA_matches_truth"])
+        self.assertFalse(checks["legB_matches_truth"])
+
+    def test_observed_exceeding_truth_fails(self):
+        bad = det_leg()
+        bad["observed_by_op"] = {"skcipher/encrypt": 2,
+                                 "skcipher/decrypt": 1, "any/alloc": 1}
+        checks, _detail = oracles.check_r01_det(det_leg(), bad)
+        self.assertTrue(checks["legA_matches_truth"])
+        self.assertFalse(checks["legB_matches_truth"])
+
+    def test_phantom_family_fails_truth(self):
+        # An extra observed family no ledger row issues: the
+        # per-op truth equation (not just the pinned keys) fails.
+        bad = det_leg()
+        bad["observed_by_op"] = {"skcipher/encrypt": 1,
+                                 "skcipher/decrypt": 1, "any/alloc": 1,
+                                 "aead/encrypt": 1}
+        checks, _detail = oracles.check_r01_det(det_leg(), bad)
+        self.assertFalse(checks["legB_matches_truth"])
+
+    def test_truth_match_passes_with_determinism(self):
+        checks, detail = oracles.check_r01_det(det_leg(), det_leg())
+        self.assertTrue(all(checks.values()), checks)
+        self.assertEqual(detail["fixture_truth"]["skcipher/encrypt"], 1)
 
 
 def floor_workload(hash_issued=20, hash_done=20, skc_issued=10, skc_done=10):
@@ -253,6 +294,28 @@ class R02Tests(unittest.TestCase):
             r02_workload(), r02_kernel(0, 0), r02_product(0, 0, 0, 0), quiet(), quiet()
         )
         self.assertFalse(checks["kernel_traffic_proved"])
+
+    def test_direction_compensation_fails(self):
+        # P8-N3: 32 KiB encrypt / 96 KiB decrypt with matching
+        # kernel/product call counts (64/192) sums to the 128 KiB
+        # combined total against 64/64 truth — the combined gate
+        # passes while neither direction reconciles.
+        workload = r02_workload(written=64 * 1024, read=64 * 1024)
+        kernel = r02_kernel(enc=64, dec=192)
+        bad = r02_product(enc=64, dec=192,
+                          enc_bytes=32 * 1024, dec_bytes=96 * 1024)
+        checks, _d = oracles.check_r02(
+            workload, kernel, bad, quiet(), quiet())
+        self.assertTrue(checks["calls_equal_kernel"])
+        self.assertTrue(checks["chunking_explained"])
+        self.assertFalse(checks["bytes_reconcile"])
+
+    def test_single_direction_shortfall_fails(self):
+        bad = r02_product(enc_bytes=64 * 1024 - 4096,
+                          dec_bytes=64 * 1024 + 4096)
+        checks, _d = oracles.check_r02(
+            r02_workload(), r02_kernel(), bad, quiet(), quiet())
+        self.assertFalse(checks["bytes_reconcile"])
 
 
 def r03_ledgers(sent=1000, received=1000):
@@ -521,6 +584,65 @@ class R04Tests(unittest.TestCase):
         rows = frow(101, "alloc", 1) + frow(202, "alloc", 1)
         checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 2)
         self.assertFalse(checks["foreign_present"])
+
+    def test_nested_absorbed_into_foreign_fails(self):
+        # P8-N1: one owned nested call re-attributed to foreign
+        # (19:7 nested) keeps outer 20:6, allocs 1:1 and coverage
+        # 54/54 — the outer ratio alone cannot see it.
+        rows = (frow(101, "ahash", 20) + frow(101, "shash", 19)
+                + frow(101, "alloc", 1) + frow(202, "ahash", 6)
+                + frow(202, "shash", 7) + frow(202, "alloc", 1))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 54)
+        self.assertTrue(checks["ratio_exact"])
+        self.assertTrue(checks["coverage_exact"])
+        self.assertFalse(checks["owned_nested_exact"])
+        self.assertFalse(checks["foreign_nested_exact"])
+
+    def test_proportional_loss_fails_absolute_gates(self):
+        # P8-N1: halved observations (10:3 outer and nested) keep
+        # the ratio and coverage equations against unchanged 20:6
+        # workload receipts — absolute counts must fail.
+        rows = (frow(101, "ahash", 10) + frow(101, "shash", 10)
+                + frow(101, "alloc", 1) + frow(202, "ahash", 3)
+                + frow(202, "shash", 3) + frow(202, "alloc", 1))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 28)
+        self.assertTrue(checks["ratio_exact"])
+        self.assertTrue(checks["coverage_exact"])
+        self.assertFalse(checks["owned_outer_exact"])
+        self.assertFalse(checks["foreign_outer_exact"])
+
+    def test_mixed_nested_arm_within_burst_fails(self):
+        # One population splitting digest + finup nesting (10/10
+        # for 20 outer) matches no admitted single arm per burst.
+        rows = (frow(101, "ahash", 20) + frow(101, "shash", 10)
+                + frow(101, "finup", 10) + frow(101, "alloc", 1)
+                + frow(202, "ahash", 6) + frow(202, "shash", 6)
+                + frow(202, "alloc", 1))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 54)
+        self.assertTrue(checks["owned_outer_exact"])
+        self.assertFalse(checks["owned_nested_exact"])
+        self.assertTrue(checks["foreign_nested_exact"])
+
+    def test_absent_nesting_fails(self):
+        rows = (frow(101, "ahash", 20) + frow(101, "alloc", 1)
+                + frow(202, "ahash", 6) + frow(202, "shash", 6)
+                + frow(202, "alloc", 1))
+        checks, _d = oracles.check_r04_foreign([101], [202], 20, 6, rows, 34)
+        self.assertFalse(checks["owned_nested_exact"])
+        self.assertTrue(checks["foreign_nested_exact"])
+
+    def test_finup_single_arms_pass_per_population(self):
+        # Each burst takes exactly one admitted arm, but the arms
+        # may differ per population (owned finup-2x, foreign
+        # digest-1x here; the mirror is pinned above).
+        rows = (frow(101, "ahash", 20) + frow(101, "finup", 40)
+                + frow(101, "alloc", 1) + frow(202, "ahash", 6)
+                + frow(202, "shash", 6) + frow(202, "alloc", 1))
+        checks, detail = oracles.check_r04_foreign(
+            [101], [202], 20, 6, rows, 74)
+        self.assertTrue(all(checks.values()), checks)
+        self.assertEqual(detail["owned_nested_arm"], "finup-2x")
+        self.assertEqual(detail["foreign_nested_arm"], "digest-1x")
 
 
 def agg_obs(family="skcipher", op="encrypt", result="ok", calls=20,
