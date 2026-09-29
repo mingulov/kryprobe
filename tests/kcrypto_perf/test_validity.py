@@ -113,6 +113,15 @@ class AfalgValidityTests(unittest.TestCase):
             kernel="7.0.14", cls="P-64", capture_rc=3)
         self.assertFalse(got["valid"])
 
+    def test_probe_alloc_unpinned_destroy(self):
+        report = afalg_report(80000, 80000, alloc=20,
+                              loss=zero_loss(destroy_skip=7))
+        got = VALIDITY.check_leg_agg(
+            report, driver_summary(80000),
+            kernel="7.0.14", cls="P-64", capture_rc=3,
+            expected_alloc=20, pin_destroy=False)
+        self.assertTrue(got["valid"], got["reasons"])
+
     def test_bad_capture_rc_invalid(self):
         got = VALIDITY.check_leg_agg(
             afalg_report(100, 100), driver_summary(100),

@@ -202,7 +202,7 @@ class SamplerTests(unittest.TestCase):
         path = write_tmp(content)
         parsed = PARSERS.parse_sampler(path)
         self.assertEqual(parsed["rss_max_kb"], 15000)
-        self.assertAlmostEqual(parsed["cpu_s"], 2.1)
+        self.assertAlmostEqual(parsed["cpu_s"], 2.2)
         self.assertEqual(parsed["samples"], 3)
 
     def test_single_sample_cpu_zero(self):

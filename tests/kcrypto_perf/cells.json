@@ -1,0 +1,375 @@
+{
+  "$schema": "kryprobe-perf-campaign/v1",
+  "campaign": "kcrypto-t14",
+  "manifest_version": 1,
+  "frozen_utc": "2026-09-29T10:55:00Z",
+  "freeze_rule": "frozen before the first T14 sampling boot; any stimulus/mode/equivalence/validity edit invalidates sealed receipts (preflight mapping runs used a throwaway prototype driver and are not samples)",
+  "budgets": {
+    "B1_throughput_ratio_min": 0.95,
+    "B2_p99_ratio_max": 1.1,
+    "applies": "qualified flat-out 4 KiB / 1 MiB aggregate pair-sets on supported kernels (7.0.14, 7.2.6); floor and paced sets publish envelopes",
+    "verdict": "median inside AND >=80% of pairs inside => PASS; median outside AND >=80% outside => FAIL; else INCONCLUSIVE (see docs/bench-thresholds.md)"
+  },
+  "global": {
+    "kernels": [
+      "6.12.111",
+      "7.0.14",
+      "7.2.6"
+    ],
+    "vng": {
+      "6.12.111": "v6.12.111",
+      "7.0.14": "v7.0.14",
+      "7.2.6": "v7.2.6"
+    },
+    "warmup_s": 10,
+    "measure_s": 30,
+    "capture_s": 50,
+    "settle_s": 5,
+    "quiet_s": 5,
+    "pairs_per_set": 5,
+    "max_attempted_pairs": 8,
+    "guest_cpus": 4,
+    "guest_memory": "4G",
+    "detail_cap": 100000,
+    "paced_rate_per_s": 1000,
+    "paced_late_max_frac": 0.01
+  },
+  "classes": {
+    "P-64": {
+      "title": "64 B skcipher roundtrips (AF_ALG cbc(aes))",
+      "driver": "skcipher",
+      "size": 64
+    },
+    "P-4K": {
+      "title": "4 KiB skcipher roundtrips (AF_ALG cbc(aes))",
+      "driver": "skcipher",
+      "size": 4096
+    },
+    "P-1M": {
+      "title": "1 MiB skcipher roundtrips (AF_ALG cbc(aes))",
+      "driver": "skcipher",
+      "size": 1048576
+    },
+    "P-AEAD": {
+      "title": "high-rate AEAD roundtrips (AF_ALG gcm(aes), 1024 B + 32 B assoc + 16 B tag)",
+      "driver": "aead",
+      "size": 1024,
+      "assoc": 32,
+      "tag": 16
+    },
+    "P-ASYNC": {
+      "title": "deliberately asynchronous completion (fixture async-once GO loop)",
+      "driver": "async",
+      "size": 16
+    }
+  },
+  "modes": {
+    "disabled": {
+      "title": "tracing disabled (no observer): baseline A of every pair"
+    },
+    "attached-idle": {
+      "title": "observer attached, workload idle: footprint legs only, never a workload pair"
+    },
+    "aggregation": {
+      "title": "api-returns capture during workload (report --system)",
+      "profile": "api-returns"
+    },
+    "full-details": {
+      "title": "request-lifecycle capture during workload (report --system --kcrypto-profile request-lifecycle)",
+      "profile": "request-lifecycle"
+    },
+    "stack-sampling": {
+      "status": "NOT_RUN",
+      "reason": "no standalone product toggle: R1 stacks are first-seen-only attribution inside api-returns (lifecycle object captures no stacks); stack observables reported from aggregation who rows plus the diag-stack-7014 probe"
+    }
+  },
+  "sets": [
+    {
+      "id": "perf-P-64-agg-7014",
+      "class": "P-64",
+      "mode": "aggregation",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs",
+      "hosts_bulk": true
+    },
+    {
+      "id": "perf-P-64-det-7014",
+      "class": "P-64",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-4K-agg-7014",
+      "class": "P-4K",
+      "mode": "aggregation",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": true,
+      "kind": "pairs",
+      "hosts_bulk": true
+    },
+    {
+      "id": "perf-P-4K-det-7014",
+      "class": "P-4K",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-1M-agg-7014",
+      "class": "P-1M",
+      "mode": "aggregation",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": true,
+      "kind": "pairs",
+      "hosts_bulk": true
+    },
+    {
+      "id": "perf-P-1M-det-7014",
+      "class": "P-1M",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-AEAD-agg-7014",
+      "class": "P-AEAD",
+      "mode": "aggregation",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs",
+      "hosts_bulk": true
+    },
+    {
+      "id": "perf-P-AEAD-det-7014",
+      "class": "P-AEAD",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-ASYNC-agg-7014",
+      "class": "P-ASYNC",
+      "mode": "aggregation",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs",
+      "hosts_bulk": true
+    },
+    {
+      "id": "perf-P-ASYNC-det-7014",
+      "class": "P-ASYNC",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-64-det-paced-7014",
+      "class": "P-64",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "paced",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-4K-det-paced-7014",
+      "class": "P-4K",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "paced",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-AEAD-det-paced-7014",
+      "class": "P-AEAD",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "paced",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-ASYNC-det-paced-7014",
+      "class": "P-ASYNC",
+      "mode": "full-details",
+      "kernel": "7.0.14",
+      "workload": "paced",
+      "budgeted": false,
+      "kind": "cost-only"
+    },
+    {
+      "id": "perf-P-64-agg-726",
+      "class": "P-64",
+      "mode": "aggregation",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-64-det-726",
+      "class": "P-64",
+      "mode": "full-details",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-4K-agg-726",
+      "class": "P-4K",
+      "mode": "aggregation",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": true,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-4K-det-726",
+      "class": "P-4K",
+      "mode": "full-details",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-1M-agg-726",
+      "class": "P-1M",
+      "mode": "aggregation",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": true,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-1M-det-726",
+      "class": "P-1M",
+      "mode": "full-details",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-AEAD-agg-726",
+      "class": "P-AEAD",
+      "mode": "aggregation",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-AEAD-det-726",
+      "class": "P-AEAD",
+      "mode": "full-details",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-ASYNC-agg-726",
+      "class": "P-ASYNC",
+      "mode": "aggregation",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-ASYNC-det-726",
+      "class": "P-ASYNC",
+      "mode": "full-details",
+      "kernel": "7.2.6",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-4K-agg-612",
+      "class": "P-4K",
+      "mode": "aggregation",
+      "kernel": "6.12.111",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    },
+    {
+      "id": "perf-P-1M-agg-612",
+      "class": "P-1M",
+      "mode": "aggregation",
+      "kernel": "6.12.111",
+      "workload": "flat",
+      "budgeted": false,
+      "kind": "pairs"
+    }
+  ],
+  "diagnostics": [
+    {
+      "id": "footprint-7014",
+      "kind": "footprint",
+      "kernel": "7.0.14",
+      "mode": "attached-idle",
+      "note": "api-returns session live 40 s, workload idle: observer CPU/RSS + attach/detach cost"
+    },
+    {
+      "id": "footprint-726",
+      "kind": "footprint",
+      "kernel": "7.2.6",
+      "mode": "attached-idle",
+      "note": "api-returns session live 40 s, workload idle: observer CPU/RSS + attach/detach cost"
+    },
+    {
+      "id": "footprint-612",
+      "kind": "footprint",
+      "kernel": "6.12.111",
+      "mode": "attached-idle",
+      "note": "api-returns session live 40 s, workload idle: observer CPU/RSS + attach/detach cost"
+    },
+    {
+      "id": "diag-stack-7014",
+      "kind": "probe-pairs",
+      "class": "P-64",
+      "mode": "aggregation",
+      "kernel": "7.0.14",
+      "workload": "many-submitter",
+      "pairs": 3,
+      "note": "fresh thread per 50 ops forces first-seen stack capture per submitter; disabled-vs-aggregation, report only (not a budget pair-set)"
+    }
+  ],
+  "equivalence": {
+    "flat_afalg": "7.x: product enc == dec == driver ops_total, alloc == 1, destroy_skip == 1, errors == 0, queued == 0",
+    "floor_afalg": "6.12: per (op, arm in {cbc-aes-aesni, __cbc-aes-aesni}) calls == ops_total; alloc rows exactly [cbc(aes), cryptd(__cbc-aes-aesni)] each == 1",
+    "async": "enc calls == queued == GOs, ok == 0 (EINPROGRESS), alloc == GOs, destroy_skip == GOs",
+    "details_clean": "truncated == false, loss == {}, observations == expected calls, emitted == admitted, unfinished == 0 (sync classes)",
+    "details_async": "envelope-only: terminals unknown, unfinished == GOs",
+    "details_truncated": "truncated flag or emitted >= cap with emitted < offered: envelope data point, never a valid pair leg"
+  },
+  "validity": {
+    "capture_rc": [0, 3],
+    "driver_rc": 0,
+    "quiet_calls": 0,
+    "unexpected_loss_zero": ["ktot_gap", "ring_drops", "overflow_identities", "predrop_cfg_fail", "predrop_fret_fail", "predrop_arg_null", "predrop_chase_fail", "predrop_name_fail", "predrop_spare_6", "predrop_spare_7"],
+    "product_lat_note": "api-returns lat[8] is unpopulated (zeros); workload latency comes only from the driver ledger"
+  }
+}

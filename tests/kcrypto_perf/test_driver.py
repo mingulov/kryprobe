@@ -68,6 +68,30 @@ class DriverTests(unittest.TestCase):
         proc, _ = run_driver("nope", "64", "1", "0.5")
         self.assertEqual(proc.returncode, 2)
 
+    def test_threads_two(self):
+        proc, ledger = run_driver("skcipher", "64", "1", "0.5", "--threads",
+                                  "2")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        summary = json.loads(
+            Path(str(ledger) + ".summary.json").read_text())
+        self.assertEqual(summary["threads"], 2)
+        self.assertGreater(summary["ops_meas"], 100)
+
+    def test_async_threads_rejected(self):
+        proc, _ = run_driver("async", "16", "0.5", "0.2", "--threads", "2")
+        self.assertEqual(proc.returncode, 2)
+
+    def test_paced_rate(self):
+        proc, ledger = run_driver("skcipher", "64", "1", "0.5", "--paced",
+                                  "200")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        summary = json.loads(
+            Path(str(ledger) + ".summary.json").read_text())
+        self.assertEqual(summary["paced"], 200)
+        # 1.5 s at 200/s offers ~300 ops; allow scheduling slack.
+        self.assertGreater(summary["ops_total"], 200)
+        self.assertLess(summary["ops_total"], 400)
+
     def test_async_fake_control_format(self):
         tmp = Path(tempfile.mkdtemp(prefix="t14async"))
         ctl = tmp / "control"
