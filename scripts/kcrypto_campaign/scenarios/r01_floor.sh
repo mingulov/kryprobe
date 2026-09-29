@@ -56,7 +56,7 @@ modprobe algif_skcipher 2>/dev/null
   2> "$OUT/aggregate.stderr.log" &
 CAP=$!
 wait_attach "$OUT/aggregate.stderr.log" "$OUT/aggregate-attach.txt" || FAIL=1
-ftrace_begin "crypto_ahash_digest crypto_shash_digest crypto_skcipher_encrypt crypto_skcipher_decrypt" \
+ftrace_begin "crypto_ahash_digest crypto_shash_digest crypto_shash_finup crypto_skcipher_encrypt crypto_skcipher_decrypt" \
   || FAIL=1
 python3 -c "
 import sys
@@ -69,7 +69,7 @@ print('generator finished', flush=True)
 " > "$OUT/workload-stdout.log" 2>&1
 echo "workload_rc=$?" > "$OUT/workload-rc.txt"
 # shellcheck disable=SC2034
-ftrace_end crypto_ahash_digest crypto_shash_digest crypto_skcipher_encrypt crypto_skcipher_decrypt \
+ftrace_end crypto_ahash_digest crypto_shash_digest crypto_shash_finup crypto_skcipher_encrypt crypto_skcipher_decrypt \
   > "$OUT/kernel-counts.txt" 2>&1 || FAIL=1
 wait "$CAP"
 rc=$?

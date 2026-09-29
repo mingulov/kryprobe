@@ -678,6 +678,7 @@ def judge_r01_floor(oracle_spec, cell_dir):
     product = {
         "ahash_digest": agg_calls(parsed, "ahash", "digest"),
         "shash_digest": agg_calls(parsed, "shash", "digest"),
+        "shash_finup": agg_calls(parsed, "shash", "finup"),
         "skcipher_encrypt": agg_calls(parsed, "skcipher", "encrypt"),
         "skcipher_decrypt": agg_calls(parsed, "skcipher", "decrypt"),
         "ring_drops": parsed["loss"].get("ring_drops", "?"),
@@ -696,8 +697,10 @@ def judge_r01_floor(oracle_spec, cell_dir):
         and split.get("encrypt", {}).get("__cbc(aes)") == workload["skc_issued"]
         and split.get("decrypt", {}).get("cbc(aes)") == workload["skc_issued"]
         and split.get("decrypt", {}).get("__cbc(aes)") == workload["skc_issued"])
+    # Bodies carry the route-INVARIANT counts only (the nested
+    # arm varies per burst, so it is gated in checks with the
+    # taken arm recorded in detail, never in the body equation).
     expected_body = {"ahash_digest": workload["hash_issued"],
-                     "shash_digest": workload["hash_issued"],
                      "skcipher_encrypt": 2 * workload["skc_issued"],
                      "skcipher_decrypt": 2 * workload["skc_issued"]}
     actual_body = {k: kernel_ref[k] for k in expected_body}

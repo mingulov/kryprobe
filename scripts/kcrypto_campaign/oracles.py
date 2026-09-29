@@ -225,11 +225,17 @@ def check_r01_floor(workload: dict, kernel_ref: dict, product: dict,
     the ftrace per-function counts; ``product`` the observed
     per-function counts + ``ring_drops``; ``refusal`` carries
     ``exit``/``stderr`` (gate: stable exit-4 Unusable). Product
-    must equal the KERNEL reference exactly; the documented
-    6.12 routes are gated separately at the kernel level: one
-    ahash + one shash per digest (T07 precedent), and one outer
-    + one cryptd-nested inner call per skcipher op (2x issued).
-    The aggregate leg is the refusal leg's positive control.
+    must equal the KERNEL reference exactly on every traced
+    function; the documented 6.12 routes are gated separately
+    at the kernel level. The outer ahash call is 1:1 with
+    issued digests on every run; the NESTED route is
+    scatterlist-shaped (page layout per burst) and takes
+    exactly one admitted arm: one shash digest per digest
+    (T07 precedent), one shash finup per digest, or two
+    finups per digest on split scatterlists. Skcipher keeps
+    one outer + one cryptd-nested inner call per op (2x
+    issued). The aggregate leg is the refusal leg's positive
+    control.
     """
     checks = {}
     checks["workload_proved"] = (
@@ -240,19 +246,33 @@ def check_r01_floor(workload: dict, kernel_ref: dict, product: dict,
     checks["hash_kernel_equal"] = (
         product.get("ahash_digest") == kernel_ref.get("ahash_digest")
         and product.get("shash_digest") == kernel_ref.get("shash_digest")
+        and product.get("shash_finup") == kernel_ref.get("shash_finup")
     )
     checks["skcipher_kernel_equal"] = (
         product.get("skcipher_encrypt") == kernel_ref.get("skcipher_encrypt")
         and product.get("skcipher_decrypt") == kernel_ref.get("skcipher_decrypt")
     )
-    checks["kernel_nonempty"] = all(
-        (kernel_ref.get(name) or 0) > 0
-        for name in ("ahash_digest", "shash_digest",
-                     "skcipher_encrypt", "skcipher_decrypt")
+    checks["kernel_nonempty"] = (
+        (kernel_ref.get("ahash_digest") or 0) > 0
+        and ((kernel_ref.get("shash_digest") or 0) > 0
+             or (kernel_ref.get("shash_finup") or 0) > 0)
+        and (kernel_ref.get("skcipher_encrypt") or 0) > 0
+        and (kernel_ref.get("skcipher_decrypt") or 0) > 0
     )
+    issued = workload.get("hash_issued")
+    digest = kernel_ref.get("shash_digest")
+    finup = kernel_ref.get("shash_finup")
+    if digest == issued and finup == 0:
+        nested_route = "digest-1x"
+    elif digest == 0 and finup == issued:
+        nested_route = "finup-1x"
+    elif digest == 0 and finup == 2 * (issued or 0):
+        nested_route = "finup-2x"
+    else:
+        nested_route = "undocumented"
     checks["hash_route_documented"] = (
-        kernel_ref.get("ahash_digest") == workload.get("hash_issued")
-        and kernel_ref.get("shash_digest") == workload.get("hash_issued")
+        kernel_ref.get("ahash_digest") == issued
+        and nested_route != "undocumented"
     )
     checks["skcipher_route_documented"] = (
         kernel_ref.get("skcipher_encrypt") == 2 * (workload.get("skc_issued") or 0)
@@ -263,6 +283,7 @@ def check_r01_floor(workload: dict, kernel_ref: dict, product: dict,
     detail = {
         "kernel": dict(kernel_ref),
         "product": {k: product.get(k) for k in kernel_ref},
+        "nested_route": nested_route,
         "refusal_exit": refusal.get("exit"),
     }
     return checks, detail

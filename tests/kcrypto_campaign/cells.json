@@ -104,16 +104,18 @@
             "scenario": "r01_floor.sh",
             "aggregate": "hash_burst n=20 + skcipher_burst n=10 via repo fixture",
             "refusal": "report --system --kcrypto-profile request-lifecycle",
-            "kernel_ref": "ftrace ahash/shash digest + skcipher enc/dec"
+            "kernel_ref": "ftrace ahash/shash digest+finup + skcipher enc/dec"
           },
           "oracle": {
             "predicate": "check_r01_floor",
             "hash_issued": 20,
             "skcipher_issued": 10,
             "refusal_exit": 4,
+            "nested_route": "exactly one of digest-1x | finup-1x | finup-2x per burst",
             "kernel_ref": [
               "ahash_digest",
               "shash_digest",
+              "shash_finup",
               "skcipher_encrypt",
               "skcipher_decrypt"
             ]

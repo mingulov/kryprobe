@@ -58,13 +58,13 @@ def floor_workload(hash_issued=20, hash_done=20, skc_issued=10, skc_done=10):
             "skc_issued": skc_issued, "skc_done": skc_done}
 
 
-def floor_kernel(ahash=20, shash=20, enc=20, dec=20):
-    return {"ahash_digest": ahash, "shash_digest": shash,
+def floor_kernel(ahash=20, shash=20, finup=0, enc=20, dec=20):
+    return {"ahash_digest": ahash, "shash_digest": shash, "shash_finup": finup,
             "skcipher_encrypt": enc, "skcipher_decrypt": dec}
 
 
-def floor_product(ahash=20, shash=20, enc=20, dec=20, drops="0"):
-    return {"ahash_digest": ahash, "shash_digest": shash,
+def floor_product(ahash=20, shash=20, finup=0, enc=20, dec=20, drops="0"):
+    return {"ahash_digest": ahash, "shash_digest": shash, "shash_finup": finup,
             "skcipher_encrypt": enc, "skcipher_decrypt": dec,
             "ring_drops": drops}
 
@@ -114,6 +114,52 @@ class R01FloorTests(unittest.TestCase):
             floor_product(shash=40), floor_refusal())
         self.assertTrue(checks["hash_kernel_equal"])
         self.assertFalse(checks["hash_route_documented"])
+
+    def test_finup_route_passes(self):
+        # Scatterlist-shaped nesting: the same 20 digests nest
+        # one finup each instead of one digest (R01-floor-612
+        # re-run). Kernel and product agree exactly on the taken
+        # arm; the digest arm reads a recorded zero.
+        checks, detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(shash=0, finup=20),
+            floor_product(shash=0, finup=20), floor_refusal())
+        self.assertTrue(all(checks.values()), checks)
+        self.assertEqual(detail["nested_route"], "finup-1x")
+
+    def test_finup_double_route_passes(self):
+        # Split scatterlists nest two finups per digest (7.0.14
+        # R04-foreign shape, 12/6): admitted with exact
+        # kernel==product equality on the taken arm.
+        checks, detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(shash=0, finup=40),
+            floor_product(shash=0, finup=40), floor_refusal())
+        self.assertTrue(all(checks.values()), checks)
+        self.assertEqual(detail["nested_route"], "finup-2x")
+
+    def test_mixed_nesting_fails_route(self):
+        # Digest AND finup nonzero: no admitted arm (the re-wave
+        # never mixes arms within one burst); equality holds but
+        # the route is undocumented.
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(shash=10, finup=10),
+            floor_product(shash=10, finup=10), floor_refusal())
+        self.assertTrue(checks["hash_kernel_equal"])
+        self.assertFalse(checks["hash_route_documented"])
+
+    def test_absent_nesting_fails_nonempty(self):
+        # Neither nested function fired: the digests are
+        # unaccounted below the outer call.
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(shash=0, finup=0),
+            floor_product(shash=0, finup=0), floor_refusal())
+        self.assertFalse(checks["kernel_nonempty"])
+        self.assertFalse(checks["hash_route_documented"])
+
+    def test_finup_divergence_fails(self):
+        checks, _detail = oracles.check_r01_floor(
+            floor_workload(), floor_kernel(shash=0, finup=20),
+            floor_product(shash=0, finup=19), floor_refusal())
+        self.assertFalse(checks["hash_kernel_equal"])
 
     def test_dropped_product_fails(self):
         checks, _detail = oracles.check_r01_floor(
