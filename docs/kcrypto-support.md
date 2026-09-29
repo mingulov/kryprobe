@@ -88,7 +88,7 @@ drift, never pinned. See ADR-0006 and `docs/deployment.md`.
 
 ## P8 real-consumer re-verification (T13)
 
-Head `603492c`, 11/11 sealed cells PASS (campaign PASS;
+Head `f938fe6`, 11/11 sealed cells PASS (campaign PASS;
 `docs/kcrypto-matrix.md`). The api-returns rows above are
 re-verified on live consumers on all three kernels with
 kernel-exact oracles (product == ftrace on every traced

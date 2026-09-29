@@ -10,11 +10,11 @@ this wave's sealed cells (11/11 PASS, campaign PASS). Optional
 R2 IDs (X01–X03) and the QEMU demo (D01–D08) are out of R1 scope
 and listed only as NOT_RUN.
 
-Final tested artifacts (T13, head `603492c`, manifest
+Final tested artifacts (T13, head `f938fe6`, manifest
 `8d663eb5…`): kryprobe `a3de8ca2…`, kcrypto.bpf.o
 `bd14e714…`, kcrypto-lifecycle.bpf.o `6bc13e94…`, fixture
 modules `53fc38b3…` (7.0.14) / `7b60903c…` (7.2.6), repo
-fixture `f5dd2cbc…`, oracle `d7b2b027…` (full pins in each
+fixture `f5dd2cbc…`, oracle `87eda535…` (full pins in each
 sealed `stage.json`; pins uniform across all 11 cells).
 
 ## Deterministic cases (prior phases, accepted)
