@@ -146,6 +146,11 @@ echo "recva_rc=$?" >> "$OUT/traffic-rc.txt"
 # shellcheck disable=SC2034
 ftrace_end $FNS > "$OUT/kernel-main.txt" 2>&1 || FAIL=1
 finish_capture product-main
+# XFRM packet/error-counter ledger (matrix: "XFRM state/counters"):
+# per-SA lifetime packets/bytes plus replay/failed stats per
+# namespace, keys hidden (no key material archived, ever).
+ip -n "$NSA" -s xfrm state list nokeys > "$OUT/xfrm-stats-main-a.txt" 2>&1 || FAIL=1
+ip -n "$NSB" -s xfrm state list nokeys > "$OUT/xfrm-stats-main-b.txt" 2>&1 || FAIL=1
 
 # Auth-fail phase: receiver B's inbound SA is deleted and re-added
 # with a wrong AUTH key (enc key unchanged): every decrypt runs,
@@ -175,6 +180,10 @@ echo "recvf_rc=$?" >> "$OUT/traffic-rc.txt"
 # shellcheck disable=SC2034
 ftrace_end $FNS > "$OUT/kernel-authfail.txt" 2>&1 || FAIL=1
 finish_capture product-authfail
+# Auth-fail phase ledger: the rekeyed inbound SA's packet/error
+# counters after 100 wrong-key decrypts (keys hidden).
+ip -n "$NSA" -s xfrm state list nokeys > "$OUT/xfrm-stats-authfail-a.txt" 2>&1 || FAIL=1
+ip -n "$NSB" -s xfrm state list nokeys > "$OUT/xfrm-stats-authfail-b.txt" 2>&1 || FAIL=1
 
 # Quiet-after window (namespaces still up, no traffic).
 capture product-quiet-after 8

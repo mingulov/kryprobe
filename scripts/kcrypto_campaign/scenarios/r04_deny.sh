@@ -50,23 +50,34 @@ ls /sys/kernel/btf/ > "$OUT/btf-objs.txt" 2>&1
 
 modprobe algif_hash 2>/dev/null
 
-# Refusal leg: world-readable copies (the staged dir is root-only),
-# then drop all privilege for the capture attempt.
-mkdir -p "$OUT/unpriv/kryprobe-bpf"
-cp "$OUT/kryprobe" "$OUT/unpriv/kryprobe"
-cp "$OUT/kryprobe-bpf/kcrypto.bpf.o" "$OUT/unpriv/kryprobe-bpf/kcrypto.bpf.o"
-cp "$OUT/kryprobe-bpf/kcrypto-lifecycle.bpf.o" "$OUT/unpriv/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
-chmod -R a+rX "$OUT/unpriv"
-echo "unpriv_sha=$(sha256sum "$OUT/unpriv/kryprobe" | cut -d' ' -f1)" > "$OUT/unpriv-sha.txt"
+# Refusal leg: world-readable copies under world-traversable /tmp
+# (the staged dir is root-only, so copies inside it stay
+# object-missing to the unpriv user and never reach the attach
+# gate under test), then drop all privilege for the capture
+# attempt. Nobody first proves the object readable by hashing it;
+# a failed readability proof voids the control (FAIL=1).
+UNPRIV=$(mktemp -d /tmp/t13-unpriv-XXXXXX)
+mkdir -p "$UNPRIV/kryprobe-bpf"
+cp "$OUT/kryprobe" "$UNPRIV/kryprobe"
+cp "$OUT/kryprobe-bpf/kcrypto.bpf.o" "$UNPRIV/kryprobe-bpf/kcrypto.bpf.o"
+cp "$OUT/kryprobe-bpf/kcrypto-lifecycle.bpf.o" "$UNPRIV/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
+chmod -R a+rX "$UNPRIV"
+echo "unpriv_dir=$UNPRIV" > "$OUT/unpriv-sha.txt"
+echo "unpriv_kryprobe_sha=$(sha256sum "$UNPRIV/kryprobe" | cut -d' ' -f1)" >> "$OUT/unpriv-sha.txt"
+setpriv --reuid=65534 --regid=65534 --clear-groups \
+  sha256sum "$UNPRIV/kryprobe-bpf/kcrypto.bpf.o" > "$OUT/unpriv-read.raw" \
+  2> "$OUT/unpriv-read.err" || FAIL=1
+cut -d' ' -f1 "$OUT/unpriv-read.raw" > "$OUT/unpriv-read-sha.txt"
 # --out points at world-writable /tmp: the staged dir is root-only
 # and an --out precheck failure (exit 1) would mask the capability
 # refusal (exit 4) under test.
-KRYPROBE_BPF_DIR="$OUT/unpriv/kryprobe-bpf" setpriv --reuid=65534 --regid=65534 --clear-groups \
-  "$OUT/unpriv/kryprobe" report --system --duration 5 --format json \
+KRYPROBE_BPF_DIR="$UNPRIV/kryprobe-bpf" setpriv --reuid=65534 --regid=65534 --clear-groups \
+  "$UNPRIV/kryprobe" report --system --duration 5 --format json \
   --out /tmp/t13-refusal.json 2> "$OUT/refusal-stderr.log"
 echo "refusal_rc=$?" > "$OUT/refusal-rc.txt"
 cp /tmp/t13-refusal.json "$OUT/refusal.json" 2>/dev/null || echo "no refusal.json (bring-up refused)" > "$OUT/refusal.json"
 rm -f /tmp/t13-refusal.json
+rm -rf "$UNPRIV"
 
 # Control leg: privileged capture + ftrace window + fixture traffic.
 "$KP" report --system --format json --duration 60 --out "$OUT/control.json" \
