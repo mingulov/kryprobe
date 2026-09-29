@@ -69,10 +69,21 @@ For per-request detail (submit/terminal/status/latency rows)
 use `--kcrypto-profile request-lifecycle` — supported on 7.x
 only (typed refusal on the 6.12 floor), bounded at 100,000
 observations per capture with explicit truncation, and hash
-lifecycles are not observed under either profile.
+lifecycles are not observed under either profile. Measured
+detail bound (P9 campaign): detail captures retaining more
+than ~4096 observations report counted
+`tombstone_evictions` loss in the session receipt (4096-entry
+adapter FIFO) — size captures to stay below it, or treat
+the loss as disqualifying, never as free headroom.
 
 ## 5. Know the limits (read before publishing numbers)
 
+- Measured aggregation overhead (P9 campaign, 4 KiB skcipher
+  at ~41–47k ops/s): ~18–20% throughput cost and ~20–22%
+  tail-latency cost vs tracing-disabled — the release does
+  NOT meet a ≤5%/≤10% budget there (both kernels FAIL).
+  Slower workloads cost less (~3–6% at 1 MiB rates). Never
+  publish an overhead number without its workload rate.
 - Completion is unobserved: api-returns rows prove API returns,
   never provider-body execution or async completion. Do not
   claim work the rows do not show.
