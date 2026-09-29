@@ -102,9 +102,14 @@ class DriverTests(unittest.TestCase):
         self.assertLess(summary["ops_total"], 400)
 
     def test_bulk_skcipher_reads_no_timestamps(self):
-        # P9R1A-N8 repair: the sealed campaign's --bulk legs
-        # still paid three clock reads per op; future bulk
-        # legs must not read the clock at all.
+        # P9R1A-N8 repair (P9R2O-N6 scope note): the sealed
+        # campaign's --bulk legs still paid three clock reads
+        # per op inside roundtrip(); the repaired
+        # roundtrip_bulk() method itself reads no timestamps
+        # (asserted here). worker_loop still reads the clock
+        # once per op for pacing/phase in both modes —
+        # symmetric and harmless, but the no-clock guarantee
+        # covers roundtrip_bulk only, not whole bulk legs.
         worker = FIXTURE.Skcipher(64)
         try:
             with mock.patch.object(

@@ -226,7 +226,48 @@ class HostReceiptGateTests(unittest.TestCase):
         self.assertTrue(all(leg["valid"] for leg in got["legs"]))
 
 
+def _sealed_names(cell: Path) -> list:
+    """Names listed in a sealed cell's SHA256SUMS manifest."""
+    return [line.split("  ")[1]
+            for line in (cell / "SHA256SUMS").read_text().splitlines()]
+
+
 class PinGateTests(unittest.TestCase):
+    def test_missing_mandatory_artifact_file_fails_cell(self):
+        # P9R2A-N01: a removed binary must FAIL even when the
+        # remaining bytes re-seal consistently — only the named
+        # unshipped pre-repair validity.py pin is unverifiable.
+        with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
+            cell = _sealed_cell(tmp)
+            (cell / "kryprobe").unlink()
+            names = [name for name in _sealed_names(cell)
+                     if name != "kryprobe"]
+            CLI.krecept.seal_artifacts(cell, names, writers_done=True)
+            got = CLI.verify_cell(cell, _manifest())
+        self.assertTrue(got["seal_ok"], "re-seal must hold")
+        self.assertTrue(got["errors"], "missing binary must fail")
+        self.assertTrue(any("kryprobe" in err
+                            for err in got["errors"]),
+                        got["errors"])
+
+    def test_missing_mandatory_pin_key_fails_cell(self):
+        # P9R2A-N01: a removed pin row must FAIL just like a
+        # removed file — mandatory pin keys are enforced, not
+        # skipped when absent.
+        with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
+            cell = _sealed_cell(tmp)
+            stage = json.loads((cell / "stage.json").read_text())
+            del stage["sha256"]["kryprobe"]
+            (cell / "stage.json").write_text(json.dumps(stage))
+            CLI.krecept.seal_artifacts(cell, _sealed_names(cell),
+                                       writers_done=True)
+            got = CLI.verify_cell(cell, _manifest())
+        self.assertTrue(got["seal_ok"], "re-seal must hold")
+        self.assertTrue(got["errors"], "missing pin key must fail")
+        self.assertTrue(any("kryprobe" in err
+                            for err in got["errors"]),
+                        got["errors"])
+
     def test_pin_mismatch_fails_cell_despite_consistent_seal(self):
         with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
             cell = _sealed_cell(tmp, kryprobe_bytes=b"mutated-bytes",
@@ -330,6 +371,40 @@ class OutDirTests(unittest.TestCase):
             self.assertTrue((out / "campaign.json").is_file())
             self.assertFalse((ev / "verdicts").exists())
             self.assertFalse((ev / "campaign.json").exists())
+
+    def test_verify_rejects_out_dir_inside_evidence_dir(self):
+        # P9R2O-N6: an --out-dir inside --evidence-dir would
+        # write judgments into the sealed tree; fail closed.
+        with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
+            tmp = Path(tmp)
+            ev = tmp / "evidence"
+            ev.mkdir()
+            manifest_path = tmp / "cells.json"
+            manifest_path.write_text(json.dumps({
+                "$schema": "kryprobe-perf-campaign/v1",
+                "campaign": "test", "manifest_version": 1,
+                "frozen_utc": "2026-09-29", "freeze_rule": "test",
+                "budgets": {"B1_throughput_ratio_min": 0.95,
+                            "B2_p99_ratio_max": 1.10},
+                "global": {"kernels": ["7.0.14"],
+                           "vng": {"7.0.14": "v7.0.14"},
+                           "warmup_s": 10.0, "measure_s": 30.0,
+                           "capture_s": 50, "settle_s": 5,
+                           "quiet_s": 5, "pairs_per_set": 5,
+                           "max_attempted_pairs": 6,
+                           "guest_cpus": 4, "guest_memory": "4G",
+                           "detail_cap": 100000},
+                "classes": {"P-64": {"driver": "skcipher",
+                                     "size": 64}},
+                "modes": {"disabled": {}, "aggregation": {}},
+                "sets": [{"id": "S", "class": "P-64",
+                          "mode": "aggregation", "kernel": "7.0.14",
+                          "workload": "flat", "budgeted": False}],
+                "diagnostics": []}))
+            rc = CLI.main(["verify", "--manifest", str(manifest_path),
+                           "--evidence-dir", str(ev),
+                           "--out-dir", str(ev / "out")])
+            self.assertEqual(rc, 2)
 
     def test_verify_refuses_implicit_in_place(self):
         with tempfile.TemporaryDirectory(prefix="t14j") as tmp:
