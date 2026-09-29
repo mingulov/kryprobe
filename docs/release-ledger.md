@@ -1,19 +1,19 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# R1 release ledger (P9/T14 release candidate, repair-2 re-issue)
+# R1 release ledger (P9/T14 release candidate, repair-3 re-issue)
 
 The release-candidate identity: what was measured, on which
 bytes, against which frozen contracts, and where every claim's
 receipt lives. Publication is a separate owner action — this
 ledger supports review, not release.
 
-This re-issue (repair-2, committed AFTER the repair gates)
-supersedes the repair-1 ledger: it splits the residuals
-heading into carried/accepted vs T14-pending (P9R2O-N4),
-corrects the E-battery NOT_PROVED wording (P9R2O-N2), notes
-the rebuild cache scope (P9R2O-N6), and records the repair-2
-evidence. Per-finding dispositions live in
-`.outbox/kcrypto-t14/REPAIR-1.md` (round 1) and
-`.outbox/kcrypto-t14/REPAIR-2.md` (round 2).
+This re-issue (repair-3, committed AFTER the repair gates)
+supersedes the repair-2 ledger: it records the repair-3
+evidence (the `"none"`-pin gate restriction, the C18 cache
+wording correction, the rejudge-3 hardening comparison, the
+77 suites, the 78 re-seal). Per-finding dispositions live in
+`.outbox/kcrypto-t14/REPAIR-1.md` (round 1),
+`.outbox/kcrypto-t14/REPAIR-2.md` (round 2), and
+`.outbox/kcrypto-t14/REPAIR-3.md` (round 3).
 
 ## Release identity
 
@@ -22,7 +22,7 @@ evidence. Per-finding dispositions live in
   x86-64; kernel-only product scope, no third-party import).
 - Candidate base: `b50ee1a430e71fd470ef5eb817a98e6b8f3f9177`
   (accepted P8 head, `task/kcrypto-t13`).
-- Candidate head: `task/kcrypto-t14` repair-2 head (this
+- Candidate head: `task/kcrypto-t14` repair-3 head (this
   commit; full SHA + tree in the T14 HANDOFF §Repository
   state — BPF/ABI/wire/event-v0 frozen, measurement +
   packaging + docs only; zero SOURCE delta under `crates/`,
@@ -88,8 +88,12 @@ suites 272 + 107). Repair-2 re-runs the campaign unit suites
 on the pin-gate fix bytes (272 + 110, `73` log; 65–67
 transfer by 0-byte Rust delta — no Rust input changed) and
 repeats the hardening comparison with the mandatory pin gate
-(0 diffs, `72` log + diff). The wave R-wave (11/11 PASS on
-identical product sources) stands. Results sealed below.
+(0 diffs, `72` log + diff). Repair-3 re-runs the suites on
+the `"none"`-pin restriction bytes (272 + 113, `77` log;
+65–67 transfer again by 0-byte Rust delta) and repeats the
+hardening comparison once more (0 diffs, `76` log + diff).
+The wave R-wave (11/11 PASS on identical product sources)
+stands. Results sealed below.
 
 ## P9 evidence map (workspace `evidence/kcrypto-t14/`)
 
@@ -115,6 +119,12 @@ identical product sources) stands. Results sealed below.
   the MANDATORY pin gate (floor fix excluded per owner
   STOP): 0 diffs across 26 sets + 4 diags + 274 legs; no
   verdict moves on present-artifact sealed cells.
+- `rejudge-3/` + `76-rejudge3-verify.log` +
+  `76-rejudge3-diff.md`: repair-3 hardening comparison with
+  the `"none"`-pin restriction (floor fix excluded per owner
+  STOP): 0 diffs across 26 sets + 4 diags + 274 legs; no
+  verdict moves (sealed `"none"` occurs only for
+  `kcrypto_fixture.ko`).
 - `ebat/`: 25 sealed repair-1 cells (22 E-battery + 2
   canary + 1 install) + the oracle, adapted runner (diff
   recorded), staging/batch/judge scripts;
@@ -126,14 +136,16 @@ identical product sources) stands. Results sealed below.
 - Gate logs: `cargo xtask check` (65), `cargo xtask test bpf`
   (66, incl. post-lane object hashes),
   `cargo xtask verify generated` (67), campaign unit suites
-  (68 repair-1; 73 repair-2 on the pin-gate fix bytes),
+  (68 repair-1; 73 repair-2 on the pin-gate fix bytes; 77
+  repair-3 on the `"none"`-pin fix bytes),
   E-battery runs, release build (61) + forced rebuild
   verify (69) + zero-delta (70).
 - `final-seal/`: stage manifest + sha256sums + head/tree
   record for the final package (digests re-verified
   identical after the last edit).
 - `SHA256SUMS.txt`: top-level seal (self-check OK; 71 log
-  repair-1, 75 log repair-2 with preserved seal tooling).
+  repair-1, 75 log repair-2, 78 log repair-3 with preserved
+  seal tooling).
 
 ## Carried and accepted (P7/P8)
 
