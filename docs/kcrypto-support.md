@@ -86,6 +86,51 @@ drift, never pinned. See ADR-0006 and `docs/deployment.md`.
 | Filters | After ingestion, per request (`Exclude` policy from the CLI); proved mismatches hide, unevaluable rows stay visible; admitted/filtered/unknown tallied on the FILTER line + `filter_*` coverage counters; `comm` is the decoded display name (lossy UTF-8), so `--filter-comm` matches the rendered identity exactly | Same engine; unobserved contexts land in `Unknown` under `Exclude` and still render; tallies additionally ride the envelope coverage record (exact unknown-union + filtered) |
 | Session streaming | Event-v0 JSONL (unchanged, frozen) | Versioned session envelope (`lifecycle-session/v1`) with run-unique `session:live-*` id, start/observations/coverage/receipt; receiptless streams are truncated, never clean |
 
+## P8 real-consumer re-verification (T13)
+
+Head `603492c`, 11/11 sealed cells PASS (campaign PASS;
+`docs/kcrypto-matrix.md`). The api-returns rows above are
+re-verified on live consumers on all three kernels with
+kernel-exact oracles (product == ftrace on every traced
+function, or exact attribution equations where no kernel
+reference exists):
+
+- skcipher/dm-crypt (R02, 7.0.14 + 7.2.6): 64 MiB bounded I/O
+  each direction, checksums match, 131072/131072 exact at a
+  proved uniform 512 B/call chunking; wrong-key mismatch is
+  the in-cell negative control; quiet windows 0/0.
+- AEAD/ESP-XFRM (R03, 7.0.14 + 7.2.6): owned netns/veth with
+  authenc(hmac(sha256),cbc(aes)) SAs; 1000/1000 delivered both
+  directions per kernel; wrong-key leg 100 sent / 0 received
+  with kernel-equality on the authfail counts (nesting-aware);
+  packet totals stay contextual (state/packet ledgers), never
+  equated to API calls.
+- ahash/shash fixture + floor (R01): deterministic 10-row
+  ledgers identical across legs on 7.x (validate rc 0/0,
+  attach 9/9); 6.12 floor proves hash 20 + skcipher 10x2 with
+  product == ftrace exactly, and the request-lifecycle floor
+  refusal stays typed (`kcrypto_fsession_unavailable`, attach
+  type 58 refused, exit 4).
+- Negatives (R04, both 7.x kernels): unprivileged capture
+  refuses exit 4 (`live session unusable`, control workload
+  kernel-proved); foreign-traffic cells prove unique owned
+  correspondence (outer ahash 20:6, bind-alloc 1:1, who ==
+  agg exactly, zero unattributed rows) — aggregate totals
+  cannot absorb the decoy.
+
+Route note 3 (T13, all kernels): the nested hash route below
+the outer ahash call is scatterlist/page-layout-shaped PER
+BURST, not per kernel or per release: identical fixture bytes
+take digest-1x, finup-1x, or finup-2x arms on different runs
+(digest-1x on 6.12/7.0/7.2 seals, finup-1x on the 6.12
+floor seal, finup-2x on a 7.0.14 foreign seal). The T13
+oracles admit exactly these arms and require product ==
+kernel equality on `crypto_ahash_digest`, `crypto_shash_digest`,
+and `crypto_shash_finup` simultaneously, so the taken arm never
+affects exactness; each seal records its arm. Pinning any
+single nested shape (e.g. shash_digest == issued) is
+unprovable and must not be reintroduced.
+
 ## Explicit non-goals (both profiles)
 
 - Keys, IVs, plaintext/ciphertext, AAD/tag bytes, digest outputs, RNG
