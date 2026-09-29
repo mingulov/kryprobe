@@ -644,6 +644,24 @@ class DualLockTests(unittest.TestCase):
             CLI.resolve_lock_paths(
                 ["/tmp/task.lock", "/tmp/task.lock"])
 
+    def test_dotpath_alias_refuses(self):
+        # P8-N16 run-side pin: resolve normalizes the dotpath,
+        # so the alias pair is one lock and refuses.
+        with self.assertRaisesRegex(ValueError, "two locks"):
+            CLI.resolve_lock_paths(
+                ["/tmp/task.lock", "/tmp/./task.lock"])
+
+    def test_symlink_alias_refuses(self):
+        # P8-N16 run-side pin: resolve follows the symlink, so
+        # the alias pair is one lock and refuses.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (real,) = self._locks(tmp, "task.lock")
+            link = str(Path(tmp) / "alias.lock")
+            os.symlink(real, link)
+            with self.assertRaisesRegex(ValueError, "[Dd]istinct"):
+                CLI.resolve_lock_paths([real, link])
+
     def _cells(self, tmp, mapping):
         root = Path(tmp)
         for portion, locks in mapping.items():
@@ -692,6 +710,61 @@ class DualLockTests(unittest.TestCase):
                     self._cells(tmp, mapping), sorted(mapping))
             self.assertEqual(verdict["verdict"], "FAIL")
             self.assertTrue(any("istinct" in reason
+                                for reason in verdict["reasons"]))
+
+    def test_dotpath_alias_pair_fails(self):
+        # P8-N16: two receipt STRINGS resolving to one lock
+        # OBJECT are one lock, not two (dev/inode identity,
+        # not string comparison). The /tmp/./ dotpath spells
+        # the same runner object twice, with no task lock.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (runner,) = self._locks(tmp, "bpf-lane.lock")
+            alias = str(Path(tmp)) + "/./bpf-lane.lock"
+            mapping = {"R01-det-7014": [runner, alias],
+                       "R02-7014": [runner, alias]}
+            with mock.patch.dict(os.environ,
+                                 {"KRYPROBE_LANE_LOCK": runner}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
+            self.assertEqual(verdict["verdict"], "FAIL")
+            self.assertTrue(any("istinct" in reason
+                                for reason in verdict["reasons"]))
+
+    def test_symlink_alias_pair_fails(self):
+        # P8-N16: a symlink alias of the runner lock is the
+        # same OBJECT (stat follows the link), so the pair
+        # holds fewer than two DISTINCT lock objects.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (runner,) = self._locks(tmp, "bpf-lane.lock")
+            link = str(Path(tmp) / "alias.lock")
+            os.symlink(runner, link)
+            mapping = {"R01-det-7014": [runner, link],
+                       "R02-7014": [runner, link]}
+            with mock.patch.dict(os.environ,
+                                 {"KRYPROBE_LANE_LOCK": runner}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
+            self.assertEqual(verdict["verdict"], "FAIL")
+            self.assertTrue(any("istinct" in reason
+                                for reason in verdict["reasons"]))
+
+    def test_unstatable_receipt_lock_fails_closed(self):
+        # P8-N16: a receipt lock path that cannot be stated
+        # proves no object, so the gate fails closed.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (runner,) = self._locks(tmp, "bpf-lane.lock")
+            gone = str(Path(tmp) / "gone.lock")
+            mapping = {"R01-det-7014": [runner, gone],
+                       "R02-7014": [runner, gone]}
+            with mock.patch.dict(os.environ,
+                                 {"KRYPROBE_LANE_LOCK": runner}):
+                verdict = CLI.verify_campaign_locks(
+                    self._cells(tmp, mapping), sorted(mapping))
+            self.assertEqual(verdict["verdict"], "FAIL")
+            self.assertTrue(any("nstatable" in reason
                                 for reason in verdict["reasons"]))
 
     def test_common_without_runner_lock_fails(self):

@@ -769,14 +769,19 @@ def verify_campaign_locks(cells_dir: Path, required_ids: list) -> dict:
     """Prove common-plus-task exclusion from spawn receipts (P8-N8).
 
     Every required portion's ``spawn.json`` must record at least
-    two DISTINCT held locks (P8-N10), the lock sets must share
-    at least one common lock across the whole campaign, and
-    that common set must include the effective host-runner BPF
-    lock object by device/inode (P8-N15). Returns ``{"verdict",
-    "reasons", "common"}``.
+    two DISTINCT held lock OBJECTS by device/inode (P8-N10,
+    P8-N16: distinct strings spelling one object are one lock),
+    the object sets must share at least one common lock across
+    the whole campaign, and that common set must include the
+    effective host-runner BPF lock object by device/inode
+    (P8-N15). Receipt paths that cannot be stated prove no
+    object, so they fail closed. Returns ``{"verdict",
+    "reasons", "common"}`` (``common`` names one receipt path
+    per common object, sorted).
     """
     reasons: list[str] = []
     sets: dict[str, set] = {}
+    labels: dict[tuple, str] = {}
     for portion_id in required_ids:
         spawn = cells_dir / portion_id / "spawn.json"
         try:
@@ -784,14 +789,27 @@ def verify_campaign_locks(cells_dir: Path, required_ids: list) -> dict:
         except (OSError, ValueError) as err:
             reasons.append(f"portion {portion_id}: spawn receipt unreadable: {err}")
             continue
-        distinct = set(locks)
-        if len(distinct) < 2:
+        ids: set[tuple] = set()
+        for lock in locks:
+            try:
+                ident = Path(lock).stat()
+            except OSError as err:
+                reasons.append(
+                    f"portion {portion_id}: lock {lock!r} unstatable: {err} "
+                    f"(fail closed; a receipt path that resolves to no "
+                    f"object proves no exclusion)")
+                continue
+            key = (ident.st_dev, ident.st_ino)
+            ids.add(key)
+            labels.setdefault(key, lock)
+        if len(ids) < 2:
             reasons.append(
                 f"portion {portion_id}: task-only lock {locks!r} "
-                f"({len(distinct)} distinct, common + task required)")
-        sets[portion_id] = set(locks)
-    common = sorted(set.intersection(*sets.values())) if sets else []
-    if sets and not common:
+                f"({len(ids)} distinct lock objects, common + task required)")
+        sets[portion_id] = ids
+    common_ids = sorted(set.intersection(*sets.values())) if sets else []
+    common = sorted(labels[key] for key in common_ids)
+    if sets and not common_ids:
         reasons.append("no common lock shared across the campaign")
     runner = runner_bpf_lock_path()
     try:
@@ -803,17 +821,8 @@ def verify_campaign_locks(cells_dir: Path, required_ids: list) -> dict:
             reasons.append(
                 f"runner BPF lock {runner} unstatable: {err} "
                 "(cannot prove shared exclusion; reconciled lock required)")
-    if sets and common and runner_id is not None:
-        reconciled = False
-        for lock in common:
-            try:
-                ident = Path(lock).stat()
-            except OSError:
-                continue
-            if (ident.st_dev, ident.st_ino) == runner_id:
-                reconciled = True
-                break
-        if not reconciled:
+    if sets and common_ids and runner_id is not None:
+        if runner_id not in set(common_ids):
             reasons.append(
                 f"no reconciled host BPF lock in common {common!r} "
                 f"(runner effective lock {runner} "
