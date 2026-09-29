@@ -96,9 +96,10 @@ function, or exact attribution equations where no kernel
 reference exists):
 
 - skcipher/dm-crypt (R02, 7.0.14 + 7.2.6): 64 MiB bounded I/O
-  each direction, checksums match, 131072/131072 exact at a
-  proved uniform 512 B/call chunking; wrong-key mismatch is
-  the in-cell negative control; quiet windows 0/0.
+  each direction, checksums match, 131072/131072 exact with
+  per-direction byte equality plus integral-average 512 B/call
+  consistency (average-only, not a uniformity proof); wrong-key
+  mismatch is the in-cell negative control; quiet windows 0/0.
 - AEAD/ESP-XFRM (R03, 7.0.14 + 7.2.6): owned netns/veth with
   authenc(hmac(sha256),cbc(aes)) SAs; 1000/1000 delivered both
   directions per kernel; wrong-key leg 100 sent / 0 received
