@@ -256,19 +256,14 @@ def seal_artifacts(run_dir: Path, names: list[str], *, writers_done: bool) -> di
     return sums
 
 
-def check_seal_contents(run_dir: Path) -> list[str]:
-    """Re-hash every ``SHA256SUMS`` entry of a run dir.
+def _well_formed_seal_entries(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Split seal text into well-formed (want, name) entries + problems.
 
-    Returns the list of problems (empty when the seal verifies):
-    a missing sealed file, a hash mismatch, or a malformed seal
-    line each fail — seal existence alone proves nothing.
+    Blank lines are skipped; every other line must carry a
+    64-hex digest plus a file name, else it is a problem.
     """
-    run_dir = Path(run_dir)
+    entries: list[tuple[str, str]] = []
     problems: list[str] = []
-    try:
-        text = (run_dir / "SHA256SUMS").read_text()
-    except OSError as err:
-        return [f"seal unreadable: {err}"]
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line:
@@ -281,6 +276,43 @@ def check_seal_contents(run_dir: Path) -> list[str]:
         if not sep or not name or not re.fullmatch(r"[0-9a-f]{64}", want):
             problems.append(f"seal line {lineno} malformed")
             continue
+        entries.append((want, name))
+    return entries, problems
+
+
+def sealed_names(run_dir: Path) -> set[str]:
+    """Names listed by the well-formed ``SHA256SUMS`` lines of a run dir.
+
+    The coverage set for :func:`check_seal_contents` callers: blank
+    and malformed lines contribute nothing, and hash correctness
+    is judged separately — a listed-but-tampered file is covered
+    yet mismatched, each reported on its own.
+    """
+    try:
+        text = (Path(run_dir) / "SHA256SUMS").read_text()
+    except OSError:
+        return set()
+    entries, _ = _well_formed_seal_entries(text)
+    return {name for _, name in entries}
+
+
+def check_seal_contents(run_dir: Path) -> list[str]:
+    """Re-hash every ``SHA256SUMS`` entry of a run dir.
+
+    Returns the list of problems (empty when the seal verifies):
+    a missing sealed file, a hash mismatch, a malformed seal
+    line, or a vacuous seal (no valid entries at all) each fail —
+    seal existence alone proves nothing.
+    """
+    run_dir = Path(run_dir)
+    try:
+        text = (run_dir / "SHA256SUMS").read_text()
+    except OSError as err:
+        return [f"seal unreadable: {err}"]
+    entries, problems = _well_formed_seal_entries(text)
+    if not entries:
+        problems.append("seal is empty: no valid sealed entries")
+    for want, name in entries:
         target = run_dir / name
         if not target.is_file():
             problems.append(f"sealed file missing: {name}")

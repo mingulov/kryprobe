@@ -238,6 +238,18 @@ def cmd_verify(args) -> int:
         for problem in receipts.check_seal_contents(run_dir):
             judged["reasons"].append(problem)
             judged["verdict"] = "FAIL"
+        covered = receipts.sealed_names(run_dir)
+        required = {"run.json"}
+        for path in sorted(run_dir.iterdir()):
+            if path.is_file() and path.name != "SHA256SUMS":
+                required.add(path.name)
+        for name in sorted(required - covered):
+            if name.startswith("cell-") and name.endswith(".json"):
+                judged["reasons"].append(
+                    f"adjudicated receipt {name!r} is not sealed")
+            else:
+                judged["reasons"].append(f"run artifact {name!r} is not sealed")
+            judged["verdict"] = "FAIL"
     for cell_id in sorted(judged["per_cell"]):
         print(f"{cell_id}: {judged['per_cell'][cell_id]}")
     for reason in judged["reasons"]:
