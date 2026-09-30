@@ -307,8 +307,9 @@ class QmpTests(unittest.TestCase):
 
 
 class QemuCmdCellTests(unittest.TestCase):
-    def _cmd(self, **kwargs):
+    def _cmd(self, devices=(), **kwargs):
         image = test_manifest()["images"][0]
+        image["devices"] = list(devices)
         return runner._qemu_cmd(
             test_manifest()["qemu"],
             image,
@@ -337,6 +338,24 @@ class QemuCmdCellTests(unittest.TestCase):
     def test_qemu_cmd_rejects_unknown_cell(self):
         with self.assertRaises(runner.GuestError):
             self._cmd(cell_id="FROB")
+
+    def test_d05_crypto_hangs_off_hotplug_port(self):
+        # q35's pcie.0 root bus refuses hotplug; the removal cell
+        # hangs its crypto device off a hotplug-capable root port.
+        cmd = self._cmd(cell_id="D05", devices=["crypto0"])
+        self.assertIn("pcie-root-port,id=rp0,hotplug=on", cmd)
+        specs = [cmd[i + 1] for i, arg in enumerate(cmd)
+                 if arg == "-device"]
+        crypto = [spec for spec in specs
+                  if spec.startswith("virtio-crypto-pci")]
+        self.assertEqual(len(crypto), 1)
+        self.assertIn("bus=rp0", crypto[0])
+
+    def test_other_cells_keep_root_bus_crypto(self):
+        cmd = self._cmd(cell_id="D04", devices=["crypto0"])
+        joined = " ".join(cmd)
+        self.assertNotIn("pcie-root-port", joined)
+        self.assertNotIn("bus=rp0", joined)
 
 
 class QmpRemovalTests(unittest.TestCase):

@@ -178,13 +178,21 @@ def _qemu_cmd(
     ]
     if data_disk is not None:
         cmd += ["-drive", f"file={data_disk},format=qcow2,if=virtio"]
+    # q35's pcie.0 root bus refuses hotplug ("Bus 'pcie.0' does not
+    # support hotplugging"), so the removal cell hangs its crypto
+    # device off a hotplug-capable root port; other cells keep the
+    # plain root-bus attachment.
+    hotplug_port = cell_id == "D05" and bool(image["devices"])
+    if hotplug_port:
+        cmd += ["-device", "pcie-root-port,id=rp0,hotplug=on"]
     for index, device in enumerate(image["devices"]):
         backend = f"cryptodev-backend-builtin,id=crypto_backend{index}"
         cmd += ["-object", backend]
-        cmd += [
-            "-device",
-            f"virtio-crypto-pci,id={device},cryptodev=crypto_backend{index}",
-        ]
+        spec = (f"virtio-crypto-pci,id={device},"
+                f"cryptodev=crypto_backend{index}")
+        if hotplug_port:
+            spec += ",bus=rp0"
+        cmd += ["-device", spec]
     return cmd
 
 
