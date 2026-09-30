@@ -132,10 +132,10 @@ class WindowedReportTests(unittest.TestCase):
         self.assertEqual(parsed["KRYPROBE_WINDOWS"][0]["lines"], 1)
 
     def test_windowed_block_counts_nonempty_lines(self):
-        text = self._block(1, '{"a": 1}\n\n{"b": 2}')
+        text = self._block(1, '{\n"a": 1\n\n}')
         parsed = console.parse_console(text)
         # Mirrors the guest's `grep -c .` (non-empty lines only).
-        self.assertEqual(parsed["KRYPROBE_WINDOWS"][1]["lines"], 2)
+        self.assertEqual(parsed["KRYPROBE_WINDOWS"][1]["lines"], 3)
 
     def test_duplicate_window_refused(self):
         with self.assertRaises(console.ConsoleError):

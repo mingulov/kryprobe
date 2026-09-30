@@ -580,8 +580,8 @@ class D08Tests(unittest.TestCase):
         lines.append(
             'DEMO:PROBE {"fact": "kryprobe-exit", "exit": 3}')
         body = ("\n".join(lines) + "\n"
-                + krepo(product_calls, verdict="partial",
-                        missing=("capture-integrity", "completion")))
+                + krepo_window(0, 2)
+                + krepo_window(1, product_calls))
         return body
 
     def _workload(self):
@@ -877,7 +877,7 @@ class ProductReconcileTests(unittest.TestCase):
         lines.append(ledger(1, "d08-w0", ts=5.0))
         lines.append(
             'DEMO:SOAK {"window": 0, "ops_ok": true,'
-            ' "kryprobe_exit": 3, "report_lines": 10}')
+            ' "kryprobe_exit": 3, "report_lines": 1}')
         lines.append(mark("KRYPROBE-START", 59.0))
         lines.append(mark("STOP-WINDOW-START", 60.0))
         lines.append(ledger(0, "d08-stop", ts=61.0))
@@ -885,13 +885,15 @@ class ProductReconcileTests(unittest.TestCase):
         lines.append(mark("STOP-WINDOW-END", 96.0))
         lines.append(
             'DEMO:SOAK {"window": 1, "ops_ok": true,'
-            ' "kryprobe_exit": 0, "report_lines": 10,'
+            ' "kryprobe_exit": 0, "report_lines": 1,'
             ' "traffic_active_at_stop": true}')
         lines.append(mark("WORKLOAD-DONE", 97.0))
         lines.append(KRYPROBE_EXIT)
         receipt, _ = cells.build_cell(
             cell(workload, "D08"), "run1", "msha",
-            "\n".join(lines) + "\n" + krepo(1), PROC, "guest1")
+            "\n".join(lines) + "\n" + krepo_window(0, 2)
+            + krepo_window(1, 1, verdict="observed", missing=()),
+            PROC, "guest1")
         self.assertTrue(all(receipt["checks"].values()), receipt["checks"])
 
     def test_d08_exit1_window_refused(self):
@@ -903,20 +905,22 @@ class ProductReconcileTests(unittest.TestCase):
         lines.append(ledger(0, "d08-w0", ts=4.0))
         lines.append(
             'DEMO:SOAK {"window": 0, "ops_ok": true,'
-            ' "kryprobe_exit": 1, "report_lines": 10}')
+            ' "kryprobe_exit": 1, "report_lines": 1}')
         lines.append(mark("KRYPROBE-START", 59.0))
         lines.append(mark("STOP-WINDOW-START", 60.0))
         lines.append(ledger(0, "d08-stop", ts=61.0))
         lines.append(mark("STOP-WINDOW-END", 62.0))
         lines.append(
             'DEMO:SOAK {"window": 1, "ops_ok": true,'
-            ' "kryprobe_exit": 0, "report_lines": 10,'
+            ' "kryprobe_exit": 0, "report_lines": 1,'
             ' "traffic_active_at_stop": true}')
         lines.append(mark("WORKLOAD-DONE", 63.0))
         lines.append(KRYPROBE_EXIT)
         receipt, _ = cells.build_cell(
             cell(workload, "D08"), "run1", "msha",
-            "\n".join(lines) + "\n" + krepo(1), PROC, "guest1")
+            "\n".join(lines) + "\n" + krepo_window(0, 1)
+            + krepo_window(1, 1, verdict="observed", missing=()),
+            PROC, "guest1")
         self.assertFalse(receipt["checks"]["windows_ok"])
 
 

@@ -81,7 +81,7 @@ def ledger_names(workload: dict) -> list[str]:
                        "product-report.json", "cell-D07.json"],
         "stop-soak": ["workload-ledger.jsonl", "soak-windows.json",
                       "stop-receipt.json", "product-report.json",
-                      "cell-D08.json"],
+                      "window-reports.json", "cell-D08.json"],
     }
     if kind not in table:
         raise CellError(f"unknown workload kind {kind!r}")
@@ -167,6 +167,36 @@ def _report_verdict(report) -> tuple[str | None, set[str]]:
             isinstance(item, str) for item in missing):
         return status, set()
     return status, set(missing)
+
+
+def window_ring_drops(report) -> int | None:
+    """Measured ``ring_drops`` from one window report (None when absent).
+
+    The counter lives at
+    ``coverage.detailed_events.counters[]`` as a string integer
+    (live ``"0"``). A missing counter, a missing coverage subtree,
+    or an unparsable value is an absent measurement — never zero.
+    """
+    if not isinstance(report, dict):
+        return None
+    try:
+        counters = report["coverage"]["detailed_events"]["counters"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(counters, list):
+        return None
+    for counter in counters:
+        if not isinstance(counter, dict):
+            continue
+        if counter.get("name") != "ring_drops":
+            continue
+        value = counter.get("value")
+        if type(value) is int and value >= 0:
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+    return None
 
 
 def _verdict_exit_checks(report, exit_code: int | None) -> tuple[dict, dict]:
@@ -795,8 +825,47 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
         capture_end = None
     else:
         capture_end = kryprobe_start + STOP_CAPTURE_S
+    # Per-window product capture (R1): every window's report must be
+    # on the console as a numbered block, and the guest-measured
+    # SOAK report_lines must equal the host-measured block lines
+    # (a torn or duplicated emission fails). Dropped traffic is the
+    # measured per-window ring_drops sum — never an asserted zero.
+    # Caller-ledger continuity (gapless/exact above) is judged
+    # separately from product capture integrity here.
+    kry_windows = parsed.get("KRYPROBE_WINDOWS") or {}
+    soak_by_window = {row.get("window"): row for row in soak
+                      if type(row.get("window")) is int}
+    per_window = []
+    omitted = []
+    reports_complete = True
+    for window in range(windows):
+        block = kry_windows.get(window)
+        soak_row = soak_by_window.get(window)
+        if block is None or soak_row is None:
+            reports_complete = False
+            if block is None:
+                omitted.append(window)
+            per_window.append({"window": window, "report_lines": None,
+                               "ring_drops": None})
+            continue
+        soak_lines = soak_row.get("report_lines")
+        lines_ok = (type(soak_lines) is int and soak_lines > 0
+                    and soak_lines == block["lines"])
+        if not lines_ok:
+            reports_complete = False
+        per_window.append({"window": window,
+                           "report_lines": block["lines"],
+                           "ring_drops": window_ring_drops(
+                               block["report"])})
+    measured = [row["ring_drops"] for row in per_window]
+    if all(type(drops) is int for drops in measured):
+        dropped: int | None = sum(measured)
+    else:
+        dropped = None
+    stop_block = kry_windows.get(windows - 1)
+    stop_report = stop_block["report"] if stop_block else None
     product_checks, product_info = stop_window_product(
-        parsed["KRYPROBE"], _kryprobe_exit(parsed), stop_rows,
+        stop_report, _kryprobe_exit(parsed), stop_rows,
         workload["block_bytes"], capture_end)
     # Nineteen loop KRYPROBE-STARTs precede the stop tail, and the
     # first can share its 0.01 s tick with PRELUDE-DONE (live 2.51
@@ -820,27 +889,39 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
                          == windows * workload["window_ops"]),
         "all_status_ok": len(ok_rows) == len(parsed["LEDGER"]) > 0,
         "stop_under_traffic": stop_ok,
-        "kryprobe_present": parsed["KRYPROBE"] is not None,
+        "kryprobe_present": stop_report is not None,
+        "product_reports_complete": reports_complete,
+        "product_no_drops": dropped == 0,
         **product_checks,
     }
     receipt["checks"] = checks
     receipt["observation"] = {"expected": windows * workload["window_ops"],
                               "actual": len(ok_rows)}
     receipt["product"] = product_info
-    exits = sorted({row.get("kryprobe_exit") for row in soak
-                    if type(row.get("kryprobe_exit")) is int})
-    receipt["loss"] = {"dropped": 0, "omitted": [],
-                       "basis": "gapless workload ledger + named "
-                                f"kryprobe exits every window: {exits}"}
+    receipt["loss"] = {
+        "dropped": dropped,
+        "windows_measured": sum(1 for drops in measured
+                                if type(drops) is int),
+        "windows": windows,
+        "per_window": per_window,
+        "omitted": omitted,
+        "basis": ("per-window product reports 0..%d (console) + SOAK "
+                  "report_lines agreement; caller-ledger continuity "
+                  "judged separately" % (windows - 1)),
+    }
     checks["loss_visible"] = reconcile.loss_visible(
-        {"dropped": 0, "omitted": []})
+        {"dropped": dropped, "omitted": omitted})
+    retained = {str(window): block["report"]
+                for window, block in sorted(kry_windows.items())}
     ledgers = {
         "workload-ledger.jsonl": _jsonl(parsed["LEDGER"]),
         "soak-windows.json": json.dumps(soak, indent=2, sort_keys=True)
         + "\n",
         "stop-receipt.json": json.dumps(
             dict(last[0]) if last else {}, indent=2, sort_keys=True) + "\n",
-        "product-report.json": json.dumps(parsed["KRYPROBE"], indent=2,
+        "product-report.json": json.dumps(stop_report, indent=2,
+                                          sort_keys=True) + "\n",
+        "window-reports.json": json.dumps(retained, indent=2,
                                           sort_keys=True) + "\n",
     }
     return receipt, ledgers

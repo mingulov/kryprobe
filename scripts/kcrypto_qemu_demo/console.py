@@ -5,8 +5,10 @@
 The guest speaks to the host only through serial-console marker
 lines. Single-line markers look like ``DEMO:<channel> <json>``;
 the product report rides a multi-line passthrough between
-``DEMO:KRYPROBE-BEGIN`` and ``DEMO:KRYPROBE-END``. Kernel noise
-is ignored but counted. Anything else refuses loudly:
+``DEMO:KRYPROBE-BEGIN`` and ``DEMO:KRYPROBE-END``, and D08 soak
+windows ride numbered bounded blocks between
+``DEMO:KRYPROBE-WINDOW-BEGIN`` and ``DEMO:KRYPROBE-WINDOW-END``.
+Kernel noise is ignored but counted. Anything else refuses loudly:
 
 - unknown channels, malformed prefixes, malformed JSON;
 - unterminated or nested passthrough blocks;
@@ -14,10 +16,10 @@ is ignored but counted. Anything else refuses loudly:
   ``payload``, ``plaintext``, ``ciphertext``, ``aad``, ``kaddr``)
   anywhere in a DEMO line — the guest tools must never emit
   secret material, and the parser is the second gate. The
-  KRYPROBE passthrough is exempt: its bytes come from the
-  hash-pinned, P9-accepted product renderer (fixed v0 schema),
-  never from guest tools, so a product field name cannot fail
-  the guest's hygiene gate.
+  KRYPROBE passthrough and the numbered window blocks are
+  exempt: their bytes come from the hash-pinned, P9-accepted
+  product renderer (fixed v0 schema), never from guest tools,
+  so a product field name cannot fail the guest's hygiene gate.
 
 :func:`check_sequence` additionally requires ledger rows to be
 gapless from 0: a gap is lost evidence, never a pass.
@@ -58,6 +60,15 @@ DENIED_KEYS = frozenset(
 BEGIN = "DEMO:KRYPROBE-BEGIN"
 END = "DEMO:KRYPROBE-END"
 
+# Numbered per-window product reports (D08 loss accounting): every
+# soak window's report reaches the console in its own bounded block
+# so the oracle validates each window instead of asserting
+# unmeasured zero loss.
+WINDOW_BEGIN = "DEMO:KRYPROBE-WINDOW-BEGIN"
+WINDOW_END = "DEMO:KRYPROBE-WINDOW-END"
+WINDOW_MAX_BYTES = 1_000_000
+WINDOW_MAX_ID = 255
+
 
 class ConsoleError(ValueError):
     """Console evidence refused: unparseable, gapped, or unsafe."""
@@ -75,22 +86,49 @@ def _scan_denied(obj) -> None:
             _scan_denied(value)
 
 
+def _window_id(header: str, lineno: int, marker: str) -> int:
+    """Strict window number from a WINDOW-BEGIN/END header payload."""
+    try:
+        obj = json.loads(header)
+    except json.JSONDecodeError as err:
+        raise ConsoleError(
+            f"line {lineno}: {marker} header is not JSON: {err}"
+        ) from err
+    if not isinstance(obj, dict):
+        raise ConsoleError(
+            f"line {lineno}: {marker} header must be an object")
+    window = obj.get("window")
+    if type(window) is not int or not 0 <= window <= WINDOW_MAX_ID:
+        raise ConsoleError(
+            f"line {lineno}: {marker} window {window!r} out of range")
+    return window
+
+
 def parse_console(text: str) -> dict:
     """Parse console text into per-channel rows (strict, fail-closed).
 
     Returns a dict with one list per known channel, ``KRYPROBE``
-    (the reassembled product-report object or ``None``), and
-    ``noise_lines`` (non-marker lines ignored with provenance).
+    (the reassembled product-report object or ``None``),
+    ``KRYPROBE_WINDOWS`` (window number -> ``{"report", "lines"}``
+    for numbered per-window blocks), and ``noise_lines``
+    (non-marker lines ignored with provenance).
     """
     parsed: dict = {channel: [] for channel in sorted(CHANNELS)}
     parsed["KRYPROBE"] = None
+    parsed["KRYPROBE_WINDOWS"] = {}
     parsed["noise_lines"] = 0
     passthrough: list[str] | None = None
+    window_open: int | None = None
+    window_lines: list[str] = []
+    window_bytes = 0
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if passthrough is not None:
             if line == BEGIN:
                 raise ConsoleError(f"line {lineno}: nested {BEGIN}")
+            if line.startswith(WINDOW_BEGIN) or line.startswith(WINDOW_END):
+                raise ConsoleError(
+                    f"line {lineno}: window marker inside {BEGIN} block")
             if line == END:
                 body = "\n".join(passthrough)
                 try:
@@ -108,9 +146,66 @@ def parse_console(text: str) -> dict:
                 continue
             passthrough.append(raw.rstrip("\n"))
             continue
+        if window_open is not None:
+            if line == BEGIN:
+                raise ConsoleError(
+                    f"line {lineno}: {BEGIN} inside window block")
+            if line.startswith(WINDOW_BEGIN):
+                raise ConsoleError(
+                    f"line {lineno}: nested {WINDOW_BEGIN}")
+            if line.startswith(WINDOW_END):
+                rest = line[len(WINDOW_END):]
+                if not rest.startswith(" "):
+                    raise ConsoleError(
+                        f"line {lineno}: {WINDOW_END} without a header")
+                closing = _window_id(rest[1:], lineno, WINDOW_END)
+                if closing != window_open:
+                    raise ConsoleError(
+                        f"line {lineno}: {WINDOW_END} window {closing} "
+                        f"does not match open window {window_open}")
+                body = "\n".join(window_lines)
+                try:
+                    report = json.loads(body)
+                except json.JSONDecodeError as err:
+                    raise ConsoleError(
+                        f"line {lineno}: window {window_open} body "
+                        f"is not JSON: {err}"
+                    ) from err
+                # No denylist scan: product-owned bytes, like the
+                # legacy passthrough.
+                parsed["KRYPROBE_WINDOWS"][window_open] = {
+                    "report": report,
+                    "lines": sum(1 for entry in window_lines if entry),
+                }
+                window_open = None
+                window_lines = []
+                window_bytes = 0
+                continue
+            window_bytes += len(raw) + 1
+            if window_bytes > WINDOW_MAX_BYTES:
+                raise ConsoleError(
+                    f"line {lineno}: window {window_open} block exceeds "
+                    f"{WINDOW_MAX_BYTES} bytes")
+            window_lines.append(raw.rstrip("\n"))
+            continue
         if line == BEGIN:
             passthrough = []
             continue
+        if line.startswith(WINDOW_BEGIN):
+            rest = line[len(WINDOW_BEGIN):]
+            if not rest.startswith(" "):
+                raise ConsoleError(
+                    f"line {lineno}: {WINDOW_BEGIN} without a header")
+            window = _window_id(rest[1:], lineno, WINDOW_BEGIN)
+            if window in parsed["KRYPROBE_WINDOWS"]:
+                raise ConsoleError(
+                    f"line {lineno}: duplicate window {window} block")
+            window_open = window
+            window_lines = []
+            window_bytes = 0
+            continue
+        if line.startswith(WINDOW_END):
+            raise ConsoleError(f"line {lineno}: {WINDOW_END} without {WINDOW_BEGIN}")
         if line == END:
             raise ConsoleError(f"line {lineno}: {END} without {BEGIN}")
         if not line.startswith("DEMO:"):
@@ -134,6 +229,8 @@ def parse_console(text: str) -> dict:
         parsed[channel].append(row)
     if passthrough is not None:
         raise ConsoleError(f"unterminated {BEGIN} block")
+    if window_open is not None:
+        raise ConsoleError(f"unterminated {WINDOW_BEGIN} window {window_open}")
     return parsed
 
 

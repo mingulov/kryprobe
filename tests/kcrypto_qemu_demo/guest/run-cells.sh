@@ -147,6 +147,16 @@ passthrough() {
   echo "DEMO:KRYPROBE-END" > "$CONSOLE"
 }
 
+# Emit one D08 window's product report as a bounded, numbered
+# console block (R1): every window retained, the host validates
+# each window's lines + ring_drops instead of asserting zero loss.
+# $1 = window number, $2 = report file (must exist; guarded by callers).
+window_report() {
+  echo "DEMO:KRYPROBE-WINDOW-BEGIN {\"window\": $1}" > "$CONSOLE"
+  cat "$2" > "$CONSOLE"
+  echo "DEMO:KRYPROBE-WINDOW-END {\"window\": $1}" > "$CONSOLE"
+}
+
 # Resolve a mapped device to its devtmpfs node (/dev/dm-N): no udev
 # runs here, so /dev/mapper/<name> never appears; the kernel-owned
 # sysfs name is the honest handle.
@@ -471,6 +481,9 @@ cell_D08() {
     rows="$(grep -c . "$OUT/krep-d08-$w.json" 2>/dev/null || true)"
     if [ -z "$rows" ]; then rows=0; fi
     echo "DEMO:SOAK {\"window\": $w, \"ops_ok\": $ok, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
+    if [ -f "$OUT/krep-d08-$w.json" ]; then
+      window_report "$w" "$OUT/krep-d08-$w.json"
+    fi
     if [ "$ok" != true ] || ! kryprobe_ok "$kexit"; then
       head -c 2000 "$OUT/krep-d08-$w.out" > "$CONSOLE" 2>/dev/null || true
       die "SOAK-W$w"
@@ -493,7 +506,7 @@ cell_D08() {
   echo "DEMO:SOAK {\"window\": 19, \"ops_ok\": true, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"traffic_active_at_stop\": true, \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
   echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
   if [ -f "$OUT/krep-d08-stop.json" ]; then
-    passthrough "$OUT/krep-d08-stop.json"
+    window_report 19 "$OUT/krep-d08-stop.json"
   fi
   if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d08-stop.out" > "$CONSOLE" 2>/dev/null || true
