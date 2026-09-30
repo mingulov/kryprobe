@@ -54,6 +54,16 @@ processes are never signaled. The strict-exclusivity vs
 one-owned-guest wording call is AWAITING-OWNER (O3); the evidence
 stands under either reading once clean re-runs exist.
 
+Verification chain (what each checker establishes): `verify`
+re-checks the per-cell `SHA256SUMS` contents and re-judges the
+recorded receipt checks through the shared-harness reconciler;
+`indep-check.py` independently re-parses consoles and cross-checks
+receipt/ledger/console/run-log consistency without adjudicating
+verdicts; the host suite pins the oracle rules on fixtures. Seal
+integrity ultimately rests on `sha256sum -c` over the campaign
+`SHA256SUMS`, and every new receipt records its judging
+`harness_commit`.
+
 Host gates (no KVM needed):
 
 ```sh

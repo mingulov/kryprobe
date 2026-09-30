@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 
 SCHEMA_INPUT = "kcrypto.qemu-demo.inputs/v1"
@@ -252,6 +254,59 @@ def seal_artifacts(run_dir: Path, names: list[str], *, writers_done: bool) -> di
     lines = "".join(f"{digest}  {name}\n" for name, digest in sorted(sums.items()))
     (run_dir / "SHA256SUMS").write_text(lines)
     return sums
+
+
+def check_seal_contents(run_dir: Path) -> list[str]:
+    """Re-hash every ``SHA256SUMS`` entry of a run dir.
+
+    Returns the list of problems (empty when the seal verifies):
+    a missing sealed file, a hash mismatch, or a malformed seal
+    line each fail — seal existence alone proves nothing.
+    """
+    run_dir = Path(run_dir)
+    problems: list[str] = []
+    try:
+        text = (run_dir / "SHA256SUMS").read_text()
+    except OSError as err:
+        return [f"seal unreadable: {err}"]
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        want, sep, name = line.partition("  ")
+        if not sep:
+            want, sep, name = line.partition(" ")
+        name = name.strip().lstrip("*")
+        want = want.strip()
+        if not sep or not name or not re.fullmatch(r"[0-9a-f]{64}", want):
+            problems.append(f"seal line {lineno} malformed")
+            continue
+        target = run_dir / name
+        if not target.is_file():
+            problems.append(f"sealed file missing: {name}")
+        elif sha256_file(target) != want:
+            problems.append(f"seal mismatch: {name}")
+    return problems
+
+
+def harness_commit(path: Path) -> str:
+    """Judging-harness commit for a tree path.
+
+    Returns the full ``git rev-parse HEAD`` sha, or ``"unknown"``
+    outside a git tree (or when git is unavailable) — an
+    unbound revision is recorded honestly, never invented.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, ValueError):
+        return "unknown"
+    sha = proc.stdout.strip()
+    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return "unknown"
+    return sha
 
 
 def finalize_cell_receipt(receipt_path: Path, stop_fragment: dict) -> dict:

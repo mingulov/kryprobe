@@ -125,6 +125,7 @@ def cmd_run(args) -> int:
         receipt = cells.unsupported_receipt(
             cell, run_id, UNSUPPORTED_WORKLOADS[kind],
             manifest["_manifest_sha256"])
+        receipt["harness_commit"] = receipts.harness_commit(HERE.parent)
         path = run_dir / f"cell-{cell['id']}.json"
         receipts.atomic_write_json(path, receipt)
         receipts.seal_artifacts(run_dir, ["run.json", path.name],
@@ -186,6 +187,7 @@ def cmd_run(args) -> int:
         stop = runner.stop_guest(guest)
     finalized = receipts.finalize_cell_receipt(receipt_path, stop)
     finalized["custody"]["hashes_unchanged"] = True
+    finalized["harness_commit"] = receipts.harness_commit(HERE.parent)
     finalized["pins"] = {
         "kryprobe": manifest["product"]["cli_sha"],
         "kcrypto.bpf.o": manifest["product"]["bpf_agg_sha"],
@@ -232,6 +234,10 @@ def cmd_verify(args) -> int:
     if not sealed:
         judged["reasons"].append("run dir is unsealed (SHA256SUMS missing)")
         judged["verdict"] = "FAIL"
+    else:
+        for problem in receipts.check_seal_contents(run_dir):
+            judged["reasons"].append(problem)
+            judged["verdict"] = "FAIL"
     for cell_id in sorted(judged["per_cell"]):
         print(f"{cell_id}: {judged['per_cell'][cell_id]}")
     for reason in judged["reasons"]:
