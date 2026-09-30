@@ -542,6 +542,67 @@ class D07Tests(unittest.TestCase):
         self.assertLess(attach["attach_ts"], attach["unlock_ts"])
         self.assertEqual(attach["unobserved"]["mark"], "UNOBSERVED")
 
+    def test_d07_attach_via_stdout_propagated(self):
+        lines = "\n".join(PRELUDE_MARKS + [
+            mark("KRYPROBE-START", 9.0),
+            'DEMO:PROBE {"fact": "kryprobe-attached", "via": "stdout",'
+            ' "wait_s": 4}',
+            mark("ATTACH-READY", 10.0),
+            mark("UNLOCK-START", 11.0),
+            mark("UNLOCK-DONE", 12.0),
+            mark("WORKLOAD-STOP", 15.0),
+            mark("WORKLOAD-DONE", 16.0),
+            KRYPROBE_EXIT,
+        ])
+        workload = {"kind": "early-boot", "observer": "early",
+                    "io_bytes": 16777216}
+        receipt, ledgers = cells.build_cell(
+            cell(workload, "D07"), "run1", "msha",
+            lines + "\n" + KREPO, PROC, "guest1")
+        attach = json.loads(ledgers["attach-ready.json"])
+        self.assertEqual(attach["method"], "stdout")
+        self.assertTrue(receipt["checks"]["attach_via_known"])
+
+    def test_d07_attach_via_fallback_propagated(self):
+        lines = "\n".join(PRELUDE_MARKS + [
+            mark("KRYPROBE-START", 9.0),
+            'DEMO:PROBE {"fact": "kryprobe-attached",'
+            ' "via": "bpf-link", "wait_s": 9}',
+            mark("ATTACH-READY", 10.0),
+            mark("UNLOCK-START", 11.0),
+            mark("UNLOCK-DONE", 12.0),
+            mark("WORKLOAD-STOP", 15.0),
+            mark("WORKLOAD-DONE", 16.0),
+            KRYPROBE_EXIT,
+        ])
+        workload = {"kind": "early-boot", "observer": "early",
+                    "io_bytes": 16777216}
+        receipt, ledgers = cells.build_cell(
+            cell(workload, "D07"), "run1", "msha",
+            lines + "\n" + KREPO, PROC, "guest1")
+        attach = json.loads(ledgers["attach-ready.json"])
+        self.assertEqual(attach["method"], "bpf-link")
+        self.assertTrue(receipt["checks"]["attach_via_known"])
+
+    def test_d07_missing_attach_via_fails(self):
+        lines = "\n".join(PRELUDE_MARKS + [
+            mark("KRYPROBE-START", 9.0),
+            mark("ATTACH-READY", 10.0),
+            mark("UNLOCK-START", 11.0),
+            mark("UNLOCK-DONE", 12.0),
+            mark("WORKLOAD-STOP", 15.0),
+            mark("WORKLOAD-DONE", 16.0),
+            KRYPROBE_EXIT,
+        ])
+        workload = {"kind": "early-boot", "observer": "early",
+                    "io_bytes": 16777216}
+        receipt, ledgers = cells.build_cell(
+            cell(workload, "D07"), "run1", "msha",
+            lines + "\n" + KREPO, PROC, "guest1")
+        attach = json.loads(ledgers["attach-ready.json"])
+        self.assertEqual(attach["method"], "unknown")
+        self.assertFalse(receipt["checks"]["attach_via_known"])
+
     def test_d07_unlock_before_attach_fails(self):
         lines = "\n".join(PRELUDE_MARKS + [
             mark("UNLOCK-START", 11.0),
