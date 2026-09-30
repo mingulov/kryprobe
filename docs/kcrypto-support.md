@@ -7,7 +7,7 @@ hook lists and the test suites below — not against release strings.
 the boundary on that kernel. Anything else is an explicit refusal or
 an explicit unknown, never a silent gap.
 
-Evidence basis: accepted P3–P5 records and coverage at `88757d6`
+Evidence basis: accepted P3–P5 records and coverage at `bee0b6a`
 (hook lists verified in-tree; suite names verified in-tree). T11
 re-verifies the cited guest cells on 7.0.14 + 7.2.6 with controls
 (see the T11 handoff); until then the kernel column carries the
@@ -88,7 +88,7 @@ drift, never pinned. See ADR-0006 and `docs/deployment.md`.
 
 ## P8 real-consumer re-verification (T13)
 
-Head `f938fe6`, 11/11 sealed cells PASS (campaign PASS;
+Head `f1f0fe`, 11/11 sealed cells PASS (campaign PASS;
 `docs/kcrypto-matrix.md`). The api-returns rows above are
 re-verified on live consumers on all three kernels with
 kernel-exact oracles (product == ftrace on every traced

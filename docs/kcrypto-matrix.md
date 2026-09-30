@@ -10,7 +10,7 @@ this wave's sealed cells (11/11 PASS, campaign PASS). Optional
 R2 IDs (X01–X03) and the QEMU demo (D01–D08) are out of R1 scope
 and listed only as NOT_RUN.
 
-Final tested artifacts (T13, head `f938fe6`, manifest
+Final tested artifacts (T13, head `f1f0fe`, manifest
 `8d663eb5…`): kryprobe `a3de8ca2…`, kcrypto.bpf.o
 `bd14e714…`, kcrypto-lifecycle.bpf.o `6bc13e94…`, fixture
 modules `53fc38b3…` (7.0.14) / `7b60903c…` (7.2.6), repo
@@ -26,12 +26,12 @@ sealed `stage.json`; pins uniform across all 11 cells).
 | S05 | T03 | accepted P1 delivery; `release_artifacts` suite | accepted prior |
 | F01–F07 | T04, T07 | accepted P1 delivery lane (37 PASS supported / 33+4 floor) | accepted prior |
 | Q01–Q02 | T05, T08 | accepted P2/P3 suites + guest cells | accepted prior |
-| Q03–Q08 | T05, T09 | accepted P4 (`e52c52e`) | accepted prior |
-| Q09 | T05, T12 | accepted P7 (`0f43994`): I01/Q09 seams + E06/E07 cells | accepted prior |
-| A01–A03 | T10 | accepted P5 (`88757d6`) | accepted prior |
-| C01–C04 | T11 | accepted P6 (`4861b0a`) | accepted prior |
-| O01–O02 | T11 | accepted P6 (`4861b0a`) | accepted prior |
-| I01–I04 | T12 | accepted P7 (`0f43994`): E04–E07/sol04 cells | accepted prior |
+| Q03–Q08 | T05, T09 | accepted P4 (`58081d6`) | accepted prior |
+| Q09 | T05, T12 | accepted P7 (`8d23cf3`): I01/Q09 seams + E06/E07 cells | accepted prior |
+| A01–A03 | T10 | accepted P5 (`bee0b6a`) | accepted prior |
+| C01–C04 | T11 | accepted P6 (`f9e9066`) | accepted prior |
+| O01–O02 | T11 | accepted P6 (`f9e9066`) | accepted prior |
+| I01–I04 | T12 | accepted P7 (`8d23cf3`): E04–E07/sol04 cells | accepted prior |
 | P01–P02 | T06–T12 | accepted P6/P7 canary lanes + sol04 | accepted prior |
 | H01 (T06 share) | T06 | accepted loader gates | accepted prior |
 | H02 (T06 share) | T06 | accepted loader gates | accepted prior |
@@ -41,7 +41,7 @@ sealed `stage.json`; pins uniform across all 11 cells).
 | ID | Owner | Proved by | Status |
 |---|---|---|---|
 | E01–E03, E05–E06 | P2 | accepted bounded-mode checkpoint + P7 requalification | accepted prior |
-| E04–E07 | P7 | accepted P7 (`0f43994`) guest cells, both kernels | accepted prior |
+| E04–E07 | P7 | accepted P7 (`8d23cf3`) guest cells, both kernels | accepted prior |
 | E08 | P7 | accepted P7 7.0.14 soak (7.2.6 NOT_RUN, accepted) | accepted prior |
 
 ## Real consumers (this wave, T13 PASS)

@@ -31,8 +31,10 @@ The floor successor is
 Its `RESULTS.md` and `PROVENANCE.json` bind the original T14 seal; it
 supplements the original floor INVALIDs without editing their history.
 Seal digests for the four evidence trees are in the release notes.
-The source chain is main `d69d88d` -> accepted T14 `2540b49` ->
-accepted demo `4206971` -> release documentation/CI preparation.
+The source chain is main `865301b` -> accepted T14 `d7cb048` ->
+accepted demo `a3987e7` -> release documentation/CI preparation.
+Commit identities are post-2026-09-30 author-name rewrite; the
+content-identical pre-rewrite SHAs remain in the private acceptance records.
 The runtime source and frozen contracts are unchanged by that preparation.
 
 ## Historical T14 repair-3 record
@@ -51,9 +53,9 @@ wording correction, the rejudge-3 hardening comparison, the
 - Product: KryProbe kernel-crypto observer (R1 scope:
   api-returns + request-lifecycle profiles on Linux 6.12+
   x86-64; kernel-only product scope, no third-party import).
-- Candidate base: `b50ee1a430e71fd470ef5eb817a98e6b8f3f9177`
+- Candidate base: `648c4d1af373a7d8b7489a5b049e2836c6cb6646`
   (accepted P8 head, `task/kcrypto-t13`).
-- Candidate head: `2540b491ce0747e7efc2b63dc1d5c2eef62b9223`
+- Candidate head: `d7cb04826525d3e1696c3a58d4932c98801b8580`
   (`task/kcrypto-t14` repair-3; full SHA + tree in the T14 HANDOFF §Repository
   state — BPF/ABI/wire/event-v0 frozen, measurement +
   packaging + docs only; zero SOURCE delta under `crates/`,
@@ -98,14 +100,14 @@ wording correction, the rejudge-3 hardening comparison, the
 
 | Phase | Accepted at | Record |
 |---|---|---|
-| P1 (T07) | `7ec080b` | T07 done record |
-| P2 envelope | `8025335` + packet-r4 | P2 record |
-| P3 (T08) | `75f0758` | P3 record |
-| P4 (T09) | `e52c52e` | P4 record |
-| P5 (T10) | `88757d6` | P5 record |
-| P6 (T11) | `4861b0a` | P6 record |
-| P7 (T12) | `0f43994` | P7 record (E08/7.2.6 NOT_RUN carried) |
-| P8 (T13) | `b50ee1a` | P8 record, 11/11 cells PASS |
+| P1 (T07) | `d522476` | T07 done record |
+| P2 envelope | `241106f` + packet-r4 | P2 record |
+| P3 (T08) | `319e983` | P3 record |
+| P4 (T09) | `58081d6` | P4 record |
+| P5 (T10) | `bee0b6a` | P5 record |
+| P6 (T11) | `f9e9066` | P6 record |
+| P7 (T12) | `8d23cf3` | P7 record (E08/7.2.6 NOT_RUN carried) |
+| P8 (T13) | `648c4d1` | P8 record, 11/11 cells PASS |
 
 Historical passes are carried verdicts, not new evidence.
 Repair-1 re-runs on the final bytes: the full P7 E-battery
@@ -248,15 +250,15 @@ The original records below remain available without rewriting their bytes:
 
 ## Historical main-drift recheck at T14 handoff (ADR-0005)
 
-At handoff: `main` head `d69d88d` (review-remain G10); zero
+At handoff: `main` head `865301b` (review-remain G10); zero
 commits on `main` outside the P8 base history
-(`git rev-list --count b50ee1a..main` == 0), i.e. `main` is
+(`git rev-list --count 648c4d1..main` == 0), i.e. `main` is
 an ancestor of the base — no drift into the wave. The wave
 branch is 166 commits ahead of `main` (the kcrypto task
 stack + the T14 wave + repair-1 + repair-2). Report only —
 worker never rebases/merges/pushes/tags; owner integrates.
 
-That handoff proposed a fast-forward from `d69d88d`; it did not
+That handoff proposed a fast-forward from `865301b`; it did not
 perform one. The current release preparation includes the accepted
 repair-3 and demo heads listed above, plus the owner decisions.
 The coordinator rechecks main immediately before a fast-forward and
