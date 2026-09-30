@@ -112,5 +112,100 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("1.0–9.0s guest", svg)
 
 
+def make_sealed(cell_dir: Path) -> None:
+    (cell_dir / "SHA256SUMS").write_text("seal\n")
+
+
+def make_log(root: Path, name: str, verdict: str) -> None:
+    (root / name).write_text(json.dumps(
+        {"cell": "D01", "verdict": verdict, "reasons": []}))
+
+
+class TimelineV2Tests(unittest.TestCase):
+    """R6 RED: verdict-aware rows, evidence layers, unsealed marking."""
+
+    def test_v1_default_unchanged(self):
+        # V1 rendering stays byte-stable (sealed p10a4 SVG reproduces).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_cell(root, "D01", dict(RUN_RECEIPT), MARKS)
+            edges, rows = timeline.collect_run(root)
+        self.assertEqual(rows["D01"]["verdict"], "RUN")
+        self.assertTrue(all("layer" not in edge for edge in edges))
+
+    def test_v2_rows_show_run_log_verdicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            passing = make_cell(root, "D01", dict(RUN_RECEIPT), MARKS)
+            make_sealed(passing)
+            make_log(root, "D01.log", "PASS")
+            failing = make_cell(root, "D02", dict(RUN_RECEIPT), MARKS)
+            make_sealed(failing)
+            make_log(root, "D02.log", "FAIL")
+            _, rows = timeline.collect_run(root, v2=True)
+        self.assertEqual(rows["D01"]["verdict"], "PASS")
+        self.assertEqual(rows["D02"]["verdict"], "FAIL")
+
+    def test_v2_unsealed_history_marked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            torn = dict(RUN_RECEIPT)
+            torn["checks"] = {"console": False}
+            cell_dir = make_cell(root, "D01-rerun1", torn, MARKS)
+            self.assertFalse((cell_dir / "SHA256SUMS").exists())
+            (root / "D01-rerun1.log").write_text(
+                "run: seal refused: seal artifact missing\n")
+            edges, rows = timeline.collect_run(root, v2=True)
+            svg = timeline.render_svg("run9", edges, rows, v2=True)
+        self.assertEqual(rows["D01-rerun1"]["verdict"], "FAIL")
+        self.assertFalse(rows["D01-rerun1"]["sealed"])
+        self.assertIn("unsealed-history", svg)
+
+    def test_v2_edges_carry_evidence_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cell_dir = make_cell(root, "D01", dict(RUN_RECEIPT), MARKS)
+            make_sealed(cell_dir)
+            make_log(root, "D01.log", "PASS")
+            edges, _ = timeline.collect_run(root, v2=True)
+        by_pair = {(e["frm"], e["to"]): (e["label"], e["layer"])
+                   for e in edges}
+        self.assertEqual(by_pair[("requested", "selected")],
+                         ("observed", "guest-probe"))
+        self.assertEqual(by_pair[("selected", "entered")],
+                         ("unknown", "none"))
+        self.assertEqual(by_pair[("returned", "completed")],
+                         ("observed", "caller-ledger"))
+        self.assertEqual(by_pair[("completed", "reported")],
+                         ("reference", "product-report"))
+
+    def test_v2_selected_entered_never_observed(self):
+        # A6: caller-ledger success proves neither provider-body
+        # entry nor product completion; the edge stays unknown.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cell_dir = make_cell(root, "D01", dict(RUN_RECEIPT), MARKS)
+            make_sealed(cell_dir)
+            make_log(root, "D01.log", "PASS")
+            edges, _ = timeline.collect_run(root, v2=True)
+        entered = [e for e in edges
+                   if (e["frm"], e["to"]) == ("selected", "entered")]
+        self.assertEqual(len(entered), 1)
+        self.assertEqual(entered[0]["label"], "unknown")
+
+    def test_v2_svg_shows_verdicts_and_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cell_dir = make_cell(root, "D01", dict(RUN_RECEIPT), MARKS)
+            make_sealed(cell_dir)
+            make_log(root, "D01.log", "PASS")
+            edges, rows = timeline.collect_run(root, v2=True)
+            svg = timeline.render_svg("run9", edges, rows, v2=True)
+        self.assertIn("[PASS]", svg)
+        self.assertIn("caller-ledger", svg)
+        self.assertIn("run ID", svg)
+        self.assertIn("replay", svg)
+
+
 if __name__ == "__main__":
     unittest.main()
