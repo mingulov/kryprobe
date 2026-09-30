@@ -12,9 +12,10 @@
   (never boots, never repairs a run).
 
 Exit status: 0 PASS, 1 FAIL/error, 2 usage, 3 NOT_RUN/UNSUPPORTED.
-Only the ``cold-boot-no-observer`` workload (cell T01-harness) is
-implemented in attempt 2; every other workload kind writes an
-explicit NOT_RUN receipt without booting — never a PASS.
+Attempt 4 implements every workload kind except ``nested-fallback``
+(D06), whose X01 prerequisite is proven absent and seals
+UNSUPPORTED without booting. Unknown kinds seal NOT_RUN without
+booting — never a PASS.
 """
 
 import argparse
@@ -25,9 +26,28 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from kcrypto_qemu_demo import receipts, reconcile, runner  # noqa: E402
+from kcrypto_qemu_demo import cells, receipts, reconcile, runner  # noqa: E402
 
-IMPLEMENTED_WORKLOADS = frozenset({"cold-boot-no-observer"})
+IMPLEMENTED_WORKLOADS = frozenset({
+    "cold-boot-no-observer",
+    "provider-selection",
+    "cpu-variant",
+    "dmcrypt-io",
+    "virtio-device",
+    "device-removal",
+    "early-boot",
+    "stop-soak",
+})
+
+# Workload kinds with no live implementation whose prerequisite is
+# proven absent (sealed UNSUPPORTED without booting, never a PASS).
+UNSUPPORTED_WORKLOADS = {
+    "nested-fallback": (
+        "X01 threshold provider absent from the tree and no kernel"
+        " source to port it; no real-driver fallback trigger"
+        " qualified with exact source + live evidence"
+    ),
+}
 
 PRODUCT_PIN_NAMES = ["kryprobe", "kcrypto.bpf.o", "kcrypto-lifecycle.bpf.o"]
 
@@ -95,14 +115,39 @@ def cmd_run(args) -> int:
         },
     )
     kind = cell["workload"].get("kind")
+    if kind in UNSUPPORTED_WORKLOADS:
+        receipt = cells.unsupported_receipt(
+            cell, run_id, UNSUPPORTED_WORKLOADS[kind])
+        path = run_dir / f"cell-{cell['id']}.json"
+        receipts.atomic_write_json(path, receipt)
+        receipts.seal_artifacts(run_dir, ["run.json", path.name],
+                                writers_done=True)
+        print(json.dumps({"cell": cell["id"], "verdict": "UNSUPPORTED",
+                          "reason": receipt["reason"]}))
+        return EXIT_NOT_RUN
     if kind not in IMPLEMENTED_WORKLOADS:
         path = _not_run_receipt(
             run_dir, run_id, cell["id"],
-            f"workload kind {kind!r} is not implemented in attempt 2",
+            f"workload kind {kind!r} is not implemented",
         )
         receipts.seal_artifacts(run_dir, ["run.json", path.name], writers_done=True)
         print(json.dumps({"cell": cell["id"], "verdict": "NOT_RUN", "reason": path.name}))
         return EXIT_NOT_RUN
+    try:
+        seal_ledgers = cells.check_evidence_cover(cell)
+    except cells.CellError as err:
+        print(f"run: evidence skew refused: {err}", file=sys.stderr)
+        return EXIT_FAIL
+    images = {image["id"]: image for image in manifest["images"]}
+    image = images[cell["image"]]
+    qmp_device = None
+    if kind == "device-removal":
+        if len(image["devices"]) != 1:
+            print("run: device-removal needs an image with exactly one"
+                  f" device, {cell['image']!r} has"
+                  f" {len(image['devices'])}", file=sys.stderr)
+            return EXIT_FAIL
+        qmp_device = image["devices"][0]
     lock_paths = [Path(p) for p in args.lock]
     try:
         guest = runner.launch_guest(
@@ -112,6 +157,7 @@ def cmd_run(args) -> int:
             name=f"kcrypto-demo-{cell['id']}",
             lock_paths=lock_paths,
             needs_data_disk=bool(cell["workload"].get("needs_data_disk")),
+            cell_id=cell["id"],
         )
     except (runner.GuestError, OSError) as err:
         print(f"run: launch refused: {err}", file=sys.stderr)
@@ -123,6 +169,7 @@ def cmd_run(args) -> int:
             run_dir=run_dir,
             run_id=run_id,
             manifest_sha256=manifest["_manifest_sha256"],
+            qmp_device=qmp_device,
         )
     finally:
         stop = runner.stop_guest(guest)
@@ -135,7 +182,8 @@ def cmd_run(args) -> int:
     }
     finalized["executed"] = dict(finalized["pins"])
     receipts.atomic_write_json(receipt_path, finalized)
-    names = ["run.json", "spawn.json", "stop.json", "console.log", receipt_path.name]
+    names = ["run.json", "spawn.json", "stop.json", "console.log",
+             *seal_ledgers]
     try:
         sums = receipts.seal_artifacts(run_dir, names, writers_done=True)
     except (FileNotFoundError, ValueError) as err:
@@ -148,7 +196,11 @@ def cmd_run(args) -> int:
         "reasons": judged["reasons"],
         "sha256sums": sums,
     }))
-    return EXIT_PASS if judged["verdict"] == "PASS" else EXIT_FAIL
+    if judged["verdict"] == "PASS":
+        return EXIT_PASS
+    if judged["verdict"] in ("NOT_RUN", "UNSUPPORTED"):
+        return EXIT_NOT_RUN
+    return EXIT_FAIL
 
 
 def cmd_verify(args) -> int:

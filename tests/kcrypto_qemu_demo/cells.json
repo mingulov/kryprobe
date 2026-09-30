@@ -18,7 +18,7 @@
       "image": "img-7014-base",
       "workload": {"kind": "provider-selection", "requests": 300, "block_bytes": 4096, "rate_per_s": 10},
       "limits": {"timeout_s": 180},
-      "expected_evidence": ["workload-ledger.jsonl", "product-report.json", "cell-D01.json"]
+      "expected_evidence": ["workload-ledger.jsonl", "registry.json", "product-report.json", "cell-D01.json"]
     },
     {
       "id": "D02",
@@ -26,7 +26,7 @@
       "image": "img-7014-nocrypto",
       "workload": {"kind": "cpu-variant", "requests": 300, "block_bytes": 4096, "rate_per_s": 10, "retained_control": true},
       "limits": {"timeout_s": 180},
-      "expected_evidence": ["workload-ledger.jsonl", "product-report.json", "cpu-flags.txt", "cell-D02.json"]
+      "expected_evidence": ["workload-ledger.jsonl", "registry.json", "handles.json", "product-report.json", "cpu-flags.txt", "cell-D02.json"]
     },
     {
       "id": "D03",
@@ -40,15 +40,15 @@
       "id": "D04",
       "title": "virtual crypto device path (one device)",
       "image": "img-7014-1crypt",
-      "workload": {"kind": "virtio-device", "devices": 1},
+      "workload": {"kind": "virtio-device", "devices": 1, "control_ops": 50, "virtio_ops": 50},
       "limits": {"timeout_s": 180},
-      "expected_evidence": ["device-ledger.json", "queue-reference.json", "cell-D04.json"]
+      "expected_evidence": ["device-ledger.json", "queue-reference.json", "product-report.json", "cell-D04.json"]
     },
     {
       "id": "D05",
       "title": "loss of a device (quiesced removal)",
       "image": "img-7014-1crypt",
-      "workload": {"kind": "device-removal", "mode": "quiesced"},
+      "workload": {"kind": "device-removal", "mode": "quiesced", "post_ops": 10},
       "limits": {"timeout_s": 180},
       "expected_evidence": ["removal-ledger.json", "qmp-events.jsonl", "cell-D05.json"]
     },
@@ -58,23 +58,23 @@
       "image": "img-7014-base",
       "workload": {"kind": "nested-fallback", "sizes": [512, 1024, 4096], "ops_per_size": 100},
       "limits": {"timeout_s": 180},
-      "expected_evidence": ["parent-ledger.jsonl", "child-ledger.jsonl", "cell-D06.json"]
+      "expected_evidence": ["cell-D06.json"]
     },
     {
       "id": "D07",
       "title": "cold boot with early observer",
       "image": "img-7014-base",
-      "workload": {"kind": "early-boot", "observer": "early"},
+      "workload": {"kind": "early-boot", "observer": "early", "io_bytes": 16777216, "needs_data_disk": true},
       "limits": {"timeout_s": 300},
-      "expected_evidence": ["serial.log", "attach-ready.json", "io-ledger.json", "cell-D07.json"]
+      "expected_evidence": ["attach-ready.json", "io-ledger.json", "product-report.json", "cell-D07.json"]
     },
     {
       "id": "D08",
       "title": "stop and slower stability (20-minute soak)",
       "image": "img-7014-base",
-      "workload": {"kind": "stop-soak", "aggregate_minutes": 20},
+      "workload": {"kind": "stop-soak", "aggregate_minutes": 20, "windows": 20, "window_ops": 600},
       "limits": {"timeout_s": 1500},
-      "expected_evidence": ["soak-windows.json", "stop-receipt.json", "cell-D08.json"]
+      "expected_evidence": ["workload-ledger.jsonl", "soak-windows.json", "stop-receipt.json", "product-report.json", "cell-D08.json"]
     }
   ]
 }
