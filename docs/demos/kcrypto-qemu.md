@@ -1,12 +1,23 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # kcrypto QEMU demo (P10): reproduction + viewer narration
 
-Status (attempt 2, `p10a2-20260930T000653Z`): Task 1 DONE. Host
-suite 70/70 GREEN; T01-harness cold boot PASS (sealed); D01–D08
-sealed NOT_RUN (workload kinds unimplemented — no boots, no PASS
-claimed). Attempt 1 (`p10a1-20260929T233833Z`) authored the same
-files but never executed them (FD-exhaustion BLOCKED). See
-`.outbox/kcrypto-demo-qemu/HANDOFF-a2.md` (PARTIAL).
+Status (final wave, `p10a4-20260930T002951Z`, sealed
+`SHA256SUMS` 199/199 OK): host suite 159/159 GREEN
+(`host-suite-S19.log`); T01-harness cold boot PASS
+(`T01-run.log`); D01/D02/D03/D04/D05/D07/D08 PASS on rerun
+(`D01-rerun3.log`, `D02-rerun1.log`, `D03-rerun1.log`,
+`D04-rerun2.log`, `D05-rerun1.log`, `D07-rerun1.log`,
+`D08-rerun1.log`) with every first failure preserved sealed
+(`D01-run.log` FAIL, `D02-run.log` FAIL, `D03-run.log` FAIL,
+`D04-run.log` UNSUPPORTED(false), `D05-run.log` FAIL,
+`D07-run.log` FAIL, `D08-run.log` FAIL); D06 UNSUPPORTED×2 by
+design (`D06-run.log`, `D06-rerun1.log`: X01 provider absent,
+no kernel source). Cross-checks: `indep-check.out` 0 failures
+over 23 dirs; per-cell `verify --run-dir` verdicts match run
+logs. Earlier campaigns: `p10a2-20260930T000653Z` (Task 1 DONE,
+D01–D08 NOT_RUN) and `p10a1-20260929T233833Z` (BLOCKED, never
+executed). Nothing below claims more than the sealed run logs
+and cell receipts.
 
 ## Reproduce (attempt 2+)
 
@@ -41,25 +52,69 @@ python3 -B -m unittest discover -s tests/kcrypto_qemu_demo -v
 including cleanup. A timeout, skip, incomplete reference or stale
 artifact can never yield PASS.
 
-## Viewer narration (8–12 minute story, when qualified)
+## Viewer narration (8–12 minute story, qualified per beat)
 
-1. Available vs selected (D01): the registry lists providers; one
-   allocation selects one driver. Registered-but-unused stays
-   "available", never "used".
-2. Fresh vs held (D02): a new transform selects under the new CPU
-   flags; the held handle does not migrate.
-3. Real disk (D03): guest-only dm-crypt writes/reads 64 MiB; the
-   workload ledger and the product view agree on bytes, counted
-   separately from API calls.
-4. Virtual device / fallback (D04–D06): only with proved queue and
-   binding evidence; otherwise the claim stops at driver selection
-   and the device stays "unknown".
-5. Early boot (D07): the observer attaches before the controlled
-   unlock; everything before attach is UNOBSERVED.
-6. Honest unknowns (D08): loss, caps and stops are explicit; the
-   timeline labels every arrow observed/reference/inferred/unknown
-   with its run ID, and replay is labeled replay.
+Evidence root for every beat: sealed campaign
+`evidence/kcrypto-demo-qemu/p10a4-20260930T002951Z/`
+(`SHA256SUMS` 199/199 OK). Static visual: `timeline.svg` in the
+same dir.
+
+1. Available vs selected (D01 — QUALIFIED): `D01-rerun3.log`
+   verdict PASS; `cell-D01.json` checks `selected_in_registry`,
+   `alloc_split`, `exact_count` all true over a 300/300
+   `workload-ledger.jsonl`; `registry.json` lists the providers
+   while the single `d01-generic` allocation selects
+   `cbc-aes-aesni` (console). Registered-but-unused stays
+   "available", never "used". First failures preserved:
+   `D01-run.log`, `D01-rerun1.log`, `D01-rerun2.log` (FAIL —
+   printk tore JSON ×2).
+2. Fresh vs held (D02 — QUALIFIED): `D02-rerun1.log` verdict
+   PASS; the fresh `d02-fresh0` allocation selects
+   `cbc(ecb(aes-lib))` (console) for 300/300 ledger ops while
+   `handles.json` brackets the held `d02-held` `cbc(aes)` handle
+   (held → released, never migrated). First failure preserved:
+   `D02-run.log` (FAIL — NO-CBC-DRIVER, 0 ops).
+3. Real disk (D03 — QUALIFIED): `D03-rerun1.log` verdict PASS;
+   `io-ledger.json` records guest-only dm-crypt `demo-d03`
+   create/load/resume/remove with exactly 67108864 bytes (64
+   MiB) written and fsynced; the io ledger and the product view
+   agree on bytes, counted separately from API calls. First
+   failure preserved: `D03-run.log` (FAIL — pre-attach burst,
+   `product_traffic`).
+4. Virtual device / fallback (D04–D06 — STOPS AT DRIVER
+   SELECTION): D04 `D04-rerun2.log` verdict PASS but
+   `cell-D04.json` pins `device_unknown`, `queue_proof_absent`,
+   `no_offload_claim` true and `queue-reference.json` states
+   "claim stops at driver selection" (R2 virtqueue adapter
+   unavailable); D05 `D05-rerun1.log` verdict PASS with
+   `removal-ledger.json` showing `virtio1`/`virtio_crypto`
+   before and `[]` after plus recorded fresh traffic
+   (`device_after_empty`, `qmp_event_present`); D06
+   UNSUPPORTED×2 (`D06-run.log`, `D06-rerun1.log`) — no
+   fallback trigger qualified, so no failover is narrated. The
+   device stays "unknown"; no queue/binding/offload claim is
+   made.
+5. Early boot (D07 — QUALIFIED): `D07-rerun1.log` verdict PASS;
+   `cell-D07.json` checks `unlock_after_attach` true with
+   `dmap_order`, `io_bytes_exact`, `readback_match` true over
+   the `demo-d07` dm-crypt unlock (16 MiB write/fsync in
+   `io-ledger.json`); everything before attach stays
+   UNOBSERVED. First failure preserved: `D07-run.log` (FAIL —
+   fail-closed custody: foreign qemu exit).
+6. Honest unknowns (D08 — QUALIFIED): `D08-rerun1.log` verdict
+   PASS with 15/15 checks in `cell-D08.json` (`loss_visible`,
+   `product_saw_head`, `product_missed_tail`, `windows_complete`,
+   `stop_under_traffic`); 12000/12000 `workload-ledger.jsonl`
+   ops across 20 `soak-windows.json` windows; `stop-receipt.json`
+   records the stop under live traffic (window 19, kryprobe
+   exit 3). The timeline (`timeline.svg`) labels every arrow
+   observed/reference/inferred/unknown with its run ID, and
+   replay is labeled replay. First failure preserved:
+   `D08-run.log` (FAIL — `marks_ordered` + `product_suffix`).
 
 No firmware-to-userspace completeness claim, no transparent
 failover claim, no physical-accelerator claim, no secret material
-in any output.
+in any output. Narrower, per the seals: no queue/offload claim
+for D04 (device "unknown"), no fallback claim for D06
+(UNSUPPORTED×2), no pre-attach observation claim for D07, and no
+verdict beyond the exact sealed run IDs cited per beat.
