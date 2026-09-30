@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 
 from kcrypto_qemu_demo.receipts import (
+    KNOWN_CELLS,
     SCHEMA_CELL,
     atomic_write_json,
     verify_artifact,
@@ -36,6 +37,10 @@ from kcrypto_qemu_demo.receipts import (
 
 class GuestError(RuntimeError):
     """Owned-guest custody failure (locks, identity, QMP, stop, cleanup)."""
+
+
+# Cells the guest dispatcher understands (campaign cells + PROBE).
+GUEST_CELLS = frozenset(KNOWN_CELLS | {"PROBE"})
 
 
 @dataclass
@@ -139,8 +144,21 @@ def _qemu_cmd(
     data_disk: pathlib.Path | None,
     qmp_socket: pathlib.Path,
     console_log: pathlib.Path,
+    cell_id: str | None = None,
 ) -> list[str]:
-    """Build the frozen QEMU command line (no host-root sharing, no network)."""
+    """Build the frozen QEMU command line (no host-root sharing, no network).
+
+    ``cell_id`` (when given) selects the guest workload through the
+    kernel command line (``kcrypto.cell=<ID>``); unknown or blank
+    IDs refuse — the guest must never boot an ambiguous cell.
+    """
+    append = "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 panic=-1"
+    if cell_id is not None:
+        if not cell_id or any(ch.isspace() for ch in cell_id):
+            raise GuestError(f"blank cell selector {cell_id!r} (refusing)")
+        if cell_id not in GUEST_CELLS:
+            raise GuestError(f"unknown cell selector {cell_id!r} (refusing)")
+        append += f" kcrypto.cell={cell_id}"
     cmd = [
         qemu["path"],
         "-accel", "kvm",
@@ -152,7 +170,7 @@ def _qemu_cmd(
         "-serial", f"file:{console_log}",
         "-kernel", image["vmlinuz"],
         "-initrd", image["initramfs"],
-        "-append", "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 panic=-1",
+        "-append", append,
         "-drive", f"file={overlay},format=qcow2,if=virtio",
         "-qmp", f"unix:{qmp_socket},server=on,wait=off",
         "-nic", "none",
@@ -180,6 +198,7 @@ def launch_guest(
     qemu_cmd_override: list[str] | None = None,
     console_name: str = "console.log",
     needs_data_disk: bool = False,
+    cell_id: str | None = None,
 ) -> OwnedGuest:
     """Launch one owned disk-backed guest under the lane locks.
 
@@ -241,6 +260,7 @@ def launch_guest(
             cmd = _qemu_cmd(
                 manifest["qemu"], image, overlay=overlay, data_disk=data_disk,
                 qmp_socket=qmp_socket, console_log=console_log,
+                cell_id=cell_id,
             )
         else:
             cmd = list(qemu_cmd_override)
@@ -251,6 +271,7 @@ def launch_guest(
             {
                 "name": name,
                 "image_id": image_id,
+                "cell_id": cell_id,
                 "qemu_pid": proc.pid,
                 "qemu_start_ticks": start_ticks,
                 "cmd": cmd,
@@ -318,6 +339,108 @@ def qmp_command(guest: OwnedGuest, command: dict, timeout_s: float = 10.0) -> di
         return qmp_exchange(sock, command, timeout_s=timeout_s)
     except OSError as err:
         raise GuestError(f"QMP connect to owned socket failed: {err}") from err
+    finally:
+        sock.close()
+
+
+def qmp_device_del_and_wait(
+    sock: socket.socket, device_id: str, timeout_s: float = 60.0
+) -> dict:
+    """Delete one owned device and wait for its exact removal event.
+
+    Operates on an already-connected QMP socket (unit-testable via
+    socketpair): greeting, handshake, ``device_del``, then reads
+    until BOTH the command's ``{"return": {}}`` AND the matching
+    ``DEVICE_DELETED`` event for ``device_id`` arrive (either
+    order), bounded by a monotonic ``timeout_s`` deadline.
+    Unrelated events are ignored but a missing event, a command
+    error, or a closed socket refuses — removal is never assumed.
+    Returns the matching event object.
+    """
+    if not device_id or any(ch.isspace() for ch in str(device_id)):
+        raise GuestError(f"blank QMP device id {device_id!r} (refusing)")
+    deadline = time.monotonic() + timeout_s
+    sock.settimeout(timeout_s)
+    fh = sock.makefile("r")
+    try:
+        greeting = fh.readline()
+    except (OSError, ValueError) as err:
+        raise GuestError(f"QMP greeting unreadable: {err}") from err
+    try:
+        json.loads(greeting)
+    except (json.JSONDecodeError, TypeError) as err:
+        raise GuestError(f"QMP greeting is not JSON: {err}") from err
+    try:
+        sock.sendall(b'{"execute": "qmp_capabilities"}\n')
+        json.loads(fh.readline())
+        sock.sendall(
+            (json.dumps({"execute": "device_del",
+                         "arguments": {"id": device_id}}) + "\n").encode()
+        )
+    except (OSError, ValueError) as err:
+        raise GuestError(f"QMP device_del send failed: {err}") from err
+    returned = False
+    pending_event: dict | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GuestError(
+                f"timed out waiting for DEVICE_DELETED {device_id!r}"
+                f" (returned={returned})"
+            )
+        sock.settimeout(remaining)
+        try:
+            line = fh.readline()
+        except (OSError, ValueError) as err:
+            raise GuestError(
+                f"QMP event read failed waiting for DEVICE_DELETED"
+                f" {device_id!r}: {err}"
+            ) from err
+        if not line:
+            raise GuestError(
+                f"QMP closed waiting for DEVICE_DELETED {device_id!r}"
+            )
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as err:
+            raise GuestError(f"QMP event is not JSON: {err}") from err
+        if not isinstance(message, dict):
+            raise GuestError(f"QMP event is not an object: {message!r}")
+        if "event" in message:
+            if (
+                message.get("event") == "DEVICE_DELETED"
+                and isinstance(message.get("data"), dict)
+                and message["data"].get("device") == device_id
+            ):
+                if returned:
+                    return message
+                # Event arrived first: keep reading for the return.
+                pending_event = message
+            continue
+        if "error" in message:
+            raise GuestError(f"QMP device_del {device_id!r} refused: {message}")
+        if "return" in message:
+            returned = True
+            if isinstance(pending_event, dict):
+                return pending_event
+            continue
+        raise GuestError(f"QMP unexpected message during device_del: {message!r}")
+
+
+def qmp_remove_device(
+    guest: OwnedGuest, device_id: str, timeout_s: float = 60.0
+) -> dict:
+    """Remove one device from the owned guest (owned socket only)."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout_s)
+    try:
+        try:
+            sock.connect(guest.qmp_socket)
+        except OSError as err:
+            raise GuestError(
+                f"QMP connect to owned socket failed: {err}"
+            ) from err
+        return qmp_device_del_and_wait(sock, device_id, timeout_s=timeout_s)
     finally:
         sock.close()
 
@@ -415,6 +538,34 @@ def stop_guest(guest: OwnedGuest) -> dict:
     return fragment
 
 
+def _wait_for_console_mark(
+    guest: OwnedGuest,
+    console_log: pathlib.Path,
+    needle: str,
+    timeout_s: float,
+    poll_s: float = 1.0,
+) -> bool:
+    """Poll the serial log for a guest mark (bounded, monotonic).
+
+    Returns True on the first sighting, False when the guest exits
+    first or the budget expires — the caller judges a missed mark
+    as failed evidence, never as success.
+    """
+    start = time.monotonic()
+    while True:
+        try:
+            text = console_log.read_text(errors="replace")
+        except OSError:
+            text = ""
+        if needle in text:
+            return True
+        if guest.proc.poll() is not None:
+            return False
+        if time.monotonic() - start > timeout_s:
+            return False
+        time.sleep(poll_s)
+
+
 def run_cell(
     *,
     guest: OwnedGuest,
@@ -422,38 +573,86 @@ def run_cell(
     run_dir: pathlib.Path,
     run_id: str,
     manifest_sha256: str | None,
+    qmp_device: str | None = None,
 ) -> pathlib.Path:
     """Run one manifest cell against the owned guest (bounded wait).
 
-    Waits up to the cell's frozen ``timeout_s`` budget for the guest
-    command, then writes the cell receipt (schema cell/v1) with the
-    process outcome and the harness console check. The caller stops
-    the guest afterwards and finalizes the receipt with the stop
-    fragment. Returns the receipt path.
+    The harness cell keeps its legacy console check; every D-cell
+    parses the full console into sealed ledgers through
+    :mod:`cells` (exact counts, gapless sequences, ordered marks).
+    The removal cell additionally drives one QMP ``device_del``
+    mid-flight once the guest marks QUIESCED, and records the
+    exact removal event (or its absence) for the receipt. The
+    caller stops the guest afterwards and finalizes the receipt
+    with the stop fragment. Returns the receipt path.
     """
+    from kcrypto_qemu_demo import cells as cell_builders
+
     run_dir = pathlib.Path(run_dir)
     timeout_s = cell["limits"]["timeout_s"]
-    wait = wait_guest(guest, timeout_s)
-    console = run_dir / "console.log"
+    kind = cell["workload"].get("kind")
+    console_log = run_dir / "console.log"
+    if kind == "cold-boot-no-observer":
+        wait = wait_guest(guest, timeout_s)
+        try:
+            text = console_log.read_text(errors="replace")
+        except OSError:
+            text = ""
+        receipt = {
+            "$schema": SCHEMA_CELL,
+            "run_id": run_id,
+            "cell_id": cell["id"],
+            "image": guest.name,
+            "verdict": "RUN",
+            "process": {
+                "exit": wait["exit"],
+                "timed_out": wait["timed_out"],
+                "reaped": guest.proc.returncode is not None,
+            },
+            "observation": {"expected": 1,
+                            "actual": 1 if "INIT-READY" in text else 0},
+            "checks": {"console_has_init_ready": "INIT-READY" in text},
+            "custody": {"manifest_sha256": manifest_sha256},
+        }
+        receipt_path = run_dir / f"cell-{cell['id']}.json"
+        atomic_write_json(receipt_path, receipt)
+        return receipt_path
+    extra: dict = {}
+    deadline = time.monotonic() + timeout_s
+    if kind == "device-removal":
+        if not qmp_device:
+            raise GuestError("device-removal needs exactly one QMP device")
+        quiesce_budget = max(1.0, timeout_s - 70.0)
+        seen = _wait_for_console_mark(
+            guest, console_log, '"name": "QUIESCED"', quiesce_budget)
+        if not seen:
+            extra = {"expected_device": qmp_device, "qmp_events": [],
+                     "qmp_error": "guest never marked QUIESCED"}
+        else:
+            try:
+                event = qmp_remove_device(guest, qmp_device,
+                                          timeout_s=min(
+                                              60.0, deadline -
+                                              time.monotonic()))
+                extra = {"expected_device": qmp_device,
+                         "qmp_events": [event], "qmp_error": None}
+            except GuestError as err:
+                extra = {"expected_device": qmp_device, "qmp_events": [],
+                         "qmp_error": str(err)}
+    remaining = max(1.0, deadline - time.monotonic())
+    wait = wait_guest(guest, remaining)
     try:
-        text = console.read_text(errors="replace")
+        text = console_log.read_text(errors="replace")
     except OSError:
         text = ""
-    receipt = {
-        "$schema": SCHEMA_CELL,
-        "run_id": run_id,
-        "cell_id": cell["id"],
-        "image": guest.name,
-        "verdict": "RUN",
-        "process": {
-            "exit": wait["exit"],
-            "timed_out": wait["timed_out"],
-            "reaped": guest.proc.returncode is not None,
-        },
-        "observation": {"expected": 1, "actual": 1 if "INIT-READY" in text else 0},
-        "checks": {"console_has_init_ready": "INIT-READY" in text},
-        "custody": {"manifest_sha256": manifest_sha256},
-    }
+    receipt, ledgers = cell_builders.build_cell(
+        cell, run_id, manifest_sha256, text,
+        {"exit": wait["exit"], "timed_out": wait["timed_out"],
+         "reaped": guest.proc.returncode is not None},
+        guest.name, extra=extra or None,
+    )
+    for name, body in sorted(ledgers.items()):
+        (run_dir / name).write_text(body)
     receipt_path = run_dir / f"cell-{cell['id']}.json"
     atomic_write_json(receipt_path, receipt)
     return receipt_path

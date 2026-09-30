@@ -306,5 +306,123 @@ class QmpTests(unittest.TestCase):
             thread.join(timeout=10)
 
 
+class QemuCmdCellTests(unittest.TestCase):
+    def _cmd(self, **kwargs):
+        image = test_manifest()["images"][0]
+        return runner._qemu_cmd(
+            test_manifest()["qemu"],
+            image,
+            overlay=Path("/run/disk-overlay.qcow2"),
+            data_disk=None,
+            qmp_socket=Path("/run/qmp.sock"),
+            console_log=Path("/run/console.log"),
+            **kwargs,
+        )
+
+    def test_qemu_cmd_carries_cell_selector(self):
+        cmd = self._cmd(cell_id="D01")
+        append = cmd[cmd.index("-append") + 1]
+        self.assertIn("kcrypto.cell=D01", append)
+        self.assertIn("console=ttyS0", append)
+
+    def test_qemu_cmd_without_cell_has_no_selector(self):
+        cmd = self._cmd()
+        append = cmd[cmd.index("-append") + 1]
+        self.assertNotIn("kcrypto.cell=", append)
+
+    def test_qemu_cmd_rejects_blank_cell(self):
+        with self.assertRaises(runner.GuestError):
+            self._cmd(cell_id="D 01")
+
+    def test_qemu_cmd_rejects_unknown_cell(self):
+        with self.assertRaises(runner.GuestError):
+            self._cmd(cell_id="FROB")
+
+
+class QmpRemovalTests(unittest.TestCase):
+    def _serve(self, script):
+        # script: list of (expect_substr_or_None, [reply_lines]).
+        server, client = socket.socketpair()
+        observed: list = []
+
+        def serve():
+            with server:
+                server.sendall(
+                    b'{"QMP": {"version": {"qemu": {"micro": 1}}}}\n'
+                )
+                fh = server.makefile("r")
+                for expect, replies in script:
+                    if expect is not None:
+                        observed.append(json.loads(fh.readline()))
+                    for reply in replies:
+                        server.sendall((reply + "\n").encode())
+                # Hold the socket briefly so the client cannot see
+                # EOF before its deadline logic runs.
+                time.sleep(2)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return server, client, thread, observed
+
+    def test_device_del_waits_for_event(self):
+        _, client, thread, observed = self._serve([
+            ("caps", ['{"return": {}}']),
+            ("del", ['{"return": {}}',
+                     '{"event": "DEVICE_DELETED",'
+                     ' "data": {"device": "crypto0"}}']),
+        ])
+        try:
+            with client:
+                event = runner.qmp_device_del_and_wait(
+                    client, "crypto0", timeout_s=5.0
+                )
+        finally:
+            thread.join(timeout=10)
+        self.assertEqual(event["event"], "DEVICE_DELETED")
+        self.assertEqual(event["data"]["device"], "crypto0")
+        self.assertEqual(observed[1]["execute"], "device_del")
+        self.assertEqual(observed[1]["arguments"]["id"], "crypto0")
+
+    def test_device_del_ignores_unrelated_event(self):
+        _, client, thread, _ = self._serve([
+            ("caps", ['{"return": {}}']),
+            ("del", ['{"event": "DEVICE_DELETED",'
+                     ' "data": {"device": "other"}}',
+                     '{"return": {}}',
+                     '{"event": "DEVICE_DELETED",'
+                     ' "data": {"device": "crypto0"}}']),
+        ])
+        try:
+            with client:
+                event = runner.qmp_device_del_and_wait(
+                    client, "crypto0", timeout_s=5.0
+                )
+        finally:
+            thread.join(timeout=10)
+        self.assertEqual(event["data"]["device"], "crypto0")
+
+    def test_device_del_error_refuses_without_wait(self):
+        _, client, thread, _ = self._serve([
+            ("caps", ['{"return": {}}']),
+            ("del", ['{"error": {"class": "DeviceNotFound"}}']),
+        ])
+        try:
+            with client, self.assertRaisesRegex(runner.GuestError, "device_del"):
+                runner.qmp_device_del_and_wait(client, "crypto0", timeout_s=2.0)
+        finally:
+            thread.join(timeout=10)
+
+    def test_device_del_timeout_refuses(self):
+        _, client, thread, _ = self._serve([
+            ("caps", ['{"return": {}}']),
+            ("del", ['{"return": {}}']),
+        ])
+        try:
+            with client, self.assertRaisesRegex(runner.GuestError, "DEVICE_DELETED"):
+                runner.qmp_device_del_and_wait(client, "crypto0", timeout_s=0.5)
+        finally:
+            thread.join(timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main()
