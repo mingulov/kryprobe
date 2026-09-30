@@ -29,6 +29,25 @@ records the exact successor-artifact recipe meanwhile.
 - DEMO: rows: ADDRESS-FREE. Zero `^DEMO:.*"ip"` matches across
   every sealed console; all IPs arrive via product passthrough.
 
+## Observed state (p10a7 repair, firsthand)
+
+Two address-bearing populations, both product passthrough:
+
+- `product-report.json`: 252 `"ip"` fields (D04-repair1 32,
+  D07-repair1/2/3 70 each, D08-repair2 10; D07-broken1,
+  D07-late1, D08-repair1 carry 0; D05 has no product report
+  by design). `privacy-scan.log` TOTAL 252 is accurate per
+  its stated method (product reports only) and must not be
+  read as the campaign total.
+- `window-reports.json` (D08 retention, R1): 568 `"ip"`
+  fields — D08-repair1 224, D08-repair2 344 (byte count and
+  recursive JSON-key count agree). The sealed consoles carry
+  the same per-window copies inside the numbered
+  `KRYPROBE-WINDOW-BEGIN/END` blocks (14 blocks / 224 fields
+  repair1, 20 blocks / 344 fields repair2).
+- Campaign address-bearing total: 252 + 568 = 820. DEMO:
+  rows stay address-free across all repair consoles.
+
 Privacy claims are therefore narrowed to keys/credentials
 everywhere; kernel-address material rides the product bytes
 pending O1.
@@ -50,14 +69,22 @@ is a presentation artifact, never re-judged.
      value with `"ip": "REDACTED-kernel-ip"` (string marker —
      visibly schema-breaking by design, so the successor can
      never be mistaken for judgeable evidence);
-   - every `console.log` KRYPROBE / KRYPROBE-WINDOW block: the
-     same replacement, so console and ledgers agree.
+   - every `window-reports.json` (D08 retention): the same
+     replacement over every retained per-window report, so no
+     window population survives the named transform;
+   - every `console.log` KRYPROBE block and every numbered
+     KRYPROBE-WINDOW block: the same replacement, so console
+     and ledgers agree.
    DEMO: rows, run logs, receipts, and seals are byte-identical
    to the origin otherwise.
 4. Sketch (stdlib only; hash the exact script into provenance):
    `re.sub(r'"ip":\s*\d+', '"ip": "REDACTED-kernel-ip"', text)`
-   applied to the files above, then recount (expect 0 remaining
-   `"ip": <int>` and N replacements logged per file).
+   applied to every file above, then recount residual
+   `"ip": <int>` across the whole successor tree (expect 0
+   remaining anywhere, and N replacements logged per file —
+   the per-file counts must sum to the origin populations:
+   252 product + 568 window for p10a7, 407 product for p10a4,
+   plus the identical console-block copies).
 5. Write the successor seal: fresh `SHA256SUMS` over the
    successor tree (same `./`-prefixed `sha256sum` format). Never
    copy the origin `SHA256SUMS` as the successor's.
