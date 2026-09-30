@@ -1,0 +1,48 @@
+{
+  "status": "UNFROZEN-template",
+  "note": "Template for the frozen image inputs. Copy each entry into the run manifest (inputs/v1) with exact measured sha256 values before the first boot; null means unmeasured. The freeze step must hash the exact vmlinuz/initramfs/rootfs bytes, record the effective QEMU CPU model/flags, and pin root/firmware artifacts without altering other VM caches.",
+  "images": [
+    {
+      "id": "img-7014-base",
+      "kernel": "7.0.14",
+      "vmlinuz": null,
+      "vmlinuz_sha256": null,
+      "config_sha256": null,
+      "initramfs": null,
+      "initramfs_sha256": null,
+      "rootfs": null,
+      "rootfs_sha256": null,
+      "rootfs_format": "raw",
+      "cpu": {"model": "host", "flags": []},
+      "devices": []
+    },
+    {
+      "id": "img-7014-nocrypto",
+      "kernel": "7.0.14",
+      "vmlinuz": null,
+      "vmlinuz_sha256": null,
+      "config_sha256": null,
+      "initramfs": null,
+      "initramfs_sha256": null,
+      "rootfs": null,
+      "rootfs_sha256": null,
+      "rootfs_format": "raw",
+      "cpu": {"model": "host,-aes,-vaes", "flags": ["no-aes"]},
+      "devices": []
+    },
+    {
+      "id": "img-7014-1crypt",
+      "kernel": "7.0.14",
+      "vmlinuz": null,
+      "vmlinuz_sha256": null,
+      "config_sha256": null,
+      "initramfs": null,
+      "initramfs_sha256": null,
+      "rootfs": null,
+      "rootfs_sha256": null,
+      "rootfs_format": "raw",
+      "cpu": {"model": "host", "flags": []},
+      "devices": ["crypto0"]
+    }
+  ]
+}

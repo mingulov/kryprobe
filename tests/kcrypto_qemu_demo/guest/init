@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Demo guest init (attempt 1: harness cold boot, no observer, no workload).
+# Runs as PID 1 from the frozen initramfs: mounts the required virtual
+# filesystems, emits serial milestones, then powers off. Later tasks
+# extend this ordering: manifest check -> observer start -> structured
+# attach-ready -> controlled encrypted-volume unlock -> normal root boot.
+set -eu
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null || true
+
+echo "INIT-READY uptime=$(cut -d' ' -f1 /proc/uptime)" > /dev/console
+echo "OBSERVER-ABSENT WORKLOAD-ABSENT" > /dev/console
+if [ -r /proc/crypto ]; then
+  echo "CRYPTO-REGISTRY-BEGIN" > /dev/console
+  grep -E '^(name|driver|priority)' /proc/crypto > /dev/console 2>/dev/null || true
+  echo "CRYPTO-REGISTRY-END" > /dev/console
+fi
+
+sleep 5
+echo "POWERING-OFF" > /dev/console
+poweroff -f

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Demo guest observer handoff (Task 4 stub, NOT implemented in attempt 1).
+#
+# Required behavior (plan Task 4): keep the one initramfs collector alive
+# with its original output descriptors through switch_root, with an
+# explicit guest init service adopting the existing process rather than
+# launching a second collector. Descriptor closure, root switching and
+# collector death are tested; a second collector fails the boot cell.
+#
+# This file records the unit shape only. The adoption mechanism (pidfd +
+# /run output preservation + readiness re-check after switch_root) and
+# its guest integration are Task 4 work gated on the T12 output contract.
+[Unit]
+Description=Adopt the demo boot observer across switch_root (unimplemented)
+ConditionPathExists=/run/demo/observer.pid
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/false
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
