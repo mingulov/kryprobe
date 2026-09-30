@@ -18,6 +18,10 @@ mark() { echo "DEMO:MARK {\"name\": \"$1\", \"ts_mono\": $(uptime_s)}" > "$CONSO
 # ~1 s per 10 KB, and poweroff's own emerg printk otherwise
 # splices into still-draining evidence (D01-rerun1/2 tears).
 down() { sleep 3; poweroff -f; sleep 30; }
+# kryprobe exits: 0 clean, 3 partial (verdict gaps named in the
+# report; the host judges which gaps are structural). Anything
+# else is a failed product view.
+kryprobe_ok() { [ "$1" -eq 0 ] || [ "$1" -eq 3 ]; }
 die() { mark "FAILED-$1"; down; exit 1; }
 
 # --- shared prelude -------------------------------------------------
@@ -171,7 +175,7 @@ cell_D01() {
   if [ -f "$OUT/krep-d01.json" ]; then
     passthrough "$OUT/krep-d01.json"
   fi
-  if [ "$kexit" -ne 0 ]; then
+  if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d01.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
@@ -205,7 +209,7 @@ cell_D02() {
   if [ -f "$OUT/krep-d02.json" ]; then
     passthrough "$OUT/krep-d02.json"
   fi
-  if [ "$kexit" -ne 0 ]; then
+  if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d02.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
@@ -242,7 +246,7 @@ cell_D03() {
   if [ -f "$OUT/krep-d03.json" ]; then
     passthrough "$OUT/krep-d03.json"
   fi
-  if [ "$kexit" -ne 0 ]; then
+  if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d03.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
@@ -286,7 +290,7 @@ cell_D04() {
   if [ -f "$OUT/krep-d04.json" ]; then
     passthrough "$OUT/krep-d04.json"
   fi
-  if [ "$kexit" -ne 0 ]; then
+  if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d04.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
@@ -389,7 +393,7 @@ cell_D07() {
   if [ -f "$OUT/krep-d07.json" ]; then
     passthrough "$OUT/krep-d07.json"
   fi
-  if [ "$kexit" -ne 0 ]; then
+  if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d07.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
@@ -416,7 +420,7 @@ cell_D08() {
     rows="$(grep -c . "$OUT/krep-d08-$w.json" 2>/dev/null || true)"
     if [ -z "$rows" ]; then rows=0; fi
     echo "DEMO:SOAK {\"window\": $w, \"ops_ok\": $ok, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
-    if [ "$ok" != true ] || [ "$kexit" -ne 0 ]; then
+    if [ "$ok" != true ] || ! kryprobe_ok "$kexit"; then
       head -c 2000 "$OUT/krep-d08-$w.out" > "$CONSOLE" 2>/dev/null || true
       die "SOAK-W$w"
     fi
@@ -440,7 +444,7 @@ cell_D08() {
   if [ -f "$OUT/krep-d08-stop.json" ]; then
     passthrough "$OUT/krep-d08-stop.json"
   fi
-  if [ "$kexit" -ne 0 ]; then
+  if ! kryprobe_ok "$kexit"; then
     head -c 2000 "$OUT/krep-d08-stop.out" > "$CONSOLE" 2>/dev/null || true
     die "SOAK-STOP-KRYPROBE"
   fi
