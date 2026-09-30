@@ -281,6 +281,14 @@ def _build_d04(cell, run_id, guest_name, manifest_sha256, process,
             cell, run_id,
             "no virtio-crypto device/driver in this boot"
             " (device path unproven; queue claims need the R2 adapter)")
+        # Keep the process/custody shape so the caller can merge
+        # the owned stop fragment (cleanup proof rides along).
+        receipt["process"] = {
+            "exit": process.get("exit"),
+            "timed_out": bool(process.get("timed_out")),
+            "reaped": bool(process.get("reaped")),
+        }
+        receipt["custody"] = {"manifest_sha256": manifest_sha256}
         return receipt, ledgers
     generic = groups.get("d04-generic", [])
     generic_ok = (len(generic) == workload["control_ops"]

@@ -94,16 +94,22 @@ def cmd_run(args) -> int:
     except (receipts.InputError, OSError) as err:
         print(f"run: refused: {err}", file=sys.stderr)
         return EXIT_FAIL
-    cells = {cell["id"]: cell for cell in manifest["cells"]}
-    if args.cell not in cells:
+    by_id = {cell["id"]: cell for cell in manifest["cells"]}
+    if args.cell not in by_id:
         print(f"run: unknown cell {args.cell!r}", file=sys.stderr)
         return EXIT_USAGE
-    cell = cells[args.cell]
+    cell = by_id[args.cell]
     if run_dir.exists():
         print(f"run: refusing to reuse existing {run_dir}", file=sys.stderr)
         return EXIT_FAIL
     run_dir.mkdir(mode=0o700, parents=True)
-    run_id = run_dir.name
+    # Campaign run ID: the parent campaign dir when this cell runs
+    # inside one (parent holds INPUTS.json), else the dir itself.
+    campaign_parent = run_dir.resolve().parent
+    if (campaign_parent / "INPUTS.json").is_file():
+        run_id = campaign_parent.name
+    else:
+        run_id = run_dir.name
     receipts.atomic_write_json(
         run_dir / "run.json",
         {
@@ -133,11 +139,14 @@ def cmd_run(args) -> int:
         receipts.seal_artifacts(run_dir, ["run.json", path.name], writers_done=True)
         print(json.dumps({"cell": cell["id"], "verdict": "NOT_RUN", "reason": path.name}))
         return EXIT_NOT_RUN
-    try:
-        seal_ledgers = cells.check_evidence_cover(cell)
-    except cells.CellError as err:
-        print(f"run: evidence skew refused: {err}", file=sys.stderr)
-        return EXIT_FAIL
+    if kind == "cold-boot-no-observer":
+        seal_ledgers = [f"cell-{cell['id']}.json"]
+    else:
+        try:
+            seal_ledgers = cells.check_evidence_cover(cell)
+        except cells.CellError as err:
+            print(f"run: evidence skew refused: {err}", file=sys.stderr)
+            return EXIT_FAIL
     images = {image["id"]: image for image in manifest["images"]}
     image = images[cell["image"]]
     qmp_device = None

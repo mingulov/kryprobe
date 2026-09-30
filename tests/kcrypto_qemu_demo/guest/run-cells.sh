@@ -105,11 +105,13 @@ cell_PROBE() {
   if "$KRYPROBE" report --system --duration 10 --format json \
       --out "$OUT/krep-probe.json" > "$OUT/krep-probe.out" 2>&1; then
     echo "DEMO:PROBE {\"fact\": \"kryprobe\", \"exit\": 0}" > "$CONSOLE"
-    passthrough "$OUT/krep-probe.json"
   else
     rc=$?
     echo "DEMO:PROBE {\"fact\": \"kryprobe\", \"exit\": $rc}" > "$CONSOLE"
     head -c 2000 "$OUT/krep-probe.out" > "$CONSOLE" 2>/dev/null || true
+  fi
+  if [ -f "$OUT/krep-probe.json" ]; then
+    passthrough "$OUT/krep-probe.json"
   fi
   mark "PROBE-LIFECYCLE-START"
   if "$KRYPROBE" report --system --duration 10 --format json \
@@ -120,6 +122,9 @@ cell_PROBE() {
     rc=$?
     echo "DEMO:PROBE {\"fact\": \"kryprobe-lifecycle\", \"exit\": $rc}" > "$CONSOLE"
     head -c 2000 "$OUT/krep-probe-lc.out" > "$CONSOLE" 2>/dev/null || true
+  fi
+  if [ -f "$OUT/krep-probe-lc.json" ]; then
+    passthrough "$OUT/krep-probe-lc.json"
   fi
   # Root-disk census: partitions + first-level listing, read-only.
   for part in /dev/vda*; do
