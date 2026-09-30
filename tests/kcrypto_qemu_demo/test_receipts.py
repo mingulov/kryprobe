@@ -199,5 +199,17 @@ class SkipTests(unittest.TestCase):
         self.assertTrue(any("actual_body" in r for r in judged["reasons"]))
 
 
+class HarnessCommitTests(unittest.TestCase):
+    def test_harness_commit_inside_repo(self):
+        # R8 RED: the judging harness revision binds receipts.
+        sha = receipts.harness_commit(ROOT)
+        self.assertRegex(sha, r"^[0-9a-f]{40}$")
+
+    def test_harness_commit_outside_repo_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                receipts.harness_commit(Path(tmp)), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -160,6 +160,60 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("UNSUPPORTED", proc.stdout)
 
+    def _sealed_pass_dir(self, root: Path) -> Path:
+        # Hand-sealed PASS dir: run.json + one all-true RUN receipt
+        # + SHA256SUMS (hashlib only, no harness import).
+        cell_dir = root / "D09"
+        cell_dir.mkdir()
+        (cell_dir / "run.json").write_text(json.dumps(
+            {"run_id": "run9", "cell_id": "D09"}))
+        (cell_dir / "cell-D09.json").write_text(json.dumps(
+            {"$schema": "kcrypto.qemu-demo.cell/v1",
+             "run_id": "run9", "cell_id": "D09", "verdict": "RUN",
+             "process": {"exit": 0, "timed_out": False,
+                         "reaped": True},
+             "cleanup": {"remaining_owned": {},
+                         "preexisting_unchanged": True},
+             "custody": {"manifest_sha256": "ab" * 32},
+             "observation": {"expected": 1, "actual": 1},
+             "checks": {"console_has_init_ready": True}}))
+        lines = ""
+        for name in ("cell-D09.json", "run.json"):
+            digest = hashlib.sha256(
+                (cell_dir / name).read_bytes()).hexdigest()
+            lines += f"{digest}  {name}\n"
+        (cell_dir / "SHA256SUMS").write_text(lines)
+        return cell_dir
+
+    def test_verify_passes_intact_sealed_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("campaign: PASS", proc.stdout)
+
+    def test_verify_rejects_tampered_seal(self):
+        # R8 RED: verify must check SHA256SUMS contents, not just
+        # its existence.
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            with (cell_dir / "run.json").open("a") as fh:
+                fh.write(" ")
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("seal", proc.stdout)
+        self.assertIn("campaign: FAIL", proc.stdout)
+
+    def test_verify_rejects_missing_sealed_file(self):
+        # R8 RED: a sealed entry deleted after sealing must fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            (cell_dir / "run.json").unlink()
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("seal", proc.stdout)
+        self.assertIn("campaign: FAIL", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
