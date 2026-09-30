@@ -9,6 +9,7 @@ the no-boot D06 UNSUPPORTED lane, offline verify): nothing here
 boots a guest, takes a lock, or needs privilege.
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -121,6 +122,13 @@ class CliTests(unittest.TestCase):
             self.assertEqual(receipt["verdict"], "UNSUPPORTED")
             self.assertTrue(receipt["reason"])
             self.assertTrue(receipt["positive_control"])
+            # The no-boot seal still pins its manifest (no process
+            # key: no worker process ever existed).
+            want = hashlib.sha256(
+                manifest.read_bytes()).hexdigest()
+            self.assertEqual(receipt["custody"],
+                             {"manifest_sha256": want})
+            self.assertNotIn("process", receipt)
             self.assertTrue((cell_dir / "SHA256SUMS").is_file())
             # No guest ever booted: no spawn, no console, no overlay.
             self.assertFalse((cell_dir / "spawn.json").exists())

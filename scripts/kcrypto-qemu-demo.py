@@ -123,7 +123,8 @@ def cmd_run(args) -> int:
     kind = cell["workload"].get("kind")
     if kind in UNSUPPORTED_WORKLOADS:
         receipt = cells.unsupported_receipt(
-            cell, run_id, UNSUPPORTED_WORKLOADS[kind])
+            cell, run_id, UNSUPPORTED_WORKLOADS[kind],
+            manifest["_manifest_sha256"])
         path = run_dir / f"cell-{cell['id']}.json"
         receipts.atomic_write_json(path, receipt)
         receipts.seal_artifacts(run_dir, ["run.json", path.name],

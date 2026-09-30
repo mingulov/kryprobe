@@ -37,9 +37,14 @@ ATTACH_SLACK_S = 5.0
 ALLOWED_PARTIAL_MISSING = frozenset({"capture-integrity", "completion"})
 
 
-def unsupported_receipt(cell: dict, run_id: str, reason: str) -> dict:
-    """A declared UNSUPPORTED receipt (no boot, named control)."""
-    return {
+def unsupported_receipt(cell: dict, run_id: str, reason: str,
+                        manifest_sha256: str | None = None) -> dict:
+    """A declared UNSUPPORTED receipt (no boot, named control).
+
+    The seal still pins its manifest; there is deliberately no
+    ``process`` key (no worker process ever existed).
+    """
+    receipt = {
         "$schema": SCHEMA_CELL,
         "run_id": run_id,
         "cell_id": cell["id"],
@@ -47,6 +52,9 @@ def unsupported_receipt(cell: dict, run_id: str, reason: str) -> dict:
         "reason": reason,
         "positive_control": POSITIVE_CONTROL,
     }
+    if manifest_sha256 is not None:
+        receipt["custody"] = {"manifest_sha256": manifest_sha256}
+    return receipt
 
 
 def ledger_names(workload: dict) -> list[str]:
