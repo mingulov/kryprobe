@@ -790,6 +790,9 @@ def _build_d07(cell, run_id, guest_name, manifest_sha256, process,
     io_checks, info = _io_checks(parsed, want)
     presence_checks, presence_info = product_presence(
         parsed["KRYPROBE"], _kryprobe_exit(parsed))
+    attached = _probe_rows(parsed, "kryprobe-attached")
+    via = attached[-1].get("via") if attached else None
+    method = via if isinstance(via, str) and via else "unknown"
     checks = {
         "marks_ordered": console.marks_ordered(
             parsed["MARK"],
@@ -797,6 +800,7 @@ def _build_d07(cell, run_id, guest_name, manifest_sha256, process,
                              "UNLOCK-START", "UNLOCK-DONE",
                              "WORKLOAD-STOP", "WORKLOAD-DONE"]),
         "unlock_after_attach": unlocked,
+        "attach_via_known": method != "unknown",
         **io_checks,
         **_dmap_checks(parsed),
         "kryprobe_present": parsed["KRYPROBE"] is not None,
@@ -809,7 +813,7 @@ def _build_d07(cell, run_id, guest_name, manifest_sha256, process,
     ledgers = {
         "attach-ready.json": json.dumps(
             {"attach_ts": attach_ts, "unlock_ts": unlock_ts,
-             "method": "bpf-prog-fd", "unobserved": gap},
+             "method": method, "unobserved": gap},
             indent=2, sort_keys=True) + "\n",
         "io-ledger.json": json.dumps({"io": parsed["IO"],
                                       "dmap": parsed["DMAP"]},

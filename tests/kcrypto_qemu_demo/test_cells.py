@@ -507,6 +507,8 @@ class D07Tests(unittest.TestCase):
         lines = list(PRELUDE_MARKS)
         lines += [
             mark("KRYPROBE-START", 9.0),
+            'DEMO:PROBE {"fact": "kryprobe-attached", "via": "stdout",'
+            ' "wait_s": 1}',
             mark("ATTACH-READY", 10.0),
             mark("UNLOCK-START", 11.0),
             'DEMO:DMAP {"event": "create", "name": "demo-d07",'

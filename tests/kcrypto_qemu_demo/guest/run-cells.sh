@@ -3,7 +3,9 @@
 # Demo guest cell dispatcher (attempt 4).
 # Usage: run-cells.sh <CELL-ID>  (exec'd by /init as PID 1)
 # No secret material (keys, IVs, tags, payloads, kernel addresses)
-# may ever appear on argv, trace output, or console: metadata only.
+# may ever appear on argv, trace output, or console DEMO: rows:
+# metadata only. Product passthrough blocks carry the hash-pinned
+# product's bytes verbatim (guest tools never compose those bytes).
 # Never set -x in this file: the dm-crypt table carries key bytes.
 set -eu
 
@@ -28,8 +30,11 @@ die() { mark "FAILED-$1"; down; exit 1; }
 # 1.2 s dm-crypt burst finish before the collection window opened
 # (interval start 8.94 s, I/O done 6.75 s) -- zero traffic observed.
 # Primary signal: the {"audit":"attach"} line on kryprobe's stdout
-# log. Fallback: live bpf-prog fds (stdout may be block-buffered
-# when redirected). Dies honestly when neither appears.
+# log. Fallback: a live bpf-link fd owned by the kryprobe pid
+# (stdout may be block-buffered when redirected). A link IS an
+# attachment by kernel construction; a bare prog_id in fdinfo
+# would prove only that a program is loaded, so fdinfo alone no
+# longer qualifies. Dies honestly when neither appears.
 # $1 = kryprobe stdout log, $2 = kryprobe pid.
 wait_attached() {
   out="$1"; kpid="$2"
@@ -44,10 +49,17 @@ wait_attached() {
     sleep 0.5
     i=$((i + 1))
   done
-  if ls "/proc/$kpid/fdinfo" > /dev/null 2>&1 && \
-     grep -l 'prog_id:' "/proc/$kpid/fdinfo/"* 2>/dev/null | head -1 | grep -q .; then
+  link=false
+  if [ -d "/proc/$kpid/fd" ]; then
+    for fd in "/proc/$kpid/fd/"*; do
+      case "$(readlink "$fd" 2>/dev/null || true)" in
+        *bpf-link*) link=true; break ;;
+      esac
+    done
+  fi
+  if [ "$link" = true ]; then
     now="$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
-    echo "DEMO:PROBE {\"fact\": \"kryprobe-attached\", \"via\": \"fdinfo-fallback\", \"wait_s\": $((now - start))}" > "$CONSOLE"
+    echo "DEMO:PROBE {\"fact\": \"kryprobe-attached\", \"via\": \"bpf-link\", \"wait_s\": $((now - start))}" > "$CONSOLE"
     return 0
   fi
   head -c 2000 "$out" > "$CONSOLE" 2>/dev/null || true
@@ -428,8 +440,7 @@ cell_D07() {
     --out "$OUT/krep-d07.json" > "$OUT/krep-d07.out" 2>&1 &
   kp=$!
   # Attach-ready: the observer reports attach (stdout) or holds a
-  # live bpf-prog fd (fdinfo fallback); the helper dies honestly
-  # when neither appears.
+  # live bpf-link fd; the helper dies honestly when neither appears.
   wait_attached "$OUT/krep-d07.out" "$kp"
   mark "ATTACH-READY"
   sectors="$(cat /sys/block/vdb/size)"
