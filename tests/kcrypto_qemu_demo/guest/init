@@ -59,7 +59,7 @@ fi
 # (a hang can never pass).
 case "$CELL" in
   D08) WATCHDOG=1440 ;;
-  D07) WATCHDOG=270 ;;
+  D07|D07-late|D07-broken) WATCHDOG=270 ;;
   *) WATCHDOG=150 ;;
 esac
 ( sleep "$WATCHDOG"

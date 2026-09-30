@@ -69,6 +69,22 @@
       "expected_evidence": ["attach-ready.json", "io-ledger.json", "product-report.json", "cell-D07.json"]
     },
     {
+      "id": "D07-late",
+      "title": "boot with deliberately late observer (negative)",
+      "image": "img-7014-base",
+      "workload": {"kind": "early-boot", "observer": "late", "io_bytes": 16777216, "needs_data_disk": true},
+      "limits": {"timeout_s": 300},
+      "expected_evidence": ["attach-ready.json", "io-ledger.json", "product-report.json", "cell-D07-late.json"]
+    },
+    {
+      "id": "D07-broken",
+      "title": "boot with deliberately broken collector (negative)",
+      "image": "img-7014-base",
+      "workload": {"kind": "early-boot", "observer": "broken", "io_bytes": 16777216, "needs_data_disk": false},
+      "limits": {"timeout_s": 300},
+      "expected_evidence": ["attach-ready.json", "io-ledger.json", "product-report.json", "cell-D07-broken.json"]
+    },
+    {
       "id": "D08",
       "title": "stop and slower stability (20-minute soak)",
       "image": "img-7014-base",

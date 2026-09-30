@@ -472,6 +472,70 @@ cell_D07() {
   finish
 }
 
+# --- D07-late: deliberately late observer (negative control) ----
+# Unlock first, start the observer after: the oracle must fail
+# unlock_after_attach with the unlock inside the UNOBSERVED span.
+cell_D07_LATE() {
+  prelude "af_alg algif_skcipher dm-crypt"
+  [ -e /dev/vdb ] || die "NO-DATA-DISK"
+  sectors="$(cat /sys/block/vdb/size)"
+  keyhex="$(od -A n -t x1 -N 64 /dev/urandom | tr -d ' \n')"
+  printf '0 %s crypt aes-xts-plain64 %s 0 /dev/vdb 0' "$sectors" "$keyhex" \
+    > "$OUT/d07late.table"
+  chmod 600 "$OUT/d07late.table"
+  keyhex=""
+  mark "UNLOCK-START"
+  dmap create --name demo-d07late > "$CONSOLE" || die "DMAP-CREATE"
+  dmap load --name demo-d07late --table-file "$OUT/d07late.table" \
+    --sectors "$sectors" > "$CONSOLE" || die "DMAP-LOAD"
+  dmap resume --name demo-d07late > "$CONSOLE" || die "DMAP-RESUME"
+  mark "UNLOCK-DONE"
+  dmnode="$(dm_node demo-d07late)" || die "NO-DM-NODE"
+  echo "DEMO:PROBE {\"fact\": \"dmnode\", \"name\": \"demo-d07late\", \"node\": \"$dmnode\"}" > "$CONSOLE"
+  iochk --dev "$dmnode" --bytes 16777216 > "$CONSOLE" || die "IOCHK"
+  dmap remove --name demo-d07late > "$CONSOLE" || die "DMAP-REMOVE"
+  # Observer starts only now: deliberately late.
+  mark "KRYPROBE-START"
+  "$KRYPROBE" report --system --duration 120 --format json \
+    --out "$OUT/krep-d07late.json" > "$OUT/krep-d07late.out" 2>&1 &
+  kp=$!
+  wait_attached "$OUT/krep-d07late.out" "$kp"
+  mark "ATTACH-READY"
+  mark "WORKLOAD-STOP"
+  if wait "$kp"; then kexit=0; else kexit=$?; fi
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d07late.json" ]; then
+    passthrough "$OUT/krep-d07late.json"
+  fi
+  if ! kryprobe_ok "$kexit"; then
+    head -c 2000 "$OUT/krep-d07late.out" > "$CONSOLE" 2>/dev/null || true
+    die "KRYPROBE"
+  fi
+  finish
+}
+
+# --- D07-broken: deliberately broken collector (negative) -------
+# Hide the aggregate BPF object (after the manifest check, and
+# recorded), then start the observer: attach must never become
+# ready, and the boot must fail — never a green boot capture.
+cell_D07_BROKEN() {
+  prelude "af_alg algif_skcipher dm-crypt"
+  if [ -f /opt/kryprobe/bin/kryprobe-bpf/kcrypto.bpf.o ]; then
+    mv /opt/kryprobe/bin/kryprobe-bpf/kcrypto.bpf.o \
+      "$OUT/kcrypto.bpf.o.hidden-by-broken-cell"
+  fi
+  echo "DEMO:PROBE {\"fact\": \"broken-collector\", \"object\": \"kcrypto.bpf.o\", \"hidden\": true}" > "$CONSOLE"
+  mark "KRYPROBE-START"
+  "$KRYPROBE" report --system --duration 120 --format json \
+    --out "$OUT/krep-d07broken.json" > "$OUT/krep-d07broken.out" 2>&1 &
+  kp=$!
+  wait_attached "$OUT/krep-d07broken.out" "$kp"
+  # Reached only if attach became ready despite the hidden
+  # object: the negative control itself misfired — fail loudly
+  # instead of narrating a "broken" boot as green.
+  die "BROKEN-CELL-ATTACHED"
+}
+
 # --- D08: 20-minute bounded aggregate soak + stop under traffic ----
 cell_D08() {
   prelude "af_alg algif_skcipher"
@@ -534,6 +598,8 @@ case "$CELL" in
   D04) cell_D04 ;;
   D05) cell_D05 ;;
   D07) cell_D07 ;;
+  D07-late) cell_D07_LATE ;;
+  D07-broken) cell_D07_BROKEN ;;
   D08) cell_D08 ;;
   D06)
     echo "NOT_RUN cell=$CELL reason=x01-threshold-provider-absent" > "$OUT/cell-$CELL.status"

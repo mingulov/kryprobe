@@ -77,30 +77,32 @@ def unsupported_receipt(cell: dict, run_id: str, reason: str,
     return receipt
 
 
-def ledger_names(workload: dict) -> list[str]:
-    """Sealed file names for a workload kind (ledgers + receipt)."""
+def ledger_names(workload: dict, cell_id: str) -> list[str]:
+    """Sealed file names for a workload kind (ledgers + receipt).
+
+    The receipt filename follows the cell ID so boot variants
+    (D07-late/D07-broken) seal under their own names.
+    """
     kind = workload.get("kind")
     table = {
         "provider-selection": ["workload-ledger.jsonl", "registry.json",
-                               "product-report.json", "cell-D01.json"],
+                               "product-report.json"],
         "cpu-variant": ["workload-ledger.jsonl", "registry.json",
                         "handles.json", "cpu-flags.txt",
-                        "product-report.json", "cell-D02.json"],
-        "dmcrypt-io": ["io-ledger.json", "product-report.json",
-                       "cell-D03.json"],
+                        "product-report.json"],
+        "dmcrypt-io": ["io-ledger.json", "product-report.json"],
         "virtio-device": ["device-ledger.json", "queue-reference.json",
-                          "product-report.json", "cell-D04.json"],
-        "device-removal": ["removal-ledger.json", "qmp-events.jsonl",
-                           "cell-D05.json"],
+                          "product-report.json"],
+        "device-removal": ["removal-ledger.json", "qmp-events.jsonl"],
         "early-boot": ["attach-ready.json", "io-ledger.json",
-                       "product-report.json", "cell-D07.json"],
+                       "product-report.json"],
         "stop-soak": ["workload-ledger.jsonl", "soak-windows.json",
                       "stop-receipt.json", "product-report.json",
-                      "window-reports.json", "cell-D08.json"],
+                      "window-reports.json"],
     }
     if kind not in table:
         raise CellError(f"unknown workload kind {kind!r}")
-    return list(table[kind])
+    return [*table[kind], f"cell-{cell_id}.json"]
 
 
 def _base_receipt(cell: dict, run_id: str, guest_name: str,
@@ -980,7 +982,7 @@ def check_evidence_cover(cell: dict) -> list[str]:
     instead of sealing a partial cell.
     """
     kind = cell["workload"].get("kind")
-    want = set(ledger_names({"kind": kind}))
+    want = set(ledger_names({"kind": kind}, cell.get("id", "?")))
     have = set(cell.get("expected_evidence", []))
     if want != have:
         raise CellError(

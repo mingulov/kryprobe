@@ -64,7 +64,8 @@ REQUIRED_CELL_KEYS = frozenset(
 )
 
 KNOWN_CELLS = frozenset(
-    {"T01-harness", "D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08"}
+    {"T01-harness", "D01", "D02", "D03", "D04", "D05", "D06", "D07",
+     "D07-late", "D07-broken", "D08"}
 )
 
 # The plan's only bounded budgets: 180 s ordinary, 300 s boot, 1500 s
