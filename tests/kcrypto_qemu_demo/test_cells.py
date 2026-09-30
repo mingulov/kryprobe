@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from kcrypto_qemu_demo import cells  # noqa: E402
+from kcrypto_qemu_demo import cells, receipts, runner  # noqa: E402
 
 PROC = {"exit": 0, "timed_out": False, "reaped": True}
 
@@ -616,6 +616,53 @@ class D07Tests(unittest.TestCase):
             cell(workload, "D07"), "run1", "msha", lines, PROC, "guest1")
         self.assertFalse(receipt["checks"]["unlock_after_attach"])
 
+    def test_d07_late_attach_fails_with_unobserved_unlock(self):
+        # R5 late negative: the unlock precedes attach, so the boot
+        # cell must fail with the unlock inside the UNOBSERVED span.
+        lines = "\n".join(PRELUDE_MARKS + [
+            mark("KRYPROBE-START", 9.0),
+            mark("UNLOCK-START", 9.5),
+            mark("UNLOCK-DONE", 10.5),
+            'DEMO:PROBE {"fact": "kryprobe-attached", "via": "stdout",'
+            ' "wait_s": 1}',
+            mark("ATTACH-READY", 12.0),
+            mark("WORKLOAD-STOP", 15.0),
+            mark("WORKLOAD-DONE", 16.0),
+            KRYPROBE_EXIT,
+        ])
+        workload = {"kind": "early-boot", "observer": "late",
+                    "io_bytes": 16777216}
+        receipt, _ = cells.build_cell(
+            cell(workload, "D07-late"), "run1", "msha",
+            lines + "\n" + KREPO, PROC, "guest1")
+        self.assertFalse(receipt["checks"]["unlock_after_attach"])
+        self.assertFalse(all(receipt["checks"].values()))
+        gap = receipt["unobserved"]
+        self.assertEqual(gap["mark"], "UNOBSERVED")
+        self.assertTrue(gap["bounded"])
+        self.assertLess(9.5, gap["end"])
+        self.assertTrue(receipt["checks"]["attach_via_known"])
+
+    def test_d07_broken_collector_fails(self):
+        # R5 broken negative: attach never becomes ready, so the
+        # boot cell must fail — never a green boot capture.
+        lines = "\n".join(PRELUDE_MARKS + [
+            mark("KRYPROBE-START", 9.0),
+            'DEMO:PROBE {"fact": "broken-collector",'
+            ' "object": "kcrypto.bpf.o", "hidden": true}',
+            mark("FAILED-KRYPROBE-ATTACH-TIMEOUT", 19.0),
+        ])
+        workload = {"kind": "early-boot", "observer": "broken",
+                    "io_bytes": 16777216}
+        receipt, ledgers = cells.build_cell(
+            cell(workload, "D07-broken"), "run1", "msha", lines + "\n",
+            PROC, "guest1")
+        self.assertFalse(receipt["checks"]["unlock_after_attach"])
+        self.assertFalse(all(receipt["checks"].values()))
+        attach = json.loads(ledgers["attach-ready.json"])
+        self.assertEqual(attach["method"], "unknown")
+        self.assertFalse(receipt["unobserved"]["bounded"])
+
 
 class D08Tests(unittest.TestCase):
     def _console(self, product_calls=1, stop_ts=(61.0, 95.0)):
@@ -1110,9 +1157,40 @@ class DispatchTests(unittest.TestCase):
             ("device-removal", "D05"), ("early-boot", "D07"),
             ("stop-soak", "D08"),
         ]:
-            names = cells.ledger_names({"kind": kind})
+            names = cells.ledger_names({"kind": kind}, cell_id)
             self.assertTrue(names, kind)
             self.assertIn(f"cell-{cell_id}.json", names, kind)
+
+    def test_ledger_names_cell_receipt(self):
+        # R5 RED: the receipt filename follows the cell ID so boot
+        # variants seal under their own names.
+        names = cells.ledger_names({"kind": "early-boot"}, "D07-late")
+        self.assertIn("cell-D07-late.json", names)
+        self.assertNotIn("cell-D07.json", names)
+        names = cells.ledger_names({"kind": "early-boot"}, "D07-broken")
+        self.assertIn("cell-D07-broken.json", names)
+
+    def test_known_cells_cover_boot_variants(self):
+        # R5 RED: late/broken boot negatives are runnable cells.
+        self.assertIn("D07-late", receipts.KNOWN_CELLS)
+        self.assertIn("D07-broken", receipts.KNOWN_CELLS)
+        self.assertIn("D07-late", runner.GUEST_CELLS)
+        self.assertIn("D07-broken", runner.GUEST_CELLS)
+
+    def test_boot_variant_topology(self):
+        # R5 RED: cells.json carries the late/broken boot cells
+        # with evidence cover matching their builders.
+        topo = json.loads((HERE / "cells.json").read_text())
+        by_id = {entry["id"]: entry for entry in topo["cells"]}
+        for cell_id, observer in (("D07-late", "late"),
+                                  ("D07-broken", "broken")):
+            entry = by_id[cell_id]
+            self.assertEqual(entry["workload"]["kind"], "early-boot")
+            self.assertEqual(entry["workload"]["observer"], observer)
+            self.assertEqual(entry["limits"], {"timeout_s": 300})
+            self.assertEqual(
+                sorted(entry["expected_evidence"]),
+                sorted(cells.ledger_names(entry["workload"], cell_id)))
 
 
 if __name__ == "__main__":

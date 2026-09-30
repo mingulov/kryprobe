@@ -339,6 +339,14 @@ class QemuCmdCellTests(unittest.TestCase):
         with self.assertRaises(runner.GuestError):
             self._cmd(cell_id="FROB")
 
+    def test_qemu_cmd_accepts_boot_variant_selectors(self):
+        # R5 RED: the late/broken boot negatives ride the kernel
+        # cmdline selector like every other D-cell.
+        for cell_id in ("D07-late", "D07-broken"):
+            cmd = self._cmd(cell_id=cell_id)
+            append = cmd[cmd.index("-append") + 1]
+            self.assertIn(f"kcrypto.cell={cell_id}", append)
+
     def test_d05_crypto_hangs_off_hotplug_port(self):
         # q35's pcie.0 root bus refuses hotplug; the removal cell
         # hangs its crypto device off a hotplug-capable root port.
