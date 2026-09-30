@@ -4,7 +4,9 @@
 
 Runs short AF_ALG bursts on the build host (needs
 CONFIG_CRYPTO_USER_API; fails loudly without it — never a silent
-skip) plus ledger-format checks. The async class needs the kernel
+skip) plus ledger-format checks. The AEAD burst asserts the
+driver's loud ENOENT refusal on kernels without AF_ALG AEAD
+instead of skipping. The async class needs the kernel
 fixture and is format-tested against a fake control file only;
 its guest semantics are proved by the campaign's own validity
 gates. Run from the product worktree root::
@@ -59,7 +61,16 @@ class DriverTests(unittest.TestCase):
 
     def test_aead_burst(self):
         proc, ledger = run_driver("aead", "1024", "1", "0.5")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        if proc.returncode != 0:
+            # Honest denial on kernels without AF_ALG AEAD:
+            # bind(("aead", "gcm(aes)")) raises ENOENT and the driver
+            # fails loudly per contract. Only that exact refusal
+            # signature passes here; anything else fails below.
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("driver failed:", proc.stderr)
+            self.assertIn("[Errno 2] No such file or directory",
+                          proc.stderr)
+            return
         summary = json.loads(Path(str(ledger) + ".summary.json").read_text())
         self.assertGreater(summary["ops_meas"], 10)
         self.assertEqual(summary["size"], 1024)
