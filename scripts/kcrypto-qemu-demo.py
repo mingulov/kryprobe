@@ -226,7 +226,14 @@ def cmd_verify(args) -> int:
     if not found:
         print("verify: no cell receipts", file=sys.stderr)
         return EXIT_FAIL
-    receipts_list = [json.loads(path.read_text()) for path in found]
+    receipts_list = []
+    for path in found:
+        try:
+            receipts_list.append(json.loads(path.read_text()))
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            print(f"reason: cell receipt {path.name} is not valid JSON: {err}")
+            print("campaign: FAIL")
+            return EXIT_FAIL
     required = [item.get("cell_id", "?") for item in receipts_list]
     judged = reconcile.reconcile_campaign(
         required, receipts_list, uniform_pins=PRODUCT_PIN_NAMES
