@@ -56,7 +56,7 @@ def build_once(src, pins, peel, tree, vendor_files, notices_files, payload, stag
     shutil.copyfile(src / "packaging/install.sh", binary / "packaging/install.sh")
     shutil.copyfile(src / "LICENSE", binary / "LICENSE")
     shutil.copytree(src / "LICENSES", binary / "LICENSES")
-    gpl2 = Path("/usr/share/common-licenses/GPL-2")
+    gpl2 = Path(__file__).with_name("GPL-2.txt")
     if not gpl2.is_file() or digest(gpl2) != pins["gpl2_text_sha256"]:
         raise SystemExit("GPL-2 text missing or not the pinned bytes")
     shutil.copyfile(gpl2, binary / "LICENSES/GPL-2.0-only.txt")

@@ -68,5 +68,5 @@
     "demo": "a3987e7379014a2a079dfc63a0a321f0409244ef"
   },
   "gpl2_text_sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
-  "gpl2_note": "Exact bytes of /usr/share/common-licenses/GPL-2 on the assembly host; the pipeline refuses to substitute any other license text."
+  "gpl2_note": "Exact bytes of packaging/release/GPL-2.txt (vendored; identical to Debian common-licenses GPL-2); the pipeline refuses to substitute any other license text."
 }
