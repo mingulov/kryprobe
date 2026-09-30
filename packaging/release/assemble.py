@@ -4,8 +4,9 @@
 
 Inputs: --src (checkout of the release tag), --staging (pin-verified draft
 assets, see verify-inputs.py), --pins (packaging/release-pins.json).
-Output: --out directory with the nine release files, built TWICE and
+Output: --out directory with the five release files, built TWICE and
 byte-compared to prove determinism. Any deviation fails closed.
+Raw measurement evidence is never a release asset (ADR-0012).
 
 Usage: assemble.py --tag TAG --src DIR --pins FILE --staging DIR --work DIR --out DIR
 """
@@ -25,10 +26,6 @@ from pathlib import Path, PurePosixPath
 
 BUILD_INPUTS = ["crates", "xtask", "packaging", "Cargo.toml", "Cargo.lock",
                 "rust-toolchain.toml", ".cargo"]
-EVIDENCE_FILES = {"t14": "kryprobe-v0.1.0-evidence-t14.tar.zst",
-                  "demo-p10a4": "kryprobe-v0.1.0-evidence-demo-p10a4.tar.zst",
-                  "demo-p10a7": "kryprobe-v0.1.0-evidence-demo-p10a7.tar.zst",
-                  "floor-correction": "kryprobe-v0.1.0-evidence-floor-correction.tar.zst"}
 
 
 def digest(path):
@@ -303,31 +300,16 @@ def main():
         assets.append(aa)
         print(f"assemble: {filename}: {aa['sha256']} deterministic, {aa['files']} members")
 
-    for label, filename in EVIDENCE_FILES.items():
-        spec = pins["staging_archives"][filename]
-        blob = staging / filename
-        if digest(blob) != spec["sha256"] or blob.stat().st_size != spec["bytes"]:
-            return fail(f"evidence input drifted: {filename}")
-        shutil.copyfile(blob, out / filename)
-        seal = pins["evidence_seals"][label]
-        assets.append({"asset": filename, "sha256": spec["sha256"], "bytes": spec["bytes"],
-                       "archived_files": seal["archived_files"],
-                       "original_root": seal["root"], "original_seal": seal["seal"],
-                       "original_seal_sha256": seal["seal_sha256"]})
-
     notes = (first / "kryprobe-v0.1.0-linux-x86_64" / "RELEASE-NOTES.md").read_text()
     (out / "RELEASE-NOTES.md").write_text(notes)
     manifest = {"product": "KryProbe", "version": "0.1.0",
                 "prepared_from_commit": peel, "source_tree": tree,
-                "assets": assets, "evidence_preserved": True,
+                "assets": assets, "evidence_preserved": False,
+                "evidence_policy": "Raw measurement evidence is never a release asset (ADR-0012).",
                 "runtime_source_changes": False,
                 "live_qualification": "original accepted evidence at recorded payload hashes; full R1 remains open"}
     (out / "RELEASE-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
     order = ["RELEASE-MANIFEST.json", "RELEASE-NOTES.md",
-             "kryprobe-v0.1.0-evidence-demo-p10a4.tar.zst",
-             "kryprobe-v0.1.0-evidence-demo-p10a7.tar.zst",
-             "kryprobe-v0.1.0-evidence-floor-correction.tar.zst",
-             "kryprobe-v0.1.0-evidence-t14.tar.zst",
              "kryprobe-v0.1.0-linux-x86_64.tar.gz",
              "kryprobe-v0.1.0-source.tar.gz"]
     (out / "SHA256SUMS").write_text("".join(f"{digest(out / n)}  {n}\n" for n in order))
@@ -335,7 +317,9 @@ def main():
     for entry in back["assets"]:
         p = out / entry["asset"]
         assert digest(p) == entry["sha256"] and p.stat().st_size == entry["bytes"], entry["asset"]
-    print(f"assemble: dist complete: 9 files, outer seal {digest(out / 'SHA256SUMS')}")
+    assert sorted(p.name for p in out.iterdir() if p.is_file()) == sorted(order + ["SHA256SUMS"]), \
+        "dist/ is not exactly the 5-asset set"
+    print(f"assemble: dist complete: 5 files, outer seal {digest(out / 'SHA256SUMS')}")
     return 0
 
 

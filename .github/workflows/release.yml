@@ -122,7 +122,7 @@ jobs:
           test -f tools/packaging/release-pins.json
           test -f tools/packaging/release/verify-inputs.py
           test -f tools/packaging/release/assemble.py
-          command -v zstd readelf python3 gh
+          command -v readelf python3 gh
       - name: download staging draft
         run: |
           set -euo pipefail
@@ -135,8 +135,18 @@ jobs:
       - name: assemble release deterministically
         run: python3 tools/packaging/release/assemble.py --tag "$TAG" --src src --pins tools/packaging/release-pins.json --staging staging --work work --out dist
       - name: replace staging bytes with pipeline bytes
+        # ADR-0012: releases publish exactly these five assets. Uploads only
+        # overwrite same-name draft files, so a stray draft asset (e.g. an
+        # evidence blob from an old staging process) would otherwise survive
+        # and get published: both dist/ and the readback are compared against
+        # the exact sorted name set, and any deviation fails before publish.
+        # The pipeline never auto-deletes; the operator cleans the draft.
         run: |
           set -euo pipefail
+          printf '%s\n' RELEASE-MANIFEST.json RELEASE-NOTES.md SHA256SUMS kryprobe-v0.1.0-linux-x86_64.tar.gz kryprobe-v0.1.0-source.tar.gz > asset-allowlist.txt
+          ls dist | LC_ALL=C sort > dist-have.txt
+          LC_ALL=C sort asset-allowlist.txt -o asset-allowlist.txt
+          diff asset-allowlist.txt dist-have.txt || { echo "dist/ is not exactly the 5-asset allowlist" >&2; exit 1; }
           for f in dist/*; do
             gh release upload "$TAG" --repo "${{ github.repository }}" --clobber "$f"
           done
@@ -148,8 +158,9 @@ jobs:
           gh release download "$TAG" --repo "${{ github.repository }}" --dir readback
           cmp dist/SHA256SUMS readback/SHA256SUMS
           (cd readback && sha256sum -c SHA256SUMS)
-          test "$(ls readback | wc -l)" = 9
-          echo "readback verified: 9/9 assets"
+          ls readback | LC_ALL=C sort > readback-have.txt
+          diff asset-allowlist.txt readback-have.txt || { echo "published asset set != 5-asset allowlist (stray draft assets?)" >&2; exit 1; }
+          echo "readback verified: 5/5 assets"
       - name: record provenance summary
         run: |
           {

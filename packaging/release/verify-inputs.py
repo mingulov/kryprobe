@@ -6,6 +6,11 @@ Every staging input is untrusted until it matches packaging/release-pins.json
 exactly. Any mismatch, missing file, count drift, symlink, absolute path or
 parent escape aborts with nonzero exit and names the offender.
 
+Staging holds exactly the payload and vendor input archives. Raw measurement
+evidence is never a release input (ADR-0012): any evidence-shaped or otherwise
+unexpected staging file is refused. Only the three rebuilt outputs
+(RELEASE-MANIFEST.json, RELEASE-NOTES.md, SHA256SUMS) are ignored, never trusted.
+
 Usage: verify-inputs.py --pins PINS --staging DIR --out JSON
 """
 import argparse
@@ -14,7 +19,7 @@ import json
 import subprocess
 import sys
 import tarfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 
 def digest(path):
@@ -27,98 +32,6 @@ def fail(msg):
     return 1
 
 
-def verify_evidence(asset, spec, failures):
-    """Stream-decode one .tar.zst and check every member against its seal."""
-    name = asset.name
-    want_archive = spec["archive"]
-    actual = digest(asset)
-    if actual != want_archive["sha256"] or asset.stat().st_size != want_archive["bytes"]:
-        failures.append(f"{name}: archive hash/size mismatch")
-        return
-    try:
-        decoder = subprocess.Popen(["zstd", "-d", "-q", "-c", str(asset)], stdout=subprocess.PIPE)
-    except FileNotFoundError:
-        failures.append(f"{name}: zstd CLI missing on runner")
-        return
-    sealed = {}
-    seal_rel = f"{spec['root']}/{spec['seal']}"
-    members = {}
-    completed = False
-    try:
-        with tarfile.open(fileobj=decoder.stdout, mode="r|") as archive:
-            for member in archive:
-                p = PurePosixPath(member.name)
-                if p.is_absolute() or ".." in p.parts or member.issym() or member.islnk():
-                    failures.append(f"{name}: unsafe member {member.name}")
-                    return
-                if member.isdir():
-                    continue
-                if not member.isfile() or member.name in members:
-                    failures.append(f"{name}: bad/duplicate member {member.name}")
-                    return
-                with archive.extractfile(member) as stream:
-                    members[member.name] = {
-                        "sha256": hashlib.file_digest(stream, "sha256").hexdigest(),
-                        "bytes": member.size,
-                    }
-        completed = True
-    finally:
-        # Never wait() on a live decoder: an early return would leave zstd
-        # blocked on a full pipe until the job timeout. Drain the finite
-        # stream first so the decoder always terminates on its own; killing
-        # is racy (a cleanly finishing decoder looks alive for an instant)
-        # and would mask its real exit code.
-        try:
-            while decoder.stdout.read(65536):
-                pass
-        except (BrokenPipeError, ValueError):
-            pass
-        rc = decoder.wait()
-    if not completed:
-        return
-    if rc != 0:
-        failures.append(f"{name}: zstd decode failed rc={rc}")
-        return
-    if seal_rel not in members:
-        failures.append(f"{name}: seal {seal_rel} absent from archive")
-        return
-    # Re-read the seal content through a second decode to parse entries.
-    decoder = subprocess.Popen(["zstd", "-d", "-q", "-c", str(asset)], stdout=subprocess.PIPE)
-    seal_text = None
-    try:
-        with tarfile.open(fileobj=decoder.stdout, mode="r|") as archive:
-            for member in archive:
-                if member.isfile() and member.name == seal_rel:
-                    with archive.extractfile(member) as stream:
-                        seal_text = stream.read().decode()
-    finally:
-        decoder.kill()
-        decoder.wait()
-    if hashlib.sha256(seal_text.encode()).hexdigest() != spec["seal_sha256"]:
-        failures.append(f"{name}: seal digest mismatch vs pins")
-        return
-    for line in seal_text.splitlines():
-        want, sep, filename = line.partition("  ")
-        if not sep or len(want) != 64:
-            failures.append(f"{name}: malformed seal line")
-            return
-        sealed[f"{spec['root']}/{filename.removeprefix('./')}"] = want
-    if len(sealed) != spec["sealed_entries"]:
-        failures.append(f"{name}: sealed count {len(sealed)} != {spec['sealed_entries']}")
-        return
-    if len(members) != spec["archived_files"]:
-        failures.append(f"{name}: member count {len(members)} != {spec['archived_files']}")
-        return
-    for rel, want in sealed.items():
-        if rel not in members:
-            failures.append(f"{name}: sealed file missing {rel}")
-            return
-        if members[rel]["sha256"] != want:
-            failures.append(f"{name}: sealed bytes differ {rel}")
-            return
-    print(f"verify-inputs: {name}: {len(members)} members, seal {spec['seal_sha256'][:12]}... OK")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pins", required=True)
@@ -129,22 +42,19 @@ def main():
     staging = Path(args.staging)
     failures = []
 
-    expected = {"kryprobe-v0.1.0-linux-x86_64.tar.gz", "kryprobe-v0.1.0-source.tar.gz",
-                *pins["staging_archives"]}
+    expected = {"kryprobe-v0.1.0-linux-x86_64.tar.gz", "kryprobe-v0.1.0-source.tar.gz"}
+    rebuilt = {"RELEASE-MANIFEST.json", "RELEASE-NOTES.md", "SHA256SUMS"}
     have = {p.name for p in staging.iterdir() if p.is_file()}
     if not expected <= have:
         return fail(f"staging inputs missing={sorted(expected - have)}")
+    refused = []
     for extra in sorted(have - expected):
-        print(f"verify-inputs: ignoring non-input staging file {extra} (rebuilt, never trusted)")
-
-    key = {"t14": "kryprobe-v0.1.0-evidence-t14.tar.zst",
-           "demo-p10a4": "kryprobe-v0.1.0-evidence-demo-p10a4.tar.zst",
-           "demo-p10a7": "kryprobe-v0.1.0-evidence-demo-p10a7.tar.zst",
-           "floor-correction": "kryprobe-v0.1.0-evidence-floor-correction.tar.zst"}
-    for label, spec in pins["evidence_seals"].items():
-        spec = dict(spec)
-        spec["archive"] = pins["staging_archives"][key[label]]
-        verify_evidence(staging / key[label], spec, failures)
+        if extra in rebuilt:
+            print(f"verify-inputs: ignoring non-input staging file {extra} (rebuilt, never trusted)")
+        else:
+            refused.append(extra)
+    if refused:
+        return fail(f"refusing unexpected staging files (evidence is never a release input): {refused}")
 
     # Staging binary archive: payload members must equal pins, and the
     # staged binary must self-report the same identities with pins enforced.
@@ -226,7 +136,7 @@ def main():
         return fail("; ".join(failures))
     Path(args.out).write_text(json.dumps({
         "staging": str(staging),
-        "evidence_archives_verified": sorted(key.values()),
+        "evidence_excluded": True,
         "payload_verified": want_payload,
         "vendor_tree_sha256": pins["vendor_tree_sha256"],
         "verdict": "INPUTS_VERIFIED",
