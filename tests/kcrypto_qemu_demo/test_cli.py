@@ -234,6 +234,20 @@ class CliTests(unittest.TestCase):
         self.assertIn("empty", proc.stdout)
         self.assertIn("campaign: FAIL", proc.stdout)
 
+    def test_verify_reports_broken_receipt_json_cleanly(self):
+        # R2-4 RED: a syntax-destroying tamper must fail with a
+        # clean reason-style line, exit 1, no traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            with (cell_dir / "cell-D09.json").open("a") as fh:
+                fh.write("{oops-not-json")
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("cell-D09.json", proc.stdout)
+        self.assertIn("reason:", proc.stdout)
+        self.assertIn("campaign: FAIL", proc.stdout)
+        self.assertNotIn("Traceback", proc.stderr)
+
     def test_verify_rejects_omitted_receipt(self):
         # R2-1 RED (D07-late shape): the judged receipt dropped
         # from the seal while its checks read PASS must fail
