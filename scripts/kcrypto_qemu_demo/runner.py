@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Owned disk-backed QEMU guests for the P10 demo campaign (Task 1).
 
-One guest at a time under the task lane lock. Every guest records
+One guest at a time under the task lane lock plus the reconciled
+common kvm-host flock. Every guest records
 its exact identity — PID plus start ticks (never a PID alone),
 QMP socket, overlay and backing identities — in ``spawn.json``
 BEFORE any control command. QEMU is driven with ``subprocess.Popen``,
@@ -207,6 +208,7 @@ def launch_guest(
     console_name: str = "console.log",
     needs_data_disk: bool = False,
     cell_id: str | None = None,
+    refuse_foreign: bool = False,
 ) -> OwnedGuest:
     """Launch one owned disk-backed guest under the lane locks.
 
@@ -217,7 +219,12 @@ def launch_guest(
     overlay is created from the pinned backing file (never shared,
     never reused). ``qemu_cmd_override`` is host-test-only: harmless
     host binaries (``true``/``sleep``) stand in for QEMU so custody
-    is unit-testable without KVM.
+    is unit-testable without KVM. ``refuse_foreign`` refuses the
+    launch when foreign qemu processes exist instead of booting
+    beside them (releases the locks, writes no receipt, never
+    signals the foreign processes); otherwise the explicit
+    preexisting set is recorded and the stop path fails closed on
+    any change.
     """
     run_dir = pathlib.Path(run_dir)
     if not run_dir.is_dir():
@@ -232,6 +239,12 @@ def launch_guest(
     held = acquire_locks([pathlib.Path(p) for p in lock_paths])
     try:
         before = qemu_inventory()
+        if refuse_foreign and before:
+            raise GuestError(
+                "refusing launch beside foreign qemu PIDs "
+                f"{sorted(before)} (--refuse-foreign: wait for a "
+                "clean lane instead)"
+            )
         overlay = run_dir / "disk-overlay.qcow2"
         qmp_socket = run_dir / "qmp.sock"
         console_log = run_dir / console_name
@@ -290,6 +303,7 @@ def launch_guest(
                 "overlay_created": qemu_cmd_override is None,
                 "lock_paths": [str(p) for p in lock_paths],
                 "preexisting_qemu_pids": sorted(before),
+                "refuse_foreign": bool(refuse_foreign),
                 "manifest_sha256": manifest.get("_manifest_sha256"),
             },
         )

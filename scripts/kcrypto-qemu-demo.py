@@ -168,6 +168,7 @@ def cmd_run(args) -> int:
             lock_paths=lock_paths,
             needs_data_disk=bool(cell["workload"].get("needs_data_disk")),
             cell_id=cell["id"],
+            refuse_foreign=args.refuse_foreign,
         )
     except (runner.GuestError, OSError) as err:
         print(f"run: launch refused: {err}", file=sys.stderr)
@@ -251,6 +252,9 @@ def main(argv=None) -> int:
     run.add_argument("--run-dir", required=True)
     run.add_argument("--lock", action="append", default=[],
                      help="exclusive lane lock (repeatable, at least one)")
+    run.add_argument("--refuse-foreign", action="store_true",
+                     help="refuse launch when foreign qemu exists"
+                     " (otherwise the preexisting set is recorded)")
     run.set_defaults(func=cmd_run)
     verify = sub.add_parser("verify", help="reconcile sealed receipts (offline)")
     verify.add_argument("--run-dir", required=True)

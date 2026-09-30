@@ -42,6 +42,18 @@ python3 scripts/kcrypto-qemu-demo.py verify --run-dir /path/to/fresh/run
 exclusive lane (one guest at a time; never touch foreign
 VMs/overlays). `verify` is offline: it never boots or repairs.
 
+Lane locks and foreign guests: `run` takes every required flock
+via repeatable `--lock` — the task lane lock plus the reconciled
+common kvm-host flock (`.artifacts/locks/kvm-host.lock`) — holds
+them for the whole boot, and records the explicit preexisting-qemu
+set in `spawn.json` before launching.
+`--refuse-foreign` refuses the launch when that set is non-empty
+instead of booting beside foreign guests; without it the set is
+recorded and the stop path fails closed on any change. Foreign
+processes are never signaled. The strict-exclusivity vs
+one-owned-guest wording call is AWAITING-OWNER (O3); the evidence
+stands under either reading once clean re-runs exist.
+
 Host gates (no KVM needed):
 
 ```sh
