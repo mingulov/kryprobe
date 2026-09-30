@@ -106,7 +106,8 @@ def build(args) -> tuple[bytes, dict[str, str]]:
                                       "../../lib/demo/libgcc_s.so.1"))
     for name, src in staged.items():
         is_exec = (name == "init" or "/bin/" in name
-                   or name.endswith(".sh") or name == "bin/busybox")
+                   or name.endswith(".sh") or name == "bin/busybox"
+                   or name.endswith("ld-linux-x86-64.so.2"))
         mode = 0o755 if is_exec else 0o644
         entries.append(cpio.file_entry(name, src.read_bytes(), mode=mode))
     entries.append(
