@@ -1,24 +1,62 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Demo guest init (attempt 1: harness cold boot, no observer, no workload).
-# Runs as PID 1 from the frozen initramfs: mounts the required virtual
-# filesystems, emits serial milestones, then powers off. Later tasks
-# extend this ordering: manifest check -> observer start -> structured
-# attach-ready -> controlled encrypted-volume unlock -> normal root boot.
+# Demo guest init (attempt 4): unified dispatcher.
+# Runs as PID 1 from the frozen initramfs: mounts the required
+# virtual filesystems, selects the cell from the kernel command
+# line (kcrypto.cell=<ID>, default T01-harness), and execs the
+# cell workload. T01-harness keeps its legacy no-observer,
+# no-workload behavior; every D-cell runs prelude (manifest
+# check, module loads, registry/CPU probes) then its workload.
+# No secret material (keys, IVs, tags, payloads) may ever appear
+# on argv, trace output, or console: metadata only. Never set -x.
 set -eu
 
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
+mkdir -p /run/demo
 
-echo "INIT-READY uptime=$(cut -d' ' -f1 /proc/uptime)" > /dev/console
-echo "OBSERVER-ABSENT WORKLOAD-ABSENT" > /dev/console
-if [ -r /proc/crypto ]; then
-  echo "CRYPTO-REGISTRY-BEGIN" > /dev/console
-  grep -E '^(name|driver|priority)' /proc/crypto > /dev/console 2>/dev/null || true
-  echo "CRYPTO-REGISTRY-END" > /dev/console
+export PATH=/bin:/sbin:/opt/demo/bin
+CONSOLE=/dev/console
+
+CELL=""
+for arg in $(cat /proc/cmdline); do
+  case "$arg" in
+    kcrypto.cell=*) CELL="${arg#kcrypto.cell=}" ;;
+  esac
+done
+CELL="${CELL:-T01-harness}"
+
+uptime_s() { cut -d' ' -f1 /proc/uptime; }
+
+# Legacy T01 path: byte-stable markers, no observer, no workload.
+if [ "$CELL" = "T01-harness" ]; then
+  echo "INIT-READY uptime=$(uptime_s)" > "$CONSOLE"
+  echo "DEMO:MARK {\"name\": \"INIT-READY\", \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
+  echo "OBSERVER-ABSENT WORKLOAD-ABSENT" > "$CONSOLE"
+  if [ -r /proc/crypto ]; then
+    echo "CRYPTO-REGISTRY-BEGIN" > "$CONSOLE"
+    grep -E '^(name|driver|priority)' /proc/crypto > "$CONSOLE" 2>/dev/null || true
+    echo "CRYPTO-REGISTRY-END" > "$CONSOLE"
+  fi
+  sleep 5
+  echo "POWERING-OFF" > "$CONSOLE"
+  poweroff -f
+  sleep 30
+  exit 0
 fi
 
-sleep 5
-echo "POWERING-OFF" > /dev/console
-poweroff -f
+# D-cells and PROBE: the dispatcher owns the boot from here.
+# A hard watchdog bounds every cell even if a workload hangs;
+# the host judges a watchdog poweroff by its missing DONE mark
+# (a hang can never pass).
+case "$CELL" in
+  D08) WATCHDOG=1440 ;;
+  D07) WATCHDOG=270 ;;
+  *) WATCHDOG=150 ;;
+esac
+( sleep "$WATCHDOG"
+  echo "DEMO:MARK {\"name\": \"WATCHDOG-FIRED\", \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
+  poweroff -f ) &
+
+exec /sbin/run-cells.sh "$CELL"
