@@ -23,6 +23,36 @@ down() { sleep 3; poweroff -f; sleep 30; }
 # else is a failed product view.
 kryprobe_ok() { [ "$1" -eq 0 ] || [ "$1" -eq 3 ]; }
 die() { mark "FAILED-$1"; down; exit 1; }
+# Wait until kryprobe has attached (bounded 10 s): D03's first boot
+# showed attach takes ~5 s while the old fixed 2 s sleep let the
+# 1.2 s dm-crypt burst finish before the collection window opened
+# (interval start 8.94 s, I/O done 6.75 s) -- zero traffic observed.
+# Primary signal: the {"audit":"attach"} line on kryprobe's stdout
+# log. Fallback: live bpf-prog fds (stdout may be block-buffered
+# when redirected). Dies honestly when neither appears.
+# $1 = kryprobe stdout log, $2 = kryprobe pid.
+wait_attached() {
+  out="$1"; kpid="$2"
+  start="$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if grep -q '"audit":"attach"' "$out" 2>/dev/null; then
+      now="$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
+      echo "DEMO:PROBE {\"fact\": \"kryprobe-attached\", \"via\": \"stdout\", \"wait_s\": $((now - start))}" > "$CONSOLE"
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if ls "/proc/$kpid/fdinfo" > /dev/null 2>&1 && \
+     grep -l 'prog_id:' "/proc/$kpid/fdinfo/"* 2>/dev/null | head -1 | grep -q .; then
+    now="$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
+    echo "DEMO:PROBE {\"fact\": \"kryprobe-attached\", \"via\": \"fdinfo-fallback\", \"wait_s\": $((now - start))}" > "$CONSOLE"
+    return 0
+  fi
+  head -c 2000 "$out" > "$CONSOLE" 2>/dev/null || true
+  die "KRYPROBE-ATTACH-TIMEOUT"
+}
 
 # --- shared prelude -------------------------------------------------
 # Manifest check, module loads, registry + CPU + device probes.
@@ -177,7 +207,7 @@ cell_D01() {
   "$KRYPROBE" report --system --duration 60 --format json \
     --out "$OUT/krep-d01.json" > "$OUT/krep-d01.out" 2>&1 &
   kp=$!
-  sleep 2
+  wait_attached "$OUT/krep-d01.out" "$kp"
   mark "WORKLOAD-START"
   algd run --name 'cbc(aes)' --keylen 16 --ops 150 --bytes 4096 \
     --rate 10 --op encrypt --alloc-id d01-generic > "$CONSOLE" || die "ALGD-GENERIC"
@@ -208,7 +238,7 @@ cell_D02() {
   "$KRYPROBE" report --system --duration 60 --format json \
     --out "$OUT/krep-d02.json" > "$OUT/krep-d02.out" 2>&1 &
   kp=$!
-  sleep 2
+  wait_attached "$OUT/krep-d02.out" "$kp"
   mark "WORKLOAD-START"
   # The no-AES CPU may not bind the generic name at all (lskcipher
   # only): probe once, then hold/run under the name that binds.
@@ -254,7 +284,7 @@ cell_D03() {
   "$KRYPROBE" report --system --duration 45 --format json \
     --out "$OUT/krep-d03.json" > "$OUT/krep-d03.out" 2>&1 &
   kp=$!
-  sleep 2
+  wait_attached "$OUT/krep-d03.out" "$kp"
   mark "WORKLOAD-START"
   dmap create --name demo-d03 > "$CONSOLE" || die "DMAP-CREATE"
   dmap load --name demo-d03 --table-file "$OUT/d03.table" \
@@ -293,7 +323,7 @@ cell_D04() {
   "$KRYPROBE" report --system --duration 30 --format json \
     --out "$OUT/krep-d04.json" > "$OUT/krep-d04.out" 2>&1 &
   kp=$!
-  sleep 2
+  wait_attached "$OUT/krep-d04.out" "$kp"
   mark "WORKLOAD-START"
   if [ -n "$vdrv" ]; then
     if algd run --name "$vdrv" --keylen 16 --ops 50 --bytes 4096 \
@@ -384,19 +414,11 @@ cell_D07() {
   "$KRYPROBE" report --system --duration 120 --format json \
     --out "$OUT/krep-d07.json" > "$OUT/krep-d07.out" 2>&1 &
   kp=$!
-  # Attach-ready: the observer holds a live bpf-prog fd (bounded 30 s).
-  ready=false
-  i=0
-  while [ "$i" -lt 30 ]; do
-    if ls "/proc/$kp/fdinfo" > /dev/null 2>&1 && \
-       grep -l 'prog_id:' "/proc/$kp/fdinfo/"* 2>/dev/null | head -1 | grep -q .; then
-      ready=true
-      break
-    fi
-    sleep 1
-    i=$((i + 1))
-  done
-  if [ "$ready" = true ]; then mark "ATTACH-READY"; else die "ATTACH-NOT-READY"; fi
+  # Attach-ready: the observer reports attach (stdout) or holds a
+  # live bpf-prog fd (fdinfo fallback); the helper dies honestly
+  # when neither appears.
+  wait_attached "$OUT/krep-d07.out" "$kp"
+  mark "ATTACH-READY"
   sectors="$(cat /sys/block/vdb/size)"
   keyhex="$(od -A n -t x1 -N 64 /dev/urandom | tr -d ' \n')"
   printf '0 %s crypt aes-xts-plain64 %s 0 /dev/vdb 0' "$sectors" "$keyhex" \
@@ -435,7 +457,7 @@ cell_D08() {
     "$KRYPROBE" report --system --duration 60 --format json \
       --out "$OUT/krep-d08-$w.json" > "$OUT/krep-d08-$w.out" 2>&1 &
     kp=$!
-    sleep 2
+    wait_attached "$OUT/krep-d08-$w.out" "$kp"
     if algd run --name 'cbc(aes)' --keylen 16 --ops 600 --bytes 4096 \
         --rate 10 --op encrypt --alloc-id "d08-w$w" > "$CONSOLE" 2>&1; then
       ok=true
@@ -457,7 +479,7 @@ cell_D08() {
   "$KRYPROBE" report --system --duration 30 --format json \
     --out "$OUT/krep-d08-stop.json" > "$OUT/krep-d08-stop.out" 2>&1 &
   kp=$!
-  sleep 2
+  wait_attached "$OUT/krep-d08-stop.out" "$kp"
   mark "STOP-WINDOW-START"
   algd run --name 'cbc(aes)' --keylen 16 --ops 600 --bytes 4096 \
     --rate 10 --op encrypt --alloc-id d08-stop > "$CONSOLE" || die "SOAK-STOP-OPS"
