@@ -40,7 +40,7 @@
       "id": "D04",
       "title": "virtual crypto device path (one device)",
       "image": "img-7014-1crypt",
-      "workload": {"kind": "virtio-device", "devices": 1, "control_ops": 50, "virtio_ops": 50},
+      "workload": {"kind": "virtio-device", "devices": 1, "control_ops": 50, "virtio_ops": 50, "rate_per_s": 10, "block_bytes": 4096},
       "limits": {"timeout_s": 180},
       "expected_evidence": ["device-ledger.json", "queue-reference.json", "product-report.json", "cell-D04.json"]
     },
@@ -72,7 +72,7 @@
       "id": "D08",
       "title": "stop and slower stability (20-minute soak)",
       "image": "img-7014-base",
-      "workload": {"kind": "stop-soak", "aggregate_minutes": 20, "windows": 20, "window_ops": 600},
+      "workload": {"kind": "stop-soak", "aggregate_minutes": 20, "windows": 20, "window_ops": 600, "rate_per_s": 10, "block_bytes": 4096},
       "limits": {"timeout_s": 1500},
       "expected_evidence": ["workload-ledger.jsonl", "soak-windows.json", "stop-receipt.json", "product-report.json", "cell-D08.json"]
     }

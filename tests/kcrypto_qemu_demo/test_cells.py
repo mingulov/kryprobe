@@ -41,11 +41,26 @@ def registry(name, driver, priority, rtype="skcipher"):
     )
 
 
-KREPO = (
-    "DEMO:KRYPROBE-BEGIN\n"
-    '{"session": "s1", "rows": [{"api": "skcipher_encrypt", "count": 4}]}\n'
-    "DEMO:KRYPROBE-END\n"
-)
+def krepo(calls, op_bytes=4096, errors=0, verdict="observed",
+          missing=()):
+    obs = (
+        '{"operation_class": "encrypt", "phase": "returned",'
+        ' "backend_payload": {"row": "agg", "counts": {"calls": %d,'
+        ' "errors": %d, "ok": %d}, "bytes": %d}}'
+        % (calls, errors, calls, calls * op_bytes)
+    )
+    return (
+        "DEMO:KRYPROBE-BEGIN\n"
+        '{"observations": [%s], "verdict": {"status": "%s",'
+        ' "missing": [%s]}}\n'
+        "DEMO:KRYPROBE-END\n"
+        % (obs, verdict, ", ".join('"%s"' % m for m in missing))
+    )
+
+
+KREPO = krepo(4)
+
+KRYPROBE_EXIT = 'DEMO:PROBE {"fact": "kryprobe-exit", "exit": 0}'
 
 PRELUDE_MARKS = [
     mark("INIT-READY", 1.0),
@@ -73,6 +88,7 @@ class D01Tests(unittest.TestCase):
             registry("cbc(aes)", "cbc-aes-generic", 100),
             'DEMO:PROBE {"fact": "selected", "name": "cbc(aes)",'
             ' "driver": "cbc-aes-aesni"}',
+            mark("KRYPROBE-START", 2.5),
             mark("WORKLOAD-START", 3.0),
         ]
         ts = 4.0
@@ -83,6 +99,7 @@ class D01Tests(unittest.TestCase):
             lines.append(ledger(seq, "d01-driver", ts=round(ts, 1)))
             ts += 0.1
         lines += [mark("WORKLOAD-STOP", ts), mark("WORKLOAD-DONE", ts + 1)]
+        lines.append(KRYPROBE_EXIT)
         return "[ 0.1] noise\n" + "\n".join(lines) + "\n" + KREPO
 
     def _workload(self, n_each=2):
@@ -147,6 +164,7 @@ class D02Tests(unittest.TestCase):
             'DEMO:PROBE {"fact": "selected", "name": "cbc(aes)",'
             ' "driver": "cbc-aes-generic"}',
             'DEMO:CPU {"flags": " fpu no-aes "}',
+            mark("KRYPROBE-START", 2.5),
             mark("WORKLOAD-START", 3.0),
             'DEMO:HANDLE {"event": "held", "alloc_id": "d02-held",'
             ' "ts_mono": 3.5}',
@@ -158,6 +176,7 @@ class D02Tests(unittest.TestCase):
             ' "ts_mono": 5.0}',
             mark("WORKLOAD-STOP", 6.0),
             mark("WORKLOAD-DONE", 7.0),
+            KRYPROBE_EXIT,
         ]
         return "\n".join(lines) + "\n" + KREPO
 
@@ -188,6 +207,7 @@ class D03Tests(unittest.TestCase):
     def test_d03_io_and_dmap(self):
         lines = list(PRELUDE_MARKS)
         lines += [
+            mark("KRYPROBE-START", 2.5),
             mark("WORKLOAD-START", 3.0),
             'DEMO:DMAP {"event": "create", "name": "demo-d03",'
             ' "sectors": -1, "status": 0, "ts_mono": 3.1}',
@@ -207,6 +227,7 @@ class D03Tests(unittest.TestCase):
             'DEMO:DMAP {"event": "remove", "name": "demo-d03",'
             ' "sectors": 0, "status": 0, "ts_mono": 6.1}',
             mark("WORKLOAD-DONE", 7.0),
+            KRYPROBE_EXIT,
         ]
         workload = {"kind": "dmcrypt-io", "bytes_each_direction": 67108864,
                     "block_bytes": 4096, "needs_data_disk": True}
@@ -244,6 +265,7 @@ class D04Tests(unittest.TestCase):
             ]
         else:
             lines += ['DEMO:PROBE {"fact": "virtio-driver", "driver": ""}']
+        lines.append(mark("KRYPROBE-START", 2.5))
         lines.append(mark("WORKLOAD-START", 3.0))
         if virtio and alloc_ok:
             lines.append(ledger(0, "d04-virtio", ts=3.5))
@@ -251,12 +273,15 @@ class D04Tests(unittest.TestCase):
             'DEMO:PROBE {"fact": "virtio-alloc", "ok": %s}'
             % ("true" if alloc_ok else "false"))
         lines.append(ledger(0, "d04-generic", ts=4.0))
-        lines += [mark("WORKLOAD-STOP", 5.0), mark("WORKLOAD-DONE", 6.0)]
-        return "\n".join(lines) + "\n" + KREPO
+        lines += [mark("WORKLOAD-STOP", 5.0), mark("WORKLOAD-DONE", 6.0),
+                  KRYPROBE_EXIT]
+        observed = 1 + (1 if virtio and alloc_ok else 0)
+        return "\n".join(lines) + "\n" + krepo(observed)
 
     def _workload(self):
         return {"kind": "virtio-device", "devices": 1, "virtio_ops": 1,
-                "control_ops": 1}
+                "control_ops": 1, "rate_per_s": 10,
+                "block_bytes": 4096}
 
     def test_d04_stops_at_driver_selection(self):
         receipt, ledgers = cells.build_cell(
@@ -387,6 +412,7 @@ class D07Tests(unittest.TestCase):
     def test_d07_unlock_after_attach(self):
         lines = list(PRELUDE_MARKS)
         lines += [
+            mark("KRYPROBE-START", 9.0),
             mark("ATTACH-READY", 10.0),
             mark("UNLOCK-START", 11.0),
             'DEMO:DMAP {"event": "create", "name": "demo-d07",'
@@ -408,6 +434,7 @@ class D07Tests(unittest.TestCase):
             ' "sectors": 0, "status": 0, "ts_mono": 14.2}',
             mark("WORKLOAD-STOP", 15.0),
             mark("WORKLOAD-DONE", 16.0),
+            KRYPROBE_EXIT,
         ]
         workload = {"kind": "early-boot", "observer": "early",
                     "io_bytes": 16777216}
@@ -436,10 +463,12 @@ class D07Tests(unittest.TestCase):
 class D08Tests(unittest.TestCase):
     def _console(self):
         lines = list(PRELUDE_MARKS)
+        lines.append(mark("KRYPROBE-START", 3.0))
         lines.append(ledger(0, "d08-w0", ts=4.0))
         lines.append(
             'DEMO:SOAK {"window": 0, "ops_ok": true,'
             ' "kryprobe_exit": 0, "report_lines": 10}')
+        lines.append(mark("KRYPROBE-START", 59.0))
         lines.append(mark("STOP-WINDOW-START", 60.0))
         lines.append(ledger(0, "d08-stop", ts=61.0))
         lines.append(mark("STOP-WINDOW-END", 62.0))
@@ -448,11 +477,13 @@ class D08Tests(unittest.TestCase):
             ' "kryprobe_exit": 0, "report_lines": 10,'
             ' "traffic_active_at_stop": true}')
         lines.append(mark("WORKLOAD-DONE", 63.0))
-        return "\n".join(lines) + "\n" + KREPO
+        lines.append(KRYPROBE_EXIT)
+        return "\n".join(lines) + "\n" + krepo(1)
 
     def test_d08_windows_and_stop(self):
         workload = {"kind": "stop-soak", "aggregate_minutes": 20,
-                    "windows": 2, "window_ops": 1}
+                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
+                    "block_bytes": 4096}
         receipt, ledgers = cells.build_cell(
             cell(workload, "D08"), "run1", "msha", self._console(), PROC,
             "guest1",
@@ -467,10 +498,143 @@ class D08Tests(unittest.TestCase):
         console = self._console().replace(
             '"window": 0, "ops_ok": true', '"window": 0, "ops_ok": false')
         workload = {"kind": "stop-soak", "aggregate_minutes": 20,
-                    "windows": 2, "window_ops": 1}
+                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
+                    "block_bytes": 4096}
         receipt, _ = cells.build_cell(
             cell(workload, "D08"), "run1", "msha", console, PROC, "guest1")
         self.assertFalse(all(receipt["checks"].values()))
+
+
+class ProductReconcileTests(unittest.TestCase):
+    def _console(self, workload_ops=4, product_calls=4, errors=0,
+                 kexit=0, kverdict="observed", kmissing=(),
+                 with_kstart=True):
+        lines = list(PRELUDE_MARKS)
+        lines += [
+            registry("cbc(aes)", "cbc-aes-aesni", 400),
+            'DEMO:PROBE {"fact": "selected", "name": "cbc(aes)",'
+            ' "driver": "cbc-aes-aesni"}',
+        ]
+        if with_kstart:
+            lines.append(mark("KRYPROBE-START", 2.5))
+        lines.append(mark("WORKLOAD-START", 3.0))
+        ts = 4.0
+        for seq in range(workload_ops // 2):
+            lines.append(ledger(seq, "d01-generic", ts=round(ts, 1)))
+            ts += 0.1
+        for seq in range(workload_ops // 2):
+            lines.append(ledger(seq, "d01-driver", ts=round(ts, 1)))
+            ts += 0.1
+        lines += [mark("WORKLOAD-STOP", round(ts, 1)),
+                  mark("WORKLOAD-DONE", round(ts + 1, 1))]
+        lines.append(
+            'DEMO:PROBE {"fact": "kryprobe-exit", "exit": %d}' % kexit)
+        body = ("\n".join(lines) + "\n"
+                + krepo(product_calls, errors=errors, verdict=kverdict,
+                        missing=kmissing))
+        return body
+
+    def _workload(self, ops=4):
+        return {"kind": "provider-selection", "requests": ops,
+                "block_bytes": 4096, "rate_per_s": 10}
+
+    def _build(self, **kwargs):
+        ops = kwargs.pop("workload_ops", 4)
+        return cells.build_cell(
+            cell(self._workload(ops)), "run1", "msha",
+            self._console(workload_ops=ops, **kwargs), PROC, "guest1")
+
+    def test_product_suffix_exact_passes(self):
+        receipt, _ = self._build()
+        for name in ("product_internal", "product_suffix",
+                     "product_verdict", "product_exit_ok"):
+            self.assertTrue(receipt["checks"][name], name)
+        self.assertEqual(receipt["product"]["missed"], 0)
+
+    def test_product_suffix_within_attach_window_passes(self):
+        # Product attached late and missed one op: inside the
+        # (window + slack) bound, still an honest suffix.
+        receipt, _ = self._build(workload_ops=4, product_calls=3)
+        self.assertTrue(receipt["checks"]["product_suffix"])
+        self.assertEqual(receipt["product"]["missed"], 1)
+
+    def test_product_overcount_fails(self):
+        receipt, _ = self._build(workload_ops=4, product_calls=5)
+        self.assertFalse(receipt["checks"]["product_suffix"])
+
+    def test_product_errors_fail(self):
+        receipt, _ = self._build(errors=1)
+        self.assertFalse(receipt["checks"]["product_internal"])
+
+    def test_product_exit_1_fails(self):
+        receipt, _ = self._build(kexit=1)
+        self.assertFalse(receipt["checks"]["product_exit_ok"])
+
+    def test_product_partial_with_structural_gaps_passes(self):
+        receipt, _ = self._build(
+            kexit=3, kverdict="partial",
+            kmissing=("capture-integrity", "completion"))
+        self.assertTrue(receipt["checks"]["product_verdict"])
+        self.assertTrue(receipt["checks"]["product_exit_ok"])
+
+    def test_product_partial_with_attach_gap_fails(self):
+        receipt, _ = self._build(
+            kexit=3, kverdict="partial", kmissing=("attach",))
+        self.assertFalse(receipt["checks"]["product_verdict"])
+
+    def test_missing_kryprobe_start_fails(self):
+        receipt, _ = self._build(with_kstart=False)
+        self.assertFalse(receipt["checks"]["product_suffix"])
+
+    def test_d08_exit3_window_accepted(self):
+        workload = {"kind": "stop-soak", "aggregate_minutes": 20,
+                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
+                    "block_bytes": 4096}
+        lines = list(PRELUDE_MARKS)
+        lines.append(mark("KRYPROBE-START", 3.0))
+        lines.append(ledger(0, "d08-w0", ts=4.0))
+        lines.append(
+            'DEMO:SOAK {"window": 0, "ops_ok": true,'
+            ' "kryprobe_exit": 3, "report_lines": 10}')
+        lines.append(mark("KRYPROBE-START", 59.0))
+        lines.append(mark("STOP-WINDOW-START", 60.0))
+        lines.append(ledger(0, "d08-stop", ts=61.0))
+        lines.append(mark("STOP-WINDOW-END", 62.0))
+        lines.append(
+            'DEMO:SOAK {"window": 1, "ops_ok": true,'
+            ' "kryprobe_exit": 0, "report_lines": 10,'
+            ' "traffic_active_at_stop": true}')
+        lines.append(mark("WORKLOAD-DONE", 63.0))
+        lines.append(KRYPROBE_EXIT)
+        receipt, _ = cells.build_cell(
+            cell(workload, "D08"), "run1", "msha",
+            "\n".join(lines) + "\n" + krepo(1), PROC, "guest1")
+        self.assertTrue(all(receipt["checks"].values()), receipt["checks"])
+
+    def test_d08_exit1_window_refused(self):
+        workload = {"kind": "stop-soak", "aggregate_minutes": 20,
+                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
+                    "block_bytes": 4096}
+        lines = list(PRELUDE_MARKS)
+        lines.append(mark("KRYPROBE-START", 3.0))
+        lines.append(ledger(0, "d08-w0", ts=4.0))
+        lines.append(
+            'DEMO:SOAK {"window": 0, "ops_ok": true,'
+            ' "kryprobe_exit": 1, "report_lines": 10}')
+        lines.append(mark("KRYPROBE-START", 59.0))
+        lines.append(mark("STOP-WINDOW-START", 60.0))
+        lines.append(ledger(0, "d08-stop", ts=61.0))
+        lines.append(mark("STOP-WINDOW-END", 62.0))
+        lines.append(
+            'DEMO:SOAK {"window": 1, "ops_ok": true,'
+            ' "kryprobe_exit": 0, "report_lines": 10,'
+            ' "traffic_active_at_stop": true}')
+        lines.append(mark("WORKLOAD-DONE", 63.0))
+        lines.append(KRYPROBE_EXIT)
+        receipt, _ = cells.build_cell(
+            cell(workload, "D08"), "run1", "msha",
+            "\n".join(lines) + "\n" + krepo(1), PROC, "guest1")
+        self.assertFalse(receipt["checks"]["windows_ok"])
 
 
 class DispatchTests(unittest.TestCase):

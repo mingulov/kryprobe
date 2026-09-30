@@ -14,7 +14,11 @@ KRYPROBE=/opt/kryprobe/bin/kryprobe
 
 uptime_s() { cut -d' ' -f1 /proc/uptime; }
 mark() { echo "DEMO:MARK {\"name\": \"$1\", \"ts_mono\": $(uptime_s)}" > "$CONSOLE"; }
-die() { mark "FAILED-$1"; poweroff -f; sleep 30; exit 1; }
+# Drain the UART before poweroff: the 115200-baud serial takes
+# ~1 s per 10 KB, and poweroff's own emerg printk otherwise
+# splices into still-draining evidence (D01-rerun1/2 tears).
+down() { sleep 3; poweroff -f; sleep 30; }
+die() { mark "FAILED-$1"; down; exit 1; }
 
 # --- shared prelude -------------------------------------------------
 # Manifest check, module loads, registry + CPU + device probes.
@@ -94,14 +98,14 @@ dm_node() {
 finish() {
   mark "WORKLOAD-DONE"
   echo "POWERING-OFF" > "$CONSOLE"
-  poweroff -f
-  sleep 30
+  down
 }
 
 # --- PROBE: environment qualification only, no cell verdict --------
 cell_PROBE() {
   prelude "none"
   mark "PROBE-KRYPROBE-START"
+  mark "KRYPROBE-START"
   if "$KRYPROBE" report --system --duration 10 --format json \
       --out "$OUT/krep-probe.json" > "$OUT/krep-probe.out" 2>&1; then
     echo "DEMO:PROBE {\"fact\": \"kryprobe\", \"exit\": 0}" > "$CONSOLE"
@@ -114,6 +118,7 @@ cell_PROBE() {
     passthrough "$OUT/krep-probe.json"
   fi
   mark "PROBE-LIFECYCLE-START"
+  mark "KRYPROBE-START"
   if "$KRYPROBE" report --system --duration 10 --format json \
       --kcrypto-profile request-lifecycle \
       --out "$OUT/krep-probe-lc.json" > "$OUT/krep-probe-lc.out" 2>&1; then
@@ -150,6 +155,7 @@ cell_D01() {
   drv="$(best_driver 'cbc(aes)')"
   if [ -z "$drv" ]; then die "NO-CBC-DRIVER"; fi
   echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv\"}" > "$CONSOLE"
+  mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 60 --format json \
     --out "$OUT/krep-d01.json" > "$OUT/krep-d01.out" 2>&1 &
   kp=$!
@@ -178,6 +184,7 @@ cell_D02() {
   drv="$(best_driver 'cbc(aes)')"
   if [ -z "$drv" ]; then die "NO-CBC-DRIVER"; fi
   echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv\"}" > "$CONSOLE"
+  mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 60 --format json \
     --out "$OUT/krep-d02.json" > "$OUT/krep-d02.out" 2>&1 &
   kp=$!
@@ -215,6 +222,7 @@ cell_D03() {
     > "$OUT/d03.table"
   chmod 600 "$OUT/d03.table"
   keyhex=""
+  mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 45 --format json \
     --out "$OUT/krep-d03.json" > "$OUT/krep-d03.out" 2>&1 &
   kp=$!
@@ -253,6 +261,7 @@ cell_D04() {
   vdrv="$(algd registry | grep -i 'virtio' | grep -F '"type": "skcipher"' \
     | head -1 | sed -E 's/.*"driver": "([^"]+)".*/\1/')"
   echo "DEMO:PROBE {\"fact\": \"virtio-driver\", \"driver\": \"$vdrv\"}" > "$CONSOLE"
+  mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 30 --format json \
     --out "$OUT/krep-d04.json" > "$OUT/krep-d04.out" 2>&1 &
   kp=$!
@@ -341,6 +350,7 @@ cell_D07() {
   # Default api-returns profile: probe-base2/3 show lifecycle
   # attaches only 10/12 here (product-side shortfall, recorded as
   # follow-up), while api-returns attaches 9/9 complete.
+  mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 120 --format json \
     --out "$OUT/krep-d07.json" > "$OUT/krep-d07.out" 2>&1 &
   kp=$!
@@ -391,6 +401,7 @@ cell_D08() {
   prelude "af_alg algif_skcipher"
   w=0
   while [ "$w" -lt 19 ]; do
+    mark "KRYPROBE-START"
     "$KRYPROBE" report --system --duration 60 --format json \
       --out "$OUT/krep-d08-$w.json" > "$OUT/krep-d08-$w.out" 2>&1 &
     kp=$!
@@ -404,7 +415,7 @@ cell_D08() {
     if wait "$kp"; then kexit=0; else kexit=$?; fi
     rows="$(grep -c . "$OUT/krep-d08-$w.json" 2>/dev/null || true)"
     if [ -z "$rows" ]; then rows=0; fi
-    echo "DEMO:SOAK {\"window\": $w, \"ops_ok\": $ok, \"kryprobe_exit\": $kexit, \"report_lines\": $rows}" > "$CONSOLE"
+    echo "DEMO:SOAK {\"window\": $w, \"ops_ok\": $ok, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
     if [ "$ok" != true ] || [ "$kexit" -ne 0 ]; then
       head -c 2000 "$OUT/krep-d08-$w.out" > "$CONSOLE" 2>/dev/null || true
       die "SOAK-W$w"
@@ -412,6 +423,7 @@ cell_D08() {
     w=$((w + 1))
   done
   # Final window: the capture stops while traffic continues.
+  mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 30 --format json \
     --out "$OUT/krep-d08-stop.json" > "$OUT/krep-d08-stop.out" 2>&1 &
   kp=$!
@@ -423,7 +435,8 @@ cell_D08() {
   mark "STOP-WINDOW-END"
   rows="$(grep -c . "$OUT/krep-d08-stop.json" 2>/dev/null || true)"
   if [ -z "$rows" ]; then rows=0; fi
-  echo "DEMO:SOAK {\"window\": 19, \"ops_ok\": true, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"traffic_active_at_stop\": true}" > "$CONSOLE"
+  echo "DEMO:SOAK {\"window\": 19, \"ops_ok\": true, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"traffic_active_at_stop\": true, \"ts_mono\": $(uptime_s)}" > "$CONSOLE"
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
   if [ -f "$OUT/krep-d08-stop.json" ]; then
     passthrough "$OUT/krep-d08-stop.json"
   fi
@@ -447,8 +460,7 @@ case "$CELL" in
     echo "NOT_RUN cell=$CELL reason=x01-threshold-provider-absent" > "$OUT/cell-$CELL.status"
     mark "UNSUPPORTED-X01-ABSENT"
     echo "POWERING-OFF" > "$CONSOLE"
-    poweroff -f
-    sleep 30
+    down
     ;;
   *)
     echo "REFUSED cell=$CELL reason=unknown-cell" > "$OUT/cell-UNKNOWN.status"

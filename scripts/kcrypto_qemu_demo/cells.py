@@ -26,6 +26,16 @@ POSITIVE_CONTROL = "T01-harness cold boot"
 
 PRELUDE_MARKS = ["INIT-READY", "MANIFEST-OK", "PRELUDE-DONE"]
 
+# BPF load + probe-attach budget after the kryprobe launch: ops
+# the product cannot yet see are honestly pre-attach traffic.
+ATTACH_SLACK_S = 5.0
+
+# Product verdict gaps that are structural for synchronous
+# traffic (proven by D01-rerun2 forensics): the api-returns
+# profile counts sync calls exactly but never completes the
+# async-oriented integrity/continuity dimensions.
+ALLOWED_PARTIAL_MISSING = frozenset({"capture-integrity", "completion"})
+
 
 def unsupported_receipt(cell: dict, run_id: str, reason: str) -> dict:
     """A declared UNSUPPORTED receipt (no boot, named control)."""
@@ -111,6 +121,181 @@ def _group_ledger(rows: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def _kryprobe_start_before(marks: list[dict], workload_ts) -> float | None:
+    """Last KRYPROBE-START mark strictly before the workload start."""
+    if isinstance(workload_ts, bool) or not isinstance(
+            workload_ts, (int, float)):
+        return None
+    cands = [mark.get("ts_mono") for mark in marks
+             if mark.get("name") == "KRYPROBE-START"
+             and isinstance(mark.get("ts_mono"), (int, float))
+             and not isinstance(mark.get("ts_mono"), bool)
+             and mark["ts_mono"] < workload_ts]
+    return max(cands) if cands else None
+
+
+def _kryprobe_exit(parsed: dict):
+    rows = _probe_rows(parsed, "kryprobe-exit")
+    if not rows:
+        return None
+    exit_code = rows[-1].get("exit")
+    return exit_code if type(exit_code) is int else None
+
+
+def _report_verdict(report) -> tuple[str | None, set[str]]:
+    if not isinstance(report, dict):
+        return None, set()
+    verdict = report.get("verdict")
+    if not isinstance(verdict, dict):
+        return None, set()
+    status = verdict.get("status")
+    missing = verdict.get("missing")
+    if not isinstance(missing, list) or not all(
+            isinstance(item, str) for item in missing):
+        return status, set()
+    return status, set(missing)
+
+
+def _verdict_exit_checks(report, exit_code: int | None) -> tuple[dict, dict]:
+    """Judge the product's self-grade (exit + named verdict gaps)."""
+    status, missing = _report_verdict(report)
+    verdict_ok = (
+        (status == "observed" and not missing)
+        or (status == "partial" and bool(missing)
+            and missing <= ALLOWED_PARTIAL_MISSING)
+    )
+    exit_ok = (
+        (exit_code == 0 and status == "observed" and not missing)
+        or (exit_code == 3 and status == "partial" and verdict_ok)
+    )
+    checks = {"product_verdict": bool(verdict_ok),
+              "product_exit_ok": bool(exit_ok)}
+    info = {"kryprobe_exit": exit_code, "verdict_status": status,
+            "verdict_missing": sorted(missing)}
+    return checks, info
+
+
+def _encrypt_totals(report) -> dict | None:
+    """Summed encrypt/agg observation counts (None when malformed)."""
+    if not isinstance(report, dict):
+        return None
+    observations = report.get("observations")
+    if not isinstance(observations, list):
+        return None
+    calls = ok = errors = nbytes = 0
+    found = False
+    for obs in observations:
+        if not isinstance(obs, dict):
+            return None
+        if obs.get("operation_class") != "encrypt":
+            continue
+        payload = obs.get("backend_payload")
+        if not isinstance(payload, dict) or payload.get("row") != "agg":
+            continue
+        counts = payload.get("counts")
+        if not isinstance(counts, dict):
+            return None
+        try:
+            calls += int(counts["calls"])
+            ok += int(counts["ok"])
+            errors += int(counts["errors"])
+            nbytes += int(payload["bytes"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        found = True
+    if not found:
+        return None
+    return {"calls": calls, "ok": ok, "errors": errors, "bytes": nbytes}
+
+
+def reconcile_product(report, exit_code: int | None, workload_ok: int,
+                      rate_per_s: float, op_bytes: int,
+                      kryprobe_start, workload_start) -> tuple[dict, dict]:
+    """Reconcile exact workload counts against the product view.
+
+    The product observes a suffix of the traffic (it cannot see
+    pre-attach ops): ``missed = workload - product`` must be
+    within the attach window plus slack, and never negative (the
+    product must not count more than was performed). Bytes must
+    match ``ok * op_bytes`` exactly, errors must be zero, and the
+    verdict gaps must be the allowed structural set.
+    """
+    totals = _encrypt_totals(report)
+    internal = (
+        totals is not None and totals["ok"] == totals["calls"]
+        and totals["errors"] == 0
+        and totals["bytes"] == totals["ok"] * op_bytes
+    )
+    missed: int | None = None
+    max_missed: int | None = None
+    suffix = False
+    if (totals is not None and isinstance(kryprobe_start, (int, float))
+            and not isinstance(kryprobe_start, bool)
+            and isinstance(workload_start, (int, float))
+            and not isinstance(workload_start, bool)
+            and workload_start > kryprobe_start and rate_per_s > 0):
+        import math
+        missed = workload_ok - totals["ok"]
+        max_missed = math.ceil(
+            rate_per_s * ((workload_start - kryprobe_start)
+                          + ATTACH_SLACK_S))
+        suffix = 0 <= missed <= max_missed
+    verdict_checks, verdict_info = _verdict_exit_checks(report, exit_code)
+    checks = {"product_internal": bool(internal),
+              "product_suffix": bool(suffix), **verdict_checks}
+    info = {"product_ok": totals["ok"] if totals else None,
+            "product_bytes": totals["bytes"] if totals else None,
+            "missed": missed, "max_missed": max_missed, **verdict_info}
+    return checks, info
+
+
+def product_presence(report, exit_code: int | None) -> tuple[dict, dict]:
+    """Presence rule for I/O cells: traffic seen, no errors, gaps named.
+
+    dm-crypt splits batches across requests, so exact API counts
+    are not reconcilable by construction (the plan counts I/O
+    bytes and API calls as separate populations): the product
+    must show nonzero qualified traffic with zero errors.
+    """
+    traffic = False
+    no_errors = True
+    classes: set[str] = set()
+    observations = (report.get("observations")
+                    if isinstance(report, dict) else None)
+    if not isinstance(observations, list):
+        observations = None
+    if observations is not None:
+        for obs in observations:
+            if not isinstance(obs, dict):
+                observations = None
+                break
+            payload = obs.get("backend_payload")
+            if not isinstance(payload, dict):
+                continue
+            counts = payload.get("counts")
+            if not isinstance(counts, dict):
+                continue
+            try:
+                ok = int(counts.get("ok", 0))
+                errors = int(counts.get("errors", 0))
+                nbytes = int(payload.get("bytes", 0))
+            except (TypeError, ValueError):
+                observations = None
+                break
+            if errors != 0:
+                no_errors = False
+            if ok > 0 and nbytes > 0:
+                traffic = True
+                classes.add(str(obs.get("operation_class")))
+    verdict_checks, verdict_info = _verdict_exit_checks(report, exit_code)
+    checks = {"product_traffic": bool(traffic and observations is not None),
+              "product_no_errors": bool(no_errors
+                                        and observations is not None),
+              **verdict_checks}
+    info = {"classes": sorted(classes), **verdict_info}
+    return checks, info
+
+
 def _jsonl(rows: list[dict]) -> str:
     return "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
 
@@ -135,11 +320,17 @@ def _build_d01(cell, run_id, guest_name, manifest_sha256, process,
     selected_driver = selected[0].get("driver") if selected else None
     used = [selected_driver] if selected_driver else []
     usage = reconcile.provider_usage(sorted(drivers), used)
+    workload_start = _mark_ts(parsed["MARK"], "WORKLOAD-START")
+    kryprobe_start = _kryprobe_start_before(parsed["MARK"], workload_start)
+    product_checks, product_info = reconcile_product(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed), len(ok_rows),
+        workload["rate_per_s"], workload["block_bytes"],
+        kryprobe_start, workload_start)
     checks = {
         "marks_ordered": console.marks_ordered(
             parsed["MARK"],
-            PRELUDE_MARKS + ["WORKLOAD-START", "WORKLOAD-STOP",
-                             "WORKLOAD-DONE"]),
+            PRELUDE_MARKS + ["KRYPROBE-START", "WORKLOAD-START",
+                             "WORKLOAD-STOP", "WORKLOAD-DONE"]),
         "sequence_gapless": gapless,
         "exact_count": len(parsed["LEDGER"]) == want,
         "all_status_ok": len(ok_rows) == len(parsed["LEDGER"]) > 0,
@@ -148,11 +339,13 @@ def _build_d01(cell, run_id, guest_name, manifest_sha256, process,
                             for rows in groups.values())),
         "selected_in_registry": selected_driver in drivers,
         "kryprobe_present": parsed["KRYPROBE"] is not None,
+        **product_checks,
     }
     receipt["checks"] = checks
     receipt["observation"] = {"expected": want, "actual": len(ok_rows)}
     receipt["provider_usage"] = usage
     receipt["selected_driver"] = selected_driver
+    receipt["product"] = product_info
     ledgers = {
         "workload-ledger.jsonl": _jsonl(parsed["LEDGER"]),
         "registry.json": json.dumps(registry, indent=2, sort_keys=True)
@@ -227,17 +420,21 @@ def _build_d03(cell, run_id, guest_name, manifest_sha256, process,
     receipt = _base_receipt(cell, run_id, guest_name, manifest_sha256,
                             process)
     io_checks, info = _io_checks(parsed, want)
+    presence_checks, presence_info = product_presence(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed))
     checks = {
         "marks_ordered": console.marks_ordered(
             parsed["MARK"],
-            PRELUDE_MARKS + ["WORKLOAD-START", "WORKLOAD-STOP",
-                             "WORKLOAD-DONE"]),
+            PRELUDE_MARKS + ["KRYPROBE-START", "WORKLOAD-START",
+                             "WORKLOAD-STOP", "WORKLOAD-DONE"]),
         **io_checks,
         **_dmap_checks(parsed),
         "kryprobe_present": parsed["KRYPROBE"] is not None,
+        **presence_checks,
     }
     receipt["checks"] = checks
     receipt["observation"] = {"expected": want, "actual": info["io_bytes"]}
+    receipt["product"] = presence_info
     # I/O bytes are measured; the kernel's internal API-call split
     # count is not instrumented here, so it stays explicitly
     # unknown instead of a fabricated fragment count.
@@ -298,13 +495,21 @@ def _build_d04(cell, run_id, guest_name, manifest_sha256, process,
         [{"driver": "virtio_crypto", "dev": row.get("dev")}
          for row in virtio_rows], queue_rows=[])
     offload = reconcile.is_offload("virtio_crypto", queue_proof=None)
+    observed_ok = [row for row in parsed["LEDGER"]
+                   if row.get("status") == 0]
+    workload_start = _mark_ts(parsed["MARK"], "WORKLOAD-START")
+    kryprobe_start = _kryprobe_start_before(parsed["MARK"], workload_start)
+    product_checks, product_info = reconcile_product(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed), len(observed_ok),
+        workload["rate_per_s"], workload["block_bytes"],
+        kryprobe_start, workload_start)
     receipt = _base_receipt(cell, run_id, guest_name, manifest_sha256,
                             process)
     receipt["checks"] = {
         "marks_ordered": console.marks_ordered(
             parsed["MARK"],
-            PRELUDE_MARKS + ["WORKLOAD-START", "WORKLOAD-STOP",
-                             "WORKLOAD-DONE"]),
+            PRELUDE_MARKS + ["KRYPROBE-START", "WORKLOAD-START",
+                             "WORKLOAD-STOP", "WORKLOAD-DONE"]),
         "virtio_present": True,
         "virtio_alloc_recorded": bool(alloc_rows),
         "generic_control_ok": generic_ok,
@@ -312,12 +517,14 @@ def _build_d04(cell, run_id, guest_name, manifest_sha256, process,
         "device_unknown": identified["device"] == "unknown",
         "no_offload_claim": offload is False,
         "kryprobe_present": parsed["KRYPROBE"] is not None,
+        **product_checks,
     }
     receipt["observation"] = {"expected": workload["control_ops"],
                               "actual": len(generic)}
     receipt["device"] = identified["device"]
     receipt["virtio_driver"] = vdrv
     receipt["virtio_alloc_ok"] = alloc_ok
+    receipt["product"] = product_info
     return receipt, ledgers
 
 
@@ -400,20 +607,24 @@ def _build_d07(cell, run_id, guest_name, manifest_sha256, process,
     unlocked = reconcile.unlock_after_attach(attach_ts, unlock_ts)
     gap = reconcile.unobserved_interval(0.0, attach_ts)
     io_checks, info = _io_checks(parsed, want)
+    presence_checks, presence_info = product_presence(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed))
     checks = {
         "marks_ordered": console.marks_ordered(
             parsed["MARK"],
-            PRELUDE_MARKS + ["ATTACH-READY", "UNLOCK-START",
-                             "UNLOCK-DONE", "WORKLOAD-STOP",
-                             "WORKLOAD-DONE"]),
+            PRELUDE_MARKS + ["KRYPROBE-START", "ATTACH-READY",
+                             "UNLOCK-START", "UNLOCK-DONE",
+                             "WORKLOAD-STOP", "WORKLOAD-DONE"]),
         "unlock_after_attach": unlocked,
         **io_checks,
         **_dmap_checks(parsed),
         "kryprobe_present": parsed["KRYPROBE"] is not None,
+        **presence_checks,
     }
     receipt["checks"] = checks
     receipt["observation"] = {"expected": want, "actual": info["io_bytes"]}
     receipt["unobserved"] = gap
+    receipt["product"] = presence_info
     ledgers = {
         "attach-ready.json": json.dumps(
             {"attach_ts": attach_ts, "unlock_ts": unlock_ts,
@@ -451,15 +662,24 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
     last = [row for row in soak if row.get("window") == windows - 1]
     stop_ok = (len(last) == 1
                and last[0].get("traffic_active_at_stop") is True
-               and last[0].get("kryprobe_exit") == 0)
+               and last[0].get("kryprobe_exit") in (0, 3))
+    stop_rows = [row for row in parsed["LEDGER"]
+                 if row.get("alloc_id") == "d08-stop"
+                 and row.get("status") == 0]
+    stop_start = _mark_ts(parsed["MARK"], "STOP-WINDOW-START")
+    kryprobe_start = _kryprobe_start_before(parsed["MARK"], stop_start)
+    product_checks, product_info = reconcile_product(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed), len(stop_rows),
+        workload["rate_per_s"], workload["block_bytes"],
+        kryprobe_start, stop_start)
     checks = {
         "marks_ordered": console.marks_ordered(
             parsed["MARK"],
-            PRELUDE_MARKS + ["STOP-WINDOW-START", "STOP-WINDOW-END",
-                             "WORKLOAD-DONE"]),
+            PRELUDE_MARKS + ["KRYPROBE-START", "STOP-WINDOW-START",
+                             "STOP-WINDOW-END", "WORKLOAD-DONE"]),
         "windows_complete": ids == list(range(windows)),
         "windows_ok": judged["ok"] and all(
-            row.get("ops_ok") is True and row.get("kryprobe_exit") == 0
+            row.get("ops_ok") is True and row.get("kryprobe_exit") in (0, 3)
             for row in soak) and len(soak) == windows,
         "ledger_gapless": gapless,
         "ledger_exact": (len(parsed["LEDGER"])
@@ -467,10 +687,12 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
         "all_status_ok": len(ok_rows) == len(parsed["LEDGER"]) > 0,
         "stop_under_traffic": stop_ok,
         "kryprobe_present": parsed["KRYPROBE"] is not None,
+        **product_checks,
     }
     receipt["checks"] = checks
     receipt["observation"] = {"expected": windows * workload["window_ops"],
                               "actual": len(ok_rows)}
+    receipt["product"] = product_info
     receipt["loss"] = {"dropped": 0, "omitted": [],
                          "basis": "gapless workload ledger + kryprobe"
                                   " exit 0 (clean/complete) every window"}
