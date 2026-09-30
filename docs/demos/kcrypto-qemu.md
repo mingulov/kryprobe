@@ -121,7 +121,11 @@ same dir.
    UNSUPPORTED×2 (`D06-run.log`, `D06-rerun1.log`) — no
    fallback trigger qualified, so no failover is narrated. The
    device stays "unknown"; no queue/binding/offload claim is
-   made.
+   made. Successors (repair campaign
+   `p10a7-20260930T044828Z/`, per its `SUPERSEDED.md`):
+   `D04-repair1.log` PASS 13/13 and `D05-repair1.log` PASS
+   6/6 supersede the two tainted p10a4 PASSes (foreign qemu
+   at spawn); the predecessors above stay citable history.
 5. Early boot (D07 — QUALIFIED): `D07-rerun1.log` verdict PASS;
    `cell-D07.json` checks `unlock_after_attach` true with
    `dmap_order`, `io_bytes_exact`, `readback_match` true over
@@ -139,6 +143,11 @@ same dir.
    observed/reference/unknown with its run ID, and
    replay is labeled replay. First failure preserved:
    `D08-run.log` (FAIL — `marks_ordered` + `product_suffix`).
+   Successor (repair campaign `p10a7-20260930T044828Z/`, per
+   its `SUPERSEDED.md`): `D08-repair2.log` PASS 19/19
+   supersedes this run under the measured-loss oracle (the
+   15-check verdict above is superseded, not re-judged;
+   `D08-repair1.log` FAIL preserved).
 
 No firmware-to-userspace completeness claim, no transparent
 failover claim, no physical-accelerator claim, no key/credential
