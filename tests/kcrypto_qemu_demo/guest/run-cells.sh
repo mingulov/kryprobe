@@ -160,11 +160,15 @@ cell_D01() {
   algd run --name "$drv" --keylen 16 --ops 150 --bytes 4096 \
     --rate 10 --op encrypt --alloc-id d01-driver > "$CONSOLE" || die "ALGD-DRIVER"
   mark "WORKLOAD-STOP"
-  if ! wait "$kp"; then
+  if wait "$kp"; then kexit=0; else kexit=$?; fi
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d01.json" ]; then
+    passthrough "$OUT/krep-d01.json"
+  fi
+  if [ "$kexit" -ne 0 ]; then
     head -c 2000 "$OUT/krep-d01.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
-  passthrough "$OUT/krep-d01.json"
   finish
 }
 
@@ -189,11 +193,15 @@ cell_D02() {
     --rate 10 --op encrypt --alloc-id d02-fresh1 > "$CONSOLE" || die "ALGD-FRESH1"
   wait "$held" || die "ALGD-HELD"
   mark "WORKLOAD-STOP"
-  if ! wait "$kp"; then
+  if wait "$kp"; then kexit=0; else kexit=$?; fi
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d02.json" ]; then
+    passthrough "$OUT/krep-d02.json"
+  fi
+  if [ "$kexit" -ne 0 ]; then
     head -c 2000 "$OUT/krep-d02.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
-  passthrough "$OUT/krep-d02.json"
   finish
 }
 
@@ -221,11 +229,15 @@ cell_D03() {
   iochk --dev "$dmnode" --bytes 67108864 > "$CONSOLE" || die "IOCHK"
   mark "WORKLOAD-STOP"
   dmap remove --name demo-d03 > "$CONSOLE" || die "DMAP-REMOVE"
-  if ! wait "$kp"; then
+  if wait "$kp"; then kexit=0; else kexit=$?; fi
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d03.json" ]; then
+    passthrough "$OUT/krep-d03.json"
+  fi
+  if [ "$kexit" -ne 0 ]; then
     head -c 2000 "$OUT/krep-d03.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
-  passthrough "$OUT/krep-d03.json"
   finish
 }
 
@@ -260,11 +272,15 @@ cell_D04() {
   algd run --name 'cbc(aes)' --keylen 16 --ops 50 --bytes 4096 \
     --rate 10 --op encrypt --alloc-id d04-generic > "$CONSOLE" || die "ALGD-GENERIC"
   mark "WORKLOAD-STOP"
-  if ! wait "$kp"; then
+  if wait "$kp"; then kexit=0; else kexit=$?; fi
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d04.json" ]; then
+    passthrough "$OUT/krep-d04.json"
+  fi
+  if [ "$kexit" -ne 0 ]; then
     head -c 2000 "$OUT/krep-d04.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
-  passthrough "$OUT/krep-d04.json"
   finish
 }
 
@@ -358,11 +374,15 @@ cell_D07() {
   iochk --dev "$dmnode" --bytes 16777216 > "$CONSOLE" || die "IOCHK"
   dmap remove --name demo-d07 > "$CONSOLE" || die "DMAP-REMOVE"
   mark "WORKLOAD-STOP"
-  if ! wait "$kp"; then
+  if wait "$kp"; then kexit=0; else kexit=$?; fi
+  echo "DEMO:PROBE {\"fact\": \"kryprobe-exit\", \"exit\": $kexit}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d07.json" ]; then
+    passthrough "$OUT/krep-d07.json"
+  fi
+  if [ "$kexit" -ne 0 ]; then
     head -c 2000 "$OUT/krep-d07.out" > "$CONSOLE" 2>/dev/null || true
     die "KRYPROBE"
   fi
-  passthrough "$OUT/krep-d07.json"
   finish
 }
 
@@ -404,11 +424,13 @@ cell_D08() {
   rows="$(grep -c . "$OUT/krep-d08-stop.json" 2>/dev/null || true)"
   if [ -z "$rows" ]; then rows=0; fi
   echo "DEMO:SOAK {\"window\": 19, \"ops_ok\": true, \"kryprobe_exit\": $kexit, \"report_lines\": $rows, \"traffic_active_at_stop\": true}" > "$CONSOLE"
+  if [ -f "$OUT/krep-d08-stop.json" ]; then
+    passthrough "$OUT/krep-d08-stop.json"
+  fi
   if [ "$kexit" -ne 0 ]; then
     head -c 2000 "$OUT/krep-d08-stop.out" > "$CONSOLE" 2>/dev/null || true
     die "SOAK-STOP-KRYPROBE"
   fi
-  passthrough "$OUT/krep-d08-stop.json"
   finish
 }
 

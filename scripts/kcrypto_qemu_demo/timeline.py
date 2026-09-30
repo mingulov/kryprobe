@@ -131,8 +131,11 @@ def collect_run(run_dir: Path) -> tuple[list[dict], dict[str, dict]]:
         cell_id = (receipt or {}).get("cell_id", child.name)
         run_id = (receipt or {}).get("run_id", child.name)
         cell_edges_list, facts = cell_edges(cell_id, run_id, child)
+        facts["cell"] = cell_id
+        for edge in cell_edges_list:
+            edge["row"] = child.name
         edges.extend(cell_edges_list)
-        rows[cell_id] = facts
+        rows[child.name] = facts
     judged = reconcile.timeline_edges(edges)
     if not judged["ok"]:
         raise ValueError(f"timeline refuses unproved arrows: {judged}")
@@ -173,8 +176,9 @@ def render_svg(run_id: str, edges: list[dict], rows: dict[str, dict]) -> str:
         '<text x="20" y="74">edge labels: observed (green) /'
         " reference (blue) / unknown (grey); run ID on every edge</text>",
     ]
-    for index, cell_id in enumerate(sorted(rows)):
-        facts = rows[cell_id]
+    for index, row_name in enumerate(sorted(rows)):
+        facts = rows[row_name]
+        cell_id = facts.get("cell", row_name)
         y = top + index * row_h
         verdict = facts.get("verdict", "UNKNOWN")
         color = VERDICT_COLORS.get(verdict, "#6e7781")
@@ -185,13 +189,13 @@ def render_svg(run_id: str, edges: list[dict], rows: dict[str, dict]) -> str:
             else "span unknown"
         )
         parts.append(
-            f'<text x="20" y="{y + 18}">{html.escape(cell_id)}'
+            f'<text x="20" y="{y + 18}">{html.escape(row_name)}'
             f" [{html.escape(str(verdict))}]</text>"
         )
         parts.append(
             f'<text x="20" y="{y + 34}" font-size="11">{span_text}</text>'
         )
-        cell_edges = [edge for edge in edges if edge["cell"] == cell_id]
+        cell_edges = [edge for edge in edges if edge["row"] == row_name]
         x = left
         step = (width - left - 20) // max(len(cell_edges), 1)
         for edge in cell_edges:
