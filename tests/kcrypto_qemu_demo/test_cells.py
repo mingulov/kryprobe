@@ -637,6 +637,149 @@ class D08Tests(unittest.TestCase):
         self.assertFalse(receipt["checks"]["traffic_spans_capture_end"])
 
 
+def krepo_window(window, calls, op_bytes=4096, errors=0,
+                 ring_drops=0, verdict="partial",
+                 missing=("capture-integrity", "completion")):
+    """One numbered per-window product report block (R1 protocol)."""
+    obs = (
+        '{"operation_class": "encrypt", "phase": "returned",'
+        ' "backend_payload": {"row": "agg", "counts": {"calls": %d,'
+        ' "errors": %d, "ok": %d}, "bytes": %d}}'
+        % (calls, errors, calls, calls * op_bytes)
+    )
+    coverage = (
+        '{"detailed_events": {"counters": ['
+        '{"name": "ring_drops", "value": "%d"}]}}' % ring_drops
+    )
+    return (
+        'DEMO:KRYPROBE-WINDOW-BEGIN {"window": %d}\n'
+        '{"observations": [%s], "coverage": %s,'
+        ' "verdict": {"status": "%s", "missing": [%s]}}\n'
+        'DEMO:KRYPROBE-WINDOW-END {"window": %d}\n'
+        % (window, obs, coverage, verdict,
+           ", ".join('"%s"' % m for m in missing), window)
+    )
+
+
+class D08WindowReportTests(unittest.TestCase):
+    """R1 RED: every window's report retained + validated, loss measured."""
+
+    def _console(self, drops0=0, drops1=0, calls1=1, lines0=1, lines1=1,
+                 with_block0=True, with_block1=True, legacy=False):
+        lines = list(PRELUDE_MARKS)
+        lines.append(mark("KRYPROBE-START", 2.0))
+        lines.append(ledger(0, "d08-w0", ts=4.0))
+        lines.append(ledger(1, "d08-w0", ts=5.0))
+        lines.append(
+            'DEMO:SOAK {"window": 0, "ops_ok": true,'
+            ' "kryprobe_exit": 3, "report_lines": %d}' % lines0)
+        lines.append(mark("KRYPROBE-START", 59.0))
+        lines.append(mark("STOP-WINDOW-START", 60.0))
+        lines.append(ledger(0, "d08-stop", ts=61.0))
+        lines.append(ledger(1, "d08-stop", ts=95.0))
+        lines.append(mark("STOP-WINDOW-END", 96.0))
+        lines.append(
+            'DEMO:SOAK {"window": 1, "ops_ok": true,'
+            ' "kryprobe_exit": 3, "report_lines": %d,'
+            ' "traffic_active_at_stop": true}' % lines1)
+        lines.append(mark("WORKLOAD-DONE", 97.0))
+        lines.append(
+            'DEMO:PROBE {"fact": "kryprobe-exit", "exit": 3}')
+        body = "\n".join(lines) + "\n"
+        if with_block0:
+            body += krepo_window(0, 2, ring_drops=drops0)
+        if with_block1:
+            body += krepo_window(1, calls1, ring_drops=drops1)
+        if legacy:
+            body += krepo(calls1, verdict="partial",
+                          missing=("capture-integrity", "completion"))
+        return body
+
+    def _workload(self):
+        return {"kind": "stop-soak", "aggregate_minutes": 20,
+                "windows": 2, "window_ops": 2, "rate_per_s": 10,
+                "block_bytes": 4096}
+
+    def _build(self, **kwargs):
+        return cells.build_cell(
+            cell(self._workload(), "D08"), "run1", "msha",
+            self._console(**kwargs), PROC, "guest1")
+
+    def test_d08_windowed_reports_pass(self):
+        receipt, ledgers = self._build()
+        self.assertTrue(all(receipt["checks"].values()),
+                        receipt["checks"])
+        self.assertTrue(receipt["checks"]["product_reports_complete"])
+        self.assertTrue(receipt["checks"]["product_no_drops"])
+        self.assertEqual(receipt["loss"]["dropped"], 0)
+        self.assertEqual(receipt["loss"]["windows_measured"], 2)
+        # The stop-window product view still judges the tail shape.
+        self.assertTrue(receipt["checks"]["product_saw_head"])
+        self.assertTrue(receipt["checks"]["product_missed_tail"])
+        self.assertTrue(receipt["checks"]["kryprobe_present"])
+        # Every window's report is retained as a sealed ledger.
+        self.assertIn("window-reports.json", ledgers)
+        retained = json.loads(ledgers["window-reports.json"])
+        self.assertEqual(sorted(retained), ["0", "1"])
+        stop = json.loads(ledgers["product-report.json"])
+        self.assertEqual(stop, retained["1"])
+
+    def test_d08_missing_window_report_fails(self):
+        receipt, _ = self._build(with_block0=False)
+        self.assertFalse(receipt["checks"]["product_reports_complete"])
+        self.assertIn(0, receipt["loss"]["omitted"])
+        self.assertFalse(all(receipt["checks"].values()))
+
+    def test_d08_missing_stop_window_report_fails(self):
+        receipt, _ = self._build(with_block1=False)
+        self.assertFalse(receipt["checks"]["product_reports_complete"])
+        self.assertFalse(receipt["checks"]["kryprobe_present"])
+
+    def test_d08_zero_soak_report_lines_fails(self):
+        receipt, _ = self._build(lines0=0)
+        self.assertFalse(receipt["checks"]["product_reports_complete"])
+
+    def test_d08_report_lines_mismatch_fails(self):
+        # The guest-measured SOAK count must equal the host-measured
+        # console block lines: a torn or duplicated emission fails.
+        receipt, _ = self._build(lines0=2)
+        self.assertFalse(receipt["checks"]["product_reports_complete"])
+
+    def test_d08_nonzero_ring_drops_fails(self):
+        receipt, _ = self._build(drops0=7)
+        self.assertFalse(receipt["checks"]["product_no_drops"])
+        self.assertEqual(receipt["loss"]["dropped"], 7)
+        per = {row["window"]: row["ring_drops"]
+               for row in receipt["loss"]["per_window"]}
+        self.assertEqual(per, {0: 7, 1: 0})
+        self.assertFalse(all(receipt["checks"].values()))
+
+    def test_d08_stop_window_drops_counted(self):
+        receipt, _ = self._build(drops0=2, drops1=3)
+        self.assertEqual(receipt["loss"]["dropped"], 5)
+        self.assertFalse(receipt["checks"]["product_no_drops"])
+
+    def test_d08_unmeasured_drops_fail_closed(self):
+        # A window report without the ring_drops counter is an
+        # absent measurement, never zero loss.
+        body = self._console()
+        body = body.replace('"value": "0"', '"value": "oops"', 1)
+        receipt, _ = cells.build_cell(
+            cell(self._workload(), "D08"), "run1", "msha", body,
+            PROC, "guest1")
+        self.assertFalse(receipt["checks"]["product_no_drops"])
+        self.assertIsNone(receipt["loss"]["dropped"])
+        self.assertFalse(receipt["checks"]["loss_visible"])
+
+    def test_d08_legacy_single_block_no_longer_passes(self):
+        # The A1 hole: only the final window's report on the
+        # console must not satisfy the per-window oracle.
+        receipt, _ = self._build(with_block0=False, with_block1=False,
+                                 legacy=True)
+        self.assertFalse(receipt["checks"]["product_reports_complete"])
+        self.assertFalse(all(receipt["checks"].values()))
+
+
 class ProductReconcileTests(unittest.TestCase):
     def _console(self, workload_ops=4, product_calls=4, errors=0,
                  kexit=0, kverdict="observed", kmissing=(),

@@ -16,6 +16,7 @@ a fail-closed behavior:
 - multi-line product-report passthrough reassembles exactly.
 """
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -104,6 +105,108 @@ class ParseTests(unittest.TestCase):
         text = "DEMO:KRYPROBE-BEGIN\nDEMO:KRYPROBE-BEGIN\nDEMO:KRYPROBE-END\n"
         with self.assertRaises(console.ConsoleError):
             console.parse_console(text)
+
+
+class WindowedReportTests(unittest.TestCase):
+    """R1 RED: numbered per-window product reports (D08 loss accounting).
+
+    Every D08 window's product report must reach the console as a
+    bounded, numbered block so the oracle can validate per-window
+    capture instead of asserting unmeasured zero loss.
+    """
+
+    def _block(self, window, body='{"ok": true}'):
+        head = ('DEMO:KRYPROBE-WINDOW-BEGIN {"window": %s}\n'
+                % json.dumps(window))
+        tail = ('DEMO:KRYPROBE-WINDOW-END {"window": %s}\n'
+                % json.dumps(window))
+        return head + body + "\n" + tail
+
+    def test_windowed_blocks_parsed_per_window(self):
+        text = self._block(0) + self._block(3, '{"ok": false}')
+        parsed = console.parse_console(text)
+        self.assertEqual(
+            parsed["KRYPROBE_WINDOWS"][0]["report"], {"ok": True})
+        self.assertEqual(
+            parsed["KRYPROBE_WINDOWS"][3]["report"], {"ok": False})
+        self.assertEqual(parsed["KRYPROBE_WINDOWS"][0]["lines"], 1)
+
+    def test_windowed_block_counts_nonempty_lines(self):
+        text = self._block(1, '{"a": 1}\n\n{"b": 2}')
+        parsed = console.parse_console(text)
+        # Mirrors the guest's `grep -c .` (non-empty lines only).
+        self.assertEqual(parsed["KRYPROBE_WINDOWS"][1]["lines"], 2)
+
+    def test_duplicate_window_refused(self):
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(self._block(2) + self._block(2))
+
+    def test_mismatched_window_end_refused(self):
+        text = (
+            'DEMO:KRYPROBE-WINDOW-BEGIN {"window": 1}\n'
+            '{"ok": true}\n'
+            'DEMO:KRYPROBE-WINDOW-END {"window": 2}\n'
+        )
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(text)
+
+    def test_window_end_without_begin_refused(self):
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(
+                'DEMO:KRYPROBE-WINDOW-END {"window": 0}\n')
+
+    def test_unterminated_window_block_refused(self):
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(
+                'DEMO:KRYPROBE-WINDOW-BEGIN {"window": 0}\n{"ok": true}\n')
+
+    def test_nested_window_block_refused(self):
+        text = (
+            'DEMO:KRYPROBE-WINDOW-BEGIN {"window": 0}\n'
+            'DEMO:KRYPROBE-WINDOW-BEGIN {"window": 1}\n'
+            'DEMO:KRYPROBE-WINDOW-END {"window": 0}\n'
+        )
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(text)
+
+    def test_window_block_inside_legacy_block_refused(self):
+        text = (
+            "DEMO:KRYPROBE-BEGIN\n"
+            'DEMO:KRYPROBE-WINDOW-BEGIN {"window": 0}\n'
+            "DEMO:KRYPROBE-END\n"
+        )
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(text)
+
+    def test_legacy_block_inside_window_block_refused(self):
+        text = (
+            'DEMO:KRYPROBE-WINDOW-BEGIN {"window": 0}\n'
+            "DEMO:KRYPROBE-BEGIN\n"
+            'DEMO:KRYPROBE-WINDOW-END {"window": 0}\n'
+        )
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(text)
+
+    def test_non_json_window_body_refused(self):
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(self._block(0, "not json {"))
+
+    def test_non_object_window_header_refused(self):
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(
+                "DEMO:KRYPROBE-WINDOW-BEGIN 7\n{}\n"
+                'DEMO:KRYPROBE-WINDOW-END {"window": 7}\n')
+
+    def test_out_of_range_window_refused(self):
+        for window in (-1, 256, "x", True):
+            with self.assertRaises(console.ConsoleError,
+                                   msg=f"window={window!r}"):
+                console.parse_console(self._block(window))
+
+    def test_oversized_window_block_refused(self):
+        big = '{"pad": "%s"}' % ("x" * 2_000_000)
+        with self.assertRaises(console.ConsoleError):
+            console.parse_console(self._block(0, big))
 
 
 class SequenceTests(unittest.TestCase):
