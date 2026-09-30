@@ -22,6 +22,9 @@
  *   algd hold --name N --keylen K --hold-s S --alloc-id A
  *     allocate + setkey, emit DEMO:HANDLE held, sleep S, emit
  *     released. The retained-handle control for D02.
+ *   algd probe --name N --keylen K
+ *     bind + setkey + accept + close without I/O; emits one
+ *     DEMO:PROBE bind-probe row (no LEDGER pollution).
  *
  * Exits: 0 ok, 1 internal/operation failure, 2 usage.
  */
@@ -300,6 +303,8 @@ static int cmd_run(int argc, char **argv)
 			       " \"alloc_id\": \"", i, opname, bytes,
 			       op_status);
 			json_escape(stdout, alloc_id);
+			printf("\", \"name\": \"");
+			json_escape(stdout, name);
 			printf("\", \"ts_mono\": %.6f}\n", mono_now());
 			fflush(stdout);
 			fprintf(stderr, "algd: run: op %d failed, aborting\n",
@@ -310,6 +315,8 @@ static int cmd_run(int argc, char **argv)
 		       " \"bytes\": %ld, \"status\": 0, \"alloc_id\": \"",
 		       i, opname, bytes);
 		json_escape(stdout, alloc_id);
+		printf("\", \"name\": \"");
+		json_escape(stdout, name);
 		printf("\", \"ts_mono\": %.6f}\n", mono_now());
 		fflush(stdout);
 		gap.tv_sec = 0;
@@ -368,11 +375,15 @@ static int cmd_hold(int argc, char **argv)
 	}
 	printf("DEMO:HANDLE {\"event\": \"held\", \"alloc_id\": \"");
 	json_escape(stdout, alloc_id);
+	printf("\", \"name\": \"");
+	json_escape(stdout, name);
 	printf("\", \"ts_mono\": %.6f}\n", mono_now());
 	fflush(stdout);
 	sleep((unsigned int)hold_s);
 	printf("DEMO:HANDLE {\"event\": \"released\", \"alloc_id\": \"");
 	json_escape(stdout, alloc_id);
+	printf("\", \"name\": \"");
+	json_escape(stdout, name);
 	printf("\", \"ts_mono\": %.6f}\n", mono_now());
 	fflush(stdout);
 	rc = 0;
@@ -385,11 +396,52 @@ done:
 	return rc;
 }
 
+static int cmd_probe(int argc, char **argv)
+{
+	const char *name = flag_value(argc, argv, "--name");
+	const char *k = flag_value(argc, argv, "--keylen");
+	long keylen;
+	int tfmfd = -1, opfd = -1, rc = 1;
+	unsigned char *key = NULL;
+
+	if (!name || !k || (keylen = atol(k)) <= 0 || keylen > 64) {
+		fprintf(stderr, "usage: algd probe --name N --keylen K\n");
+		return 2;
+	}
+	key = malloc((size_t)keylen);
+	if (!key) {
+		fprintf(stderr, "algd: probe: out of memory\n");
+		return 1;
+	}
+	prng_fill(key, (size_t)keylen, 0xbeef);
+	tfmfd = alg_bind("skcipher", name);
+	if (tfmfd < 0)
+		goto out;
+	if (alg_setkey(tfmfd, key, (size_t)keylen) != 0)
+		goto out;
+	opfd = accept(tfmfd, NULL, 0);
+	if (opfd < 0)
+		goto out;
+	rc = 0;
+out:
+	printf("DEMO:PROBE {\"fact\": \"bind-probe\", \"name\": \"");
+	json_escape(stdout, name);
+	printf("\", \"ok\": %s, \"ts_mono\": %.6f}\n",
+	       rc == 0 ? "true" : "false", mono_now());
+	fflush(stdout);
+	if (opfd >= 0)
+		close(opfd);
+	if (tfmfd >= 0)
+		close(tfmfd);
+	free(key);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (argc < 2) {
-		fprintf(stderr, "usage: algd {registry|run|hold} ...\n");
+		fprintf(stderr, "usage: algd {registry|run|hold|probe} ...\n");
 		return 2;
 	}
 	if (strcmp(argv[1], "registry") == 0)
@@ -398,6 +450,8 @@ int main(int argc, char **argv)
 		return cmd_run(argc - 1, argv + 1);
 	if (strcmp(argv[1], "hold") == 0)
 		return cmd_hold(argc - 1, argv + 1);
-	fprintf(stderr, "usage: algd {registry|run|hold} ...\n");
+	if (strcmp(argv[1], "probe") == 0)
+		return cmd_probe(argc - 1, argv + 1);
+	fprintf(stderr, "usage: algd {registry|run|hold|probe} ...\n");
 	return 2;
 }

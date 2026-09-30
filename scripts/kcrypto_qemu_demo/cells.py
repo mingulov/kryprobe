@@ -345,6 +345,13 @@ def _build_d01(cell, run_id, guest_name, manifest_sha256, process,
     receipt["observation"] = {"expected": want, "actual": len(ok_rows)}
     receipt["provider_usage"] = usage
     receipt["selected_driver"] = selected_driver
+    # Names each allocation half actually bound: on CPUs where the
+    # generic name refuses to bind, the guest falls back to the
+    # selected driver for the generic half (recorded, not hidden).
+    receipt["alloc_names"] = {
+        alloc_id: sorted({row.get("name") for row in rows})
+        for alloc_id, rows in groups.items()
+    }
     receipt["product"] = product_info
     ledgers = {
         "workload-ledger.jsonl": _jsonl(parsed["LEDGER"]),

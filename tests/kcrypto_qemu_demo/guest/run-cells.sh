@@ -71,11 +71,23 @@ prelude() {
   mark "PRELUDE-DONE"
 }
 
-# Highest-priority skcipher driver implementing a generic name.
+# Highest-priority driver implementing a generic name: skcipher
+# first, then the sync-only lskcipher (the no-AES CPU offers
+# cbc(aes) only as lskcipher). Prints "priority driver type".
 best_driver() {
-  algd registry | grep -F "\"name\": \"$1\"" | grep -F '"type": "skcipher"' \
+  pick="$(algd registry | grep -F "\"name\": \"$1\"")"
+  out="$(echo "$pick" | grep -F '"type": "skcipher"' \
     | sed -E 's/.*"driver": "([^"]+)".*"priority": ([0-9]+).*/\2 \1/' \
-    | sort -rn | head -1 | cut -d' ' -f2
+    | sort -rn | head -1)"
+  if [ -z "$out" ]; then
+    out="$(echo "$pick" | grep -F '"type": "lskcipher"' \
+      | sed -E 's/.*"driver": "([^"]+)".*"priority": ([0-9]+).*/\2 \1/' \
+      | sort -rn | head -1)"
+    if [ -n "$out" ]; then out="$out lskcipher"; fi
+  else
+    out="$out skcipher"
+  fi
+  echo "$out" | cut -d' ' -f2-
 }
 
 # Emit a kryprobe JSON report through the passthrough channel.
@@ -156,9 +168,11 @@ cell_PROBE() {
 # --- D01: generic + exact-driver allocations, 300 ops total --------
 cell_D01() {
   prelude "af_alg algif_skcipher"
-  drv="$(best_driver 'cbc(aes)')"
+  pick="$(best_driver 'cbc(aes)')"
+  drv="$(echo "$pick" | cut -d' ' -f1)"
+  drvtype="$(echo "$pick" | cut -d' ' -f2)"
   if [ -z "$drv" ]; then die "NO-CBC-DRIVER"; fi
-  echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv\"}" > "$CONSOLE"
+  echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv\", \"type\": \"$drvtype\"}" > "$CONSOLE"
   mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 60 --format json \
     --out "$OUT/krep-d01.json" > "$OUT/krep-d01.out" 2>&1 &
@@ -185,20 +199,30 @@ cell_D01() {
 # --- D02: cpu variant + retained handle across fresh allocs --------
 cell_D02() {
   prelude "af_alg algif_skcipher"
-  drv="$(best_driver 'cbc(aes)')"
+  pick="$(best_driver 'cbc(aes)')"
+  drv="$(echo "$pick" | cut -d' ' -f1)"
+  drvtype="$(echo "$pick" | cut -d' ' -f2)"
   if [ -z "$drv" ]; then die "NO-CBC-DRIVER"; fi
-  echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv\"}" > "$CONSOLE"
+  echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv\", \"type\": \"$drvtype\"}" > "$CONSOLE"
   mark "KRYPROBE-START"
   "$KRYPROBE" report --system --duration 60 --format json \
     --out "$OUT/krep-d02.json" > "$OUT/krep-d02.out" 2>&1 &
   kp=$!
   sleep 2
   mark "WORKLOAD-START"
-  algd hold --name 'cbc(aes)' --keylen 16 --hold-s 45 \
+  # The no-AES CPU may not bind the generic name at all (lskcipher
+  # only): probe once, then hold/run under the name that binds.
+  # LEDGER/HANDLE name fields record the truth either way.
+  if algd probe --name 'cbc(aes)' --keylen 16 > "$CONSOLE" 2>&1; then
+    gname='cbc(aes)'
+  else
+    gname="$drv"
+  fi
+  algd hold --name "$gname" --keylen 16 --hold-s 45 \
     --alloc-id d02-held > "$CONSOLE" &
   held=$!
   sleep 3
-  algd run --name 'cbc(aes)' --keylen 16 --ops 150 --bytes 4096 \
+  algd run --name "$gname" --keylen 16 --ops 150 --bytes 4096 \
     --rate 10 --op encrypt --alloc-id d02-fresh0 > "$CONSOLE" || die "ALGD-FRESH0"
   algd run --name "$drv" --keylen 16 --ops 150 --bytes 4096 \
     --rate 10 --op encrypt --alloc-id d02-fresh1 > "$CONSOLE" || die "ALGD-FRESH1"
@@ -339,8 +363,10 @@ cell_D05() {
   else
     echo "DEMO:PROBE {\"fact\": \"post-removal-alloc\", \"ok\": false}" > "$CONSOLE"
   fi
-  drv2="$(best_driver 'cbc(aes)' || true)"
-  echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv2\"}" > "$CONSOLE"
+  pick2="$(best_driver 'cbc(aes)' || true)"
+  drv2="$(echo "$pick2" | cut -d' ' -f1)"
+  drvtype2="$(echo "$pick2" | cut -d' ' -f2)"
+  echo "DEMO:PROBE {\"fact\": \"selected\", \"name\": \"cbc(aes)\", \"driver\": \"$drv2\", \"type\": \"$drvtype2\"}" > "$CONSOLE"
   finish
 }
 

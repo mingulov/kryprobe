@@ -27,10 +27,11 @@ def mark(name, ts):
     return f'DEMO:MARK {{"name": "{name}", "ts_mono": {ts}}}'
 
 
-def ledger(seq, alloc, status=0, ts=10.0):
+def ledger(seq, alloc, status=0, ts=10.0, name="cbc(aes)"):
     return (
         f'DEMO:LEDGER {{"seq": {seq}, "op": "encrypt", "bytes": 4096,'
-        f' "status": {status}, "alloc_id": "{alloc}", "ts_mono": {ts}}}'
+        f' "status": {status}, "alloc_id": "{alloc}", "name": "{name}",'
+        f' "ts_mono": {ts}}}'
     )
 
 
@@ -120,6 +121,49 @@ class D01Tests(unittest.TestCase):
         self.assertIn("product-report.json", ledgers)
         ledger_rows = ledgers["workload-ledger.jsonl"].strip().split("\n")
         self.assertEqual(len(ledger_rows), 4)
+
+    def test_d01_alloc_names_records_bound_names(self):
+        receipt, _ = cells.build_cell(
+            cell(self._workload()), "run1", "msha", self._console(), PROC,
+            "guest1",
+        )
+        self.assertEqual(receipt["alloc_names"],
+                         {"d01-generic": ["cbc(aes)"],
+                          "d01-driver": ["cbc(aes)"]})
+
+    def test_d01_alloc_names_records_fallback_names(self):
+        # No-AES CPUs refuse the generic bind; the guest then binds
+        # the exact driver for the generic half. The receipt must
+        # record the fallback, not hide it.
+        lines = list(PRELUDE_MARKS)
+        lines += [
+            registry("cbc(aes)", "cbc-aes-generic", 100),
+            'DEMO:PROBE {"fact": "selected", "name": "cbc(aes)",'
+            ' "driver": "cbc-aes-generic", "type": "skcipher"}',
+            'DEMO:PROBE {"fact": "bind-probe", "name": "cbc(aes)",'
+            ' "ok": false, "ts_mono": 2.6}',
+            mark("KRYPROBE-START", 2.5),
+            mark("WORKLOAD-START", 3.0),
+        ]
+        ts = 4.0
+        for seq in range(2):
+            lines.append(ledger(seq, "d01-generic", ts=round(ts, 1),
+                                name="cbc-aes-generic"))
+            ts += 0.1
+        for seq in range(2):
+            lines.append(ledger(seq, "d01-driver", ts=round(ts, 1),
+                                name="cbc-aes-generic"))
+            ts += 0.1
+        lines += [mark("WORKLOAD-STOP", ts), mark("WORKLOAD-DONE", ts + 1)]
+        lines.append(KRYPROBE_EXIT)
+        console = "[ 0.1] noise\n" + "\n".join(lines) + "\n" + KREPO
+        receipt, _ = cells.build_cell(
+            cell(self._workload()), "run1", "msha", console, PROC, "guest1")
+        self.assertTrue(all(receipt["checks"].values()),
+                        receipt["checks"])
+        self.assertEqual(receipt["alloc_names"],
+                         {"d01-generic": ["cbc-aes-generic"],
+                          "d01-driver": ["cbc-aes-generic"]})
 
     def test_d01_short_count_fails(self):
         receipt, _ = cells.build_cell(
