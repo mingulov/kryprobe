@@ -207,11 +207,13 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    src = Path(args.src)
-    pins = json.loads(Path(args.pins).read_text())
-    staging = Path(args.staging)
-    work = Path(args.work)
-    out = Path(args.out)
+    # Resolve everything: consumer checks run children under foreign cwds,
+    # so relative CLI paths would resolve against the wrong directory.
+    src = Path(args.src).resolve()
+    pins = json.loads(Path(args.pins).resolve().read_text())
+    staging = Path(args.staging).resolve()
+    work = Path(args.work).resolve()
+    out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
     peel = subprocess.check_output(["git", "-C", str(src), "rev-parse", f"{args.tag}^{{}}"],
@@ -246,6 +248,17 @@ def main():
         if data is None:
             return fail(f"staging binary archive missing {extra}")
         stage_extra[extra] = data
+    try:
+        stage_manifest = json.loads(stage_extra["manifest.json"])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        stage_manifest = None
+    if not stage_manifest or \
+            stage_manifest.get("binary", {}).get("sha256") != pins["payload"]["cli"] or \
+            sorted(o.get("sha256") for o in stage_manifest.get("objects", [])) != \
+            sorted([pins["payload"]["bpf_api"], pins["payload"]["bpf_lifecycle"]]) or \
+            sorted(stage_manifest.get("pin_digests", [])) != \
+            sorted([pins["payload"]["bpf_api"], pins["payload"]["bpf_lifecycle"]]):
+        return fail("staging manifest.json identities differ from pins")
 
     with tarfile.open(staging / "kryprobe-v0.1.0-source.tar.gz", "r:gz") as tar:
         stage_src = {m.name: tar.extractfile(m).read() for m in tar if m.isfile()}

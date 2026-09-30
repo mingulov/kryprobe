@@ -1,7 +1,7 @@
 {
   "$schema": "kryprobe/release-pins-1",
   "release": "0.1.0",
-  "note": "Trust root for the CI/CD release pipeline (see .github/workflows/release.yml). Every hash below is already public in docs/release-ledger.md and docs/releases/v0.1.0.md; this file only makes them machine-checkable. The pipeline refuses to publish unless downloaded staging bytes match these pins exactly.",
+  "note": "Trust root for the CI/CD release pipeline (see .github/workflows/release.yml). Payload, seal and checkpoint hashes are already public in docs/release-ledger.md and docs/releases/v0.1.0.md; the staging-archive, vendor-tree and GPL-2 pins below are pipeline packaging values, independently recomputed and reviewed at introduction. The pipeline refuses to publish unless downloaded staging bytes match these pins exactly.",
   "payload": {
     "cli": "c9ae31bd5517700404392311d68643aede4936ae47c41db39caef8800fe24ec2",
     "bpf_api": "c76fd83f532869b6d86f7189af0d4575d78b27137f5b77873b3043fe9eba97f5",

@@ -29,9 +29,7 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-  actions: read
+permissions: {}
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -41,6 +39,9 @@ jobs:
   require-green:
     name: require exact-commit CI
     runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       peel: ${{ steps.resolve.outputs.peel }}
@@ -53,7 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag || github.ref_name }}"
-          PEEL="$(git ls-remote "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" 'refs/tags/$TAG^{}' | awk '/\^\{\}$/{print $1}')"
+          PEEL="$(git ls-remote "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk '/\^\{\}$/{print $1}')"
           test -n "$PEEL" || { echo "tag $TAG has no peeled commit" >&2; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "peel=$PEEL" >> "$GITHUB_OUTPUT"
@@ -85,6 +86,9 @@ jobs:
     name: verify, assemble and publish
     runs-on: ubuntu-latest
     needs: require-green
+    timeout-minutes: 240
+    permissions:
+      contents: write
     env:
       TAG: ${{ needs.require-green.outputs.tag }}
       PEEL: ${{ needs.require-green.outputs.peel }}
@@ -99,6 +103,11 @@ jobs:
           path: src
           fetch-depth: 0
       - name: checkout release tooling
+        # Bootstrap note: v0.1.0 dispatches with TOOLS_REF set to the reviewed
+        # main commit carrying packaging/release/*, because the tag predates
+        # the tooling. The resolved SHA is logged below and in the summary;
+        # audit the dispatch against that SHA. Later releases default to the
+        # tag itself (workflow and tools from the tagged tree).
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ env.TOOLS_REF }}
@@ -141,11 +150,6 @@ jobs:
           (cd readback && sha256sum -c SHA256SUMS)
           test "$(ls readback | wc -l)" = 9
           echo "readback verified: 9/9 assets"
-      - name: publish
-        run: |
-          set -euo pipefail
-          gh release edit "$TAG" --repo "${{ github.repository }}" --title "KryProbe v0.1.0" --draft=false --latest
-          gh release view "$TAG" --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease,publishedAt,url --jq '{tagName, isDraft, isPrerelease, publishedAt, url}'
       - name: record provenance summary
         run: |
           {
@@ -160,3 +164,8 @@ jobs:
             cat dist/SHA256SUMS
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: publish
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "${{ github.repository }}" --title "KryProbe $TAG" --draft=false --latest
+          gh release view "$TAG" --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease,publishedAt,url --jq '{tagName, isDraft, isPrerelease, publishedAt, url}'

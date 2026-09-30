@@ -10,7 +10,6 @@ Usage: verify-inputs.py --pins PINS --staging DIR --out JSON
 """
 import argparse
 import hashlib
-import io
 import json
 import subprocess
 import sys
@@ -44,6 +43,7 @@ def verify_evidence(asset, spec, failures):
     sealed = {}
     seal_rel = f"{spec['root']}/{spec['seal']}"
     members = {}
+    completed = False
     try:
         with tarfile.open(fileobj=decoder.stdout, mode="r|") as archive:
             for member in archive:
@@ -61,8 +61,21 @@ def verify_evidence(asset, spec, failures):
                         "sha256": hashlib.file_digest(stream, "sha256").hexdigest(),
                         "bytes": member.size,
                     }
+        completed = True
     finally:
+        # Never wait() on a live decoder: an early return would leave zstd
+        # blocked on a full pipe until the job timeout. Drain the finite
+        # stream first so the decoder always terminates on its own; killing
+        # is racy (a cleanly finishing decoder looks alive for an instant)
+        # and would mask its real exit code.
+        try:
+            while decoder.stdout.read(65536):
+                pass
+        except (BrokenPipeError, ValueError):
+            pass
         rc = decoder.wait()
+    if not completed:
+        return
     if rc != 0:
         failures.append(f"{name}: zstd decode failed rc={rc}")
         return
@@ -72,12 +85,15 @@ def verify_evidence(asset, spec, failures):
     # Re-read the seal content through a second decode to parse entries.
     decoder = subprocess.Popen(["zstd", "-d", "-q", "-c", str(asset)], stdout=subprocess.PIPE)
     seal_text = None
-    with tarfile.open(fileobj=decoder.stdout, mode="r|") as archive:
-        for member in archive:
-            if member.isfile() and member.name == seal_rel:
-                with archive.extractfile(member) as stream:
-                    seal_text = stream.read().decode()
-    decoder.wait()
+    try:
+        with tarfile.open(fileobj=decoder.stdout, mode="r|") as archive:
+            for member in archive:
+                if member.isfile() and member.name == seal_rel:
+                    with archive.extractfile(member) as stream:
+                        seal_text = stream.read().decode()
+    finally:
+        decoder.kill()
+        decoder.wait()
     if hashlib.sha256(seal_text.encode()).hexdigest() != spec["seal_sha256"]:
         failures.append(f"{name}: seal digest mismatch vs pins")
         return
@@ -146,6 +162,16 @@ def main():
         data = blobs.get(f"{top}/{rel}")
         if data is None or hashlib.sha256(data).hexdigest() != want:
             failures.append(f"binary archive: payload mismatch {rel}")
+    try:
+        manifest = json.loads(blobs.get(f"{top}/manifest.json", b""))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        manifest = None
+    if not manifest or manifest.get("binary", {}).get("sha256") != pins["payload"]["cli"] or \
+            sorted(o.get("sha256") for o in manifest.get("objects", [])) != \
+            sorted([pins["payload"]["bpf_api"], pins["payload"]["bpf_lifecycle"]]) or \
+            sorted(manifest.get("pin_digests", [])) != \
+            sorted([pins["payload"]["bpf_api"], pins["payload"]["bpf_lifecycle"]]):
+        failures.append("binary archive: manifest.json identities differ from pins")
     if failures:
         return fail("; ".join(failures))
     # The doctor resolves BPF identities from its stage layout, so run it
@@ -159,7 +185,7 @@ def main():
         cli = tmp / top / "bin" / "kryprobe"
         proc = subprocess.run([str(cli), "doctor", "--versions", "--json"],
                               capture_output=True, text=True, timeout=60)
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         return fail(f"staged binary does not execute: {exc}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -171,9 +197,9 @@ def main():
         return fail("doctor --versions is not JSON")
     if not (rep.get("pins_enforced") and rep.get("profile_pins_enforced")):
         return fail("staged binary reports pins not enforced")
-    if rep.get("kcrypto", {}).get("sha256") != pins["payload"]["bpf_api"]:
+    if (rep.get("kcrypto") or {}).get("sha256") != pins["payload"]["bpf_api"]:
         return fail("staged binary self-reported api BPF mismatch")
-    if rep.get("kcrypto_lifecycle", {}).get("sha256") != pins["payload"]["bpf_lifecycle"]:
+    if (rep.get("kcrypto_lifecycle") or {}).get("sha256") != pins["payload"]["bpf_lifecycle"]:
         return fail("staged binary self-reported lifecycle BPF mismatch")
     print("verify-inputs: staged payload self-report OK")
 
