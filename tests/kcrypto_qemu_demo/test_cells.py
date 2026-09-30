@@ -924,6 +924,95 @@ class ProductReconcileTests(unittest.TestCase):
         self.assertFalse(receipt["checks"]["windows_ok"])
 
 
+def agg_report(ok, op_bytes=4096):
+    """Minimal stop-window product report object (partial, exit 3)."""
+    return {
+        "observations": [{
+            "operation_class": "encrypt",
+            "backend_payload": {
+                "row": "agg",
+                "counts": {"calls": ok, "ok": ok, "errors": 0},
+                "bytes": ok * op_bytes,
+            },
+        }],
+        "verdict": {"status": "partial",
+                    "missing": ["capture-integrity", "completion"]},
+    }
+
+
+def straddle_rows(n_before, n_after, end=89.0):
+    """Caller stop rows straddling the nominal capture end."""
+    rows = [{"ts_mono": 60.0 + i * 0.01} for i in range(n_before)]
+    rows += [{"ts_mono": 90.0 + i * 0.01} for i in range(n_after)]
+    assert all(row["ts_mono"] < end for row in rows[:n_before])
+    assert all(row["ts_mono"] > end for row in rows[n_before:])
+    return rows
+
+
+class StopShareBoundTests(unittest.TestCase):
+    """R2 RED: the stop rule needs an observed-share bound + deficit check."""
+
+    def _judge(self, ok, n_before=264, n_after=336):
+        rows = straddle_rows(n_before, n_after)
+        return cells.stop_window_product(
+            agg_report(ok), 3, rows, 4096, 89.0)
+
+    def test_live_shape_passes_bounds(self):
+        checks, info = self._judge(301)
+        self.assertTrue(checks["product_share_bounded"])
+        self.assertTrue(checks["product_deficit_explained"])
+        self.assertAlmostEqual(info["observed_share"], 301 / 600)
+        self.assertEqual(info["tail_deficit"], 299 - 336)
+
+    def test_single_op_share_fails(self):
+        # Astra A2 degenerate: ok=1/600 passes the S19 rule.
+        checks, _ = self._judge(1)
+        self.assertFalse(checks["product_share_bounded"])
+        self.assertFalse(checks["product_deficit_explained"])
+
+    def test_near_full_share_fails(self):
+        checks, _ = self._judge(599)
+        self.assertFalse(checks["product_share_bounded"])
+        self.assertFalse(checks["product_deficit_explained"])
+
+    def test_low_share_fails(self):
+        checks, _ = self._judge(100)
+        self.assertFalse(checks["product_share_bounded"])
+        self.assertFalse(checks["product_deficit_explained"])
+
+    def test_deficit_beyond_tail_fails_alone(self):
+        # Share inside the band but the deficit does not match the
+        # post-capture tail: unexplained, must fail on its own.
+        checks, _ = self._judge(250, n_before=500, n_after=100)
+        self.assertTrue(checks["product_share_bounded"])
+        self.assertFalse(checks["product_deficit_explained"])
+
+    def test_share_band_boundaries(self):
+        checks, _ = self._judge(120)
+        self.assertTrue(checks["product_share_bounded"])
+        checks, _ = self._judge(480)
+        self.assertTrue(checks["product_share_bounded"])
+        checks, _ = self._judge(119)
+        self.assertFalse(checks["product_share_bounded"])
+        checks, _ = self._judge(481)
+        self.assertFalse(checks["product_share_bounded"])
+
+    def test_deficit_tolerance_boundaries(self):
+        # |missed - after| <= 100 with after=336: ok=364 passes.
+        checks, _ = self._judge(364)
+        self.assertTrue(checks["product_deficit_explained"])
+        checks, _ = self._judge(365)
+        self.assertFalse(checks["product_deficit_explained"])
+
+    def test_unmeasured_share_fails_closed(self):
+        rows = straddle_rows(264, 336)
+        checks, info = cells.stop_window_product(
+            {"observations": []}, 3, rows, 4096, 89.0)
+        self.assertFalse(checks["product_share_bounded"])
+        self.assertFalse(checks["product_deficit_explained"])
+        self.assertIsNone(info["observed_share"])
+
+
 class DispatchTests(unittest.TestCase):
     def test_unknown_kind_refuses(self):
         with self.assertRaises(cells.CellError):
