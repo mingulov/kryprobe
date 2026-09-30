@@ -1,0 +1,72 @@
+{
+  "$schema": "kryprobe/release-pins-1",
+  "release": "0.1.0",
+  "note": "Trust root for the CI/CD release pipeline (see .github/workflows/release.yml). Every hash below is already public in docs/release-ledger.md and docs/releases/v0.1.0.md; this file only makes them machine-checkable. The pipeline refuses to publish unless downloaded staging bytes match these pins exactly.",
+  "payload": {
+    "cli": "c9ae31bd5517700404392311d68643aede4936ae47c41db39caef8800fe24ec2",
+    "bpf_api": "c76fd83f532869b6d86f7189af0d4575d78b27137f5b77873b3043fe9eba97f5",
+    "bpf_lifecycle": "7244932d0c8828919770b32ba1555b1a74eccd674de326a6173d062dd0f150cb"
+  },
+  "evidence_seals": {
+    "t14": {
+      "root": "evidence/kcrypto-t14",
+      "seal": "SHA256SUMS.txt",
+      "seal_sha256": "cd78ddc74b07bd1f97e6b726d762576ee371be432bb49370a602fea3fd6acd2a",
+      "sealed_entries": 5028,
+      "archived_files": 5029
+    },
+    "demo-p10a4": {
+      "root": "evidence/kcrypto-demo-qemu/p10a4-20260930T002951Z",
+      "seal": "SHA256SUMS",
+      "seal_sha256": "cc8479736db3bd423b5ae2e52ff974b025cd9d81ef389e651db5031f4c4b59e9",
+      "sealed_entries": 199,
+      "archived_files": 221
+    },
+    "demo-p10a7": {
+      "root": "evidence/kcrypto-demo-qemu/p10a7-20260930T044828Z",
+      "seal": "SHA256SUMS",
+      "seal_sha256": "fdda9dbbed499fb7f0b1afcef3c296b70a4d377edfec3769bbdb723180372508",
+      "sealed_entries": 106,
+      "archived_files": 116
+    },
+    "floor-correction": {
+      "root": "evidence/kcrypto-t14-floor-rejudge/20260930T111512Z",
+      "seal": "SHA256SUMS",
+      "seal_sha256": "bcfd58135be21cee639d55bab9d9f7eb273906c944807ba204e7f25dfec4385b",
+      "sealed_entries": 68,
+      "archived_files": 69
+    }
+  },
+  "staging_archives": {
+    "kryprobe-v0.1.0-evidence-t14.tar.zst": {
+      "sha256": "bb404a12ad1c8100edfe5b60f8e1674f3bf4fd45d49b304608c1bb39ef129046",
+      "bytes": 1420382950
+    },
+    "kryprobe-v0.1.0-evidence-demo-p10a4.tar.zst": {
+      "sha256": "1329cc7e6312f0fddd04b678e7a504ec8377ce888608e9f27702201e40997876",
+      "bytes": 620828
+    },
+    "kryprobe-v0.1.0-evidence-demo-p10a7.tar.zst": {
+      "sha256": "b0af8f4e73fbc7493a5a3c193ec2d5dd75271dc9560858cce04a2324a4e72404",
+      "bytes": 493146
+    },
+    "kryprobe-v0.1.0-evidence-floor-correction.tar.zst": {
+      "sha256": "e8e4ddf0624efd00f53c834cb0ac8cafdb907316c54bd46eebf30654d04d79d6",
+      "bytes": 127539
+    }
+  },
+  "vendor_tree_sha256": "c01deebd31c22381a4a107b2e8e72d2f55f621bd7b594b993c3fa4637f7e9ad0",
+  "vendor_tree_files": 2972,
+  "vendor_tree_note": "SHA-256 over the canonical 'sha256  relpath' listing (sorted by relpath, LF) of vendor/ plus LICENSES/dependencies/ as carried in the source archive.",
+  "counts": {
+    "tracked_source_files": 407,
+    "binary_archive_members": 134,
+    "source_archive_members": 3383
+  },
+  "measured_checkpoints": {
+    "t14": "d7cb04826525d3e1696c3a58d4932c98801b8580",
+    "demo": "a3987e7379014a2a079dfc63a0a321f0409244ef"
+  },
+  "gpl2_text_sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6",
+  "gpl2_note": "Exact bytes of /usr/share/common-licenses/GPL-2 on the assembly host; the pipeline refuses to substitute any other license text."
+}
