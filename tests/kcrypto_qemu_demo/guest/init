@@ -7,8 +7,8 @@
 # cell workload. T01-harness keeps its legacy no-observer,
 # no-workload behavior; every D-cell runs prelude (manifest
 # check, module loads, registry/CPU probes) then its workload.
-# No secret material (keys, IVs, tags, payloads) may ever appear
-# on argv, trace output, or console: metadata only. Never set -x.
+# No key/credential material (keys, IVs, tags, payloads) may ever
+# appear on argv, trace output, or console: metadata only. Never set -x.
 set -eu
 
 mount -t proc none /proc

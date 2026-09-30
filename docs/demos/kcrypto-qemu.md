@@ -135,8 +135,14 @@ same dir.
    `D08-run.log` (FAIL — `marks_ordered` + `product_suffix`).
 
 No firmware-to-userspace completeness claim, no transparent
-failover claim, no physical-accelerator claim, no secret material
-in any output. Narrower, per the seals: no queue/offload claim
+failover claim, no physical-accelerator claim, no key/credential
+material in any output. Product passthrough carries decimal
+kernel IPs verbatim (407 `"ip"` fields across the 10 nonzero
+p10a4 `product-report.json` files); DEMO: rows are address-free.
+Redaction procedure: `kcrypto-qemu-redaction.md` (successor
+artifact only — originals preserved, seals untouched; the
+redact-fork vs scope-change decision is AWAITING-OWNER as O1).
+Narrower, per the seals: no queue/offload claim
 for D04 (device "unknown"), no fallback claim for D06
 (UNSUPPORTED×2), no pre-attach observation claim for D07, and no
 verdict beyond the exact sealed run IDs cited per beat.

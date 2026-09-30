@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Demo guest cell dispatcher (attempt 4).
 # Usage: run-cells.sh <CELL-ID>  (exec'd by /init as PID 1)
-# No secret material (keys, IVs, tags, payloads, kernel addresses)
-# may ever appear on argv, trace output, or console DEMO: rows:
+# No key or credential material (keys, IVs, tags, payloads) may
+# ever appear on argv, trace output, or console DEMO: rows:
 # metadata only. Product passthrough blocks carry the hash-pinned
-# product's bytes verbatim (guest tools never compose those bytes).
+# product's bytes verbatim, including decimal kernel IPs
+# (redaction procedure: docs/demos/kcrypto-qemu-redaction.md).
 # Never set -x in this file: the dm-crypt table carries key bytes.
 set -eu
 

@@ -15,7 +15,7 @@ Kernel noise is ignored but counted. Anything else refuses loudly:
 - denylisted secret-ish JSON keys (``key``, ``iv``, ``tag``,
   ``payload``, ``plaintext``, ``ciphertext``, ``aad``, ``kaddr``)
   anywhere in a DEMO line — the guest tools must never emit
-  secret material, and the parser is the second gate. The
+  key/credential material, and the parser is the second gate. The
   KRYPROBE passthrough and the numbered window blocks are
   exempt: their bytes come from the hash-pinned, P9-accepted
   product renderer (fixed v0 schema), never from guest tools,
