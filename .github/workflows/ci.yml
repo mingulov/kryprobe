@@ -24,8 +24,21 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@v2
+      - name: BPF nightly (release-consumer test prerequisite)
+        run: rustup toolchain install nightly-2026-09-16 -c rust-src -c rustfmt -c clippy --profile minimal
+      - name: pinned linker
+        run: cargo install bpf-linker --version 0.10.4 --locked
+      - name: build objects for host release-consumer tests
+        run: cargo xtask build --bpf
+      - name: build workspace binaries and test fixtures
+        run: cargo xtask build
       - name: merge gate
         run: cargo xtask check
+      - name: campaign, performance and demo harness tests
+        run: |
+          python3 -B -m unittest discover -s tests/kcrypto_campaign -p 'test_*.py' -v
+          python3 -B -m unittest discover -s tests/kcrypto_perf -p 'test_*.py' -v
+          python3 -B -m unittest discover -s tests/kcrypto_qemu_demo -p 'test_*.py' -v
       - name: pin strict gate (fail-closed proof)
         # No pins are baked in CI: with KRYPROBE_REQUIRE_PINS=1 the
         # privilege build must refuse an unpinned binary. `!` inverts:
