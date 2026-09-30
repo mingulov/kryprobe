@@ -120,6 +120,26 @@ best_driver() {
   echo "$out" | cut -d' ' -f2-
 }
 
+# virtio-crypto function-driver bindings, one "bus dev" pair per
+# line (empty when unbound). Modern kernels bind the PCI device to
+# the virtio-pci transport while the virtio_crypto function driver
+# owns the child virtio device -- D04's first boot proved a PCI-only
+# scan blind (0x1af4:0x1054 on virtio-pci, algs live).
+virtio_bound() {
+  for pci in /sys/bus/pci/devices/*; do
+    if [ -e "$pci/driver" ] && \
+       [ "$(basename "$(readlink "$pci/driver")")" = "virtio_crypto" ]; then
+      echo "pci ${pci##*/}"
+    fi
+  done
+  for v in /sys/bus/virtio/devices/*; do
+    if [ -e "$v/driver" ] && \
+       [ "$(basename "$(readlink "$v/driver")")" = "virtio_crypto" ]; then
+      echo "virtio ${v##*/}"
+    fi
+  done
+}
+
 # Emit a kryprobe JSON report through the passthrough channel.
 passthrough() {
   echo "DEMO:KRYPROBE-BEGIN" > "$CONSOLE"
@@ -310,11 +330,8 @@ cell_D03() {
 # --- D04: one virtual device; claim stops without queue proof ------
 cell_D04() {
   prelude "af_alg algif_skcipher virtio_crypto"
-  for pci in /sys/bus/pci/devices/*; do
-    if [ -e "$pci/driver" ] && \
-       [ "$(basename "$(readlink "$pci/driver")")" = "virtio_crypto" ]; then
-      echo "DEMO:VIRTIO {\"dev\": \"${pci##*/}\", \"driver\": \"virtio_crypto\", \"queue_proof\": false}" > "$CONSOLE"
-    fi
+  virtio_bound | while read -r bus dev; do
+    echo "DEMO:VIRTIO {\"dev\": \"$dev\", \"bus\": \"$bus\", \"driver\": \"virtio_crypto\", \"queue_proof\": false}" > "$CONSOLE"
   done
   vdrv="$(algd registry | grep -i 'virtio' | grep -F '"type": "skcipher"' \
     | head -1 | sed -E 's/.*"driver": "([^"]+)".*/\1/')"
@@ -354,37 +371,23 @@ cell_D04() {
 # --- D05: quiesced removal; guest watches sysfs, host drives QMP ---
 cell_D05() {
   prelude "af_alg algif_skcipher virtio_crypto"
-  have_before=0
-  for pci in /sys/bus/pci/devices/*; do
-    if [ -e "$pci/driver" ] && \
-       [ "$(basename "$(readlink "$pci/driver")")" = "virtio_crypto" ]; then
-      have_before=$((have_before + 1))
-      echo "DEMO:VIRTIO {\"dev\": \"${pci##*/}\", \"driver\": \"virtio_crypto\", \"phase\": \"before\"}" > "$CONSOLE"
-    fi
+  before="$(virtio_bound)"
+  if [ -z "$before" ]; then die "NO-VIRTIO-BEFORE"; fi
+  echo "$before" | while read -r bus dev; do
+    echo "DEMO:VIRTIO {\"dev\": \"$dev\", \"bus\": \"$bus\", \"driver\": \"virtio_crypto\", \"phase\": \"before\"}" > "$CONSOLE"
   done
-  if [ "$have_before" -eq 0 ]; then die "NO-VIRTIO-BEFORE"; fi
   mark "QUIESCED"
   # Wait (bounded) for the host-driven removal to reach sysfs.
   gone=false
   i=0
   while [ "$i" -lt 100 ]; do
-    n=0
-    for pci in /sys/bus/pci/devices/*; do
-      if [ -e "$pci/driver" ] && \
-         [ "$(basename "$(readlink "$pci/driver")")" = "virtio_crypto" ]; then
-        n=$((n + 1))
-      fi
-    done
-    if [ "$n" -eq 0 ]; then gone=true; break; fi
+    if [ -z "$(virtio_bound)" ]; then gone=true; break; fi
     sleep 1
     i=$((i + 1))
   done
   if [ "$gone" = true ]; then mark "REMOVAL-OBSERVED"; else die "REMOVAL-NOT-OBSERVED"; fi
-  for pci in /sys/bus/pci/devices/*; do
-    if [ -e "$pci/driver" ] && \
-       [ "$(basename "$(readlink "$pci/driver")")" = "virtio_crypto" ]; then
-      echo "DEMO:VIRTIO {\"dev\": \"${pci##*/}\", \"driver\": \"virtio_crypto\", \"phase\": \"after\"}" > "$CONSOLE"
-    fi
+  virtio_bound | while read -r bus dev; do
+    echo "DEMO:VIRTIO {\"dev\": \"$dev\", \"bus\": \"$bus\", \"driver\": \"virtio_crypto\", \"phase\": \"after\"}" > "$CONSOLE"
   done
   # Fresh allocation after removal: reselect or refuse, as observed.
   if algd run --name 'cbc(aes)' --keylen 16 --ops 10 --bytes 4096 \
