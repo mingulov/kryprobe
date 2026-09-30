@@ -30,11 +30,13 @@ rootfs, CLI, both BPF objects), and write `INPUTS.json`
 sha256 binds the run; any input change invalidates sealed receipts.
 
 ```sh
-# worktree root, isolated target/tmp, exclusive lane lock held by run
+# worktree root, isolated target/tmp, both lane locks held by run
 python3 scripts/kcrypto-qemu-demo.py plan --manifest INPUTS.json
 python3 scripts/kcrypto-qemu-demo.py run --manifest INPUTS.json \
   --cell T01-harness --run-dir /path/to/fresh/run \
-  --lock /path/to/.artifacts/locks/kcrypto-demo-qemu.lock
+  --lock /path/to/.artifacts/locks/kcrypto-demo-qemu.lock \
+  --lock /path/to/.artifacts/locks/kvm-host.lock \
+  --refuse-foreign
 python3 scripts/kcrypto-qemu-demo.py verify --run-dir /path/to/fresh/run
 ```
 
