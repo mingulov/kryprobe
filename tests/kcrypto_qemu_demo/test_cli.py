@@ -214,6 +214,41 @@ class CliTests(unittest.TestCase):
         self.assertIn("seal", proc.stdout)
         self.assertIn("campaign: FAIL", proc.stdout)
 
+    def test_verify_rejects_empty_seal(self):
+        # R2-1 RED: a vacuous seal must fail, never PASS.
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            (cell_dir / "SHA256SUMS").write_text("")
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("empty", proc.stdout)
+        self.assertIn("campaign: FAIL", proc.stdout)
+
+    def test_verify_rejects_whitespace_seal(self):
+        # R2-1 RED: a whitespace-only seal is vacuous too.
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            (cell_dir / "SHA256SUMS").write_text("  \n\t\n")
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("empty", proc.stdout)
+        self.assertIn("campaign: FAIL", proc.stdout)
+
+    def test_verify_rejects_omitted_receipt(self):
+        # R2-1 RED (D07-late shape): the judged receipt dropped
+        # from the seal while its checks read PASS must fail
+        # closed with an explicit unsealed-receipt reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            cell_dir = self._sealed_pass_dir(Path(tmp))
+            lines = (cell_dir / "SHA256SUMS").read_text().splitlines()
+            kept = [ln for ln in lines if "cell-D09.json" not in ln]
+            self.assertTrue(kept)  # run.json entry still seals
+            (cell_dir / "SHA256SUMS").write_text("\n".join(kept) + "\n")
+            proc = run_cli("verify", "--run-dir", str(cell_dir))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("cell-D09.json", proc.stdout)
+        self.assertIn("campaign: FAIL", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

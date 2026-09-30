@@ -199,6 +199,29 @@ class SkipTests(unittest.TestCase):
         self.assertTrue(any("actual_body" in r for r in judged["reasons"]))
 
 
+class SealContentsTests(unittest.TestCase):
+    def _sealed_tmp(self, tmp: Path, seal_text: str) -> Path:
+        (tmp / "run.json").write_text("{}\n")
+        (tmp / "SHA256SUMS").write_text(seal_text)
+        return tmp
+
+    def test_empty_seal_is_a_problem(self):
+        # R2-1 RED: a vacuous seal verifies nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = receipts.check_seal_contents(
+                self._sealed_tmp(Path(tmp), ""))
+        self.assertTrue(problems, "empty seal must not verify clean")
+        self.assertTrue(any("empty" in p for p in problems), problems)
+
+    def test_whitespace_seal_is_a_problem(self):
+        # R2-1 RED: whitespace-only seals are vacuous too.
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = receipts.check_seal_contents(
+                self._sealed_tmp(Path(tmp), "  \n\t\n"))
+        self.assertTrue(problems, "whitespace seal must not verify clean")
+        self.assertTrue(any("empty" in p for p in problems), problems)
+
+
 class HarnessCommitTests(unittest.TestCase):
     def test_harness_commit_inside_repo(self):
         # R8 RED: the judging harness revision binds receipts.
