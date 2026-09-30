@@ -296,6 +296,49 @@ def product_presence(report, exit_code: int | None) -> tuple[dict, dict]:
     return checks, info
 
 
+def _driver_product(report, driver: str) -> dict | None:
+    """Aggregate encrypt-returned product rows for one driver.
+
+    Async backends (virtio-crypto) report queued-not-returned
+    counts; the split is returned factually for the receipt, and
+    None marks a driver the product never saw.
+    """
+    calls = ok = queued = nbytes = errors = 0
+    seen = False
+    observations = (report.get("observations")
+                    if isinstance(report, dict) else None)
+    if not isinstance(observations, list):
+        return None
+    for obs in observations:
+        if not isinstance(obs, dict):
+            return None
+        if obs.get("operation_class") != "encrypt":
+            continue
+        if obs.get("phase") != "returned":
+            continue
+        payload = obs.get("backend_payload")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("driver") != driver:
+            continue
+        counts = payload.get("counts")
+        if not isinstance(counts, dict):
+            continue
+        try:
+            calls += int(counts.get("calls", 0))
+            ok += int(counts.get("ok", 0))
+            queued += int(counts.get("queued", 0))
+            errors += int(counts.get("errors", 0))
+            nbytes += int(payload.get("bytes", 0))
+        except (TypeError, ValueError):
+            return None
+        seen = True
+    if not seen:
+        return None
+    return {"calls": calls, "ok": ok, "queued": queued,
+            "bytes": nbytes, "errors": errors}
+
+
 def _jsonl(rows: list[dict]) -> str:
     return "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
 
@@ -502,14 +545,17 @@ def _build_d04(cell, run_id, guest_name, manifest_sha256, process,
         [{"driver": "virtio_crypto", "dev": row.get("dev")}
          for row in virtio_rows], queue_rows=[])
     offload = reconcile.is_offload("virtio_crypto", queue_proof=None)
-    observed_ok = [row for row in parsed["LEDGER"]
-                   if row.get("status") == 0]
-    workload_start = _mark_ts(parsed["MARK"], "WORKLOAD-START")
-    kryprobe_start = _kryprobe_start_before(parsed["MARK"], workload_start)
-    product_checks, product_info = reconcile_product(
-        parsed["KRYPROBE"], _kryprobe_exit(parsed), len(observed_ok),
-        workload["rate_per_s"], workload["block_bytes"],
-        kryprobe_start, workload_start)
+    # The offload half is async (queued-not-returned), so the sync
+    # content rule cannot apply: presence plus per-driver selection
+    # is the D04 product contract. When the guest bind itself
+    # refused, the recorded refusal is the evidence and the
+    # product's silence agrees vacuously.
+    presence_checks, presence_info = product_presence(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed))
+    virtio_product = _driver_product(parsed["KRYPROBE"], vdrv)
+    virtio_seen = (not alloc_ok) or (
+        virtio_product is not None and virtio_product["calls"] > 0
+        and virtio_product["bytes"] > 0)
     receipt = _base_receipt(cell, run_id, guest_name, manifest_sha256,
                             process)
     receipt["checks"] = {
@@ -524,14 +570,16 @@ def _build_d04(cell, run_id, guest_name, manifest_sha256, process,
         "device_unknown": identified["device"] == "unknown",
         "no_offload_claim": offload is False,
         "kryprobe_present": parsed["KRYPROBE"] is not None,
-        **product_checks,
+        "product_virtio_seen": bool(virtio_seen),
+        **presence_checks,
     }
     receipt["observation"] = {"expected": workload["control_ops"],
                               "actual": len(generic)}
     receipt["device"] = identified["device"]
     receipt["virtio_driver"] = vdrv
     receipt["virtio_alloc_ok"] = alloc_ok
-    receipt["product"] = product_info
+    receipt["virtio_product"] = virtio_product
+    receipt["product"] = presence_info
     return receipt, ledgers
 
 

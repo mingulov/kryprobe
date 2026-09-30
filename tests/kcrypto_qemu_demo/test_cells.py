@@ -61,6 +61,33 @@ def krepo(calls, op_bytes=4096, errors=0, verdict="observed",
 
 KREPO = krepo(4)
 
+
+def krepo_drivers(specs, verdict="observed", missing=()):
+    """KRYPROBE block with per-driver encrypt rows.
+
+    Each spec is (driver, calls, ok, queued): async backends
+    (virtio-crypto) report queued-not-returned counts, so the
+    queued split is first-class here.
+    """
+    obs = []
+    for driver, calls, ok, queued in specs:
+        obs.append(
+            '{"operation_class": "encrypt", "phase": "returned",'
+            ' "backend_payload": {"row": "agg", "driver": "%s",'
+            ' "counts": {"calls": %d, "errors": 0, "ok": %d,'
+            ' "queued": %d}, "bytes": %d}}'
+            % (driver, calls, ok, queued, calls * 4096)
+        )
+    return (
+        "DEMO:KRYPROBE-BEGIN\n"
+        '{"observations": [%s], "verdict": {"status": "%s",'
+        ' "missing": [%s]}}\n'
+        "DEMO:KRYPROBE-END\n"
+        % (", ".join(obs), verdict,
+           ", ".join('"%s"' % m for m in missing))
+    )
+
+
 KRYPROBE_EXIT = 'DEMO:PROBE {"fact": "kryprobe-exit", "exit": 0}'
 
 PRELUDE_MARKS = [
@@ -319,8 +346,12 @@ class D04Tests(unittest.TestCase):
         lines.append(ledger(0, "d04-generic", ts=4.0))
         lines += [mark("WORKLOAD-STOP", 5.0), mark("WORKLOAD-DONE", 6.0),
                   KRYPROBE_EXIT]
-        observed = 1 + (1 if virtio and alloc_ok else 0)
-        return "\n".join(lines) + "\n" + krepo(observed)
+        # Live D04 shape: the virtio half reports queued (async
+        # backend), the generic control half returned-ok.
+        specs = [("cbc-aes-aesni", 1, 1, 0)]
+        if virtio and alloc_ok:
+            specs.insert(0, ("cbc-virtio", 1, 0, 1))
+        return "\n".join(lines) + "\n" + krepo_drivers(specs)
 
     def _workload(self):
         return {"kind": "virtio-device", "devices": 1, "virtio_ops": 1,
@@ -337,6 +368,25 @@ class D04Tests(unittest.TestCase):
         self.assertIn("queue-reference.json", ledgers)
         queue = json.loads(ledgers["queue-reference.json"])
         self.assertFalse(queue["queue_proof"])
+        # The async virtio half is queued-not-returned; the split
+        # is recorded, and the driver row proves product-side
+        # selection.
+        self.assertTrue(receipt["checks"]["product_virtio_seen"])
+        self.assertEqual(receipt["virtio_product"],
+                         {"calls": 1, "ok": 0, "queued": 1,
+                          "bytes": 4096, "errors": 0})
+
+    def test_d04_unseen_virtio_traffic_fails(self):
+        # Alloc succeeded but the product shows no virtio driver
+        # row: selection uncorroborated, the claim fails.
+        lines = self._console().split("DEMO:KRYPROBE-BEGIN")[0]
+        console = lines + krepo_drivers([("cbc-aes-aesni", 1, 1, 0)])
+        receipt, _ = cells.build_cell(
+            cell(self._workload(), "D04"), "run1", "msha", console, PROC,
+            "guest1",
+        )
+        self.assertFalse(receipt["checks"]["product_virtio_seen"])
+        self.assertIsNone(receipt["virtio_product"])
 
     def test_d04_failed_alloc_still_judged(self):
         receipt, _ = cells.build_cell(
