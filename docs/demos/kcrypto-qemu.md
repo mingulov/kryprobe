@@ -83,26 +83,30 @@ same dir.
 
 1. Available vs selected (D01 — QUALIFIED): `D01-rerun3.log`
    verdict PASS; `cell-D01.json` checks `selected_in_registry`,
-   `alloc_split`, `exact_count` all true over a 300/300
-   `workload-ledger.jsonl`; `registry.json` lists the providers
-   while the single `d01-generic` allocation selects
+   `alloc_split`, `exact_count` all true over 150 generic + 150
+   explicit-driver ops (300/300 `workload-ledger.jsonl`) with a
+   268-op product total (`product_ok`); `registry.json` lists the
+   providers while the single `d01-generic` allocation selects
    `cbc-aes-aesni` (console). Registered-but-unused stays
    "available", never "used". First failures preserved:
    `D01-run.log`, `D01-rerun1.log`, `D01-rerun2.log` (FAIL —
    printk tore JSON ×2).
 2. Fresh vs held (D02 — QUALIFIED): `D02-rerun1.log` verdict
    PASS; the fresh `d02-fresh0` allocation selects
-   `cbc(ecb(aes-lib))` (console) for 300/300 ledger ops while
-   `handles.json` brackets the held `d02-held` `cbc(aes)` handle
-   (held → released, never migrated). First failure preserved:
-   `D02-run.log` (FAIL — NO-CBC-DRIVER, 0 ops).
+   `cbc(ecb(aes-lib))` (console) for 150 + 150 fresh ops
+   (300/300 ledger) with a 258-op product total (`product_ok`)
+   while `handles.json` brackets the held `d02-held` `cbc(aes)`
+   handle (held → released, never migrated). First failure
+   preserved: `D02-run.log` (FAIL — NO-CBC-DRIVER, 0 ops).
 3. Real disk (D03 — QUALIFIED): `D03-rerun1.log` verdict PASS;
    `io-ledger.json` records guest-only dm-crypt `demo-d03`
    create/load/resume/remove with exactly 67108864 bytes (64
-   MiB) written and fsynced; the io ledger and the product view
-   agree on bytes, counted separately from API calls. First
-   failure preserved: `D03-run.log` (FAIL — pre-attach burst,
-   `product_traffic`).
+   MiB) written and fsynced; the product view is a separate
+   population (encrypt returned 117638 ops / 60230656 bytes in
+   `product-report.json`), leaving a 6878208-byte gap vs the io
+   ledger that is UNRESOLVED (the oracle claims presence only,
+   never byte agreement). First failure preserved:
+   `D03-run.log` (FAIL — pre-attach burst, `product_traffic`).
 4. Virtual device / fallback (D04–D06 — STOPS AT DRIVER
    SELECTION): D04 `D04-rerun2.log` verdict PASS but
    `cell-D04.json` pins `device_unknown`, `queue_proof_absent`,
@@ -130,7 +134,7 @@ same dir.
    ops across 20 `soak-windows.json` windows; `stop-receipt.json`
    records the stop under live traffic (window 19, kryprobe
    exit 3). The timeline (`timeline.svg`) labels every arrow
-   observed/reference/inferred/unknown with its run ID, and
+   observed/reference/unknown with its run ID, and
    replay is labeled replay. First failure preserved:
    `D08-run.log` (FAIL — `marks_ordered` + `product_suffix`).
 
