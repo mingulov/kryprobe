@@ -145,7 +145,7 @@ kernel-referenced leg. Pinning any single nested shape (e.g.
 shash_digest == issued) is unprovable and must not be
 reintroduced.
 
-## P9 release-candidate promotion (T14)
+## P9 measured performance and first-release limits (T14)
 
 Wave head `task/kcrypto-t14` (final SHA + tree in
 `docs/release-ledger.md` and the T14 HANDOFF), budgets frozen
@@ -155,8 +155,9 @@ classes (64 B,
 4 KiB, 1 MiB skcipher; high-rate AEAD; deliberately async) ×
 observer modes (disabled baseline, aggregation, full details)
 in 5 attempted alternating A/B pairs per set (10 s warm-up +
-30 s measurement; aggregate sets qualified 5/5, all det and
-floor sets 0/5 — see verdicts below), one vng guest per set
+30 s measurement; 7.x aggregate sets qualified 5/5 and all det
+sets 0/5; the corrected floor evaluation gives 5/5 for both
+floor sets — see verdicts below), one vng guest per set
 on 7.0.14 + 7.2.6 with
 6.12.111 floor aggregate sets, plus attached-idle footprint
 legs, per-op reference-perturbation controls, and one
@@ -191,12 +192,22 @@ set truncates at the 100,000-observation bound (offered
 preserved. Reported instead: truncation points, below-cap
 absolute operating data (never ratioed), async detail
 envelope-only (terminals `Unknown`, `unfinished` == offered),
-6.12 floor absolute operating data with pairs INVALID
-(`destroy_skip == 3` vs the flat pin `== 1`; see the report),
+6.12 floor ENVELOPE data (the separately authorized checker correction
+removes the erroneous flat `destroy_skip == 1` requirement; the recorded
+value 3 is preserved),
 attached-idle CPU/RSS per kernel, and first-seen stack
 attribution counts from the aggregation who rows. Lifecycle
 on the 6.12 floor refuses typed exit 4
 (`kcrypto_fsession_unavailable`).
+
+Both corrected floor sets have 5/5 valid pairs and no predefined budget.
+Observed/baseline median throughput and workload-p99 ratios are
+0.739196 / 1.394026 for 4 KiB and 0.889887 / 1.243607 for 1 MiB.
+The original floor INVALIDs remain preserved as history. The 24 other
+sets and all four diagnostics are unchanged; the whole campaign remains
+INVALID (13 detail sets and one stack diagnostic).
+The owner accepts these limits for v0.1.0; full item-2 performance
+qualification remains unmet. See [release notes](releases/v0.1.0.md).
 
 Mode resolutions: stack sampling is NOT_RUN as a standalone
 mode (no product toggle — R1 stacks are first-seen-only

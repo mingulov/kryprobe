@@ -1,5 +1,17 @@
 # Versioning policy (1B-M5)
 
+## Product releases
+
+The product version is `[workspace.package].version` in `Cargo.toml`.
+The first public release is `0.1.0`; its intended Git tag is `v0.1.0`.
+Preparation of release notes does not create a tag or publish a release.
+Published tags identify immutable commits and are never moved to replace
+released bytes. Source and binary assets record their source revision and
+checksums. A product release does not imply a bump of the internal markers
+below or completion of every qualification milestone.
+
+## Internal surfaces
+
 Six markers version six independent surfaces. Each marker versions
 exactly one surface; a change to one surface never bumps another
 marker's version.

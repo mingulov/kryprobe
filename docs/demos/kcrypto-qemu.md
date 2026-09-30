@@ -1,6 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # kcrypto QEMU demo (P10): reproduction + viewer narration
 
+First-release scope (owner decisions, 2026-09-30): initramfs-local
+observation, with three fresh D07 boots and late/broken-observer controls
+in repair campaign `p10a7-20260930T044828Z`. Continuous capture through
+`switch_root` is deferred. The original completed p10a4/p10a7 evidence
+may retain kernel stack addresses. Future runs require strict exclusivity
+with both locks and `--refuse-foreign`; unrelated guests are never stopped.
+See [v0.1.0 release notes](../releases/v0.1.0.md) for the decisions and seals.
+The original wave below is retained as history; the stated p10a7 successors
+and controls govern the current demo claims.
+
 Status (final wave, `p10a4-20260930T002951Z`, sealed
 `SHA256SUMS` 199/199 OK): host suite 159/159 GREEN
 (`host-suite-S19.log`); T01-harness cold boot PASS
@@ -52,9 +62,9 @@ set in `spawn.json` before launching.
 `--refuse-foreign` refuses the launch when that set is non-empty
 instead of booting beside foreign guests; without it the set is
 recorded and the stop path fails closed on any change. Foreign
-processes are never signaled. The strict-exclusivity vs
-one-owned-guest wording call is AWAITING-OWNER (O3); the evidence
-stands under either reading once clean re-runs exist.
+processes are never signaled. The owner selected strict exclusivity (O3):
+always pass `--refuse-foreign` for demo runs and wait/refuse when another
+guest exists. The accepted replacement runs already meet this rule.
 
 Verification chain (what each checker establishes): `verify`
 re-checks the per-cell `SHA256SUMS` contents and re-judges the
@@ -133,6 +143,10 @@ same dir.
    `io-ledger.json`); everything before attach stays
    UNOBSERVED. First failure preserved: `D07-run.log` (FAIL —
    fail-closed custody: foreign qemu exit).
+   Repair evidence: `D07-repair1`, `D07-repair2` and `D07-repair3`
+   prove three fresh initramfs-local boots; `D07-late1` and
+   `D07-broken1` are the negative controls. See the repair campaign's
+   `D07-matrix.md`. No observer continuity through `switch_root` is claimed.
 6. Honest unknowns (D08 — QUALIFIED): `D08-rerun1.log` verdict
    PASS with 15/15 checks in `cell-D08.json` (`loss_visible`,
    `product_saw_head`, `product_missed_tail`, `windows_complete`,
@@ -154,9 +168,11 @@ failover claim, no physical-accelerator claim, no key/credential
 material in any output. Product passthrough carries decimal
 kernel IPs verbatim (407 `"ip"` fields across the 10 nonzero
 p10a4 `product-report.json` files); DEMO: rows are address-free.
-Redaction procedure: `kcrypto-qemu-redaction.md` (successor
-artifact only — originals preserved, seals untouched; the
-redact-fork vs scope-change decision is AWAITING-OWNER as O1).
+O1 is resolved by an explicit owner exception for the completed p10a4
+and p10a7 disposable guests: publish the original address-bearing bytes
+with their original seals. The optional procedure in
+`kcrypto-qemu-redaction.md` remains available for a separately authorized
+future redacted copy; it is not required for these campaigns.
 Narrower, per the seals: no queue/offload claim
 for D04 (device "unknown"), no fallback claim for D06
 (UNSUPPORTED×2), no pre-attach observation claim for D07, and no

@@ -1,10 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # kcrypto QEMU demo: kernel-address redaction procedure
 
-Status: PROCEDURE ONLY. The redact-fork vs scope-change decision
-is AWAITING-OWNER (O1). Do not execute this procedure until the
-owner disposes O1; this document narrows the privacy claims and
-records the exact successor-artifact recipe meanwhile.
+Status: OPTIONAL PROCEDURE, not selected for v0.1.0. On 2026-09-30
+the owner allowed original kernel stack addresses in the completed
+p10a4/p10a7 disposable-demo evidence, preserving original seals.
+No redacted successor is required or produced for those campaigns.
+The recipe below remains available for a future separately authorized
+copy. See [release notes](../releases/v0.1.0.md).
 
 ## Observed state (p10a4, firsthand)
 
@@ -49,8 +51,8 @@ Two address-bearing populations, both product passthrough:
   rows stay address-free across all repair consoles.
 
 Privacy claims are therefore narrowed to keys/credentials
-everywhere; kernel-address material rides the product bytes
-pending O1.
+everywhere; the original kernel-address material remains in the product
+bytes under the scoped O1 owner exception.
 
 ## Successor-artifact recipe
 
@@ -99,5 +101,5 @@ is a presentation artifact, never re-judged.
   seals untouched and never re-sealed.
 - No quiet substitution: the successor name, seal, and
   provenance must identify it as redacted.
-- This procedure decides nothing about O1 (fork vs scope
-  change); it only makes the fork branch mechanical.
+- This procedure does not broaden the owner exception to other captures
+  or authorize publishing keys, credentials or payload contents.

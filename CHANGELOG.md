@@ -5,7 +5,28 @@ All notable user-facing changes to the KryProbe thin spine. The
 `kryprobe.event/v0` session schema is frozen and never appears here;
 any schema change requires an ADR plus a version bump.
 
-## Unreleased — kcrypto backend (K5)
+## 0.1.0 — first public release (prepared, not yet tagged)
+
+- Kernel-only observation with the default api-returns profile on Linux
+  6.12+ and request-lifecycle on capable 7.x kernels, with typed refusals
+  and explicit coverage/loss reporting.
+- Profile-bound binary/BPF packaging, verified staged installation,
+  lifecycle session replay, filtering and kernel-crypto support tables.
+- QEMU demonstrations of provider selection, controlled consumers, early
+  initramfs capture and explicit observation gaps.
+- Initial release scope approved with measured performance limits:
+  both 7.x 4 KiB budget FAILs and all 13 detail INVALID sets stand.
+  The corrected offline evaluation gives both 6.12 floor sets ENVELOPE
+  with 5/5 valid pairs each; no performance budget applies to those sets.
+- Boot continuity through `switch_root` is deferred. Original evidence
+  from the two completed demo campaigns may retain kernel stack addresses.
+  Future demo runs require strict host exclusivity.
+
+See [release notes](docs/releases/v0.1.0.md) for the exact scope, evidence
+identities and remaining qualification gaps. The entries below describe
+development leading to this first release, not earlier public releases.
+
+## Pre-release development — kcrypto backend (K5)
 
 Live kernel-crypto observation on top of the thin spine: the BPF
 sensor, system-wide watch/report/check, policy verdicts, and token
@@ -63,7 +84,7 @@ were renumbered — see the migration note below.
   parses once per tick (not per row); fail-open policy verdicts
   closed (unevaluable rules yield `INCONCLUSIVE`, never `Clean`).
 
-## Unreleased — thin-spine milestone (historical)
+## Pre-release development — thin-spine milestone (historical)
 
 Executable skeleton: frozen contracts plus a working runtime spine
 (session/target/authority model, CLI, reporting, synthetic backend,

@@ -21,6 +21,12 @@ policy checks (`check --system`), and token-delegated privileged
 bring-up (`token mint|status`). `docs/commands.md` is the command
 reference; this file is the overview.
 
+The first public release is being prepared as **v0.1.0**. Read the
+[release scope and measured limits](docs/releases/v0.1.0.md) before
+deploying or publishing performance numbers. Kernel-crypto functionality
+has live evidence; full performance qualification remains incomplete.
+The [quick start](docs/kcrypto-quickstart.md) covers installation and capture.
+
 ## Backends
 
 | Backend     | Status                                |
@@ -99,9 +105,9 @@ the `USAGE` text verbatim, so README edits cannot drift from the CLI.
 `cargo xtask` is the only supported orchestration entry point:
 
 ```
+cargo xtask build --bpf # prerequisite for release-consumer tests on a fresh checkout
+cargo xtask build       # workspace binaries, including host-test fixtures
 cargo xtask check       # pinned-toolchain gate + fmt + clippy + doc + host tests
-cargo xtask build       # cargo build --locked --workspace
-cargo xtask build --bpf # BPF spine + kcrypto objects into target/kryprobe-bpf/
 cargo xtask test host   # cargo test --locked --workspace
 cargo xtask test bpf    # BPF pipeline lane (object + fixture + suites)
 cargo xtask verify generated  # schema-freeze + fixture-validation tests
@@ -134,7 +140,9 @@ toolchain and prints the install command.
 agent workflow rules. Human contributors need three procedures:
 
 - Gate: `cargo xtask check` (pinned toolchain, fmt, clippy, doc,
-  host tests) is the required pre-merge gate — run it, not bare
+  host tests) is the required pre-merge gate; first run both build commands
+  on a fresh checkout, using that worktree's own `target/` directory.
+  Run the gate, not bare
   `cargo test` (which skips the seam gate, the pins, and `--locked`).
   CI enforces the same gate plus the BPF lane and supply scans.
   Behavior changes land with tests; output-shape changes update the

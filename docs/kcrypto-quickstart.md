@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# KryProbe kernel-crypto quick start (R1 release candidate)
+# KryProbe kernel-crypto quick start (v0.1.0)
 
 Observe kernel crypto API use (skcipher/AEAD/hash call returns,
 transform selection, submitter attribution) on a supported Linux
@@ -7,6 +7,10 @@ kernel. This page goes from a release bundle to a first verified
 capture in five steps; `docs/deployment.md` is the full privilege
 runbook and `docs/kcrypto-support.md` is the support table with
 the release's measured limits.
+
+The [first-release notes](releases/v0.1.0.md) state the owner-approved
+scope and remaining qualification gaps. Full R1 performance qualification
+is incomplete.
 
 ## 1. Install the release bundle
 
@@ -82,7 +86,10 @@ the loss as disqualifying, never as free headroom.
   at ~41–47k ops/s): ~18–20% throughput cost and ~20–22%
   tail-latency cost vs tracing-disabled — the release does
   NOT meet a ≤5%/≤10% budget there (both kernels FAIL).
-  Slower workloads cost less (~3–6% at 1 MiB rates). Never
+  The measured 7.x 1 MiB workloads cost ~3–6% throughput; the
+  7.0.14 budget verdict remains INCONCLUSIVE. The corrected
+  6.12 floor measurements show ~26.1%/11.0% throughput cost
+  at 4 KiB/1 MiB, with no predefined budget. Never
   publish an overhead number without its workload rate.
 - Completion is unobserved: api-returns rows prove API returns,
   never provider-body execution or async completion. Do not
@@ -99,6 +106,8 @@ the loss as disqualifying, never as free headroom.
 - Pre-attach boot traffic is unobserved. Transform state from
   before attach has unknown provenance (never a fabricated
   allocation).
+- The boot demo is initramfs-local: three fresh boots plus late/broken
+  observer controls. Continuous capture through `switch_root` is deferred.
 
 Support window, kernel floor, and accepted residuals:
 `docs/kcrypto-support.md`. Release identity and evidence map:

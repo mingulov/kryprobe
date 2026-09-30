@@ -1,10 +1,41 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# R1 release ledger (P9/T14 release candidate, repair-3 re-issue)
+# v0.1.0 release ledger and accepted P9/T14 evidence
 
 The release-candidate identity: what was measured, on which
 bytes, against which frozen contracts, and where every claim's
 receipt lives. Publication is a separate owner action — this
-ledger supports review, not release.
+ledger supports review, not release. The initial public release has the
+limited scope in [v0.1.0 release notes](releases/v0.1.0.md); R1 remains open.
+
+## First-release decisions and corrected floor results (2026-09-30)
+
+The owner has resolved all five release-policy choices:
+
+- O1: original stack addresses may remain in the two completed disposable
+  demo campaigns, p10a4/p10a7. Their original bytes and seals are preserved.
+- O2: boot-demo scope is initramfs-local, with three fresh boots and the
+  late/broken-observer controls. Continuous `switch_root` capture is deferred.
+- Item-2: accept measured performance limits for the first release; full
+  qualification remains unmet, with 7.x budget FAILs and detail INVALIDs intact.
+- Floor: one authorized corrected offline evaluation is complete. Both
+  Linux 6.12 sets now have ENVELOPE verdicts and 5/5 valid pairs. Throughput/
+  workload-p99 medians are 0.739196/1.394026 (4 KiB) and
+  0.889887/1.243607 (1 MiB); these are unbudgeted operating data, not PASSes.
+  All measured values, the 24 other sets and all four diagnostics are unchanged.
+  The whole campaign remains INVALID with 14 reasons.
+- O3: future QEMU demo runs use strict exclusivity, both locks and
+  `--refuse-foreign`; they wait/refuse without stopping unrelated guests.
+
+The floor successor is
+`evidence/kcrypto-t14-floor-rejudge/20260930T111512Z/`, sealed 68/68.
+Its `RESULTS.md` and `PROVENANCE.json` bind the original T14 seal; it
+supplements the original floor INVALIDs without editing their history.
+Seal digests for the four evidence trees are in the release notes.
+The source chain is main `d69d88d` -> accepted T14 `2540b49` ->
+accepted demo `4206971` -> release documentation/CI preparation.
+The runtime source and frozen contracts are unchanged by that preparation.
+
+## Historical T14 repair-3 record
 
 This re-issue (repair-3, committed AFTER the repair gates)
 supersedes the repair-2 ledger: it records the repair-3
@@ -22,8 +53,8 @@ wording correction, the rejudge-3 hardening comparison, the
   x86-64; kernel-only product scope, no third-party import).
 - Candidate base: `b50ee1a430e71fd470ef5eb817a98e6b8f3f9177`
   (accepted P8 head, `task/kcrypto-t13`).
-- Candidate head: `task/kcrypto-t14` repair-3 head (this
-  commit; full SHA + tree in the T14 HANDOFF §Repository
+- Candidate head: `2540b491ce0747e7efc2b63dc1d5c2eef62b9223`
+  (`task/kcrypto-t14` repair-3; full SHA + tree in the T14 HANDOFF §Repository
   state — BPF/ABI/wire/event-v0 frozen, measurement +
   packaging + docs only; zero SOURCE delta under `crates/`,
   `xtask/`, `packaging/` vs base,
@@ -160,11 +191,11 @@ re-proved, not silently dropped):
   7014 re-proved in repair-1).
 - X01–X03 / D01–D08: separate P10 demo scope, out of R1.
 
-## T14 results pending owner disposition
+## T14 results accepted as first-release limitations
 
-T14 outcomes recorded honestly; owner disposition still
-required (P9R2O-N4 heading split — the old "Accepted
-residuals" heading implied acceptance that hasn't happened):
+The owner accepted the following limits for v0.1.0 on 2026-09-30.
+The floor correction above is the sole separately derived verdict change.
+The original records below remain available without rewriting their bytes:
 
 - Stack sampling NOT_RUN as a standalone mode (no product
   toggle; observables reported instead — see support §P9).
@@ -175,12 +206,12 @@ residuals" heading implied acceptance that hasn't happened):
 - `perf-P-1M-agg-7014` INCONCLUSIVE (spread 0.84–1.13, 2/5
   inside; a noisy interval stays inconclusive).
 - All 13 det sets INVALID (0/5 valid: 100k truncation at
-  28–44x offered + counted tombstone loss below cap); both
-  floor sets INVALID (0/5 valid: `destroy_skip == 3` vs the
-  judge-applied flat pin — harness defect P9R1O-N2 recorded,
-  code fixed, re-judge pending owner authority);
-  diag-stack INVALID (one paced leg missed pace). Item-2
-  disposition (narrow vs new wave) is AWAITING-OWNER.
+  28–44x offered + counted tombstone loss below cap).
+  Both floor sets were originally INVALID (0/5 valid because
+  the checker applied a flat destroy-skip pin to the nested route);
+  the authorized correction above gives ENVELOPE, 5/5 each.
+  Diag-stack remains INVALID (one paced leg missed pace).
+  Full item-2 qualification and a new sampling wave are deferred.
 - Observer gaps: drain lag NOT measured (no numerical
   bound); map/state occupancy levels NOT reported; stop
   cost NOT measured; host load/governor/CPU-features/
@@ -215,7 +246,7 @@ residuals" heading implied acceptance that hasn't happened):
 - Three attempt-1 cells sampled with the foreign QEMU
   co-resident (disclosed measurement limitation, no re-run).
 
-## Main-drift recheck (ADR-0005)
+## Historical main-drift recheck at T14 handoff (ADR-0005)
 
 At handoff: `main` head `d69d88d` (review-remain G10); zero
 commits on `main` outside the P8 base history
@@ -225,8 +256,8 @@ branch is 166 commits ahead of `main` (the kcrypto task
 stack + the T14 wave + repair-1 + repair-2). Report only —
 worker never rebases/merges/pushes/tags; owner integrates.
 
-Explicit integration result for owner review: with zero
-drift, integrating this candidate fast-forwards `main` from
-`d69d88d` to the repair-2 head (full SHA + tree in the T14
-HANDOFF §Repository state). Owner acts; worker states, never
-performs.
+That handoff proposed a fast-forward from `d69d88d`; it did not
+perform one. The current release preparation includes the accepted
+repair-3 and demo heads listed above, plus the owner decisions.
+The coordinator rechecks main immediately before a fast-forward and
+records the actual integrated SHA/tree. Publication remains an owner action.
