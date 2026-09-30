@@ -41,6 +41,21 @@ ALLOWED_PARTIAL_MISSING = frozenset({"capture-integrity", "completion"})
 # stop window's KRYPROBE-START mark plus this. Loop windows use 60.
 STOP_CAPTURE_S = 30
 
+# Stop-window observed-share band (R2): the 30 s capture covers
+# half the 60 s stop window by construction (nominal share 0.5);
+# the band admits +-0.3 (~+-18 s of combined attach latency and
+# duration-accounting drift) and rejects captures that saw nearly
+# nothing or nearly everything (the stop was not mid-traffic).
+STOP_SHARE_MIN = 0.2
+STOP_SHARE_MAX = 0.8
+
+# Stop-window deficit tolerance (R2): the missed tail must match
+# the post-capture caller rows within 100 ops (~10 s at the
+# nominal 10 ops/s: the 5 s attach slack plus observed
+# duration-accounting drift, live 37). Larger deficits are
+# unexplained.
+STOP_DEFICIT_TOL = 100
+
 
 def unsupported_receipt(cell: dict, run_id: str, reason: str,
                         manifest_sha256: str | None = None) -> dict:
@@ -395,6 +410,11 @@ def stop_window_product(report, exit_code: int | None,
     straddle the nominal capture end guest-side, proving traffic
     was active at the stop without trusting product timestamps
     (robust to seconds of duration-accounting drift either way).
+    The observed share must also sit inside the construction-set
+    band (a near-empty or near-full capture proves no mid-traffic
+    stop), and the missed tail must reconcile with the
+    post-capture caller rows within tolerance (unexplained
+    deficits fail).
     """
     totals = _encrypt_totals(report)
     n_stop = len(stop_rows)
@@ -416,6 +436,9 @@ def stop_window_product(report, exit_code: int | None,
                 before += 1
             elif ts > capture_end:
                 after += 1
+    share = totals["ok"] / n_stop if (totals and n_stop) else None
+    tail_deficit = (missed - after
+                    if (missed is not None and end_ok) else None)
     verdict_checks, verdict_info = _verdict_exit_checks(report, exit_code)
     checks = {
         "product_internal": bool(internal),
@@ -424,6 +447,12 @@ def stop_window_product(report, exit_code: int | None,
             missed is not None and 0 < missed < n_stop),
         "traffic_spans_capture_end": bool(end_ok and before > 0
                                           and after > 0),
+        "product_share_bounded": bool(
+            share is not None
+            and STOP_SHARE_MIN <= share <= STOP_SHARE_MAX),
+        "product_deficit_explained": bool(
+            tail_deficit is not None
+            and abs(tail_deficit) <= STOP_DEFICIT_TOL),
         **verdict_checks,
     }
     info = {"product_ok": totals["ok"] if totals else None,
@@ -431,6 +460,7 @@ def stop_window_product(report, exit_code: int | None,
             "missed": missed, "stop_rows": n_stop,
             "capture_end_nominal": capture_end if end_ok else None,
             "rows_before_end": before, "rows_after_end": after,
+            "observed_share": share, "tail_deficit": tail_deficit,
             **verdict_info}
     return checks, info
 
