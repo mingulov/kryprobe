@@ -555,48 +555,86 @@ class D07Tests(unittest.TestCase):
 
 
 class D08Tests(unittest.TestCase):
-    def _console(self):
+    def _console(self, product_calls=1, stop_ts=(61.0, 95.0)):
+        # Live D08 shape: the loop window starts on the same 0.01 s
+        # tick as PRELUDE-DONE (the 2.51 == 2.51 collision), every
+        # window exits 3/partial, and the stop window's traffic
+        # straddles the nominal capture end (59 + 30 = 89).
         lines = list(PRELUDE_MARKS)
-        lines.append(mark("KRYPROBE-START", 3.0))
+        lines.append(mark("KRYPROBE-START", 2.0))
         lines.append(ledger(0, "d08-w0", ts=4.0))
+        lines.append(ledger(1, "d08-w0", ts=5.0))
         lines.append(
             'DEMO:SOAK {"window": 0, "ops_ok": true,'
-            ' "kryprobe_exit": 0, "report_lines": 10}')
+            ' "kryprobe_exit": 3, "report_lines": 1}')
         lines.append(mark("KRYPROBE-START", 59.0))
         lines.append(mark("STOP-WINDOW-START", 60.0))
-        lines.append(ledger(0, "d08-stop", ts=61.0))
-        lines.append(mark("STOP-WINDOW-END", 62.0))
+        lines.append(ledger(0, "d08-stop", ts=stop_ts[0]))
+        lines.append(ledger(1, "d08-stop", ts=stop_ts[1]))
+        lines.append(mark("STOP-WINDOW-END", 96.0))
         lines.append(
             'DEMO:SOAK {"window": 1, "ops_ok": true,'
-            ' "kryprobe_exit": 0, "report_lines": 10,'
+            ' "kryprobe_exit": 3, "report_lines": 1,'
             ' "traffic_active_at_stop": true}')
-        lines.append(mark("WORKLOAD-DONE", 63.0))
-        lines.append(KRYPROBE_EXIT)
-        return "\n".join(lines) + "\n" + krepo(1)
+        lines.append(mark("WORKLOAD-DONE", 97.0))
+        lines.append(
+            'DEMO:PROBE {"fact": "kryprobe-exit", "exit": 3}')
+        body = ("\n".join(lines) + "\n"
+                + krepo(product_calls, verdict="partial",
+                        missing=("capture-integrity", "completion")))
+        return body
+
+    def _workload(self):
+        return {"kind": "stop-soak", "aggregate_minutes": 20,
+                "windows": 2, "window_ops": 2, "rate_per_s": 10,
+                "block_bytes": 4096}
 
     def test_d08_windows_and_stop(self):
-        workload = {"kind": "stop-soak", "aggregate_minutes": 20,
-                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
-                    "block_bytes": 4096}
         receipt, ledgers = cells.build_cell(
-            cell(workload, "D08"), "run1", "msha", self._console(), PROC,
-            "guest1",
+            cell(self._workload(), "D08"), "run1", "msha",
+            self._console(), PROC, "guest1",
         )
         self.assertTrue(all(receipt["checks"].values()), receipt["checks"])
         self.assertIn("soak-windows.json", ledgers)
         self.assertIn("stop-receipt.json", ledgers)
         stop = json.loads(ledgers["stop-receipt.json"])
         self.assertTrue(stop["traffic_active_at_stop"])
+        # The stop window shows partial overlap: head seen, tail
+        # missed, traffic spanning the capture end.
+        self.assertTrue(receipt["checks"]["product_saw_head"])
+        self.assertTrue(receipt["checks"]["product_missed_tail"])
+        self.assertTrue(receipt["checks"]["traffic_spans_capture_end"])
+        self.assertEqual(receipt["product"]["missed"], 1)
 
     def test_d08_failed_window_fails(self):
         console = self._console().replace(
             '"window": 0, "ops_ok": true', '"window": 0, "ops_ok": false')
-        workload = {"kind": "stop-soak", "aggregate_minutes": 20,
-                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
-                    "block_bytes": 4096}
         receipt, _ = cells.build_cell(
-            cell(workload, "D08"), "run1", "msha", console, PROC, "guest1")
+            cell(self._workload(), "D08"), "run1", "msha", console, PROC,
+            "guest1")
         self.assertFalse(all(receipt["checks"].values()))
+
+    def test_d08_full_capture_fails_missed_tail(self):
+        # The product saw every stop op: capture never stopped
+        # mid-traffic, the cell's point unproven.
+        receipt, _ = cells.build_cell(
+            cell(self._workload(), "D08"), "run1", "msha",
+            self._console(product_calls=2), PROC, "guest1")
+        self.assertFalse(receipt["checks"]["product_missed_tail"])
+
+    def test_d08_no_head_traffic_fails(self):
+        receipt, _ = cells.build_cell(
+            cell(self._workload(), "D08"), "run1", "msha",
+            self._console(product_calls=0), PROC, "guest1")
+        self.assertFalse(receipt["checks"]["product_saw_head"])
+
+    def test_d08_no_straddle_fails(self):
+        # Both stop ops precede the nominal capture end: traffic
+        # did not span the stop.
+        receipt, _ = cells.build_cell(
+            cell(self._workload(), "D08"), "run1", "msha",
+            self._console(stop_ts=(61.0, 62.0)), PROC, "guest1")
+        self.assertFalse(receipt["checks"]["traffic_spans_capture_end"])
 
 
 class ProductReconcileTests(unittest.TestCase):
@@ -681,24 +719,32 @@ class ProductReconcileTests(unittest.TestCase):
         self.assertFalse(receipt["checks"]["product_suffix"])
 
     def test_d08_exit3_window_accepted(self):
+        # Mixed exits: loop window partial (exit 3) tolerated, stop
+        # window clean (exit 0, observed). The stop window keeps the
+        # partial-overlap shape (2 ops straddling the 89 nominal
+        # capture end, product saw the head only) the S19 rule
+        # requires: a single fully-captured stop op no longer proves
+        # the stop happened mid-traffic.
         workload = {"kind": "stop-soak", "aggregate_minutes": 20,
-                    "windows": 2, "window_ops": 1, "rate_per_s": 10,
+                    "windows": 2, "window_ops": 2, "rate_per_s": 10,
                     "block_bytes": 4096}
         lines = list(PRELUDE_MARKS)
         lines.append(mark("KRYPROBE-START", 3.0))
         lines.append(ledger(0, "d08-w0", ts=4.0))
+        lines.append(ledger(1, "d08-w0", ts=5.0))
         lines.append(
             'DEMO:SOAK {"window": 0, "ops_ok": true,'
             ' "kryprobe_exit": 3, "report_lines": 10}')
         lines.append(mark("KRYPROBE-START", 59.0))
         lines.append(mark("STOP-WINDOW-START", 60.0))
         lines.append(ledger(0, "d08-stop", ts=61.0))
-        lines.append(mark("STOP-WINDOW-END", 62.0))
+        lines.append(ledger(1, "d08-stop", ts=95.0))
+        lines.append(mark("STOP-WINDOW-END", 96.0))
         lines.append(
             'DEMO:SOAK {"window": 1, "ops_ok": true,'
             ' "kryprobe_exit": 0, "report_lines": 10,'
             ' "traffic_active_at_stop": true}')
-        lines.append(mark("WORKLOAD-DONE", 63.0))
+        lines.append(mark("WORKLOAD-DONE", 97.0))
         lines.append(KRYPROBE_EXIT)
         receipt, _ = cells.build_cell(
             cell(workload, "D08"), "run1", "msha",

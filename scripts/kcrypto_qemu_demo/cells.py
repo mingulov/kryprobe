@@ -36,6 +36,11 @@ ATTACH_SLACK_S = 5.0
 # async-oriented integrity/continuity dimensions.
 ALLOWED_PARTIAL_MISSING = frozenset({"capture-integrity", "completion"})
 
+# Stop-window kryprobe capture duration in seconds, guest-pinned
+# (run-cells.sh `--duration 30`): the nominal capture end is the
+# stop window's KRYPROBE-START mark plus this. Loop windows use 60.
+STOP_CAPTURE_S = 30
+
 
 def unsupported_receipt(cell: dict, run_id: str, reason: str,
                         manifest_sha256: str | None = None) -> dict:
@@ -345,6 +350,59 @@ def _driver_product(report, driver: str) -> dict | None:
         return None
     return {"calls": calls, "ok": ok, "queued": queued,
             "bytes": nbytes, "errors": errors}
+
+
+def stop_window_product(report, exit_code: int | None,
+                        stop_rows: list[dict], op_bytes: int,
+                        capture_end) -> tuple[dict, dict]:
+    """Stop-window product rule: the capture ends mid-traffic by design.
+
+    The suffix rule cannot apply here (it models head-only misses,
+    while the stop window's misses are the post-capture tail, e.g.
+    296 of 600 live): the product must stay internally exact
+    (``bytes == ok * op_bytes``, zero errors), show PARTIAL
+    overlap (head seen, ``0 < missed < n``), and the LEDGER must
+    straddle the nominal capture end guest-side, proving traffic
+    was active at the stop without trusting product timestamps
+    (robust to seconds of duration-accounting drift either way).
+    """
+    totals = _encrypt_totals(report)
+    n_stop = len(stop_rows)
+    missed = n_stop - totals["ok"] if totals else None
+    internal = (
+        totals is not None and totals["ok"] == totals["calls"]
+        and totals["errors"] == 0
+        and totals["bytes"] == totals["ok"] * op_bytes
+    )
+    end_ok = (isinstance(capture_end, (int, float))
+              and not isinstance(capture_end, bool))
+    before = after = 0
+    if end_ok:
+        for row in stop_rows:
+            ts = row.get("ts_mono")
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                continue
+            if ts < capture_end:
+                before += 1
+            elif ts > capture_end:
+                after += 1
+    verdict_checks, verdict_info = _verdict_exit_checks(report, exit_code)
+    checks = {
+        "product_internal": bool(internal),
+        "product_saw_head": bool(totals is not None and totals["ok"] > 0),
+        "product_missed_tail": bool(
+            missed is not None and 0 < missed < n_stop),
+        "traffic_spans_capture_end": bool(end_ok and before > 0
+                                          and after > 0),
+        **verdict_checks,
+    }
+    info = {"product_ok": totals["ok"] if totals else None,
+            "product_bytes": totals["bytes"] if totals else None,
+            "missed": missed, "stop_rows": n_stop,
+            "capture_end_nominal": capture_end if end_ok else None,
+            "rows_before_end": before, "rows_after_end": after,
+            **verdict_info}
+    return checks, info
 
 
 def _jsonl(rows: list[dict]) -> str:
@@ -713,7 +771,8 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
                  if isinstance(row.get("window"), int))
     judged = reconcile.soak_windows(
         [{"id": row.get("window"), "capped": True, "reset": None,
-          "duration_s": 60 if row.get("window") != windows - 1 else 30}
+          "duration_s": (60 if row.get("window") != windows - 1
+                         else STOP_CAPTURE_S)}
          for row in soak])
     gapless = True
     try:
@@ -731,15 +790,27 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
                  and row.get("status") == 0]
     stop_start = _mark_ts(parsed["MARK"], "STOP-WINDOW-START")
     kryprobe_start = _kryprobe_start_before(parsed["MARK"], stop_start)
-    product_checks, product_info = reconcile_product(
-        parsed["KRYPROBE"], _kryprobe_exit(parsed), len(stop_rows),
-        workload["rate_per_s"], workload["block_bytes"],
-        kryprobe_start, stop_start)
+    if isinstance(kryprobe_start, bool) or not isinstance(
+            kryprobe_start, (int, float)):
+        capture_end = None
+    else:
+        capture_end = kryprobe_start + STOP_CAPTURE_S
+    product_checks, product_info = stop_window_product(
+        parsed["KRYPROBE"], _kryprobe_exit(parsed), stop_rows,
+        workload["block_bytes"], capture_end)
+    # Nineteen loop KRYPROBE-STARTs precede the stop tail, and the
+    # first can share its 0.01 s tick with PRELUDE-DONE (live 2.51
+    # == 2.51 breaks the shared strict-ts helper): order the
+    # prelude and the stop tail separately instead.
+    starts = [i for i, mark in enumerate(parsed["MARK"])
+              if mark.get("name") == "KRYPROBE-START"]
+    tail = parsed["MARK"][starts[-1]:] if starts else []
+    marks_ok = (console.marks_ordered(parsed["MARK"], PRELUDE_MARKS)
+                and console.marks_ordered(
+                    tail, ["KRYPROBE-START", "STOP-WINDOW-START",
+                           "STOP-WINDOW-END", "WORKLOAD-DONE"]))
     checks = {
-        "marks_ordered": console.marks_ordered(
-            parsed["MARK"],
-            PRELUDE_MARKS + ["KRYPROBE-START", "STOP-WINDOW-START",
-                             "STOP-WINDOW-END", "WORKLOAD-DONE"]),
+        "marks_ordered": marks_ok,
         "windows_complete": ids == list(range(windows)),
         "windows_ok": judged["ok"] and all(
             row.get("ops_ok") is True and row.get("kryprobe_exit") in (0, 3)
@@ -756,9 +827,11 @@ def _build_d08(cell, run_id, guest_name, manifest_sha256, process,
     receipt["observation"] = {"expected": windows * workload["window_ops"],
                               "actual": len(ok_rows)}
     receipt["product"] = product_info
+    exits = sorted({row.get("kryprobe_exit") for row in soak
+                    if type(row.get("kryprobe_exit")) is int})
     receipt["loss"] = {"dropped": 0, "omitted": [],
-                         "basis": "gapless workload ledger + kryprobe"
-                                  " exit 0 (clean/complete) every window"}
+                       "basis": "gapless workload ledger + named "
+                                f"kryprobe exits every window: {exits}"}
     checks["loss_visible"] = reconcile.loss_visible(
         {"dropped": 0, "omitted": []})
     ledgers = {
