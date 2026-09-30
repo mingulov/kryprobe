@@ -16,6 +16,13 @@ mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
 mkdir -p /run/demo
 
+# Quiet the console: printk bytes interleave with DEMO marker
+# lines on the serial stream and tear multi-line evidence
+# (observed: ACPI/poweroff lines spliced into the kryprobe JSON
+# in D01-rerun1). Boot logs before this point are already
+# captured; only emergences still print.
+dmesg -n 1 2>/dev/null || true
+
 export PATH=/bin:/sbin:/opt/demo/bin
 CONSOLE=/dev/console
 
