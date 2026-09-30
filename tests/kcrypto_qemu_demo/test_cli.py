@@ -134,6 +134,19 @@ class CliTests(unittest.TestCase):
             self.assertFalse((cell_dir / "spawn.json").exists())
             self.assertFalse((cell_dir / "console.log").exists())
 
+    def test_run_accepts_refuse_foreign(self):
+        # R7 RED: the no-boot lane accepts (and ignores) the flag.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "INPUTS.json"
+            manifest.write_text(json.dumps(fixture_manifest()))
+            cell_dir = root / "D06"
+            proc = run_cli("run", "--manifest", str(manifest),
+                           "--cell", "D06", "--run-dir", str(cell_dir),
+                           "--lock", str(root / "lock"),
+                           "--refuse-foreign")
+            self.assertEqual(proc.returncode, 3, proc.stderr + proc.stdout)
+
     def test_verify_offline_judges_unsupported(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

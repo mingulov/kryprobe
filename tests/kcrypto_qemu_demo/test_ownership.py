@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -128,6 +129,86 @@ class OwnershipTests(unittest.TestCase):
                     lock_paths=[Path(tmp) / "lane.lock"],
                     qemu_cmd_override=["true"],
                 )
+
+    def test_refuse_foreign_qemu_blocks_launch(self):
+        # R7 RED: --refuse-foreign must not boot beside foreign qemu.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "cell"
+            run_dir.mkdir()
+            lock = Path(tmp) / "lane.lock"
+            foreign = {"424242": {"args": ["qemu-system-x86_64"],
+                                  "start_ticks": "1"}}
+            with mock.patch.object(runner, "qemu_inventory",
+                                   return_value=dict(foreign)):
+                with self.assertRaisesRegex(runner.GuestError,
+                                            "foreign qemu"):
+                    runner.launch_guest(
+                        manifest=test_manifest(),
+                        image_id="img-test",
+                        run_dir=run_dir,
+                        name="demo-test-guest",
+                        lock_paths=[lock],
+                        qemu_cmd_override=["true"],
+                        refuse_foreign=True,
+                    )
+            self.assertFalse((run_dir / "spawn.json").exists())
+            # The refusal must not leak the lane lock.
+            held = runner.acquire_locks([lock])
+            for fh in held:
+                fh.close()
+
+    def test_refuse_foreign_qemu_clean_launches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "cell"
+            run_dir.mkdir()
+            with mock.patch.object(runner, "qemu_inventory",
+                                   return_value={}):
+                guest = runner.launch_guest(
+                    manifest=test_manifest(),
+                    image_id="img-test",
+                    run_dir=run_dir,
+                    name="demo-test-guest",
+                    lock_paths=[Path(tmp) / "lane.lock"],
+                    qemu_cmd_override=["true"],
+                    refuse_foreign=True,
+                )
+                try:
+                    spawn = json.loads(
+                        (run_dir / "spawn.json").read_text())
+                    self.assertEqual(spawn["preexisting_qemu_pids"], [])
+                    self.assertTrue(spawn["refuse_foreign"])
+                    runner.wait_guest(guest, timeout_s=30)
+                finally:
+                    stop = runner.stop_guest(guest)
+            self.assertTrue(stop["preexisting_qemu_unchanged"])
+
+    def test_default_launch_records_foreign_set(self):
+        # Without --refuse-foreign the explicit preexisting set is
+        # recorded (never silently tolerated, never signaled).
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "cell"
+            run_dir.mkdir()
+            foreign = {"424242": {"args": ["qemu-system-x86_64"],
+                                  "start_ticks": "1"}}
+            with mock.patch.object(runner, "qemu_inventory",
+                                   return_value=dict(foreign)):
+                guest = runner.launch_guest(
+                    manifest=test_manifest(),
+                    image_id="img-test",
+                    run_dir=run_dir,
+                    name="demo-test-guest",
+                    lock_paths=[Path(tmp) / "lane.lock"],
+                    qemu_cmd_override=["true"],
+                )
+                try:
+                    spawn = json.loads(
+                        (run_dir / "spawn.json").read_text())
+                    self.assertEqual(spawn["preexisting_qemu_pids"],
+                                     ["424242"])
+                    self.assertFalse(spawn["refuse_foreign"])
+                    runner.wait_guest(guest, timeout_s=30)
+                finally:
+                    runner.stop_guest(guest)
 
     def test_contended_lock_refuses_without_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
