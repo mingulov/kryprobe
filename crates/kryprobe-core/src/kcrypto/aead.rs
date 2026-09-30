@@ -157,3 +157,126 @@ pub fn qualify_success(attempt: &AeadAttempt, terminal: Terminal) -> AeadSuccess
         aad: known(attempt.aad),
     }
 }
+
+/// Kani proofs (audit #17): exhaustive contracts for the pure AEAD split.
+/// Compiled only under `cargo kani` (which sets `--cfg kani` and supplies
+/// the `kani` crate); invisible to normal builds, tests, and clippy.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::kcrypto::{OpDirection, Terminal};
+
+    /// Decrypt split is exact: `Known` exactly when the input covers the
+    /// tag, summing back with no wrap; otherwise `ShortInput` echoing the
+    /// observed scalars (never a wrapped ~4 GiB payload).
+    #[kani::proof]
+    fn decrypt_split_exact() {
+        let cryptlen: u32 = kani::any();
+        let auth: u32 = kani::any();
+        kani::assume(auth != 0);
+        let assoc: Option<u32> = kani::any();
+        let attempt = derive_attempt(OpDirection::Decrypt, cryptlen, assoc, Some(auth));
+        match attempt.payload {
+            AeadLen::Known(rest) => {
+                kani::assert(cryptlen >= auth, "known only when input covers tag");
+                kani::assert(rest + auth == cryptlen, "exact split, no wrap");
+            }
+            AeadLen::Unknown(AeadUnknown::ShortInput {
+                cryptlen: c,
+                authsize: t,
+            }) => {
+                kani::assert(c == cryptlen && t == auth, "short-input echoes scalars");
+                kani::assert(cryptlen < auth, "short only when input under tag");
+            }
+            _ => kani::assert(false, "decrypt payload has no other shape"),
+        }
+        kani::assert(
+            matches!(attempt.tag, AeadLen::Known(t) if t == auth),
+            "valid authsize yields known tag",
+        );
+        kani::assert(
+            matches!(attempt.input, AeadLen::Known(c) if c == cryptlen),
+            "input always known",
+        );
+    }
+
+    /// Missing/zero authsize leaves payload and tag unknown, never guessed.
+    #[kani::proof]
+    fn decrypt_unknown_authsize_unknown() {
+        let cryptlen: u32 = kani::any();
+        let assoc: Option<u32> = kani::any();
+        let zero: bool = kani::any();
+        let auth = if zero { Some(0) } else { None };
+        let attempt = derive_attempt(OpDirection::Decrypt, cryptlen, assoc, auth);
+        kani::assert(
+            matches!(attempt.payload, AeadLen::Unknown(_)),
+            "no payload guess without valid authsize",
+        );
+        kani::assert(
+            matches!(attempt.tag, AeadLen::Unknown(_)),
+            "no tag guess without valid authsize",
+        );
+    }
+
+    /// Encrypt echoes the input as payload whatever the tag validity.
+    #[kani::proof]
+    fn encrypt_echoes_input() {
+        let cryptlen: u32 = kani::any();
+        let assoc: Option<u32> = kani::any();
+        let auth: Option<u32> = kani::any();
+        let attempt = derive_attempt(OpDirection::Encrypt, cryptlen, assoc, auth);
+        kani::assert(
+            matches!(attempt.payload, AeadLen::Known(p) if p == cryptlen),
+            "encrypt payload echoes input",
+        );
+        match auth {
+            Some(a) if a != 0 => kani::assert(
+                matches!(attempt.tag, AeadLen::Known(t) if t == a),
+                "valid authsize yields known tag",
+            ),
+            _ => kani::assert(
+                matches!(attempt.tag, AeadLen::Unknown(_)),
+                "invalid authsize yields unknown tag",
+            ),
+        }
+    }
+
+    /// Success qualification: non-success terminals (or unknown) qualify
+    /// zero everywhere; zero-status terminals pass `Known` through and
+    /// qualify unknown derivations as zero.
+    #[kani::proof]
+    fn qualify_success_contract() {
+        let encrypt: bool = kani::any();
+        let direction = if encrypt {
+            OpDirection::Encrypt
+        } else {
+            OpDirection::Decrypt
+        };
+        let cryptlen: u32 = kani::any();
+        let assoc: Option<u32> = kani::any();
+        let auth: Option<u32> = kani::any();
+        let attempt = derive_attempt(direction, cryptlen, assoc, auth);
+        let which: u8 = kani::any();
+        let status: i32 = kani::any();
+        let terminal = match which % 3 {
+            0 => Terminal::Sync(status),
+            1 => Terminal::Callback(status),
+            _ => Terminal::Unknown,
+        };
+        let qualified = qualify_success(&attempt, terminal);
+        let succeeded = matches!(terminal, Terminal::Sync(0) | Terminal::Callback(0));
+        if !succeeded {
+            kani::assert(
+                qualified == AeadSuccess::default(),
+                "non-success qualifies zero",
+            );
+        } else {
+            kani::assert(qualified.input == cryptlen, "input passes through");
+            kani::assert(qualified.payload <= cryptlen, "payload bounded by input");
+            kani::assert(
+                qualified.aad == assoc.unwrap_or(0),
+                "aad passes known through, unknown as zero",
+            );
+        }
+    }
+}

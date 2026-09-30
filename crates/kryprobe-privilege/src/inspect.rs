@@ -130,6 +130,12 @@ fn cap_eff(status: &str) -> String {
 /// Crate-private: the only external entry is the inspection facet
 /// (`TargetInspectionAuthority::inspect` on `LocalPrivilegedAuthority`).
 pub(crate) fn inspect_pid(pid: u32) -> Result<TargetSnapshot, InspectError> {
+    // No live pid exceeds i32::MAX (Linux pid_max <= 2^22); anything above
+    // is gone by construction. Reject before the narrowing cast so the
+    // fail-closed verdict never depends on negative-pid errno mapping.
+    if pid > i32::MAX as u32 {
+        return Err(InspectError::TargetGone);
+    }
     // Raw syscall: this libc exposes SYS_pidfd_open but no pidfd_open wrapper.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) } as i32;
     if raw < 0 {
@@ -188,4 +194,19 @@ pub(crate) fn inspect_pid(pid: u32) -> Result<TargetSnapshot, InspectError> {
         yama_scope,
         caps,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pids above i32::MAX fail closed without reaching the syscall.
+    #[test]
+    fn huge_pid_is_target_gone() {
+        assert_eq!(
+            inspect_pid(i32::MAX as u32 + 1),
+            Err(InspectError::TargetGone)
+        );
+        assert_eq!(inspect_pid(u32::MAX), Err(InspectError::TargetGone));
+    }
 }

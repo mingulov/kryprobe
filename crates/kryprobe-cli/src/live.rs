@@ -688,6 +688,13 @@ fn decode_tick_row(
 /// KTOT gap from call counts: `KTOT − ΣKAGG` calls (saturating).
 /// `None` when totals are absent (no baseline — the caller leaves the
 /// dimension uncovered, never claims zero).
+///
+/// Skew note (audit X1): rows and totals are read non-atomically while
+/// producers are active, so a busy session can show a transient gap > 0
+/// with no loss; the coverage assembly treats any gap as `Partial`
+/// (conservative direction — never a false `Complete`). Threshold
+/// alerting, when wired (audit #3), must key on gap persistence over
+/// ticks, not on a point gap.
 fn ktot_gap_from_calls(agg_calls: &[u64], totals_calls: Option<u64>) -> Option<u64> {
     totals_calls.map(|totals| {
         totals.saturating_sub(

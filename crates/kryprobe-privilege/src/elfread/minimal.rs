@@ -34,9 +34,9 @@ pub fn dynamic_symbols(bytes: &[u8]) -> anyhow::Result<Vec<(String, u64)>> {
     for i in 0..phnum {
         let off = phoff.saturating_add(i.saturating_mul(phentsize));
         let p_type = u32le(bytes, off)?;
-        let p_offset = u64le(bytes, off + 8)?;
-        let p_vaddr = u64le(bytes, off + 16)?;
-        let p_memsz = u64le(bytes, off + 40)?;
+        let p_offset = u64le(bytes, checked_off(off, 8)?)?;
+        let p_vaddr = u64le(bytes, checked_off(off, 16)?)?;
+        let p_memsz = u64le(bytes, checked_off(off, 40)?)?;
         if p_type == 1 {
             loads.push((p_offset, p_vaddr, p_memsz));
         } else if p_type == 2 {
@@ -52,7 +52,7 @@ pub fn dynamic_symbols(bytes: &[u8]) -> anyhow::Result<Vec<(String, u64)>> {
     for idx in 0usize..128 {
         let base = (dyn_off as usize).saturating_add(idx.saturating_mul(16));
         let tag = i64le(bytes, base)?;
-        let val = u64le(bytes, base + 8)?;
+        let val = u64le(bytes, checked_off(base, 8)?)?;
         match tag {
             0 => break,
             4 => hash = Some(val),
@@ -73,9 +73,9 @@ pub fn dynamic_symbols(bytes: &[u8]) -> anyhow::Result<Vec<(String, u64)>> {
     for i in 0..count {
         let base = (sym_off as usize).saturating_add(i.saturating_mul(24));
         let st_name = u32le(bytes, base)?;
-        let st_type = bytes_at(bytes, base + 4, 1)?[0] & 0xf;
-        let st_shndx = u16le(bytes, base + 6)?;
-        let st_value = u64le(bytes, base + 8)?;
+        let st_type = bytes_at(bytes, checked_off(base, 4)?, 1)?[0] & 0xf;
+        let st_shndx = u16le(bytes, checked_off(base, 6)?)?;
+        let st_value = u64le(bytes, checked_off(base, 8)?)?;
         if st_shndx == 0 || st_value == 0 {
             continue;
         }
@@ -104,15 +104,15 @@ fn symbol_count(
 ) -> anyhow::Result<usize> {
     if let Some(va) = hash {
         let off = va_to_offset(loads, va).ok_or_else(|| anyhow!("bad DT_HASH VA"))? as usize;
-        return Ok(u32le(bytes, off + 4)? as usize);
+        return Ok(u32le(bytes, checked_off(off, 4)?)? as usize);
     }
     let Some(va) = gnu_hash else {
         return Err(anyhow!("no DT_HASH or DT_GNU_HASH"));
     };
     let off = va_to_offset(loads, va).ok_or_else(|| anyhow!("bad DT_GNU_HASH VA"))? as usize;
     let nbuckets = u32le(bytes, off)? as usize;
-    let symoffset = u32le(bytes, off + 4)? as usize;
-    let bloom_size = u32le(bytes, off + 8)? as usize;
+    let symoffset = u32le(bytes, checked_off(off, 4)?)? as usize;
+    let bloom_size = u32le(bytes, checked_off(off, 8)?)? as usize;
     let buckets = off
         .saturating_add(16)
         .saturating_add(bloom_size.saturating_mul(8));
@@ -169,6 +169,13 @@ fn va_to_offset(loads: &[(u64, u64, u64)], va: u64) -> Option<u64> {
     }
     None
 }
+/// Adds a small constant stride to an untrusted-derived file offset, failing
+/// closed on overflow instead of wrapping (release) or panicking (debug).
+fn checked_off(off: usize, n: usize) -> anyhow::Result<usize> {
+    off.checked_add(n)
+        .ok_or_else(|| anyhow!("elf offset overflow"))
+}
+
 fn bytes_at(bytes: &[u8], off: usize, len: usize) -> anyhow::Result<&[u8]> {
     let end = off
         .checked_add(len)
@@ -195,4 +202,78 @@ fn u64le(bytes: &[u8], off: usize) -> anyhow::Result<u64> {
 
 fn i64le(bytes: &[u8], off: usize) -> anyhow::Result<i64> {
     Ok(u64le(bytes, off)? as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_u16(dst: &mut [u8], off: usize, v: u16) {
+        dst[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(dst: &mut [u8], off: usize, v: u32) {
+        dst[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u64(dst: &mut [u8], off: usize, v: u64) {
+        dst[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_phdr(
+        dst: &mut [u8],
+        off: usize,
+        p_type: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_memsz: u64,
+    ) {
+        put_u32(dst, off, p_type);
+        put_u64(dst, off + 8, p_offset);
+        put_u64(dst, off + 16, p_vaddr);
+        put_u64(dst, off + 40, p_memsz);
+    }
+
+    fn put_dyn(dst: &mut [u8], off: usize, tag: i64, val: u64) {
+        put_u64(dst, off, tag as u64);
+        put_u64(dst, off + 8, val);
+    }
+
+    /// Crafted ELF whose DT_HASH file offset lands on `usize::MAX`: the
+    /// `off + 4` read must fail closed, never wrap (release) or panic
+    /// (debug). Pre-fix this panics in debug / mis-parses to Ok in release.
+    #[test]
+    fn dt_hash_offset_overflow_is_rejected() {
+        let mut bytes = vec![0u8; 2 * 1024 * 1024];
+        bytes[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        put_u64(&mut bytes, 0x20, 0x40); // phoff
+        put_u16(&mut bytes, 0x36, 56); // phentsize
+        put_u16(&mut bytes, 0x38, 3); // phnum
+        // Normal LOAD covering the dynamic table + symtab-zero area.
+        put_phdr(&mut bytes, 0x40, 1, 0x100, 0x1000, 0x100);
+        // Hostile LOAD: file offset pinned at u64::MAX.
+        put_phdr(&mut bytes, 0x78, 1, u64::MAX, 0x2000, 0x1000);
+        put_phdr(&mut bytes, 0xb0, 2, 0, 0x1000, 0);
+        put_dyn(&mut bytes, 0x100, 6, 0x1080); // DT_SYMTAB -> zero area
+        put_dyn(&mut bytes, 0x110, 5, 0x1000); // DT_STRTAB
+        put_dyn(&mut bytes, 0x120, 10, 0x10); // DT_STRSZ
+        put_dyn(&mut bytes, 0x130, 4, 0x2000); // DT_HASH -> usize::MAX
+        put_dyn(&mut bytes, 0x140, 0, 0); // DT_NULL
+        let err = dynamic_symbols(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("elf offset overflow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Positive control: header-only ELF with no dynamic segment.
+    #[test]
+    fn no_dynamic_segment_yields_empty() {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        put_u64(&mut bytes, 0x20, 0x40);
+        put_u16(&mut bytes, 0x36, 56);
+        put_u16(&mut bytes, 0x38, 0);
+        assert_eq!(dynamic_symbols(&bytes).unwrap(), Vec::new());
+    }
 }

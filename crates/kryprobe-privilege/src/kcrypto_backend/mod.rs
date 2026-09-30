@@ -950,6 +950,25 @@ mod tests {
     }
 
     #[test]
+    fn fold_vwho_scales_to_2048_lanes() {
+        // Audit #9/R1: per-tick fold cost must stay sane at lane scale.
+        // Generous wall bound (a linear fold takes ~us) — trips only on
+        // pathological blowup, never flakes.
+        let lanes: Vec<_> = (0..2048u64)
+            .map(|i| vwho_lane(b'x', 100 + (i % 97) as u32, 5, 3, 100, 200 + i))
+            .collect();
+        let start = std::time::Instant::now();
+        let folded = fold_vwho(&lanes);
+        let elapsed = start.elapsed();
+        assert_eq!(folded.calls, 3 * 2048);
+        assert_eq!(folded.last_ns, 200 + 2047);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "2048-lane fold took {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn stack_ips_truncate_at_first_zero() {
         // 127-frame KSTACK value shape: frames, then zero padding.
         let mut bytes = [0u8; 1016];

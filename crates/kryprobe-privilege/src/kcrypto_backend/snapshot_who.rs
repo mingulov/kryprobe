@@ -27,6 +27,8 @@ pub struct WhoSnapshot {
     /// empty when `stack` is negative or the `KSTACK` row is absent).
     pub stack_ips: Vec<u64>,
     /// First nonzero return for `key.kh` (`None` when `KERR` has no row).
+    /// Keyed by crypto identity alone: the failure may originate from a
+    /// different TGID sharing this `kh` (audit X3, documented trade-off).
     pub first_errno: Option<i32>,
     /// Crypto params for `key.kh` (`None` when `KPARAMS` has no row —
     /// params chase skipped or `alg == 0`).

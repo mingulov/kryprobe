@@ -422,3 +422,24 @@ fn k5_agg_row_gains_key_hash_and_lat() {
         Some(&serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8]))
     );
 }
+
+#[test]
+fn who_row_render_scales_to_2048_rows() {
+    // Audit #9/R1: per-tick who-row render cost must stay sane at row
+    // scale. Generous wall bound (pure serde_json builds take ~ms) —
+    // trips only on pathological blowup, never flakes.
+    let table = SymTable::parse(TINY_MAP);
+    let snap = who_snapshot(true, true);
+    let first = observation_for_who(&snap, ObservationId::new(0), &table);
+    assert!(first.backend_payload.is_object());
+    let start = std::time::Instant::now();
+    for i in 1..2048u64 {
+        let obs = observation_for_who(&snap, ObservationId::new(i), &table);
+        assert_eq!(obs.backend_payload, first.backend_payload);
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "2048 who rows took {elapsed:?}"
+    );
+}
