@@ -45,6 +45,9 @@ def main():
     expected = {"kryprobe-v0.1.0-linux-x86_64.tar.gz", "kryprobe-v0.1.0-source.tar.gz"}
     rebuilt = {"RELEASE-MANIFEST.json", "RELEASE-NOTES.md", "SHA256SUMS"}
     have = {p.name for p in staging.iterdir() if p.is_file()}
+    nonfiles = sorted(p.name for p in staging.iterdir() if not p.is_file())
+    if nonfiles:
+        return fail(f"refusing non-regular staging entries: {nonfiles}")
     if not expected <= have:
         return fail(f"staging inputs missing={sorted(expected - have)}")
     refused = []

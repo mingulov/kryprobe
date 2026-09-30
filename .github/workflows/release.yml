@@ -144,7 +144,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' RELEASE-MANIFEST.json RELEASE-NOTES.md SHA256SUMS kryprobe-v0.1.0-linux-x86_64.tar.gz kryprobe-v0.1.0-source.tar.gz > asset-allowlist.txt
-          ls dist | LC_ALL=C sort > dist-have.txt
+          ls -A dist | LC_ALL=C sort > dist-have.txt
           LC_ALL=C sort asset-allowlist.txt -o asset-allowlist.txt
           diff asset-allowlist.txt dist-have.txt || { echo "dist/ is not exactly the 5-asset allowlist" >&2; exit 1; }
           for f in dist/*; do
@@ -158,7 +158,7 @@ jobs:
           gh release download "$TAG" --repo "${{ github.repository }}" --dir readback
           cmp dist/SHA256SUMS readback/SHA256SUMS
           (cd readback && sha256sum -c SHA256SUMS)
-          ls readback | LC_ALL=C sort > readback-have.txt
+          ls -A readback | LC_ALL=C sort > readback-have.txt
           diff asset-allowlist.txt readback-have.txt || { echo "published asset set != 5-asset allowlist (stray draft assets?)" >&2; exit 1; }
           echo "readback verified: 5/5 assets"
       - name: record provenance summary
