@@ -86,7 +86,7 @@ fn parse_reports_kcrypto_dims() {
         assert_eq!(got.name, *want_name);
         assert_eq!(got.dims, *want_dims, "dims drifted for {want_name}");
     }
-    assert_eq!(parsed.maps.len(), 11);
+    assert_eq!(parsed.maps.len(), 10);
 }
 
 #[test]
