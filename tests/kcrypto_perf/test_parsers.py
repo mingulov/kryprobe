@@ -268,7 +268,7 @@ class TelemetryTests(unittest.TestCase):
         stop = {"total_us": 42000, "detach_us": 3000,
                 "snapshot_us": 9000, "render_us": 30000}
         occ = {"kagg": 4, "ktot": 1, "kidn": 4, "kwho": 2,
-               "kstack": 1, "kerr": 0, "kparams": 1, "kdrops": 8,
+               "kstack": 1, "kerr": 0, "kparams": 1, "kdrops_slots": 8,
                "kring_pending": None}
         content = (self._line({"v": 1, "stop": {"total_us": 1},
                                 "occupancy": {"kagg": 0}})

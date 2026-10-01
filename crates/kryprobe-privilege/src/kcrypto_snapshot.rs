@@ -175,10 +175,11 @@ pub struct SnapshotRows {
     /// Snapshot wall (`CLOCK_MONOTONIC`, taken before the walk).
     pub monotonic_ns: u64,
     /// Window-max ring ingest lag in ns (R1 drain-lag gap):
-    /// max over this window's `KRING` records of
-    /// (consume `CLOCK_MONOTONIC` − `KCtl.val2` event ns),
-    /// saturating. `None` when the window drained zero records
-    /// (no data, not zero lag).
+    /// max over this window's timestamped `KRING` records
+    /// (`IDENT`/`OVERFLOW` kinds) of (consume `CLOCK_MONOTONIC` −
+    /// `KCtl.val2` event ns), saturating. Sparse by design (one
+    /// record per new identity — steady-state windows read `None`).
+    /// `None` means zero timestamped records (no data, not zero lag).
     pub lagmax_ns: Option<u64>,
 }
 
@@ -748,7 +749,10 @@ pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsE
 }
 
 /// Resident-entry counts over the agg maps (R1 occupancy gap):
-/// every count the sealed P9 cells never gave. Each map is counted
+/// every count the sealed P9 cells never gave. RESIDENCY, not loss
+/// accounting: these count live map entries at close (arrays report
+/// their slot count); drops/loss ride the snapshot `drops` and
+/// integrity fields, never this struct. Each map is counted
 /// independently; a failed walk yields `None` for that map (honest,
 /// never a silent zero) and never fails the session — occupancy is
 /// best-effort telemetry, not validity input.
@@ -772,8 +776,10 @@ pub struct AggOccupancy {
     pub kerr: Option<u64>,
     /// Resident `KPARAMS` rows.
     pub kparams: Option<u64>,
-    /// `KDROPS` is an 8-entry array by construction.
-    pub kdrops: Option<u64>,
+    /// `KDROPS` counter slots: always 8 (an 8-entry array by
+    /// construction). Slot count, NOT drops observed — loss
+    /// accounting rides the snapshot `drops` + integrity fields.
+    pub kdrops_slots: Option<u64>,
 }
 
 /// Iteration safety cap: 32x the largest agg map (`KWHO`, 2048) —
@@ -813,7 +819,7 @@ pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
         kstack: count_map_entries(&maps.stack, 4, "snapshot/occ-kstack"),
         kerr: count_map_entries(&maps.err, 8, "snapshot/occ-kerr"),
         kparams: count_map_entries(&maps.params, 8, "snapshot/occ-kparams"),
-        kdrops: Some(8),
+        kdrops_slots: Some(8),
     }
 }
 

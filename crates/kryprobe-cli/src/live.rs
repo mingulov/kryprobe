@@ -234,7 +234,7 @@ fn count_json(count: Option<u64>) -> String {
 /// the Python `parse_telemetry` consumer (v1).
 pub fn telemetry_occupancy_line(occ: &AggOccupancy) -> String {
     format!(
-        "kryprobe: telemetry {{\"v\":1,\"occupancy\":{{\"kagg\":{},\"ktot\":{},\"kidn\":{},\"kring_pending\":{},\"kwho\":{},\"kstack\":{},\"kerr\":{},\"kparams\":{},\"kdrops\":{}}}}}",
+        "kryprobe: telemetry {{\"v\":1,\"occupancy\":{{\"kagg\":{},\"ktot\":{},\"kidn\":{},\"kring_pending\":{},\"kwho\":{},\"kstack\":{},\"kerr\":{},\"kparams\":{},\"kdrops_slots\":{}}}}}",
         count_json(occ.kagg),
         count_json(occ.ktot),
         count_json(occ.kidn),
@@ -243,7 +243,7 @@ pub fn telemetry_occupancy_line(occ: &AggOccupancy) -> String {
         count_json(occ.kstack),
         count_json(occ.kerr),
         count_json(occ.kparams),
-        count_json(occ.kdrops),
+        count_json(occ.kdrops_slots),
     )
 }
 
@@ -281,6 +281,36 @@ pub fn telemetry_stop_line(total_us: u64, session: Option<&SessionStop>, render_
     format!(
         "kryprobe: telemetry {{\"v\":1,\"stop\":{{\"total_us\":{total_us},\"finish_us\":{finish},\"finalize_us\":{finalize},\"assemble_us\":{assemble},\"render_us\":{render_us}}}}}"
     )
+}
+
+/// R1 stop telemetry (machine-readable): one line joining the
+/// session spans (`LiveOutcome.stop`) with the render + write span
+/// measured from `t_render`. `total_us` spans session end → output
+/// written; without session spans the total covers render + write
+/// only and the sub-spans read `null` — honest, never silent zero.
+/// Shared by the `watch` and `report` finish paths: every clean
+/// session ends with exactly one stop line.
+pub fn emit_stop_line(outcome: &LiveOutcome, t_render: std::time::Instant, stderr: &mut dyn Write) {
+    let render_us = {
+        let elapsed = t_render.elapsed();
+        elapsed
+            .as_secs()
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::from(elapsed.subsec_micros()))
+    };
+    let total_us = outcome.stop.map_or(render_us, |spans| {
+        let elapsed = spans.ended.elapsed();
+        elapsed
+            .as_secs()
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::from(elapsed.subsec_micros()))
+            .max(render_us)
+    });
+    let _ = writeln!(
+        stderr,
+        "{}",
+        telemetry_stop_line(total_us, outcome.stop.as_ref(), render_us)
+    );
 }
 
 /// Live capture outcome (brief-exact shape).
@@ -1783,7 +1813,10 @@ fn drive_session_inner(
             );
         }
         // R1 drain-lag telemetry (machine-readable; the progress
-        // line above stays human-only by contract).
+        // line above stays human-only by contract). Agg lagmax is
+        // IDENT-ring edge staleness — sparse by design (one record
+        // per new identity, so steady-state ticks read null); the
+        // per-op lag signal lives on the detail ticks.
         eprintln!(
             "{}",
             telemetry_tick_line(barrier_id, snap.lagmax_ns.map(|ns| ns / 1000))
@@ -2713,13 +2746,13 @@ mod tests {
             kstack: Some(1),
             kerr: Some(0),
             kparams: Some(1),
-            kdrops: Some(8),
+            kdrops_slots: Some(8),
         };
         assert_eq!(
             telemetry_occupancy_line(&occ),
             "kryprobe: telemetry {\"v\":1,\"occupancy\":{".to_owned()
                 + "\"kagg\":4,\"ktot\":1,\"kidn\":4,\"kring_pending\":null,"
-                + "\"kwho\":2,\"kstack\":1,\"kerr\":0,\"kparams\":1,\"kdrops\":8}}"
+                + "\"kwho\":2,\"kstack\":1,\"kerr\":0,\"kparams\":1,\"kdrops_slots\":8}}"
         );
     }
 
