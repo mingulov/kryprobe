@@ -197,3 +197,48 @@ def parse_sampler(path: Path) -> dict:
                  + (samples[-1][3] - samples[0][3]))
     return {"rss_max_kb": rss_max, "cpu_s": cpu_ticks / clk_tck,
             "samples": len(samples)}
+
+
+TELEMETRY_PREFIX = "kryprobe: telemetry "
+TELEMETRY_VERSION = 1
+
+
+def parse_telemetry(path: Path) -> dict:
+    """Fold R1 machine-readable telemetry from a capture stderr log.
+
+    Ticks fold to the session max drain lag (``lagmax_us``); the
+    last stop-span/occupancy object wins. Malformed lines and
+    unknown versions are counted (never fatal — telemetry is
+    best-effort observability, not validity input). A missing file
+    raises :class:`ParseError` (module discipline).
+    """
+    try:
+        text = Path(path).read_text()
+    except OSError as err:
+        raise ParseError(f"cannot read {path}: {err}") from err
+    lagmax = None
+    stop = None
+    occupancy = None
+    lines = 0
+    malformed = 0
+    for raw in text.splitlines():
+        if not raw.startswith(TELEMETRY_PREFIX):
+            continue
+        lines += 1
+        try:
+            obj = json.loads(raw[len(TELEMETRY_PREFIX):])
+        except ValueError:
+            malformed += 1
+            continue
+        if not isinstance(obj, dict) or obj.get("v") != TELEMETRY_VERSION:
+            malformed += 1
+            continue
+        lag = obj.get("lagmax_us")
+        if isinstance(lag, int) and not isinstance(lag, bool):
+            lagmax = lag if lagmax is None else max(lagmax, lag)
+        if isinstance(obj.get("stop"), dict):
+            stop = obj["stop"]
+        if isinstance(obj.get("occupancy"), dict):
+            occupancy = obj["occupancy"]
+    return {"lagmax_us": lagmax, "stop": stop, "occupancy": occupancy,
+            "lines": lines, "malformed": malformed}

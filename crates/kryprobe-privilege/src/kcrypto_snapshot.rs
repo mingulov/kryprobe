@@ -54,6 +54,7 @@ use std::time::Duration;
 
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::drain::{DrainError, DrainEvent, DrainThread};
+use crate::fd::OwnedFd;
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, possible_cpus};
 
 /// Snapshot row wire version (D7).
@@ -173,6 +174,12 @@ pub struct SnapshotRows {
     pub drops: u8,
     /// Snapshot wall (`CLOCK_MONOTONIC`, taken before the walk).
     pub monotonic_ns: u64,
+    /// Window-max ring ingest lag in ns (R1 drain-lag gap):
+    /// max over this window's `KRING` records of
+    /// (consume `CLOCK_MONOTONIC` − `KCtl.val2` event ns),
+    /// saturating. `None` when the window drained zero records
+    /// (no data, not zero lag).
+    pub lagmax_ns: Option<u64>,
 }
 
 /// Decoded snapshot row.
@@ -544,6 +551,7 @@ fn push_ident_record(
     record: Vec<u8>,
     idents: &mut Vec<IdentBytes>,
     overflow_identities: &mut u64,
+    lagmax_ns: &mut Option<u64>,
 ) -> Result<(), MapOpsError> {
     if record.len() != 48 {
         return Err(MapOpsError::LookupFailed {
@@ -555,6 +563,14 @@ fn push_ident_record(
         stage: "snapshot/ring-record-decode".to_owned(),
         errno: libc::EBADMSG,
     })?;
+    // R1 drain lag: consume-time minus event-time, saturating (a
+    // post-ingest clock step never underflows into a huge lag).
+    // Control records are rare (~512/lifetime), so a clock read
+    // per record is affordable and exact.
+    if kctl.kind == KCTL_IDENT || kctl.kind == KCTL_OVERFLOW {
+        let lag = monotonic_now()?.saturating_sub(kctl.val2);
+        *lagmax_ns = Some(lagmax_ns.map_or(lag, |prev| prev.max(lag)));
+    }
     match kctl.kind {
         KCTL_IDENT | KCTL_OVERFLOW => {
             if kctl.kind == KCTL_OVERFLOW {
@@ -578,15 +594,16 @@ fn collect_until_barrier(
     drain: &DrainThread,
     idents: &mut Vec<IdentBytes>,
     overflow_identities: &mut u64,
+    lagmax_ns: &mut Option<u64>,
 ) -> Result<(), MapOpsError> {
     loop {
         match drain.receiver().recv_timeout(Duration::from_secs(5)) {
             Ok(DrainEvent::Record(record)) => {
-                push_ident_record(record, idents, overflow_identities)?;
+                push_ident_record(record, idents, overflow_identities, lagmax_ns)?;
             }
             Ok(DrainEvent::Barrier(_)) => {
                 while let Ok(DrainEvent::Record(record)) = drain.receiver().try_recv() {
-                    push_ident_record(record, idents, overflow_identities)?;
+                    push_ident_record(record, idents, overflow_identities, lagmax_ns)?;
                 }
                 return Ok(());
             }
@@ -628,14 +645,15 @@ pub fn session_drain(sensor: &ConfiguredKcrypto) -> Result<DrainThread, MapOpsEr
 fn drain_idents_with(
     drain: &DrainThread,
     barrier: u64,
-) -> Result<(Vec<IdentBytes>, u64), MapOpsError> {
+) -> Result<(Vec<IdentBytes>, u64, Option<u64>), MapOpsError> {
     // The worker emits the barrier after the backlog it observed, so
     // records collected before the barrier are exactly this window.
     drain.inject_barrier(barrier);
     let mut idents = Vec::new();
     let mut overflow_identities = 0;
-    collect_until_barrier(drain, &mut idents, &mut overflow_identities)?;
-    Ok((idents, overflow_identities))
+    let mut lagmax_ns = None;
+    collect_until_barrier(drain, &mut idents, &mut overflow_identities, &mut lagmax_ns)?;
+    Ok((idents, overflow_identities, lagmax_ns))
 }
 
 /// Drain `KRING` through a short-lived [`DrainThread`] (spawn/stop per
@@ -655,18 +673,25 @@ fn drain_idents_with(
 /// (ident never seen for a row) as unknown
 /// (`coverage_gap`/`unknown`) — never misattribute, crash, or
 /// silently drop.
-fn drain_idents(sensor: &ConfiguredKcrypto) -> Result<(Vec<IdentBytes>, u64), MapOpsError> {
+fn drain_idents(
+    sensor: &ConfiguredKcrypto,
+) -> Result<(Vec<IdentBytes>, u64, Option<u64>), MapOpsError> {
     let drain = session_drain(sensor)?;
     let result = drain_idents_with(&drain, 1);
     // Always joined (even on collect failure) so the thread never escapes.
     let (_stats, tail) = drain.stop_and_drain();
-    let (mut idents, mut overflow_identities) = result?;
+    let (mut idents, mut overflow_identities, mut lagmax_ns) = result?;
     for event in tail {
         if let DrainEvent::Record(record) = event {
-            push_ident_record(record, &mut idents, &mut overflow_identities)?;
+            push_ident_record(
+                record,
+                &mut idents,
+                &mut overflow_identities,
+                &mut lagmax_ns,
+            )?;
         }
     }
-    Ok((idents, overflow_identities))
+    Ok((idents, overflow_identities, lagmax_ns))
 }
 
 /// Snapshot every kcrypto map through a session drain: same walk as
@@ -687,7 +712,7 @@ pub fn snapshot_rows_with_drain(
     let rows = walk_kagg(sensor)?;
     let totals = read_ktot(sensor)?;
     let drops = read_kidn_drops(sensor)?;
-    let (idents, overflow_identities) = drain_idents_with(drain, barrier)?;
+    let (idents, overflow_identities, lagmax_ns) = drain_idents_with(drain, barrier)?;
     Ok(SnapshotRows {
         rows,
         totals,
@@ -695,6 +720,7 @@ pub fn snapshot_rows_with_drain(
         overflow_identities,
         drops,
         monotonic_ns,
+        lagmax_ns,
     })
 }
 
@@ -709,7 +735,7 @@ pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsE
     let rows = walk_kagg(sensor)?;
     let totals = read_ktot(sensor)?;
     let drops = read_kidn_drops(sensor)?;
-    let (idents, overflow_identities) = drain_idents(sensor)?;
+    let (idents, overflow_identities, lagmax_ns) = drain_idents(sensor)?;
     Ok(SnapshotRows {
         rows,
         totals,
@@ -717,7 +743,78 @@ pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsE
         overflow_identities,
         drops,
         monotonic_ns,
+        lagmax_ns,
     })
+}
+
+/// Resident-entry counts over the agg maps (R1 occupancy gap):
+/// every count the sealed P9 cells never gave. Each map is counted
+/// independently; a failed walk yields `None` for that map (honest,
+/// never a silent zero) and never fails the session — occupancy is
+/// best-effort telemetry, not validity input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AggOccupancy {
+    /// Resident `KAGG` rows.
+    pub kagg: Option<u64>,
+    /// `KTOT` is a 1-entry array by construction.
+    pub ktot: Option<u64>,
+    /// Resident `KIDN` keys (first-seen gate + drop counters).
+    pub kidn: Option<u64>,
+    /// `KRING` pending bytes: always `None` (no ringbuf-occupancy
+    /// API in aya-ebpf 0.2.1 — stated, not faked).
+    pub kring_pending: Option<u64>,
+    /// Resident `KWHO` rows.
+    pub kwho: Option<u64>,
+    /// Resident `KSTACK` ids (`None` when the stack-trace map
+    /// refuses iteration on the running kernel).
+    pub kstack: Option<u64>,
+    /// Resident `KERR` rows.
+    pub kerr: Option<u64>,
+    /// Resident `KPARAMS` rows.
+    pub kparams: Option<u64>,
+    /// `KDROPS` is an 8-entry array by construction.
+    pub kdrops: Option<u64>,
+}
+
+/// Iteration safety cap: 32x the largest agg map (`KWHO`, 2048) —
+/// a corrupt map iterator terminates here instead of spinning.
+const OCCUPANCY_WALK_CAP: u64 = 65_536;
+
+/// Count resident keys of one map fd by `get_next_key` iteration.
+/// `None` on any walk failure (honest, never a silent zero).
+fn count_map_entries(fd: &OwnedFd, key_size: usize, stage: &str) -> Option<u64> {
+    let mut count = 0u64;
+    let mut key: Option<Vec<u8>> = None;
+    loop {
+        if count >= OCCUPANCY_WALK_CAP {
+            return None;
+        }
+        // SAFETY: `key_size` is the map's exact key width (loader dims).
+        let next = unsafe { map_get_next_key(fd, key.as_deref(), key_size, stage) }.ok()?;
+        let Some(k) = next else { break };
+        key = Some(k);
+        count += 1;
+    }
+    Some(count)
+}
+
+/// Read [`AggOccupancy`] from a live attached sensor. Call while
+/// attached (after the closing tick, before detach): each count is
+/// an independent best-effort walk.
+#[must_use]
+pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
+    let maps = &sensor.loaded.maps;
+    AggOccupancy {
+        kagg: count_map_entries(&maps.agg, 260, "snapshot/occ-kagg"),
+        ktot: Some(1),
+        kidn: count_map_entries(&maps.ident, 8, "snapshot/occ-kidn"),
+        kring_pending: None,
+        kwho: count_map_entries(&maps.who, 16, "snapshot/occ-kwho"),
+        kstack: count_map_entries(&maps.stack, 4, "snapshot/occ-kstack"),
+        kerr: count_map_entries(&maps.err, 8, "snapshot/occ-kerr"),
+        kparams: count_map_entries(&maps.params, 8, "snapshot/occ-kparams"),
+        kdrops: Some(8),
+    }
 }
 
 #[cfg(test)]

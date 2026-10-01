@@ -91,8 +91,8 @@ use kryprobe_privilege::kcrypto_lifecycle::sensor::{
 };
 use kryprobe_privilege::kcrypto_lifecycle::view::prog_miss_delta_sum;
 use kryprobe_privilege::kcrypto_snapshot::{
-    ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
-    shared_losses_from_snapshot, snapshot_rows_with_drain,
+    AggOccupancy, ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped, session_drain,
+    shared_losses_from_snapshot, snapshot_occupancy, snapshot_rows_with_drain,
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -182,6 +182,107 @@ impl Default for LiveConfig {
     }
 }
 
+/// Session-stop spans (R1 stop-cost gap): teardown telemetry,
+/// never validity input. Measured inside the session tail
+/// (quiesce → outcome assembly); the render span + wall total
+/// join in `cmd_report`, which emits the single stop line.
+/// `finish_us` is profile-shaped: agg = `sensor.finish()` (drain
+/// stop); lifecycle = the P7-N5 stop-phase reconcile
+/// (fence → bounded drain → close → quiet → finish).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionStop {
+    /// Stop-phase reconcile + drain stop in µs (profile-shaped,
+    /// see above).
+    pub finish_us: u64,
+    /// `backend.finalize()` in µs.
+    pub finalize_us: u64,
+    /// Report assembly (feed + integrity + coverage) in µs.
+    pub assemble_us: u64,
+    /// Session end (tick loop break) — the stop wall starts here.
+    pub ended: Instant,
+}
+
+/// R1 machine-readable telemetry line bodies (stderr
+/// `kryprobe: telemetry {...}`). The harness folds these into
+/// per-leg observer metrics (drain lag, stop spans, occupancy).
+/// SEPARATE from the human-only progress line (which stays
+/// unscripted by contract). Shapes twinned with
+/// `scripts/kcrypto_perf/parsers.py::parse_telemetry` (v1).
+pub fn telemetry_tick_line(tick: u64, lagmax_us: Option<u64>) -> String {
+    match lagmax_us {
+        Some(us) => format!("kryprobe: telemetry {{\"v\":1,\"tick\":{tick},\"lagmax_us\":{us}}}"),
+        None => format!("kryprobe: telemetry {{\"v\":1,\"tick\":{tick},\"lagmax_us\":null}}"),
+    }
+}
+
+/// Whole microseconds elapsed since `t` (saturating at `u64::MAX`
+/// seconds — stop spans never approach it).
+fn us_since(t: Instant) -> u64 {
+    let elapsed = t.elapsed();
+    elapsed
+        .as_secs()
+        .saturating_mul(1_000_000)
+        .saturating_add(u64::from(elapsed.subsec_micros()))
+}
+
+/// Render one count for the occupancy line (`None` → `null`).
+fn count_json(count: Option<u64>) -> String {
+    count.map_or("null".to_owned(), |n| n.to_string())
+}
+
+/// R1 occupancy telemetry line (agg profile). Shape twinned with
+/// the Python `parse_telemetry` consumer (v1).
+pub fn telemetry_occupancy_line(occ: &AggOccupancy) -> String {
+    format!(
+        "kryprobe: telemetry {{\"v\":1,\"occupancy\":{{\"kagg\":{},\"ktot\":{},\"kidn\":{},\"kring_pending\":{},\"kwho\":{},\"kstack\":{},\"kerr\":{},\"kparams\":{},\"kdrops\":{}}}}}",
+        count_json(occ.kagg),
+        count_json(occ.ktot),
+        count_json(occ.kidn),
+        count_json(occ.kring_pending),
+        count_json(occ.kwho),
+        count_json(occ.kstack),
+        count_json(occ.kerr),
+        count_json(occ.kparams),
+        count_json(occ.kdrops),
+    )
+}
+
+/// R1 occupancy telemetry line (lifecycle profile). Cumulative
+/// ledger equation + close backlog bytes (the ring drained at
+/// close, so close-state record counts would read zero — the
+/// ledger carries the state evidence instead). Shape twinned with
+/// the Python `parse_telemetry` consumer (v1).
+pub fn telemetry_detail_occupancy_line(
+    admitted: u64,
+    emitted: u64,
+    unfinished: u64,
+    backlog_bytes: u64,
+) -> String {
+    format!(
+        "kryprobe: telemetry {{\"v\":1,\"occupancy\":{{\"admitted\":{admitted},\"emitted\":{emitted},\"unfinished\":{unfinished},\"backlog_bytes\":{backlog_bytes}}}}}"
+    )
+}
+
+/// R1 stop telemetry line. `session` carries the in-session spans
+/// (finish/finalize/assemble); `render_us` covers render + write;
+/// `total_us` spans session end → report written. Shape twinned
+/// with the Python `parse_telemetry` consumer (v1).
+pub fn telemetry_stop_line(total_us: u64, session: Option<&SessionStop>, render_us: u64) -> String {
+    let (finish, finalize, assemble) = session.map_or(
+        ("null".to_owned(), "null".to_owned(), "null".to_owned()),
+        |spans| {
+            (
+                spans.finish_us.to_string(),
+                spans.finalize_us.to_string(),
+                spans.assemble_us.to_string(),
+            )
+        },
+    );
+    format!(
+        "kryprobe: telemetry {{\"v\":1,\"stop\":{{\"total_us\":{total_us},\"finish_us\":{finish},\"finalize_us\":{finalize},\"assemble_us\":{assemble},\"render_us\":{render_us}}}}}"
+    )
+}
+
 /// Live capture outcome (brief-exact shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveOutcome {
@@ -213,6 +314,11 @@ pub struct LiveOutcome {
     /// coverage record and receipt; `None` where the profile runs no
     /// lifecycle reducer).
     pub lifecycle_totals: Option<LifecycleTotals>,
+    /// Session-stop spans (R1 telemetry): `Some` on governed
+    /// sessions that time their tail; never rendered into the
+    /// report (the renderer field-picks — this rides the stderr
+    /// telemetry line via `cmd_report` instead).
+    pub stop: Option<SessionStop>,
 }
 
 /// Request-lifecycle terminal totals: the reducer equation plus every
@@ -1676,6 +1782,12 @@ fn drive_session_inner(
                 u64::from(snap.drops),
             );
         }
+        // R1 drain-lag telemetry (machine-readable; the progress
+        // line above stays human-only by contract).
+        eprintln!(
+            "{}",
+            telemetry_tick_line(barrier_id, snap.lagmax_ns.map(|ns| ns / 1000))
+        );
         let stopped = stop.load(Ordering::Relaxed)
             || interrupted
             || deadline.is_some_and(|end| Instant::now() >= end);
@@ -1684,11 +1796,15 @@ fn drive_session_inner(
         }
         sleep_tick(tick_ms, stop);
     };
+    // R1 stop wall starts at the loop break (session end).
+    let t_stop = Instant::now();
     // Observing -> Quiescing: the loop stopped taking new work.
     hop(controller, SessionState::Quiescing, "session quiesce")?;
     // Session drain stops once, after the closing tick: later snapshots
     // (finalize) run their own one-shot drains.
+    let t_finish = Instant::now();
     sensor.finish();
+    let finish_us = us_since(t_finish);
     // Stage closing counts for the finalize fast path (M5): the
     // same parsed counts the coverage gap uses below, so finalize
     // and coverage agree by construction.
@@ -1709,6 +1825,7 @@ fn drive_session_inner(
     // All-`NotRun` baseline is core's (1B-H1): the backend ignores its
     // context — it assesses its own sensor.
     let notrun = CoverageSummary::not_run();
+    let t_finalize = Instant::now();
     let summary = backend
         .finalize(&FinalizeContext {
             session,
@@ -1716,6 +1833,8 @@ fn drive_session_inner(
             integrity: &baseline,
         })
         .map_err(|err| backend_err("live finalize", err))?;
+    let finalize_us = us_since(t_finalize);
+    let t_assemble = Instant::now();
     // Feed drops come from the closing snapshot's retained read (M3):
     // no end-of-session re-read of the key (a drop landing between the
     // closing snapshot and the feed is unattributed — a microseconds
@@ -1748,6 +1867,7 @@ fn drive_session_inner(
         },
     });
     hop(controller, SessionState::Finalized, "session finalize")?;
+    let assemble_us = us_since(t_assemble);
     Ok(LiveOutcome {
         observations: report.take_observations(),
         summary,
@@ -1759,6 +1879,12 @@ fn drive_session_inner(
         enrichment: None,
         // The aggregate profile runs no lifecycle reducer.
         lifecycle_totals: None,
+        stop: Some(SessionStop {
+            finish_us,
+            finalize_us,
+            assemble_us,
+            ended: t_stop,
+        }),
     })
 }
 
@@ -1898,6 +2024,9 @@ fn drive_lifecycle_session_inner(
     let mut last_display: Option<Instant> = None;
     let mut display_completed = 0u64;
     let mut display_records = 0u64;
+    // R1 drain-lag telemetry: window maxima fold into the display
+    // accumulator (same cadence as the human progress line).
+    let mut display_lagmax_ns: Option<u64> = None;
     // `Unknown`-terminal records counted from the records
     // themselves: the ambiguous reducer branch emits `Unknown`
     // without touching `unfinished`, so the ledger alone cannot
@@ -1970,6 +2099,9 @@ fn drive_lifecycle_session_inner(
             let completed = sensor.take_completed()?;
             window_completed += completed.len() as u64;
             window_records += drained.records as u64;
+            if let Some(lag) = drained.lagmax_ns {
+                display_lagmax_ns = Some(display_lagmax_ns.map_or(lag, |prev| prev.max(lag)));
+            }
             decode_records(completed, &mut observations)?;
             interrupted |= SIGINT_SEEN.load(Ordering::Relaxed);
             if drained.records == 0 && !drained.busy {
@@ -2002,8 +2134,15 @@ fn drive_lifecycle_session_inner(
                 // display updates; stopping flushes the pending totals.
                 report(barrier_id, display_completed, display_records);
             }
+            // R1 drain-lag telemetry (machine-readable; the progress
+            // line above stays human-only by contract).
+            eprintln!(
+                "{}",
+                telemetry_tick_line(barrier_id, display_lagmax_ns.map(|ns| ns / 1000))
+            );
             display_completed = 0;
             display_records = 0;
+            display_lagmax_ns = None;
             last_display = Some(display_now);
         }
         if stopped {
@@ -2020,6 +2159,8 @@ fn drive_lifecycle_session_inner(
             sensor.wait_for_activity(max_wait, !window_quiet)?;
         }
     }
+    // R1 stop wall starts at the loop break (session end).
+    let t_stop = Instant::now();
     // Observing -> Quiescing: the loop stopped taking new work.
     hop(controller, SessionState::Quiescing, "lifecycle quiesce")?;
     // Stop-time reconciliation, P7-N5 contracted phase order
@@ -2073,8 +2214,11 @@ fn drive_lifecycle_session_inner(
     backend.note_output_omissions(omitted.get());
     // Quiescing -> Draining: queued events become evidence now.
     hop(controller, SessionState::Draining, "lifecycle drain")?;
+    // R1: the P7-N5 stop phase ends here; its wall is `finish_us`.
+    let finish_us = us_since(t_stop);
     // Finalize ONCE, then the shared feed ONCE.
     let notrun = CoverageSummary::not_run();
+    let t_finalize = Instant::now();
     let summary = backend
         .finalize(&FinalizeContext {
             session,
@@ -2082,6 +2226,8 @@ fn drive_lifecycle_session_inner(
             integrity: &baseline,
         })
         .map_err(|err| backend_err("live lifecycle finalize", err))?;
+    let finalize_us = us_since(t_finalize);
+    let t_assemble = Instant::now();
     let ledger = sensor.ledger()?;
     let mut report = DriverReport::default();
     report.extend_observations(std::mem::take(&mut observations));
@@ -2134,6 +2280,19 @@ fn drive_lifecycle_session_inner(
         unknown_terminals,
         close.backlog_bytes,
     );
+    let assemble_us = us_since(t_assemble);
+    // R1 occupancy telemetry (machine-readable): the ledger
+    // equation + close backlog. Emitted after the span closes
+    // (telemetry never measures itself).
+    eprintln!(
+        "{}",
+        telemetry_detail_occupancy_line(
+            lifecycle_totals.admitted,
+            lifecycle_totals.emitted,
+            lifecycle_totals.unfinished,
+            close.backlog_bytes,
+        )
+    );
     Ok(LiveOutcome {
         observations: report.take_observations(),
         summary,
@@ -2146,6 +2305,12 @@ fn drive_lifecycle_session_inner(
         // never dropped between sensor and render).
         enrichment: Some(ledger.enrichment.clone()),
         lifecycle_totals: Some(lifecycle_totals),
+        stop: Some(SessionStop {
+            finish_us,
+            finalize_us,
+            assemble_us,
+            ended: t_stop,
+        }),
     })
 }
 
@@ -2499,7 +2664,7 @@ fn run_live_session_inner(
     let progress = |tick: u64, rows: u64, drops: u64| {
         eprintln!("kryprobe: progress tick={tick} rows={rows} drops={drops}");
     };
-    drive_session(
+    let outcome = drive_session(
         cfg,
         backend,
         &mut production,
@@ -2511,12 +2676,84 @@ fn run_live_session_inner(
         Some(concrete),
         controller,
         Some(&progress),
-    )
+    )?;
+    // R1 occupancy telemetry (machine-readable): read while the
+    // sensor is still attached (before `sensor` drops at scope
+    // end), emitted best-effort — a failed walk yields `None`
+    // counts, never a session error.
+    eprintln!("{}", telemetry_occupancy_line(&snapshot_occupancy(&sensor)));
+    Ok(outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_tick_line_vectors() {
+        // Twinned with the Python `parse_telemetry` consumer (v1).
+        assert_eq!(
+            telemetry_tick_line(3, Some(310)),
+            "kryprobe: telemetry {\"v\":1,\"tick\":3,\"lagmax_us\":310}"
+        );
+        assert_eq!(
+            telemetry_tick_line(1, None),
+            "kryprobe: telemetry {\"v\":1,\"tick\":1,\"lagmax_us\":null}"
+        );
+    }
+
+    #[test]
+    fn telemetry_occupancy_line_vector() {
+        let occ = AggOccupancy {
+            kagg: Some(4),
+            ktot: Some(1),
+            kidn: Some(4),
+            kring_pending: None,
+            kwho: Some(2),
+            kstack: Some(1),
+            kerr: Some(0),
+            kparams: Some(1),
+            kdrops: Some(8),
+        };
+        assert_eq!(
+            telemetry_occupancy_line(&occ),
+            "kryprobe: telemetry {\"v\":1,\"occupancy\":{".to_owned()
+                + "\"kagg\":4,\"ktot\":1,\"kidn\":4,\"kring_pending\":null,"
+                + "\"kwho\":2,\"kstack\":1,\"kerr\":0,\"kparams\":1,\"kdrops\":8}}"
+        );
+    }
+
+    #[test]
+    fn telemetry_detail_occupancy_line_vector() {
+        assert_eq!(
+            telemetry_detail_occupancy_line(30000, 30000, 0, 128),
+            "kryprobe: telemetry {\"v\":1,\"occupancy\":{".to_owned()
+                + "\"admitted\":30000,\"emitted\":30000,\"unfinished\":0,"
+                + "\"backlog_bytes\":128}}"
+        );
+    }
+
+    #[test]
+    fn telemetry_stop_line_vectors() {
+        let spans = SessionStop {
+            finish_us: 3000,
+            finalize_us: 9000,
+            assemble_us: 2000,
+            ended: Instant::now(),
+        };
+        assert_eq!(
+            telemetry_stop_line(42000, Some(&spans), 28000),
+            "kryprobe: telemetry {\"v\":1,\"stop\":{".to_owned()
+                + "\"total_us\":42000,\"finish_us\":3000,\"finalize_us\":9000,"
+                + "\"assemble_us\":2000,\"render_us\":28000}}"
+        );
+        assert_eq!(
+            telemetry_stop_line(28000, None, 28000),
+            "kryprobe: telemetry {\"v\":1,\"stop\":{".to_owned()
+                + "\"total_us\":28000,\"finish_us\":null,\"finalize_us\":null,"
+                + "\"assemble_us\":null,\"render_us\":28000}}"
+        );
+    }
 
     fn runtime_with(btf: bool) -> RuntimeCapabilities {
         RuntimeCapabilities {

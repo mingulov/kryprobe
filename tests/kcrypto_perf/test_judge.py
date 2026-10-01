@@ -248,6 +248,24 @@ class HostReceiptGateTests(unittest.TestCase):
         self.assertTrue(all(leg["valid"] for leg in got["legs"]))
 
 
+class HostFactsTests(unittest.TestCase):
+    # R1 closes the P9R1O-N7 gap (host load/governor/CPU/tracing
+    # unrecorded): every fact is present or explicitly unavailable
+    # with a reason — never silently absent.
+    REQUIRED = {"kernel", "cpu_flags", "loadavg", "governor",
+                "tracing_on", "btf", "vmlinux_btf_sha256",
+                "kernel_config_sha256"}
+
+    def test_every_fact_present_or_unavailable_with_reason(self):
+        facts, unavailable = CLI._host_facts()
+        for key in self.REQUIRED:
+            self.assertTrue(
+                key in facts or key in unavailable, key)
+        for key, reason in unavailable.items():
+            self.assertTrue(str(reason).strip(),
+                            f"empty reason for {key}")
+
+
 def _sealed_names(cell: Path) -> list:
     """Names listed in a sealed cell's SHA256SUMS manifest."""
     return [line.split("  ")[1]

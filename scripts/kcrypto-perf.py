@@ -749,6 +749,18 @@ def observer_metrics(cell_dir: Path, leg: dict, parsed_agg,
         metrics["sampler_error"] = str(err)
     metrics["attach_ready_s"] = _read_attach(
         legs_dir / f"{leg_id}-attach.txt")
+    try:
+        tele = kparsers.parse_telemetry(
+            legs_dir / f"{leg_id}-capture.stderr.log")
+        metrics["lagmax_us"] = tele["lagmax_us"]
+        metrics["stop_us"] = (tele["stop"] or {}).get("total_us")
+        metrics["stop_spans_us"] = tele["stop"]
+        metrics["occupancy"] = tele["occupancy"]
+        metrics["telemetry_lines"] = tele["lines"]
+        if tele["malformed"]:
+            metrics["telemetry_malformed"] = tele["malformed"]
+    except kparsers.ParseError as err:
+        metrics["telemetry_error"] = str(err)
     if parsed_agg is not None:
         metrics["loss"] = parsed_agg["loss"]
         metrics["verdict"] = parsed_agg["verdict"]

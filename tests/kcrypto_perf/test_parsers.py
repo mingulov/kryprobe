@@ -241,5 +241,64 @@ class LedgerCsvTests(unittest.TestCase):
             PARSERS.parse_ledger_csv(path)
 
 
+class TelemetryTests(unittest.TestCase):
+    # R1 gap closure: machine-readable `kryprobe: telemetry {...}`
+    # stderr lines (drain lag, stop spans, occupancy). Best-effort
+    # observability: malformed lines are counted, never fatal;
+    # a missing file is a ParseError (module discipline).
+    PREFIX = "kryprobe: telemetry "
+
+    def _line(self, obj):
+        import json as _json
+        return self.PREFIX + _json.dumps(obj) + "\n"
+
+    def test_ticks_fold_to_max_lag(self):
+        content = ("kryprobe: progress tick=1 rows=3 drops=0\n"
+                   + self._line({"v": 1, "tick": 1, "lagmax_us": 120})
+                   + self._line({"v": 1, "tick": 2, "lagmax_us": 95})
+                   + self._line({"v": 1, "tick": 3, "lagmax_us": 310}))
+        parsed = PARSERS.parse_telemetry(write_tmp(content))
+        self.assertEqual(parsed["lagmax_us"], 310)
+        self.assertEqual(parsed["lines"], 3)
+        self.assertEqual(parsed["malformed"], 0)
+        self.assertIsNone(parsed["stop"])
+        self.assertIsNone(parsed["occupancy"])
+
+    def test_stop_occupancy_last_wins(self):
+        stop = {"total_us": 42000, "detach_us": 3000,
+                "snapshot_us": 9000, "render_us": 30000}
+        occ = {"kagg": 4, "ktot": 1, "kidn": 4, "kwho": 2,
+               "kstack": 1, "kerr": 0, "kparams": 1, "kdrops": 8,
+               "kring_pending": None}
+        content = (self._line({"v": 1, "stop": {"total_us": 1},
+                                "occupancy": {"kagg": 0}})
+                   + self._line({"v": 1, "stop": stop,
+                                 "occupancy": occ}))
+        parsed = PARSERS.parse_telemetry(write_tmp(content))
+        self.assertEqual(parsed["stop"], stop)
+        self.assertEqual(parsed["occupancy"], occ)
+
+    def test_malformed_counted_never_fatal(self):
+        content = (self.PREFIX + "{not json\n"
+                   + self._line({"v": 99, "tick": 1, "lagmax_us": 5})
+                   + self._line({"v": 1, "tick": 2, "lagmax_us": 7}))
+        parsed = PARSERS.parse_telemetry(write_tmp(content))
+        self.assertEqual(parsed["malformed"], 2)
+        self.assertEqual(parsed["lagmax_us"], 7)
+
+    def test_empty_gives_nones(self):
+        parsed = PARSERS.parse_telemetry(
+            write_tmp("kryprobe: progress tick=1 rows=0 drops=0\n"))
+        self.assertIsNone(parsed["lagmax_us"])
+        self.assertIsNone(parsed["stop"])
+        self.assertIsNone(parsed["occupancy"])
+        self.assertEqual(parsed["lines"], 0)
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(PARSERS.ParseError):
+            PARSERS.parse_telemetry(
+                write_tmp("x").parent / "definitely-missing.log")
+
+
 if __name__ == "__main__":
     unittest.main()

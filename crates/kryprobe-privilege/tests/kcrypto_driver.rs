@@ -1232,6 +1232,7 @@ fn gate_snap(rows: Vec<RowBytes>) -> SnapshotRows {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 0,
+        lagmax_ns: None,
     }
 }
 
