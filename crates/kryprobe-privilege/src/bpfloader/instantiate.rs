@@ -274,6 +274,7 @@ pub fn load_kcrypto(
                 err: take("KERR")?,
                 params: take("KPARAMS")?,
                 drops: take("KDROPS")?,
+                ident_cache: take("KIDENT")?,
             },
             progs,
         },

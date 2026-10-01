@@ -102,7 +102,8 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 /// 120B — `planning/kryprobe-phaseK1-sensor-plan.md` Task 2) plus the
 /// four K5 attribution maps (`KWHO`/`KSTACK`/`KERR`/`KPARAMS` —
 /// `planning/kryprobe-phaseK5-attribution-token-design.md` §2.1) plus
-/// the fix-wave `KDROPS` pre-`KTOT` site counters (G-C1);
+/// the fix-wave `KDROPS` pre-`KTOT` site counters (G-C1), plus the R1
+/// `KIDENT` per-socket identity cache (BPF-internal, never snapshotted).
 /// names dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
@@ -193,6 +194,15 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             key_size: 4,
             value_size: 8,
             max_entries: 8,
+        },
+    ),
+    (
+        "KIDENT",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 256,
+            max_entries: 256,
         },
     ),
 ];
@@ -384,6 +394,9 @@ pub struct KcryptoMaps {
     pub params: OwnedFd,
     /// `KDROPS` (pre-`KTOT` skip sites, 8 per-CPU u64 counters).
     pub drops: OwnedFd,
+    /// `KIDENT` (R1 identity cache, BPF-internal: never read here;
+    /// the fd only keeps the map alive with the sensor).
+    pub ident_cache: OwnedFd,
 }
 
 /// Fully loaded kcrypto object: maps + per-program fds, all RAII-owned.
@@ -414,6 +427,7 @@ impl KcryptoMaps {
             err: self.err.try_clone_cloexec()?,
             params: self.params.try_clone_cloexec()?,
             drops: self.drops.try_clone_cloexec()?,
+            ident_cache: self.ident_cache.try_clone_cloexec()?,
         })
     }
 }
