@@ -764,6 +764,7 @@ fn outcome_with(
         enrichment: None,
         // Aggregate-profile fixture: no lifecycle reducer.
         lifecycle_totals: None,
+        stop: None,
     }
 }
 

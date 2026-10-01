@@ -557,3 +557,50 @@ fn aead_reconfiguration_pins_new_epoch() {
     assert_eq!(done[1].meta.epoch, Some(2));
     assert_eq!(done[1].meta.aead.expect("extension").authsize, Some(8));
 }
+
+/// R1 window lag: an edge timestamped a known delta behind the
+/// ingest clock lands in `[delta, delta + slack]`; a reset window
+/// with no edges takes `None`.
+#[test]
+fn lagmax_window_bounds_known_staleness() {
+    use kryprobe_privilege::host::monotonic_ns;
+    let mut core = SensorCore::new(16, 16, 16, 8, 8, true);
+    core.reset_lagmax_ns();
+    // (a) Empty window: no timestamped edges decoded.
+    assert_eq!(core.take_lagmax_ns(), None);
+    // (b) Known-staleness window: ts trails the ingest clock by
+    // exactly 5ms; lag = ingest_now - ts >= 5ms by monotonicity.
+    core.reset_lagmax_ns();
+    let now = monotonic_ns().expect("monotonic clock");
+    let ts = now.saturating_sub(5_000_000);
+    let mut edge = vec![0u8; 112];
+    edge[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
+    edge[2] = 7;
+    edge[3] = 1;
+    edge[4..6].copy_from_slice(&1u16.to_le_bytes());
+    edge[8..16].copy_from_slice(&0xabc_u64.to_le_bytes());
+    edge[16..24].copy_from_slice(&ts.to_le_bytes());
+    edge[28..32].copy_from_slice(&16u32.to_le_bytes());
+    edge[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+    edge[40..48].copy_from_slice(&0xFFFF_8880_0000_1000_u64.to_le_bytes());
+    edge[48..52].copy_from_slice(&0u32.to_le_bytes());
+    edge[52] = 1;
+    edge[53] = 1;
+    edge[54..56].copy_from_slice(&0x03u16.to_le_bytes());
+    let mut ret = vec![0u8; 112];
+    ret[0..2].copy_from_slice(&0x434cu16.to_le_bytes());
+    ret[2] = 7;
+    ret[3] = 2;
+    ret[4..6].copy_from_slice(&1u16.to_le_bytes());
+    ret[8..16].copy_from_slice(&0xabc_u64.to_le_bytes());
+    ret[16..24].copy_from_slice(&ts.saturating_add(1_000).to_le_bytes());
+    ret[32..40].copy_from_slice(&0x4000u64.to_le_bytes());
+    assert_eq!(core.ingest_records(&[edge, ret]), 1);
+    let lag = core.take_lagmax_ns().expect("two timestamped edges");
+    assert!(
+        (5_000_000..=65_000_000_000).contains(&lag),
+        "lag {lag}ns outside [5ms, 65s]"
+    );
+    // (c) Take drains: the next take is `None` until new edges.
+    assert_eq!(core.take_lagmax_ns(), None);
+}

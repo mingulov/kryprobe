@@ -607,6 +607,7 @@ impl LifecycleSessionSensor for ScriptedOutputSensor<'_> {
                 records: completed,
                 completed,
                 busy: false,
+                lagmax_ns: None,
             });
         }
         let call = self.drains.fetch_add(1, Ordering::Relaxed);
@@ -621,6 +622,7 @@ impl LifecycleSessionSensor for ScriptedOutputSensor<'_> {
             records: completed,
             completed,
             busy: false,
+            lagmax_ns: None,
         })
     }
 

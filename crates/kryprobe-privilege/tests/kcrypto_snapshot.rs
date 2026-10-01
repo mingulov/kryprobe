@@ -382,6 +382,7 @@ fn shared_losses_ctor_wires_ring_drops_with_zero_queue() {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 999,
+        lagmax_ns: None,
     };
     for drops in [0u8, 1, 255] {
         assert_eq!(

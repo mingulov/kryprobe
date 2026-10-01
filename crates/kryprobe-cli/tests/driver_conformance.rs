@@ -558,6 +558,7 @@ fn agg_tick() -> SnapshotRows {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
+        lagmax_ns: None,
     }
 }
 
@@ -973,6 +974,7 @@ impl LifecycleSessionSensor for ConformanceLifecycleSensor<'_> {
             records: completed,
             completed,
             busy: false,
+            lagmax_ns: None,
         })
     }
 

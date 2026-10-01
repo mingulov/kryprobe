@@ -1206,6 +1206,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         overflow_identities: 0,
         drops: 7,
         monotonic_ns: wall,
+        lagmax_ns: None,
     };
     let sensor = ScriptedSensor {
         script: vec![tick(100), tick(200), tick(300)],
@@ -1380,6 +1381,7 @@ fn live_stop_mid_run_tears_down_cleanly() {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
+        lagmax_ns: None,
     };
     let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut sensor = MidStopSensor {
@@ -1457,6 +1459,7 @@ fn live_sigint_ends_window_with_interrupted_outcome() {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
+        lagmax_ns: None,
     };
     let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut sensor = MidStopSensor {
@@ -1534,6 +1537,7 @@ fn live_progress_hook_sees_every_tick() {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: wall,
+        lagmax_ns: None,
     };
     let mut sensor = ScriptedSensor {
         script: vec![tick(100), tick(200)],
@@ -1606,6 +1610,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         overflow_identities: 0,
         drops: 7,
         monotonic_ns: wall,
+        lagmax_ns: None,
     };
     let mut sensor = ScriptedSensor {
         script: vec![tick(100), tick(200), tick(300), tick(400), tick(500)],
@@ -1700,6 +1705,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
+        lagmax_ns: None,
     };
     let mut sensor = ScriptedSensor {
         script: vec![tick],
@@ -1853,6 +1859,7 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
+        lagmax_ns: None,
     };
     let mut sensor = ScriptedSensor {
         script: vec![tick],
@@ -1956,6 +1963,7 @@ impl kryprobe_cli::live::LifecycleSessionSensor for ScriptedLifecycleSensor<'_> 
                 records: completed,
                 completed,
                 busy: false,
+                lagmax_ns: None,
             },
         )
     }
@@ -2628,6 +2636,7 @@ impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
                 records,
                 completed: records,
                 busy,
+                lagmax_ns: None,
             },
         )
     }

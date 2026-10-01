@@ -1183,6 +1183,7 @@ mod tests {
             overflow_identities: 0,
             drops: 0,
             monotonic_ns: 7,
+            lagmax_ns: None,
         }
     }
 

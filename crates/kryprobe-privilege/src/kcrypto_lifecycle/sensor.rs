@@ -440,6 +440,12 @@ pub struct SensorCore {
     ledger_capacity: usize,
     retained_dropped: u64,
     tfm: TransformTracker,
+    /// Window-max ingest lag in ns (R1 drain-lag gap): max over
+    /// ingested edges of (ingest `CLOCK_MONOTONIC` − edge `ts_ns`),
+    /// saturating. Reset + read per drain window by
+    /// [`LifecycleSensor::drain_once_raw`]; `None` when the window
+    /// ingested zero timestamped edges (no data, not zero lag).
+    lagmax_ns: Option<u64>,
 }
 
 impl SensorCore {
@@ -481,7 +487,33 @@ impl SensorCore {
                 aead_frontend_off,
                 refcnt_present,
             ),
+            lagmax_ns: None,
         }
+    }
+
+    /// Fold one decoded edge's ingest lag into the window max. A
+    /// failed clock read skips the sample (telemetry never breaks
+    /// ingest).
+    fn note_edge_lag(&mut self, ts_ns: u64) {
+        if let Ok(now) = crate::host::monotonic_ns() {
+            let lag = now.saturating_sub(ts_ns);
+            self.lagmax_ns = Some(self.lagmax_ns.map_or(lag, |prev| prev.max(lag)));
+        }
+    }
+
+    /// Reset the window lag accumulator (drain-window start).
+    /// Window discipline: reset → ingest → take, exactly once per
+    /// window ([`LifecycleSensor::drain_once_raw`] owns the only
+    /// production use).
+    pub fn reset_lagmax_ns(&mut self) {
+        self.lagmax_ns = None;
+    }
+
+    /// Take the window lag accumulator (drain-window end): max
+    /// ingest lag in ns over the window's decoded edges, or `None`
+    /// when the window decoded zero timestamped edges.
+    pub fn take_lagmax_ns(&mut self) -> Option<u64> {
+        self.lagmax_ns.take()
     }
 
     /// The transform-lifetime tracker (T07 generations + loss).
@@ -556,6 +588,7 @@ impl SensorCore {
                         continue;
                     }
                 };
+                self.note_edge_lag(raw.ts_ns);
                 self.edge_hits[tfm_slot(raw.site, raw.edge)] += 1;
                 self.tfm.join(raw);
                 continue;
@@ -567,6 +600,7 @@ impl SensorCore {
                     continue;
                 }
             };
+            self.note_edge_lag(raw.ts_ns);
             // T07.3 first-seen, R2 submit-only: the SUBMIT's live
             // entry chase (word + driver) offers the transform to
             // the tracker — returns carry no chase (honest BPF
@@ -684,6 +718,10 @@ pub struct DrainOutcome {
     pub completed: usize,
     /// Stopped on a busy/torn record: more may arrive later.
     pub busy: bool,
+    /// Window-max ingest lag in ns (R1 drain-lag gap): max over
+    /// this window's decoded edges of (ingest time − edge
+    /// `ts_ns`). `None` when the window decoded zero edges.
+    pub lagmax_ns: Option<u64>,
 }
 
 /// Quiet-drain visit budget per round: 8192 covers a full ring
@@ -911,13 +949,16 @@ impl LifecycleSensor {
         }
         let producer = self.area.producer();
         let consumed = self.area.consume_live(self.consumer, producer, budget);
+        self.core.reset_lagmax_ns();
         let completed = self.core.ingest_records(&consumed.records);
+        let lagmax_ns = self.core.take_lagmax_ns();
         self.consumer = consumed.consumer;
         self.area.set_consumer(consumed.consumer);
         let outcome = DrainOutcome {
             records: consumed.records.len(),
             completed,
             busy: consumed.busy,
+            lagmax_ns,
         };
         Ok((outcome, consumed.records))
     }
