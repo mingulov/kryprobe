@@ -116,13 +116,25 @@ cells plus one separately-named many-submitter diagnostic probe.
 Attached-idle is an observer-footprint leg (session live,
 workload idle), not a workload pair.
 
-## R1 frozen performance budgets (DRAFT — freezes before the first R1 sampling boot)
+## R1 frozen performance budgets (FROZEN 2026-10-01T14:27:42Z — no edits after first R1 sampling boot)
 
-R1 re-tests the OPTIMIZED observer against the UNCHANGED P9
-budgets: B1 (median throughput ratio ≥ 0.95) and B2 (median
-workload-p99 ratio ≤ 1.10), same verdict rule (median plus ≥80%
-of pairs inside), same QUALIFIED pair-set conditions. No budget
-is moved; the observer changed, the bar did not.
+R1 re-tests the observer against the UNCHANGED P9 budgets: B1
+(median throughput ratio ≥ 0.95) and B2 (median workload-p99
+ratio ≤ 1.10), same verdict rule (median plus ≥80% of pairs
+inside), same QUALIFIED pair-set conditions. No budget is
+moved; the bar did not move.
+
+Observer delta vs P9: NONE on the probe path. The BPF objects
+are bit-identical to the P9-qualified build; the H1
+per-alg identity-cache experiment measured neutral on host
+A/B (0.807–0.826 vs replicated baseline 0.800–0.846) and was
+reverted. R1 product changes are capture-side only:
+machine-readable observer telemetry (drain lag, occupancy,
+stop spans) on stderr, which cannot perturb the driver
+workload. The 4K optimization leg is therefore routed to the
+owner per stop conditions with a replicated host floor
+(0.80–0.85); the frozen 4K budgets stand and the wave judges
+them honestly.
 
 Pre-pinned R1 rule changes (all frozen in advance, never
 post-hoc):
@@ -143,6 +155,23 @@ post-hoc):
   (`hosts_bulk`), and the repaired `roundtrip_bulk` fixture
   (no clock reads) finally quantifies timestamping cost,
   unquantified in P9 (P9R1A-N8).
+
+R1 wave scope (targeted; the 26-set manifest stays the frozen
+campaign definition): 8 sets — `perf-P-4K-agg-7014`,
+`perf-P-4K-agg-726` (budgeted FAIL floor + timestamping cost +
+bulk control), `perf-P-1M-agg-7014` (INCONCLUSIVE clean
+re-run), `perf-P-1M-det-7014/726` + `perf-P-64-det-paced-7014`
++ `perf-P-4K-det-paced-7014` + `perf-P-AEAD-det-paced-7014`
+(below-cap det under the tolerant rule; P9 reconciled them
+exactly with tombstone-only loss). The other 18 sets are
+NOT_RUN: flat fast-det truncates 5–44x by construction and
+async-det sheds/misses the pace gate by construction (P9
+INVALIDs stand on unchanged code+shape); `perf-P-1M-agg-726`
+PASS stands (observer + ledger fixture unchanged);
+64/AEAD/ASYNC-agg reference ratios stand (726 row-cost control
+comes from the 4K-726 bulk legs, same kernel + rate regime);
+612 floor verdicts stand (re-judge executed); diagnostics
+unchanged.
 
 The R1 judge tree (`scripts/` at the freeze commit) is frozen
 with the manifest (SHA recorded in the freeze receipt); T14

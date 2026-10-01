@@ -2,8 +2,8 @@
   "$schema": "kryprobe-perf-campaign/v1",
   "campaign": "kcrypto-t14",
   "manifest_version": 1,
-  "frozen_utc": "DRAFT-R1-UNFROZEN",
-  "freeze_rule": "R1 DRAFT (v3 content): freezes before the first R1 sampling boot; any stimulus/mode/equivalence/validity edit after the freeze stamp invalidates sealed receipts. P9 v2 stamp was 2026-09-29T10:55:00Z (T14 sealed campaign).",
+  "frozen_utc": "2026-10-01T14:27:42Z",
+  "freeze_rule": "R1 FROZEN (v3): no stimulus/mode/equivalence/validity edit after the freeze stamp without invalidating sealed receipts. P9 v2 stamp was 2026-09-29T10:55:00Z (T14 sealed campaign).",
   "budgets": {
     "B1_throughput_ratio_min": 0.95,
     "B2_p99_ratio_max": 1.1,
