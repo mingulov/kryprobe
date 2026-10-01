@@ -94,6 +94,20 @@ jobs:
         run: |
           sudo modprobe --ignore-install algif_aead
           grep -q algif_aead /proc/modules
+      - name: working bpftool for the link oracle
+        # The image's /usr/sbin/bpftool is a stub (rc=2): azure
+        # linux-tools ship no bpftool binary and noble has no
+        # bpftool package. The lane's link-count oracle shells out
+        # to `bpftool`, so take the generic-tools binary and shadow
+        # the stub via /usr/local/bin (first in PATH, including
+        # sudo's secure_path). Fail fast if the oracle stays broken.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic
+          REAL=$(find /usr/lib/linux-tools -name bpftool | head -1)
+          test -n "$REAL"
+          sudo ln -sf "$REAL" /usr/local/bin/bpftool
+          sudo bpftool link show
       - name: privileged lane (reviewed runner)
         # Invoked unprivileged: the runner builds as the runner user
         # and elevates internally (sudo -n + private mount namespace).
