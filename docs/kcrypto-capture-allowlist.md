@@ -4,8 +4,7 @@
 Closed list of everything the kcrypto fexit sensor stores in
 `KCFG`/`KAGG`/`KTOT`/`KIDN`/`KRING` (K1) plus
 `KWHO`/`KSTACK`/`KERR`/`KPARAMS` (K5 attribution) plus `KDROPS`
-(fix-wave pre-`KTOT` site counters) plus `KIDENT` (R1 per-`alg`
-identity cache, BPF-internal). Anything not on
+(fix-wave pre-`KTOT` site counters). Anything not on
 this list is not captured; the [NEVER](#never-list) section names the
 categories the sensor must never read. Field order and sizes twin
 `crates/bpf-kcrypto/src/bin/kcrypto.rs` (BPF owns the originals) and
@@ -211,22 +210,6 @@ only — no identities, no names (kp2 §8 capture integrity, kp2 §9
 scalar counts). The configured destroy site always counts (C7: live
 transform identity is unavailable at the exit edge); it is separately keyed and excluded from loss
 verdicts, still counted (never silent).
-
-## `KIDENT`: per-`alg` identity cache (key u64 → 256B `VIdent`, R1)
-
-Plain hash, 256 entries, BPF-internal (never snapshotted, never
-published): key = the `crypto_alg` address, value = the memoized
-canonical `(cra_name, cra_driver_name)` byte pairs (128B + 128B) that
-the slow path would otherwise re-read every event. Stores no new
-capture — the same allowlisted names (kp2 §9 bounded names), memoized;
-hit bytes are re-scanned through the same canonicalizer, so
-downstream rows are bit-identical to the slow path. Exactness rests on
-`crypto_alg`-address stability across the session (a crypto-driver
-unload/reload mid-session requires a sensor restart — same
-session-stability class as the pinned `KCFG` offsets); there are no
-validation reads on the hit path (measured: per-call probe cost
-dominates, a tripwire costs as much as the saved reads). The
-alloc path never touches the cache (requested-name identity).
 
 ## Known-uncountable remainder: fexit guard-skips (fix wave, G-C1)
 

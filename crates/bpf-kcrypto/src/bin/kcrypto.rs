@@ -122,10 +122,6 @@ const KDROPS_DESTROY: u32 = 5;
 
 /// `BPF_NOEXIST` (`enum bpf_map_update_elem_flags`, UAPI `linux/bpf.h`).
 const BPF_NOEXIST: u64 = 1;
-/// `BPF_ANY` (`enum bpf_map_update_elem_flags`, UAPI `linux/bpf.h`):
-/// insert-or-update, for the R1 identity cache (misses insert;
-/// concurrent winners write the same deterministic value).
-const BPF_ANY: u64 = 0;
 
 /// `BPF_F_FAST_STACK_CMP` (`enum bpf_stack_build_id_flags`, UAPI
 /// `linux/bpf.h`): compare-and-reuse stack ids instead of allocating a
@@ -254,19 +250,6 @@ pub struct VParams {
     pub max_keysize: u32,
 }
 
-/// `KIDENT` value: memoized canonical `(cra_name, cra_driver_name)`
-/// (256B, R1). Byte-laid (align 1) so a hit copies straight into the
-/// `KAgg` slot's name lanes and a miss inserts straight from them —
-/// zero extra stack on the 512B frame. Keyed by the `crypto_alg`
-/// address: on the req paths both names are pure functions of `alg`
-/// (kernel static strings); the alloc path never touches the cache
-/// (requested-name identity, `drv_src == 0`).
-#[repr(C)]
-pub struct VIdent {
-    pub name: [u8; 128],
-    pub drv: [u8; 128],
-}
-
 // SAME numbers as the ABI mirrors + loader KCRYPTO_MAPS (duplication
 // deliberate + cited: a dims drift must fail here AND at load).
 const _: () = assert!(size_of::<KConfig>() == 76);
@@ -276,7 +259,6 @@ const _: () = assert!(size_of::<KCtl>() == 48);
 const _: () = assert!(size_of::<KWhoKey>() == 16);
 const _: () = assert!(size_of::<VWho>() == 80);
 const _: () = assert!(size_of::<VParams>() == 16);
-const _: () = assert!(size_of::<VIdent>() == 256);
 
 #[map]
 static KCFG: Array<KConfig> = Array::with_max_entries(1, 0);
@@ -298,8 +280,6 @@ static KERR: HashMap<u64, i32> = HashMap::with_max_entries(256, 0);
 static KPARAMS: HashMap<u64, VParams> = HashMap::with_max_entries(256, 0);
 #[map]
 static KDROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
-#[map]
-static KIDENT: HashMap<u64, VIdent> = HashMap::with_max_entries(256, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers (all #[inline(always)]: R4 call-free)
@@ -1005,56 +985,22 @@ fn observe(
 ) -> i32 {
     let mut slot = MaybeUninit::<KAgg>::uninit();
     let base = slot.as_mut_ptr().cast::<u8>();
-    // R1 identity cache: on the req paths (`alg != 0`, `drv_src !=
-    // 0`) both names are pure functions of the `crypto_alg` address,
-    // so a hit copies the memoized canonical bytes and skips both
-    // 128B probe-reads (plus the 260B zero: the copy + head writes
-    // below fill every lane). The alloc path always misses
-    // (requested-name identity, `drv_src == 0`). Hit bytes are
-    // re-scanned with the slow path below, so downstream is
-    // bit-identical on both paths.
-    let cacheable = alg != 0 && drv_src != 0;
-    let mut hit = false;
-    if cacheable && let Some(found) = KIDENT.get_ptr(alg) {
-        // SAFETY: map-owned 256 bytes, live across the call.
-        let cached: &VIdent = unsafe { &*found };
-        // R1: NO validation reads on the hit path — measured
-        // (prof2 vs P9 c-driver) that per-call probe cost
-        // dominates, so a tripwire's 2 calls cost as much as
-        // the 2 saved reads. Exactness rests on the
-        // documented alg-stability assumption + the exactness
-        // lanes, which fail on any misattribution.
-        let src = cached as *const VIdent as *const u8;
-        // SAFETY: `base.add(4)..base.add(260)` spans the
-        // name lanes (the head is written below).
-        let dst = unsafe { base.add(4) };
-        let mut j = 0u32;
-        while j < 256 {
-            unsafe {
-                *dst.add(j as usize) = *src.add(j as usize);
-            }
-            j += 1;
+    let mut p = base;
+    let mut i = 0u32;
+    while i < 260 {
+        unsafe {
+            p.write_volatile(0);
         }
-        hit = true;
+        p = unsafe { p.add(1) };
+        i += 1;
     }
-    if !hit {
-        let mut p = base;
-        let mut i = 0u32;
-        while i < 260 {
-            unsafe {
-                p.write_volatile(0);
-            }
-            p = unsafe { p.add(1) };
-            i += 1;
-        }
-        if !read_name(cra_src, unsafe { base.add(4) }) {
-            drop_inc(KDROPS_NAME);
-            return 0;
-        }
-        if drv_src != 0 && !read_name(drv_src, unsafe { base.add(132) }) {
-            drop_inc(KDROPS_NAME);
-            return 0;
-        }
+    if !read_name(cra_src, unsafe { base.add(4) }) {
+        drop_inc(KDROPS_NAME);
+        return 0;
+    }
+    if drv_src != 0 && !read_name(drv_src, unsafe { base.add(132) }) {
+        drop_inc(KDROPS_NAME);
+        return 0;
     }
     let ctx_class = classify_ctx(cfg.task_flags, cfg.pf_kthread);
     unsafe {
@@ -1075,15 +1021,6 @@ fn observe(
     } else {
         0
     };
-    if cacheable && !hit {
-        // Memoize the just-canonicalized bytes (miss only; the
-        // alloc path never inserts). Best-effort: a full map keeps
-        // the correct slow path, uncached.
-        // SAFETY: `base.add(4)` spans the 256 canonical name bytes
-        // scanned above; `VIdent` is byte-laid (align 1).
-        let ident: &VIdent = unsafe { &*(base.add(4) as *const VIdent) };
-        let _ = KIDENT.insert(alg, ident, BPF_ANY);
-    }
     // Borrow the slot directly (no `assume_init` copy: a second 260B
     // key on the 512B frame overflows it).
     //
