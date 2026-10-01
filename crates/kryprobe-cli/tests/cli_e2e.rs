@@ -1177,6 +1177,12 @@ fn watch_live_proves_traffic_case() {
     if !lane_ready("watch_live_proves_traffic_case") {
         return;
     }
+    if !kryprobe_testkit::alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: watch_live_proves_traffic_case requires an AEAD alg (none bind on this kernel)"
+        );
+        return;
+    }
     let traffic = spawn_traffic();
     let output = Command::new(kryprobe())
         .args(["watch", "--system", "--duration", "2"])
@@ -1208,6 +1214,12 @@ fn watch_live_proves_traffic_case() {
 fn report_live_proves_json_case() {
     let _guard = lane_guard();
     if !lane_ready("report_live_proves_json_case") {
+        return;
+    }
+    if !kryprobe_testkit::alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: report_live_proves_json_case requires an AEAD alg (none bind on this kernel)"
+        );
         return;
     }
     let traffic = spawn_traffic();
@@ -1528,6 +1540,12 @@ fn check_live_violation_exit10_case() {
 fn check_live_clean_exit3_inconclusive_case() {
     let _guard = lane_guard();
     if !lane_ready("check_live_clean_exit3_inconclusive_case") {
+        return;
+    }
+    if !kryprobe_testkit::alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: check_live_clean_exit3_inconclusive_case requires an AEAD alg (none bind on this kernel)"
+        );
         return;
     }
     let scratch = check_scratch("live-0");

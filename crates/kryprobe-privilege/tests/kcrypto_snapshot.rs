@@ -754,6 +754,12 @@ fn snapshot_byte_exactness_against_fixture() {
     if !lane_ready("snapshot_byte_exactness_against_fixture") {
         return;
     }
+    if !alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: snapshot_byte_exactness_against_fixture requires an AEAD alg (none bind on this kernel)"
+        );
+        return;
+    }
     // Complete deterministic algorithm setup before the measured window.
     // The cold diagnostic observed modprobe SHA-512 work during setup;
     // that is real system crypto activity, but is not part of this

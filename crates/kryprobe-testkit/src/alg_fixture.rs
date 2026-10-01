@@ -427,6 +427,18 @@ pub fn aead_roundtrip(alg: &str, ops: u64) -> Result<CipherCounts, FixtureError>
     aead_roundtrip_with(alg, ops, &[0x42u8; 16], &[0x11u8; 12], &[0xaau8; 32])
 }
 
+/// Probe-only `AF_ALG` bind: true when `aead`/`alg` binds on this
+/// kernel (no traffic, fd closed). AEAD-dependent tests gate on this:
+/// a bind failure means the kernel cannot supply AEAD traffic at all
+/// (environmental, not a product defect). Note hosted CI ships
+/// `gcm(aes)` but blocks the `algif_aead` autoload — the sudo CI job
+/// enables it with `modprobe --ignore-install algif_aead`, so the
+/// gate never triggers there; it covers genuinely AEAD-less kernels.
+#[must_use]
+pub fn aead_alg_available(alg: &str) -> bool {
+    alg_bind("aead", alg).is_ok()
+}
+
 /// Canary `aead` roundtrip (R2-04): same choreography as
 /// [`aead_roundtrip`], but key, IV, and plaintext carry the
 /// `KPROBE-CANARY-*` markers (IV is the 12B marker prefix —
@@ -831,4 +843,24 @@ pub fn burst_encrypt(alg: &str, secs: u64) -> Result<BurstCounts, FixtureError> 
         }
     }
     Ok(BurstCounts { ops, secs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bogus algorithms never probe available (environment-independent).
+    #[test]
+    fn bogus_aead_alg_is_unavailable() {
+        assert!(!aead_alg_available("definitely-not-an-alg-xyz"));
+    }
+
+    /// Availability is deterministic within a boot (bind, close, repeat).
+    #[test]
+    fn availability_is_deterministic() {
+        assert_eq!(
+            aead_alg_available("gcm(aes)"),
+            aead_alg_available("gcm(aes)")
+        );
+    }
 }

@@ -639,6 +639,12 @@ fn live_capture_proves_session() {
     if !lane_ready("live_capture_proves_session") {
         return;
     }
+    if !kryprobe_testkit::alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: live_capture_proves_session requires an AEAD alg (none bind on this kernel)"
+        );
+        return;
+    }
     let _env = env_guard();
     let prior = std::env::var_os("KRYPROBE_BPF_DIR");
     // Both the backend's `configure` and the session sensor resolve the

@@ -607,6 +607,12 @@ fn aead_exactness_and_bad_tag_errors() {
     if !lane_ready("aead_exactness_and_bad_tag_errors") {
         return;
     }
+    if !alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: aead_exactness_and_bad_tag_errors requires an AEAD alg (none bind on this kernel)"
+        );
+        return;
+    }
     let sensor = Sensor::attach();
     let counts = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
     assert_eq!((counts.enc, counts.dec), (10, 10));

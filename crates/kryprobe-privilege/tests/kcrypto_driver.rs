@@ -101,6 +101,32 @@ fn agg_payload_named(fam: u8, op: u8, res: u8, ctx: u8, alg: &str, drv: &str) ->
     out
 }
 
+/// Valid 382B agg payload with explicit counters (capture-gate tests).
+#[allow(clippy::too_many_arguments)]
+fn agg_payload_counts(
+    fam: u8,
+    op: u8,
+    res: u8,
+    alg: &str,
+    calls: u64,
+    bytes: u64,
+    ok: u64,
+    errors: u64,
+    queued: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(382);
+    out.push(0x01);
+    out.push(1);
+    out.extend_from_slice(&kagg_bytes_for(fam, op, res, KCTX_PROC, alg, TEST_DRV));
+    // VAgg word order: calls, bytes, ok, errors, queued, first, last, lat[8].
+    for w in [
+        calls, bytes, ok, errors, queued, 100, 200, 0, 0, 0, 0, 0, 0, 0, 0,
+    ] {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
+}
+
 /// Valid 122B totals payload.
 fn totals_payload_for(res: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(122);
@@ -1041,6 +1067,322 @@ fn sum_obs(
     out
 }
 
+/// Capture-gate verdict (shared-VM stray-traffic retry, E2E only).
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureVerdict {
+    /// Every asserted cell matches: proceed to `driver.run`.
+    Clean,
+    /// A cell EXCEEDS the fixture truth (calls above max, or shape skew
+    /// at/above expected calls): another process's kcrypto traffic landed
+    /// in the kernel-wide rows during the capture window — re-capture.
+    Excess(String),
+    /// A cell is BELOW the fixture truth: a sensor miss, never
+    /// contamination — fail immediately, no retry.
+    Short(String),
+}
+
+fn alg_name_matches(words: &[u64; 16], expected: &str) -> bool {
+    let bytes = words_to_bytes(words);
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    bytes[..end] == *expected.as_bytes()
+}
+
+/// Row-level sums over one asserted cell, mirroring [`sum_obs`]
+/// (sums across driver names; `drv` is not part of the filter).
+fn sum_rows(
+    rows: &[kryprobe_privilege::kcrypto_snapshot::RowBytes],
+    fam: u8,
+    op: u8,
+    res: u8,
+    alg: &str,
+) -> (u64, u64, u64, u64, u64) {
+    let mut out = (0, 0, 0, 0, 0);
+    for row in rows {
+        let ParsedRow::Agg { kagg, vagg } = parse_snapshot_row(row.as_bytes()).expect("row parses")
+        else {
+            continue;
+        };
+        if kagg.fam() == fam
+            && kagg.op() == op
+            && kagg.res() == res
+            && alg_name_matches(&kagg.alg(), alg)
+        {
+            out.0 += vagg.calls;
+            out.1 += vagg.bytes;
+            out.2 += vagg.ok;
+            out.3 += vagg.errors;
+            out.4 += vagg.queued;
+        }
+    }
+    out
+}
+
+/// Row-level pre-gate for the E2E capture: every cell the truth
+/// assertions below check must already match at the snapshot level.
+/// Bounds mirror the observation assertions exactly (skcipher 18..=20
+/// per G9, everything else exact); the gate never accepts a capture
+/// the assertions would reject.
+///
+/// One gated cell: (label, fam, op, res, alg, min_calls, max_calls,
+/// bytes_per_call or None, exact (ok, errors, queued) or None when the
+/// test only gates calls).
+type GateCell = (
+    &'static str,
+    u8,
+    u8,
+    u8,
+    &'static str,
+    u64,
+    u64,
+    Option<u64>,
+    Option<(u64, u64, u64)>,
+);
+
+fn gate_capture(snap: &SnapshotRows) -> CaptureVerdict {
+    const CELLS: &[GateCell] = &[
+        (
+            "skcipher/enc",
+            KFAM_SK,
+            KOP_ENC,
+            KRES_OK,
+            "cbc(aes)",
+            18,
+            20,
+            Some(32),
+            None,
+        ),
+        (
+            "skcipher/dec",
+            KFAM_SK,
+            KOP_DEC,
+            KRES_OK,
+            "cbc(aes)",
+            18,
+            20,
+            Some(32),
+            None,
+        ),
+        (
+            "any/alloc",
+            KFAM_ANY,
+            KOP_ALLOC,
+            KRES_OK,
+            "cbc(aes)",
+            1,
+            1,
+            None,
+            None,
+        ),
+        (
+            "ahash/digest",
+            KFAM_AHASH,
+            KOP_DIGEST,
+            KRES_OK,
+            "sha512",
+            8,
+            8,
+            Some(64),
+            Some((8, 0, 0)),
+        ),
+        (
+            "shash/digest",
+            KFAM_SHASH,
+            KOP_DIGEST,
+            KRES_OK,
+            "sha512",
+            8,
+            8,
+            Some(64),
+            Some((8, 0, 0)),
+        ),
+        (
+            "shash/finup",
+            KFAM_SHASH,
+            KOP_FINUP,
+            KRES_OK,
+            "sha512",
+            4,
+            4,
+            Some(16),
+            Some((4, 0, 0)),
+        ),
+        (
+            "aead/enc",
+            KFAM_AEAD,
+            KOP_ENC,
+            KRES_OK,
+            "gcm(aes)",
+            11,
+            11,
+            Some(32),
+            Some((11, 0, 0)),
+        ),
+        (
+            "aead/dec-ok",
+            KFAM_AEAD,
+            KOP_DEC,
+            KRES_OK,
+            "gcm(aes)",
+            10,
+            10,
+            Some(48),
+            Some((10, 0, 0)),
+        ),
+        (
+            "aead/dec-err",
+            KFAM_AEAD,
+            KOP_DEC,
+            KRES_ERR,
+            "gcm(aes)",
+            1,
+            1,
+            Some(48),
+            Some((0, 1, 0)),
+        ),
+    ];
+    for (name, fam, op, res, alg, min_calls, max_calls, byte_shape, class_shape) in CELLS {
+        let got = sum_rows(&snap.rows, *fam, *op, *res, alg);
+        if got.0 < *min_calls {
+            return CaptureVerdict::Short(format!(
+                "{name}: calls {} < min {min_calls} ({got:?})",
+                got.0
+            ));
+        }
+        if got.0 > *max_calls {
+            return CaptureVerdict::Excess(format!(
+                "{name}: calls {} > max {max_calls} ({got:?})",
+                got.0
+            ));
+        }
+        // In-range calls with skewed shape: contamination-shaped (stray
+        // bytes merge into our rows). A systematic product skew fails
+        // closed after the bounded attempts with this tuple attached.
+        if let Some(per_call) = byte_shape
+            && got.1 != got.0 * per_call
+        {
+            return CaptureVerdict::Excess(format!(
+                "{name}: bytes {} != {per_call}×calls {} ({got:?})",
+                got.1, got.0
+            ));
+        }
+        if let Some((ok, errors, queued)) = class_shape
+            && (got.2, got.3, got.4) != (*ok, *errors, *queued)
+        {
+            return CaptureVerdict::Excess(format!(
+                "{name}: class ({}, {}, {}) != ({ok}, {errors}, {queued}) ({got:?})",
+                got.2, got.3, got.4
+            ));
+        }
+        // skcipher cells carry no static class tuple (ok == the in-range
+        // call count); check the G9 shape explicitly. any/alloc gates
+        // calls only — the test asserts `.0 == 1` and leaves alloc
+        // byte/class shape intentionally unconstrained.
+        if name.starts_with("skcipher/") && (got.2, got.3, got.4) != (got.0, 0, 0) {
+            return CaptureVerdict::Excess(format!("{name}: class shape skew ({got:?})"));
+        }
+    }
+    CaptureVerdict::Clean
+}
+
+/// Hand-built fixture-truth capture: one row per gated cell at the
+/// exact counts the E2E truth asserts (skcipher dec at 19 exercises
+/// the in-range G9 bound rather than the 20 endpoint).
+fn gate_truth_rows() -> Vec<RowBytes> {
+    [
+        (KFAM_SK, KOP_ENC, KRES_OK, "cbc(aes)", 20, 640, 20, 0, 0),
+        (KFAM_SK, KOP_DEC, KRES_OK, "cbc(aes)", 19, 608, 19, 0, 0),
+        (KFAM_ANY, KOP_ALLOC, KRES_OK, "cbc(aes)", 1, 0, 1, 0, 0),
+        (KFAM_AHASH, KOP_DIGEST, KRES_OK, "sha512", 8, 512, 8, 0, 0),
+        (KFAM_SHASH, KOP_DIGEST, KRES_OK, "sha512", 8, 512, 8, 0, 0),
+        (KFAM_SHASH, KOP_FINUP, KRES_OK, "sha512", 4, 64, 4, 0, 0),
+        (KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)", 11, 352, 11, 0, 0),
+        (KFAM_AEAD, KOP_DEC, KRES_OK, "gcm(aes)", 10, 480, 10, 0, 0),
+        (KFAM_AEAD, KOP_DEC, KRES_ERR, "gcm(aes)", 1, 48, 0, 1, 0),
+    ]
+    .into_iter()
+    .map(|(fam, op, res, alg, calls, bytes, ok, errors, queued)| {
+        RowBytes::new(agg_payload_counts(
+            fam, op, res, alg, calls, bytes, ok, errors, queued,
+        ))
+        .expect("hand-built row")
+    })
+    .collect()
+}
+
+fn gate_snap(rows: Vec<RowBytes>) -> SnapshotRows {
+    SnapshotRows {
+        rows,
+        totals: None,
+        idents: Vec::new(),
+        overflow_identities: 0,
+        drops: 0,
+        monotonic_ns: 0,
+    }
+}
+
+#[test]
+fn capture_gate_classifies_clean_excess_short() {
+    // Fixture truth is Clean.
+    assert_eq!(
+        gate_capture(&gate_snap(gate_truth_rows())),
+        CaptureVerdict::Clean
+    );
+    // The exact observed contamination tuple is Excess, not Short.
+    let mut rows = gate_truth_rows();
+    rows[4] = RowBytes::new(agg_payload_counts(
+        KFAM_SHASH, KOP_DIGEST, KRES_OK, "sha512", 9, 26232, 9, 0, 0,
+    ))
+    .expect("row");
+    assert!(matches!(
+        gate_capture(&gate_snap(rows)),
+        CaptureVerdict::Excess(_)
+    ));
+    // A sensor miss (below truth) is Short: fail fast, never retry.
+    let mut rows = gate_truth_rows();
+    rows[3] = RowBytes::new(agg_payload_counts(
+        KFAM_AHASH, KOP_DIGEST, KRES_OK, "sha512", 7, 448, 7, 0, 0,
+    ))
+    .expect("row");
+    assert!(matches!(
+        gate_capture(&gate_snap(rows)),
+        CaptureVerdict::Short(_)
+    ));
+    // Exact calls with skewed bytes is contamination-shaped: Excess.
+    let mut rows = gate_truth_rows();
+    rows[4] = RowBytes::new(agg_payload_counts(
+        KFAM_SHASH, KOP_DIGEST, KRES_OK, "sha512", 8, 600, 8, 0, 0,
+    ))
+    .expect("row");
+    assert!(matches!(
+        gate_capture(&gate_snap(rows)),
+        CaptureVerdict::Excess(_)
+    ));
+    // skcipher G9 edges: 18 clean, 17 short, 21 excess.
+    for (calls, clean) in [(18, true), (17, false), (21, false)] {
+        let mut rows = gate_truth_rows();
+        rows[0] = RowBytes::new(agg_payload_counts(
+            KFAM_SK,
+            KOP_ENC,
+            KRES_OK,
+            "cbc(aes)",
+            calls,
+            calls * 32,
+            calls,
+            0,
+            0,
+        ))
+        .expect("row");
+        let verdict = gate_capture(&gate_snap(rows));
+        if clean {
+            assert_eq!(verdict, CaptureVerdict::Clean);
+        } else if calls < 18 {
+            assert!(matches!(verdict, CaptureVerdict::Short(_)));
+        } else {
+            assert!(matches!(verdict, CaptureVerdict::Excess(_)));
+        }
+    }
+}
+
 fn words_to_bytes(words: &[u64; 16]) -> [u8; 128] {
     let mut out = [0u8; 128];
     for (i, w) in words.iter().enumerate() {
@@ -1140,6 +1482,12 @@ fn driver_e2e_matches_fixture_truth() {
     if !lane_ready("driver_e2e_matches_fixture_truth") {
         return;
     }
+    if !alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: driver_e2e_matches_fixture_truth requires an AEAD alg (none bind on this kernel)"
+        );
+        return;
+    }
     // The backend's `configure` loads its own sensor from this object
     // (direct-privileged, token None per D5); the env locator is exact.
     let object_path = kcrypto_object_path();
@@ -1153,28 +1501,58 @@ fn driver_e2e_matches_fixture_truth() {
         );
     }
     let prepared = alg_fixture::PreparedHashFinups::new("sha512").expect("prepare hash prefix");
-    let bytes = kcrypto_bytes();
-    let (sensor, _points) = load_kcrypto_configured(&bytes, None)
-        .unwrap_or_else(|err| panic!("bring-up failed: {err}"));
-    // Task-1 P4 traffic, identical counts (lane-exclusive, fresh sensor).
-    let sk = alg_fixture::skcipher_roundtrip("cbc(aes)", 20).expect("skcipher traffic");
-    assert_eq!((sk.enc, sk.dec), (20, 20));
-    let single = alg_fixture::hash_digest("sha512", 8).expect("hash traffic");
-    assert_eq!((single.digests, single.digest_len), (8, 64));
-    let multi = prepared
-        .finish(4)
-        .expect("cloned finup traffic and digest goldens");
-    assert_eq!((multi.digests, multi.digest_len), (4, 64));
-    let aead = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
-    assert_eq!((aead.enc, aead.dec), (10, 10));
-    alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
+    // Bounded re-capture on the contamination signature. Agg rows are
+    // kernel-wide, so a background process's kcrypto traffic during the
+    // capture window merges into the asserted cells (observed once on a
+    // hosted runner: shash/digest/sha512 read (9, 26232, 9, 0, 0) — a
+    // foreign 25720-byte op no 64-byte fixture input can produce).
+    // EXCESS re-captures on a fresh sensor (max 3 attempts); SHORTFALL
+    // fails immediately (a sensor miss, never contamination); 3/3
+    // excess fails closed. Exactness is preserved: only a Clean capture
+    // reaches `driver.run`, and the truth assertions below still run.
+    let (snap, who, who_drops, sensor) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let bytes = kcrypto_bytes();
+            let (sensor, _points) = load_kcrypto_configured(&bytes, None)
+                .unwrap_or_else(|err| panic!("bring-up failed: {err}"));
+            // Task-1 P4 traffic, identical counts (lane-exclusive, fresh sensor).
+            let sk = alg_fixture::skcipher_roundtrip("cbc(aes)", 20).expect("skcipher traffic");
+            assert_eq!((sk.enc, sk.dec), (20, 20));
+            let single = alg_fixture::hash_digest("sha512", 8).expect("hash traffic");
+            assert_eq!((single.digests, single.digest_len), (8, 64));
+            let multi = prepared
+                .finish(4)
+                .expect("cloned finup traffic and digest goldens");
+            assert_eq!((multi.digests, multi.digest_len), (4, 64));
+            let aead = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
+            assert_eq!((aead.enc, aead.dec), (10, 10));
+            alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
 
-    // Snapshot, then drive the FULL lifecycle through `driver.run`
-    // (registry + register_kcrypto + live-shape runtime caps). The owned
-    // blobs outlive the run; events borrow them (D6).
-    let snap: SnapshotRows = snapshot_rows(&sensor).expect("snapshot_rows");
-    let (who, who_drops) =
-        kryprobe_privilege::kcrypto_backend::snapshot_who(&sensor).expect("finup caller evidence");
+            // Snapshot, then gate BEFORE driving the FULL lifecycle
+            // through `driver.run` (registry + register_kcrypto +
+            // live-shape runtime caps). The owned blobs outlive the run;
+            // events borrow them (D6).
+            let snap: SnapshotRows = snapshot_rows(&sensor).expect("snapshot_rows");
+            let (who, who_drops) = kryprobe_privilege::kcrypto_backend::snapshot_who(&sensor)
+                .expect("finup caller evidence");
+            match gate_capture(&snap) {
+                CaptureVerdict::Clean => break (snap, who, who_drops, sensor),
+                CaptureVerdict::Short(detail) => {
+                    panic!("capture shortfall (sensor miss, not contamination): {detail}")
+                }
+                CaptureVerdict::Excess(detail) if attempt < 3 => {
+                    println!(
+                        "RETRY: capture attempt {attempt} contaminated ({detail}); re-capturing on a fresh sensor"
+                    );
+                }
+                CaptureVerdict::Excess(detail) => {
+                    panic!("capture contaminated 3/3 attempts (shared-VM stray traffic): {detail}")
+                }
+            }
+        }
+    };
     assert_eq!(who_drops, 0, "caller evidence must be measured clean");
     assert!(!snap.rows.is_empty(), "snapshot must carry agg rows");
     let mut events: Vec<RawEvent<'_>> = snap.rows.iter().map(raw_event_for_agg).collect();
