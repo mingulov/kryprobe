@@ -29,6 +29,12 @@
 //!   driver has no clock and emits no coverage — coverage there is
 //!   input session state). Interval walls normalize away; status +
 //!   counters compare exact.
+//! - Duplicate-key streams are excluded by scripting: aggregate-live
+//!   upserts latest-per-key (`live.rs:1609` — repeats collapse) while
+//!   batch appends every decode, so equality on duplicate-key streams
+//!   is untestable by design. Fixtures script distinct keys only
+//!   (`agg_tick`: two distinct-key agg rows). Follow-up: none —
+//!   structural.
 
 use kryprobe_cli::live::{
     LifecycleSessionSensor, LiveConfig, SessionSensor, drive_lifecycle_session, drive_session,
@@ -313,7 +319,8 @@ fn counter(name: &str, value: u64) -> DimensionCounter {
 /// finalize. Decode mirrors `KCryptoBackend::decode` structurally
 /// (strict parse → fail-closed refuse → stamp from row payload →
 /// issue id) minus the production observation constructors (which are
-/// `pub(crate)` — widening them is outside this task's allowance).
+/// `pub(crate)` — widening them was permitted but unnecessary, so the
+/// harness uses fakes instead).
 /// Fixed verdict-neutral labels; content sensitivity rides the
 /// backend-payload echo plus the row-stamped clocks — identical bytes
 /// decode identically on both drivers, any byte divergence flips the
