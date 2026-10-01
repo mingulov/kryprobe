@@ -37,6 +37,7 @@ use kryprobe_core::evidence::{
 use kryprobe_core::ids::{IdIssuer, ObservationId, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_privilege::btf_resolve::{KCRYPTO_SYMBOLS, load_kcrypto_configured};
+use kryprobe_privilege::capture_gate::{CaptureVerdict, GateCell, check_cells};
 use kryprobe_privilege::kcrypto_backend::{KCRYPTO_CAPABILITIES, KCryptoBackend, register_kcrypto};
 use kryprobe_privilege::kcrypto_snapshot::{
     IdentBytes, ParsedRow, RowBytes, SnapshotRows, TotalsBytes, parse_snapshot_row,
@@ -1067,20 +1068,6 @@ fn sum_obs(
     out
 }
 
-/// Capture-gate verdict (shared-VM stray-traffic retry, E2E only).
-#[derive(Debug, PartialEq, Eq)]
-enum CaptureVerdict {
-    /// Every asserted cell matches: proceed to `driver.run`.
-    Clean,
-    /// A cell EXCEEDS the fixture truth (calls above max, or shape skew
-    /// at/above expected calls): another process's kcrypto traffic landed
-    /// in the kernel-wide rows during the capture window — re-capture.
-    Excess(String),
-    /// A cell is BELOW the fixture truth: a sensor miss, never
-    /// contamination — fail immediately, no retry.
-    Short(String),
-}
-
 fn alg_name_matches(words: &[u64; 16], expected: &str) -> bool {
     let bytes = words_to_bytes(words);
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
@@ -1122,25 +1109,9 @@ fn sum_rows(
 /// Bounds mirror the observation assertions exactly (skcipher 18..=20
 /// per G9, everything else exact); the gate never accepts a capture
 /// the assertions would reject.
-///
-/// One gated cell: (label, fam, op, res, alg, min_calls, max_calls,
-/// bytes_per_call or None, exact (ok, errors, queued) or None when the
-/// test only gates calls).
-type GateCell = (
-    &'static str,
-    u8,
-    u8,
-    u8,
-    &'static str,
-    u64,
-    u64,
-    Option<u64>,
-    Option<(u64, u64, u64)>,
-);
-
 fn gate_capture(snap: &SnapshotRows) -> CaptureVerdict {
     const CELLS: &[GateCell] = &[
-        (
+        GateCell::bounded(
             "skcipher/enc",
             KFAM_SK,
             KOP_ENC,
@@ -1148,10 +1119,9 @@ fn gate_capture(snap: &SnapshotRows) -> CaptureVerdict {
             "cbc(aes)",
             18,
             20,
-            Some(32),
-            None,
+            32,
         ),
-        (
+        GateCell::bounded(
             "skcipher/dec",
             KFAM_SK,
             KOP_DEC,
@@ -1159,129 +1129,74 @@ fn gate_capture(snap: &SnapshotRows) -> CaptureVerdict {
             "cbc(aes)",
             18,
             20,
-            Some(32),
-            None,
+            32,
         ),
-        (
-            "any/alloc",
-            KFAM_ANY,
-            KOP_ALLOC,
-            KRES_OK,
-            "cbc(aes)",
-            1,
-            1,
-            None,
-            None,
-        ),
-        (
+        GateCell::calls("any/alloc", KFAM_ANY, KOP_ALLOC, KRES_OK, "cbc(aes)", 1, 1),
+        GateCell::exact(
             "ahash/digest",
             KFAM_AHASH,
             KOP_DIGEST,
             KRES_OK,
             "sha512",
             8,
+            64,
             8,
-            Some(64),
-            Some((8, 0, 0)),
+            0,
+            0,
         ),
-        (
+        GateCell::exact(
             "shash/digest",
             KFAM_SHASH,
             KOP_DIGEST,
             KRES_OK,
             "sha512",
             8,
+            64,
             8,
-            Some(64),
-            Some((8, 0, 0)),
+            0,
+            0,
         ),
-        (
+        GateCell::exact(
             "shash/finup",
             KFAM_SHASH,
             KOP_FINUP,
             KRES_OK,
             "sha512",
             4,
+            16,
             4,
-            Some(16),
-            Some((4, 0, 0)),
+            0,
+            0,
         ),
-        (
-            "aead/enc",
-            KFAM_AEAD,
-            KOP_ENC,
-            KRES_OK,
-            "gcm(aes)",
-            11,
-            11,
-            Some(32),
-            Some((11, 0, 0)),
+        GateCell::exact(
+            "aead/enc", KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)", 11, 32, 11, 0, 0,
         ),
-        (
+        GateCell::exact(
             "aead/dec-ok",
             KFAM_AEAD,
             KOP_DEC,
             KRES_OK,
             "gcm(aes)",
             10,
+            48,
             10,
-            Some(48),
-            Some((10, 0, 0)),
+            0,
+            0,
         ),
-        (
+        GateCell::exact(
             "aead/dec-err",
             KFAM_AEAD,
             KOP_DEC,
             KRES_ERR,
             "gcm(aes)",
             1,
+            48,
+            0,
             1,
-            Some(48),
-            Some((0, 1, 0)),
+            0,
         ),
     ];
-    for (name, fam, op, res, alg, min_calls, max_calls, byte_shape, class_shape) in CELLS {
-        let got = sum_rows(&snap.rows, *fam, *op, *res, alg);
-        if got.0 < *min_calls {
-            return CaptureVerdict::Short(format!(
-                "{name}: calls {} < min {min_calls} ({got:?})",
-                got.0
-            ));
-        }
-        if got.0 > *max_calls {
-            return CaptureVerdict::Excess(format!(
-                "{name}: calls {} > max {max_calls} ({got:?})",
-                got.0
-            ));
-        }
-        // In-range calls with skewed shape: contamination-shaped (stray
-        // bytes merge into our rows). A systematic product skew fails
-        // closed after the bounded attempts with this tuple attached.
-        if let Some(per_call) = byte_shape
-            && got.1 != got.0 * per_call
-        {
-            return CaptureVerdict::Excess(format!(
-                "{name}: bytes {} != {per_call}×calls {} ({got:?})",
-                got.1, got.0
-            ));
-        }
-        if let Some((ok, errors, queued)) = class_shape
-            && (got.2, got.3, got.4) != (*ok, *errors, *queued)
-        {
-            return CaptureVerdict::Excess(format!(
-                "{name}: class ({}, {}, {}) != ({ok}, {errors}, {queued}) ({got:?})",
-                got.2, got.3, got.4
-            ));
-        }
-        // skcipher cells carry no static class tuple (ok == the in-range
-        // call count); check the G9 shape explicitly. any/alloc gates
-        // calls only — the test asserts `.0 == 1` and leaves alloc
-        // byte/class shape intentionally unconstrained.
-        if name.starts_with("skcipher/") && (got.2, got.3, got.4) != (got.0, 0, 0) {
-            return CaptureVerdict::Excess(format!("{name}: class shape skew ({got:?})"));
-        }
-    }
-    CaptureVerdict::Clean
+    check_cells(CELLS, |c| sum_rows(&snap.rows, c.fam, c.op, c.res, c.alg))
 }
 
 /// Hand-built fixture-truth capture: one row per gated cell at the

@@ -13,6 +13,7 @@ pub mod bpfloader;
 pub mod bpfselftest;
 mod btf;
 pub mod btf_resolve;
+pub mod capture_gate;
 pub mod decoy;
 pub mod drain;
 pub mod elevate;
