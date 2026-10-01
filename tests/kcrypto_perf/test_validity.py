@@ -164,7 +164,8 @@ class FloorValidityTests(unittest.TestCase):
                  "algorithm": "cryptd(__cbc-aes-aesni)"}],
             "totals": {"calls": 4 * arm_calls + 2, "errors": 0,
                        "ok": 4 * arm_calls + 2, "queued": 0},
-            "loss": zero_loss(), "verdict": {"status": "partial"},
+            "loss": zero_loss(destroy_skip=3),
+            "verdict": {"status": "partial"},
             "who": []}
 
     def test_nested_arms_valid(self):
@@ -182,17 +183,29 @@ class FloorValidityTests(unittest.TestCase):
             kernel="6.12.111", cls="P-4K", capture_rc=3)
         self.assertFalse(got["valid"])
 
-    def test_floor_destroy_skip_unpinned_per_manifest(self):
-        # The frozen manifest's floor equivalence names no
-        # destroy pin (cells.json equivalence.floor_afalg);
-        # the observed floor counter (3) is recorded, never
-        # judged. P9R1O-N2 harness-defect repair.
+    def test_floor_destroy_skip_pinned_3_r1(self):
+        # R1 manifest v3 pins floor destroy_skip == 3 in
+        # advance (P9 sealed 10/10 + rejudge-verified; the
+        # nested floor route destroys 3 transforms per
+        # socket-close). P9 left it unjudged (P9R1O-N2).
         report = self._floor_report(100)
         report["loss"] = zero_loss(destroy_skip=3)
         got = VALIDITY.check_leg_agg(
             report, driver_summary(100),
             kernel="6.12.111", cls="P-4K", capture_rc=3)
         self.assertTrue(got["valid"], got["reasons"])
+
+    def test_floor_destroy_skip_mismatch_invalid_r1(self):
+        report = self._floor_report(100)
+        report["loss"] = zero_loss(destroy_skip=1)
+        got = VALIDITY.check_leg_agg(
+            report, driver_summary(100),
+            kernel="6.12.111", cls="P-4K", capture_rc=3)
+        self.assertFalse(got["valid"])
+        self.assertTrue(
+            any("predrop_destroy_skip" in r
+                for r in got["reasons"]),
+            got["reasons"])
 
 
 class AsyncValidityTests(unittest.TestCase):
@@ -266,6 +279,28 @@ class DetailsValidityTests(unittest.TestCase):
             self._lc(10, unfinished=10, terminals={"unknown": 10}),
             expected_calls=10, cls="P-ASYNC")
         self.assertEqual(got["outcome"], "envelope")
+        self.assertFalse(got["valid"])
+
+    def test_tombstone_only_loss_valid_r1(self):
+        # R1 pre-pinned rule: bounded tombstone-FIFO churn is
+        # maintenance, not lost observations — tolerated (and
+        # recorded), never silent.
+        got = VALIDITY.check_leg_details(
+            self._lc(216,
+                     loss={"adapter.tombstone_evictions": 75900}),
+            expected_calls=216, cls="P-1M")
+        self.assertEqual(got["outcome"], "valid", got["reasons"])
+        self.assertTrue(got["valid"])
+        self.assertEqual(
+            got["tolerated"],
+            {"adapter.tombstone_evictions": 75900})
+
+    def test_tombstone_plus_hard_loss_invalid(self):
+        got = VALIDITY.check_leg_details(
+            self._lc(216, loss={"adapter.tombstone_evictions": 5,
+                                "kernel.disabled": 1}),
+            expected_calls=216, cls="P-1M")
+        self.assertEqual(got["outcome"], "invalid")
         self.assertFalse(got["valid"])
 
 

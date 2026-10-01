@@ -115,3 +115,35 @@ stack-attribution observables reported from the aggregation
 cells plus one separately-named many-submitter diagnostic probe.
 Attached-idle is an observer-footprint leg (session live,
 workload idle), not a workload pair.
+
+## R1 frozen performance budgets (DRAFT — freezes before the first R1 sampling boot)
+
+R1 re-tests the OPTIMIZED observer against the UNCHANGED P9
+budgets: B1 (median throughput ratio ≥ 0.95) and B2 (median
+workload-p99 ratio ≤ 1.10), same verdict rule (median plus ≥80%
+of pairs inside), same QUALIFIED pair-set conditions. No budget
+is moved; the observer changed, the bar did not.
+
+Pre-pinned R1 rule changes (all frozen in advance, never
+post-hoc):
+
+- Detail validity is tombstone-tolerant: a detail leg is valid
+  iff it does not truncate, obs == expected, emitted ==
+  admitted, unfinished == 0 (sync), driver rc 0 with no
+  timeout, pace gate held (paced legs), and the receipt loss
+  dict carries ONLY `adapter.tombstone_evictions` (counts
+  reported per leg via `tolerated`, unbounded). Any other loss
+  key invalidates. (P9 invited this rule in advance;
+  `scripts/kcrypto_perf/validity.py`
+  `TOLERATED_DETAIL_LOSS` implements it.)
+- Floor `predrop_destroy_skip == 3` is pinned in the manifest
+  (P9 sealed 10/10 + floor-rejudge verified;
+  `FLOOR_DESTROY_PIN`). Floor sets stay ENVELOPE (non-budget).
+- Bulk reference legs extend to 726/612 agg sets
+  (`hosts_bulk`), and the repaired `roundtrip_bulk` fixture
+  (no clock reads) finally quantifies timestamping cost,
+  unquantified in P9 (P9R1A-N8).
+
+The R1 judge tree (`scripts/` at the freeze commit) is frozen
+with the manifest (SHA recorded in the freeze receipt); T14
+reproduction keeps its own PINNED judge and is unaffected.
