@@ -17,7 +17,7 @@ pub use session_v1::{SessionFinding, validate_lifecycle_session};
 
 use self::kinds::KIND_TABLE;
 use crate::EVENT_SCHEMA_V0;
-use crate::checker::{StreamChecker, StreamFinding};
+use crate::checker::{DEFAULT_MAX_FINDINGS, StreamChecker, StreamFinding};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -46,6 +46,16 @@ pub enum ValidationFinding {
         /// I/O detail.
         detail: String,
     },
+    /// Retention cap reached on the schema-mismatch buffer: this many
+    /// further mismatches were counted but not retained. At most one,
+    /// no line number; the count saturates at `u64::MAX` (a lower bound
+    /// past that). Stream-buffer truncation surfaces separately as
+    /// [`Stream`](Self::Stream)([`StreamFinding::Truncated`]); drift and
+    /// unreadable signals always survive the cap.
+    Truncated {
+        /// Mismatches dropped after the cap (saturating).
+        dropped: u64,
+    },
 }
 
 impl std::fmt::Display for ValidationFinding {
@@ -62,6 +72,9 @@ impl std::fmt::Display for ValidationFinding {
                 write!(f, "schema drift: disk {actual} != frozen {expected}")
             }
             Self::Unreadable { detail } => write!(f, "unreadable stream: {detail}"),
+            Self::Truncated { dropped } => {
+                write!(f, "+{dropped} further finding(s) truncated")
+            }
         }
     }
 }
@@ -149,12 +162,21 @@ fn default_schema_path() -> std::path::PathBuf {
 /// (installed binary) validates against the embedded copy; a
 /// present-but-unreadable file fails closed with `SchemaDrift{unreadable}`.
 pub fn validate_file(path: &Path) -> Vec<ValidationFinding> {
-    validate_file_with_schema(path, &default_schema_path())
+    validate_file_with_max_findings(path, DEFAULT_MAX_FINDINGS)
+}
+
+/// [`validate_file`] with an explicit retained-findings cap.
+pub fn validate_file_with_max_findings(path: &Path, max_findings: usize) -> Vec<ValidationFinding> {
+    validate_file_with_schema(path, &default_schema_path(), max_findings)
 }
 
 /// [`validate_file`] with an explicit on-disk schema location (test seam:
 /// installed binaries have no on-disk copy, so tests pass a missing path).
-fn validate_file_with_schema(path: &Path, schema_path: &Path) -> Vec<ValidationFinding> {
+fn validate_file_with_schema(
+    path: &Path,
+    schema_path: &Path,
+    max_findings: usize,
+) -> Vec<ValidationFinding> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -164,10 +186,14 @@ fn validate_file_with_schema(path: &Path, schema_path: &Path) -> Vec<ValidationF
         }
     };
     match resolve_schema_at(schema_path).bytes() {
-        Some(bytes) => validate_reader(BufReader::new(file), bytes),
+        Some(bytes) => validate_reader_with_max_findings(BufReader::new(file), bytes, max_findings),
         None => {
             // Fail-closed: a present-but-unreadable file cannot prove no drift.
-            let mut findings = validate_reader(BufReader::new(file), EMBEDDED_SCHEMA.as_bytes());
+            let mut findings = validate_reader_with_max_findings(
+                BufReader::new(file),
+                EMBEDDED_SCHEMA.as_bytes(),
+                max_findings,
+            );
             if !findings
                 .iter()
                 .any(|finding| matches!(finding, ValidationFinding::Unreadable { .. }))
@@ -184,25 +210,30 @@ fn validate_file_with_schema(path: &Path, schema_path: &Path) -> Vec<ValidationF
 
 /// Single-pass validation state shared by [`validate_str`] and
 /// [`validate_reader`]: structural findings keep line order, schema
-/// mismatches follow, drift closes. Memory is O(1) in the record count
-/// plus one entry per finding (clean streams stay flat).
+/// mismatches follow, drift closes. Each finding buffer is capped
+/// independently (first-N plus one marker); drift and unreadable always
+/// survive. Memory is O(cap) in the worst case; clean streams stay flat.
 struct LineValidator<'kinds> {
     checker: StreamChecker<'kinds>,
     mismatches: Vec<ValidationFinding>,
+    mismatch_dropped: u64,
+    max_findings: usize,
 }
 
 impl Default for LineValidator<'_> {
     fn default() -> Self {
-        Self {
-            checker: StreamChecker::new(KIND_TABLE),
-            mismatches: Vec::new(),
-        }
+        Self::with_max_findings(DEFAULT_MAX_FINDINGS)
     }
 }
 
 impl LineValidator<'_> {
-    fn new() -> Self {
-        Self::default()
+    fn with_max_findings(max_findings: usize) -> Self {
+        Self {
+            checker: StreamChecker::with_max_findings(KIND_TABLE, max_findings),
+            mismatches: Vec::new(),
+            mismatch_dropped: 0,
+            max_findings,
+        }
     }
 
     fn push_line(&mut self, line_no: usize, line: &str) {
@@ -214,6 +245,11 @@ impl LineValidator<'_> {
             && let Some(found) = record.get("schema").and_then(Value::as_str)
             && found != EVENT_SCHEMA_V0
         {
+            // Cap-before-alloc: count without building the finding past cap.
+            if self.mismatches.len() >= self.max_findings {
+                self.mismatch_dropped = self.mismatch_dropped.saturating_add(1);
+                return;
+            }
             self.mismatches.push(ValidationFinding::SchemaMismatch {
                 line: line_no,
                 found: found.to_owned(),
@@ -229,6 +265,11 @@ impl LineValidator<'_> {
             .map(ValidationFinding::Stream)
             .collect();
         findings.extend(self.mismatches);
+        if self.mismatch_dropped > 0 {
+            findings.push(ValidationFinding::Truncated {
+                dropped: self.mismatch_dropped,
+            });
+        }
         if fnv1a64(schema_disk_bytes) != fnv1a64(EMBEDDED_SCHEMA.as_bytes()) {
             findings.push(ValidationFinding::SchemaDrift {
                 expected: schema_fnv1a_hex(),
@@ -242,7 +283,16 @@ impl LineValidator<'_> {
 /// Validates stream `text` against caller-supplied on-disk schema bytes.
 /// Pure core of [`validate_file`]; tamper tests drive this directly.
 pub fn validate_str(text: &str, schema_disk_bytes: &[u8]) -> Vec<ValidationFinding> {
-    let mut validator = LineValidator::new();
+    validate_str_with_max_findings(text, schema_disk_bytes, DEFAULT_MAX_FINDINGS)
+}
+
+/// [`validate_str`] with an explicit retained-findings cap.
+pub fn validate_str_with_max_findings(
+    text: &str,
+    schema_disk_bytes: &[u8],
+    max_findings: usize,
+) -> Vec<ValidationFinding> {
+    let mut validator = LineValidator::with_max_findings(max_findings);
     for (index, line) in text.lines().enumerate() {
         validator.push_line(index + 1, line);
     }
@@ -257,7 +307,15 @@ pub fn validate_str(text: &str, schema_disk_bytes: &[u8]) -> Vec<ValidationFindi
 /// whenever the pass completes. Callers gate on findings first: a `Some`
 /// summary with non-empty findings must be discarded, as before.
 pub fn validate_and_render_file(path: &Path) -> (Vec<ValidationFinding>, Option<String>) {
-    validate_and_render_file_with_schema(path, &default_schema_path())
+    validate_and_render_file_with_max_findings(path, DEFAULT_MAX_FINDINGS)
+}
+
+/// [`validate_and_render_file`] with an explicit retained-findings cap.
+pub fn validate_and_render_file_with_max_findings(
+    path: &Path,
+    max_findings: usize,
+) -> (Vec<ValidationFinding>, Option<String>) {
+    validate_and_render_file_with_schema(path, &default_schema_path(), max_findings)
 }
 
 /// [`validate_and_render_file`] with an explicit on-disk schema location
@@ -265,6 +323,7 @@ pub fn validate_and_render_file(path: &Path) -> (Vec<ValidationFinding>, Option<
 fn validate_and_render_file_with_schema(
     path: &Path,
     schema_path: &Path,
+    max_findings: usize,
 ) -> (Vec<ValidationFinding>, Option<String>) {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -278,11 +337,16 @@ fn validate_and_render_file_with_schema(
         }
     };
     match resolve_schema_at(schema_path).bytes() {
-        Some(bytes) => validate_and_render_reader(BufReader::new(file), bytes),
+        Some(bytes) => {
+            validate_and_render_reader_with_max_findings(BufReader::new(file), bytes, max_findings)
+        }
         None => {
             // Fail-closed: a present-but-unreadable file cannot prove no drift.
-            let (mut findings, summary) =
-                validate_and_render_reader(BufReader::new(file), EMBEDDED_SCHEMA.as_bytes());
+            let (mut findings, summary) = validate_and_render_reader_with_max_findings(
+                BufReader::new(file),
+                EMBEDDED_SCHEMA.as_bytes(),
+                max_findings,
+            );
             if !findings
                 .iter()
                 .any(|finding| matches!(finding, ValidationFinding::Unreadable { .. }))
@@ -346,11 +410,17 @@ pub(crate) fn next_line_capped(reader: &mut impl BufRead) -> CappedLine {
 /// Streaming [`validate_str`]: same findings, O(1) records in memory.
 /// Stops fail-closed with [`ValidationFinding::Unreadable`] on any I/O
 /// error (including invalid UTF-8) or overlong line.
-pub fn validate_reader(
+pub fn validate_reader(reader: impl BufRead, schema_disk_bytes: &[u8]) -> Vec<ValidationFinding> {
+    validate_reader_with_max_findings(reader, schema_disk_bytes, DEFAULT_MAX_FINDINGS)
+}
+
+/// [`validate_reader`] with an explicit retained-findings cap.
+pub fn validate_reader_with_max_findings(
     mut reader: impl BufRead,
     schema_disk_bytes: &[u8],
+    max_findings: usize,
 ) -> Vec<ValidationFinding> {
-    let mut validator = LineValidator::new();
+    let mut validator = LineValidator::with_max_findings(max_findings);
     let mut index = 0usize;
     loop {
         match next_line_capped(&mut reader) {
@@ -374,10 +444,19 @@ pub fn validate_reader(
 /// Stops fail-closed with [`ValidationFinding::Unreadable`] and no
 /// summary on any I/O error (including invalid UTF-8).
 pub fn validate_and_render_reader(
-    mut reader: impl BufRead,
+    reader: impl BufRead,
     schema_disk_bytes: &[u8],
 ) -> (Vec<ValidationFinding>, Option<String>) {
-    let mut validator = LineValidator::new();
+    validate_and_render_reader_with_max_findings(reader, schema_disk_bytes, DEFAULT_MAX_FINDINGS)
+}
+
+/// [`validate_and_render_reader`] with an explicit retained-findings cap.
+pub fn validate_and_render_reader_with_max_findings(
+    mut reader: impl BufRead,
+    schema_disk_bytes: &[u8],
+    max_findings: usize,
+) -> (Vec<ValidationFinding>, Option<String>) {
+    let mut validator = LineValidator::with_max_findings(max_findings);
     let mut summary = crate::render::Summary::default();
     let mut index = 0usize;
     loop {
@@ -419,7 +498,7 @@ mod tests {
             "missing fixture at {}",
             fixture.display()
         );
-        let findings = validate_file_with_schema(&fixture, &missing);
+        let findings = validate_file_with_schema(&fixture, &missing, DEFAULT_MAX_FINDINGS);
         assert!(findings.is_empty(), "installed-mode findings: {findings:?}");
     }
 
@@ -429,7 +508,7 @@ mod tests {
         let scratch = kryprobe_testkit::TempDir::named("drift").expect("temp dir");
         let decoy = scratch.path().join("event-v0.schema.json");
         std::fs::write(&decoy, b"{\"edited\": true}").expect("decoy schema");
-        let findings = validate_file_with_schema(&fixture_path(), &decoy);
+        let findings = validate_file_with_schema(&fixture_path(), &decoy, DEFAULT_MAX_FINDINGS);
         assert!(
             findings
                 .iter()
@@ -463,7 +542,8 @@ mod tests {
     fn unreadable_schema_path_fails_closed() {
         // A schema path that exists but cannot be read as a file (here a
         // directory) still fails closed with `unreadable` drift.
-        let findings = validate_file_with_schema(&fixture_path(), &std::env::temp_dir());
+        let findings =
+            validate_file_with_schema(&fixture_path(), &std::env::temp_dir(), DEFAULT_MAX_FINDINGS);
         assert!(
             findings.iter().any(|f| matches!(
                 f,

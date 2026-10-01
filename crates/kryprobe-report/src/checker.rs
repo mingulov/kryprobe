@@ -12,6 +12,10 @@ use std::fmt;
 
 use serde_json::Value;
 
+/// Default retained-findings cap: first-N plus one marker (audit X2).
+/// Well-formed-heavy streams never approach it; floods stay bounded.
+pub const DEFAULT_MAX_FINDINGS: usize = 10_000;
+
 /// One structural defect found by [`check_stream`]; `line` is 1-based.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamFinding {
@@ -42,6 +46,13 @@ pub enum StreamFinding {
         /// Current (smaller) `monotonic_ns` digit string.
         current: String,
     },
+    /// Retention cap reached: this many further findings were counted
+    /// but not retained. Always last, at most one, no line number.
+    /// The count saturates at `u64::MAX` (a lower bound past that).
+    Truncated {
+        /// Findings dropped after the cap (saturating).
+        dropped: u64,
+    },
 }
 
 impl fmt::Display for StreamFinding {
@@ -61,6 +72,9 @@ impl fmt::Display for StreamFinding {
                 f,
                 "line {line}: clock went backwards: {current} < {previous}"
             ),
+            StreamFinding::Truncated { dropped } => {
+                write!(f, "+{dropped} further finding(s) truncated")
+            }
         }
     }
 }
@@ -83,9 +97,19 @@ const STRING_KEYS: &[&str] = &["schema", "kind", "session_id", "record_id", "mon
 /// Findings are in line order: envelope keys, string types, `monotonic_ns`
 /// digit-string shape (`^(0|[1-9][0-9]*)$`), `session_id`/`record_id`
 /// prefixed-ID shape, per-kind required payload keys from `kinds`, and
-/// non-decreasing `monotonic_ns`. Blank lines are skipped.
+/// non-decreasing `monotonic_ns`. Blank lines are skipped. Retention is
+/// capped at [`DEFAULT_MAX_FINDINGS`] (see [`StreamChecker`).
 pub fn check_stream(text: &str, kinds: &[(&str, &[&str])]) -> Vec<StreamFinding> {
-    let mut checker = StreamChecker::new(kinds);
+    check_stream_with_max_findings(text, kinds, DEFAULT_MAX_FINDINGS)
+}
+
+/// [`check_stream`] with an explicit retained-findings cap.
+pub fn check_stream_with_max_findings(
+    text: &str,
+    kinds: &[(&str, &[&str])],
+    max_findings: usize,
+) -> Vec<StreamFinding> {
+    let mut checker = StreamChecker::with_max_findings(kinds, max_findings);
     for (index, line) in text.lines().enumerate() {
         checker.push_line(index + 1, line);
     }
@@ -93,25 +117,40 @@ pub fn check_stream(text: &str, kinds: &[(&str, &[&str])]) -> Vec<StreamFinding>
 }
 
 /// Incremental [`check_stream`]: one `push_line` per physical line, then
-/// [`finish`](Self::finish). Holds only the previous clock plus findings:
-/// each finding is size-capped ([`shorten`]), but the COUNT is not — a
-/// million-malformed-line import grows the vec (audit X2, P1: cap with a
-/// truncation signal). Well-formed-heavy streams stay small.
+/// [`finish`](Self::finish). Holds only the previous clock plus findings.
+///
+/// Retention contract (audit X2-A): at most `max_findings` findings are
+/// kept, in line order, plus exactly one [`StreamFinding::Truncated`]
+/// marker iff anything was dropped (max N+1 entries; `len()` counts the
+/// marker too). Dropped findings are still *counted*, and validation
+/// (clock state) continues past the cap — only retention stops. Each
+/// kept finding is size-capped ([`shorten`]).
 #[derive(Debug)]
 pub struct StreamChecker<'a> {
     kinds: &'a [(&'a str, &'a [&'a str])],
     previous: Option<String>,
-    findings: Vec<StreamFinding>,
+    sink: Sink,
 }
 
 impl<'a> StreamChecker<'a> {
-    /// New checker over the per-kind required-payload-key table.
+    /// New checker over the per-kind required-payload-key table, keeping
+    /// at most [`DEFAULT_MAX_FINDINGS`] findings.
     #[must_use]
     pub fn new(kinds: &'a [(&'a str, &'a [&'a str])]) -> Self {
+        Self::with_max_findings(kinds, DEFAULT_MAX_FINDINGS)
+    }
+
+    /// New checker with an explicit retained-findings cap.
+    #[must_use]
+    pub fn with_max_findings(kinds: &'a [(&'a str, &'a [&'a str])], max_findings: usize) -> Self {
         Self {
             kinds,
             previous: None,
-            findings: Vec::new(),
+            sink: Sink {
+                kept: Vec::new(),
+                dropped: 0,
+                max: max_findings,
+            },
         }
     }
 
@@ -126,14 +165,43 @@ impl<'a> StreamChecker<'a> {
             line_no,
             self.kinds,
             &mut self.previous,
-            &mut self.findings,
+            &mut self.sink,
         );
     }
 
-    /// Collected findings, in line order.
+    /// Collected findings, in line order, with the truncation marker last
+    /// when the cap dropped anything.
     #[must_use]
     pub fn finish(self) -> Vec<StreamFinding> {
-        self.findings
+        self.sink.finish()
+    }
+}
+
+/// Capped finding retention: keeps the first `max` findings, counts the
+/// rest without building them (cap-before-alloc via lazy construction).
+#[derive(Debug)]
+struct Sink {
+    kept: Vec<StreamFinding>,
+    dropped: u64,
+    max: usize,
+}
+
+impl Sink {
+    fn push(&mut self, make: impl FnOnce() -> StreamFinding) {
+        if self.kept.len() < self.max {
+            self.kept.push(make());
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    fn finish(mut self) -> Vec<StreamFinding> {
+        if self.dropped > 0 {
+            self.kept.push(StreamFinding::Truncated {
+                dropped: self.dropped,
+            });
+        }
+        self.kept
     }
 }
 
@@ -142,50 +210,46 @@ fn check_record(
     line_no: usize,
     kinds: &[(&str, &[&str])],
     previous: &mut Option<String>,
-    findings: &mut Vec<StreamFinding>,
+    sink: &mut Sink,
 ) {
     let record: Value = match serde_json::from_str(line) {
         Ok(record) => record,
         Err(_) => {
-            findings.push(bad_shape(line_no, "record", line));
+            sink.push(|| bad_shape(line_no, "record", line));
             return;
         }
     };
     let object = match record.as_object() {
         Some(object) => object,
         None => {
-            findings.push(bad_shape(line_no, "record", line));
+            sink.push(|| bad_shape(line_no, "record", line));
             return;
         }
     };
     for key in ENVELOPE_KEYS {
         if !object.contains_key(*key) {
-            findings.push(StreamFinding::MissingKey {
+            sink.push(|| StreamFinding::MissingKey {
                 line: line_no,
                 key: (*key).to_string(),
             });
         }
     }
-    check_string_shapes(object, line_no, findings);
-    check_payload_keys(object, line_no, kinds, findings);
-    check_clock(object, line_no, previous, findings);
+    check_string_shapes(object, line_no, sink);
+    check_payload_keys(object, line_no, kinds, sink);
+    check_clock(object, line_no, previous, sink);
 }
 
-fn check_string_shapes(
-    object: &serde_json::Map<String, Value>,
-    line_no: usize,
-    findings: &mut Vec<StreamFinding>,
-) {
+fn check_string_shapes(object: &serde_json::Map<String, Value>, line_no: usize, sink: &mut Sink) {
     for key in STRING_KEYS {
         let Some(value) = object.get(*key) else {
             continue;
         };
         let Some(text) = value.as_str() else {
-            findings.push(bad_shape(line_no, key, &render(value)));
+            sink.push(|| bad_shape(line_no, key, &render(value)));
             continue;
         };
         if !shape_ok(key, text) {
-            findings.push(bad_shape(line_no, key, text));
+            sink.push(|| bad_shape(line_no, key, text));
         }
     }
 }
@@ -202,13 +266,13 @@ fn check_payload_keys(
     object: &serde_json::Map<String, Value>,
     line_no: usize,
     kinds: &[(&str, &[&str])],
-    findings: &mut Vec<StreamFinding>,
+    sink: &mut Sink,
 ) {
     let Some(payload) = object.get("payload") else {
         return;
     };
     let Some(payload) = payload.as_object() else {
-        findings.push(bad_shape(line_no, "payload", &render(payload)));
+        sink.push(|| bad_shape(line_no, "payload", &render(payload)));
         return;
     };
     let kind = object
@@ -220,7 +284,7 @@ fn check_payload_keys(
     };
     for key in required.1 {
         if !payload.contains_key(*key) {
-            findings.push(StreamFinding::MissingKey {
+            sink.push(|| StreamFinding::MissingKey {
                 line: line_no,
                 key: format!("payload.{key}"),
             });
@@ -232,7 +296,7 @@ fn check_clock(
     object: &serde_json::Map<String, Value>,
     line_no: usize,
     previous: &mut Option<String>,
-    findings: &mut Vec<StreamFinding>,
+    sink: &mut Sink,
 ) {
     let Some(current) = object
         .get("monotonic_ns")
@@ -246,7 +310,7 @@ fn check_clock(
     if let Some(prev) = previous
         && digit_less_than(current, prev)
     {
-        findings.push(StreamFinding::ClockWentBackwards {
+        sink.push(|| StreamFinding::ClockWentBackwards {
             line: line_no,
             previous: prev.clone(),
             current: current.to_string(),

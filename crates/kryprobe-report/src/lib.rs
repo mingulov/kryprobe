@@ -17,7 +17,10 @@ pub mod snapshot;
 pub mod validate;
 pub mod writer;
 
-pub use checker::{StreamChecker, StreamFinding, check_stream};
+pub use checker::{
+    DEFAULT_MAX_FINDINGS, StreamChecker, StreamFinding, check_stream,
+    check_stream_with_max_findings,
+};
 pub use cover::{CoverageGap, GapCtx};
 pub use observe::ObservationExtra;
 pub use render::{render_summary, render_summary_reader, sanitize_cell};
@@ -26,8 +29,11 @@ pub use snapshot::{SnapshotBarrier, SnapshotParams, SnapshotUnit};
 pub use validate::{
     LifecycleFinding, MAX_VALIDATE_LINE_BYTES, ResolvedSchema, SessionFinding, ValidationFinding,
     lifecycle_v1_payload, resolve_schema, resolve_schema_at, schema_fnv1a_hex,
-    validate_and_render_file, validate_and_render_reader, validate_file,
-    validate_lifecycle_session, validate_lifecycle_v1, validate_reader, validate_str,
+    validate_and_render_file, validate_and_render_file_with_max_findings,
+    validate_and_render_reader, validate_and_render_reader_with_max_findings, validate_file,
+    validate_file_with_max_findings, validate_lifecycle_session, validate_lifecycle_v1,
+    validate_reader, validate_reader_with_max_findings, validate_str,
+    validate_str_with_max_findings,
 };
 pub use writer::{JsonlWriter, ReportError, SessionWriteError, SessionWriter, write_str_atomic};
 
