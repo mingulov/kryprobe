@@ -252,6 +252,11 @@ pub fn telemetry_occupancy_line(occ: &AggOccupancy) -> String {
 /// close, so close-state record counts would read zero — the
 /// ledger carries the state evidence instead). Shape twinned with
 /// the Python `parse_telemetry` consumer (v1).
+/// R1 detail occupancy line. Reducer equation: `admitted ==
+/// emitted + live` with `live ≈ 0` at close (`finish` drains
+/// pending truthless stop-the-world); `unfinished ⊆ emitted`
+/// (truthless-drained subset, never double-counted against
+/// `admitted`). `backlog_bytes` is the close backpressure residue.
 pub fn telemetry_detail_occupancy_line(
     admitted: u64,
     emitted: u64,
@@ -286,10 +291,12 @@ pub fn telemetry_stop_line(total_us: u64, session: Option<&SessionStop>, render_
 /// R1 stop telemetry (machine-readable): one line joining the
 /// session spans (`LiveOutcome.stop`) with the render + write span
 /// measured from `t_render`. `total_us` spans session end → output
-/// written; without session spans the total covers render + write
-/// only and the sub-spans read `null` — honest, never silent zero.
-/// Shared by the `watch` and `report` finish paths: every clean
-/// session ends with exactly one stop line.
+/// written; it is a SUPERSET of the sub-spans (residual =
+/// uninstrumented teardown: map/drain close, detach, scheduling).
+/// Without session spans the total covers render + write only and
+/// the sub-spans read `null` — honest, never silent zero. Shared
+/// by the `watch` and `report` finish paths: every clean session
+/// ends with exactly one stop line.
 pub fn emit_stop_line(outcome: &LiveOutcome, t_render: std::time::Instant, stderr: &mut dyn Write) {
     let render_us = {
         let elapsed = t_render.elapsed();
