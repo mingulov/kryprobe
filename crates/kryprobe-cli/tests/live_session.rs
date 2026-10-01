@@ -3384,7 +3384,10 @@ fn report_live_unwritable_out_reaches_live_handler() {
     // kept; no-stdout kept; no-file-before-failure kept (every leg);
     // "no cannot write" kept on live failure; "not selftest" kept.
     // No property dropped: the run()-level leg pins live dispatch +
-    // --out plumbing + failure-before-write + verdict + profile.
+    // failure-before-write + verdict + profile. The argv→handler
+    // --out path is exercised only for the pre-write failure leg
+    // (missing parent dir); successful --out delivery is not pinned
+    // here (one-time S1 guest proof, no regression guard — P2-R3-N3).
     let dir = scratch("report-live-out");
     let good = dir.path().join("report.jsonl");
     let argv: Vec<String> = [
@@ -3583,7 +3586,7 @@ fn report_live_unwritable_out_reaches_live_handler() {
 }
 
 #[test]
-fn stdout_flush_failure_cannot_be_clean() {
+fn stdout_write_failure_cannot_be_clean() {
     // P2r/C5: the reached stdout write-failure seam end to end: the
     // real binary with stdout wired to /dev/full (every write fails
     // ENOSPC) must exit not-clean with the stdout note on stderr.
