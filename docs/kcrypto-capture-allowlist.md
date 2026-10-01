@@ -223,9 +223,9 @@ hit bytes are re-scanned through the same canonicalizer, so
 downstream rows are bit-identical to the slow path. Exactness rests on
 `crypto_alg`-address stability across the session (a crypto-driver
 unload/reload mid-session requires a sensor restart — same
-session-stability class as the pinned `KCFG` offsets); an 8+8-byte
-prefix tripwire against fresh reads converts realistic staleness to
-the correct slow path (defense-in-depth, documented non-exact). The
+session-stability class as the pinned `KCFG` offsets); there are no
+validation reads on the hit path (measured: per-call probe cost
+dominates, a tripwire costs as much as the saved reads). The
 alloc path never touches the cache (requested-name identity).
 
 ## Known-uncountable remainder: fexit guard-skips (fix wave, G-C1)
