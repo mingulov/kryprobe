@@ -123,9 +123,8 @@ const KDROPS_DESTROY: u32 = 5;
 /// `BPF_NOEXIST` (`enum bpf_map_update_elem_flags`, UAPI `linux/bpf.h`).
 const BPF_NOEXIST: u64 = 1;
 /// `BPF_ANY` (`enum bpf_map_update_elem_flags`, UAPI `linux/bpf.h`):
-/// insert-or-update, for the R1 identity cache (a tripwire mismatch
-/// re-resolves + overwrites the stale entry; concurrent winners write
-/// the same deterministic value).
+/// insert-or-update, for the R1 identity cache (misses insert;
+/// concurrent winners write the same deterministic value).
 const BPF_ANY: u64 = 0;
 
 /// `BPF_F_FAST_STACK_CMP` (`enum bpf_stack_build_id_flags`, UAPI
@@ -979,32 +978,6 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
     record_kerr(kh, kerr);
 }
 
-/// R1 prefix tripwire: compare the first 8 bytes of each cached name
-/// against fresh single-word reads (faults fold to 0 via `read_u64`).
-/// Defense-in-depth ONLY — not an exactness mechanism: exactness rests
-/// on the documented `crypto_alg`-address stability assumption (R1: a
-/// crypto-driver unload/reload mid-session requires a sensor restart —
-/// the same session-stability class as the pinned `KCFG` offsets). A
-/// mismatch (or a faulted read) falls back to the slow path, which
-/// re-resolves + re-inserts; both paths converge on identical
-/// downstream bytes. Register scalars + one bounded loop — no new
-/// stack slots (the 512B frame binds).
-#[inline(always)]
-fn ident_prefix_ok(cached: &VIdent, cra_src: u64, drv_src: u64) -> bool {
-    let cra = read_u64(cra_src);
-    let drv = read_u64(drv_src);
-    let cp = cached as *const VIdent as *const u8;
-    let mut diff = 0u8;
-    let mut i = 0u32;
-    while i < 8 {
-        let shift = i * 8;
-        diff |= unsafe { *cp.add(i as usize) } ^ ((cra >> shift) as u8);
-        diff |= unsafe { *cp.add(128 + i as usize) } ^ ((drv >> shift) as u8);
-        i += 1;
-    }
-    diff == 0
-}
-
 /// Record one attributed observation: build the key (volatile-zeroed,
 /// then filled), update `KTOT` always, update-or-insert `KAGG` (overflow
 /// path on map-full), then the first-seen `KIDN` gate + `IDENT` event.
@@ -1045,20 +1018,24 @@ fn observe(
     if cacheable && let Some(found) = KIDENT.get_ptr(alg) {
         // SAFETY: map-owned 256 bytes, live across the call.
         let cached: &VIdent = unsafe { &*found };
-        if ident_prefix_ok(cached, cra_src, drv_src) {
-            let src = cached as *const VIdent as *const u8;
-            // SAFETY: `base.add(4)..base.add(260)` spans the
-            // name lanes (the head is written below).
-            let dst = unsafe { base.add(4) };
-            let mut j = 0u32;
-            while j < 256 {
-                unsafe {
-                    *dst.add(j as usize) = *src.add(j as usize);
-                }
-                j += 1;
+        // R1: NO validation reads on the hit path — measured
+        // (prof2 vs P9 c-driver) that per-call probe cost
+        // dominates, so a tripwire's 2 calls cost as much as
+        // the 2 saved reads. Exactness rests on the
+        // documented alg-stability assumption + the exactness
+        // lanes, which fail on any misattribution.
+        let src = cached as *const VIdent as *const u8;
+        // SAFETY: `base.add(4)..base.add(260)` spans the
+        // name lanes (the head is written below).
+        let dst = unsafe { base.add(4) };
+        let mut j = 0u32;
+        while j < 256 {
+            unsafe {
+                *dst.add(j as usize) = *src.add(j as usize);
             }
-            hit = true;
+            j += 1;
         }
+        hit = true;
     }
     if !hit {
         let mut p = base;
