@@ -1140,6 +1140,12 @@ fn driver_e2e_matches_fixture_truth() {
     if !lane_ready("driver_e2e_matches_fixture_truth") {
         return;
     }
+    if !alg_fixture::aead_alg_available("gcm(aes)") {
+        println!(
+            "SKIP: driver_e2e_matches_fixture_truth requires an AEAD alg (none bind on this kernel)"
+        );
+        return;
+    }
     // The backend's `configure` loads its own sensor from this object
     // (direct-privileged, token None per D5); the env locator is exact.
     let object_path = kcrypto_object_path();

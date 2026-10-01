@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # 4B-H1: the merge gate, automated. `cargo xtask check` (not bare
 # cargo) is the required pre-merge gate — this workflow runs it on
-# every push/PR, plus the unprivileged BPF lane and supply-chain
-# scans. The privileged sudo suites still need a self-hosted runner
-# with BPF caps (4B-H2, tracked gap) — until then they run via
-# `scripts/sudo-lane.sh` with the lane lock, scheduled by hand.
+# every push/PR, plus the unprivileged BPF lane, supply-chain scans,
+# and the privileged sudo lane (4B-H2, closed: stock hosted runners
+# run the reviewed `scripts/sudo-lane.sh` via passwordless sudo —
+# BPF load/attach works there; the azure kernel only needs the
+# `algif_aead` frontend enabled for AEAD traffic).
 name: ci
 
 on:
@@ -66,8 +67,53 @@ jobs:
         run: cargo xtask build --bpf
       - name: pipeline lane
         # Honest-denial asserts hold without caps; privileged asserts
-        # need the self-hosted runner (4B-H2).
+        # run in the sudo-bpf job below.
         run: cargo xtask test bpf
+
+  sudo-bpf:
+    name: privileged sudo lane
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - name: BPF nightly
+        run: rustup toolchain install nightly-2026-09-16 -c rust-src -c rustfmt -c clippy --profile minimal
+      - name: pinned linker
+        run: cargo install bpf-linker --version 0.10.4 --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: build objects
+        run: cargo xtask build --bpf
+      - name: enable AEAD traffic frontend
+        # The azure kernel ships gcm(aes) but blocks the algif_aead
+        # autoload (install /bin/false). Without this line the AEAD
+        # lane bodies cannot bind. Fail fast if the module sticks.
+        run: |
+          sudo modprobe --ignore-install algif_aead
+          grep -q algif_aead /proc/modules
+      - name: privileged lane (reviewed runner)
+        # Invoked unprivileged: the runner builds as the runner user
+        # and elevates internally (sudo -n + private mount namespace).
+        # 33 bodies as root, 1 privilege-refusal proof as non-root,
+        # 4 guest bodies recorded OTHER_LANE (lab/vng lanes own them).
+        run: |
+          scripts/sudo-lane.sh --out "$RUNNER_TEMP/sudo-lane" \
+            --traffic-generator tests/fixtures/kcrypto_gen.py
+      - name: lane summary receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-lane-summary
+          path: ${{ runner.temp }}/sudo-lane/summary.json
+      - name: full lane evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-lane-evidence
+          path: ${{ runner.temp }}/sudo-lane/
 
   supply:
     name: supply chain
