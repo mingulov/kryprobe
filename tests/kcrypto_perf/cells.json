@@ -2,8 +2,8 @@
   "$schema": "kryprobe-perf-campaign/v1",
   "campaign": "kcrypto-t14",
   "manifest_version": 1,
-  "frozen_utc": "2026-09-29T10:55:00Z",
-  "freeze_rule": "frozen before the first T14 sampling boot; any stimulus/mode/equivalence/validity edit invalidates sealed receipts (preflight mapping runs used a throwaway prototype driver and are not samples)",
+  "frozen_utc": "DRAFT-R1-UNFROZEN",
+  "freeze_rule": "R1 DRAFT (v3 content): freezes before the first R1 sampling boot; any stimulus/mode/equivalence/validity edit after the freeze stamp invalidates sealed receipts. P9 v2 stamp was 2026-09-29T10:55:00Z (T14 sealed campaign).",
   "budgets": {
     "B1_throughput_ratio_min": 0.95,
     "B2_p99_ratio_max": 1.1,
@@ -222,7 +222,8 @@
       "kernel": "7.2.6",
       "workload": "flat",
       "budgeted": false,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     },
     {
       "id": "perf-P-64-det-726",
@@ -240,7 +241,8 @@
       "kernel": "7.2.6",
       "workload": "flat",
       "budgeted": true,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     },
     {
       "id": "perf-P-4K-det-726",
@@ -258,7 +260,8 @@
       "kernel": "7.2.6",
       "workload": "flat",
       "budgeted": true,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     },
     {
       "id": "perf-P-1M-det-726",
@@ -276,7 +279,8 @@
       "kernel": "7.2.6",
       "workload": "flat",
       "budgeted": false,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     },
     {
       "id": "perf-P-AEAD-det-726",
@@ -294,7 +298,8 @@
       "kernel": "7.2.6",
       "workload": "flat",
       "budgeted": false,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     },
     {
       "id": "perf-P-ASYNC-det-726",
@@ -312,7 +317,8 @@
       "kernel": "6.12.111",
       "workload": "flat",
       "budgeted": false,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     },
     {
       "id": "perf-P-1M-agg-612",
@@ -321,7 +327,8 @@
       "kernel": "6.12.111",
       "workload": "flat",
       "budgeted": false,
-      "kind": "pairs"
+      "kind": "pairs",
+      "hosts_bulk": true
     }
   ],
   "diagnostics": [
@@ -359,9 +366,9 @@
   ],
   "equivalence": {
     "flat_afalg": "7.x: product enc == dec == driver ops_total, alloc == 1, destroy_skip == 1, errors == 0, queued == 0",
-    "floor_afalg": "6.12: per (op, arm in {cbc-aes-aesni, __cbc-aes-aesni}) calls == ops_total; alloc rows exactly [cbc(aes), cryptd(__cbc-aes-aesni)] each == 1",
+    "floor_afalg": "6.12: per (op, arm in {cbc-aes-aesni, __cbc-aes-aesni}) calls == ops_total; alloc rows exactly [cbc(aes), cryptd(__cbc-aes-aesni)] each == 1; predrop_destroy_skip == 3 (R1 pinned in advance: P9 sealed 10/10 + floor-rejudge verified; nested route destroys 3 transforms per socket-close)",
     "async": "enc calls == queued == GOs, ok == 0 (EINPROGRESS), alloc == GOs, destroy_skip == GOs",
-    "details_clean": "truncated == false, loss == {}, observations == expected calls, emitted == admitted, unfinished == 0 (sync classes)",
+    "details_clean": "truncated == false, loss keys subset of {adapter.tombstone_evictions} (R1 tombstone-tolerant: FIFO maintenance tolerated and recorded, never silent), observations == expected calls, emitted == admitted, unfinished == 0 (sync classes)",
     "details_async": "envelope-only: terminals unknown, unfinished == GOs",
     "details_truncated": "truncated flag or emitted >= cap with emitted < offered: envelope data point, never a valid pair leg"
   },

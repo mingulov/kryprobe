@@ -827,6 +827,7 @@ def judge_observed_leg(cell_dir: Path, leg: dict, kernel: str,
         out["observer"] = observer_metrics(cell_dir, leg, None, parsed)
         out.update(valid=verdict["valid"], reasons=verdict["reasons"],
                    outcome=verdict["outcome"])
+        out["tolerated"] = verdict.get("tolerated", {})
         return out
     out.update(valid=False, reasons=[f"unknown mode {leg['mode']}"],
                outcome="invalid")

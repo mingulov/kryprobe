@@ -71,13 +71,12 @@ def check_leg_agg(parsed: dict, summary: dict, kernel: str, cls: str,
         family = AFALG_FAMILY[cls]
         if kernel == "6.12.111":
             reasons.extend(_check_floor_counts(parsed, ops, family))
-            # P9R1O-N2: the frozen manifest's floor
-            # equivalence names no destroy pin
-            # (equivalence.floor_afalg lists arms + allocs
-            # only; validity.unexpected_loss_zero excludes
-            # predrop_destroy_skip). The floor counter is
-            # recorded, never judged.
-            reasons.extend(_loss_reasons(parsed.get("loss", {}), None))
+            # R1 manifest v3 pins floor destroy_skip == 3 in
+            # advance (P9 sealed 10/10 + rejudge-verified;
+            # P9R1O-N2 left it unjudged because the P9
+            # manifest named no pin — the R1 manifest does).
+            reasons.extend(_loss_reasons(parsed.get("loss", {}),
+                                         FLOOR_DESTROY_PIN))
         else:
             reasons.extend(_check_flat_counts(parsed, ops, family,
                                               expected_alloc))
@@ -156,6 +155,18 @@ def _check_async_counts(parsed: dict, gos: int) -> list:
     return reasons
 
 
+# R1 pre-pinned detail rule (manifest details_clean, frozen before
+# the first R1 sampling boot): these receipt-loss keys are bounded
+# FIFO maintenance, not lost observations — tolerated (recorded in
+# `tolerated`, never silent). Any other loss key still invalidates.
+TOLERATED_DETAIL_LOSS = frozenset({"adapter.tombstone_evictions"})
+
+# R1 manifest v3 floor pin (equivalence.floor_afalg): the nested
+# floor route destroys 3 transforms per socket-close (P9 sealed
+# 10/10 + floor-rejudge verified). Pinned in advance, judged.
+FLOOR_DESTROY_PIN = 3
+
+
 def check_leg_details(parsed: dict, expected_calls: int, cls: str) -> dict:
     """Judge one details-mode observed leg.
 
@@ -167,16 +178,21 @@ def check_leg_details(parsed: dict, expected_calls: int, cls: str) -> dict:
     receipt = parsed.get("receipt", {})
     loss = receipt.get("loss", {}) or {}
     reasons = []
+    tolerated = {k: v for k, v in loss.items()
+                 if k in TOLERATED_DETAIL_LOSS}
+    hard_loss = {k: v for k, v in loss.items()
+                 if k not in TOLERATED_DETAIL_LOSS}
     emitted = receipt.get("emitted")
     at_cap = (isinstance(emitted, int) and emitted >= 100000
               and emitted < expected_calls)
     if receipt.get("truncated") or at_cap:
         return {"valid": False, "outcome": "truncated",
+                "tolerated": tolerated,
                 "reasons": ["detail bound hit: "
                             f"obs={parsed.get('observations')} "
                             f"emitted={emitted} offered={expected_calls}"]}
-    if loss:
-        reasons.append(f"detail loss={loss}")
+    if hard_loss:
+        reasons.append(f"detail loss={hard_loss}")
     if parsed.get("observations") != expected_calls:
         reasons.append(f"detail obs={parsed.get('observations')} "
                        f"want {expected_calls}")
@@ -185,6 +201,7 @@ def check_leg_details(parsed: dict, expected_calls: int, cls: str) -> dict:
                        f"{receipt.get('admitted')}")
     if cls == "P-ASYNC":
         return {"valid": False, "outcome": "envelope",
+                "tolerated": tolerated,
                 "reasons": reasons + [
                     "async terminals unknown: "
                     f"unfinished={receipt.get('unfinished')} "
@@ -192,8 +209,10 @@ def check_leg_details(parsed: dict, expected_calls: int, cls: str) -> dict:
     if receipt.get("unfinished"):
         reasons.append(f"unfinished={receipt.get('unfinished')}")
     if reasons:
-        return {"valid": False, "outcome": "invalid", "reasons": reasons}
-    return {"valid": True, "outcome": "valid", "reasons": []}
+        return {"valid": False, "outcome": "invalid",
+                "tolerated": tolerated, "reasons": reasons}
+    return {"valid": True, "outcome": "valid",
+            "tolerated": tolerated, "reasons": []}
 
 
 def check_quiet(totals: dict) -> dict:
