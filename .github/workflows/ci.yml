@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # 4B-H1: the merge gate, automated. `cargo xtask check` (not bare
 # cargo) is the required pre-merge gate — this workflow runs it on
-# every push/PR, plus the unprivileged BPF lane and supply-chain
-# scans. The privileged sudo suites still need a self-hosted runner
-# with BPF caps (4B-H2, tracked gap) — until then they run via
-# `scripts/sudo-lane.sh` with the lane lock, scheduled by hand.
+# every push/PR, plus the unprivileged BPF lane, supply-chain scans,
+# and the privileged sudo lane (4B-H2, closed: stock hosted runners
+# run the reviewed `scripts/sudo-lane.sh` via passwordless sudo —
+# BPF load/attach works there; the azure kernel only needs the
+# `algif_aead` frontend enabled for AEAD traffic).
 name: ci
 
 on:
@@ -66,8 +67,84 @@ jobs:
         run: cargo xtask build --bpf
       - name: pipeline lane
         # Honest-denial asserts hold without caps; privileged asserts
-        # need the self-hosted runner (4B-H2).
+        # run in the sudo-bpf job below.
         run: cargo xtask test bpf
+
+  sudo-bpf:
+    name: privileged sudo lane
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - name: BPF nightly
+        run: rustup toolchain install nightly-2026-09-16 -c rust-src -c rustfmt -c clippy --profile minimal
+      - name: pinned linker
+        run: cargo install bpf-linker --version 0.10.4 --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: build objects
+        run: cargo xtask build --bpf
+      - name: enable AEAD traffic frontend
+        # The azure kernel ships gcm(aes) but blocks the algif_aead
+        # autoload (install /bin/false). Without this line the AEAD
+        # lane bodies cannot bind. Fail fast if the module sticks.
+        run: |
+          sudo modprobe --ignore-install algif_aead
+          grep -q algif_aead /proc/modules
+      - name: working bpftool for the link oracle
+        # The image's /usr/sbin/bpftool is a stub (rc=2): azure
+        # linux-tools ship no bpftool binary and noble has no
+        # bpftool package. The lane's link-count oracle shells out
+        # to `bpftool`, so take the generic-tools binary and shadow
+        # the stub via /usr/local/bin (first in PATH, including
+        # sudo's secure_path). Fail fast if the oracle stays broken.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic
+          REAL=$(find /usr/lib/linux-tools -name bpftool | head -1)
+          test -n "$REAL"
+          sudo ln -sf "$REAL" /usr/local/bin/bpftool
+          sudo bpftool link show
+      - name: privileged lane (reviewed runner)
+        # Invoked unprivileged: the runner builds as the runner user
+        # and elevates internally (sudo -n + private mount namespace).
+        # 33 bodies as root, 1 privilege-refusal proof as non-root,
+        # 4 guest bodies recorded OTHER_LANE (lab/vng lanes own them).
+        # Exit 4 with zero FAIL is the lane's documented qualified
+        # pass (hosted 6.17 < 7.0 fsession floor: the 3 lifecycle
+        # bodies + their support probe refuse typed). But exit 4
+        # ALSO means lock-held NOT_RUN (nothing executed, no
+        # summary) — so the summary check below disambiguates and
+        # keeps this job fail-closed either way.
+        run: |
+          set +e
+          scripts/sudo-lane.sh --out "$RUNNER_TEMP/sudo-lane" \
+            --traffic-generator tests/fixtures/kcrypto_gen.py
+          code=$?
+          set -e
+          test "$code" -eq 0 -o "$code" -eq 4
+          python3 - "$RUNNER_TEMP/sudo-lane/summary.json" <<'EOF'
+          import json, sys
+          summary = json.load(open(sys.argv[1]))
+          assert summary.get("complete") is True, "lane summary incomplete"
+          assert not summary["counts"].get("FAIL"), "lane has FAIL bodies"
+          print("sudo-lane verdict:", summary["counts"])
+          EOF
+      - name: lane summary receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-lane-summary
+          path: ${{ runner.temp }}/sudo-lane/summary.json
+      - name: full lane evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-lane-evidence
+          path: ${{ runner.temp }}/sudo-lane/
 
   supply:
     name: supply chain

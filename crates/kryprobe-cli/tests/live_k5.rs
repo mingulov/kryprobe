@@ -566,11 +566,22 @@ fn attribution_golden_python() {
         drain_lines(oracle.child().stderr.take().expect("oracle stderr"));
     let start = Instant::now();
     loop {
-        let attached = oracle_err
+        // "Attach" matches both "Attaching N probes..." (bpftrace
+        // <=0.20, which never prints "Attached") and "Attached";
+        // watch stdout AND stderr (<=0.20 announces on stdout,
+        // newer on stderr). A failed attach after "Attaching"
+        // still fails loudly via the early-death assert below
+        // (bpftrace exits nonzero).
+        let attached = oracle_out
             .lock()
-            .expect("oracle err lock")
+            .expect("oracle out lock")
             .iter()
-            .any(|line| line.contains("Attached"));
+            .any(|line| line.contains("Attach"))
+            || oracle_err
+                .lock()
+                .expect("oracle err lock")
+                .iter()
+                .any(|line| line.contains("Attach"));
         if attached {
             break;
         }
