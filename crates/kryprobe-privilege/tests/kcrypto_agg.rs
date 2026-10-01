@@ -21,9 +21,9 @@
 //! missing. The C3 re-verification needs only BTF and runs everywhere.
 
 use kryprobe_abi::kcrypto_agg::{
-    KCTL_GAP, KCTL_GENCHANGE, KCTL_HEALTH, KCTL_IDENT, KCTL_OVERFLOW, KCTX_SOFTIRQ, KConfig, KCtl,
-    KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC,
-    KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, VAgg, fold_vagg, kagg_from_bytes,
+    KCTL_GAP, KCTL_GENCHANGE, KCTL_HEALTH, KCTL_IDENT, KCTL_OVERFLOW, KCTX_PROC, KCTX_SOFTIRQ,
+    KConfig, KCtl, KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC,
+    KOP_DEC, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, VAgg, fold_vagg, kagg_from_bytes,
     kcrypto_ident_hash, kctl_from_bytes, kctl_pack_head, kctl_pack_lens, vagg_from_bytes,
 };
 use kryprobe_core::attach::{CookieAllocator, GenerationGuard, LinkGroup};
@@ -39,6 +39,7 @@ use kryprobe_privilege::btf_resolve::{
     FIRST_MEMBER_LINKS, KCRYPTO_SYMBOLS, PF_KTHREAD, resolve_aggregate_offsets, resolve_btf_ids,
     resolve_member_offset,
 };
+use kryprobe_privilege::capture_gate::{CaptureVerdict, CellSums, GateCell, check_cells};
 use kryprobe_privilege::mapops::{
     map_get_next_key, map_lookup_bytes, map_update_bytes, possible_cpus,
 };
@@ -182,6 +183,7 @@ impl Sensor {
 }
 
 /// One dumped `KAGG` row: decoded attribution + names + folded value.
+#[derive(Clone)]
 struct AggRow {
     fam: u8,
     op: u8,
@@ -401,6 +403,296 @@ fn sum_rows(rows: &[AggRow], fam: u8, op: u8, res: u8, alg: &str) -> VAgg {
     out
 }
 
+/// Capture gates: row-level pre-checks mirroring each test's asserted
+/// cells (shared-VM stray-traffic retry — see `capture_gate`). Bounds
+/// mirror the truth assertions exactly; unasserted dimensions stay
+/// `Any` (the gate never rejects a capture the test would accept),
+/// except OK-row class, which is exact by the BPF class-bucket
+/// invariant. Alloc class stays `Any`: its ok value is
+/// product-unspecified (the test deliberately does not assert it).
+fn vagg_sums(val: &VAgg) -> CellSums {
+    (val.calls, val.bytes, val.ok, val.errors, val.queued)
+}
+
+fn gate_skcipher(rows: &[AggRow]) -> CaptureVerdict {
+    const CELLS: &[GateCell] = &[
+        GateCell::bounded(
+            "skcipher/enc",
+            KFAM_SK,
+            KOP_ENC,
+            KRES_OK,
+            "cbc(aes)",
+            48,
+            50,
+            32,
+        ),
+        GateCell::bounded(
+            "skcipher/dec",
+            KFAM_SK,
+            KOP_DEC,
+            KRES_OK,
+            "cbc(aes)",
+            48,
+            50,
+            32,
+        ),
+        GateCell::calls_bytes(
+            "any/alloc",
+            KFAM_ANY,
+            KOP_ALLOC,
+            KRES_OK,
+            "cbc(aes)",
+            1,
+            1,
+            0,
+        ),
+        GateCell::calls(
+            "skcipher/enc-err",
+            KFAM_SK,
+            KOP_ENC,
+            KRES_ERR,
+            "cbc(aes)",
+            0,
+            0,
+        ),
+        GateCell::calls(
+            "skcipher/dec-err",
+            KFAM_SK,
+            KOP_DEC,
+            KRES_ERR,
+            "cbc(aes)",
+            0,
+            0,
+        ),
+    ];
+    check_cells(CELLS, |c| {
+        vagg_sums(&sum_rows(rows, c.fam, c.op, c.res, c.alg))
+    })
+}
+
+fn gate_aead(rows: &[AggRow]) -> CaptureVerdict {
+    const CELLS: &[GateCell] = &[
+        GateCell::exact(
+            "aead/enc", KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)", 11, 32, 11, 0, 0,
+        ),
+        GateCell::exact(
+            "aead/dec", KFAM_AEAD, KOP_DEC, KRES_OK, "gcm(aes)", 10, 48, 10, 0, 0,
+        ),
+        GateCell::exact(
+            "aead/dec-err",
+            KFAM_AEAD,
+            KOP_DEC,
+            KRES_ERR,
+            "gcm(aes)",
+            1,
+            48,
+            0,
+            1,
+            0,
+        ),
+    ];
+    check_cells(CELLS, |c| {
+        vagg_sums(&sum_rows(rows, c.fam, c.op, c.res, c.alg))
+    })
+}
+
+fn gate_hash(rows: &[AggRow]) -> CaptureVerdict {
+    const CELLS: &[GateCell] = &[
+        GateCell::exact(
+            "ahash/digest",
+            KFAM_AHASH,
+            KOP_DIGEST,
+            KRES_OK,
+            "sha256",
+            10,
+            64,
+            10,
+            0,
+            0,
+        ),
+        GateCell::exact(
+            "shash/digest",
+            KFAM_SHASH,
+            KOP_DIGEST,
+            KRES_OK,
+            "sha256",
+            10,
+            64,
+            10,
+            0,
+            0,
+        ),
+        GateCell::exact(
+            "shash/finup",
+            KFAM_SHASH,
+            KOP_FINUP,
+            KRES_OK,
+            "sha256",
+            6,
+            16,
+            6,
+            0,
+            0,
+        ),
+    ];
+    check_cells(CELLS, |c| {
+        vagg_sums(&sum_rows(rows, c.fam, c.op, c.res, c.alg))
+    })
+}
+
+fn gate_burst(rows: &[AggRow], ops: u64) -> CaptureVerdict {
+    // Runtime truth: the burst length is fixture-reported per attempt.
+    let cells = [GateCell::exact(
+        "burst/enc",
+        KFAM_SK,
+        KOP_ENC,
+        KRES_OK,
+        "ctr(aes)",
+        ops,
+        4096,
+        ops,
+        0,
+        0,
+    )];
+    check_cells(&cells, |c| {
+        vagg_sums(&sum_rows(rows, c.fam, c.op, c.res, c.alg))
+    })
+}
+
+/// Hand-built dump row (gate classification tests only).
+#[allow(clippy::too_many_arguments)]
+fn agg_row(
+    fam: u8,
+    op: u8,
+    res: u8,
+    alg: &str,
+    calls: u64,
+    bytes: u64,
+    ok: u64,
+    errors: u64,
+    queued: u64,
+) -> AggRow {
+    AggRow {
+        fam,
+        op,
+        res,
+        ctx: KCTX_PROC,
+        alg: alg.to_owned(),
+        drv: "t-drv".to_owned(),
+        alg_words: [0u64; 16],
+        drv_words: [0u64; 16],
+        val: VAgg {
+            calls,
+            bytes,
+            ok,
+            errors,
+            queued,
+            first_ns: 100,
+            last_ns: 200,
+            lat: [0; 8],
+        },
+    }
+}
+
+#[test]
+fn capture_gates_classify_agg_tables() {
+    // skcipher truth (dec at 49 exercises the bound interior; alloc
+    // ok left 0 pins the class-Any behavior).
+    let truth = vec![
+        agg_row(KFAM_SK, KOP_ENC, KRES_OK, "cbc(aes)", 50, 1600, 50, 0, 0),
+        agg_row(KFAM_SK, KOP_DEC, KRES_OK, "cbc(aes)", 49, 1568, 49, 0, 0),
+        agg_row(KFAM_ANY, KOP_ALLOC, KRES_OK, "cbc(aes)", 1, 0, 0, 0, 0),
+    ];
+    assert_eq!(gate_skcipher(&truth), CaptureVerdict::Clean);
+    // Absent error rows sum to zeros: clean, not short.
+    // Stray decrypt op: excess.
+    let mut rows = truth.clone();
+    rows[1] = agg_row(KFAM_SK, KOP_DEC, KRES_OK, "cbc(aes)", 51, 1632, 51, 0, 0);
+    assert!(matches!(gate_skcipher(&rows), CaptureVerdict::Excess(_)));
+    // Stray error row where the test asserts absence: excess.
+    let mut rows = truth.clone();
+    rows.push(agg_row(
+        KFAM_SK, KOP_ENC, KRES_ERR, "cbc(aes)", 1, 32, 0, 1, 0,
+    ));
+    assert!(matches!(gate_skcipher(&rows), CaptureVerdict::Excess(_)));
+    // Kworker miss below the G9 floor: short, never retried.
+    let mut rows = truth.clone();
+    rows[0] = agg_row(KFAM_SK, KOP_ENC, KRES_OK, "cbc(aes)", 47, 1504, 47, 0, 0);
+    assert!(matches!(gate_skcipher(&rows), CaptureVerdict::Short(_)));
+
+    // AEAD truth.
+    let truth = vec![
+        agg_row(KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)", 11, 352, 11, 0, 0),
+        agg_row(KFAM_AEAD, KOP_DEC, KRES_OK, "gcm(aes)", 10, 480, 10, 0, 0),
+        agg_row(KFAM_AEAD, KOP_DEC, KRES_ERR, "gcm(aes)", 1, 48, 0, 1, 0),
+    ];
+    assert_eq!(gate_aead(&truth), CaptureVerdict::Clean);
+    let mut rows = truth.clone();
+    rows[1] = agg_row(KFAM_AEAD, KOP_DEC, KRES_OK, "gcm(aes)", 11, 528, 11, 0, 0);
+    assert!(matches!(gate_aead(&rows), CaptureVerdict::Excess(_)));
+    let mut rows = truth.clone();
+    rows[0] = agg_row(KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)", 10, 320, 10, 0, 0);
+    assert!(matches!(gate_aead(&rows), CaptureVerdict::Short(_)));
+
+    // Hash truth.
+    let truth = vec![
+        agg_row(KFAM_AHASH, KOP_DIGEST, KRES_OK, "sha256", 10, 640, 10, 0, 0),
+        agg_row(KFAM_SHASH, KOP_DIGEST, KRES_OK, "sha256", 10, 640, 10, 0, 0),
+        agg_row(KFAM_SHASH, KOP_FINUP, KRES_OK, "sha256", 6, 96, 6, 0, 0),
+    ];
+    assert_eq!(gate_hash(&truth), CaptureVerdict::Clean);
+    // The v4 signature shape (foreign bytes at excess calls): excess.
+    let mut rows = truth.clone();
+    rows[1] = agg_row(
+        KFAM_SHASH, KOP_DIGEST, KRES_OK, "sha256", 11, 26424, 11, 0, 0,
+    );
+    assert!(matches!(gate_hash(&rows), CaptureVerdict::Excess(_)));
+    let mut rows = truth.clone();
+    rows[2] = agg_row(KFAM_SHASH, KOP_FINUP, KRES_OK, "sha256", 5, 80, 5, 0, 0);
+    assert!(matches!(gate_hash(&rows), CaptureVerdict::Short(_)));
+
+    // Burst truth at synthetic runtime ops.
+    let ops = 150_000u64;
+    let truth = vec![agg_row(
+        KFAM_SK,
+        KOP_ENC,
+        KRES_OK,
+        "ctr(aes)",
+        ops,
+        ops * 4096,
+        ops,
+        0,
+        0,
+    )];
+    assert_eq!(gate_burst(&truth, ops), CaptureVerdict::Clean);
+    let mut rows = truth.clone();
+    rows[0] = agg_row(
+        KFAM_SK,
+        KOP_ENC,
+        KRES_OK,
+        "ctr(aes)",
+        ops + 1,
+        (ops + 1) * 4096,
+        ops + 1,
+        0,
+        0,
+    );
+    assert!(matches!(gate_burst(&rows, ops), CaptureVerdict::Excess(_)));
+    let mut rows = truth.clone();
+    rows[0] = agg_row(
+        KFAM_SK,
+        KOP_ENC,
+        KRES_OK,
+        "ctr(aes)",
+        ops - 1,
+        (ops - 1) * 4096,
+        ops - 1,
+        0,
+        0,
+    );
+    assert!(matches!(gate_burst(&rows, ops), CaptureVerdict::Short(_)));
+}
+
 /// `ok + errors + queued == calls` on every row (the conservation law;
 /// destroy rows are exempt — none exist — see the BPF limitation note).
 fn assert_conservation(rows: &[AggRow], what: &str) {
@@ -547,12 +839,35 @@ fn skcipher_exactness() {
     if !lane_ready("skcipher_exactness") {
         return;
     }
-    let sensor = Sensor::attach();
-    let counts = alg_fixture::skcipher_roundtrip("cbc(aes)", 50).expect("skcipher traffic");
-    assert_eq!((counts.enc, counts.dec), (50, 50));
-    let rows = dump_kagg(&sensor);
-    let tot = dump_ktot(&sensor);
-    let ring = drain_ring(&sensor);
+    // Bounded re-capture on the contamination signature (kernel-wide
+    // rows + shared-VM background traffic — see `capture_gate`).
+    // EXCESS re-captures (max 3); SHORTFALL fails immediately.
+    let (sensor, rows, tot, ring) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let sensor = Sensor::attach();
+            let counts = alg_fixture::skcipher_roundtrip("cbc(aes)", 50).expect("skcipher traffic");
+            assert_eq!((counts.enc, counts.dec), (50, 50));
+            let rows = dump_kagg(&sensor);
+            let tot = dump_ktot(&sensor);
+            let ring = drain_ring(&sensor);
+            match gate_skcipher(&rows) {
+                CaptureVerdict::Clean => break (sensor, rows, tot, ring),
+                CaptureVerdict::Short(detail) => {
+                    panic!("capture shortfall (sensor miss, not contamination): {detail}")
+                }
+                CaptureVerdict::Excess(detail) if attempt < 3 => {
+                    println!(
+                        "RETRY: skcipher capture attempt {attempt} contaminated ({detail}); re-capturing on a fresh sensor"
+                    );
+                }
+                CaptureVerdict::Excess(detail) => {
+                    panic!("capture contaminated 3/3 attempts (shared-VM stray traffic): {detail}")
+                }
+            }
+        }
+    };
     assert_no_overflow(&sensor, &ring, "skcipher");
     // Per-identity exactness (P4: fixture truth vs sensor delta).
     // BOUNDED 48..=50 (G9 kworker-miss finding: cbc(aes) is
@@ -613,13 +928,35 @@ fn aead_exactness_and_bad_tag_errors() {
         );
         return;
     }
-    let sensor = Sensor::attach();
-    let counts = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
-    assert_eq!((counts.enc, counts.dec), (10, 10));
-    alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
-    let rows = dump_kagg(&sensor);
-    let tot = dump_ktot(&sensor);
-    let ring = drain_ring(&sensor);
+    // Bounded re-capture on the contamination signature (see
+    // `capture_gate`): EXCESS re-captures (max 3), SHORTFALL fails.
+    let (sensor, rows, tot, ring) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let sensor = Sensor::attach();
+            let counts = alg_fixture::aead_roundtrip("gcm(aes)", 10).expect("aead traffic");
+            assert_eq!((counts.enc, counts.dec), (10, 10));
+            alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
+            let rows = dump_kagg(&sensor);
+            let tot = dump_ktot(&sensor);
+            let ring = drain_ring(&sensor);
+            match gate_aead(&rows) {
+                CaptureVerdict::Clean => break (sensor, rows, tot, ring),
+                CaptureVerdict::Short(detail) => {
+                    panic!("capture shortfall (sensor miss, not contamination): {detail}")
+                }
+                CaptureVerdict::Excess(detail) if attempt < 3 => {
+                    println!(
+                        "RETRY: aead capture attempt {attempt} contaminated ({detail}); re-capturing on a fresh sensor"
+                    );
+                }
+                CaptureVerdict::Excess(detail) => {
+                    panic!("capture contaminated 3/3 attempts (shared-VM stray traffic): {detail}")
+                }
+            }
+        }
+    };
     assert_no_overflow(&sensor, &ring, "aead");
     // N=10 clean roundtrip + 1 bad-tag encrypt + 1 bad-tag (failed) decrypt.
     let enc = sum_rows(&rows, KFAM_AEAD, KOP_ENC, KRES_OK, "gcm(aes)");
@@ -654,17 +991,40 @@ fn hash_points_observed() {
         return;
     }
     let prepared = alg_fixture::PreparedHashFinups::new("sha256").expect("prepare hash prefix");
-    let sensor = Sensor::attach();
-    let single = alg_fixture::hash_digest("sha256", 10).expect("hash traffic");
-    assert_eq!(single.digests, 10);
-    assert_eq!(single.digest_len, 32);
-    let multi = prepared
-        .finish(6)
-        .expect("cloned finup traffic and digest goldens");
-    assert_eq!((multi.digests, multi.digest_len), (6, 32));
-    let rows = dump_kagg(&sensor);
-    let tot = dump_ktot(&sensor);
-    let ring = drain_ring(&sensor);
+    // Bounded re-capture on the contamination signature (see
+    // `capture_gate`): EXCESS re-captures (max 3), SHORTFALL fails.
+    // Preparation stays pre-sensor (invisible); `finish` repeats.
+    let (sensor, rows, tot, ring) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let sensor = Sensor::attach();
+            let single = alg_fixture::hash_digest("sha256", 10).expect("hash traffic");
+            assert_eq!(single.digests, 10);
+            assert_eq!(single.digest_len, 32);
+            let multi = prepared
+                .finish(6)
+                .expect("cloned finup traffic and digest goldens");
+            assert_eq!((multi.digests, multi.digest_len), (6, 32));
+            let rows = dump_kagg(&sensor);
+            let tot = dump_ktot(&sensor);
+            let ring = drain_ring(&sensor);
+            match gate_hash(&rows) {
+                CaptureVerdict::Clean => break (sensor, rows, tot, ring),
+                CaptureVerdict::Short(detail) => {
+                    panic!("capture shortfall (sensor miss, not contamination): {detail}")
+                }
+                CaptureVerdict::Excess(detail) if attempt < 3 => {
+                    println!(
+                        "RETRY: hash capture attempt {attempt} contaminated ({detail}); re-capturing on a fresh sensor"
+                    );
+                }
+                CaptureVerdict::Excess(detail) => {
+                    panic!("capture contaminated 3/3 attempts (shared-VM stray traffic): {detail}")
+                }
+            }
+        }
+    };
     assert_no_overflow(&sensor, &ring, "hash");
     // Single-shot digest: one ahash + one shash observation per op,
     // each sized 64B (C2 nbytes / shash len arg).
@@ -751,27 +1111,50 @@ fn burst_exactness_near_million() {
     if !lane_ready("burst_exactness_near_million") {
         return;
     }
-    let sensor = Sensor::attach();
-    // Distinct alg from the skcipher test (parallel-run isolation).
-    let burst = alg_fixture::burst_encrypt("ctr(aes)", 10).expect("burst traffic");
-    assert!(
-        burst.ops > 100_000,
-        "burst made sensible progress: {}",
-        burst.ops
-    );
-    let rows = dump_kagg(&sensor);
-    let tot = dump_ktot(&sensor);
-    let ring = drain_ring(&sensor);
+    // Bounded re-capture on the contamination signature (see
+    // `capture_gate`): EXCESS re-captures (max 3), SHORTFALL fails.
+    // The gate's truth is this attempt's fixture-reported ops.
+    let (sensor, rows, tot, ring, ops) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let sensor = Sensor::attach();
+            // Distinct alg from the skcipher test (parallel-run isolation).
+            let burst = alg_fixture::burst_encrypt("ctr(aes)", 10).expect("burst traffic");
+            assert!(
+                burst.ops > 100_000,
+                "burst made sensible progress: {}",
+                burst.ops
+            );
+            let rows = dump_kagg(&sensor);
+            let tot = dump_ktot(&sensor);
+            let ring = drain_ring(&sensor);
+            match gate_burst(&rows, burst.ops) {
+                CaptureVerdict::Clean => break (sensor, rows, tot, ring, burst.ops),
+                CaptureVerdict::Short(detail) => {
+                    panic!("capture shortfall (sensor miss, not contamination): {detail}")
+                }
+                CaptureVerdict::Excess(detail) if attempt < 3 => {
+                    println!(
+                        "RETRY: burst capture attempt {attempt} contaminated ({detail}); re-capturing on a fresh sensor"
+                    );
+                }
+                CaptureVerdict::Excess(detail) => {
+                    panic!("capture contaminated 3/3 attempts (shared-VM stray traffic): {detail}")
+                }
+            }
+        }
+    };
     assert_no_overflow(&sensor, &ring, "burst");
     // P4 at scale: the sensor delta equals fixture truth EXACTLY.
     let enc = sum_rows(&rows, KFAM_SK, KOP_ENC, KRES_OK, "ctr(aes)");
-    assert_eq!(enc.calls, burst.ops, "burst enc calls == fixture truth");
+    assert_eq!(enc.calls, ops, "burst enc calls == fixture truth");
     assert_eq!(
         enc.bytes,
-        burst.ops * 4096,
+        ops * 4096,
         "burst enc bytes == ops * 4KiB (no sampling, no drops)"
     );
-    assert_eq!(enc.ok, burst.ops, "burst enc ok");
+    assert_eq!(enc.ok, ops, "burst enc ok");
     assert_eq!(enc.errors + enc.queued, 0, "burst clean buckets");
     assert_conservation(&rows, "burst");
     assert_totals_conservation(&rows, &tot, "burst");
