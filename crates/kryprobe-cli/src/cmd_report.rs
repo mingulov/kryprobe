@@ -380,7 +380,7 @@ fn finish_report_live(
         Some(path) => match write_str_atomic(path, &text) {
             Ok(()) => {
                 let _ = writeln!(stderr, "wrote {}", path.display());
-                emit_stop_line(&outcome, t_render, stderr);
+                crate::live::emit_stop_line(&outcome, t_render, stderr);
                 code
             }
             Err(err) => {
@@ -390,43 +390,10 @@ fn finish_report_live(
         },
         None => {
             let code = emit_stdout_text(stdout, stderr, "report", &text, code);
-            emit_stop_line(&outcome, t_render, stderr);
+            crate::live::emit_stop_line(&outcome, t_render, stderr);
             code
         }
     }
-}
-
-/// R1 stop telemetry (machine-readable): one line joining the
-/// session spans (`LiveOutcome.stop`) with the render + write span
-/// measured here. `total_us` spans session end → report written;
-/// without session spans (profiles that do not time their tail)
-/// the total covers render + write only and the sub-spans read
-/// `null` — honest, never a silent zero.
-fn emit_stop_line(
-    outcome: &crate::live::LiveOutcome,
-    t_render: std::time::Instant,
-    stderr: &mut dyn Write,
-) {
-    let render_us = {
-        let elapsed = t_render.elapsed();
-        elapsed
-            .as_secs()
-            .saturating_mul(1_000_000)
-            .saturating_add(u64::from(elapsed.subsec_micros()))
-    };
-    let total_us = outcome.stop.map_or(render_us, |spans| {
-        let elapsed = spans.ended.elapsed();
-        elapsed
-            .as_secs()
-            .saturating_mul(1_000_000)
-            .saturating_add(u64::from(elapsed.subsec_micros()))
-            .max(render_us)
-    });
-    let _ = writeln!(
-        stderr,
-        "{}",
-        crate::live::telemetry_stop_line(total_us, outcome.stop.as_ref(), render_us)
-    );
 }
 
 /// Pre-flight `--out` check (P6-N8): the parent directory must

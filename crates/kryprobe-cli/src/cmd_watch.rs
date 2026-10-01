@@ -58,6 +58,7 @@ fn finish_watch(
             // finalize together — a torn stream reports 1, never a
             // silent capture code. Bytes identical to the two-write
             // form on success.
+            let t_render = std::time::Instant::now();
             let mut text = kryprobe_report::live_render::render_watch_tables_filtered(
                 &outcome.observations,
                 &outcome.coverage,
@@ -73,7 +74,12 @@ fn finish_watch(
             } else {
                 0
             };
-            emit_stdout_text(stdout, stderr, "watch", &text, code)
+            let code = emit_stdout_text(stdout, stderr, "watch", &text, code);
+            // R1 stop telemetry: every clean session (interrupted
+            // included — the spans still timed the tail) ends with
+            // exactly one machine-readable stop line.
+            crate::live::emit_stop_line(&outcome, t_render, stderr);
+            code
         }
         Err(err) => {
             let _ = writeln!(stderr, "watch: {err}");
