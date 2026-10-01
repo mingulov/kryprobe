@@ -585,8 +585,8 @@ mod tests {
                 dims: *dims,
             })
             .collect();
-        // 5 K1 maps + 4 K5 attribution maps + KDROPS (fix wave).
-        assert_eq!(good.len(), 10);
+        // 5 K1 maps + 4 K5 attribution maps + KDROPS (fix wave) + KIDENT (R1).
+        assert_eq!(good.len(), 11);
         assert!(valid_kcrypto_dims(&good));
         // Spine shape is NOT kcrypto shape (discrimination).
         let spineish = vec![ParsedMap {
