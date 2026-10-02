@@ -264,9 +264,20 @@ class TelemetryTests(unittest.TestCase):
         self.assertIsNone(parsed["stop"])
         self.assertIsNone(parsed["occupancy"])
 
+    def test_float_lag_counts_malformed_and_keeps_int_max(self):
+        # A present non-null lag of the wrong type is malformed
+        # (never silently rounded or ignored); the int max still folds.
+        content = (self._line({"v": 1, "tick": 1, "lagmax_us": 120.5})
+                   + self._line({"v": 1, "tick": 2, "lagmax_us": 95}))
+        parsed = PARSERS.parse_telemetry(write_tmp(content))
+        self.assertEqual(parsed["lagmax_us"], 95)
+        self.assertEqual(parsed["malformed"], 1)
+        self.assertEqual(parsed["lines"], 2)
+
     def test_stop_occupancy_last_wins(self):
-        stop = {"total_us": 42000, "detach_us": 3000,
-                "snapshot_us": 9000, "render_us": 30000}
+        stop = {"total_us": 42000, "finish_us": 3000,
+                "finalize_us": 9000, "assemble_us": 3000,
+                "render_us": 30000}
         occ = {"kagg": 4, "ktot": 1, "kidn": 4, "kwho": 2,
                "kstack": 1, "kerr": 0, "kparams": 1, "kdrops_slots": 8,
                "kring_pending": None}
@@ -277,6 +288,11 @@ class TelemetryTests(unittest.TestCase):
         parsed = PARSERS.parse_telemetry(write_tmp(content))
         self.assertEqual(parsed["stop"], stop)
         self.assertEqual(parsed["occupancy"], occ)
+        # Twinned with live.rs telemetry_stop_line: the stop object
+        # carries exactly the emitter's keys (no total==sub-span equality).
+        self.assertEqual(set(parsed["stop"]),
+                         {"total_us", "finish_us", "finalize_us",
+                          "assemble_us", "render_us"})
 
     def test_malformed_counted_never_fatal(self):
         content = (self.PREFIX + "{not json\n"
