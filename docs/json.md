@@ -10,6 +10,17 @@ require exact key sets). Event-v0 JSONL (`report --format jsonl`,
 `schemas/event-v0.schema.json` — and the import shell has
 `schemas/shell-v1.schema.json`.
 
+For `api-returns`, ordinary report JSON retains the terminal non-atomic
+sample diagnostics: `snapshot_agg_calls`, `snapshot_totals_calls`,
+`snapshot_gap_unreconciled` (legacy alias `ktot_gap`), queue drops,
+terminal unread bytes/busy state, and the explicit snapshot-consistency
+reason. Reverse skew or sum overflow leaves the difference unavailable,
+with a diagnostic flag, rather than clamping it to zero. Frozen event-v0
+JSONL/replay retain conservative coverage only; they cannot preserve those
+new named counters or their magnitudes. A validated final host barrier
+does not establish a kernel writer fence. See
+[aggregate evidence semantics](kcrypto-evidence.md).
+
 Stderr is human-only and unstable (4B-M4): progress lines
 (`kryprobe: progress …`), warnings, and diagnostics may change or
 vanish without notice — never script on them. The one exception is

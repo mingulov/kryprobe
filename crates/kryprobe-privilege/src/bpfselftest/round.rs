@@ -197,7 +197,10 @@ fn drain_until_settled(
         }
     }
     watcher_outcome??;
-    Ok((records, stats))
+    Ok((
+        records,
+        stats.map_err(|err| BpfSelftestError::Drain(err.to_string()))?,
+    ))
 }
 
 /// Tally drained records into the outcome: generation + flag checks,

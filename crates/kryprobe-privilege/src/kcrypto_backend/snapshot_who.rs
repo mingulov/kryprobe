@@ -92,8 +92,8 @@ pub(crate) fn stack_ips_from_bytes(bytes: &[u8]) -> Vec<u64> {
     out
 }
 
-/// Read the `KIDN[KWHO_DROPS]` per-row identity drop counter (M5:
-/// the finalize fast path's only map read). Absent key reads
+/// Read the `KIDN[KWHO_DROPS]` identity-drop indicator as part of the
+/// terminal sample (a capped u8, not an unbounded lost-call count). Absent key reads
 /// healthy-zero; any other errno fails loud (same rule as the
 /// `snapshot_who` tail this was extracted from).
 pub(crate) fn read_kwho_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotError> {

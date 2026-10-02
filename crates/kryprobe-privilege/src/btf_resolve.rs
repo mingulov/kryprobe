@@ -590,23 +590,6 @@ pub struct ConfiguredKcrypto {
     pub links: Vec<(String, OwnedLink)>,
 }
 
-impl ConfiguredKcrypto {
-    /// Duplicates the sensor handle (H1(b)): the clone snapshots the
-    /// SAME kernel sensor (dup'd fds — no second attach, no double
-    /// probe stream, no double map memory). Only used to hand the
-    /// live tick loop its own handle onto the backend's sensor.
-    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-        let mut links = Vec::with_capacity(self.links.len());
-        for (name, link) in &self.links {
-            links.push((name.clone(), link.try_clone()?));
-        }
-        Ok(Self {
-            loaded: self.loaded.try_clone()?,
-            links,
-        })
-    }
-}
-
 /// Configured bring-up failure: resolution, load, KCFG write, group
 /// minting, or a total attach failure. Per-point outcomes ride the
 /// [`ConfiguredError::NoPointAttached`] variant (diagnosable, never

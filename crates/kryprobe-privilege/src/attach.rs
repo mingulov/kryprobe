@@ -62,14 +62,6 @@ impl OwnedLink {
         self._fd.as_raw_fd()
     }
 
-    /// Duplicates the link handle (H1(b)): the clone refers to the
-    /// SAME kernel link (no re-attach, no second probe stream).
-    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-        Ok(Self {
-            _fd: self._fd.try_clone_cloexec()?,
-        })
-    }
-
     /// Wraps an already-created link fd. Crate-private, for the decoy
     /// harness's test-local wide attach only: it performs no attach
     /// and no authorization, so the facet's pid-0 refusal still guards

@@ -436,7 +436,7 @@ fn privileged_roundtrip(loaded: &LoadedSpine, spec: &RoundtripSpec) -> Option<Ro
     while let Ok(DrainEvent::Record(bytes)) = drain.receiver().try_recv() {
         records.push(bytes);
     }
-    let stats = drain.stop();
+    let stats = drain.stop().expect("drain joins");
     let status = child.wait().expect("fixture must exit");
     assert!(status.success(), "fixture failed: {status}");
 
