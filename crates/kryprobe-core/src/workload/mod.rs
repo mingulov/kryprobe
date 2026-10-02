@@ -13,8 +13,8 @@ mod scope;
 mod snapshot;
 
 pub use context::{ContextIdentity, ContextQualification, ExecutionKind};
-pub use evidence::{AttributionEvidence, AttributionStatus};
-pub use identity::WorkloadIdentity;
+pub use evidence::{AttributionEvidence, AttributionStatus, WorkloadOrigin};
+pub use identity::{JoinQualification, WorkloadIdentity, qualify_join};
 pub use scope::{ScopeDecision, ScopePartition};
 pub use snapshot::{
     MetadataUnavailable, SnapshotConsistency, SnapshotKey, SnapshotRequest, UnknownByDifference,

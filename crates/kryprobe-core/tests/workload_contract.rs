@@ -6,7 +6,7 @@
 
 use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, ContextIdentity, ExecutionKind, ScopeDecision,
-    ScopePartition, WorkloadIdentity,
+    ScopePartition, WorkloadIdentity, WorkloadOrigin,
 };
 
 /// An unknown selector match is its own population: it never counts as a
@@ -65,6 +65,7 @@ fn wrong_kernel_metadata_is_rejected() {
     let bad_verified = AttributionEvidence::new(
         "hook_context",
         "metadata_label",
+        WorkloadOrigin::OperatorMetadataFile,
         AttributionStatus::Verified,
         None,
     );
@@ -73,6 +74,7 @@ fn wrong_kernel_metadata_is_rejected() {
     let good_verified = AttributionEvidence::new(
         "hook_context",
         "captured_cgroup",
+        WorkloadOrigin::KernelCapture,
         AttributionStatus::Verified,
         Some((100, 200)),
     );

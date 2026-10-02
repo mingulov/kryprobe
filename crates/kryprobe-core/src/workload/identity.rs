@@ -98,6 +98,46 @@ impl WorkloadIdentity {
     }
 }
 
+/// Outcome of joining one hash bucket to workload identities: hashes
+/// are indexes, not proof. Zero or one distinct identity keys resolve;
+/// two or more distinct keys sharing a bucket are `Ambiguous` and their
+/// counts stay split, never merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinQualification {
+    /// No candidate in the bucket.
+    None,
+    /// Exactly one distinct identity key (boxed: the struct is large
+    /// next to the unit/`Vec` variants).
+    Unique(Box<WorkloadIdentity>),
+    /// Two or more distinct identity keys share the bucket: ambiguous.
+    Ambiguous(Vec<String>),
+}
+
+/// Qualify one hash-bucket join over candidate identities. Compares full
+/// identity keys (never the hash alone): distinct keys with the same
+/// hash yield `Ambiguous` with every competing key retained.
+#[must_use]
+pub fn qualify_join(candidates: &[WorkloadIdentity]) -> JoinQualification {
+    let mut keys: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let key = candidate.identity_key();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    match keys.len() {
+        0 => JoinQualification::None,
+        1 => JoinQualification::Unique(Box::new(
+            candidates
+                .iter()
+                .find(|c| c.identity_key() == keys[0])
+                .expect("key came from these candidates")
+                .clone(),
+        )),
+        _ => JoinQualification::Ambiguous(keys),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +145,24 @@ mod tests {
     #[test]
     fn unresolved_identity_has_no_key() {
         assert_eq!(WorkloadIdentity::none().identity_key(), "unresolved");
+    }
+
+    #[test]
+    fn synthetic_hash_collision_stays_ambiguous_and_split() {
+        // Two distinct pods (distinct UIDs) landing in one hash bucket:
+        // the join qualifies ambiguous and retains BOTH keys. Counts
+        // keyed by either UID never merge into one row.
+        let a = WorkloadIdentity::pod("cluster-a", "api-7c9d", "production", "uid-1111");
+        let b = WorkloadIdentity::pod("cluster-a", "api-7c9d", "production", "uid-2222");
+        match qualify_join(&[a.clone(), b.clone()]) {
+            JoinQualification::Ambiguous(keys) => {
+                assert_eq!(keys.len(), 2);
+                assert!(keys.contains(&a.identity_key()));
+                assert!(keys.contains(&b.identity_key()));
+            }
+            other => panic!("collision must qualify ambiguous, got {other:?}"),
+        }
+        assert!(matches!(qualify_join(&[a]), JoinQualification::Unique(_)));
+        assert!(matches!(qualify_join(&[]), JoinQualification::None));
     }
 }

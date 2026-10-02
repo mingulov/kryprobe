@@ -22,6 +22,24 @@ pub enum AttributionStatus {
     Unsupported,
 }
 
+/// Workload origin: where the workload side of an association came
+/// from. Distinct from the association method: the origin names the
+/// evidence producer, the method names how it was joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadOrigin {
+    /// Kernel capture path (event-time cgroup id).
+    KernelCapture,
+    /// Operator-supplied metadata file (untrusted input).
+    OperatorMetadataFile,
+    /// Runtime/Kubernetes adapter (M2; unresolved in M1).
+    RuntimeAdapter,
+    /// Host proc/cgroup tree walk.
+    HostProc,
+    /// Origin not established.
+    Unknown,
+}
+
 /// Evidence for one context→workload association: relationship, method,
 /// source, status, and validity interval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +48,8 @@ pub struct AttributionEvidence {
     pub relationship: String,
     /// Method, e.g. `captured_cgroup`, `metadata_file`, `metadata_label`.
     pub method: String,
+    /// Workload origin (the evidence producer).
+    pub source: WorkloadOrigin,
     /// Categorical status.
     pub status: AttributionStatus,
     /// Validity interval `[start_ns, end_ns]`; required for `Verified`.
@@ -41,31 +61,35 @@ impl AttributionEvidence {
     pub fn new(
         relationship: &str,
         method: &str,
+        source: WorkloadOrigin,
         status: AttributionStatus,
         validity: Option<(u64, u64)>,
     ) -> Self {
         Self {
             relationship: relationship.to_string(),
             method: method.to_string(),
+            source,
             status,
             validity,
         }
     }
 
-    /// Validity rules: `Verified` requires the `captured_cgroup` method
-    /// plus a well-ordered validity interval; anything weaker claiming
-    /// `Verified` is a contradiction and refuses. Metadata-file content
-    /// stronger than `Asserted` without corroboration refuses.
+    /// Validity rules: `Verified` requires the `captured_cgroup` method,
+    /// the `KernelCapture` source, plus a well-ordered validity
+    /// interval; anything weaker claiming `Verified` is a contradiction
+    /// and refuses. Metadata-file content stronger than `Asserted`
+    /// without corroboration refuses.
     pub fn validate(&self) -> Result<(), String> {
         if self.relationship.is_empty() || self.method.is_empty() {
             return Err("relationship and method must be non-empty".to_string());
         }
         match self.status {
             AttributionStatus::Verified => {
-                if self.method != "captured_cgroup" {
+                if self.method != "captured_cgroup" || self.source != WorkloadOrigin::KernelCapture
+                {
                     return Err(format!(
-                        "verified status requires captured_cgroup method, got '{}'",
-                        self.method
+                        "verified status requires captured_cgroup method + kernel_capture source, got '{}' + '{:?}'",
+                        self.method, self.source
                     ));
                 }
                 match self.validity {
@@ -99,10 +123,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verified_requires_method_and_interval() {
+    fn verified_requires_method_source_and_interval() {
         let no_interval = AttributionEvidence::new(
             "hook_context",
             "captured_cgroup",
+            WorkloadOrigin::KernelCapture,
             AttributionStatus::Verified,
             None,
         );
@@ -110,10 +135,19 @@ mod tests {
         let inverted = AttributionEvidence::new(
             "hook_context",
             "captured_cgroup",
+            WorkloadOrigin::KernelCapture,
             AttributionStatus::Verified,
             Some((200, 100)),
         );
         assert!(inverted.validate().is_err());
+        let wrong_source = AttributionEvidence::new(
+            "hook_context",
+            "captured_cgroup",
+            WorkloadOrigin::OperatorMetadataFile,
+            AttributionStatus::Verified,
+            Some((100, 200)),
+        );
+        assert!(wrong_source.validate().is_err());
     }
 
     #[test]
@@ -121,6 +155,7 @@ mod tests {
         let overclaim = AttributionEvidence::new(
             "hook_context",
             "metadata_file",
+            WorkloadOrigin::OperatorMetadataFile,
             AttributionStatus::Verified,
             Some((100, 200)),
         );
@@ -128,6 +163,7 @@ mod tests {
         let honest = AttributionEvidence::new(
             "hook_context",
             "metadata_file",
+            WorkloadOrigin::OperatorMetadataFile,
             AttributionStatus::Asserted,
             None,
         );
