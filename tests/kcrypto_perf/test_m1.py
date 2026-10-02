@@ -191,13 +191,15 @@ class CtxRuleTests(unittest.TestCase):
         ctx = {"rows": 192, "present_calls": 5000, "system_calls": 5000,
                "unknown_calls": 0, "drops": 0}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 5000, 5000, "n_cgroup", 192), [])
+            m1validity.check_ctx_leg(ctx, 5000, "n_cgroup", 192), [])
 
     def test_below_capacity_violations(self):
         base = {"rows": 3, "present_calls": 100, "system_calls": 100,
                 "unknown_calls": 0, "drops": 0}
         cases = [
-            ({"present_calls": 99, "unknown_calls": 1}, "present"),
+            # A2: no present-vs-ops rule anymore — an inconsistent
+            # triple fails the identity instead.
+            ({"present_calls": 99}, "identity"),
             ({"unknown_calls": 1, "system_calls": 101}, "unknown"),
             ({"drops": 1}, "drops"),
             ({"rows": 4}, "rows"),
@@ -209,41 +211,68 @@ class CtxRuleTests(unittest.TestCase):
             # (system/present/unknown must still add up unless the
             # contradiction itself is under test).
             reasons = m1validity.check_ctx_leg(ctx, ctx["system_calls"],
-                                              100, "single", 3)
+                                              "single", 3)
             self.assertTrue(any(needle in reason for reason in reasons),
                             f"{delta} -> {reasons}")
 
     def test_contradiction_distinct_from_unreadable(self):
         ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
                "unknown_calls": None, "drops": 0}
-        reasons = m1validity.check_ctx_leg(ctx, 100, 100, "single", 3)
+        reasons = m1validity.check_ctx_leg(ctx, 100, "single", 3)
         self.assertTrue(any("contradiction" in reason for reason in reasons))
 
     def test_system_must_match_report_totals(self):
         ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
                "unknown_calls": 0, "drops": 0}
-        reasons = m1validity.check_ctx_leg(ctx, 999, 100, "single", 3)
+        reasons = m1validity.check_ctx_leg(ctx, 999, "single", 3)
         self.assertTrue(any("report totals" in reason for reason in reasons))
 
     def test_churn_full_rules(self):
         ctx = {"rows": 1024, "present_calls": 9000, "system_calls": 10000,
                "unknown_calls": 1000, "drops": 1000}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 10000, 10000, "churn_full", 1024),
+            m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024),
             [])
         bad_rows = dict(ctx, rows=1023)
         self.assertTrue(m1validity.check_ctx_leg(
-            bad_rows, 10000, 10000, "churn_full", 1024))
+            bad_rows, 10000, "churn_full", 1024))
         bad_silent = dict(ctx, unknown_calls=0, drops=0,
                           present_calls=10000)
         self.assertTrue(m1validity.check_ctx_leg(
-            bad_silent, 10000, 10000, "churn_full", 1024))
+            bad_silent, 10000, "churn_full", 1024))
 
     def test_expected_rows_none_skips_pin(self):
         ctx = {"rows": 7, "present_calls": 100, "system_calls": 100,
                "unknown_calls": 0, "drops": 0}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 100, 100, "single", None), [])
+            m1validity.check_ctx_leg(ctx, 100, "single", None), [])
+
+    def test_a2_no_driver_oracle_arithmetic(self):
+        # A2 regression: kernel calls per roundtrip are kernel/shape
+        # dependent (2 flat, 4 6.12-floor, plus allocs), so the
+        # overlay pins no present-vs-ops relation — a 4x-shaped
+        # consistent triple passes the exactness rules.
+        ctx = {"rows": 3, "present_calls": 4008, "system_calls": 4008,
+               "unknown_calls": 0, "drops": 0}
+        self.assertEqual(
+            m1validity.check_ctx_leg(ctx, 4008, "single", 3), [])
+
+    def test_a2_sealed_612_diag_ctx_passes_exactness(self):
+        # Replay of the sealed 6.12 diag ctx object
+        # (cells/m1-diag-612-ctx, legs/leg00B-capture.stderr.log):
+        # ops_total=1226880, KTOT=system=present=4907528. Row pin
+        # skipped (diag kind): the floor splits kh across cryptd arms.
+        ctx = {"rows": 12, "present_calls": 4907528,
+               "system_calls": 4907528, "unknown_calls": 0, "drops": 0}
+        self.assertEqual(
+            m1validity.check_ctx_leg(ctx, 4907528, "single", None), [])
+
+    def test_churn_full_unreadable_present_or_drops(self):
+        ctx = {"rows": 1024, "present_calls": None,
+               "system_calls": 10000, "unknown_calls": 1000,
+               "drops": 1000}
+        reasons = m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024)
+        self.assertTrue(any("unreadable" in reason for reason in reasons))
 
 
 class SetVerdictTests(unittest.TestCase):

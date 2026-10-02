@@ -1438,8 +1438,7 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
     else:
         expected_rows = manifest["workloads"][shape]["expected_rows"]
     reasons = km1validity.check_ctx_leg(
-        ctx, parsed["totals"].get("calls"),
-        judged["driver"]["ops_total"], shape, expected_rows)
+        ctx, parsed["totals"].get("calls"), shape, expected_rows)
     if reasons:
         judged["valid"] = False
         judged["outcome"] = "invalid"

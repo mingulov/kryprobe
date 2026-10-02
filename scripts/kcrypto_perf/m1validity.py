@@ -10,11 +10,16 @@ no validity) and checks the unknown-by-difference identity plus the
 per-shape exactness rules from the frozen gate protocol:
 
 - below-capacity shapes (single, n_cgroup, churn_below): every counted
-  call attributed — ``present == ops_total``, ``unknown == 0``,
-  ``drops == 0``, ``rows == expected_rows`` exactly.
+  call attributed — ``unknown == 0``, ``drops == 0``,
+  ``rows == expected_rows`` exactly. (A2: frozen validity already
+  reconciles driver↔sensor per-op on every overlay-reached leg, so no
+  driver-oracle conjunct here — the overlay reconciles
+  sensor↔attribution. The A1 ``KTOT == ops_total`` conjunct was
+  arithmetically false: ``enc == ops`` AND ``dec == ops`` per §5¶1.)
 - churn_full: the system ledger stays exact with all unassigned calls
-  explicitly countable — ``rows == 1024``, ``present + drops ==
-  ops_total``, ``unknown == drops``, ``unknown > 0``.
+  explicitly countable — ``rows == 1024``, ``unknown == drops``,
+  ``unknown > 0``, present/drops readable (``present + drops ==
+  system`` is then entailed, not separately pinned — A2).
 - every C leg: ``system == report totals`` cross-check and a recomputed
   ``unknown == system - present`` (operands-present-but-unknown-null is
   a contradiction, distinct from an unreadable walk).
@@ -71,11 +76,13 @@ def parse_ctx_telemetry(path: Path) -> dict:
     return out
 
 
-def check_ctx_leg(ctx: dict, totals_calls, ops_total: int,
-                  shape: str, expected_rows: int) -> list:
+def check_ctx_leg(ctx: dict, totals_calls, shape: str,
+                  expected_rows: int) -> list:
     """M1 ctx exactness rules for one C leg. Returns reasons (empty =
-    valid). ``totals_calls`` is the report TOTALS calls (cross-check);
-    ``ops_total`` the driver oracle (whole-window ops)."""
+    valid). ``totals_calls`` is the report TOTALS calls (cross-check).
+    No driver-oracle arithmetic (A2): kernel calls per roundtrip are
+    shape- and kernel-dependent (2 flat, 4 6.12-floor, plus allocs),
+    and frozen validity already reconciles driver↔sensor per-op."""
     reasons = []
     rows = ctx["rows"]
     present = ctx["present_calls"]
@@ -98,12 +105,11 @@ def check_ctx_leg(ctx: dict, totals_calls, ops_total: int,
     if shape == "churn_full":
         if rows != 1024:
             reasons.append(f"churn_full rows={rows}, want exactly 1024")
-        if present is not None and drops is not None:
-            if present + drops != ops_total:
-                reasons.append(
-                    f"churn_full present+drops={present + drops} != "
-                    f"driver ops={ops_total}")
-        else:
+        # A2: readability required; the sum-vs-oracle comparison is
+        # dropped (calls-per-roundtrip is kernel/shape-dependent, and
+        # present+drops==system is entailed by unknown==drops plus
+        # the identity above).
+        if present is None or drops is None:
             reasons.append("churn_full present/drops unreadable")
         if unknown is not None and drops is not None:
             if unknown != drops:
@@ -117,10 +123,8 @@ def check_ctx_leg(ctx: dict, totals_calls, ops_total: int,
         # expected_rows=None skips the row pin (6.12 diagnostic: the
         # floor splits kh across cryptd arms, so exactness without a
         # row-shape claim is the honest check).
-        if present != ops_total:
-            reasons.append(
-                f"{shape} present={present} != driver ops={ops_total} "
-                "(eligible partition must reconcile exactly)")
+        # A2: no present-vs-ops comparison (see the docstring —
+        # frozen validity reconciles driver↔sensor per-op).
         if unknown != 0:
             reasons.append(f"{shape} unknown={unknown}, want 0")
         if drops != 0:
