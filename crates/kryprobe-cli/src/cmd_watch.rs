@@ -715,8 +715,7 @@ mod tests {
             let body = stops[0]
                 .strip_prefix("kryprobe: telemetry ")
                 .expect("telemetry prefix");
-            let parsed: serde_json::Value =
-                serde_json::from_str(body).expect("stop line parses");
+            let parsed: serde_json::Value = serde_json::from_str(body).expect("stop line parses");
             assert_eq!(parsed["v"].as_u64(), Some(1));
             assert!(parsed["stop"]["total_us"].as_u64().is_some());
             assert!(parsed["stop"]["render_us"].as_u64().is_some());
@@ -733,12 +732,7 @@ mod tests {
         ] {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let code = finish_watch(
-                Err(err),
-                &FilterArgs::default(),
-                &mut stdout,
-                &mut stderr,
-            );
+            let code = finish_watch(Err(err), &FilterArgs::default(), &mut stdout, &mut stderr);
             assert_eq!(code, code_want);
             assert!(stdout.is_empty());
             let err_text = String::from_utf8(stderr).expect("utf-8");
