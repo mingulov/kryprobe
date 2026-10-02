@@ -193,6 +193,17 @@ re-proved, not silently dropped):
   7014 re-proved in repair-1).
 - X01–X03 / D01–D08: separate P10 demo scope, out of R1.
 
+## R1 1 MiB aggregate follow-up
+
+A new `perf-P-1M-agg-7014` wave on 2026-10-01 at
+`0c16410bf064fb67cc8fbb7b30820aa473b5e041` passed the frozen budgets:
+median throughput ratio 0.982 and workload-p99 ratio 1.015, with all
+5 pairs inside both budgets. This PASS applies only to that R1 sample;
+it does not re-grade P9 or qualify v0.1.0 release bytes or other sets.
+Retained private-workspace report:
+`evidence/kcrypto-r1-perf/perf-report.md`; original cell `SHA256SUMS`
+digest: `611d2fc23685639cd216f99015ba09a6796f6bd6218024a2ccb792044f27a317`.
+
 ## T14 results accepted as first-release limitations
 
 The owner accepted the following limits for v0.1.0 on 2026-09-30.
