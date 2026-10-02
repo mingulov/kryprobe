@@ -2812,9 +2812,7 @@ mod tests {
         assert_eq!(parsed["stop"]["finalize_us"].as_u64(), Some(9000));
         assert_eq!(parsed["stop"]["assemble_us"].as_u64(), Some(2000));
         let total_us = parsed["stop"]["total_us"].as_u64().expect("total number");
-        let render_us = parsed["stop"]["render_us"]
-            .as_u64()
-            .expect("render number");
+        let render_us = parsed["stop"]["render_us"].as_u64().expect("render number");
         assert!(
             total_us >= render_us,
             "total {total_us} >= render {render_us}"
