@@ -207,8 +207,9 @@ def parse_telemetry(path: Path) -> dict:
     """Fold R1 machine-readable telemetry from a capture stderr log.
 
     Ticks fold to the session max drain lag (``lagmax_us``); the
-    last stop-span/occupancy object wins. Malformed lines and
-    unknown versions are counted (never fatal — telemetry is
+    last stop-span/occupancy object wins. Malformed lines, unknown
+    versions, and present-but-invalid lag values (floats included —
+    never rounded) are counted (never fatal — telemetry is
     best-effort observability, not validity input). A missing file
     raises :class:`ParseError` (module discipline).
     """
@@ -236,6 +237,12 @@ def parse_telemetry(path: Path) -> dict:
         lag = obj.get("lagmax_us")
         if isinstance(lag, int) and not isinstance(lag, bool):
             lagmax = lag if lagmax is None else max(lagmax, lag)
+        elif lag is not None:
+            # Present non-null lag of the wrong type (float, str,
+            # bool): malformed, never silently rounded or ignored.
+            # Intentional null / absent lag stays uncounted; the
+            # line's stop/occupancy objects still fold below.
+            malformed += 1
         if isinstance(obj.get("stop"), dict):
             stop = obj["stop"]
         if isinstance(obj.get("occupancy"), dict):
