@@ -38,6 +38,7 @@ use kryprobe_abi::kcrypto_agg::{
     KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCtl, KIDN_DROPS, VAgg, fold_vagg, kagg_from_bytes,
     kctl_from_bytes, vagg_from_bytes,
 };
+use kryprobe_abi::kcrypto_ctx::{KCTL_CTX_OVERFLOW, KCtxKey, VCtx, fold_vctx};
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, RawEventHeader};
 use kryprobe_core::DrainConfig;
 use kryprobe_core::backend::RawEvent;
@@ -162,6 +163,9 @@ pub struct SnapshotRows {
     pub idents: Vec<IdentBytes>,
     /// `OVERFLOW`-kind records in this drain (healthy: 0).
     pub overflow_identities: u64,
+    /// `CTX_OVERFLOW`-kind records in this drain (healthy: 0):
+    /// first-per-`kh` `KCTX`-full notices, independent of KIDN-full.
+    pub ctx_overflow_identities: u64,
     /// `KIDN[KIDN_DROPS]` at snapshot time (M3: retained, not
     /// discarded — the feed and finalize reuse the closing snapshot's
     /// value instead of re-reading the key at session end).
@@ -441,7 +445,7 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
 
 /// `KTOT` read + percpu fold (`None` on `ENOENT` only — any other errno
 /// fails the snapshot).
-fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsError> {
+pub(crate) fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsError> {
     let (ncpu, value_len) = percpu_buffer_len(120)?;
     // SAFETY: KTOT is PerCpuArray<VAgg>; VAgg is 120B
     // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus.
@@ -547,14 +551,17 @@ fn drain_setup_error(err: DrainError) -> MapOpsError {
     }
 }
 
-/// Push one ring record into the ident set: `IDENT`/`OVERFLOW` kinds
-/// encode as [`IdentBytes`] (`OVERFLOW` additionally counted); reserved
-/// kinds (`GENCHANGE`/`GAP`/`HEALTH`, never emitted — K1 pins) skip
+/// Push one ring record into the ident set: `IDENT`/`OVERFLOW`/
+/// `CTX_OVERFLOW` kinds encode as [`IdentBytes`] (the two overflow
+/// kinds additionally counted, separately — KIDN-full vs KCTX-full
+/// are independent attribution losses); reserved kinds
+/// (`GENCHANGE`/`GAP`/`HEALTH`, never emitted — K1 pins) skip
 /// forward-compatibly. Non-48B payloads fail loud (BPF/ABI drift).
 fn push_ident_record(
     record: Vec<u8>,
     idents: &mut Vec<IdentBytes>,
     overflow_identities: &mut u64,
+    ctx_overflow_identities: &mut u64,
     lagmax_ns: &mut Option<u64>,
 ) -> Result<(), MapOpsError> {
     if record.len() != 48 {
@@ -571,14 +578,17 @@ fn push_ident_record(
     // post-ingest clock step never underflows into a huge lag).
     // Control records are rare (~512/lifetime), so a clock read
     // per record is affordable and exact.
-    if kctl.kind == KCTL_IDENT || kctl.kind == KCTL_OVERFLOW {
+    if kctl.kind == KCTL_IDENT || kctl.kind == KCTL_OVERFLOW || kctl.kind == KCTL_CTX_OVERFLOW {
         let lag = monotonic_now()?.saturating_sub(kctl.val2);
         *lagmax_ns = Some(lagmax_ns.map_or(lag, |prev| prev.max(lag)));
     }
     match kctl.kind {
-        KCTL_IDENT | KCTL_OVERFLOW => {
+        KCTL_IDENT | KCTL_OVERFLOW | KCTL_CTX_OVERFLOW => {
             if kctl.kind == KCTL_OVERFLOW {
                 *overflow_identities = overflow_identities.saturating_add(1);
+            }
+            if kctl.kind == KCTL_CTX_OVERFLOW {
+                *ctx_overflow_identities = ctx_overflow_identities.saturating_add(1);
             }
             let mut bytes = Vec::with_capacity(IDENT_BYTES_LEN);
             bytes.push(SNAPSHOT_VERSION);
@@ -599,6 +609,7 @@ fn collect_until_barrier(
     expected_barrier: u64,
     idents: &mut Vec<IdentBytes>,
     overflow_identities: &mut u64,
+    ctx_overflow_identities: &mut u64,
     lagmax_ns: &mut Option<u64>,
 ) -> Result<(), MapOpsError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -612,14 +623,24 @@ fn collect_until_barrier(
         }
         match receiver.recv_timeout(remaining) {
             Ok(DrainEvent::Record(record)) => {
-                push_ident_record(record, idents, overflow_identities, lagmax_ns)?;
+                push_ident_record(
+                    record,
+                    idents,
+                    overflow_identities,
+                    ctx_overflow_identities,
+                    lagmax_ns,
+                )?;
             }
             Ok(DrainEvent::Barrier(id)) if id == expected_barrier => {
                 for _ in 0..DRAIN_BUDGET.queue_depth {
                     match receiver.try_recv() {
-                        Ok(DrainEvent::Record(record)) => {
-                            push_ident_record(record, idents, overflow_identities, lagmax_ns)?
-                        }
+                        Ok(DrainEvent::Record(record)) => push_ident_record(
+                            record,
+                            idents,
+                            overflow_identities,
+                            ctx_overflow_identities,
+                            lagmax_ns,
+                        )?,
                         _ => break,
                     }
                 }
@@ -664,21 +685,28 @@ pub fn session_drain(sensor: &ConfiguredKcrypto) -> Result<DrainThread, MapOpsEr
 fn drain_idents_with(
     drain: &DrainThread,
     barrier: u64,
-) -> Result<(Vec<IdentBytes>, u64, Option<u64>), MapOpsError> {
+) -> Result<(Vec<IdentBytes>, u64, u64, Option<u64>), MapOpsError> {
     // The worker emits the barrier after the backlog it observed, so
     // this is a host checkpoint, not proof that kernel writers finished.
     drain.inject_barrier(barrier);
     let mut idents = Vec::new();
     let mut overflow_identities = 0;
+    let mut ctx_overflow_identities = 0;
     let mut lagmax_ns = None;
     collect_until_barrier(
         drain.receiver(),
         barrier.max(1),
         &mut idents,
         &mut overflow_identities,
+        &mut ctx_overflow_identities,
         &mut lagmax_ns,
     )?;
-    Ok((idents, overflow_identities, lagmax_ns))
+    Ok((
+        idents,
+        overflow_identities,
+        ctx_overflow_identities,
+        lagmax_ns,
+    ))
 }
 
 /// Drain `KRING` through a short-lived [`DrainThread`] (spawn/stop per
@@ -700,7 +728,7 @@ fn drain_idents_with(
 /// silently drop.
 fn drain_idents(
     sensor: &ConfiguredKcrypto,
-) -> Result<(Vec<IdentBytes>, u64, Option<u64>), MapOpsError> {
+) -> Result<(Vec<IdentBytes>, u64, u64, Option<u64>), MapOpsError> {
     let drain = session_drain(sensor)?;
     let result = drain_idents_with(&drain, 1);
     // Always joined (even on collect failure) so the thread never escapes.
@@ -709,28 +737,35 @@ fn drain_idents(
         stage: format!("snapshot/ring-stop:{err}"),
         errno: libc::EIO,
     });
-    let (mut idents, mut overflow_identities, mut lagmax_ns) = match (result, stats) {
-        (Err(primary), Err(cleanup)) => {
-            return Err(MapOpsError::LookupFailed {
-                stage: format!("{primary}; cleanup also failed: {cleanup}"),
-                errno: libc::EIO,
-            });
-        }
-        (Err(primary), _) => return Err(primary),
-        (_, Err(cleanup)) => return Err(cleanup),
-        (Ok(rows), Ok(_)) => rows,
-    };
+    let (mut idents, mut overflow_identities, mut ctx_overflow_identities, mut lagmax_ns) =
+        match (result, stats) {
+            (Err(primary), Err(cleanup)) => {
+                return Err(MapOpsError::LookupFailed {
+                    stage: format!("{primary}; cleanup also failed: {cleanup}"),
+                    errno: libc::EIO,
+                });
+            }
+            (Err(primary), _) => return Err(primary),
+            (_, Err(cleanup)) => return Err(cleanup),
+            (Ok(rows), Ok(_)) => rows,
+        };
     for event in tail {
         if let DrainEvent::Record(record) = event {
             push_ident_record(
                 record,
                 &mut idents,
                 &mut overflow_identities,
+                &mut ctx_overflow_identities,
                 &mut lagmax_ns,
             )?;
         }
     }
-    Ok((idents, overflow_identities, lagmax_ns))
+    Ok((
+        idents,
+        overflow_identities,
+        ctx_overflow_identities,
+        lagmax_ns,
+    ))
 }
 
 /// Snapshot every kcrypto map through a session drain: same walk as
@@ -751,12 +786,14 @@ pub fn snapshot_rows_with_drain(
     let rows = walk_kagg(sensor)?;
     let totals = read_ktot(sensor)?;
     let drops = read_kidn_drops(sensor)?;
-    let (idents, overflow_identities, lagmax_ns) = drain_idents_with(drain, barrier)?;
+    let (idents, overflow_identities, ctx_overflow_identities, lagmax_ns) =
+        drain_idents_with(drain, barrier)?;
     Ok(SnapshotRows {
         rows,
         totals,
         idents,
         overflow_identities,
+        ctx_overflow_identities,
         drops,
         monotonic_ns,
         lagmax_ns,
@@ -775,6 +812,7 @@ pub(crate) fn terminal_rows(
         drops: read_kidn_drops(sensor)?,
         idents: Vec::new(),
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         monotonic_ns: 0,
         lagmax_ns: None,
     };
@@ -793,6 +831,7 @@ pub(crate) fn append_drain_tail(
                 record,
                 &mut snapshot.idents,
                 &mut snapshot.overflow_identities,
+                &mut snapshot.ctx_overflow_identities,
                 &mut snapshot.lagmax_ns,
             )?;
         }
@@ -811,12 +850,13 @@ pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsE
     let rows = walk_kagg(sensor)?;
     let totals = read_ktot(sensor)?;
     let drops = read_kidn_drops(sensor)?;
-    let (idents, overflow_identities, lagmax_ns) = drain_idents(sensor)?;
+    let (idents, overflow_identities, ctx_overflow_identities, lagmax_ns) = drain_idents(sensor)?;
     Ok(SnapshotRows {
         rows,
         totals,
         idents,
         overflow_identities,
+        ctx_overflow_identities,
         drops,
         monotonic_ns,
         lagmax_ns,
@@ -855,6 +895,30 @@ pub struct AggOccupancy {
     /// construction). Slot count, NOT drops observed — loss
     /// accounting rides the snapshot `drops` + integrity fields.
     pub kdrops_slots: Option<u64>,
+    /// Resident `KCTX` rows (ctx-v1).
+    pub kctx: Option<u64>,
+}
+
+/// Terminal ctx-v1 attribution account (M1 early gate): the operands
+/// of the unknown-by-difference identity from one consistent
+/// post-fence read. Every field is fail-soft (`None` = unreadable,
+/// never a silent zero); the JUDGE recomputes
+/// `unknown == system - present` and treats operands-present-but-
+/// `unknown == None` as a contradiction (invalid), distinct from an
+/// unreadable walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CtxTerminal {
+    /// Resident `KCTX` rows.
+    pub rows: Option<u64>,
+    /// Σ `KCTX[*].calls` (saturating; call counts never near u64::MAX).
+    pub present_calls: Option<u64>,
+    /// `KTOT` system-ledger calls.
+    pub system_calls: Option<u64>,
+    /// `system - present` (checked; `None` on missing operands or a
+    /// negative difference — see the struct docs).
+    pub unknown_calls: Option<u64>,
+    /// Exact `KCTX_DROPS` refuse-new count.
+    pub drops: Option<u64>,
 }
 
 /// Iteration safety cap: 32x the largest agg map (`KWHO`, 2048) —
@@ -879,6 +943,54 @@ fn count_map_entries(fd: &OwnedFd, key_size: usize, stage: &str) -> Option<u64> 
     Some(count)
 }
 
+/// Fold one `KCTX` dump into per-key totals (ADR-0008 §(e)): each
+/// `(key, per-CPU lanes)` entry folds independently via [`fold_vctx`] —
+/// counts never merge across context keys. Order-preserving.
+#[must_use]
+pub fn fold_ctx_dump(dump: &[(KCtxKey, Vec<VCtx>)]) -> Vec<(KCtxKey, VCtx)> {
+    dump.iter()
+        .map(|(key, lanes)| (*key, fold_vctx(lanes)))
+        .collect()
+}
+
+/// Unknown-by-difference outcome over a consistent stop snapshot: the
+/// system total, the summed per-context contribution, the unknown
+/// magnitude, and the exact refused-insert count (`KCTX_DROPS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtxUnknownOutcome {
+    /// The system total operand (`KTOT.calls`).
+    pub system_total: u64,
+    /// The summed per-context operand (`ΣKCTX.calls`).
+    pub per_context_sum: u64,
+    /// The unknown magnitude (`system_total − per_context_sum`).
+    pub unknown: u64,
+    /// Exact refused-insert count (informational: refused calls are
+    /// already inside `unknown`, never double-counted).
+    pub refused: u64,
+}
+
+/// Resolve unknown-by-difference from a fenced terminal snapshot
+/// (ADR-0008 §(e)): checked subtraction via the Task 01 contract —
+/// contradiction surfaces, never saturates. Callers must only invoke
+/// this with a `Quiescent` receipt; unproven snapshots stay samples.
+pub fn ctx_unknown_from_totals(
+    system_total: u64,
+    per_context_sum: u64,
+    refused: u64,
+) -> Result<CtxUnknownOutcome, String> {
+    let diff = kryprobe_core::workload::UnknownByDifference::compute(
+        kryprobe_core::workload::SnapshotConsistency::Quiescent,
+        system_total,
+        per_context_sum,
+    )?;
+    Ok(CtxUnknownOutcome {
+        system_total: diff.system_total,
+        per_context_sum: diff.per_context_sum,
+        unknown: diff.unknown,
+        refused,
+    })
+}
+
 /// Read [`AggOccupancy`] through retained map FDs, including after link close.
 /// Each count is an independent best-effort walk, not a consistency proof.
 #[must_use]
@@ -894,6 +1006,7 @@ pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
         kerr: count_map_entries(&maps.err, 8, "snapshot/occ-kerr"),
         kparams: count_map_entries(&maps.params, 8, "snapshot/occ-kparams"),
         kdrops_slots: Some(8),
+        kctx: count_map_entries(&maps.ctx, 32, "snapshot/occ-kctx"),
     }
 }
 
@@ -909,7 +1022,7 @@ mod tests {
         tx.send(DrainEvent::Record(record)).unwrap();
         tx.send(DrainEvent::Barrier(7)).unwrap();
         let mut idents = Vec::new();
-        collect_until_barrier(&rx, 7, &mut idents, &mut 0, &mut None).unwrap();
+        collect_until_barrier(&rx, 7, &mut idents, &mut 0, &mut 0, &mut None).unwrap();
         assert_eq!(
             idents.len(),
             1,

@@ -150,6 +150,10 @@ impl Sensor {
             parent_ok: 0,
             params_ok: 0,
             _pad2: [0, 0],
+            // ctx-v1 lifetime pair, zeroed (Task02 wires resolution).
+            task_start_off: 0,
+            start_ok: 0,
+            _pad3: [0, 0, 0],
         };
         map_update_bytes(
             &loaded.maps.config,
@@ -1169,7 +1173,7 @@ fn kcfg_roundtrip_matches_resolver() {
     if !lane_ready("kcfg_roundtrip_matches_resolver") {
         return;
     }
-    // Load only (no attach, no traffic): the 76B KCFG row the loader
+    // Load only (no attach, no traffic): the 84B KCFG row the loader
     // path writes must read back byte-identical (pin + codec + dims).
     let bytes = kcrypto_bytes();
     let ids = resolve_btf_ids().expect("P0 symbols must resolve");
@@ -1202,12 +1206,16 @@ fn kcfg_roundtrip_matches_resolver() {
         parent_ok: 0,
         params_ok: 0,
         _pad2: [0, 0],
+        // ctx-v1 lifetime pair, zeroed (Task02 wires resolution).
+        task_start_off: 0,
+        start_ok: 0,
+        _pad3: [0, 0, 0],
     };
     let want = cfg.to_bytes();
     assert_eq!(
         want.len(),
-        76,
-        "KCFG wire is 76B (C2 + shash_base + K5 tail)"
+        84,
+        "KCFG wire is 84B (C2 + shash_base + K5 tail + ctx-v1 pair)"
     );
     map_update_bytes(
         &loaded.maps.config,
@@ -1216,12 +1224,12 @@ fn kcfg_roundtrip_matches_resolver() {
         "kcfg/roundtrip",
     )
     .expect("KCFG write");
-    // SAFETY: KCFG wire is exactly 76B (asserted above).
+    // SAFETY: KCFG wire is exactly 84B (asserted above).
     let got = unsafe {
         map_lookup_bytes(
             &loaded.maps.config,
             &0u32.to_le_bytes(),
-            76,
+            84,
             "kcfg/roundtrip",
         )
     }

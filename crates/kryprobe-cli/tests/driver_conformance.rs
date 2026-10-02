@@ -528,6 +528,7 @@ impl SessionSensor for ConformanceSensor {
                 drops: [0; 8],
                 drain: Default::default(),
                 started_ns,
+                fence: kryprobe_privilege::kcrypto_fence::CloseOutcome::Pending,
             },
         )
     }
@@ -576,6 +577,7 @@ fn agg_tick() -> SnapshotRows {
         totals: Some(totals_row(30)),
         idents: vec![ident_row()],
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
         lagmax_ns: None,

@@ -26,6 +26,8 @@ pub mod inspect;
 pub mod kallsyms;
 pub mod kcrypto_backend;
 pub mod kcrypto_context;
+pub mod kcrypto_ctx_obs;
+pub mod kcrypto_fence;
 pub mod kcrypto_lifecycle;
 pub mod kcrypto_snapshot;
 pub mod local;

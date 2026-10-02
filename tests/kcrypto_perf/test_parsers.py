@@ -315,6 +315,23 @@ class TelemetryTests(unittest.TestCase):
             PARSERS.parse_telemetry(
                 write_tmp("x").parent / "definitely-missing.log")
 
+    def test_ctx_line_counted_never_malformed_folds_nothing(self):
+        # M1 terminal ctx line (live.rs telemetry_ctx_line): the frozen
+        # consumer counts the line and folds nothing from it (no lag /
+        # stop / occupancy keys) — the M1 judge parses `ctx` separately.
+        content = (self._line({"v": 1, "tick": 1, "lagmax_us": 120})
+                   + self._line({"v": 1, "ctx": {"rows": 1024,
+                                                 "present_calls": 5000,
+                                                 "system_calls": 5026,
+                                                 "unknown_calls": 26,
+                                                 "drops": 26}}))
+        parsed = PARSERS.parse_telemetry(write_tmp(content))
+        self.assertEqual(parsed["lines"], 2)
+        self.assertEqual(parsed["malformed"], 0)
+        self.assertEqual(parsed["lagmax_us"], 120)
+        self.assertIsNone(parsed["stop"])
+        self.assertIsNone(parsed["occupancy"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -102,10 +102,11 @@ pub const KWHO_DROPS: u64 = u64::MAX - 1;
 
 /// `KCFG` value: the 9 loader-resolved offsets + kthread flag + pad
 /// (44B, K1) + the 7 K5 attribution offsets + `parent_ok`/`params_ok`
-/// flags + pad (76B total).
+/// flags + pad (76B) + the ctx-v1 lifetime offset + `start_ok` + pad
+/// (84B total).
 ///
-/// Append-only: the K1 field offsets are unchanged. Twin: `KConfig` in
-/// `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
+/// Append-only: the K1/K5 field offsets are unchanged. Twin: `KConfig`
+/// in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct KConfig {
@@ -155,6 +156,13 @@ pub struct KConfig {
     pub params_ok: u8,
     /// Reserved, zero.
     pub _pad2: [u8; 2],
+    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator).
+    pub task_start_off: u32,
+    /// Nonzero iff the start offset resolved (BPF emits `start_ns == 0`
+    /// — the unknown-lifetime bucket — when false).
+    pub start_ok: u8,
+    /// Reserved, zero.
+    pub _pad3: [u8; 3],
 }
 
 impl KConfig {
@@ -185,12 +193,15 @@ impl KConfig {
         "parent_ok",
         "params_ok",
         "_pad2",
+        "task_start_off",
+        "start_ok",
+        "_pad3",
     ];
 
     /// Little-endian wire bytes for the `KCFG` map update (x86-64 target).
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 76] {
-        let mut out = [0u8; 76];
+    pub fn to_bytes(&self) -> [u8; 84] {
+        let mut out = [0u8; 84];
         out[0..4].copy_from_slice(&self.sk_req_base.to_le_bytes());
         out[4..8].copy_from_slice(&self.async_tfm.to_le_bytes());
         out[8..12].copy_from_slice(&self.tfm_alg.to_le_bytes());
@@ -212,6 +223,9 @@ impl KConfig {
         out[72] = self.parent_ok;
         out[73] = self.params_ok;
         out[74..76].copy_from_slice(&self._pad2);
+        out[76..80].copy_from_slice(&self.task_start_off.to_le_bytes());
+        out[80] = self.start_ok;
+        out[81..84].copy_from_slice(&self._pad3);
         out
     }
 }
@@ -1018,9 +1032,10 @@ mod tests {
     }
 
     #[test]
-    fn kconfig_wire_is_76_with_k5_tail() {
+    fn kconfig_wire_is_84_with_ctx_tail() {
         // K1 head bytes unchanged (append-only extension); the K5 tail
-        // carries the new offsets + flags.
+        // carries the new offsets + flags, and the ctx-v1 tail carries
+        // the start-time offset + flag (ADR-0008 wire §wire).
         let cfg = KConfig {
             sk_req_base: 32,
             task_real_parent: 1232,
@@ -1032,10 +1047,12 @@ mod tests {
             cra_max_keysize: 76,
             parent_ok: 1,
             params_ok: 0,
+            task_start_off: 1664,
+            start_ok: 1,
             ..KConfig::default()
         };
         let wire = cfg.to_bytes();
-        assert_eq!(wire.len(), 76);
+        assert_eq!(wire.len(), 84);
         assert_eq!(u32::from_le_bytes([wire[0], wire[1], wire[2], wire[3]]), 32);
         assert_eq!(
             u32::from_le_bytes([wire[44], wire[45], wire[46], wire[47]]),
@@ -1048,6 +1065,12 @@ mod tests {
         assert_eq!(wire[72], 1);
         assert_eq!(wire[73], 0);
         assert_eq!(&wire[74..76], &[0, 0]);
+        assert_eq!(
+            u32::from_le_bytes([wire[76], wire[77], wire[78], wire[79]]),
+            1664
+        );
+        assert_eq!(wire[80], 1);
+        assert_eq!(&wire[81..84], &[0, 0, 0]);
     }
 
     #[test]

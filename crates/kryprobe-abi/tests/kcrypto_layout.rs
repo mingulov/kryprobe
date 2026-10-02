@@ -19,9 +19,10 @@ fn kconfig_size_align_and_offsets_pinned() {
     // 11 x u32 (44B K1 head: the 6 P2/task offsets + pf_kthread + the
     // AEAD/ahash length offsets + shash_base + _pad as 11th word; brief
     // C2 + the K4-fix3 shash resolution) + 7 x u32 K5 offsets + 2 flag
-    // bytes + 2 pad bytes = 76B. Append-only: every K1 offset below is
+    // bytes + 2 pad bytes (76B) + ctx-v1 u32 start offset + flag byte +
+    // 3 pad bytes = 84B. Append-only: every K1/K5 offset below is
     // unchanged.
-    assert_eq!(std::mem::size_of::<KConfig>(), 76);
+    assert_eq!(std::mem::size_of::<KConfig>(), 84);
     assert_eq!(std::mem::align_of::<KConfig>(), 4);
     assert_eq!(std::mem::offset_of!(KConfig, sk_req_base), 0);
     assert_eq!(std::mem::offset_of!(KConfig, async_tfm), 4);
@@ -44,6 +45,9 @@ fn kconfig_size_align_and_offsets_pinned() {
     assert_eq!(std::mem::offset_of!(KConfig, parent_ok), 72);
     assert_eq!(std::mem::offset_of!(KConfig, params_ok), 73);
     assert_eq!(std::mem::offset_of!(KConfig, _pad2), 74);
+    assert_eq!(std::mem::offset_of!(KConfig, task_start_off), 76);
+    assert_eq!(std::mem::offset_of!(KConfig, start_ok), 80);
+    assert_eq!(std::mem::offset_of!(KConfig, _pad3), 81);
 }
 
 #[test]

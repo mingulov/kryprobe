@@ -500,6 +500,7 @@ mod tests {
             totals: None,
             idents: Vec::new(),
             overflow_identities: 0,
+            ctx_overflow_identities: 0,
             drops: 0,
             monotonic_ns: 0,
             lagmax_ns: None,

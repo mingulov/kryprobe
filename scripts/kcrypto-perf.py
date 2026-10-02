@@ -27,6 +27,8 @@ from kcrypto_perf import stats as kstats  # noqa: E402
 from kcrypto_perf import parsers as kparsers  # noqa: E402
 from kcrypto_perf import validity as kvalidity  # noqa: E402
 from kcrypto_perf import manifest as kmanifest  # noqa: E402
+from kcrypto_perf import m1manifest as km1manifest  # noqa: E402
+from kcrypto_perf import m1validity as km1validity  # noqa: E402
 
 _SPEC = importlib.util.spec_from_file_location(
     "kcrypto_campaign_cli", str(HERE / "kcrypto-campaign.py"))
@@ -39,6 +41,24 @@ PERF_MANIFEST = HERE.parent / "tests" / "kcrypto_perf" / "cells.json"
 
 def sha256_file(path: Path) -> str:
     return krecept.sha256_file(Path(path))
+
+
+def load_any_manifest(path: Path) -> dict:
+    """Load the frozen or M1 manifest by its declared $schema (the
+    $schema read itself is unvalidated JSON; the strict loader for
+    the named schema validates everything after)."""
+    try:
+        declared = json.loads(Path(path).read_bytes()).get("$schema")
+    except (OSError, ValueError) as err:
+        raise kmanifest.InputError(f"manifest unreadable: {err}") from err
+    if declared == km1manifest.SCHEMA:
+        return km1manifest.load_manifest(Path(path))
+    return kmanifest.load_manifest(Path(path))
+
+
+def is_m1_manifest(manifest: dict) -> bool:
+    """True for M1 early-gate manifests (M1 code paths only)."""
+    return manifest.get("$schema") == km1manifest.SCHEMA
 
 
 def find_set(manifest: dict, set_id: str) -> dict:
@@ -63,6 +83,8 @@ def gen_legs(entry: dict, manifest: dict, kind: str, start_pair: int = 0,
     alternation from ``start_pair``). Returns a list of dicts with
     leg_id/side/mode/cls/driver/size/workload/paced/bulk/threads.
     """
+    if entry.get("kind") == "m1-pairs":
+        return _gen_m1_legs(entry, manifest, start_pair, n_pairs)
     glob = manifest["global"]
     paced_rate = glob.get("paced_rate_per_s", 1000)
     if kind == "diag":
@@ -106,7 +128,39 @@ def gen_legs(entry: dict, manifest: dict, kind: str, start_pair: int = 0,
     return legs
 
 
+def _gen_m1_legs(entry: dict, manifest: dict, start_pair: int,
+                 n_pairs: int) -> list:
+    """M1 pair-set legs: per-side modes (C/R sets observe on both
+    sides with different staged artifacts; C/D and R/D keep the
+    frozen disabled-A shape). ``threads`` is the judge's
+    expected_alloc (never passed to the M1 driver); alternation and
+    leg_id shape match the frozen rule exactly."""
+    cls = manifest["classes"][entry["class"]]
+    workload = manifest["workloads"][entry["workload"]]
+    if n_pairs < 0:
+        n_pairs = entry["pairs"]
+    legs = []
+    for i in range(n_pairs):
+        pair = start_pair + i
+        order = ("A", "B") if pair % 2 == 0 else ("B", "A")
+        for side in order:
+            legs.append({
+                "leg_id": f"leg{pair:02d}{side}", "side": side,
+                "mode": entry["mode_a"] if side == "A" else entry["mode_b"],
+                "cls": entry["class"], "driver": cls["driver"],
+                "size": cls["size"], "workload": entry["workload"],
+                "paced": 0, "bulk": 0,
+                "threads": workload["driver_threads"]})
+    return legs
+
+
 def _gen_diag_legs(entry: dict, paced_rate: int) -> list:
+    if entry["kind"] == "m1-612-ctx":
+        return [{"leg_id": "leg00B", "side": "B", "mode": "aggregation",
+                 "cls": entry["class"], "driver": "skcipher",
+                 "size": entry["size"],
+                 "workload": entry["workload"],
+                 "paced": 0, "bulk": 0, "threads": 1}]
     if entry["kind"] == "footprint":
         return [{"leg_id": "leg00B", "side": "B", "mode": "attached-idle",
                  "cls": "P-64", "driver": "none", "size": 0,
@@ -127,13 +181,18 @@ def _gen_diag_legs(entry: dict, paced_rate: int) -> list:
 
 
 def cmd_plan(args) -> int:
-    manifest = kmanifest.load_manifest(Path(args.manifest))
+    manifest = load_any_manifest(Path(args.manifest))
     print(f"manifest {args.manifest} sha={manifest['_manifest_sha256'][:12]}...")
     total_legs = 0
     for entry in manifest["sets"]:
         legs = gen_legs(entry, manifest, "set")
         total_legs += len(legs)
-        print(f"set {entry['id']}: {entry['class']} x {entry['mode']} x "
+        if entry.get("kind") == "m1-pairs":
+            desc = (f"{entry['class']} x {entry['obs_a']}/{entry['mode_a']} "
+                    f"vs {entry['obs_b']}/{entry['mode_b']}")
+        else:
+            desc = f"{entry['class']} x {entry['mode']}"
+        print(f"set {entry['id']}: {desc} x "
               f"{entry['kernel']} {entry['workload']} "
               f"budgeted={entry['budgeted']} kind={entry.get('kind', 'pairs')} "
               f"legs={len(legs)}")
@@ -152,6 +211,9 @@ def cmd_plan(args) -> int:
 def stage_run_dir(args, entry: dict, manifest: dict, kind: str,
                   manifest_sha: str, vng: str, legs: list,
                   cell_id: str) -> tuple:
+    if is_m1_manifest(manifest):
+        return stage_m1_run_dir(args, entry, manifest, kind,
+                                manifest_sha, vng, legs, cell_id)
     out_root = Path(args.out_root)
     out_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     run_dir = out_root / cell_id
@@ -242,6 +304,134 @@ def stage_run_dir(args, entry: dict, manifest: dict, kind: str,
              "diag": entry["id"] if kind == "diag" else None,
              "kernel": entry["kernel"], "head": head,
              "manifest_sha256": manifest_sha, "sha256": pins,
+             "legs": [leg["leg_id"] for leg in legs]}
+    (run_dir / "stage.json").write_text(json.dumps(stage, indent=2) + "\n")
+    timeout_s = len(legs) * (glob["capture_s"] + 60) + 600
+    return run_dir, stage, timeout_s
+
+
+def _parse_obs_arg(value: str, side: str) -> tuple:
+    """Parse one --obs-A/--obs-B value: the literal DISABLED, or
+    ``kryprobe_path:bpf_dir`` (the colon splits on its LAST
+    occurrence so paths may contain colons)."""
+    if value == "DISABLED":
+        return (None, None)
+    cli, sep, bpf_dir = value.rpartition(":")
+    if not sep or not cli or not bpf_dir:
+        raise owned_guest.GuestError(
+            f"--obs-{side} wants DISABLED or CLI:BPFDIR, got {value!r}")
+    return (Path(cli), Path(bpf_dir))
+
+
+def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
+                     manifest_sha: str, vng: str, legs: list,
+                     cell_id: str) -> tuple:
+    """Stage one M1 cell: obs-A/obs-B observer dirs (exe + sibling
+    kryprobe-bpf/, or a DISABLED marker), the M1 scenario, the M1
+    driver, and per-cell driver flags from the manifest workload."""
+    out_root = Path(args.out_root)
+    out_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    run_dir = out_root / cell_id
+    if run_dir.exists():
+        raise owned_guest.GuestError(
+            f"run dir {run_dir} already exists (refusing reuse)")
+    run_dir.mkdir(mode=0o700)
+    pins: dict = {}
+    if kind == "set":
+        obs_roles = {"A": entry["obs_a"], "B": entry["obs_b"]}
+    else:
+        obs_roles = {"A": "D", "B": "C"}
+    for side, role in obs_roles.items():
+        obs_dir = run_dir / f"obs-{side}"
+        obs_dir.mkdir()
+        if role == "D":
+            (obs_dir / "DISABLED").write_text("disabled side (no observer)\n")
+            pins[f"obs-{side}/DISABLED"] = sha256_file(obs_dir / "DISABLED")
+            continue
+        cli_src, bpf_src = _parse_obs_arg(
+            args.obs_a if side == "A" else args.obs_b, side)
+        if cli_src is None:
+            raise owned_guest.GuestError(
+                f"side {side} role {role} needs an observer, got DISABLED")
+        cli_src = cli_src.resolve(strict=True)
+        bpf_src = bpf_src.resolve(strict=True)
+        shutil.copyfile(cli_src, obs_dir / "kryprobe")
+        (obs_dir / "kryprobe").chmod(0o755)
+        pins[f"obs-{side}/kryprobe"] = sha256_file(obs_dir / "kryprobe")
+        (obs_dir / "kryprobe-bpf").mkdir()
+        for obj in ("kcrypto.bpf.o", "kcrypto-lifecycle.bpf.o"):
+            shutil.copyfile(bpf_src / obj, obs_dir / "kryprobe-bpf" / obj)
+            pins[f"obs-{side}/kryprobe-bpf/{obj}"] = sha256_file(
+                obs_dir / "kryprobe-bpf" / obj)
+    driver = Path(args.driver).resolve(strict=True)
+    shutil.copyfile(driver, run_dir / "kcrypto_perf.py")
+    pins["kcrypto_perf.py"] = sha256_file(run_dir / "kcrypto_perf.py")
+    configs = sorted(Path(f"~/.cache/virtme-ng/{vng}/amd64/boot").expanduser()
+                     .glob("config-*"))
+    if len(configs) != 1:
+        raise ValueError(f"want exactly one guest config for {vng}, "
+                         f"found {configs}")
+    shutil.copyfile(configs[0], run_dir / "guest-config")
+    pins["guest-config"] = sha256_file(run_dir / "guest-config")
+    pins["kcrypto_fixture.ko"] = "none"
+    shutil.copyfile(SCENARIOS / "perf_set_m1.sh", run_dir / "inner.sh")
+    pins["inner.sh"] = sha256_file(run_dir / "inner.sh")
+    judge_dir = run_dir / "judge"
+    judge_dir.mkdir()
+    for src, name in ((HERE / "kcrypto-perf.py", "kcrypto-perf.py"),
+                      (HERE / "kcrypto_perf" / "validity.py",
+                       "validity.py"),
+                      (HERE / "kcrypto_perf" / "m1validity.py",
+                       "m1validity.py"),
+                      (HERE / "kcrypto_perf" / "stats.py", "stats.py")):
+        shutil.copyfile(src, judge_dir / name)
+        pins[f"judge/{name}"] = sha256_file(judge_dir / name)
+    with (run_dir / "legs.tsv").open("w") as fh:
+        for leg in legs:
+            fh.write("\t".join(str(leg[key]) for key in
+                                ("leg_id", "side", "mode", "cls", "driver",
+                                 "size", "workload", "paced", "bulk",
+                                 "threads")) + "\n")
+    pins["legs.tsv"] = sha256_file(run_dir / "legs.tsv")
+    glob = manifest["global"]
+    workload = manifest["workloads"][entry["workload"]]
+    (run_dir / "set.env").write_text(
+        f"SET_ID={cell_id}\nCAPTURE_S={glob['capture_s']}\n"
+        f"WARMUP_S={glob['warmup_s']}\nMEASURE_S={glob['measure_s']}\n"
+        f"SETTLE_S={glob['settle_s']}\nQUIET_S={glob['quiet_s']}\n"
+        f"NEED_MODULE=0\n"
+        # F-06: quote — multi-word flags (n_cgroup/churn) must
+        # survive `set -u` sourcing as one word (re-split at use).
+        f"M1_DRIVER_FLAGS=\"{workload['driver_flags']}\"\n")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE.parent,
+                          capture_output=True, text=True,
+                          check=True).stdout.strip()
+    (run_dir / "head-sha.txt").write_text(head + "\n")
+    pins["head-sha.txt"] = sha256_file(run_dir / "head-sha.txt")
+    pins["set.env"] = sha256_file(run_dir / "set.env")
+
+    def _pin_or_none(name):
+        return pins.get(name, "none")
+
+    (run_dir / "pins.env").write_text(
+        f"ORACLE_SHA={pins['judge/m1validity.py']}\n"
+        f"CLI_A_SHA={_pin_or_none('obs-A/kryprobe')}\n"
+        f"BPF_A_AGG_SHA={_pin_or_none('obs-A/kryprobe-bpf/kcrypto.bpf.o')}\n"
+        f"BPF_A_LC_SHA={_pin_or_none('obs-A/kryprobe-bpf/kcrypto-lifecycle.bpf.o')}\n"
+        f"CLI_B_SHA={_pin_or_none('obs-B/kryprobe')}\n"
+        f"BPF_B_AGG_SHA={_pin_or_none('obs-B/kryprobe-bpf/kcrypto.bpf.o')}\n"
+        f"BPF_B_LC_SHA={_pin_or_none('obs-B/kryprobe-bpf/kcrypto-lifecycle.bpf.o')}\n"
+        f"MODULE_SHA={pins['kcrypto_fixture.ko']}\n"
+        f"DRIVER_SHA={pins['kcrypto_perf.py']}\n")
+    pins["pins.env"] = sha256_file(run_dir / "pins.env")
+    stage = {"schema": "kcrypto-t14-stage/v1", "cell": cell_id,
+             "kind": kind,
+             "set": entry["id"] if kind == "set" else None,
+             "diag": entry["id"] if kind == "diag" else None,
+             "kernel": entry["kernel"], "head": head,
+             "manifest_sha256": manifest_sha, "sha256": pins,
+             "obs_a": obs_roles["A"], "obs_b": obs_roles["B"],
+             "scenario": "perf_set_m1.sh", "fixture": "kcrypto_perf_m1.py",
              "legs": [leg["leg_id"] for leg in legs]}
     (run_dir / "stage.json").write_text(json.dumps(stage, indent=2) + "\n")
     timeout_s = len(legs) * (glob["capture_s"] + 60) + 600
@@ -419,7 +609,8 @@ def build_host_receipt(args, entry: dict, manifest: dict, run_dir: Path,
     receipt.input = {
         "set": stage["set"], "diag": stage["diag"],
         "kernel": stage["kernel"], "legs": stage["legs"],
-        "scenario": "perf_set.sh", "fixture": "kcrypto_perf.py",
+        "scenario": stage.get("scenario", "perf_set.sh"),
+        "fixture": stage.get("fixture", "kcrypto_perf.py"),
     }
     receipt.observation = {
         "quiet_calls": _read_kv(run_dir / "quiet-calls.txt").get(
@@ -479,7 +670,17 @@ def _read_kv(path: Path) -> dict:
 
 
 def cmd_run(args) -> int:
-    manifest = kmanifest.load_manifest(Path(args.manifest))
+    manifest = load_any_manifest(Path(args.manifest))
+    m1 = is_m1_manifest(manifest)
+    if m1:
+        if not args.obs_a or not args.obs_b:
+            print("run: M1 manifest needs --obs-a and --obs-b "
+                  "(DISABLED or CLI:BPFDIR)", file=sys.stderr)
+            return 2
+    elif not args.kryprobe or not args.bpf_dir:
+        print("run: frozen manifest needs --kryprobe and --bpf-dir",
+              file=sys.stderr)
+        return 2
     if args.set:
         entry = find_set(manifest, args.set)
         kind = "set"
@@ -499,7 +700,8 @@ def cmd_run(args) -> int:
     name = f"t14-{cell_id}"
     locks = _CLI.resolve_lock_paths(
         [args.lock] if isinstance(args.lock, str) else args.lock)
-    print(f"staged {run_dir} pins={stage['sha256']['kryprobe'][:12]}... "
+    first_pin = next(iter(stage["sha256"].values()))
+    print(f"staged {run_dir} pins={first_pin[:12]}... "
           f"legs={len(legs)} timeout_s={timeout_s}")
     result = owned_guest.run_cell(
         portion_id=cell_id,
@@ -529,14 +731,28 @@ def cmd_run(args) -> int:
         if path.is_file():
             shutil.copyfile(path, cell_dir / path.name)
             seal_names.append(path.name)
-    for sub in ("legs", "kryprobe-bpf", "judge"):
+    subdirs = ("legs", "obs-A", "obs-B", "judge") if m1 \
+        else ("legs", "kryprobe-bpf", "judge")
+    for sub in subdirs:
         src = run_dir / sub
-        if src.is_dir():
-            (cell_dir / sub).mkdir(exist_ok=True)
-            for path in sorted(src.iterdir()):
+        if not src.is_dir():
+            continue
+        if m1:
+            # M1 obs dirs nest kryprobe-bpf/ one deeper: seal
+            # recursively (frozen subdirs stay flat, see below).
+            for path in sorted(src.rglob("*")):
                 if path.is_file():
-                    shutil.copyfile(path, cell_dir / sub / path.name)
-                    seal_names.append(f"{sub}/{path.name}")
+                    rel = path.relative_to(src)
+                    dest = cell_dir / sub / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, dest)
+                    seal_names.append(f"{sub}/{rel}")
+            continue
+        (cell_dir / sub).mkdir(exist_ok=True)
+        for path in sorted(src.iterdir()):
+            if path.is_file():
+                shutil.copyfile(path, cell_dir / sub / path.name)
+                seal_names.append(f"{sub}/{path.name}")
     krecept.seal_artifacts(cell_dir, seal_names, writers_done=True)
     print(f"sealed {cell_dir} ({len(seal_names)} files)")
     return 0
@@ -998,6 +1214,97 @@ def check_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     return reasons, {"checked": checked, "unverifiable": unverifiable}
 
 
+M1_BASE_PINS = frozenset({
+    "kcrypto_perf.py",
+    "inner.sh",
+    "guest-config",
+    "legs.tsv",
+    "head-sha.txt",
+    "set.env",
+    "pins.env",
+    "kcrypto_fixture.ko",
+    "judge/kcrypto-perf.py",
+    "judge/validity.py",
+    "judge/m1validity.py",
+    "judge/stats.py",
+})
+
+M1_OBS_PINS = ("kryprobe", "kryprobe-bpf/kcrypto.bpf.o",
+               "kryprobe-bpf/kcrypto-lifecycle.bpf.o")
+
+
+def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
+    """M1 stage pins: base pins plus per-side observer pins (a DISABLED
+    side pins its marker instead). Guest in-hashes must match staged
+    pins per side. Returns (reasons, observed)."""
+    cell_dir = Path(cell_dir)
+    pins = stage.get("sha256", {}) or {}
+    if not pins:
+        return ["stage carries no artifact pins"], {}
+    reasons = []
+    checked = []
+    want = set(M1_BASE_PINS)
+    for side in ("A", "B"):
+        role = stage.get(f"obs_{side.lower()}")
+        if role == "D":
+            want.add(f"obs-{side}/DISABLED")
+        elif role in ("R", "C"):
+            for tail in M1_OBS_PINS:
+                want.add(f"obs-{side}/{tail}")
+        else:
+            reasons.append(f"stage obs_{side.lower()} role {role!r} unknown")
+    for name in sorted(want):
+        if name not in pins:
+            reasons.append(
+                f"pin {name}: mandatory pin key missing from stage")
+    for name in sorted(pins):
+        pinned = pins[name]
+        if pinned == "none":
+            if name != "kcrypto_fixture.ko":
+                reasons.append(
+                    f"pin {name}: unexpected \"none\" pin "
+                    "value (fail closed)")
+            continue
+        target = cell_dir / name
+        if not target.is_file():
+            reasons.append(
+                f"pin {name}: staged file missing from sealed cell")
+            continue
+        try:
+            actual = sha256_file(target)
+        except OSError as err:
+            reasons.append(f"pin {name}: unreadable: {err}")
+            continue
+        if actual != pinned:
+            reasons.append(
+                f"pin {name}: sealed bytes differ from staged pin")
+        else:
+            checked.append(name)
+    env = _read_kv(cell_dir / "environment.txt")
+    guest_dims = (("ko", "kcrypto_fixture.ko"),
+                  ("driver", "kcrypto_perf.py"))
+    for dim, pin_name in guest_dims:
+        pinned = pins.get(pin_name)
+        if pinned is None or pinned == "none":
+            continue
+        if env.get(dim) != pinned:
+            reasons.append(
+                f"guest {dim}: in-guest hash differs from staged pin")
+    for side in ("a", "b"):
+        for dim, tail in (("kryprobe", "kryprobe"),
+                          ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
+                          ("lc", "kryprobe-bpf/kcrypto-lifecycle.bpf.o")):
+            pin_name = f"obs-{side.upper()}/{tail}"
+            pinned = pins.get(pin_name)
+            if pinned is None or pinned == "none":
+                continue
+            if env.get(f"obs_{side}_{dim}") != pinned:
+                reasons.append(
+                    f"guest obs_{side}_{dim}: in-guest hash differs "
+                    "from staged pin")
+    return reasons, {"checked": checked, "unverifiable": []}
+
+
 def verify_cell(cell_dir: Path, manifest: dict) -> dict:
     """Judge one sealed cell (legs, quiet, seal, receipts, pins)."""
     cell_dir = Path(cell_dir)
@@ -1027,7 +1334,11 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
     if receipt_reasons:
         verdict["errors"].extend(receipt_reasons)
         return verdict
-    pin_reasons, pin_obs = check_stage_pins(cell_dir, stage)
+    m1 = is_m1_manifest(manifest)
+    if m1:
+        pin_reasons, pin_obs = check_m1_stage_pins(cell_dir, stage)
+    else:
+        pin_reasons, pin_obs = check_stage_pins(cell_dir, stage)
     verdict["pin_check"] = pin_obs
     if pin_reasons:
         verdict["errors"].extend(pin_reasons)
@@ -1050,10 +1361,19 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
     verdict["spec_boot_invalid"] = not quiet_check["valid"]
     windows = (manifest["global"]["warmup_s"],
                manifest["global"]["measure_s"])
+    m1_entry = None
+    if m1:
+        if stage.get("kind") == "set":
+            m1_entry = find_set(manifest, stage["set"])
+        else:
+            m1_entry = find_diag(manifest, stage["diag"])
     legs = []
     for idx, leg in enumerate(spec):
         judged = judge_leg(cell_dir, leg, kernel, windows)
         judged["order"] = idx
+        if m1:
+            judged = apply_m1_ctx_overlay(cell_dir, judged, leg, m1_entry,
+                                          manifest)
         if not quiet_check["valid"]:
             judged["valid"] = False
             judged["outcome"] = "invalid"
@@ -1062,6 +1382,69 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         legs.append(judged)
     verdict["legs"] = legs
     return verdict
+
+
+def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
+                         entry: dict, manifest: dict) -> dict:
+    """M1 ctx attribution overlay on one frozen-judged leg.
+
+    C-side observed legs must carry the terminal ctx object and pass
+    the per-shape exactness rules; R-side observed legs must NOT
+    carry one (an R leg with ctx means artifact mixup — invalid).
+    Disabled legs pass through with their observer role recorded."""
+    side = leg["side"]
+    if entry.get("kind") == "m1-pairs":
+        obs = entry["obs_a"] if side == "A" else entry["obs_b"]
+    else:
+        obs = "C" if side == "B" else "D"
+    judged["obs"] = obs
+    if leg["mode"] == "disabled" or obs == "D":
+        return judged
+    if not judged.get("valid") or "driver" not in judged:
+        # Frozen-invalid already (or no driver summary): keep the
+        # frozen reasons focused, skip the ctx overlay.
+        return judged
+    legs_dir = cell_dir / "legs"
+    stderr_log = legs_dir / f"{leg['leg_id']}-capture.stderr.log"
+    if obs == "R":
+        try:
+            km1validity.parse_ctx_telemetry(stderr_log)
+        except ValueError:
+            return judged
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [
+            "R leg carries a ctx object (artifact mixup: C staged as R?)"]
+        return judged
+    try:
+        ctx = km1validity.parse_ctx_telemetry(stderr_log)
+    except ValueError as err:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [str(err)]
+        return judged
+    judged["ctx"] = ctx
+    try:
+        parsed = kparsers.parse_api_returns(
+            legs_dir / f"{leg['leg_id']}-report.json")
+    except kparsers.ParseError as err:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [str(err)]
+        return judged
+    shape = leg["workload"]
+    if entry.get("kind") == "m1-612-ctx":
+        expected_rows = None
+    else:
+        expected_rows = manifest["workloads"][shape]["expected_rows"]
+    reasons = km1validity.check_ctx_leg(
+        ctx, parsed["totals"].get("calls"),
+        judged["driver"]["ops_total"], shape, expected_rows)
+    if reasons:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + reasons
+    return judged
 
 
 def parse_legs_tsv(path: Path) -> list:
@@ -1158,6 +1541,8 @@ def form_pairs(cell_verdicts: list) -> list:
 def judge_set(set_id: str, cell_verdicts: list, manifest: dict) -> dict:
     """Combine a set's cells (incl. spares) into the set verdict."""
     entry = find_set(manifest, set_id)
+    if entry.get("kind") == "m1-pairs":
+        return judge_m1_set(set_id, entry, cell_verdicts, manifest)
     out: dict = {"set": set_id, "class": entry["class"],
                  "mode": entry["mode"], "kernel": entry["kernel"],
                  "budgeted": entry["budgeted"],
@@ -1194,6 +1579,65 @@ def judge_set(set_id: str, cell_verdicts: list, manifest: dict) -> dict:
                       "p99": kstats.median(ratios_p99)}
     if bulk:
         out["perturbation"] = perturbation_report(cell_verdicts, bulk)
+    if entry["budgeted"]:
+        budgets = manifest["budgets"]
+        b1 = kstats.set_verdict(
+            ratios_t, lo=budgets["B1_throughput_ratio_min"], hi=None)
+        b2 = kstats.set_verdict(
+            ratios_p99, lo=None, hi=budgets["B2_p99_ratio_max"])
+        out["B1"] = b1
+        out["B2"] = b2
+        if b1 == "PASS" and b2 == "PASS":
+            out.update(verdict="PASS", reasons=[])
+        elif b1 == "FAIL" or b2 == "FAIL":
+            out.update(verdict="FAIL",
+                       reasons=[f"B1={b1} B2={b2}"])
+        else:
+            out.update(verdict="INCONCLUSIVE",
+                       reasons=[f"B1={b1} B2={b2}"])
+    else:
+        out.update(verdict="ENVELOPE",
+                   reasons=["non-budget set: envelope published"])
+    return out
+
+
+def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
+                 manifest: dict) -> dict:
+    """Combine an M1 set's cells into the set verdict (ADR-0016: the
+    set's own pair/attempt counts; the attempt budget is ENFORCED (an
+    exhausted budget is INVALID, never PASS); the frozen median+80%
+    rule decides budgeted sets, others publish ENVELOPE medians)."""
+    out: dict = {"set": set_id, "class": entry["class"],
+                 "mode": f"{entry['obs_a']}/{entry['mode_a']} "
+                         f"vs {entry['obs_b']}/{entry['mode_b']}",
+                 "kernel": entry["kernel"], "budgeted": entry["budgeted"],
+                 "kind": "m1-pairs", "workload": entry["workload"]}
+    for verdict in cell_verdicts:
+        if verdict.get("errors"):
+            out.update(verdict="INVALID",
+                       reasons=[f"{verdict['cell']}: {verdict['errors']}"])
+            return out
+    pairs = form_pairs(cell_verdicts)
+    out["pairs"] = pairs
+    valid = sum(1 for pair in pairs if pair["valid"])
+    attempted = len(pairs)
+    out["set_check"] = {"qualified": valid >= entry["pairs"],
+                        "valid_pairs": valid,
+                        "attempted_pairs": attempted}
+    if attempted > entry["max_attempted"]:
+        out.update(verdict="INVALID",
+                   reasons=[f"attempt budget exhausted: {attempted}/"
+                            f"{entry['max_attempted']} attempted"])
+        return out
+    if valid < entry["pairs"]:
+        out.update(verdict="INVALID",
+                   reasons=[f"only {valid}/{entry['pairs']} valid pairs"])
+        return out
+    ratios_t = [pair["ratios"]["throughput"] for pair in pairs
+                if pair["valid"]]
+    ratios_p99 = [pair["ratios"]["p99"] for pair in pairs if pair["valid"]]
+    out["medians"] = {"throughput": kstats.median(ratios_t),
+                      "p99": kstats.median(ratios_p99)}
     if entry["budgeted"]:
         budgets = manifest["budgets"]
         b1 = kstats.set_verdict(
@@ -1277,6 +1721,14 @@ def judge_diag(diag_id: str, cell_verdict: dict, manifest: dict) -> dict:
                             "observer": leg.get("observer")}
         out.update(verdict="ENVELOPE", reasons=["footprint published"])
         return out
+    if entry["kind"] == "m1-612-ctx":
+        leg = cell_verdict["legs"][0]
+        out["leg"] = {key: leg.get(key) for key in
+                      ("leg_id", "valid", "outcome", "reasons", "stats",
+                       "observer", "ctx")}
+        out.update(verdict="PASS",
+                   reasons=["6.12 floor: attach + exactness proven"])
+        return out
     pairs = form_pairs([cell_verdict])
     out["pairs"] = pairs
     out.update(verdict="ENVELOPE", reasons=["probe published"])
@@ -1310,7 +1762,7 @@ def cmd_verify(args) -> int:
                   file=sys.stderr)
             return 2
     out_root = Path(args.out_dir) if args.out_dir else None
-    manifest = kmanifest.load_manifest(Path(args.manifest))
+    manifest = load_any_manifest(Path(args.manifest))
     cells_dir = Path(args.evidence_dir)
     required_sets = [entry["id"] for entry in manifest["sets"]]
     required_diags = [entry["id"] for entry in manifest["diagnostics"]]
@@ -1447,8 +1899,14 @@ def main(argv=None) -> int:
     group = run.add_mutually_exclusive_group(required=True)
     group.add_argument("--set")
     group.add_argument("--diag")
-    run.add_argument("--kryprobe", required=True)
-    run.add_argument("--bpf-dir", required=True)
+    run.add_argument("--kryprobe", default=None,
+                     help="frozen manifest: observer binary (M1: use --obs-a/--obs-b)")
+    run.add_argument("--bpf-dir", default=None,
+                     help="frozen manifest: BPF object dir (M1: use --obs-a/--obs-b)")
+    run.add_argument("--obs-a", default=None,
+                     help="M1 manifest: side-A observer DISABLED or CLI:BPFDIR")
+    run.add_argument("--obs-b", default=None,
+                     help="M1 manifest: side-B observer DISABLED or CLI:BPFDIR")
     run.add_argument("--ko", action="append", default=[],
                      help="K=V fixture module, repeatable")
     run.add_argument("--driver", required=True)

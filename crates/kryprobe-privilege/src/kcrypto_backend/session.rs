@@ -4,8 +4,8 @@
 use super::*;
 use crate::drain::{DrainStats, DrainThread};
 use crate::kcrypto_snapshot::{
-    AggOccupancy, SnapshotRows, session_drain, snapshot_occupancy, snapshot_rows_with_drain,
-    terminal_rows,
+    AggOccupancy, CtxTerminal, SnapshotRows, session_drain, snapshot_occupancy,
+    snapshot_rows_with_drain, terminal_rows,
 };
 
 /// One checked terminal sample. Closing links and joining the host drain do
@@ -25,6 +25,11 @@ pub struct AggregateTerminalSample {
     pub drain: DrainStats,
     /// Monotonic lower bound recorded before the first possible attach.
     pub started_ns: u64,
+    /// ctx-v1 writer-fence outcome: `Quiescent` (with the completion
+    /// bound) proves no admitted writer remained when the terminal
+    /// reads ran; `Pending` means the drain deadline exhausted and
+    /// the snapshot stays a non-atomic sample.
+    pub fence: crate::kcrypto_fence::CloseOutcome,
 }
 
 impl AggregateTerminalSample {
@@ -89,6 +94,7 @@ pub(super) struct ConfiguredSession {
     pub(super) attached_points: usize,
     pub(super) drain: Option<DrainThread>,
     pub(super) drain_stats: Option<DrainStats>,
+    pub(super) fence_outcome: Option<crate::kcrypto_fence::CloseOutcome>,
     pub(super) who_cache: WhoCache,
     pub(super) phase: SessionPhase,
 }
@@ -107,6 +113,7 @@ impl ConfiguredSession {
             attached_points,
             drain: None,
             drain_stats: None,
+            fence_outcome: None,
             who_cache: WhoCache::new(),
             phase: SessionPhase::Active,
         }
@@ -212,6 +219,19 @@ impl KCryptoBackend {
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let state = configured(&mut guard, generation)?;
         state.active()?;
+        // ctx-v1 fence close (ADR-0009): refuse fresh entrants, then
+        // drain-wait BEFORE link close — a `Quiescent` receipt proves
+        // the terminal reads below saw no admitted writer. Map faults
+        // fail loud; a drained deadline yields `Pending` and the
+        // sample stays a non-atomic sample (never exact); a deadline
+        // exhaustion yields `Pending`, never a receipt.
+        let fence = crate::kcrypto_fence::close_kernel_fence(&state.sensor.loaded.maps)
+            .map_err(|err| protocol("kcrypto_fence_close", &err.to_string()))?;
+        // F-01: the receipt gates the terminal ctx read below — a
+        // `Pending` close must omit the line, never print a sample as
+        // terminal. Recorded before link close so it survives a later
+        // drain failure (the fence fact stays factual).
+        state.fence_outcome = Some(fence);
         state.sensor.links.clear();
         let result = (|| {
             let drain = state
@@ -242,6 +262,7 @@ impl KCryptoBackend {
                     drops,
                     drain: stats,
                     started_ns: state.started_ns,
+                    fence,
                 };
                 sample.validate_interval()?;
                 let integrity = integrity_for_snapshot(
@@ -313,5 +334,31 @@ impl KCryptoBackend {
         Ok(snapshot_occupancy(
             &configured(&mut guard, generation)?.sensor,
         ))
+    }
+
+    /// Terminal ctx-v1 attribution account from one post-finish read
+    /// (M1 early gate): links are closed and the fence is shut, so the
+    /// maps are frozen and the walk is a consistent terminal read. The
+    /// walk itself is fail-soft per field (see [`CtxTerminal`]).
+    /// Fail-closed on the fence receipt (F-01): `Pending` (or no
+    /// fence attempt yet) refuses here, and the caller omits the
+    /// line — an unproven snapshot never renders as terminal.
+    pub fn session_ctx_terminal(
+        &self,
+        generation: PlanGeneration,
+    ) -> Result<CtxTerminal, BackendError> {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let state = configured(&mut guard, generation)?;
+        match state.fence_outcome {
+            Some(outcome) if !outcome.is_pending() => Ok(snapshot_ctx_terminal(&state.sensor)),
+            Some(_) => Err(protocol(
+                "kcrypto_ctx_pending_fence",
+                "fence close pending: terminal ctx unproven",
+            )),
+            None => Err(protocol(
+                "kcrypto_ctx_unfenced",
+                "terminal ctx read before fence close",
+            )),
+        }
     }
 }

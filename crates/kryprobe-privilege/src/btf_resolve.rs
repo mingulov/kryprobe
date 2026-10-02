@@ -19,7 +19,7 @@
 //! (`Documentation/bpf/btf.rst`, UAPI `linux/btf.h`).
 //!
 //! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
-//! 9-offsets + K5 attribution offsets → 76B projection) and
+//! 9-offsets + K5 attribution offsets + ctx-v1 start pair → 84B projection) and
 //! [`load_kcrypto_configured`] (the single resolve → load → write-KCFG
 //! → attach entry K2 calls). K5 Task 3 adds [`resolve_kcrypto_offsets`]
 //! (fail-soft parent/params offsets + flags for the KCFG tail).
@@ -187,14 +187,17 @@ impl std::fmt::Display for BtfError {
 
 impl std::error::Error for BtfError {}
 
-/// K5 attribution offsets: the 7 BPF parent/params chase offsets
-/// (all u32 byte offsets) plus the two fail-soft gate flags.
+/// K5 attribution offsets + ctx-v1 lifetime offset: the 7 BPF
+/// parent/params chase offsets plus the `task_struct.start_time`
+/// offset (all u32 byte offsets) plus the fail-soft gate flags.
 ///
 /// Group-atomic by contract: `parent_ok` is true iff ALL three parent
 /// members resolve (else all three offsets are 0); `params_ok` is true
-/// iff ALL four params members resolve (else all four are 0). The BPF
-/// gates each chase on its flag, and userspace omits the gated keys
-/// when the flag is false — never zero-filled in output.
+/// iff ALL four params members resolve (else all four are 0);
+/// `start_ok` is true iff the start-time member resolves (else the
+/// offset is 0). The BPF gates each chase on its flag, and userspace
+/// omits the gated keys when the flag is false — never zero-filled
+/// in output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KcryptoOffsets {
     /// `task_struct.real_parent` (bytes; K5 parent chase).
@@ -215,6 +218,10 @@ pub struct KcryptoOffsets {
     pub parent_ok: bool,
     /// True iff all four params offsets resolved.
     pub params_ok: bool,
+    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator).
+    pub task_start_off: u32,
+    /// True iff the start-time member resolved.
+    pub start_ok: bool,
 }
 
 /// K5 attribution-offset resolution failure: the BTF image itself is
@@ -502,6 +509,10 @@ fn kcrypto_offsets_from_btf(btf: &Btf) -> KcryptoOffsets {
         (Some(bs), Some(iv), Some(min), Some(max)) => (true, (bs, iv, min, max)),
         _ => (false, (0, 0, 0, 0)),
     };
+    let (start_ok, task_start_off) = match btf.member_offset("task_struct", "start_time").ok() {
+        Some(off) => (true, off),
+        None => (false, 0),
+    };
     KcryptoOffsets {
         task_real_parent,
         task_tgid,
@@ -512,14 +523,18 @@ fn kcrypto_offsets_from_btf(btf: &Btf) -> KcryptoOffsets {
         cra_max_keysize,
         parent_ok,
         params_ok,
+        task_start_off,
+        start_ok,
     }
 }
 
-/// Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail): the 9
-/// resolved offsets + [`PF_KTHREAD`] + zero pad → the 76B [`KConfig`]
-/// in C2 word order, with the 7 K5 attribution offsets + flags
-/// (`parent_ok`/`params_ok` nonzero iff the group resolved — a false
-/// flag pairs with group zeros by [`resolve_kcrypto_offsets`]).
+/// Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail + ctx-v1
+/// lifetime pair): the 9 resolved offsets + [`PF_KTHREAD`] + zero pad
+/// → the 84B [`KConfig`] in C2 word order, with the 7 K5 attribution
+/// offsets + flags (`parent_ok`/`params_ok` nonzero iff the group
+/// resolved — a false flag pairs with group zeros by
+/// [`resolve_kcrypto_offsets`]) plus the ctx-v1 start-time offset +
+/// `start_ok`.
 /// Total (no failure mode: every input word is copied verbatim).
 #[must_use]
 pub fn kconfig_from_offsets(off: AggregateOffsets, k5: KcryptoOffsets) -> KConfig {
@@ -545,6 +560,9 @@ pub fn kconfig_from_offsets(off: AggregateOffsets, k5: KcryptoOffsets) -> KConfi
         parent_ok: u8::from(k5.parent_ok),
         params_ok: u8::from(k5.params_ok),
         _pad2: [0, 0],
+        task_start_off: k5.task_start_off,
+        start_ok: u8::from(k5.start_ok),
+        _pad3: [0, 0, 0],
     }
 }
 
@@ -739,6 +757,9 @@ pub fn load_kcrypto_configured(
         "kcrypto_configured/kcfg",
     )
     .map_err(ConfiguredError::Configure)?;
+    // ctx-v1 fence open (ADR-0009): explicit `CLOSED = 0` before the
+    // first attach — admission is open by construction from here on.
+    crate::kcrypto_fence::open_kernel_fence(&loaded.maps).map_err(ConfiguredError::Configure)?;
     let authority = LocalPrivilegedAuthority;
     let mut alloc = CookieAllocator::new(PlanGeneration::new(1));
     let guard = GenerationGuard {
@@ -2294,11 +2315,12 @@ mod tests {
 
     #[test]
     fn kconfig_from_offsets_lays_out_c2_words() {
-        // Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail): the 9
-        // resolved offsets + PF_KTHREAD + zero pad → the 76B KCFG wire
-        // layout in C2 word order, with the K5 attribution offsets +
-        // flags verbatim in the tail (a false flag pairs with group
-        // zeros — here the params group is off, so its words are 0).
+        // Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail +
+        // ctx-v1 lifetime pair): the 9 resolved offsets + PF_KTHREAD +
+        // zero pad → the 84B KCFG wire layout in C2 word order, with the
+        // K5 attribution offsets + flags verbatim in the tail (a false
+        // flag pairs with group zeros — here the params group is off,
+        // so its words are 0; the ctx-v1 start pair is on).
         let off = AggregateOffsets {
             sk_req_base: 32,
             async_tfm: 32,
@@ -2320,9 +2342,11 @@ mod tests {
             cra_max_keysize: 0,
             parent_ok: true,
             params_ok: false,
+            task_start_off: 1664,
+            start_ok: true,
         };
         let cfg = kconfig_from_offsets(off, k5);
-        let mut want = [0u8; 76];
+        let mut want = [0u8; 84];
         for (i, word) in [
             32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 8, 0, 1432, 1424, 1648, 0, 0, 0, 0,
         ]
@@ -2333,6 +2357,8 @@ mod tests {
         }
         want[72] = 1;
         want[73] = 0;
+        want[76..80].copy_from_slice(&1664u32.to_le_bytes());
+        want[80] = 1;
         assert_eq!(cfg.to_bytes(), want);
     }
 
@@ -2359,7 +2385,12 @@ mod tests {
         };
         named(
             "task_struct",
-            &[("real_parent", 1432), ("tgid", 1424), ("comm", 1648)],
+            &[
+                ("real_parent", 1432),
+                ("tgid", 1424),
+                ("comm", 1648),
+                ("start_time", 1664),
+            ],
         );
         named(
             "crypto_alg",
@@ -2389,6 +2420,8 @@ mod tests {
                 cra_max_keysize: 408,
                 parent_ok: true,
                 params_ok: true,
+                task_start_off: 1664,
+                start_ok: true,
             }
         );
     }

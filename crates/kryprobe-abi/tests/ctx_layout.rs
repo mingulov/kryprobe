@@ -7,8 +7,8 @@
 //! the cross-workspace backstop when the BPF side lands).
 
 use kryprobe_abi::kcrypto_ctx::{
-    KCTL_CTX_OVERFLOW, KCTLFENCE_CLOSED_BIT, KCTLFENCE_COUNT_MASK, KCTX_DROPS_SLOTS,
-    KCTX_MAX_ENTRIES, KCtxKey, VCtx, kctx_entry_bytes, kctx_map_bytes,
+    KCTL_CTX_OVERFLOW, KCTLCLOSED_CLOSED, KCTLCLOSED_OPEN, KCTLCOUNT_SLOTS, KCTX_DROPS_SLOTS,
+    KCTX_MAX_ENTRIES, KCTXOVF_MAX_ENTRIES, KCtxKey, VCtx, kctx_entry_bytes, kctx_map_bytes,
 };
 
 #[test]
@@ -44,10 +44,11 @@ fn capacity_fence_and_overflow_consts_pinned() {
     assert_eq!(KCTX_DROPS_SLOTS, 1);
     // New ring kind value; the 48-byte KCtl layout is unchanged.
     assert_eq!(KCTL_CTX_OVERFLOW, 6);
-    // Fence word: bit 63 CLOSED, bits 0..62 active count.
-    assert_eq!(KCTLFENCE_CLOSED_BIT, 1 << 63);
-    assert_eq!(KCTLFENCE_COUNT_MASK, (1 << 63) - 1);
-    assert_eq!(KCTLFENCE_CLOSED_BIT | KCTLFENCE_COUNT_MASK, u64::MAX);
+    // Fence control (ADR-0009): closed flag + per-CPU count + gate.
+    assert_eq!(KCTLCLOSED_OPEN, 0);
+    assert_eq!(KCTLCLOSED_CLOSED, 1);
+    assert_eq!(KCTLCOUNT_SLOTS, 1);
+    assert_eq!(KCTXOVF_MAX_ENTRIES, 256);
 }
 
 #[test]

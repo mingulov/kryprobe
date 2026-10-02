@@ -95,6 +95,18 @@ const KCTX_UNKNOWN: u8 = 3;
 
 const KCTL_IDENT: u8 = 1;
 const KCTL_OVERFLOW: u8 = 4;
+/// ctx-v1 (ADR-0008): `KCTX` insert refused (map full), first per `kh`.
+/// The 48-byte ring layout is unchanged; only the kind value is new.
+const KCTL_CTX_OVERFLOW: u8 = 6;
+
+// ctx-v1 fence control (M1 control ABI v1, ADR-0009): a `CLOSED`
+// flag word plus a per-CPU active-writer count. The BPF target has no
+// atomic RMW (`target_has_atomic` is unset — `fetch_add` does not
+// exist), so admission is increment-then-check with plain per-CPU
+// ops, never a fetch: increment this CPU's lane, then read `CLOSED`;
+// a closed entrant decrements and refuses without touching data.
+// Single-thread program order + cache coherence make the check
+// airtight (ADR-0009 carries the argument).
 
 /// Reserved `KIDN` key: ring-reserve-failure counter (saturating `u8`).
 const KIDN_DROPS: u64 = u64::MAX;
@@ -147,7 +159,9 @@ const MAX_ERRNO: u64 = 4095;
 
 /// `KCFG` value: the K1 offsets + kthread flag + pad (44B head,
 /// offsets unchanged) + the 7 K5 attribution offsets +
-/// `parent_ok`/`params_ok` + pad (76B total).
+/// `parent_ok`/`params_ok` + pad (76B) + the ctx-v1 lifetime offset +
+/// `start_ok` + pad (84B total). Append-only: every earlier offset is
+/// unchanged.
 #[repr(C)]
 pub struct KConfig {
     pub sk_req_base: u32,
@@ -171,6 +185,13 @@ pub struct KConfig {
     pub parent_ok: u8,
     pub params_ok: u8,
     pub _pad2: [u8; 2],
+    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator).
+    pub task_start_off: u32,
+    /// Nonzero iff the start offset resolved (BPF emits `start_ns == 0`
+    /// — the unknown-lifetime bucket — when false).
+    pub start_ok: u8,
+    /// Reserved, zero.
+    pub _pad3: [u8; 3],
 }
 
 /// `KAGG` key: attribution head + 128B alg + 128B drv, 260B packed.
@@ -250,15 +271,42 @@ pub struct VParams {
     pub max_keysize: u32,
 }
 
+/// `KCTX` key: accounting identity (32B, `repr(C)`, align 8).
+/// Twin: `KCtxKey` in `crates/kryprobe-abi/src/kcrypto_ctx.rs`.
+#[repr(C)]
+pub struct KCtxKey {
+    pub kh: u64,
+    pub cgroup: u64,
+    pub tgid: u32,
+    pub uid: u32,
+    pub start_ns: u64,
+}
+
+/// Context counters (56B): `KCTX` value. Same fold semantics as
+/// `VAgg` minus the always-zero `lat` histogram.
+/// Twin: `VCtx` in `crates/kryprobe-abi/src/kcrypto_ctx.rs`.
+#[repr(C)]
+pub struct VCtx {
+    pub calls: u64,
+    pub bytes: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub queued: u64,
+    pub first_ns: u64,
+    pub last_ns: u64,
+}
+
 // SAME numbers as the ABI mirrors + loader KCRYPTO_MAPS (duplication
 // deliberate + cited: a dims drift must fail here AND at load).
-const _: () = assert!(size_of::<KConfig>() == 76);
+const _: () = assert!(size_of::<KConfig>() == 84);
 const _: () = assert!(size_of::<KAgg>() == 260);
 const _: () = assert!(size_of::<VAgg>() == 120);
 const _: () = assert!(size_of::<KCtl>() == 48);
 const _: () = assert!(size_of::<KWhoKey>() == 16);
 const _: () = assert!(size_of::<VWho>() == 80);
 const _: () = assert!(size_of::<VParams>() == 16);
+const _: () = assert!(size_of::<KCtxKey>() == 32);
+const _: () = assert!(size_of::<VCtx>() == 56);
 
 #[map]
 static KCFG: Array<KConfig> = Array::with_max_entries(1, 0);
@@ -280,6 +328,17 @@ static KERR: HashMap<u64, i32> = HashMap::with_max_entries(256, 0);
 static KPARAMS: HashMap<u64, VParams> = HashMap::with_max_entries(256, 0);
 #[map]
 static KDROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
+// ctx-v1 maps (ADR-0008): per-context accounting + fence + overflow gate.
+#[map]
+static KCTX: PerCpuHashMap<KCtxKey, VCtx> = PerCpuHashMap::with_max_entries(1024, 0);
+#[map]
+static KCTX_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static KCTLCLOSED: Array<u8> = Array::with_max_entries(1, 0);
+#[map]
+static KCTLCOUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static KCTXOVF: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers (all #[inline(always)]: R4 call-free)
@@ -696,6 +755,192 @@ fn who_drops_inc() {
     }
 }
 
+/// ctx-v1 fence admission (ADR-0009): increment-then-check with
+/// plain per-CPU ops (no BPF atomic RMW exists on this target).
+/// Increment this CPU's `KCTLCOUNT` lane, then read `KCTLCLOSED`; a
+/// closed entrant decrements and reports refusal WITHOUT touching any
+/// data map or the ring; an admitted entrant must run exactly one
+/// [`fence_release`] after its last write. An unreadable control word
+/// refuses (fail-closed: same discipline as the `KCFG` miss path).
+#[inline(always)]
+fn fence_admit() -> bool {
+    let Some(slot) = KCTLCOUNT.get_ptr_mut(0) else {
+        return false;
+    };
+    unsafe {
+        *slot = (*slot).saturating_add(1);
+    }
+    let closed = match KCTLCLOSED.get(0) {
+        Some(flag) => *flag != 0,
+        None => true,
+    };
+    if closed {
+        if let Some(slot) = KCTLCOUNT.get_ptr_mut(0) {
+            unsafe {
+                *slot = (*slot).saturating_sub(1);
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// ctx-v1 fence release: the single wrapper epilogue decrement after
+/// the hook's last write (covers every `KDROPS` early-return path —
+/// they all run inside admission).
+#[inline(always)]
+fn fence_release() {
+    if let Some(slot) = KCTLCOUNT.get_ptr_mut(0) {
+        unsafe {
+            *slot = (*slot).saturating_sub(1);
+        }
+    }
+}
+
+/// In-place per-CPU ctx-lane update (current CPU's copy, exclusive):
+/// same classification/stamp discipline as [`update_slot`] over the
+/// 7-word `VCtx` (no `lat`: C4 admits no durations from one edge).
+///
+/// # Safety
+///
+/// `slot` must be a live per-CPU map value pointer for this CPU.
+#[inline(always)]
+unsafe fn update_ctx_slot(slot: *mut VCtx, nbytes: u64, now: u64, res: u8) {
+    unsafe {
+        let calls = core::ptr::addr_of_mut!((*slot).calls);
+        let was = *calls;
+        *calls = was.saturating_add(1);
+        let bytes = core::ptr::addr_of_mut!((*slot).bytes);
+        *bytes = (*bytes).saturating_add(nbytes);
+        if res == KRES_OK {
+            let ok = core::ptr::addr_of_mut!((*slot).ok);
+            *ok = (*ok).saturating_add(1);
+        } else if res == KRES_ERR {
+            let errors = core::ptr::addr_of_mut!((*slot).errors);
+            *errors = (*errors).saturating_add(1);
+        } else if res == KRES_QUEUED {
+            let queued = core::ptr::addr_of_mut!((*slot).queued);
+            *queued = (*queued).saturating_add(1);
+        }
+        if was == 0 {
+            core::ptr::addr_of_mut!((*slot).first_ns).write(now);
+        }
+        core::ptr::addr_of_mut!((*slot).last_ns).write(now);
+    }
+}
+
+/// Zero a `VCtx` init slot in place (volatile stores: R4, no memset).
+#[inline(always)]
+fn vctx_zero_slot(slot: *mut VCtx) {
+    unsafe {
+        core::ptr::addr_of_mut!((*slot).calls).write_volatile(0);
+        core::ptr::addr_of_mut!((*slot).bytes).write_volatile(0);
+        core::ptr::addr_of_mut!((*slot).ok).write_volatile(0);
+        core::ptr::addr_of_mut!((*slot).errors).write_volatile(0);
+        core::ptr::addr_of_mut!((*slot).queued).write_volatile(0);
+        core::ptr::addr_of_mut!((*slot).first_ns).write_volatile(0);
+        core::ptr::addr_of_mut!((*slot).last_ns).write_volatile(0);
+    }
+}
+
+/// `KCTX`-full path (ADR-0008 §(d), refuse-new): totals already
+/// updated; bump the exact per-CPU `KCTX_DROPS` count and emit one
+/// `CTX_OVERFLOW` event on the first refusal per `kh` (gated by
+/// `KCTXOVF`; a full gate stays silent under the same C9 rationale as
+/// `KIDN`). Refused calls surface via unknown-by-difference.
+#[inline(always)]
+fn ctx_overflow_path(kh: u64, head: u64, lens: u64, now: u64) {
+    if let Some(slot) = KCTX_DROPS.get_ptr_mut(0) {
+        unsafe {
+            *slot = (*slot).saturating_add(1);
+        }
+    }
+    if KCTXOVF.get_ptr(kh).is_none() {
+        let one: u8 = 1;
+        if KCTXOVF.insert(kh, one, BPF_NOEXIST).is_ok() {
+            emit_ctl(KCTL_CTX_OVERFLOW, kh, head, lens, now);
+        }
+    }
+}
+
+/// Record one context-qualified observation (row hash `kh`,
+/// precomputed): build the 32B `KCtxKey` (event-time cgroup, tgid,
+/// uid, kernel lifetime discriminator — zeros when unreadable, each
+/// its own bucket) and update-or-insert `KCTX` with the KAGG
+/// insert-zero/`BPF_NOEXIST` discipline. Runs after the `KAGG` update
+/// (never disturbs `KTOT`/`KAGG`); refusal counts `KCTX_DROPS` only.
+///
+/// The key AND the `VCtx` zero both carve from the shared init
+/// scratch (`VCtx` @ 0..56, `KCtxKey` @ 64..96 — a separate 32B slot
+/// overflows the 512B frame): disjoint regions, both 8-aligned.
+///
+/// # Safety
+///
+/// `aux` must span the shared 120B init scratch whose `VAgg` zero is
+/// dead (copied into the map by the insert, or never built on the
+/// hit path).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn ctx_record(
+    kh: u64,
+    now: u64,
+    nbytes: u64,
+    res: u8,
+    cfg: &Cfg,
+    head: u64,
+    lens: u64,
+    aux: *mut u8,
+) {
+    // SAFETY: `aux` spans 120 bytes; the carves below (0..56, 64..96)
+    // are inside it, disjoint, and 8-aligned.
+    let key_slot = unsafe { aux.add(64) } as *mut KCtxKey;
+    let pid_tgid = bpf_get_current_pid_tgid();
+    // SAFETY: raw helper, no pointer arguments (same call as `who_upsert`).
+    let cgroup = unsafe { bpf_get_current_cgroup_id() };
+    let uid = bpf_get_current_uid_gid() as u32;
+    let start_ns = if cfg.start_ok != 0 {
+        // SAFETY: helper with no pointer arguments.
+        let task = unsafe { bpf_get_current_task() };
+        if task != 0 {
+            read_u64(task.wrapping_add(cfg.task_start_off as u64))
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    unsafe {
+        core::ptr::addr_of_mut!((*key_slot).kh).write(kh);
+        core::ptr::addr_of_mut!((*key_slot).cgroup).write(cgroup);
+        core::ptr::addr_of_mut!((*key_slot).tgid).write((pid_tgid >> 32) as u32);
+        core::ptr::addr_of_mut!((*key_slot).uid).write(uid);
+        core::ptr::addr_of_mut!((*key_slot).start_ns).write(start_ns);
+    }
+    // SAFETY: fully initialized above.
+    let key_ref: &KCtxKey = unsafe { &*key_slot };
+    if let Some(found) = KCTX.get_ptr_mut(key_ref) {
+        unsafe {
+            update_ctx_slot(found, nbytes, now, res);
+        }
+    } else {
+        // SAFETY: `aux` spans 120 bytes; the `VAgg` zero above is dead
+        // (copied into the map by the insert, or never built on the
+        // hit path).
+        vctx_zero_slot(aux as *mut VCtx);
+        // SAFETY: fully zeroed above.
+        let zero_ref: &VCtx = unsafe { &*(aux as *const VCtx) };
+        let _ = KCTX.insert(key_ref, zero_ref, BPF_NOEXIST);
+        match KCTX.get_ptr_mut(key_ref) {
+            Some(filled) => unsafe {
+                update_ctx_slot(filled, nbytes, now, res);
+            },
+            None => {
+                ctx_overflow_path(kh, head, lens, now);
+            }
+        }
+    }
+}
+
 /// In-place per-CPU who-lane update (current CPU's copy, exclusive):
 /// first-touch stamps `first_ns` when the lane was fresh (`calls == 0`
 /// — the broadcast insert carries `calls == 0`); `tid`/`comm` refresh
@@ -1072,6 +1317,22 @@ fn observe(
             }
         }
     }
+    // ctx-v1 context accounting: after the `KAGG` update (never
+    // disturbs `KTOT`/`KAGG` — a ctx-path refusal counts `KCTX_DROPS`
+    // only and the observation still lands in the aggregates).
+    // SAFETY: `aux` spans 120 exclusive stack bytes, 8-aligned; the
+    // `VAgg` zero above is dead (copied into the map by the insert,
+    // or never built on the hit path).
+    ctx_record(
+        kh,
+        now,
+        nbytes,
+        res,
+        cfg,
+        head,
+        lens,
+        aux.as_mut_ptr() as *mut u8,
+    );
     // First-seen gate: exactly one `IDENT` per identity (the `is_ok`
     // resolves the concurrent-inserter race). A full `KIDN` (insert
     // failed AND the key is still absent — not a lost race) stays SILENT
@@ -1099,7 +1360,8 @@ fn observe(
 
 /// Loaded `KCFG` row, as stack scalars (K1 head only: the K5 tail is
 /// read by a second miss-only `KCFG` lookup in `who_record`, so the
-/// per-event `Cfg` stays 40B and the 512B frame fits).
+/// per-event `Cfg` stays small and the 512B frame fits; the ctx-v1
+/// lifetime pair rides along — every hook needs it per event).
 struct Cfg {
     sk_req_base: u32,
     async_tfm: u32,
@@ -1111,6 +1373,8 @@ struct Cfg {
     aead_cryptlen_off: u32,
     ahash_nbytes_off: u32,
     shash_base: u32,
+    task_start_off: u32,
+    start_ok: u8,
 }
 
 /// Load the `KCFG` row into stack scalars (`None` = skipped observation;
@@ -1134,6 +1398,8 @@ fn load_cfg() -> Option<Cfg> {
                 aead_cryptlen_off: cfg.aead_cryptlen_off,
                 ahash_nbytes_off: cfg.ahash_nbytes_off,
                 shash_base: cfg.shash_base,
+                task_start_off: cfg.task_start_off,
+                start_ok: cfg.start_ok,
             })
         }
         None => None,
@@ -1148,6 +1414,18 @@ fn load_cfg() -> Option<Cfg> {
 /// (`drv` zeros — the driver is not chosen yet); result via `ERR_PTR`.
 #[fexit(function = "crypto_alloc_tfm_node")]
 pub fn kcrypto_alloc(ctx: FExitContext) -> i32 {
+    // ctx-v1 fence: admit first (refused entrants touch nothing),
+    // single release epilogue after the last write.
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_alloc_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_alloc_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1187,6 +1465,16 @@ pub fn kcrypto_alloc(ctx: FExitContext) -> i32 {
 /// supplies no destroy identity or return-value observation.
 #[fexit(function = "crypto_destroy_tfm")]
 pub fn kcrypto_destroy(_ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_destroy_inner();
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_destroy_inner() -> i32 {
     if load_cfg().is_none() {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1202,6 +1490,16 @@ pub fn kcrypto_destroy(_ctx: FExitContext) -> i32 {
 /// at resolve time and the suite re-verifies).
 #[fexit(function = "crypto_skcipher_encrypt")]
 pub fn kcrypto_skenc(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_skenc_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_skenc_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1238,6 +1536,16 @@ pub fn kcrypto_skenc(ctx: FExitContext) -> i32 {
 /// `crypto_skcipher_decrypt(req)` exit: `cryptlen` @ 0 bytes (first member).
 #[fexit(function = "crypto_skcipher_decrypt")]
 pub fn kcrypto_skdec(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_skdec_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_skdec_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1275,6 +1583,16 @@ pub fn kcrypto_skdec(ctx: FExitContext) -> i32 {
 /// the KCFG `aead_cryptlen_off` (C2 — all families fill bytes).
 #[fexit(function = "crypto_aead_encrypt")]
 pub fn kcrypto_aeadenc(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_aeadenc_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_aeadenc_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1312,6 +1630,16 @@ pub fn kcrypto_aeadenc(ctx: FExitContext) -> i32 {
 /// the KCFG `aead_cryptlen_off` (C2).
 #[fexit(function = "crypto_aead_decrypt")]
 pub fn kcrypto_aeaddec(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_aeaddec_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_aeaddec_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1349,6 +1677,16 @@ pub fn kcrypto_aeaddec(ctx: FExitContext) -> i32 {
 /// the KCFG `ahash_nbytes_off` (C2).
 #[fexit(function = "crypto_ahash_digest")]
 pub fn kcrypto_ahash(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_ahash_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_ahash_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1388,6 +1726,16 @@ pub fn kcrypto_ahash(ctx: FExitContext) -> i32 {
 /// `len` = `arg2`.
 #[fexit(function = "crypto_shash_digest")]
 pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_shash_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_shash_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;
@@ -1429,6 +1777,16 @@ pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
 /// `crypto_shash_finup(desc, data, len, out)` exit: same chase as digest.
 #[fexit(function = "crypto_shash_finup")]
 pub fn kcrypto_finup(ctx: FExitContext) -> i32 {
+    if !fence_admit() {
+        return 0;
+    }
+    let rc = kcrypto_finup_inner(ctx);
+    fence_release();
+    rc
+}
+
+#[inline(always)]
+fn kcrypto_finup_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
         drop_inc(KDROPS_CFG);
         return 0;

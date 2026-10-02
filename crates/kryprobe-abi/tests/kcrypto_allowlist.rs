@@ -10,6 +10,7 @@
 //! (brief Step 2): the field set, the doc, and the canary move as one.
 
 use kryprobe_abi::kcrypto_agg::{KAgg, KConfig, KCtl, KWhoKey, VAgg, VParams, VWho};
+use kryprobe_abi::kcrypto_ctx::{KCtxKey, VCtx};
 use kryprobe_abi::kcrypto_lifecycle::{LConfig, LEdge, LTfm};
 use std::path::PathBuf;
 
@@ -35,6 +36,9 @@ const KCONFIG_WANT: &[&str] = &[
     "parent_ok",
     "params_ok",
     "_pad2",
+    "task_start_off",
+    "start_ok",
+    "_pad3",
 ];
 const KAGG_WANT: &[&str] = &["fam", "op", "res", "ctx", "alg", "drv"];
 const VAGG_WANT: &[&str] = &[
@@ -46,6 +50,10 @@ const VWHO_WANT: &[&str] = &[
     "comm", "tid", "uid", "cgroup", "ppid", "pcomm", "stack", "calls", "first_ns", "last_ns",
 ];
 const VPARAMS_WANT: &[&str] = &["blocksize", "ivsize", "min_keysize", "max_keysize"];
+const KCTXKEY_WANT: &[&str] = &["kh", "cgroup", "tgid", "uid", "start_ns"];
+const VCTX_WANT: &[&str] = &[
+    "calls", "bytes", "ok", "errors", "queued", "first_ns", "last_ns",
+];
 const LEDGE_WANT: &[&str] = &[
     "magic",
     "version",
@@ -120,6 +128,8 @@ fn allowlist_field_set_matches_docs() {
     assert_eq!(KWhoKey::FIELDS, KWHOKEY_WANT, "KWhoKey fields drifted");
     assert_eq!(VWho::FIELDS, VWHO_WANT, "VWho fields drifted");
     assert_eq!(VParams::FIELDS, VPARAMS_WANT, "VParams fields drifted");
+    assert_eq!(KCtxKey::FIELDS, KCTXKEY_WANT, "KCtxKey fields drifted");
+    assert_eq!(VCtx::FIELDS, VCTX_WANT, "VCtx fields drifted");
     assert_eq!(LEdge::FIELDS, LEDGE_WANT, "LEdge fields drifted");
     assert_eq!(LTfm::FIELDS, LTFM_WANT, "LTfm fields drifted");
     assert_eq!(LConfig::FIELDS, LCONFIG_WANT, "LConfig fields drifted");
@@ -134,6 +144,8 @@ fn allowlist_field_set_matches_docs() {
         ("KWhoKey", KWhoKey::FIELDS),
         ("VWho", VWho::FIELDS),
         ("VParams", VParams::FIELDS),
+        ("KCtxKey", KCtxKey::FIELDS),
+        ("VCtx", VCtx::FIELDS),
         ("LEdge", LEdge::FIELDS),
         ("LTfm", LTfm::FIELDS),
         ("LConfig", LConfig::FIELDS),
@@ -184,6 +196,9 @@ fn field_lists_match_declarations() {
         parent_ok,
         params_ok,
         _pad2,
+        task_start_off,
+        start_ok,
+        _pad3,
     } = KConfig::default();
     let _ = (
         sk_req_base,
@@ -207,6 +222,9 @@ fn field_lists_match_declarations() {
         parent_ok,
         params_ok,
         _pad2,
+        task_start_off,
+        start_ok,
+        _pad3,
     );
     let KAgg {
         fam,

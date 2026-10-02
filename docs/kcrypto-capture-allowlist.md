@@ -30,7 +30,7 @@ counts, return/error class, timestamps, PID/TGID/comm/cgroup metadata,
 and kernel/build metadata. Every field below cites the §9 category it
 falls under (plus the sharper kp2 section where one exists).
 
-## `KCFG`: loader-written config, not observations (76B `KConfig`)
+## `KCFG`: loader-written config, not observations (84B `KConfig`)
 
 Written once by `load_kcrypto_configured` from live-BTF resolution
 (`kconfig_from_offsets`); never touched by traffic. WHY: kernel/build
@@ -60,6 +60,9 @@ the BPF cannot chase request→tfm→algorithm.
 | `parent_ok` | u8 | nonzero iff the parent offsets resolved (K5) | resolution flag, not an observation |
 | `params_ok` | u8 | nonzero iff the params offsets resolved (K5) | resolution flag, not an observation |
 | `_pad2` | 2B | zero | reserved, always 0 |
+| `task_start_off` | u32 | BTF `task_struct.start_time` (ctx-v1) | kernel layout metadata |
+| `start_ok` | u8 | nonzero iff the start offset resolved (ctx-v1) | resolution flag, not an observation |
+| `_pad3` | 3B | zero | reserved, always 0 |
 
 ## `KAGG` key: attribution head + identity (260B `KAgg`)
 
@@ -198,6 +201,48 @@ Reserved key `KWHO_DROPS` (`u64::MAX - 1`) in `KIDN`:
 `KWHO`/`KERR`/`KPARAMS` insert-failure counter, saturating (kp2 §8:
 attribution loss surfaces here instead of vanishing; separate from
 `KIDN_DROPS` so ring loss and attribution loss stay distinguishable).
+
+## `KCTX` key: accounting identity (32B `KCtxKey`, ctx-v1)
+
+Per-context accounting key: the `kh` row hash plus the event-time
+caller context (cgroup id, tgid, uid, task start-time discriminator).
+Zeros mean unreadable (own explicit bucket, never merged).
+
+| Field | Bytes | Source | WHY (kp2 §9) |
+|---|---|---|---|
+| `kh` | u64 | `kh_of` over the full `KAgg` row | name-free derived join key (kp2 §7/§8) |
+| `cgroup` | u64 | `bpf_get_current_cgroup_id` at event time (0 = unreadable) | cgroup metadata (kp2 §9) |
+| `tgid` | u32 | event-time thread-group id | PID/TGID metadata (kp2 §9) |
+| `uid` | u32 | event-time uid (low 32) | uid metadata (kp2 §9) |
+| `start_ns` | u64 | `task_struct.start_time` via BTF offset, iff `start_ok` (0 = unreadable) | process-lifetime discriminator (kp2 §9) |
+
+## `KCTX` value: context counters (56B `VCtx`, ctx-v1)
+
+Per-CPU lanes, userspace-folded (`fold_vctx`: saturating sums, min
+`first_ns` over busy lanes, max `last_ns`). Same discipline as
+`VAgg` minus the always-zero `lat` histogram (C4: no durations from a
+single edge).
+
+| Field | Bytes | Source | WHY (kp2 §9) |
+|---|---|---|---|
+| `calls` | u64 | observations attributed to this row | return/error class tallies (kp2 §9) |
+| `bytes` | u64 | request sizes only | scalar byte counts (kp2 §9) |
+| `ok` | u64 | return 0 / valid alloc pointer | return/error class tallies (kp2 §9) |
+| `errors` | u64 | other-negative return / `ERR_PTR` | return/error class tallies (kp2 §9) |
+| `queued` | u64 | `-EINPROGRESS`/`-EBUSY` return | return/error class tallies (kp2 §9) |
+| `first_ns` | u64 | first seen-edge `ktime` per lane | timestamps (kp2 §9) |
+| `last_ns` | u64 | last seen-edge `ktime` per lane | timestamps (kp2 §9) |
+
+## `KCTX_DROPS` / `KCTLCLOSED` / `KCTLCOUNT` / `KCTXOVF` (ctx-v1 control)
+
+- `KCTX_DROPS`: per-CPU array, 1 exact `u64` slot: refused `KCTX`
+  inserts (map full). Scalar count (kp2 §8/§9).
+- `KCTLCLOSED`: array, 1 byte: fence closed flag (0 open, nonzero
+  closed). Control flag, not an observation.
+- `KCTLCOUNT`: per-CPU array, 1 `u64` slot per lane: active-writer
+  count for the fence drain-wait. Control count, not an observation.
+- `KCTXOVF`: hash map u64 → u8, 256 entries: first-per-`kh`
+  `CTX_OVERFLOW` gate (key = `kh`, value = 1). Name-free gate (kp2 §7).
 
 ## `KDROPS`: pre-`KTOT` skip sites (8 per-CPU u64, fix wave)
 

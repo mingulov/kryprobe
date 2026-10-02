@@ -24,6 +24,7 @@ pub(crate) mod observe;
 mod session;
 pub use session::AggregateTerminalSample;
 use session::{ConfiguredSession, SessionPhase};
+pub(crate) mod snapshot_ctx;
 pub(crate) mod snapshot_drops;
 pub(crate) mod snapshot_who;
 
@@ -38,7 +39,8 @@ pub use object::{
     locate_kcrypto_object_bytes, locate_kcrypto_object_identity, locate_lifecycle_object_bytes,
     locate_lifecycle_object_identity, pins_enforced, profile_pins_enforced, sha256_hex,
 };
-pub use observe::observation_for_who;
+pub use observe::{observation_for_ctx, observation_for_who};
+pub use snapshot_ctx::{CtxSnapshot, snapshot_ctx, snapshot_ctx_terminal};
 pub use snapshot_drops::{
     KDROP_DESTROY, KDROP_SITES, SnapshotError, fold_drop_lanes, snapshot_drops,
 };
@@ -1042,6 +1044,7 @@ mod tests {
             }),
             idents: vec![],
             overflow_identities: 0,
+            ctx_overflow_identities: 0,
             drops: 0,
             monotonic_ns: 7,
             lagmax_ns: None,
@@ -1275,6 +1278,11 @@ mod tests {
                     err: fd(),
                     params: fd(),
                     drops: fd(),
+                    ctx: fd(),
+                    ctx_drops: fd(),
+                    ctl_closed: fd(),
+                    ctx_ovf: fd(),
+                    ctl_count: fd(),
                 },
                 progs: Vec::new(),
             },
@@ -1385,6 +1393,42 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ctx_refuses_without_quiescent_receipt() {
+        // F-01: unfenced and Pending sessions omit the line (Err);
+        // only a Quiescent receipt reaches the walk (fail-soft Nones
+        // on the inert-fd sensor — the gate, not the walk, is under
+        // test here).
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(6);
+        let fresh = || ConfiguredSession::new(generation, configured_with_non_map_fds(), 10);
+        // Unfenced (no finish yet): refuse.
+        *backend.state.lock().unwrap() = Some(fresh());
+        assert!(backend.session_ctx_terminal(generation).is_err());
+        // Pending fence: refuse.
+        let mut pending = fresh();
+        pending.fence_outcome = Some(crate::kcrypto_fence::CloseOutcome::Pending);
+        *backend.state.lock().unwrap() = Some(pending);
+        assert!(backend.session_ctx_terminal(generation).is_err());
+        // Quiescent: reach the walk (all-None on inert FDs).
+        let mut proven = fresh();
+        proven.fence_outcome = Some(crate::kcrypto_fence::CloseOutcome::Quiescent(
+            crate::kcrypto_fence::QuiescentReceipt { fence_ns: 1 },
+        ));
+        *backend.state.lock().unwrap() = Some(proven);
+        let terminal = backend.session_ctx_terminal(generation).unwrap();
+        assert_eq!(
+            (
+                terminal.rows,
+                terminal.present_calls,
+                terminal.system_calls,
+                terminal.unknown_calls,
+                terminal.drops
+            ),
+            (None, None, None, None, None)
+        );
+    }
+
+    #[test]
     fn terminal_interval_rejects_contradictions_without_clamping() {
         let mut sample = AggregateTerminalSample {
             snapshot: hand_snapshot(&[1], Some(1)),
@@ -1393,6 +1437,7 @@ mod tests {
             drops: [0; 8],
             drain: Default::default(),
             started_ns: 10,
+            fence: crate::kcrypto_fence::CloseOutcome::Pending,
         };
         sample.snapshot.monotonic_ns = 200;
         assert!(

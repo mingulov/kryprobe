@@ -59,7 +59,7 @@ use kryprobe_privilege::kcrypto_lifecycle::sensor::{
 };
 use kryprobe_privilege::kcrypto_lifecycle::view::prog_miss_delta_sum;
 use kryprobe_privilege::kcrypto_snapshot::{
-    AggOccupancy, ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped,
+    AggOccupancy, CtxTerminal, ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped,
     shared_losses_from_drain,
 };
 use std::collections::HashMap;
@@ -202,7 +202,7 @@ fn count_json(count: Option<u64>) -> String {
 /// the Python `parse_telemetry` consumer (v1).
 pub fn telemetry_occupancy_line(occ: &AggOccupancy) -> String {
     format!(
-        "kryprobe: telemetry {{\"v\":1,\"occupancy\":{{\"kagg\":{},\"ktot\":{},\"kidn\":{},\"kring_pending\":{},\"kwho\":{},\"kstack\":{},\"kerr\":{},\"kparams\":{},\"kdrops_slots\":{}}}}}",
+        "kryprobe: telemetry {{\"v\":1,\"occupancy\":{{\"kagg\":{},\"ktot\":{},\"kidn\":{},\"kring_pending\":{},\"kwho\":{},\"kstack\":{},\"kerr\":{},\"kparams\":{},\"kdrops_slots\":{},\"kctx\":{}}}}}",
         count_json(occ.kagg),
         count_json(occ.ktot),
         count_json(occ.kidn),
@@ -212,6 +212,24 @@ pub fn telemetry_occupancy_line(occ: &AggOccupancy) -> String {
         count_json(occ.kerr),
         count_json(occ.kparams),
         count_json(occ.kdrops_slots),
+        count_json(occ.kctx),
+    )
+}
+
+/// M1 terminal ctx telemetry line (agg profile): the unknown-
+/// by-difference operands from one consistent post-fence read (rows,
+/// present/system/unknown calls, exact drops). The frozen
+/// `parse_telemetry` consumer ignores the `ctx` object (no lag/stop/
+/// occupancy keys — counted as a line, never malformed); the M1 judge
+/// parses it fail-closed (absence invalidates the leg).
+pub fn telemetry_ctx_line(ctx: &CtxTerminal) -> String {
+    format!(
+        "kryprobe: telemetry {{\"v\":1,\"ctx\":{{\"rows\":{},\"present_calls\":{},\"system_calls\":{},\"unknown_calls\":{},\"drops\":{}}}}}",
+        count_json(ctx.rows),
+        count_json(ctx.present_calls),
+        count_json(ctx.system_calls),
+        count_json(ctx.unknown_calls),
+        count_json(ctx.drops),
     )
 }
 
@@ -810,6 +828,7 @@ struct SessionMeasurements {
     busy: bool,
     who_drops: u64,
     overflow_identities: u64,
+    ctx_overflow_identities: u64,
     drops: [u64; 8],
     observations_decoded: u64,
     interval: ValidityInterval,
@@ -854,11 +873,13 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
             unexpected_drops = unexpected_drops.saturating_add(*count);
         }
     }
-    let mut aggregate_counts = dim(if unexpected_drops > 0 || m.overflow_identities > 0 {
-        CoverageStatus::Partial
-    } else {
-        CoverageStatus::Unknown
-    });
+    let mut aggregate_counts = dim(
+        if unexpected_drops > 0 || m.overflow_identities > 0 || m.ctx_overflow_identities > 0 {
+            CoverageStatus::Partial
+        } else {
+            CoverageStatus::Unknown
+        },
+    );
     aggregate_counts
         .counters
         .push(counter("uncovered:aggregate_snapshot_not_quiescent", 1));
@@ -904,6 +925,7 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     // skips are invisible to the ring.
     let transport_partial = m.ring_drops != 0
         || m.overflow_identities != 0
+        || m.ctx_overflow_identities != 0
         || m.queue_drops != 0
         || m.backlog_bytes != 0
         || m.busy;
@@ -1791,6 +1813,7 @@ fn drive_session_inner(
     let mut observations = Vec::new();
     let mut latest = HashMap::new();
     let mut overflow_identities = 0u64;
+    let mut ctx_overflow_identities = 0u64;
     let mut barrier_id = 0u64;
     let mut interrupted = false;
     // Cancellation is checked before admitting another full running tick.
@@ -1816,6 +1839,8 @@ fn drive_session_inner(
             &mut latest,
         )?;
         overflow_identities = overflow_identities.saturating_add(snap.overflow_identities);
+        ctx_overflow_identities =
+            ctx_overflow_identities.saturating_add(snap.ctx_overflow_identities);
         if let Some(report) = progress {
             report(
                 barrier_id,
@@ -1863,6 +1888,8 @@ fn drive_session_inner(
         &mut latest,
     )?;
     overflow_identities = overflow_identities.saturating_add(terminal.snapshot.overflow_identities);
+    ctx_overflow_identities =
+        ctx_overflow_identities.saturating_add(terminal.snapshot.ctx_overflow_identities);
     // Also cover identities retained from running ticks, not only the tail.
     for row in &observations {
         for stamp in [row.started_ns, row.ended_ns]
@@ -1922,6 +1949,7 @@ fn drive_session_inner(
         who_drops: terminal.who_drops,
         ring_drops: u64::from(drops),
         overflow_identities,
+        ctx_overflow_identities,
         drops: kdrop_sites,
         observations_decoded: report.observations().len() as u64,
         interval: ValidityInterval {
@@ -2725,6 +2753,12 @@ fn run_live_session_inner(
         if let Ok(occupancy) = concrete.session_occupancy(generation) {
             eprintln!("{}", telemetry_occupancy_line(&occupancy));
         }
+        // M1 terminal ctx account (same frozen maps, next line): a
+        // session-state failure omits the line and the M1 judge fails
+        // the leg closed (no attribution evidence, no validity).
+        if let Ok(ctx) = concrete.session_ctx_terminal(generation) {
+            eprintln!("{}", telemetry_ctx_line(&ctx));
+        }
         Ok(outcome)
     })();
     finish_capture(result, &mut production)
@@ -2759,12 +2793,40 @@ mod tests {
             kerr: Some(0),
             kparams: Some(1),
             kdrops_slots: Some(8),
+            kctx: Some(3),
         };
         assert_eq!(
             telemetry_occupancy_line(&occ),
             "kryprobe: telemetry {\"v\":1,\"occupancy\":{".to_owned()
                 + "\"kagg\":4,\"ktot\":1,\"kidn\":4,\"kring_pending\":null,"
-                + "\"kwho\":2,\"kstack\":1,\"kerr\":0,\"kparams\":1,\"kdrops_slots\":8}}"
+                + "\"kwho\":2,\"kstack\":1,\"kerr\":0,\"kparams\":1,\"kdrops_slots\":8,\"kctx\":3}}"
+        );
+    }
+
+    #[test]
+    fn telemetry_ctx_line_vector() {
+        // Twinned with the M1 `parse_ctx_telemetry` consumer: exact
+        // key order + null rendering; the frozen `parse_telemetry`
+        // ignores the `ctx` object (covered in test_parsers.py).
+        let ctx = CtxTerminal {
+            rows: Some(1024),
+            present_calls: Some(5000),
+            system_calls: Some(5026),
+            unknown_calls: Some(26),
+            drops: Some(26),
+        };
+        assert_eq!(
+            telemetry_ctx_line(&ctx),
+            "kryprobe: telemetry {\"v\":1,\"ctx\":{".to_owned()
+                + "\"rows\":1024,\"present_calls\":5000,\"system_calls\":5026,"
+                + "\"unknown_calls\":26,\"drops\":26}}"
+        );
+        let ctx_none = CtxTerminal::default();
+        assert_eq!(
+            telemetry_ctx_line(&ctx_none),
+            "kryprobe: telemetry {\"v\":1,\"ctx\":{".to_owned()
+                + "\"rows\":null,\"present_calls\":null,\"system_calls\":null,"
+                + "\"unknown_calls\":null,\"drops\":null}}"
         );
     }
 
@@ -2996,6 +3058,7 @@ mod tests {
             who_drops: 0,
             ring_drops: 0,
             overflow_identities: 0,
+            ctx_overflow_identities: 0,
             drops: [0; 8],
             observations_decoded: 12,
             interval: ValidityInterval {

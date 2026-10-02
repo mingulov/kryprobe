@@ -97,12 +97,15 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 
 /// Frozen kcrypto maps, in creation order. Asserted against the object.
 ///
-/// The exact Task-2 contract (`KConfig` 76B per C2 + the K4-fix3
-/// `shash_base` word + the K5 attribution tail, `KAgg` 260B, `VAgg`
-/// 120B — `planning/kryprobe-phaseK1-sensor-plan.md` Task 2) plus the
-/// four K5 attribution maps (`KWHO`/`KSTACK`/`KERR`/`KPARAMS` —
+/// The exact Task-2 contract (`KConfig` 84B per C2 + the K4-fix3
+/// `shash_base` word + the K5 attribution tail + the ctx-v1 lifetime
+/// pair, `KAgg` 260B, `VAgg` 120B —
+/// `planning/kryprobe-phaseK1-sensor-plan.md` Task 2) plus the four K5
+/// attribution maps (`KWHO`/`KSTACK`/`KERR`/`KPARAMS` —
 /// `planning/kryprobe-phaseK5-attribution-token-design.md` §2.1) plus
-/// the fix-wave `KDROPS` pre-`KTOT` site counters (G-C1);
+/// the fix-wave `KDROPS` pre-`KTOT` site counters (G-C1) plus the five
+/// ctx-v1 maps (`KCTX`/`KCTX_DROPS`/`KCTLCLOSED`/`KCTXOVF`/`KCTLCOUNT`
+/// — ADR-0008/ADR-0009);
 /// names dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
@@ -110,7 +113,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 76,
+            value_size: 84,
             max_entries: 1,
         },
     ),
@@ -193,6 +196,51 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             key_size: 4,
             value_size: 8,
             max_entries: 8,
+        },
+    ),
+    (
+        "KCTX",
+        MapDims {
+            map_type: 5,
+            key_size: 32,
+            value_size: 56,
+            max_entries: 1024,
+        },
+    ),
+    (
+        "KCTX_DROPS",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+        },
+    ),
+    (
+        "KCTLCLOSED",
+        MapDims {
+            map_type: 2,
+            key_size: 4,
+            value_size: 1,
+            max_entries: 1,
+        },
+    ),
+    (
+        "KCTXOVF",
+        MapDims {
+            map_type: 1,
+            key_size: 8,
+            value_size: 1,
+            max_entries: 256,
+        },
+    ),
+    (
+        "KCTLCOUNT",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
         },
     ),
 ];
@@ -384,6 +432,16 @@ pub struct KcryptoMaps {
     pub params: OwnedFd,
     /// `KDROPS` (pre-`KTOT` skip sites, 8 per-CPU u64 counters).
     pub drops: OwnedFd,
+    /// `KCTX` (ctx-v1 per-context counters, 1024 entries).
+    pub ctx: OwnedFd,
+    /// `KCTX_DROPS` (ctx-v1 exact refused-insert count, 1 per-CPU u64).
+    pub ctx_drops: OwnedFd,
+    /// `KCTLCLOSED` (ctx-v1 fence closed flag, 1 byte).
+    pub ctl_closed: OwnedFd,
+    /// `KCTXOVF` (ctx-v1 first-per-`kh` overflow gate, 256 entries).
+    pub ctx_ovf: OwnedFd,
+    /// `KCTLCOUNT` (ctx-v1 per-CPU active-writer count, 1 per-CPU u64).
+    pub ctl_count: OwnedFd,
 }
 
 /// Fully loaded kcrypto object: maps + per-program fds, all RAII-owned.

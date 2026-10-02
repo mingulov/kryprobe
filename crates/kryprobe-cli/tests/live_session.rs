@@ -1070,6 +1070,7 @@ impl kryprobe_cli::live::SessionSensor for ScriptedSensor {
                 drops: self.drop_sites,
                 drain: Default::default(),
                 started_ns: 0,
+                fence: kryprobe_privilege::kcrypto_fence::CloseOutcome::Pending,
             },
         )
     }
@@ -1228,6 +1229,7 @@ impl kryprobe_cli::live::SessionSensor for TerminalSensor {
             totals: Some(script_totals(10)),
             idents: Vec::new(),
             overflow_identities: 0,
+            ctx_overflow_identities: 0,
             drops: 0,
             monotonic_ns: 100,
             lagmax_ns: None,
@@ -1267,6 +1269,7 @@ impl kryprobe_cli::live::SessionSensor for TerminalSensor {
                         kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(overflow).unwrap(),
                     ],
                     overflow_identities: 1,
+                    ctx_overflow_identities: 0,
                     drops: 7,
                     monotonic_ns: 200,
                     lagmax_ns: None,
@@ -1280,6 +1283,7 @@ impl kryprobe_cli::live::SessionSensor for TerminalSensor {
                     ..Default::default()
                 },
                 started_ns: 10,
+                fence: kryprobe_privilege::kcrypto_fence::CloseOutcome::Pending,
             },
         )
     }
@@ -1580,6 +1584,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         totals: Some(script_totals(30)),
         idents: vec![script_ident()],
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 7,
         monotonic_ns: wall,
         lagmax_ns: None,
@@ -1752,6 +1757,7 @@ impl kryprobe_cli::live::SessionSensor for MidStopSensor {
                 drops: [0; 8],
                 drain: Default::default(),
                 started_ns: 0,
+                fence: kryprobe_privilege::kcrypto_fence::CloseOutcome::Pending,
             },
         )
     }
@@ -1777,6 +1783,7 @@ fn live_stop_mid_run_tears_down_cleanly() {
         totals: Some(script_totals(10)),
         idents: vec![script_ident()],
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
         lagmax_ns: None,
@@ -1855,6 +1862,7 @@ fn live_sigint_ends_window_with_interrupted_outcome() {
         totals: Some(script_totals(10)),
         idents: vec![script_ident()],
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
         lagmax_ns: None,
@@ -1933,6 +1941,7 @@ fn live_progress_hook_sees_every_tick() {
         totals: Some(script_totals(10)),
         idents: vec![script_ident()],
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 0,
         monotonic_ns: wall,
         lagmax_ns: None,
@@ -2006,6 +2015,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         totals: Some(script_totals(30)),
         idents: vec![script_ident()],
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 7,
         monotonic_ns: wall,
         lagmax_ns: None,
@@ -2101,6 +2111,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         totals: None,
         idents: Vec::new(),
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
         lagmax_ns: None,
@@ -2259,6 +2270,7 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         totals: None,
         idents: Vec::new(),
         overflow_identities: 0,
+        ctx_overflow_identities: 0,
         drops: 0,
         monotonic_ns: 100,
         lagmax_ns: None,

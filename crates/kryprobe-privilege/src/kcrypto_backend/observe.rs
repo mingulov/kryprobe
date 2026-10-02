@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! D8 decode tables (1A-M10): snapshot rows to observations.
 
-use super::WhoSnapshot;
+use super::{CtxSnapshot, WhoSnapshot};
 
 /// Payload note on `UNOBSERVED` rows (unreachable-by-construction: only the
 /// void destroy path carries this class, and it emits no rows).
@@ -390,5 +390,99 @@ pub fn observation_for_who(
         correlation: None,
         integrity: IntegrityRef::new(0),
         backend_payload: payload,
+    }
+}
+
+/// Build the context-qualified observation for one folded `KCTX` row
+/// (ctx-v1, M1 Task 02): `row = "ctx"` with the full accounting key
+/// (`kh`, `cgroup`, `tgid`, `uid`, `start_ns`) plus folded counters.
+/// Zero `cgroup`/`start_ns` stay explicit (`context_unknown: true`) —
+/// unknown context never renders as a host workload row.
+pub fn observation_for_ctx(ctx: &CtxSnapshot, id: ObservationId) -> NativeObservation {
+    let unknown = ctx.key.cgroup == 0 || ctx.key.start_ns == 0;
+    let payload = json!({
+        "row": "ctx",
+        "key_hash": ctx.key.kh,
+        "cgroup": ctx.key.cgroup,
+        "tgid": ctx.key.tgid,
+        "uid": ctx.key.uid,
+        "start_ns": ctx.key.start_ns,
+        "context_unknown": unknown,
+        "calls": ctx.val.calls,
+        "bytes": ctx.val.bytes,
+        "ok": ctx.val.ok,
+        "errors": ctx.val.errors,
+        "queued": ctx.val.queued,
+        "first_ns": ctx.val.first_ns,
+        "last_ns": ctx.val.last_ns,
+        "capture_profile": CAPTURE_API_RETURNS,
+    });
+    NativeObservation {
+        id,
+        backend: BackendId::KCrypto,
+        target: None,
+        object: None,
+        implementation: None,
+        phase: EvidencePhase::Discovered,
+        call_kind: CallKind::Unknown,
+        operation_class: OperationClass::Unknown,
+        native_name: None,
+        native_code: None,
+        native_result: NativeResult::KCrypto { status: 0 },
+        started_ns: Some(ctx.val.first_ns),
+        ended_ns: Some(ctx.val.last_ns),
+        correlation: None,
+        integrity: IntegrityRef::new(0),
+        backend_payload: payload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kryprobe_abi::kcrypto_ctx::{KCtxKey, VCtx};
+
+    fn snapshot(cgroup: u64, start_ns: u64) -> CtxSnapshot {
+        CtxSnapshot {
+            key: KCtxKey {
+                kh: 7,
+                cgroup,
+                tgid: 1000,
+                uid: 1000,
+                start_ns,
+            },
+            val: VCtx {
+                calls: 5,
+                bytes: 2560,
+                ok: 5,
+                errors: 0,
+                queued: 0,
+                first_ns: 11,
+                last_ns: 22,
+            },
+        }
+    }
+
+    #[test]
+    fn ctx_row_renders_key_and_counters() {
+        let obs = observation_for_ctx(&snapshot(43812, 555), ObservationId::new(3));
+        assert_eq!(obs.backend_payload["row"], "ctx");
+        assert_eq!(obs.backend_payload["context_unknown"], false);
+        assert_eq!(obs.backend_payload["cgroup"], 43812u64);
+        assert_eq!(obs.backend_payload["calls"], 5u64);
+        assert_eq!(obs.started_ns, Some(11));
+        assert_eq!(obs.ended_ns, Some(22));
+    }
+
+    #[test]
+    fn unreadable_context_stays_explicit_never_host() {
+        for (cgroup, start_ns) in [(0, 555), (43812, 0), (0, 0)] {
+            let obs = observation_for_ctx(&snapshot(cgroup, start_ns), ObservationId::new(4));
+            assert_eq!(
+                obs.backend_payload["context_unknown"], true,
+                "cgroup={cgroup} start_ns={start_ns}"
+            );
+            assert_eq!(obs.backend_payload["row"], "ctx");
+        }
     }
 }

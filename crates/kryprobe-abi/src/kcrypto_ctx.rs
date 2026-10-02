@@ -31,11 +31,21 @@ pub const KCTL_CTX_OVERFLOW: u8 = 6;
 /// count, never a saturating flag). `PerCpuArray<u64>` with 1 slot.
 pub const KCTX_DROPS_SLOTS: u32 = 1;
 
-/// `KCTLFENCE` control word (M1 control ABI v1, ADR-0008 §(f)): bit 63
-/// is `CLOSED`, bits 0..62 are the active-writer count.
-pub const KCTLFENCE_CLOSED_BIT: u64 = 1 << 63;
-/// Mask for the active-writer count within the fence word.
-pub const KCTLFENCE_COUNT_MASK: u64 = (1 << 63) - 1;
+/// `KCTLCLOSED` value (M1 control ABI v1, ADR-0009): fence closed flag,
+/// 0 = open, nonzero = closed. `Array<u8>` with 1 slot, written by
+/// userspace close, read by BPF admission.
+pub const KCTLCLOSED_OPEN: u8 = 0;
+/// Closed flag value written at fence close.
+pub const KCTLCLOSED_CLOSED: u8 = 1;
+
+/// `KCTLCOUNT` value (M1 control ABI v1, ADR-0009): per-CPU
+/// active-writer count. `PerCpuArray<u64>` with 1 slot; BPF owns its
+/// own lane with plain ops (no BPF atomic RMW exists on this target),
+/// userspace folds all lanes at drain-wait.
+pub const KCTLCOUNT_SLOTS: u32 = 1;
+
+/// `KCTXOVF` capacity: first-per-`kh` overflow gate entries.
+pub const KCTXOVF_MAX_ENTRIES: u32 = 256;
 
 /// `KCTX` key: accounting identity (32B, `repr(C)`, align 8, no padding).
 ///

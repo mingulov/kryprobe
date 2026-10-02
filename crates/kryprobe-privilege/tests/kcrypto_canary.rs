@@ -307,7 +307,8 @@ fn kconfig_bytes_match_live_resolver() {
     // Unprivileged (BTF read only): the KCFG bytes the configured
     // entry writes equal the 9 live-resolved offsets + `PF_KTHREAD` +
     // zero pad in C2 word order, plus the 7 K5 attribution offsets +
-    // flags verbatim in the tail.
+    // flags verbatim in the tail, plus the ctx-v1 start-time offset
+    // + flag (ADR-0008).
     if !btf_available() {
         println!("SKIP: no /sys/kernel/btf/vmlinux on this host");
         return;
@@ -317,8 +318,8 @@ fn kconfig_bytes_match_live_resolver() {
     let bytes = kconfig_from_offsets(off, k5).to_bytes();
     assert_eq!(
         bytes.len(),
-        76,
-        "KCFG wire is 76B (C2 + shash_base + K5 tail)"
+        84,
+        "KCFG wire is 84B (C2 + shash_base + K5 tail + ctx-v1 tail)"
     );
     let word =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
@@ -347,7 +348,11 @@ fn kconfig_bytes_match_live_resolver() {
     assert_eq!(word(68), k5.cra_max_keysize, "word 17: cra_max_keysize");
     assert_eq!(bytes[72], u8::from(k5.parent_ok), "parent_ok flag");
     assert_eq!(bytes[73], u8::from(k5.params_ok), "params_ok flag");
-    assert_eq!(&bytes[74..76], &[0, 0], "tail zero pad");
+    assert_eq!(&bytes[74..76], &[0, 0], "K5 tail zero pad");
+    // ctx-v1 tail: start-time offset verbatim + flag as 0/1 + zero pad.
+    assert_eq!(word(76), k5.task_start_off, "word 19: task_start_off");
+    assert_eq!(bytes[80], u8::from(k5.start_ok), "start_ok flag");
+    assert_eq!(&bytes[81..84], &[0, 0, 0], "ctx tail zero pad");
 }
 
 /// Our bpffs pin dir (pid-suffixed: never collides, never shared).
