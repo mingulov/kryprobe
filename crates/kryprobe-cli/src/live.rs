@@ -292,27 +292,17 @@ pub fn telemetry_stop_line(total_us: u64, session: Option<&SessionStop>, render_
 /// session spans (`LiveOutcome.stop`) with the render + write span
 /// measured from `t_render`. `total_us` spans session end → output
 /// written; it is a SUPERSET of the sub-spans (residual =
-/// uninstrumented teardown: map/drain close, detach, scheduling).
+/// uninstrumented teardown: map/drain close, detach, the
+/// post-session agg occupancy walk, scheduling).
 /// Without session spans the total covers render + write only and
 /// the sub-spans read `null` — honest, never silent zero. Shared
 /// by the `watch` and `report` finish paths: every clean session
 /// ends with exactly one stop line.
 pub fn emit_stop_line(outcome: &LiveOutcome, t_render: std::time::Instant, stderr: &mut dyn Write) {
-    let render_us = {
-        let elapsed = t_render.elapsed();
-        elapsed
-            .as_secs()
-            .saturating_mul(1_000_000)
-            .saturating_add(u64::from(elapsed.subsec_micros()))
-    };
-    let total_us = outcome.stop.map_or(render_us, |spans| {
-        let elapsed = spans.ended.elapsed();
-        elapsed
-            .as_secs()
-            .saturating_mul(1_000_000)
-            .saturating_add(u64::from(elapsed.subsec_micros()))
-            .max(render_us)
-    });
+    let render_us = us_since(t_render);
+    let total_us = outcome
+        .stop
+        .map_or(render_us, |spans| us_since(spans.ended).max(render_us));
     let _ = writeln!(
         stderr,
         "{}",
@@ -2792,6 +2782,60 @@ mod tests {
             "kryprobe: telemetry {\"v\":1,\"stop\":{".to_owned()
                 + "\"total_us\":28000,\"finish_us\":null,\"finalize_us\":null,"
                 + "\"assemble_us\":null,\"render_us\":28000}}"
+        );
+    }
+
+    #[test]
+    fn emit_stop_line_joins_spans_with_clamped_total() {
+        // R1 followup minor 3: characterization for the `us_since`
+        // refactor — spans join verbatim, the total never reads
+        // below the render span, absent spans read null with the
+        // total equal to the render span.
+        use crate::cmd_watch::fixtures::{healthy_coverage, outcome_with};
+        let mut outcome = outcome_with(Vec::new(), healthy_coverage(0));
+        outcome.stop = Some(SessionStop {
+            finish_us: 3000,
+            finalize_us: 9000,
+            assemble_us: 2000,
+            ended: Instant::now(),
+        });
+        let mut stderr = Vec::new();
+        emit_stop_line(&outcome, Instant::now(), &mut stderr);
+        let text = String::from_utf8(stderr).expect("utf-8");
+        assert_eq!(text.lines().count(), 1, "exactly one line: {text:?}");
+        let body = text
+            .strip_prefix("kryprobe: telemetry ")
+            .expect("telemetry prefix");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("stop line parses");
+        assert_eq!(parsed["v"].as_u64(), Some(1));
+        assert_eq!(parsed["stop"]["finish_us"].as_u64(), Some(3000));
+        assert_eq!(parsed["stop"]["finalize_us"].as_u64(), Some(9000));
+        assert_eq!(parsed["stop"]["assemble_us"].as_u64(), Some(2000));
+        let total_us = parsed["stop"]["total_us"].as_u64().expect("total number");
+        let render_us = parsed["stop"]["render_us"]
+            .as_u64()
+            .expect("render number");
+        assert!(
+            total_us >= render_us,
+            "total {total_us} >= render {render_us}"
+        );
+
+        // No session spans: the total covers render + write only
+        // (equal here — one shared clock read) with null sub-spans.
+        let bare = outcome_with(Vec::new(), healthy_coverage(0));
+        let mut stderr = Vec::new();
+        emit_stop_line(&bare, Instant::now(), &mut stderr);
+        let text = String::from_utf8(stderr).expect("utf-8");
+        let body = text
+            .strip_prefix("kryprobe: telemetry ")
+            .expect("telemetry prefix");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("stop line parses");
+        assert!(parsed["stop"]["finish_us"].is_null());
+        assert!(parsed["stop"]["finalize_us"].is_null());
+        assert!(parsed["stop"]["assemble_us"].is_null());
+        assert_eq!(
+            parsed["stop"]["total_us"], parsed["stop"]["render_us"],
+            "spanless total equals render"
         );
     }
 
