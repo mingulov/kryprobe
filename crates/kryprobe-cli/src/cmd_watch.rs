@@ -678,6 +678,77 @@ mod tests {
         );
     }
 
+    /// R1 followup minor 2: every clean watch session (interrupted
+    /// included — the spans still timed the tail) ends with exactly
+    /// one parseable stop line; stdout and the exit code are unchanged.
+    #[test]
+    fn finish_watch_emits_exactly_one_parseable_stop_line() {
+        for interrupted in [false, true] {
+            let mut outcome = watch_fixture();
+            outcome.interrupted = interrupted;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = finish_watch(
+                Ok(outcome),
+                &FilterArgs::default(),
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, if interrupted { 3 } else { 0 });
+            assert!(
+                String::from_utf8(stdout)
+                    .expect("utf-8")
+                    .contains("COMPLETE"),
+                "stdout preserved (interrupted={interrupted})"
+            );
+            let err_text = String::from_utf8(stderr).expect("utf-8");
+            let stops: Vec<&str> = err_text
+                .lines()
+                .filter(|line| line.contains("\"stop\":{"))
+                .collect();
+            assert_eq!(stops.len(), 1, "exactly one stop line: {err_text:?}");
+            assert_eq!(
+                err_text.lines().last(),
+                Some(stops[0]),
+                "session ends with the stop line"
+            );
+            let body = stops[0]
+                .strip_prefix("kryprobe: telemetry ")
+                .expect("telemetry prefix");
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).expect("stop line parses");
+            assert_eq!(parsed["v"].as_u64(), Some(1));
+            assert!(parsed["stop"]["total_us"].as_u64().is_some());
+            assert!(parsed["stop"]["render_us"].as_u64().is_some());
+        }
+    }
+
+    /// R1 followup minor 2: a failed capture names the failure and
+    /// emits no stop line (no session ran, so no spans exist).
+    #[test]
+    fn finish_watch_failure_emits_no_stop_line() {
+        for (err, code_want) in [
+            (LiveError::Unusable("btf gate".to_owned()), 4),
+            (LiveError::Internal("boom".to_owned()), 1),
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = finish_watch(
+                Err(err),
+                &FilterArgs::default(),
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, code_want);
+            assert!(stdout.is_empty());
+            let err_text = String::from_utf8(stderr).expect("utf-8");
+            assert!(
+                !err_text.contains("\"stop\":{"),
+                "no stop line on failure: {err_text:?}"
+            );
+        }
+    }
+
     #[test]
     fn finish_with_pid_filter_hides_mismatch_and_tallies() {
         // P6-N3: the production watch path applies the submitter

@@ -493,7 +493,11 @@ impl SensorCore {
 
     /// Fold one decoded edge's ingest lag into the window max. A
     /// failed clock read skips the sample (telemetry never breaks
-    /// ingest).
+    /// ingest). The per-edge `CLOCK_MONOTONIC` read stays by
+    /// R1-followup decision: vDSO cost (~25ns/edge) is negligible
+    /// beside µs-scale ingest, and a batched timestamp would change
+    /// lag semantics (batch-end overstates, batch-start understates)
+    /// — revisit only on lifecycle-profile evidence.
     fn note_edge_lag(&mut self, ts_ns: u64) {
         if let Ok(now) = crate::host::monotonic_ns() {
             let lag = now.saturating_sub(ts_ns);
