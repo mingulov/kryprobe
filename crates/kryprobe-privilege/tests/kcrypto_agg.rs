@@ -218,7 +218,7 @@ fn cstr(bytes: &[u8]) -> String {
 
 /// Dump every `KAGG` row (key iteration + per-CPU fold).
 fn dump_kagg(sensor: &Sensor) -> Vec<AggRow> {
-    let ncpu = possible_cpus() as usize;
+    let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
     let mut rows = Vec::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
@@ -256,7 +256,7 @@ fn dump_kagg(sensor: &Sensor) -> Vec<AggRow> {
 
 /// Fold the single `KTOT` row.
 fn dump_ktot(sensor: &Sensor) -> VAgg {
-    let ncpu = possible_cpus() as usize;
+    let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
     // SAFETY: KTOT value is VAgg, 120B × possible_cpus.
     let raw = unsafe {
         map_lookup_bytes(
@@ -1073,7 +1073,7 @@ fn hash_points_observed() {
                     map_lookup_bytes(
                         &sensor.loaded.maps.who,
                         &k,
-                        80 * possible_cpus() as usize,
+                        80 * possible_cpus().expect("trusted possible CPU topology") as usize,
                         "hash/who-value",
                     )
                 }

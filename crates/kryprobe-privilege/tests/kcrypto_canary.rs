@@ -102,7 +102,7 @@ struct Row {
 
 /// Decode every `KAGG` row (key iteration + per-CPU fold).
 fn dump_kagg_rows(sensor: &ConfiguredKcrypto) -> Vec<Row> {
-    let ncpu = possible_cpus() as usize;
+    let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
     let mut rows = Vec::new();
     let mut key: Option<Vec<u8>> = None;
     loop {
@@ -223,7 +223,7 @@ fn drain_ring_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
 /// Raw bytes of every map + the ring (KCFG + all KAGG keys/values +
 /// KTOT + all KIDN keys/values + ring payloads): the canary haystack.
 fn dump_all_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
-    let ncpu = possible_cpus() as usize;
+    let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
     let mut out = Vec::new();
     // SAFETY: KCFG wire is exactly 76B.
     out.extend_from_slice(

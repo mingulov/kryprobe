@@ -71,6 +71,28 @@ fn wait_readable(fd: RawFd, max_wait: Duration) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod activity_wait_tests {
+    #[test]
+    fn unavailable_topology_refuses_lifecycle_counters_before_bpf() {
+        use crate::bpfloader::{LifecycleMaps, LoadedLifecycle};
+        use crate::kcrypto_lifecycle::ConfiguredLifecycle;
+        use crate::mapops::topology_tests::{assert_refused, bad_fd, with_topology};
+        let sensor = ConfiguredLifecycle {
+            loaded: LoadedLifecycle {
+                maps: LifecycleMaps {
+                    config: bad_fd(),
+                    ring: bad_fd(),
+                    loss: bad_fd(),
+                    agg: bad_fd(),
+                    ctr: bad_fd(),
+                },
+                progs: Vec::new(),
+            },
+            links: Vec::new(),
+        };
+        let (result, calls) = with_topology(None, || super::read_kernel_counters(&sensor));
+        assert_refused(result, calls, libc::ENODATA);
+    }
+
     use super::wait_readable;
     use std::io::{Read, Write};
     use std::os::{fd::AsRawFd, unix::net::UnixStream};

@@ -596,6 +596,17 @@ fn drive_stale_gen(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unavailable_topology_refuses_decoy_counters_before_bpf() {
+        use crate::mapops::topology_tests::{spine, with_topology};
+        let (result, calls) = with_topology(None, || super::read_counters(&spine(), 0, 1));
+        assert!(
+            matches!(result, Err(super::BpfSelftestError::Map(_))),
+            "{result:?}"
+        );
+        assert_eq!(calls, 0, "topology refusal must precede the first lookup");
+    }
+
     use super::*;
     use kryprobe_core::ReconcileVerdict;
 
