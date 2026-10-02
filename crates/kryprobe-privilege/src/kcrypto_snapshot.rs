@@ -55,7 +55,7 @@ use std::time::Duration;
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::drain::{DrainError, DrainEvent, DrainThread};
 use crate::fd::OwnedFd;
-use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, possible_cpus};
+use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
 
 /// Snapshot row wire version (D7).
 pub const SNAPSHOT_VERSION: u8 = 0x01;
@@ -397,7 +397,7 @@ fn vagg_to_bytes(vagg: &VAgg) -> [u8; 120] {
 
 /// Full `KAGG` walk: key iteration + per-key percpu lookup + [`fold_vagg`].
 fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
-    let ncpu = possible_cpus() as usize;
+    let (ncpu, value_len) = percpu_buffer_len(120)?;
     let mut rows = Vec::new();
     // M8: one lane buffer per walk, cleared per row (not one alloc
     // per row per tick).
@@ -418,7 +418,7 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
         // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus, and the
         // kernel writes all possible lanes.
         let raw = unsafe {
-            map_lookup_bytes(&sensor.loaded.maps.agg, &k, 120 * ncpu, "snapshot/kagg-val")
+            map_lookup_bytes(&sensor.loaded.maps.agg, &k, value_len, "snapshot/kagg-val")
         }?;
         lanes.clear();
         for c in 0..ncpu {
@@ -449,14 +449,14 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
 /// `KTOT` read + percpu fold (`None` on `ENOENT` only — any other errno
 /// fails the snapshot).
 fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsError> {
-    let ncpu = possible_cpus() as usize;
+    let (ncpu, value_len) = percpu_buffer_len(120)?;
     // SAFETY: KTOT is PerCpuArray<VAgg>; VAgg is 120B
     // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus.
     let raw = match unsafe {
         map_lookup_bytes(
             &sensor.loaded.maps.total,
             &0u32.to_le_bytes(),
-            120 * ncpu,
+            value_len,
             "snapshot/ktot",
         )
     } {
@@ -825,6 +825,13 @@ pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unavailable_topology_refuses_totals_before_bpf() {
+        use crate::mapops::topology_tests::{assert_refused, sensor, with_topology};
+        let (result, calls) = with_topology(None, || super::read_ktot(&sensor()));
+        assert_refused(result, calls, libc::ENODATA);
+    }
+
     use super::*;
 
     #[test]

@@ -2,8 +2,15 @@
 //! Raw map element ops: u64 lookup/update + percpu sums (T7c2).
 
 use crate::fd::OwnedFd;
-use crate::probe::bpf_sys::{bpf, last_errno};
+#[cfg(not(test))]
+use crate::probe::bpf_sys::bpf;
+use crate::probe::bpf_sys::last_errno;
 use core::ffi::c_void;
+#[cfg(test)]
+use topology_tests::bpf;
+
+#[cfg(test)]
+pub(crate) mod topology_tests;
 
 const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;
@@ -37,7 +44,7 @@ pub enum MapOpsError {
     LookupFailed {
         /// Lookup stage that failed.
         stage: String,
-        /// Kernel errno.
+        /// Kernel or local validation errno.
         errno: i32,
     },
     /// Element update failed.
@@ -150,22 +157,18 @@ pub fn online_cpus() -> u32 {
     if n < 1 { 1 } else { n as u32 }
 }
 
-/// Upper bound for a sane possible-CPU count parsed from sysfs.
-///
-/// Real `CONFIG_NR_CPUS` tops out at 8192; anything above this from a
-/// text file is corruption, and sizing a `Vec<u64>` from it could OOM.
-/// Such input is rejected (`None`) so the caller falls back to the
-/// `sysconf` count, which is kernel-measured rather than parsed.
+/// Resource bound for CPU ids and lane counts accepted from sysfs.
+/// Larger topologies refuse capture instead of guessing a smaller count.
 const MAX_SANE_CPUS: u32 = 65_536;
+const MAX_CPU_LIST_BYTES: usize = 64 * 1024;
 
 /// Parse a Linux CPU list (e.g. `"0-3,8-11\n"`) into a CPU count.
 ///
 /// Fail-closed: any malformed, overflowing, oversized, or absurd input
-/// yields `None` (the caller falls back to a safe over-estimate). Never
-/// panics. Overlaps can only over-count, which is the safe direction
-/// for buffer sizing.
+/// yields `None`. Ranges must be ordered and non-overlapping, like the
+/// kernel's cpulist output. Never substitute a smaller topology signal.
 fn possible_cpus_from_str(text: &str) -> Option<u32> {
-    if text.len() > 64 * 1024 {
+    if text.len() > MAX_CPU_LIST_BYTES {
         return None;
     }
     let text = text.trim();
@@ -173,8 +176,15 @@ fn possible_cpus_from_str(text: &str) -> Option<u32> {
         return None;
     }
     let mut total: u32 = 0;
+    let mut previous = None;
     for item in text.split(',') {
         let item = item.trim();
+        if !item
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b.is_ascii_whitespace())
+        {
+            return None;
+        }
         let (lo, hi) = match item.split_once('-') {
             None => {
                 let cpu: u32 = item.parse().ok()?;
@@ -192,6 +202,10 @@ fn possible_cpus_from_str(text: &str) -> Option<u32> {
                 (lo, hi)
             }
         };
+        if hi >= MAX_SANE_CPUS || previous.is_some_and(|last| lo <= last) {
+            return None;
+        }
+        previous = Some(hi);
         total = total.checked_add((hi - lo).checked_add(1)?)?;
         if total > MAX_SANE_CPUS {
             return None;
@@ -200,14 +214,7 @@ fn possible_cpus_from_str(text: &str) -> Option<u32> {
     if total == 0 { None } else { Some(total) }
 }
 
-/// `_SC_NPROCESSORS_CONF` (≥1; `max(1)` fallback documented).
-fn conf_cpus() -> u32 {
-    // SAFETY: sysconf takes no pointers; an error return folds into the max(1) fallback.
-    let conf = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
-    if conf < 1 { 1 } else { conf as u32 }
-}
-
-/// Possible CPU count for percpu-map buffer sizing (≥1).
+/// Validated possible CPU count for percpu-map buffer sizing (≥1).
 ///
 /// The kernel writes `num_possible_cpus()` lanes on percpu map lookup,
 /// which exceeds the online count whenever any CPU is offline — sizing
@@ -215,48 +222,66 @@ fn conf_cpus() -> u32 {
 /// reads the possible set from `/sys/devices/system/cpu/possible` (the
 /// same source libbpf's `libbpf_num_possible_cpus` uses) rather than
 /// `_SC_NPROCESSORS_CONF`, so the count matches the kernel's lane count
-/// by construction instead of by POSIX-semantics assumption, and so the
-/// parser stays a pure, deterministically unit-testable function.
-/// The parsed value is clamped to `max(parsed, online)`: a
-/// parseable-but-stale sysfs file must never shrink the buffer below a
-/// trusted signal. Unreadable/unparseable input falls back to
-/// `max(conf, online)` (safe/larger direction).
+/// by construction. Missing, malformed, or contradictory topology
+/// returns a typed refusal; configured/online/affinity counts cannot
+/// establish a safe fallback bound. Online count only detects a
+/// contradiction, never supplies a replacement count.
 ///
-/// Cached process-wide (M1): every snapshot path calls this per tick
-/// (4+ sysfs reads per tick for a value that changes only on CPU
-/// hotplug). Hotplug staleness is accepted and fail-loud: a CPU added
-/// mid-process grows the kernel's lane count past the cached value
-/// (undersized buffers), which is exactly why every consumer treats
-/// short reads as loud errors (`EBADMSG`, never a silent partial
-/// fold) — a hotplug event fails the tick visibly instead of
-/// corrupting memory. Hotplug-remove only oversizes (harmless).
-pub fn possible_cpus() -> u32 {
-    static CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(possible_cpus_uncached)
-}
-
-/// Uncached [`possible_cpus`] read (one sysfs read + two `sysconf`s).
-fn possible_cpus_uncached() -> u32 {
-    let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").ok();
-    possible_cpus_from_topology(text.as_deref(), conf_cpus(), online_cpus())
-}
-
-/// [`possible_cpus`] over an injected CPU topology (test seam).
-///
-/// `possible_text` is the raw `/sys/devices/system/cpu/possible` content
-/// (`None` = unreadable file); `conf`/`online` are the two `sysconf`
-/// signals. The offline-CPU path (possible > online) is unproducible on
-/// an all-online host and offlining live CPUs is out of scope, so tests
-/// drive this seam with a synthetic possible≠online mismatch instead.
-/// [`possible_cpus`] is this function applied to the real host reads —
-/// no behavior change on the real path.
-fn possible_cpus_from_topology(possible_text: Option<&str>, conf: u32, online: u32) -> u32 {
-    if let Some(text) = possible_text
-        && let Some(parsed) = possible_cpus_from_str(text)
-    {
-        return parsed.max(online);
+/// Cached process-wide, including refusals: Linux fixes cpu_possible_mask
+/// during boot; CPU online/offline changes do not change its lanes.
+/// See <https://docs.kernel.org/core-api/cpu_hotplug.html#cpu-maps>.
+/// A lookup supplies no userspace buffer length: decoder length checks
+/// cannot detect or prevent a kernel overwrite from an undersized buffer.
+pub fn possible_cpus() -> Result<u32, MapOpsError> {
+    #[cfg(test)]
+    if let Some((text, online)) = topology_tests::topology() {
+        return possible_cpus_from_topology(text, online);
     }
-    conf.max(online)
+    static CACHED: std::sync::OnceLock<Result<u32, MapOpsError>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(possible_cpus_uncached).clone()
+}
+
+/// Uncached, bounded sysfs read plus an online-count consistency check.
+fn possible_cpus_uncached() -> Result<u32, MapOpsError> {
+    use std::io::Read;
+    let text = std::fs::File::open("/sys/devices/system/cpu/possible")
+        .and_then(|file| {
+            let mut text = String::new();
+            file.take((MAX_CPU_LIST_BYTES + 1) as u64)
+                .read_to_string(&mut text)?;
+            Ok(text)
+        })
+        .ok();
+    possible_cpus_from_topology(text.as_deref(), online_cpus())
+}
+
+fn possible_cpus_from_topology(
+    possible_text: Option<&str>,
+    online: u32,
+) -> Result<u32, MapOpsError> {
+    let refusal = |errno| MapOpsError::LookupFailed {
+        stage: "percpu/possible-cpus".to_owned(),
+        errno,
+    };
+    let text = possible_text.ok_or_else(|| refusal(libc::ENODATA))?;
+    possible_cpus_from_str(text)
+        .filter(|count| *count >= online)
+        .ok_or_else(|| refusal(libc::EINVAL))
+}
+
+/// Trusted lane count and kernel-aligned byte length, checked before allocation.
+pub(crate) fn percpu_buffer_len(value_size: usize) -> Result<(usize, usize), MapOpsError> {
+    let ncpu = possible_cpus()? as usize;
+    let value_len = value_size
+        .checked_add(7)
+        .map(|size| size & !7)
+        .and_then(|stride| stride.checked_mul(ncpu))
+        .filter(|len| *len > 0)
+        .ok_or_else(|| MapOpsError::LookupFailed {
+            stage: "percpu/value-size".to_owned(),
+            errno: libc::EOVERFLOW,
+        })?;
+    Ok((ncpu, value_len))
 }
 
 /// Update one element with raw key/value bytes (`BPF_ANY`, K1 Task 2:
@@ -298,8 +323,9 @@ pub fn map_update_bytes(
 /// # Safety
 ///
 /// The caller must pass the map's exact value size (percpu maps:
-/// `value_size * possible_cpus()` — the kernel writes all possible
-/// lanes). An undersized buffer is a kernel heap overwrite (L-SEC-02);
+/// `round_up(value_size, 8) * possible_cpus()?` — the kernel writes all
+/// possible lanes, including offline CPUs). A topology refusal must
+/// propagate before lookup. An undersized buffer is a kernel heap overwrite (L-SEC-02);
 /// every call site documents its size provenance. Same trust model as
 /// [`map_lookup_percpu_sum`].
 pub unsafe fn map_lookup_bytes(
@@ -392,8 +418,9 @@ pub unsafe fn map_get_next_key(
 /// Buffer is sized by [`possible_cpus`], not [`online_cpus`]: the kernel
 /// writes possible-CPUs worth of lanes on percpu lookup.
 pub fn map_lookup_percpu_sum(map: &OwnedFd, key: u32, stage: &str) -> Result<u64, MapOpsError> {
+    let (ncpu, _) = percpu_buffer_len(size_of::<u64>())?;
     let key = key as u64;
-    let mut values = vec![0u64; possible_cpus() as usize];
+    let mut values = vec![0u64; ncpu];
     let mut attr = ElemAttr {
         map_fd: map.as_raw_fd() as u32,
         _pad: 0,
@@ -490,7 +517,7 @@ mod tests {
         // M1: the cached value is exactly the live read (stable
         // across calls — one sysfs read per process, not per tick).
         let live = possible_cpus_uncached();
-        assert!(live >= 1);
+        assert!(live.as_ref().is_ok_and(|count| *count >= 1));
         assert_eq!(possible_cpus(), live);
         assert_eq!(possible_cpus(), live);
     }
@@ -526,6 +553,11 @@ mod tests {
             "0x10",
             "0-99999999999",
             "0-100000",
+            "+1",
+            "0,0",
+            "0-3,2-4",
+            "4,0-3",
+            "65536",
         ] {
             assert_eq!(possible_cpus_from_str(text), None, "input {text:?}");
         }
@@ -534,7 +566,7 @@ mod tests {
 
     #[test]
     fn possible_ge_online_invariant() {
-        let possible = possible_cpus();
+        let possible = possible_cpus().unwrap();
         assert!(possible >= 1);
         assert!(
             possible >= online_cpus(),
@@ -544,19 +576,20 @@ mod tests {
     }
 
     #[test]
-    fn possible_fallback_is_safe_direction() {
-        // Unreadable/unparseable possible set falls back to max(conf,
-        // online) — the safe (larger) direction on every input shape.
-        for (possible_text, conf, online) in [
-            (None, 8, 4),
-            (None, 2, 4),
-            (Some("garbage"), 8, 4),
-            (Some(""), 8, 4),
-            (Some("0-100000"), 8, 4),
+    fn unavailable_or_invalid_possible_topology_refuses() {
+        for (text, errno) in [
+            (None, libc::ENODATA),
+            (Some("garbage"), libc::EINVAL),
+            (Some(""), libc::EINVAL),
+            (Some("0-100000"), libc::EINVAL),
         ] {
-            let fallback = possible_cpus_from_topology(possible_text, conf, online);
-            assert_eq!(fallback, conf.max(online), "input {possible_text:?}");
-            assert!(fallback >= 1);
+            assert_eq!(
+                possible_cpus_from_topology(text, 4),
+                Err(MapOpsError::LookupFailed {
+                    stage: "percpu/possible-cpus".to_owned(),
+                    errno,
+                }),
+            );
         }
     }
 
@@ -568,23 +601,22 @@ mod tests {
         // of which are online. Unproducible on an all-online host, so it
         // runs through the injected-topology seam.
         assert_eq!(
-            possible_cpus_from_topology(Some("0-7\n"), 8, 4),
-            8,
+            possible_cpus_from_topology(Some("0-7\n"), 4),
+            Ok(8),
             "offline CPUs must not shrink the percpu buffer"
         );
         assert_eq!(
-            possible_cpus_from_topology(Some("0-3,8-11"), 12, 4),
-            8,
+            possible_cpus_from_topology(Some("0-3,8-11"), 4),
+            Ok(8),
             "disjoint possible set still sizes by possible"
         );
     }
 
     #[test]
-    fn stale_possible_never_shrinks_below_online() {
-        // A parseable-but-stale sysfs file (fewer lanes than are
-        // online) clamps up to the trusted online signal.
-        assert_eq!(possible_cpus_from_topology(Some("0-1\n"), 4, 4), 4);
-        assert_eq!(possible_cpus_from_topology(Some("0\n"), 16, 16), 16);
+    fn contradictory_possible_topology_refuses() {
+        for (text, online) in [("0-1\n", 4), ("0\n", 16)] {
+            assert!(possible_cpus_from_topology(Some(text), online).is_err());
+        }
     }
 
     #[test]
@@ -593,7 +625,7 @@ mod tests {
         // real host reads it must equal `possible_cpus()`.
         let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").ok();
         assert_eq!(
-            possible_cpus_from_topology(text.as_deref(), conf_cpus(), online_cpus()),
+            possible_cpus_from_topology(text.as_deref(), online_cpus()),
             possible_cpus()
         );
     }

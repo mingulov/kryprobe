@@ -3,7 +3,7 @@
 //! shared [`SnapshotError`].
 
 use crate::btf_resolve::ConfiguredKcrypto;
-use crate::mapops::{MapOpsError, map_lookup_bytes, possible_cpus};
+use crate::mapops::{MapOpsError, map_lookup_bytes, percpu_buffer_len};
 /// Attribution-snapshot failure: an underlying map walk/read failure
 /// (stage + errno preserved). Per-row join misses degrade instead (empty
 /// `stack_ips`, `None` errno/params — the snapshot caller rule: unjoined
@@ -52,8 +52,9 @@ pub const KDROP_SITES: [&str; 8] = [
 pub const KDROP_DESTROY: usize = 5;
 
 /// Fold one `KDROPS` percpu read (`ncpu` LE `u64` lanes) into a site
-/// total. `None` on a short read (a broken post-attach read must be
-/// loud, never a silent partial sum). Saturating (never wraps —
+/// total. `None` on a truncated input slice. This decoder check cannot
+/// protect a kernel lookup buffer: its full size must be established
+/// before BPF is called. Saturating (never wraps —
 /// magnitude honesty at scale).
 #[must_use]
 pub fn fold_drop_lanes(raw: &[u8], ncpu: usize) -> Option<u64> {
@@ -74,7 +75,7 @@ pub fn fold_drop_lanes(raw: &[u8], ncpu: usize) -> Option<u64> {
 /// Structural failures fail the whole snapshot (the
 /// [`super::snapshot_who`] discipline: loud, never a silent zero).
 pub fn snapshot_drops(sensor: &ConfiguredKcrypto) -> Result<[u64; 8], SnapshotError> {
-    let ncpu = possible_cpus() as usize;
+    let (ncpu, value_len) = percpu_buffer_len(8)?;
     let mut out = [0u64; 8];
     for (site, slot) in out.iter_mut().enumerate() {
         // SAFETY: KDROPS is PerCpuArray<u64> (bpf-kcrypto map def);
@@ -83,7 +84,7 @@ pub fn snapshot_drops(sensor: &ConfiguredKcrypto) -> Result<[u64; 8], SnapshotEr
             map_lookup_bytes(
                 &sensor.loaded.maps.drops,
                 &(site as u32).to_le_bytes(),
-                8 * ncpu,
+                value_len,
                 "snapshot/drops",
             )
         }?;

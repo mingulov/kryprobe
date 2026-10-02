@@ -3,7 +3,7 @@
 
 use super::SnapshotError;
 use crate::btf_resolve::ConfiguredKcrypto;
-use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, possible_cpus};
+use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
 use kryprobe_abi::kcrypto_agg::{
     KWHO_DROPS, KWhoKey, VParams, VWho, kwho_key_from_bytes, vparams_from_bytes, vwho_from_bytes,
 };
@@ -251,7 +251,7 @@ fn join_err_params(
     Ok((first_errno, params))
 }
 
-/// Structural failures (walk errors, short reads, undecodable lanes)
+/// Structural failures (unverified topology, walk errors, undecodable lanes)
 /// fail the whole snapshot as [`SnapshotError::Map`] (a broken
 /// post-attach read must be loud, never a silent zero).
 pub fn snapshot_who(maps: &ConfiguredKcrypto) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
@@ -268,7 +268,7 @@ pub fn snapshot_who_cached(
     maps: &ConfiguredKcrypto,
     cache: &mut WhoCache,
 ) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
-    let ncpu = possible_cpus() as usize;
+    let (ncpu, value_len) = percpu_buffer_len(80)?;
     let mut out = Vec::new();
     let mut lanes: Vec<VWho> = Vec::with_capacity(ncpu);
     let mut tick_err: HashMap<u64, (Option<i32>, Option<VParams>)> = HashMap::new();
@@ -291,7 +291,7 @@ pub fn snapshot_who_cached(
         // SAFETY: KWHO is PerCpuHashMap<KWhoKey, VWho>; VWho is 80B
         // (vwho_from_bytes); ncpu is possible_cpus.
         let raw =
-            unsafe { map_lookup_bytes(&maps.loaded.maps.who, &k, 80 * ncpu, "snapshot/who-val") }?;
+            unsafe { map_lookup_bytes(&maps.loaded.maps.who, &k, value_len, "snapshot/who-val") }?;
         lanes.clear();
         for c in 0..ncpu {
             let lane = raw

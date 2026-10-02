@@ -997,7 +997,7 @@ fn monotonic_now() -> u64 {
 /// snapshot-decoded rows. Catches fold/encode drift in the snapshotter.
 fn assert_snapshot_fold_matches_raw_maps(sensor: &ConfiguredKcrypto, rows: &[SnapRow], tot: &VAgg) {
     use kryprobe_privilege::mapops::map_get_next_key;
-    let ncpu = possible_cpus() as usize;
+    let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
     let mut key: Option<Vec<u8>> = None;
     let mut raw_rows = 0;
     loop {
