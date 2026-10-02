@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kryprobe.local/schemas/workload-report-v1.schema.json",
+  "title": "kryprobe workload-report v1",
+  "description": "Standalone versioned workload-context report (ADR-0008 ctx-v1). Cgroups by numeric ID only; no filesystem paths (allowlist ADR pending, spec 9.3).",
+  "type": "object",
+  "required": [
+    "schema",
+    "session",
+    "interval",
+    "profile",
+    "boundary",
+    "contexts",
+    "partition",
+    "selectors",
+    "coverage"
+  ],
+  "properties": {
+    "schema": {
+      "const": "kryprobe.workload-report.v1"
+    },
+    "session": {
+      "type": "object",
+      "required": ["session_id", "kernel_identity"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "kernel_identity": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "interval": {
+      "type": "object",
+      "required": ["start_ns", "end_ns", "consistency"],
+      "properties": {
+        "start_ns": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "end_ns": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "consistency": {
+          "enum": ["quiescent", "unproven"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "string"
+    },
+    "boundary": {
+      "type": "string"
+    },
+    "contexts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kh", "cgroup_id", "tgid", "uid", "execution_kind", "calls"],
+        "properties": {
+          "kh": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "cgroup_id": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "tgid": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uid": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "start_ns": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "execution_kind": {
+            "enum": ["proc", "kthread", "softirq", "unknown"]
+          },
+          "calls": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "workload": {
+            "type": ["object", "null"]
+          },
+          "attribution": {
+            "type": ["object", "null"]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "partition": {
+      "type": "object",
+      "required": ["matched", "nonmatched", "unknown_match"],
+      "properties": {
+        "matched": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "nonmatched": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "unknown_match": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectors": {
+      "type": "object"
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["capture", "attribution", "metadata", "correlation"],
+      "properties": {
+        "capture": {
+          "type": "string"
+        },
+        "attribution": {
+          "type": "string"
+        },
+        "metadata": {
+          "type": "string"
+        },
+        "correlation": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -26,3 +26,4 @@ pub use program::ProgramId;
 pub mod session;
 pub mod synthetic;
 pub mod target;
+pub mod workload;
