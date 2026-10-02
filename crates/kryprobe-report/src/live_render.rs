@@ -710,9 +710,8 @@ fn boundary_for(obs: &NativeObservation) -> Result<&'static str, ReportError> {
 /// - aggregate counts / event transport, unknown delivery →
 ///   `loader_state_unknown` (the sensor may never have run);
 /// - aggregate counts, measured drops → `counter_map_exhausted`;
-/// - aggregate counts, pure twin mismatch → `event_transport_loss`
-///   (closest measured-loss reason; severity rides `impact`, and the
-///   `ktot_gap` magnitude stays in session evidence);
+/// - non-atomic aggregate samples stay Unknown with the generic reason above;
+///   the frozen schema cannot preserve their named diagnostic counters;
 /// - event transport, measured loss → `event_transport_loss`;
 /// - completion unobserved → `observation_continuity` /
 ///   `callback_discovery_window` (completion callbacks were never
@@ -868,6 +867,7 @@ pub fn render_live_jsonl(
     };
     writer.session_end(&SessionEnd {
         verdict,
+        // Checked host stream completion only; never a kernel writer fence.
         final_barrier: FinalBarrier::Validated,
         unresolved_gap_ids,
         child_exit_code: None,

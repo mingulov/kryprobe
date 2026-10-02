@@ -389,7 +389,7 @@ fn drain_config() -> DrainConfig {
 /// BEFORE the final channel sweep, so records forwarded after the
 /// collector's last receive are collected, never dropped with the
 /// channel.
-fn grace_drain(drain: DrainThread) -> (Vec<Vec<u8>>, u64) {
+fn grace_drain(drain: DrainThread) -> Result<(Vec<Vec<u8>>, u64), BpfSelftestError> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut records: Vec<Vec<u8>> = Vec::new();
     while Instant::now() < deadline {
@@ -405,7 +405,8 @@ fn grace_drain(drain: DrainThread) -> (Vec<Vec<u8>>, u64) {
             records.push(bytes);
         }
     }
-    (records, stats.queue_drops)
+    let stats = stats.map_err(|err| BpfSelftestError::Drain(err.to_string()))?;
+    Ok((records, stats.queue_drops))
 }
 
 fn read_counters(
@@ -507,7 +508,7 @@ fn drive_tgid(
     go(decoy)?;
     await_done(target_lines)?;
     await_done(decoy_lines)?;
-    let (records, queue_drops) = grace_drain(drain);
+    let (records, queue_drops) = grace_drain(drain)?;
     let (entry_base, ret_base) = (pair.entry_base, pair.ret_base);
     drop(pair);
     let target_exit = wait_exit(target)?;
@@ -571,7 +572,7 @@ fn drive_stale_gen(
         .map_err(|err| BpfSelftestError::Drain(format!("{err:?}")))?;
     go(target)?;
     await_done(lines)?;
-    let (records, queue_drops) = grace_drain(drain);
+    let (records, queue_drops) = grace_drain(drain)?;
     let (entry_base, ret_base) = (pair.entry_base, pair.ret_base);
     drop(pair);
     let target_exit = wait_exit(target)?;

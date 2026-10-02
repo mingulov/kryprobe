@@ -62,10 +62,14 @@ guessing (see `docs/runbook.md` for the exit-4 triage tree).
 - `"row": "who"`: submitter attribution (tgid/comm/uid, sampled
   stack id) — supported inference, never a proved user origin.
 - `coverage.*`: per-dimension status + loss counters. Any
-  nonzero unexpected-loss counter (`ktot_gap`, `ring_drops`,
+  nonzero unexpected-loss counter (`ring_drops`, `user_queue_drops`,
   `overflow_identities`, `predrop_*` except the C7-expected
   `destroy_skip`) takes the measurement outside the qualified
   envelope — re-run quieter or shorter, do not ratio it.
+- `snapshot_gap_unreconciled` (older diagnostic alias `ktot_gap`) is
+  the difference between separate terminal map reads, not a lost-call
+  count. Zero does not establish an atomic sample or complete delivery;
+  see [evidence semantics](kcrypto-evidence.md).
 - `verdict: partial` with `missing: [capture-integrity,
   completion]` is the declared honest state, not a failure.
 

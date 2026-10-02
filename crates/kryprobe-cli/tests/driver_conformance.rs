@@ -512,11 +512,31 @@ impl SessionSensor for ConformanceSensor {
         Ok((Vec::new(), 0))
     }
 
-    fn drop_sites(&mut self) -> Result<[u64; 8], kryprobe_cli::live::LiveError> {
-        Ok([0; 8])
+    fn finish(
+        &mut self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_backend::AggregateTerminalSample,
+        kryprobe_cli::live::LiveError,
+    > {
+        let snapshot = self.script.last().expect("script").clone();
+        let started_ns = snapshot.monotonic_ns;
+        Ok(
+            kryprobe_privilege::kcrypto_backend::AggregateTerminalSample {
+                snapshot,
+                who: Vec::new(),
+                who_drops: 0,
+                drops: [0; 8],
+                drain: Default::default(),
+                started_ns,
+            },
+        )
     }
 
-    fn finish(&mut self) {}
+    fn cleanup(
+        &mut self,
+    ) -> Result<Option<kryprobe_privilege::drain::DrainStats>, kryprobe_cli::live::LiveError> {
+        Ok(None)
+    }
 }
 
 fn agg_row(calls: u64, name8: &[u8; 8]) -> RowBytes {
@@ -619,10 +639,18 @@ fn expected_agg_coverage(attached: usize, expected: usize, decoded: u64) -> Cove
         .counters
         .push(counter("probes_expected", expected as u64));
     let mut aggregate_counts = DimensionCoverage::new(CoverageStatus::Unknown, zero);
-    aggregate_counts.counters.push(counter("ktot_gap", 0));
+    aggregate_counts
+        .counters
+        .push(counter("uncovered:aggregate_snapshot_not_quiescent", 1));
     aggregate_counts
         .counters
         .push(counter("uncovered:kernel_delivery_unmeasured", 1));
+    aggregate_counts.counters.extend([
+        counter("snapshot_agg_calls", 30),
+        counter("snapshot_totals_calls", 30),
+        counter("ktot_gap", 0),
+        counter("snapshot_gap_unreconciled", 0),
+    ]);
     for site in KDROP_SITES {
         aggregate_counts
             .counters
@@ -636,6 +664,14 @@ fn expected_agg_coverage(attached: usize, expected: usize, decoded: u64) -> Cove
     detailed_events
         .counters
         .push(counter("overflow_identities", 0));
+    detailed_events.counters.extend([
+        counter("user_queue_drops", 0),
+        counter("terminal_backlog_bytes", 0),
+        counter("terminal_busy", 0),
+        counter("uncovered:aggregate_snapshot_not_quiescent", 1),
+    ]);
+    let mut attribution = DimensionCoverage::new(complete, zero);
+    attribution.counters.push(counter("who_drops", 0));
     let mut completion = DimensionCoverage::new(CoverageStatus::Unknown, zero);
     completion
         .counters
@@ -649,7 +685,7 @@ fn expected_agg_coverage(attached: usize, expected: usize, decoded: u64) -> Cove
         attachment,
         aggregate_counts,
         detailed_events,
-        attribution: DimensionCoverage::new(complete, zero),
+        attribution,
         correlation: DimensionCoverage::new(complete, zero),
         completion,
     }
@@ -681,7 +717,7 @@ fn batch_vs_live_aggregate_agree() {
     let mut controller = attached_controller();
     let cfg = LiveConfig {
         source: "kernel-crypto".to_owned(),
-        duration_secs: Some(60),
+        duration_secs: Some(0),
         tick_ms: 1,
         token: None,
         json_audit: false,

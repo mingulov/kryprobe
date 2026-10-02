@@ -19,17 +19,11 @@
 //! the row (`VAgg.last_ns` for agg/totals, `KCtl.val2` first-seen ns
 //! for idents).
 //!
-//! v0.1 limits (documented, Task 2 owns the steady state): live ticks
-//! share one session drain ([`session_drain`] +
-//! [`snapshot_rows_with_drain`], one barrier window per tick); the
-//! one-shot [`snapshot_rows`] wrapper (spawn/stop per call) is retained
-//! for single snapshots such as `finalize`. The `KIDN_DROPS` read is validated but
-//! not retained ([`SnapshotRows`] carries no drops field — callers pass
-//! their own [`map_lookup_bytes`] read to
-//! [`shared_losses_from_snapshot`]); drain queue stats are discarded
-//! (queue 1024 + concurrent recv: drops are practically impossible at
-//! KIDN-gated record counts, and [`shared_losses_from_snapshot`] pins
-//! queue 0).
+//! Live ticks share one session drain; their userspace barrier only orders
+//! forwarded host records. Shutdown joins that drain and decodes its complete
+//! forwarded tail. Terminal map reads are still non-atomic: this profile has
+//! no kernel writer fence. Ring loss belongs to the backend; measured queue
+//! loss is fed once from the checked drain statistics.
 //!
 //! Privacy (kp2 S9): snapshot bytes re-encode K1 map/ring bytes only —
 //! aggregate counters, algorithm/driver names, and identity hashes. No
@@ -355,12 +349,11 @@ pub fn raw_event_stamped(payload: &[u8], monotonic_ns: u64) -> RawEvent<'_> {
     }
 }
 
-/// Build the shared loss feed from a snapshot plus the caller's own
-/// `KIDN[KIDN_DROPS]` read (v0.1: the short-lived drain keeps no queue
-/// accounting, so the queue pins 0 — K3 feeds the result once).
+/// Feed only the aggregate transport's measured queue losses. The backend
+/// already owns the KIDN ring-reservation indicator.
 #[must_use]
-pub fn shared_losses_from_snapshot(_snap: &SnapshotRows, drops: u8) -> SharedLosses {
-    SharedLosses::new(u64::from(drops), 0)
+pub fn shared_losses_from_drain(stats: &crate::drain::DrainStats) -> SharedLosses {
+    stats.shared_losses(0)
 }
 
 /// `CLOCK_MONOTONIC` now (unprivileged; the snapshot wall). The
@@ -523,6 +516,16 @@ const DRAIN_BUDGET: DrainConfig = DrainConfig {
 /// returns).
 fn drain_setup_error(err: DrainError) -> MapOpsError {
     match err {
+        DrainError::ThreadSpawnFailed { detail } => MapOpsError::LookupFailed {
+            stage: format!("snapshot/ring-spawn:{detail}"),
+            errno: libc::EAGAIN,
+        },
+        DrainError::WorkerPanicked | DrainError::CollectorDisconnected => {
+            MapOpsError::LookupFailed {
+                stage: format!("snapshot/ring-worker:{err}"),
+                errno: libc::EIO,
+            }
+        }
         DrainError::ConfigInvalid { reason } => MapOpsError::LookupFailed {
             stage: format!("snapshot/ring-config:{reason}"),
             errno: libc::EINVAL,
@@ -592,22 +595,37 @@ fn push_ident_record(
 /// Collect ring records until the barrier checkpoint, then sweep the
 /// post-barrier tail the worker may have pushed before observing stop.
 fn collect_until_barrier(
-    drain: &DrainThread,
+    receiver: &std::sync::mpsc::Receiver<DrainEvent>,
+    expected_barrier: u64,
     idents: &mut Vec<IdentBytes>,
     overflow_identities: &mut u64,
     lagmax_ns: &mut Option<u64>,
 ) -> Result<(), MapOpsError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match drain.receiver().recv_timeout(Duration::from_secs(5)) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(MapOpsError::LookupFailed {
+                stage: "snapshot/ring-barrier-deadline".to_owned(),
+                errno: libc::ETIMEDOUT,
+            });
+        }
+        match receiver.recv_timeout(remaining) {
             Ok(DrainEvent::Record(record)) => {
                 push_ident_record(record, idents, overflow_identities, lagmax_ns)?;
             }
-            Ok(DrainEvent::Barrier(_)) => {
-                while let Ok(DrainEvent::Record(record)) = drain.receiver().try_recv() {
-                    push_ident_record(record, idents, overflow_identities, lagmax_ns)?;
+            Ok(DrainEvent::Barrier(id)) if id == expected_barrier => {
+                for _ in 0..DRAIN_BUDGET.queue_depth {
+                    match receiver.try_recv() {
+                        Ok(DrainEvent::Record(record)) => {
+                            push_ident_record(record, idents, overflow_identities, lagmax_ns)?
+                        }
+                        _ => break,
+                    }
                 }
                 return Ok(());
             }
+            Ok(DrainEvent::Barrier(_)) => continue,
             Err(RecvTimeoutError::Timeout) => {
                 return Err(MapOpsError::LookupFailed {
                     stage: "snapshot/ring-drain".to_owned(),
@@ -628,7 +646,7 @@ fn collect_until_barrier(
 /// every tick through [`snapshot_rows_with_drain`] (2B-C1 — a per-tick
 /// spawn/stop pays thread + ~2MB mmap + epoll + up to 10ms quantum on
 /// every tick, making sub-100ms cadence unachievable). Stop it once,
-/// after the closing tick, via [`DrainThread::stop`].
+/// after closing owned links, via [`DrainThread::stop_and_drain`].
 pub fn session_drain(sensor: &ConfiguredKcrypto) -> Result<DrainThread, MapOpsError> {
     DrainThread::spawn(&sensor.loaded.maps.ring, KRING_MAX_ENTRIES, &DRAIN_BUDGET)
         .map_err(drain_setup_error)
@@ -640,27 +658,33 @@ pub fn session_drain(sensor: &ConfiguredKcrypto) -> Result<DrainThread, MapOpsEr
 /// Window-attribution note: records the worker pushes after emitting
 /// the barrier but before the sweep observe no newer barrier yet, so
 /// the sweep attributes them to this window (up to one tick early).
-/// Every record is still consumed exactly once — no loss, no
-/// duplication — and the per-call tail-race loss below cannot occur
+/// Every forwarded record is consumed once. Queue refusals remain measured
+/// separately; the per-call tail-race loss below cannot occur
 /// while the drain stays open.
 fn drain_idents_with(
     drain: &DrainThread,
     barrier: u64,
 ) -> Result<(Vec<IdentBytes>, u64, Option<u64>), MapOpsError> {
     // The worker emits the barrier after the backlog it observed, so
-    // records collected before the barrier are exactly this window.
+    // this is a host checkpoint, not proof that kernel writers finished.
     drain.inject_barrier(barrier);
     let mut idents = Vec::new();
     let mut overflow_identities = 0;
     let mut lagmax_ns = None;
-    collect_until_barrier(drain, &mut idents, &mut overflow_identities, &mut lagmax_ns)?;
+    collect_until_barrier(
+        drain.receiver(),
+        barrier.max(1),
+        &mut idents,
+        &mut overflow_identities,
+        &mut lagmax_ns,
+    )?;
     Ok((idents, overflow_identities, lagmax_ns))
 }
 
 /// Drain `KRING` through a short-lived [`DrainThread`] (spawn/stop per
-/// call): one-shot wrapper retained for single snapshots such as
-/// `finalize`. Live ticks share a [`session_drain`] instead (2B-C1).
-/// Drain stats are discarded (see the module docs).
+/// call): one-shot wrapper retained for single snapshots for diagnostics. Live ticks share a [`session_drain`] instead (2B-C1).
+/// This diagnostic wrapper does not return transport statistics. Production
+/// finalization uses the persistent collector and its checked statistics.
 ///
 /// Tail race CLOSED (P7/T12 — was an ACCEPTED v0.1 limitation):
 /// records the worker forwarded after the post-barrier tail sweep
@@ -680,8 +704,22 @@ fn drain_idents(
     let drain = session_drain(sensor)?;
     let result = drain_idents_with(&drain, 1);
     // Always joined (even on collect failure) so the thread never escapes.
-    let (_stats, tail) = drain.stop_and_drain();
-    let (mut idents, mut overflow_identities, mut lagmax_ns) = result?;
+    let (stats, tail) = drain.stop_and_drain();
+    let stats = stats.map_err(|err| MapOpsError::LookupFailed {
+        stage: format!("snapshot/ring-stop:{err}"),
+        errno: libc::EIO,
+    });
+    let (mut idents, mut overflow_identities, mut lagmax_ns) = match (result, stats) {
+        (Err(primary), Err(cleanup)) => {
+            return Err(MapOpsError::LookupFailed {
+                stage: format!("{primary}; cleanup also failed: {cleanup}"),
+                errno: libc::EIO,
+            });
+        }
+        (Err(primary), _) => return Err(primary),
+        (_, Err(cleanup)) => return Err(cleanup),
+        (Ok(rows), Ok(_)) => rows,
+    };
     for event in tail {
         if let DrainEvent::Record(record) = event {
             push_ident_record(
@@ -725,12 +763,49 @@ pub fn snapshot_rows_with_drain(
     })
 }
 
+/// Read final maps and decode the joined host tail. This is a non-atomic
+/// sample: link close and the userspace barrier provide no kernel writer fence.
+pub(crate) fn terminal_rows(
+    sensor: &ConfiguredKcrypto,
+    tail: Vec<DrainEvent>,
+) -> Result<SnapshotRows, MapOpsError> {
+    let mut snapshot = SnapshotRows {
+        rows: walk_kagg(sensor)?,
+        totals: read_ktot(sensor)?,
+        drops: read_kidn_drops(sensor)?,
+        idents: Vec::new(),
+        overflow_identities: 0,
+        monotonic_ns: 0,
+        lagmax_ns: None,
+    };
+    append_drain_tail(&mut snapshot, tail)?;
+    Ok(snapshot)
+}
+
+/// Decode forwarded tail records once, preserving their channel order.
+pub(crate) fn append_drain_tail(
+    snapshot: &mut SnapshotRows,
+    tail: Vec<DrainEvent>,
+) -> Result<(), MapOpsError> {
+    for event in tail {
+        if let DrainEvent::Record(record) = event {
+            push_ident_record(
+                record,
+                &mut snapshot.idents,
+                &mut snapshot.overflow_identities,
+                &mut snapshot.lagmax_ns,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Snapshot every kcrypto map of a configured sensor: `KAGG` full walk +
 /// percpu fold, `KTOT`, the `KIDN_DROPS` validation read, and a `KRING`
 /// drain. Map order for rows, ring order for idents.
 ///
 /// One-shot form (spawn/stop per call): retained for single snapshots
-/// such as `finalize`. Live ticks use [`snapshot_rows_with_drain`].
+/// for diagnostics. Live ticks use [`snapshot_rows_with_drain`].
 pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsError> {
     let monotonic_ns = monotonic_now()?;
     let rows = walk_kagg(sensor)?;
@@ -804,9 +879,8 @@ fn count_map_entries(fd: &OwnedFd, key_size: usize, stage: &str) -> Option<u64> 
     Some(count)
 }
 
-/// Read [`AggOccupancy`] from a live attached sensor. Call while
-/// attached (after the closing tick, before detach): each count is
-/// an independent best-effort walk.
+/// Read [`AggOccupancy`] through retained map FDs, including after link close.
+/// Each count is an independent best-effort walk, not a consistency proof.
 #[must_use]
 pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
     let maps = &sensor.loaded.maps;
@@ -825,6 +899,30 @@ pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collector_waits_for_its_expected_host_barrier() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(DrainEvent::Barrier(99)).unwrap();
+        tx.send(DrainEvent::Barrier(98)).unwrap();
+        let mut record = vec![0; 48];
+        record[0] = KCTL_IDENT;
+        tx.send(DrainEvent::Record(record)).unwrap();
+        tx.send(DrainEvent::Barrier(7)).unwrap();
+        let mut idents = Vec::new();
+        collect_until_barrier(&rx, 7, &mut idents, &mut 0, &mut None).unwrap();
+        assert_eq!(
+            idents.len(),
+            1,
+            "earlier unrelated markers cannot terminate this window"
+        );
+    }
+
+    #[test]
+    fn terminal_unavailable_topology_refuses_before_bpf() {
+        use crate::mapops::topology_tests::{assert_refused, sensor, with_topology};
+        let (result, calls) = with_topology(None, || super::terminal_rows(&sensor(), Vec::new()));
+        assert_refused(result, calls, libc::ENODATA);
+    }
     #[test]
     fn unavailable_topology_refuses_totals_before_bpf() {
         use crate::mapops::topology_tests::{assert_refused, sensor, with_topology};

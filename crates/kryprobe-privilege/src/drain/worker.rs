@@ -2,7 +2,7 @@
 //! Drain worker thread: epoll pace, budget, bounded queue (T7c2 split).
 
 use super::area::RingArea;
-use super::{DrainEvent, DrainStats};
+use super::{DrainError, DrainEvent, DrainFailure, DrainStats};
 use crate::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,14 +51,15 @@ impl Worker {
         true
     }
 
-    pub(crate) fn run(self) -> DrainStats {
+    pub(crate) fn run(self) -> Result<DrainStats, DrainFailure> {
         let mut stats = DrainStats::default();
         let mut consumer = self.area.consumer();
         let mut disconnected = false;
+        let mut failure = None;
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
         'run: while !self.stop.load(Ordering::Acquire) {
             // SAFETY: epoll fd live; events buffer valid for one entry.
-            unsafe {
+            let polled = unsafe {
                 libc::epoll_wait(
                     self._epoll.as_raw_fd(),
                     events.as_mut_ptr(),
@@ -66,6 +67,19 @@ impl Worker {
                     self.timeout_ms,
                 )
             };
+            if polled < 0 {
+                let errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                if errno == libc::EINTR {
+                    continue;
+                }
+                failure = Some(DrainError::EpollFailed {
+                    stage: "wait".to_owned(),
+                    errno,
+                });
+                break;
+            }
             if self.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -78,11 +92,13 @@ impl Worker {
                 self.area.set_consumer(consumer);
                 if !self.forward(out.records, &mut stats) {
                     disconnected = true;
+                    failure = Some(DrainError::CollectorDisconnected);
                     break 'run;
                 }
             }
             if !self.forward_barrier() {
                 disconnected = true;
+                failure = Some(DrainError::CollectorDisconnected);
                 break 'run;
             }
         }
@@ -98,12 +114,25 @@ impl Worker {
             let producer = self.area.producer();
             if producer != consumer {
                 let out = self.area.consume_live(consumer, producer, self.budget);
-                self.area.set_consumer(out.consumer);
-                self.forward(out.records, &mut stats);
+                consumer = out.consumer;
+                self.area.set_consumer(consumer);
+                stats.busy = out.busy;
+                if !self.forward(out.records, &mut stats) && failure.is_none() {
+                    failure = Some(DrainError::CollectorDisconnected);
+                }
             }
-            self.forward_barrier();
+            if !self.forward_barrier() && failure.is_none() {
+                failure = Some(DrainError::CollectorDisconnected);
+            }
         }
-        stats
+        stats.backlog_bytes = self.area.producer().saturating_sub(consumer);
+        match failure {
+            Some(error) => Err(DrainFailure {
+                error,
+                stats: Some(stats),
+            }),
+            None => Ok(stats),
+        }
     }
 }
 
@@ -168,7 +197,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DrainEvent>(16);
         let stop = Arc::new(AtomicBool::new(true));
         let (worker, _epoll) = worker_with(area, tx, stop);
-        let stats = worker.run();
+        let stats = worker.run().expect("worker joins");
         assert_eq!(stats.records, 3, "final sweep delivers committed records");
         assert_eq!(stats.queue_drops, 0, "no queue pressure");
         let mut got = Vec::new();
@@ -203,7 +232,7 @@ mod tests {
         tx.try_send(DrainEvent::Barrier(9)).expect("prefill fits");
         let stop = Arc::new(AtomicBool::new(true));
         let (worker, _epoll) = worker_with(area, tx, stop);
-        let stats = worker.run();
+        let stats = worker.run().expect("worker joins");
         assert_eq!(stats.records, 2, "both records walked");
         assert_eq!(stats.queue_drops, 2, "both counted as queue drops");
         assert!(
@@ -211,5 +240,109 @@ mod tests {
             "only the prefill is receivable"
         );
         assert!(rx.try_recv().is_err(), "swept records never queued");
+    }
+
+    #[test]
+    fn fatal_poll_preserves_final_sweep_and_partial_statistics() {
+        let area = RingArea::test_area(4096);
+        let end = area.test_commit(0, &[9; 8]);
+        area.test_set_producer(end);
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (mut worker, _epoll) = worker_with(area, tx, stop.clone());
+        // /dev/null is an owned live fd, but cannot be epoll_wait's epfd.
+        worker._epoll = worker._owned.try_clone_cloexec().expect("clone null");
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                assert!(matches!(
+                    rx.recv().expect("final record"),
+                    DrainEvent::Record(_)
+                ));
+                stop.store(true, std::sync::atomic::Ordering::Release);
+            });
+            worker.run()
+        });
+        let failure = outcome.expect_err("fatal poll cannot become success");
+        assert!(matches!(
+            failure.error,
+            crate::drain::DrainError::EpollFailed {
+                errno: libc::EINVAL,
+                ..
+            }
+        ));
+        let stats = failure.stats.expect("known partial counters");
+        assert_eq!(stats.records, 1);
+        assert_eq!(stats.queue_drops, 0);
+    }
+
+    #[test]
+    fn bounded_final_sweep_reports_unread_bytes() {
+        let area = RingArea::test_area(4096);
+        let mut end = 0;
+        for value in [1, 2, 3] {
+            end = area.test_commit(end, &[value; 8]);
+        }
+        area.test_set_producer(end);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(4);
+        let (mut worker, _epoll) = worker_with(area, tx, Arc::new(AtomicBool::new(true)));
+        worker.budget = 1;
+        let stats = worker.run().expect("bounded sweep");
+        assert_eq!(stats.records, 1);
+        assert_eq!(stats.backlog_bytes, 32, "two 16-byte frames remain");
+        assert!(
+            !stats.busy,
+            "budget exhaustion is distinct from a busy header"
+        );
+    }
+
+    #[test]
+    fn busy_final_frame_is_reported_without_inventing_a_record_count() {
+        let area = RingArea::test_area(4096);
+        area.test_write_hdr(0, super::super::frame::BUSY_BIT | 8);
+        area.test_set_producer(16);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(4);
+        let (worker, _epoll) = worker_with(area, tx, Arc::new(AtomicBool::new(true)));
+        let stats = worker.run().expect("bounded busy sweep");
+        assert_eq!(
+            (
+                stats.records,
+                stats.queue_drops,
+                stats.backlog_bytes,
+                stats.busy
+            ),
+            (0, 0, 16, true)
+        );
+    }
+
+    #[test]
+    fn real_queue_refusal_and_backend_ring_indicator_roll_up_seven_three() {
+        use kryprobe_core::backend::{BackendSummary, DriverReport};
+        use kryprobe_core::enums::BackendId;
+        let area = RingArea::test_area(4096);
+        let mut end = 0;
+        for value in [1, 2, 3] {
+            end = area.test_commit(end, &[value; 8]);
+        }
+        area.test_set_producer(end);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(DrainEvent::Barrier(1)).unwrap();
+        let (worker, _epoll) = worker_with(area, tx, Arc::new(AtomicBool::new(true)));
+        let stats = worker.run().expect("real queue full refusal");
+        let mut report = DriverReport::default();
+        report.push_summary(BackendSummary {
+            backend: BackendId::KCrypto,
+            observations: 0,
+            integrity: crate::kcrypto_backend::integrity_for_counts(100, Some(125), 7, 0).unwrap(),
+        });
+        report.feed_shared_losses(stats.shared_losses(0)).unwrap();
+        let total = report.session_integrity_checked().unwrap();
+        assert_eq!(
+            (
+                total.ring_reservation_failures,
+                total.user_queue_drops,
+                total.state_insert_failures
+            ),
+            (7, 3, 0)
+        );
     }
 }

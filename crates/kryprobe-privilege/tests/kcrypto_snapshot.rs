@@ -38,7 +38,7 @@ use kryprobe_privilege::kcrypto_snapshot::{
     IDENT_BYTES_LEN, IdentBytes, ParsedRow, ROW_BYTES_LEN, ROW_KIND_AGG, ROW_KIND_IDENT,
     ROW_KIND_TOTALS, RowBytes, SNAPSHOT_VERSION, SnapshotRows, TOTALS_BYTES_LEN, TotalsBytes,
     parse_snapshot_row, raw_event_for_agg, raw_event_for_ident, raw_event_for_totals,
-    session_drain, shared_losses_from_snapshot, snapshot_rows, snapshot_rows_with_drain,
+    session_drain, shared_losses_from_drain, snapshot_rows, snapshot_rows_with_drain,
 };
 use kryprobe_privilege::mapops::{map_lookup_bytes, possible_cpus};
 use kryprobe_testkit::alg_fixture;
@@ -370,25 +370,19 @@ fn raw_event_headers_pass_split_header() {
 }
 
 // ---------------------------------------------------------------------------
-// `shared_losses_from_snapshot`: ring drops ride through, queue pins 0.
+// Aggregate queue losses have one measured transport owner.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn shared_losses_ctor_wires_ring_drops_with_zero_queue() {
-    let snap = SnapshotRows {
-        rows: vec![RowBytes::new(agg_payload()).expect("row")],
-        totals: Some(TotalsBytes::new(totals_payload()).expect("totals")),
-        idents: vec![IdentBytes::new(ident_payload()).expect("ident")],
-        overflow_identities: 0,
-        drops: 0,
-        monotonic_ns: 999,
-        lagmax_ns: None,
-    };
-    for drops in [0u8, 1, 255] {
+fn shared_losses_ctor_owns_queue_only() {
+    for queue_drops in [0, 1, 255] {
+        let stats = kryprobe_privilege::drain::DrainStats {
+            queue_drops,
+            ..Default::default()
+        };
         assert_eq!(
-            shared_losses_from_snapshot(&snap, drops),
-            SharedLosses::new(u64::from(drops), 0),
-            "drops={drops}: ring rides, queue pins 0 (v0.1 short-lived drain)"
+            shared_losses_from_drain(&stats),
+            SharedLosses::new(0, queue_drops)
         );
     }
 }
@@ -706,9 +700,8 @@ fn compat_ring_matches_canary_twin() {
     let drops = twin_read_drops(&sensor);
     assert_eq!(drops, 0, "ring-reserve drops counter pins zero");
     assert_eq!(
-        shared_losses_from_snapshot(&snap, drops),
-        SharedLosses::new(0, 0),
-        "healthy shared losses pin zero"
+        snap.drops, drops,
+        "snapshot retains independently measured ring indicator"
     );
 }
 
@@ -745,7 +738,7 @@ fn session_drain_serves_many_windows_with_one_spawn() {
     }
     assert_eq!(drain_spawns() - before, 1, "no per-window respawn (2B-C1)");
     assert!(seen_idents > 0, "windows must observe traffic idents");
-    let _stats = drain.stop();
+    let _stats = drain.stop().expect("drain joins");
 }
 
 #[test]
@@ -962,9 +955,8 @@ fn snapshot_byte_exactness_against_fixture() {
     let drops = twin_read_drops(&sensor);
     assert_eq!(drops, 0, "ring-reserve drops counter pins zero");
     assert_eq!(
-        shared_losses_from_snapshot(&snap, drops),
-        SharedLosses::new(0, 0),
-        "healthy shared losses pin zero"
+        snap.drops, drops,
+        "snapshot retains independently measured ring indicator"
     );
     // Snapshot wall: a live CLOCK_MONOTONIC stamp, not fabricable from rows.
     assert!(snap.monotonic_ns > 0, "snapshot wall must be nonzero");
@@ -1167,7 +1159,7 @@ fn drain_start_stop_cycle_leaks_nothing() {
     assert_eq!((counts.enc, counts.dec), (3, 3));
     let snap = snapshot_rows_with_drain(&sensor, &drain, 1).expect("cycle snapshot");
     assert!(!snap.idents.is_empty(), "cycle observes traffic idents");
-    let stats = drain.stop();
+    let stats = drain.stop().expect("drain joins");
     assert_eq!(drain_spawns() - spawns_before, 1, "one spawn accounted");
     assert_eq!(
         live_fds("anon_inode:[eventpoll]"),

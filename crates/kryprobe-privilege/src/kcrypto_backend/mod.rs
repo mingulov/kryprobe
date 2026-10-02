@@ -1,50 +1,37 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! KCryptoBackend: kernel-crypto through the FROZEN 7-method trait (K2 Task 2).
+//! Kernel-crypto aggregate backend through the frozen seven-method trait.
 //!
-//! The backend owns the system-wide fexit sensor from `configure` (idempotent
-//! by [`PlanGeneration`]: first call loads + attaches via
-//! [`load_kcrypto_configured`], same-generation re-calls are no-ops), and
-//! decodes Task-1 snapshot rows ([`parse_snapshot_row`]) into
-//! [`NativeObservation`]s per the D8 tables. `finalize` maps D10 integrity
-//! (ring drops + the `KTOT - ΣKAGG` insert gap) from a fresh snapshot of the
-//! live sensor; pre-configure it counts without integrity (zeros).
+//! Configure owns one sensor, its links and its collector under a mutex. The
+//! same active generation may configure idempotently; foreign or closed
+//! generations require a fresh backend. No live caller receives a link clone.
 //!
-//! Row-kind decode shapes (all pinned by `tests/kcrypto_driver.rs`):
-//! agg rows map the full D8 tables (symbol/call/phase/status/context +
-//! identity in `backend_payload`); totals rows decode to a `Completed`
-//! aggregate carrier (the read verdict, not an op verdict — per-class
-//! outcomes ride the payload counts, and in the PARTIAL path the gap is
-//! receipted in integrity while totals stay exact); ident rows decode to
-//! `Discovered` first-seen markers (head-derived call/class/symbol, no
-//! verdict). Inventory-only (`KFAM_ANY`) rows force `Selected` +
-//! `not_applicable` + `execution: "unsupported"`, never crash, never silent.
+//! `finish_session` closes links, checks the collector join and forwarded tail,
+//! then reads one terminal non-atomic map sample with cold who joins. Finalize
+//! consumes only that generation's checked receipt, caches its summary, and
+//! refuses configured callers without a receipt. It never reads active maps.
 //!
-//! Privacy (kp2 S9): names/family/op/counts/results/timestamps/context-class
-//! only; rows carry no keys/IV/plain/cipher/digests/buffers/pointers, and
-//! neither do these observations. C10: `target`/`object`/`implementation`
-//! stay `None`, never fabricated.
+//! Ring and who loss indicators belong to the backend; queue refusal belongs
+//! to shared transport. A difference between KTOT and KAGG samples is not an
+//! insertion-loss oracle. Link close does not prove kernel writer completion.
 //!
-//! No new privileged syscall sites: loading reuses
-//! [`load_kcrypto_configured`], finalize reuses [`snapshot_rows`] +
-//! [`crate::mapops::map_lookup_bytes`], decode is pure.
-//!
-//! K5 Task 3 adds the snapshot side of attribution: [`snapshot_who`]
-//! walks `KWHO`/`KSTACK`/`KERR`/`KPARAMS` (map access reuses
-//! [`crate::mapops`], like [`snapshot_rows`]) into [`WhoSnapshot`]s.
-//! K5 Task 4 decodes those into `row="who"` observations
-//! ([`observation_for_who`], pure over the snapshot + parsed table),
-//! adds `key_hash`/`lat` to agg payloads, and merges `who_drops` into
-//! finalize integrity.
+//! Decode retains the existing row and privacy contracts: aggregate metadata
+//! only, no keys, IVs, payload buffers or fabricated C10 attribution. Loading,
+//! attachment and map access reuse the existing privileged authority paths.
 
 pub(crate) mod integrity;
 pub(crate) mod object;
 pub(crate) mod observe;
+mod session;
+pub use session::AggregateTerminalSample;
+use session::{ConfiguredSession, SessionPhase};
 pub(crate) mod snapshot_drops;
 pub(crate) mod snapshot_who;
 
 // 1A-M10: the pre-split `pub` surface, re-exported so
 // `kcrypto_backend::X` paths keep resolving.
-pub(crate) use integrity::{integrity_for_counts, integrity_for_snapshot};
+#[cfg(test)]
+pub(crate) use integrity::integrity_for_counts;
+pub(crate) use integrity::integrity_for_snapshot;
 pub(crate) use object::kcrypto_object_bytes;
 pub use object::{
     LocateMiss, ObjectLocateError, kcrypto_object_candidates, lifecycle_object_candidates,
@@ -55,7 +42,6 @@ pub use observe::observation_for_who;
 pub use snapshot_drops::{
     KDROP_DESTROY, KDROP_SITES, SnapshotError, fold_drop_lanes, snapshot_drops,
 };
-pub(crate) use snapshot_who::read_kwho_drops;
 pub use snapshot_who::{WhoCache, WhoJoins, WhoSnapshot, snapshot_who, snapshot_who_cached};
 // 1A-M10: unit-test-only helpers (the tests mod stayed whole in
 // this file; production reaches them through the phases above).
@@ -79,7 +65,7 @@ use crate::btf_resolve::{
 use crate::kcrypto_lifecycle::profile::{LifecycleProfile, SessionGuard, acquire_kcrypto_session};
 #[cfg(test)]
 use crate::kcrypto_snapshot::SnapshotRows;
-use crate::kcrypto_snapshot::{ParsedRow, parse_snapshot_row, snapshot_rows};
+use crate::kcrypto_snapshot::{ParsedRow, parse_snapshot_row};
 #[cfg(test)]
 use crate::mapops::MapOpsError;
 #[cfg(test)]
@@ -128,7 +114,7 @@ const KCRYPTO_MAP_COUNT: u64 = 10;
 /// plus a decode counter. `Send + Sync` via the mutex + atomics (the sensor
 /// is fd-backed, no interior aliasing).
 pub struct KCryptoBackend {
-    state: Mutex<Option<(PlanGeneration, ConfiguredKcrypto)>>,
+    state: Mutex<Option<ConfiguredSession>>,
     staged: Mutex<StagedBringup>,
     decoded: AtomicUsize,
     session: Mutex<Option<SessionGuard>>,
@@ -142,23 +128,6 @@ pub struct KCryptoBackend {
 struct StagedBringup {
     object: Option<Vec<u8>>,
     token: Option<File>,
-    closing: Option<ClosingCounts>,
-}
-
-/// Closing-tick counts staged by the live driver (M5): the finalize
-/// fast path computes integrity from these plus one fresh
-/// `KWHO_DROPS` read — no snapshot walk, no who walk. Generation-
-/// tagged so stale counts can never serve another session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClosingCounts {
-    /// Session generation the counts belong to.
-    pub generation: PlanGeneration,
-    /// ΣKAGG calls over the closing tick (saturating).
-    pub agg_calls: u64,
-    /// KTOT calls (`None` when the closing tick had no totals).
-    pub totals_calls: Option<u64>,
-    /// Retained `KIDN_DROPS` from the closing snapshot.
-    pub drops: u8,
 }
 
 impl std::fmt::Debug for KCryptoBackend {
@@ -212,8 +181,6 @@ impl KCryptoBackend {
     }
 
     /// Drains staged inputs (empty unless staged since the last drain).
-    /// Leaves `closing` in place: it belongs to a later lifecycle
-    /// stage (staged after the tick loop, consumed by `finalize`).
     fn take_staged_inputs(&self) -> StagedBringup {
         let mut staged = self
             .staged
@@ -222,61 +189,7 @@ impl KCryptoBackend {
         StagedBringup {
             object: staged.object.take(),
             token: staged.token.take(),
-            closing: staged.closing,
         }
-    }
-
-    /// Stages closing-tick counts for the finalize fast path (M5).
-    /// Overwrites any previous staging.
-    pub fn stage_closing_counts(&self, closing: ClosingCounts) {
-        self.staged
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .closing = Some(closing);
-    }
-
-    /// Takes staged closing counts iff they belong to `generation`.
-    /// A foreign generation discards them (stale counts never serve
-    /// another session); a hit drains once.
-    fn take_closing_for(&self, generation: PlanGeneration) -> Option<ClosingCounts> {
-        let mut staged = self
-            .staged
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        match staged.closing {
-            Some(closing) if closing.generation == generation => {
-                staged.closing = None;
-                Some(closing)
-            }
-            _ => {
-                staged.closing = None;
-                None
-            }
-        }
-    }
-
-    /// Hands the live tick loop its own handle onto the configured
-    /// sensor (H1(b)): dup'd fds onto the SAME kernel sensor — one
-    /// attach, one probe stream, one set of maps shared by ticks and
-    /// finalize. Typed error before `configure` (never a handle to
-    /// nothing); fd exhaustion surfaces as `Exhausted`, never a
-    /// half-dup'd sensor.
-    pub fn session_sensor(&self) -> Result<ConfiguredKcrypto, BackendError> {
-        let guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let Some((_, sensor)) = guard.as_ref() else {
-            return Err(BackendError::Internal(InternalError::new(
-                "kcrypto_sensor_unconfigured",
-            )));
-        };
-        sensor.try_clone().map_err(|err| {
-            BackendError::Exhausted(BudgetReason::with_detail(
-                "kcrypto_sensor_clone",
-                &err.to_string(),
-            ))
-        })
     }
 }
 
@@ -300,7 +213,7 @@ impl SharedKcryptoBackend {
         }
     }
 
-    /// Borrows the shared concrete backend (staging + sensor handle).
+    /// Borrows the shared concrete backend (staging + governed session access).
     #[must_use]
     pub fn backend(&self) -> &KCryptoBackend {
         &self.inner
@@ -558,20 +471,20 @@ impl Backend for KCryptoBackend {
         ctx: &mut ConfigureContext<'_>,
         _plan: &BackendPlan,
     ) -> Result<(), BackendError> {
-        // Idempotent by generation: same-generation re-calls are no-ops
-        // (no reload, no re-charge) so K3 can call per watch tick.
-        {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            if let Some((generation, _)) = state.as_ref()
-                && *generation == ctx.generation
+        // Serialize bring-up with close/read/finalize; no temporary second
+        // sensor can escape while a concurrent configure replaces state.
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(current) = state.as_ref() {
+            if current.generation == ctx.generation && matches!(current.phase, SessionPhase::Active)
             {
                 return Ok(());
             }
+            return Err(session::protocol(
+                "kcrypto_session_already_configured",
+                "use a fresh backend for a new or closed generation",
+            ));
         }
-        // First call (or a new generation): claim the process share
+        // First configure: claim the process share
         // for api-returns (no cross-profile capture: a live lifecycle
         // session refuses this typed). The local hold covers the
         // load; success stashes it with the sensor, failure drops it
@@ -582,7 +495,7 @@ impl Backend for KCryptoBackend {
                 &busy.to_string(),
             ))
         })?;
-        // First call (or a new generation): staged inputs win when
+        // Staged inputs win when
         // the live session staged them (H1(b)/M2 — the already-read
         // bytes skip the locator re-read; the staged token loads
         // token-only delegations), else the historical direct path:
@@ -594,34 +507,17 @@ impl Backend for KCryptoBackend {
             None => kcrypto_object_bytes()?,
         };
         let token_fd = staged.token.as_ref().map(File::as_raw_fd);
+        let started_ns = crate::host::monotonic_ns()
+            .map_err(|err| session::protocol("kcrypto_attach_clock", &err.to_string()))?;
         let (sensor, _points) =
             load_kcrypto_configured(&bytes, token_fd).map_err(configured_error_to_backend)?;
         // Charge only after the load succeeds (a failed configure charges
         // nothing); the sensor stashes only after the charges land, so a
-        // refused charge drops the fresh sensor and keeps prior state.
-        // L6: the re-check + charges + stash run under one held lock —
-        // a concurrent configure of the same generation that stashed
-        // while this load ran turns this call into a no-op (the loser
-        // drops its fresh sensor via RAII and charges nothing: no
-        // double-load-survives, no double-charge). The slow load stays
-        // outside the lock; the critical section is two in-memory
-        // budget charges plus the stash (no lock ordering: the budget
-        // is caller-owned `&mut`, never a mutex).
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some((generation, _)) = state.as_ref()
-            && *generation == ctx.generation
-        {
-            return Ok(());
-        }
+        // refused charge drops the fresh sensor and leaves state unconfigured.
         charge(ctx, BudgetKind::Links, sensor.links.len() as u64)?;
         charge(ctx, BudgetKind::StateEntries, KCRYPTO_MAP_COUNT)?;
-        *state = Some((ctx.generation, sensor));
-        // Stash the process hold with the sensor (replacing any prior
-        // hold on generation change; the replaced guard's drop keeps
-        // the count exact).
+        *state = Some(ConfiguredSession::new(ctx.generation, sensor, started_ns));
+        // Retain the process hold for this backend's configured lifetime.
         *self
             .session
             .lock()
@@ -654,69 +550,34 @@ impl Backend for KCryptoBackend {
     }
 
     fn finalize(&self, _ctx: &FinalizeContext<'_>) -> Result<BackendSummary, BackendError> {
-        let observations = self.decoded.load(Ordering::Relaxed) as u64;
-        let guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let Some((generation, sensor)) = guard.as_ref() else {
-            // Pre-configure: no sensor to assess — counts echo, integrity
-            // pins zero (documented; never echo the ctx baseline).
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(state) = guard.as_mut() else {
             return Ok(BackendSummary {
                 backend: BackendId::KCrypto,
-                observations,
+                observations: self.decoded.load(Ordering::Relaxed) as u64,
                 integrity: IntegritySummary::default(),
             });
         };
-        // Staged fast path (M5): the live driver staged closing-tick
-        // counts, so integrity computes from those plus one fresh
-        // `KWHO_DROPS` read — no snapshot walk, no who walk. The gap
-        // agrees with the session coverage by construction (same
-        // closing counts). Unstaged callers (driver tests, direct
-        // use) fall through to the historical full assessment.
-        if let Some(closing) = self.take_closing_for(*generation) {
-            let who_drops = read_kwho_drops(sensor).map_err(|err| {
-                BackendError::Internal(InternalError::with_detail(
-                    "kcrypto_finalize_read",
-                    &format!("who drops: {err}"),
-                ))
-            })?;
-            return Ok(BackendSummary {
-                backend: BackendId::KCrypto,
-                observations,
-                integrity: integrity_for_counts(
-                    closing.agg_calls,
-                    closing.totals_calls,
-                    closing.drops,
-                    who_drops,
-                )?,
-            });
+        match &state.phase {
+            SessionPhase::Sampled(integrity) => {
+                let summary = BackendSummary {
+                    backend: BackendId::KCrypto,
+                    observations: self.decoded.load(Ordering::Relaxed) as u64,
+                    integrity: *integrity,
+                };
+                state.phase = SessionPhase::Finalized(summary);
+                Ok(summary)
+            }
+            SessionPhase::Finalized(summary) => Ok(*summary),
+            SessionPhase::Active => Err(session::protocol(
+                "kcrypto_terminal_receipt_missing",
+                "close, join and sample this generation first",
+            )),
+            SessionPhase::Failed(err) => Err(session::protocol(
+                "kcrypto_session_failed",
+                &err.to_string(),
+            )),
         }
-        // End-of-session assessment over a fresh snapshot (the ring drain
-        // lands here too — the session is over, nothing else consumes it).
-        let snap = snapshot_rows(sensor).map_err(|err| {
-            BackendError::Internal(InternalError::with_detail(
-                "kcrypto_finalize_read",
-                &format!("snapshot: {err}"),
-            ))
-        })?;
-        // Retained read (M3): the fresh snapshot already carries
-        // `KIDN_DROPS` — no second lookup of the key.
-        let drops = snap.drops;
-        // K5: attribution-insert loss joins the state-insert counter (the
-        // who rows themselves decode per-tick in Task 5; finalize only
-        // needs the loss count).
-        let (_who_rows, who_drops) = snapshot_who(sensor).map_err(|err| {
-            BackendError::Internal(InternalError::with_detail(
-                "kcrypto_finalize_read",
-                &format!("who snapshot: {err}"),
-            ))
-        })?;
-        Ok(BackendSummary {
-            backend: BackendId::KCrypto,
-            observations,
-            integrity: integrity_for_snapshot(&snap, drops, who_drops)?,
-        })
     }
 }
 
@@ -1189,10 +1050,13 @@ mod tests {
 
     #[test]
     fn partial_path_gap_reports_with_totals_preserved() {
-        // Gap > 0 -> state_insert_failures == gap (PARTIAL path, unpriv).
+        // Non-atomic sample skew cannot establish insertion failure.
         let snap = hand_snapshot(&[10, 20], Some(40));
         let integrity = integrity_for_snapshot(&snap, 0, 0).expect("gap maps");
-        assert_eq!(integrity.state_insert_failures, 10, "KTOT(40) - ΣKAGG(30)");
+        assert_eq!(
+            integrity.state_insert_failures, 0,
+            "non-atomic difference is not loss"
+        );
         assert_eq!(integrity.ring_reservation_failures, 0);
         // Healthy: no gap, drops ride through saturating.
         let snap = hand_snapshot(&[10, 20], Some(30));
@@ -1203,8 +1067,8 @@ mod tests {
         let snap = hand_snapshot(&[10, 20], Some(40));
         let integrity = integrity_for_snapshot(&snap, 0, 5).expect("who drops merge");
         assert_eq!(
-            integrity.state_insert_failures, 15,
-            "gap(10) + who_drops(5)"
+            integrity.state_insert_failures, 5,
+            "only measured who_drops"
         );
         let integrity = integrity_for_snapshot(&snap, 0, u64::MAX).expect("who drops saturate");
         assert_eq!(integrity.state_insert_failures, u64::MAX);
@@ -1241,6 +1105,41 @@ mod tests {
     }
 
     #[test]
+    fn non_atomic_sample_gap_is_not_insertion_loss() {
+        // A writer can advance KTOT after KAGG was read. The 25-call
+        // difference has no omission oracle; only who_drops is measured.
+        let snap = hand_snapshot(&[100], Some(125));
+        let integrity = integrity_for_snapshot(&snap, 7, 5).expect("valid rows");
+        assert_eq!(integrity.state_insert_failures, 5);
+        assert_eq!(integrity.ring_reservation_failures, 7);
+    }
+
+    #[test]
+    fn aggregate_ring_loss_is_owned_once_in_driver_rollup() {
+        use kryprobe_core::backend::DriverReport;
+        let snap = hand_snapshot(&[100], Some(100));
+        let mut report = DriverReport::default();
+        report.push_summary(BackendSummary {
+            backend: BackendId::KCrypto,
+            observations: 0,
+            integrity: integrity_for_snapshot(&snap, 7, 0).expect("valid rows"),
+        });
+        report
+            .feed_shared_losses(crate::kcrypto_snapshot::shared_losses_from_drain(
+                &crate::drain::DrainStats {
+                    queue_drops: 3,
+                    ..Default::default()
+                },
+            ))
+            .expect("single transport feed");
+        let rolled = report.session_integrity_checked().expect("fed report");
+        assert_eq!(
+            (rolled.ring_reservation_failures, rolled.user_queue_drops),
+            (7, 3)
+        );
+    }
+
+    #[test]
     fn kdrop_site_names_pin_eight() {
         // Fix wave (G-C1): the KDROPS site order is a BPF/userspace
         // contract — index order pins exactly (destroy is separately
@@ -1272,52 +1171,12 @@ mod tests {
         assert_eq!(via_counts, via_snapshot);
         assert_eq!(via_counts.ring_reservation_failures, 3);
         assert_eq!(via_counts.state_insert_failures, 5, "gap 0 + who 5");
-        // Gap leg: totals beyond Σagg accrue as insert failures.
+        // Gap leg: totals beyond Σagg do not change measured insertion loss.
         let gapped = integrity_for_counts(30, Some(40), 0, 1).expect("gap");
-        assert_eq!(gapped.state_insert_failures, 11, "gap 10 + who 1");
+        assert_eq!(gapped.state_insert_failures, 1, "only measured who drops");
         // Missing totals: no baseline, no gap claim.
         let nobase = integrity_for_counts(30, None, 0, 2).expect("no baseline");
         assert_eq!(nobase.state_insert_failures, 2);
-    }
-
-    #[test]
-    fn staged_closing_counts_match_generation_only() {
-        // M5: staged closing counts serve only the generation they
-        // were staged for; a foreign generation discards them (stale
-        // counts never poison another session's integrity).
-        let backend = KCryptoBackend::new();
-        let generation = PlanGeneration::new(4);
-        backend.stage_closing_counts(ClosingCounts {
-            generation,
-            agg_calls: 30,
-            totals_calls: Some(30),
-            drops: 3,
-        });
-        assert!(
-            backend.take_closing_for(PlanGeneration::new(5)).is_none(),
-            "foreign generation discards"
-        );
-        assert!(
-            backend.take_closing_for(generation).is_none(),
-            "discarded staging is gone for good"
-        );
-        backend.stage_closing_counts(ClosingCounts {
-            generation,
-            agg_calls: 30,
-            totals_calls: Some(30),
-            drops: 3,
-        });
-        let hit = backend
-            .take_closing_for(generation)
-            .expect("matching generation hits");
-        assert_eq!(
-            (hit.agg_calls, hit.totals_calls, hit.drops),
-            (30, Some(30), 3)
-        );
-        assert!(
-            backend.take_closing_for(generation).is_none(),
-            "closing staging drains once"
-        );
     }
 
     #[test]
@@ -1382,7 +1241,7 @@ mod tests {
         // before configure there is no sensor, typed (never a panic
         // or a silent empty handle).
         let backend = KCryptoBackend::new();
-        let err = match backend.session_sensor() {
+        let err = match backend.open_session(PlanGeneration::new(1)) {
             Ok(_) => panic!("unconfigured backend has no sensor"),
             Err(err) => err,
         };
@@ -1392,6 +1251,228 @@ mod tests {
             }
             other => panic!("expected Internal(unconfigured), got {other:?}"),
         }
+    }
+
+    fn configured_with_non_map_fds() -> ConfiguredKcrypto {
+        use crate::bpfloader::{KcryptoMaps, LoadedKcrypto};
+        use crate::fd::OwnedFd;
+        use std::os::fd::IntoRawFd;
+        let fd = || {
+            let file = std::fs::File::open("/dev/null").expect("owned inert fd");
+            // SAFETY: ownership transfers from File exactly once.
+            unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) }
+        };
+        ConfiguredKcrypto {
+            loaded: LoadedKcrypto {
+                maps: KcryptoMaps {
+                    config: fd(),
+                    agg: fd(),
+                    total: fd(),
+                    ident: fd(),
+                    ring: fd(),
+                    who: fd(),
+                    stack: fd(),
+                    err: fd(),
+                    params: fd(),
+                    drops: fd(),
+                },
+                progs: Vec::new(),
+            },
+            links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn configured_finalize_requires_checked_terminal_receipt() {
+        let backend = KCryptoBackend::new();
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(
+            PlanGeneration::new(4),
+            configured_with_non_map_fds(),
+            1,
+        ));
+        let ctx = FinalizeContext {
+            session: SessionId::new(1),
+            coverage: &kryprobe_core::evidence::CoverageSummary::not_run(),
+            integrity: &IntegritySummary::default(),
+        };
+        let err = backend
+            .finalize(&ctx)
+            .expect_err("configured but never stopped");
+        let BackendError::Internal(reason) = err else {
+            panic!("typed refusal expected")
+        };
+        assert_eq!(
+            reason.reason, "kcrypto_terminal_receipt_missing",
+            "refuse before reading any map"
+        );
+    }
+
+    #[test]
+    fn pre_drive_cleanup_closes_only_its_generation_and_retains_attach_metadata() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(4);
+        let (owned, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut sensor = configured_with_non_map_fds();
+        // A real OS lifetime signal: a duplicated owner would keep this peer
+        // open after cleanup. No fd-number reuse or timing assumption.
+        let link = unsafe { crate::fd::OwnedFd::from_raw_fd(owned.into_raw_fd()) };
+        sensor.links.push((
+            "owned test link".to_owned(),
+            crate::attach::OwnedLink::from_fd(link),
+        ));
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(generation, sensor, 10));
+        assert!(backend.abort_session(PlanGeneration::new(5)).is_err());
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(backend.abort_session(generation).unwrap(), None);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0, "sole link owner closed");
+        assert_eq!(
+            backend.abort_session(generation).unwrap(),
+            None,
+            "repeat cleanup is idempotent"
+        );
+        let guard = backend.state.lock().unwrap();
+        let state = guard.as_ref().unwrap();
+        assert_eq!(state.attached_points, 1);
+        assert!(state.sensor.links.is_empty());
+        assert!(matches!(state.phase, SessionPhase::Failed(_)));
+        drop(guard);
+        assert!(backend.open_session(generation).is_err());
+        assert!(backend.finish_session(generation).is_err());
+        let ctx = FinalizeContext {
+            session: SessionId::new(1),
+            coverage: &kryprobe_core::evidence::CoverageSummary::not_run(),
+            integrity: &IntegritySummary::default(),
+        };
+        assert!(
+            backend
+                .finalize(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("kcrypto_session_failed")
+        );
+    }
+
+    #[test]
+    fn repeated_finalize_returns_the_staged_summary_without_new_reads() {
+        let backend = KCryptoBackend::new();
+        let mut state =
+            ConfiguredSession::new(PlanGeneration::new(4), configured_with_non_map_fds(), 10);
+        state.phase = SessionPhase::Sampled(integrity_for_counts(100, Some(125), 7, 5).unwrap());
+        *backend.state.lock().unwrap() = Some(state);
+        backend.decoded.store(12, Ordering::Relaxed);
+        let ctx = FinalizeContext {
+            session: SessionId::new(1),
+            coverage: &kryprobe_core::evidence::CoverageSummary::not_run(),
+            integrity: &IntegritySummary::default(),
+        };
+        let first = backend.finalize(&ctx).unwrap();
+        backend.decoded.store(99, Ordering::Relaxed);
+        assert_eq!(backend.finalize(&ctx).unwrap(), first);
+        assert_eq!(
+            (
+                first.observations,
+                first.integrity.ring_reservation_failures,
+                first.integrity.state_insert_failures
+            ),
+            (12, 7, 5)
+        );
+    }
+
+    #[test]
+    fn terminal_interval_rejects_contradictions_without_clamping() {
+        let mut sample = AggregateTerminalSample {
+            snapshot: hand_snapshot(&[1], Some(1)),
+            who: Vec::new(),
+            who_drops: 0,
+            drops: [0; 8],
+            drain: Default::default(),
+            started_ns: 10,
+        };
+        sample.snapshot.monotonic_ns = 200;
+        assert!(
+            sample.validate_interval().is_ok(),
+            "zero stamps remain unspecified"
+        );
+        for (first, last) in [(9u64, 100u64), (20, 201), (100, 20)] {
+            let mut bytes = hand_agg(1);
+            bytes[302..310].copy_from_slice(&first.to_le_bytes());
+            bytes[310..318].copy_from_slice(&last.to_le_bytes());
+            sample.snapshot.rows = vec![crate::kcrypto_snapshot::RowBytes::new(bytes).unwrap()];
+            assert!(
+                sample.validate_interval().is_err(),
+                "contradictory {first}/{last}"
+            );
+        }
+        sample.snapshot.rows.clear();
+        sample.snapshot.monotonic_ns = 9;
+        assert!(
+            sample.validate_interval().is_err(),
+            "upper wall precedes lower wall"
+        );
+    }
+
+    #[test]
+    fn terminal_map_failure_is_not_an_empty_success_sample() {
+        let sensor = configured_with_non_map_fds();
+        assert!(crate::kcrypto_snapshot::terminal_rows(&sensor, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn drain_open_failure_is_sticky_for_direct_backend_callers() {
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(4);
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(
+            generation,
+            configured_with_non_map_fds(),
+            10,
+        ));
+        let first = backend.open_session(generation).unwrap_err();
+        assert!(first.to_string().contains("kcrypto_session_drain"));
+        let second = backend.open_session(generation).unwrap_err();
+        assert!(
+            second.to_string().contains("kcrypto_session_closed"),
+            "failed capture cannot restart its collector: {second}"
+        );
+        assert!(backend.abort_session(generation).is_ok());
+    }
+
+    #[test]
+    fn running_read_failure_refuses_later_sampling_and_finalize() {
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(4);
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(
+            generation,
+            configured_with_non_map_fds(),
+            10,
+        ));
+        let first = backend.session_who(generation).unwrap_err();
+        assert!(first.to_string().contains("kcrypto_session_who"));
+        assert!(
+            backend
+                .session_who(generation)
+                .unwrap_err()
+                .to_string()
+                .contains("kcrypto_session_closed")
+        );
+        assert!(backend.finish_session(generation).is_err());
+        let ctx = FinalizeContext {
+            session: SessionId::new(1),
+            coverage: &kryprobe_core::evidence::CoverageSummary::not_run(),
+            integrity: &IntegritySummary::default(),
+        };
+        let err = backend.finalize(&ctx).unwrap_err().to_string();
+        assert!(err.contains("kcrypto_session_failed"));
+        assert!(
+            err.contains("kcrypto_session_who"),
+            "original failure retained"
+        );
+        assert!(backend.abort_session(generation).is_ok());
     }
 
     #[test]

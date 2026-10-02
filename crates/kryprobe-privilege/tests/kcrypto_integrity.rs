@@ -391,6 +391,7 @@ fn q09_user_queue_drops_feed_shared_losses_and_partial() {
     let stats = DrainStats {
         records: 100,
         queue_drops: 7,
+        ..DrainStats::default()
     };
     let shared = stats.shared_losses(3);
     assert_eq!(

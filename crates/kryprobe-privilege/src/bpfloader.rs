@@ -399,39 +399,6 @@ pub struct LoadedKcrypto {
     pub progs: Vec<(String, OwnedFd)>,
 }
 
-impl KcryptoMaps {
-    /// Duplicates every map handle (H1(b)): clones address the SAME
-    /// kernel maps (no second sensor, no double memory).
-    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-        Ok(Self {
-            config: self.config.try_clone_cloexec()?,
-            agg: self.agg.try_clone_cloexec()?,
-            total: self.total.try_clone_cloexec()?,
-            ident: self.ident.try_clone_cloexec()?,
-            ring: self.ring.try_clone_cloexec()?,
-            who: self.who.try_clone_cloexec()?,
-            stack: self.stack.try_clone_cloexec()?,
-            err: self.err.try_clone_cloexec()?,
-            params: self.params.try_clone_cloexec()?,
-            drops: self.drops.try_clone_cloexec()?,
-        })
-    }
-}
-
-impl LoadedKcrypto {
-    /// Duplicates maps + program handles onto the same kernel objects.
-    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-        let mut progs = Vec::with_capacity(self.progs.len());
-        for (name, prog) in &self.progs {
-            progs.push((name.clone(), prog.try_clone_cloexec()?));
-        }
-        Ok(Self {
-            maps: self.maps.try_clone()?,
-            progs,
-        })
-    }
-}
-
 /// Loaded lifecycle maps, by T06 profile name.
 #[derive(Debug)]
 pub struct LifecycleMaps {

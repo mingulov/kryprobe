@@ -11,20 +11,52 @@ and does not prove.
 ## What one count means
 
 One count is one observed API-invocation return — not one delivered
-kernel operation and not one completed request. Totals reconcile
-against aggregate rows internally (`ktot_gap`), but a zero gap with
-zero ring drops proves product-side reconciliation only. It does not
+kernel operation and not one completed request. Totals and aggregate
+rows are read separately. Their difference (`snapshot_gap_unreconciled`,
+also retained under the older `ktot_gap` diagnostic name) is not a lost-call
+count: an in-flight writer can advance one read after the other. Zero
+difference and zero ring drops do not prove an atomic sample. They do not
 prove the kernel invoked the sensor for every operation: kernel-side
 skips (a hook that never ran, e.g. the G9 cryptd/kworker short-count
 signature) are invisible to every product counter.
 
-Accordingly a reconciled session reports `aggregate_counts`,
+Accordingly a session without measured loss reports `aggregate_counts`,
 `detailed_events`, and `completion` coverage as `Unknown` (reason
 counters `uncovered:kernel_delivery_unmeasured` /
 `uncovered:completion_unobserved`). Exact-count and absence claims
 over such sessions are inconclusive, never clean. Measured loss still
 flips its own dimension to `Partial`; real observations still fire
 violations — only unprovable absence degrades.
+
+## Checked stop and terminal sampling
+
+Duration, stdin EOF and SIGINT close the backend's owned links, join its
+collector, decode every forwarded tail record once, and take one terminal
+map sample with fresh who joins. Cumulative terminal rows replace running
+rows. The interval starts before attachment and ends after the terminal
+map reads; contradictory nonzero timestamps fail the capture.
+
+This remains a **non-atomic sample**. Link close, an empty ring, repeated
+stable reads and userspace barriers do not establish a kernel writer fence.
+`uncovered:aggregate_snapshot_not_quiescent` records that limit. Exact
+reconciliation requires a later versioned kernel control contract.
+
+The backend owns the measured ring and who drop indicators; shared transport
+owns measured queue refusals. Ring 7 and queue 3 therefore remain 7 and 3.
+The ring/who indicators are existing capped u8 counters, not unbounded exact
+loss totals. A bounded final ring sweep also reports `terminal_backlog_bytes`
+and `terminal_busy`; unread bytes are not missing-record counts. Worker panic,
+poll/map/topology/decode failure or missing terminal receipt fails the capture
+with any known partial drain statistics; panic never supplies clean zeros.
+
+Ordinary JSON retains raw row/total measurements, diagnostic counters and
+consistency reasons. Frozen event-v0 JSONL and replay preserve conservative
+Unknown/Partial status but cannot preserve new counter names or the exact
+sample-difference magnitude. A difference never becomes `omitted_count`.
+`session_end.final_barrier = validated` attests completed host output only,
+not atomic maps or finished kernel writers. `missing_final_barrier` means an
+actually expected host marker failed, not that this profile lacks a kernel
+quiescence protocol. Zero counters never qualify exact counts or absence.
 
 ## Status is representative, errnos are exact only on who rows
 
@@ -60,7 +92,7 @@ within the stated bound", not "delivery was complete".
 
 - API selection and return classes per (family, op, result, context).
 - Caller identity markers (who rows) with params and first failure.
-- Internal counter reconciliation and transport-loss accounting.
+- Non-atomic aggregate measurements and checked transport-loss accounting.
 - Policy violations on real observations; inconclusive (never clean)
   absence/exact-count verdicts.
 

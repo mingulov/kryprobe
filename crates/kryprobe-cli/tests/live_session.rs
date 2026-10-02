@@ -1051,13 +1051,35 @@ impl kryprobe_cli::live::SessionSensor for ScriptedSensor {
         ))
     }
 
-    fn drop_sites(&mut self) -> Result<[u64; 8], kryprobe_cli::live::LiveError> {
-        Ok(self.drop_sites)
-    }
-
-    fn finish(&mut self) {
+    fn finish(
+        &mut self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_backend::AggregateTerminalSample,
+        kryprobe_cli::live::LiveError,
+    > {
         self.finished
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut snapshot = self.script.last().expect("script").clone();
+        snapshot.idents.clear();
+        snapshot.overflow_identities = 0;
+        Ok(
+            kryprobe_privilege::kcrypto_backend::AggregateTerminalSample {
+                snapshot,
+                who: vec![self.who.clone()],
+                who_drops: 0,
+                drops: self.drop_sites,
+                drain: Default::default(),
+                started_ns: 0,
+            },
+        )
+    }
+
+    fn cleanup(
+        &mut self,
+    ) -> Result<Option<kryprobe_privilege::drain::DrainStats>, kryprobe_cli::live::LiveError> {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
     }
 }
 
@@ -1185,6 +1207,360 @@ fn script_ident() -> kryprobe_privilege::kcrypto_snapshot::IdentBytes {
     kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(out).expect("hand ident")
 }
 
+struct TerminalSensor {
+    cleanups: usize,
+    finishes: usize,
+    ticks: usize,
+    cleanup_error: bool,
+}
+
+impl kryprobe_cli::live::SessionSensor for TerminalSensor {
+    fn snapshot_tick(
+        &mut self,
+        _: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<kryprobe_privilege::kcrypto_snapshot::SnapshotRows, kryprobe_cli::live::LiveError>
+    {
+        self.ticks += 1;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+            rows: vec![script_agg_as(10, b"cbc(aes)")],
+            totals: Some(script_totals(10)),
+            idents: Vec::new(),
+            overflow_identities: 0,
+            drops: 0,
+            monotonic_ns: 100,
+            lagmax_ns: None,
+        })
+    }
+    fn kallsyms_text(&mut self) -> String {
+        String::new()
+    }
+    fn snapshot_who(
+        &mut self,
+    ) -> Result<
+        (Vec<kryprobe_privilege::kcrypto_backend::WhoSnapshot>, u64),
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok((Vec::new(), 0))
+    }
+    fn finish(
+        &mut self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_backend::AggregateTerminalSample,
+        kryprobe_cli::live::LiveError,
+    > {
+        self.finishes += 1;
+        let mut ident = vec![0; 50];
+        ident[0] = 1;
+        ident[1] = 3;
+        ident[2] = kryprobe_abi::kcrypto_agg::KCTL_IDENT;
+        let mut overflow = ident.clone();
+        overflow[2] = kryprobe_abi::kcrypto_agg::KCTL_OVERFLOW;
+        Ok(
+            kryprobe_privilege::kcrypto_backend::AggregateTerminalSample {
+                snapshot: kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+                    rows: vec![script_agg_as(100, b"cbc(aes)")],
+                    totals: Some(script_totals(125)),
+                    idents: vec![
+                        kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(ident).unwrap(),
+                        kryprobe_privilege::kcrypto_snapshot::IdentBytes::new(overflow).unwrap(),
+                    ],
+                    overflow_identities: 1,
+                    drops: 7,
+                    monotonic_ns: 200,
+                    lagmax_ns: None,
+                },
+                who: Vec::new(),
+                who_drops: 0,
+                drops: [0; 8],
+                drain: kryprobe_privilege::drain::DrainStats {
+                    records: 5,
+                    queue_drops: 3,
+                    ..Default::default()
+                },
+                started_ns: 10,
+            },
+        )
+    }
+    fn cleanup(
+        &mut self,
+    ) -> Result<Option<kryprobe_privilege::drain::DrainStats>, kryprobe_cli::live::LiveError> {
+        self.cleanups += 1;
+        if self.cleanup_error {
+            Err(kryprobe_cli::live::LiveError::Internal(
+                "scripted_cleanup_failure".to_owned(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[test]
+fn terminal_sample_replaces_running_rows_and_keeps_stop_only_tail() {
+    let _suite = suite_guard();
+    let mut controller = attached_controller();
+    let backend = kryprobe_privilege::kcrypto_backend::KCryptoBackend::new();
+    let mut sensor = TerminalSensor {
+        cleanups: 0,
+        finishes: 0,
+        ticks: 0,
+        cleanup_error: false,
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+        json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+    };
+    let outcome = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &std::sync::atomic::AtomicBool::new(false),
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+        &mut controller,
+        None,
+    )
+    .expect("terminal sample");
+    let agg = outcome
+        .observations
+        .iter()
+        .find(|row| row.backend_payload["row"] == "agg")
+        .expect("agg");
+    assert_eq!(
+        (
+            agg.backend_payload["counts"]["calls"].as_u64(),
+            outcome
+                .observations
+                .iter()
+                .filter(|row| row.backend_payload["row"] == "ident")
+                .count(),
+            outcome.integrity.user_queue_drops
+        ),
+        (Some(100), 2, 3),
+        "terminal counters replace running rows; stop-only IDENT/OVERFLOW and real queue drops survive"
+    );
+    assert_eq!(
+        outcome.integrity.state_insert_failures, 0,
+        "25-call sample skew is not loss"
+    );
+    assert_eq!(outcome.coverage.aggregate_counts.interval.start_ns, 10);
+    assert_eq!(outcome.coverage.aggregate_counts.interval.end_ns, Some(200));
+    assert_eq!((sensor.finishes, sensor.cleanups), (1, 0));
+    let json = kryprobe_cli::cmd_report::render_report_json(&outcome).expect("ordinary JSON");
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let counts = doc["coverage"]["aggregate_counts"]["counters"]
+        .as_array()
+        .unwrap();
+    for (name, value) in [
+        ("snapshot_agg_calls", "100"),
+        ("snapshot_totals_calls", "125"),
+        ("snapshot_gap_unreconciled", "25"),
+        ("uncovered:aggregate_snapshot_not_quiescent", "1"),
+    ] {
+        assert!(
+            counts
+                .iter()
+                .any(|c| c["name"] == name && c["value"] == value),
+            "JSON retains {name}"
+        );
+    }
+    let jsonl = kryprobe_report::live_render::render_live_jsonl(
+        &outcome.observations,
+        &outcome.coverage,
+        false,
+    )
+    .unwrap();
+    let schema = include_bytes!("../../../schemas/event-v0.schema.json");
+    let (findings, replay) =
+        kryprobe_report::validate_and_render_reader(std::io::Cursor::new(jsonl.as_bytes()), schema);
+    assert!(
+        findings.is_empty(),
+        "schema/replay validation: {findings:?}"
+    );
+    let replay = replay.expect("replay summary");
+    assert!(replay.contains("partial"), "replay stays partial: {replay}");
+    assert!(
+        !jsonl.contains("snapshot_gap_unreconciled"),
+        "frozen schema has no counter field"
+    );
+    for row in jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+    {
+        if row["kind"] == "coverage_gap" {
+            assert!(row["payload"]["omitted_count"].is_null());
+            assert_ne!(row["payload"]["reason"], "missing_final_barrier");
+        }
+        if row["kind"] == "session_end" {
+            assert_eq!(row["payload"]["verdict"], "PARTIAL");
+            assert_eq!(
+                row["payload"]["final_barrier"], "validated",
+                "host stream completion only"
+            );
+        }
+    }
+    let policy = kryprobe_policy::parse_policy("version: 1\nrules:\n  - id: no-kernel-md5\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: md5\n    decision: deny\n").unwrap();
+    assert!(matches!(
+        kryprobe_policy::evaluate(&policy, &outcome.observations, &outcome.coverage),
+        kryprobe_policy::PolicyVerdict::Inconclusive { .. }
+    ));
+}
+
+#[test]
+fn refused_initial_transition_still_cleans_up_and_keeps_both_errors() {
+    let _suite = suite_guard();
+    let backend = kryprobe_privilege::kcrypto_backend::KCryptoBackend::new();
+    let mut controller = attached_controller();
+    controller
+        .transition(kryprobe_core::session::SessionState::Observing)
+        .unwrap();
+    let mut sensor = TerminalSensor {
+        cleanups: 0,
+        finishes: 0,
+        ticks: 0,
+        cleanup_error: true,
+    };
+    let cfg = kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+        json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+    };
+    let err = kryprobe_cli::live::drive_session(
+        &cfg,
+        &backend,
+        &mut sensor,
+        &std::sync::atomic::AtomicBool::new(false),
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+        &mut controller,
+        None,
+    )
+    .expect_err("invalid entry state");
+    assert_eq!((sensor.cleanups, sensor.finishes, sensor.ticks), (1, 0, 0));
+    let text = err.to_string();
+    assert!(
+        text.contains("session start") && text.contains("scripted_cleanup_failure"),
+        "{text}"
+    );
+}
+
+#[test]
+fn sigint_reset_causal_control() {
+    // A bounded reproduction of the old test interference: reset exactly
+    // after the setter, before the driver can observe it. The no-reset leg
+    // is the positive control. All real global-aware tests now own this guard.
+    let _suite = suite_guard();
+    struct SignalSensor {
+        inner: TerminalSensor,
+        reset: bool,
+    }
+    impl kryprobe_cli::live::SessionSensor for SignalSensor {
+        fn snapshot_tick(
+            &mut self,
+            id: u64,
+            stop: &std::sync::atomic::AtomicBool,
+        ) -> Result<kryprobe_privilege::kcrypto_snapshot::SnapshotRows, kryprobe_cli::live::LiveError>
+        {
+            let row = self.inner.snapshot_tick(id, stop)?;
+            if id == 1 {
+                stop.store(false, std::sync::atomic::Ordering::Relaxed);
+                kryprobe_privilege::host::SIGINT_SEEN
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                if self.reset {
+                    std::thread::spawn(|| {
+                        kryprobe_privilege::host::SIGINT_SEEN
+                            .store(false, std::sync::atomic::Ordering::Relaxed)
+                    })
+                    .join()
+                    .unwrap();
+                }
+            }
+            Ok(row)
+        }
+        fn kallsyms_text(&mut self) -> String {
+            String::new()
+        }
+        fn snapshot_who(
+            &mut self,
+        ) -> Result<
+            (Vec<kryprobe_privilege::kcrypto_backend::WhoSnapshot>, u64),
+            kryprobe_cli::live::LiveError,
+        > {
+            Ok((Vec::new(), 0))
+        }
+        fn finish(
+            &mut self,
+        ) -> Result<
+            kryprobe_privilege::kcrypto_backend::AggregateTerminalSample,
+            kryprobe_cli::live::LiveError,
+        > {
+            self.inner.finish()
+        }
+        fn cleanup(
+            &mut self,
+        ) -> Result<Option<kryprobe_privilege::drain::DrainStats>, kryprobe_cli::live::LiveError>
+        {
+            self.inner.cleanup()
+        }
+    }
+    for reset in [true, false] {
+        kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut sensor = SignalSensor {
+            inner: TerminalSensor {
+                cleanups: 0,
+                finishes: 0,
+                ticks: 0,
+                cleanup_error: false,
+            },
+            reset,
+        };
+        let mut controller = attached_controller();
+        let backend = kryprobe_privilege::kcrypto_backend::KCryptoBackend::new();
+        let cfg = kryprobe_cli::live::LiveConfig {
+            source: "kernel-crypto".to_owned(),
+            duration_secs: Some(60),
+            tick_ms: 1,
+            token: None,
+            json_audit: false,
+            profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        };
+        let outcome = kryprobe_cli::live::drive_session(
+            &cfg,
+            &backend,
+            &mut sensor,
+            &std::sync::atomic::AtomicBool::new(false),
+            9,
+            kryprobe_core::ids::SessionId::new(1),
+            kryprobe_core::ids::PlanGeneration::new(1),
+            &kryprobe_core::ids::IdIssuer::default(),
+            None,
+            &mut controller,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (outcome.interrupted, sensor.inner.ticks),
+            if reset { (false, 2) } else { (true, 1) }
+        );
+        kryprobe_privilege::host::SIGINT_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn live_success_path_scripted_sensor_three_ticks() {
     // P0-4: N ticks → decode → coverage → finalize, unprivileged.
@@ -1259,8 +1635,8 @@ fn live_success_path_scripted_sensor_three_ticks() {
     assert_eq!(outcome.observations.len(), 7, "4 keys + 3 idents");
     assert_eq!(
         backend.decodes.load(std::sync::atomic::Ordering::Relaxed),
-        12,
-        "decode serves agg+totals+ident (who bypasses decode)"
+        15,
+        "three ticks plus the terminal aggregate/totals sample"
     );
     // Barrier cadence: exactly 3 ticks, sequential ids from 1.
     assert_eq!(
@@ -1272,11 +1648,11 @@ fn live_success_path_scripted_sensor_three_ticks() {
         vec![1, 2, 3]
     );
     // Kallsyms seam: one table per tick (C2 counting leg, H-T3).
-    assert_eq!(sensor.tables.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert_eq!(sensor.tables.load(std::sync::atomic::Ordering::Relaxed), 4);
     assert_eq!(
         kryprobe_privilege::kallsyms::parse_calls() - parses_before,
-        3,
-        "one real parse per tick across 3 who rows per tick (C2)"
+        4,
+        "one real parse per tick plus one for terminal who rows"
     );
     // 1B-H4: the governed session ends Finalized, observably.
     assert_eq!(
@@ -1357,13 +1733,35 @@ impl kryprobe_cli::live::SessionSensor for MidStopSensor {
         Ok((Vec::new(), 0))
     }
 
-    fn drop_sites(&mut self) -> Result<[u64; 8], kryprobe_cli::live::LiveError> {
-        Ok([0; 8])
-    }
-
-    fn finish(&mut self) {
+    fn finish(
+        &mut self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_backend::AggregateTerminalSample,
+        kryprobe_cli::live::LiveError,
+    > {
         self.finished
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut snapshot = self.tick.clone();
+        snapshot.idents.clear();
+        snapshot.overflow_identities = 0;
+        Ok(
+            kryprobe_privilege::kcrypto_backend::AggregateTerminalSample {
+                snapshot,
+                who: Vec::new(),
+                who_drops: 0,
+                drops: [0; 8],
+                drain: Default::default(),
+                started_ns: 0,
+            },
+        )
+    }
+
+    fn cleanup(
+        &mut self,
+    ) -> Result<Option<kryprobe_privilege::drain::DrainStats>, kryprobe_cli::live::LiveError> {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
     }
 }
 
@@ -1673,13 +2071,13 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
     // decodes); only accumulation is bounded.
     assert_eq!(
         backend.decodes.load(std::sync::atomic::Ordering::Relaxed),
-        20,
-        "5 ticks x (2 agg + totals + ident)"
+        23,
+        "5 ticks x (2 agg + totals + ident), then 3 terminal cumulative rows"
     );
     assert_eq!(
         kryprobe_privilege::kallsyms::parse_calls() - parses_before,
-        5,
-        "one real parse per tick across 3 who rows per tick (C2)"
+        6,
+        "one real parse per tick plus the cold terminal projection"
     );
     assert_eq!(
         outcome.terminal_state,
@@ -1752,6 +2150,10 @@ fn live_corrupt_snapshot_row_fails_closed() {
         None,
     )
     .expect_err("corrupt row must fail the session");
+    assert!(
+        sensor.finished.load(std::sync::atomic::Ordering::Relaxed),
+        "a corrupt tick still closes and joins its sensor"
+    );
     let msg = format!("{err:?}");
     assert!(
         msg.contains("live parse agg"),
@@ -1899,6 +2301,10 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         None,
     )
     .expect_err("failing decode must fail the session");
+    assert!(
+        sensor.finished.load(std::sync::atomic::Ordering::Relaxed),
+        "a decode failure still closes and joins its sensor"
+    );
     let msg = format!("{err:?}");
     assert!(
         msg.contains("live decode agg"),
@@ -2133,6 +2539,7 @@ fn lifecycle_live_config() -> kryprobe_cli::live::LiveConfig {
 
 #[test]
 fn live_lifecycle_scripted_session_drives_green() {
+    let _suite = suite_guard();
     // T06 item 4: two scripted ticks (grounded sync + callback) plus
     // one truthless finish record decode through the REAL lifecycle
     // backend into three kept observations; the machine finalizes;
@@ -2268,6 +2675,7 @@ fn live_lifecycle_scripted_session_drives_green() {
 
 #[test]
 fn live_lifecycle_observation_cap_truncates_deterministically() {
+    let _suite = suite_guard();
     // Round-2 (sol-M2/astra-M4, C12): past 100K decoded records the
     // session stops early with exactly the cap kept, an explicit
     // truncation counter, and `Partial` completion — bounded
@@ -2338,6 +2746,7 @@ fn live_lifecycle_observation_cap_truncates_deterministically() {
 
 #[test]
 fn live_lifecycle_close_backlog_flips_transport() {
+    let _suite = suite_guard();
     // Round-2 (sol-M2/astra-M3): a nonzero quiet-verdict backlog
     // reaches coverage and flips `detailed_events` — teardown
     // backlog is reported evidence, never vanishing state.
@@ -2395,6 +2804,7 @@ fn live_lifecycle_close_backlog_flips_transport() {
 
 #[test]
 fn live_lifecycle_backlog_never_hides_transport_residual() {
+    let _suite = suite_guard();
     // P6r2-N1 (reviewer's exact driver scenario): 73 accepted,
     // 0 consumed, no kernel losses, quiet-close backlog 128 bytes —
     // driven through the REAL `drive_lifecycle_session` + the
@@ -2466,6 +2876,7 @@ fn live_lifecycle_backlog_never_hides_transport_residual() {
 
 #[test]
 fn live_lifecycle_registry_backend_drives_same_decoder() {
+    let _suite = suite_guard();
     // T06 item 4 core: the backend reached through the REAL registry
     // (registered via `register_lifecycle_shared`) decodes and
     // finalizes through the live driver — registry and live entry
@@ -2521,6 +2932,7 @@ fn live_lifecycle_registry_backend_drives_same_decoder() {
 
 #[test]
 fn live_lifecycle_unconfigured_sensor_refuses_typed() {
+    let _suite = suite_guard();
     // The production sensor over an unconfigured backend refuses on
     // the first tick with a typed `Internal` naming the lifecycle
     // stage (the `session_sensor` precedent); the machine parks in
@@ -2712,6 +3124,7 @@ impl kryprobe_cli::live::LifecycleSessionSensor for BurstLifecycleSensor<'_> {
 
 #[test]
 fn live_lifecycle_tick_drains_to_quiet() {
+    let _suite = suite_guard();
     // T07-R3-05: one tick sustains three drain rounds (busy, busy,
     // quiet) — the burst collapses into a SINGLE window (one
     // progress call with the summed rows/records), not three
@@ -2783,6 +3196,7 @@ fn live_lifecycle_tick_drains_to_quiet() {
 
 #[test]
 fn live_lifecycle_drain_round_cap_bounds_flood() {
+    let _suite = suite_guard();
     // T07-R3-05: an endless busy producer cannot starve the window
     // — the per-tick round cap bounds the sustained loop (the
     // first window drains exactly 8 rounds), the window still
@@ -2849,6 +3263,7 @@ fn live_lifecycle_drain_round_cap_bounds_flood() {
 
 #[test]
 fn live_lifecycle_idle_burst_does_not_wait_for_display_tick() {
+    let _suite = suite_guard();
     // Catch a driver that sleeps for the display cadence after an empty
     // ring snapshot. Channels place the burst after that snapshot; no
     // sleep guesses where the producer and consumer are. The receive
@@ -2919,6 +3334,7 @@ fn live_lifecycle_idle_burst_does_not_wait_for_display_tick() {
 }
 #[test]
 fn live_lifecycle_display_cadence_is_independent_of_drain_windows() {
+    let _suite = suite_guard();
     // A backlog requires three service windows, all before the next
     // display tick. Only the initial update and final pending totals
     // should reach the output callback.
@@ -2969,6 +3385,7 @@ fn live_lifecycle_display_cadence_is_independent_of_drain_windows() {
 
 #[test]
 fn live_lifecycle_busy_without_progress_services_wait_and_stop() {
+    let _suite = suite_guard();
     // A pending producer can leave the oldest record busy. A bounded
     // drain cap alone still spins between windows unless zero-progress
     // windows yield. Cancellation arrives at that wait boundary.
@@ -3014,6 +3431,7 @@ fn live_lifecycle_busy_without_progress_services_wait_and_stop() {
 
 #[test]
 fn sustained_backlog_services_stop() {
+    let _suite = suite_guard();
     // P2/K05: records keep flowing (sustained backlog); stop must be
     // serviced inside the same window — the round cap and quiet are
     // bounds, not prerequisites. Stop latched at round 5 of 8 ends
@@ -3069,6 +3487,7 @@ fn sustained_backlog_services_stop() {
 
 #[test]
 fn busy_record_yields_without_spin() {
+    let _suite = suite_guard();
     // P2/K05: a busy head with zero progress yields through
     // `wait_for_activity` (pending-writer retry, bounded wait —
     // asserted inside the fake) instead of spinning windows.
@@ -3122,6 +3541,7 @@ fn busy_record_yields_without_spin() {
 
 #[test]
 fn observation_cap_counts_omissions() {
+    let _suite = suite_guard();
     // P2/K05: cap truncation counts EVERY dropped record across
     // batches — loop batches plus stop-time reconciliation — not a
     // bare flag. 60K + 60K loop records with a 10-record finish tail
@@ -3268,6 +3688,7 @@ impl kryprobe_core::backend::Backend for FinalizeFailingBackend {
 
 #[test]
 fn backend_finalize_failure_parks_failed_partial() {
+    let _suite = suite_guard();
     // P2/K05 (P2r/C5 renamed: this covers backend finalization, not
     // the final-output seams — a terminal-accounting (finalize)
     // failure cannot yield a clean session): the driver surfaces the

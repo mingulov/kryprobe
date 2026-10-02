@@ -37,13 +37,39 @@ pub enum DrainEvent {
 }
 
 /// End-of-drain counters for the loss ledger.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainStats {
-    /// Records delivered.
+    /// Records walked, including those refused by the bounded queue.
     pub records: u64,
     /// Records dropped on a full drain queue.
     pub queue_drops: u64,
+    /// Bytes still unread after the bounded final sweep; never a record count.
+    pub backlog_bytes: u64,
+    /// The final sweep stopped on a busy or invalid ring frame.
+    pub busy: bool,
 }
+
+/// Checked worker failure with its known statistics. A panic leaves them
+/// unknown (`None`), never a fabricated zero-loss receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainFailure {
+    /// Failure observed while polling, forwarding, or joining.
+    pub error: DrainError,
+    /// Measurements retained before failure, when the worker returned them.
+    pub stats: Option<DrainStats>,
+}
+
+impl std::fmt::Display for DrainFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; partial drain statistics: {:?}",
+            self.error, self.stats
+        )
+    }
+}
+
+impl std::error::Error for DrainFailure {}
 
 impl DrainStats {
     /// Combine both shared-layer observation points into one
@@ -62,6 +88,15 @@ impl DrainStats {
 /// Drain failure: config, mapping, or epoll setup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrainError {
+    /// The OS refused to create the worker thread.
+    ThreadSpawnFailed {
+        /// OS error detail, without ring data.
+        detail: String,
+    },
+    /// The worker panicked; its final statistics are unavailable.
+    WorkerPanicked,
+    /// The collector disappeared before forwarding completed.
+    CollectorDisconnected,
     /// Drain configuration rejected.
     ConfigInvalid {
         /// Rejection reason.
@@ -93,6 +128,9 @@ pub enum DrainError {
 impl std::fmt::Display for DrainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ThreadSpawnFailed { detail } => write!(f, "drain worker spawn: {detail}"),
+            Self::WorkerPanicked => write!(f, "drain worker panicked"),
+            Self::CollectorDisconnected => write!(f, "drain collector disconnected"),
             Self::ConfigInvalid { reason } => write!(f, "invalid drain config: {reason}"),
             Self::MmapFailed { stage, errno } => {
                 write!(f, "ringbuf mmap failed at {stage}: errno {errno}")
@@ -126,7 +164,7 @@ pub fn drain_spawns() -> u64 {
 /// Ringbuf drain thread: epoll-paced, budgeted, bounded queue.
 #[derive(Debug)]
 pub struct DrainThread {
-    join: Option<std::thread::JoinHandle<DrainStats>>,
+    join: Option<std::thread::JoinHandle<Result<DrainStats, DrainFailure>>>,
     rx: Receiver<DrainEvent>,
     stop: Arc<AtomicBool>,
     barrier: Arc<AtomicU64>,
@@ -202,7 +240,12 @@ impl DrainThread {
             budget: config.max_events_per_iter as usize,
             timeout_ms: config.poll_timeout_ms as i32,
         };
-        let join = std::thread::spawn(move || worker.run());
+        let join = std::thread::Builder::new()
+            .name("kryprobe-drain".to_owned())
+            .spawn(move || worker.run())
+            .map_err(|err| DrainError::ThreadSpawnFailed {
+                detail: err.to_string(),
+            })?;
         SPAWNS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             join: Some(join),
@@ -223,12 +266,8 @@ impl DrainThread {
     }
 
     /// Signal stop, join the thread, return its counters.
-    pub fn stop(mut self) -> DrainStats {
-        self.stop.store(true, Ordering::Release);
-        match self.join.take() {
-            Some(handle) => handle.join().unwrap_or_default(),
-            None => DrainStats::default(),
-        }
+    pub fn stop(self) -> Result<DrainStats, DrainFailure> {
+        self.stop_and_drain().0
     }
 
     /// Signal stop, join the worker, THEN sweep the channel to empty:
@@ -237,11 +276,20 @@ impl DrainThread {
     /// channel order, never dropped with the channel. The join
     /// happens-before the sweep, so the tail is complete without any
     /// sleep or retry. Returns the worker counters plus the tail.
-    pub fn stop_and_drain(mut self) -> (DrainStats, Vec<DrainEvent>) {
+    pub fn stop_and_drain(mut self) -> (Result<DrainStats, DrainFailure>, Vec<DrainEvent>) {
         self.stop.store(true, Ordering::Release);
         let stats = match self.join.take() {
-            Some(handle) => handle.join().unwrap_or_default(),
-            None => DrainStats::default(),
+            Some(handle) => handle.join().unwrap_or(Err(DrainFailure {
+                error: DrainError::WorkerPanicked,
+                stats: None,
+            })),
+            None => Err(DrainFailure {
+                error: DrainError::StateInvalid {
+                    expected: "running worker",
+                    actual: "joined",
+                },
+                stats: None,
+            }),
         };
         let mut tail = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
@@ -252,10 +300,13 @@ impl DrainThread {
 }
 
 impl Drop for DrainThread {
-    /// Backstop only: signals stop without joining, so counters are lost.
+    /// Backstop only: closes the worker lifetime even on an unwinding caller.
     /// Prefer [`DrainThread::stop`], which joins and returns [`DrainStats`].
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -344,10 +395,11 @@ mod tests {
                 tx.try_send(DrainEvent::Record(vec![i]))
                     .expect("bounded tail fits the queue");
             }
-            DrainStats {
+            Ok(DrainStats {
                 records: 4,
                 queue_drops: 0,
-            }
+                ..DrainStats::default()
+            })
         });
         let drain = DrainThread {
             join: Some(join),
@@ -356,6 +408,7 @@ mod tests {
             barrier: Arc::new(AtomicU64::new(0)),
         };
         let (stats, tail) = drain.stop_and_drain();
+        let stats = stats.expect("joined worker");
         assert_eq!(stats.records, 4, "worker counters join");
         assert_eq!(stats.queue_drops, 0, "no queue pressure");
         let records: Vec<Vec<u8>> = tail
@@ -377,6 +430,7 @@ mod tests {
         let stats = DrainStats {
             records: 10,
             queue_drops: 5,
+            ..DrainStats::default()
         };
         // Records delivered are not a loss; the ring count rides in from
         // the BPF LOSS[0] reader alongside the drain's queue drops.
@@ -384,6 +438,86 @@ mod tests {
         assert_eq!(
             DrainStats::default().shared_losses(0),
             SharedLosses::default()
+        );
+    }
+
+    #[test]
+    fn panicked_worker_keeps_tail_and_refuses_zero_statistics() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let join = std::thread::spawn(move || {
+            tx.send(DrainEvent::Record(vec![9]))
+                .expect("collector alive");
+            panic!("scripted worker panic");
+        });
+        let drain = DrainThread {
+            join: Some(join),
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            barrier: Arc::new(AtomicU64::new(0)),
+        };
+        let (result, tail) = drain.stop_and_drain();
+        assert_eq!(tail, vec![DrainEvent::Record(vec![9])]);
+        let failure = result.expect_err("panic cannot produce clean counters");
+        assert_eq!(failure.error, super::DrainError::WorkerPanicked);
+        assert_eq!(failure.stats, None);
+    }
+
+    #[test]
+    fn stop_only_identity_and_overflow_tail_reaches_snapshot_decoder_once() {
+        use crate::kcrypto_snapshot::{
+            ParsedRow, SnapshotRows, append_drain_tail, parse_snapshot_row,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            for kind in [
+                kryprobe_abi::kcrypto_agg::KCTL_IDENT,
+                kryprobe_abi::kcrypto_agg::KCTL_OVERFLOW,
+            ] {
+                let mut bytes = vec![0; 48];
+                bytes[0] = kind;
+                tx.send(DrainEvent::Record(bytes)).unwrap();
+            }
+            Ok(DrainStats {
+                records: 2,
+                ..Default::default()
+            })
+        });
+        let drain = DrainThread {
+            join: Some(join),
+            rx,
+            stop,
+            barrier: Arc::new(AtomicU64::new(0)),
+        };
+        let (stats, tail) = drain.stop_and_drain();
+        assert_eq!(stats.unwrap().records, 2);
+        let mut snap = SnapshotRows {
+            rows: Vec::new(),
+            totals: None,
+            idents: Vec::new(),
+            overflow_identities: 0,
+            drops: 0,
+            monotonic_ns: 0,
+            lagmax_ns: None,
+        };
+        append_drain_tail(&mut snap, tail).unwrap();
+        let kinds: Vec<_> = snap
+            .idents
+            .iter()
+            .map(|row| match parse_snapshot_row(row.as_bytes()).unwrap() {
+                ParsedRow::Ident { kctl } => kctl.kind,
+                _ => panic!("identity"),
+            })
+            .collect();
+        assert_eq!(kinds, vec![1, 4]);
+        assert_eq!(snap.overflow_identities, 1);
+        assert!(
+            append_drain_tail(&mut snap, vec![DrainEvent::Record(vec![0; 47])]).is_err(),
+            "malformed forwarded tail fails closed"
         );
     }
 }

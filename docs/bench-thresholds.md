@@ -86,6 +86,12 @@ rc 0 with no timeout; the boot quiet leg shows 0 calls. Any
 measured rate with unexplained loss is outside the qualified
 envelope regardless of overhead.
 
+For current aggregate captures, `ktot_gap` is retained as a conservative
+qualification diagnostic: it is a difference between non-atomic samples,
+not an insertion-loss count. A zero difference still requires the independent
+driver ledger above and does not prove kernel writer quiescence. Historical
+pair-set receipts remain bound to their recorded source and artifacts.
+
 ### Verdict rule (frozen)
 
 Per pair-set, with pair ratios in preserved run order:
