@@ -211,6 +211,35 @@ fi
     || { echo "install.sh: token mint failed" >&2; exit 1; }
 echo "+ file caps granted; verifying"
 "$BIN_DST" token status --bin "$BIN_DST"
-"$BIN_DST" doctor | grep -E "^probe (kcrypto_object|kcrypto_attach|cap_state):" \
-    || { echo "install.sh: doctor verify failed" >&2; exit 1; }
+# Doctor deliberately exits zero for degraded probes. Preserve its process
+# status separately, then require exactly one passing row per mandatory
+# aggregate predicate. Unselected probes (including lifecycle support) are
+# informational here. Keep stdout byte-exact until validation: a shell
+# variable could strip NULs and turn malformed output into a passing row.
+DOCTOR_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/kryprobe-doctor.XXXXXXXXXX")
+trap 'rm -f -- "$DOCTOR_OUTPUT"' 0
+trap 'exit 1' 1 2 15
+DOCTOR_STATUS=0
+"$BIN_DST" doctor > "$DOCTOR_OUTPUT" || DOCTOR_STATUS=$?
+cat "$DOCTOR_OUTPUT"
+if [ "$DOCTOR_STATUS" -ne 0 ]; then
+    echo "install.sh: doctor verify failed (exit $DOCTOR_STATUS)" >&2
+    exit "$DOCTOR_STATUS"
+fi
+# Both commands only read the file; neither pipeline side writes to it.
+# shellcheck disable=SC2094
+if ! tr -d '\000' < "$DOCTOR_OUTPUT" | cmp -s - "$DOCTOR_OUTPUT"; then
+    echo "install.sh: doctor verify failed (NUL in output)" >&2
+    exit 1
+fi
+for PROBE in kcrypto_object kcrypto_attach cap_state; do
+    # Count selected names even with malformed spacing/delimiters, so a
+    # malformed duplicate cannot hide alongside a well-formed passing row.
+    if ! ROW_COUNT=$(LC_ALL=C grep -Ec "^[[:space:]]*probe[[:space:]]+$PROBE([^[:alnum:]_]|$)" "$DOCTOR_OUTPUT") \
+        || [ "$ROW_COUNT" -ne 1 ] \
+        || ! LC_ALL=C grep -Eq "^probe $PROBE: pass: [^[:space:][:cntrl:]][^[:cntrl:]]*$" "$DOCTOR_OUTPUT"; then
+        echo "install.sh: doctor verify failed (expected one passing $PROBE row)" >&2
+        exit 1
+    fi
+done
 echo "+ install verified"

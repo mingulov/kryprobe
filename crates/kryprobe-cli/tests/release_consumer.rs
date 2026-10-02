@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Release-consumer honesty: the staging and installer scripts verify
 //! what they consume. Real scripts, owned temp dirs only — no global
-//! install, no capabilities. Each case builds (or reuses a scratch
-//! copy of) a pinned stage from `build-release.sh`, mutates one axis,
-//! and asserts the consumer refuses before touching the destination.
+//! install, no capabilities. Artifact cases build (or reuse a scratch
+//! copy of) a pinned stage from `build-release.sh`, mutate one axis,
+//! and assert refusal before touching the destination. Doctor protocol
+//! fixtures cover the installer's final verification predicate separately.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -136,6 +137,209 @@ fn rewrite_manifest(stage: &Path) {
         "{{\"kryprobe_release_manifest\":2,\"binary\":{{\"path\":\"bin/kryprobe\",\"sha256\":\"{bin}\"}},\"objects\":[{{\"name\":\"kcrypto.bpf.o\",\"path\":\"bin/kryprobe-bpf/kcrypto.bpf.o\",\"sha256\":\"{obj}\"}},{{\"name\":\"kcrypto-lifecycle.bpf.o\",\"path\":\"bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o\",\"sha256\":\"{lifecycle}\"}}],\"pins_enforced\":true,\"profile_pins_enforced\":true,\"pin_digests\":[\"{obj}\",\"{lifecycle}\"]}}\n"
     );
     std::fs::write(stage.join("manifest.json"), manifest).expect("manifest");
+}
+
+const PASSING_DOCTOR: &str = "probe cap_state: pass: CapEff CAP_BPF, CAP_PERFMON\n\
+probe kcrypto_object: pass: /fixture/bin/kryprobe-bpf/kcrypto.bpf.o\n\
+probe kcrypto_attach: pass: 9/9 attached\n";
+
+/// Exercise the real installer through its live verification branch without
+/// granting capabilities or loading BPF. Only the binary's external protocol
+/// and `id -u` are fixtures; copying, hashing, validation and exit handling run
+/// unchanged. These tests do not establish installed capture readiness.
+fn install_doctor_fixture(doctor: &[u8], status: u8, skip: Option<&str>) -> std::process::Output {
+    let scratch = kryprobe_testkit::TempDir::named("installer-doctor").expect("scratch");
+    let stage = scratch.path().join("stage");
+    copy_file_assert_bytes(&stage.join(PAYLOAD[1]), b"aggregate protocol fixture\n");
+    copy_file_assert_bytes(&stage.join(PAYLOAD[2]), b"lifecycle protocol fixture\n");
+    let binary = stage.join(PAYLOAD[0]);
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+set -eu
+if [ "$#" -eq 3 ] && [ "$1" = doctor ] && [ "$2" = --versions ] && [ "$3" = --json ]; then
+    objects="$(dirname -- "$0")/kryprobe-bpf"
+    aggregate=$(sha256sum "$objects/kcrypto.bpf.o")
+    lifecycle=$(sha256sum "$objects/kcrypto-lifecycle.bpf.o")
+    printf '{"pins_enforced":true,"profile_pins_enforced":true,"kcrypto":{"path":"%s/kcrypto.bpf.o","sha256":"%s"},"kcrypto_lifecycle":{"path":"%s/kcrypto-lifecycle.bpf.o","sha256":"%s"}}\n' "$objects" "${aggregate%% *}" "$objects" "${lifecycle%% *}"
+elif [ "$#" -eq 4 ] && [ "$1" = token ] && [ "$3" = --bin ] && [ "$4" = "$0" ]; then
+    case "$2" in mint|status) : ;; *) exit 98 ;; esac
+elif [ "$#" -eq 1 ] && [ "$1" = doctor ]; then
+    cat "$KRYPROBE_TEST_DOCTOR_OUT"
+    printf '%s\n' 'doctor diagnostic on stderr' >&2
+    exit "$KRYPROBE_TEST_DOCTOR_STATUS"
+else
+    echo 'unexpected protocol fixture invocation' >&2
+    exit 99
+fi
+"#,
+    )
+    .expect("protocol fixture");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    rewrite_checksums(&stage, &PAYLOAD);
+    rewrite_manifest(&stage);
+    let tools = scratch.path().join("tools");
+    let id = tools.join("id");
+    copy_file_assert_bytes(
+        &id,
+        b"#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = -u ] || exit 97\nprintf '%s\\n' 0\n",
+    );
+    std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o755)).expect("chmod id");
+    let doctor_file = scratch.path().join("doctor.stdout");
+    std::fs::write(&doctor_file, doctor).expect("doctor output fixture");
+    let tmp = scratch.path().join("tmp");
+    std::fs::create_dir(&tmp).expect("private tmp");
+    let mut path = vec![tools];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    ));
+    let mut cmd = Command::new("sh");
+    cmd.arg(workspace_root().join("packaging/install.sh"))
+        .arg("--stage")
+        .arg(&stage)
+        .arg("--prefix")
+        .arg(scratch.path().join("installed"))
+        .env("PATH", std::env::join_paths(path).expect("fixture PATH"))
+        .env("TMPDIR", &tmp)
+        .env("KRYPROBE_TEST_DOCTOR_OUT", doctor_file)
+        .env("KRYPROBE_TEST_DOCTOR_STATUS", status.to_string());
+    match skip {
+        Some("no-mint") => {
+            cmd.arg("--no-mint");
+        }
+        Some("destdir") => {
+            cmd.arg("--destdir").arg(scratch.path().join("destdir"));
+        }
+        None => {}
+        Some(_) => panic!("unknown skip fixture"),
+    }
+    let out = run(&mut cmd);
+    assert_eq!(std::fs::read_dir(tmp).expect("private tmp").count(), 0);
+    out
+}
+
+#[test]
+fn installer_verifies_all_selected_passing_rows() {
+    // Unselected degradation, including lifecycle floor refusal, must not
+    // become a blanket failure of aggregate installation verification.
+    let doctor = format!(
+        "{PASSING_DOCTOR}probe kcrypto_lifecycle: skipped: kernel floor unsupported\n\
+         probe unrelated: failed: detail names cap_state and kcrypto_attach\n\
+         coverage-profile: kernel-crypto-v1\nverdict: ready\n"
+    );
+    let out = install_doctor_fixture(doctor.as_bytes(), 0, None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("+ install verified"));
+    assert!(
+        stdout.contains(&doctor),
+        "doctor diagnostics must be retained"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("doctor diagnostic on stderr"));
+}
+
+#[test]
+fn installer_refuses_each_nonpassing_selected_outcome() {
+    for row in PASSING_DOCTOR.lines() {
+        let name = row
+            .strip_prefix("probe ")
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap();
+        for outcome in [
+            "denied: attach (errno 1)",
+            "skipped: unavailable",
+            "failed: 8/9 attached",
+        ] {
+            let doctor = PASSING_DOCTOR.replace(row, &format!("probe {name}: {outcome}"));
+            let out = install_doctor_fixture(doctor.as_bytes(), 0, None);
+            assert!(!out.status.success(), "{name}: {outcome} must be refused");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(!stdout.contains("+ install verified"));
+            assert!(stdout.contains(&doctor), "nonpassing diagnostics retained");
+        }
+    }
+}
+
+#[test]
+fn installer_preserves_doctor_failure_status_and_diagnostics() {
+    for doctor in [PASSING_DOCTOR, "doctor aborted before producing rows\n"] {
+        let out = install_doctor_fixture(doctor.as_bytes(), 7, None);
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "doctor status must not be hidden"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("+ install verified"));
+        assert!(stdout.contains(doctor));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("doctor diagnostic on stderr"));
+    }
+}
+
+#[test]
+fn installer_requires_one_well_formed_row_per_selected_predicate() {
+    for row in PASSING_DOCTOR.lines() {
+        let name = row
+            .strip_prefix("probe ")
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap();
+        let without = PASSING_DOCTOR.replace(&format!("{row}\n"), "");
+        for (case, doctor) in [
+            ("missing", without.clone()),
+            ("duplicate", format!("{PASSING_DOCTOR}{row}\n")),
+            (
+                "contradictory",
+                format!("{PASSING_DOCTOR}probe {name}: failed: unavailable\n"),
+            ),
+            (
+                "missing delimiter",
+                format!("{without}probe {name} pass: fixture\n"),
+            ),
+            ("missing detail", format!("{without}probe {name}: pass:\n")),
+            (
+                "unknown outcome",
+                format!("{without}probe {name}: passing: fixture\n"),
+            ),
+            (
+                "unrelated substring",
+                format!("{without}probe unrelated: pass: probe {name}: pass: fixture\n"),
+            ),
+            (
+                "malformed duplicate",
+                format!("{PASSING_DOCTOR}probe {name} pass: fixture\n"),
+            ),
+            (
+                "NUL in outcome",
+                format!("{without}probe {name}: pa\0ss: fixture\n"),
+            ),
+        ] {
+            let out = install_doctor_fixture(doctor.as_bytes(), 0, None);
+            assert!(!out.status.success(), "{name}: {case} must be refused");
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("+ install verified"));
+        }
+    }
+}
+
+#[test]
+fn installer_skipped_verification_never_claims_capture_verified() {
+    for skip in ["no-mint", "destdir"] {
+        let out = install_doctor_fixture(b"doctor must not run\n", 7, Some(skip));
+        assert!(
+            out.status.success(),
+            "{skip}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("+ install verified"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("doctor diagnostic on stderr"));
+    }
 }
 
 /// Seed every destination file with sentinel bytes so
