@@ -1924,15 +1924,24 @@ fn driver_e2e_matches_fixture_truth() {
         "unconfigured decoder contributes no measured losses"
     );
     // SAFETY: KIDN value is u8; value_len 1 is exact.
-    let drops = unsafe {
+    let drops = match unsafe {
         map_lookup_bytes(
             &sensor.loaded.maps.ident,
             &KIDN_DROPS.to_le_bytes(),
             1,
             "driver-twin/kidn-drops",
         )
-    }
-    .expect("independent ring-reserve indicator read")[0];
+    } {
+        Ok(value) => value[0],
+        // KIDN_DROPS is inserted only after a failed reserve; absence is
+        // healthy zero. Other map-read failures must stay loud.
+        Err(kryprobe_privilege::mapops::MapOpsError::LookupFailed { errno, .. })
+            if errno == libc::ENOENT =>
+        {
+            0
+        }
+        Err(err) => panic!("independent ring-reserve indicator read: {err}"),
+    };
     assert_eq!(drops, 0, "ring-reserve drops pin zero (independent read)");
 
     // K2 documents the shared-feed skip: the lenient total reads zero and
