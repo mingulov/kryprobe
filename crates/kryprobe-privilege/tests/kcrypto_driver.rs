@@ -8,8 +8,9 @@
 //! (`driver_e2e_matches_fixture_truth`) is an `#[ignore]`d lane-style
 //! test that returns early (honest skip) when not root or when BTF is
 //! missing; it brings up the K1 configured sensor, drives the Task-1 P4
-//! `alg_fixture` traffic, snapshots, and proves the full
-//! `BackendDriver::run` pass decodes fixture truth exactly.
+//! `alg_fixture` traffic and proves decoded fixture truth exactly. It also
+//! checks that a configured `BackendDriver::run` without an aggregate terminal
+//! receipt refuses typed; the unconfigured decode-only summary is separate.
 //!
 //! Privileged hygiene mirrors `kcrypto_snapshot.rs`: suite lock (sensors
 //! are system-wide), prebuilt-as-user binary under sudo, workspace
@@ -24,11 +25,13 @@ use kryprobe_abi::kcrypto_agg::{
 };
 use kryprobe_core::backend::{
     Backend, BackendDriver, BackendRegistry, ConfigureContext, DecodeContext, DetectContext,
-    FinalizeContext, PlanContext, RawEvent,
+    DriverError, DriverReport, FinalizeContext, PlanContext, RawEvent,
 };
 use kryprobe_core::budget::{BudgetKind, BudgetManager};
 use kryprobe_core::capability::RuntimeCapabilities;
-use kryprobe_core::enums::{BackendId, CallKind, CoverageStatus, EvidencePhase, OperationClass};
+use kryprobe_core::enums::{
+    BackendId, CallKind, CaptureMode, CoverageStatus, EvidencePhase, OperationClass,
+};
 use kryprobe_core::error::BackendError;
 use kryprobe_core::evidence::{
     CoverageSummary, DimensionCoverage, IntegritySummary, NativeObservation, NativeResult,
@@ -38,7 +41,9 @@ use kryprobe_core::ids::{IdIssuer, ObservationId, PlanGeneration, SessionId};
 use kryprobe_core::plan::{CapabilityRequirements, PlanBudget};
 use kryprobe_privilege::btf_resolve::{KCRYPTO_SYMBOLS, load_kcrypto_configured};
 use kryprobe_privilege::capture_gate::{CaptureVerdict, GateCell, check_cells};
-use kryprobe_privilege::kcrypto_backend::{KCRYPTO_CAPABILITIES, KCryptoBackend, register_kcrypto};
+use kryprobe_privilege::kcrypto_backend::{
+    KCRYPTO_CAPABILITIES, KCryptoBackend, SharedKcryptoBackend, register_kcrypto,
+};
 use kryprobe_privilege::kcrypto_snapshot::{
     IdentBytes, ParsedRow, RowBytes, SnapshotRows, TotalsBytes, parse_snapshot_row,
     raw_event_for_agg, raw_event_for_ident, raw_event_for_totals, snapshot_rows,
@@ -1425,7 +1430,8 @@ fn driver_e2e_matches_fixture_truth() {
     // EXCESS re-captures on a fresh sensor (max 3 attempts); SHORTFALL
     // fails immediately (a sensor miss, never contamination); 3/3
     // excess fails closed. Exactness is preserved: only a Clean capture
-    // reaches `driver.run`, and the truth assertions below still run.
+    // reaches the decode assertions below. The configured generic driver's
+    // receipt refusal is checked independently of captured fixture truth.
     let (snap, who, who_drops, sensor) = {
         let mut attempt = 0u32;
         loop {
@@ -1446,10 +1452,8 @@ fn driver_e2e_matches_fixture_truth() {
             assert_eq!((aead.enc, aead.dec), (10, 10));
             alg_fixture::aead_decrypt_bad_tag("gcm(aes)").expect("bad-tag decrypt must EBADMSG");
 
-            // Snapshot, then gate BEFORE driving the FULL lifecycle
-            // through `driver.run` (registry + register_kcrypto +
-            // live-shape runtime caps). The owned blobs outlive the run;
-            // events borrow them (D6).
+            // Snapshot, then gate before testing registry refusal and pure
+            // decode. The owned blobs outlive those checks (D6).
             let snap: SnapshotRows = snapshot_rows(&sensor).expect("snapshot_rows");
             let (who, who_drops) = kryprobe_privilege::kcrypto_backend::snapshot_who(&sensor)
                 .expect("finup caller evidence");
@@ -1479,7 +1483,10 @@ fn driver_e2e_matches_fixture_truth() {
         events.push(raw_event_for_ident(ident));
     }
     let mut registry = BackendRegistry::new();
-    register_kcrypto(&mut registry).expect("register");
+    let shared = SharedKcryptoBackend::new();
+    registry
+        .register(Box::new(shared.clone()))
+        .expect("register");
     let mut driver = BackendDriver::harness();
     let runtime = RuntimeCapabilities {
         kernel_release: "lane".to_owned(),
@@ -1491,15 +1498,104 @@ fn driver_e2e_matches_fixture_truth() {
         yama_scope: 0,
         caps: vec!["CAP_BPF".to_owned(), "CAP_SYS_ADMIN".to_owned()],
     };
-    let report = driver
+    let backend = shared.backend();
+    let instances = backend
+        .detect(&DetectContext {
+            session: SessionId::new(1),
+            runtime: &runtime,
+        })
+        .expect("detect fixture lane");
+    assert_eq!(instances.len(), 1, "one instance");
+    let plan = backend
+        .plan(
+            &PlanContext {
+                session: SessionId::new(1),
+                runtime: &runtime,
+            },
+            &instances[0],
+            CaptureMode::Trace,
+        )
+        .expect("plan fixture lane");
+    assert_eq!(plan.probes.len(), 9);
+    // The generic seven-method driver has no aggregate close/join step. Its
+    // configured finalizer must refuse; captured events from another sensor
+    // cannot stand in for this backend's checked terminal receipt.
+    let error = driver
         .run(&registry, &runtime, &events)
-        .unwrap_or_else(|err| panic!("driver run failed: {err}"));
-    assert!(
-        report.skipped().is_empty(),
-        "no skips on a healthy lane host"
+        .expect_err("configured aggregate needs an explicit terminal receipt");
+    match error {
+        DriverError::Backend {
+            backend: BackendId::KCrypto,
+            error: BackendError::Internal(reason),
+        } => {
+            assert_eq!(reason.reason, "kcrypto_terminal_receipt_missing");
+        }
+        other => panic!("wrong configured refusal: {other}"),
+    }
+    // The missing-receipt protocol error leaves this generation active so its
+    // owner may still close it. Same-generation configure is a no-op; foreign
+    // generations cannot replace it or consume another session's budget.
+    let mut budget = open_budget();
+    let mut ctx = ConfigureContext {
+        session: SessionId::new(1),
+        generation: PlanGeneration::new(1),
+        budget: &mut budget,
+    };
+    backend
+        .configure(&mut ctx, &plan)
+        .expect("same active generation");
+    assert_eq!(budget.used(BudgetKind::Links), 0, "no-op charges nothing");
+    assert_eq!(budget.used(BudgetKind::StateEntries), 0);
+    let mut budget = open_budget();
+    let mut ctx = ConfigureContext {
+        session: SessionId::new(1),
+        generation: PlanGeneration::new(2),
+        budget: &mut budget,
+    };
+    let error = backend
+        .configure(&mut ctx, &plan)
+        .expect_err("foreign generation refused");
+    let BackendError::Internal(reason) = error else {
+        panic!("typed generation refusal")
+    };
+    assert_eq!(reason.reason, "kcrypto_session_already_configured");
+    assert_eq!(budget.used(BudgetKind::Links), 0, "refusal charges nothing");
+    assert_eq!(budget.used(BudgetKind::StateEntries), 0);
+    assert_eq!(
+        backend
+            .abort_session(PlanGeneration::new(1))
+            .expect("owned cleanup"),
+        None
     );
-    assert_eq!(report.plans().len(), 1, "one plan for one instance");
-    assert_eq!(report.plans()[0].probes.len(), 9);
+    drop(registry);
+    drop(shared);
+
+    // Preserve every independent fixture/decode assertion through the supported
+    // unconfigured decoder. This summary counts decodes only; it is not a live
+    // stopped-sensor receipt and does not assess the fixture sensor's losses.
+    let decoder = KCryptoBackend::new();
+    let baseline = IntegritySummary::default();
+    let issuer = IdIssuer::default();
+    let ctx = decode_ctx(
+        SessionId::new(1),
+        PlanGeneration::new(1),
+        &baseline,
+        &issuer,
+    );
+    let decoded: Vec<_> = events
+        .iter()
+        .map(|event| decoder.decode(&ctx, *event).expect("fixture decode"))
+        .collect();
+    let summary = decoder
+        .finalize(&FinalizeContext {
+            session: SessionId::new(1),
+            coverage: &CoverageSummary::not_run(),
+            integrity: &baseline,
+        })
+        .expect("unconfigured decode-only finalize");
+    let mut report = DriverReport::default();
+    report.extend_observations(decoded);
+    report.push_summary(summary);
     assert_eq!(report.summaries().len(), 1);
     let observations = &report.observations();
     assert_eq!(
@@ -1817,14 +1913,15 @@ fn driver_e2e_matches_fixture_truth() {
         assert_eq!(kctl.val3, 0, "IDENT val3 must be reserved zero");
     }
 
-    // Finalize: observations == decoded; healthy integrity (drops 0, gap 0).
+    // Decode-only finalize counts observations, without a configured sensor's
+    // integrity receipt. The real captured sensor's indicator is read below.
     let summary = &report.summaries()[0];
     assert_eq!(summary.backend, BackendId::KCrypto);
     assert_eq!(summary.observations, observations.len() as u64);
     assert_eq!(
         summary.integrity,
         IntegritySummary::default(),
-        "healthy lane: zero losses"
+        "unconfigured decoder contributes no measured losses"
     );
     // SAFETY: KIDN value is u8; value_len 1 is exact.
     let drops = unsafe {
@@ -1835,8 +1932,7 @@ fn driver_e2e_matches_fixture_truth() {
             "driver-twin/kidn-drops",
         )
     }
-    .map(|v| v[0])
-    .unwrap_or(0);
+    .expect("independent ring-reserve indicator read")[0];
     assert_eq!(drops, 0, "ring-reserve drops pin zero (independent read)");
 
     // K2 documents the shared-feed skip: the lenient total reads zero and
@@ -1849,36 +1945,6 @@ fn driver_e2e_matches_fixture_truth() {
     assert!(
         report.session_integrity_checked().is_err(),
         "checked total refuses before the feed"
-    );
-
-    // Configure idempotency on the live backend: same generation is a
-    // no-op (no re-charge); a new generation reloads and charges 9/5.
-    let backend = registry.get(BackendId::KCrypto).expect("kcrypto live");
-    let mut budget = open_budget();
-    let mut ctx = ConfigureContext {
-        session: SessionId::new(1),
-        generation: PlanGeneration::new(1),
-        budget: &mut budget,
-    };
-    backend
-        .configure(&mut ctx, &report.plans()[0])
-        .expect("same-generation re-configure is a no-op");
-    assert_eq!(budget.used(BudgetKind::Links), 0, "no-op charges nothing");
-    assert_eq!(budget.used(BudgetKind::StateEntries), 0);
-    let mut budget = open_budget();
-    let mut ctx = ConfigureContext {
-        session: SessionId::new(1),
-        generation: PlanGeneration::new(2),
-        budget: &mut budget,
-    };
-    backend
-        .configure(&mut ctx, &report.plans()[0])
-        .expect("new-generation re-configure reloads");
-    assert_eq!(budget.used(BudgetKind::Links), 9, "Links += attached_n");
-    assert_eq!(
-        budget.used(BudgetKind::StateEntries),
-        10,
-        "StateEntries += maps"
     );
 }
 
