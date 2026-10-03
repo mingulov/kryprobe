@@ -112,17 +112,22 @@ def parse_attach_audit(path: Path) -> dict:
     return out
 
 
+_U64_MAX = 2 ** 64 - 1
+
+
 def _unsigned_counter(value):
-    """Strict unsigned-counter validation (A3 review idea #7): a real
-    int >= 0 (bools are not counters) or a digit string (serde JSON
-    form). Permissive ``int()`` would coerce False->0, 0.5->0,
-    True->1 — mistyped evidence must refuse, never coerce."""
+    """Strict unsigned-counter validation (A3 review idea #7, A4 M3):
+    a real int in u64 range (bools are not counters) or a digit
+    string (serde JSON form). Permissive ``int()`` would coerce
+    False->0, 0.5->0, True->1 — mistyped evidence must refuse,
+    never coerce; above-range values are mistyped, never counts."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value >= 0 else None
+        return value if 0 <= value <= _U64_MAX else None
     if isinstance(value, str) and value.isdigit():
-        return int(value)
+        parsed = int(value)
+        return parsed if parsed <= _U64_MAX else None
     return None
 
 
@@ -150,6 +155,12 @@ def parse_ctx_overflow_counter(path: Path) -> int:
     except (KeyError, TypeError) as err:
         raise ValueError(
             f"{path}: no detailed_events counters: {err}") from err
+    # A4 M3: a null counters container must refuse as leg-invalid,
+    # never raise an uncaught TypeError from the loop below.
+    if not isinstance(counters, list):
+        raise ValueError(
+            f"{path}: detailed_events counters not a list: "
+            f"{counters!r}")
     found = None
     for entry in counters:
         if not isinstance(entry, dict):

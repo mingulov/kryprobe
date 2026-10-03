@@ -1491,20 +1491,38 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let ready: Vec<Arc<AtomicU64>> = (0..4).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        // M2: first fixture failure, if any — failed traffic must
+        // never read ready (the join below fails the test loud).
+        let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let mut hammers = Vec::new();
         for thread in 0..4 {
             let stop = Arc::clone(&stop);
             let ready = Arc::clone(&ready[thread]);
+            let first_err = Arc::clone(&first_err);
             hammers.push(std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = kryprobe_testkit::alg_fixture::skcipher_roundtrip("cbc(aes)", 4);
-                    ready.fetch_add(1, Ordering::Relaxed);
+                    match kryprobe_testkit::alg_fixture::skcipher_roundtrip("cbc(aes)", 4) {
+                        Ok(_) => {
+                            ready.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            let mut slot = first_err.lock().unwrap();
+                            if slot.replace(format!("{err:?}")).is_none() {
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                            return;
+                        }
+                    }
                 }
             }));
         }
-        // Ready barrier: every hammer completed >= 1 roundtrip batch
-        // BEFORE the close starts — overlap is proven, and the maps
-        // hold hammer-attributed rows for the freeze comparison.
+        // Ready barrier: every hammer completed >= 1 SUCCESSFUL
+        // roundtrip batch BEFORE the close starts, and all four loop
+        // until stop (set after the close returns) — every hammer was
+        // alive and generating traffic across the close, and the maps
+        // hold hammer-attributed rows for the freeze comparison. A
+        // write overlapping the CLOSED store itself is highly
+        // probable but not controlled (characterization, not proof).
         let barrier = Instant::now();
         while ready.iter().any(|r| r.load(Ordering::Relaxed) == 0) {
             assert!(
@@ -1538,6 +1556,11 @@ mod tests {
         for hammer in hammers {
             hammer.join().expect("hammer joins");
         }
+        // M2: the barrier above only proves successful batches ran;
+        // a fixture failure anywhere fails the test (failed traffic
+        // never reads ready, so readiness still implies success).
+        let first_err = first_err.lock().unwrap().clone();
+        assert!(first_err.is_none(), "hammer traffic failed: {first_err:?}");
         let (Some(rows), Some(present), Some(system), Some(unknown), Some(drops)) = (
             terminal.rows,
             terminal.present_calls,

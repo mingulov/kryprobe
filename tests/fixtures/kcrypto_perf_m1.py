@@ -644,10 +644,13 @@ def _run_n_cgroup(argv0, opts):
         "merge_s": (t_merged - t_end) / 1e9,
         # N6: actor-start skew (max-min shard meas start),
         # informational like merge_s — the stagger from sequential
-        # fork+exec plus scheduling jitter. Measured 1.3 s at 64
-        # actors (30 s legs read ~31.3 s, margin 3.7 s to the 35 s
-        # ceiling); the judge does not gate on it (the frozen
-        # timing gate already bounds the total window).
+        # fork+exec plus scheduling jitter. Quiet-canary measured
+        # 1.8-2.4 s at 64 actors (leg00A 2.423 s; 30 s legs read
+        # ~32 s, margin ~3 s to the 35 s ceiling); the judge does
+        # not gate on it (the frozen timing gate already bounds the
+        # total window). merge_s (50-67 s at this scale) is likewise
+        # excluded from the window but NOT from campaign wall time
+        # or the driver timeout (A4 review I4).
         "skew_s": (t_meas_max - t_meas_start) / 1e9,
         "bulk": False, "paced": 0, "threads": actors,
         "offered": offered, "late": late,

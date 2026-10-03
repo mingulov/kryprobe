@@ -403,6 +403,26 @@ class CtxOverflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m1validity.parse_ctx_overflow_counter(path)
 
+    def test_parse_overflow_rejects_out_of_range(self):
+        # A4 review M3: the serialized counter is a u64 — values
+        # above 2**64-1 are mistyped evidence, never a count.
+        for bad in (2 ** 64, 2 ** 100, str(2 ** 64)):
+            path = write_tmp(json.dumps(self._report(bad)))
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                m1validity.parse_ctx_overflow_counter(path)
+        path = write_tmp(json.dumps(self._report(2 ** 64 - 1)))
+        self.assertEqual(
+            m1validity.parse_ctx_overflow_counter(path), 2 ** 64 - 1)
+
+    def test_parse_overflow_rejects_null_counters(self):
+        # A4 review M3: a null counters container must refuse as a
+        # leg-invalid ValueError, never an uncaught TypeError.
+        report = self._report("0")
+        report["coverage"]["detailed_events"]["counters"] = None
+        path = write_tmp(json.dumps(report))
+        with self.assertRaises(ValueError):
+            m1validity.parse_ctx_overflow_counter(path)
+
     def test_below_cap_overflow_rules(self):
         ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
                "unknown_calls": 0, "drops": 0}
