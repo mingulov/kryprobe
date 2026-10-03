@@ -427,9 +427,9 @@
   }
  ],
  "equivalence": {
-  "single": "7.0.14: product enc == dec == driver ops_total, alloc == 1, errors == 0, queued == 0; ctx present == ops_total, unknown == 0, drops == 0, rows == 3.",
+  "single": "7.0.14: product enc == dec == driver ops_total, alloc == 1, errors == 0, queued == 0; ctx present == system, unknown == 0, drops == 0, rows == 3 (A2: present is NOT == ops_total — kernel calls per roundtrip are kernel/shape-dependent).",
   "n_cgroup": "same with 64 actors: alloc == 64, ctx rows == 192.",
-  "churn_below": "200 deterministic arrivals: alloc == 200, ctx rows == 600, present == ops_total, unknown == 0, drops == 0.",
-  "churn_full": "800 deterministic arrivals: alloc == 800, ctx rows == 1024, present + drops == ops_total, unknown == drops > 0, KTOT == ops_total."
+  "churn_below": "200 deterministic arrivals: alloc == 200, ctx rows == 600, present == system, unknown == 0, drops == 0.",
+  "churn_full": "800 deterministic arrivals: alloc == 800, ctx rows == 1024, system ledger exact, unknown == drops > 0."
  }
 }

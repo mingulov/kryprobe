@@ -210,6 +210,25 @@ impl KCryptoBackend {
         result
     }
 
+    /// Detach links, then close the kernel fence (F1 order,
+    /// structural — the ONLY fence path; `finish_session` never calls
+    /// `close_kernel_fence` directly). Detaching FIRST stops new BPF
+    /// invocations at the source (fast quiescence under load + a
+    /// crisp session bound: nothing executes past detach); the fence
+    /// then refuses laggards (`CLOSED`) and drain-waits (polls +
+    /// visibility grace/rescan). The old order (fence-then-detach
+    /// with a single all-zero poll) issued the receipt while an
+    /// admitted writer's increment could still be invisible to the
+    /// closer — a torn terminal read. Map faults fail loud; deadline
+    /// exhaustion yields `Pending`, never a receipt.
+    fn detach_and_close_fence(
+        state: &mut ConfiguredSession,
+    ) -> Result<crate::kcrypto_fence::CloseOutcome, BackendError> {
+        state.sensor.links.clear();
+        crate::kcrypto_fence::close_kernel_fence(&state.sensor.loaded.maps)
+            .map_err(|err| protocol("kcrypto_fence_close", &err.to_string()))
+    }
+
     /// Close owned links once, join and check the drain, then read one terminal
     /// non-atomic sample. Any failure makes finalization sticky-refused.
     pub fn finish_session(
@@ -219,20 +238,18 @@ impl KCryptoBackend {
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let state = configured(&mut guard, generation)?;
         state.active()?;
-        // ctx-v1 fence close (ADR-0009): refuse fresh entrants, then
-        // drain-wait BEFORE link close — a `Quiescent` receipt proves
-        // the terminal reads below saw no admitted writer. Map faults
-        // fail loud; a drained deadline yields `Pending` and the
-        // sample stays a non-atomic sample (never exact); a deadline
-        // exhaustion yields `Pending`, never a receipt.
-        let fence = crate::kcrypto_fence::close_kernel_fence(&state.sensor.loaded.maps)
-            .map_err(|err| protocol("kcrypto_fence_close", &err.to_string()))?;
+        // ctx-v1 fence close (ADR-0009, F1 order): detach FIRST, then
+        // refuse + drain — a `Quiescent` receipt proves the terminal
+        // reads below saw no admitted writer (nothing can start past
+        // detach+CLOSED; the grace+rescan closes the
+        // increment-visibility race). A `Pending` close keeps the
+        // sample a non-atomic sample (never exact).
+        let fence = Self::detach_and_close_fence(state)?;
         // F-01: the receipt gates the terminal ctx read below — a
         // `Pending` close must omit the line, never print a sample as
-        // terminal. Recorded before link close so it survives a later
-        // drain failure (the fence fact stays factual).
+        // terminal. Recorded before the drain stop so it survives a
+        // later drain failure (the fence fact stays factual).
         state.fence_outcome = Some(fence);
-        state.sensor.links.clear();
         let result = (|| {
             let drain = state
                 .drain

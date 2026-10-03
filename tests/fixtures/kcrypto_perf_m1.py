@@ -614,13 +614,18 @@ def _run_n_cgroup(argv0, opts):
         print(f"m1: {failed} actor children failed (worst rc={worst})",
               file=sys.stderr)
         return 1
+    # F6: t_end stamps the workload end (all children reaped),
+    # BEFORE the shard merge — the merge rewrites the whole ledger
+    # (seconds at M1 scale) and must not inflate the measure window.
+    # Its own cost rides merge_s.
+    t_end = time.monotonic_ns()
     try:
         (ops_total, ops_meas, rows_meas, fails, late, offered,
          t_warm_start, t_meas_start) = _merge_shards(shards, opts["ledger"])
     except (OSError, ValueError, AssertionError, KeyError) as exc:
         print(f"m1: shard merge failed: {exc}", file=sys.stderr)
         return 1
-    t_end = time.monotonic_ns()
+    t_merged = time.monotonic_ns()
     if t_meas_start is None:
         t_meas_start = t_end
     summary = {
@@ -629,6 +634,7 @@ def _run_n_cgroup(argv0, opts):
         "size": opts["size"], "t_warm_start_ns": t_warm_start,
         "t_meas_start_ns": t_meas_start, "t_end_ns": t_end,
         "meas_window_s": (t_end - t_meas_start) / 1e9,
+        "merge_s": (t_merged - t_end) / 1e9,
         "bulk": False, "paced": 0, "threads": actors,
         "offered": offered, "late": late,
         "pattern": "seq8", "iv": "seq64", "fails": fails,
@@ -648,6 +654,7 @@ def _run_n_cgroup(argv0, opts):
     print(f"driver done: ops={ops_total} meas={ops_meas} "
           f"rows={rows_meas} fails={fails} late={late} "
           f"wall_s={(t_end - t_warm_start) / 1e9:.1f} "
+          f"merge_s={(t_merged - t_end) / 1e9:.2f} "
           f"actors={actors} cgroups={cgroups}", flush=True)
     return 0 if fails == 0 else 1
 
@@ -697,13 +704,16 @@ def _run_churn(argv0, opts):
         print(f"m1: {failed} arrival children failed (worst rc={worst})",
               file=sys.stderr)
         return 1
+    # F6: t_end stamps the workload end (all arrivals reaped),
+    # BEFORE the arrival merge — same rule as the n_cgroup path.
+    t_end = time.monotonic_ns()
     try:
         (ops_total, ops_meas, rows_meas, fails, late, offered,
          t_warm_start, t_meas_start) = _merge_shards(shards, opts["ledger"])
     except (OSError, ValueError, AssertionError, KeyError) as exc:
         print(f"m1: arrival merge failed: {exc}", file=sys.stderr)
         return 1
-    t_end = time.monotonic_ns()
+    t_merged = time.monotonic_ns()
     if t_meas_start is None:
         t_meas_start = t_end
     summary = {
@@ -712,6 +722,7 @@ def _run_churn(argv0, opts):
         "size": opts["size"], "t_warm_start_ns": t_warm_start,
         "t_meas_start_ns": t_meas_start, "t_end_ns": t_end,
         "meas_window_s": (t_end - t_meas_start) / 1e9,
+        "merge_s": (t_merged - t_end) / 1e9,
         "bulk": False, "paced": 0, "threads": arrival,
         "offered": offered, "late": late,
         "pattern": "seq8", "iv": "seq64", "fails": fails,
@@ -731,6 +742,7 @@ def _run_churn(argv0, opts):
     print(f"driver done: ops={ops_total} meas={ops_meas} "
           f"rows={rows_meas} fails={fails} late={late} "
           f"wall_s={(t_end - t_warm_start) / 1e9:.1f} "
+          f"merge_s={(t_merged - t_end) / 1e9:.2f} "
           f"arrivals={arrival}", flush=True)
     return 0 if fails == 0 else 1
 

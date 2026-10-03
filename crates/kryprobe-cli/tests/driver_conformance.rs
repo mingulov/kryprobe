@@ -666,6 +666,9 @@ fn expected_agg_coverage(attached: usize, expected: usize, decoded: u64) -> Cove
     detailed_events
         .counters
         .push(counter("overflow_identities", 0));
+    detailed_events
+        .counters
+        .push(counter("ctx_overflow_identities", 0));
     detailed_events.counters.extend([
         counter("user_queue_drops", 0),
         counter("terminal_backlog_bytes", 0),

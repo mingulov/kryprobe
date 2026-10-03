@@ -19,7 +19,7 @@
 //! (`Documentation/bpf/btf.rst`, UAPI `linux/btf.h`).
 //!
 //! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
-//! 9-offsets + K5 attribution offsets + ctx-v1 start pair → 84B projection) and
+//! 9-offsets + K5 attribution offsets + ctx-v1 pairs → 92B projection) and
 //! [`load_kcrypto_configured`] (the single resolve → load → write-KCFG
 //! → attach entry K2 calls). K5 Task 3 adds [`resolve_kcrypto_offsets`]
 //! (fail-soft parent/params offsets + flags for the KCFG tail).
@@ -218,10 +218,17 @@ pub struct KcryptoOffsets {
     pub parent_ok: bool,
     /// True iff all four params offsets resolved.
     pub params_ok: bool,
-    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator).
+    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator —
+    /// read from the group leader, see below).
     pub task_start_off: u32,
     /// True iff the start-time member resolved.
     pub start_ok: bool,
+    /// `task_struct.group_leader` (bytes; F5: BPF chases the leader
+    /// before reading `start_time`, so `start_ns` is the
+    /// PROCESS-group start, never the current thread's).
+    pub task_group_leader_off: u32,
+    /// True iff the group-leader member resolved.
+    pub gl_ok: bool,
 }
 
 /// K5 attribution-offset resolution failure: the BTF image itself is
@@ -513,6 +520,11 @@ fn kcrypto_offsets_from_btf(btf: &Btf) -> KcryptoOffsets {
         Some(off) => (true, off),
         None => (false, 0),
     };
+    let (gl_ok, task_group_leader_off) = match btf.member_offset("task_struct", "group_leader").ok()
+    {
+        Some(off) => (true, off),
+        None => (false, 0),
+    };
     KcryptoOffsets {
         task_real_parent,
         task_tgid,
@@ -525,16 +537,18 @@ fn kcrypto_offsets_from_btf(btf: &Btf) -> KcryptoOffsets {
         params_ok,
         task_start_off,
         start_ok,
+        task_group_leader_off,
+        gl_ok,
     }
 }
 
 /// Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail + ctx-v1
-/// lifetime pair): the 9 resolved offsets + [`PF_KTHREAD`] + zero pad
-/// → the 84B [`KConfig`] in C2 word order, with the 7 K5 attribution
+/// lifetime pairs): the 9 resolved offsets + [`PF_KTHREAD`] + zero pad
+/// → the 92B [`KConfig`] in C2 word order, with the 7 K5 attribution
 /// offsets + flags (`parent_ok`/`params_ok` nonzero iff the group
 /// resolved — a false flag pairs with group zeros by
 /// [`resolve_kcrypto_offsets`]) plus the ctx-v1 start-time offset +
-/// `start_ok`.
+/// `start_ok` plus the ctx-v1 group-leader offset + `gl_ok` (F5).
 /// Total (no failure mode: every input word is copied verbatim).
 #[must_use]
 pub fn kconfig_from_offsets(off: AggregateOffsets, k5: KcryptoOffsets) -> KConfig {
@@ -563,6 +577,9 @@ pub fn kconfig_from_offsets(off: AggregateOffsets, k5: KcryptoOffsets) -> KConfi
         task_start_off: k5.task_start_off,
         start_ok: u8::from(k5.start_ok),
         _pad3: [0, 0, 0],
+        task_group_leader_off: k5.task_group_leader_off,
+        gl_ok: u8::from(k5.gl_ok),
+        _pad4: [0, 0, 0],
     }
 }
 
@@ -2316,11 +2333,12 @@ mod tests {
     #[test]
     fn kconfig_from_offsets_lays_out_c2_words() {
         // Pure CONFIG projection (K1 Task 3 head + K5 Task 3 tail +
-        // ctx-v1 lifetime pair): the 9 resolved offsets + PF_KTHREAD +
-        // zero pad → the 84B KCFG wire layout in C2 word order, with the
+        // ctx-v1 lifetime pairs): the 9 resolved offsets + PF_KTHREAD +
+        // zero pad → the 92B KCFG wire layout in C2 word order, with the
         // K5 attribution offsets + flags verbatim in the tail (a false
         // flag pairs with group zeros — here the params group is off,
-        // so its words are 0; the ctx-v1 start pair is on).
+        // so its words are 0; the ctx-v1 start pair is on, the F5
+        // group-leader pair is on).
         let off = AggregateOffsets {
             sk_req_base: 32,
             async_tfm: 32,
@@ -2344,9 +2362,11 @@ mod tests {
             params_ok: false,
             task_start_off: 1664,
             start_ok: true,
+            task_group_leader_off: 1392,
+            gl_ok: true,
         };
         let cfg = kconfig_from_offsets(off, k5);
-        let mut want = [0u8; 84];
+        let mut want = [0u8; 92];
         for (i, word) in [
             32u32, 32, 32, 60, 188, 44, PF_KTHREAD, 52, 48, 8, 0, 1432, 1424, 1648, 0, 0, 0, 0,
         ]
@@ -2359,10 +2379,13 @@ mod tests {
         want[73] = 0;
         want[76..80].copy_from_slice(&1664u32.to_le_bytes());
         want[80] = 1;
+        want[84..88].copy_from_slice(&1392u32.to_le_bytes());
+        want[88] = 1;
         assert_eq!(cfg.to_bytes(), want);
     }
 
     /// Synthetic K5 image: `task_struct` with the 3 parent members +
+    /// the 2 ctx-v1 lifetime members (`start_time`, `group_leader`) +
     /// `crypto_alg` with the 4 params members. `drop` omits one member
     /// entirely (group fail-soft proof).
     fn k5_fixture(drop: Option<(&str, &str)>) -> Vec<u8> {
@@ -2390,6 +2413,7 @@ mod tests {
                 ("tgid", 1424),
                 ("comm", 1648),
                 ("start_time", 1664),
+                ("group_leader", 1392),
             ],
         );
         named(
@@ -2422,6 +2446,8 @@ mod tests {
                 params_ok: true,
                 task_start_off: 1664,
                 start_ok: true,
+                task_group_leader_off: 1392,
+                gl_ok: true,
             }
         );
     }
@@ -2466,6 +2492,24 @@ mod tests {
             ),
             (0, 0, 0, 0)
         );
+        // Each ctx-v1 lifetime member fails soft INDEPENDENTLY (F5):
+        // a missing `group_leader` zeroes only its own pair (BPF then
+        // emits the unknown-lifetime bucket), never the parent/params
+        // groups or the start-time pair.
+        let bytes = k5_fixture(Some(("task_struct", "group_leader")));
+        let off = resolve_kcrypto_offsets_from(&bytes).expect("fail-soft never errs");
+        assert!(off.parent_ok);
+        assert!(off.params_ok);
+        assert!(off.start_ok);
+        assert_eq!(off.task_start_off, 1664);
+        assert!(!off.gl_ok);
+        assert_eq!(off.task_group_leader_off, 0);
+        let bytes = k5_fixture(Some(("task_struct", "start_time")));
+        let off = resolve_kcrypto_offsets_from(&bytes).expect("fail-soft never errs");
+        assert!(!off.start_ok);
+        assert_eq!(off.task_start_off, 0);
+        assert!(off.gl_ok);
+        assert_eq!(off.task_group_leader_off, 1392);
     }
 
     #[test]

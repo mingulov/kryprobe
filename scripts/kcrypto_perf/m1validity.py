@@ -76,10 +76,85 @@ def parse_ctx_telemetry(path: Path) -> dict:
     return out
 
 
+def parse_attach_audit(path: Path) -> dict:
+    """Last ``{"audit": "attach", ...}`` object from a capture stderr log.
+
+    Returns ``{"attached": int, "expected": int}`` (bools rejected
+    like the frozen consumer). Raises ``ValueError`` when no attach
+    audit exists or any value is mistyped/missing — the caller
+    converts this to a diag-invalid reason (fail-closed).
+    """
+    try:
+        text = Path(path).read_text()
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    found = None
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("audit") == "attach":
+            found = obj
+    if found is None:
+        raise ValueError(f"{path}: no attach audit object")
+    out = {}
+    for key in ("attached", "expected"):
+        if key not in found:
+            raise ValueError(f"{path}: attach.{key} missing")
+        val = found[key]
+        if not isinstance(val, int) or isinstance(val, bool):
+            raise ValueError(f"{path}: attach.{key}={val!r} not int")
+        out[key] = val
+    return out
+
+
+def parse_ctx_overflow_counter(path: Path) -> int:
+    """``ctx_overflow_identities`` from a sealed report's
+    ``coverage.detailed_events.counters``.
+
+    M1-local extraction — the frozen parser's loss-counter set is
+    untouched. Counter values are JSON strings (serde);
+    ``int(value)`` mirrors the frozen consumer. Raises ``ValueError``
+    when the report is unreadable, the counter is missing, or its
+    value is mistyped — the caller converts this to a leg-invalid
+    reason (fail-closed).
+    """
+    try:
+        doc = json.loads(Path(path).read_text())
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    except ValueError as err:
+        raise ValueError(f"bad JSON in {path}: {err}") from err
+    try:
+        counters = doc["coverage"]["detailed_events"]["counters"]
+    except (KeyError, TypeError) as err:
+        raise ValueError(
+            f"{path}: no detailed_events counters: {err}") from err
+    for entry in counters:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") == "ctx_overflow_identities":
+            try:
+                return int(entry.get("value"))
+            except (TypeError, ValueError) as err:
+                raise ValueError(
+                    f"{path}: bad ctx_overflow_identities counter "
+                    f"{entry.get('value')!r}: {err}") from err
+    raise ValueError(f"{path}: ctx_overflow_identities counter missing")
+
+
 def check_ctx_leg(ctx: dict, totals_calls, shape: str,
-                  expected_rows: int) -> list:
+                  expected_rows: int, ctx_overflow=None) -> list:
     """M1 ctx exactness rules for one C leg. Returns reasons (empty =
-    valid). ``totals_calls`` is the report TOTALS calls (cross-check).
+    valid). ``totals_calls`` is the report TOTALS calls (cross-check);
+    ``ctx_overflow`` is the sealed ``ctx_overflow_identities``
+    coverage counter (F8: 0 on below-cap shapes, >= 1 on churn_full —
+    first-per-kh lower bound, freeze §5). ``None`` means the counter
+    is unreadable (invalid, never skipped).
     No driver-oracle arithmetic (A2): kernel calls per roundtrip are
     shape- and kernel-dependent (2 flat, 4 6.12-floor, plus allocs),
     and frozen validity already reconciles driver↔sensor per-op."""
@@ -111,6 +186,11 @@ def check_ctx_leg(ctx: dict, totals_calls, shape: str,
         # the identity above).
         if present is None or drops is None:
             reasons.append("churn_full present/drops unreadable")
+        # F4 (codex review): without this gate, a leg with readable
+        # present/drops but missing system+unknown (e.g. unreadable
+        # report TOTALS) passes every guarded comparison silently.
+        if system is None or unknown is None:
+            reasons.append("churn_full system/unknown unreadable")
         if unknown is not None and drops is not None:
             if unknown != drops:
                 reasons.append(
@@ -119,6 +199,15 @@ def check_ctx_leg(ctx: dict, totals_calls, shape: str,
             reasons.append(
                 f"churn_full unknown={unknown}, want > 0 (saturation "
                 "must show)")
+        # F8: the sealed overflow counter must show the saturation
+        # (first-per-kh gating: lower bound, so >= 1, never exact).
+        if ctx_overflow is None:
+            reasons.append(
+                "churn_full ctx_overflow_identities unreadable")
+        elif ctx_overflow < 1:
+            reasons.append(
+                f"churn_full ctx_overflow_identities={ctx_overflow}, "
+                "want >= 1 (saturation must show)")
     else:
         # expected_rows=None skips the row pin (6.12 diagnostic: the
         # floor splits kh across cryptd arms, so exactness without a
@@ -129,6 +218,13 @@ def check_ctx_leg(ctx: dict, totals_calls, shape: str,
             reasons.append(f"{shape} unknown={unknown}, want 0")
         if drops != 0:
             reasons.append(f"{shape} drops={drops}, want 0")
+        # F8: below capacity nothing may overflow — a nonzero sealed
+        # counter contradicts the clean drops/unknown above.
+        if ctx_overflow is None:
+            reasons.append(f"{shape} ctx_overflow_identities unreadable")
+        elif ctx_overflow != 0:
+            reasons.append(f"{shape} ctx_overflow_identities="
+                           f"{ctx_overflow}, want 0")
         if expected_rows is not None and rows != expected_rows:
             reasons.append(
                 f"{shape} rows={rows}, want exactly {expected_rows}")

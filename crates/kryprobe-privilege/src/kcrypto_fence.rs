@@ -190,11 +190,21 @@ pub fn open_kernel_fence(maps: &KcryptoMaps) -> Result<(), MapOpsError> {
 }
 
 /// Close the kernel fence: write `CLOSED = 1`, then wait (bounded)
-/// for every `KCTLCOUNT` lane to drain to zero. At all-zero record
-/// the completion bound and return the `Quiescent` receipt; on
+/// for every `KCTLCOUNT` lane to drain to zero. At all-zero, sleep a
+/// visibility grace and re-scan: only a second all-zero read records
+/// the completion bound and returns the `Quiescent` receipt. On
 /// deadline exhaustion return `Pending` (timeout never yields
 /// `Quiescent`). Map faults fail loud ([`MapOpsError`]) — a broken
 /// control read is structural, never a silent zero.
+///
+/// Why the grace + rescan (F1): a first all-zero read can race a
+/// still-invisible admitted increment (BPF store → other-CPU map-read
+/// visibility latency). After the grace any such store is visible,
+/// and no NEW admission can start past `CLOSED` (refused entrants
+/// touch nothing) — so the second all-zero read proves quiescence.
+/// Callers detach links BEFORE calling (see
+/// `detach_and_close_fence`): no new invocations can start at all
+/// past detach, and the polls drain the stragglers.
 pub fn close_kernel_fence(maps: &KcryptoMaps) -> Result<CloseOutcome, MapOpsError> {
     map_update_bytes(
         &maps.ctl_closed,
@@ -205,9 +215,14 @@ pub fn close_kernel_fence(maps: &KcryptoMaps) -> Result<CloseOutcome, MapOpsErro
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if kernel_lanes_drained(maps)? {
-            return Ok(CloseOutcome::Quiescent(QuiescentReceipt {
-                fence_ns: now_ns(),
-            }));
+            // Visibility grace (F1): >100x any store-visibility or
+            // detach latency; burns deadline like any other wait.
+            std::thread::sleep(Duration::from_millis(5));
+            if kernel_lanes_drained(maps)? {
+                return Ok(CloseOutcome::Quiescent(QuiescentReceipt {
+                    fence_ns: now_ns(),
+                }));
+            }
         }
         if Instant::now() >= deadline {
             return Ok(CloseOutcome::Pending);

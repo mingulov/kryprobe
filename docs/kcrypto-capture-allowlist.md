@@ -30,7 +30,7 @@ counts, return/error class, timestamps, PID/TGID/comm/cgroup metadata,
 and kernel/build metadata. Every field below cites the §9 category it
 falls under (plus the sharper kp2 section where one exists).
 
-## `KCFG`: loader-written config, not observations (84B `KConfig`)
+## `KCFG`: loader-written config, not observations (92B `KConfig`)
 
 Written once by `load_kcrypto_configured` from live-BTF resolution
 (`kconfig_from_offsets`); never touched by traffic. WHY: kernel/build
@@ -63,6 +63,9 @@ the BPF cannot chase request→tfm→algorithm.
 | `task_start_off` | u32 | BTF `task_struct.start_time` (ctx-v1) | kernel layout metadata |
 | `start_ok` | u8 | nonzero iff the start offset resolved (ctx-v1) | resolution flag, not an observation |
 | `_pad3` | 3B | zero | reserved, always 0 |
+| `task_group_leader_off` | u32 | BTF `task_struct.group_leader` (ctx-v1, F5) | kernel layout metadata |
+| `gl_ok` | u8 | nonzero iff the group-leader offset resolved (ctx-v1, F5) | resolution flag, not an observation |
+| `_pad4` | 3B | zero | reserved, always 0 |
 
 ## `KAGG` key: attribution head + identity (260B `KAgg`)
 
@@ -214,7 +217,7 @@ Zeros mean unreadable (own explicit bucket, never merged).
 | `cgroup` | u64 | `bpf_get_current_cgroup_id` at event time (0 = unreadable) | cgroup metadata (kp2 §9) |
 | `tgid` | u32 | event-time thread-group id | PID/TGID metadata (kp2 §9) |
 | `uid` | u32 | event-time uid (low 32) | uid metadata (kp2 §9) |
-| `start_ns` | u64 | `task_struct.start_time` via BTF offset, iff `start_ok` (0 = unreadable) | process-lifetime discriminator (kp2 §9) |
+| `start_ns` | u64 | `task_struct.group_leader->start_time` via BTF offsets, iff `start_ok` + `gl_ok` (0 = unreadable) | process-lifetime discriminator (kp2 §9) |
 
 ## `KCTX` value: context counters (56B `VCtx`, ctx-v1)
 

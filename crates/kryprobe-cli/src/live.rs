@@ -945,6 +945,13 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     detailed_events
         .counters
         .push(counter("overflow_identities", m.overflow_identities));
+    // F8 (M1 review): the ctx identity-overflow magnitude rides the
+    // sealed report next to its KIDN twin — the M1 judge pins it
+    // (0 below capacity, >= 1 on churn_full).
+    detailed_events.counters.push(counter(
+        "ctx_overflow_identities",
+        m.ctx_overflow_identities,
+    ));
     detailed_events.counters.extend([
         counter("user_queue_drops", m.queue_drops),
         counter("terminal_backlog_bytes", m.backlog_bytes),

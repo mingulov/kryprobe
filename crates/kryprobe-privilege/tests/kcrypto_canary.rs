@@ -318,8 +318,8 @@ fn kconfig_bytes_match_live_resolver() {
     let bytes = kconfig_from_offsets(off, k5).to_bytes();
     assert_eq!(
         bytes.len(),
-        84,
-        "KCFG wire is 84B (C2 + shash_base + K5 tail + ctx-v1 tail)"
+        92,
+        "KCFG wire is 92B (C2 + shash_base + K5 tail + ctx-v1 tail + F5 tail)"
     );
     let word =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
@@ -353,6 +353,14 @@ fn kconfig_bytes_match_live_resolver() {
     assert_eq!(word(76), k5.task_start_off, "word 19: task_start_off");
     assert_eq!(bytes[80], u8::from(k5.start_ok), "start_ok flag");
     assert_eq!(&bytes[81..84], &[0, 0, 0], "ctx tail zero pad");
+    // F5 tail: group-leader offset verbatim + flag as 0/1 + zero pad.
+    assert_eq!(
+        word(84),
+        k5.task_group_leader_off,
+        "word 21: task_group_leader_off"
+    );
+    assert_eq!(bytes[88], u8::from(k5.gl_ok), "gl_ok flag");
+    assert_eq!(&bytes[89..92], &[0, 0, 0], "F5 tail zero pad");
 }
 
 /// Our bpffs pin dir (pid-suffixed: never collides, never shared).

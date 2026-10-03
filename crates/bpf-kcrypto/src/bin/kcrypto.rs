@@ -160,8 +160,8 @@ const MAX_ERRNO: u64 = 4095;
 /// `KCFG` value: the K1 offsets + kthread flag + pad (44B head,
 /// offsets unchanged) + the 7 K5 attribution offsets +
 /// `parent_ok`/`params_ok` + pad (76B) + the ctx-v1 lifetime offset +
-/// `start_ok` + pad (84B total). Append-only: every earlier offset is
-/// unchanged.
+/// `start_ok` + pad (84B) + the ctx-v1 group-leader offset + `gl_ok`
+/// + pad (92B total). Append-only: every earlier offset is unchanged.
 #[repr(C)]
 pub struct KConfig {
     pub sk_req_base: u32,
@@ -185,13 +185,24 @@ pub struct KConfig {
     pub parent_ok: u8,
     pub params_ok: u8,
     pub _pad2: [u8; 2],
-    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator).
+    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator —
+    /// read from the group leader, see below).
     pub task_start_off: u32,
     /// Nonzero iff the start offset resolved (BPF emits `start_ns == 0`
     /// — the unknown-lifetime bucket — when false).
     pub start_ok: u8,
     /// Reserved, zero.
     pub _pad3: [u8; 3],
+    /// `task_struct.group_leader` (bytes; F5: `ctx_record` chases the
+    /// leader before reading `start_time`, so `start_ns` is the
+    /// PROCESS-group start, never the current thread's).
+    pub task_group_leader_off: u32,
+    /// Nonzero iff the group-leader offset resolved (BPF emits
+    /// `start_ns == 0` when false — a thread start must never
+    /// masquerade as a process start).
+    pub gl_ok: u8,
+    /// Reserved, zero.
+    pub _pad4: [u8; 3],
 }
 
 /// `KAGG` key: attribution head + 128B alg + 128B drv, 260B packed.
@@ -298,7 +309,7 @@ pub struct VCtx {
 
 // SAME numbers as the ABI mirrors + loader KCRYPTO_MAPS (duplication
 // deliberate + cited: a dims drift must fail here AND at load).
-const _: () = assert!(size_of::<KConfig>() == 84);
+const _: () = assert!(size_of::<KConfig>() == 92);
 const _: () = assert!(size_of::<KAgg>() == 260);
 const _: () = assert!(size_of::<VAgg>() == 120);
 const _: () = assert!(size_of::<KCtl>() == 48);
@@ -880,17 +891,7 @@ fn ctx_overflow_path(kh: u64, head: u64, lens: u64, now: u64) {
 /// dead (copied into the map by the insert, or never built on the
 /// hit path).
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn ctx_record(
-    kh: u64,
-    now: u64,
-    nbytes: u64,
-    res: u8,
-    cfg: &Cfg,
-    head: u64,
-    lens: u64,
-    aux: *mut u8,
-) {
+fn ctx_record(kh: u64, now: u64, nbytes: u64, res: u8, head: u64, lens: u64, aux: *mut u8) {
     // SAFETY: `aux` spans 120 bytes; the carves below (0..56, 64..96)
     // are inside it, disjoint, and 8-aligned.
     let key_slot = unsafe { aux.add(64) } as *mut KCtxKey;
@@ -898,16 +899,30 @@ fn ctx_record(
     // SAFETY: raw helper, no pointer arguments (same call as `who_upsert`).
     let cgroup = unsafe { bpf_get_current_cgroup_id() };
     let uid = bpf_get_current_uid_gid() as u32;
-    let start_ns = if cfg.start_ok != 0 {
-        // SAFETY: helper with no pointer arguments.
-        let task = unsafe { bpf_get_current_task() };
-        if task != 0 {
-            read_u64(task.wrapping_add(cfg.task_start_off as u64))
-        } else {
-            0
+    // F5: the contract wants the PROCESS-group start
+    // (`task_struct.group_leader->start_time`), not the current
+    // thread's. The lifetime offsets come from `KCFG` here (same
+    // lookup shape as `chase_parent`; per-event because `start_ns`
+    // is key material, and `Cfg` has no room for them). Flags-off, a
+    // 0 leader, or an unreadable row degrades to the
+    // unknown-lifetime bucket — never a thread start masquerading
+    // as a process start.
+    let start_ns = match KCFG.get(0) {
+        Some(row) if row.start_ok != 0 && row.gl_ok != 0 => {
+            // SAFETY: helper with no pointer arguments.
+            let task = unsafe { bpf_get_current_task() };
+            if task == 0 {
+                0
+            } else {
+                let leader = read_u64(task.wrapping_add(row.task_group_leader_off as u64));
+                if leader == 0 {
+                    0
+                } else {
+                    read_u64(leader.wrapping_add(row.task_start_off as u64))
+                }
+            }
         }
-    } else {
-        0
+        _ => 0,
     };
     unsafe {
         core::ptr::addr_of_mut!((*key_slot).kh).write(kh);
@@ -1328,7 +1343,6 @@ fn observe(
         now,
         nbytes,
         res,
-        cfg,
         head,
         lens,
         aux.as_mut_ptr() as *mut u8,
@@ -1362,6 +1376,10 @@ fn observe(
 /// read by a second miss-only `KCFG` lookup in `who_record`, so the
 /// per-event `Cfg` stays small and the 512B frame fits; the ctx-v1
 /// lifetime pair rides along — every hook needs it per event).
+/// Per-event hot config (40B): the K1 offsets only. The ctx-v1
+/// lifetime offsets are NOT copied here — `ctx_record` reads them
+/// from `KCFG` itself (one array lookup per event; the frame budget
+/// has no room for a wider `Cfg`).
 struct Cfg {
     sk_req_base: u32,
     async_tfm: u32,
@@ -1373,8 +1391,6 @@ struct Cfg {
     aead_cryptlen_off: u32,
     ahash_nbytes_off: u32,
     shash_base: u32,
-    task_start_off: u32,
-    start_ok: u8,
 }
 
 /// Load the `KCFG` row into stack scalars (`None` = skipped observation;
@@ -1398,8 +1414,6 @@ fn load_cfg() -> Option<Cfg> {
                 aead_cryptlen_off: cfg.aead_cryptlen_off,
                 ahash_nbytes_off: cfg.ahash_nbytes_off,
                 shash_base: cfg.shash_base,
-                task_start_off: cfg.task_start_off,
-                start_ok: cfg.start_ok,
             })
         }
         None => None,

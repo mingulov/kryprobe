@@ -145,6 +145,31 @@ pub fn fold_vctx(lanes: &[VCtx]) -> VCtx {
     out
 }
 
+/// Checked [`fold_vctx`]: `None` when any counter lane-sum overflows
+/// (ADR-0008 §(e): saturation of any input counter refuses the
+/// receipt — never a silent wrap). The receipt path
+/// (`snapshot_ctx`) uses this; tick-path grouping keeps the
+/// saturating fold (codebase precedent for non-receipt folds).
+pub fn try_fold_vctx(lanes: &[VCtx]) -> Option<VCtx> {
+    let mut out = VCtx::default();
+    let mut first = u64::MAX;
+    let mut any = false;
+    for lane in lanes {
+        out.calls = out.calls.checked_add(lane.calls)?;
+        out.bytes = out.bytes.checked_add(lane.bytes)?;
+        out.ok = out.ok.checked_add(lane.ok)?;
+        out.errors = out.errors.checked_add(lane.errors)?;
+        out.queued = out.queued.checked_add(lane.queued)?;
+        out.last_ns = out.last_ns.max(lane.last_ns);
+        if lane.calls > 0 {
+            any = true;
+            first = first.min(lane.first_ns);
+        }
+    }
+    out.first_ns = if any { first } else { 0 };
+    Some(out)
+}
+
 /// Decode one `u64` lane word; `None` on a short buffer.
 fn lane_word(bytes: &[u8], at: usize) -> Option<u64> {
     bytes
@@ -243,5 +268,45 @@ mod tests {
         assert_eq!(folded.first_ns, 100);
         assert_eq!(folded.last_ns, 200);
         assert_eq!(fold_vctx(&[idle, idle]).first_ns, 0);
+    }
+
+    #[test]
+    fn try_fold_matches_saturating_fold_when_clean() {
+        let busy = VCtx {
+            calls: 5,
+            bytes: 7,
+            first_ns: 100,
+            last_ns: 200,
+            ..VCtx::default()
+        };
+        let idle = VCtx::default();
+        assert_eq!(
+            try_fold_vctx(&[idle, busy, idle]),
+            Some(fold_vctx(&[idle, busy, idle]))
+        );
+    }
+
+    #[test]
+    fn try_fold_refuses_saturated_counters() {
+        // F8a (M1 review): ADR-0008 §(e) — saturation refuses the
+        // receipt, never a silent wrap.
+        let full = VCtx {
+            calls: u64::MAX,
+            ..VCtx::default()
+        };
+        let one = VCtx {
+            calls: 1,
+            ..VCtx::default()
+        };
+        assert_eq!(try_fold_vctx(&[full, one]), None);
+        let full_bytes = VCtx {
+            bytes: u64::MAX,
+            ..VCtx::default()
+        };
+        let some_bytes = VCtx {
+            bytes: 3,
+            ..VCtx::default()
+        };
+        assert_eq!(try_fold_vctx(&[full_bytes, some_bytes]), None);
     }
 }

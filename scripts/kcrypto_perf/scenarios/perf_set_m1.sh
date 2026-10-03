@@ -15,8 +15,8 @@
 # expected_alloc and is NEVER passed to the M1 driver (its --threads
 # stays 1; actor shape comes from M1_DRIVER_FLAGS). $1 = staged out dir.
 # Exit 0: all legs attempted; exit 2: set abort (ambient traffic,
-# attach timeout, or module failure) — host seals partial, verify
-# marks the set INVALID (never retried into green).
+# attach timeout, warmup failure, or module failure) — host seals
+# partial, verify marks the set INVALID (never retried into green).
 set -u
 OUT="$1"
 . "$OUT/pins.env"
@@ -143,6 +143,26 @@ start_capture() {
     2> "$OUT/legs/$leg-capture.stderr.log" &
   CAP_PID=$!
 }
+
+# Pre-quiet crypto warmup (F2 + A3): first-use kernel autoloads (alg
+# templates, request_module workers) fire crypto kevents on their
+# first request — inside the quiet window or the first leg they read
+# as ambient/pollution (canary leg00A). One tiny driver run through
+# the REAL leg path BEFORE quiet absorbs every first-use load (same
+# cipher the legs use, so the same module set); request_module is
+# synchronous, so the boot is quiescent when the warmup exits. No
+# observer runs during warmup (nothing to pollute); the throwaway
+# warmup-* files are sealed with the cell for audit and ignored by
+# the judge (it iterates staged legs.tsv rows, not files). Warmup
+# failure aborts the boot (the legs would fail the same way — loud,
+# never retried into green).
+run_driver "warmup" "skcipher" "4096" "1" "1"
+if ! grep -q "^driver_rc=0$" "$OUT/legs/warmup-driver-rc.txt" 2>/dev/null \
+  || ! grep -q "^driver_timeout=0$" "$OUT/legs/warmup-driver-rc.txt" \
+  2>/dev/null; then
+  echo "FAIL=warmup" > "$OUT/done.txt"
+  exit 2
+fi
 
 # Quiet leg: any ambient crypto traffic aborts the boot (fast fail —
 # a polluted boot cannot yield equivalent-work pairs). Runs the side-B

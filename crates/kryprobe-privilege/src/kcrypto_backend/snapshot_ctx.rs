@@ -11,7 +11,9 @@
 use super::SnapshotError;
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
-use kryprobe_abi::kcrypto_ctx::{KCtxKey, VCtx, fold_vctx, kctx_key_from_bytes, vctx_from_bytes};
+use kryprobe_abi::kcrypto_ctx::{
+    KCtxKey, VCtx, kctx_key_from_bytes, try_fold_vctx, vctx_from_bytes,
+};
 
 /// One snapshotted context row: the folded `KCTX` value for its key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,10 +64,14 @@ pub fn snapshot_ctx(maps: &ConfiguredKcrypto) -> Result<(Vec<CtxSnapshot>, u64),
                 })?;
             lanes.push(lane);
         }
-        out.push(CtxSnapshot {
-            key: ctx_key,
-            val: fold_vctx(&lanes),
-        });
+        // F8a: checked lane fold — a saturated per-key row fails
+        // the whole snapshot (ADR-0008 §(e): saturation refuses the
+        // receipt).
+        let val = try_fold_vctx(&lanes).ok_or_else(|| MapOpsError::LookupFailed {
+            stage: "snapshot/ctx-lane-overflow".to_owned(),
+            errno: libc::EOVERFLOW,
+        })?;
+        out.push(CtxSnapshot { key: ctx_key, val });
     }
     let drops = read_kctx_drops(maps)?;
     Ok((out, drops))
@@ -90,6 +96,14 @@ pub(crate) fn read_kctx_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotE
         Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => return Ok(0),
         Err(err) => return Err(err.into()),
     };
+    sum_u64_lanes(&raw, ncpu)
+}
+
+/// Checked sum of one `u64`-per-lane array slice (F8a): a short
+/// buffer fails `EBADMSG` (same as before); a lane-sum overflow
+/// fails `EOVERFLOW` (ADR-0008 §(e): saturation refuses the receipt
+/// — never a silent wrap).
+fn sum_u64_lanes(raw: &[u8], ncpu: usize) -> Result<u64, SnapshotError> {
     let mut total = 0u64;
     for c in 0..ncpu {
         let lane = raw
@@ -100,7 +114,12 @@ pub(crate) fn read_kctx_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotE
             })?;
         let mut word = [0u8; 8];
         word.copy_from_slice(lane);
-        total = total.saturating_add(u64::from_le_bytes(word));
+        total = total.checked_add(u64::from_le_bytes(word)).ok_or_else(|| {
+            MapOpsError::LookupFailed {
+                stage: "snapshot/ctx-drops-overflow".to_owned(),
+                errno: libc::EOVERFLOW,
+            }
+        })?;
     }
     Ok(total)
 }
@@ -114,10 +133,11 @@ pub fn snapshot_ctx_terminal(maps: &ConfiguredKcrypto) -> crate::kcrypto_snapsho
     use crate::kcrypto_snapshot::{CtxTerminal, ParsedRow, parse_snapshot_row, read_ktot};
     let (rows, present_calls, drops) = match snapshot_ctx(maps) {
         Ok((rows, drops)) => {
-            let present = rows
-                .iter()
-                .fold(0u64, |acc, row| acc.saturating_add(row.val.calls));
-            (Some(rows.len() as u64), Some(present), Some(drops))
+            // F8a: checked present sum — saturation refuses the
+            // present operand (=> unknown None => the judge INVALIDs
+            // the leg), same fail-soft shape as the checked_sub below.
+            let present = sum_present_calls(&rows);
+            (Some(rows.len() as u64), present, Some(drops))
         }
         Err(_) => (None, None, None),
     };
@@ -137,5 +157,71 @@ pub fn snapshot_ctx_terminal(maps: &ConfiguredKcrypto) -> crate::kcrypto_snapsho
         system_calls,
         unknown_calls,
         drops,
+    }
+}
+
+/// Checked sum of folded per-key `calls` (F8a): `None` on overflow
+/// (ADR-0008 §(e): saturation refuses the receipt operand — never a
+/// silent wrap).
+fn sum_present_calls(rows: &[CtxSnapshot]) -> Option<u64> {
+    rows.iter()
+        .try_fold(0u64, |acc, row| acc.checked_add(row.val.calls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot_with_calls(calls: u64) -> CtxSnapshot {
+        CtxSnapshot {
+            key: KCtxKey::default(),
+            val: VCtx {
+                calls,
+                ..VCtx::default()
+            },
+        }
+    }
+
+    #[test]
+    fn present_sum_clean() {
+        let rows = vec![snapshot_with_calls(100), snapshot_with_calls(23)];
+        assert_eq!(sum_present_calls(&rows), Some(123));
+        assert_eq!(sum_present_calls(&[]), Some(0));
+    }
+
+    #[test]
+    fn present_sum_overflow_refuses() {
+        // F8a (M1 review): ADR-0008 §(e) — saturation refuses the
+        // receipt operand.
+        let rows = vec![snapshot_with_calls(u64::MAX), snapshot_with_calls(1)];
+        assert_eq!(sum_present_calls(&rows), None);
+    }
+
+    #[test]
+    fn drops_lanes_clean() {
+        let mut raw = vec![0u8; 16];
+        raw[0..8].copy_from_slice(&40u64.to_le_bytes());
+        raw[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(sum_u64_lanes(&raw, 2).unwrap(), 42);
+    }
+
+    #[test]
+    fn drops_lanes_short_buffer_is_ebadmsg() {
+        let raw = vec![0u8; 8];
+        let err = sum_u64_lanes(&raw, 2).unwrap_err();
+        let stage = format!("{err:?}");
+        assert!(stage.contains("snapshot/ctx-drops-lane"), "{stage}");
+    }
+
+    #[test]
+    fn drops_lanes_overflow_is_eoverflow() {
+        // F8a (M1 review): ADR-0008 §(e) — saturation refuses the
+        // receipt, never a silent wrap.
+        let mut raw = vec![0u8; 16];
+        raw[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        raw[8..16].copy_from_slice(&1u64.to_le_bytes());
+        let err = sum_u64_lanes(&raw, 2).unwrap_err();
+        let stage = format!("{err:?}");
+        assert!(stage.contains("snapshot/ctx-drops-overflow"), "{stage}");
     }
 }

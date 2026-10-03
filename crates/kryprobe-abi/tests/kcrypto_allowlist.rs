@@ -39,6 +39,9 @@ const KCONFIG_WANT: &[&str] = &[
     "task_start_off",
     "start_ok",
     "_pad3",
+    "task_group_leader_off",
+    "gl_ok",
+    "_pad4",
 ];
 const KAGG_WANT: &[&str] = &["fam", "op", "res", "ctx", "alg", "drv"];
 const VAGG_WANT: &[&str] = &[
@@ -199,6 +202,9 @@ fn field_lists_match_declarations() {
         task_start_off,
         start_ok,
         _pad3,
+        task_group_leader_off,
+        gl_ok,
+        _pad4,
     } = KConfig::default();
     let _ = (
         sk_req_base,
@@ -225,6 +231,9 @@ fn field_lists_match_declarations() {
         task_start_off,
         start_ok,
         _pad3,
+        task_group_leader_off,
+        gl_ok,
+        _pad4,
     );
     let KAgg {
         fam,

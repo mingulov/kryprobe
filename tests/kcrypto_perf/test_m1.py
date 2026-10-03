@@ -15,8 +15,11 @@ the product worktree root::
 
 import importlib.util
 import json
+import os
+import socket
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -44,6 +47,19 @@ def write_tmp(content, suffix=""):
     fh.write(content)
     fh.close()
     return Path(fh.name)
+
+
+def _afalg_usable():
+    """Probe AF_ALG cbc(aes) (the M1 driver's cipher): driver live-run
+    tests skip loudly without it (capability probe, not a behavior
+    skip)."""
+    try:
+        sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+        sock.bind(("skcipher", "cbc(aes)"))
+        sock.close()
+    except OSError:
+        return False
+    return True
 
 
 class ManifestTests(unittest.TestCase):
@@ -186,12 +202,42 @@ class CtxParseTests(unittest.TestCase):
         self.assertIsNone(ctx["rows"])
 
 
+class AttachAuditTests(unittest.TestCase):
+    def _line(self, obj):
+        return json.dumps(obj) + "\n"
+
+    def test_happy_path_last_wins(self):
+        content = (self._line({"audit": "attach", "attached": 8,
+                               "expected": 9})
+                   + self._line({"audit": "attach", "attached": 9,
+                                 "expected": 9}))
+        audit = m1validity.parse_attach_audit(write_tmp(content))
+        self.assertEqual(audit, {"attached": 9, "expected": 9})
+
+    def test_missing_raises(self):
+        content = self._line({"audit": "object-load", "path": "x"})
+        with self.assertRaises(ValueError):
+            m1validity.parse_attach_audit(write_tmp(content))
+
+    def test_mistyped_and_bool_rejected(self):
+        cases = ({"attached": 9.0, "expected": 9},
+                 {"attached": True, "expected": 9},
+                 {"attached": 9, "expected": "9"},
+                 {"attached": 9})
+        for bad in cases:
+            obj = {"audit": "attach"}
+            obj.update(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                m1validity.parse_attach_audit(write_tmp(self._line(obj)))
+
+
 class CtxRuleTests(unittest.TestCase):
     def test_below_capacity_exact(self):
         ctx = {"rows": 192, "present_calls": 5000, "system_calls": 5000,
                "unknown_calls": 0, "drops": 0}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 5000, "n_cgroup", 192), [])
+            m1validity.check_ctx_leg(ctx, 5000, "n_cgroup", 192,
+                                     ctx_overflow=0), [])
 
     def test_below_capacity_violations(self):
         base = {"rows": 3, "present_calls": 100, "system_calls": 100,
@@ -211,41 +257,45 @@ class CtxRuleTests(unittest.TestCase):
             # (system/present/unknown must still add up unless the
             # contradiction itself is under test).
             reasons = m1validity.check_ctx_leg(ctx, ctx["system_calls"],
-                                              "single", 3)
+                                              "single", 3, ctx_overflow=0)
             self.assertTrue(any(needle in reason for reason in reasons),
                             f"{delta} -> {reasons}")
 
     def test_contradiction_distinct_from_unreadable(self):
         ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
                "unknown_calls": None, "drops": 0}
-        reasons = m1validity.check_ctx_leg(ctx, 100, "single", 3)
+        reasons = m1validity.check_ctx_leg(ctx, 100, "single", 3,
+                                           ctx_overflow=0)
         self.assertTrue(any("contradiction" in reason for reason in reasons))
 
     def test_system_must_match_report_totals(self):
         ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
                "unknown_calls": 0, "drops": 0}
-        reasons = m1validity.check_ctx_leg(ctx, 999, "single", 3)
+        reasons = m1validity.check_ctx_leg(ctx, 999, "single", 3,
+                                           ctx_overflow=0)
         self.assertTrue(any("report totals" in reason for reason in reasons))
 
     def test_churn_full_rules(self):
         ctx = {"rows": 1024, "present_calls": 9000, "system_calls": 10000,
                "unknown_calls": 1000, "drops": 1000}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024),
+            m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024,
+                                     ctx_overflow=7),
             [])
         bad_rows = dict(ctx, rows=1023)
         self.assertTrue(m1validity.check_ctx_leg(
-            bad_rows, 10000, "churn_full", 1024))
+            bad_rows, 10000, "churn_full", 1024, ctx_overflow=7))
         bad_silent = dict(ctx, unknown_calls=0, drops=0,
                           present_calls=10000)
         self.assertTrue(m1validity.check_ctx_leg(
-            bad_silent, 10000, "churn_full", 1024))
+            bad_silent, 10000, "churn_full", 1024, ctx_overflow=7))
 
     def test_expected_rows_none_skips_pin(self):
         ctx = {"rows": 7, "present_calls": 100, "system_calls": 100,
                "unknown_calls": 0, "drops": 0}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 100, "single", None), [])
+            m1validity.check_ctx_leg(ctx, 100, "single", None,
+                                     ctx_overflow=0), [])
 
     def test_a2_no_driver_oracle_arithmetic(self):
         # A2 regression: kernel calls per roundtrip are kernel/shape
@@ -255,24 +305,161 @@ class CtxRuleTests(unittest.TestCase):
         ctx = {"rows": 3, "present_calls": 4008, "system_calls": 4008,
                "unknown_calls": 0, "drops": 0}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 4008, "single", 3), [])
+            m1validity.check_ctx_leg(ctx, 4008, "single", 3,
+                                     ctx_overflow=0), [])
 
     def test_a2_sealed_612_diag_ctx_passes_exactness(self):
         # Replay of the sealed 6.12 diag ctx object
         # (cells/m1-diag-612-ctx, legs/leg00B-capture.stderr.log):
         # ops_total=1226880, KTOT=system=present=4907528. Row pin
         # skipped (diag kind): the floor splits kh across cryptd arms.
+        # The overflow channel is asserted clean explicitly (F8): the
+        # sealed file predates the counter, so full-cell replay of the
+        # old cell documents the legacy-missing behavior instead.
         ctx = {"rows": 12, "present_calls": 4907528,
                "system_calls": 4907528, "unknown_calls": 0, "drops": 0}
         self.assertEqual(
-            m1validity.check_ctx_leg(ctx, 4907528, "single", None), [])
+            m1validity.check_ctx_leg(ctx, 4907528, "single", None,
+                                     ctx_overflow=0), [])
 
     def test_churn_full_unreadable_present_or_drops(self):
         ctx = {"rows": 1024, "present_calls": None,
                "system_calls": 10000, "unknown_calls": 1000,
                "drops": 1000}
-        reasons = m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024)
+        reasons = m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024,
+                                           ctx_overflow=7)
         self.assertTrue(any("unreadable" in reason for reason in reasons))
+
+    def test_churn_full_unreadable_system_or_unknown(self):
+        # F4 (codex review) regression: readable present/drops with
+        # missing system+unknown (unreadable report TOTALS) must not
+        # pass silently.
+        ctx = {"rows": 1024, "present_calls": 9000,
+               "system_calls": None, "unknown_calls": None,
+               "drops": 1000}
+        reasons = m1validity.check_ctx_leg(ctx, None, "churn_full", 1024,
+                                           ctx_overflow=7)
+        self.assertTrue(any("unreadable" in reason for reason in reasons))
+
+
+class CtxOverflowTests(unittest.TestCase):
+    # F8 (codex review): ctx_overflow_identities must be exported
+    # (sealed coverage counter) and judged — 0 on below-cap shapes,
+    # >= 1 on churn_full (first-per-kh lower bound, freeze §5).
+    LOSS = ("ktot_gap", "ring_drops", "overflow_identities",
+            "predrop_cfg_fail", "predrop_fret_fail", "predrop_arg_null",
+            "predrop_chase_fail", "predrop_name_fail",
+            "predrop_destroy_skip", "predrop_spare_6", "predrop_spare_7")
+
+    def _report(self, overflow, totals_calls=100):
+        counters = [{"name": name, "value": "0"} for name in self.LOSS]
+        if overflow != "missing":
+            counters.append({"name": "ctx_overflow_identities",
+                             "value": overflow})
+        return {"observations": [
+            {"backend_payload": {"row": "totals",
+                                "counts": {"calls": totals_calls}}}],
+                "coverage": {
+                    "aggregate_counts": {"counters": counters[:1]},
+                    "detailed_events": {"counters": counters}},
+                "verdict": {"status": "complete"}}
+
+    def test_parse_overflow_counter(self):
+        path = write_tmp(json.dumps(self._report("7")))
+        self.assertEqual(m1validity.parse_ctx_overflow_counter(path), 7)
+        path = write_tmp(json.dumps(self._report(0)))
+        self.assertEqual(m1validity.parse_ctx_overflow_counter(path), 0)
+
+    def test_parse_overflow_missing_or_mistyped(self):
+        path = write_tmp(json.dumps(self._report("missing")))
+        with self.assertRaises(ValueError):
+            m1validity.parse_ctx_overflow_counter(path)
+        path = write_tmp(json.dumps(self._report("seven")))
+        with self.assertRaises(ValueError):
+            m1validity.parse_ctx_overflow_counter(path)
+        with self.assertRaises(ValueError):
+            m1validity.parse_ctx_overflow_counter(
+                Path("/nonexistent/report.json"))
+
+    def test_below_cap_overflow_rules(self):
+        ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
+               "unknown_calls": 0, "drops": 0}
+        self.assertEqual(
+            m1validity.check_ctx_leg(ctx, 100, "single", 3,
+                                     ctx_overflow=0), [])
+        reasons = m1validity.check_ctx_leg(ctx, 100, "single", 3,
+                                            ctx_overflow=2)
+        self.assertTrue(any("ctx_overflow_identities=2" in reason
+                            for reason in reasons))
+        reasons = m1validity.check_ctx_leg(ctx, 100, "single", 3,
+                                            ctx_overflow=None)
+        self.assertTrue(any("unreadable" in reason for reason in reasons))
+
+    def test_churn_full_overflow_rules(self):
+        ctx = {"rows": 1024, "present_calls": 9000, "system_calls": 10000,
+               "unknown_calls": 1000, "drops": 1000}
+        self.assertEqual(
+            m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024,
+                                     ctx_overflow=1), [])
+        reasons = m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024,
+                                            ctx_overflow=0)
+        self.assertTrue(any("want >= 1" in reason for reason in reasons))
+        reasons = m1validity.check_ctx_leg(ctx, 10000, "churn_full", 1024,
+                                            ctx_overflow=None)
+        self.assertTrue(any("unreadable" in reason for reason in reasons))
+
+    def _cell_dir(self, ctx, overflow, totals_calls):
+        tmp = Path(tempfile.mkdtemp())
+        legs = tmp / "legs"
+        legs.mkdir()
+        line = ("kryprobe: telemetry "
+                + json.dumps({"v": 1, "ctx": ctx}) + "\n")
+        (legs / "leg00B-capture.stderr.log").write_text(line)
+        (legs / "leg00B-report.json").write_text(
+            json.dumps(self._report(overflow, totals_calls)))
+        return tmp
+
+    def test_pairs_overlay_extracts_counter(self):
+        ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
+               "unknown_calls": 0, "drops": 0}
+        cell = self._cell_dir(ctx, "0", 100)
+        judged = {"leg_id": "leg00B", "valid": True, "outcome": "valid",
+                  "reasons": [], "driver": {"rc": 0}}
+        leg = {"leg_id": "leg00B", "side": "B", "mode": "aggregation",
+               "workload": "single"}
+        entry = {"kind": "m1-pairs", "obs_a": "C", "obs_b": "C"}
+        manifest = {"workloads": {"single": {"expected_rows": 3}}}
+        out = CLI.apply_m1_ctx_overlay(cell, judged, leg, entry, manifest)
+        self.assertTrue(out["valid"])
+        self.assertEqual(out["ctx_overflow_identities"], 0)
+
+    def test_pairs_overlay_missing_counter_invalid(self):
+        ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
+               "unknown_calls": 0, "drops": 0}
+        cell = self._cell_dir(ctx, "missing", 100)
+        judged = {"leg_id": "leg00B", "valid": True, "outcome": "valid",
+                  "reasons": [], "driver": {"rc": 0}}
+        leg = {"leg_id": "leg00B", "side": "B", "mode": "aggregation",
+               "workload": "single"}
+        entry = {"kind": "m1-pairs", "obs_a": "C", "obs_b": "C"}
+        manifest = {"workloads": {"single": {"expected_rows": 3}}}
+        out = CLI.apply_m1_ctx_overlay(cell, judged, leg, entry, manifest)
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("ctx_overflow_identities" in reason
+                            for reason in out["reasons"]))
+
+    def test_diag_overlay_extracts_counter(self):
+        ctx = {"rows": 12, "present_calls": 100, "system_calls": 100,
+               "unknown_calls": 0, "drops": 0}
+        cell = self._cell_dir(ctx, "0", 100)
+        judged = {"leg_id": "leg00B", "valid": False, "outcome": "invalid",
+                  "reasons": ["floor alloc calls=2"],
+                  "driver": {"rc": 0}}
+        leg = {"leg_id": "leg00B", "side": "B", "mode": "aggregation",
+               "workload": "single"}
+        out = CLI.apply_m1_diag_overlay(cell, judged, leg)
+        self.assertEqual(out["diag"]["ctx_overflow_identities"], 0)
+        self.assertEqual(out["diag"]["exactness"], [])
 
 
 class SetVerdictTests(unittest.TestCase):
@@ -280,18 +467,23 @@ class SetVerdictTests(unittest.TestCase):
         self.manifest = m1manifest.load_manifest(
             ROOT / "tests" / "kcrypto_perf" / "cells-m1.json")
 
+    def _pair(self, name, inside=True, seed=0, first=None):
+        if inside:
+            ratio_t, ratio_p = 0.99, 1.02
+        else:
+            idx = int(name[3:])
+            ratio_t, ratio_p = (0.90, 1.20) if (idx + seed) % 2 == 0 \
+                else (0.91, 1.21)
+        if first is None:
+            first = "A" if int(name[3:]) % 2 == 0 else "B"
+        order = ("A", "B") if first == "A" else ("B", "A")
+        return {"pair": name, "valid": True, "reasons": [],
+                "order": order,
+                "ratios": {"throughput": ratio_t, "p99": ratio_p}}
+
     def _pairs(self, n, inside=True, seed=0):
-        pairs = []
-        for i in range(n):
-            if inside:
-                ratio_t, ratio_p = 0.99, 1.02
-            else:
-                ratio_t, ratio_p = (0.90, 1.20) if (i + seed) % 2 == 0 \
-                    else (0.91, 1.21)
-            pairs.append({"pair": f"leg{i:02d}", "valid": True,
-                          "reasons": [],
-                          "ratios": {"throughput": ratio_t, "p99": ratio_p}})
-        return pairs
+        return [self._pair(f"leg{i:02d}", inside, seed)
+                for i in range(n)]
 
     def _cells(self, pairs):
         # judge_m1_set only reads verdict errors + form_pairs over
@@ -315,7 +507,8 @@ class SetVerdictTests(unittest.TestCase):
                                       self._cells(None), self.manifest)
             self.assertEqual(judged["verdict"], "FAIL")
             mixed = self._pairs(5, inside=True) + \
-                self._pairs(5, inside=False, seed=1)
+                [self._pair(f"leg{i:02d}", inside=False, seed=1)
+                 for i in range(5, 10)]
             CLI.form_pairs = lambda cells: mixed
             judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
                                       self._cells(None), self.manifest)
@@ -349,6 +542,49 @@ class SetVerdictTests(unittest.TestCase):
                                       self._cells(None), self.manifest)
             self.assertEqual(judged["verdict"], "ENVELOPE")
             self.assertIn("throughput", judged["medians"])
+        finally:
+            CLI.form_pairs = real_form
+
+    def test_eleven_valid_first_ten_decide(self):
+        # F2 (codex review) regression: 11 valid pairs decide on the
+        # first 10 in attempt order; the extra stays published but
+        # non-deciding. The 11th pair is far outside budgets — the
+        # verdict must still be PASS (it must not leak into B1/B2).
+        entry = CLI.find_set(self.manifest, "m1-P-4K-single-cr")
+        pairs = self._pairs(10, inside=True)
+        outlier = self._pair("leg10", inside=True)
+        outlier["ratios"] = {"throughput": 0.10, "p99": 9.99}
+        pairs.append(outlier)
+        real_form = CLI.form_pairs
+        try:
+            CLI.form_pairs = lambda cells: pairs
+            judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
+                                      self._cells(None), self.manifest)
+            self.assertEqual(judged["verdict"], "PASS")
+            self.assertEqual(len(judged["deciding_pairs"]), 10)
+            self.assertEqual(judged["non_deciding_pairs"], ["leg10"])
+            self.assertEqual(judged["order_balance"],
+                             {"first_a": 5, "first_b": 5})
+        finally:
+            CLI.form_pairs = real_form
+
+    def test_unbalanced_deciding_is_invalid(self):
+        # F2 (codex review) regression: a mid-run spare substitution
+        # (leg03 lost, leg10 deciding) unbalances the aggregate order
+        # to 6/4 even though every pair keeps its frozen parity — the
+        # budgeted verdict must be INVALID, never a quiet PASS.
+        entry = CLI.find_set(self.manifest, "m1-P-4K-single-cr")
+        pairs = [self._pair(f"leg{i:02d}", inside=True)
+                 for i in (0, 1, 2, 4, 5, 6, 7, 8, 9, 10)]
+        self.assertEqual(len(pairs), 10)
+        real_form = CLI.form_pairs
+        try:
+            CLI.form_pairs = lambda cells: pairs
+            judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
+                                      self._cells(None), self.manifest)
+            self.assertEqual(judged["verdict"], "INVALID")
+            self.assertTrue(any("balance" in reason
+                                for reason in judged["reasons"]))
         finally:
             CLI.form_pairs = real_form
 
@@ -407,6 +643,175 @@ class DriverTests(unittest.TestCase):
         seqs = sorted(int(line.split(",")[0]) for line in rows)
         # Globally unique seqs 0..4, each exactly twice (enc+dec).
         self.assertEqual(seqs, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+
+    def _run_with_slow_merge(self, argv, delay_s=2.0):
+        real_merge = M1DRIVER._merge_shards
+
+        def slow_merge(shards, out):
+            time.sleep(delay_s)
+            return real_merge(shards, out)
+
+        M1DRIVER._merge_shards = slow_merge
+        try:
+            return M1DRIVER.main(argv)
+        finally:
+            M1DRIVER._merge_shards = real_merge
+
+    @unittest.skipUnless(_afalg_usable(), "AF_ALG cbc(aes) unavailable")
+    def test_churn_tiny_run_merge_outside_window(self):
+        # F6 (codex review) regression: the arrival merge must not
+        # inflate meas_window_s; its cost rides merge_s. The 2s
+        # injected merge would blow the 2s window under the old
+        # (t_end-after-merge) order. First in-suite execution of the
+        # churn path (previously never run anywhere).
+        tmp = Path(tempfile.mkdtemp())
+        ledger = str(tmp / "churn.csv")
+        argv = [M1DRIVER.__file__, "skcipher", "4096", "2", "1",
+               "--churn-every-ms", "500", "--churn-ops", "2", ledger]
+        rc = self._run_with_slow_merge(argv)
+        self.assertEqual(rc, 0)
+        summary = json.loads(
+            Path(ledger + ".summary.json").read_text())
+        self.assertEqual(summary["arrivals"], 6)
+        self.assertEqual(summary["fails"], 0)
+        self.assertGreater(summary["ops_meas"], 0)
+        self.assertGreaterEqual(summary["merge_s"], 2.0)
+        # 2s window + reap skew, WITHOUT the injected 2s merge (the
+        # old order would read ~4s+ here).
+        self.assertLess(summary["meas_window_s"], 3.5)
+        self.assertEqual(summary["rows_meas"], 2 * summary["ops_meas"])
+
+    @unittest.skipUnless(os.geteuid() == 0,
+                         "n_cgroup driver needs root (cgroup mkdir)")
+    @unittest.skipUnless(_afalg_usable(), "AF_ALG cbc(aes) unavailable")
+    def test_n_cgroup_tiny_run_merge_outside_window(self):
+        # F6 (codex review) regression for the n_cgroup path (same
+        # rule as churn): t_end stamps the reaped workload end, the
+        # shard merge rides merge_s. First execution of this path
+        # (previously never run anywhere).
+        tmp = Path(tempfile.mkdtemp())
+        ledger = str(tmp / "nc.csv")
+        argv = [M1DRIVER.__file__, "skcipher", "4096", "2", "1",
+               "--actors", "4", "--cgroups", "2", ledger]
+        rc = self._run_with_slow_merge(argv)
+        self.assertEqual(rc, 0)
+        summary = json.loads(
+            Path(ledger + ".summary.json").read_text())
+        self.assertEqual(
+            (summary["actors"], summary["cgroups"]), (4, 2))
+        self.assertEqual(summary["fails"], 0)
+        self.assertGreater(summary["ops_meas"], 0)
+        self.assertGreaterEqual(summary["merge_s"], 2.0)
+        self.assertLess(summary["meas_window_s"], 3.5)
+        self.assertEqual(summary["rows_meas"], 2 * summary["ops_meas"])
+        tag = f"{M1DRIVER.M1_CGROUP_TAG}-{os.getpid()}"
+        leftovers = sorted(Path(M1DRIVER.M1_CGROUP_BASE).glob(f"{tag}-*"))
+        self.assertEqual(leftovers, [])
+
+
+class DiagVerdictTests(unittest.TestCase):
+    # F3 (codex review): the m1-612-ctx diag's C leg is frozen-invalid
+    # BY DESIGN (aggregation + 6.12-floor subject shape), so the frozen
+    # legs-valid gate cannot adjudicate it. The diag verdict rests on
+    # structure + quiet + driver + capture + attach 9/9 + A2 exactness.
+    def setUp(self):
+        self.manifest = m1manifest.load_manifest(
+            ROOT / "tests" / "kcrypto_perf" / "cells-m1.json")
+        self.entry = CLI.find_diag(self.manifest, "m1-diag-612-ctx")
+
+    def _leg(self, **over):
+        leg = {"leg_id": "leg00B", "side": "B", "mode": "aggregation",
+               "cls": "P-4K", "workload": "single",
+               "valid": False, "outcome": "invalid",
+               "reasons": ["floor alloc calls=2"],
+               "driver": {"rc": 0, "ops_total": 1226880},
+               "driver_rc": 0, "driver_timeout": 0, "capture_rc": 3,
+               "stats": {"throughput": 1.0}, "observer": {},
+               "diag": {
+                   "attach": {"attached": 9, "expected": 9},
+                   "ctx": {"rows": 12, "present_calls": 4907528,
+                           "system_calls": 4907528, "unknown_calls": 0,
+                           "drops": 0},
+                   "totals_calls": 4907528, "exactness": []}}
+        leg.update(over)
+        return leg
+
+    def _cell(self, legs):
+        return {"cell": "fake-diag", "errors": [],
+                "spec_boot_invalid": False,
+                "quiet": {"totals": {"calls": 0}, "valid": True,
+                          "reasons": []},
+                "legs": legs}
+
+    def test_frozen_invalid_leg_passes_diag(self):
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([self._leg()]))
+        self.assertEqual(judged["verdict"], "PASS")
+        self.assertEqual(judged["attach"], {"attached": 9, "expected": 9})
+        # The frozen shape verdict stays visible for transparency.
+        self.assertFalse(judged["leg"]["frozen_shape"]["valid"])
+
+    def test_judge_diag_dispatches_m1_branch(self):
+        judged = CLI.judge_diag("m1-diag-612-ctx",
+                                self._cell([self._leg()]), self.manifest)
+        self.assertEqual(judged["verdict"], "PASS")
+
+    def test_diag_requires_single_b_leg(self):
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([]))
+        self.assertEqual(judged["verdict"], "INVALID")
+        judged = CLI.judge_m1_diag(
+            "m1-diag-612-ctx", self.entry,
+            self._cell([self._leg(side="A")]))
+        self.assertEqual(judged["verdict"], "INVALID")
+
+    def test_diag_requires_quiet(self):
+        cell = self._cell([self._leg()])
+        cell["spec_boot_invalid"] = True
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry, cell)
+        self.assertEqual(judged["verdict"], "INVALID")
+        self.assertTrue(any("quiet" in reason
+                            for reason in judged["reasons"]))
+
+    def test_diag_requires_clean_driver_and_capture(self):
+        for bad in ({"driver_rc": 1}, {"driver_timeout": 1},
+                    {"capture_rc": 1}, {"capture_rc": None}):
+            judged = CLI.judge_m1_diag(
+                "m1-diag-612-ctx", self.entry,
+                self._cell([self._leg(**bad)]))
+            self.assertEqual(judged["verdict"], "INVALID", bad)
+        leg = self._leg()
+        leg["driver"] = {"rc": 2}
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
+
+    def test_diag_requires_attach_9_9(self):
+        leg = self._leg()
+        leg["diag"] = {"attach": {"attached": 8, "expected": 9},
+                       "ctx": leg["diag"]["ctx"],
+                       "totals_calls": 4907528, "exactness": []}
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
+        leg = self._leg()
+        leg["diag"] = {"attach_error": "no attach audit object"}
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
+
+    def test_diag_requires_exactness(self):
+        leg = self._leg()
+        leg["diag"] = dict(leg["diag"],
+                           exactness=["single unknown=5, want 0"])
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
+        leg = self._leg()
+        del leg["diag"]
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
 
 
 if __name__ == "__main__":

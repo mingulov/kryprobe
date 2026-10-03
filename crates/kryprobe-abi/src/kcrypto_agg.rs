@@ -103,10 +103,10 @@ pub const KWHO_DROPS: u64 = u64::MAX - 1;
 /// `KCFG` value: the 9 loader-resolved offsets + kthread flag + pad
 /// (44B, K1) + the 7 K5 attribution offsets + `parent_ok`/`params_ok`
 /// flags + pad (76B) + the ctx-v1 lifetime offset + `start_ok` + pad
-/// (84B total).
+/// (84B) + the ctx-v1 group-leader offset + `gl_ok` + pad (92B total).
 ///
-/// Append-only: the K1/K5 field offsets are unchanged. Twin: `KConfig`
-/// in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
+/// Append-only: the K1/K5/ctx-v1 field offsets are unchanged. Twin:
+/// `KConfig` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct KConfig {
@@ -156,13 +156,24 @@ pub struct KConfig {
     pub params_ok: u8,
     /// Reserved, zero.
     pub _pad2: [u8; 2],
-    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator).
+    /// `task_struct.start_time` (bytes; ctx-v1 lifetime discriminator —
+    /// read from the group leader, see below).
     pub task_start_off: u32,
     /// Nonzero iff the start offset resolved (BPF emits `start_ns == 0`
     /// — the unknown-lifetime bucket — when false).
     pub start_ok: u8,
     /// Reserved, zero.
     pub _pad3: [u8; 3],
+    /// `task_struct.group_leader` (bytes; F5: BPF chases the leader
+    /// before reading `start_time`, so `start_ns` is the
+    /// PROCESS-group start, never the current thread's).
+    pub task_group_leader_off: u32,
+    /// Nonzero iff the group-leader offset resolved (BPF emits
+    /// `start_ns == 0` when false — a thread start must never
+    /// masquerade as a process start).
+    pub gl_ok: u8,
+    /// Reserved, zero.
+    pub _pad4: [u8; 3],
 }
 
 impl KConfig {
@@ -196,12 +207,15 @@ impl KConfig {
         "task_start_off",
         "start_ok",
         "_pad3",
+        "task_group_leader_off",
+        "gl_ok",
+        "_pad4",
     ];
 
     /// Little-endian wire bytes for the `KCFG` map update (x86-64 target).
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 84] {
-        let mut out = [0u8; 84];
+    pub fn to_bytes(&self) -> [u8; 92] {
+        let mut out = [0u8; 92];
         out[0..4].copy_from_slice(&self.sk_req_base.to_le_bytes());
         out[4..8].copy_from_slice(&self.async_tfm.to_le_bytes());
         out[8..12].copy_from_slice(&self.tfm_alg.to_le_bytes());
@@ -226,6 +240,9 @@ impl KConfig {
         out[76..80].copy_from_slice(&self.task_start_off.to_le_bytes());
         out[80] = self.start_ok;
         out[81..84].copy_from_slice(&self._pad3);
+        out[84..88].copy_from_slice(&self.task_group_leader_off.to_le_bytes());
+        out[88] = self.gl_ok;
+        out[89..92].copy_from_slice(&self._pad4);
         out
     }
 }
@@ -1032,10 +1049,11 @@ mod tests {
     }
 
     #[test]
-    fn kconfig_wire_is_84_with_ctx_tail() {
+    fn kconfig_wire_is_92_with_ctx_tail() {
         // K1 head bytes unchanged (append-only extension); the K5 tail
-        // carries the new offsets + flags, and the ctx-v1 tail carries
-        // the start-time offset + flag (ADR-0008 wire §wire).
+        // carries the new offsets + flags, the ctx-v1 tail carries
+        // the start-time offset + flag (ADR-0008 wire §wire), and the
+        // F5 tail carries the group-leader offset + flag.
         let cfg = KConfig {
             sk_req_base: 32,
             task_real_parent: 1232,
@@ -1049,10 +1067,12 @@ mod tests {
             params_ok: 0,
             task_start_off: 1664,
             start_ok: 1,
+            task_group_leader_off: 1392,
+            gl_ok: 1,
             ..KConfig::default()
         };
         let wire = cfg.to_bytes();
-        assert_eq!(wire.len(), 84);
+        assert_eq!(wire.len(), 92);
         assert_eq!(u32::from_le_bytes([wire[0], wire[1], wire[2], wire[3]]), 32);
         assert_eq!(
             u32::from_le_bytes([wire[44], wire[45], wire[46], wire[47]]),
@@ -1071,6 +1091,12 @@ mod tests {
         );
         assert_eq!(wire[80], 1);
         assert_eq!(&wire[81..84], &[0, 0, 0]);
+        assert_eq!(
+            u32::from_le_bytes([wire[84], wire[85], wire[86], wire[87]]),
+            1392
+        );
+        assert_eq!(wire[88], 1);
+        assert_eq!(&wire[89..92], &[0, 0, 0]);
     }
 
     #[test]

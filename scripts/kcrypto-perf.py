@@ -1400,6 +1400,10 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
     judged["obs"] = obs
     if leg["mode"] == "disabled" or obs == "D":
         return judged
+    if entry.get("kind") == "m1-612-ctx":
+        # F3: the diag's C leg is frozen-invalid BY DESIGN — the diag
+        # adjudicates attach + ctx directly, never via leg["valid"].
+        return apply_m1_diag_overlay(cell_dir, judged, leg)
     if not judged.get("valid") or "driver" not in judged:
         # Frozen-invalid already (or no driver summary): keep the
         # frozen reasons focused, skip the ctx overlay.
@@ -1424,25 +1428,80 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["reasons"] = judged.get("reasons", []) + [str(err)]
         return judged
     judged["ctx"] = ctx
+    report_path = legs_dir / f"{leg['leg_id']}-report.json"
     try:
-        parsed = kparsers.parse_api_returns(
-            legs_dir / f"{leg['leg_id']}-report.json")
+        parsed = kparsers.parse_api_returns(report_path)
     except kparsers.ParseError as err:
         judged["valid"] = False
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + [str(err)]
         return judged
+    try:
+        ctx_overflow = km1validity.parse_ctx_overflow_counter(report_path)
+    except ValueError as err:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [str(err)]
+        return judged
+    judged["ctx_overflow_identities"] = ctx_overflow
     shape = leg["workload"]
-    if entry.get("kind") == "m1-612-ctx":
-        expected_rows = None
-    else:
-        expected_rows = manifest["workloads"][shape]["expected_rows"]
+    # Diag legs never reach here (apply_m1_diag_overlay above).
+    expected_rows = manifest["workloads"][shape]["expected_rows"]
     reasons = km1validity.check_ctx_leg(
-        ctx, parsed["totals"].get("calls"), shape, expected_rows)
+        ctx, parsed["totals"].get("calls"), shape, expected_rows,
+        ctx_overflow=ctx_overflow)
     if reasons:
         judged["valid"] = False
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + reasons
+    return judged
+
+
+def apply_m1_diag_overlay(cell_dir: Path, judged: dict,
+                          leg: dict) -> dict:
+    """m1-612-ctx evidence extraction (F3): attach audit + terminal ctx
+    + report totals + A2 exactness, stashed under ``judged["diag"]``
+    WITHOUT consulting the frozen shape verdict (aggregation mode +
+    6.12-floor subject shape never satisfy ``check_leg_agg`` — that is
+    the diag's subject, not its failure). Any unreadable evidence is
+    recorded as a ``*_error`` key; ``judge_m1_diag`` turns every such
+    key into an INVALID reason (fail-closed)."""
+    legs_dir = cell_dir / "legs"
+    stderr_log = legs_dir / f"{leg['leg_id']}-capture.stderr.log"
+    diag: dict = {}
+    try:
+        diag["attach"] = km1validity.parse_attach_audit(stderr_log)
+    except ValueError as err:
+        diag["attach_error"] = str(err)
+    try:
+        ctx = km1validity.parse_ctx_telemetry(stderr_log)
+    except ValueError as err:
+        diag["ctx_error"] = str(err)
+        judged["diag"] = diag
+        return judged
+    diag["ctx"] = ctx
+    judged["ctx"] = ctx
+    report_path = legs_dir / f"{leg['leg_id']}-report.json"
+    try:
+        parsed = kparsers.parse_api_returns(report_path)
+    except kparsers.ParseError as err:
+        diag["report_error"] = str(err)
+        judged["diag"] = diag
+        return judged
+    diag["totals_calls"] = parsed["totals"].get("calls")
+    try:
+        diag["ctx_overflow_identities"] = \
+            km1validity.parse_ctx_overflow_counter(report_path)
+    except ValueError as err:
+        diag["overflow_error"] = str(err)
+        judged["diag"] = diag
+        return judged
+    # Row pin skipped (diag kind): the floor splits kh across cryptd
+    # arms, so exactness without a row-shape claim is the honest check.
+    diag["exactness"] = km1validity.check_ctx_leg(
+        ctx, parsed["totals"].get("calls"), leg["workload"], None,
+        ctx_overflow=diag["ctx_overflow_identities"])
+    judged["diag"] = diag
     return judged
 
 
@@ -1618,7 +1677,9 @@ def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
             return out
     pairs = form_pairs(cell_verdicts)
     out["pairs"] = pairs
-    valid = sum(1 for pair in pairs if pair["valid"])
+    valid_pairs = sorted((pair for pair in pairs if pair["valid"]),
+                         key=lambda pair: pair["pair"])
+    valid = len(valid_pairs)
     attempted = len(pairs)
     out["set_check"] = {"qualified": valid >= entry["pairs"],
                         "valid_pairs": valid,
@@ -1632,9 +1693,35 @@ def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
         out.update(verdict="INVALID",
                    reasons=[f"only {valid}/{entry['pairs']} valid pairs"])
         return out
-    ratios_t = [pair["ratios"]["throughput"] for pair in pairs
-                if pair["valid"]]
-    ratios_p99 = [pair["ratios"]["p99"] for pair in pairs if pair["valid"]]
+    if entry["budgeted"]:
+        # F2 (codex review) + A3: when spares push the valid count
+        # past the quorum, the frozen 80% rule is undefined (8/10 vs
+        # 9/11) and spare substitution can unbalance the AB/BA order
+        # (the frozen gate pins each pair's parity, not the aggregate
+        # 5/5). Decide on the first `pairs` valid pairs in attempt
+        # order (pair names are zero-padded attempt indices); extras
+        # stay published but non-deciding. The 5/5 order balance is
+        # REQUIRED for a budgeted verdict (ADR-0016 counterfactual
+        # discipline); anything else is INVALID, never a quiet PASS.
+        deciding = valid_pairs[:entry["pairs"]]
+        out["deciding_pairs"] = [pair["pair"] for pair in deciding]
+        out["non_deciding_pairs"] = [pair["pair"] for pair in
+                                     valid_pairs[entry["pairs"]:]]
+        firsts = [pair["order"][0] for pair in deciding]
+        first_a = sum(1 for side in firsts if side == "A")
+        out["order_balance"] = {"first_a": first_a,
+                                "first_b": len(firsts) - first_a}
+        if first_a * 2 != len(firsts):
+            out.update(verdict="INVALID",
+                       reasons=[f"order balance {first_a}/"
+                                f"{len(firsts) - first_a} over deciding "
+                                "pairs, want 5/5"])
+            return out
+        ratios_t = [pair["ratios"]["throughput"] for pair in deciding]
+        ratios_p99 = [pair["ratios"]["p99"] for pair in deciding]
+    else:
+        ratios_t = [pair["ratios"]["throughput"] for pair in valid_pairs]
+        ratios_p99 = [pair["ratios"]["p99"] for pair in valid_pairs]
     out["medians"] = {"throughput": kstats.median(ratios_t),
                       "p99": kstats.median(ratios_p99)}
     if entry["budgeted"]:
@@ -1701,6 +1788,71 @@ def perturbation_report(cell_verdicts: list, bulk: list) -> dict:
     return report
 
 
+def judge_m1_diag(diag_id: str, entry: dict, cell_verdict: dict) -> dict:
+    """Adjudicate the m1-612-ctx diagnostic (F3 + A3).
+
+    The diag's C leg is frozen-invalid BY DESIGN (aggregation mode +
+    6.12-floor subject shape never satisfy ``check_leg_agg``), so the
+    frozen legs-valid gate cannot adjudicate it. The PASS bar is: one
+    B-side aggregation leg, a clean boot-quiet, a clean driver run, a
+    clean capture (rc in {0, 3}), full attach (9/9 per the frozen
+    attach audit), and the A2 ctx exactness rules. Driver/capture
+    fields are re-derived from the judged leg — every early
+    ``judge_leg`` exit (unreadable summary, driver failure, timing or
+    thread mismatch, corrupt ledger) is a genuine evidence failure,
+    never a shape artifact, so a missing field is INVALID. The frozen
+    shape verdict is copied through for transparency.
+    """
+    out: dict = {"diag": diag_id, "kind": entry["kind"],
+                 "kernel": entry["kernel"]}
+    legs = cell_verdict.get("legs", [])
+    if len(legs) != 1:
+        out.update(verdict="INVALID",
+                   reasons=[f"want exactly 1 leg, have {len(legs)}"])
+        return out
+    leg = legs[0]
+    out["leg"] = {key: leg.get(key) for key in
+                  ("leg_id", "valid", "outcome", "reasons", "stats",
+                   "observer", "ctx")}
+    out["leg"]["frozen_shape"] = {"valid": leg.get("valid"),
+                                  "reasons": leg.get("reasons", [])}
+    reasons = []
+    if leg.get("side") != "B" or leg.get("mode") != "aggregation":
+        reasons.append(f"want one B-side aggregation leg, have "
+                       f"side={leg.get('side')} "
+                       f"mode={leg.get('mode')}")
+    if cell_verdict.get("spec_boot_invalid"):
+        reasons.append("boot quiet failed")
+    driver = leg.get("driver") or {}
+    if leg.get("driver_rc") != 0 or driver.get("rc") != 0 or \
+            leg.get("driver_timeout"):
+        reasons.append(f"driver rc={driver.get('rc')} "
+                       f"driver_rc={leg.get('driver_rc')} "
+                       f"timeout={leg.get('driver_timeout')}")
+    if leg.get("capture_rc") not in (0, 3):
+        reasons.append(f"capture rc={leg.get('capture_rc')} (want 0/3)")
+    diag = leg.get("diag") or {}
+    for key in ("attach_error", "ctx_error", "report_error",
+                "overflow_error"):
+        if diag.get(key):
+            reasons.append(f"diag {key}: {diag[key]}")
+    attach = diag.get("attach") or {}
+    out["attach"] = diag.get("attach")
+    if attach.get("attached") != 9 or attach.get("expected") != 9:
+        reasons.append(f"attach {attach.get('attached')}/"
+                       f"{attach.get('expected')} (want 9/9)")
+    out["ctx"] = diag.get("ctx")
+    out["totals_calls"] = diag.get("totals_calls")
+    for reason in diag.get("exactness") or []:
+        reasons.append(f"exactness: {reason}")
+    if reasons:
+        out.update(verdict="INVALID", reasons=reasons)
+        return out
+    out.update(verdict="PASS",
+               reasons=["6.12 floor: attach + exactness proven"])
+    return out
+
+
 def judge_diag(diag_id: str, cell_verdict: dict, manifest: dict) -> dict:
     entry = find_diag(manifest, diag_id)
     out: dict = {"diag": diag_id, "kind": entry["kind"],
@@ -1709,6 +1861,10 @@ def judge_diag(diag_id: str, cell_verdict: dict, manifest: dict) -> dict:
         out.update(verdict="INVALID",
                    reasons=cell_verdict["errors"])
         return out
+    if entry["kind"] == "m1-612-ctx":
+        # F3: above the frozen legs-valid gate — the diag's C leg is
+        # frozen-invalid by design; judge_m1_diag adjudicates it.
+        return judge_m1_diag(diag_id, entry, cell_verdict)
     if not all(leg["valid"] for leg in cell_verdict.get("legs", [])):
         bad = [leg["leg_id"] for leg in cell_verdict.get("legs", [])
                if not leg["valid"]]
@@ -1719,14 +1875,6 @@ def judge_diag(diag_id: str, cell_verdict: dict, manifest: dict) -> dict:
         out["footprint"] = {"totals": leg.get("totals"),
                             "observer": leg.get("observer")}
         out.update(verdict="ENVELOPE", reasons=["footprint published"])
-        return out
-    if entry["kind"] == "m1-612-ctx":
-        leg = cell_verdict["legs"][0]
-        out["leg"] = {key: leg.get(key) for key in
-                      ("leg_id", "valid", "outcome", "reasons", "stats",
-                       "observer", "ctx")}
-        out.update(verdict="PASS",
-                   reasons=["6.12 floor: attach + exactness proven"])
         return out
     pairs = form_pairs([cell_verdict])
     out["pairs"] = pairs

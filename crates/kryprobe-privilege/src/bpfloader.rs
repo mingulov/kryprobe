@@ -97,7 +97,7 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 
 /// Frozen kcrypto maps, in creation order. Asserted against the object.
 ///
-/// The exact Task-2 contract (`KConfig` 84B per C2 + the K4-fix3
+/// The exact Task-2 contract (`KConfig` 92B per C2 + the K4-fix3
 /// `shash_base` word + the K5 attribution tail + the ctx-v1 lifetime
 /// pair, `KAgg` 260B, `VAgg` 120B —
 /// `planning/kryprobe-phaseK1-sensor-plan.md` Task 2) plus the four K5
@@ -113,7 +113,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
         MapDims {
             map_type: 2,
             key_size: 4,
-            value_size: 84,
+            value_size: 92,
             max_entries: 1,
         },
     ),

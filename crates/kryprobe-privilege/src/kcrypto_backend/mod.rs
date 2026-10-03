@@ -1429,6 +1429,128 @@ mod tests {
     }
 
     #[test]
+    fn finish_session_quiescent_under_hammer_freezes_terminal() {
+        // F1 (M1 review): the adversarial close — 4 threads hammering
+        // AF_ALG roundtrips while `finish_session` runs the
+        // detach-first + CLOSED + polls + grace/rescan sequence. The
+        // close must still return `Quiescent` (fast, no deadline
+        // slog: detach stops new invocations at the source), and the
+        // terminal ctx read must be contradiction-free (all-Some — a
+        // torn read would None an operand) and frozen across re-reads
+        // (no post-receipt admission past detach+CLOSED).
+        //
+        // Honesty note: this test LOCKS the fixed behavior; it does
+        // not deterministically fail on the old order (the old race
+        // window is microseconds per close — a sometimes-failing test
+        // proves nothing). The order itself is proven by construction
+        // (see `detach_and_close_fence` + ADR-0009): detach stops new
+        // invocations, CLOSED refuses laggards (refused entrants touch
+        // nothing — the admit gate is top-of-path in every hook), the
+        // polls drain stragglers, the grace+rescan closes the
+        // increment-visibility race. Privileged: needs root + BTF +
+        // the built BPF object; SKIPs otherwise (same discipline as
+        // the `kcrypto_ctx` privileged lane).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        if !(crate::host::euid_is_root()
+            && std::path::Path::new("/sys/kernel/btf/vmlinux").exists())
+        {
+            println!("SKIP: needs root + BTF (privileged exactness lane)");
+            return;
+        }
+        let object = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("kryprobe-bpf")
+            .join("kcrypto.bpf.o");
+        let object = match std::fs::read(&object) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                println!("SKIP: missing BPF object — run `cargo xtask build --bpf`");
+                return;
+            }
+        };
+        let (sensor, _points) =
+            crate::btf_resolve::load_kcrypto_configured(&object, None).expect("bring-up");
+        assert!(!sensor.links.is_empty(), "test needs attached links");
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(7);
+        let started = crate::host::monotonic_ns().expect("monotonic clock");
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(generation, sensor, started));
+        backend.open_session(generation).expect("drain open");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut hammers = Vec::new();
+        for _ in 0..4 {
+            let stop = Arc::clone(&stop);
+            hammers.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = kryprobe_testkit::alg_fixture::skcipher_roundtrip("cbc(aes)", 4);
+                }
+            }));
+        }
+
+        let t0 = Instant::now();
+        let sample = backend
+            .finish_session(generation)
+            .expect("finish under hammer");
+        let close_dt = t0.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        for hammer in hammers {
+            hammer.join().expect("hammer joins");
+        }
+
+        assert!(
+            sample.fence.is_quiescent_receipt(),
+            "close quiesces under hammer, got {:?}",
+            sample.fence
+        );
+        assert!(
+            close_dt < Duration::from_secs(4),
+            "close is fast, not a deadline slog: {close_dt:?}"
+        );
+        let terminal = backend
+            .session_ctx_terminal(generation)
+            .expect("terminal ctx after Quiescent");
+        let (Some(rows), Some(present), Some(system), Some(unknown), Some(drops)) = (
+            terminal.rows,
+            terminal.present_calls,
+            terminal.system_calls,
+            terminal.unknown_calls,
+            terminal.drops,
+        ) else {
+            panic!("torn terminal read: {terminal:?}");
+        };
+        // `unknown` is Some, so `checked_sub` succeeded: the direct
+        // subtraction below cannot underflow.
+        assert_eq!(unknown, system - present, "unknown-by-difference holds");
+        assert!(rows > 0 && system > 0, "hammer traffic observed");
+        let terminal2 = backend
+            .session_ctx_terminal(generation)
+            .expect("second terminal read");
+        assert_eq!(
+            (
+                terminal2.rows,
+                terminal2.present_calls,
+                terminal2.system_calls,
+                terminal2.unknown_calls,
+                terminal2.drops
+            ),
+            (
+                Some(rows),
+                Some(present),
+                Some(system),
+                Some(unknown),
+                Some(drops)
+            ),
+            "terminal frozen across re-reads"
+        );
+    }
+
+    #[test]
     fn terminal_interval_rejects_contradictions_without_clamping() {
         let mut sample = AggregateTerminalSample {
             snapshot: hand_snapshot(&[1], Some(1)),

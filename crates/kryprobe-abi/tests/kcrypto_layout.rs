@@ -20,9 +20,10 @@ fn kconfig_size_align_and_offsets_pinned() {
     // AEAD/ahash length offsets + shash_base + _pad as 11th word; brief
     // C2 + the K4-fix3 shash resolution) + 7 x u32 K5 offsets + 2 flag
     // bytes + 2 pad bytes (76B) + ctx-v1 u32 start offset + flag byte +
-    // 3 pad bytes = 84B. Append-only: every K1/K5 offset below is
-    // unchanged.
-    assert_eq!(std::mem::size_of::<KConfig>(), 84);
+    // 3 pad bytes (84B) + ctx-v1 u32 group-leader offset + flag byte +
+    // 3 pad bytes = 92B. Append-only: every K1/K5/ctx-v1 offset below
+    // is unchanged.
+    assert_eq!(std::mem::size_of::<KConfig>(), 92);
     assert_eq!(std::mem::align_of::<KConfig>(), 4);
     assert_eq!(std::mem::offset_of!(KConfig, sk_req_base), 0);
     assert_eq!(std::mem::offset_of!(KConfig, async_tfm), 4);
@@ -48,6 +49,9 @@ fn kconfig_size_align_and_offsets_pinned() {
     assert_eq!(std::mem::offset_of!(KConfig, task_start_off), 76);
     assert_eq!(std::mem::offset_of!(KConfig, start_ok), 80);
     assert_eq!(std::mem::offset_of!(KConfig, _pad3), 81);
+    assert_eq!(std::mem::offset_of!(KConfig, task_group_leader_off), 84);
+    assert_eq!(std::mem::offset_of!(KConfig, gl_ok), 88);
+    assert_eq!(std::mem::offset_of!(KConfig, _pad4), 89);
 }
 
 #[test]
