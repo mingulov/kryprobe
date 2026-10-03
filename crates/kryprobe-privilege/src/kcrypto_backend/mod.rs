@@ -1439,19 +1439,26 @@ mod tests {
         // torn read would None an operand) and frozen across re-reads
         // (no post-receipt admission past detach+CLOSED).
         //
-        // Honesty note: this test LOCKS the fixed behavior; it does
-        // not deterministically fail on the old order (the old race
-        // window is microseconds per close — a sometimes-failing test
-        // proves nothing). The order itself is proven by construction
-        // (see `detach_and_close_fence` + ADR-0009): detach stops new
-        // invocations, CLOSED refuses laggards (refused entrants touch
-        // nothing — the admit gate is top-of-path in every hook), the
-        // polls drain stragglers, the grace+rescan closes the
-        // increment-visibility race. Privileged: needs root + BTF +
-        // the built BPF object; SKIPs otherwise (same discipline as
-        // the `kcrypto_ctx` privileged lane).
+        // Honesty note: this test LOCKS the fixed behavior; it is
+        // a characterization lock with teeth, not a deterministic
+        // red-green pair (the old race window is microseconds per
+        // close — see the old-order control outcome in the freeze
+        // record). The order itself is proven by construction (see
+        // `detach_and_close_fence` + ADR-0009/ADR-0010/ADR-0011):
+        // CLOSED refuses laggards (refused entrants touch nothing —
+        // the admit gate is top-of-path in every hook), the polls
+        // drain stragglers, the grace+rescan closes the
+        // increment-visibility race; detach-first bounds the wait.
+        // N1 strengthening: a per-thread ready barrier PROVES the
+        // hammers overlapped the close (no probabilistic overlap),
+        // and the first terminal read happens BEFORE stop/join —
+        // equality across the join demonstrates stability
+        // immediately after receipt (a post-receipt admission would
+        // appear only in the second read). Privileged: needs root +
+        // BTF + the built BPF object; SKIPs otherwise (same
+        // discipline as the `kcrypto_ctx` privileged lane).
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::time::{Duration, Instant};
 
         if !(crate::host::euid_is_root()
@@ -1483,14 +1490,28 @@ mod tests {
         backend.open_session(generation).expect("drain open");
 
         let stop = Arc::new(AtomicBool::new(false));
+        let ready: Vec<Arc<AtomicU64>> = (0..4).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let mut hammers = Vec::new();
-        for _ in 0..4 {
+        for thread in 0..4 {
             let stop = Arc::clone(&stop);
+            let ready = Arc::clone(&ready[thread]);
             hammers.push(std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     let _ = kryprobe_testkit::alg_fixture::skcipher_roundtrip("cbc(aes)", 4);
+                    ready.fetch_add(1, Ordering::Relaxed);
                 }
             }));
+        }
+        // Ready barrier: every hammer completed >= 1 roundtrip batch
+        // BEFORE the close starts — overlap is proven, and the maps
+        // hold hammer-attributed rows for the freeze comparison.
+        let barrier = Instant::now();
+        while ready.iter().any(|r| r.load(Ordering::Relaxed) == 0) {
+            assert!(
+                barrier.elapsed() < Duration::from_secs(30),
+                "hammers never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         let t0 = Instant::now();
@@ -1498,10 +1519,6 @@ mod tests {
             .finish_session(generation)
             .expect("finish under hammer");
         let close_dt = t0.elapsed();
-        stop.store(true, Ordering::Relaxed);
-        for hammer in hammers {
-            hammer.join().expect("hammer joins");
-        }
 
         assert!(
             sample.fence.is_quiescent_receipt(),
@@ -1512,9 +1529,15 @@ mod tests {
             close_dt < Duration::from_secs(4),
             "close is fast, not a deadline slog: {close_dt:?}"
         );
+        // First terminal read BEFORE stop/join: stability immediately
+        // after receipt, while refused post-close traffic still flies.
         let terminal = backend
             .session_ctx_terminal(generation)
             .expect("terminal ctx after Quiescent");
+        stop.store(true, Ordering::Relaxed);
+        for hammer in hammers {
+            hammer.join().expect("hammer joins");
+        }
         let (Some(rows), Some(present), Some(system), Some(unknown), Some(drops)) = (
             terminal.rows,
             terminal.present_calls,
@@ -1546,7 +1569,7 @@ mod tests {
                 Some(unknown),
                 Some(drops)
             ),
-            "terminal frozen across re-reads"
+            "terminal frozen from receipt across the join"
         );
     }
 

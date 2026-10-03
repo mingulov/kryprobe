@@ -112,16 +112,32 @@ def parse_attach_audit(path: Path) -> dict:
     return out
 
 
+def _unsigned_counter(value):
+    """Strict unsigned-counter validation (A3 review idea #7): a real
+    int >= 0 (bools are not counters) or a digit string (serde JSON
+    form). Permissive ``int()`` would coerce False->0, 0.5->0,
+    True->1 — mistyped evidence must refuse, never coerce."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 def parse_ctx_overflow_counter(path: Path) -> int:
     """``ctx_overflow_identities`` from a sealed report's
     ``coverage.detailed_events.counters``.
 
     M1-local extraction — the frozen parser's loss-counter set is
-    untouched. Counter values are JSON strings (serde);
-    ``int(value)`` mirrors the frozen consumer. Raises ``ValueError``
-    when the report is unreadable, the counter is missing, or its
-    value is mistyped — the caller converts this to a leg-invalid
-    reason (fail-closed).
+    untouched. The value is validated as an unsigned counter
+    (int >= 0 or digit string — stricter than the frozen
+    consumer's ``int()``, fail-closed direction); duplicate entries
+    for the counter contradict and refuse. Raises ``ValueError``
+    when the report is unreadable, the counter is missing,
+    duplicated, or its value is mistyped — the caller converts
+    this to a leg-invalid reason (fail-closed).
     """
     try:
         doc = json.loads(Path(path).read_text())
@@ -134,17 +150,25 @@ def parse_ctx_overflow_counter(path: Path) -> int:
     except (KeyError, TypeError) as err:
         raise ValueError(
             f"{path}: no detailed_events counters: {err}") from err
+    found = None
     for entry in counters:
         if not isinstance(entry, dict):
             continue
         if entry.get("name") == "ctx_overflow_identities":
-            try:
-                return int(entry.get("value"))
-            except (TypeError, ValueError) as err:
+            if found is not None:
+                raise ValueError(
+                    f"{path}: duplicate ctx_overflow_identities "
+                    "counter entries")
+            value = _unsigned_counter(entry.get("value"))
+            if value is None:
                 raise ValueError(
                     f"{path}: bad ctx_overflow_identities counter "
-                    f"{entry.get('value')!r}: {err}") from err
-    raise ValueError(f"{path}: ctx_overflow_identities counter missing")
+                    f"{entry.get('value')!r}")
+            found = value
+    if found is None:
+        raise ValueError(
+            f"{path}: ctx_overflow_identities counter missing")
+    return found
 
 
 def check_ctx_leg(ctx: dict, totals_calls, shape: str,

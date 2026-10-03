@@ -538,11 +538,13 @@ def _merge_shards(shard_paths, ledger_path):
     min over shards WITH meas ops (warm-only arrivals carry a
     fallback stamp that must not shrink the window); None when no
     shard measured (degenerate — the caller points it at t_end so
-    the frozen timing check fails the leg loudly). Raises on any
-    unreadable shard."""
+    the frozen timing check fails the leg loudly). The merged meas
+    MAX (same filter) rides along for actor-skew reporting (N6).
+    Raises on any unreadable shard."""
     ops_total = ops_meas = rows_meas = fails = late = offered = 0
     t_warm_start = None
     t_meas_start = None
+    t_meas_max = None
     offset = 0
     with open(ledger_path, "w", newline="") as out:
         out.write("seq,phase,op,dt_ns\n")
@@ -560,6 +562,7 @@ def _merge_shards(shard_paths, ledger_path):
             if summary["ops_meas"] > 0:
                 t1 = summary["t_meas_start_ns"]
                 t_meas_start = t1 if t_meas_start is None else min(t_meas_start, t1)
+                t_meas_max = t1 if t_meas_max is None else max(t_meas_max, t1)
             shard_max = -1
             with open(shard) as fh:
                 header = fh.readline()
@@ -572,7 +575,7 @@ def _merge_shards(shard_paths, ledger_path):
                     out.write(f"{offset + seq},{rest}")
             offset += shard_max + 1
     return (ops_total, ops_meas, rows_meas, fails, late, offered,
-            t_warm_start, t_meas_start)
+            t_warm_start, t_meas_start, t_meas_max)
 
 
 def _run_n_cgroup(argv0, opts):
@@ -599,6 +602,10 @@ def _run_n_cgroup(argv0, opts):
             group = dirs[(i // per_group) % cgroups]
             pids.append(_spawn_legacy_child(argv0, opts, shards[i], group))
         failed, worst = _reap_children(pids)
+        # N6: t_end stamps the reaped workload end BEFORE cgroup
+        # teardown — rmdir is parent-side overhead, never workload
+        # (same F6 principle as the merge exclusion below).
+        t_end = time.monotonic_ns()
     finally:
         leftovers = []
         for path in dirs:
@@ -614,20 +621,20 @@ def _run_n_cgroup(argv0, opts):
         print(f"m1: {failed} actor children failed (worst rc={worst})",
               file=sys.stderr)
         return 1
-    # F6: t_end stamps the workload end (all children reaped),
-    # BEFORE the shard merge — the merge rewrites the whole ledger
-    # (seconds at M1 scale) and must not inflate the measure window.
-    # Its own cost rides merge_s.
-    t_end = time.monotonic_ns()
+    # F6: the shard merge runs AFTER t_end — it rewrites the whole
+    # ledger (seconds at M1 scale) and must not inflate the measure
+    # window. Its own cost rides merge_s.
     try:
         (ops_total, ops_meas, rows_meas, fails, late, offered,
-         t_warm_start, t_meas_start) = _merge_shards(shards, opts["ledger"])
+         t_warm_start, t_meas_start,
+         t_meas_max) = _merge_shards(shards, opts["ledger"])
     except (OSError, ValueError, AssertionError, KeyError) as exc:
         print(f"m1: shard merge failed: {exc}", file=sys.stderr)
         return 1
     t_merged = time.monotonic_ns()
     if t_meas_start is None:
         t_meas_start = t_end
+        t_meas_max = t_end
     summary = {
         "ops_total": ops_total, "ops_meas": ops_meas,
         "rows_meas": rows_meas, "class": opts["class"],
@@ -635,6 +642,13 @@ def _run_n_cgroup(argv0, opts):
         "t_meas_start_ns": t_meas_start, "t_end_ns": t_end,
         "meas_window_s": (t_end - t_meas_start) / 1e9,
         "merge_s": (t_merged - t_end) / 1e9,
+        # N6: actor-start skew (max-min shard meas start),
+        # informational like merge_s — the stagger from sequential
+        # fork+exec plus scheduling jitter. Measured 1.3 s at 64
+        # actors (30 s legs read ~31.3 s, margin 3.7 s to the 35 s
+        # ceiling); the judge does not gate on it (the frozen
+        # timing gate already bounds the total window).
+        "skew_s": (t_meas_max - t_meas_start) / 1e9,
         "bulk": False, "paced": 0, "threads": actors,
         "offered": offered, "late": late,
         "pattern": "seq8", "iv": "seq64", "fails": fails,
@@ -708,8 +722,12 @@ def _run_churn(argv0, opts):
     # BEFORE the arrival merge — same rule as the n_cgroup path.
     t_end = time.monotonic_ns()
     try:
+        # N6: the meas MAX rides along but churn publishes no skew_s
+        # (arrival spread across the window is the workload shape,
+        # not start overhead — a skew number would mislead).
         (ops_total, ops_meas, rows_meas, fails, late, offered,
-         t_warm_start, t_meas_start) = _merge_shards(shards, opts["ledger"])
+         t_warm_start, t_meas_start,
+         _t_meas_max) = _merge_shards(shards, opts["ledger"])
     except (OSError, ValueError, AssertionError, KeyError) as exc:
         print(f"m1: arrival merge failed: {exc}", file=sys.stderr)
         return 1

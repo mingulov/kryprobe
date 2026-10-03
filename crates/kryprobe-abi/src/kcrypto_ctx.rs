@@ -146,15 +146,26 @@ pub fn fold_vctx(lanes: &[VCtx]) -> VCtx {
 }
 
 /// Checked [`fold_vctx`]: `None` when any counter lane-sum overflows
-/// (ADR-0008 §(e): saturation of any input counter refuses the
-/// receipt — never a silent wrap). The receipt path
-/// (`snapshot_ctx`) uses this; tick-path grouping keeps the
-/// saturating fold (codebase precedent for non-receipt folds).
+/// or any input counter is already saturated (ADR-0008 §(e):
+/// saturation of any input counter refuses the receipt — never a
+/// silent wrap). BPF counters saturate at `u64::MAX`, so a MAX input
+/// word is saturated/corrupt by construction (N5); stamps are NOT
+/// counters (`u64::MAX` is the `first_ns` idle sentinel) and stay
+/// exempt. The receipt path (`snapshot_ctx`) uses this; tick-path
+/// grouping keeps the saturating fold (codebase precedent for
+/// non-receipt folds).
 pub fn try_fold_vctx(lanes: &[VCtx]) -> Option<VCtx> {
     let mut out = VCtx::default();
     let mut first = u64::MAX;
     let mut any = false;
     for lane in lanes {
+        // N5: already-saturated inputs refuse even when the running
+        // sum would not overflow (0 + MAX is exact but saturated).
+        for word in [lane.calls, lane.bytes, lane.ok, lane.errors, lane.queued] {
+            if word == u64::MAX {
+                return None;
+            }
+        }
         out.calls = out.calls.checked_add(lane.calls)?;
         out.bytes = out.bytes.checked_add(lane.bytes)?;
         out.ok = out.ok.checked_add(lane.ok)?;
@@ -308,5 +319,43 @@ mod tests {
             ..VCtx::default()
         };
         assert_eq!(try_fold_vctx(&[full_bytes, some_bytes]), None);
+    }
+
+    #[test]
+    fn try_fold_refuses_already_saturated_input() {
+        // N5 (A3 review): a lone u64::MAX lane is already saturated
+        // in-BPF (BPF counters saturate at MAX) — 0+MAX overflowing
+        // nothing must still refuse. Stamps are exempt: u64::MAX is
+        // the first_ns idle sentinel (fold_vctx init), never a
+        // counter value.
+        let saturated = VCtx {
+            calls: u64::MAX,
+            ..VCtx::default()
+        };
+        assert_eq!(try_fold_vctx(&[saturated]), None);
+        assert_eq!(try_fold_vctx(&[VCtx::default(), saturated]), None);
+        let saturated_lat = VCtx {
+            queued: u64::MAX,
+            ..VCtx::default()
+        };
+        assert_eq!(try_fold_vctx(&[saturated_lat]), None);
+    }
+
+    #[test]
+    fn try_fold_exempts_stamps_from_saturation_refusal() {
+        // N5 PPV (security check): stamps are min/max-folded, never
+        // summed — a MAX stamp word must NOT refuse (u64::MAX is the
+        // first_ns idle sentinel, not a counter value). Identical
+        // behavior on base and patch by construction (no check).
+        let stamped = VCtx {
+            calls: 3,
+            first_ns: u64::MAX,
+            last_ns: u64::MAX,
+            ..VCtx::default()
+        };
+        let folded = try_fold_vctx(&[stamped]).expect("stamps exempt");
+        assert_eq!(folded.calls, 3);
+        assert_eq!(folded.first_ns, u64::MAX);
+        assert_eq!(folded.last_ns, u64::MAX);
     }
 }

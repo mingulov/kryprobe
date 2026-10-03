@@ -671,6 +671,45 @@ pub fn fold_vagg(lanes: &[VAgg]) -> VAgg {
     out
 }
 
+/// Checked [`fold_vagg`]: `None` when any counter/histogram lane-sum
+/// overflows or any input counter is already saturated (N5, same
+/// contract as [`crate::kcrypto_ctx::try_fold_vctx`]: BPF lanes
+/// saturate at `u64::MAX`, so a MAX input word refuses; stamps stay
+/// exempt). The M1 terminal KTOT read uses this; tick/report paths
+/// keep the saturating fold (frozen behavior, non-receipt).
+pub fn try_fold_vagg(lanes: &[VAgg]) -> Option<VAgg> {
+    let mut out = VAgg::default();
+    let mut first = u64::MAX;
+    let mut any = false;
+    for lane in lanes {
+        for word in [lane.calls, lane.bytes, lane.ok, lane.errors, lane.queued] {
+            if word == u64::MAX {
+                return None;
+            }
+        }
+        for slot in lane.lat.iter() {
+            if *slot == u64::MAX {
+                return None;
+            }
+        }
+        out.calls = out.calls.checked_add(lane.calls)?;
+        out.bytes = out.bytes.checked_add(lane.bytes)?;
+        out.ok = out.ok.checked_add(lane.ok)?;
+        out.errors = out.errors.checked_add(lane.errors)?;
+        out.queued = out.queued.checked_add(lane.queued)?;
+        out.last_ns = out.last_ns.max(lane.last_ns);
+        for (slot, add) in out.lat.iter_mut().zip(lane.lat.iter()) {
+            *slot = slot.checked_add(*add)?;
+        }
+        if lane.calls > 0 {
+            any = true;
+            first = first.min(lane.first_ns);
+        }
+    }
+    out.first_ns = if any { first } else { 0 };
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // Wire codecs (little-endian, x86-64 target; alignment-safe by construction)
 // ---------------------------------------------------------------------------
@@ -894,6 +933,61 @@ mod tests {
         assert_eq!(folded.calls, u64::MAX);
         assert_eq!(folded.bytes, u64::MAX);
         assert_eq!(folded.ok, 1);
+    }
+
+    #[test]
+    fn try_fold_vagg_matches_saturating_fold_when_clean() {
+        let busy = VAgg {
+            calls: 5,
+            bytes: 7,
+            ok: 1,
+            first_ns: 100,
+            last_ns: 200,
+            lat: [0, 2, 0, 0, 0, 0, 0, 0],
+            ..VAgg::default()
+        };
+        let idle = VAgg::default();
+        assert_eq!(
+            try_fold_vagg(&[idle, busy, idle]),
+            Some(fold_vagg(&[idle, busy, idle]))
+        );
+    }
+
+    #[test]
+    fn try_fold_vagg_refuses_overflow_and_saturated_inputs() {
+        // N5 (A3 review): sum overflow refuses, and so does an
+        // already-saturated input word (even a lone MAX lane).
+        let full = VAgg {
+            calls: u64::MAX,
+            ..VAgg::default()
+        };
+        let one = VAgg {
+            calls: 1,
+            ..VAgg::default()
+        };
+        assert_eq!(try_fold_vagg(&[full, one]), None);
+        assert_eq!(try_fold_vagg(&[full]), None);
+        let full_lat = VAgg {
+            lat: [0, 0, u64::MAX, 0, 0, 0, 0, 0],
+            ..VAgg::default()
+        };
+        assert_eq!(try_fold_vagg(&[VAgg::default(), full_lat]), None);
+    }
+
+    #[test]
+    fn try_fold_vagg_exempts_stamps_from_saturation_refusal() {
+        // N5 PPV (security check): stamps are min/max-folded, never
+        // summed — a MAX stamp word must NOT refuse.
+        let stamped = VAgg {
+            calls: 3,
+            first_ns: u64::MAX,
+            last_ns: u64::MAX,
+            ..VAgg::default()
+        };
+        let folded = try_fold_vagg(&[stamped]).expect("stamps exempt");
+        assert_eq!(folded.calls, 3);
+        assert_eq!(folded.first_ns, u64::MAX);
+        assert_eq!(folded.last_ns, u64::MAX);
     }
 
     #[test]

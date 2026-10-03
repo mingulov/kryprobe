@@ -219,9 +219,10 @@ pub fn close_kernel_fence(maps: &KcryptoMaps) -> Result<CloseOutcome, MapOpsErro
             // detach latency; burns deadline like any other wait.
             std::thread::sleep(Duration::from_millis(5));
             if kernel_lanes_drained(maps)? {
-                return Ok(CloseOutcome::Quiescent(QuiescentReceipt {
-                    fence_ns: now_ns(),
-                }));
+                // N1: the receipt honors the deadline — a drain
+                // landing on the boundary is Pending, never
+                // Quiescent (timeout never yields a receipt).
+                return Ok(close_receipt_decision(Instant::now(), deadline));
             }
         }
         if Instant::now() >= deadline {
@@ -229,6 +230,18 @@ pub fn close_kernel_fence(maps: &KcryptoMaps) -> Result<CloseOutcome, MapOpsErro
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Receipt-vs-Pending decision after the second all-zero read (N1):
+/// a drain observed at/past the deadline is `Pending` — timeout
+/// never yields `Quiescent`, even on the boundary (a 5 s drain
+/// means a sick machine; the leg goes INVALID loudly, never
+/// silently exact).
+fn close_receipt_decision(now: Instant, deadline: Instant) -> CloseOutcome {
+    if now >= deadline {
+        return CloseOutcome::Pending;
+    }
+    CloseOutcome::Quiescent(QuiescentReceipt { fence_ns: now_ns() })
 }
 
 /// True when every `KCTLCOUNT` lane reads zero.
@@ -302,6 +315,25 @@ mod tests {
         let (admit, _) = bpf_admit_twins(&fence, 1);
         assert!(!admit());
         assert_eq!(fence.active_count(), 0);
+    }
+
+    #[test]
+    fn boundary_drain_is_pending_not_quiescent() {
+        // N1: the receipt path honors the deadline — a drain
+        // observed at/past it is Pending, even double-drained.
+        let deadline = Instant::now();
+        assert!(matches!(
+            close_receipt_decision(deadline, deadline),
+            CloseOutcome::Pending
+        ));
+        assert!(matches!(
+            close_receipt_decision(deadline + Duration::from_secs(1), deadline),
+            CloseOutcome::Pending
+        ));
+        assert!(matches!(
+            close_receipt_decision(deadline, deadline + Duration::from_secs(1)),
+            CloseOutcome::Quiescent(_)
+        ));
     }
 
     #[test]

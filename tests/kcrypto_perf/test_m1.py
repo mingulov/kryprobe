@@ -381,6 +381,28 @@ class CtxOverflowTests(unittest.TestCase):
             m1validity.parse_ctx_overflow_counter(
                 Path("/nonexistent/report.json"))
 
+    def test_parse_overflow_rejects_non_counter_values(self):
+        # A3 review idea #7: the decoder must validate an unsigned
+        # counter — permissive int() coerces False->0, 0.5->0,
+        # True->1. Bools, floats, negatives, and non-digit strings
+        # are all mistyped evidence, never zero.
+        for bad in (False, True, 0.5, 2.7, -3, "-3", "3.0", "",
+                    None, [3], {"v": 3}):
+            path = write_tmp(json.dumps(self._report(bad)))
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                m1validity.parse_ctx_overflow_counter(path)
+
+    def test_parse_overflow_rejects_duplicates(self):
+        # A3 review idea #7: two entries for the same counter are
+        # contradictory evidence — first-match-wins would silently
+        # ignore one of them.
+        report = self._report("0")
+        report["coverage"]["detailed_events"]["counters"].append(
+            {"name": "ctx_overflow_identities", "value": "0"})
+        path = write_tmp(json.dumps(report))
+        with self.assertRaises(ValueError):
+            m1validity.parse_ctx_overflow_counter(path)
+
     def test_below_cap_overflow_rules(self):
         ctx = {"rows": 3, "present_calls": 100, "system_calls": 100,
                "unknown_calls": 0, "drops": 0}
@@ -588,6 +610,75 @@ class SetVerdictTests(unittest.TestCase):
         finally:
             CLI.form_pairs = real_form
 
+    def _m1_leg(self, pair, side, order):
+        # Real-path legs (no form_pairs monkeypatch): in-budget
+        # ratios (B/A throughput 0.99, p99 1.02).
+        stats = {"throughput": 0.99 if side == "B" else 1.0,
+                 "p50_ns": 100, "p99_ns": 102 if side == "B" else 100}
+        return {"leg_id": f"leg{pair:02d}{side}", "side": side,
+                "bulk": 0, "valid": True, "order": order,
+                "stats": stats}
+
+    def _m1_cell(self, name, pairs):
+        legs = []
+        for pair in pairs:
+            first, second = ("A", "B") if pair % 2 == 0 else ("B", "A")
+            legs.append(self._m1_leg(pair, first, 2 * pair))
+            legs.append(self._m1_leg(pair, second, 2 * pair + 1))
+        return {"cell": name, "errors": [], "legs": legs}
+
+    def test_duplicate_attempt_ids_are_invalid(self):
+        # N4 (A3 review): a spare staged with --start-pair 0
+        # re-stages leg00/leg01 — form_pairs would silently
+        # overwrite the main legs and undercount attempts. The M1
+        # audit rejects before pairing (frozen pairing untouched).
+        entry = CLI.find_set(self.manifest, "m1-P-4K-single-cr")
+        main = self._m1_cell("m1-P-4K-single-cr", range(10))
+        spare = self._m1_cell("m1-P-4K-single-cr-spare1", range(2))
+        judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
+                                  [main, spare], self.manifest)
+        self.assertEqual(judged["verdict"], "INVALID")
+        self.assertTrue(any("duplicate" in reason
+                            for reason in judged["reasons"]))
+
+    def test_gapped_attempt_indices_are_invalid(self):
+        # N4: a spare staged with --start-pair 11 skips pair 10 —
+        # silently short evidence. Contiguity from 0 is enforced.
+        entry = CLI.find_set(self.manifest, "m1-P-4K-single-cr")
+        main = self._m1_cell("m1-P-4K-single-cr", range(10))
+        spare = self._m1_cell("m1-P-4K-single-cr-spare1", (11, 12))
+        judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
+                                  [main, spare], self.manifest)
+        self.assertEqual(judged["verdict"], "INVALID")
+        self.assertTrue(any("contiguous" in reason
+                            for reason in judged["reasons"]))
+
+    def test_malformed_leg_ids_are_invalid(self):
+        # N4: legs.tsv carries no leg_id shape check — the audit is
+        # the fail-closed backstop for corrupted attempt identity.
+        entry = CLI.find_set(self.manifest, "m1-P-4K-single-cr")
+        main = self._m1_cell("m1-P-4K-single-cr", range(10))
+        main["legs"][0]["leg_id"] = "xx00A"
+        judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
+                                  [main], self.manifest)
+        self.assertEqual(judged["verdict"], "INVALID")
+        self.assertTrue(any("leg_id" in reason
+                            for reason in judged["reasons"]))
+
+    def test_contiguous_main_plus_spare_judges(self):
+        # N4 control: main 00-09 + spare 10-11 (contiguous, no dups)
+        # passes the audit and judges on the real path — 12 valid,
+        # first 10 deciding, 5/5 balance, in-budget ratios → PASS.
+        entry = CLI.find_set(self.manifest, "m1-P-4K-single-cr")
+        main = self._m1_cell("m1-P-4K-single-cr", range(10))
+        spare = self._m1_cell("m1-P-4K-single-cr-spare1", (10, 11))
+        judged = CLI.judge_m1_set("m1-P-4K-single-cr", entry,
+                                  [main, spare], self.manifest)
+        self.assertEqual(judged["verdict"], "PASS")
+        self.assertEqual(len(judged["deciding_pairs"]), 10)
+        self.assertEqual(judged["non_deciding_pairs"],
+                         ["leg10", "leg11"])
+
 
 class DriverTests(unittest.TestCase):
     def test_churn_counts_deterministic(self):
@@ -639,6 +730,10 @@ class DriverTests(unittest.TestCase):
         merged = M1DRIVER._merge_shards(
             [str(tmp / "sa"), str(tmp / "sb")], str(tmp / "merged.csv"))
         self.assertEqual(merged[:3], (5, 5, 10))
+        # N6: the merge also reports the max shard meas start (min
+        # 2000 / max 2500 here) so callers can publish actor skew.
+        self.assertEqual(len(merged), 9)
+        self.assertEqual(merged[8], 2500)
         rows = (tmp / "merged.csv").read_text().splitlines()[1:]
         seqs = sorted(int(line.split(",")[0]) for line in rows)
         # Globally unique seqs 0..4, each exactly twice (enc+dec).
@@ -704,9 +799,48 @@ class DriverTests(unittest.TestCase):
         self.assertGreaterEqual(summary["merge_s"], 2.0)
         self.assertLess(summary["meas_window_s"], 3.5)
         self.assertEqual(summary["rows_meas"], 2 * summary["ops_meas"])
+        # N6: actor-start skew is published (informational, like
+        # merge_s) and sane: within the measured window.
+        self.assertIn("skew_s", summary)
+        self.assertGreaterEqual(summary["skew_s"], 0.0)
+        self.assertLessEqual(summary["skew_s"],
+                             summary["meas_window_s"])
         tag = f"{M1DRIVER.M1_CGROUP_TAG}-{os.getpid()}"
         leftovers = sorted(Path(M1DRIVER.M1_CGROUP_BASE).glob(f"{tag}-*"))
         self.assertEqual(leftovers, [])
+
+    @unittest.skipUnless(os.geteuid() == 0,
+                         "n_cgroup driver needs root (cgroup mkdir)")
+    @unittest.skipUnless(_afalg_usable(), "AF_ALG cbc(aes) unavailable")
+    def test_n_cgroup_cleanup_after_t_end(self):
+        # N6 (A3 review) structural: cgroup teardown is parent-side
+        # overhead — every rmdir must land AFTER the stamped t_end,
+        # never inside the measure window. Timestamped via a
+        # recording os.rmdir wrapper (no timing flakes: ordering,
+        # not duration, is asserted).
+        tmp = Path(tempfile.mkdtemp())
+        ledger = str(tmp / "nc-clean.csv")
+        argv = [M1DRIVER.__file__, "skcipher", "4096", "1", "0",
+               "--actors", "2", "--cgroups", "1", ledger]
+        rmdir_at = []
+        real_rmdir = os.rmdir
+
+        def recording_rmdir(path, *args, **kwargs):
+            rmdir_at.append(time.monotonic_ns())
+            return real_rmdir(path, *args, **kwargs)
+
+        os.rmdir = recording_rmdir
+        try:
+            rc = M1DRIVER.main(argv)
+        finally:
+            os.rmdir = real_rmdir
+        self.assertEqual(rc, 0)
+        summary = json.loads(
+            Path(ledger + ".summary.json").read_text())
+        self.assertEqual(summary["fails"], 0)
+        self.assertTrue(rmdir_at, "expected cgroup teardown calls")
+        for stamp in rmdir_at:
+            self.assertGreaterEqual(stamp, summary["t_end_ns"])
 
 
 class DiagVerdictTests(unittest.TestCase):
@@ -812,6 +946,66 @@ class DiagVerdictTests(unittest.TestCase):
         judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
                                    self._cell([leg]))
         self.assertEqual(judged["verdict"], "INVALID")
+
+    def test_diag_rejects_vacuous_observation(self):
+        # N2 (A3 review): driver ran positive traffic and attach is
+        # 9/9, but BOTH sensor ledgers read zero — agreeing zeros
+        # must not PASS (the frozen driver<->sensor reconciliation
+        # the overlay docstring cites does not run on the diag path).
+        leg = self._leg()
+        leg["diag"] = {
+            "attach": {"attached": 9, "expected": 9},
+            "ctx": {"rows": 0, "present_calls": 0, "system_calls": 0,
+                    "unknown_calls": 0, "drops": 0},
+            "totals_calls": 0, "exactness": []}
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
+        self.assertTrue(any("observation" in reason
+                            for reason in judged["reasons"]))
+
+    def test_diag_rejects_partial_observation(self):
+        # N2 variant: sensors agree exactly but saw ~half the
+        # workload (ratio 0.98x vs flat 2x / floor 4x) — gross
+        # partial misses must not PASS either.
+        leg = self._leg()
+        leg["diag"] = {
+            "attach": {"attached": 9, "expected": 9},
+            "ctx": {"rows": 6, "present_calls": 1200000,
+                    "system_calls": 1200000, "unknown_calls": 0,
+                    "drops": 0},
+            "totals_calls": 1200000, "exactness": []}
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "INVALID")
+        self.assertTrue(any("ratio" in reason
+                            for reason in judged["reasons"]))
+
+    def test_diag_accepts_flat_ratio(self):
+        # N2 control (anti-A1): the band must contain the FLAT shape
+        # too (7.x canary leg00B: 1595873/797936 = 2.00000125) —
+        # the diag must not overfit the 4x floor equation.
+        leg = self._leg()
+        leg["driver"] = {"rc": 0, "ops_total": 797936}
+        leg["diag"] = {
+            "attach": {"attached": 9, "expected": 9},
+            "ctx": {"rows": 3, "present_calls": 1595873,
+                    "system_calls": 1595873, "unknown_calls": 0,
+                    "drops": 0},
+            "totals_calls": 1595873, "exactness": []}
+        judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                   self._cell([leg]))
+        self.assertEqual(judged["verdict"], "PASS")
+
+    def test_diag_rejects_missing_driver_ops(self):
+        # N2: a missing/non-positive driver denominator is INVALID
+        # (fail-closed — never a vacuous ratio).
+        for bad_ops in (None, 0, -5, True, "1226880"):
+            leg = self._leg()
+            leg["driver"] = {"rc": 0, "ops_total": bad_ops}
+            judged = CLI.judge_m1_diag("m1-diag-612-ctx", self.entry,
+                                       self._cell([leg]))
+            self.assertEqual(judged["verdict"], "INVALID", bad_ops)
 
 
 if __name__ == "__main__":

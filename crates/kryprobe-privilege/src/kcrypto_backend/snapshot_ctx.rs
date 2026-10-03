@@ -130,7 +130,7 @@ fn sum_u64_lanes(raw: &[u8], ncpu: usize) -> Result<u64, SnapshotError> {
 /// field is fail-soft (`None` = unreadable, never a silent zero); the
 /// judge recomputes the identity (see [`CtxTerminal`]).
 pub fn snapshot_ctx_terminal(maps: &ConfiguredKcrypto) -> crate::kcrypto_snapshot::CtxTerminal {
-    use crate::kcrypto_snapshot::{CtxTerminal, ParsedRow, parse_snapshot_row, read_ktot};
+    use crate::kcrypto_snapshot::{CtxTerminal, ParsedRow, parse_snapshot_row, read_ktot_checked};
     let (rows, present_calls, drops) = match snapshot_ctx(maps) {
         Ok((rows, drops)) => {
             // F8a: checked present sum — saturation refuses the
@@ -141,7 +141,9 @@ pub fn snapshot_ctx_terminal(maps: &ConfiguredKcrypto) -> crate::kcrypto_snapsho
         }
         Err(_) => (None, None, None),
     };
-    let system_calls = read_ktot(maps).ok().flatten().and_then(|totals| {
+    // N5: checked KTOT fold — a saturated system ledger refuses the
+    // system operand (EOVERFLOW → None, same fail-soft shape).
+    let system_calls = read_ktot_checked(maps).ok().flatten().and_then(|totals| {
         match parse_snapshot_row(totals.as_bytes()) {
             Ok(ParsedRow::Totals { vagg }) => Some(vagg.calls),
             _ => None,
@@ -160,12 +162,18 @@ pub fn snapshot_ctx_terminal(maps: &ConfiguredKcrypto) -> crate::kcrypto_snapsho
     }
 }
 
-/// Checked sum of folded per-key `calls` (F8a): `None` on overflow
-/// (ADR-0008 §(e): saturation refuses the receipt operand — never a
-/// silent wrap).
+/// Checked sum of folded per-key `calls` (F8a + N5): `None` on
+/// overflow or on an already-saturated input row (ADR-0008 §(e):
+/// saturation refuses the receipt operand — never a silent wrap).
 fn sum_present_calls(rows: &[CtxSnapshot]) -> Option<u64> {
-    rows.iter()
-        .try_fold(0u64, |acc, row| acc.checked_add(row.val.calls))
+    rows.iter().try_fold(0u64, |acc, row| {
+        // N5: a MAX row is saturated in-BPF (or a saturated fold) —
+        // refuse even when the running sum would not overflow.
+        if row.val.calls == u64::MAX {
+            return None;
+        }
+        acc.checked_add(row.val.calls)
+    })
 }
 
 #[cfg(test)]
@@ -194,6 +202,14 @@ mod tests {
         // F8a (M1 review): ADR-0008 §(e) — saturation refuses the
         // receipt operand.
         let rows = vec![snapshot_with_calls(u64::MAX), snapshot_with_calls(1)];
+        assert_eq!(sum_present_calls(&rows), None);
+    }
+
+    #[test]
+    fn present_sum_refuses_already_saturated_row() {
+        // N5 (A3 review): a lone MAX row is already saturated —
+        // 0+MAX overflowing nothing must still refuse.
+        let rows = vec![snapshot_with_calls(u64::MAX)];
         assert_eq!(sum_present_calls(&rows), None);
     }
 

@@ -769,6 +769,13 @@ def _read_int_kv(path: Path, key: str):
     return None
 
 
+def _is_positive_int(value) -> bool:
+    """Strict positive-int check (N2): real ints only — bools are not
+    counters (``True`` is not 1 op), floats/strings/None never pass."""
+    return isinstance(value, int) and not isinstance(value, bool) \
+        and value > 0
+
+
 def check_leg_timing(summary: dict, warmup_s: float,
                      measure_s: float) -> list:
     """Enforce the frozen 10 s warm-up + 30 s measurement (P9R1A-N7).
@@ -1659,6 +1666,49 @@ def judge_set(set_id: str, cell_verdicts: list, manifest: dict) -> dict:
     return out
 
 
+def audit_m1_attempt_ids(cell_verdicts: list) -> list:
+    """M1 raw-attempt identity audit (N4), BEFORE frozen pairing.
+
+    ``form_pairs`` is frozen: it silently overwrites ``slot[side]``
+    on duplicate leg_ids and ``attempted`` counts deduplicated
+    pairs — a mistyped spare ``--start-pair`` would substitute
+    evidence and defeat the attempt budget. The audit rejects:
+    duplicate leg_ids across the set's cells, malformed leg_ids
+    (legs.tsv carries no shape check — want ``legNN{A,B}``), and
+    gapped pair indices (staging always numbers contiguously from
+    0: main 00..N, spares continue — runbook per-class starts).
+    Missing sides per index stay with frozen pairing (invalid
+    pairs fail quorum). Empty leg lists pass vacuously (quorum
+    INVALIDs them downstream anyway).
+    """
+    seen: set = set()
+    dupes: set = set()
+    malformed: set = set()
+    indices: set = set()
+    for verdict in cell_verdicts:
+        for leg in verdict.get("legs", []):
+            leg_id = leg.get("leg_id", "")
+            if leg_id in seen:
+                dupes.add(leg_id)
+            seen.add(leg_id)
+            if len(leg_id) == 6 and leg_id.startswith("leg") \
+                    and leg_id[3:5].isdigit() and leg_id[5] in "AB":
+                indices.add(int(leg_id[3:5]))
+            else:
+                malformed.add(leg_id)
+    reasons = []
+    if dupes:
+        reasons.append(f"duplicate attempt leg_ids: {sorted(dupes)} "
+                       "(spare restaged main attempts?)")
+    if malformed:
+        reasons.append(f"malformed attempt leg_ids: {sorted(malformed)} "
+                       "(want legNN{{A,B}})")
+    if indices != set(range(len(indices))):
+        reasons.append(f"non-contiguous attempt indices: have "
+                       f"{sorted(indices)} (want 0..{len(indices) - 1})")
+    return reasons
+
+
 def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
                  manifest: dict) -> dict:
     """Combine an M1 set's cells into the set verdict (ADR-0016: the
@@ -1675,6 +1725,10 @@ def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
             out.update(verdict="INVALID",
                        reasons=[f"{verdict['cell']}: {verdict['errors']}"])
             return out
+    audit_reasons = audit_m1_attempt_ids(cell_verdicts)
+    if audit_reasons:
+        out.update(verdict="INVALID", reasons=audit_reasons)
+        return out
     pairs = form_pairs(cell_verdicts)
     out["pairs"] = pairs
     valid_pairs = sorted((pair for pair in pairs if pair["valid"]),
@@ -1796,12 +1850,14 @@ def judge_m1_diag(diag_id: str, entry: dict, cell_verdict: dict) -> dict:
     frozen legs-valid gate cannot adjudicate it. The PASS bar is: one
     B-side aggregation leg, a clean boot-quiet, a clean driver run, a
     clean capture (rc in {0, 3}), full attach (9/9 per the frozen
-    attach audit), and the A2 ctx exactness rules. Driver/capture
-    fields are re-derived from the judged leg — every early
-    ``judge_leg`` exit (unreadable summary, driver failure, timing or
-    thread mismatch, corrupt ledger) is a genuine evidence failure,
-    never a shape artifact, so a missing field is INVALID. The frozen
-    shape verdict is copied through for transparency.
+    attach audit), POSITIVE observation on the driver and both sensor
+    ledgers with a bounded system/ops ratio, and the A2 ctx exactness
+    rules. Driver/capture fields are re-derived from the judged leg —
+    every early ``judge_leg`` exit (unreadable summary, driver
+    failure, timing or thread mismatch, corrupt ledger) is a genuine
+    evidence failure, never a shape artifact, so a missing field is
+    INVALID. The frozen shape verdict is copied through for
+    transparency.
     """
     out: dict = {"diag": diag_id, "kind": entry["kind"],
                  "kernel": entry["kernel"]}
@@ -1843,6 +1899,35 @@ def judge_m1_diag(diag_id: str, entry: dict, cell_verdict: dict) -> dict:
                        f"{attach.get('expected')} (want 9/9)")
     out["ctx"] = diag.get("ctx")
     out["totals_calls"] = diag.get("totals_calls")
+    # N2 (A3 review): the frozen driver<->sensor per-op reconciliation
+    # does NOT run on the diag path (the frozen shape verdict is
+    # ignored by design), so agreeing-but-empty (or grossly partial)
+    # sensor ledgers would PASS on exactness alone. Require positive
+    # observation on the driver and both sensors, plus a bounded
+    # system/ops ratio. The band [1.5, 6.0] contains the flat shape
+    # (7.x: 1595873/797936 = 2.00000125) and the floor shape (6.12.111
+    # sealed diag: 4907528/1226880 = 4.0000065) with margin, and
+    # excludes vacuous 0x, flat-missing-one-side 1x, and runaway >=6x
+    # — without pinning an exact floor equation (A1 overclaim
+    # discipline). Known residual: a floor leg missing one cryptd arm
+    # (~2-3x) still passes the band; single-arm detection needs the
+    # rows pin (sealed rows=12, N=1 — pin only after the re-stage
+    # confirms stability).
+    driver_ops = driver.get("ops_total")
+    totals = diag.get("totals_calls")
+    system = (diag.get("ctx") or {}).get("system_calls")
+    if not _is_positive_int(driver_ops):
+        reasons.append(f"observation: driver ops_total={driver_ops!r} "
+                       "(want positive int)")
+    elif not _is_positive_int(totals) or not _is_positive_int(system):
+        reasons.append(f"observation: report totals={totals!r} "
+                       f"ctx system={system!r} (want both positive)")
+    else:
+        ratio = system / driver_ops
+        out["system_per_op"] = ratio
+        if not 1.5 <= ratio <= 6.0:
+            reasons.append(f"observation ratio system/ops={ratio:.4f} "
+                           "(want within [1.5, 6.0])")
     for reason in diag.get("exactness") or []:
         reasons.append(f"exactness: {reason}")
     if reasons:

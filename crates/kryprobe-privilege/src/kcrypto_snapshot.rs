@@ -36,7 +36,7 @@
 
 use kryprobe_abi::kcrypto_agg::{
     KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCtl, KIDN_DROPS, VAgg, fold_vagg, kagg_from_bytes,
-    kctl_from_bytes, vagg_from_bytes,
+    kctl_from_bytes, try_fold_vagg, vagg_from_bytes,
 };
 use kryprobe_abi::kcrypto_ctx::{KCTL_CTX_OVERFLOW, KCtxKey, VCtx, fold_vctx};
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, RawEventHeader};
@@ -478,6 +478,54 @@ pub(crate) fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes
     bytes.push(SNAPSHOT_VERSION);
     bytes.push(ROW_KIND_TOTALS);
     bytes.extend_from_slice(&vagg_to_bytes(&fold_vagg(&lanes)));
+    debug_assert_eq!(bytes.len(), TOTALS_BYTES_LEN);
+    Ok(Some(TotalsBytes(bytes)))
+}
+
+/// Checked `KTOT` read + percpu fold for the M1 receipt path (N5):
+/// same bytes as [`read_ktot`] when clean, `EOVERFLOW` when the
+/// fold refuses (lane-sum overflow or an already-saturated input
+/// word — ADR-0008 §(e)). Tick/report/legacy-terminal callers keep
+/// [`read_ktot`] (saturating fold, frozen behavior).
+pub(crate) fn read_ktot_checked(
+    sensor: &ConfiguredKcrypto,
+) -> Result<Option<TotalsBytes>, MapOpsError> {
+    let (ncpu, value_len) = percpu_buffer_len(120)?;
+    // SAFETY: KTOT is PerCpuArray<VAgg>; VAgg is 120B
+    // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus.
+    let raw = match unsafe {
+        map_lookup_bytes(
+            &sensor.loaded.maps.total,
+            &0u32.to_le_bytes(),
+            value_len,
+            "snapshot/ktot",
+        )
+    } {
+        Ok(raw) => raw,
+        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let mut lanes = Vec::with_capacity(ncpu);
+    for c in 0..ncpu {
+        let lane = raw
+            .get(c * 120..(c + 1) * 120)
+            .and_then(vagg_from_bytes)
+            .ok_or_else(|| MapOpsError::LookupFailed {
+                stage: "snapshot/ktot-lane".to_owned(),
+                errno: libc::EBADMSG,
+            })?;
+        lanes.push(lane);
+    }
+    let folded = try_fold_vagg(&lanes).ok_or_else(|| MapOpsError::LookupFailed {
+        stage: "snapshot/ktot-checked".to_owned(),
+        errno: libc::EOVERFLOW,
+    })?;
+    let mut bytes = Vec::with_capacity(TOTALS_BYTES_LEN);
+    bytes.push(SNAPSHOT_VERSION);
+    bytes.push(ROW_KIND_TOTALS);
+    bytes.extend_from_slice(&vagg_to_bytes(&folded));
     debug_assert_eq!(bytes.len(), TOTALS_BYTES_LEN);
     Ok(Some(TotalsBytes(bytes)))
 }
