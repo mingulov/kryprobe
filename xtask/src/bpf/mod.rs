@@ -368,6 +368,7 @@ pub(crate) fn test_bpf() -> i32 {
         ("kryprobe-privilege", "kcrypto_attach"),
         ("kryprobe-privilege", "kcrypto_agg"),
         ("kryprobe-privilege", "kcrypto_canary"),
+        ("kryprobe-privilege", "kcrypto_ctx"),
         ("kryprobe-privilege", "kcrypto_lifecycle_object"),
         ("kryprobe-privilege", "kcrypto_lifecycle_decode"),
         ("kryprobe-privilege", "kcrypto_lifecycle_sensor"),
