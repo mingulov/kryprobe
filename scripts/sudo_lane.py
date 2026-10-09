@@ -448,7 +448,11 @@ def prepare(root, out, cargo, traffic_generator):
                   "rustc": subprocess.check_output(["rustc", "--version"], cwd=root, env=env, text=True).strip()},
     }
     dump(out / "manifest.json", manifest)
-    print(f"sudo-lane: prepared 34 lane bodies (33 root, 1 non-root), 1 separate lab body and 3 vng-guest bodies at {out}", flush=True)
+    lab_bodies = len(EXPECTED[LAB_SUITE])
+    vng_bodies = len(EXPECTED[VNG_SUITE])
+    lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
+    print(f"sudo-lane: prepared {lane_bodies} lane bodies ({lane_bodies - 1} root, 1 non-root), "
+          f"{lab_bodies} separate lab body and {vng_bodies} vng-guest bodies at {out}", flush=True)
     return manifest
 
 
@@ -677,8 +681,11 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             raise InterruptedError("cancelled; lane cleanup complete")
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
-    dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": 34,
-                                "root_bodies": 33, "nonroot_bodies": 1, "other_lane_bodies": 4,
+    lab_bodies = len(EXPECTED[LAB_SUITE])
+    vng_bodies = len(EXPECTED[VNG_SUITE])
+    lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
+    dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
+                                "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
                                 "complete": True})
     print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
     return code
