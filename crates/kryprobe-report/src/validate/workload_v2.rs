@@ -1347,9 +1347,14 @@ fn validate_attribution_rules(
         status,
         AttributionStatus::Asserted | AttributionStatus::Verified
     ) {
-        let covers = match (capture_window, &validity) {
-            (Some((start, end)), Some(window)) => window.start_ns <= start && end <= window.end_ns,
-            _ => false,
+        // A defective interval already refuses on its own finding; without a
+        // usable window the coverage check must not cascade (R4).
+        let Some((start, end)) = capture_window else {
+            return;
+        };
+        let covers = match &validity {
+            Some(window) => window.start_ns <= start && end <= window.end_ns,
+            None => false,
         };
         if !covers {
             findings.push(V2Finding::InvalidCombination {
@@ -1874,6 +1879,43 @@ mod tests {
             validate_workload_v2(&v).is_empty(),
             "expired Stale binding must validate: {:?}",
             validate_workload_v2(&v)
+        );
+    }
+
+    #[test]
+    fn defective_interval_refuses_without_cascading_coverage() {
+        // Round-4: a defective report interval refuses on its own finding;
+        // attribution-coverage findings must not cascade from asserting rows
+        // (ADR-0012 "without cascading").
+        let mut v = minimal_valid();
+        v["interval"]["start_ns"] = json!("200");
+        v["interval"]["end_ns"] = json!("100");
+        assert_eq!(
+            validate_workload_v2(&v),
+            vec![V2Finding::InvalidCombination {
+                detail: "interval is inverted".to_string(),
+            }],
+            "inverted interval must refuse once, without coverage cascade"
+        );
+        let mut v = minimal_valid();
+        v["interval"]["start_ns"] = json!("18446744073709551616");
+        assert_eq!(
+            validate_workload_v2(&v),
+            vec![V2Finding::InvalidCombination {
+                detail: "interval bounds do not parse as u64".to_string(),
+            }],
+            "unparseable interval must refuse once, without coverage cascade"
+        );
+        // Control: a valid interval with non-covering validity still refuses
+        // on the coverage finding itself.
+        let mut v = minimal_valid();
+        v["interval"]["end_ns"] = json!("1000");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { detail }
+                    if detail.contains("does not cover the report interval"))),
+            "expired Asserted binding on a valid interval must still refuse on coverage"
         );
     }
 
