@@ -93,6 +93,7 @@ fn wrong_kernel_metadata_is_rejected() {
             tgid: 1000,
             start_ns: 555,
         }],
+        capture_interval: None,
     };
     let foreign_snapshot = MetadataSnapshot {
         collector: "docker-fixture-v1".to_string(),

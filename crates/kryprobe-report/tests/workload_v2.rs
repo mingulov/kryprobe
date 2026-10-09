@@ -129,6 +129,61 @@ fn matching_violation_binds_selector_to_forbidden_row() {
 }
 
 #[test]
+fn fixtures_use_native_context_codes_and_ordered_starts() {
+    // Round-2: native context codes are proc=0, kthread=1 (softirq=2 is
+    // reserved, never emitted); process starts never exceed the capture
+    // end.
+    for name in [
+        "complete-raw-ids.json",
+        "asserted-metadata.json",
+        "unknown-context.json",
+        "unknown-match.json",
+        "full-map.json",
+        "stale-metadata.json",
+        "partial-capture.json",
+        "matching-violation.json",
+    ] {
+        let v = load_fixture(name);
+        let end: u64 = v["interval"]["end_ns"]
+            .as_str()
+            .expect("interval end")
+            .parse()
+            .expect("u64 end");
+        let dict = v["dictionary"].as_array().expect("dictionary");
+        for row in v["contexts"].as_array().expect("rows") {
+            let start: u64 = row["start_ns"]
+                .as_str()
+                .expect("start")
+                .parse()
+                .expect("u64 start");
+            assert!(
+                start <= end,
+                "{name}: process start {start} exceeds capture end {end}"
+            );
+            let expected = match row["execution_kind"].as_str().expect("kind") {
+                "proc" => 0,
+                "kthread" => 1,
+                kind => panic!("{name}: unexpected execution kind {kind}"),
+            };
+            let code = if let Some(native) = row.get("native") {
+                native["context"].as_u64().expect("inline context")
+            } else {
+                let id = row["native_ref"].as_str().expect("native_ref");
+                dict.iter()
+                    .find(|e| e["dict_id"] == id)
+                    .expect("entry resolves")["context"]
+                    .as_u64()
+                    .expect("dict context")
+            };
+            assert_eq!(
+                code, expected,
+                "{name}: native context code must match the row kind"
+            );
+        }
+    }
+}
+
+#[test]
 fn v1_bytes_are_not_v2() {
     assert!(workload_v2::dispatch_schema("kryprobe.workload-report.v1").is_err());
     assert!(workload_v2::dispatch_schema("kryprobe.event/v0").is_err());
