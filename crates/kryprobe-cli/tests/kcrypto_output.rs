@@ -720,6 +720,7 @@ fn output_config() -> LiveConfig {
         token: None,
         json_audit: false,
         profile: LifecycleProfile::RequestLifecycle,
+        workload: false,
     }
 }
 

@@ -117,6 +117,7 @@ pub fn run(
         token: token.map(Path::to_owned),
         json_audit: false,
         profile,
+        workload: false,
     };
     finish_check(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),

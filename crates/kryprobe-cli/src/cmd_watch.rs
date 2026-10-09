@@ -108,6 +108,7 @@ pub fn run_watch(
         token: token.map(Path::to_owned),
         json_audit: false,
         profile,
+        workload: false,
     };
     finish_watch(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
@@ -396,6 +397,10 @@ pub(crate) mod fixtures {
             // Aggregate-profile fixture: no lifecycle reducer.
             lifecycle_totals: None,
             stop: None,
+            // Non-workload fixture: no helper, no terminal, no capture.
+            workload_preflight: None,
+            workload_terminal: None,
+            workload_capture: None,
         }
     }
 

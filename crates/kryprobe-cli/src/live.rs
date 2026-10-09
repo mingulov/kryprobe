@@ -62,6 +62,9 @@ use kryprobe_privilege::kcrypto_snapshot::{
     AggOccupancy, CtxTerminal, ParsedRow, SnapshotRows, parse_snapshot_row, raw_event_stamped,
     shared_losses_from_drain,
 };
+use kryprobe_privilege::workload_launch::{WorkloadPreflight, preflight_helper};
+use kryprobe_report::workload::NativeIdentity;
+use crate::workload::{TerminalWorkload, WorkloadCapture, execution_kind_for_ctx, join_capture};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::Write;
@@ -133,11 +136,17 @@ pub struct LiveConfig {
     /// Capture profile (T06 F8a): registry + live entry points both
     /// select this (never diverge); default keeps api-returns.
     pub profile: LifecycleProfile,
+    /// M1 workload capture: attest the fixed helper before capture
+    /// threads own authority fds, then collect the terminal natives
+    /// plus per-context `KCTX` rows for the common typed report.
+    /// Historical (non-workload) sessions leave this false and never
+    /// spawn the helper.
+    pub workload: bool,
 }
 
 impl Default for LiveConfig {
     /// `kernel-crypto`, unbounded, 1000ms ticks, no explicit token,
-    /// no audit trail, `api-returns` profile.
+    /// no audit trail, `api-returns` profile, no workload capture.
     fn default() -> Self {
         Self {
             source: LIVE_SOURCE.to_owned(),
@@ -146,6 +155,7 @@ impl Default for LiveConfig {
             token: None,
             json_audit: false,
             profile: LifecycleProfile::default(),
+            workload: false,
         }
     }
 }
@@ -332,6 +342,21 @@ pub struct LiveOutcome {
     /// report (the renderer field-picks — this rides the stderr
     /// telemetry line via `cmd_report` instead).
     pub stop: Option<SessionStop>,
+    /// M1 workload helper preflight (`Some` exactly when
+    /// `LiveConfig.workload` is set): the verified launch target or
+    /// the typed reason metadata is unavailable. Established before
+    /// capture; consumed by the post-capture serve.
+    pub workload_preflight: Option<WorkloadPreflight>,
+    /// M1 terminal workload essentials (`Some` exactly when
+    /// `LiveConfig.workload` is set): parsed terminal natives plus
+    /// the system ledger and capture interval. Intermediate: the
+    /// orchestrator joins it with the `KCTX` rows below.
+    pub workload_terminal: Option<TerminalWorkload>,
+    /// M1 joined workload capture (`Some` exactly when
+    /// `LiveConfig.workload` is set and the post-finish `KCTX` walk
+    /// succeeded): per-context rows plus ledger operands, ready for
+    /// the common typed report.
+    pub workload_capture: Option<WorkloadCapture>,
 }
 
 /// Request-lifecycle terminal totals: the reducer equation plus every
@@ -1793,6 +1818,77 @@ fn ingest_who_rows(
 /// shared feed ONCE, then coverage from the session measurements.
 /// NEVER finalizes per tick (D1/M1).
 #[allow(clippy::too_many_arguments)]
+/// Parse the terminal sample into workload essentials: every
+/// terminal `KAGG` row becomes one native identity (verbatim
+/// algorithm/driver names via the shared decoder — an all-zero
+/// driver is the explicit absent-driver allocation record, never an
+/// empty string), keyed by the same `kh` the `KCTX` rows carry, plus
+/// the terminal `KTOT` system ledger and the capture interval.
+/// Corrupt rows refuse [`LiveError::Internal`]; a missing terminal
+/// totals row is [`LiveError::Unusable`] (no system operand, no
+/// ledger).
+fn terminal_workload(sample: &AggregateTerminalSample) -> Result<TerminalWorkload, LiveError> {
+    use crate::workload::ParsedNative;
+    let mut natives = Vec::with_capacity(sample.snapshot.rows.len());
+    for row in &sample.snapshot.rows {
+        let parsed = parse_snapshot_row(row.as_bytes())
+            .map_err(|err| LiveError::Internal(format!("live workload native: {err}")))?;
+        let ParsedRow::Agg { kagg, .. } = parsed else {
+            return Err(LiveError::Internal(
+                "live workload native: unexpected row kind".to_owned(),
+            ));
+        };
+        let (algorithm, driver_words) = kryprobe_privilege::workload_launch::kagg_names(&kagg);
+        if algorithm.is_empty() {
+            return Err(LiveError::Internal(
+                "live workload native: empty algorithm name".to_owned(),
+            ));
+        }
+        natives.push(ParsedNative {
+            kh: kh_of(
+                kagg.fam(),
+                kagg.op(),
+                kagg.res(),
+                kagg.ctx(),
+                &kagg.alg(),
+                &kagg.drv(),
+            ),
+            native: NativeIdentity::new(
+                kagg.fam(),
+                kagg.op(),
+                kagg.res(),
+                kagg.ctx(),
+                &algorithm,
+                if driver_words.is_empty() {
+                    None
+                } else {
+                    Some(driver_words.as_str())
+                },
+            ),
+            kind: execution_kind_for_ctx(kagg.ctx()),
+        });
+    }
+    let Some(totals) = &sample.snapshot.totals else {
+        return Err(LiveError::Unusable(
+            "live workload ledger: terminal totals unreadable".to_owned(),
+        ));
+    };
+    let parsed = parse_snapshot_row(totals.as_bytes())
+        .map_err(|err| LiveError::Internal(format!("live workload ledger: {err}")))?;
+    let ParsedRow::Totals { vagg } = parsed else {
+        return Err(LiveError::Internal(
+            "live workload ledger: unexpected row kind".to_owned(),
+        ));
+    };
+    Ok(TerminalWorkload {
+        natives,
+        system_total: vagg.calls,
+        system_saturated: vagg.calls == u64::MAX,
+        interval_start_ns: sample.started_ns,
+        interval_end_ns: sample.snapshot.monotonic_ns,
+    })
+}
+
 fn drive_session_inner(
     cfg: &LiveConfig,
     backend: &dyn Backend,
@@ -1869,6 +1965,14 @@ fn drive_session_inner(
     terminal
         .validate_interval()
         .map_err(|err| backend_err("live terminal interval", err))?;
+    // M1 workload essentials: parsed terminal natives plus the system
+    // ledger and capture interval (`None` unless workload mode — the
+    // historical path pays no parse cost and changes no bytes).
+    let workload_terminal = if cfg.workload {
+        Some(terminal_workload(&terminal)?)
+    } else {
+        None
+    };
     hop(controller, SessionState::Draining, "session drain")?;
     // Replace all running cumulative rows, including keys absent from the final
     // sample. Identity records are disjoint stream evidence and stay retained.
@@ -1983,6 +2087,13 @@ fn drive_session_inner(
             assemble_us,
             ended: t_stop,
         }),
+        // The helper preflight rides in at the orchestrator (it is
+        // established before capture, outside the tick driver).
+        workload_preflight: None,
+        workload_terminal,
+        // The post-finish `KCTX` walk joins at the orchestrator (the
+        // driver owns ticks, never the terminal map walk).
+        workload_capture: None,
     })
 }
 
@@ -2409,6 +2520,12 @@ fn drive_lifecycle_session_inner(
             assemble_us,
             ended: t_stop,
         }),
+        // The lifecycle profile carries no `KCTX` maps: workload
+        // views refuse it before capture (argument layer), so these
+        // stay `None` here by construction.
+        workload_preflight: None,
+        workload_terminal: None,
+        workload_capture: None,
     })
 }
 
@@ -2491,6 +2608,14 @@ fn run_lifecycle_session_inner(
             "unsupported live source '{}': only '{}' is captured live",
             cfg.source, LIVE_SOURCE
         )));
+    }
+    // M1 workload views need the api-returns `KCTX` maps: the
+    // argument layer refuses this combination (exit 2), so reaching
+    // here is a programming error, never a user path.
+    if cfg.workload {
+        return Err(LiveError::Internal(
+            "workload capture needs the api-returns profile".to_owned(),
+        ));
     }
     let backend = registry
         .get(BackendId::KCrypto)
@@ -2649,6 +2774,16 @@ fn run_live_session_inner(
             cfg.source, LIVE_SOURCE
         )));
     }
+    // M1 workload preflight: attest the fixed helper BEFORE capture
+    // threads own authority fds (the boundary verifies here; the
+    // post-capture serve re-verifies before consuming metadata).
+    // Failure is data (raw-ID capture + typed unavailability), never
+    // a session error — enrichment cannot stall capture.
+    let workload_preflight = if cfg.workload {
+        Some(preflight_helper(None))
+    } else {
+        None
+    };
     let backend = registry
         .get(BackendId::KCrypto)
         .ok_or_else(|| LiveError::Unusable("kcrypto backend not registered".to_owned()))?;
@@ -2744,7 +2879,7 @@ fn run_live_session_inner(
         let progress = |tick: u64, rows: u64, drops: u64| {
             eprintln!("kryprobe: progress tick={tick} rows={rows} drops={drops}");
         };
-        let outcome = drive_session(
+        let mut outcome = drive_session(
             cfg,
             backend,
             &mut production,
@@ -2765,6 +2900,25 @@ fn run_live_session_inner(
         // the leg closed (no attribution evidence, no validity).
         if let Ok(ctx) = concrete.session_ctx_terminal(generation) {
             eprintln!("{}", telemetry_ctx_line(&ctx));
+        }
+        outcome.workload_preflight = workload_preflight;
+        // M1 workload join: the post-finish `KCTX` walk (same frozen
+        // maps as the telemetry account above) meets the terminal
+        // natives. An unreadable walk is unusable capture (no rows,
+        // no report — zero rows would fabricate); an inconsistent
+        // join is internal. Bounded and separate from BPF drain/stop
+        // (the drain stopped inside the session above).
+        if cfg.workload {
+            let (ctx_rows, refused) = concrete
+                .session_ctx_rows(generation)
+                .map_err(|err| LiveError::Unusable(format!("workload ctx rows: {err}")))?;
+            let terminal = outcome.workload_terminal.as_ref().ok_or_else(|| {
+                LiveError::Internal("workload terminal missing".to_owned())
+            })?;
+            outcome.workload_capture = Some(
+                join_capture(terminal, &ctx_rows, refused)
+                    .map_err(|err| LiveError::Internal(format!("workload join: {err}")))?,
+            );
         }
         Ok(outcome)
     })();

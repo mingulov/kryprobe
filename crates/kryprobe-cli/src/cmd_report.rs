@@ -480,6 +480,7 @@ pub fn run_report_live(
         // trail (object load + attach); human mode stays silent.
         json_audit: !matches!(format, ReportFormat::Human),
         profile,
+        workload: false,
     };
     finish_report_live(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),

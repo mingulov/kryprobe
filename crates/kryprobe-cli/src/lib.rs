@@ -26,6 +26,7 @@ pub mod selftest_synth;
 pub mod selftest_token;
 pub mod token;
 pub mod verdict;
+pub mod workload;
 
 use args::{ArgsError, Command, USAGE};
 use std::io::Write;

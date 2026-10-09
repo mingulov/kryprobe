@@ -155,6 +155,7 @@ fn live_gate_fail_names_gate() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let runtime = kryprobe_core::capability::RuntimeCapabilities {
         kernel_release: "test".to_owned(),
@@ -289,6 +290,7 @@ fn open_session() -> (
             token: None,
             json_audit: false,
             profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+            workload: false,
         },
         kryprobe_core::capability::RuntimeCapabilities {
             kernel_release: "test".to_owned(),
@@ -701,6 +703,7 @@ fn live_capture_proves_session() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let outcome = kryprobe_cli::live::run_live_capture(&cfg, &lane_runtime())
         .unwrap_or_else(|err| panic!("live capture failed: {err}"));
@@ -926,6 +929,7 @@ fn live_capture_proves_session() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let outcome0 = kryprobe_cli::live::run_live_capture(&cfg0, &lane_runtime())
         .unwrap_or_else(|err| panic!("zero-window capture failed: {err}"));
@@ -1319,6 +1323,7 @@ fn terminal_sample_replaces_running_rows_and_keeps_stop_only_tail() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let outcome = kryprobe_cli::live::drive_session(
         &cfg,
@@ -1440,6 +1445,7 @@ fn refused_initial_transition_still_cleans_up_and_keeps_both_errors() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let err = kryprobe_cli::live::drive_session(
         &cfg,
@@ -1542,6 +1548,7 @@ fn sigint_reset_causal_control() {
             token: None,
             json_audit: false,
             profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+            workload: false,
         };
         let outcome = kryprobe_cli::live::drive_session(
             &cfg,
@@ -1615,6 +1622,7 @@ fn live_success_path_scripted_sensor_three_ticks() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut sensor = sensor;
@@ -1806,6 +1814,7 @@ fn live_stop_mid_run_tears_down_cleanly() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = std::thread::scope(|scope| {
@@ -1885,6 +1894,7 @@ fn live_sigint_ends_window_with_interrupted_outcome() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = std::thread::scope(|scope| {
@@ -1972,6 +1982,7 @@ fn live_progress_hook_sees_every_tick() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let outcome = kryprobe_cli::live::drive_session(
@@ -2046,6 +2057,7 @@ fn live_observations_bounded_by_row_keys_not_ticks() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let parses_before = kryprobe_privilege::kallsyms::parse_calls();
@@ -2142,6 +2154,7 @@ fn live_corrupt_snapshot_row_fails_closed() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     // The corrupt row fails before the who/kallsyms stage — the
@@ -2297,6 +2310,7 @@ fn live_backend_failure_runs_failed_partial_recovery() {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let err = kryprobe_cli::live::drive_session(
@@ -2546,6 +2560,7 @@ fn lifecycle_live_config() -> kryprobe_cli::live::LiveConfig {
         token: None,
         json_audit: false,
         profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::RequestLifecycle,
+        workload: false,
     }
 }
 

@@ -727,6 +727,7 @@ fn batch_vs_live_aggregate_agree() {
         token: None,
         json_audit: false,
         profile: LifecycleProfile::ApiReturns,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut sensor = ConformanceSensor { script: vec![tick] };
@@ -1291,6 +1292,7 @@ fn batch_vs_live_lifecycle_agree() {
         token: None,
         json_audit: false,
         profile: LifecycleProfile::RequestLifecycle,
+        workload: false,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut sensor = ConformanceLifecycleSensor {
