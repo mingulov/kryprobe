@@ -101,6 +101,7 @@ fn base_input(rows: Vec<ReportRowInput>, observed: u64) -> AssemblyInput {
         system_total: CountOperand {
             value: observed,
             saturated: false,
+            population: "global".to_string(),
         },
         per_context_saturated: false,
         refused_inserts: 0,
@@ -496,13 +497,17 @@ fn live_assembly_matches_decoded_fixture_render() {
     let decoded = report_from_bytes(&bytes).expect("replays");
     let (u1, e1) = unresolved();
     let (u2, e2) = unresolved();
+    // Mirror the corrected fixture (R2: proc native context 0,
+    // capture end 1000 past the row starts).
+    let proc_native = NativeIdentity::new(1, 2, 0, 0, "cbc(aes)", "cbc-aes-aesni");
     let mut input = base_input(
         vec![
-            row(7, 43812, 1000, 555, 20, native(), u1, e1),
-            row(7, 43813, 1001, 556, 30, native(), u2, e2),
+            row(7, 43812, 1000, 555, 20, proc_native.clone(), u1, e1),
+            row(7, 43813, 1001, 556, 30, proc_native, u2, e2),
         ],
         50,
     );
+    input.interval_end_ns = 1000;
     input.metadata = MetadataAvailability::Unavailable(
         kryprobe_core::workload::MetadataUnavailable::NoPrincipal,
     );
@@ -566,6 +571,7 @@ fn assembly_enforces_conservation() {
     input.system_total = CountOperand {
         value: 60,
         saturated: false,
+        population: "global".to_string(),
     };
     input.partition = ScopePartition::from_counts(50, 0, 0).expect("valid");
     input.refused_inserts = 11;
@@ -578,6 +584,7 @@ fn assembly_enforces_conservation() {
     input.system_total = CountOperand {
         value: 50,
         saturated: true,
+        population: "global".to_string(),
     };
     assert!(matches!(
         assemble(input),

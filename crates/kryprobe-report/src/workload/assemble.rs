@@ -165,13 +165,15 @@ fn build_ledger(
 ) -> Result<ReportLedger, WorkloadBuildError> {
     match consistency {
         SnapshotConsistency::Quiescent => {
+            let system_value = system_total.value;
+            let system_saturated = system_total.saturated;
             let qualified = compute_qualified(
                 SnapshotConsistency::Quiescent,
-                "global",
                 system_total,
                 kryprobe_core::workload::CountOperand {
                     value: per_context_sum,
                     saturated: per_context_saturated,
+                    population: "global".to_string(),
                 },
             )
             .map_err(WorkloadBuildError::LedgerRefused)?;
@@ -179,12 +181,12 @@ fn build_ledger(
                 return Err(WorkloadBuildError::RefusedExceedsUnknown);
             }
             Ok(ReportLedger {
-                system_total: system_total.value,
+                system_total: system_value,
                 per_context_sum,
                 unknown: qualified.difference.unknown,
                 consistency: SnapshotConsistency::Quiescent,
                 gap_unreconciled: false,
-                system_saturated: system_total.saturated,
+                system_saturated,
                 per_context_saturated,
                 refused_inserts,
             })

@@ -281,7 +281,9 @@ pub struct AssemblyInput {
     pub consistency: SnapshotConsistency,
     /// Capture profile name (non-empty, within 256 bytes).
     pub profile: String,
-    /// System-total operand with its saturation qualification.
+    /// System-total operand with its saturation qualification, tagged
+    /// with the counted population (`global` for whole-report ledgers;
+    /// the derived per-context operand agrees, else refusal).
     pub system_total: CountOperand,
     /// Whether the per-context fold saturated.
     pub per_context_saturated: bool,
