@@ -15,6 +15,7 @@ pub mod render;
 pub mod session;
 pub mod snapshot;
 pub mod validate;
+pub mod workload;
 pub mod writer;
 
 pub use checker::{
@@ -34,6 +35,13 @@ pub use validate::{
     validate_file_with_max_findings, validate_lifecycle_session, validate_lifecycle_v1,
     validate_reader, validate_reader_with_max_findings, validate_str,
     validate_str_with_max_findings,
+};
+pub use workload::{
+    AssemblyInput, CoverageLevel, GroupBy, GroupKey, LegacyV1Error, MetadataAvailability,
+    NativeIdentity, ReportCoverage, ReportInterval, ReportLedger, ReportRow, ReportRowInput,
+    ReportScope, ReportSession, WORKLOAD_RENDER_MAX_GROUPS, WORKLOAD_RENDER_MAX_ROWS,
+    WorkloadBuildError, WorkloadDecodeError, WorkloadReport, WorkloadSelector, WorkloadWriteError,
+    assemble, render_legacy_v1, report_from_bytes, report_from_reader,
 };
 pub use writer::{JsonlWriter, ReportError, SessionWriteError, SessionWriter, write_str_atomic};
 
