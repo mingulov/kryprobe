@@ -35,6 +35,7 @@ pub mod mapops;
 pub mod probe;
 pub mod refused;
 pub mod token;
+pub mod workload_launch;
 
 pub use inspect::{InspectError, TargetSnapshot};
 pub use kcrypto_backend::{

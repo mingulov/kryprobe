@@ -392,6 +392,33 @@ impl KCryptoBackend {
         }
     }
 
+    /// Terminal per-row `KCTX` dump plus the exact `KCTX_DROPS` count
+    /// (M1 Stage 3 export glue): the same post-finish frozen maps the
+    /// [`session_ctx_terminal`](Self::session_ctx_terminal) aggregates
+    /// walk, but row-preserving so the CLI can join each context key
+    /// against its native identity and feed the common typed report.
+    /// Same F-01 gate (refuses before a non-pending fence outcome);
+    /// structural walk failures fail loud via [`SnapshotError::Map`].
+    pub fn session_ctx_rows(
+        &self,
+        generation: PlanGeneration,
+    ) -> Result<(Vec<CtxSnapshot>, u64), BackendError> {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let state = configured(&mut guard, generation)?;
+        match state.fence_outcome {
+            Some(outcome) if !outcome.is_pending() => snapshot_ctx(&state.sensor)
+                .map_err(|err| protocol("kcrypto_ctx_rows", &err.to_string())),
+            Some(_) => Err(protocol(
+                "kcrypto_ctx_pending_fence",
+                "fence close pending: terminal ctx unproven",
+            )),
+            None => Err(protocol(
+                "kcrypto_ctx_unfenced",
+                "terminal ctx read before fence close",
+            )),
+        }
+    }
+
     /// Terminal program-miss account from one post-finish read (M1
     /// Stage 1): per-program guard-skip deltas joined by (`section`,
     /// `program_id`) bijection against the attach-time baseline.
