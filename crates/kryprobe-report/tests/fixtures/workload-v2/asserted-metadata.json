@@ -48,7 +48,7 @@
         "status": "asserted",
         "validity": {
           "start_ns": "100",
-          "end_ns": "200",
+          "end_ns": "1000",
           "clock": "monotonic_boot"
         }
       }
@@ -83,7 +83,7 @@
         "status": "asserted",
         "validity": {
           "start_ns": "100",
-          "end_ns": "200",
+          "end_ns": "1000",
           "clock": "monotonic_boot"
         }
       }

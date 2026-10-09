@@ -258,10 +258,11 @@ fn truncate_to_budget(response: &mut SnapshotResponse) -> Result<(), MetadataUna
 /// Verify that a response answers a request: session equality, kernel
 /// scope agreement (every served association answers a key inside the
 /// response kernel scope; only typed kernel refusals may come from a
-/// foreign kernel), chunk validity, every association/error key drawn
-/// from (and covering, for single-chunk responses) the request keys
-/// exactly once, and a valid response value. Refusals name the rule,
-/// never input bytes.
+/// foreign kernel), temporal agreement (every Asserted/Verified
+/// association's validity covers the request capture interval),
+/// chunk validity, every association/error key drawn from (and
+/// covering, for single-chunk responses) the request keys exactly once,
+/// and a valid response value. Refusals name the rule, never input bytes.
 pub fn bind_response_to_request(
     request: &SnapshotRequest,
     response: &SnapshotResponse,
@@ -282,6 +283,24 @@ pub fn bind_response_to_request(
         {
             return Err(
                 "response association answers a key outside the response kernel scope".to_string(),
+            );
+        }
+        // Receiving-boundary temporal validation (R3): an Asserted or
+        // Verified association applies its counts only when its validity
+        // window covers the request's counted capture interval — the same
+        // coverage rule the resolver enforces when producing replies.
+        // Stale and weaker statuses assert nothing about the counted
+        // interval, so they carry no temporal requirement here.
+        if matches!(
+            assoc.evidence.status,
+            AttributionStatus::Asserted | AttributionStatus::Verified
+        ) && !validity_covers_capture(
+            request.capture_interval.as_ref(),
+            assoc.evidence.validity.as_ref(),
+        ) {
+            return Err(
+                "response association validity does not cover the request capture interval"
+                    .to_string(),
             );
         }
     }

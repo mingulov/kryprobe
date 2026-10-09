@@ -1012,6 +1012,14 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
         .get("consistency")
         .and_then(Value::as_str)
         .expect("shapes checked");
+    // The counted capture/report window for attribution coverage (R3):
+    // usable only when ordered and representable — otherwise the
+    // interval finding above already refuses and attribution checks must
+    // not cascade.
+    let capture_window: Option<(u64, u64)> = match (start, end) {
+        (Some(start), Some(end)) if start <= end => Some((start, end)),
+        _ => None,
+    };
 
     // Dictionary: ids unique (distinct natives sharing one kh stay
     // representable — refs disambiguate by id); every key parses as u64.
@@ -1110,7 +1118,7 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
             }
         }
         if let Some(attribution) = row.get("attribution") {
-            validate_attribution_rules(attribution, i, findings);
+            validate_attribution_rules(attribution, i, capture_window, findings);
         }
     }
     if calls_overflow {
@@ -1268,9 +1276,15 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
 }
 
 /// Evidence cross-rules for one context attribution: reuse the frozen
-/// [`AttributionEvidence`] validation, mapping refusal to a static
+/// [`AttributionEvidence`] validation, then enforce evidence-vs-capture
+/// agreement for asserting statuses, mapping every refusal to a static
 /// positional finding (never echoing input bytes).
-fn validate_attribution_rules(attribution: &Value, index: usize, findings: &mut Vec<V2Finding>) {
+fn validate_attribution_rules(
+    attribution: &Value,
+    index: usize,
+    capture_window: Option<(u64, u64)>,
+    findings: &mut Vec<V2Finding>,
+) {
     let item = attribution.as_object().expect("shapes checked");
     let relationship = match item.get("relationship").and_then(Value::as_str) {
         Some("hook_context") => Relationship::HookContext,
@@ -1320,6 +1334,30 @@ fn validate_attribution_rules(attribution: &Value, index: usize, findings: &mut 
         findings.push(V2Finding::InvalidCombination {
             detail: format!("contexts[{index}].attribution contradicts evidence rules"),
         });
+        return;
+    }
+    // Receiving-boundary temporal validation (R3): asserted/verified
+    // attribution applies its row counts only when its validity window
+    // covers the whole counted capture/report interval — the same
+    // conservative coverage rule as D01, applied here where the evidence
+    // meets the parsed interval. Stale and weaker statuses assert
+    // nothing about the counted interval. A defective interval refuses
+    // on its own finding; without a usable window no cascade follows.
+    if matches!(
+        status,
+        AttributionStatus::Asserted | AttributionStatus::Verified
+    ) {
+        let covers = match (capture_window, &validity) {
+            (Some((start, end)), Some(window)) => window.start_ns <= start && end <= window.end_ns,
+            _ => false,
+        };
+        if !covers {
+            findings.push(V2Finding::InvalidCombination {
+                detail: format!(
+                    "contexts[{index}].attribution validity does not cover the report interval"
+                ),
+            });
+        }
     }
 }
 
@@ -1799,6 +1837,42 @@ mod tests {
         assert!(
             validate_workload_v2(&v).is_empty(),
             "agreeing workload/pod cluster must validate: {:?}",
+            validate_workload_v2(&v)
+        );
+    }
+
+    #[test]
+    fn expired_binding_asserted_refuses() {
+        // Receiving-boundary temporal validation: an Asserted binding
+        // whose validity expired before the counted interval cannot
+        // support asserted/matched claims — the same conservative
+        // coverage rule as D01, applied where the evidence meets the
+        // report interval. (Round-3 oracle.)
+        let mut v = minimal_valid();
+        v["interval"]["end_ns"] = json!("1000");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "expired Asserted binding must refuse"
+        );
+        // Positive control: covering validity validates.
+        let mut v = minimal_valid();
+        v["interval"]["end_ns"] = json!("1000");
+        v["contexts"][0]["attribution"]["validity"]["end_ns"] = json!("1000");
+        assert!(
+            validate_workload_v2(&v).is_empty(),
+            "covering Asserted binding must validate: {:?}",
+            validate_workload_v2(&v)
+        );
+        // Stale keeps its honest expired window: it asserts nothing about
+        // the counted interval.
+        let mut v = minimal_valid();
+        v["interval"]["end_ns"] = json!("1000");
+        v["contexts"][0]["attribution"]["status"] = json!("stale");
+        assert!(
+            validate_workload_v2(&v).is_empty(),
+            "expired Stale binding must validate: {:?}",
             validate_workload_v2(&v)
         );
     }

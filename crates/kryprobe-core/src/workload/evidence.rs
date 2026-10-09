@@ -29,6 +29,18 @@ pub const METHOD_RUNTIME_ADAPTER: &str = "runtime_adapter";
 /// No association established: the method of an unresolved association.
 pub const METHOD_UNRESOLVED: &str = "unresolved";
 
+/// The closed method vocabulary: every association method, whatever its
+/// status, is one of these six exact strings (snapshot schema `$defs`
+/// `evidence.method`). Schema-invalid methods refuse at decode.
+const METHOD_VOCABULARY: [&str; 6] = [
+    METHOD_CAPTURED_CGROUP,
+    METHOD_CGROUP_INODE_BIND,
+    METHOD_METADATA_FILE,
+    METHOD_METADATA_LABEL,
+    METHOD_RUNTIME_ADAPTER,
+    METHOD_UNRESOLVED,
+];
+
 /// Categorical association status. No confidence percentages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +244,8 @@ impl AttributionEvidence {
     ///
     /// - Every supplied validity interval must be ordered, whatever the
     ///   status. Inverted asserted/stale intervals refuse (D08).
+    /// - Every status carries a method inside the frozen six-word
+    ///   vocabulary: schema-invalid methods refuse at decode (R3).
     /// - `Verified` requires [`Relationship::HookContext`], a
     ///   well-ordered validity interval, plus one of the two
     ///   kernel-corroborated (method, source) pairs —
@@ -249,6 +263,9 @@ impl AttributionEvidence {
             && !validity.is_ordered()
         {
             return Err("validity interval is inverted".to_string());
+        }
+        if !METHOD_VOCABULARY.contains(&self.method.as_str()) {
+            return Err("association method is outside the frozen vocabulary".to_string());
         }
         let hook_only = matches!(
             self.status,
