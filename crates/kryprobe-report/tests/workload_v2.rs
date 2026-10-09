@@ -184,6 +184,51 @@ fn fixtures_use_native_context_codes_and_ordered_starts() {
 }
 
 #[test]
+fn asserted_fixture_bindings_cover_capture() {
+    // Round-3: every Asserted/Verified fixture binding must cover the
+    // counted capture interval it claims. Pins the asserted-metadata +
+    // matching-violation window repair.
+    for name in ["asserted-metadata.json", "matching-violation.json"] {
+        let v = load_fixture(name);
+        let start: u64 = v["interval"]["start_ns"]
+            .as_str()
+            .expect("interval start")
+            .parse()
+            .expect("u64 start");
+        let end: u64 = v["interval"]["end_ns"]
+            .as_str()
+            .expect("interval end")
+            .parse()
+            .expect("u64 end");
+        for row in v["contexts"].as_array().expect("rows") {
+            let Some(attribution) = row.get("attribution") else {
+                continue;
+            };
+            let status = attribution["status"].as_str().expect("status");
+            assert!(
+                matches!(status, "asserted" | "verified"),
+                "{name}: expected an asserting status, got {status}"
+            );
+            let validity = attribution.get("validity").expect("validity present");
+            let vs: u64 = validity["start_ns"]
+                .as_str()
+                .expect("validity start")
+                .parse()
+                .expect("u64 validity start");
+            let ve: u64 = validity["end_ns"]
+                .as_str()
+                .expect("validity end")
+                .parse()
+                .expect("u64 validity end");
+            assert!(
+                vs <= start && end <= ve,
+                "{name}: validity [{vs},{ve}] must cover capture [{start},{end}]"
+            );
+        }
+    }
+}
+
+#[test]
 fn v1_bytes_are_not_v2() {
     assert!(workload_v2::dispatch_schema("kryprobe.workload-report.v1").is_err());
     assert!(workload_v2::dispatch_schema("kryprobe.event/v0").is_err());

@@ -4,9 +4,10 @@
 //! wire field names consumed by Stage 2B/2C/2D.
 
 use kryprobe_core::workload::{
-    AttributionStatus, BindingProvenance, ChunkInfo, KernelIdentity, MetadataEntry,
-    MetadataSnapshot, ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotKey,
-    SnapshotRequest, ValidityInterval, WorkloadIdentity, WorkloadOrigin,
+    AttributionEvidence, AttributionStatus, BindingProvenance, ChunkInfo, KernelIdentity,
+    METHOD_METADATA_FILE, MetadataEntry, MetadataSnapshot, Relationship, ResolvedAssociation,
+    ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotKey, SnapshotRequest,
+    SnapshotResponse, ValidityInterval, WorkloadIdentity, WorkloadOrigin,
 };
 use kryprobe_core::workload::{
     MAX_METADATA_BYTES, MAX_SNAPSHOT_ASSOCIATIONS, MAX_SNAPSHOT_REQUEST_BYTES,
@@ -745,4 +746,251 @@ fn contract_types_are_all_exercised() {
     let _ = WorkloadIdentity::none();
     let _ = ResponseStatus::Complete;
     let _ = SnapshotErrorCode::Unsupported;
+}
+
+fn container_identity() -> WorkloadIdentity {
+    WorkloadIdentity::container(
+        "docker://host-a",
+        "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57",
+        Some("lifetime-a"),
+    )
+}
+
+/// B3 escape-payload shape: matching session/kernel/key, Complete single
+/// chunk, exact counters, Asserted `metadata_file` evidence. Coherence is
+/// supplied by the caller (identity + validity); the shape itself is the
+/// wire the R2 ingress accepted unconditionally.
+fn escape_response(
+    key: SnapshotKey,
+    identity: WorkloadIdentity,
+    validity: Option<ValidityInterval>,
+) -> SnapshotResponse {
+    SnapshotResponse {
+        session_id: SESSION.to_string(),
+        kernel_identity: KernelIdentity::Known(KERNEL_A.to_string()),
+        associations: vec![ResolvedAssociation {
+            key,
+            identity,
+            evidence: AttributionEvidence::asserted_metadata(
+                Relationship::HookContext,
+                METHOD_METADATA_FILE,
+                validity,
+            ),
+        }],
+        errors: vec![],
+        status: ResponseStatus::Complete,
+        chunk: ChunkInfo::single(),
+        counters: SnapshotCounters {
+            resolved: 1,
+            unresolved: 0,
+            refused: 0,
+        },
+    }
+}
+
+/// Ingress coherence, variant A: Asserted-with-empty-identity refuses at
+/// every receiving boundary — decode, validate, bind. (Round-3 oracle.)
+#[test]
+fn ingress_asserted_without_identity_refuses() {
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    let response = escape_response(
+        key(KERNEL_A, 43812),
+        WorkloadIdentity::none(),
+        Some(ValidityInterval::monotonic(500, 2500)),
+    );
+    assert!(
+        response.validate().is_err(),
+        "Asserted without identity must refuse validate"
+    );
+    let bytes = serde_json::to_vec(&response).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_response(&bytes).is_err(),
+        "Asserted without identity must refuse decode"
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &response).is_err(),
+        "Asserted without identity must refuse bind"
+    );
+}
+
+/// Ingress coherence, variant B: a cgroup-zero key carrying an identity
+/// refuses at every receiving boundary. (Round-3 oracle.)
+#[test]
+fn ingress_cgroup_zero_with_identity_refuses() {
+    let req = request_with_capture(vec![key(KERNEL_A, 0)], 1000, 2000);
+    let response = escape_response(
+        key(KERNEL_A, 0),
+        container_identity(),
+        Some(ValidityInterval::monotonic(500, 2500)),
+    );
+    assert!(
+        response.validate().is_err(),
+        "cgroup-zero with identity must refuse validate"
+    );
+    let bytes = serde_json::to_vec(&response).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_response(&bytes).is_err(),
+        "cgroup-zero with identity must refuse decode"
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &response).is_err(),
+        "cgroup-zero with identity must refuse bind"
+    );
+}
+
+/// Receiving-boundary temporal validation: a coherent Asserted reply whose
+/// validity does not cover the request capture interval validates as a
+/// value but refuses binding; a covering reply binds. (Round-3 oracle.)
+#[test]
+fn bind_refuses_asserted_when_validity_does_not_cover_capture() {
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    // Expired binding: validity [100,200] cannot cover capture [1000,2000].
+    let expired = escape_response(
+        key(KERNEL_A, 43812),
+        container_identity(),
+        Some(ValidityInterval::monotonic(100, 200)),
+    );
+    assert!(
+        expired.validate().is_ok(),
+        "coherent expired reply still validates as a value"
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &expired).is_err(),
+        "expired Asserted must refuse bind"
+    );
+    // Positive control: covering validity binds.
+    let covered = escape_response(
+        key(KERNEL_A, 43812),
+        container_identity(),
+        Some(ValidityInterval::monotonic(500, 2500)),
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &covered).is_ok(),
+        "covering Asserted must bind"
+    );
+}
+
+/// Verified replies obey the same receiving-boundary coverage rule: the
+/// kernel corroboration proves the binding, not its applicability to the
+/// counted interval. (Round-3 oracle.)
+#[test]
+fn bind_refuses_verified_when_validity_does_not_cover_capture() {
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    let mut response = escape_response(
+        key(KERNEL_A, 43812),
+        container_identity(),
+        Some(ValidityInterval::monotonic(100, 200)),
+    );
+    response.associations[0].evidence = AttributionEvidence::verified_kernel_capture(
+        Relationship::HookContext,
+        ValidityInterval::monotonic(100, 200),
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &response).is_err(),
+        "expired Verified must refuse bind"
+    );
+    response.associations[0].evidence = AttributionEvidence::verified_kernel_capture(
+        Relationship::HookContext,
+        ValidityInterval::monotonic(500, 2500),
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &response).is_ok(),
+        "covering Verified must bind"
+    );
+}
+
+/// Coverage needs both windows: an Asserted reply to a capture-less
+/// request, or an Asserted reply with no validity window, cannot
+/// establish applicability and refuses binding. (Round-3 oracle.)
+#[test]
+fn bind_refuses_asserted_without_coverable_window() {
+    // No counted interval on the request: nothing to cover.
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let reply = escape_response(
+        key(KERNEL_A, 43812),
+        container_identity(),
+        Some(ValidityInterval::monotonic(0, u64::MAX)),
+    );
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &reply).is_err(),
+        "Asserted to a capture-less request must refuse bind"
+    );
+    // No validity window on the reply: nothing to cover with.
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    let reply = escape_response(key(KERNEL_A, 43812), container_identity(), None);
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &reply).is_err(),
+        "Asserted without validity must refuse bind"
+    );
+}
+
+/// The closed 6-method IPC vocabulary holds for EVERY status: a
+/// schema-invalid method refuses decode even on stale/unresolved/
+/// ambiguous/unsupported associations. (Round-3 oracle.)
+#[test]
+fn schema_invalid_evidence_method_refuses_decode() {
+    for status in [
+        AttributionStatus::Unresolved,
+        AttributionStatus::Ambiguous,
+        AttributionStatus::Stale,
+        AttributionStatus::Unsupported,
+    ] {
+        // Stale is usable: it carries an identity; the rest do not.
+        let identity = if status == AttributionStatus::Stale {
+            container_identity()
+        } else {
+            WorkloadIdentity::none()
+        };
+        let mut response = escape_response(
+            key(KERNEL_A, 43812),
+            identity,
+            Some(ValidityInterval::monotonic(500, 2500)),
+        );
+        response.associations[0].evidence = AttributionEvidence::new(
+            Relationship::HookContext,
+            "not_a_method",
+            WorkloadOrigin::OperatorMetadataFile,
+            status,
+            Some(ValidityInterval::monotonic(500, 2500)),
+        );
+        response.counters = SnapshotCounters {
+            resolved: 0,
+            unresolved: 1,
+            refused: 0,
+        };
+        let bytes = serde_json::to_vec(&response).expect("encodes");
+        assert!(
+            kryprobe_core::workload::decode_response(&bytes).is_err(),
+            "{status:?} with a schema-invalid method must refuse decode"
+        );
+        assert!(
+            response.validate().is_err(),
+            "{status:?} with a schema-invalid method must refuse validate"
+        );
+    }
+    // Positive control: the rule is vocabulary membership, not a new
+    // status pairing — an in-vocabulary method on an unusual status
+    // still decodes.
+    let mut response = escape_response(
+        key(KERNEL_A, 43812),
+        WorkloadIdentity::none(),
+        Some(ValidityInterval::monotonic(500, 2500)),
+    );
+    response.associations[0].evidence = AttributionEvidence::new(
+        Relationship::HookContext,
+        METHOD_METADATA_FILE,
+        WorkloadOrigin::OperatorMetadataFile,
+        AttributionStatus::Unresolved,
+        Some(ValidityInterval::monotonic(500, 2500)),
+    );
+    response.counters = SnapshotCounters {
+        resolved: 0,
+        unresolved: 1,
+        refused: 0,
+    };
+    let bytes = serde_json::to_vec(&response).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_response(&bytes).is_ok(),
+        "in-vocabulary method on Unresolved must still decode"
+    );
 }
