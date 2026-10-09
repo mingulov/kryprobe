@@ -7,6 +7,7 @@ use crate::kcrypto_snapshot::{
     AggOccupancy, CtxTerminal, SnapshotRows, session_drain, snapshot_occupancy,
     snapshot_rows_with_drain, terminal_rows,
 };
+use std::collections::HashMap;
 
 /// One checked terminal sample. Closing links and joining the host drain do
 /// not prove that all kernel writers have completed; every map read here is
@@ -97,6 +98,14 @@ pub(super) struct ConfiguredSession {
     pub(super) fence_outcome: Option<crate::kcrypto_fence::CloseOutcome>,
     pub(super) who_cache: WhoCache,
     pub(super) phase: SessionPhase,
+    /// Retained-name → ELF-section table parsed from the loaded object
+    /// bytes at configure time (miss-telemetry labels; empty when the
+    /// table was unbuildable — telemetry then reads unavailable).
+    pub(super) miss_sections: HashMap<String, String>,
+    /// Attach-time miss absolutes (`None` when the baseline read
+    /// failed — fail-soft: the capture still runs, telemetry reads
+    /// unavailable rather than failing the session).
+    pub(super) miss_baseline: Option<Vec<AggProgMissAbs>>,
 }
 
 impl ConfiguredSession {
@@ -104,6 +113,8 @@ impl ConfiguredSession {
         generation: PlanGeneration,
         sensor: ConfiguredKcrypto,
         started_ns: u64,
+        miss_sections: HashMap<String, String>,
+        miss_baseline: Option<Vec<AggProgMissAbs>>,
     ) -> Self {
         let attached_points = sensor.links.len();
         Self {
@@ -111,6 +122,8 @@ impl ConfiguredSession {
             sensor,
             started_ns,
             attached_points,
+            miss_sections,
+            miss_baseline,
             drain: None,
             drain_stats: None,
             fence_outcome: None,
@@ -376,6 +389,56 @@ impl KCryptoBackend {
                 "kcrypto_ctx_unfenced",
                 "terminal ctx read before fence close",
             )),
+        }
+    }
+
+    /// Terminal program-miss account from one post-finish read (M1
+    /// Stage 1): per-program guard-skip deltas joined by (`section`,
+    /// `program_id`) bijection against the attach-time baseline.
+    /// Fail-closed on the fence receipt (same F-01 rule as ctx):
+    /// `Pending` (or no fence attempt yet) is a protocol error, never
+    /// a terminal read. Fail-SOFT on the telemetry itself: an
+    /// unreadable baseline/current or a refused join yields
+    /// [`MissTerminal::Unavailable`] (the capture keeps its partial
+    /// verdict path — an unreadable miss counter never fails the
+    /// session and never reads as zero).
+    pub fn session_miss_terminal(
+        &self,
+        generation: PlanGeneration,
+    ) -> Result<MissTerminal, BackendError> {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let state = configured(&mut guard, generation)?;
+        match state.fence_outcome {
+            Some(outcome) if outcome.is_pending() => Err(protocol(
+                "kcrypto_miss_pending_fence",
+                "fence close pending: terminal misses unproven",
+            )),
+            None => Err(protocol(
+                "kcrypto_miss_unfenced",
+                "terminal miss read before fence close",
+            )),
+            Some(_) => {
+                let Some(baseline) = state.miss_baseline.as_ref() else {
+                    return Ok(MissTerminal::Unavailable {
+                        reason: "miss baseline unavailable (attach-time read failed)".to_owned(),
+                    });
+                };
+                let current =
+                    match snapshot_agg_misses(&state.sensor.loaded.progs, &state.miss_sections) {
+                        Ok(current) => current,
+                        Err(err) => {
+                            return Ok(MissTerminal::Unavailable {
+                                reason: format!("miss current unreadable: {err}"),
+                            });
+                        }
+                    };
+                match join_agg_miss_deltas(baseline, &current) {
+                    Ok(deltas) => Ok(MissTerminal::Available(deltas)),
+                    Err(err) => Ok(MissTerminal::Unavailable {
+                        reason: format!("miss join refused: {err}"),
+                    }),
+                }
+            }
         }
     }
 }

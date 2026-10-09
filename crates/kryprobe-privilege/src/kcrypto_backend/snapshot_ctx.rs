@@ -99,10 +99,14 @@ pub(crate) fn read_kctx_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotE
     sum_u64_lanes(&raw, ncpu)
 }
 
-/// Checked sum of one `u64`-per-lane array slice (F8a): a short
-/// buffer fails `EBADMSG` (same as before); a lane-sum overflow
-/// fails `EOVERFLOW` (ADR-0008 §(e): saturation refuses the receipt
-/// — never a silent wrap).
+/// Checked sum of one `u64`-per-lane array slice (F8a + M1 lone-MAX):
+/// a short buffer fails `EBADMSG` (same as before); a lane-sum
+/// overflow fails `EOVERFLOW` (ADR-0008 §(e): saturation refuses the
+/// receipt — never a silent wrap); and a lone-`MAX` lane refuses
+/// with `EOVERFLOW` as well — a `MAX` counter already saturated
+/// in-BPF (or in a prior fold), so even `0 + MAX` (which overflows
+/// nothing) must not sum (same contract as [`try_fold_vctx`]'s
+/// input refusal and [`sum_present_calls`]).
 fn sum_u64_lanes(raw: &[u8], ncpu: usize) -> Result<u64, SnapshotError> {
     let mut total = 0u64;
     for c in 0..ncpu {
@@ -114,12 +118,20 @@ fn sum_u64_lanes(raw: &[u8], ncpu: usize) -> Result<u64, SnapshotError> {
             })?;
         let mut word = [0u8; 8];
         word.copy_from_slice(lane);
-        total = total.checked_add(u64::from_le_bytes(word)).ok_or_else(|| {
-            MapOpsError::LookupFailed {
+        let val = u64::from_le_bytes(word);
+        if val == u64::MAX {
+            return Err(MapOpsError::LookupFailed {
                 stage: "snapshot/ctx-drops-overflow".to_owned(),
                 errno: libc::EOVERFLOW,
             }
-        })?;
+            .into());
+        }
+        total = total
+            .checked_add(val)
+            .ok_or_else(|| MapOpsError::LookupFailed {
+                stage: "snapshot/ctx-drops-overflow".to_owned(),
+                errno: libc::EOVERFLOW,
+            })?;
     }
     Ok(total)
 }
@@ -227,6 +239,19 @@ mod tests {
         let err = sum_u64_lanes(&raw, 2).unwrap_err();
         let stage = format!("{err:?}");
         assert!(stage.contains("snapshot/ctx-drops-lane"), "{stage}");
+    }
+
+    #[test]
+    fn drops_lanes_lone_max_refuses() {
+        // M1: a lone MAX lane already saturated in-BPF (or in a prior
+        // fold) — 0+MAX overflowing nothing must still refuse with
+        // EOVERFLOW, never sum to MAX.
+        let mut raw = vec![0u8; 16];
+        raw[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        raw[8..16].copy_from_slice(&0u64.to_le_bytes());
+        let err = sum_u64_lanes(&raw, 2).unwrap_err();
+        let stage = format!("{err:?}");
+        assert!(stage.contains("snapshot/ctx-drops-overflow"), "{stage}");
     }
 
     #[test]

@@ -47,6 +47,13 @@ EXPECTED = {
         "attach_all_points", "pin_roundtrip_proves_r2_and_cleanup"],
     ("kryprobe-privilege", "kcrypto_canary"): [
         "configured_entry_writes_kcfg_from_resolver", "canary_kcrypto"],
+    ("kryprobe-privilege", "kcrypto_ctx"): [
+        "ctx_first_over_capacity_is_exact",
+        "ctx_map_full_refuse_new_is_exact",
+        "fence_close_freezes_our_ctx_rows",
+        "same_process_cgroup_migration_splits_counts",
+        "second_observer_sees_same_ctx_rows",
+    ],
     ("kryprobe-privilege", "kcrypto_driver"): ["driver_e2e_matches_fixture_truth"],
     ("kryprobe-privilege", "kcrypto_snapshot"): [
         "compat_ring_matches_canary_twin", "session_drain_serves_many_windows_with_one_spawn",
@@ -58,6 +65,11 @@ EXPECTED = {
     ("kryprobe-privilege", "kcrypto_tfm_lifecycle"): [
         "host_alloc_capture_assigns_generations", "lifecycle_canary_no_secret_bytes_in_views",
         "host_op_first_seen_carries_selected_driver"],
+    # M1 Stage 1: the hammer oracle lives in the lib unit tests
+    # (backend internals); inventoried exactly like suites.
+    ("kryprobe-privilege", "kryprobe_privilege"): [
+        "kcrypto_backend::tests::finish_session_quiescent_under_hammer_freezes_terminal",
+    ],
     ("kryprobe-privilege", "token_plumbing"): [
         "smoke", "token_path_allowlist_denies_unlisted_object"],
     ("kryprobe-testkit", "guest_ledger"): ["guest_ledger_matches_scenario_contract"],
@@ -436,7 +448,11 @@ def prepare(root, out, cargo, traffic_generator):
                   "rustc": subprocess.check_output(["rustc", "--version"], cwd=root, env=env, text=True).strip()},
     }
     dump(out / "manifest.json", manifest)
-    print(f"sudo-lane: prepared 34 lane bodies (33 root, 1 non-root), 1 separate lab body and 3 vng-guest bodies at {out}", flush=True)
+    lab_bodies = len(EXPECTED[LAB_SUITE])
+    vng_bodies = len(EXPECTED[VNG_SUITE])
+    lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
+    print(f"sudo-lane: prepared {lane_bodies} lane bodies ({lane_bodies - 1} root, 1 non-root), "
+          f"{lab_bodies} separate lab body and {vng_bodies} vng-guest bodies at {out}", flush=True)
     return manifest
 
 
@@ -511,8 +527,13 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     manifest = json.loads(manifest_bytes)
     if manifest["schema"] != "kryprobe-privileged-lane/v1":
         raise ValueError("unknown prepared manifest")
-    # O_RDONLY avoids protected_regular restrictions on user-owned /tmp locks.
-    lane_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o644)
+    # O_RDONLY avoids protected_regular restrictions on user-owned /tmp locks;
+    # O_CREAT re-triggers the denial (fs.protected_regular=2 on sticky dirs),
+    # so create only when the lock does not exist yet.
+    try:
+        lane_fd = os.open(lock_path, os.O_RDONLY)
+    except FileNotFoundError:
+        lane_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o644)
     try:
         fcntl.flock(lane_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -660,8 +681,11 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             raise InterruptedError("cancelled; lane cleanup complete")
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
-    dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": 34,
-                                "root_bodies": 33, "nonroot_bodies": 1, "other_lane_bodies": 4,
+    lab_bodies = len(EXPECTED[LAB_SUITE])
+    vng_bodies = len(EXPECTED[VNG_SUITE])
+    lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
+    dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
+                                "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
                                 "complete": True})
     print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
     return code
