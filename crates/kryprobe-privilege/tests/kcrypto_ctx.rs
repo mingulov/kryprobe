@@ -26,6 +26,7 @@ use kryprobe_privilege::kcrypto_snapshot::fold_ctx_dump;
 /// total as a lower bound. Privileged: needs the true object + own
 /// cgroups; SKIPs (runs + prints) when unprivileged.
 #[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
 fn same_process_cgroup_migration_splits_counts() {
     if !is_root_with_btf() {
         println!("SKIP: needs root + BTF (privileged exactness lane)");
@@ -562,6 +563,7 @@ fn our_ctx_rows(
 /// our rows byte-identical (refused entrants touch nothing — not even
 /// `KTOT`). Privileged: needs the true object; SKIPs otherwise.
 #[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
 fn fence_close_freezes_our_ctx_rows() {
     use kryprobe_privilege::btf_resolve::load_kcrypto_configured;
     use kryprobe_privilege::kcrypto_fence::close_kernel_fence;
@@ -783,6 +785,7 @@ fn decode_ktot(snap: &kryprobe_privilege::kcrypto_snapshot::SnapshotRows) -> Res
 /// (fewer attempts than asserted), never silently. Privileged: needs
 /// the true object; SKIPs otherwise.
 #[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
 fn ctx_map_full_refuse_new_is_exact() {
     use kryprobe_privilege::kcrypto_backend::snapshot_ctx;
     use kryprobe_privilege::kcrypto_snapshot::snapshot_rows;
@@ -868,11 +871,121 @@ fn ctx_map_full_refuse_new_is_exact() {
     );
 }
 
+/// Isolated first-over-capacity EQUALITY oracle (M1 Stage 1): 344
+/// forked children x 3 contexts (alloc + enc + dec, distinct tgids by
+/// kernel construction) = 1032 distinct contexts against the
+/// 1024-entry `KCTX` on a FRESH isolated sensor (own bring-up, no
+/// shared state with any other test). Every equality is exact (`==`,
+/// never `>=`): rows == 1024 (the FIRST refusal lands on the 1025th
+/// distinct context — earlier saturation fails), drops == 8,
+/// present == 1024, system == 1032, unknown == 8. The KTOT gate
+/// (system == 1032 exactly) proves zero ambient traffic for the
+/// whole attempt window — any ambient crypto fails loudly (re-run
+/// on a quiet host), never silently. Fenced (`Quiescent` receipt)
+/// and terminal-read. Privileged: needs root + BTF + the true
+/// object; lane-ignored.
+#[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
+fn ctx_first_over_capacity_is_exact() {
+    use kryprobe_privilege::kcrypto_backend::{snapshot_ctx, snapshot_ctx_terminal};
+    use kryprobe_privilege::kcrypto_fence::close_kernel_fence;
+
+    if !is_root_with_btf() {
+        println!("SKIP: needs root + BTF (privileged exactness lane)");
+        return;
+    }
+    const KIDS: usize = 344;
+    const KEYS_PER_KID: u64 = 3;
+    const ATTEMPTED: u64 = KIDS as u64 * KEYS_PER_KID;
+    const OVER: u64 = ATTEMPTED - 1024;
+    assert_eq!(ATTEMPTED, 1032);
+    assert_eq!(OVER, 8);
+    let object = kcrypto_object_bytes().expect("BPF object present");
+    let (sensor, _points) =
+        kryprobe_privilege::btf_resolve::load_kcrypto_configured(&object, None).expect("bring-up");
+    // Pre-quiet: a fresh sensor with no traffic yet — any ambient
+    // row already occupying a slot voids the equality (fail loud).
+    let (rows0, drops0) = snapshot_ctx(&sensor).expect("baseline snapshot");
+    assert!(
+        rows0.is_empty(),
+        "ambient rows before our kids void isolation: {} rows",
+        rows0.len()
+    );
+    assert_eq!(drops0, 0, "ambient drops before our kids void isolation");
+
+    let mut kids = Vec::with_capacity(KIDS);
+    for _ in 0..KIDS {
+        // SAFETY: the child runs raw syscalls only, then `_exit` — no
+        // allocator, no std locks, no harness return.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::_exit(child_crypto_once()) };
+        }
+        kids.push(pid);
+    }
+    for pid in &kids {
+        let mut status = 0;
+        // SAFETY: `status` is a live int; blocking wait for our child.
+        let got = unsafe { libc::waitpid(*pid, &mut status, 0) };
+        assert_eq!(got, *pid, "waitpid reaps our child");
+        assert!(
+            libc::WIFEXITED(status),
+            "child {pid} exited normally, status {status}"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "child {pid} crypto stages all green (10+stage otherwise)"
+        );
+    }
+    let kid_tgids: std::collections::HashSet<u32> = kids.iter().map(|pid| *pid as u32).collect();
+    // Fence first (Quiescent receipt), then the terminal account —
+    // the equalities below read frozen maps, never a live race.
+    let close = close_kernel_fence(&sensor.loaded.maps).expect("fence closes");
+    assert!(
+        close.is_quiescent_receipt(),
+        "fence drains to Quiescent, got {close:?}"
+    );
+    let terminal = snapshot_ctx_terminal(&sensor);
+    let rows = terminal.rows.expect("rows Some");
+    let present = terminal.present_calls.expect("present Some");
+    let system = terminal.system_calls.expect("system Some");
+    let unknown = terminal.unknown_calls.expect("unknown Some");
+    let drops = terminal.drops.expect("drops Some");
+    // Ambient gate FIRST: system counts every observation on the
+    // machine — exactly our attempts, or the equality is unevaluable
+    // (fail loud, re-run quiet).
+    assert_eq!(
+        system, ATTEMPTED,
+        "ambient gate: system={system} want exactly {ATTEMPTED} (ambient or loss voids equality)"
+    );
+    assert_eq!(rows, 1024, "map holds exactly 1024 rows");
+    assert_eq!(present, 1024, "exactly 1024 attempts present");
+    assert_eq!(
+        drops, OVER,
+        "first refusal at context 1025: drops == {OVER}"
+    );
+    assert_eq!(unknown, OVER, "unknown == drops == {OVER}");
+    // Every admitted kid context attempted exactly once.
+    let (live_rows, _) = snapshot_ctx(&sensor).expect("post-fence snapshot");
+    let mut admitted = 0u64;
+    for row in &live_rows {
+        if kid_tgids.contains(&row.key.tgid) {
+            assert_eq!(row.val.calls, 1, "admitted kid key attempted once");
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, 1024, "all 1024 rows are ours");
+    println!("first-over-capacity: rows=1024 present=1024 system=1032 unknown=8 drops=8");
+}
+
 /// Controlled second observer (req 5): two live sensors share the
 /// fexit trampoline and the same machine-wide calls land in both
 /// ledgers. Both fences close `Quiescent` and both terminal snapshots
 /// agree on our rows exactly. Privileged; SKIPs otherwise.
 #[test]
+#[ignore = "BPF lane: run with `cargo xtask test bpf`"]
 fn second_observer_sees_same_ctx_rows() {
     use kryprobe_privilege::btf_resolve::load_kcrypto_configured;
     use kryprobe_privilege::kcrypto_fence::close_kernel_fence;
