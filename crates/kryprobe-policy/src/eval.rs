@@ -52,7 +52,11 @@ pub enum PolicyVerdict<'a> {
 /// Capture-source name for a backend (`kernel-crypto` is the v0.1
 /// live source; `p11` is retired/reserved and `openssl` reserved,
 /// naming only legacy data — ADR-0004).
-fn source_name(backend: BackendId) -> &'static str {
+///
+/// `pub(crate)` for the Stage 2D scoped evaluator, which reuses the
+/// matcher, specifiedness predicate, and source gate over its
+/// definitely matching rows (no duplicate matching semantics).
+pub(crate) fn source_name(backend: BackendId) -> &'static str {
     match backend {
         BackendId::KCrypto => "kernel-crypto",
         BackendId::P11 => "p11",
@@ -110,7 +114,7 @@ fn module_matches(pattern: &str, obs: &NativeObservation) -> bool {
 
 /// A rule matches an observation only if the source agrees and ALL
 /// present keys match.
-fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
+pub(crate) fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
     if rule.source != source_name(obs.backend) {
         return false;
     }
@@ -180,7 +184,7 @@ fn rule_matches(rule: &Rule, obs: &NativeObservation) -> bool {
 /// semantics, D3) and `module` over kernel-crypto (explicit backend
 /// gate that never matches v0.1 data, D4 — other backends must carry
 /// the key).
-fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
+pub(crate) fn rule_specified(rule: &Rule, obs: &NativeObservation) -> bool {
     if rule.source != source_name(obs.backend) {
         return false;
     }
