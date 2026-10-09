@@ -180,6 +180,21 @@
           "items": {
             "$ref": "#/$defs/snapshot_key"
           }
+        },
+        "capture_interval": {
+          "type": "object",
+          "required": ["start_ns", "end_ns"],
+          "properties": {
+            "start_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "end_ns": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -230,8 +245,7 @@
                 "enum": ["kernel_mismatch", "unknown_kernel", "budget_exceeded", "unsupported"]
               },
               "detail": {
-                "type": "string",
-                "maxLength": 256
+                "enum": ["kernel_differs", "kernel_unknown", "budget_dropped", "unsupported_key"]
               }
             },
             "additionalProperties": false

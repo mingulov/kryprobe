@@ -85,6 +85,7 @@ impl KernelIdentity {
 
 /// A monotonic-nanosecond interval `[start_ns, end_ns]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotInterval {
     /// Interval start (inclusive).
     pub start_ns: u64,
@@ -112,6 +113,7 @@ impl SnapshotInterval {
 /// How one metadata entry's kernel-cgroup association was obtained. File
 /// entries assert; `verified` status in a file refuses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindingProvenance {
     /// Method: `metadata_file` or `metadata_label` (frozen vocabulary).
     pub method: String,
@@ -150,6 +152,7 @@ impl BindingProvenance {
 /// they claim, with provenance. All strings are bounded display/identity
 /// fields — no paths, no labels beyond the M1 allowlist (`display_name`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataEntry {
     /// Claimed container association.
     #[serde(default)]
@@ -237,6 +240,7 @@ impl MetadataEntry {
 /// identity, snapshot interval, execution-kernel identity (or explicit
 /// inability), and bounded asserted entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataSnapshot {
     /// Collector/source identity (non-empty, bounded).
     pub collector: String,

@@ -24,7 +24,7 @@ const EMBEDDED_SCHEMA: &str = include_str!("../../../../schemas/workload-report-
 
 /// Fixed freeze pin (FNV-1a 64 hex) over the v2 schema bytes: any schema
 /// edit must update this pin deliberately (E01).
-pub const WORKLOAD_V2_SCHEMA_FNV1A: &str = "21f928d6671cca20";
+pub const WORKLOAD_V2_SCHEMA_FNV1A: &str = "92e9d634369c605c";
 
 /// Required top-level keys, in schema order.
 const REQUIRED: &[&str] = &[
@@ -367,17 +367,27 @@ fn validate_native_shape(
             bad(findings, format!("{path}.{key}"), "integer 0..=255");
         }
     }
-    for key in ["algorithm", "driver"] {
-        if !native
-            .get(key)
-            .is_some_and(|v| is_bounded_string(v, MAX_STRING_FIELD_BYTES))
-        {
-            bad(
-                findings,
-                format!("{path}.{key}"),
-                "non-empty string <= 256 bytes",
-            );
-        }
+    if !native
+        .get("algorithm")
+        .is_some_and(|v| is_bounded_string(v, MAX_STRING_FIELD_BYTES))
+    {
+        bad(
+            findings,
+            format!("{path}.algorithm"),
+            "non-empty string <= 256 bytes",
+        );
+    }
+    // The driver is absent exactly when unavailable: allocation captures
+    // carry zero driver bytes, so absence validates (explicitly
+    // unavailable) while present-but-empty refuses.
+    if let Some(driver) = native.get("driver")
+        && !is_bounded_string(driver, MAX_STRING_FIELD_BYTES)
+    {
+        bad(
+            findings,
+            format!("{path}.driver"),
+            "non-empty string <= 256 bytes (absent when unavailable)",
+        );
     }
     if dictionary_entry && !native.get("kh").is_some_and(is_digit_string) {
         bad(findings, format!("{path}.kh"), "digit string");
@@ -820,7 +830,7 @@ fn validate_selectors(obj: &serde_json::Map<String, Value>, findings: &mut Vec<V
             }
             match selectors.get("container") {
                 Some(container) => {
-                    validate_container_shape(container, "selectors.container", findings);
+                    validate_selector_container_shape(container, findings);
                 }
                 None => bad(
                     findings,
@@ -834,6 +844,33 @@ fn validate_selectors(obj: &serde_json::Map<String, Value>, findings: &mut Vec<V
             "selectors.kind".to_string(),
             "none | cgroup-id | container-id",
         ),
+    }
+}
+
+/// Selector container shape: runtime + FULL id ONLY, matching the
+/// frozen schema — unlike workload containers, selectors carry no
+/// lifetime, so any extra key (including `lifetime`) refuses.
+fn validate_selector_container_shape(value: &Value, findings: &mut Vec<V2Finding>) {
+    const PATH: &str = "selectors.container";
+    let Some(container) = value.as_object() else {
+        bad(findings, PATH.to_string(), "object");
+        return;
+    };
+    if !check_no_extra_keys(container, &["runtime", "id"]) {
+        findings.push(V2Finding::UnknownKey);
+    }
+    if !container
+        .get("runtime")
+        .is_some_and(|v| is_bounded_string(v, MAX_STRING_FIELD_BYTES))
+    {
+        bad(
+            findings,
+            format!("{PATH}.runtime"),
+            "non-empty string <= 256 bytes",
+        );
+    }
+    if !container.get("id").is_some_and(|v| is_hex_string(v, 64)) {
+        bad(findings, format!("{PATH}.id"), "64 lowercase hex chars");
     }
 }
 
@@ -976,13 +1013,14 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
         .and_then(Value::as_str)
         .expect("shapes checked");
 
-    // Dictionary: ids unique; entry tuples retained for ref checks.
+    // Dictionary: ids unique (distinct natives sharing one kh stay
+    // representable — refs disambiguate by id); every key parses as u64.
     let entries = obj
         .get("dictionary")
         .and_then(Value::as_array)
         .expect("shapes checked");
     let mut dict_ids: Vec<&str> = Vec::new();
-    for entry in entries {
+    for (i, entry) in entries.iter().enumerate() {
         let id = entry
             .get("dict_id")
             .and_then(Value::as_str)
@@ -993,6 +1031,11 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
             });
         } else {
             dict_ids.push(id);
+        }
+        if parse_digit(entry.get("kh").expect("shapes checked")).is_none() {
+            findings.push(V2Finding::InvalidCombination {
+                detail: format!("dictionary[{i}].kh does not parse as u64"),
+            });
         }
     }
 
@@ -1023,6 +1066,28 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
         if parse_digit(row.get("cgroup_id").expect("shapes checked")).is_none() {
             findings.push(V2Finding::InvalidCombination {
                 detail: format!("contexts[{i}].cgroup_id does not parse as u64"),
+            });
+        }
+        if parse_digit(row.get("start_ns").expect("shapes checked")).is_none() {
+            findings.push(V2Finding::InvalidCombination {
+                detail: format!("contexts[{i}].start_ns does not parse as u64"),
+            });
+        }
+        // Report-level cluster agreement: workload.cluster must equal
+        // workload.pod.cluster when both are present, mirroring core
+        // check_consistency (D02).
+        if let Some(workload) = row.get("workload").and_then(Value::as_object)
+            && let (Some(top), Some(pod)) = (
+                workload.get("cluster").and_then(Value::as_str),
+                workload
+                    .get("pod")
+                    .and_then(Value::as_object)
+                    .and_then(|pod| pod.get("cluster").and_then(Value::as_str)),
+            )
+            && top != pod
+        {
+            findings.push(V2Finding::InvalidCombination {
+                detail: format!("contexts[{i}].workload cluster contradicts pod cluster"),
             });
         }
         if let Some(native_ref) = row.get("native_ref").and_then(Value::as_str) {
@@ -1101,6 +1166,13 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
             detail: "report scope disagrees with applied selectors".to_string(),
         });
     }
+    if let Some(cgroup) = selectors.get("cgroup_id")
+        && parse_digit(cgroup).is_none()
+    {
+        findings.push(V2Finding::InvalidCombination {
+            detail: "selectors.cgroup_id does not parse as u64".to_string(),
+        });
+    }
     match (system, per_context, unknown, refused) {
         (Some(system), Some(per_context), Some(unknown), Some(refused)) => {
             if per_context != calls_sum {
@@ -1163,7 +1235,18 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
                         .checked_add(nonmatched)
                         .and_then(|base| base.checked_add(unknown_match))
                     {
-                        Some(observed) if observed == per_context => {}
+                        Some(observed) if observed == per_context => {
+                            // An unscoped report matches its WHOLE observed
+                            // population: matched = observed, others zero.
+                            if !scope_is_scoped
+                                && (matched != per_context || nonmatched != 0 || unknown_match != 0)
+                            {
+                                findings.push(V2Finding::InvalidCombination {
+                                    detail: "unscoped partition must match its whole observed population"
+                                        .to_string(),
+                                });
+                            }
+                        }
                         Some(_) => findings.push(V2Finding::InvalidCombination {
                             detail: "partition observed contradicts ledger per-context sum"
                                 .to_string(),
@@ -1256,7 +1339,7 @@ mod tests {
             "profile": "api-returns",
             "boundary": "api_return",
             "dictionary": [
-                {"dict_id": "n0", "kh": "7", "family": 1, "op": 2, "result": 0, "context": 1, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}
+                {"dict_id": "n0", "kh": "7", "family": 1, "op": 2, "result": 0, "context": 0, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}
             ],
             "contexts": [
                 {"kh": "7", "cgroup_id": "43812", "tgid": 1000, "uid": 1000, "start_ns": "555", "execution_kind": "proc", "calls": "50", "native_ref": "n0",
@@ -1264,10 +1347,10 @@ mod tests {
                  "attribution": {"relationship": "hook_context", "method": "metadata_file", "source": "operator_metadata_file", "status": "asserted",
                                  "validity": {"start_ns": "100", "end_ns": "200", "clock": "monotonic_boot"}}},
                 {"kh": "7", "cgroup_id": "43813", "tgid": 1001, "uid": 1000, "start_ns": "556", "execution_kind": "proc", "calls": "50",
-                 "native": {"family": 1, "op": 2, "result": 0, "context": 1, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}}
+                 "native": {"family": 1, "op": 2, "result": 0, "context": 0, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}}
             ],
             "ledger": {"system_total": "100", "per_context_sum": "100", "unknown": "0", "consistency": "quiescent", "gap_unreconciled": false, "system_saturated": false, "per_context_saturated": false, "refused_inserts": "0"},
-            "partition": {"matched": "50", "nonmatched": "50", "unknown_match": "0"},
+            "partition": {"matched": "100", "nonmatched": "0", "unknown_match": "0"},
             "selectors": {"kind": "none"},
             "scope": {"capture_scope": "system", "report_scope": "unscoped", "group_by": "none"},
             "metadata": {"status": "available"},
@@ -1566,5 +1649,175 @@ mod tests {
         assert_eq!(schema_fnv1a_hex(), WORKLOAD_V2_SCHEMA_FNV1A);
         assert!(check_schema_drift(EMBEDDED_SCHEMA.as_bytes()).is_none());
         assert!(check_schema_drift(b"{tampered}").is_some());
+    }
+
+    #[test]
+    fn unscoped_split_partition_refuses() {
+        // ADR-0012: an unscoped report matches its WHOLE observed
+        // population — matched = observed, other buckets zero.
+        // (Round-2 G05.3 oracle.)
+        let mut v = minimal_valid();
+        v["partition"]["matched"] = json!("50");
+        v["partition"]["nonmatched"] = json!("50");
+        v["partition"]["unknown_match"] = json!("0");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "unscoped split partition must refuse"
+        );
+        let mut v = minimal_valid();
+        v["partition"]["matched"] = json!("90");
+        v["partition"]["nonmatched"] = json!("0");
+        v["partition"]["unknown_match"] = json!("10");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "unscoped unknown_match must refuse"
+        );
+    }
+
+    #[test]
+    fn absent_driver_validates_as_unavailable() {
+        // Allocation captures carry zero driver bytes: an absent driver is
+        // explicitly unavailable, never a defect. (Round-2 G05.4 oracle.)
+        let mut v = minimal_valid();
+        v["dictionary"][0]
+            .as_object_mut()
+            .expect("entry")
+            .remove("driver");
+        v["contexts"][1]["native"]
+            .as_object_mut()
+            .expect("native")
+            .remove("driver");
+        assert!(
+            validate_workload_v2(&v).is_empty(),
+            "absent driver must validate: {:?}",
+            validate_workload_v2(&v)
+        );
+    }
+
+    #[test]
+    fn empty_driver_refuses() {
+        // Absent means unavailable; present-but-empty is malformed.
+        let mut v = minimal_valid();
+        v["dictionary"][0]["driver"] = json!("");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::BadShape { .. })),
+            "empty dictionary driver must refuse"
+        );
+        let mut v = minimal_valid();
+        v["contexts"][1]["native"]["driver"] = json!("");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::BadShape { .. })),
+            "empty inline driver must refuse"
+        );
+    }
+
+    #[test]
+    fn distinct_natives_sharing_kh_are_representable() {
+        // kh is an index, not proof: two distinct native tuples sharing one
+        // kh stay disambiguated by their dict_id refs. (Round-2 G05.4
+        // kh-collision oracle.)
+        let mut v = minimal_valid();
+        v["dictionary"].as_array_mut().expect("array").push(json!(
+            {"dict_id": "n1", "kh": "7", "family": 1, "op": 3, "result": 0, "context": 0, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}
+        ));
+        v["contexts"][1]
+            .as_object_mut()
+            .expect("row")
+            .remove("native");
+        v["contexts"][1]["native_ref"] = json!("n1");
+        assert!(
+            validate_workload_v2(&v).is_empty(),
+            "kh collision must stay representable: {:?}",
+            validate_workload_v2(&v)
+        );
+    }
+
+    #[test]
+    fn unrepresentable_digit_strings_refuse() {
+        // Every digit string must parse as u64 — including lifetime,
+        // unreferenced dictionary keys, and selector ids. (Round-2 D03
+        // oracle.)
+        let overflow = json!("18446744073709551616");
+        let mut v = minimal_valid();
+        v["contexts"][0]["start_ns"] = overflow.clone();
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "overflow start_ns must refuse"
+        );
+        let mut v = minimal_valid();
+        v["dictionary"].as_array_mut().expect("array").push(json!(
+            {"dict_id": "nx", "kh": "18446744073709551616", "family": 1, "op": 2, "result": 0, "context": 0, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}
+        ));
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "overflow unreferenced dictionary kh must refuse"
+        );
+        let mut v = minimal_valid();
+        v["selectors"] = json!({"kind": "cgroup-id", "cgroup_id": "18446744073709551616"});
+        v["scope"]["report_scope"] = json!("scoped");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "overflow selector cgroup_id must refuse"
+        );
+    }
+
+    #[test]
+    fn conflicting_workload_cluster_refuses() {
+        // Report-level D02: workload.cluster must agree with
+        // workload.pod.cluster, mirroring core check_consistency.
+        // (Round-2 D02 oracle.)
+        let mut v = minimal_valid();
+        v["contexts"][0]["workload"]["cluster"] = json!("cluster-a");
+        v["contexts"][0]["workload"]["pod"] = json!(
+            {"cluster": "cluster-b", "uid": "uid-1", "name": "api", "namespace": "production"}
+        );
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "conflicting workload/pod cluster must refuse"
+        );
+        let mut v = minimal_valid();
+        v["contexts"][0]["workload"]["cluster"] = json!("cluster-a");
+        v["contexts"][0]["workload"]["pod"] = json!(
+            {"cluster": "cluster-a", "uid": "uid-1", "name": "api", "namespace": "production"}
+        );
+        assert!(
+            validate_workload_v2(&v).is_empty(),
+            "agreeing workload/pod cluster must validate: {:?}",
+            validate_workload_v2(&v)
+        );
+    }
+
+    #[test]
+    fn selector_container_lifetime_refuses() {
+        // The frozen schema permits only runtime/id under
+        // selectors.container: a lifetime there refuses. (Round-2 D10
+        // oracle.)
+        let mut v = minimal_valid();
+        v["selectors"] = json!(
+            {"kind": "container-id", "container": {"runtime": "docker://host-a", "id": CONTAINER_ID, "lifetime": "lifetime-a"}}
+        );
+        v["scope"]["report_scope"] = json!("scoped");
+        assert!(
+            validate_workload_v2(&v)
+                .iter()
+                .any(|f| matches!(f, V2Finding::UnknownKey | V2Finding::BadShape { .. })),
+            "selector container lifetime must refuse"
+        );
     }
 }
