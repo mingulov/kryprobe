@@ -224,14 +224,19 @@ mod tests {
             );
             let _ = std::fs::remove_file(&path);
         }
-        // Lookalike keys are untouched by the policy (unknown fields stay
-        // ignored per the frozen contract).
+        // Lookalike keys are untouched by the executable policy, but the
+        // amended contract closes every IPC decoder (R2
+        // `deny_unknown_fields`): unknown fields refuse instead of being
+        // discarded, matching the closed schemas.
         let lookalike = valid_doc(&valid_entry()).replace(
             r#""collector":"t""#,
             r#""collector":"t","executable_path_hint":"x""#,
         );
         let path = write_scratch("lookalike", lookalike.as_bytes());
-        assert!(load_metadata_file(&path).is_ok());
+        assert_eq!(
+            load_metadata_file(&path),
+            Err(MetadataUnavailable::ParseFailed)
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

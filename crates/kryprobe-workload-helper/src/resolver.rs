@@ -32,8 +32,8 @@ use crate::host_reader::{HostReadError, HostView};
 use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, HELPER_REQUEST_TIMEOUT_NS, KernelIdentity,
     METHOD_METADATA_FILE, MetadataSnapshot, MetadataUnavailable, Relationship, ResolvedAssociation,
-    ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotInterval, SnapshotKeyError,
-    SnapshotRequest, SnapshotResponse, ValidityInterval, WorkloadOrigin, resolve,
+    ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotInterval, SnapshotKeyDetail,
+    SnapshotKeyError, SnapshotRequest, SnapshotResponse, ValidityInterval, WorkloadOrigin, resolve,
 };
 
 /// Boot-nanosecond clock (uptime-derived in production, scripted in
@@ -130,10 +130,10 @@ impl Resolver {
             entries: Vec::new(),
         });
         let mut response = resolve(request, &effective)?;
-        // Defensive convergence (B2 D01 ruling): the frozen entry point
-        // ignores an explicit file `stale` status when validity overlaps
-        // (or is absent). The helper honors the file's own staleness —
-        // a downgrade only, converging with the announced Round-2 fix.
+        // Defense in depth (R2 D01): the frozen entry point already
+        // honors an explicit file `stale` status, so this downgrade is
+        // a post-merge no-op — kept so a stale file can never surface
+        // as asserted through this path.
         honor_explicit_stale(&mut response, &effective);
         self.upgrade_unresolved(&mut response, &host_kernel, clock, start_ns, now_ns);
         recount(&mut response);
@@ -364,7 +364,7 @@ fn convert_one_to_unsupported(response: &mut SnapshotResponse, index: usize) {
     response.errors.push(SnapshotKeyError {
         key,
         code: SnapshotErrorCode::Unsupported,
-        detail: "host verification exceeded its budget".to_string(),
+        detail: SnapshotKeyDetail::UnsupportedKey,
     });
 }
 
@@ -411,7 +411,7 @@ fn truncate_to_budget(response: &mut SnapshotResponse) -> Result<(), MetadataUna
         response.errors.push(SnapshotKeyError {
             key: dropped.key,
             code: SnapshotErrorCode::BudgetExceeded,
-            detail: "association dropped to fit the response budget".to_string(),
+            detail: SnapshotKeyDetail::BudgetDropped,
         });
         response.status = ResponseStatus::Truncated;
     }
@@ -499,6 +499,19 @@ mod tests {
         SnapshotRequest {
             session_id: SESSION.to_string(),
             keys,
+            capture_interval: None,
+        }
+    }
+
+    /// A request with an established counted interval: only this form can
+    /// reach covered `Asserted` bindings (R2 coverage gate). Tests whose
+    /// intent needs asserted metadata use this; liveness/upgrade tests
+    /// with no counted interval honestly stay absent.
+    fn request_with_capture(keys: Vec<SnapshotKey>, start_ns: u64, end_ns: u64) -> SnapshotRequest {
+        SnapshotRequest {
+            session_id: SESSION.to_string(),
+            keys,
+            capture_interval: Some(SnapshotInterval { start_ns, end_ns }),
         }
     }
 
@@ -589,21 +602,21 @@ mod tests {
 
     #[test]
     fn explicit_file_stale_is_honored_despite_overlap() {
-        // B2 D01 ruling: the frozen entry point asserts whenever validity
-        // overlaps (or is absent), ignoring an explicit file `stale`. The
-        // helper downgrades to the file's own staleness (Round-2
-        // convergence; a downgrade only).
+        // R2 D01: the frozen entry point honors an explicit file `stale`
+        // status whatever the validity (overlap, absence, or coverage);
+        // the helper downgrade converges with that ruling and is now a
+        // no-op on this path (kept as defense in depth).
         let fixture = TFixture::create("file-stale");
         let live = fixture.cgroup_dir("live");
         for validity in [None, Some(ValidityInterval::monotonic(1500, 2500))] {
             let mut meta = metadata_for(live);
             meta.entries[0].binding.status = AttributionStatus::Stale;
             meta.entries[0].binding.validity = validity;
-            // Sanity: the frozen path alone asserts here (the defect).
+            // Sanity: the frozen path alone honors stale here (R2 fix).
             let frozen = resolve(&request(vec![key(live, 4242)]), &meta).expect("frozen");
             assert_eq!(
                 frozen.associations[0].evidence.status,
-                AttributionStatus::Asserted,
+                AttributionStatus::Stale,
                 "frozen baseline for validity {validity:?}"
             );
             let mut resolver = Resolver::new(fixture.view(), Some(meta));
@@ -624,6 +637,10 @@ mod tests {
 
     #[test]
     fn asserted_and_stale_never_upgrade() {
+        // The counted interval is established ([1000,2000]): the expired
+        // validity [100,200] stays stale (uncovered, identity kept) while
+        // the covering validity [500,2500] asserts — and neither settled
+        // status is promoted by liveness.
         let fixture = TFixture::create("no-upgrade");
         let live = fixture.cgroup_dir("live");
         let mut stale_meta = metadata_for(live);
@@ -631,7 +648,11 @@ mod tests {
         let mut resolver = Resolver::new(fixture.view(), Some(stale_meta));
         let clock = ScriptedClock::new(vec![NOW]);
         let response = resolver
-            .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+            .resolve(
+                &request_with_capture(vec![key(live, 4242)], 1000, 2000),
+                &clock,
+                NOW,
+            )
             .expect("resolves");
         assert_eq!(
             response.associations[0].evidence.status,
@@ -639,9 +660,15 @@ mod tests {
             "expired bindings stay stale even when live"
         );
 
-        let mut resolver = Resolver::new(fixture.view(), Some(metadata_for(live)));
+        let mut asserted_meta = metadata_for(live);
+        asserted_meta.entries[0].binding.validity = Some(ValidityInterval::monotonic(500, 2500));
+        let mut resolver = Resolver::new(fixture.view(), Some(asserted_meta));
         let response = resolver
-            .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+            .resolve(
+                &request_with_capture(vec![key(live, 4242)], 1000, 2000),
+                &clock,
+                NOW,
+            )
             .expect("resolves");
         assert_eq!(
             response.associations[0].evidence.status,
@@ -908,7 +935,10 @@ mod tests {
                     method: kryprobe_core::workload::METHOD_METADATA_FILE.to_string(),
                     source: WorkloadOrigin::OperatorMetadataFile,
                     status: AttributionStatus::Asserted,
-                    validity: None,
+                    // Covered by the [1000,2000] capture below, so these
+                    // assert with full max-size identity (R2 coverage
+                    // gate): slim unresolved rows would fit the budget.
+                    validity: Some(ValidityInterval::monotonic(500, 2500)),
                 },
             });
         }
@@ -923,14 +953,15 @@ mod tests {
         };
         // Sanity: the frozen path truncates this on its own.
         let keys: Vec<SnapshotKey> = (0..256u64).map(|i| key(1000 + i, 4242)).collect();
-        let frozen = resolve(&request(keys.clone()), &snapshot).expect("frozen resolves");
+        let frozen = resolve(&request_with_capture(keys.clone(), 1000, 2000), &snapshot)
+            .expect("frozen resolves");
         assert_eq!(frozen.status, ResponseStatus::Truncated);
 
         // The helper path preserves frozen truncation end to end.
         let mut resolver = Resolver::new(fixture.view(), Some(snapshot));
         let clock = ScriptedClock::new(vec![NOW]);
         let response = resolver
-            .resolve(&request(keys), &clock, NOW)
+            .resolve(&request_with_capture(keys, 1000, 2000), &clock, NOW)
             .expect("resolves");
         assert!(response.validate().is_ok());
         assert_eq!(response.status, ResponseStatus::Truncated);

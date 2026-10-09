@@ -337,6 +337,8 @@ mod tests {
                 tgid: 1,
                 start_ns: 1,
             }],
+            // IPC framing tests carry no counted interval (wire-omitted).
+            capture_interval: None,
         };
         serde_json::to_vec(&request).expect("encodes")
     }
@@ -436,6 +438,7 @@ mod tests {
                     tgid: 1,
                     start_ns: 1,
                 }],
+                capture_interval: None,
             },
             &kryprobe_core::workload::MetadataSnapshot {
                 collector: "t".to_string(),

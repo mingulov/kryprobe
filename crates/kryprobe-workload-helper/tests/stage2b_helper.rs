@@ -125,6 +125,22 @@ fn request_json(keys: &[SnapshotKey]) -> Vec<u8> {
     let request = SnapshotRequest {
         session_id: SESSION.to_string(),
         keys: keys.to_vec(),
+        // No counted interval established (wire-omitted): matches stay
+        // unknown/stale, never asserted — honest for tests whose intent
+        // is not coverage.
+        capture_interval: None,
+    };
+    serde_json::to_vec(&request).expect("request encodes")
+}
+
+/// A request with an established counted interval: only this form can
+/// reach covered `Asserted` bindings (R2 coverage gate). Tests whose
+/// intent needs asserted metadata use this.
+fn request_json_with_capture(keys: &[SnapshotKey], start_ns: u64, end_ns: u64) -> Vec<u8> {
+    let request = SnapshotRequest {
+        session_id: SESSION.to_string(),
+        keys: keys.to_vec(),
+        capture_interval: Some(kryprobe_core::workload::SnapshotInterval { start_ns, end_ns }),
     };
     serde_json::to_vec(&request).expect("request encodes")
 }
@@ -341,15 +357,22 @@ fn wrong_kernel_metadata_is_rejected() {
     assert_eq!(response.errors[0].code, SnapshotErrorCode::KernelMismatch);
     assert_eq!(response.errors[0].key.cgroup, 43812);
 
-    // Positive control: the same bytes under kernel A resolve.
+    // Positive control: the same bytes under kernel A resolve. The
+    // R2 coverage gate requires a validity window covering the counted
+    // interval, so the control carries both (the kernel comparison is
+    // the intent under test, not coverage).
+    let covered_a = entry_json(
+        43812,
+        Some(r#"{"start_ns":500,"end_ns":2500,"clock":"monotonic_boot"}"#),
+    );
     let meta_a = fixture.metadata_file(
         "a.json",
-        &metadata_json(Some(KERNEL_A), &entry_json(43812, None), (1000, 2000)),
+        &metadata_json(Some(KERNEL_A), &covered_a, (1000, 2000)),
     );
     let response = decode_stdout(&run_serve(
         &fixture,
         Some(&meta_a),
-        &request_json(&[key(KERNEL_A, 43812, 4242)]),
+        &request_json_with_capture(&[key(KERNEL_A, 43812, 4242)], 1000, 2000),
     ));
     assert_eq!(response.associations.len(), 1);
     assert_eq!(
@@ -362,8 +385,9 @@ fn wrong_kernel_metadata_is_rejected() {
 fn expired_binding_stays_stale() {
     let fixture = Fixture::create("stale");
     // The cgroup object is LIVE in the fixture tree, but the metadata
-    // binding validity [100,200] does not overlap the snapshot window
-    // [1000,2000]: the association must stay stale, never refresh.
+    // binding validity [100,200] does not cover the counted capture
+    // interval [1000,2000] (R2 coverage gate): the association must stay
+    // stale, never refresh.
     let live = fixture.cgroup_dir("live-group");
     let stale_entry = entry_json(
         live,
@@ -376,7 +400,7 @@ fn expired_binding_stays_stale() {
     let response = decode_stdout(&run_serve(
         &fixture,
         Some(&meta),
-        &request_json(&[key(KERNEL_A, live, 4242)]),
+        &request_json_with_capture(&[key(KERNEL_A, live, 4242)], 1000, 2000),
     ));
     assert_eq!(response.associations.len(), 1);
     assert_eq!(
@@ -389,10 +413,11 @@ fn expired_binding_stays_stale() {
         "stale keeps its asserted identity"
     );
 
-    // Positive control: overlapping validity asserts.
+    // Positive control: covering validity asserts (overlap alone
+    // never asserts under the R2 coverage gate).
     let fresh_entry = entry_json(
         live,
-        Some(r#"{"start_ns":1500,"end_ns":2500,"clock":"monotonic_boot"}"#),
+        Some(r#"{"start_ns":500,"end_ns":2500,"clock":"monotonic_boot"}"#),
     );
     let fresh = fixture.metadata_file(
         "fresh.json",
@@ -401,7 +426,7 @@ fn expired_binding_stays_stale() {
     let response = decode_stdout(&run_serve(
         &fixture,
         Some(&fresh),
-        &request_json(&[key(KERNEL_A, live, 4242)]),
+        &request_json_with_capture(&[key(KERNEL_A, live, 4242)], 1000, 2000),
     ));
     assert_eq!(
         response.associations[0].evidence.status,
@@ -740,14 +765,21 @@ fn rebooted_host_skips_verification() {
         b"test-boot-id-002\n",
     );
     let live = fixture.cgroup_dir("live");
+    // Covered validity + counted capture so the frozen path asserts
+    // (R2 coverage gate); the cross-boot live view must still refuse
+    // to upgrade it.
+    let covered = entry_json(
+        live,
+        Some(r#"{"start_ns":500,"end_ns":2500,"clock":"monotonic_boot"}"#),
+    );
     let meta = fixture.metadata_file(
         "a.json",
-        &metadata_json(Some(KERNEL_A), &entry_json(live, None), (1000, 2000)),
+        &metadata_json(Some(KERNEL_A), &covered, (1000, 2000)),
     );
     let response = decode_stdout(&run_serve(
         &fixture,
         Some(&meta),
-        &request_json(&[key(KERNEL_A, live, 4242)]),
+        &request_json_with_capture(&[key(KERNEL_A, live, 4242)], 1000, 2000),
     ));
     assert_eq!(
         response.associations[0].evidence.status,
