@@ -39,20 +39,19 @@ pub enum WorkloadSelector {
     /// Descendants never join; `0` refuses at construction (the
     /// unreadable marker is not selectable).
     Cgroup(u64),
-    /// Full container identity: runtime instance + full id, with an
-    /// optional lifetime narrowing. An absent lifetime selects the
-    /// container across lifetimes (frozen by the
+    /// Full container identity: runtime instance + full id ONLY. M1
+    /// selectors carry no lifetime (D10: the amended v2 report wire
+    /// `selectors.container` allows runtime+id only), so the selector
+    /// always matches the container across lifetimes (frozen by the
     /// `matching-violation` fixture: the lifetime-less selector
-    /// matches the lifetime-a row); a present lifetime matches only
-    /// rows with that observed lifetime, while same-id rows with an
-    /// unobserved lifetime are unknown.
+    /// matches the lifetime-a row). Lifetime narrowing is not
+    /// representable in M1 and refuses at construction — never
+    /// silently dropped (dropping would change scope).
     Container {
         /// Runtime instance identity (non-empty, bounded).
         runtime: String,
         /// Full container id (64 lowercase hex; abbreviations refuse).
         id: String,
-        /// Lifetime narrowing when present.
-        lifetime: Option<String>,
     },
 }
 
@@ -98,11 +97,13 @@ impl WorkloadSelector {
         Ok(Self::Cgroup(id))
     }
 
-    /// Full-container-identity selector: non-empty bounded runtime, a
-    /// full 64-char lowercase-hex id (abbreviated, non-hex, or
-    /// uppercase ids refuse), and an optional bounded lifetime. An
-    /// empty lifetime normalizes to absent, mirroring identity-key
-    /// normalization.
+    /// Full-container-identity selector: non-empty bounded runtime
+    /// and a full 64-char lowercase-hex id (abbreviated, non-hex, or
+    /// uppercase ids refuse). The `lifetime` argument must be `None`:
+    /// any present lifetime refuses, because lifetime narrowing is not
+    /// representable on the amended M1 report wire (D10:
+    /// `selectors.container` carries runtime+id only) and silently
+    /// dropping it would change scope.
     pub fn container(
         runtime: &str,
         id: &str,
@@ -118,21 +119,14 @@ impl WorkloadSelector {
                 "container selector requires a full 64-character lowercase-hex id (abbreviations refuse)",
             ));
         }
-        let lifetime = match lifetime {
-            Some(lifetime) if !lifetime.is_empty() => {
-                if lifetime.len() > MAX_STRING_FIELD_BYTES {
-                    return Err(SelectorError::new(
-                        "container selector lifetime exceeds 256 bytes",
-                    ));
-                }
-                Some(lifetime.to_string())
-            }
-            _ => None,
-        };
+        if lifetime.is_some() {
+            return Err(SelectorError::new(
+                "container selector refuses a lifetime (M1 selectors are runtime + id only)",
+            ));
+        }
         Ok(Self::Container {
             runtime: runtime.to_string(),
             id: id.to_string(),
-            lifetime,
         })
     }
 
@@ -378,11 +372,7 @@ fn decide(selector: &WorkloadSelector, row: &ScopedRow<'_>) -> ScopeDecision {
                 ScopeDecision::NonMatch
             }
         }
-        WorkloadSelector::Container {
-            runtime,
-            id,
-            lifetime,
-        } => {
+        WorkloadSelector::Container { runtime, id } => {
             let Some(container) = row.identity.container.as_ref() else {
                 // No container association (none, or pod-only): no
                 // container key is established — unknown.
@@ -399,17 +389,11 @@ fn decide(selector: &WorkloadSelector, row: &ScopedRow<'_>) -> ScopeDecision {
             if container.runtime != *runtime || container.id != *id {
                 return ScopeDecision::NonMatch;
             }
-            match (
-                lifetime,
-                container.lifetime.as_ref().filter(|l| !l.is_empty()),
-            ) {
-                (None, _) => ScopeDecision::Match,
-                (Some(want), Some(have)) if want == have => ScopeDecision::Match,
-                (Some(_), Some(_)) => ScopeDecision::NonMatch,
-                // The selector narrows by lifetime but the row never
-                // observed one: the row may or may not belong.
-                (Some(_), None) => ScopeDecision::Unknown,
-            }
+            // Runtime+id equality is the whole M1 match: observed row
+            // lifetimes never narrow the selection (D10 — the selector
+            // wire carries runtime+id only, so matching spans
+            // lifetimes by construction).
+            ScopeDecision::Match
         }
     }
 }
@@ -572,30 +556,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_lifetime_normalizes_to_absent() {
-        let selector = WorkloadSelector::container(
-            "docker://host-a",
-            "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57",
-            Some(""),
-        )
-        .expect("empty lifetime normalizes");
-        assert!(matches!(
-            selector,
-            WorkloadSelector::Container { lifetime: None, .. }
-        ));
-    }
-
-    #[test]
-    fn oversize_lifetime_refuses() {
+    fn present_lifetime_refuses_without_input_echo() {
+        // D10: the amended report wire carries runtime+id only, so any
+        // present selector lifetime — empty, bounded, or oversize —
+        // refuses explicitly (exit 2) rather than narrowing or
+        // silently dropping (dropping would change scope).
+        let id = "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57";
         let big = "l".repeat(MAX_STRING_FIELD_BYTES + 1);
-        assert!(
-            WorkloadSelector::container(
-                "docker://host-a",
-                "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57",
-                Some(&big),
-            )
-            .is_err()
-        );
+        for lifetime in [Some("lifetime-a"), Some(""), Some(big.as_str())] {
+            let err = WorkloadSelector::container("docker://host-a", id, lifetime)
+                .expect_err("present lifetime refuses");
+            assert_eq!(err.exit_intent(), 2);
+            assert!(
+                !err.to_string().contains("lifetime-a"),
+                "refusal withholds input bytes: {err}"
+            );
+        }
     }
 
     #[test]

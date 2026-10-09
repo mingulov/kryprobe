@@ -578,10 +578,27 @@ fn container_selector_without_lifetime_matches_any_lifetime() {
 }
 
 #[test]
-fn container_selector_lifetime_narrows_exactly() {
-    // A lifetime-qualified selector: same id + other lifetime is a
-    // definite non-match; same id + unobserved lifetime is unknown
-    // (the row may or may not belong to the selected lifetime).
+fn container_selector_lifetime_refuses() {
+    // D10: lifetime narrowing is not representable on the amended M1
+    // report wire (`selectors.container` carries runtime+id only), so
+    // a lifetime-bearing selector refuses explicitly (exit 2) instead
+    // of narrowing or silently dropping the lifetime (dropping would
+    // change scope).
+    let err = WorkloadSelector::container(RUNTIME, ID_A, Some("lifetime-a"))
+        .expect_err("lifetime-bearing selector refuses");
+    assert_eq!(err.exit_intent(), 2);
+    assert!(
+        !err.to_string().contains("lifetime-a"),
+        "refusal withholds input bytes: {err}"
+    );
+}
+
+#[test]
+fn container_selector_without_lifetime_matches_across_lifetimes() {
+    // Positive control: the lifetime-less selector matches the same
+    // runtime+id across observed lifetimes (a, b) and an unobserved
+    // lifetime — cross-lifetime matching still works after the D10
+    // refusal (the wire cannot narrow, so the selector never does).
     let a = agg_obs(1, "cbc(aes)", "cbc-aes-aesni", "ok");
     let b = agg_obs(2, "cbc(aes)", "cbc-aes-aesni", "ok");
     let c = agg_obs(3, "cbc(aes)", "cbc-aes-aesni", "ok");
@@ -608,12 +625,11 @@ fn container_selector_lifetime_narrows_exactly() {
             &c,
         ),
     ];
-    let selector =
-        WorkloadSelector::container(RUNTIME, ID_A, Some("lifetime-a")).expect("selector");
+    let selector = WorkloadSelector::container(RUNTIME, ID_A, None).expect("container selector");
     let scoped = scope_rows(&selector, &rows).expect("scopes");
-    assert_eq!(scoped.partition.matched(), 10);
-    assert_eq!(scoped.partition.nonmatched(), 10);
-    assert_eq!(scoped.partition.unknown_match(), 10);
+    assert_eq!(scoped.partition.matched(), 30);
+    assert_eq!(scoped.partition.nonmatched(), 0);
+    assert_eq!(scoped.partition.unknown_match(), 0);
 }
 
 #[test]
