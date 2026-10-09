@@ -321,9 +321,10 @@ impl SnapshotResponse {
     /// Response rules: well-formed session, bounded kernel tag, bounded
     /// associations/errors, valid chunk, exact counters, status
     /// consistent with budget errors, every association
-    /// key/identity/evidence valid, every error key valid (details are a
-    /// closed enum, self-validating), and the encoded bytes within
-    /// budget.
+    /// key/identity/evidence valid and coherent (usable statuses carry an
+    /// established identity, cgroup-0 keys carry none), every error key
+    /// valid (details are a closed enum, self-validating), and the
+    /// encoded bytes within budget.
     pub fn validate(&self) -> Result<(), MetadataUnavailable> {
         validate_session_id(&self.session_id)?;
         self.kernel_identity.validate()?;
@@ -348,6 +349,24 @@ impl SnapshotResponse {
                 .evidence
                 .validate()
                 .map_err(|_| MetadataUnavailable::ParseFailed)?;
+            // Ingress coherence (R3): usable statuses require an
+            // established identity, mirroring `WorkloadObservation` — an
+            // Asserted association with no identity contradicts the
+            // enrichment row — and cgroup-0 keys carry no identity: the
+            // unknown-cgroup population never resolves, whatever a
+            // received reply claims.
+            let usable = matches!(
+                assoc.evidence.status,
+                AttributionStatus::Verified
+                    | AttributionStatus::Asserted
+                    | AttributionStatus::Stale
+            );
+            if usable != assoc.identity.is_resolved() {
+                return Err(MetadataUnavailable::ParseFailed);
+            }
+            if assoc.key.cgroup == 0 && assoc.identity.is_resolved() {
+                return Err(MetadataUnavailable::ParseFailed);
+            }
             match assoc.evidence.status {
                 AttributionStatus::Verified | AttributionStatus::Asserted => {
                     resolved += 1;
