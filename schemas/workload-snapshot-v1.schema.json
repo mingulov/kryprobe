@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kryprobe.local/schemas/workload-snapshot-v1.schema.json",
+  "title": "kryprobe workload snapshot IPC v1",
+  "description": "Helper snapshot request/response wire shapes (Stage 2A contract). Request bytes <= 4096, response bytes <= 65536 with <= 256 associations. Field names are frozen; Stage 2B implements this exact codec.",
+  "type": "object",
+  "$defs": {
+    "snapshot_key": {
+      "type": "object",
+      "required": ["kernel_scope", "cgroup", "tgid", "start_ns"],
+      "properties": {
+        "kernel_scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "cgroup": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tgid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "start_ns": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "kernel_identity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["known"],
+          "properties": {
+            "known": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "const": "unknown"
+        }
+      ]
+    },
+    "workload_identity": {
+      "type": "object",
+      "required": ["container", "pod", "cluster", "node", "ancestor_container"],
+      "properties": {
+        "container": {
+          "type": ["object", "null"],
+          "required": ["runtime", "id"],
+          "properties": {
+            "runtime": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "lifetime": {
+              "type": ["string", "null"],
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        },
+        "pod": {
+          "type": ["object", "null"],
+          "required": ["cluster", "uid", "name", "namespace"],
+          "properties": {
+            "cluster": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "uid": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "namespace": {
+              "type": "string",
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        },
+        "cluster": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "node": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "ancestor_container": {
+          "type": ["object", "null"],
+          "required": ["runtime", "id"],
+          "properties": {
+            "runtime": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "id": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "lifetime": {
+              "type": ["string", "null"],
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["relationship", "method", "source", "status"],
+      "properties": {
+        "relationship": {
+          "enum": ["hook_context", "submitter", "completion_context", "workload_origin", "consumer"]
+        },
+        "method": {
+          "enum": ["captured_cgroup", "cgroup_inode_bind", "metadata_file", "metadata_label", "runtime_adapter", "unresolved"]
+        },
+        "source": {
+          "enum": ["kernel_capture", "operator_metadata_file", "runtime_adapter", "host_proc", "unknown"]
+        },
+        "status": {
+          "enum": ["verified", "asserted", "unresolved", "ambiguous", "stale", "unsupported"]
+        },
+        "validity": {
+          "type": ["object", "null"],
+          "required": ["start_ns", "end_ns", "clock"],
+          "properties": {
+            "start_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "end_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "clock": {
+              "const": "monotonic_boot"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "title": "snapshot request",
+      "type": "object",
+      "required": ["session_id", "keys"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/snapshot_key"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "snapshot response",
+      "type": "object",
+      "required": ["session_id", "kernel_identity", "associations", "errors", "status", "chunk", "counters"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "kernel_identity": {
+          "$ref": "#/$defs/kernel_identity"
+        },
+        "associations": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["key", "identity", "evidence"],
+            "properties": {
+              "key": {
+                "$ref": "#/$defs/snapshot_key"
+              },
+              "identity": {
+                "$ref": "#/$defs/workload_identity"
+              },
+              "evidence": {
+                "$ref": "#/$defs/evidence"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "errors": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["key", "code", "detail"],
+            "properties": {
+              "key": {
+                "$ref": "#/$defs/snapshot_key"
+              },
+              "code": {
+                "enum": ["kernel_mismatch", "unknown_kernel", "budget_exceeded", "unsupported"]
+              },
+              "detail": {
+                "type": "string",
+                "maxLength": 256
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "status": {
+          "enum": ["complete", "truncated"]
+        },
+        "chunk": {
+          "type": "object",
+          "required": ["index", "total"],
+          "properties": {
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "counters": {
+          "type": "object",
+          "required": ["resolved", "unresolved", "refused"],
+          "properties": {
+            "resolved": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unresolved": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "refused": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

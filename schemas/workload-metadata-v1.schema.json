@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kryprobe.local/schemas/workload-metadata-v1.schema.json",
+  "title": "kryprobe workload metadata v1",
+  "description": "Operator-supplied metadata snapshot file (Stage 2A contract, spec F07). Files assert: binding status is asserted or stale only, never verified. All intervals are monotonic boot-time nanoseconds. Byte budget 1048576, entries <= 1024, strings <= 256 bytes, nesting depth <= 16.",
+  "type": "object",
+  "required": [
+    "collector",
+    "snapshot_interval",
+    "kernel_identity",
+    "entries"
+  ],
+  "properties": {
+    "collector": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "snapshot_interval": {
+      "type": "object",
+      "required": ["start_ns", "end_ns"],
+      "properties": {
+        "start_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_ns": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "kernel_identity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["known"],
+          "properties": {
+            "known": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "const": "unknown"
+        }
+      ]
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "required": ["binding"],
+        "properties": {
+          "container": {
+            "type": ["object", "null"],
+            "required": ["runtime", "id"],
+            "properties": {
+              "runtime": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "id": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "lifetime": {
+                "type": ["string", "null"],
+                "maxLength": 256
+              }
+            },
+            "additionalProperties": false
+          },
+          "pod": {
+            "type": ["object", "null"],
+            "required": ["cluster", "uid", "name", "namespace"],
+            "properties": {
+              "cluster": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "uid": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "namespace": {
+                "type": "string",
+                "maxLength": 256
+              }
+            },
+            "additionalProperties": false
+          },
+          "cluster": {
+            "type": ["string", "null"],
+            "maxLength": 256
+          },
+          "node": {
+            "type": ["string", "null"],
+            "maxLength": 256
+          },
+          "ancestor_container": {
+            "type": ["object", "null"],
+            "required": ["runtime", "id"],
+            "properties": {
+              "runtime": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "id": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "lifetime": {
+                "type": ["string", "null"],
+                "maxLength": 256
+              }
+            },
+            "additionalProperties": false
+          },
+          "display_name": {
+            "type": ["string", "null"],
+            "maxLength": 256
+          },
+          "cgroup_id": {
+            "type": ["integer", "null"],
+            "minimum": 0
+          },
+          "binding": {
+            "type": "object",
+            "required": ["method", "source", "status"],
+            "properties": {
+              "method": {
+                "enum": ["metadata_file", "metadata_label"]
+              },
+              "source": {
+                "const": "operator_metadata_file"
+              },
+              "status": {
+                "enum": ["asserted", "stale"]
+              },
+              "validity": {
+                "type": ["object", "null"],
+                "required": ["start_ns", "end_ns", "clock"],
+                "properties": {
+                  "start_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "end_ns": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "clock": {
+                    "const": "monotonic_boot"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

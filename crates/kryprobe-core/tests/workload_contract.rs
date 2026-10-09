@@ -5,8 +5,10 @@
 //! lands and pass after.
 
 use kryprobe_core::workload::{
-    AttributionEvidence, AttributionStatus, ContextIdentity, ExecutionKind, ScopeDecision,
-    ScopePartition, WorkloadIdentity, WorkloadOrigin,
+    AttributionEvidence, AttributionStatus, BindingProvenance, ContextIdentity, ExecutionKind,
+    KernelIdentity, METHOD_METADATA_FILE, MetadataEntry, MetadataSnapshot, Relationship,
+    ScopeDecision, ScopePartition, SnapshotErrorCode, SnapshotInterval, SnapshotKey,
+    SnapshotRequest, ValidityInterval, WorkloadIdentity, WorkloadOrigin,
 };
 
 /// An unknown selector match is its own population: it never counts as a
@@ -63,7 +65,7 @@ fn wrong_kernel_metadata_is_rejected() {
     // Verified status requires the captured_cgroup method plus a validity
     // interval; anything else is a contradiction.
     let bad_verified = AttributionEvidence::new(
-        "hook_context",
+        Relationship::HookContext,
         "metadata_label",
         WorkloadOrigin::OperatorMetadataFile,
         AttributionStatus::Verified,
@@ -72,13 +74,54 @@ fn wrong_kernel_metadata_is_rejected() {
     assert!(bad_verified.validate().is_err());
 
     let good_verified = AttributionEvidence::new(
-        "hook_context",
+        Relationship::HookContext,
         "captured_cgroup",
         WorkloadOrigin::KernelCapture,
         AttributionStatus::Verified,
-        Some((100, 200)),
+        Some(ValidityInterval::monotonic(100, 200)),
     );
     assert!(good_verified.validate().is_ok());
+
+    // The resolver REALLY compares kernels: a captured key from kernel A
+    // served from a snapshot taken on kernel B refuses with a typed
+    // kernel-mismatch error — the metadata names are never applied.
+    let request = SnapshotRequest {
+        session_id: "0123456789abcdef0123456789abcdef".to_string(),
+        keys: vec![SnapshotKey {
+            kernel_scope: "kernel-A-boot-1111".to_string(),
+            cgroup: 43812,
+            tgid: 1000,
+            start_ns: 555,
+        }],
+    };
+    let foreign_snapshot = MetadataSnapshot {
+        collector: "docker-fixture-v1".to_string(),
+        snapshot_interval: SnapshotInterval {
+            start_ns: 1000,
+            end_ns: 2000,
+        },
+        kernel_identity: KernelIdentity::Known("kernel-B-boot-2222".to_string()),
+        entries: vec![MetadataEntry {
+            container: None,
+            pod: None,
+            cluster: None,
+            node: None,
+            ancestor_container: None,
+            display_name: Some("web-0".to_string()),
+            cgroup_id: Some(43812),
+            binding: BindingProvenance {
+                method: METHOD_METADATA_FILE.to_string(),
+                source: WorkloadOrigin::OperatorMetadataFile,
+                status: AttributionStatus::Asserted,
+                validity: None,
+            },
+        }],
+    };
+    let response =
+        kryprobe_core::workload::resolve(&request, &foreign_snapshot).expect("resolver runs");
+    assert!(response.associations.is_empty());
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(response.errors[0].code, SnapshotErrorCode::KernelMismatch);
 
     // A container-ID-looking cgroup name is a candidate until checked:
     // promoting it to verified without a check refuses. Full IDs only:

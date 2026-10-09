@@ -1,0 +1,131 @@
+{
+  "schema": "kryprobe.workload-report.v2",
+  "session": {
+    "session_id": "0123456789abcdef0123456789abcdef",
+    "kernel_identity": "7.0.0-38-generic/boot-A"
+  },
+  "interval": {
+    "start_ns": "100",
+    "end_ns": "200",
+    "consistency": "quiescent",
+    "clock": "monotonic_boot"
+  },
+  "profile": "api-returns",
+  "boundary": "api_return",
+  "dictionary": [
+    {
+      "dict_id": "n0",
+      "kh": "7",
+      "family": 1,
+      "op": 2,
+      "result": 0,
+      "context": 1,
+      "algorithm": "cbc(aes)",
+      "driver": "cbc-aes-aesni"
+    },
+    {
+      "dict_id": "n1",
+      "kh": "9",
+      "family": 1,
+      "op": 2,
+      "result": 0,
+      "context": 1,
+      "algorithm": "ecb(des)",
+      "driver": "des_generic"
+    }
+  ],
+  "contexts": [
+    {
+      "kh": "9",
+      "cgroup_id": "43812",
+      "tgid": 1000,
+      "uid": 1000,
+      "start_ns": "555",
+      "execution_kind": "proc",
+      "calls": "20",
+      "native_ref": "n1",
+      "workload": {
+        "container": {
+          "runtime": "docker://host-a",
+          "id": "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57",
+          "lifetime": "lifetime-a"
+        }
+      },
+      "attribution": {
+        "relationship": "hook_context",
+        "method": "metadata_file",
+        "source": "operator_metadata_file",
+        "status": "asserted",
+        "validity": {
+          "start_ns": "100",
+          "end_ns": "200",
+          "clock": "monotonic_boot"
+        }
+      }
+    },
+    {
+      "kh": "7",
+      "cgroup_id": "43813",
+      "tgid": 1001,
+      "uid": 1000,
+      "start_ns": "556",
+      "execution_kind": "proc",
+      "calls": "30",
+      "native_ref": "n0",
+      "workload": {
+        "container": {
+          "runtime": "docker://host-a",
+          "id": "9c4d2f7a8b1e4a6c9d0f3b5a7c8e1d2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b1c3d",
+          "lifetime": "lifetime-b"
+        }
+      },
+      "attribution": {
+        "relationship": "hook_context",
+        "method": "metadata_file",
+        "source": "operator_metadata_file",
+        "status": "asserted",
+        "validity": {
+          "start_ns": "100",
+          "end_ns": "200",
+          "clock": "monotonic_boot"
+        }
+      }
+    }
+  ],
+  "ledger": {
+    "system_total": "50",
+    "per_context_sum": "50",
+    "unknown": "0",
+    "consistency": "quiescent",
+    "gap_unreconciled": false,
+    "system_saturated": false,
+    "per_context_saturated": false,
+    "refused_inserts": "0"
+  },
+  "partition": {
+    "matched": "20",
+    "nonmatched": "30",
+    "unknown_match": "0"
+  },
+  "selectors": {
+    "kind": "container-id",
+    "container": {
+      "runtime": "docker://host-a",
+      "id": "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57"
+    }
+  },
+  "scope": {
+    "capture_scope": "system",
+    "report_scope": "scoped",
+    "group_by": "container"
+  },
+  "metadata": {
+    "status": "available"
+  },
+  "coverage": {
+    "capture": "complete",
+    "attribution": "complete",
+    "metadata": "complete",
+    "correlation": "complete"
+  }
+}

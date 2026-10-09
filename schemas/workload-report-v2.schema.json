@@ -1,0 +1,456 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kryprobe.local/schemas/workload-report-v2.schema.json",
+  "title": "kryprobe workload-report v2",
+  "description": "Standalone versioned workload-context report (Stage 2A contract). Full native operation identity (inline or collision-qualified dictionary), context/lifetime/session identities, authoritative ledger operands, typed metadata, independent coverage. Cgroups by numeric ID only; no filesystem paths. File bytes <= 1048576, contexts <= 1024, dictionary <= 1024.",
+  "type": "object",
+  "required": [
+    "schema",
+    "session",
+    "interval",
+    "profile",
+    "boundary",
+    "dictionary",
+    "contexts",
+    "ledger",
+    "partition",
+    "selectors",
+    "scope",
+    "metadata",
+    "coverage"
+  ],
+  "properties": {
+    "schema": {
+      "const": "kryprobe.workload-report.v2"
+    },
+    "session": {
+      "type": "object",
+      "required": ["session_id", "kernel_identity"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "kernel_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "interval": {
+      "type": "object",
+      "required": ["start_ns", "end_ns", "consistency", "clock"],
+      "properties": {
+        "start_ns": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "end_ns": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "consistency": {
+          "enum": ["quiescent", "unproven"]
+        },
+        "clock": {
+          "const": "monotonic_boot"
+        }
+      },
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "boundary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "dictionary": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "required": ["dict_id", "kh", "family", "op", "result", "context", "algorithm", "driver"],
+        "properties": {
+          "dict_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "kh": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "family": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "op": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "result": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "context": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "algorithm": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "driver": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "contexts": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "required": ["kh", "cgroup_id", "tgid", "uid", "start_ns", "execution_kind", "calls"],
+        "properties": {
+          "kh": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "cgroup_id": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "tgid": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "uid": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "start_ns": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "execution_kind": {
+            "enum": ["proc", "kthread", "softirq", "unknown"]
+          },
+          "calls": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "native": {
+            "type": "object",
+            "required": ["family", "op", "result", "context", "algorithm", "driver"],
+            "properties": {
+              "family": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "op": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "result": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "context": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "algorithm": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "driver": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "additionalProperties": false
+          },
+          "native_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "workload": {
+            "type": "object",
+            "minProperties": 1,
+            "properties": {
+              "container": {
+                "type": "object",
+                "required": ["runtime", "id"],
+                "properties": {
+                  "runtime": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "lifetime": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "additionalProperties": false
+              },
+              "pod": {
+                "type": "object",
+                "required": ["cluster", "uid", "name", "namespace"],
+                "properties": {
+                  "cluster": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "uid": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "name": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "namespace": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "additionalProperties": false
+              },
+              "cluster": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "node": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "ancestor_container": {
+                "type": "object",
+                "required": ["runtime", "id"],
+                "properties": {
+                  "runtime": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "lifetime": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "attribution": {
+            "type": "object",
+            "required": ["relationship", "method", "source", "status"],
+            "properties": {
+              "relationship": {
+                "enum": ["hook_context", "submitter", "completion_context", "workload_origin", "consumer"]
+              },
+              "method": {
+                "enum": ["captured_cgroup", "cgroup_inode_bind", "metadata_file", "metadata_label", "runtime_adapter", "unresolved"]
+              },
+              "source": {
+                "enum": ["kernel_capture", "operator_metadata_file", "runtime_adapter", "host_proc", "unknown"]
+              },
+              "status": {
+                "enum": ["verified", "asserted", "unresolved", "ambiguous", "stale", "unsupported"]
+              },
+              "validity": {
+                "type": "object",
+                "required": ["start_ns", "end_ns", "clock"],
+                "properties": {
+                  "start_ns": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$"
+                  },
+                  "end_ns": {
+                    "type": "string",
+                    "pattern": "^[0-9]+$"
+                  },
+                  "clock": {
+                    "const": "monotonic_boot"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "ledger": {
+      "type": "object",
+      "required": ["system_total", "per_context_sum", "unknown", "consistency", "gap_unreconciled", "system_saturated", "per_context_saturated", "refused_inserts"],
+      "properties": {
+        "system_total": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "per_context_sum": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "unknown": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "consistency": {
+          "enum": ["quiescent", "unproven"]
+        },
+        "gap_unreconciled": {
+          "type": "boolean"
+        },
+        "system_saturated": {
+          "type": "boolean"
+        },
+        "per_context_saturated": {
+          "type": "boolean"
+        },
+        "refused_inserts": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "partition": {
+      "type": "object",
+      "required": ["matched", "nonmatched", "unknown_match"],
+      "properties": {
+        "matched": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "nonmatched": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "unknown_match": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectors": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["none", "cgroup-id", "container-id"]
+        },
+        "cgroup_id": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "container": {
+          "type": "object",
+          "required": ["runtime", "id"],
+          "properties": {
+            "runtime": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "required": ["capture_scope", "report_scope", "group_by"],
+      "properties": {
+        "capture_scope": {
+          "const": "system"
+        },
+        "report_scope": {
+          "enum": ["unscoped", "scoped"]
+        },
+        "group_by": {
+          "enum": ["none", "cgroup", "container"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["available", "unavailable"]
+        },
+        "reason": {
+          "enum": ["no_principal", "helper_refused", "budget_exceeded", "unsupported_environment", "parse_failed"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["capture", "attribution", "metadata", "correlation"],
+      "properties": {
+        "capture": {
+          "enum": ["complete", "partial", "unavailable"]
+        },
+        "attribution": {
+          "enum": ["complete", "partial", "unavailable"]
+        },
+        "metadata": {
+          "enum": ["complete", "partial", "unavailable"]
+        },
+        "correlation": {
+          "enum": ["complete", "partial", "unavailable"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

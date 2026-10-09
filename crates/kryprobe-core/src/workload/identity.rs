@@ -38,6 +38,7 @@ pub struct ContainerRef {
     /// Runtime lifetime metadata when available; `None` (or empty, which
     /// normalizes to unobserved in keys) means the lifetime was not
     /// established — an explicit unknown, never a wildcard.
+    #[serde(default)]
     pub lifetime: Option<String>,
 }
 
@@ -200,6 +201,57 @@ impl WorkloadIdentity {
         !self.identity_keys().is_empty()
     }
 
+    /// String-budget check: every identity component fits the bounded
+    /// string field. Used by snapshot wire validation.
+    #[must_use]
+    pub fn check_bounds(&self, max_bytes: usize) -> bool {
+        let fields = [
+            self.container
+                .as_ref()
+                .map(|c| c.runtime.as_str())
+                .unwrap_or(""),
+            self.container.as_ref().map(|c| c.id.as_str()).unwrap_or(""),
+            self.container
+                .as_ref()
+                .and_then(|c| c.lifetime.as_deref())
+                .unwrap_or(""),
+            self.pod.as_ref().map(|p| p.cluster.as_str()).unwrap_or(""),
+            self.pod.as_ref().map(|p| p.uid.as_str()).unwrap_or(""),
+            self.pod.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
+            self.pod
+                .as_ref()
+                .map(|p| p.namespace.as_str())
+                .unwrap_or(""),
+            self.cluster.as_deref().unwrap_or(""),
+            self.node.as_deref().unwrap_or(""),
+            self.ancestor_container
+                .as_ref()
+                .map(|c| c.runtime.as_str())
+                .unwrap_or(""),
+            self.ancestor_container
+                .as_ref()
+                .map(|c| c.id.as_str())
+                .unwrap_or(""),
+            self.ancestor_container
+                .as_ref()
+                .and_then(|c| c.lifetime.as_deref())
+                .unwrap_or(""),
+        ];
+        fields.iter().all(|f| f.len() <= max_bytes)
+    }
+
+    /// Consistency of the two cluster sources: when both the top-level
+    /// cluster and the pod's cluster are present they must agree —
+    /// contradictory cluster sources refuse (D02). The pod identity key
+    /// always uses the pod's own cluster.
+    #[must_use]
+    pub fn check_consistency(&self) -> bool {
+        match (&self.cluster, &self.pod) {
+            (Some(top), Some(pod)) => top == &pod.cluster,
+            _ => true,
+        }
+    }
+
     /// Selection-name equality (name + namespace): used to detect the
     /// name-reuse case that MUST still split by UID.
     #[must_use]
@@ -293,6 +345,16 @@ mod tests {
         assert!(empty_container.identity_keys().is_empty());
         let empty_pod = WorkloadIdentity::pod("", "api", "production", "");
         assert!(empty_pod.identity_keys().is_empty());
+    }
+
+    #[test]
+    fn contradictory_cluster_sources_are_inconsistent() {
+        let mut conflicted = WorkloadIdentity::pod("cluster-a", "api", "production", "uid-1");
+        conflicted.cluster = Some("cluster-b".to_string());
+        assert!(!conflicted.check_consistency());
+        let agreed = WorkloadIdentity::pod("cluster-a", "api", "production", "uid-1");
+        assert!(agreed.check_consistency());
+        assert!(WorkloadIdentity::none().check_consistency());
     }
 
     #[test]

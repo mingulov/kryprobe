@@ -3,7 +3,7 @@
 //! (ADR-0008 §(g), spec F05): `observed = matched + nonmatched +
 //! unknown_match` with checked arithmetic.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Selector outcome for one observation: `Unknown` is neither match nor
 /// non-match and never collapses into either.
@@ -21,11 +21,34 @@ pub enum ScopeDecision {
 /// A fixed observed population partitioned by one selector. The
 /// invariant `observed = matched + nonmatched + unknown_match` is
 /// established at construction with checked addition; overflow refuses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Deserialization routes through the same checked constructor (D05):
+/// an overflowing triple on the wire refuses instead of building a
+/// partition whose `observed()` would wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct ScopePartition {
     matched: u64,
     nonmatched: u64,
     unknown_match: u64,
+}
+
+/// Wire shape for [`ScopePartition`]: identical fields, checked on
+/// conversion via [`ScopePartition::from_counts`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ScopePartitionWire {
+    matched: u64,
+    nonmatched: u64,
+    unknown_match: u64,
+}
+
+impl<'de> Deserialize<'de> for ScopePartition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ScopePartitionWire::deserialize(deserializer)?;
+        Self::from_counts(wire.matched, wire.nonmatched, wire.unknown_match)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ScopePartition {
@@ -99,5 +122,18 @@ mod tests {
     fn zero_population_is_valid() {
         let p = ScopePartition::from_counts(0, 0, 0).expect("empty is valid");
         assert_eq!(p.observed(), 0);
+    }
+
+    #[test]
+    fn deserialization_routes_through_checked_construction() {
+        let ok: ScopePartition =
+            serde_json::from_str(r#"{"matched":70,"nonmatched":20,"unknown_match":10}"#)
+                .expect("valid triple decodes");
+        assert_eq!(ok.observed(), 100);
+        let overflow = format!(
+            r#"{{"matched":{},"nonmatched":1,"unknown_match":0}}"#,
+            u64::MAX
+        );
+        assert!(serde_json::from_str::<ScopePartition>(&overflow).is_err());
     }
 }

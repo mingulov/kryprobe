@@ -1,0 +1,89 @@
+{
+  "schema": "kryprobe.workload-report.v2",
+  "session": {
+    "session_id": "0123456789abcdef0123456789abcdef",
+    "kernel_identity": "7.0.0-38-generic/boot-A"
+  },
+  "interval": {
+    "start_ns": "100",
+    "end_ns": "200",
+    "consistency": "quiescent",
+    "clock": "monotonic_boot"
+  },
+  "profile": "api-returns",
+  "boundary": "api_return",
+  "dictionary": [
+    {
+      "dict_id": "n0",
+      "kh": "7",
+      "family": 1,
+      "op": 2,
+      "result": 0,
+      "context": 1,
+      "algorithm": "cbc(aes)",
+      "driver": "cbc-aes-aesni"
+    }
+  ],
+  "contexts": [
+    {
+      "kh": "7",
+      "cgroup_id": "43812",
+      "tgid": 1000,
+      "uid": 1000,
+      "start_ns": "555",
+      "execution_kind": "proc",
+      "calls": "20",
+      "native_ref": "n0"
+    },
+    {
+      "kh": "7",
+      "cgroup_id": "43813",
+      "tgid": 1001,
+      "uid": 1000,
+      "start_ns": "556",
+      "execution_kind": "proc",
+      "calls": "30",
+      "native": {
+        "family": 1,
+        "op": 2,
+        "result": 0,
+        "context": 1,
+        "algorithm": "cbc(aes)",
+        "driver": "cbc-aes-aesni"
+      }
+    }
+  ],
+  "ledger": {
+    "system_total": "50",
+    "per_context_sum": "50",
+    "unknown": "0",
+    "consistency": "quiescent",
+    "gap_unreconciled": false,
+    "system_saturated": false,
+    "per_context_saturated": false,
+    "refused_inserts": "0"
+  },
+  "partition": {
+    "matched": "50",
+    "nonmatched": "0",
+    "unknown_match": "0"
+  },
+  "selectors": {
+    "kind": "none"
+  },
+  "scope": {
+    "capture_scope": "system",
+    "report_scope": "unscoped",
+    "group_by": "none"
+  },
+  "metadata": {
+    "status": "unavailable",
+    "reason": "no_principal"
+  },
+  "coverage": {
+    "capture": "complete",
+    "attribution": "unavailable",
+    "metadata": "unavailable",
+    "correlation": "complete"
+  }
+}

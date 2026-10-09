@@ -20,14 +20,24 @@ pub enum ExecutionKind {
     Unknown,
 }
 
+/// The observed boundary an execution context was captured at. Owned
+/// and decodable (D12): IPC buffers decode into this without static
+/// input. Later milestones extend the vocabulary versioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationBoundary {
+    /// Kernel crypto API return edge (M1).
+    ApiReturn,
+}
+
 /// Which boundary/context properties were actually established for one
 /// captured context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContextQualification {
     /// Capture happened in hook context (vs a later snapshot join).
     pub hook_context: bool,
-    /// Observed boundary, e.g. `api_return`.
-    pub boundary: &'static str,
+    /// Observed boundary.
+    pub boundary: ObservationBoundary,
     /// The cgroup id was read (vs `cgroup == 0` unreadable).
     pub cgroup_observed: bool,
     /// The process lifetime discriminator was read (vs `start_ns == 0`).
@@ -41,7 +51,7 @@ impl ContextQualification {
     pub fn for_identity(id: &ContextIdentity) -> Self {
         Self {
             hook_context: true,
-            boundary: "api_return",
+            boundary: ObservationBoundary::ApiReturn,
             cgroup_observed: id.cgroup != 0,
             lifetime_observed: id.start_ns != 0,
         }

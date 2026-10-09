@@ -12,6 +12,7 @@ mod kinds;
 mod lifecycle_v1;
 mod session_v1;
 pub mod workload_v1;
+pub mod workload_v2;
 
 pub use lifecycle_v1::{LifecycleFinding, lifecycle_v1_payload, validate_lifecycle_v1};
 pub use session_v1::{SessionFinding, validate_lifecycle_session};

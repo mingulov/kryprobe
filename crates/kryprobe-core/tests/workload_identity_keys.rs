@@ -12,7 +12,7 @@ use std::collections::HashMap;
 const RUNTIME_A: &str = "docker://host-a/var/run/docker.sock";
 const RUNTIME_B: &str = "docker://host-b/var/run/docker.sock";
 const ID_1: &str = "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57";
-const ID_2: &str = "9c4d2f7a8b1e4a6c9d0f3b5a7c8e1d2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b1c3";
+const ID_2: &str = "9c4d2f7a8b1e4a6c9d0f3b5a7c8e1d2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b1c3d";
 
 fn container(runtime: &str, id: &str, lifetime: Option<&str>) -> WorkloadIdentity {
     WorkloadIdentity::container(runtime, id, lifetime)
@@ -53,7 +53,7 @@ fn unresolved_identity_cannot_promote_to_unique() {
     assert!(!none.is_resolved());
     assert!(none.identity_keys().is_empty());
     assert!(matches!(
-        kryprobe_core::workload::qualify_join(&[none.clone()]),
+        kryprobe_core::workload::qualify_join(std::slice::from_ref(&none)),
         JoinQualification::Unresolved
     ));
     assert!(matches!(
@@ -99,7 +99,9 @@ fn container_only_identity_resolves_without_pod() {
     let a = container(RUNTIME_A, ID_1, Some("lifetime-a"));
     assert!(a.is_resolved());
     match kryprobe_core::workload::qualify_join(std::slice::from_ref(&a)) {
-        JoinQualification::Unique(identity) => assert_eq!(identity.identity_keys(), a.identity_keys()),
+        JoinQualification::Unique(identity) => {
+            assert_eq!(identity.identity_keys(), a.identity_keys())
+        }
         other => panic!("container-only identity must qualify unique, got {other:?}"),
     }
 }
