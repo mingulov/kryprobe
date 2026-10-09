@@ -160,7 +160,7 @@ fn run_serve(args: &Args) -> i32 {
         Err(kind) => return refuse(kind),
     };
 
-    // 4. Conservative join: frozen pure answer plus verified liveness.
+    // 4. Conservative join: frozen pure answer plus liveness corroboration.
     let clock = UptimeClock { view: &view };
     let mut resolver = Resolver::new(view.clone(), snapshot);
     let response = match resolver.resolve(&request, &clock, start_ns) {

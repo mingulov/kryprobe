@@ -183,8 +183,10 @@ impl Default for HelperCounters {
     }
 }
 
-/// One verified live binding: the object identity plus when it was
-/// observed (boot-ns, for TTL).
+/// One remembered live binding: the object identity plus when it was
+/// observed (boot-ns, for TTL). Remembered liveness bounds re-scans;
+/// promotion to `Verified` additionally requires an established workload
+/// identity (R3 coherence).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveBinding {
     /// Object device.

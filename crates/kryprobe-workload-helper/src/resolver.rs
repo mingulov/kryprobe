@@ -8,10 +8,14 @@
 //! - The frozen pure entry point answers every key first (asserted/stale/
 //!   ambiguous/unresolved associations, kernel-mismatch/unknown-kernel
 //!   refusals). The helper never reimplements that logic.
-//! - Only `Unresolved` associations upgrade, and only to
-//!   `Verified(cgroup_inode_bind)` with an EMPTY identity (liveness is
-//!   verified; workload identity is never invented). Stale stays stale,
-//!   asserted stays asserted, refusals stand.
+//! - Only `Unresolved` associations are promotion candidates, and only to
+//!   `Verified(cgroup_inode_bind)` — but R3 ingress coherence (ADR-0012
+//!   (c6)) requires an established identity for `Verified`, and liveness
+//!   observation (dev/ino) establishes no workload identity, so
+//!   identity-less candidates stay `Unresolved`: liveness is remembered
+//!   (bounding re-scans) but never promoted, and workload identity is
+//!   never invented. Stale stays stale, asserted stays asserted,
+//!   refusals stand.
 //! - Upgrades require the key's kernel scope to equal the live host scope
 //!   (no cross-boot verification) plus a confined pid-hint check and a
 //!   single batched inode scan for the request's whole uncached set.
@@ -74,7 +78,7 @@ impl Clock for ScriptedClock {
     }
 }
 
-/// The M1 resolver: frozen pure resolution plus verified-liveness joins.
+/// The M1 resolver: frozen pure resolution plus liveness joins.
 #[derive(Debug)]
 pub struct Resolver {
     view: HostView,
@@ -105,9 +109,10 @@ impl Resolver {
         self.cache.history_len()
     }
 
-    /// Resolve one request: frozen pure answer first, then same-boot
-    /// verified-liveness upgrades under `start_ns` + helper-timeout
-    /// deadline. `now` readings come from `clock`.
+    /// Resolve one request: frozen pure answer first, then the
+    /// same-boot liveness pass under `start_ns` + helper-timeout
+    /// deadline (`Verified` promotion requires an established identity
+    /// per R3 coherence). `now` readings come from `clock`.
     pub fn resolve(
         &mut self,
         request: &SnapshotRequest,
@@ -149,9 +154,12 @@ impl Resolver {
         Ok(response)
     }
 
-    /// Upgrade pass over unresolved same-boot associations (cache hits,
-    /// pid checks, one batched inode scan). Deadline trips convert
-    /// still-pending keys to `Unsupported`; established results stand.
+    /// Liveness pass over unresolved same-boot associations (cache hits,
+    /// pid checks, one batched inode scan). Promotion to `Verified`
+    /// additionally requires an established identity (R3 coherence), so
+    /// liveness-only candidates stay `Unresolved` with their liveness
+    /// remembered. Deadline trips convert still-pending keys to
+    /// `Unsupported`; established results stand.
     fn upgrade_unresolved(
         &mut self,
         response: &mut SnapshotResponse,
@@ -171,13 +179,18 @@ impl Resolver {
             }
             pending.push(index);
         }
-        // Cache pass (cheap, no deadline): fresh positives verify at
-        // once; fresh negatives/tombstones settle as unanswered.
+        // Cache pass (cheap, no deadline): fresh positives carry
+        // remembered liveness — promotion still requires an established
+        // identity (R3 coherence), so identity-less hits stay unresolved
+        // with their host work saved. Fresh negatives/tombstones settle
+        // as unanswered.
         let mut need_host: Vec<usize> = Vec::new();
         for index in pending {
             let cgroup = response.associations[index].key.cgroup;
             if let Some(binding) = self.cache.lookup_positive(cgroup, now_ns) {
-                apply_verified(&mut response.associations[index], binding);
+                if response.associations[index].identity.is_resolved() {
+                    apply_verified(&mut response.associations[index], binding);
+                }
             } else if self.cache.lookup_negative(cgroup, now_ns) {
                 // Throttled: stays unresolved.
             } else if self.cache.lookup_tombstone(cgroup, now_ns) {
@@ -226,12 +239,16 @@ impl Resolver {
                                 ino: object.ino,
                                 observed_ns: now_ns,
                             };
-                            // A full cache refuses the insert (counted)
-                            // but the verification already happened: the
-                            // key still verifies — saturation is visible,
-                            // never a silent downgrade.
+                            // The liveness observation is remembered
+                            // (bounding re-scans; a full cache refuses the
+                            // insert, counted, never silent) — but
+                            // promotion to `Verified` additionally requires
+                            // an established identity (R3 coherence), which
+                            // liveness alone never establishes.
                             let _ = self.cache.insert_positive(cgroup, binding);
-                            apply_verified(&mut response.associations[index], binding);
+                            if response.associations[index].identity.is_resolved() {
+                                apply_verified(&mut response.associations[index], binding);
+                            }
                         }
                         None => {
                             let _ = self.cache.insert_tombstone(cgroup, now_ns);
@@ -337,8 +354,9 @@ fn honor_explicit_stale(response: &mut SnapshotResponse, effective: &MetadataSna
 }
 
 /// Verified-liveness evidence: the captured cgroup bound to the live
-/// object, valid for one cache TTL from observation. Identity stays
-/// empty: liveness invents no workload.
+/// object, valid for one cache TTL from observation. Callers must ensure
+/// the association already carries an established identity: R3 coherence
+/// refuses `Verified` without one, and liveness invents no workload.
 fn apply_verified(assoc: &mut ResolvedAssociation, binding: LiveBinding) {
     let validity = ValidityInterval::monotonic(
         binding.observed_ns,
@@ -571,7 +589,12 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_live_cgroup_verifies_with_empty_identity() {
+    fn live_cgroup_without_identity_stays_unresolved() {
+        // R3 coherence (ADR-0012 (c6)): `Verified` requires an established
+        // identity, and liveness observation (dev/ino) establishes none —
+        // so a live cgroup with no metadata stays `Unresolved`, with its
+        // liveness remembered (bounding re-scans) rather than promoted.
+        // Workload identity is never invented.
         let fixture = TFixture::create("verify");
         let live = fixture.cgroup_dir("live");
         let mut resolver = Resolver::new(fixture.view(), None);
@@ -581,11 +604,14 @@ mod tests {
             .expect("resolves");
         assert_eq!(response.associations.len(), 1);
         let assoc = &response.associations[0];
-        assert_eq!(assoc.evidence.status, AttributionStatus::Verified);
-        assert_eq!(assoc.evidence.method, "cgroup_inode_bind");
+        assert_eq!(assoc.evidence.status, AttributionStatus::Unresolved);
+        assert_eq!(assoc.evidence.method, "unresolved");
         assert!(!assoc.identity.is_resolved());
-        assert!(assoc.evidence.validity.is_some());
-        // The response still validates and binds to its request.
+        assert!(assoc.evidence.validity.is_none());
+        assert_eq!(resolver.counters().inserts, 1);
+        // The response still validates and binds to its request
+        // (`Unresolved` carries no temporal requirement, so the
+        // capture-less request binds).
         assert!(response.validate().is_ok());
         assert!(
             kryprobe_core::workload::bind_response_to_request(
@@ -598,6 +624,16 @@ mod tests {
         let bytes = kryprobe_core::workload::encode_response(&response).expect("encodes");
         assert!(decode_response(&bytes).is_ok());
         assert_eq!(resolver.history_len(), 1);
+        // Second resolve: remembered liveness saves the host work (a
+        // positive hit) while the key still stays unresolved.
+        let again = resolver
+            .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            again.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        assert_eq!(resolver.counters().positive_hits, 1);
     }
 
     #[test]
@@ -705,7 +741,11 @@ mod tests {
     }
 
     #[test]
-    fn consistent_pid_hint_verifies() {
+    fn consistent_pid_hint_stays_unresolved_without_identity() {
+        // The pid agrees with the captured cgroup and the object is live,
+        // but R3 coherence withholds `Verified`: no established identity,
+        // no promotion. Liveness is still remembered (contrast the
+        // migrated-hint path, which skips the scan entirely).
         let fixture = TFixture::create("consistent");
         let live = fixture.cgroup_dir("grp/live");
         fixture.pid(7002, "/grp/live", 222);
@@ -716,8 +756,10 @@ mod tests {
             .expect("resolves");
         assert_eq!(
             response.associations[0].evidence.status,
-            AttributionStatus::Verified
+            AttributionStatus::Unresolved
         );
+        assert_eq!(resolver.counters().inserts, 1);
+        assert_eq!(resolver.counters().migration_skipped, 0);
     }
 
     #[test]
@@ -757,17 +799,21 @@ mod tests {
         let a = fixture.cgroup_dir("a");
         let b = fixture.cgroup_dir("b");
         let mut resolver = Resolver::new(fixture.view(), None);
-        // Prime: key a verifies and caches under a generous clock.
+        // Prime: key a's liveness is observed and remembered under a
+        // generous clock (R3 coherence withholds `Verified`: no
+        // established identity — but the remembered liveness stands).
         let primer = ScriptedClock::new(vec![NOW]);
         let primed = resolver
             .resolve(&request(vec![key(a, 4242)]), &primer, NOW)
             .expect("primes");
         assert_eq!(
             primed.associations[0].evidence.status,
-            AttributionStatus::Verified
+            AttributionStatus::Unresolved
         );
-        // Main request: key a re-verifies from cache (established work
-        // stands) while the scan-phase deadline trips for key b.
+        assert_eq!(resolver.counters().inserts, 1);
+        // Main request: key a re-resolves from remembered liveness
+        // (established work stands) while the scan-phase deadline trips
+        // for key b.
         let start = NOW + 10_000;
         let clock = ScriptedClock::new(vec![
             start,                                 // request now
@@ -784,13 +830,15 @@ mod tests {
             )
             .is_ok()
         );
-        let verified: Vec<u64> = response
-            .associations
-            .iter()
-            .filter(|assoc| assoc.evidence.status == AttributionStatus::Verified)
-            .map(|assoc| assoc.key.cgroup)
-            .collect();
-        assert_eq!(verified, vec![a]);
+        // Key a stands on its remembered liveness (a positive hit, no
+        // re-scan); key b converts to `Unsupported` (deadline).
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, a);
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        assert_eq!(resolver.counters().positive_hits, 1);
         assert_eq!(response.errors.len(), 1);
         assert_eq!(response.errors[0].code, SnapshotErrorCode::Unsupported);
         assert_eq!(response.errors[0].key.cgroup, b);
@@ -804,6 +852,8 @@ mod tests {
         let mut resolver = Resolver::new(fixture.view(), None);
         let clock = ScriptedClock::new(vec![NOW]);
         // Same cgroup, two tgids (both gone): one scan serves both.
+        // R3 coherence withholds `Verified` (no established identity),
+        // but the remembered liveness is still shared.
         let response = resolver
             .resolve(
                 &request(vec![key(live, 4242), key(live, 4243)]),
@@ -816,11 +866,12 @@ mod tests {
             response
                 .associations
                 .iter()
-                .all(|a| a.evidence.status == AttributionStatus::Verified),
-            "both keys verify, second from cache"
+                .all(|a| a.evidence.status == AttributionStatus::Unresolved),
+            "both keys stay unresolved, second from the shared scan"
         );
-        // Second resolve: both served from cache (scan throttle would
-        // refuse a re-scan anyway within the refresh interval).
+        // Second resolve: both served from remembered liveness (scan
+        // throttle would refuse a re-scan anyway within the refresh
+        // interval).
         let response = resolver
             .resolve(
                 &request(vec![key(live, 4242), key(live, 4243)]),
@@ -832,7 +883,7 @@ mod tests {
             response
                 .associations
                 .iter()
-                .all(|a| a.evidence.status == AttributionStatus::Verified)
+                .all(|a| a.evidence.status == AttributionStatus::Unresolved)
         );
         assert!(resolver.counters().positive_hits >= 2);
         // One walk bound both keys (two inserts, one scan generation).
@@ -840,13 +891,14 @@ mod tests {
     }
 
     #[test]
-    fn full_cache_still_verifies_with_visible_saturation() {
+    fn full_cache_stays_unresolved_with_visible_saturation() {
         let fixture = TFixture::create("cachefull");
         // A single response cannot hold 256 associations (byte budget),
         // so fill the cache pin across four in-process batches, then
-        // resolve one more live cgroup: the key still verifies
-        // (verification already happened) while the overflow refusal is
-        // counted, never silent.
+        // resolve one more live cgroup: remembered liveness still fills
+        // the cache (R3 coherence withholds `Verified`, but the
+        // observation is real) while the overflow refusal is counted,
+        // never silent.
         let pin = kryprobe_core::workload::MAX_RESOLVER_CACHE_ENTRIES as u64;
         let step = kryprobe_core::workload::RESOLVER_MIN_REFRESH_INTERVAL_NS + 1;
         let mut resolver = Resolver::new(fixture.view(), None);
@@ -864,8 +916,8 @@ mod tests {
                 filled
                     .associations
                     .iter()
-                    .all(|a| a.evidence.status == AttributionStatus::Verified),
-                "batch {batch} verifies"
+                    .all(|a| a.evidence.status == AttributionStatus::Unresolved),
+                "batch {batch} stays unresolved"
             );
         }
         assert_eq!(resolver.counters().inserts, pin);
@@ -877,8 +929,8 @@ mod tests {
             .expect("resolves");
         assert_eq!(
             response.associations[0].evidence.status,
-            AttributionStatus::Verified,
-            "a full cache must not downgrade an established binding"
+            AttributionStatus::Unresolved,
+            "remembered liveness never promotes without an established identity"
         );
         assert_eq!(resolver.counters().insert_refused_full, 1);
         assert!(response.validate().is_ok());

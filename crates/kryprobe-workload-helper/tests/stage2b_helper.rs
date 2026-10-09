@@ -507,6 +507,11 @@ fn symlink_escape_is_refused() {
     assert_eq!(response.associations.len(), 1);
     // The scan completes honestly (missing tgid: unresolved, retained).
     assert_eq!(response.associations[0].key.cgroup, live);
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Unresolved,
+        "R3 coherence withholds Verified without an established identity"
+    );
     // ...and the escape attempts were refused, visibly.
     let counters = stderr_counters(&run.stderr);
     assert!(
@@ -789,9 +794,11 @@ fn rebooted_host_skips_verification() {
 }
 
 #[test]
-fn live_cgroup_without_metadata_verifies_liveness() {
+fn live_cgroup_without_metadata_stays_unresolved() {
     // No metadata file at all: a captured cgroup bound to a live object
-    // verifies liveness with an empty identity (never an invented one).
+    // stays `Unresolved` — R3 coherence (ADR-0012 (c6)) requires an
+    // established identity for `Verified`, and liveness observation
+    // establishes none (never an invented one).
     let fixture = Fixture::create("liveness");
     let live = fixture.cgroup_dir("live");
     let response = decode_stdout(&run_serve(
@@ -802,14 +809,11 @@ fn live_cgroup_without_metadata_verifies_liveness() {
     assert_eq!(response.associations.len(), 1);
     assert_eq!(
         response.associations[0].evidence.status,
-        AttributionStatus::Verified
+        AttributionStatus::Unresolved
     );
-    assert_eq!(
-        response.associations[0].evidence.method,
-        "cgroup_inode_bind"
-    );
+    assert_eq!(response.associations[0].evidence.method, "unresolved");
     assert!(
         !response.associations[0].identity.is_resolved(),
-        "liveness verification invents no workload identity"
+        "liveness observation invents no workload identity"
     );
 }
