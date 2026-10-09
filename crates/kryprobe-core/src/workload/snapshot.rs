@@ -10,7 +10,9 @@
 //! Codec discipline: byte limits apply BEFORE allocation/parsing (on the
 //! raw byte length), count limits AFTER parsing (on the decoded value).
 
-use super::{AttributionEvidence, KernelIdentity, MetadataSnapshot, WorkloadIdentity};
+use super::{
+    AttributionEvidence, KernelIdentity, MetadataSnapshot, SnapshotInterval, WorkloadIdentity,
+};
 use super::{
     AttributionStatus, MAX_HELPER_RETRIES, MAX_KERNEL_IDENTITY_BYTES, MAX_METADATA_BYTES,
     MAX_METADATA_NESTING_DEPTH, MAX_RESOLVER_CACHE_ENTRIES, MAX_RESOLVER_TOMBSTONES,
@@ -25,7 +27,7 @@ const EMBEDDED_SNAPSHOT_SCHEMA: &str =
 
 /// Fixed freeze pin (FNV-1a 64 hex) over the snapshot schema bytes: any
 /// schema edit must update this pin deliberately.
-pub const WORKLOAD_SNAPSHOT_SCHEMA_FNV1A: &str = "38832964ea2d9f7e";
+pub const WORKLOAD_SNAPSHOT_SCHEMA_FNV1A: &str = "717b522c7e2d7907";
 
 /// FNV-1a 64 over bytes (drift detection, not security).
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -62,18 +64,31 @@ pub enum SnapshotConsistency {
 /// Bounded helper snapshot request (Task 03 implements the helper; the
 /// bytes on the wire never exceed [`MAX_SNAPSHOT_REQUEST_BYTES`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotRequest {
     /// Session id (32 lowercase hex chars).
     pub session_id: String,
     /// Captured context keys to resolve (bounded count).
     pub keys: Vec<SnapshotKey>,
+    /// The counted capture interval (monotonic boot-time ns, inclusive):
+    /// the window the request's counts were observed in. Resolution
+    /// asserts a binding only when its validity COVERS this interval;
+    /// `None` (omitted on the wire) means the counted interval was not
+    /// established, so covered assertions are unreachable and matches
+    /// stay unknown/stale, never asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_interval: Option<SnapshotInterval>,
 }
 
 impl SnapshotRequest {
     /// Request rules: well-formed session, non-empty deduplicated keys
-    /// within the count budget, every key valid.
+    /// within the count budget, every key valid, capture interval
+    /// ordered when present.
     pub fn validate(&self) -> Result<(), MetadataUnavailable> {
         validate_session_id(&self.session_id)?;
+        if let Some(interval) = &self.capture_interval {
+            interval.validate()?;
+        }
         if self.keys.is_empty() {
             return Err(MetadataUnavailable::ParseFailed);
         }
@@ -95,6 +110,7 @@ impl SnapshotRequest {
 /// One resolvable captured key: kernel/session scope + cgroup + process
 /// lifetime discriminator. No names, no paths.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotKey {
     /// Kernel/boot scope tag.
     pub kernel_scope: String,
@@ -133,6 +149,7 @@ pub fn validate_session_id(session_id: &str) -> Result<(), MetadataUnavailable> 
 /// One resolved association: the request key echoed back, the workload
 /// identity established for it (possibly none), and the evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedAssociation {
     /// The request key this association answers.
     pub key: SnapshotKey,
@@ -157,16 +174,46 @@ pub enum SnapshotErrorCode {
     Unsupported,
 }
 
+/// Typed per-key refusal detail (closed static vocabulary, D09):
+/// incoming replies carry one of these tokens — arbitrary strings never
+/// decode, so untrusted bytes cannot smuggle prose into diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotKeyDetail {
+    /// The snapshot kernel differs from the key's kernel scope.
+    KernelDiffers,
+    /// The snapshot kernel is unknown: no key is servable.
+    KernelUnknown,
+    /// The key was dropped to fit the response byte budget.
+    BudgetDropped,
+    /// The key cannot be resolved in this environment.
+    UnsupportedKey,
+}
+
+impl std::fmt::Display for SnapshotKeyDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KernelDiffers => write!(f, "snapshot kernel differs from key scope"),
+            Self::KernelUnknown => write!(f, "snapshot kernel is unknown"),
+            Self::BudgetDropped => {
+                write!(f, "association dropped to fit the response budget")
+            }
+            Self::UnsupportedKey => write!(f, "key cannot be resolved in this environment"),
+        }
+    }
+}
+
 /// One refused key: the request key echoed back plus a typed code and a
-/// short static detail (details never echo untrusted input bytes).
+/// typed static detail (details never echo untrusted input bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotKeyError {
     /// The request key this error answers.
     pub key: SnapshotKey,
     /// Typed refusal code.
     pub code: SnapshotErrorCode,
-    /// Short static detail (bounded, no input echo).
-    pub detail: String,
+    /// Typed static detail (closed vocabulary).
+    pub detail: SnapshotKeyDetail,
 }
 
 /// Response completeness: `Complete` covers every request key with an
@@ -212,6 +259,7 @@ impl ChunkInfo {
 
 /// Wire shape for [`ChunkInfo`]: identical fields, checked on conversion.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChunkInfoWire {
     index: u32,
     total: u32,
@@ -238,6 +286,7 @@ impl<'de> Deserialize<'de> for ChunkInfo {
 /// unresolved/ambiguous/stale/unsupported associations (present but not
 /// usable as resolved); `refused` counts errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotCounters {
     /// Verified/asserted associations.
     pub resolved: u64,
@@ -250,6 +299,7 @@ pub struct SnapshotCounters {
 /// The frozen snapshot response: session-bound, chunked, counted, and
 /// byte-budgeted. Field names are frozen by the Stage 2A contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotResponse {
     /// Echo of the request session id (binding).
     pub session_id: String,
@@ -268,12 +318,15 @@ pub struct SnapshotResponse {
 }
 
 impl SnapshotResponse {
-    /// Response rules: well-formed session, bounded associations/errors,
-    /// valid chunk, exact counters, status consistent with budget
-    /// errors, every association key/identity/evidence valid, every
-    /// error key/detail valid, and the encoded bytes within budget.
+    /// Response rules: well-formed session, bounded kernel tag, bounded
+    /// associations/errors, valid chunk, exact counters, status
+    /// consistent with budget errors, every association
+    /// key/identity/evidence valid, every error key valid (details are a
+    /// closed enum, self-validating), and the encoded bytes within
+    /// budget.
     pub fn validate(&self) -> Result<(), MetadataUnavailable> {
         validate_session_id(&self.session_id)?;
+        self.kernel_identity.validate()?;
         if self.associations.len() > MAX_SNAPSHOT_ASSOCIATIONS {
             return Err(MetadataUnavailable::BudgetExceeded);
         }
@@ -309,9 +362,6 @@ impl SnapshotResponse {
         }
         for error in &self.errors {
             error.key.validate()?;
-            if error.detail.len() > MAX_STRING_FIELD_BYTES {
-                return Err(MetadataUnavailable::BudgetExceeded);
-            }
         }
         let refused = self.errors.len() as u64;
         if self.counters.resolved != resolved
@@ -381,6 +431,7 @@ pub struct UnknownByDifference {
 /// Wire shape for [`UnknownByDifference`]: identical fields, recomputed
 /// on conversion.
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnknownByDifferenceWire {
     system_total: u64,
     per_context_sum: u64,
@@ -440,14 +491,21 @@ impl UnknownByDifference {
     }
 }
 
-/// One difference operand with its saturation qualification: a saturated
-/// counter no longer measures its population, so exactness refuses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// One difference operand with its saturation qualification and the
+/// counted population it covers: a saturated counter no longer measures
+/// its population, so exactness refuses, and operands covering different
+/// populations never difference (D06).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CountOperand {
     /// The counter value.
     pub value: u64,
     /// Whether the counter saturated while measuring.
     pub saturated: bool,
+    /// The counted population this operand covers (`global` or
+    /// `kh:<digits>`): both operands must agree, checked — never
+    /// caller-asserted.
+    pub population: String,
 }
 
 /// Typed unknown-by-difference refusal (static diagnostics, no
@@ -460,8 +518,10 @@ pub enum DifferenceError {
     SaturatedOperand,
     /// Per-context sum exceeds the system total.
     Contradictory,
-    /// The population tag is empty or over budget.
+    /// A population tag is empty or over budget.
     BadPopulation,
+    /// The operands cover different populations.
+    PopulationMismatch,
 }
 
 impl std::fmt::Display for DifferenceError {
@@ -476,6 +536,9 @@ impl std::fmt::Display for DifferenceError {
                 )
             }
             Self::BadPopulation => write!(f, "difference population tag is malformed"),
+            Self::PopulationMismatch => {
+                write!(f, "difference operands cover different populations")
+            }
         }
     }
 }
@@ -483,7 +546,11 @@ impl std::fmt::Display for DifferenceError {
 /// A population- and fence-qualified unknown-by-difference (D06): the
 /// magnitude plus the scope it was computed over and the fence receipt
 /// qualifying its exactness.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deserialization routes through checked construction (D05/D06): the
+/// magnitude is recomputed from its operands, the population tag is
+/// validated, and only a `Quiescent` fence decodes — an `Unproven`
+/// "qualification" refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QualifiedDifference {
     /// The recomputed magnitude.
     pub difference: UnknownByDifference,
@@ -494,20 +561,64 @@ pub struct QualifiedDifference {
     pub consistency: SnapshotConsistency,
 }
 
-/// Compute a qualified unknown magnitude: both operands must cover the
-/// same named population, prove a `Quiescent` fence, and arrive
-/// unsaturated — anything else refuses typed (D06).
+/// Wire shape for [`QualifiedDifference`]: identical fields, checked on
+/// conversion.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualifiedDifferenceWire {
+    difference: UnknownByDifference,
+    population: String,
+    consistency: SnapshotConsistency,
+}
+
+impl<'de> Deserialize<'de> for QualifiedDifference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = QualifiedDifferenceWire::deserialize(deserializer)?;
+        if wire.consistency != SnapshotConsistency::Quiescent {
+            return Err(serde::de::Error::custom(
+                "qualified difference requires a quiescent snapshot",
+            ));
+        }
+        if wire.population.is_empty() || wire.population.len() > MAX_STRING_FIELD_BYTES {
+            return Err(serde::de::Error::custom(
+                "difference population tag is malformed",
+            ));
+        }
+        Ok(Self {
+            difference: wire.difference,
+            population: wire.population,
+            consistency: wire.consistency,
+        })
+    }
+}
+
+/// Whether a population tag is well-formed: non-empty and within the
+/// string bound.
+fn population_well_formed(population: &str) -> bool {
+    !population.is_empty() && population.len() <= MAX_STRING_FIELD_BYTES
+}
+
+/// Compute a qualified unknown magnitude: both operands must carry
+/// well-formed tags for the SAME population, prove a `Quiescent` fence,
+/// and arrive unsaturated — anything else refuses typed (D06).
 pub fn compute_qualified(
     consistency: SnapshotConsistency,
-    population: &str,
     system: CountOperand,
     per_context: CountOperand,
 ) -> Result<QualifiedDifference, DifferenceError> {
     if consistency != SnapshotConsistency::Quiescent {
         return Err(DifferenceError::Unproven);
     }
-    if population.is_empty() || population.len() > MAX_STRING_FIELD_BYTES {
+    if !population_well_formed(&system.population)
+        || !population_well_formed(&per_context.population)
+    {
         return Err(DifferenceError::BadPopulation);
+    }
+    if system.population != per_context.population {
+        return Err(DifferenceError::PopulationMismatch);
     }
     if system.saturated || per_context.saturated {
         return Err(DifferenceError::SaturatedOperand);
@@ -522,7 +633,7 @@ pub fn compute_qualified(
             per_context_sum: per_context.value,
             unknown,
         },
-        population: population.to_string(),
+        population: system.population,
         consistency,
     })
 }
@@ -706,21 +817,20 @@ mod tests {
         assert!(serde_json::from_str::<UnknownByDifference>(negative).is_err());
     }
 
+    fn operand(value: u64, population: &str) -> CountOperand {
+        CountOperand {
+            value,
+            saturated: false,
+            population: population.to_string(),
+        }
+    }
+
     #[test]
     fn qualified_difference_refuses_saturation_and_contradiction() {
-        let unsaturated = CountOperand {
-            value: 100,
-            saturated: false,
-        };
-        let per_context = CountOperand {
-            value: 60,
-            saturated: false,
-        };
         let qualified = compute_qualified(
             SnapshotConsistency::Quiescent,
-            "global",
-            unsaturated,
-            per_context,
+            operand(100, "global"),
+            operand(60, "global"),
         )
         .expect("qualified computes");
         assert_eq!(qualified.difference.unknown, 40);
@@ -729,37 +839,84 @@ mod tests {
         let saturated = CountOperand {
             value: u64::MAX,
             saturated: true,
+            population: "global".to_string(),
         };
         assert_eq!(
-            compute_qualified(
-                SnapshotConsistency::Quiescent,
-                "global",
-                saturated,
-                saturated
-            ),
+            compute_qualified(SnapshotConsistency::Quiescent, saturated.clone(), saturated,),
             Err(DifferenceError::SaturatedOperand)
         );
         assert_eq!(
             compute_qualified(
                 SnapshotConsistency::Unproven,
-                "global",
-                unsaturated,
-                per_context
+                operand(100, "global"),
+                operand(60, "global"),
             ),
             Err(DifferenceError::Unproven)
         );
         assert_eq!(
             compute_qualified(
                 SnapshotConsistency::Quiescent,
-                "global",
-                per_context,
-                unsaturated
+                operand(60, "global"),
+                operand(100, "global"),
             ),
             Err(DifferenceError::Contradictory)
         );
         assert_eq!(
-            compute_qualified(SnapshotConsistency::Quiescent, "", unsaturated, per_context),
+            compute_qualified(
+                SnapshotConsistency::Quiescent,
+                operand(100, ""),
+                operand(60, "global"),
+            ),
             Err(DifferenceError::BadPopulation)
+        );
+    }
+
+    #[test]
+    fn population_mismatch_refuses() {
+        // Operands tag their own populations: differing coverage never
+        // differences, and no silent caller assertion substitutes.
+        // (Round-2 D06 oracle.)
+        assert_eq!(
+            compute_qualified(
+                SnapshotConsistency::Quiescent,
+                operand(100, "global"),
+                operand(60, "kh:7"),
+            ),
+            Err(DifferenceError::PopulationMismatch)
+        );
+        assert_eq!(
+            compute_qualified(
+                SnapshotConsistency::Quiescent,
+                operand(100, "kh:7"),
+                operand(60, "kh:7"),
+            )
+            .expect("agreeing populations compute")
+            .difference
+            .unknown,
+            40
+        );
+    }
+
+    #[test]
+    fn unproven_qualified_difference_refuses_decode() {
+        // A stored "qualification" without a fence receipt never decodes,
+        // and a stored magnitude that contradicts its operands refuses —
+        // the same recomputation discipline as UnknownByDifference.
+        // (Round-2 D06 oracle.)
+        let unproven = r#"{"difference":{"system_total":100,"per_context_sum":60,"unknown":40},"population":"global","consistency":"unproven"}"#;
+        assert!(
+            serde_json::from_str::<QualifiedDifference>(unproven).is_err(),
+            "unproven qualification must refuse decode"
+        );
+        let tampered = r#"{"difference":{"system_total":100,"per_context_sum":60,"unknown":41},"population":"global","consistency":"quiescent"}"#;
+        assert!(
+            serde_json::from_str::<QualifiedDifference>(tampered).is_err(),
+            "contradictory stored magnitude must refuse decode"
+        );
+        let bad_population = r#"{"difference":{"system_total":100,"per_context_sum":60,"unknown":40},"population":"","consistency":"quiescent"}"#;
+        assert!(
+            serde_json::from_str::<QualifiedDifference>(bad_population).is_err(),
+            "malformed population must refuse decode"
         );
     }
 
@@ -799,6 +956,7 @@ mod tests {
         let exact = SnapshotRequest {
             session_id: "0123456789abcdef0123456789abcdef".to_string(),
             keys: vec![key.clone(); MAX_SNAPSHOT_ASSOCIATIONS],
+            capture_interval: None,
         };
         // Duplicates refuse even at the boundary count.
         assert!(exact.validate().is_err());
@@ -813,8 +971,16 @@ mod tests {
         let ok = SnapshotRequest {
             session_id: "0123456789abcdef0123456789abcdef".to_string(),
             keys: distinct,
+            capture_interval: None,
         };
         assert!(ok.validate().is_ok());
+        // An inverted capture interval refuses.
+        let mut bad_interval = ok.clone();
+        bad_interval.capture_interval = Some(super::SnapshotInterval {
+            start_ns: 200,
+            end_ns: 100,
+        });
+        assert!(bad_interval.validate().is_err());
         let _ = key;
     }
 

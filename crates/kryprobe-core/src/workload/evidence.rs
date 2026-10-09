@@ -79,6 +79,7 @@ pub enum ClockDomain {
 /// within the enclosing snapshot's kernel/boot scope (exact-matched by
 /// the resolver); comparing intervals across scopes is meaningless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidityInterval {
     /// Interval start, inclusive (monotonic boot-time ns).
     pub start_ns: u64,
@@ -133,6 +134,7 @@ pub enum WorkloadOrigin {
 /// Evidence for one context→workload association: relationship, method,
 /// source, status, and validity interval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttributionEvidence {
     /// Relationship kind (typed: only hook context is M1-provable).
     pub relationship: Relationship,

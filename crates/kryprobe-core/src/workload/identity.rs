@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 /// captured context. Every identity key is UID-based; names are
 /// display/selection metadata and never identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadIdentity {
     /// Runtime instance + full container id + lifetime metadata.
     pub container: Option<ContainerRef>,
@@ -30,6 +31,7 @@ pub struct WorkloadIdentity {
 
 /// A runtime container reference: instance + FULL id + lifetime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerRef {
     /// Runtime instance identity.
     pub runtime: String,
@@ -44,6 +46,7 @@ pub struct ContainerRef {
 
 /// A pod reference: cluster + UID identity, name display-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PodRef {
     /// Cluster identity.
     pub cluster: String,
@@ -274,9 +277,9 @@ fn normalize_lifetime(lifetime: &Option<String>) -> Option<String> {
 }
 
 /// Outcome of joining one hash bucket to workload identities: hashes
-/// are indexes, not proof. Zero or one distinct identity keys resolve;
-/// two or more distinct keys sharing a bucket are `Ambiguous` and their
-/// counts stay split, never merged.
+/// are indexes, not proof. Zero or one distinct identity key SETS
+/// resolve; two or more disagreeing sets sharing a bucket are
+/// `Ambiguous` and their counts stay split, never merged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinQualification {
     /// No candidate in the bucket.
@@ -285,44 +288,66 @@ pub enum JoinQualification {
     /// candidates stay in their captured-context rows; this outcome
     /// never promotes to `Unique`.
     Unresolved,
-    /// Exactly one distinct identity key (boxed: the struct is large
-    /// next to the unit/`Vec` variants).
+    /// Exactly one distinct identity key set (boxed: the struct is large
+    /// next to the unit/`Vec` variants). One candidate never collides
+    /// with itself, however many compatible facets it carries.
     Unique(Box<WorkloadIdentity>),
-    /// Two or more distinct identity keys share the bucket: ambiguous.
+    /// Two or more disagreeing key sets share the bucket: ambiguous.
     /// Keys are sorted for deterministic rendering.
     Ambiguous(Vec<IdentityKey>),
 }
 
 /// Qualify one hash-bucket join over candidate identities. Compares full
 /// structured identity keys (never the hash alone, never a joined
-/// string): distinct keys with the same hash yield `Ambiguous` with every
-/// competing key retained. Candidates without keys do not resolve and
-/// can never yield `Unique` on their own; callers keep them in their
-/// captured-context (unknown-workload) rows rather than merging them
-/// into a resolved row.
+/// string): distinct key SETS with the same hash yield `Ambiguous` with
+/// every competing key retained. The associations within one candidate
+/// are compatible facets of a single workload (container + pod + node +
+/// ancestor describe one thing from several sides), so one candidate —
+/// however many facets it carries — never collides with itself; only
+/// candidates that DISAGREE yield `Ambiguous`. Candidates without keys
+/// do not resolve and can never yield `Unique` on their own; callers
+/// keep them in their captured-context (unknown-workload) rows rather
+/// than merging them into a resolved row.
 #[must_use]
 pub fn qualify_join(candidates: &[WorkloadIdentity]) -> JoinQualification {
     if candidates.is_empty() {
         return JoinQualification::None;
     }
-    let mut keys: Vec<IdentityKey> = Vec::new();
+    // Distinct non-empty per-candidate key sets (each sorted for stable
+    // comparison): compatible facets union, disagreeing sets collide.
+    let mut sets: Vec<Vec<IdentityKey>> = Vec::new();
     for candidate in candidates {
-        for key in candidate.identity_keys() {
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
+        let mut keys = candidate.identity_keys();
+        if keys.is_empty() {
+            continue;
+        }
+        keys.sort();
+        if !sets.contains(&keys) {
+            sets.push(keys);
         }
     }
-    match keys.len() {
+    match sets.len() {
         0 => JoinQualification::Unresolved,
         1 => JoinQualification::Unique(Box::new(
             candidates
                 .iter()
-                .find(|c| c.identity_keys().contains(&keys[0]))
-                .expect("key came from these candidates")
+                .find(|c| {
+                    let mut keys = c.identity_keys();
+                    keys.sort();
+                    keys == sets[0]
+                })
+                .expect("key set came from these candidates")
                 .clone(),
         )),
         _ => {
+            let mut keys: Vec<IdentityKey> = Vec::new();
+            for set in &sets {
+                for key in set {
+                    if !keys.contains(key) {
+                        keys.push(key.clone());
+                    }
+                }
+            }
             keys.sort();
             JoinQualification::Ambiguous(keys)
         }

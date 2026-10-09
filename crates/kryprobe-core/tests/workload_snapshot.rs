@@ -31,6 +31,15 @@ fn request(keys: Vec<SnapshotKey>) -> SnapshotRequest {
     SnapshotRequest {
         session_id: SESSION.to_string(),
         keys,
+        capture_interval: None,
+    }
+}
+
+fn request_with_capture(keys: Vec<SnapshotKey>, start_ns: u64, end_ns: u64) -> SnapshotRequest {
+    SnapshotRequest {
+        session_id: SESSION.to_string(),
+        keys,
+        capture_interval: Some(kryprobe_core::workload::SnapshotInterval { start_ns, end_ns }),
     }
 }
 
@@ -98,11 +107,12 @@ fn unknown_snapshot_kernel_is_refused() {
     assert_eq!(response.errors[0].code, SnapshotErrorCode::UnknownKernel);
 }
 
-/// A same-kernel cgroup match resolves to an asserted association; the
-/// pure path never corroborates past asserted.
+/// A same-kernel cgroup match whose validity COVERS the capture
+/// interval resolves to an asserted association; the pure path never
+/// corroborates past asserted.
 #[test]
 fn same_kernel_match_resolves_asserted() {
-    let req = request(vec![key(KERNEL_A, 43812)]);
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
     let snap = snapshot(
         KernelIdentity::Known(KERNEL_A.to_string()),
         vec![entry(43812, Some(ValidityInterval::monotonic(500, 2500)))],
@@ -142,6 +152,98 @@ fn duplicate_cgroup_claims_yield_ambiguous() {
         AttributionStatus::Ambiguous
     );
     assert!(!response.associations[0].identity.is_resolved());
+}
+
+/// Capture coverage gates assertion: a validity window covering the
+/// whole counted interval asserts; mere overlap, absent validity, or
+/// absent capture never assert. (Round-2 D01 oracles.)
+#[test]
+fn covered_capture_asserts() {
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, Some(ValidityInterval::monotonic(500, 2500)))],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Asserted
+    );
+    assert_eq!(response.counters.resolved, 1);
+}
+
+#[test]
+fn uncovered_capture_with_validity_stays_stale() {
+    // B2's trace: counts captured during [100,200] must not receive
+    // Asserted metadata whose validity is [1000,2000].
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 100, 200);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, Some(ValidityInterval::monotonic(1000, 2000)))],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Stale
+    );
+    assert!(response.associations[0].identity.is_resolved());
+    assert_eq!(response.counters.resolved, 0);
+    assert_eq!(response.counters.unresolved, 1);
+}
+
+#[test]
+fn uncovered_capture_without_validity_stays_unresolved() {
+    // No validity window: applicability cannot be established, so the
+    // match retains unknown attribution with no identity.
+    let req = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, None)],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert!(!response.associations[0].identity.is_resolved());
+    assert_eq!(response.counters.resolved, 0);
+    assert_eq!(response.counters.unresolved, 1);
+}
+
+#[test]
+fn absent_capture_never_asserts() {
+    // Without a counted interval, coverage cannot be established: even a
+    // wide validity window must not assert.
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, Some(ValidityInterval::monotonic(0, u64::MAX)))],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_ne!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Asserted
+    );
+    assert_eq!(response.counters.resolved, 0);
+}
+
+/// Typed refusal details round-trip exactly, with static rendering.
+/// (Round-2 D09 oracle.)
+#[test]
+fn typed_error_details_round_trip() {
+    use kryprobe_core::workload::SnapshotKeyDetail;
+    for detail in [
+        SnapshotKeyDetail::KernelDiffers,
+        SnapshotKeyDetail::KernelUnknown,
+        SnapshotKeyDetail::BudgetDropped,
+        SnapshotKeyDetail::UnsupportedKey,
+    ] {
+        let wire = serde_json::to_string(&detail).expect("serializes");
+        let decoded: SnapshotKeyDetail = serde_json::from_str(&wire).expect("decodes");
+        assert_eq!(decoded, detail);
+        assert!(!format!("{detail}").is_empty());
+    }
+    assert!(serde_json::from_str::<SnapshotKeyDetail>("\"free text\"").is_err());
 }
 
 /// A binding whose validity ended before the snapshot interval stays
@@ -280,7 +382,29 @@ fn wire_field_names_are_frozen() {
         .keys()
         .map(String::as_str)
         .collect();
+    // The additive capture interval omits itself when unset: old senders
+    // encode byte-identical requests.
     assert_eq!(req_keys, vec!["keys", "session_id"]);
+
+    let captured = request_with_capture(vec![key(KERNEL_A, 43812)], 1000, 2000);
+    let captured_value = serde_json::to_value(&captured).expect("request serializes");
+    let captured_keys: Vec<&str> = captured_value
+        .as_object()
+        .expect("request is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        captured_keys,
+        vec!["capture_interval", "keys", "session_id"]
+    );
+    let interval_keys: Vec<&str> = captured_value["capture_interval"]
+        .as_object()
+        .expect("interval is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(interval_keys, vec!["end_ns", "start_ns"]);
 
     let key_keys: Vec<&str> = req_value["keys"][0]
         .as_object()
@@ -383,28 +507,235 @@ fn oversized_response_truncates_with_typed_errors() {
 /// caller must split it across smaller requests/chunks.
 #[test]
 fn unwritable_response_refuses() {
+    // Max-size keys (128-char scope, wide numerics) with asserted
+    // identity-carrying matches: even the all-errors form of 256 such
+    // keys exceeds the 64 KiB budget.
     let keys: Vec<SnapshotKey> = (0..MAX_SNAPSHOT_ASSOCIATIONS as u64)
         .map(|c| SnapshotKey {
             kernel_scope: "k".repeat(128),
-            cgroup: c + 1,
-            tgid: 1000,
-            start_ns: 555,
+            cgroup: u64::MAX - c,
+            tgid: u32::MAX,
+            start_ns: u64::MAX,
         })
         .collect();
     let entries: Vec<MetadataEntry> = keys
         .iter()
-        .map(|k| {
-            let mut e = entry(k.cgroup, None);
-            e.display_name = Some("d".repeat(256));
-            e
-        })
+        .map(|k| entry(k.cgroup, Some(ValidityInterval::monotonic(0, u64::MAX))))
         .collect();
-    let req = request(keys);
+    let req = request_with_capture(keys, 1000, 2000);
     let snap = snapshot(KernelIdentity::Known("k".repeat(128)), entries);
     let err = kryprobe_core::workload::resolve(&req, &snap).expect_err("unwritable refuses");
     assert_eq!(
         err,
         kryprobe_core::workload::MetadataUnavailable::BudgetExceeded
+    );
+}
+
+/// An explicitly Stale binding never resolves Asserted, even when its
+/// validity overlaps the snapshot window. (Round-2 D01 oracle.)
+#[test]
+fn explicit_stale_status_is_honored() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let mut stale_entry = entry(43812, Some(ValidityInterval::monotonic(500, 2500)));
+    stale_entry.binding.status = AttributionStatus::Stale;
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![stale_entry],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(response.associations.len(), 1);
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Stale
+    );
+    assert_eq!(response.counters.resolved, 0);
+    assert_eq!(response.counters.unresolved, 1);
+}
+
+/// Matching metadata with NO established identity never asserts and never
+/// increments resolved counters (observation coherence). (Round-2 oracle.)
+#[test]
+fn identityless_match_stays_unresolved() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let bare = MetadataEntry {
+        container: None,
+        pod: None,
+        cluster: None,
+        node: None,
+        ancestor_container: None,
+        display_name: Some("web-0".to_string()),
+        cgroup_id: Some(43812),
+        binding: BindingProvenance {
+            method: kryprobe_core::workload::METHOD_METADATA_FILE.to_string(),
+            source: WorkloadOrigin::OperatorMetadataFile,
+            status: AttributionStatus::Asserted,
+            validity: Some(ValidityInterval::monotonic(500, 2500)),
+        },
+    };
+    let snap = snapshot(KernelIdentity::Known(KERNEL_A.to_string()), vec![bare]);
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(response.associations.len(), 1);
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert!(!response.associations[0].identity.is_resolved());
+    assert_eq!(response.counters.resolved, 0);
+    assert_eq!(response.counters.unresolved, 1);
+    assert_eq!(response.counters.refused, 0);
+}
+
+/// cgroup 0 means unreadable: even an identity-carrying file entry for
+/// cgroup 0 never yields asserted identity. (Round-2 oracle.)
+#[test]
+fn cgroup_zero_with_identity_stays_unknown() {
+    let req = request(vec![key(KERNEL_A, 0)]);
+    let claimed = entry(0, Some(ValidityInterval::monotonic(500, 2500)));
+    let snap = snapshot(KernelIdentity::Known(KERNEL_A.to_string()), vec![claimed]);
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(response.associations.len(), 1);
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert!(!response.associations[0].identity.is_resolved());
+    assert_eq!(response.counters.resolved, 0);
+    assert_eq!(response.counters.unresolved, 1);
+}
+
+/// A response serves only keys inside its own kernel scope: retargeting a
+/// valid response at another kernel refuses binding. (Round-2 oracle.)
+#[test]
+fn bound_response_requires_matching_kernel_scope() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, None)],
+    );
+    let mut response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    response.kernel_identity = KernelIdentity::Known(KERNEL_B.to_string());
+    assert!(
+        kryprobe_core::workload::bind_response_to_request(&req, &response).is_err(),
+        "foreign-kernel response must not bind served associations"
+    );
+}
+
+/// A kernel-mismatch refusal is legitimate cross-kernel evidence: it binds
+/// to the request it answers. (Round-2 oracle.)
+#[test]
+fn foreign_kernel_typed_refusal_still_binds() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_B.to_string()),
+        vec![entry(43812, None)],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(response.errors[0].code, SnapshotErrorCode::KernelMismatch);
+    assert!(kryprobe_core::workload::bind_response_to_request(&req, &response).is_ok());
+}
+
+/// Response kernel bounds are enforced: empty or oversized kernel tags
+/// refuse validation. (Round-2 oracle.)
+#[test]
+fn response_kernel_bounds_are_checked() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, None)],
+    );
+    let mut response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    response.kernel_identity = KernelIdentity::Known(String::new());
+    assert!(response.validate().is_err());
+    response.kernel_identity = KernelIdentity::Known("k".repeat(129));
+    assert!(response.validate().is_err());
+}
+
+/// Per-key refusal details are a closed static vocabulary: arbitrary
+/// strings never decode. (Round-2 D09 oracle.)
+#[test]
+fn arbitrary_error_detail_refuses_decode() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, None)],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    let mut value = serde_json::to_value(&response).expect("serializes");
+    value["errors"] = serde_json::json!([{
+        "key": {"kernel_scope": KERNEL_A, "cgroup": 43812, "tgid": 1000, "start_ns": 555},
+        "code": "unsupported",
+        "detail": "attacker-controlled free text",
+    }]);
+    value["counters"]["refused"] = serde_json::json!(1);
+    let bytes = serde_json::to_vec(&value).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_response(&bytes).is_err(),
+        "arbitrary detail must refuse"
+    );
+}
+
+/// Closed IPC schemas: unknown request fields refuse instead of being
+/// discarded. (Round-2 oracle; B2's `cgroup_path` example.)
+#[test]
+fn unknown_request_fields_refuse() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let mut value = serde_json::to_value(&req).expect("serializes");
+    value["cgroup_path"] = serde_json::json!("/sys/fs/cgroup/foo");
+    let bytes = serde_json::to_vec(&value).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_request(&bytes).is_err(),
+        "unknown request field must refuse"
+    );
+}
+
+/// Closed IPC schemas: unknown response fields refuse at every level.
+/// (Round-2 oracle.)
+#[test]
+fn unknown_response_fields_refuse() {
+    let req = request(vec![key(KERNEL_A, 43812)]);
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, None)],
+    );
+    let response = kryprobe_core::workload::resolve(&req, &snap).expect("resolves");
+    let mut value = serde_json::to_value(&response).expect("serializes");
+    value["cgroup_path"] = serde_json::json!("/sys/fs/cgroup/foo");
+    let bytes = serde_json::to_vec(&value).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_response(&bytes).is_err(),
+        "unknown top-level response field must refuse"
+    );
+    let mut value = serde_json::to_value(&response).expect("serializes");
+    value["associations"][0]["cgroup_path"] = serde_json::json!("/sys/fs/cgroup/foo");
+    let bytes = serde_json::to_vec(&value).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_response(&bytes).is_err(),
+        "unknown nested response field must refuse"
+    );
+}
+
+/// Closed IPC schemas: unknown metadata fields refuse at every level.
+/// (Round-2 oracle.)
+#[test]
+fn unknown_metadata_fields_refuse() {
+    let snap = snapshot(
+        KernelIdentity::Known(KERNEL_A.to_string()),
+        vec![entry(43812, None)],
+    );
+    let mut value = serde_json::to_value(&snap).expect("serializes");
+    value["cgroup_path"] = serde_json::json!("/sys/fs/cgroup/foo");
+    let bytes = serde_json::to_vec(&value).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_metadata(&bytes).is_err(),
+        "unknown top-level metadata field must refuse"
+    );
+    let mut value = serde_json::to_value(&snap).expect("serializes");
+    value["entries"][0]["cgroup_path"] = serde_json::json!("/sys/fs/cgroup/foo");
+    let bytes = serde_json::to_vec(&value).expect("encodes");
+    assert!(
+        kryprobe_core::workload::decode_metadata(&bytes).is_err(),
+        "unknown nested metadata field must refuse"
     );
 }
 

@@ -92,6 +92,34 @@ fn delimiter_collision_does_not_merge() {
     ));
 }
 
+/// Compatible associations within ONE candidate stay unique: a workload
+/// known by container AND node is one identity with two facets, not a
+/// hash-bucket collision. (Round-2 G03.2 oracle.)
+#[test]
+fn compatible_associations_within_one_candidate_stay_unique() {
+    let mut both = container(RUNTIME_A, ID_1, Some("lifetime-a"));
+    both.node = Some("node-a".to_string());
+    assert_eq!(both.identity_keys().len(), 2);
+    match kryprobe_core::workload::qualify_join(std::slice::from_ref(&both)) {
+        JoinQualification::Unique(identity) => {
+            assert_eq!(identity.identity_keys(), both.identity_keys());
+        }
+        other => panic!("one candidate with compatible facets must qualify unique, got {other:?}"),
+    }
+    // Two identical multi-facet candidates agree with each other.
+    match kryprobe_core::workload::qualify_join(&[both.clone(), both]) {
+        JoinQualification::Unique(_) => {}
+        other => panic!("identical candidates must qualify unique, got {other:?}"),
+    }
+    // Genuinely distinct candidates still collide.
+    let a = container(RUNTIME_A, ID_1, Some("lifetime-a"));
+    let b = container(RUNTIME_A, ID_2, Some("lifetime-b"));
+    assert!(matches!(
+        kryprobe_core::workload::qualify_join(&[a, b]),
+        JoinQualification::Ambiguous(_)
+    ));
+}
+
 /// A container-only identity (no pod) resolves on its own evidence: it is
 /// neither `unresolved` nor merged with other container-only identities.
 #[test]

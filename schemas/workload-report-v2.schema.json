@@ -75,7 +75,7 @@
       "maxItems": 1024,
       "items": {
         "type": "object",
-        "required": ["dict_id", "kh", "family", "op", "result", "context", "algorithm", "driver"],
+        "required": ["dict_id", "kh", "family", "op", "result", "context", "algorithm"],
         "properties": {
           "dict_id": {
             "type": "string",
@@ -158,7 +158,7 @@
           },
           "native": {
             "type": "object",
-            "required": ["family", "op", "result", "context", "algorithm", "driver"],
+            "required": ["family", "op", "result", "context", "algorithm"],
             "properties": {
               "family": {
                 "type": "integer",
