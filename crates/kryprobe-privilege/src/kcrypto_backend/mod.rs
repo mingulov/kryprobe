@@ -26,6 +26,7 @@ pub use session::AggregateTerminalSample;
 use session::{ConfiguredSession, SessionPhase};
 pub(crate) mod snapshot_ctx;
 pub(crate) mod snapshot_drops;
+pub(crate) mod snapshot_misses;
 pub(crate) mod snapshot_who;
 
 // 1A-M10: the pre-split `pub` surface, re-exported so
@@ -43,6 +44,10 @@ pub use observe::{observation_for_ctx, observation_for_who};
 pub use snapshot_ctx::{CtxSnapshot, snapshot_ctx, snapshot_ctx_terminal};
 pub use snapshot_drops::{
     KDROP_DESTROY, KDROP_SITES, SnapshotError, fold_drop_lanes, snapshot_drops,
+};
+pub use snapshot_misses::{
+    AggProgMissAbs, AggProgMissDelta, MissError, MissTerminal, join_agg_miss_deltas,
+    miss_sections_for_object, snapshot_agg_misses,
 };
 pub use snapshot_who::{WhoCache, WhoJoins, WhoSnapshot, snapshot_who, snapshot_who_cached};
 // 1A-M10: unit-test-only helpers (the tests mod stayed whole in
@@ -513,12 +518,25 @@ impl Backend for KCryptoBackend {
             .map_err(|err| session::protocol("kcrypto_attach_clock", &err.to_string()))?;
         let (sensor, _points) =
             load_kcrypto_configured(&bytes, token_fd).map_err(configured_error_to_backend)?;
+        // Miss-telemetry labels + attach-time baseline (M1 Stage 1):
+        // sections come from the actually loaded bytes (single parse,
+        // no loader-knowledge duplication); the baseline read is
+        // fail-soft — an unreadable counter yields unavailable
+        // telemetry, never a failed configure.
+        let miss_sections = miss_sections_for_object(&bytes).unwrap_or_default();
+        let miss_baseline = snapshot_agg_misses(&sensor.loaded.progs, &miss_sections).ok();
         // Charge only after the load succeeds (a failed configure charges
         // nothing); the sensor stashes only after the charges land, so a
         // refused charge drops the fresh sensor and leaves state unconfigured.
         charge(ctx, BudgetKind::Links, sensor.links.len() as u64)?;
         charge(ctx, BudgetKind::StateEntries, KCRYPTO_MAP_COUNT)?;
-        *state = Some(ConfiguredSession::new(ctx.generation, sensor, started_ns));
+        *state = Some(ConfiguredSession::new(
+            ctx.generation,
+            sensor,
+            started_ns,
+            miss_sections,
+            miss_baseline,
+        ));
         // Retain the process hold for this backend's configured lifetime.
         *self
             .session
@@ -1297,6 +1315,8 @@ mod tests {
             PlanGeneration::new(4),
             configured_with_non_map_fds(),
             1,
+            std::collections::HashMap::new(),
+            None,
         ));
         let ctx = FinalizeContext {
             session: SessionId::new(1),
@@ -1331,7 +1351,13 @@ mod tests {
             "owned test link".to_owned(),
             crate::attach::OwnedLink::from_fd(link),
         ));
-        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(generation, sensor, 10));
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(
+            generation,
+            sensor,
+            10,
+            std::collections::HashMap::new(),
+            None,
+        ));
         assert!(backend.abort_session(PlanGeneration::new(5)).is_err());
         assert_eq!(
             peer.read(&mut [0]).unwrap_err().kind(),
@@ -1369,8 +1395,13 @@ mod tests {
     #[test]
     fn repeated_finalize_returns_the_staged_summary_without_new_reads() {
         let backend = KCryptoBackend::new();
-        let mut state =
-            ConfiguredSession::new(PlanGeneration::new(4), configured_with_non_map_fds(), 10);
+        let mut state = ConfiguredSession::new(
+            PlanGeneration::new(4),
+            configured_with_non_map_fds(),
+            10,
+            std::collections::HashMap::new(),
+            None,
+        );
         state.phase = SessionPhase::Sampled(integrity_for_counts(100, Some(125), 7, 5).unwrap());
         *backend.state.lock().unwrap() = Some(state);
         backend.decoded.store(12, Ordering::Relaxed);
@@ -1400,7 +1431,15 @@ mod tests {
         // test here).
         let backend = KCryptoBackend::new();
         let generation = PlanGeneration::new(6);
-        let fresh = || ConfiguredSession::new(generation, configured_with_non_map_fds(), 10);
+        let fresh = || {
+            ConfiguredSession::new(
+                generation,
+                configured_with_non_map_fds(),
+                10,
+                std::collections::HashMap::new(),
+                None,
+            )
+        };
         // Unfenced (no finish yet): refuse.
         *backend.state.lock().unwrap() = Some(fresh());
         assert!(backend.session_ctx_terminal(generation).is_err());
@@ -1429,6 +1468,87 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_miss_stats_keep_capture_partial() {
+        // M1: unreadable miss telemetry is fail-SOFT (Unavailable —
+        // the capture keeps its partial verdict path), never a
+        // session failure and never a zero. Fail-CLOSED only on the
+        // fence receipt itself (Pending/unfenced refuse like ctx).
+        let backend = KCryptoBackend::new();
+        let generation = PlanGeneration::new(7);
+        let quiescent = || {
+            crate::kcrypto_fence::CloseOutcome::Quiescent(crate::kcrypto_fence::QuiescentReceipt {
+                fence_ns: 1,
+            })
+        };
+        // Unfenced / Pending: hard refuse (unproven, like ctx).
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(
+            generation,
+            configured_with_non_map_fds(),
+            10,
+            std::collections::HashMap::new(),
+            None,
+        ));
+        assert!(backend.session_miss_terminal(generation).is_err());
+        let mut pending = ConfiguredSession::new(
+            generation,
+            configured_with_non_map_fds(),
+            10,
+            std::collections::HashMap::new(),
+            None,
+        );
+        pending.fence_outcome = Some(crate::kcrypto_fence::CloseOutcome::Pending);
+        *backend.state.lock().unwrap() = Some(pending);
+        assert!(backend.session_miss_terminal(generation).is_err());
+        // Quiescent + no baseline: Ok(Unavailable), not Err.
+        let mut nobase = ConfiguredSession::new(
+            generation,
+            configured_with_non_map_fds(),
+            10,
+            std::collections::HashMap::new(),
+            None,
+        );
+        nobase.fence_outcome = Some(quiescent());
+        *backend.state.lock().unwrap() = Some(nobase);
+        match backend.session_miss_terminal(generation) {
+            Ok(MissTerminal::Unavailable { reason }) => {
+                assert!(reason.contains("baseline"), "{reason}");
+            }
+            other => panic!("want Unavailable, got {other:?}"),
+        }
+        // Quiescent + baseline but unreadable current (inert-FD prog
+        // with a section label — GET_INFO refuses): Ok(Unavailable).
+        let mut table = std::collections::HashMap::new();
+        table.insert(
+            "kcrypto_skenc".to_owned(),
+            "fexit/crypto_skcipher_encrypt".to_owned(),
+        );
+        let mut sensor = configured_with_non_map_fds();
+        sensor.loaded.progs.push(("kcrypto_skenc".to_owned(), {
+            use std::os::fd::IntoRawFd;
+            let file = std::fs::File::open("/dev/null").expect("inert fd");
+            // SAFETY: ownership transfers from File exactly once.
+            unsafe { crate::fd::OwnedFd::from_raw_fd(file.into_raw_fd()) }
+        }));
+        let baseline = vec![AggProgMissAbs {
+            section: "fexit/crypto_skcipher_encrypt".to_owned(),
+            program_id: 41,
+            misses: 0,
+            run_cnt: 0,
+            stats_enabled: Some(true),
+        }];
+        let mut badread = ConfiguredSession::new(generation, sensor, 10, table, Some(baseline));
+        badread.fence_outcome = Some(quiescent());
+        *backend.state.lock().unwrap() = Some(badread);
+        match backend.session_miss_terminal(generation) {
+            Ok(MissTerminal::Unavailable { reason }) => {
+                assert!(reason.contains("unreadable"), "{reason}");
+            }
+            other => panic!("want Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "BPF lane: run with `cargo xtask test bpf`"]
     fn finish_session_quiescent_under_hammer_freezes_terminal() {
         // F1 (M1 review): the adversarial close — 4 threads hammering
         // AF_ALG roundtrips while `finish_session` runs the
@@ -1486,7 +1606,13 @@ mod tests {
         let backend = KCryptoBackend::new();
         let generation = PlanGeneration::new(7);
         let started = crate::host::monotonic_ns().expect("monotonic clock");
-        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(generation, sensor, started));
+        *backend.state.lock().unwrap() = Some(ConfiguredSession::new(
+            generation,
+            sensor,
+            started,
+            std::collections::HashMap::new(),
+            None,
+        ));
         backend.open_session(generation).expect("drain open");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1644,6 +1770,8 @@ mod tests {
             generation,
             configured_with_non_map_fds(),
             10,
+            std::collections::HashMap::new(),
+            None,
         ));
         let first = backend.open_session(generation).unwrap_err();
         assert!(first.to_string().contains("kcrypto_session_drain"));
@@ -1663,6 +1791,8 @@ mod tests {
             generation,
             configured_with_non_map_fds(),
             10,
+            std::collections::HashMap::new(),
+            None,
         ));
         let first = backend.session_who(generation).unwrap_err();
         assert!(first.to_string().contains("kcrypto_session_who"));
