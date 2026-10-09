@@ -1,33 +1,30 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# M1 Stage 2B helper crate. Standalone workspace on purpose: the product
-# root manifest/lockfile have a single coordinator-owned writer (Stage 3
-# integrates this crate as a workspace member). It consumes the frozen
-# Stage 2A contract (kryprobe-core workload types, ADR-0012) via path
-# dependency only and pins its registry deps to the product lockfile
-# versions (serde 1.0.229, serde_json 1.0.151).
+# M1 Stage 2B helper crate, adopted as a workspace member in Stage 3.
+# It consumes the frozen Stage 2A contract (kryprobe-core workload
+# types, ADR-0012) via path dependency only.
 [package]
 name = "kryprobe-workload-helper"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-3.0-or-later"
-rust-version = "1.98"
-
-[workspace]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "kryprobe-workload-helper"
 path = "src/main.rs"
 
 [dependencies]
-kryprobe-core = { version = "=0.1.0", path = "../kryprobe-core" }
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = { version = "=1.0.151" }
+kryprobe-core.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
+# Local lint table (not `[lints] workspace = true`): binary-private
+# modules use `pub` for the intended library surface, which the
+# workspace `unreachable_pub` lint would deny under `-D warnings`.
+# Every other entry mirrors the workspace table.
 [lints.rust]
 missing_docs = "warn"
 missing_debug_implementations = "warn"
-# No unreachable_pub: binary-private modules use `pub` for the intended
-# Stage 3 library surface; the lint is inapplicable to binaries.
 bare_trait_objects = "warn"
 
 [lints.clippy]

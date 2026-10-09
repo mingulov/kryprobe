@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [workspace]
 resolver = "2"
-members = ["xtask", "crates/kryprobe-abi", "crates/kryprobe-testkit", "crates/kryprobe-core", "crates/kryprobe-privilege", "crates/kryprobe-report", "crates/kryprobe-policy", "crates/kryprobe-cli"]
+members = ["xtask", "crates/kryprobe-abi", "crates/kryprobe-testkit", "crates/kryprobe-core", "crates/kryprobe-privilege", "crates/kryprobe-report", "crates/kryprobe-policy", "crates/kryprobe-cli", "crates/kryprobe-workload-helper"]
 # crates/bpf-spine and crates/bpf-kcrypto are excluded: the bpf-target
 # `no_std` bins never enter the host build (osslscope precedent: BPF
 # objects built separately with the pinned nightly + bpf-linker lane,
@@ -29,6 +29,7 @@ kryprobe-core = { version = "0.1.0", path = "crates/kryprobe-core" }
 kryprobe-privilege = { version = "0.1.0", path = "crates/kryprobe-privilege" }
 kryprobe-report = { version = "0.1.0", path = "crates/kryprobe-report" }
 kryprobe-policy = { version = "0.1.0", path = "crates/kryprobe-policy" }
+kryprobe-workload-helper = { version = "0.1.0", path = "crates/kryprobe-workload-helper" }
 
 # Shared lint table (BP-M3): every member inherits via `[lints]
 # workspace = true`. The gate runs clippy with `-D warnings`, so

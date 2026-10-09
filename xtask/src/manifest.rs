@@ -18,6 +18,7 @@ const HOST_MANIFESTS: &[&str] = &[
     "crates/kryprobe-report/Cargo.toml",
     "crates/kryprobe-policy/Cargo.toml",
     "crates/kryprobe-cli/Cargo.toml",
+    "crates/kryprobe-workload-helper/Cargo.toml",
 ];
 
 /// `[package]` keys owned by `[workspace.package]`.
