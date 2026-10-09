@@ -1,0 +1,945 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Conservative join orchestration (spec §5.2/§5.4, frozen contract
+//! ADR-0012): the frozen pure [`resolve()`] first, then verified-liveness
+//! upgrades from the unprivileged host view.
+//!
+//! Rules:
+//!
+//! - The frozen pure entry point answers every key first (asserted/stale/
+//!   ambiguous/unresolved associations, kernel-mismatch/unknown-kernel
+//!   refusals). The helper never reimplements that logic.
+//! - Only `Unresolved` associations upgrade, and only to
+//!   `Verified(cgroup_inode_bind)` with an EMPTY identity (liveness is
+//!   verified; workload identity is never invented). Stale stays stale,
+//!   asserted stays asserted, refusals stand.
+//! - Upgrades require the key's kernel scope to equal the live host scope
+//!   (no cross-boot verification) plus a confined pid-hint check and a
+//!   single batched inode scan for the request's whole uncached set.
+//! - Cache (positive/negative/tombstone), refresh, and deadline budgets
+//!   gate host work; saturation and failures surface in
+//!   [`HelperCounters`], never silently. A tripped deadline converts
+//!   still-pending unresolved associations to `Unsupported` (partial
+//!   response); already-established results stand.
+//! - The response is recounted exactly, tail-truncated to the byte budget
+//!   (mirroring the frozen truncation semantics), revalidated, and its
+//!   outcome retained in bounded history.
+//!
+//! [`resolve()`]: kryprobe_core::workload::resolve
+//! [`HelperCounters`]: crate::cache::HelperCounters
+
+use crate::cache::{HelperCounters, LiveBinding, OutcomeRecord, ResolverCache, span_elapsed};
+use crate::host_reader::{HostReadError, HostView};
+use kryprobe_core::workload::{
+    AttributionEvidence, AttributionStatus, HELPER_REQUEST_TIMEOUT_NS, KernelIdentity,
+    METHOD_METADATA_FILE, MetadataSnapshot, MetadataUnavailable, Relationship, ResolvedAssociation,
+    ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotInterval, SnapshotKeyError,
+    SnapshotRequest, SnapshotResponse, ValidityInterval, WorkloadOrigin, resolve,
+};
+
+/// Boot-nanosecond clock (uptime-derived in production, scripted in
+/// tests — deterministic deadlines without sleeping).
+pub trait Clock {
+    /// Current time in boot nanoseconds.
+    fn now_ns(&self) -> u64;
+}
+
+/// Scripted clock for deterministic deadline/TTL tests: yields each
+/// programmed time in order, repeating the last.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct ScriptedClock {
+    times: Vec<u64>,
+    pos: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+impl ScriptedClock {
+    /// Program the yielded times (at least one).
+    #[must_use]
+    pub fn new(times: Vec<u64>) -> Self {
+        assert!(!times.is_empty(), "scripted clock needs times");
+        Self {
+            times,
+            pos: std::cell::Cell::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Clock for ScriptedClock {
+    fn now_ns(&self) -> u64 {
+        let index = self.pos.get().min(self.times.len() - 1);
+        self.pos.set(self.pos.get().saturating_add(1));
+        self.times[index]
+    }
+}
+
+/// The M1 resolver: frozen pure resolution plus verified-liveness joins.
+#[derive(Debug)]
+pub struct Resolver {
+    view: HostView,
+    metadata: Option<MetadataSnapshot>,
+    cache: ResolverCache,
+}
+
+impl Resolver {
+    /// Bind a host view and optional validated metadata snapshot.
+    #[must_use]
+    pub fn new(view: HostView, metadata: Option<MetadataSnapshot>) -> Self {
+        Self {
+            view,
+            metadata,
+            cache: ResolverCache::new(),
+        }
+    }
+
+    /// Saturation/error counters.
+    pub fn counters(&mut self) -> &mut HelperCounters {
+        self.cache.counters()
+    }
+
+    /// Retained outcome count (bounded ring).
+    #[cfg(test)]
+    #[must_use]
+    pub fn history_len(&self) -> usize {
+        self.cache.history_len()
+    }
+
+    /// Resolve one request: frozen pure answer first, then same-boot
+    /// verified-liveness upgrades under `start_ns` + helper-timeout
+    /// deadline. `now` readings come from `clock`.
+    pub fn resolve(
+        &mut self,
+        request: &SnapshotRequest,
+        clock: &dyn Clock,
+        start_ns: u64,
+    ) -> Result<SnapshotResponse, MetadataUnavailable> {
+        request.validate()?;
+        let now_ns = clock.now_ns();
+        let host_kernel = self
+            .view
+            .kernel_scope()
+            .map_err(|_| MetadataUnavailable::UnsupportedEnvironment)?;
+        let effective = self.metadata.clone().unwrap_or_else(|| MetadataSnapshot {
+            collector: "kryprobe-workload-helper".to_string(),
+            snapshot_interval: SnapshotInterval {
+                start_ns: now_ns,
+                end_ns: now_ns,
+            },
+            kernel_identity: KernelIdentity::Known(host_kernel.clone()),
+            entries: Vec::new(),
+        });
+        let mut response = resolve(request, &effective)?;
+        // Defensive convergence (B2 D01 ruling): the frozen entry point
+        // ignores an explicit file `stale` status when validity overlaps
+        // (or is absent). The helper honors the file's own staleness —
+        // a downgrade only, converging with the announced Round-2 fix.
+        honor_explicit_stale(&mut response, &effective);
+        self.upgrade_unresolved(&mut response, &host_kernel, clock, start_ns, now_ns);
+        recount(&mut response);
+        truncate_to_budget(&mut response)?;
+        recount(&mut response);
+        response.validate()?;
+        self.cache.record_outcome(OutcomeRecord {
+            at_ns: now_ns,
+            resolved: response.counters.resolved,
+            unresolved: response.counters.unresolved,
+            refused: response.counters.refused,
+        });
+        Ok(response)
+    }
+
+    /// Upgrade pass over unresolved same-boot associations (cache hits,
+    /// pid checks, one batched inode scan). Deadline trips convert
+    /// still-pending keys to `Unsupported`; established results stand.
+    fn upgrade_unresolved(
+        &mut self,
+        response: &mut SnapshotResponse,
+        host_kernel: &str,
+        clock: &dyn Clock,
+        start_ns: u64,
+        now_ns: u64,
+    ) {
+        // Partition association indices: upgradeable vs settled.
+        let mut pending: Vec<usize> = Vec::new();
+        for (index, assoc) in response.associations.iter().enumerate() {
+            if assoc.evidence.status != AttributionStatus::Unresolved {
+                continue;
+            }
+            if assoc.key.kernel_scope != host_kernel {
+                continue;
+            }
+            pending.push(index);
+        }
+        // Cache pass (cheap, no deadline): fresh positives verify at
+        // once; fresh negatives/tombstones settle as unanswered.
+        let mut need_host: Vec<usize> = Vec::new();
+        for index in pending {
+            let cgroup = response.associations[index].key.cgroup;
+            if let Some(binding) = self.cache.lookup_positive(cgroup, now_ns) {
+                apply_verified(&mut response.associations[index], binding);
+            } else if self.cache.lookup_negative(cgroup, now_ns) {
+                // Throttled: stays unresolved.
+            } else if self.cache.lookup_tombstone(cgroup, now_ns) {
+                // Ended: stays unresolved.
+            } else {
+                need_host.push(index);
+            }
+        }
+        // Pid phase (cheap, bounded work per key: two small file reads
+        // plus one depth-bounded confined resolution): liveness hints,
+        // lifetime stability, and hint/cgroup agreement.
+        let mut need_scan: Vec<usize> = Vec::new();
+        for index in need_host {
+            if self.pid_consistent(index, response, now_ns) {
+                need_scan.push(index);
+            }
+        }
+        if need_scan.is_empty() {
+            return;
+        }
+        // Scan phase: one batched walk for the whole request, gated by
+        // the resolution deadline. A trip converts the still-pending
+        // keys to `Unsupported` (partial response); every established
+        // result stands.
+        if span_elapsed(start_ns, clock.now_ns(), HELPER_REQUEST_TIMEOUT_NS) {
+            self.cache.counters().inc_deadline_trips();
+            convert_list_to_unsupported(response, &need_scan);
+            return;
+        }
+        if !self.cache.note_scan(now_ns) {
+            return;
+        }
+        let targets: Vec<u64> = need_scan
+            .iter()
+            .map(|i| response.associations[*i].key.cgroup)
+            .collect();
+        let scan = self.view.find_cgroups(&targets, self.cache.counters());
+        match scan {
+            Ok((found, _denied)) => {
+                for index in need_scan {
+                    let cgroup = response.associations[index].key.cgroup;
+                    match found.get(&cgroup) {
+                        Some(object) => {
+                            let binding = LiveBinding {
+                                dev: object.dev,
+                                ino: object.ino,
+                                observed_ns: now_ns,
+                            };
+                            // A full cache refuses the insert (counted)
+                            // but the verification already happened: the
+                            // key still verifies — saturation is visible,
+                            // never a silent downgrade.
+                            let _ = self.cache.insert_positive(cgroup, binding);
+                            apply_verified(&mut response.associations[index], binding);
+                        }
+                        None => {
+                            let _ = self.cache.insert_tombstone(cgroup, now_ns);
+                            let _ = self.cache.insert_negative(cgroup, now_ns);
+                        }
+                    }
+                }
+            }
+            Err(HostReadError::BudgetExceeded) => {
+                convert_list_to_unsupported(response, &need_scan);
+            }
+            Err(HostReadError::ReuseDetected) => {
+                // A replaced object refuses binding; keys stay unresolved
+                // (the error is already counted).
+            }
+            Err(_) => {
+                // Unsupported view mid-scan: keys stay unresolved.
+            }
+        }
+    }
+
+    /// Per-key pid consistency: the tgid is readable, its lifetime is
+    /// stable, and its confined hint resolves to the captured cgroup.
+    /// Any failure throttles (negative) and returns false; reuse also
+    /// tombstones the captured cgroup.
+    fn pid_consistent(&mut self, index: usize, response: &SnapshotResponse, now_ns: u64) -> bool {
+        let key = &response.associations[index].key;
+        let (cgroup, tgid) = (key.cgroup, key.tgid);
+        let entry = match self.view.read_pid(tgid) {
+            Ok(entry) => entry,
+            Err(error) => {
+                // Gone readers throttle briefly; denials likewise — but
+                // the captured ids stay on the key either way.
+                self.cache.counters().note_host_error(&error);
+                if matches!(error, HostReadError::GonePid { .. }) {
+                    let _ = self.cache.insert_negative(cgroup, now_ns);
+                    return self.pid_gone_allows_liveness(cgroup);
+                }
+                let _ = self.cache.insert_negative(cgroup, now_ns);
+                return false;
+            }
+        };
+        match self.cache.note_pid_lifetime(tgid, entry.start_ticks) {
+            crate::cache::LifetimeVerdict::Reused => {
+                let _ = self.cache.insert_tombstone(cgroup, now_ns);
+                return false;
+            }
+            crate::cache::LifetimeVerdict::FirstSeen | crate::cache::LifetimeVerdict::Stable => {}
+        }
+        let (_, ino) = match self.view.resolve_hint(&entry.hint, self.cache.counters()) {
+            Ok(pair) => pair,
+            Err(_) => {
+                let _ = self.cache.insert_negative(cgroup, now_ns);
+                return false;
+            }
+        };
+        if ino != cgroup {
+            // The pid moved on: this hint is not the captured cgroup.
+            self.cache.counters().inc_migration_skipped();
+            let _ = self.cache.insert_negative(cgroup, now_ns);
+            return false;
+        }
+        true
+    }
+
+    /// A gone pid does not block cgroup liveness: the captured cgroup may
+    /// outlive the process. Returns true so the scan still binds it.
+    fn pid_gone_allows_liveness(&mut self, cgroup: u64) -> bool {
+        // Drop the just-added negative: absence of the pid is not absence
+        // of the cgroup object.
+        self.cache.clear_negative(cgroup);
+        true
+    }
+}
+
+/// Honor an explicit file `stale` status: when the single matching
+/// entry says stale but frozen resolution asserted (validity overlap or
+/// absence), rewrite the association to `Stale` with the entry's own
+/// validity. Downgrades only; anything else (zero or several matches,
+/// non-asserted associations) is left untouched.
+fn honor_explicit_stale(response: &mut SnapshotResponse, effective: &MetadataSnapshot) {
+    for assoc in &mut response.associations {
+        if assoc.evidence.status != AttributionStatus::Asserted {
+            continue;
+        }
+        let mut matches = effective
+            .entries
+            .iter()
+            .filter(|entry| entry.cgroup_id == Some(assoc.key.cgroup));
+        let (Some(entry), None) = (matches.next(), matches.next()) else {
+            continue;
+        };
+        if entry.binding.status == AttributionStatus::Stale {
+            assoc.evidence = AttributionEvidence::new(
+                Relationship::HookContext,
+                METHOD_METADATA_FILE,
+                WorkloadOrigin::OperatorMetadataFile,
+                AttributionStatus::Stale,
+                entry.binding.validity,
+            );
+        }
+    }
+}
+
+/// Verified-liveness evidence: the captured cgroup bound to the live
+/// object, valid for one cache TTL from observation. Identity stays
+/// empty: liveness invents no workload.
+fn apply_verified(assoc: &mut ResolvedAssociation, binding: LiveBinding) {
+    let validity = ValidityInterval::monotonic(
+        binding.observed_ns,
+        binding
+            .observed_ns
+            .saturating_add(kryprobe_core::workload::RESOLVER_CACHE_TTL_NS),
+    );
+    assoc.evidence =
+        AttributionEvidence::verified_local_binding(Relationship::HookContext, validity);
+}
+
+/// Convert one pending unresolved association into an `Unsupported` key
+/// error (deadline/scan-budget partial responses). Non-unresolved
+/// associations are never touched.
+fn convert_one_to_unsupported(response: &mut SnapshotResponse, index: usize) {
+    if response.associations[index].evidence.status != AttributionStatus::Unresolved {
+        return;
+    }
+    let key = response.associations[index].key.clone();
+    response.associations.remove(index);
+    // Removal shifts later indices: convert via
+    // convert_list_to_unsupported (descending) only.
+    response.errors.push(SnapshotKeyError {
+        key,
+        code: SnapshotErrorCode::Unsupported,
+        detail: "host verification exceeded its budget".to_string(),
+    });
+}
+
+/// Convert a pending index list to `Unsupported` in descending order so
+/// removals keep the remaining indices valid.
+fn convert_list_to_unsupported(response: &mut SnapshotResponse, indices: &[usize]) {
+    let mut ordered: Vec<usize> = indices.to_vec();
+    ordered.sort_unstable();
+    ordered.reverse();
+    for index in ordered {
+        convert_one_to_unsupported(response, index);
+    }
+}
+
+/// Recompute exact counters over the current associations/errors.
+fn recount(response: &mut SnapshotResponse) {
+    let mut resolved: u64 = 0;
+    let mut unresolved: u64 = 0;
+    for assoc in &response.associations {
+        match assoc.evidence.status {
+            AttributionStatus::Verified | AttributionStatus::Asserted => resolved += 1,
+            AttributionStatus::Unresolved
+            | AttributionStatus::Ambiguous
+            | AttributionStatus::Stale
+            | AttributionStatus::Unsupported => unresolved += 1,
+        }
+    }
+    response.counters = SnapshotCounters {
+        resolved,
+        unresolved,
+        refused: response.errors.len() as u64,
+    };
+}
+
+/// Tail-truncate to the response byte budget, mirroring the frozen
+/// resolver semantics: request-order tail associations convert to
+/// `BudgetExceeded` errors (status `Truncated`) until the response fits;
+/// an unwritable key set refuses outright.
+fn truncate_to_budget(response: &mut SnapshotResponse) -> Result<(), MetadataUnavailable> {
+    while response.encoded_len()? > kryprobe_core::workload::MAX_SNAPSHOT_RESPONSE_BYTES {
+        let Some(dropped) = response.associations.pop() else {
+            return Err(MetadataUnavailable::BudgetExceeded);
+        };
+        response.errors.push(SnapshotKeyError {
+            key: dropped.key,
+            code: SnapshotErrorCode::BudgetExceeded,
+            detail: "association dropped to fit the response budget".to_string(),
+        });
+        response.status = ResponseStatus::Truncated;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kryprobe_core::workload::{
+        BindingProvenance, ContainerRef, KernelIdentity, MetadataEntry, SnapshotInterval,
+        SnapshotKey, SnapshotRequest, WorkloadOrigin, decode_response,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    const SESSION: &str = "0123456789abcdef0123456789abcdef";
+    const SCOPE: &str = "7.0.0-test/test-boot-id-001";
+    const NOW: u64 = 100_000_000_000;
+
+    struct TFixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl TFixture {
+        fn create(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "kwh-res-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let write = |rel: &str, body: &[u8]| {
+                let path = dir.join(rel);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&path, body).expect("write");
+            };
+            write("proc/sys/kernel/osrelease", b"7.0.0-test\n");
+            write("proc/sys/kernel/random/boot_id", b"test-boot-id-001\n");
+            write("proc/uptime", b"100.00 200.00\n");
+            std::fs::create_dir_all(dir.join("cgroup")).expect("cgroup");
+            Self { dir }
+        }
+
+        fn view(&self) -> HostView {
+            HostView::new(&self.dir.join("proc"), &self.dir.join("cgroup"))
+        }
+
+        fn cgroup_dir(&self, rel: &str) -> u64 {
+            let path = self.dir.join("cgroup").join(rel);
+            std::fs::create_dir_all(&path).expect("mkdir");
+            std::fs::metadata(&path).expect("stat").ino()
+        }
+
+        fn pid(&self, tgid: u32, hint: &str, ticks: u64) {
+            let base = self.dir.join("proc").join(tgid.to_string());
+            std::fs::create_dir_all(&base).expect("mkdir");
+            std::fs::write(base.join("cgroup"), format!("0::{hint}\n")).expect("write");
+            std::fs::write(
+                base.join("stat"),
+                format!("{tgid} (t) R 1 1 1 0 -1 4194304 10 0 0 0 5 5 0 0 20 0 2 0 {ticks} 0 0\n"),
+            )
+            .expect("write");
+        }
+    }
+
+    impl Drop for TFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn key(cgroup: u64, tgid: u32) -> SnapshotKey {
+        SnapshotKey {
+            kernel_scope: SCOPE.to_string(),
+            cgroup,
+            tgid,
+            start_ns: 555,
+        }
+    }
+
+    fn request(keys: Vec<SnapshotKey>) -> SnapshotRequest {
+        SnapshotRequest {
+            session_id: SESSION.to_string(),
+            keys,
+        }
+    }
+
+    fn metadata_for(cgroup: u64) -> MetadataSnapshot {
+        MetadataSnapshot {
+            collector: "t".to_string(),
+            snapshot_interval: SnapshotInterval {
+                start_ns: 1000,
+                end_ns: 2000,
+            },
+            kernel_identity: KernelIdentity::Known(SCOPE.to_string()),
+            entries: vec![MetadataEntry {
+                container: Some(ContainerRef {
+                    runtime: "rt".to_string(),
+                    id: "id".to_string(),
+                    lifetime: None,
+                }),
+                pod: None,
+                cluster: None,
+                node: None,
+                ancestor_container: None,
+                display_name: None,
+                cgroup_id: Some(cgroup),
+                binding: BindingProvenance {
+                    method: kryprobe_core::workload::METHOD_METADATA_FILE.to_string(),
+                    source: WorkloadOrigin::OperatorMetadataFile,
+                    status: AttributionStatus::Asserted,
+                    validity: None,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn empty_snapshot_tags_host_kernel_and_gates_foreign_keys() {
+        let fixture = TFixture::create("empty");
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        let foreign = SnapshotKey {
+            kernel_scope: "other-boot".to_string(),
+            cgroup: 1,
+            tgid: 1,
+            start_ns: 1,
+        };
+        let response = resolver
+            .resolve(&request(vec![key(999_999_111, 4242), foreign]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            response.kernel_identity,
+            KernelIdentity::Known(SCOPE.to_string())
+        );
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].code, SnapshotErrorCode::KernelMismatch);
+        // Same-boot unknown cgroup: unresolved, retained.
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, 999_999_111);
+    }
+
+    #[test]
+    fn unresolved_live_cgroup_verifies_with_empty_identity() {
+        let fixture = TFixture::create("verify");
+        let live = fixture.cgroup_dir("live");
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        let response = resolver
+            .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(response.associations.len(), 1);
+        let assoc = &response.associations[0];
+        assert_eq!(assoc.evidence.status, AttributionStatus::Verified);
+        assert_eq!(assoc.evidence.method, "cgroup_inode_bind");
+        assert!(!assoc.identity.is_resolved());
+        assert!(assoc.evidence.validity.is_some());
+        // The response still validates and binds to its request.
+        assert!(response.validate().is_ok());
+        assert!(
+            kryprobe_core::workload::bind_response_to_request(
+                &request(vec![key(live, 4242)]),
+                &response
+            )
+            .is_ok()
+        );
+        // ...and survives the frozen wire codec.
+        let bytes = kryprobe_core::workload::encode_response(&response).expect("encodes");
+        assert!(decode_response(&bytes).is_ok());
+        assert_eq!(resolver.history_len(), 1);
+    }
+
+    #[test]
+    fn explicit_file_stale_is_honored_despite_overlap() {
+        // B2 D01 ruling: the frozen entry point asserts whenever validity
+        // overlaps (or is absent), ignoring an explicit file `stale`. The
+        // helper downgrades to the file's own staleness (Round-2
+        // convergence; a downgrade only).
+        let fixture = TFixture::create("file-stale");
+        let live = fixture.cgroup_dir("live");
+        for validity in [None, Some(ValidityInterval::monotonic(1500, 2500))] {
+            let mut meta = metadata_for(live);
+            meta.entries[0].binding.status = AttributionStatus::Stale;
+            meta.entries[0].binding.validity = validity;
+            // Sanity: the frozen path alone asserts here (the defect).
+            let frozen = resolve(&request(vec![key(live, 4242)]), &meta).expect("frozen");
+            assert_eq!(
+                frozen.associations[0].evidence.status,
+                AttributionStatus::Asserted,
+                "frozen baseline for validity {validity:?}"
+            );
+            let mut resolver = Resolver::new(fixture.view(), Some(meta));
+            let clock = ScriptedClock::new(vec![NOW]);
+            let response = resolver
+                .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+                .expect("resolves");
+            assert_eq!(
+                response.associations[0].evidence.status,
+                AttributionStatus::Stale,
+                "validity {validity:?} must honor file stale"
+            );
+            assert!(response.validate().is_ok());
+            assert_eq!(response.counters.unresolved, 1);
+            assert_eq!(response.counters.resolved, 0);
+        }
+    }
+
+    #[test]
+    fn asserted_and_stale_never_upgrade() {
+        let fixture = TFixture::create("no-upgrade");
+        let live = fixture.cgroup_dir("live");
+        let mut stale_meta = metadata_for(live);
+        stale_meta.entries[0].binding.validity = Some(ValidityInterval::monotonic(100, 200));
+        let mut resolver = Resolver::new(fixture.view(), Some(stale_meta));
+        let clock = ScriptedClock::new(vec![NOW]);
+        let response = resolver
+            .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Stale,
+            "expired bindings stay stale even when live"
+        );
+
+        let mut resolver = Resolver::new(fixture.view(), Some(metadata_for(live)));
+        let response = resolver
+            .resolve(&request(vec![key(live, 4242)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Asserted,
+            "asserted files are not promoted by liveness"
+        );
+    }
+
+    #[test]
+    fn migrated_pid_hint_skips_verification() {
+        let fixture = TFixture::create("migrated");
+        let live = fixture.cgroup_dir("live");
+        let other = fixture.cgroup_dir("other");
+        // Pid claims membership of `other` while the key captured `live`:
+        // the process moved on; verification refuses.
+        fixture.pid(7001, "/other", 111);
+        // Sanity: hint resolves (guards the fixture, not the code).
+        let mut counters = HelperCounters::new();
+        let (_, ino) = fixture
+            .view()
+            .resolve_hint("/other", &mut counters)
+            .expect("hint resolves");
+        assert_eq!(ino, other);
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        let response = resolver
+            .resolve(&request(vec![key(live, 7001)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        assert_eq!(resolver.counters().migration_skipped, 1);
+    }
+
+    #[test]
+    fn consistent_pid_hint_verifies() {
+        let fixture = TFixture::create("consistent");
+        let live = fixture.cgroup_dir("grp/live");
+        fixture.pid(7002, "/grp/live", 222);
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        let response = resolver
+            .resolve(&request(vec![key(live, 7002)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Verified
+        );
+    }
+
+    #[test]
+    fn pid_reuse_tombstones_and_refuses() {
+        let fixture = TFixture::create("reuse");
+        let live = fixture.cgroup_dir("live");
+        fixture.pid(7003, "/live", 100);
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        // Prime the pid table with the old lifetime (against a missing
+        // cgroup so nothing else caches).
+        let primed = resolver
+            .resolve(&request(vec![key(424_243, 7003)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            primed.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        // Same tgid, new lifetime: the captured process is gone; the
+        // captured cgroup tombstones and verification refuses even
+        // though the object is live.
+        fixture.pid(7003, "/live", 200);
+        let refused = resolver
+            .resolve(&request(vec![key(live, 7003)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(resolver.counters().reuse_detected, 1);
+        assert_eq!(
+            refused.associations[0].evidence.status,
+            AttributionStatus::Unresolved,
+            "reused tgid must not verify the captured cgroup"
+        );
+    }
+
+    #[test]
+    fn deadline_trip_yields_partial_response() {
+        let fixture = TFixture::create("deadline");
+        let a = fixture.cgroup_dir("a");
+        let b = fixture.cgroup_dir("b");
+        let mut resolver = Resolver::new(fixture.view(), None);
+        // Prime: key a verifies and caches under a generous clock.
+        let primer = ScriptedClock::new(vec![NOW]);
+        let primed = resolver
+            .resolve(&request(vec![key(a, 4242)]), &primer, NOW)
+            .expect("primes");
+        assert_eq!(
+            primed.associations[0].evidence.status,
+            AttributionStatus::Verified
+        );
+        // Main request: key a re-verifies from cache (established work
+        // stands) while the scan-phase deadline trips for key b.
+        let start = NOW + 10_000;
+        let clock = ScriptedClock::new(vec![
+            start,                                 // request now
+            start + HELPER_REQUEST_TIMEOUT_NS + 1, // scan check: tripped
+        ]);
+        let response = resolver
+            .resolve(&request(vec![key(a, 4242), key(b, 4243)]), &clock, start)
+            .expect("partial resolves");
+        assert!(response.validate().is_ok());
+        assert!(
+            kryprobe_core::workload::bind_response_to_request(
+                &request(vec![key(a, 4242), key(b, 4243)]),
+                &response
+            )
+            .is_ok()
+        );
+        let verified: Vec<u64> = response
+            .associations
+            .iter()
+            .filter(|assoc| assoc.evidence.status == AttributionStatus::Verified)
+            .map(|assoc| assoc.key.cgroup)
+            .collect();
+        assert_eq!(verified, vec![a]);
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].code, SnapshotErrorCode::Unsupported);
+        assert_eq!(response.errors[0].key.cgroup, b);
+        assert_eq!(resolver.counters().deadline_trips, 1);
+    }
+
+    #[test]
+    fn second_key_reuses_positive_cache_without_rescan() {
+        let fixture = TFixture::create("cachehit");
+        let live = fixture.cgroup_dir("live");
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        // Same cgroup, two tgids (both gone): one scan serves both.
+        let response = resolver
+            .resolve(
+                &request(vec![key(live, 4242), key(live, 4243)]),
+                &clock,
+                NOW,
+            )
+            .expect("resolves");
+        assert_eq!(response.associations.len(), 2);
+        assert!(
+            response
+                .associations
+                .iter()
+                .all(|a| a.evidence.status == AttributionStatus::Verified),
+            "both keys verify, second from cache"
+        );
+        // Second resolve: both served from cache (scan throttle would
+        // refuse a re-scan anyway within the refresh interval).
+        let response = resolver
+            .resolve(
+                &request(vec![key(live, 4242), key(live, 4243)]),
+                &clock,
+                NOW,
+            )
+            .expect("resolves");
+        assert!(
+            response
+                .associations
+                .iter()
+                .all(|a| a.evidence.status == AttributionStatus::Verified)
+        );
+        assert!(resolver.counters().positive_hits >= 2);
+        // One walk bound both keys (two inserts, one scan generation).
+        assert_eq!(resolver.counters().inserts, 2);
+    }
+
+    #[test]
+    fn full_cache_still_verifies_with_visible_saturation() {
+        let fixture = TFixture::create("cachefull");
+        // A single response cannot hold 256 associations (byte budget),
+        // so fill the cache pin across four in-process batches, then
+        // resolve one more live cgroup: the key still verifies
+        // (verification already happened) while the overflow refusal is
+        // counted, never silent.
+        let pin = kryprobe_core::workload::MAX_RESOLVER_CACHE_ENTRIES as u64;
+        let step = kryprobe_core::workload::RESOLVER_MIN_REFRESH_INTERVAL_NS + 1;
+        let mut resolver = Resolver::new(fixture.view(), None);
+        for batch in 0..4u64 {
+            let mut keys = Vec::new();
+            for i in 0..64u64 {
+                let n = batch * 64 + i;
+                let live = fixture.cgroup_dir(&format!("grp-{n}"));
+                keys.push(key(live, 9000 + n as u32));
+            }
+            let at = NOW + batch * step;
+            let clock = ScriptedClock::new(vec![at]);
+            let filled = resolver.resolve(&request(keys), &clock, at).expect("fills");
+            assert!(
+                filled
+                    .associations
+                    .iter()
+                    .all(|a| a.evidence.status == AttributionStatus::Verified),
+                "batch {batch} verifies"
+            );
+        }
+        assert_eq!(resolver.counters().inserts, pin);
+        let overflow = fixture.cgroup_dir("grp-overflow");
+        let later = NOW + 4 * step;
+        let tick = ScriptedClock::new(vec![later]);
+        let response = resolver
+            .resolve(&request(vec![key(overflow, 9999)]), &tick, later)
+            .expect("resolves");
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Verified,
+            "a full cache must not downgrade an established binding"
+        );
+        assert_eq!(resolver.counters().insert_refused_full, 1);
+        assert!(response.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_object_tombstones_and_throttles() {
+        let fixture = TFixture::create("tomb");
+        let mut resolver = Resolver::new(fixture.view(), None);
+        let clock = ScriptedClock::new(vec![NOW]);
+        let missing = 888_777_666;
+        let first = resolver
+            .resolve(&request(vec![key(missing, 4242)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            first.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        assert_eq!(resolver.counters().tombstone_inserts, 1);
+        // Second resolve inside the throttle: negative hit, no re-scan.
+        let second = resolver
+            .resolve(&request(vec![key(missing, 4242)]), &clock, NOW)
+            .expect("resolves");
+        assert_eq!(
+            second.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        assert_eq!(resolver.counters().negative_hits, 1);
+    }
+
+    #[test]
+    fn truncation_mirror_drops_tail_to_budget() {
+        // Craft an over-budget response directly: the mirror must drop
+        // tail associations into BudgetExceeded errors, exactly like the
+        // frozen path, and recount exactly.
+        let fixture = TFixture::create("trunc");
+        let live = fixture.cgroup_dir("live");
+        let big_id = "i".repeat(256);
+        let mut entries = Vec::new();
+        for i in 0..256u64 {
+            entries.push(MetadataEntry {
+                container: Some(ContainerRef {
+                    runtime: format!("rt-{big_id}-{i}")[..256].to_string(),
+                    id: format!("{big_id}-{i:03}")[..256].to_string(),
+                    lifetime: Some(big_id.clone()),
+                }),
+                pod: None,
+                cluster: None,
+                node: None,
+                ancestor_container: None,
+                display_name: Some(format!("{big_id}-{i:03}")[..256].to_string()),
+                cgroup_id: Some(1000 + i),
+                binding: BindingProvenance {
+                    method: kryprobe_core::workload::METHOD_METADATA_FILE.to_string(),
+                    source: WorkloadOrigin::OperatorMetadataFile,
+                    status: AttributionStatus::Asserted,
+                    validity: None,
+                },
+            });
+        }
+        let snapshot = MetadataSnapshot {
+            collector: "t".to_string(),
+            snapshot_interval: SnapshotInterval {
+                start_ns: 1000,
+                end_ns: 2000,
+            },
+            kernel_identity: KernelIdentity::Known(SCOPE.to_string()),
+            entries,
+        };
+        // Sanity: the frozen path truncates this on its own.
+        let keys: Vec<SnapshotKey> = (0..256u64).map(|i| key(1000 + i, 4242)).collect();
+        let frozen = resolve(&request(keys.clone()), &snapshot).expect("frozen resolves");
+        assert_eq!(frozen.status, ResponseStatus::Truncated);
+
+        // The helper path preserves frozen truncation end to end.
+        let mut resolver = Resolver::new(fixture.view(), Some(snapshot));
+        let clock = ScriptedClock::new(vec![NOW]);
+        let response = resolver
+            .resolve(&request(keys), &clock, NOW)
+            .expect("resolves");
+        assert!(response.validate().is_ok());
+        assert_eq!(response.status, ResponseStatus::Truncated);
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|e| e.code == SnapshotErrorCode::BudgetExceeded)
+        );
+        let _ = live;
+    }
+}
