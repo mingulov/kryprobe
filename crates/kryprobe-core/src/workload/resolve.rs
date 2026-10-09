@@ -9,8 +9,9 @@
 use super::{
     AttributionEvidence, AttributionStatus, ChunkInfo, MAX_SNAPSHOT_RESPONSE_BYTES,
     METHOD_METADATA_FILE, MetadataSnapshot, MetadataUnavailable, Relationship, ResolvedAssociation,
-    ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotKey, SnapshotKeyError,
-    SnapshotRequest, SnapshotResponse, ValidityInterval, WorkloadIdentity, WorkloadOrigin,
+    ResponseStatus, SnapshotCounters, SnapshotErrorCode, SnapshotInterval, SnapshotKey,
+    SnapshotKeyDetail, SnapshotKeyError, SnapshotRequest, SnapshotResponse, ValidityInterval,
+    WorkloadIdentity, WorkloadOrigin,
 };
 
 /// Resolve one snapshot request against one metadata snapshot.
@@ -24,13 +25,21 @@ use super::{
 ///   yields [`SnapshotErrorCode::KernelMismatch`]; unknown snapshot
 ///   kernel yields [`SnapshotErrorCode::UnknownKernel`]. Either way the
 ///   key is refused — never served under a foreign kernel.
-/// - Cgroup matching is exact `u64` equality against entry `cgroup_id`.
-///   Zero matches yield `Unresolved`; two or more yield `Ambiguous`
-///   (counts stay split, never merged).
-/// - A single match whose validity does not overlap the snapshot
-///   interval stays `Stale` (reported with its identity, counted as
-///   unusable); otherwise it resolves `Asserted`. The pure path never
-///   corroborates: `Verified` is unreachable here by construction.
+/// - Cgroup matching is exact `u64` equality against entry `cgroup_id`,
+///   except cgroup 0 (unreadable): a zero key never resolves, whatever
+///   the file claims. Zero matches yield `Unresolved`; two or more
+///   yield `Ambiguous` (counts stay split, never merged).
+/// - A single match with no established identity stays `Unresolved`
+///   (observation coherence: usable statuses require an identity).
+/// - A single match whose binding is explicitly `Stale` stays `Stale`
+///   (reported with its identity, counted as unusable).
+/// - Otherwise the binding asserts only when its validity interval
+///   COVERS the request's capture interval: uncovered counts stay
+///   unknown (`Stale` when a validity window exists but does not
+///   cover, `Unresolved` when none does), never `Asserted`. An absent
+///   capture interval or an absent validity window cannot establish
+///   coverage. The pure path never corroborates: `Verified` is
+///   unreachable here by construction.
 /// - Associations keep request order. The response fits
 ///   [`MAX_SNAPSHOT_RESPONSE_BYTES`]: tail associations convert to
 ///   `BudgetExceeded` errors (status `Truncated`) until it fits; if even
@@ -45,7 +54,7 @@ pub fn resolve(
     let mut associations = Vec::with_capacity(request.keys.len());
     let mut errors = Vec::new();
     for key in &request.keys {
-        match resolve_one_key(key, snapshot) {
+        match resolve_one_key(key, snapshot, request.capture_interval.as_ref()) {
             Ok(assoc) => associations.push(assoc),
             Err(error) => errors.push(error),
         }
@@ -70,26 +79,53 @@ pub fn resolve(
     Ok(response)
 }
 
-/// Resolve one key: kernel gate first, then cgroup match.
+/// Whether a binding validity window covers the counted capture
+/// interval: both must exist, and the validity must contain the whole
+/// capture. Overlap alone does not establish applicability to every call
+/// in the aggregate.
+fn validity_covers_capture(
+    capture: Option<&SnapshotInterval>,
+    validity: Option<&ValidityInterval>,
+) -> bool {
+    match (capture, validity) {
+        (Some(capture), Some(validity)) => {
+            validity.start_ns <= capture.start_ns && capture.end_ns <= validity.end_ns
+        }
+        _ => false,
+    }
+}
+
+/// Resolve one key: kernel gate first, then cgroup match, then identity,
+/// staleness, and capture coverage.
 fn resolve_one_key(
     key: &SnapshotKey,
     snapshot: &MetadataSnapshot,
+    capture: Option<&SnapshotInterval>,
 ) -> Result<ResolvedAssociation, SnapshotKeyError> {
     if !snapshot.kernel_identity.matches_scope(&key.kernel_scope) {
         let (code, detail) = match &snapshot.kernel_identity {
             super::KernelIdentity::Known(_) => (
                 SnapshotErrorCode::KernelMismatch,
-                "snapshot kernel differs from key scope",
+                SnapshotKeyDetail::KernelDiffers,
             ),
             super::KernelIdentity::Unknown => (
                 SnapshotErrorCode::UnknownKernel,
-                "snapshot kernel is unknown",
+                SnapshotKeyDetail::KernelUnknown,
             ),
         };
         return Err(SnapshotKeyError {
             key: key.clone(),
             code,
-            detail: detail.to_string(),
+            detail,
+        });
+    }
+    // Cgroup 0 is unreadable: the unknown-cgroup population never
+    // resolves, whatever the file claims for id 0.
+    if key.cgroup == 0 {
+        return Ok(ResolvedAssociation {
+            key: key.clone(),
+            identity: WorkloadIdentity::none(),
+            evidence: AttributionEvidence::unresolved(Relationship::HookContext),
         });
     }
     let matches: Vec<_> = snapshot
@@ -105,14 +141,6 @@ fn resolve_one_key(
         }),
         1 => {
             let entry = matches[0];
-            let snapshot_window = ValidityInterval::monotonic(
-                snapshot.snapshot_interval.start_ns,
-                snapshot.snapshot_interval.end_ns,
-            );
-            let fresh = match &entry.binding.validity {
-                None => true,
-                Some(validity) => validity.overlaps(&snapshot_window),
-            };
             let identity = WorkloadIdentity {
                 container: entry.container.clone(),
                 pod: entry.pod.clone(),
@@ -120,25 +148,59 @@ fn resolve_one_key(
                 node: entry.node.clone(),
                 ancestor_container: entry.ancestor_container.clone(),
             };
-            let evidence = if fresh {
-                AttributionEvidence::asserted_metadata(
-                    Relationship::HookContext,
-                    METHOD_METADATA_FILE,
-                    entry.binding.validity,
-                )
-            } else {
-                AttributionEvidence::new(
-                    Relationship::HookContext,
-                    METHOD_METADATA_FILE,
-                    WorkloadOrigin::OperatorMetadataFile,
-                    AttributionStatus::Stale,
-                    entry.binding.validity,
-                )
-            };
+            // Observation coherence: a usable status requires an
+            // established identity.
+            if !identity.is_resolved() {
+                return Ok(ResolvedAssociation {
+                    key: key.clone(),
+                    identity: WorkloadIdentity::none(),
+                    evidence: AttributionEvidence::unresolved(Relationship::HookContext),
+                });
+            }
+            // An explicitly stale binding stays stale.
+            if entry.binding.status == AttributionStatus::Stale {
+                return Ok(ResolvedAssociation {
+                    key: key.clone(),
+                    identity,
+                    evidence: AttributionEvidence::new(
+                        Relationship::HookContext,
+                        METHOD_METADATA_FILE,
+                        WorkloadOrigin::OperatorMetadataFile,
+                        AttributionStatus::Stale,
+                        entry.binding.validity,
+                    ),
+                });
+            }
+            // Assertion requires capture coverage; uncovered counts stay
+            // unknown, never asserted.
+            if validity_covers_capture(capture, entry.binding.validity.as_ref()) {
+                return Ok(ResolvedAssociation {
+                    key: key.clone(),
+                    identity,
+                    evidence: AttributionEvidence::asserted_metadata(
+                        Relationship::HookContext,
+                        METHOD_METADATA_FILE,
+                        entry.binding.validity,
+                    ),
+                });
+            }
+            if entry.binding.validity.is_some() {
+                return Ok(ResolvedAssociation {
+                    key: key.clone(),
+                    identity,
+                    evidence: AttributionEvidence::new(
+                        Relationship::HookContext,
+                        METHOD_METADATA_FILE,
+                        WorkloadOrigin::OperatorMetadataFile,
+                        AttributionStatus::Stale,
+                        entry.binding.validity,
+                    ),
+                });
+            }
             Ok(ResolvedAssociation {
                 key: key.clone(),
-                identity,
-                evidence,
+                identity: WorkloadIdentity::none(),
+                evidence: AttributionEvidence::unresolved(Relationship::HookContext),
             })
         }
         _ => Ok(ResolvedAssociation {
@@ -186,17 +248,20 @@ fn truncate_to_budget(response: &mut SnapshotResponse) -> Result<(), MetadataUna
         response.errors.push(SnapshotKeyError {
             key: dropped.key,
             code: SnapshotErrorCode::BudgetExceeded,
-            detail: "association dropped to fit the response budget".to_string(),
+            detail: SnapshotKeyDetail::BudgetDropped,
         });
         response.status = ResponseStatus::Truncated;
     }
     Ok(())
 }
 
-/// Verify that a response answers a request: session equality, chunk
-/// validity, every association/error key drawn from (and covering, for
-/// single-chunk responses) the request keys exactly once, and a valid
-/// response value. Refusals name the rule, never input bytes.
+/// Verify that a response answers a request: session equality, kernel
+/// scope agreement (every served association answers a key inside the
+/// response kernel scope; only typed kernel refusals may come from a
+/// foreign kernel), chunk validity, every association/error key drawn
+/// from (and covering, for single-chunk responses) the request keys
+/// exactly once, and a valid response value. Refusals name the rule,
+/// never input bytes.
 pub fn bind_response_to_request(
     request: &SnapshotRequest,
     response: &SnapshotResponse,
@@ -209,6 +274,31 @@ pub fn bind_response_to_request(
         .map_err(|e| format!("binding requires a valid response: {e:?}"))?;
     if response.session_id != request.session_id {
         return Err("response session does not match request session".to_string());
+    }
+    for assoc in &response.associations {
+        if !response
+            .kernel_identity
+            .matches_scope(&assoc.key.kernel_scope)
+        {
+            return Err(
+                "response association answers a key outside the response kernel scope".to_string(),
+            );
+        }
+    }
+    for error in &response.errors {
+        let kernel_refusal = matches!(
+            error.code,
+            SnapshotErrorCode::KernelMismatch | SnapshotErrorCode::UnknownKernel
+        );
+        if !kernel_refusal
+            && !response
+                .kernel_identity
+                .matches_scope(&error.key.kernel_scope)
+        {
+            return Err(
+                "response error answers a key outside the response kernel scope".to_string(),
+            );
+        }
     }
     let mut seen: Vec<&SnapshotKey> = Vec::new();
     for assoc in &response.associations {
@@ -295,6 +385,7 @@ mod tests {
         let request = SnapshotRequest {
             session_id: SESSION.to_string(),
             keys: vec![key(1)],
+            capture_interval: None,
         };
         let response = resolve(&request, &snapshot()).expect("resolves");
         assert!(bind_response_to_request(&request, &response).is_ok());
@@ -309,12 +400,13 @@ mod tests {
         let request = SnapshotRequest {
             session_id: SESSION.to_string(),
             keys: vec![key(1)],
+            capture_interval: None,
         };
         let mut response = resolve(&request, &snapshot()).expect("resolves");
         response.errors.push(SnapshotKeyError {
             key: key(1),
             code: SnapshotErrorCode::Unsupported,
-            detail: "test".to_string(),
+            detail: SnapshotKeyDetail::UnsupportedKey,
         });
         response.counters.refused += 1;
         assert!(bind_response_to_request(&request, &response).is_err());
@@ -327,6 +419,7 @@ mod tests {
         let request = SnapshotRequest {
             session_id: SESSION.to_string(),
             keys: vec![zero],
+            capture_interval: None,
         };
         let mut snap = snapshot();
         snap.entries.push(MetadataEntry {
@@ -344,10 +437,17 @@ mod tests {
                 validity: None,
             },
         });
-        // A file claiming cgroup 0 still matches structurally; the
-        // unknown-population rule lives at the accounting layer, which
-        // never merges cgroup-0 rows with observed rows.
+        // Cgroup 0 is unreadable: a file claiming cgroup 0 never yields
+        // an asserted association — the unknown-cgroup population stays
+        // unknown with no identity, counted unresolved.
         let response = resolve(&request, &snap).expect("resolves");
         assert_eq!(response.associations.len(), 1);
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Unresolved
+        );
+        assert!(!response.associations[0].identity.is_resolved());
+        assert_eq!(response.counters.resolved, 0);
+        assert_eq!(response.counters.unresolved, 1);
     }
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// One captured execution context with its resolved workload identity
 /// and the evidence for the association.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadObservation {
     /// The captured kernel/session context.
     pub context: ContextIdentity,

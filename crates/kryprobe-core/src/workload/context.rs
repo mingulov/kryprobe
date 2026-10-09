@@ -33,6 +33,7 @@ pub enum ObservationBoundary {
 /// Which boundary/context properties were actually established for one
 /// captured context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextQualification {
     /// Capture happened in hook context (vs a later snapshot join).
     pub hook_context: bool,
@@ -63,6 +64,7 @@ impl ContextQualification {
 /// Zero-means-unreadable: `cgroup == 0` or `start_ns == 0` rows form
 /// explicit unknown populations and never merge with observed rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextIdentity {
     /// `kh_of` row hash over the full `KAgg` row.
     pub kh: u64,
@@ -146,6 +148,19 @@ mod tests {
         assert!(ContextQualification::for_identity(&observed).cgroup_observed);
         assert!(!ContextQualification::for_identity(&no_cgroup).cgroup_observed);
         assert!(!ContextQualification::for_identity(&no_lifetime).lifetime_observed);
+    }
+
+    #[test]
+    fn observation_boundary_round_trips_from_owned_buffer() {
+        // The owned D12 boundary decodes from a non-static buffer and
+        // round-trips wire-identically. (Round-2 D12 oracle.)
+        let boundary = ObservationBoundary::ApiReturn;
+        let bytes = serde_json::to_vec(&boundary).expect("serializes");
+        assert_eq!(bytes, b"\"api_return\"");
+        let owned = bytes.to_vec();
+        let decoded: ObservationBoundary =
+            serde_json::from_slice(&owned).expect("decodes from owned buffer");
+        assert_eq!(decoded, boundary);
     }
 
     #[test]

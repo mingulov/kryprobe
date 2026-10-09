@@ -34,12 +34,12 @@ pub use scope::{ScopeDecision, ScopePartition};
 pub use snapshot::{
     ChunkInfo, CountOperand, DifferenceError, MetadataUnavailable, QualifiedDifference,
     ResolvedAssociation, ResponseStatus, SnapshotConsistency, SnapshotCounters, SnapshotErrorCode,
-    SnapshotKey, SnapshotKeyError, SnapshotRequest, SnapshotResponse, UnknownByDifference,
-    WORKLOAD_SNAPSHOT_SCHEMA_FNV1A, attempt_allowed, cache_entry_expired, check_cache_budget,
-    check_json_nesting_depth, check_request_budget, check_response_budget, check_tombstone_budget,
-    compute_qualified, deadline_exceeded, decode_metadata, decode_request, decode_response,
-    encode_request, encode_response, snapshot_schema_drifted, snapshot_schema_fnv1a_hex,
-    validate_session_id,
+    SnapshotKey, SnapshotKeyDetail, SnapshotKeyError, SnapshotRequest, SnapshotResponse,
+    UnknownByDifference, WORKLOAD_SNAPSHOT_SCHEMA_FNV1A, attempt_allowed, cache_entry_expired,
+    check_cache_budget, check_json_nesting_depth, check_request_budget, check_response_budget,
+    check_tombstone_budget, compute_qualified, deadline_exceeded, decode_metadata, decode_request,
+    decode_response, encode_request, encode_response, snapshot_schema_drifted,
+    snapshot_schema_fnv1a_hex, validate_session_id,
 };
 
 /// Maximum metadata-file bytes accepted (ADR-0008 §(h)).

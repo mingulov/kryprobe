@@ -34,6 +34,7 @@ pub struct ScopePartition {
 /// Wire shape for [`ScopePartition`]: identical fields, checked on
 /// conversion via [`ScopePartition::from_counts`].
 #[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScopePartitionWire {
     matched: u64,
     nonmatched: u64,

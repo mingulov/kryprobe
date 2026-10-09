@@ -19,7 +19,7 @@
       "family": 1,
       "op": 2,
       "result": 0,
-      "context": 1,
+      "context": 0,
       "algorithm": "cbc(aes)",
       "driver": "cbc-aes-aesni"
     }

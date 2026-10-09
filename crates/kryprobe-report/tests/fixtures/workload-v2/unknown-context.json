@@ -6,7 +6,7 @@
   },
   "interval": {
     "start_ns": "100",
-    "end_ns": "200",
+    "end_ns": "1000",
     "consistency": "quiescent",
     "clock": "monotonic_boot"
   },
@@ -19,7 +19,17 @@
       "family": 1,
       "op": 2,
       "result": 0,
-      "context": 2,
+      "context": 1,
+      "algorithm": "cbc(aes)",
+      "driver": "cbc-aes-aesni"
+    },
+    {
+      "dict_id": "n1",
+      "kh": "8",
+      "family": 1,
+      "op": 2,
+      "result": 0,
+      "context": 0,
       "algorithm": "cbc(aes)",
       "driver": "cbc-aes-aesni"
     }
@@ -36,14 +46,14 @@
       "native_ref": "n0"
     },
     {
-      "kh": "7",
+      "kh": "8",
       "cgroup_id": "43812",
       "tgid": 1001,
       "uid": 1000,
       "start_ns": "0",
       "execution_kind": "proc",
       "calls": "20",
-      "native_ref": "n0"
+      "native_ref": "n1"
     }
   ],
   "ledger": {
