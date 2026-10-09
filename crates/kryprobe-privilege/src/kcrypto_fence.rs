@@ -273,16 +273,14 @@ fn kernel_lanes_drained(maps: &KcryptoMaps) -> Result<bool, MapOpsError> {
     Ok(true)
 }
 
-/// Monotonic clock for the fence-completion bound.
+/// Monotonic clock for the fence receipt stamp (`QuiescentReceipt.fence_ns`
+/// promises monotonic ns): host `CLOCK_MONOTONIC` via
+/// [`crate::host::monotonic_ns`] — the same domain as BPF `ktime`.
+/// Wall time is unusable here (NTP/adjtime jumps break receipt ordering;
+/// wall values also dwarf ktime by orders of magnitude). The close
+/// deadline keeps `Instant` (see [`close_kernel_fence`]).
 fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Test/close-path clock only (host wall fallback where no boot-time
-    // source is plumbed): the bound orders the terminal reads, it is not
-    // compared against BPF `ktime` stamps.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    crate::host::monotonic_ns().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -296,6 +294,35 @@ mod tests {
         assert!(outcome.is_quiescent_receipt());
         assert!(fence.is_closed());
         assert_eq!(fence.active_count(), 0);
+    }
+
+    #[test]
+    fn receipt_stamp_is_monotonic_not_wall() {
+        // M1: `fence_ns` promises monotonic ns. Bracket the receipt
+        // with the real monotonic clock: a wall stamp (unix-epoch ns,
+        // ~1.7e18) falls light-years outside the bracket and fails;
+        // only a CLOCK_MONOTONIC stamp passes. This is the adversarial
+        // form — wall jumps backward/forward arbitrarily, monotonic
+        // never does.
+        let before = crate::host::monotonic_ns().expect("mono reads");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let outcome = close_receipt_decision(Instant::now(), deadline);
+        let after = crate::host::monotonic_ns().expect("mono reads");
+        let CloseOutcome::Quiescent(receipt) = outcome else {
+            panic!("expected a receipt, got {outcome:?}");
+        };
+        assert!(
+            receipt.fence_ns >= before && receipt.fence_ns <= after,
+            "fence_ns {} outside monotonic bracket [{before}, {after}]",
+            receipt.fence_ns
+        );
+        // Successive receipts never go backwards (wall would flake
+        // under NTP/adjtime steps; monotonic cannot).
+        let outcome2 = close_receipt_decision(Instant::now(), deadline);
+        let CloseOutcome::Quiescent(receipt2) = outcome2 else {
+            panic!("expected a receipt, got {outcome2:?}");
+        };
+        assert!(receipt2.fence_ns >= receipt.fence_ns, "receipts ordered");
     }
 
     #[test]
@@ -314,6 +341,262 @@ mod tests {
         let _ = fence.try_close(0);
         let (admit, _) = bpf_admit_twins(&fence, 1);
         assert!(!admit());
+        assert_eq!(fence.active_count(), 0);
+    }
+
+    /// Split-access twins of the BPF admit/release pair (F2): the
+    /// actual BPF sequence is a plain load/add/store per update
+    /// (`r1 = *lane; r1 += 1; *lane = r1`) — NOT an atomic RMW — so
+    /// two same-CPU executions interleaving their steps lose an
+    /// update. These twins model the steps exactly (split
+    /// load/add/store on the shared lane word; defined Rust, same
+    /// interleaving hazard, no UB). The atomic twins above stay as
+    /// the protocol tests (admit/release/CLOSED discipline); these
+    /// are the hazard model.
+    fn bpf_admit_twins_split(
+        fence: &FenceController,
+        lane: usize,
+    ) -> (impl Fn() -> bool + '_, impl Fn() + '_) {
+        use std::sync::atomic::Ordering;
+        let slot = fence.lanes[lane].clone();
+        let closed = fence.closed.clone();
+        let admit = move || {
+            let seen = slot.load(Ordering::Relaxed);
+            slot.store(seen.wrapping_add(1), Ordering::Relaxed);
+            if closed.load(Ordering::Acquire) != KCTLCLOSED_OPEN {
+                let seen = slot.load(Ordering::Relaxed);
+                slot.store(seen.wrapping_sub(1), Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        };
+        let slot = fence.lanes[lane].clone();
+        let release = move || {
+            let seen = slot.load(Ordering::Relaxed);
+            slot.store(seen.wrapping_sub(1), Ordering::Relaxed);
+        };
+        (admit, release)
+    }
+
+    #[test]
+    fn split_twins_keep_admit_release_discipline() {
+        // The split twins obey the same protocol as the atomic ones
+        // (single-threaded: admit/release round-trips, refused
+        // entrants leave no count) — the ONLY difference is the
+        // split load/add/store steps (whose interleave hazard the
+        // next tests pin down).
+        let fence = FenceController::new_for_test(2);
+        let (admit, release) = bpf_admit_twins_split(&fence, 0);
+        assert!(admit());
+        assert_eq!(fence.active_count(), 1);
+        release();
+        assert_eq!(fence.active_count(), 0);
+        let _ = fence.try_close(0);
+        let (admit1, _) = bpf_admit_twins_split(&fence, 1);
+        assert!(!admit1());
+        assert_eq!(fence.active_count(), 0);
+    }
+
+    #[test]
+    fn split_access_scripted_interleaving_loses_update() {
+        // F2 (deterministic): two programs' admit steps interleaved
+        // load/load/store/store on one lane lose exactly one update
+        // (1 instead of 2) — the hazard the guard-serialization
+        // argument must exclude in production (see the Stage-1 fence
+        // analysis: PREEMPT_LAZY + guard proven active by I-NC64).
+        use std::sync::atomic::Ordering;
+        let fence = FenceController::new_for_test(1);
+        let lane = fence.lanes[0].clone();
+        // Program A admits: load.
+        let a_seen = lane.load(Ordering::Relaxed);
+        // Program B admits before A stores: load (same stale value).
+        let b_seen = lane.load(Ordering::Relaxed);
+        // Both store: B's store lands, A's is lost.
+        lane.store(a_seen.wrapping_add(1), Ordering::Relaxed);
+        lane.store(b_seen.wrapping_add(1), Ordering::Relaxed);
+        assert_eq!(a_seen, 0);
+        assert_eq!(b_seen, 0);
+        assert_eq!(lane.load(Ordering::Relaxed), 1, "one update lost");
+        assert_eq!(fence.active_count(), 1);
+    }
+
+    #[test]
+    fn split_access_two_programs_one_lane_hammer_loses() {
+        // F2 (deterministic via barriers): two programs (threads) on
+        // ONE lane, every admit/release pair rigged to interleave —
+        // each round loses exactly one admit and one release. N
+        // rounds admit 2N writers but count N (then release 2N from
+        // N — saturating at 0 would hide it, so assert the admit
+        // count first, then the release underflow arithmetic).
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Barrier};
+        let fence = FenceController::new_for_test(1);
+        let lane = fence.lanes[0].clone();
+        let rounds = 500u64;
+        let barrier = Arc::new(Barrier::new(2));
+        let worker = |barrier: Arc<Barrier>, lane: Arc<AtomicU64>| {
+            move || {
+                for _ in 0..rounds {
+                    // Admit steps, interleaved across the barrier:
+                    // both load the same value, both store +1 — one
+                    // lost per round.
+                    let seen = lane.load(Ordering::Relaxed);
+                    barrier.wait();
+                    lane.store(seen.wrapping_add(1), Ordering::Relaxed);
+                    barrier.wait();
+                }
+            }
+        };
+        let b1 = barrier.clone();
+        let l1 = lane.clone();
+        let t = std::thread::spawn(worker(b1, l1));
+        (worker(barrier, lane.clone()))();
+        t.join().expect("worker joins");
+        // 2*rounds admits counted exactly rounds (one lost per round,
+        // deterministically — no flake possible).
+        assert_eq!(lane.load(Ordering::Relaxed), rounds);
+        assert_eq!(fence.active_count(), rounds);
+    }
+
+    /// Deterministic writer/publication/scan model (T1): a scripted
+    /// admitted writer with explicit visibility — the deterministic
+    /// interleaving of publication with the closer's polls (no
+    /// threads, no timing).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ScriptedWriter {
+        /// Admitted (holds +1) but the increment is invisible to the
+        /// closer (scans read 0 for it) — the F3 publication window.
+        InsideUnpublished,
+        /// Admitted and visible (scans read 1).
+        InsidePublished,
+        /// Decremented (scans read 0, truthfully).
+        Released,
+    }
+
+    fn scripted_scan(writer: ScriptedWriter) -> u64 {
+        match writer {
+            ScriptedWriter::InsideUnpublished => 0,
+            ScriptedWriter::InsidePublished => 1,
+            ScriptedWriter::Released => 0,
+        }
+    }
+
+    /// Mirror of `close_kernel_fence`'s decision structure over
+    /// scripted scans: poll until all-zero (round budget = deadline)
+    /// → grace (consume one more scan) → rescan must read all-zero →
+    /// receipt round; budget exhaustion → `Pending` (`None`). The
+    /// abstraction: script rounds stand in for poll rounds, the grace
+    /// for the 5 ms sleep, the budget for the 5 s deadline. Returns
+    /// the receipt round (`Some`) or `None` for `Pending`.
+    fn twin_new_close(script: &[ScriptedWriter], budget: usize) -> Option<usize> {
+        let mut round = 0usize;
+        loop {
+            let scan = |r: usize| {
+                script
+                    .get(r)
+                    .map(|w| scripted_scan(*w))
+                    .expect("script covers the close")
+            };
+            if scan(round) == 0 {
+                // Visibility grace, then rescan (F1).
+                round += 1;
+                if scan(round) == 0 {
+                    // Deadline honored (N1): a receipt landing on the
+                    // boundary round is Pending.
+                    return if round >= budget { None } else { Some(round) };
+                }
+            }
+            round += 1;
+            if round >= budget {
+                return None;
+            }
+        }
+    }
+
+    /// Mirror of the OLD order (receipt on the FIRST all-zero read —
+    /// no grace, no rescan): the load-bearing difference from the new
+    /// close. Returns the receipt round (`Some`) or `None`.
+    fn twin_old_close(script: &[ScriptedWriter], budget: usize) -> Option<usize> {
+        for (round, writer) in script.iter().enumerate().take(budget) {
+            if scripted_scan(*writer) == 0 {
+                return Some(round);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn deterministic_close_old_receipts_early_new_waits() {
+        // T1: the oracle is "no receipt precedes writer release".
+        // Adversarial script: the writer is admitted but unpublished
+        // at round 0 (scan 0), publishes at round 1 (scan 1), and
+        // releases at round 2 (scans 0 thereafter).
+        // - OLD (first-zero receipt): receipts at round 0 — while the
+        //   writer is still inside. The old implementation FAILS the
+        //   oracle (the hole, demonstrated deterministically).
+        // - NEW (grace+rescan): round-0 zero leads to a grace scan
+        //   (round 1: published 1 — keep polling), round-2 zero leads
+        //   to a rescan (round 3: 0 — receipt). Receipt at round 3,
+        //   after the round-2 release: CORRECT.
+        let script = [
+            ScriptedWriter::InsideUnpublished,
+            ScriptedWriter::InsidePublished,
+            ScriptedWriter::Released,
+            ScriptedWriter::Released,
+            ScriptedWriter::Released,
+        ];
+        let release_round = 2usize;
+        let old = twin_old_close(&script, 8).expect("old receipts");
+        assert_eq!(old, 0, "old receipts on the first zero");
+        assert!(
+            old < release_round,
+            "old receipt (round {old}) precedes release (round {release_round}): hole demonstrated"
+        );
+        let new = twin_new_close(&script, 8).expect("new receipts");
+        assert_eq!(new, 3, "new receipts after grace+rescan");
+        assert!(
+            new >= release_round,
+            "new receipt (round {new}) must not precede release (round {release_round})"
+        );
+    }
+
+    #[test]
+    fn deterministic_close_pending_when_writer_never_releases() {
+        // T1: a writer that never releases exhausts the round budget
+        // (deadline) — the new close stays Pending, never receipts.
+        // (The old close also pends here — one scan reads nonzero
+        // every round — so this script pins the deadline, not the
+        // hole; the hole is pinned by the test above.)
+        let script = [ScriptedWriter::InsidePublished; 12];
+        assert_eq!(twin_new_close(&script, 8), None);
+        assert_eq!(twin_old_close(&script, 8), None);
+    }
+
+    #[test]
+    fn atomic_twins_stay_loss_free_under_hammer() {
+        // The atomic twins remain the protocol reference: the same
+        // two-threads-one-lane hammer with atomic RMWs loses nothing
+        // (contrast with the split-access hammer above — the
+        // difference between the twins IS the F2 hazard).
+        let fence = FenceController::new_for_test(1);
+        let rounds = 2000u64;
+        let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker = |fence: &FenceController, done: Arc<std::sync::atomic::AtomicU64>| {
+            let (admit, release) = bpf_admit_twins(fence, 0);
+            for _ in 0..rounds {
+                assert!(admit());
+                release();
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        std::thread::scope(|s| {
+            let d1 = done.clone();
+            let d2 = done.clone();
+            s.spawn(|| worker(&fence, d1));
+            s.spawn(|| worker(&fence, d2));
+        });
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 2 * rounds);
         assert_eq!(fence.active_count(), 0);
     }
 
