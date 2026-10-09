@@ -36,7 +36,7 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
 }
 
 fn native() -> NativeIdentity {
-    NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", "cbc-aes-aesni")
+    NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", Some("cbc-aes-aesni"))
 }
 
 fn context(kh: u64, cgroup: u64, tgid: u32, start_ns: u64) -> ContextIdentity {
@@ -131,7 +131,7 @@ fn workload_roundtrip_retains_native_identity() {
             1001,
             556,
             30,
-            NativeIdentity::new(2, 4, 0, 1, "gcm(aes)", "gcm-aes-aesni"),
+            NativeIdentity::new(2, 4, 0, 1, "gcm(aes)", Some("gcm-aes-aesni")),
             no_id2,
             no_ev2,
         ),
@@ -143,7 +143,10 @@ fn workload_roundtrip_retains_native_identity() {
     let replayed = report_from_bytes(&bytes).expect("replays");
     assert_eq!(replayed.rows.len(), 2);
     assert_eq!(replayed.rows[0].native.algorithm, "cbc(aes)");
-    assert_eq!(replayed.rows[0].native.driver, "cbc-aes-aesni");
+    assert_eq!(
+        replayed.rows[0].native.driver.as_deref(),
+        Some("cbc-aes-aesni")
+    );
     assert_eq!(replayed.rows[0].context.kh, 7);
     assert_eq!(replayed.rows[1].native.algorithm, "gcm(aes)");
     assert_eq!(replayed.rows[1].context.kh, 7);
@@ -185,9 +188,19 @@ fn replay_uses_captured_metadata_only() {
     for row in &first.rows {
         let evidence = row.evidence.as_ref().expect("asserted row keeps evidence");
         assert_eq!(evidence.status, AttributionStatus::Asserted);
-        assert_eq!(
-            evidence.validity,
-            Some(ValidityInterval::monotonic(100, 200))
+        // Repaired R3 window: the captured validity covers the whole
+        // counted report interval (coverage semantics, not a bare number).
+        let validity = evidence
+            .validity
+            .as_ref()
+            .expect("asserted binding carries a validity window");
+        assert_eq!(*validity, ValidityInterval::monotonic(100, 1000));
+        assert!(
+            validity.start_ns <= first.interval.start_ns
+                && first.interval.end_ns <= validity.end_ns,
+            "validity {validity:?} must cover report interval {}..{}",
+            first.interval.start_ns,
+            first.interval.end_ns
         );
     }
     // The offline render carries the captured identities verbatim.
@@ -499,7 +512,7 @@ fn live_assembly_matches_decoded_fixture_render() {
     let (u2, e2) = unresolved();
     // Mirror the corrected fixture (R2: proc native context 0,
     // capture end 1000 past the row starts).
-    let proc_native = NativeIdentity::new(1, 2, 0, 0, "cbc(aes)", "cbc-aes-aesni");
+    let proc_native = NativeIdentity::new(1, 2, 0, 0, "cbc(aes)", Some("cbc-aes-aesni"));
     let mut input = base_input(
         vec![
             row(7, 43812, 1000, 555, 20, proc_native.clone(), u1, e1),
@@ -905,4 +918,96 @@ fn replay_reader_is_bounded_and_empty_refuses() {
         report_from_reader(b"".as_slice()),
         Err(WorkloadDecodeError::Malformed)
     ));
+}
+
+/// Driverless allocation records round-trip: the model marks the driver
+/// explicitly unavailable, the encoder omits the key, the frozen
+/// validator accepts the bytes, and replay restores the unavailable
+/// marker (never a blank or fabricated name).
+#[test]
+fn driverless_allocation_record_round_trips() {
+    let (no_id, no_ev) = unresolved();
+    let driverless = NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", None);
+    driverless.validate().expect("absent driver validates");
+    let report = assemble(base_input(
+        vec![row(7, 43812, 1000, 555, 50, driverless, no_id, no_ev)],
+        50,
+    ))
+    .expect("driverless assembles");
+    assert!(report.rows[0].native.driver.is_none());
+    let bytes = report.to_json_bytes().expect("encodes");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("is JSON");
+    // The wire omits the absent driver (amended v2: absent, never empty).
+    assert!(
+        value["dictionary"][0]
+            .as_object()
+            .expect("entry")
+            .get("driver")
+            .is_none(),
+        "absent driver encodes as omitted key"
+    );
+    // The frozen validator is the oracle: absent validates as unavailable.
+    kryprobe_report::validate::workload_v2::validate_bytes(&bytes).expect("valid v2");
+    let replayed = report_from_bytes(&bytes).expect("replays");
+    assert!(replayed.rows[0].native.driver.is_none());
+    assert_eq!(replayed, report);
+    assert_eq!(replayed.to_json_bytes().expect("re-encodes"), bytes);
+}
+
+/// Present-but-empty drivers refuse at every owned boundary: model
+/// validation, assembly, and wire decode (via the frozen validator).
+#[test]
+fn empty_driver_refuses() {
+    let empty = NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", Some(""));
+    assert!(matches!(
+        empty.validate(),
+        Err(WorkloadBuildError::BadNativeIdentity)
+    ));
+    let (no_id, no_ev) = unresolved();
+    let rows = vec![row(7, 43812, 1000, 555, 50, empty, no_id, no_ev)];
+    assert!(matches!(
+        assemble(base_input(rows, 50)),
+        Err(WorkloadBuildError::BadNativeIdentity)
+    ));
+    // Wire bytes with a present-but-empty driver refuse decode.
+    let (u_id, u_ev) = unresolved();
+    let report = assemble(base_input(
+        vec![row(7, 43812, 1000, 555, 50, native(), u_id, u_ev)],
+        50,
+    ))
+    .expect("assembles");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&report.to_json_bytes().expect("encodes")).expect("is JSON");
+    value["dictionary"][0]["driver"] = serde_json::json!("");
+    let bytes = serde_json::to_vec(&value).expect("serializes");
+    assert!(matches!(
+        report_from_bytes(&bytes),
+        Err(WorkloadDecodeError::SchemaDefects { .. })
+    ));
+}
+
+/// Absent drivers render as explicit `unavailable` — never blank (which
+/// would be ambiguous against a missing column) and never fabricated.
+#[test]
+fn absent_driver_renders_explicitly() {
+    let (no_id, no_ev) = unresolved();
+    let driverless = NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", None);
+    let report = assemble(base_input(
+        vec![row(7, 43812, 1000, 555, 50, driverless, no_id, no_ev)],
+        50,
+    ))
+    .expect("assembles");
+    let text = report.render_text();
+    let line = text
+        .lines()
+        .find(|line| line.starts_with('7'))
+        .expect("detail row renders");
+    assert!(
+        line.contains(" unavailable "),
+        "absent driver renders explicitly: {line}"
+    );
+    // Replay renders the identical explicit cell.
+    let bytes = report.to_json_bytes().expect("encodes");
+    let replayed = report_from_bytes(&bytes).expect("replays");
+    assert_eq!(replayed.render_text(), text);
 }

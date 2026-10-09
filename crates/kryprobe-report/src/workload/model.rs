@@ -37,9 +37,9 @@ pub struct ReportRowInput {
 }
 
 /// Full native operation identity: the `(family, op, result, context)`
-/// numerics plus the verbatim algorithm/driver names. This is what the
-/// v2 `native` object (inline or dictionary entry) carries; `kh` alone is
-/// an index, never identity.
+/// numerics plus the verbatim algorithm name and the optional driver
+/// name. This is what the v2 `native` object (inline or dictionary entry)
+/// carries; `kh` alone is an index, never identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NativeIdentity {
     /// Algorithm family (`KAgg.fam`).
@@ -52,32 +52,49 @@ pub struct NativeIdentity {
     pub context: u8,
     /// Verbatim algorithm name (`cra_name`).
     pub algorithm: String,
-    /// Verbatim driver name (`cra_driver_name`).
-    pub driver: String,
+    /// Verbatim driver name (`cra_driver_name`), or `None` when the
+    /// driver is explicitly unavailable: allocation captures carry zero
+    /// driver bytes, so the v2 `driver` key is omitted — never empty.
+    pub driver: Option<String>,
 }
 
 impl NativeIdentity {
-    /// One native tuple. Unvalidated; call [`Self::validate`] before
-    /// assembly or encoding.
+    /// One native tuple; `driver: None` marks an allocation record whose
+    /// driver is explicitly unavailable. Unvalidated; call
+    /// [`Self::validate`] before assembly or encoding.
     #[must_use]
-    pub fn new(family: u8, op: u8, result: u8, context: u8, algorithm: &str, driver: &str) -> Self {
+    pub fn new(
+        family: u8,
+        op: u8,
+        result: u8,
+        context: u8,
+        algorithm: &str,
+        driver: Option<&str>,
+    ) -> Self {
         Self {
             family,
             op,
             result,
             context,
             algorithm: algorithm.to_string(),
-            driver: driver.to_string(),
+            driver: driver.map(str::to_string),
         }
     }
 
-    /// Wire rules: both names are non-empty and within the frozen string
-    /// bound. Diagnostics are static (never echo input bytes).
+    /// Wire rules: the algorithm is non-empty and within the frozen string
+    /// bound; the driver is absent (explicitly unavailable) or non-empty
+    /// and within the bound — present-but-empty refuses. Diagnostics are
+    /// static (never echo input bytes).
     pub fn validate(&self) -> Result<(), WorkloadBuildError> {
-        for name in [&self.algorithm, &self.driver] {
-            if name.is_empty() || name.len() > kryprobe_core::workload::MAX_STRING_FIELD_BYTES {
-                return Err(WorkloadBuildError::BadNativeIdentity);
-            }
+        if self.algorithm.is_empty()
+            || self.algorithm.len() > kryprobe_core::workload::MAX_STRING_FIELD_BYTES
+        {
+            return Err(WorkloadBuildError::BadNativeIdentity);
+        }
+        if let Some(driver) = &self.driver
+            && (driver.is_empty() || driver.len() > kryprobe_core::workload::MAX_STRING_FIELD_BYTES)
+        {
+            return Err(WorkloadBuildError::BadNativeIdentity);
         }
         Ok(())
     }
@@ -327,7 +344,8 @@ pub enum WorkloadBuildError {
     /// A row's identity/evidence coherence refuses (frozen observation
     /// rule), or an identity/evidence value breaks its wire shape.
     IncoherentRow,
-    /// A native tuple breaks its wire shape (empty/oversized names).
+    /// A native tuple breaks its wire shape (empty/oversized algorithm,
+    /// or a present-but-empty/oversized driver).
     BadNativeIdentity,
     /// A workload identity breaks its wire shape (non-hex id, empty
     /// components, cluster contradiction, oversized strings).

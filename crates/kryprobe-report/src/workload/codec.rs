@@ -261,7 +261,11 @@ fn encode_native(native: &NativeIdentity) -> Map<String, Value> {
         "algorithm".to_string(),
         Value::String(native.algorithm.clone()),
     );
-    obj.insert("driver".to_string(), Value::String(native.driver.clone()));
+    // An unavailable driver encodes as an omitted key (allocation
+    // records carry zero driver bytes) — never as an empty string.
+    if let Some(driver) = &native.driver {
+        obj.insert("driver".to_string(), Value::String(driver.clone()));
+    }
     obj
 }
 
@@ -574,13 +578,24 @@ fn decode_unavailability(value: Option<&Value>) -> Option<MetadataUnavailable> {
 }
 
 fn decode_native(obj: &Map<String, Value>) -> Option<NativeIdentity> {
+    // An omitted driver decodes as explicitly unavailable (allocation
+    // records); a present-but-empty one refuses (the frozen validator
+    // rejects it first on the report path — this keeps typed conversion
+    // honest too).
+    let driver = match obj.get("driver") {
+        None => None,
+        Some(value) => Some(value.as_str()?.to_string()),
+    };
+    if driver.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
     Some(NativeIdentity {
         family: parse_small(obj.get("family"), 255)? as u8,
         op: parse_small(obj.get("op"), 255)? as u8,
         result: parse_small(obj.get("result"), 255)? as u8,
         context: parse_small(obj.get("context"), 255)? as u8,
         algorithm: obj.get("algorithm")?.as_str()?.to_string(),
-        driver: obj.get("driver")?.as_str()?.to_string(),
+        driver,
     })
 }
 

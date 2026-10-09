@@ -200,7 +200,7 @@ impl WorkloadReport {
                 row.native.result,
                 row.native.context,
                 crate::sanitize_cell(&row.native.algorithm),
-                crate::sanitize_cell(&row.native.driver),
+                render_driver(row),
                 render_workload(row),
                 render_status(row),
                 render_ancestor(row),
@@ -279,6 +279,16 @@ fn render_metadata(metadata: &super::model::MetadataAvailability) -> String {
                 kryprobe_core::workload::MetadataUnavailable::ParseFailed => "parse_failed",
             }
         ),
+    }
+}
+
+/// Driver cell for one row: the verbatim name, or explicit
+/// `unavailable` when the record carries no driver (allocation captures
+/// carry zero driver bytes) — never blank, never fabricated.
+fn render_driver(row: &super::model::ReportRow) -> String {
+    match row.native.driver.as_deref() {
+        Some(driver) => crate::sanitize_cell(driver),
+        None => "unavailable".to_string(),
     }
 }
 
