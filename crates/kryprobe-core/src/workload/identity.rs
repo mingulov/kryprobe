@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Workload identities (ADR-0008 §(g), spec F03): UID-keyed pod identity,
-//! display-only names, verified outer-container association.
+//! Workload identities (ADR-0008 §(g), spec F03, as corrected by the
+//! Stage 2A contract ADR): UID-keyed pod identity, full runtime/container
+//! identity, display-only names, verified outer-container association.
+//!
+//! Identity keys are structured values ([`IdentityKey`]), never ambiguous
+//! delimiter-joined strings: components compare field-wise, so a `':'` in
+//! a cluster name cannot merge two distinct identities. Every established
+//! association yields its own key; an identity with no established
+//! association has no keys and never promotes (see [`qualify_join`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +35,9 @@ pub struct ContainerRef {
     pub runtime: String,
     /// Full container id (abbreviations refuse at the selector layer).
     pub id: String,
-    /// Runtime lifetime metadata when available.
+    /// Runtime lifetime metadata when available; `None` (or empty, which
+    /// normalizes to unobserved in keys) means the lifetime was not
+    /// established — an explicit unknown, never a wildcard.
     pub lifetime: Option<String>,
 }
 
@@ -45,12 +54,76 @@ pub struct PodRef {
     pub namespace: String,
 }
 
+/// One structured identity key: a single established association in
+/// directly comparable form. Field-wise equality only — there is no
+/// string serialization of a key that participates in identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IdentityKey {
+    /// Runtime instance + full container id + observed lifetime (or
+    /// explicit unknown lifetime). Distinct runtimes, ids, or known
+    /// lifetimes each split; two unknown lifetimes merge only when no
+    /// evidence distinguishes them, and the association status stays
+    /// below verified.
+    Container {
+        /// Runtime instance identity.
+        runtime: String,
+        /// Full container id.
+        id: String,
+        /// Observed lifetime, or `None` when unobserved.
+        lifetime: Option<String>,
+    },
+    /// Cluster identity + pod UID. Name/namespace never participate:
+    /// recreating a pod under the same name yields a new key, and counts
+    /// keyed by the old UID do not transfer.
+    Pod {
+        /// Cluster identity.
+        cluster: String,
+        /// Pod UID.
+        uid: String,
+    },
+    /// Node identity.
+    Node {
+        /// Node identity string.
+        node: String,
+    },
+    /// Verified outer-container association (kind nodes): kept distinct
+    /// from the workload's own container so an ancestor never merges
+    /// with (or replaces) the application identity.
+    AncestorContainer {
+        /// Runtime instance identity.
+        runtime: String,
+        /// Full container id.
+        id: String,
+        /// Observed lifetime, or `None` when unobserved.
+        lifetime: Option<String>,
+    },
+}
+
 impl WorkloadIdentity {
     /// Empty identity: captured context with no associations yet.
     #[must_use]
     pub fn none() -> Self {
         Self {
             container: None,
+            pod: None,
+            cluster: None,
+            node: None,
+            ancestor_container: None,
+        }
+    }
+
+    /// Container association: runtime instance + full id + lifetime.
+    /// A `None` (or empty) lifetime records an explicitly unobserved
+    /// lifetime.
+    #[must_use]
+    pub fn container(runtime: &str, id: &str, lifetime: Option<&str>) -> Self {
+        Self {
+            container: Some(ContainerRef {
+                runtime: runtime.to_string(),
+                id: id.to_string(),
+                lifetime: lifetime.map(str::to_string),
+            }),
             pod: None,
             cluster: None,
             node: None,
@@ -75,15 +148,56 @@ impl WorkloadIdentity {
         }
     }
 
-    /// The stable identity key: cluster + pod UID only. Names never
-    /// participate: recreating a pod under the same name yields a new
-    /// key, and counts keyed by the old UID do not transfer.
+    /// Every established identity key, in deterministic order (container,
+    /// pod, node, ancestor). Associations with empty identity components
+    /// establish nothing: they yield no key rather than a wildcard key.
+    /// An empty result means unresolved (see [`Self::is_resolved`]).
     #[must_use]
-    pub fn identity_key(&self) -> String {
-        match (&self.cluster, &self.pod) {
-            (Some(cluster), Some(pod)) => format!("pod:{cluster}:{}", pod.uid),
-            _ => "unresolved".to_string(),
+    pub fn identity_keys(&self) -> Vec<IdentityKey> {
+        let mut keys = Vec::new();
+        if let Some(c) = &self.container
+            && !c.runtime.is_empty()
+            && !c.id.is_empty()
+        {
+            keys.push(IdentityKey::Container {
+                runtime: c.runtime.clone(),
+                id: c.id.clone(),
+                lifetime: normalize_lifetime(&c.lifetime),
+            });
         }
+        if let Some(p) = &self.pod
+            && !p.cluster.is_empty()
+            && !p.uid.is_empty()
+        {
+            keys.push(IdentityKey::Pod {
+                cluster: p.cluster.clone(),
+                uid: p.uid.clone(),
+            });
+        }
+        if let Some(node) = &self.node
+            && !node.is_empty()
+        {
+            keys.push(IdentityKey::Node { node: node.clone() });
+        }
+        if let Some(c) = &self.ancestor_container
+            && !c.runtime.is_empty()
+            && !c.id.is_empty()
+        {
+            keys.push(IdentityKey::AncestorContainer {
+                runtime: c.runtime.clone(),
+                id: c.id.clone(),
+                lifetime: normalize_lifetime(&c.lifetime),
+            });
+        }
+        keys
+    }
+
+    /// Whether at least one association is established. Unresolved
+    /// identities carry captured context only and must stay in their
+    /// context rows — they never promote to [`JoinQualification::Unique`].
+    #[must_use]
+    pub fn is_resolved(&self) -> bool {
+        !self.identity_keys().is_empty()
     }
 
     /// Selection-name equality (name + namespace): used to detect the
@@ -98,6 +212,15 @@ impl WorkloadIdentity {
     }
 }
 
+/// Empty lifetime strings normalize to unobserved (`None`): only a
+/// non-empty observed lifetime participates in the key.
+fn normalize_lifetime(lifetime: &Option<String>) -> Option<String> {
+    match lifetime {
+        Some(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Outcome of joining one hash bucket to workload identities: hashes
 /// are indexes, not proof. Zero or one distinct identity keys resolve;
 /// two or more distinct keys sharing a bucket are `Ambiguous` and their
@@ -106,35 +229,51 @@ impl WorkloadIdentity {
 pub enum JoinQualification {
     /// No candidate in the bucket.
     None,
+    /// Candidates exist but none resolves to an identity key. The
+    /// candidates stay in their captured-context rows; this outcome
+    /// never promotes to `Unique`.
+    Unresolved,
     /// Exactly one distinct identity key (boxed: the struct is large
     /// next to the unit/`Vec` variants).
     Unique(Box<WorkloadIdentity>),
     /// Two or more distinct identity keys share the bucket: ambiguous.
-    Ambiguous(Vec<String>),
+    /// Keys are sorted for deterministic rendering.
+    Ambiguous(Vec<IdentityKey>),
 }
 
 /// Qualify one hash-bucket join over candidate identities. Compares full
-/// identity keys (never the hash alone): distinct keys with the same
-/// hash yield `Ambiguous` with every competing key retained.
+/// structured identity keys (never the hash alone, never a joined
+/// string): distinct keys with the same hash yield `Ambiguous` with every
+/// competing key retained. Candidates without keys do not resolve and
+/// can never yield `Unique` on their own; callers keep them in their
+/// captured-context (unknown-workload) rows rather than merging them
+/// into a resolved row.
 #[must_use]
 pub fn qualify_join(candidates: &[WorkloadIdentity]) -> JoinQualification {
-    let mut keys: Vec<String> = Vec::new();
+    if candidates.is_empty() {
+        return JoinQualification::None;
+    }
+    let mut keys: Vec<IdentityKey> = Vec::new();
     for candidate in candidates {
-        let key = candidate.identity_key();
-        if !keys.contains(&key) {
-            keys.push(key);
+        for key in candidate.identity_keys() {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
         }
     }
     match keys.len() {
-        0 => JoinQualification::None,
+        0 => JoinQualification::Unresolved,
         1 => JoinQualification::Unique(Box::new(
             candidates
                 .iter()
-                .find(|c| c.identity_key() == keys[0])
+                .find(|c| c.identity_keys().contains(&keys[0]))
                 .expect("key came from these candidates")
                 .clone(),
         )),
-        _ => JoinQualification::Ambiguous(keys),
+        _ => {
+            keys.sort();
+            JoinQualification::Ambiguous(keys)
+        }
     }
 }
 
@@ -143,8 +282,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unresolved_identity_has_no_key() {
-        assert_eq!(WorkloadIdentity::none().identity_key(), "unresolved");
+    fn unresolved_identity_has_no_keys() {
+        assert!(WorkloadIdentity::none().identity_keys().is_empty());
+        assert!(!WorkloadIdentity::none().is_resolved());
+    }
+
+    #[test]
+    fn empty_components_establish_no_key() {
+        let empty_container = WorkloadIdentity::container("", "", None);
+        assert!(empty_container.identity_keys().is_empty());
+        let empty_pod = WorkloadIdentity::pod("", "api", "production", "");
+        assert!(empty_pod.identity_keys().is_empty());
+    }
+
+    #[test]
+    fn empty_lifetime_normalizes_to_unobserved() {
+        let empty = WorkloadIdentity::container("rt", "id", Some(""));
+        let missing = WorkloadIdentity::container("rt", "id", None);
+        assert_eq!(empty.identity_keys(), missing.identity_keys());
     }
 
     #[test]
@@ -157,12 +312,16 @@ mod tests {
         match qualify_join(&[a.clone(), b.clone()]) {
             JoinQualification::Ambiguous(keys) => {
                 assert_eq!(keys.len(), 2);
-                assert!(keys.contains(&a.identity_key()));
-                assert!(keys.contains(&b.identity_key()));
+                assert!(keys.contains(&a.identity_keys()[0]));
+                assert!(keys.contains(&b.identity_keys()[0]));
             }
             other => panic!("collision must qualify ambiguous, got {other:?}"),
         }
         assert!(matches!(qualify_join(&[a]), JoinQualification::Unique(_)));
         assert!(matches!(qualify_join(&[]), JoinQualification::None));
+        assert!(matches!(
+            qualify_join(&[WorkloadIdentity::none()]),
+            JoinQualification::Unresolved
+        ));
     }
 }

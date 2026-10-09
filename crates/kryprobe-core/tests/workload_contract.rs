@@ -43,13 +43,13 @@ fn pod_name_reuse_requires_new_uid() {
         WorkloadIdentity::pod("cluster-a", "api-7c9d", "production", "uid-2222");
     let same_uid = WorkloadIdentity::pod("cluster-a", "api-7c9d", "production", "uid-1111");
     assert_ne!(
-        old.identity_key(),
-        same_name_new_uid.identity_key(),
+        old.identity_keys(),
+        same_name_new_uid.identity_keys(),
         "name reuse with a new UID must not reuse the identity"
     );
     assert_eq!(
-        old.identity_key(),
-        same_uid.identity_key(),
+        old.identity_keys(),
+        same_uid.identity_keys(),
         "same UID keeps the identity"
     );
     assert!(old.same_selection_name(&same_name_new_uid));

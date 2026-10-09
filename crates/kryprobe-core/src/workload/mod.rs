@@ -13,8 +13,12 @@ mod scope;
 mod snapshot;
 
 pub use context::{ContextIdentity, ContextQualification, ExecutionKind};
-pub use evidence::{AttributionEvidence, AttributionStatus, WorkloadOrigin};
-pub use identity::{JoinQualification, WorkloadIdentity, qualify_join};
+pub use evidence::{
+    AttributionEvidence, AttributionStatus, WorkloadOrigin, METHOD_CAPTURED_CGROUP,
+    METHOD_CGROUP_INODE_BIND, METHOD_METADATA_FILE, METHOD_METADATA_LABEL, METHOD_RUNTIME_ADAPTER,
+    METHOD_UNRESOLVED,
+};
+pub use identity::{ContainerRef, IdentityKey, JoinQualification, PodRef, WorkloadIdentity, qualify_join};
 pub use scope::{ScopeDecision, ScopePartition};
 pub use snapshot::{
     MetadataUnavailable, SnapshotConsistency, SnapshotKey, SnapshotRequest, UnknownByDifference,
