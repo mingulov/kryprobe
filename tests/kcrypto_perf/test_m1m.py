@@ -1060,5 +1060,108 @@ class LabOracleTests(unittest.TestCase):
         self.assertEqual(a25.EXPECTED_EXITS["usage"], 2)
 
 
+class VerifyCellMTests(unittest.TestCase):
+    """G4/G6: verify_cell routes M sets end to end (quiet M,
+    workload-json dispatch, M overlay, M evidence). Seal,
+    receipts, and staged pins are stubbed (unit-covered
+    elsewhere); everything downstream runs for real."""
+
+    def _cell(self):
+        from unittest import mock
+
+        manifest = m1manifest.load_manifest(M1_MANIFEST)
+        entry = CLI.find_set(manifest, "m1-P-4K-single-mr")
+        tmp = Path(tempfile.mkdtemp())
+        legs = tmp / "legs"
+        legs.mkdir()
+        meta_sha, helper_sha = "m" * 64, "h" * 64
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": "7.0.14",
+                 "manifest_sha256": manifest["_manifest_sha256"],
+                 "sha256": {
+                     "obs-B/workload-metadata.json": meta_sha,
+                     "obs-B/kryprobe-workload-helper": helper_sha}}
+        (tmp / "stage.json").write_text(json.dumps(stage))
+        legs_tsv = []
+        for leg in CLI._gen_m1_legs(entry, manifest, 0,
+                                       entry["pairs"]):
+            legs_tsv.append("\t".join(str(leg[key]) for key in
+                                      ("leg_id", "side", "mode",
+                                       "cls", "driver", "size",
+                                       "workload", "paced", "bulk",
+                                       "threads")))
+        (tmp / "legs.tsv").write_text("\n".join(legs_tsv) + "\n")
+        quiet = _wreport(system=0, perctx=0, calls=(),
+                         status="unavailable",
+                         reason="parse_failed",
+                         metadata_cov="unavailable")
+        (tmp / "quiet-report.workload-json").write_text(
+            json.dumps(quiet))
+        summary = {"ops_total": 50, "ops_meas": 50,
+                   "rows_meas": 100, "meas_window_s": 30,
+                   "t_warm_start_ns": 0,
+                   "t_meas_start_ns": 10_000_000_000,
+                   "rc": 0, "fails": 0, "late": 0, "paced": 0,
+                   "threads": 1}
+        (legs / "leg00B-driver.csv.summary.json").write_text(
+            json.dumps(summary))
+        (legs / "leg00B-driver-rc.txt").write_text(
+            "driver_rc=0\ndriver_timeout=0\n")
+        rows = ["seq,phase,op,dt_ns"]
+        for seq in range(50):
+            rows.append(f"{seq},meas,encrypt,1000")
+            rows.append(f"{seq},meas,decrypt,1000")
+        (legs / "leg00B-driver.csv").write_text("\n".join(rows)
+                                                + "\n")
+        (legs / "leg00B-capture-rc.txt").write_text(
+            "capture_rc=3\n")
+        (legs / "leg00B-report.workload-json").write_text(
+            json.dumps(_wreport()))
+        (legs / "leg00B-capture.stderr.log").write_text(
+            "kryprobe: telemetry "
+            + json.dumps({"v": 1, "ctx": _ctx(3, 100, 100, 0, 0)})
+            + "\n")
+        (legs / "leg00B-m.json").write_text(json.dumps(
+            {"schema": "kryprobe-m1-mleg/v1", "leg_id": "leg00B",
+             "side": "B", "obs": "M",
+             "metadata_sha256": meta_sha,
+             "helper_sha256": helper_sha, "principal_uid": 1000}))
+        patches = [
+            mock.patch.object(CLI._CLI, "verify_cell_seal",
+                              return_value=(True, {})),
+            mock.patch.object(CLI, "check_run_receipts",
+                              return_value=([], {})),
+            mock.patch.object(CLI, "check_m1_stage_pins",
+                              return_value=([], {}))]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return tmp, manifest
+
+    def test_m_set_routes_end_to_end(self):
+        cell, manifest = self._cell()
+        verdict = CLI.verify_cell(cell, manifest)
+        self.assertEqual(verdict["errors"], [])
+        self.assertTrue(verdict["quiet"]["valid"])
+        by_id = {leg["leg_id"]: leg for leg in verdict["legs"]}
+        self.assertEqual(len(by_id), 20)
+        m_leg = by_id["leg00B"]
+        self.assertTrue(m_leg["valid"], m_leg["reasons"])
+        self.assertEqual(m_leg["observer"]["wl_metadata_status"],
+                         "available")
+        self.assertAlmostEqual(m_leg["unknown_fraction"], 0.0)
+        # Siblings lack sealed files: invalid, never a crash.
+        self.assertFalse(by_id["leg00A"]["valid"])
+
+    def test_m_set_quiet_ambient_poison(self):
+        cell, manifest = self._cell()
+        (cell / "quiet-report.workload-json").write_text(
+            json.dumps(_wreport(system=7, perctx=7, calls=(7,))))
+        verdict = CLI.verify_cell(cell, manifest)
+        self.assertTrue(verdict["spec_boot_invalid"])
+        by_id = {leg["leg_id"]: leg for leg in verdict["legs"]}
+        self.assertFalse(by_id["leg00B"]["valid"])
+
+
 if __name__ == "__main__":
     unittest.main()
