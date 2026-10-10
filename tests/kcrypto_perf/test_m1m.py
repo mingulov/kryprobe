@@ -998,5 +998,67 @@ class LabJourneyTests(unittest.TestCase):
             common.reconcile_cgroup(ops=100, enc=100, dec=99))
 
 
+class LabOracleTests(unittest.TestCase):
+    """G11: pure oracle helpers (host-runnable halves)."""
+
+    def _common(self):
+        spec = importlib.util.spec_from_file_location(
+            "workload_lab_common",
+            str(WORKLOAD_LAB / "common.py"))
+        common = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(common)
+        return common
+
+    def _a25(self):
+        import os
+
+        sys.path.insert(0, str(WORKLOAD_LAB))
+        os.environ.setdefault("WORKLOAD_LAB_IMPORT", "1")
+        spec = importlib.util.spec_from_file_location(
+            "workload_lab_a25", str(WORKLOAD_LAB / "a25.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_inventory_diff_clean(self):
+        common = self._common()
+        before = {"containers": ["db"], "networks": ["bridge"]}
+        after = {"containers": ["db", "kryprobe-m1-05-a"],
+                 "networks": ["bridge"]}
+        self.assertEqual(common.diff_inventory(before, after), [])
+
+    def test_inventory_diff_unrelated(self):
+        common = self._common()
+        before = {"containers": []}
+        after = {"containers": ["someone-elses-db"]}
+        self.assertTrue(common.diff_inventory(before, after))
+
+    def test_proc_exited_self_alive(self):
+        import os
+
+        common = self._common()
+        self.assertFalse(common.proc_exited(os.getpid()))
+        self.assertTrue(common.proc_exited(2 ** 30))
+
+    def test_offline_report_check_happy(self):
+        a25 = self._a25()
+        self.assertEqual(a25.check_workload_report(_wreport()), [])
+
+    def test_offline_report_check_sad(self):
+        a25 = self._a25()
+        doc = _wreport()
+        doc["ledger"]["per_context_sum"] = "7"
+        self.assertTrue(a25.check_workload_report(doc))
+        doc = _wreport()
+        del doc["ledger"]
+        self.assertTrue(a25.check_workload_report(doc))
+
+    def test_exit_table(self):
+        a25 = self._a25()
+        self.assertEqual(a25.EXPECTED_EXITS["violation"], 10)
+        self.assertEqual(a25.EXPECTED_EXITS["cannot-establish"], 3)
+        self.assertEqual(a25.EXPECTED_EXITS["usage"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

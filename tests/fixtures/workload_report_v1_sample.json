@@ -1,0 +1,50 @@
+{
+  "schema": "kryprobe.workload-report.v1",
+  "session": {
+    "session_id": "0123456789abcdef0123456789abcdef",
+    "kernel_identity": "7.0.14/sample"
+  },
+  "interval": {
+    "start_ns": "100",
+    "end_ns": "200",
+    "consistency": "unproven"
+  },
+  "profile": "api-returns",
+  "boundary": "api_return",
+  "contexts": [
+    {
+      "kh": "7",
+      "cgroup_id": "43812",
+      "tgid": 1000,
+      "uid": 1000,
+      "start_ns": "555",
+      "execution_kind": "proc",
+      "calls": "50",
+      "workload": null,
+      "attribution": null
+    },
+    {
+      "kh": "9",
+      "cgroup_id": "43813",
+      "tgid": 1001,
+      "uid": 1000,
+      "start_ns": "556",
+      "execution_kind": "proc",
+      "calls": "50",
+      "workload": null,
+      "attribution": null
+    }
+  ],
+  "partition": {
+    "matched": "100",
+    "nonmatched": "0",
+    "unknown_match": "0"
+  },
+  "selectors": {},
+  "coverage": {
+    "capture": "partial",
+    "attribution": "partial",
+    "metadata": "unavailable",
+    "correlation": "complete"
+  }
+}
