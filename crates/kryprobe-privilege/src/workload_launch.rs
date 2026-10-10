@@ -858,8 +858,11 @@ fn spawn_confined(
 ) -> std::io::Result<std::process::Child> {
     // Ownership BEFORE spawning: normalize an inherited auto-reaping
     // SIGCHLD disposition so this child is always waitable — the
-    // zombie anchors every kill path.
-    ensure_waitable_sigchld();
+    // zombie anchors every kill path. A failed normalization refuses
+    // BEFORE any child exists (callers map the error to a typed
+    // refusal): an unwaitable child would leave every kill path
+    // aiming at plain numbers.
+    ensure_waitable_sigchld()?;
     let fd = pinned.as_raw_fd();
     debug_assert!(fd >= 3, "image fd parks above stdio");
     let exec_path = format!("/proc/self/fd/{fd}");
@@ -932,23 +935,64 @@ enum DrainOutcome {
 /// disposition at child-exit time governs auto-reap, so restoring
 /// `SIG_IGN` before the reap would lose ownership again. `SIG_DFL`
 /// for `SIGCHLD` discards the signal yet keeps the zombie waitable.
-fn ensure_waitable_sigchld() {
-    // SAFETY: sigaction query, then (only for auto-reaping
-    // configurations) install of plain SIG_DFL on SIGCHLD.
-    unsafe {
+/// Returns `Err` when the install fails (e.g. a seccomp
+/// `SECCOMP_RET_ERRNO` filter failing the syscall): the caller
+/// refuses to spawn, since a child spawned under a still-auto-reaping
+/// disposition would be unwaitable.
+fn ensure_waitable_sigchld() -> std::io::Result<()> {
+    // SAFETY: sigaction query only.
+    let needs_install = unsafe {
         let mut current: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) == 0
-            && current.sa_sigaction != libc::SIG_IGN
-            && (current.sa_flags & libc::SA_NOCLDWAIT) == 0
-        {
-            return;
-        }
+        libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) != 0
+            || current.sa_sigaction == libc::SIG_IGN
+            || (current.sa_flags & libc::SA_NOCLDWAIT) != 0
+    };
+    if !needs_install {
+        return Ok(());
+    }
+    install_waitable_sigchld()
+}
+
+/// Install plain `SIG_DFL` for `SIGCHLD` ([`ensure_waitable_sigchld`]
+/// decided it is needed). The install result is authoritative: `Err`
+/// (with the install `errno`) refuses the spawn.
+fn install_waitable_sigchld() -> std::io::Result<()> {
+    if sigchld_install_fault_injected() {
+        // Simulated `SECCOMP_RET_ERRNO`-style install failure (see
+        // the seam below): the refusal path below is production code.
+        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    }
+    // SAFETY: sigaction install of plain SIG_DFL on SIGCHLD.
+    unsafe {
         let mut dfl: libc::sigaction = std::mem::zeroed();
         dfl.sa_sigaction = libc::SIG_DFL;
         libc::sigemptyset(&mut dfl.sa_mask);
         dfl.sa_flags = 0;
-        let _ = libc::sigaction(libc::SIGCHLD, &dfl, std::ptr::null_mut());
+        if libc::sigaction(libc::SIGCHLD, &dfl, std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
+    Ok(())
+}
+
+/// Test-only fault injection for [`install_waitable_sigchld`]: a real
+/// install with valid arguments fails only under adversarial
+/// conditions (e.g. a seccomp `SECCOMP_RET_ERRNO` filter), which no
+/// test can arrange without harming the production syscall shape —
+/// so the test build reads one opt-in variable at the install call
+/// site and the production build hard-codes `false` (no environment
+/// read, identical syscall sequence). The seam injects AT the
+/// syscall boundary; the error return and the refuse-before-spawn
+/// propagation it exercises are production code.
+#[cfg(test)]
+fn sigchld_install_fault_injected() -> bool {
+    std::env::var_os("KRYPROBE_LAUNCH_FAIL_SIGCHLD_INSTALL").is_some_and(|v| v == "1")
+}
+
+/// Production build: fault injection is absent (see above).
+#[cfg(not(test))]
+fn sigchld_install_fault_injected() -> bool {
+    false
 }
 
 /// Whether the child is still waitable (owned): raw `waitid` with
@@ -956,10 +1000,44 @@ fn ensure_waitable_sigchld() {
 /// `ECHILD` — ownership lost (an external reap; inherited auto-reap
 /// cannot happen once [`spawn_confined`] normalizes the
 /// disposition), after which its pid/pgid are plain numbers reuse
-/// can reassign. Every other outcome (running, zombie, transient
-/// `EINTR`) keeps ownership: only a reap destroys it, and this probe
-/// never reaps.
+/// can reassign. Success (running or zombie) keeps ownership;
+/// interruptions retry to a verdict; `ECHILD`, `ESRCH`, and EVERY
+/// other errno fail closed (no signals): ownership is lost or —
+/// worse — unproven, and an unproven pid/pgid may already name
+/// strangers.
 fn child_still_waitable(child: &std::process::Child) -> bool {
+    converge_ownership(|| probe_child_once(child.id()))
+}
+
+/// Meaning of one failed ownership probe: interruptions carry no
+/// verdict (retry); anything else is lost-or-unproven (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailure {
+    /// Interrupted before any verdict — retry the probe.
+    Interrupted,
+    /// Ownership lost (reaped/gone) or unprovable — never signal.
+    Unowned,
+}
+
+/// Classify one failed `waitid` ownership probe by `errno`:
+/// `EINTR` retries; `ECHILD` (reaped) and `ESRCH` (gone) are
+/// ownership loss; every other `errno` is ownership UNPROVEN — fail
+/// closed. Pure (no syscalls) so the mapping itself is
+/// unit-testable: real `waitid` on Linux reports non-children as
+/// `ECHILD` (see `wait(2)`), so `ESRCH`/other errnos are not
+/// constructible through the syscall itself.
+fn classify_probe_failure(errno: libc::c_int) -> ProbeFailure {
+    if errno == libc::EINTR {
+        ProbeFailure::Interrupted
+    } else {
+        ProbeFailure::Unowned
+    }
+}
+
+/// One raw `waitid` ownership probe (never reaps): `Ok(())` while
+/// the child is still ours (running or zombie); failures classified
+/// by [`classify_probe_failure`].
+fn probe_child_once(pid: u32) -> Result<(), ProbeFailure> {
     // SAFETY: zeroed siginfo out-param; `WNOHANG` leaves `si_pid`
     // zero when nothing exited; `WNOWAIT` never reaps.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -967,15 +1045,33 @@ fn child_still_waitable(child: &std::process::Child) -> bool {
     let waited = unsafe {
         libc::waitid(
             libc::P_PID,
-            child.id(),
+            pid,
             &mut info,
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )
     };
     if waited == 0 {
-        return true;
+        return Ok(());
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
+    // `last_os_error` always carries a code on Unix; the fallback is
+    // unreachable — and it fails closed (`ECHILD` is unowned).
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::ECHILD);
+    Err(classify_probe_failure(errno))
+}
+
+/// Retry one-shot ownership probes through interruptions to a
+/// verdict: only a clean probe proves ownership; a lost-or-unproven
+/// verdict fails closed.
+fn converge_ownership(mut probe: impl FnMut() -> Result<(), ProbeFailure>) -> bool {
+    loop {
+        match probe() {
+            Ok(()) => return true,
+            Err(ProbeFailure::Interrupted) => continue,
+            Err(ProbeFailure::Unowned) => return false,
+        }
+    }
 }
 
 /// Kill the whole child process group and reap the direct child
@@ -992,10 +1088,19 @@ fn child_still_waitable(child: &std::process::Child) -> bool {
 /// this runs); the probe is the backstop for reaps this code did not
 /// perform.
 fn kill_and_reap(child: &mut std::process::Child) {
-    // Ownership gate: after ECHILD the numeric pid/pgid may already
-    // name strangers — NEVER signal them. Reap-only (the `Child`
-    // may still hold a cached status; `wait` then succeeds).
-    if !child_still_waitable(child) {
+    kill_and_reap_gated(child, child_still_waitable(child))
+}
+
+/// Kill path with a pre-converged ownership verdict: `false` (lost
+/// OR unproven) NEVER signals — reap-only (the `Child` may still
+/// hold a cached status; `wait` then succeeds). The verdict
+/// parameter is the canary-family seam: production always passes the
+/// real converged probe; tests drive `false` verdicts derived from
+/// each classified `errno` through this real gating code.
+fn kill_and_reap_gated(child: &mut std::process::Child, owned: bool) {
+    // Ownership gate: after ownership loss the numeric pid/pgid may
+    // already name strangers — NEVER signal them.
+    if !owned {
         let _ = child.wait();
         return;
     }
@@ -1689,8 +1794,10 @@ mod tests {
     /// Built fixture binary:
     /// `<target>/debug/examples/kryprobe_launch_fixture` next to the
     /// test executable's `deps` dir. The fixture is a Cargo *example*
-    /// (test-only by construction: `cargo build` never produces it,
-    /// `cargo install` never ships it). Every all-target `cargo test`
+    /// (test-only by construction: default `cargo build` never
+    /// produces it, default `cargo install` never ships it — only
+    /// explicit `--example` selection builds it). Every all-target
+    /// `cargo test`
     /// builds it (including the `xtask check` gate); focused
     /// `--lib`/`--test` runs must build it first (`cargo build -p
     /// kryprobe-privilege --example kryprobe_launch_fixture`) — the
@@ -2973,6 +3080,418 @@ mod tests {
             .filter_map(|path| std::fs::canonicalize(path).ok())
             .find_map(|path| pin_helper(&path).ok())
             .expect("a pinnable sleep exists")
+    }
+
+    /// C4-review oracle (item 1): a failed SIGCHLD normalization
+    /// refuses BEFORE any child exists. The probe re-execs this test
+    /// binary twice (unique filter + one thread, like the closed-stdio
+    /// oracle): the refusal child (fault ON) installs `SIG_IGN`
+    /// directly — it is single-purpose, so no sibling test shares
+    /// its process — and must observe a typed refusal plus an
+    /// untouched spawn sentinel; the control child (fault OFF) must
+    /// spawn and serve cleanly. (RED pre-fix: the fault is ignored,
+    /// the refusal spawn succeeds, the child exits nonzero.)
+    #[test]
+    fn sigchld_normalization_failure_refuses_before_spawn() {
+        if std::env::var("KRYPROBE_LAUNCH_SIGCHLD_FAIL_CHILD").is_ok() {
+            sigchld_normalization_failure_child();
+            return;
+        }
+        sigchld_normalization_failure_parent();
+    }
+
+    /// Normalization-failure child: install the hostile
+    /// disposition (this re-exec child is single-purpose — no
+    /// sibling test shares its process), then run the refusal probe
+    /// or the positive-control probe according to the inherited
+    /// fault flag (set only via the parent's spawn environment —
+    /// never mutated in-process).
+    fn sigchld_normalization_failure_child() {
+        let helper = std::env::var("KRYPROBE_LAUNCH_SIGCHLD_FAIL_HELPER").expect("helper path");
+        let log = std::env::var("KRYPROBE_LAUNCH_SIGCHLD_FAIL_LOG").expect("log path");
+        // Hostile disposition, installed directly: this re-exec
+        // child is single-purpose, so no sibling test can observe
+        // the process-global window.
+        // SAFETY: sigaction install + query on SIGCHLD in this probe child.
+        unsafe {
+            let mut ign: libc::sigaction = std::mem::zeroed();
+            ign.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ign.sa_mask);
+            ign.sa_flags = 0;
+            assert_eq!(
+                libc::sigaction(libc::SIGCHLD, &ign, std::ptr::null_mut()),
+                0,
+                "probe installs SIG_IGN"
+            );
+            let mut current: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current),
+                0,
+                "can query SIGCHLD disposition"
+            );
+            assert_eq!(
+                current.sa_sigaction,
+                libc::SIG_IGN,
+                "normalization is genuinely needed (no vacuous green)"
+            );
+        }
+        if std::env::var("KRYPROBE_LAUNCH_FAIL_SIGCHLD_INSTALL").is_ok_and(|v| v == "1") {
+            sigchld_failure_refusal_probe(Path::new(&helper), Path::new(&log));
+        } else {
+            sigchld_failure_control_probe(Path::new(&helper), Path::new(&log));
+        }
+    }
+
+    /// Shell probe command for the normalization-failure oracles:
+    /// any spawn of it touches `sentinel` (argv-carried path — no
+    /// shell quoting). Returns the open image, its path, and argv.
+    fn sigchld_failure_touch_command(sentinel: &Path) -> (std::fs::File, PathBuf, [String; 4]) {
+        let sh_path = ["/bin/sh", "/usr/bin/sh"]
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .next()
+            .expect("a shell exists");
+        let sh_image = std::fs::File::open(&sh_path).expect("shell opens");
+        let args = [
+            "-c".to_string(),
+            "touch \"$1\"".to_string(),
+            "sh".to_string(),
+            sentinel.to_string_lossy().into_owned(),
+        ];
+        (sh_image, sh_path, args)
+    }
+
+    /// Refusal probe (fault ON): normalization is needed but the
+    /// install fails → typed refusal, zero spawns — through both
+    /// the choke point and the public serve path.
+    fn sigchld_failure_refusal_probe(helper: &Path, log: &Path) {
+        let scratch =
+            kryprobe_testkit::TempDir::named("launch-sigchld-fail-child").expect("scratch");
+        let sentinel = scratch.path().join("spawned");
+        let (sh_image, sh_path, touch_args) = sigchld_failure_touch_command(&sentinel);
+        let refused = spawn_confined(&sh_image, &sh_path, &touch_args, Stdio::null(), None);
+        assert!(
+            refused.is_err(),
+            "failed normalization refuses before spawn: {refused:?}"
+        );
+        // Grace window: a spawn would have touched the sentinel in
+        // milliseconds; its continued absence proves zero spawns.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !sentinel.exists(),
+            "refused spawn leaves zero processes (sentinel untouched)"
+        );
+        // Same refusal through the public serve path: typed
+        // (`HelperRefused`) and never retried. Zero-spawn follows
+        // from the choke-point proof above (one `spawn_confined`).
+        let principal = current_principal().expect("test principal");
+        let serve_result = serve_snapshot_with_bound(
+            helper,
+            &principal,
+            None,
+            &test_request(),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            serve_result,
+            Err(MetadataUnavailable::HelperRefused),
+            "failed normalization is a typed serve refusal"
+        );
+        std::fs::write(log, format!("refused={refused:?} serve={serve_result:?}"))
+            .expect("probe log");
+    }
+
+    /// Positive-control probe (fault OFF): the same spawns succeed
+    /// under the same hostile disposition, so the refusals above
+    /// came from the injected install failure — and the sentinel
+    /// mechanism genuinely detects spawns.
+    fn sigchld_failure_control_probe(helper: &Path, log: &Path) {
+        let scratch =
+            kryprobe_testkit::TempDir::named("launch-sigchld-fail-control").expect("scratch");
+        let sentinel = scratch.path().join("spawned");
+        let (sh_image, sh_path, touch_args) = sigchld_failure_touch_command(&sentinel);
+        let mut spawned = spawn_confined(&sh_image, &sh_path, &touch_args, Stdio::null(), None)
+            .expect("spawn succeeds without the fault");
+        let status = spawned.wait().expect("reaps");
+        assert!(status.success(), "sentinel command exits cleanly");
+        assert!(sentinel.exists(), "sentinel detects a real spawn (control)");
+        let principal = current_principal().expect("test principal");
+        let response = serve_snapshot_with_bound(
+            helper,
+            &principal,
+            None,
+            &test_request(),
+            Duration::from_secs(10),
+        )
+        .expect("serve answers without the fault");
+        assert_eq!(response.session_id, SESSION);
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, 42);
+        std::fs::write(log, format!("control ok: session {}", response.session_id))
+            .expect("probe log");
+    }
+
+    /// Normalization-failure parent: stage the canned fixture, run
+    /// the refusal child (fault ON) then the control child (fault
+    /// OFF), bound both waits, quote both logs.
+    fn sigchld_normalization_failure_parent() {
+        const PROBE: &str = "sigchld_normalization_failure_refuses_before_spawn";
+        let scratch = kryprobe_testkit::TempDir::named("launch-sigchld-fail").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json"}),
+        );
+        let log_path = scratch.path().join("probe.log");
+        let test_exe = std::env::current_exe().expect("test exe");
+        for (label, fault) in [("refusal", true), ("control", false)] {
+            let mut command = Command::new(&test_exe);
+            command
+                .arg(PROBE)
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env("KRYPROBE_LAUNCH_SIGCHLD_FAIL_CHILD", "1")
+                .env("KRYPROBE_LAUNCH_SIGCHLD_FAIL_HELPER", &helper)
+                .env("KRYPROBE_LAUNCH_SIGCHLD_FAIL_LOG", &log_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if fault {
+                command.env("KRYPROBE_LAUNCH_FAIL_SIGCHLD_INSTALL", "1");
+            }
+            let mut child = command.spawn().expect("probe child spawns");
+            let status = wait_bounded(&mut child, Duration::from_secs(30));
+            let probe_log =
+                std::fs::read_to_string(&log_path).unwrap_or_else(|_| "(no probe log)".to_string());
+            let Some(status) = status else {
+                panic!("sigchld-failure {label} child timed out (log: {probe_log})");
+            };
+            assert!(
+                status.success(),
+                "sigchld-failure {label} child succeeds (child {status}, probe: {probe_log})"
+            );
+        }
+    }
+
+    /// C4-review oracle (item 2): probe-`errno` classification fails
+    /// closed — interruptions retry, EVERYTHING else (reaped, gone,
+    /// or unproven) is unowned. Pure mapping, exhaustive over the
+    /// errnos that matter.
+    #[test]
+    fn probe_errno_classification_fails_closed() {
+        assert_eq!(
+            classify_probe_failure(libc::EINTR),
+            ProbeFailure::Interrupted,
+            "interruption retries"
+        );
+        for errno in [
+            libc::ECHILD,
+            libc::ESRCH,
+            libc::EINVAL,
+            libc::EPERM,
+            libc::EACCES,
+            libc::EFAULT,
+        ] {
+            assert_eq!(
+                classify_probe_failure(errno),
+                ProbeFailure::Unowned,
+                "errno {errno} fails closed"
+            );
+        }
+    }
+
+    /// C4-review oracle (item 2): convergence retries interruptions
+    /// and still converges — to owned after a clean probe, to
+    /// unowned after a terminal verdict — and a terminal verdict
+    /// never re-probes.
+    #[test]
+    fn probe_convergence_retries_interruptions() {
+        let mut script = [
+            Err(ProbeFailure::Interrupted),
+            Err(ProbeFailure::Interrupted),
+            Ok(()),
+        ]
+        .into_iter();
+        assert!(
+            converge_ownership(|| script.next().expect("scripted probe")),
+            "interruptions converge to the eventual verdict"
+        );
+        let mut script = [Err(ProbeFailure::Interrupted), Err(ProbeFailure::Unowned)].into_iter();
+        assert!(
+            !converge_ownership(|| script.next().expect("scripted probe")),
+            "interruption then loss converges to unowned"
+        );
+        assert!(
+            !converge_ownership({
+                let mut calls = 0u32;
+                move || {
+                    calls += 1;
+                    assert_eq!(calls, 1, "a terminal verdict never re-probes");
+                    Err(classify_probe_failure(libc::ESRCH))
+                }
+            }),
+            "ESRCH converges to unowned without re-probing"
+        );
+    }
+
+    /// Positive control for the real probe path: a live child probes
+    /// owned, a reaped child probes lost (`ECHILD`).
+    #[test]
+    fn ownership_probe_follows_real_waitid() {
+        let sleep = pinnable_sleep();
+        let image = sleep.reopen().expect("sleep reopens");
+        let mut child = spawn_confined(
+            &image,
+            &sleep.path,
+            &["30".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("spawns");
+        assert!(child_still_waitable(&child), "live child probes owned");
+        child.kill().expect("dies");
+        child.wait().expect("reaps");
+        assert!(!child_still_waitable(&child), "reaped child probes lost");
+    }
+
+    /// C4-review oracle (item 2, `ESRCH` representative): a
+    /// fail-closed verdict never signals — even while the leader's
+    /// pid is STILL OURS (dead-but-unreaped zombie, group held by
+    /// the canary). The verdict travels from the scripted `errno`
+    /// through the REAL classifier + convergence loop into the REAL
+    /// kill gate; only the `waitid`-returns-`ESRCH` link is
+    /// unconstructible on Linux (`wait(2)` reports non-children as
+    /// `ECHILD`), so it is documented, not mocked.
+    #[test]
+    fn fail_closed_esrch_verdict_signals_nothing() {
+        canary_survives_fail_closed_verdict(libc::ESRCH, "ESRCH");
+    }
+
+    /// C4-review oracle (item 2, non-`EINTR` unknown-`errno`
+    /// representative): same proof for an unproven-ownership
+    /// `errno` (`EINVAL`).
+    #[test]
+    fn fail_closed_unknown_errno_verdict_signals_nothing() {
+        canary_survives_fail_closed_verdict(libc::EINVAL, "EINVAL");
+    }
+
+    /// Shared canary body for the fail-closed verdict oracles:
+    /// leader killed but left unreaped (zombie — still provably
+    /// ours), canary holding membership in the leader's group; the
+    /// gated cleanup with the `errno`-derived verdict must send
+    /// nothing for a full 1 s window. A closing `killpg` on the dead
+    /// pgid is the sensitivity control: it MUST reach the canary,
+    /// proving the window detects signaling (the exact pre-fix RED
+    /// mechanism, on purpose).
+    fn canary_survives_fail_closed_verdict(errno: libc::c_int, label: &str) {
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["30".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("leader spawns");
+        let leader_id = leader.id();
+        let leader_pid = leader_id as libc::pid_t;
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "{label}: leader really alive"
+        );
+        // Canary: raw spawn (test scaffolding, not the launcher —
+        // only its group membership matters), joining the leader's
+        // group in `pre_exec` (before its own exec).
+        let mut canary_command = Command::new(&leader_bin.path);
+        canary_command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: pre_exec setpgid-on-self only (async-signal-safe).
+        unsafe {
+            canary_command.pre_exec(move || {
+                if libc::setpgid(0, leader_pid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut canary = canary_command.spawn().expect("canary spawns");
+        // Setup proof (no vacuous green): the canary really joined
+        // the leader's group ...
+        assert_eq!(
+            // SAFETY: getpgid on a live direct child pid.
+            unsafe { libc::getpgid(canary.id() as libc::pid_t) },
+            leader_pid,
+            "{label}: canary holds membership in the leader's group"
+        );
+        // ... then the leader is killed but NOT reaped: a zombie
+        // still provably ours (the peek never reaps — `try_wait`
+        // here would reap it).
+        leader.kill().expect("leader dies");
+        let death_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if peek_child_exited(&leader).expect("peek") {
+                break;
+            }
+            assert!(
+                Instant::now() < death_deadline,
+                "{label}: leader dies promptly"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The verdict: scripted errno through the REAL classifier +
+        // convergence loop (a terminal verdict must not re-probe).
+        let owned = converge_ownership({
+            let mut calls = 0u32;
+            move || {
+                calls += 1;
+                assert_eq!(calls, 1, "{label}: terminal verdict never re-probes");
+                Err(classify_probe_failure(errno))
+            }
+        });
+        assert!(!owned, "{label}: verdict fails closed");
+        // The oracle: gated cleanup sends nothing — the canary stays
+        // alive for a full window (SIGKILL delivery is near-instant,
+        // so any signaling would show long before the window lapses).
+        kill_and_reap_gated(&mut leader, owned);
+        let window = Instant::now() + Duration::from_secs(1);
+        loop {
+            assert_eq!(
+                canary.try_wait().expect("try_wait"),
+                None,
+                "{label}: canary survives fail-closed cleanup"
+            );
+            if Instant::now() >= window {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Sensitivity control: the same `killpg` the gate just
+        // refused MUST reach the canary now — proving the window
+        // above detects signaling (the pre-fix RED mechanism).
+        // SAFETY: killpg on the dead leader's group, held only by our canary.
+        unsafe {
+            libc::killpg(leader_pid, libc::SIGKILL);
+        }
+        let gone_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if canary.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < gone_deadline,
+                "{label}: control killpg reaches the canary"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = canary.wait();
     }
 
     #[test]

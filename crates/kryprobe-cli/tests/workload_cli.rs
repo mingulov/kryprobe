@@ -268,8 +268,10 @@ fn finish_opts() -> WorkloadFinishOpts {
 
 /// Built launch fixture binary (`kryprobe-privilege` Cargo example,
 /// next to this test executable's `deps` dir). The example location
-/// is the test-only gate (`cargo build` never produces it, `cargo
-/// install` never ships it). Every all-target `cargo test` builds it
+/// is the test-only gate (default `cargo build` never produces it,
+/// default `cargo install` never ships it — only explicit
+/// `--example` selection builds it). Every all-target `cargo test`
+/// builds it
 /// (including the `xtask check` gate); focused `--test` runs must
 /// build it first (`cargo build -p kryprobe-privilege --example
 /// kryprobe_launch_fixture`) — the assert says so loudly.
