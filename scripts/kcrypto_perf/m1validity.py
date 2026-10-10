@@ -280,6 +280,19 @@ def check_m_report(parsed: dict, shape: str) -> list:
     return reasons
 
 
+def unknown_fraction(ctx: dict):
+    """Unknown-attribution fraction for one observed leg (Task05
+    Stage 4, freeze G8): unknown_calls / system_calls from the
+    sealed terminal ctx object, computed at report time. None
+    when either operand is unreadable (null) or the system is 0
+    (no population — never 0/0). Recorded, never gated."""
+    system = ctx["system_calls"]
+    unknown = ctx["unknown_calls"]
+    if system is None or unknown is None or system == 0:
+        return None
+    return unknown / system
+
+
 def check_m_cross(parsed: dict, ctx: dict) -> list:
     """Same-walk ledger↔ctx cross-equalities for one M leg (freeze
     G4). The workload join and the terminal ctx line walk the same

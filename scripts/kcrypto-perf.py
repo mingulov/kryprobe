@@ -1690,6 +1690,7 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["reasons"] = judged.get("reasons", []) + [str(err)]
         return judged
     judged["ctx"] = ctx
+    judged["unknown_fraction"] = km1validity.unknown_fraction(ctx)
     report_path = legs_dir / f"{leg['leg_id']}-report.json"
     try:
         parsed = kparsers.parse_api_returns(report_path)
@@ -1764,6 +1765,7 @@ def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["reasons"] = judged.get("reasons", []) + [str(err)]
         return judged
     judged["ctx"] = ctx
+    judged["unknown_fraction"] = km1validity.unknown_fraction(ctx)
     reasons = km1validity.check_m_cross(parsed, ctx)
     if reasons:
         judged["valid"] = False
@@ -1865,6 +1867,7 @@ def apply_m1_diag_overlay(cell_dir: Path, judged: dict,
         return judged
     diag["ctx"] = ctx
     judged["ctx"] = ctx
+    judged["unknown_fraction"] = km1validity.unknown_fraction(ctx)
     report_path = legs_dir / f"{leg['leg_id']}-report.json"
     try:
         parsed = kparsers.parse_api_returns(report_path)
