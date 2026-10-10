@@ -1733,14 +1733,25 @@ impl kryprobe_cli::live::SessionSensor for MidStopSensor {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         // Deterministic rendezvous (Stage 3 item 8): the third tick
-        // waits for the stop flag instead of racing it. The spawner
-        // sets stop exactly when it observes tick 3, so the driver
-        // can serve neither fewer (stop needs tick 3) nor more (stop
-        // lands before tick 3 returns, and nothing clears it). No
-        // timeouts, no sleeps: progress is guaranteed by
-        // construction on both sides of the rendezvous.
+        // waits for the driver's own stop disjunction instead of
+        // racing it. The spawner latches its channel — the stop flag
+        // (stop test) or SIGINT_SEEN (interrupted test) — exactly
+        // when it observes tick 3, so the driver can serve neither
+        // fewer (the latch needs tick 3) nor more (the latch lands
+        // before tick 3 returns, and nothing clears it). No sleeps:
+        // progress is guaranteed by construction on both sides of
+        // the rendezvous; the 60 s bound is a deadlock guard that
+        // fails loudly, never a synchronization timeout.
         if served == 3 {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let start = std::time::Instant::now();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed)
+                && !kryprobe_privilege::host::SIGINT_SEEN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(60),
+                    "tick-3 rendezvous: neither stop nor SIGINT latched within 60s"
+                );
                 std::thread::yield_now();
             }
         }
