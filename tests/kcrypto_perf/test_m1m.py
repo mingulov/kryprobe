@@ -1008,8 +1008,8 @@ class LabJourneyTests(unittest.TestCase):
                          "--dry-run", "epipe")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for word in ("exit 1", "report: cannot write stdout",
-                     "attempts==1", "non-exited", "K seal",
-                     "--seal-file"):
+                     "os error 32", "attempts==1", "non-exited",
+                     "K seal", "--seal-file"):
             self.assertIn(word, proc.stdout)
 
     def test_a25_epipe_live_fails_closed_on_host(self):
@@ -1313,6 +1313,13 @@ class LabOracleTests(unittest.TestCase):
         reasons = a25.check_epipe_outcome(1, "wrote out.json\n", 1)
         self.assertTrue(
             any("marker" in reason for reason in reasons),
+            reasons)
+        # Marker without the EPIPE errno detail: still untyped.
+        reasons = a25.check_epipe_outcome(
+            1, "report: cannot write stdout: No space left on "
+            "device (os error 28)\n", 1)
+        self.assertTrue(
+            any("errno detail" in reason for reason in reasons),
             reasons)
 
     def test_epipe_outcome_attempts(self):

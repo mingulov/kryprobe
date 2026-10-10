@@ -55,6 +55,12 @@ EXPECTED_EXITS = {"complete": 0, "usage": 2, "cannot-establish": 3,
 # bare nonzero).
 EPIPE_STDERR_MARKER = "report: cannot write stdout"
 
+# The errno detail riding the marker on a readerless pipe (Rust
+# std Display for ErrorKind::BrokenPipe — the mechanism can only
+# produce EPIPE, so the detail pins true-EPIPE, not just the torn
+# family).
+EPIPE_ERRNO_DETAIL = "Broken pipe (os error 32)"
+
 FROZEN_UNAVAILABLE = ("no_principal", "helper_refused",
                       "budget_exceeded", "unsupported_environment",
                       "parse_failed")
@@ -170,10 +176,11 @@ def check_epipe_seal(installed: dict, pins: dict) -> list:
 
 def check_epipe_outcome(rc: int, stderr: str, attempts: int) -> list:
     """Typed EPIPE oracle: exactly exit 1 (the exit family's
-    truncated-stdout member) plus the exact typed stderr marker,
-    on exactly one attempt (single-attempt semantics — no retry
-    pile-up). Exit 0 is the never-clean violation; any other
-    nonzero without the marker is untyped. Returns reasons
+    truncated-stdout member) plus the exact typed stderr marker
+    with the EPIPE errno detail, on exactly one attempt
+    (single-attempt semantics — no retry pile-up). Exit 0 is the
+    never-clean violation; any other nonzero, or the marker
+    without the errno detail, is untyped. Returns reasons
     (empty = typed refusal). Pure — host-tested."""
     reasons = []
     if attempts != 1:
@@ -189,6 +196,9 @@ def check_epipe_outcome(rc: int, stderr: str, attempts: int) -> list:
     if EPIPE_STDERR_MARKER not in stderr:
         reasons.append(f"stderr lacks typed marker "
                        f"{EPIPE_STDERR_MARKER!r}")
+    elif EPIPE_ERRNO_DETAIL not in stderr:
+        reasons.append(f"stderr lacks EPIPE errno detail "
+                       f"{EPIPE_ERRNO_DETAIL!r}")
     return reasons
 
 
@@ -265,9 +275,9 @@ DRY_RUN_STEPS = {
         "installed report --system to a readerless stdout pipe "
         "under M1-driver traffic (single attempt)",
         "oracle: exit 1 + typed 'report: cannot write stdout' "
-        "(never 0); attempts==1; traffic sentinel non-exited "
-        "after + ops > 0; installed bytes == K seal from "
-        "--seal-file",
+        "+ EPIPE os error 32 (never 0); attempts==1; traffic "
+        "sentinel non-exited after + ops > 0; installed bytes "
+        "== K seal from --seal-file",
     ],
 }
 
@@ -1023,6 +1033,9 @@ def journey_epipe(args) -> int:
                        "probe (setup inconclusive)")
     if summary["ops_total"] <= 0:
         raise LabError("traffic proof empty (no driver ops)")
+    # Exact-stderr evidence: the torn CLI's full stderr rides the
+    # copyback next to the receipt (pass or fail).
+    (args.out / "epipe-probe.stderr.log").write_text(stderr)
     reasons = check_epipe_outcome(proc.returncode, stderr,
                                   attempts)
     if reasons:
@@ -1034,6 +1047,8 @@ def journey_epipe(args) -> int:
                    "seal": "4/4 MATCH",
                    "rc": proc.returncode,
                    "stderr_marker": EPIPE_STDERR_MARKER,
+                   "stderr_errno": EPIPE_ERRNO_DETAIL,
+                   "stderr_file": "epipe-probe.stderr.log",
                    "wall_s": round(wall_s, 2),
                    "attempts": attempts,
                    "sentinel": "ALIVE(post-probe, non-exited)",
