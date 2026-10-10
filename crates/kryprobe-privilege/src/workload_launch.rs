@@ -40,6 +40,13 @@
 //!   principal, empty caps, `no_new_privs`, and the stdio-only fd set
 //!   before consuming any metadata. The serve response additionally
 //!   binds to its request ([`bind_response_to_request`]).
+//! - Transport (finding C1): one `poll` loop writes stdin while draining
+//!   stdout/stderr concurrently under a single overall deadline
+//!   covering spawn, writes, reads, and reap. No wait-before-drain
+//!   stall (a legal response larger than the pipe streams through)
+//!   and no unbounded EOF read (a descendant retaining a pipe
+//!   cannot outlive the deadline). Caps keep the old `cap + 1`
+//!   refusals; outcome classification is unchanged.
 //! - Retries: [`MAX_HELPER_RETRIES`] past the initial attempt, on
 //!   transport failures only (stall/crash). Typed helper refusals —
 //!   including identity-mismatch refusals — are deterministic and
@@ -74,9 +81,12 @@ pub const HELPER_FILE_NAME: &str = "kryprobe-workload-helper";
 /// helper-side timeouts, never the launcher's wait.
 pub const HELPER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Poll slice while waiting for the helper (bounded `try_wait` loop —
-/// the wait ends on child exit or the attempt timeout, never later).
-const WAIT_POLL: Duration = Duration::from_millis(10);
+/// Attest-stdout cap (one attestation line, never more).
+const ATTEST_STDOUT_CAP: usize = 4096;
+
+/// Stderr drain cap (attest ignores stderr content but must drain it:
+/// an undrained pipe stalls a chatty child exactly like stdout).
+const STDERR_DRAIN_CAP: usize = 65536;
 
 /// Pinned non-root principal: kernel UIDs/GIDs plus supplementary
 /// groups. Groups are pinned-but-retained: dropping them needs
@@ -557,16 +567,31 @@ pub fn parse_error_line(line: &str) -> Result<MetadataUnavailable, MetadataUnava
 /// Confine the child before `exec`: clear ambient caps, empty every
 /// capability set, set `no_new_privs`, close every fd except stdio
 /// and `keep` (the pinned executable fd — `CLOEXEC`, so it never
-/// survives `exec` into the helper). Runs in `pre_exec` (after
-/// `fork`, stdio already duped to 0/1/2): only async-signal-safe
-/// calls, no allocation. Any failure aborts the child before `exec`
-/// (the `Err` return blocks the exec).
+/// survives `exec` into the helper). `child_soft_limit` (tests only:
+/// production passes `None`) lowers the child's own `RLIMIT_NOFILE`
+/// soft ceiling before the close, proving the close never consults
+/// the limit — process-global lowering would starve parallel tests
+/// with `EMFILE`, so the limit applies to the child alone. Runs in
+/// `pre_exec` (after `fork`, stdio already duped to 0/1/2): only
+/// async-signal-safe calls, no allocation. Any failure aborts the
+/// child before `exec` (the `Err` return blocks the exec).
 ///
 /// # Safety
 ///
 /// Called by `std` in the child after `fork`; the body uses raw
 /// syscalls only.
-fn confine_child(keep: RawFd) -> std::io::Result<()> {
+fn confine_child(keep: RawFd, child_soft_limit: Option<u64>) -> std::io::Result<()> {
+    if let Some(soft) = child_soft_limit {
+        // SAFETY: getrlimit/setrlimit by value on stack memory only.
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        lim.rlim_cur = soft as libc::rlim_t;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     // Ambient first: clearing permitted sets while ambient bits linger
     // fails (ambient must stay within permitted+inheritable).
     // SAFETY: raw prctl numbers, no pointers.
@@ -701,15 +726,18 @@ impl CapData {
 /// affect which image runs), with `arg0` as the child's `argv[0]`
 /// (the verified path, never the fd spelling, so diagnostics name
 /// the real sibling). `stdin_mode` selects a piped stdin (serve) or
-/// null stdin (attest). Callers pass the fixed flag vocabulary only;
-/// `--metadata FILE` carries a launcher-CLI-selected path (never
-/// helper- or file-selected): the helper takes no executable paths
-/// and the launcher takes no metadata content.
+/// null stdin (attest). `child_soft_limit` lowers the child's own
+/// `RLIMIT_NOFILE` soft ceiling (tests only; production passes
+/// `None` — see [`confine_child`]). Callers pass the fixed flag
+/// vocabulary only; `--metadata FILE` carries a launcher-CLI-selected
+/// path (never helper- or file-selected): the helper takes no
+/// executable paths and the launcher takes no metadata content.
 fn spawn_confined(
     pinned: &std::fs::File,
     arg0: &Path,
     args: &[String],
     stdin_mode: Stdio,
+    child_soft_limit: Option<u64>,
 ) -> std::io::Result<std::process::Child> {
     let fd = pinned.as_raw_fd();
     debug_assert!(fd >= 3, "image fd parks above stdio");
@@ -724,60 +752,263 @@ fn spawn_confined(
     // SAFETY: `confine_child` is async-signal-safe (raw syscalls, no
     // allocation, no locks) as `pre_exec` requires; `fd` is `Copy`.
     unsafe {
-        command.pre_exec(move || confine_child(fd));
+        command.pre_exec(move || confine_child(fd, child_soft_limit));
     }
     command.spawn()
 }
 
-/// Wait for the child up to `bound`, polling in [`WAIT_POLL`] slices.
-/// A lapse kills the child, reaps it, and reports a stall (retryable
-/// transport failure — never a hang, never an orphan).
-fn wait_bounded(child: &mut std::process::Child, bound: Duration) -> WaitOutcome {
-    let start = Instant::now();
+/// One bounded stdin write: the pipe plus the bytes still to send.
+/// Dropped (EOF to the child) once everything is written — or on any
+/// write error (a broken pipe means the child died early; the exit
+/// status classifies it, exactly as before).
+struct StdinJob {
+    pipe: std::process::ChildStdin,
+    bytes: Vec<u8>,
+    written: usize,
+}
+
+/// Bounded-drain outcome (no exit codes escape: callers map these to
+/// typed unavailability with static detail, exactly as before).
+#[derive(Debug)]
+enum DrainOutcome {
+    /// Reaped exit status plus both drained pipes.
+    Done {
+        status: std::process::ExitStatus,
+        out: Vec<u8>,
+        err: Vec<u8>,
+    },
+    /// Stdout exceeded its cap (child killed and reaped).
+    OverCapStdout,
+    /// Stderr exceeded its cap (child killed and reaped).
+    OverCapStderr,
+    /// The deadline lapsed (child killed and reaped, retryable).
+    Stalled,
+    /// The wait itself failed (child killed and reaped, retryable).
+    WaitFailed,
+    /// A pipe read failed (child killed and reaped, deterministic).
+    ReadFailed,
+}
+
+/// Kill and reap unconditionally (never a hang, never an orphan).
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Mark one parent-side pipe fd nonblocking.
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl F_GETFL/F_SETFL on a live owned fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// One pipe's drain step.
+enum PipeOutcome {
+    /// Drained until it would block; more may come.
+    Open,
+    /// Clean EOF.
+    Eof,
+    /// Over the cap (`cap + 1` probe idiom).
+    OverCap,
+    /// I/O failure.
+    Failed,
+}
+
+/// Read one pipe until it would block, EOF, over-cap, or failure
+/// (interrupted reads retry, as `read_to_end` did).
+fn drain_pipe(
+    pipe: &mut impl std::io::Read,
+    acc: &mut Vec<u8>,
+    chunk: &mut [u8],
+    cap: usize,
+) -> PipeOutcome {
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return WaitOutcome::Exited(status),
-            Ok(None) => {
-                if start.elapsed() >= bound {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return WaitOutcome::Stalled;
+        match pipe.read(chunk) {
+            Ok(0) => return PipeOutcome::Eof,
+            Ok(n) => {
+                acc.extend_from_slice(&chunk[..n]);
+                if acc.len() > cap {
+                    return PipeOutcome::OverCap;
                 }
-                std::thread::sleep(WAIT_POLL);
             }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return WaitOutcome::WaitFailed;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return PipeOutcome::Open,
+            Err(_) => return PipeOutcome::Failed,
         }
     }
 }
 
-/// Bounded-wait outcome (no exit codes escape: callers map these to
-/// typed unavailability with static detail).
-enum WaitOutcome {
-    /// The child exited (status inspected by the caller).
-    Exited(std::process::ExitStatus),
-    /// The bound lapsed; the child was killed and reaped.
-    Stalled,
-    /// The wait itself failed; the child was killed and reaped.
-    WaitFailed,
-}
-
-/// Read one pipe to EOF with a hard cap (`cap + 1` probe idiom):
-/// over-cap refuses [`MetadataUnavailable::BudgetExceeded`], I/O
-/// failure refuses [`MetadataUnavailable::HelperRefused`].
-fn read_capped(pipe: impl std::io::Read, cap: usize) -> Result<Vec<u8>, MetadataUnavailable> {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    pipe.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| MetadataUnavailable::HelperRefused)?;
-    if bytes.len() > cap {
-        return Err(MetadataUnavailable::BudgetExceeded);
+/// Drain one attempt under ONE overall deadline: stdin writes plus
+/// concurrent stdout/stderr reads plus reap in a single `poll` loop.
+/// No wait-before-drain stall (a legal response larger than the pipe
+/// streams through while the child still runs) and no unbounded EOF
+/// read (a descendant retaining a pipe cannot outlive the deadline:
+/// the child is already reaped and the pipes drain until the lapse).
+/// Done requires the reaped status AND both EOFs AND a finished
+/// stdin write; anything else ends by cap or by deadline.
+#[allow(clippy::too_many_arguments)]
+fn drain_bounded(
+    child: &mut std::process::Child,
+    stdout: &mut std::process::ChildStdout,
+    stderr: &mut std::process::ChildStderr,
+    stdin: Option<StdinJob>,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    deadline: Instant,
+) -> DrainOutcome {
+    if set_nonblocking(stdout.as_raw_fd()).is_err()
+        || set_nonblocking(stderr.as_raw_fd()).is_err()
+        || stdin
+            .as_ref()
+            .is_some_and(|job| set_nonblocking(job.pipe.as_raw_fd()).is_err())
+    {
+        kill_and_reap(child);
+        return DrainOutcome::WaitFailed;
     }
-    Ok(bytes)
+    let mut stdin = stdin;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut out_eof = false;
+    let mut err_eof = false;
+    let mut status: Option<std::process::ExitStatus> = None;
+    let mut chunk = [0u8; 8192];
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exited)) => status = Some(exited),
+                Ok(None) => {}
+                Err(_) => {
+                    kill_and_reap(child);
+                    return DrainOutcome::WaitFailed;
+                }
+            }
+        }
+        if out_eof
+            && err_eof
+            && stdin.is_none()
+            && let Some(status) = status
+        {
+            return DrainOutcome::Done { status, out, err };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            kill_and_reap(child);
+            return DrainOutcome::Stalled;
+        }
+        // Poll what is still live (readers until EOF, stdin until
+        // written); an empty set sleeps until the deadline.
+        let idle = libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        };
+        let mut watched = [idle, idle, idle];
+        let mut live: usize = 0;
+        let mut stdout_slot = None;
+        let mut stderr_slot = None;
+        let mut stdin_slot = None;
+        if !out_eof {
+            watched[live] = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            stdout_slot = Some(live);
+            live += 1;
+        }
+        if !err_eof {
+            watched[live] = libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            stderr_slot = Some(live);
+            live += 1;
+        }
+        if let Some(job) = stdin.as_ref() {
+            watched[live] = libc::pollfd {
+                fd: job.pipe.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            stdin_slot = Some(live);
+            live += 1;
+        }
+        // Slice the sleep: EOFs can precede the zombie state by a
+        // scheduling window (pipes close during exit, the status
+        // lands after), leaving an empty poll set while the child
+        // is still alive — and an empty `poll` restarted by SIGCHLD
+        // sleeps through to its timeout instead of reporting EINTR.
+        // Ten-millisecond slices keep reap latency negligible while
+        // the deadline still bounds the total.
+        let slice = remaining.min(Duration::from_millis(10));
+        let timeout_ms = i32::try_from(slice.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: poll over live stack fds only (`live` entries).
+        let ready = unsafe { libc::poll(watched.as_mut_ptr(), live as libc::nfds_t, timeout_ms) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            kill_and_reap(child);
+            return DrainOutcome::WaitFailed;
+        }
+        if stdin_slot.is_some_and(|slot| watched[slot].revents != 0)
+            && let Some(job) = stdin.as_mut()
+        {
+            let mut fatal = false;
+            while job.written < job.bytes.len() {
+                match job.pipe.write(&job.bytes[job.written..]) {
+                    Ok(0) => break,
+                    Ok(n) => job.written += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        // Broken pipe: the child died early — drop
+                        // stdin and let the exit status decide.
+                        fatal = true;
+                        break;
+                    }
+                }
+            }
+            if fatal || job.written >= job.bytes.len() {
+                stdin = None;
+            }
+        }
+        if stdout_slot.is_some_and(|slot| watched[slot].revents != 0) {
+            match drain_pipe(stdout, &mut out, &mut chunk, stdout_cap) {
+                PipeOutcome::Open => {}
+                PipeOutcome::Eof => out_eof = true,
+                PipeOutcome::OverCap => {
+                    kill_and_reap(child);
+                    return DrainOutcome::OverCapStdout;
+                }
+                PipeOutcome::Failed => {
+                    kill_and_reap(child);
+                    return DrainOutcome::ReadFailed;
+                }
+            }
+        }
+        if stderr_slot.is_some_and(|slot| watched[slot].revents != 0) {
+            match drain_pipe(stderr, &mut err, &mut chunk, stderr_cap) {
+                PipeOutcome::Open => {}
+                PipeOutcome::Eof => err_eof = true,
+                PipeOutcome::OverCap => {
+                    kill_and_reap(child);
+                    return DrainOutcome::OverCapStderr;
+                }
+                PipeOutcome::Failed => {
+                    kill_and_reap(child);
+                    return DrainOutcome::ReadFailed;
+                }
+            }
+        }
+    }
 }
 
 /// Run the `--attest` handshake: pin the helper image, fd-exec the
@@ -795,15 +1026,31 @@ pub fn attest_helper(
     let pinned = pin_helper(helper)?;
     let image = pinned.reopen()?;
     let args = ["--attest".to_string(), "--require-no-new-privs".to_string()];
-    let mut child = spawn_confined(&image, &pinned.path, &args, Stdio::null())
+    let start = Instant::now();
+    let mut child = spawn_confined(&image, &pinned.path, &args, Stdio::null(), None)
         .map_err(|_| MetadataUnavailable::HelperRefused)?;
-    let stdout = child.stdout.take();
-    let _stderr = child.stderr.take();
-    match wait_bounded(&mut child, bound) {
-        WaitOutcome::Exited(status) if status.success() => {}
-        _ => return Err(MetadataUnavailable::HelperRefused),
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let deadline = start + bound;
+    let (status, out) = match drain_bounded(
+        &mut child,
+        &mut stdout,
+        &mut stderr,
+        None,
+        ATTEST_STDOUT_CAP,
+        STDERR_DRAIN_CAP,
+        deadline,
+    ) {
+        DrainOutcome::Done { status, out, .. } => (status, out),
+        DrainOutcome::OverCapStdout => return Err(MetadataUnavailable::BudgetExceeded),
+        DrainOutcome::OverCapStderr
+        | DrainOutcome::Stalled
+        | DrainOutcome::WaitFailed
+        | DrainOutcome::ReadFailed => return Err(MetadataUnavailable::HelperRefused),
+    };
+    if !status.success() {
+        return Err(MetadataUnavailable::HelperRefused);
     }
-    let out = read_capped(stdout.expect("piped stdout"), 4096)?;
     let text = String::from_utf8(out).map_err(|_| MetadataUnavailable::HelperRefused)?;
     // The attestation is the only stdout line; anything else (empty,
     // chatter, truncation) refuses.
@@ -927,29 +1174,41 @@ fn serve_once(
         Ok(image) => image,
         Err(kind) => return AttemptOutcome::Refused(kind),
     };
-    let mut child = match spawn_confined(&image, &pinned.path, &args, Stdio::piped()) {
+    let start = Instant::now();
+    let mut child = match spawn_confined(&image, &pinned.path, &args, Stdio::piped(), None) {
         Ok(child) => child,
         Err(_) => return AttemptOutcome::Refused(MetadataUnavailable::HelperRefused),
     };
-    // Write the whole request, then close stdin (EOF frames the one
-    // document). A broken pipe means the child died early — a crash,
-    // retryable below via the exit status.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&request_bytes);
-    }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let status = match wait_bounded(&mut child, bound) {
-        WaitOutcome::Exited(status) => status,
-        WaitOutcome::Stalled | WaitOutcome::WaitFailed => return AttemptOutcome::TransportFailed,
-    };
-    let out = match read_capped(stdout.expect("piped stdout"), MAX_SNAPSHOT_RESPONSE_BYTES) {
-        Ok(bytes) => bytes,
-        Err(kind) => return AttemptOutcome::Refused(kind),
-    };
-    let err = match read_capped(stderr.expect("piped stderr"), 65536) {
-        Ok(bytes) => bytes,
-        Err(kind) => return AttemptOutcome::Refused(kind),
+    // One overall deadline covers spawn, the stdin write, both
+    // concurrent reads, and the reap — no wait-before-drain stall,
+    // no unbounded EOF read.
+    let stdin = child.stdin.take().map(|pipe| StdinJob {
+        pipe,
+        bytes: request_bytes,
+        written: 0,
+    });
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let deadline = start + bound;
+    let (status, out, err) = match drain_bounded(
+        &mut child,
+        &mut stdout,
+        &mut stderr,
+        stdin,
+        MAX_SNAPSHOT_RESPONSE_BYTES,
+        STDERR_DRAIN_CAP,
+        deadline,
+    ) {
+        DrainOutcome::Done { status, out, err } => (status, out, err),
+        DrainOutcome::OverCapStdout | DrainOutcome::OverCapStderr => {
+            return AttemptOutcome::Refused(MetadataUnavailable::BudgetExceeded);
+        }
+        DrainOutcome::Stalled | DrainOutcome::WaitFailed => {
+            return AttemptOutcome::TransportFailed;
+        }
+        DrainOutcome::ReadFailed => {
+            return AttemptOutcome::Refused(MetadataUnavailable::HelperRefused);
+        }
     };
     let stderr_text = String::from_utf8_lossy(&err);
     // Typed refusal first: a stderr `{"error":"<name>"}` line is the
@@ -1379,11 +1638,13 @@ mod tests {
         );
     }
 
-    /// M1 oracle (Codex C1): an inherited fd numbered above a
-    /// subsequently lowered `RLIMIT_NOFILE` soft limit still closes.
-    /// The old `sysconf(_SC_OPEN_MAX)` loop stops at the soft limit
-    /// and leaks the high fd into the child; `close_range` does not
-    /// consult the limit at all.
+    /// M1 oracle (Codex C1): an inherited fd numbered above the
+    /// child's lowered `RLIMIT_NOFILE` soft limit still closes. The
+    /// old `sysconf(_SC_OPEN_MAX)` loop stops at the soft limit and
+    /// leaks the high fd into the child; `close_range` does not
+    /// consult the limit at all. The limit lowers in the CHILD
+    /// (`pre_exec`, via [`spawn_confined`]) — never process-global,
+    /// which would starve parallel tests with `EMFILE`.
     #[test]
     fn spawn_closes_fds_above_lowered_soft_limit() {
         const HIGH_WANT: i32 = 512;
@@ -1404,26 +1665,11 @@ mod tests {
             high,
             "high fd parks above the lowered soft limit"
         );
-        // RAII: the soft limit is process-global, so it restores on
-        // every exit path (including panic); the parked fds close.
-        // The lowered window is milliseconds and 256 fds still serve
-        // every concurrent test's tempfiles.
-        struct SoftLimitGuard {
-            soft: u64,
-            hard: u64,
-            fds: Vec<i32>,
-        }
-        impl Drop for SoftLimitGuard {
+        // RAII: the parked fds close on every exit path.
+        struct ParkedFds(Vec<i32>);
+        impl Drop for ParkedFds {
             fn drop(&mut self) {
-                let restore = libc::rlimit {
-                    rlim_cur: self.soft,
-                    rlim_max: self.hard,
-                };
-                // SAFETY: restores the saved ceiling (soft <= hard).
-                unsafe {
-                    libc::setrlimit(libc::RLIMIT_NOFILE, &restore);
-                }
-                for fd in &self.fds {
+                for fd in &self.0 {
                     // SAFETY: each fd came from the opens above.
                     unsafe {
                         libc::close(*fd);
@@ -1431,35 +1677,7 @@ mod tests {
                 }
             }
         }
-        let mut saved = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes the struct only.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
-            0,
-            "reads the current ceiling"
-        );
-        assert!(
-            saved.rlim_cur > high as u64,
-            "soft limit starts above the probe fd"
-        );
-        let _guard = SoftLimitGuard {
-            soft: saved.rlim_cur,
-            hard: saved.rlim_max,
-            fds: vec![devnull, high],
-        };
-        let lowered = libc::rlimit {
-            rlim_cur: LOW_SOFT,
-            rlim_max: saved.rlim_max,
-        };
-        // SAFETY: lowering the soft ceiling needs no privilege.
-        assert_eq!(
-            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) },
-            0,
-            "soft limit lowers below the parked fd"
-        );
+        let _parked = ParkedFds(vec![devnull, high]);
         let ls = pinnable_ls();
         let image = ls.reopen().expect("ls reopens");
         let mut child = spawn_confined(
@@ -1467,19 +1685,31 @@ mod tests {
             &ls.path,
             &["/proc/self/fd".to_string()],
             Stdio::null(),
+            Some(LOW_SOFT),
         )
         .expect("spawns");
-        let stdout = child.stdout.take().expect("piped");
-        assert!(matches!(
-            wait_bounded(&mut child, Duration::from_secs(10)),
-            WaitOutcome::Exited(status) if status.success()
-        ));
-        let out = read_capped(stdout, 4096).expect("reads");
-        assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
-            "0\n1\n2\n3\n",
-            "child sees stdio + transient only (high fd closed)"
-        );
+        let mut stdout = child.stdout.take().expect("piped");
+        let mut stderr = child.stderr.take().expect("piped");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match drain_bounded(
+            &mut child,
+            &mut stdout,
+            &mut stderr,
+            None,
+            4096,
+            4096,
+            deadline,
+        ) {
+            DrainOutcome::Done { status, out, .. } => {
+                assert!(status.success(), "ls exits clean");
+                assert_eq!(
+                    String::from_utf8(out).expect("utf-8"),
+                    "0\n1\n2\n3\n",
+                    "child sees stdio + transient only (high fd closed)"
+                );
+            }
+            other => panic!("drains cleanly: {other:?}"),
+        }
     }
 
     /// A pinnable `ls` for the fd-allowlist proofs (fd-exec needs a
@@ -1507,19 +1737,31 @@ mod tests {
             &ls.path,
             &["/proc/self/fd".to_string()],
             Stdio::null(),
+            None,
         )
         .expect("spawns");
-        let stdout = child.stdout.take().expect("piped");
-        assert!(matches!(
-            wait_bounded(&mut child, Duration::from_secs(10)),
-            WaitOutcome::Exited(status) if status.success()
-        ));
-        let out = read_capped(stdout, 4096).expect("reads");
-        assert_eq!(
-            String::from_utf8(out).expect("utf-8"),
-            "0\n1\n2\n3\n",
-            "child sees stdio + transient only"
-        );
+        let mut stdout = child.stdout.take().expect("piped");
+        let mut stderr = child.stderr.take().expect("piped");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match drain_bounded(
+            &mut child,
+            &mut stdout,
+            &mut stderr,
+            None,
+            4096,
+            4096,
+            deadline,
+        ) {
+            DrainOutcome::Done { status, out, .. } => {
+                assert!(status.success(), "ls exits clean");
+                assert_eq!(
+                    String::from_utf8(out).expect("utf-8"),
+                    "0\n1\n2\n3\n",
+                    "child sees stdio + transient only"
+                );
+            }
+            other => panic!("drains cleanly: {other:?}"),
+        }
     }
 
     fn test_request() -> SnapshotRequest {
@@ -1719,6 +1961,172 @@ mod tests {
             1,
             "binding failures never retry"
         );
+    }
+
+    /// C1 oracle (a): a legal response larger than a shrunk pipe
+    /// streams through concurrent drain. Wait-before-drain deadlocks
+    /// it (the child blocks filling the pipe while the parent waits
+    /// for the exit that never comes) and refuses after retries.
+    #[test]
+    fn large_legal_response_with_small_pipe_succeeds() {
+        use kryprobe_core::workload::{
+            AttributionStatus, BindingProvenance, ContainerRef, KernelIdentity, MetadataEntry,
+            MetadataSnapshot, PodRef, SnapshotInterval, SnapshotKey, SnapshotRequest,
+            ValidityInterval, WorkloadOrigin, encode_request,
+        };
+        let scratch = kryprobe_testkit::TempDir::named("launch-big-pipe").expect("scratch");
+        // Twelve keys, each answered by a full-facet covering entry:
+        // the response is legal but far larger than one page.
+        let mut keys = Vec::new();
+        let mut entries = Vec::new();
+        for i in 0..12u64 {
+            keys.push(SnapshotKey {
+                kernel_scope: SCOPE.to_string(),
+                cgroup: 100 + i,
+                tgid: 1000 + i as u32,
+                start_ns: 555,
+            });
+            entries.push(MetadataEntry {
+                container: Some(ContainerRef {
+                    runtime: "docker://host-a".to_string(),
+                    id: "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57"
+                        .to_string(),
+                    lifetime: None,
+                }),
+                pod: Some(PodRef {
+                    cluster: "cluster-a".to_string(),
+                    uid: format!("pod-uid-{i:04}"),
+                    name: format!("web-{i}"),
+                    namespace: "production".to_string(),
+                }),
+                cluster: Some("cluster-a".to_string()),
+                node: Some("node-a".to_string()),
+                ancestor_container: Some(ContainerRef {
+                    runtime: "docker://host-kind".to_string(),
+                    id: "90f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb99"
+                        .to_string(),
+                    lifetime: None,
+                }),
+                display_name: None,
+                cgroup_id: Some(100 + i),
+                binding: BindingProvenance {
+                    method: kryprobe_core::workload::METHOD_METADATA_FILE.to_string(),
+                    source: WorkloadOrigin::OperatorMetadataFile,
+                    status: AttributionStatus::Asserted,
+                    validity: Some(ValidityInterval::monotonic(50, 2000)),
+                },
+            });
+        }
+        let request = SnapshotRequest {
+            session_id: SESSION.to_string(),
+            keys,
+            capture_interval: Some(SnapshotInterval {
+                start_ns: 100,
+                end_ns: 1000,
+            }),
+        };
+        encode_request(&request).expect("request itself is legal");
+        let snapshot = MetadataSnapshot {
+            collector: "launch-test".to_string(),
+            snapshot_interval: SnapshotInterval {
+                start_ns: 100,
+                end_ns: 1000,
+            },
+            kernel_identity: KernelIdentity::Known(SCOPE.to_string()),
+            entries,
+        };
+        let response = kryprobe_core::workload::resolve(&request, &snapshot).expect("resolves");
+        assert!(
+            response
+                .associations
+                .iter()
+                .all(|assoc| assoc.evidence.status == AttributionStatus::Asserted),
+            "every key asserts"
+        );
+        let canned = kryprobe_core::workload::encode_response(&response).expect("encodes");
+        assert!(
+            canned.len() > 4096,
+            "response exceeds the shrunk pipe: {} bytes",
+            canned.len()
+        );
+        assert!(
+            canned.len() <= MAX_SNAPSHOT_RESPONSE_BYTES,
+            "response stays legal: {} bytes",
+            canned.len()
+        );
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({
+                "canned": "canned.json",
+                "shrink_pipes": 4096,
+                "pipe_report": "pipes.txt",
+            }),
+        );
+        let principal = current_principal().expect("test principal");
+        let served =
+            serve_snapshot_with_bound(&helper, &principal, None, &request, Duration::from_secs(2))
+                .expect("large legal response streams through concurrent drain");
+        assert_eq!(served.associations.len(), 12);
+        // The backpressure was real: both pipes held one page.
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join("pipes.txt")).expect("pipe report"),
+            "4096\n4096\n",
+            "pipes really shrunk (no vacuous green)"
+        );
+    }
+
+    /// C1 oracle (b): an exited child whose descendant retains the
+    /// pipes terminates by the deadline — refusal, never hang. The
+    /// old EOF read after the wait blocks forever here (no EOF ever
+    /// arrives), so this hangs pre-fix (RED via timeout).
+    #[test]
+    fn exited_child_with_pipe_retaining_descendant_terminates_by_deadline() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-retainer").expect("scratch");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"spawn_retainer": {"sleep_secs": 30, "pidfile": "pids"}}),
+        );
+        let principal = current_principal().expect("test principal");
+        let start = Instant::now();
+        assert_eq!(
+            serve_snapshot_with_bound(
+                &helper,
+                &principal,
+                None,
+                &test_request(),
+                Duration::from_millis(300)
+            ),
+            Err(MetadataUnavailable::HelperRefused),
+            "pipe-retaining descendant refuses by deadline"
+        );
+        // Three attempts bounded by 300 ms each: elapsed far below
+        // the 30 s retainer sleep proves the deadline (not EOF)
+        // ended every attempt.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "terminates by deadline: {:?}",
+            start.elapsed()
+        );
+        let pids_path = scratch.path().join("pids");
+        let pids = std::fs::read_to_string(&pids_path).expect("retainer pids logged");
+        assert_eq!(
+            pids.lines().count() as u32,
+            1 + MAX_HELPER_RETRIES,
+            "every attempt spawned (and outlived) its child"
+        );
+        // Hygiene: reap the orphaned sleepers we own (best effort —
+        // they self-exit after 30 s regardless).
+        for line in pids.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                // SAFETY: SIGKILL to a recorded direct grandchild pid.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
     }
 
     #[test]

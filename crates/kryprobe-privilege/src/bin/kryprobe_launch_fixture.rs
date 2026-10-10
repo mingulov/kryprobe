@@ -26,6 +26,15 @@
 //!   (default: 32 zeros).
 //! - `argv_log`: append `argv` one-per-line here (serve path).
 //! - `count`: append one `x` line here per serve invocation.
+//! - `shrink_pipes`: `fcntl(F_SETPIPE_SZ)` fds 1+2 to this capacity
+//!   at startup (the pipe is shared, so the parent's reads feel the
+//!   backpressure too — the C1 small-pipe oracle, with no launcher
+//!   test seam: the production spawn path runs unchanged).
+//! - `pipe_report`: write the actual post-shrink capacities here
+//!   (the oracle asserts them — no vacuous green).
+//! - `spawn_retainer`: `{"sleep_secs": N, "pidfile": PATH}` — fork a
+//!   grandchild holding every stdio fd, append its pid, and exit 0
+//!   immediately WITHOUT reading stdin (the C1 exited-child oracle).
 //!
 //! Relative paths resolve against the sidecar directory. A missing
 //! or unparsable sidecar exits 3 loudly (tests always write one).
@@ -141,6 +150,33 @@ fn main() {
         );
         std::process::exit(3);
     });
+    if let Some(size) = sidecar.get("shrink_pipes").and_then(|v| v.as_i64()) {
+        // Deterministic backpressure: shrink before any byte moves.
+        // SAFETY: fcntl on live stdio pipe fds. Note the odd
+        // convention: success returns the new capacity (not 0).
+        for fd in [1, 2] {
+            if unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size as libc::c_int) } < 0 {
+                eprintln!("launch-fixture: cannot shrink pipe {fd}");
+                std::process::exit(3);
+            }
+        }
+        // Self-verification: report the actual capacities so the
+        // oracle can prove the backpressure existed (no vacuous
+        // green from an unshrunk pipe).
+        if let Some(report) = sidecar.get("pipe_report").and_then(|v| resolve(&dir, v)) {
+            let mut text = String::new();
+            for fd in [1, 2] {
+                // SAFETY: fcntl read on live stdio pipe fds.
+                let got = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+                if got < 0 {
+                    eprintln!("launch-fixture: cannot read pipe {fd} size");
+                    std::process::exit(3);
+                }
+                text.push_str(&format!("{got}\n"));
+            }
+            std::fs::write(&report, text).unwrap_or_else(|_| std::process::exit(3));
+        }
+    }
     let code = if argv.iter().any(|arg| arg == "--attest") {
         run_attest(&sidecar)
     } else {
@@ -173,9 +209,38 @@ fn run_attest(sidecar: &serde_json::Value) -> i32 {
     exit
 }
 
-/// Serve path: stdin request in; refusal/crash/stall or the canned
-/// response (session-substituted) plus stderr attestation out.
+/// Serve path: stdin request in; refusal/crash/stall/retainer or
+/// the canned response (session-substituted) plus stderr
+/// attestation out.
 fn run_serve(dir: &Path, argv: &[String], sidecar: &serde_json::Value) -> i32 {
+    if let Some(retainer) = sidecar.get("spawn_retainer") {
+        // Exited child + pipe-retaining descendant: fork first (the
+        // grandchild holds every stdio fd open), record its pid, and
+        // exit 0 WITHOUT reading stdin — stdout/stderr never see EOF.
+        let sleep_secs = retainer.get("sleep_secs").and_then(|v| v.as_u64());
+        let pidfile = retainer.get("pidfile").and_then(|v| resolve(dir, v));
+        let (Some(sleep_secs), Some(pidfile)) = (sleep_secs, pidfile) else {
+            eprintln!("launch-fixture: spawn_retainer needs sleep_secs + pidfile");
+            return 3;
+        };
+        // SAFETY: fork with no locks held (single-threaded startup).
+        let forked = unsafe { libc::fork() };
+        if forked < 0 {
+            return 3;
+        }
+        if forked == 0 {
+            std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+            std::process::exit(0);
+        }
+        use std::io::Write;
+        let mut pids = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&pidfile)
+            .unwrap_or_else(|_| std::process::exit(3));
+        writeln!(pids, "{forked}").unwrap_or_else(|_| std::process::exit(3));
+        return 0;
+    }
     let mut request = String::new();
     std::io::stdin()
         .read_to_string(&mut request)
