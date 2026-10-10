@@ -3,13 +3,13 @@
 """Installed-product acceptance journeys (Task05 Stage 4, G11b/A25).
 
 Installed watch/report/scoped-policy paths, deterministic replay,
-v1-legacy migration, saturation, and unavailable-metadata cases —
-each against an independent oracle (exit-code table per F06,
-fixture self-counts, byte-identical replay, recomputed ledger
-math). Runs ONLY in an owned guest under lease against the real
-installed path (dev-flow install.sh without --stage, so the
-cap-free helper sibling ships). Every journey writes a 13.3
-receipt to --out.
+v1-legacy migration, saturation, unavailable-metadata, and
+faulted-pipe (EPIPE) cases — each against an independent oracle
+(exit-code table per F06, fixture self-counts, byte-identical
+replay, recomputed ledger math, typed refusal markers). Runs ONLY
+in an owned guest under lease against the real installed path
+(dev-flow install.sh without --stage, so the cap-free helper
+sibling ships). Every journey writes a 13.3 receipt to --out.
 
 Unrunnable on this host (no guests, disk full): --dry-run prints
 the planned steps with exact NOT_RUN state and exits 0 without
@@ -35,11 +35,25 @@ import common as lab  # noqa: E402
 from docker_lab import LabError, run, utcnow, write_receipt  # noqa: E402
 
 JOURNEYS = ("watch", "report", "policy", "replay", "migration",
-            "saturation", "unavailable-metadata")
+            "saturation", "unavailable-metadata", "epipe")
 
-# F06 exit-code family for workload-qualified report/check ops.
+# F06 exit-code family for workload-qualified report/check ops,
+# plus the truncated-stdout member (docs/commands.md "Truncated
+# stdout (1A-L11)": live.rs emit_stdout_text maps a torn stdout to
+# 1 with a typed marker; main.rs STDOUT_FAILED is the same 1 as
+# the guard backstop for an otherwise-0 exit).
 EXPECTED_EXITS = {"complete": 0, "usage": 2, "cannot-establish": 3,
-                  "env-unusable": 4, "violation": 10}
+                  "env-unusable": 4, "violation": 10,
+                  "truncated-stdout": 1}
+
+# C7-1 EPIPE: the typed stdout-failure marker the product emits on
+# a torn stream (live.rs emit_stdout_text "{tool}: cannot write
+# stdout"; pinned per-command by the cmd_report.rs/cmd_watch.rs
+# unit tests and the kcrypto_output.rs integration suite — the
+# same typed discipline as the Stage-3
+# malformed_metadata_is_rejected precedent: exact marker, never
+# bare nonzero).
+EPIPE_STDERR_MARKER = "report: cannot write stdout"
 
 FROZEN_UNAVAILABLE = ("no_principal", "helper_refused",
                       "budget_exceeded", "unsupported_environment",
@@ -120,6 +134,92 @@ def stage_helperless_copy(src: Path, dst: Path) -> None:
     shutil.copyfile(src, dst)
     os.chmod(dst, 0o755)
 
+
+def parse_pins_env(text: str) -> dict:
+    """Parse staged `pins.env` (`KEY="hex"` lines) into {key:
+    value}. Blanks and comments skipped. Pure — host-tested."""
+    pins = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        pins[key.strip()] = value.strip().strip('"')
+    return pins
+
+
+EPIPE_SEAL_DIMS = (("kryprobe", "CLI_SHA"),
+                   ("kryprobe-workload-helper", "HELPER_SHA"),
+                   ("kryprobe-bpf/kcrypto.bpf.o", "AGG_SHA"),
+                   ("kryprobe-bpf/kcrypto-lifecycle.bpf.o", "LC_SHA"))
+
+
+def check_epipe_seal(installed: dict, pins: dict) -> list:
+    """Installed bytes == K seal on all 4 dims (C7-1 leg
+    precondition). Returns reasons (empty = sealed). Pure —
+    host-tested."""
+    reasons = []
+    for name, key in EPIPE_SEAL_DIMS:
+        want = pins.get(key, "")
+        if len(want) != 64:
+            reasons.append(f"seal pin {key} missing/malformed")
+        elif installed.get(name, "") != want:
+            reasons.append(f"installed {name} != K seal")
+    return reasons
+
+
+def check_epipe_outcome(rc: int, stderr: str, attempts: int) -> list:
+    """Typed EPIPE oracle: exactly exit 1 (the exit family's
+    truncated-stdout member) plus the exact typed stderr marker,
+    on exactly one attempt (single-attempt semantics — no retry
+    pile-up). Exit 0 is the never-clean violation; any other
+    nonzero without the marker is untyped. Returns reasons
+    (empty = typed refusal). Pure — host-tested."""
+    reasons = []
+    if attempts != 1:
+        reasons.append(f"attempts={attempts}, want exactly 1 "
+                       "(no retry pile-up)")
+    if rc == 0:
+        reasons.append("clean exit 0 over a torn stdout "
+                       "(must refuse)")
+    elif rc != EXPECTED_EXITS["truncated-stdout"]:
+        reasons.append(f"rc={rc}, want "
+                       f"{EXPECTED_EXITS['truncated-stdout']} "
+                       "(typed truncated-stdout)")
+    if EPIPE_STDERR_MARKER not in stderr:
+        reasons.append(f"stderr lacks typed marker "
+                       f"{EPIPE_STDERR_MARKER!r}")
+    return reasons
+
+
+def run_with_closed_stdout(cmd: list, timeout_s: float):
+    """Run one command with stdout on a readerless pipe (C7-1
+    EPIPE): the read end closes BEFORE spawn, so the kernel fails
+    the first stdout write deterministically with EPIPE (Rust
+    ignores SIGPIPE, so the failure surfaces as a write error —
+    never a signal death — per docs/commands.md 1A-L11). No
+    reader process, no timing. Returns (proc, stderr, wall_s).
+    C7-2 grace in the budget; a hang kills and raises LabError."""
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    start = time.monotonic()
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=write_fd,
+                                stderr=subprocess.PIPE, text=True)
+    finally:
+        os.close(write_fd)
+    budget = timeout_s + lab.OWNED_REAP_GRACE_S
+    try:
+        _, stderr = proc.communicate(timeout=budget)
+    except subprocess.TimeoutExpired as err:
+        proc.kill()
+        proc.wait()
+        raise LabError(
+            f"EPIPE probe hung: {cmd[0]} exceeded {budget:.0f}s "
+            f"(budget {timeout_s:.0f}s + 1s reap grace)") from err
+    return proc, stderr, time.monotonic() - start
+
 DRY_RUN_STEPS = {
     "watch": [
         "installed watch --system over M1-driver traffic",
@@ -160,6 +260,14 @@ DRY_RUN_STEPS = {
         "and no-helper legs",
         "oracle: frozen typed reasons + available/Unresolved pin + "
         "raw rows + exit 3",
+    ],
+    "epipe": [
+        "installed report --system to a readerless stdout pipe "
+        "under M1-driver traffic (single attempt)",
+        "oracle: exit 1 + typed 'report: cannot write stdout' "
+        "(never 0); attempts==1; traffic sentinel non-exited "
+        "after + ops > 0; installed bytes == K seal from "
+        "--seal-file",
     ],
 }
 
@@ -865,6 +973,79 @@ def journey_unavailable_metadata(args) -> int:
     return 0
 
 
+def journey_epipe(args) -> int:
+    caps = a25_preflight()
+    driver = need_driver(args)
+    if not args.seal_file:
+        raise LabError("--seal-file is required (staged pins.env)")
+    seal_path = Path(args.seal_file)
+    if not seal_path.is_file():
+        raise LabError(f"seal file {seal_path} missing in guest")
+    pins = parse_pins_env(seal_path.read_text())
+    bindir = Path(caps["kryprobe"]).parent
+    installed = {}
+    for name, _ in EPIPE_SEAL_DIMS:
+        target = bindir / name
+        if not target.is_file():
+            raise LabError(f"installed {name} missing under "
+                           f"{bindir}")
+        installed[name] = hashlib.sha256(
+            target.read_bytes()).hexdigest()
+    reasons = check_epipe_seal(installed, pins)
+    if reasons:
+        raise LabError(f"K-seal mismatch: {reasons}")
+    # Traffic outlives the 10 s capture by design (meas 20 +
+    # warm 2), so the sentinel is still running when the torn
+    # CLI exits — an exited sentinel is a setup failure, never
+    # evidence.
+    traffic, ledger = start_traffic(driver, args.out, "epipe",
+                                    meas=20, warm=2)
+    try:
+        # The single EPIPE attempt: a live report renders to a
+        # readerless stdout pipe, so the first write fails with
+        # EPIPE mid-stream (no retry loop exists by
+        # construction).
+        proc, stderr, wall_s = run_with_closed_stdout(
+            ["kryprobe", "report", "--system", "--duration", "10",
+             "--format", "human"], 120)
+        attempts = 1
+        # C7-3: the traffic sentinel must be non-exited after
+        # the torn CLI run (never bare kill(pid, 0) — it
+        # matches zombies too).
+        sentinel_alive = not lab.proc_exited(traffic.pid)
+        summary = reap_traffic(traffic, ledger, "epipe-traffic",
+                               60)
+    finally:
+        if traffic.poll() is None:
+            traffic.kill()
+    if not sentinel_alive:
+        raise LabError("traffic sentinel exited during the EPIPE "
+                       "probe (setup inconclusive)")
+    if summary["ops_total"] <= 0:
+        raise LabError("traffic proof empty (no driver ops)")
+    reasons = check_epipe_outcome(proc.returncode, stderr,
+                                  attempts)
+    if reasons:
+        raise LabError(f"EPIPE oracle: {reasons} "
+                       f"(rc={proc.returncode}, stderr tail: "
+                       f"{stderr.strip()[-300:]!r})")
+    write_receipt(args.out, "a25-epipe",
+                  {"started_utc": utcnow(), "caps": caps,
+                   "seal": "4/4 MATCH",
+                   "rc": proc.returncode,
+                   "stderr_marker": EPIPE_STDERR_MARKER,
+                   "wall_s": round(wall_s, 2),
+                   "attempts": attempts,
+                   "sentinel": "ALIVE(post-probe, non-exited)",
+                   "driver_ops": summary["ops_total"],
+                   "verdict": "PASS"})
+    print(f"epipe PASS: rc={proc.returncode} "
+          f"marker={EPIPE_STDERR_MARKER!r} wall={wall_s:.1f}s "
+          f"attempts={attempts} sentinel=ALIVE "
+          f"ops={summary['ops_total']}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="a25.py",
@@ -881,6 +1062,8 @@ def main(argv=None) -> int:
                         help="metadata file in guest")
     parser.add_argument("--v1-file", default="",
                         help="stored v1 bytes (migration leg)")
+    parser.add_argument("--seal-file", default="",
+                        help="staged pins.env (epipe leg seal)")
     parser.add_argument("journey", choices=JOURNEYS)
     args = parser.parse_args(argv)
     if args.dry_run:
@@ -897,7 +1080,8 @@ def main(argv=None) -> int:
                 "migration": journey_migration,
                 "saturation": journey_saturation,
                 "unavailable-metadata":
-                    journey_unavailable_metadata}
+                    journey_unavailable_metadata,
+                "epipe": journey_epipe}
         return legs[args.journey](args)
     except LabError as err:
         print(f"{args.journey} FAIL: {err}", file=sys.stderr)

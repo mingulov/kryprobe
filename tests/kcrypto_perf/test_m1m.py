@@ -979,13 +979,13 @@ class LabJourneyTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for journey in ("watch", "report", "policy", "replay",
                         "migration", "saturation",
-                        "unavailable-metadata"):
+                        "unavailable-metadata", "epipe"):
             self.assertIn(journey, proc.stdout)
 
     def test_a25_dry_run(self):
         for journey in ("watch", "report", "policy", "replay",
                         "migration", "saturation",
-                        "unavailable-metadata"):
+                        "unavailable-metadata", "epipe"):
             proc = self._run(str(WORKLOAD_LAB / "a25.py"),
                              "--dry-run", journey)
             self.assertEqual(proc.returncode, 0,
@@ -1002,6 +1002,23 @@ class LabJourneyTests(unittest.TestCase):
                          "--dry-run", "unavailable-metadata")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("available + all-Unresolved", proc.stdout)
+
+    def test_a25_epipe_dry_run_states_fixed_expectations(self):
+        proc = self._run(str(WORKLOAD_LAB / "a25.py"),
+                         "--dry-run", "epipe")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for word in ("exit 1", "report: cannot write stdout",
+                     "attempts==1", "non-exited", "K seal",
+                     "--seal-file"):
+            self.assertIn(word, proc.stdout)
+
+    def test_a25_epipe_live_fails_closed_on_host(self):
+        # No --driver (and no installed guest product): the leg
+        # must refuse before any side effect, never PASS here.
+        proc = self._run(str(WORKLOAD_LAB / "a25.py"),
+                         "--out", tempfile.mkdtemp(), "epipe")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("epipe FAIL", proc.stderr)
 
     def test_fixture_ledger_format(self):
         spec = importlib.util.spec_from_file_location(
@@ -1269,6 +1286,75 @@ class LabOracleTests(unittest.TestCase):
         self.assertEqual(a25.EXPECTED_EXITS["violation"], 10)
         self.assertEqual(a25.EXPECTED_EXITS["cannot-establish"], 3)
         self.assertEqual(a25.EXPECTED_EXITS["usage"], 2)
+        self.assertEqual(a25.EXPECTED_EXITS["truncated-stdout"], 1)
+
+    def test_epipe_outcome_happy(self):
+        a25 = self._a25()
+        self.assertEqual(
+            a25.check_epipe_outcome(
+                1, "report: cannot write stdout: Broken pipe "
+                "(os error 32)\n", 1), [])
+
+    def test_epipe_outcome_clean_zero_refused(self):
+        a25 = self._a25()
+        reasons = a25.check_epipe_outcome(0, "", 1)
+        self.assertTrue(
+            any("exit 0" in reason for reason in reasons),
+            reasons)
+
+    def test_epipe_outcome_untyped(self):
+        a25 = self._a25()
+        # Wrong code with the marker: still untyped.
+        reasons = a25.check_epipe_outcome(
+            3, "report: cannot write stdout: EPIPE\n", 1)
+        self.assertTrue(
+            any("rc=3" in reason for reason in reasons), reasons)
+        # Right code without the marker: still untyped.
+        reasons = a25.check_epipe_outcome(1, "wrote out.json\n", 1)
+        self.assertTrue(
+            any("marker" in reason for reason in reasons),
+            reasons)
+
+    def test_epipe_outcome_attempts(self):
+        a25 = self._a25()
+        reasons = a25.check_epipe_outcome(
+            1, "report: cannot write stdout: EPIPE\n", 2)
+        self.assertTrue(
+            any("attempts=2" in reason for reason in reasons),
+            reasons)
+
+    def test_epipe_pins_env_parse(self):
+        a25 = self._a25()
+        pins = a25.parse_pins_env(
+            '# comment\n\nCLI_SHA="ab"\nLC_SHA="cd"\n')
+        self.assertEqual(pins, {"CLI_SHA": "ab", "LC_SHA": "cd"})
+        self.assertEqual(a25.parse_pins_env(""), {})
+
+    def test_epipe_seal(self):
+        a25 = self._a25()
+        pins = {key: "0123456789abcdef" * 4
+                for _, key in a25.EPIPE_SEAL_DIMS}
+        installed = {name: pins[key]
+                     for name, key in a25.EPIPE_SEAL_DIMS}
+        self.assertEqual(a25.check_epipe_seal(installed, pins), [])
+        bad = dict(installed, kryprobe="0" * 64)
+        reasons = a25.check_epipe_seal(bad, pins)
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("kryprobe", reasons[0])
+        reasons = a25.check_epipe_seal(installed, {})
+        self.assertEqual(len(reasons), 4, reasons)
+
+    def test_closed_stdout_delivers_epipe(self):
+        # The leg's pipe mechanism, host-proven without guests: a
+        # readerless stdout fails the first write with EPIPE
+        # (Errno 32), never a clean exit.
+        a25 = self._a25()
+        proc, stderr, wall = a25.run_with_closed_stdout(
+            [sys.executable, "-c",
+             "import os; os.write(1, b'x' * 4096)"], 10)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("BrokenPipeError", stderr)
+        self.assertLess(wall, 10.0)
 
     def test_parse_inconclusive_dims(self):
         a25 = self._a25()
