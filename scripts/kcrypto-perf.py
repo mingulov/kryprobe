@@ -1619,6 +1619,12 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         if m1:
             judged = apply_m1_ctx_overlay(cell_dir, judged, leg, m1_entry,
                                           manifest)
+            for reason in check_m_evidence(cell_dir, leg, m1_entry,
+                                           stage):
+                judged["valid"] = False
+                judged["outcome"] = "invalid"
+                judged["reasons"] = judged.get("reasons", []) + \
+                    [reason]
         if not quiet_check["valid"]:
             judged["valid"] = False
             judged["outcome"] = "invalid"
@@ -1774,6 +1780,65 @@ def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + reasons
     return judged
+
+
+def check_m_evidence(cell_dir: Path, leg: dict, entry: dict,
+                     stage: dict) -> list:
+    """Per-leg M-active proof (Task05 Stage 4, freeze G6). Every M
+    leg must carry its sealed legs/LEG-m.json launch audit with
+    the exact staged metadata/helper shas and a non-root
+    principal; anything else (missing file, sha mismatch, uid 0,
+    schema/identity mismatch) is invalid with the gap named, so
+    an M-without-metadata leg can never pass as M. Non-M legs
+    must NOT carry the audit (a present file is a mixup). Returns
+    reasons (empty = proven/absent-as-expected)."""
+    side = leg["side"]
+    if entry.get("kind") == "m1-pairs":
+        obs = entry["obs_a"] if side == "A" else entry["obs_b"]
+    else:
+        obs = "C" if side == "B" else "D"
+    m_path = Path(cell_dir) / "legs" / f"{leg['leg_id']}-m.json"
+    if obs != "M":
+        if m_path.is_file():
+            return [f"{leg['leg_id']}-m.json present on a {obs} "
+                    "leg (M audit mixup)"]
+        return []
+    if leg.get("mode") == "disabled":
+        return ["M leg with disabled mode (staging contradiction)"]
+    if not m_path.is_file():
+        return [f"M leg {leg['leg_id']} lacks {leg['leg_id']}-m.json "
+                "(no M-active audit)"]
+    try:
+        audit = json.loads(m_path.read_text())
+    except (OSError, ValueError) as err:
+        return [f"M leg {leg['leg_id']}-m.json unreadable: {err}"]
+    if not isinstance(audit, dict):
+        return [f"M leg {leg['leg_id']}-m.json not an object"]
+    if audit.get("schema") != "kryprobe-m1-mleg/v1":
+        return [f"M leg {leg['leg_id']}-m.json schema "
+                f"{audit.get('schema')!r} refused"]
+    for key, want in (("leg_id", leg["leg_id"]), ("side", side),
+                      ("obs", "M")):
+        if audit.get(key) != want:
+            return [f"M leg {leg['leg_id']}-m.json {key}="
+                    f"{audit.get(key)!r}, want {want!r}"]
+    pins = (stage.get("sha256") or {})
+    reasons = []
+    for key, tail in (("metadata_sha256", "workload-metadata.json"),
+                      ("helper_sha256", "kryprobe-workload-helper")):
+        pinned = pins.get(f"obs-{side}/{tail}")
+        if pinned is None or pinned == "none":
+            reasons.append(f"M leg {key}: no staged pin "
+                           f"obs-{side}/{tail}")
+        elif audit.get(key) != pinned:
+            reasons.append(f"M leg {key}={audit.get(key)!r} differs "
+                           "from the staged pin")
+    uid = audit.get("principal_uid")
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
+        reasons.append(f"M leg principal_uid={uid!r}: M legs run "
+                       "as non-root (uid 0 has no principal and "
+                       "never launches the helper)")
+    return reasons
 
 
 def apply_m1_diag_overlay(cell_dir: Path, judged: dict,
