@@ -64,9 +64,11 @@ def _afalg_usable():
 
 class ManifestTests(unittest.TestCase):
     def test_m1_manifest_loads(self):
+        # Task05 Stage 4 (freeze G10): the final 40-set v2 matrix.
         manifest = m1manifest.load_manifest(
             ROOT / "tests" / "kcrypto_perf" / "cells-m1.json")
-        self.assertEqual(len(manifest["sets"]), 24)
+        self.assertEqual(len(manifest["sets"]), 40)
+        self.assertEqual(manifest["manifest_version"], 2)
         self.assertEqual(len(manifest["diagnostics"]), 1)
         self.assertTrue(CLI.is_m1_manifest(manifest))
 

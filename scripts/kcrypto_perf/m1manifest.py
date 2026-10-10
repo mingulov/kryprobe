@@ -105,9 +105,12 @@ def load_manifest(path: Path) -> dict:
     if manifest["$schema"] != SCHEMA:
         raise InputError(f"manifest schema {manifest['$schema']!r} "
                          f"is not {SCHEMA}")
+    # Task05 Stage 4 (freeze G10): v1 is the Task02 24-set
+    # early-gate manifest (history, still loadable so sealed
+    # early cells re-judge); v2 is the final 40-set matrix.
     if type(manifest["manifest_version"]) is not int or \
-            manifest["manifest_version"] != 1:
-        raise InputError("manifest_version must be 1")
+            manifest["manifest_version"] not in (1, 2):
+        raise InputError("manifest_version must be 1 or 2")
     if not isinstance(manifest["global"], dict):
         raise InputError("manifest global must be an object")
     missing = REQUIRED_GLOBAL_KEYS - manifest["global"].keys()
