@@ -45,6 +45,81 @@ FROZEN_UNAVAILABLE = ("no_principal", "helper_refused",
                       "budget_exceeded", "unsupported_environment",
                       "parse_failed")
 
+# F1: live windows fail closed to INCONCLUSIVE by construction
+# (eval.rs: Clean needs overall CompleteForDeclaredBoundary;
+# capture-integrity + completion read weaker on every live window —
+# D1a characterized exactly this kp2 §8 pair). The journey pins
+# rc=3 AND the named dims, never rc alone.
+EXPECTED_CLEAN_MISSING = ("capture-integrity", "completion")
+
+# F1: the unconstructible clean->0 leg is recorded NOT_RUN, never
+# faked: `check` takes a live capture only (no stored-input surface
+# in args.rs Command::Check), and CLEAN needs COMPLETE coverage per
+# docs/policy.md — unreachable on live windows.
+CLEAN_ZERO_NOT_RUN_REASON = (
+    "check takes a live capture only (args.rs Command::Check has no "
+    "stored-input surface); CLEAN needs COMPLETE coverage per "
+    "docs/policy.md, unreachable on live windows "
+    "(capture-integrity + completion gaps by construction)")
+
+
+def parse_inconclusive_dims(stdout: str) -> list | None:
+    """Wire dims from an `INCONCLUSIVE missing=a,b` verdict line
+    (None when the verdict line is absent). Pure — host-tested."""
+    for line in stdout.splitlines():
+        if line.startswith("INCONCLUSIVE missing="):
+            dims = line[len("INCONCLUSIVE missing="):]
+            return [dim for dim in dims.split(",") if dim]
+    return None
+
+
+def check_noflag_available_unresolved(doc: dict) -> list:
+    """Optional-file semantics pin (F2): without
+    `--workload-metadata` the serve still succeeds, so status reads
+    `available` (status describes the serving path, not the file —
+    the taxonomy has no no-file variant) with every per-key answer
+    Unresolved: bare rows carry neither `workload` nor a
+    non-unresolved `attribution` (assemble.rs split_row keeps the
+    bare default implicit). Returns reasons (empty = pinned). Pure —
+    host-tested."""
+    reasons = []
+    metadata = doc.get("metadata", {}) if isinstance(doc, dict) \
+        else {}
+    if metadata.get("status") != "available":
+        reasons.append(f"status={metadata.get('status')!r}, want "
+                       "'available'")
+    if "reason" in metadata:
+        reasons.append(f"available carries reason="
+                       f"{metadata['reason']!r}")
+    contexts = doc.get("contexts", []) if isinstance(doc, dict) \
+        else []
+    if not contexts:
+        reasons.append("no raw rows (blocked?)")
+    for idx, row in enumerate(contexts):
+        if not isinstance(row, dict):
+            reasons.append(f"contexts[{idx}] not an object")
+            continue
+        if "workload" in row:
+            reasons.append(f"contexts[{idx}] carries workload "
+                           "identity (want Unresolved)")
+        attribution = row.get("attribution")
+        if attribution is not None:
+            status = attribution.get("status") \
+                if isinstance(attribution, dict) else None
+            if status != "unresolved":
+                reasons.append(
+                    f"contexts[{idx}].attribution.status="
+                    f"{status!r} (want 'unresolved')")
+    return reasons
+
+
+def stage_helperless_copy(src: Path, dst: Path) -> None:
+    """Stage the helperless-leg CLI copy (F2): copyfile drops the
+    exec bit and `token mint` sets the xattr only (cmd_token.rs), so
+    chmod +x explicitly — without it the leg cannot exec the copy."""
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o755)
+
 DRY_RUN_STEPS = {
     "watch": [
         "installed watch --system over M1-driver traffic",
@@ -58,9 +133,13 @@ DRY_RUN_STEPS = {
         "refuse (C7-1/A10)",
     ],
     "policy": [
-        "installed check: clean (0), violation (10), "
+        "installed check: clean (3 + named missing dims — "
+        "fail-closed on live windows), violation (10), "
         "unevaluable (3), bad policy (2), scoped legs",
-        "oracle: F06 exit table + never-10-without-evidence",
+        "clean->0 replay is NOT_RUN (no stored-input surface; "
+        "CLEAN needs COMPLETE coverage)",
+        "oracle: F06 exit table + named dims + "
+        "never-10-without-evidence",
     ],
     "replay": [
         "report FILE twice over stored workload-json bytes",
@@ -77,8 +156,10 @@ DRY_RUN_STEPS = {
         "bounded shutdown",
     ],
     "unavailable-metadata": [
-        "root, no-flag, corrupt-file, and no-helper legs",
-        "oracle: frozen typed reasons + raw rows + exit 3",
+        "root, no-flag (available + all-Unresolved), corrupt-file, "
+        "and no-helper legs",
+        "oracle: frozen typed reasons + available/Unresolved pin + "
+        "raw rows + exit 3",
     ],
 }
 
@@ -447,9 +528,19 @@ def journey_policy(args) -> int:
     out: dict = {}
     proc, summary = _check_with_traffic(args, driver, clean,
                                         "policy-clean")
-    if proc.returncode != EXPECTED_EXITS["complete"]:
-        raise LabError(f"clean policy rc={proc.returncode}, want 0")
-    out["clean"] = {"rc": 0, "driver_ops": summary["ops_total"]}
+    if proc.returncode != EXPECTED_EXITS["cannot-establish"]:
+        raise LabError(f"clean policy rc={proc.returncode}, want 3 "
+                       "(fail-closed on live windows)")
+    dims = parse_inconclusive_dims(proc.stdout)
+    if dims is None:
+        raise LabError("clean policy names no missing dims")
+    if set(dims) != set(EXPECTED_CLEAN_MISSING):
+        raise LabError(f"clean policy missing={dims}, want "
+                       f"{list(EXPECTED_CLEAN_MISSING)}")
+    out["clean"] = {"rc": 3, "missing": dims,
+                    "driver_ops": summary["ops_total"]}
+    out["clean_zero_replay"] = {"status": "NOT_RUN",
+                                "reason": CLEAN_ZERO_NOT_RUN_REASON}
     proc, summary = _check_with_traffic(args, driver, violation,
                                         "policy-violation")
     if proc.returncode != EXPECTED_EXITS["violation"]:
@@ -674,7 +765,10 @@ def journey_unavailable_metadata(args) -> int:
     meta = Path(args.metadata)
     out: dict = {}
 
-    def _case(name: str, cmd: list, want: str | None) -> dict:
+    def _run_capture(name: str, cmd: list) -> tuple:
+        """One unavailable-family capture: driver traffic under a
+        workload-json report, both reaped. Returns (proc, doc,
+        summary); oracles stay with the callers."""
         traffic, ledger = start_traffic(driver, args.out, name,
                                         meas=8, warm=2)
         try:
@@ -684,9 +778,12 @@ def journey_unavailable_metadata(args) -> int:
         finally:
             if traffic.poll() is None:
                 traffic.kill()
+        return proc, json.loads(report.read_text()), summary
+
+    def _case(name: str, cmd: list, want: str | None) -> dict:
+        proc, doc, summary = _run_capture(name, cmd)
         if proc.returncode != EXPECTED_EXITS["cannot-establish"]:
             raise LabError(f"{name}: rc={proc.returncode}, want 3")
-        doc = json.loads(report.read_text())
         status = doc.get("metadata", {}).get("status")
         reason = doc.get("metadata", {}).get("reason")
         if status != "unavailable":
@@ -701,6 +798,20 @@ def journey_unavailable_metadata(args) -> int:
         return {"reason": reason, "rows": len(doc["contexts"]),
                 "driver_ops": summary["ops_total"]}
 
+    def _case_available(name: str, cmd: list) -> dict:
+        """F2 no-flag case: the optional file is absent but the
+        serve succeeds — status `available` with every per-key
+        answer Unresolved."""
+        proc, doc, summary = _run_capture(name, cmd)
+        if proc.returncode != EXPECTED_EXITS["cannot-establish"]:
+            raise LabError(f"{name}: rc={proc.returncode}, want 3")
+        reasons = check_noflag_available_unresolved(doc)
+        if reasons:
+            raise LabError(f"{name}: {reasons}")
+        return {"status": "available",
+                "unresolved_rows": len(doc["contexts"]),
+                "driver_ops": summary["ops_total"]}
+
     base = ["kryprobe", "report", "--system", "--duration", "12",
             "--format", "workload-json"]
     if os.geteuid() == 0:
@@ -710,19 +821,18 @@ def journey_unavailable_metadata(args) -> int:
     else:
         out["root"] = {"skipped": "needs euid 0"}
     uid, gid = nonroot_principal()
-    out["no-flag"] = _case(
+    out["no-flag"] = _case_available(
         "no-flag",
         ["setpriv", f"--reuid={uid}", f"--regid={gid}",
          "--clear-groups"] + base
-        if (uid, gid) != (os.geteuid(), os.getegid()) else base,
-        None)
+        if (uid, gid) != (os.geteuid(), os.getegid()) else base)
     corrupt = args.out / "a25-corrupt-metadata.json"
     corrupt.write_text("{not json")
     helperless = args.out / "no-helper-bin"
     if os.geteuid() == 0:
         helperless.mkdir(exist_ok=True)
-        shutil.copyfile(caps["kryprobe"],
-                        helperless / "kryprobe")
+        stage_helperless_copy(Path(caps["kryprobe"]),
+                              helperless / "kryprobe")
         shutil.copytree(Path(caps["kryprobe"]).parent /
                         "kryprobe-bpf",
                         helperless / "kryprobe-bpf",

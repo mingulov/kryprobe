@@ -992,6 +992,17 @@ class LabJourneyTests(unittest.TestCase):
                              (journey, proc.stderr))
             self.assertIn("NOT_RUN", proc.stdout)
 
+    def test_a25_dry_run_states_fixed_expectations(self):
+        proc = self._run(str(WORKLOAD_LAB / "a25.py"),
+                         "--dry-run", "policy")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("named missing dims", proc.stdout)
+        self.assertIn("clean->0 replay is NOT_RUN", proc.stdout)
+        proc = self._run(str(WORKLOAD_LAB / "a25.py"),
+                         "--dry-run", "unavailable-metadata")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("available + all-Unresolved", proc.stdout)
+
     def test_fixture_ledger_format(self):
         spec = importlib.util.spec_from_file_location(
             "workload_lab_common",
@@ -1134,6 +1145,73 @@ class LabOracleTests(unittest.TestCase):
         self.assertEqual(a25.EXPECTED_EXITS["violation"], 10)
         self.assertEqual(a25.EXPECTED_EXITS["cannot-establish"], 3)
         self.assertEqual(a25.EXPECTED_EXITS["usage"], 2)
+
+    def test_parse_inconclusive_dims(self):
+        a25 = self._a25()
+        self.assertEqual(
+            a25.parse_inconclusive_dims(
+                "INCONCLUSIVE missing=capture-integrity,"
+                "completion\n"),
+            ["capture-integrity", "completion"])
+        self.assertIsNone(a25.parse_inconclusive_dims("CLEAN\n"))
+        self.assertIsNone(a25.parse_inconclusive_dims(""))
+        self.assertEqual(
+            a25.parse_inconclusive_dims(
+                "noise\nINCONCLUSIVE missing=attach\n"),
+            ["attach"])
+
+    def test_expected_clean_missing_pair(self):
+        a25 = self._a25()
+        self.assertEqual(a25.EXPECTED_CLEAN_MISSING,
+                         ("capture-integrity", "completion"))
+        self.assertIn("COMPLETE", a25.CLEAN_ZERO_NOT_RUN_REASON)
+
+    def test_noflag_oracle_happy(self):
+        a25 = self._a25()
+        self.assertEqual(
+            a25.check_noflag_available_unresolved(_wreport()), [])
+        # An explicit unresolved attribution is still Unresolved.
+        doc = _wreport()
+        doc["contexts"][0]["attribution"] = {
+            "relationship": "hook_context", "method": "none",
+            "source": "kernel", "status": "unresolved"}
+        self.assertEqual(
+            a25.check_noflag_available_unresolved(doc), [])
+
+    def test_noflag_oracle_sad(self):
+        a25 = self._a25()
+        doc = _wreport(status="unavailable",
+                       reason="no_principal")
+        self.assertTrue(a25.check_noflag_available_unresolved(doc))
+        doc = _wreport()
+        doc["metadata"]["reason"] = "no_principal"
+        self.assertTrue(a25.check_noflag_available_unresolved(doc))
+        doc = _wreport()
+        doc["contexts"][1]["workload"] = {"container": {}}
+        reasons = a25.check_noflag_available_unresolved(doc)
+        self.assertTrue(any("contexts[1]" in reason
+                            for reason in reasons), reasons)
+        doc = _wreport()
+        doc["contexts"][0]["attribution"] = {"status": "asserted"}
+        self.assertTrue(a25.check_noflag_available_unresolved(doc))
+        doc = _wreport()
+        doc["contexts"] = []
+        self.assertTrue(a25.check_noflag_available_unresolved(doc))
+
+    def test_stage_helperless_copy_is_executable(self):
+        import stat
+
+        a25 = self._a25()
+        tmp = Path(tempfile.mkdtemp())
+        src = tmp / "kryprobe"
+        src.write_text("fake-cli-bytes")
+        src.chmod(0o644)
+        dst = tmp / "staged" / "kryprobe"
+        dst.parent.mkdir()
+        a25.stage_helperless_copy(src, dst)
+        self.assertEqual(dst.read_text(), "fake-cli-bytes")
+        mode = stat.S_IMODE(dst.stat().st_mode)
+        self.assertEqual(mode & 0o111, 0o111, oct(mode))
 
 
 class VerifyCellMTests(unittest.TestCase):
