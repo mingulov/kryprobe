@@ -6,7 +6,9 @@ transform selection, submitter attribution) on a supported Linux
 kernel. This page goes from a release bundle to a first verified
 capture in five steps; `docs/deployment.md` is the full privilege
 runbook and `docs/kcrypto-support.md` is the support table with
-the release's measured limits.
+the release's measured limits. Section 6 adds the M1 workload
+views (grouped reports, cgroup filters, metadata binding) as
+three recipes.
 
 The [first-release notes](releases/v0.1.0.md) state the owner-approved
 scope and remaining qualification gaps. Full R1 performance qualification
@@ -117,3 +119,86 @@ the loss as disqualifying, never as free headroom.
 Support window, kernel floor, and accepted residuals:
 `docs/kcrypto-support.md`. Release identity and evidence map:
 `docs/release-ledger.md`.
+
+## 6. Workload reports: what ran where (M1)
+
+Workload views join per-workload crypto call counts to kernel
+context (event-time cgroup, thread-group, start time) and,
+when metadata binds, to operator workload identities. Context
+is observed execution — never a proved user origin, never a
+guessed label. All three recipes need the api-returns profile
+(the default) and a privileged capture (§1–§3); workload flags
+refuse `--format json|jsonl` and the submitter filters
+(`--filter-pid/--filter-uid/--filter-comm`), which render or
+constrain live observations that carry no workload rows.
+
+### Recipe 1 — what ran: grouped crypto counts
+
+```sh
+kryprobe report --system --duration 30 --group-by cgroup
+kryprobe report --system --duration 30 --group-by cgroup --format workload-json --out wl.json
+kryprobe report wl.json
+```
+
+The first command renders per-cgroup call counts with a
+coverage trailer (four dimensions: capture, attribution,
+metadata, correlation). The second stores the same report as
+`kryprobe.workload-report.v2` bytes; the third replays those
+bytes with no helper and no host queries — replay-after-exit
+renders workloads that are long gone, with exits on the stored
+evidence (0 asserted-complete, 3 on stored gaps or raw IDs).
+
+Expect exit 3 on a live capture: the ledger gap is exported
+unreconciled by disposition and at least one coverage
+dimension reads below complete. Exit 3 with named gaps is the
+honest state, not a failure — read the trailer before the
+counts.
+
+### Recipe 2 — which cgroups: narrow to one workload
+
+Read the cgroup ids from a recipe-1 capture, then narrow:
+
+```sh
+kryprobe report --system --duration 30 --filter-cgroup-id 4021
+kryprobe check --system --policy scoped.yaml --filter-cgroup-id 4021
+```
+
+`--filter-cgroup-id` takes one exact id (0 refuses — the
+unreadable marker is never selectable). The scoped `check`
+evaluates that one cgroup view against a scoped policy: exit
+10 prints `VIOLATION` plus the exact scoped partition
+(`matched=/nonmatched=/unknown_match=`) on stderr, 0 prints
+`CLEAN`, 3 prints `INCONCLUSIVE`. Pod and runtime selectors
+refuse until M2; `--filter-container` is unsupported (group by
+container instead).
+
+### Recipe 3 — why origin unknown: read the raw IDs
+
+Rows without bound metadata render as raw IDs (numeric
+cgroup, thread-group, start time — no names, no labels). That
+is the product refusing to guess. Diagnose from the coverage
+trailer:
+
+- `metadata: unavailable` + a `HelperRefused` note: the helper
+  sibling is missing (release-stage installs carry none until
+  the Stage-6 layout freezes; dev installs ship it), crashed,
+  or refused attestation — capture still completes, with raw
+  IDs. Install or repair the sibling and re-run; never
+  hand-fill identities into the stored bytes.
+- `metadata: partial` with `kernel_mismatch` refusals: the
+  metadata snapshot came from a different kernel — the keys
+  refuse typed and the rows stay unresolved.
+- `attribution: partial` with stale rows: the identity is kept
+  and shown, but its validity window does not cover the
+  capture interval — the row is marked stale, never promoted.
+- Principal rows reading raw IDs under root: root captures
+  carry no trusted non-root principal (`NoPrincipal`), so
+  launch-scoped metadata cannot bind. Capture as the owning
+  user through the file-cap binary instead.
+
+The privileged CLI never parses metadata itself: when no
+verified helper can serve the lookup, the rows stay raw and
+the coverage says why. Anything stricter than raw IDs needs a
+covering metadata file (`--workload-metadata FILE`, bound
+after capture through the confined helper) — and even then,
+attribution is asserted evidence, not proof of origin.

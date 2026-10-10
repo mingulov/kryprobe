@@ -220,6 +220,32 @@ workload latency comes only from the independent driver
 ledger. P7 E08 on 7.2.6 stays NOT_RUN (accepted P7 residual);
 X01–X03/D01–D08 remain the separate P10 demo scope.
 
+## M1 workload attribution
+
+Workload views (`--group-by`, `--filter-cgroup-id`,
+`--workload-metadata`, `--format workload-json`, scoped
+`check`) join api-returns call counts to kernel context rows
+(the KCTX maps: event-time cgroup, thread-group, start time)
+and, when metadata binds, to operator workload identities.
+"Supported" here means the join runs, the rows render, and the
+cited suites assert the boundary — anything else is an
+explicit refusal or an explicit unknown, never a silent gap.
+
+| Boundary (what rows prove) | Limit | Tests |
+|---|---|---|
+| Per-workload call counts per (cgroup/container view, family, op, result); raw IDs (numeric cgroup/tgid/start_ns) when no identity binds | Counts are joins of two separately-read maps: the ledger gap always exports `gap_unreconciled` (consistency `Unproven`), so live captures exit 3 with named gaps — never exact-unknown without a `Quiescent` receipt | `workload` (assembly), `workload_cli` (replay exits) |
+| Metadata binding via `--workload-metadata` through the confined helper: asserted (covering validity), stale (identity kept, row marked), unresolved (raw IDs kept) | The privileged CLI never parses metadata: binding happens only in a helper that passes attestation (uid/gid, zero caps, no-new-privs, stdio-only fds); a missing/crashed/refused helper degrades to raw IDs, never an error and never a guess | `workload_launch` (attest/serve), `workload_cli` (serve folds) |
+| Principal from kernel credentials (`/proc/self/status` of the invoker) | Root captures carry no trusted non-root principal (`NoPrincipal`): the serve never runs, rows stay raw, and `SUDO_UID`/`SUDO_USER` are never consulted | `workload_launch` (principal) |
+| One exact cgroup view (`--filter-cgroup-id`, scoped `check` with exact partition) | 0 refuses (unreadable marker, never selectable); pod/runtime selectors refuse until M2; a present `lifetime` on a scoped container selector refuses (D10: selectors match across lifetimes); `--group-by` is not a check axis | `workload_cli` (usage exits), `args` (combination rules), `kryprobe-policy` (`matching-violation` fixture) |
+| Stored `kryprobe.workload-report.v2` bytes replay via `report FILE` | Replay reads bytes only — no helper, no host queries; exits on the stored evidence (0 asserted-complete, 3 stored gaps/raw IDs); counts above 2^53 render as digit strings to survive JSON f64 | `workload_cli` (frozen fixtures), `workload` (>2^53) |
+
+M1 does not observe pod, runtime, or cluster identity from the
+kernel: any such label in a report came from operator metadata
+through the binding above, and rows without it stay numeric.
+First-seen kernel who-labels never enter the join. Hash
+request lifecycles stay unobserved (no hooks), as under both
+profiles above.
+
 ## Explicit non-goals (both profiles)
 
 - Keys, IVs, plaintext/ciphertext, AAD/tag bytes, digest outputs, RNG

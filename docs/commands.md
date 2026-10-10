@@ -30,10 +30,10 @@ kryprobe inspect --pid N [--json]
 kryprobe selftest synthetic [--out FILE]
 kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
-kryprobe watch --system [--source S] [--duration N] [--token PATH]
-kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH]
+kryprobe watch --system [--source S] [--duration N] [--token PATH] [--group-by G] [--filter-cgroup-id ID] [--workload-metadata F]
+kryprobe report --system [--duration N] [--format human|json|jsonl|workload-json] [--out FILE] [--source S] [--token PATH] [--group-by G] [--filter-cgroup-id ID] [--workload-metadata F]
 kryprobe report FILE
-kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH]
+kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH] [--filter-cgroup-id ID] [--workload-metadata F]
 kryprobe token mint [--bin PATH] [--receipt PATH] [--force]
 kryprobe token status [--bin PATH]
 kryprobe plan|observe|run ...   # stub: exit 4, typed marker
@@ -66,7 +66,13 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   by another process during the roundtrip reports `Leaked` honestly.
 - `report FILE` validates a JSONL stream against the frozen schema
   (exit 2 on corrupt input) and renders phase tables, coverage, and
-  integrity.
+  integrity. It dispatches on exact schema ids: stored
+  `kryprobe.workload-report.v2` bytes replay the typed workload
+  report with exits on the stored evidence (0 asserted-complete, 3
+  on stored gaps or raw IDs — with no helper and no host queries,
+  so replay-after-exit renders workloads that are long gone); v1
+  bytes render the legacy workload view; anything else streams as
+  legacy JSONL byte-identically.
 - `watch --system`, `report --system`, and `check --system` are the
   system-wide kcrypto commands (kp2 §2–§3): `--system` select-all is
   the only v0.1 scope, so fork/exec, new containers, and module loads
@@ -83,9 +89,31 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   policy: exit 10 prints `VIOLATION rule=…` plus stderr detail naming
   algorithm/driver/context/evidence, exit 0 prints `CLEAN`, exit 3
   prints `INCONCLUSIVE missing=…`. Unusable lanes exit 4 in all
-  three. Workload selectors (`--pid`, `--tree`, `--cgroup`,
-  `--cgroup-id`, `--unit`) and `--comm` filters are deferred past v0.1
-  and rejected naming the deferral.
+  three. Legacy workload selectors (`--pid`, `--tree`, `--cgroup`,
+  `--unit`) stay deferred past v0.1 and are rejected naming the
+  deferral; `--comm` filters are unchanged.
+- M1 workload views (`watch`/`report --system`, `check --system`):
+  `--group-by cgroup|container` renders the common typed workload
+  report (per-workload crypto call counts joined to kernel
+  context; `none` keeps the historical tables).
+  `--filter-cgroup-id ID` narrows to one exact cgroup (0 refuses —
+  the unreadable marker is never selectable).
+  `--workload-metadata FILE` binds operator metadata after capture
+  through the confined helper: asserted (covering validity),
+  stale (identity kept, row marked), or unresolved (raw IDs kept,
+  never guessed). Workload flags need the api-returns profile and
+  combine only with `--format human` or `--format workload-json`
+  (`kryprobe.workload-report.v2` bytes); `--format json|jsonl` and
+  `--filter-pid/--filter-uid/--filter-comm` refuse with workload
+  flags (those render or submitter-filter live observations, which
+  carry no workload rows). `check --filter-cgroup-id` scopes one
+  cgroup view against a scoped policy (`--group-by` is not a check
+  axis — grouping is a report rendering axis; system-wide checks
+  take no `--workload-metadata`): exit 10 prints `VIOLATION` plus
+  the exact scoped partition on stderr, 0 prints `CLEAN`, 3 prints
+  `INCONCLUSIVE`. Pod and runtime selectors (`--filter-pod`,
+  `--filter-runtime`) refuse until M2; `--filter-container` is
+  unsupported (container grouping via `--group-by container`).
 
 - Truncated stdout (1A-L11): Rust ignores SIGPIPE, so `kryprobe
   report … | head -1` hits EPIPE mid-stream. Every command's stdout

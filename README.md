@@ -50,10 +50,10 @@ kryprobe selftest bpf [--calls N] [--out FILE]
 kryprobe selftest token-smoke
 kryprobe token mint [--bin PATH] [--receipt PATH] [--force]
 kryprobe token status [--bin PATH]
-kryprobe watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P]
-kryprobe report --system [--duration N] [--format human|json|jsonl] [--out FILE] [--source S] [--token PATH] [--kcrypto-profile P]
+kryprobe watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P] [--group-by G] [--filter-cgroup-id ID] [--workload-metadata F]
+kryprobe report --system [--duration N] [--format human|json|jsonl|workload-json] [--out FILE] [--source S] [--token PATH] [--kcrypto-profile P] [--group-by G] [--filter-cgroup-id ID] [--workload-metadata F]
 kryprobe report FILE
-kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH] [--kcrypto-profile P]
+kryprobe check --system --policy FILE [--duration N] [--source S] [--token PATH] [--kcrypto-profile P] [--filter-cgroup-id ID] [--workload-metadata F]
 kryprobe <command> --help   # per-command help with examples (exit 0)
 kryprobe plan|observe|run ...   # honest stub: exits 4, see below
 ```
@@ -85,6 +85,18 @@ evaluates one capture against an explicit policy file.
 or `request-lifecycle` (per-request lifecycles, needs kernel 7.0+);
 the profile × family × boundary × provider × kernel table lives in
 `docs/kcrypto-support.md`.
+
+M1 adds workload views on the system-wide commands: `--group-by
+cgroup|container` renders per-workload crypto call counts joined to
+kernel context, `--filter-cgroup-id ID` narrows to one exact cgroup,
+`--workload-metadata FILE` binds operator metadata (asserted /
+stale / unresolved — never guessed), and `--format workload-json`
+emits the machine-readable `kryprobe.workload-report.v2` bytes that
+`report FILE` replays later with no helper and no host queries.
+Scoped `check --filter-cgroup-id` evaluates one cgroup view against
+a scoped policy. Pod/runtime selectors refuse until M2; see
+`docs/commands.md` and the recipes in
+`docs/kcrypto-quickstart.md` §6.
 
 ## Exit codes
 
