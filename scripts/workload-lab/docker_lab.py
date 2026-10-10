@@ -76,13 +76,40 @@ def termination_sleep_argv(tag: str, name: str) -> list:
             "--name", name, fixture_image_tag(tag), "300"]
 
 
-def capture_join_timeout(duration_s: float, elapsed_s: float) -> float:
-    """Remaining capture-join budget (F3 mask fix): the capture's own
-    duration minus elapsed wall, plus the C7-2 reap grace, floored at
-    the grace (an already-elapsed capture joins immediately). Pure —
-    host-tested."""
-    return max(duration_s - elapsed_s + lab.OWNED_REAP_GRACE_S,
-               lab.OWNED_REAP_GRACE_S)
+def _wait_container_gone(name: str, timeout_s: float = 30.0) -> None:
+    """Wait until `name` no longer exists (termination-leg reuse
+    guard: `--rm` auto-removal races an immediate reuse of the name —
+    the daemon still reports the stopped container as in use)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        proc = run(["docker", "inspect", "--format",
+                    "{{.State.Status}}", name], 30)
+        if proc.returncode != 0:
+            return
+        time.sleep(1)
+    raise LabError(f"{name} still present after stop (remove race?)")
+
+
+def _wait_tcp_listen(host: str, port: int, timeout_s: float,
+                     proc) -> None:
+    """Wait until host:port accepts (TLS-leg readiness: s_server
+    needs a moment after fork; connecting early refuses). Raises
+    with the server's stderr tail if the server dies first. The
+    probe connection is opened and closed without I/O."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            _, stderr = proc.communicate()
+            raise LabError("TLS server died during startup: "
+                           f"{stderr.strip()[-300:]}")
+        try:
+            sock = socket.create_connection((host, port), timeout=2)
+            sock.close()
+            return
+        except OSError:
+            time.sleep(0.5)
+    raise LabError(f"TLS server not listening on {host}:{port} "
+                   f"after {timeout_s:.0f}s")
 
 DRY_RUN_STEPS = {
     "setup": [
@@ -100,8 +127,8 @@ DRY_RUN_STEPS = {
         "oracle: per-cgroup enc/dec == fixture self-counted ops",
     ],
     "termination": [
-        "stop/rm one --entrypoint-sleep container (F4), recreate "
-        "under the same name",
+        "stop/rm one --entrypoint-sleep container (F4), await its "
+        "removal, recreate under the same name",
         "fixture runs carry relaxed seccomp+apparmor (F3: test "
         "workloads; kryprobe observes from outside)",
         "oracle: new cgroup id (never reused), fresh traffic "
@@ -114,7 +141,8 @@ DRY_RUN_STEPS = {
         "oracle: typed unavailable + raw rows + exit 3 on each",
     ],
     "tls": [
-        "userspace-TLS transfer in owned cgroups (kTLS evidence)",
+        "userspace-TLS transfer in owned cgroups (kTLS evidence; "
+        "server readiness-polled)",
         "fixture runs carry relaxed seccomp+apparmor (F3: test "
         "workloads; kryprobe observes from outside)",
         "oracle: zero kernel-crypto calls there; AF_ALG positive "
@@ -387,12 +415,14 @@ def journey_two_workloads(args) -> int:
         ["kryprobe", "report", "--system", "--duration", "60",
          "--format", "workload-json", "--out", str(report)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    capture_start = time.monotonic()
     # F3: record fixture errors BEFORE the capture join — the old
     # fixed 60+1s join measured from failure time could time out
     # over a fast fixture failure (round-1: 785 ms life) and mask it
-    # as "capture did not exit". The join below only reaps; the
-    # fixture error (the cause) raises first with the join noted.
+    # as "capture did not exit". The join below only reaps (kept
+    # generous from join time: a healthy 60 s capture runs ~64 s
+    # wall with startup/drain overrun — DW2 — so a remaining-budget
+    # join would kill it); the fixture error (the cause) raises
+    # first with the join noted.
     fixture_error = None
     try:
         sum_a = _run_fixture(args.tag, name_a, "a.csv")
@@ -401,8 +431,8 @@ def journey_two_workloads(args) -> int:
         fixture_error = err
     join_note = "joined"
     try:
-        _, _ = capture.communicate(timeout=capture_join_timeout(
-            60.0, time.monotonic() - capture_start))
+        _, _ = capture.communicate(
+            timeout=60 + lab.OWNED_REAP_GRACE_S)
     except subprocess.TimeoutExpired:
         capture.kill()
         try:
@@ -464,6 +494,7 @@ def journey_termination(args) -> int:
         proc = run(["docker", "stop", "-t", "2", name], 30)
     if proc.returncode != 0:
         raise LabError(f"stop {name} failed")
+    _wait_container_gone(name)
     started = run(termination_sleep_argv(args.tag, name), 60)
     if started.returncode != 0:
         raise LabError(f"restart {name} failed: "
@@ -592,6 +623,7 @@ def journey_tls(args) -> int:
     try:
         (server_cg / "cgroup.procs").write_text(str(server.pid))
         server_cg_id = str(server_cg.stat().st_ino)
+        _wait_tcp_listen("127.0.0.1", 18443, 30.0, server)
         report = args.out / "tls.report.workload-json"
         capture = subprocess.Popen(
             ["kryprobe", "report", "--system", "--duration", "20",
@@ -615,7 +647,10 @@ def journey_tls(args) -> int:
                 client.kill()
                 raise LabError("TLS transfer timed out") from err
             if client.returncode != 0:
-                raise LabError("TLS transfer failed: "
+                alive = "alive" if server.poll() is None \
+                    else f"exited={server.poll()}"
+                raise LabError("TLS transfer failed "
+                               f"(server {alive}): "
                                f"{stderr.strip()[-300:]}")
             positive = _run_fixture(args.tag, f"{args.tag}-pos",
                                     "pos.csv")

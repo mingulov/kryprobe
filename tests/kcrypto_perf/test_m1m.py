@@ -1066,14 +1066,57 @@ class LabJourneyTests(unittest.TestCase):
         # sleep word (the frozen driver has no sleep mode).
         self.assertEqual(argv[image_at + 1:], ["300"])
 
-    def test_capture_join_timeout_math(self):
+    def test_wait_tcp_listen_ready(self):
+        import socket
+        import types
+
         lab = self._docker_lab()
-        self.assertAlmostEqual(
-            lab.capture_join_timeout(60.0, 1.0), 60.0)
-        self.assertAlmostEqual(
-            lab.capture_join_timeout(30.0, 10.0), 21.0)
-        self.assertAlmostEqual(
-            lab.capture_join_timeout(60.0, 70.0), 1.0)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        try:
+            port = listener.getsockname()[1]
+            alive = types.SimpleNamespace(poll=lambda: None)
+            lab._wait_tcp_listen("127.0.0.1", port, 5.0, alive)
+        finally:
+            listener.close()
+
+    def test_wait_tcp_listen_dead_server(self):
+        import types
+
+        lab = self._docker_lab()
+        dead = types.SimpleNamespace(
+            poll=lambda: 1,
+            communicate=lambda: ("", "s_server boom"))
+        with self.assertRaisesRegex(lab.LabError, "boom"):
+            lab._wait_tcp_listen("127.0.0.1", 1, 5.0, dead)
+
+    def test_wait_tcp_listen_timeout(self):
+        import types
+
+        lab = self._docker_lab()
+        alive = types.SimpleNamespace(poll=lambda: None)
+        with self.assertRaisesRegex(lab.LabError,
+                                    "not listening"):
+            lab._wait_tcp_listen("127.0.0.1", 1, 0.2, alive)
+
+    def test_wait_container_gone(self):
+        from unittest import mock
+
+        lab = self._docker_lab()
+        gone = mock.Mock(returncode=1, stdout="", stderr="")
+        with mock.patch.object(lab, "run",
+                               return_value=gone) as mocked:
+            lab._wait_container_gone("x-gone", timeout_s=5.0)
+        mocked.assert_called_once()
+        present = mock.Mock(returncode=0, stdout="running",
+                            stderr="")
+        with mock.patch.object(lab, "run",
+                               return_value=present):
+            with self.assertRaisesRegex(lab.LabError,
+                                        "still present"):
+                lab._wait_container_gone("x-stuck", timeout_s=0.2)
 
     def test_lab_dry_run_discloses_relaxed_confinement(self):
         for journey in ("two-workloads", "termination",
