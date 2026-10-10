@@ -305,10 +305,26 @@ fn open_verified(path: &Path) -> std::io::Result<(std::fs::File, HelperIdentity)
     if fd < 3 {
         // Only when stdio is closed (never in practice): park the
         // image fd above stdio so confinement keeps the right fd.
+        // `F_DUPFD_CLOEXEC` — never plain `F_DUPFD`, which clears
+        // `CLOEXEC`: the parked keep-fd must not survive `exec` into
+        // the helper (a surviving fd breaks the stdio-only
+        // attestation). Verified below, fail-closed.
         // SAFETY: dups a live fd to 3+; the original closes on drop.
-        fd = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+        fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fcntl F_GETFD on a live owned fd.
+        let parked_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if parked_flags < 0 || (parked_flags & libc::FD_CLOEXEC) == 0 {
+            // SAFETY: fresh owned fd, closed exactly once.
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "parked image fd lost CLOEXEC",
+            ));
         }
         // SAFETY: fresh owned fd, wrapped exactly once.
         file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -1722,6 +1738,108 @@ mod tests {
             }
             other => panic!("drains cleanly: {other:?}"),
         }
+    }
+
+    /// Wait for a child with a hard bound: timeout kills, reaps,
+    /// and reports `None` — probe oracles never hang the suite even
+    /// when the launch path regresses into a hang.
+    fn wait_bounded(
+        child: &mut std::process::Child,
+        bound: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + bound;
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => return Some(status),
+                None => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// M1-dupfd oracle (Codex C2): a closed-stdio subprocess launch
+    /// keeps stdio-only confinement — the helper attests fds exactly
+    /// `[0,1,2]`. When the image open lands on fd 0–2 the launcher
+    /// parks it above stdio; a park that clears `CLOEXEC` (plain
+    /// `F_DUPFD`) survives `exec` and the attestation refuses. The
+    /// probe re-execs this test binary (unique filter + one thread)
+    /// so the stdio-closing probe runs single-threaded: no sibling
+    /// thread can claim the closed numbers mid-probe.
+    /// (RED pre-fix: the keep-fd leaks and the child attests
+    /// `[0,1,2,3]`.)
+    #[test]
+    fn closed_stdio_launch_keeps_stdio_only_confinement() {
+        if std::env::var("KRYPROBE_LAUNCH_CLOSED_STDIO_CHILD").is_ok() {
+            closed_stdio_child();
+            return;
+        }
+        closed_stdio_parent();
+    }
+
+    /// Closed-stdio child: close 0–2, attest, log the verdict to the
+    /// parent-provided file, restore stdio for the harness, assert.
+    fn closed_stdio_child() {
+        let helper = std::env::var("KRYPROBE_LAUNCH_CLOSED_STDIO_HELPER").expect("helper path");
+        let log = std::env::var("KRYPROBE_LAUNCH_CLOSED_STDIO_LOG").expect("log path");
+        // SAFETY: closing stdio in this single-threaded probe child.
+        for fd in [0, 1, 2] {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        let principal = current_principal().expect("test principal");
+        let result = attest_helper(Path::new(&helper), &principal, Duration::from_secs(10));
+        std::fs::write(&log, format!("{result:?}")).expect("probe log");
+        // Restore stdio before asserting: failure detail goes to the
+        // log file the parent quotes, never to closed fds.
+        for want in [0, 1, 2] {
+            // SAFETY: open(2) on /dev/null; single-threaded, so the
+            // lowest free number is exactly `want`.
+            let got = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+            assert_eq!(got, want, "stdio restores cleanly");
+        }
+        assert!(
+            result.is_ok(),
+            "closed-stdio launch attests stdio-only: {result:?}"
+        );
+    }
+
+    /// Closed-stdio parent: stage the fixture, re-exec this test
+    /// binary as the probe child, bound its wait, quote its log.
+    fn closed_stdio_parent() {
+        const PROBE: &str = "closed_stdio_launch_keeps_stdio_only_confinement";
+        let scratch = kryprobe_testkit::TempDir::named("launch-closed-stdio").expect("scratch");
+        let helper = stage_fixture(scratch.path(), "helper", serde_json::json!({}));
+        let log_path = scratch.path().join("probe.log");
+        let test_exe = std::env::current_exe().expect("test exe");
+        let mut child = Command::new(&test_exe)
+            .arg(PROBE)
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env("KRYPROBE_LAUNCH_CLOSED_STDIO_CHILD", "1")
+            .env("KRYPROBE_LAUNCH_CLOSED_STDIO_HELPER", &helper)
+            .env("KRYPROBE_LAUNCH_CLOSED_STDIO_LOG", &log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("probe child spawns");
+        let status = wait_bounded(&mut child, Duration::from_secs(30));
+        let probe_log =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|_| "(no probe log)".to_string());
+        let Some(status) = status else {
+            panic!("closed-stdio probe child timed out (log: {probe_log})");
+        };
+        assert!(
+            status.success(),
+            "closed-stdio launch keeps stdio-only confinement (child {status}, probe: {probe_log})"
+        );
     }
 
     /// A pinnable `ls` for the fd-allowlist proofs (fd-exec needs a
