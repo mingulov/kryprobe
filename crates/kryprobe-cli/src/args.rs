@@ -19,12 +19,12 @@ commands:
   token mint [--bin PATH] [--receipt PATH] [--force]
                                root one-shot file-cap grant + receipt (setcap)
   token status [--bin PATH]     file caps + token-pin usability (never privileged)
-  watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P] [--filter-* ...]
+  watch --system [--source S] [--duration N] [--token PATH] [--kcrypto-profile P] [--filter-* ...] [--group-by G] [--filter-cgroup-id ID] [--workload-metadata F]
                                continuous system-wide observe (live kcrypto)
-  report --system [--duration N] [--format human|json|jsonl] [--out F] [--source S] [--token PATH] [--kcrypto-profile P] [--filter-* ...]
+  report --system [--duration N] [--format human|json|jsonl|workload-json] [--out F] [--source S] [--token PATH] [--kcrypto-profile P] [--filter-* ...] [--group-by G] [--filter-cgroup-id ID] [--workload-metadata F]
                                bounded system-wide capture + render (live kcrypto)
-  report FILE                  validate + render a JSONL stream
-  check --system --policy F [--duration N] [--source S] [--token PATH] [--kcrypto-profile P]
+  report FILE                  validate + render a JSONL stream or workload report
+  check --system --policy F [--duration N] [--source S] [--token PATH] [--kcrypto-profile P] [--filter-cgroup-id ID] [--workload-metadata F]
                                system-wide policy check (exit 10 on violation)
   plan|observe|run ...         unsupported in thin spine (exit 4)
 
@@ -65,6 +65,9 @@ pub enum ReportFormat {
     Json,
     /// Validated event-v0 JSONL stream (session envelope records).
     Jsonl,
+    /// Machine-readable `workload-report-v2` JSON document (typed
+    /// workload report bytes, replayable via `report FILE`).
+    WorkloadJson,
 }
 
 /// Post-ingestion per-request submitter filter (P6-N3):
@@ -158,6 +161,12 @@ pub enum Command {
         profile: LifecycleProfile,
         /// Post-ingestion submitter filter (all-`None` disables).
         filter: FilterArgs,
+        /// Workload row grouping (`None` keeps the historical tables).
+        group_by: kryprobe_report::workload::GroupBy,
+        /// Exact cgroup-id view (`None` shows the whole population).
+        filter_cgroup_id: Option<u64>,
+        /// Optional workload metadata file feeding the helper.
+        workload_metadata: Option<PathBuf>,
     },
     /// Validate + render a stream.
     Report {
@@ -182,6 +191,12 @@ pub enum Command {
         profile: LifecycleProfile,
         /// Post-ingestion submitter filter (all-`None` disables).
         filter: FilterArgs,
+        /// Workload row grouping (`None` keeps the historical render).
+        group_by: kryprobe_report::workload::GroupBy,
+        /// Exact cgroup-id view (`None` shows the whole population).
+        filter_cgroup_id: Option<u64>,
+        /// Optional workload metadata file feeding the helper.
+        workload_metadata: Option<PathBuf>,
     },
     /// System-wide policy check (live kcrypto capture evaluated
     /// against the policy; exit 10 on confirmed violation).
@@ -196,6 +211,12 @@ pub enum Command {
         token: Option<PathBuf>,
         /// Capture profile (`api-returns` default, `request-lifecycle`).
         profile: LifecycleProfile,
+        /// Exact cgroup-id scope (`None` checks the whole population).
+        filter_cgroup_id: Option<u64>,
+        /// Optional workload metadata file feeding the helper
+        /// (needs `--filter-cgroup-id`: system-wide checks take no
+        /// metadata).
+        workload_metadata: Option<PathBuf>,
     },
     /// Thin-spine stub (`plan`/`observe`/`run`).
     Stub {
@@ -389,7 +410,7 @@ exits: 0 ok; 1 internal failure; 2 usage/invalid input.
 ";
 
 const WATCH_HELP: &str = "\
-usage: kryprobe watch --system [--source kernel-crypto] [--duration N] [--token PATH] [--kcrypto-profile P] [--filter-pid N] [--filter-uid N] [--filter-comm S]
+usage: kryprobe watch --system [--source kernel-crypto] [--duration N] [--token PATH] [--kcrypto-profile P] [--filter-pid N] [--filter-uid N] [--filter-comm S] [--group-by none|cgroup|container] [--filter-cgroup-id ID] [--workload-metadata FILE]
 
 Continuous system-wide observe (live kcrypto capture), rendered as
 aggregated human tables. --system is required (system scope only).
@@ -403,6 +424,9 @@ flags:
   --filter-pid N         admit only submitter pid N (exact; post-ingestion)
   --filter-uid N         admit only submitter uid N (exact; post-ingestion)
   --filter-comm S        admit only submitter comm S (exact decoded display name; post-ingestion)
+  --group-by G           workload grouping: none (default, historical tables) | cgroup | container
+  --filter-cgroup-id ID  exact cgroup-id view (selectors are views, never confinement)
+  --workload-metadata F  optional metadata file feeding the unprivileged helper
 
 filters (--filter-*): constrain the submitter identity AFTER capture
 ingestion, per request — capture is unfiltered, views filter. Rows
@@ -411,6 +435,16 @@ evaluate stay visible and count UNKNOWN (lifecycle rows always:
 frozen edges carry no task identity). Tallies ride the FILTER line
 plus coverage counters (filter_admitted/filter_filtered/
 filter_unknown); an admitted completion follows its request.
+
+workload views (--group-by, --filter-cgroup-id): render the common
+typed workload report instead of the historical tables. Any workload
+flag selects workload mode (api-returns profile only). Selectors are
+post-ingestion views over the captured population: they partition
+rows into matched/nonmatched/unknown_match, never delete evidence.
+Context is observed execution (event-time cgroup, thread-group, and
+lifetime discriminator) — it does not establish workload origin.
+Coverage carries four independent dimensions: capture, attribution,
+metadata, correlation.
 
 capture profiles (--kcrypto-profile):
   api-returns        per-API return tallies + caller contexts (default;
@@ -429,6 +463,8 @@ setup:
 examples:
   kryprobe watch --system --duration 30
   kryprobe watch --system --duration 30 --kcrypto-profile request-lifecycle
+  kryprobe watch --system --duration 30 --group-by cgroup
+  kryprobe watch --system --duration 30 --group-by container --workload-metadata meta.json
   kryprobe watch --system --kcrypto-profile frobnicate
       # exit 2: unsupported profile (names api-returns|request-lifecycle)
 
@@ -440,15 +476,16 @@ exits: 0 session complete (read the coverage trailer: exit 0 is NOT
 
 const REPORT_HELP: &str = "\
 usage: kryprobe report FILE
-       kryprobe report --system [--duration N] [--format human|json|jsonl] [--out F] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P] [--filter-pid N] [--filter-uid N] [--filter-comm S]
+       kryprobe report --system [--duration N] [--format human|json|jsonl|workload-json] [--out F] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P] [--filter-pid N] [--filter-uid N] [--filter-comm S] [--group-by none|cgroup|container] [--filter-cgroup-id ID] [--workload-metadata FILE]
 
-Validate + render a JSONL stream (FILE), or bounded system-wide
-capture + render (live mode needs --system; default window 60s).
+Validate + render a stream or stored workload report (FILE), or
+bounded system-wide capture + render (live mode needs --system;
+default window 60s).
 
 flags (live mode):
   --system               select-all scope (required for live capture)
   --duration N           capture window in seconds (>= 1)
-  --format F             human (default) | json | jsonl
+  --format F             human (default) | json | jsonl | workload-json
   --out F                output file (default: stdout)
   --source S             only 'kernel-crypto' in v0.1
   --token PATH           explicit BPF token path (overrides env + default pin)
@@ -456,6 +493,9 @@ flags (live mode):
   --filter-pid N         admit only submitter pid N (exact; post-ingestion)
   --filter-uid N         admit only submitter uid N (exact; post-ingestion)
   --filter-comm S        admit only submitter comm S (exact decoded display name; post-ingestion)
+  --group-by G           workload grouping: none (default, historical render) | cgroup | container
+  --filter-cgroup-id ID  exact cgroup-id view (selectors are views, never confinement)
+  --workload-metadata F  optional metadata file feeding the unprivileged helper
 
 filters (--filter-*): constrain the submitter identity AFTER capture
 ingestion, per request — capture is unfiltered, views filter. Rows
@@ -464,6 +504,20 @@ evaluate stay visible and count UNKNOWN (lifecycle rows always:
 frozen edges carry no task identity). Tallies ride the FILTER line,
 coverage counters, and the session envelope; an admitted completion
 follows its request.
+
+workload views (--group-by, --filter-cgroup-id, --format
+workload-json): render the common typed workload report instead of
+the historical formats. Any workload flag selects workload mode
+(api-returns profile only; json/jsonl refuse workload flags).
+Selectors are post-ingestion views over the captured population:
+they partition rows into matched/nonmatched/unknown_match, never
+delete evidence. Context is observed execution (event-time cgroup,
+thread-group, and lifetime discriminator) — it does not establish
+workload origin. Coverage carries four independent dimensions:
+capture, attribution, metadata, correlation. `report FILE`
+replays stored `workload-report-v2` bytes identically with no host
+queries (replay works after workloads disappear); legacy v1 reports
+render their stored partition plus limitations.
 
 capture profiles (--kcrypto-profile):
   api-returns        per-API return tallies + caller contexts (default;
@@ -481,7 +535,10 @@ setup:
 
 examples:
   kryprobe report session.jsonl
+  kryprobe report stored-workload.json
   kryprobe report --system --duration 10 --format json
+  kryprobe report --system --duration 10 --format workload-json --out stored-workload.json
+  kryprobe report --system --duration 10 --group-by cgroup --filter-cgroup-id 123
   kryprobe report --system --duration 10 --format json --kcrypto-profile frobnicate
       # exit 2: unsupported profile (names api-returns|request-lifecycle)
 
@@ -491,7 +548,7 @@ exits: 0 verdict clean/complete; 1 internal failure; 2 usage/invalid
 ";
 
 const CHECK_HELP: &str = "\
-usage: kryprobe check --system --policy F [--duration N] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P]
+usage: kryprobe check --system --policy F [--duration N] [--source kernel-crypto] [--token PATH] [--kcrypto-profile P] [--filter-cgroup-id ID] [--workload-metadata FILE]
 
 System-wide policy check: live kcrypto capture evaluated against
 the policy (--policy required: v0.1 has no default policy).
@@ -503,6 +560,18 @@ flags:
   --source S             only 'kernel-crypto' in v0.1
   --token PATH           explicit BPF token path (overrides env + default pin)
   --kcrypto-profile P    api-returns (default) | request-lifecycle
+  --filter-cgroup-id ID  cgroup-scoped check: exact cgroup-id scope (selectors are views, never confinement)
+  --workload-metadata F  optional metadata file feeding the unprivileged helper (scoped checks only)
+
+workload scopes (--filter-cgroup-id): evaluate the policy over the
+common typed workload report restricted to one exact cgroup view
+(api-returns profile only). Selectors are post-ingestion views over
+the captured population: definitely matching violations exit 10
+(even with unrelated gaps), unknown scope or capture gaps void a
+clean verdict (exit 3). Context is observed execution (event-time
+cgroup, thread-group, and lifetime discriminator) — it does not
+establish workload origin. Coverage carries four independent
+dimensions: capture, attribution, metadata, correlation.
 
 capture profiles (--kcrypto-profile):
   api-returns        per-API return tallies + caller contexts (default;
@@ -520,6 +589,7 @@ setup:
 
 examples:
   kryprobe check --system --policy policy/kcrypto-baseline.yaml --duration 30
+  kryprobe check --system --policy policy/kcrypto-baseline.yaml --filter-cgroup-id 123 --duration 30
   kryprobe check --system --policy policy/kcrypto-baseline.yaml --kcrypto-profile frobnicate
       # exit 2: unsupported profile (names api-returns|request-lifecycle)
 
@@ -684,6 +754,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -696,6 +769,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -708,6 +784,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         for bad in [
@@ -744,6 +823,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -767,6 +849,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -781,6 +866,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         for bad in [
@@ -810,6 +898,8 @@ mod tests {
                 policy: PathBuf::from("p.yaml"),
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -829,6 +919,8 @@ mod tests {
                 policy: PathBuf::from("p.yaml"),
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         for bad in [
@@ -852,15 +944,11 @@ mod tests {
     fn workload_selectors_deferred_on_system_commands() {
         // kp2 §3: workload scope and report filters need attribution
         // semantics first — v0.1 names the deferral, never a bare parse.
+        // M1 adds the real `--filter-cgroup-id` view; the old
+        // scope-ish spellings now hint it (below), while pid/tree/unit
+        // /comm stay deferred.
         for cmd in ["watch", "check"] {
-            for flag in [
-                "--pid",
-                "--tree",
-                "--cgroup",
-                "--cgroup-id",
-                "--unit",
-                "--comm",
-            ] {
+            for flag in ["--pid", "--tree", "--unit", "--comm"] {
                 let words: Vec<&str> = if cmd == "check" {
                     vec![cmd, "--system", "--policy", "p.yaml", flag, "x"]
                 } else {
@@ -873,13 +961,291 @@ mod tests {
                 );
             }
         }
-        for flag in ["--pid", "--cgroup-id"] {
-            let words = vec!["report", "--system", flag, "x"];
-            let err = parse(&argv(&words)).expect_err("deferred selector must not parse");
+        let words = vec!["report", "--system", "--pid", "x"];
+        let err = parse(&argv(&words)).expect_err("deferred selector must not parse");
+        assert!(
+            matches!(&err, ArgsError::Usage(reason) if reason.contains("deferred")),
+            "{words:?} gave {err:?}"
+        );
+    }
+
+    #[test]
+    fn superseded_cgroup_spellings_hint_the_view_flag() {
+        // M1: `--cgroup`/`--cgroup-id` are not views — the error names
+        // the supported spelling, never a bare "unexpected".
+        for words in [
+            vec!["watch", "--system", "--cgroup", "x"],
+            vec!["watch", "--system", "--cgroup-id", "x"],
+            vec!["report", "--system", "--cgroup-id", "x"],
+            vec!["report", "--system", "--cgroup", "x"],
+            vec!["check", "--system", "--policy", "p.yaml", "--cgroup", "x"],
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--cgroup-id",
+                "x",
+            ],
+        ] {
+            let err = parse(&argv(&words)).expect_err("hinted spelling must not parse");
             assert!(
-                matches!(&err, ArgsError::Usage(reason) if reason.contains("deferred")),
-                "{words:?} gave {err:?}"
+                matches!(&err, ArgsError::Usage(reason) if reason.contains("--filter-cgroup-id")),
+                "args {words:?} gave {err:?}"
             );
+        }
+    }
+
+    #[test]
+    fn pod_runtime_container_selectors_refuse() {
+        // Pod/runtime selectors refuse until M2; the container
+        // selector is not an M1 view (container grouping is).
+        for cmd in ["watch", "report", "check"] {
+            for (flag, needle) in [
+                ("--filter-pod", "until M2"),
+                ("--filter-runtime", "until M2"),
+                ("--filter-container", "not supported in M1"),
+            ] {
+                let mut words = vec![cmd, "--system"];
+                if cmd == "check" {
+                    words.extend(["--policy", "p.yaml"]);
+                }
+                words.extend([flag, "x"]);
+                let err = parse(&argv(&words)).expect_err("selector must not parse");
+                assert!(
+                    matches!(&err, ArgsError::Usage(reason) if reason.contains(needle)),
+                    "args {words:?} gave {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workload_view_flags_parse() {
+        use kryprobe_report::workload::GroupBy;
+        assert_eq!(
+            parse(&argv(&[
+                "watch",
+                "--system",
+                "--group-by",
+                "container",
+                "--filter-cgroup-id",
+                "42",
+                "--workload-metadata",
+                "m.json",
+            ]))
+            .unwrap()
+            .command,
+            Command::Watch {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                token: None,
+                profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
+                group_by: GroupBy::Container,
+                filter_cgroup_id: Some(42),
+                workload_metadata: Some(PathBuf::from("m.json")),
+            }
+        );
+        assert_eq!(
+            parse(&argv(&[
+                "report",
+                "--system",
+                "--format",
+                "workload-json",
+                "--group-by",
+                "cgroup",
+            ]))
+            .unwrap()
+            .command,
+            Command::ReportLive {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                format: ReportFormat::WorkloadJson,
+                out: None,
+                token: None,
+                profile: LifecycleProfile::ApiReturns,
+                filter: FilterArgs::default(),
+                group_by: GroupBy::Cgroup,
+                filter_cgroup_id: None,
+                workload_metadata: None,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&[
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--filter-cgroup-id",
+                "7",
+                "--workload-metadata",
+                "m.json",
+            ]))
+            .unwrap()
+            .command,
+            Command::Check {
+                source: "kernel-crypto".to_owned(),
+                duration: None,
+                policy: PathBuf::from("p.yaml"),
+                token: None,
+                profile: LifecycleProfile::ApiReturns,
+                filter_cgroup_id: Some(7),
+                workload_metadata: Some(PathBuf::from("m.json")),
+            }
+        );
+        // `--group-by none` is explicit historical rendering.
+        assert!(matches!(
+            parse(&argv(&["watch", "--system", "--group-by", "none"]))
+                .unwrap()
+                .command,
+            Command::Watch {
+                group_by: GroupBy::None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn workload_unsupported_combinations_refuse() {
+        // Every unsupported combination is a usage error (exit 2)
+        // naming the rule — never a silent downgrade.
+        for words in [
+            // Workload views need the api-returns KCTX maps.
+            vec![
+                "watch",
+                "--system",
+                "--kcrypto-profile",
+                "request-lifecycle",
+                "--group-by",
+                "cgroup",
+            ],
+            vec![
+                "report",
+                "--system",
+                "--kcrypto-profile",
+                "request-lifecycle",
+                "--format",
+                "workload-json",
+            ],
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--kcrypto-profile",
+                "request-lifecycle",
+                "--filter-cgroup-id",
+                "5",
+            ],
+            // Brief-exact JSON/JSONL carry no workload rows.
+            vec![
+                "report",
+                "--system",
+                "--format",
+                "json",
+                "--group-by",
+                "cgroup",
+            ],
+            vec![
+                "report",
+                "--system",
+                "--format",
+                "jsonl",
+                "--filter-cgroup-id",
+                "5",
+            ],
+            vec![
+                "report",
+                "--system",
+                "--format",
+                "json",
+                "--workload-metadata",
+                "m.json",
+            ],
+            // Submitter filters need request rows.
+            vec![
+                "watch",
+                "--system",
+                "--filter-pid",
+                "1",
+                "--group-by",
+                "cgroup",
+            ],
+            vec![
+                "report",
+                "--system",
+                "--filter-comm",
+                "x",
+                "--format",
+                "workload-json",
+            ],
+            // Grouping is a report rendering axis, not a check scope.
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--group-by",
+                "cgroup",
+            ],
+            // System-wide checks take no metadata.
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--workload-metadata",
+                "m.json",
+            ],
+            // The unreadable marker is never selectable.
+            vec!["watch", "--system", "--filter-cgroup-id", "0"],
+            vec!["report", "--system", "--filter-cgroup-id", "0"],
+            vec![
+                "check",
+                "--system",
+                "--policy",
+                "p.yaml",
+                "--filter-cgroup-id",
+                "0",
+            ],
+            // Malformed view values.
+            vec!["watch", "--system", "--group-by", "pod"],
+            vec!["watch", "--system", "--group-by"],
+            vec!["report", "--system", "--filter-cgroup-id", "nope"],
+            vec!["report", "--system", "--filter-cgroup-id"],
+            vec!["watch", "--system", "--workload-metadata"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&words)), Err(ArgsError::Usage(_))),
+                "args {words:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn help_describes_workload_contract() {
+        // Per-command help teaches the M1 contract: selectors as
+        // views, context as observed execution, four coverage dims.
+        for command in ["watch", "report", "check"] {
+            let help = subcommand_help(command).expect("help text");
+            for needle in [
+                "Selectors are",
+                "views",
+                "observed execution",
+                "capture",
+                "attribution",
+                "metadata",
+                "correlation",
+            ] {
+                assert!(
+                    help.contains(needle),
+                    "{command} help misses {needle:?}:\n{help}"
+                );
+            }
+        }
+        for needle in ["--group-by", "--filter-cgroup-id", "--workload-metadata"] {
+            assert!(USAGE.contains(needle), "usage misses {needle:?}:\n{USAGE}");
         }
     }
 
@@ -1050,6 +1416,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::RequestLifecycle,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -1060,6 +1429,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -1079,6 +1451,9 @@ mod tests {
                 token: None,
                 profile: LifecycleProfile::RequestLifecycle,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -1098,6 +1473,8 @@ mod tests {
                 policy: PathBuf::from("p.yaml"),
                 token: None,
                 profile: LifecycleProfile::RequestLifecycle,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         for bad in [
@@ -1132,6 +1509,9 @@ mod tests {
                 token: Some(PathBuf::from("t")),
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -1146,6 +1526,9 @@ mod tests {
                 token: Some(PathBuf::from("t")),
                 profile: LifecycleProfile::ApiReturns,
                 filter: FilterArgs::default(),
+                group_by: kryprobe_report::workload::GroupBy::None,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         assert_eq!(
@@ -1160,6 +1543,8 @@ mod tests {
                 policy: PathBuf::from("p.yaml"),
                 token: Some(PathBuf::from("t")),
                 profile: LifecycleProfile::ApiReturns,
+                filter_cgroup_id: None,
+                workload_metadata: None,
             }
         );
         for bad in [

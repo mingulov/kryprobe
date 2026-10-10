@@ -9,8 +9,13 @@
 //! context/evidence, kp2 §13 row 12) and gap dims go to stderr.
 
 use crate::live::{DEFAULT_TICK_MS, LiveConfig, LiveError, LiveOutcome, run_live_capture};
+use crate::workload::{
+    WorkloadFinishOpts, finish_workload_report, observations_for_rows, precheck_metadata_file,
+};
+use kryprobe_policy::workload::{CaptureIntegrity, ScopedRow, ScopedVerdict, evaluate_scoped};
 use kryprobe_policy::{Policy, evaluate, parse_policy};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
+use kryprobe_report::workload::GroupBy;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -84,13 +89,18 @@ fn finish_check(
 }
 
 /// Runs `check --system`: parse the policy (exit 2 on any rejection),
-/// then one bounded capture (default 60s) evaluated once.
+/// then one bounded capture (default 60s) evaluated once — or the
+/// cgroup-scoped verdict over the typed workload report when
+/// `--filter-cgroup-id` selects a scope.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     source: &str,
     duration: Option<u64>,
     policy: &Path,
     token: Option<&Path>,
     profile: LifecycleProfile,
+    filter_cgroup_id: Option<u64>,
+    workload_metadata: Option<&Path>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -110,6 +120,20 @@ pub fn run(
             return 2;
         }
     };
+    // The argument layer refuses metadata without a scope; direct
+    // callers get the same refusal (never a silent downgrade).
+    if workload_metadata.is_some() && filter_cgroup_id.is_none() {
+        let _ = writeln!(
+            stderr,
+            "check: --workload-metadata needs --filter-cgroup-id (system-wide checks take no metadata)"
+        );
+        return 2;
+    }
+    if let Some(path) = workload_metadata
+        && let Err(code) = precheck_metadata_file("check", path, stderr)
+    {
+        return code;
+    }
     let cfg = LiveConfig {
         source: source.to_owned(),
         duration_secs: Some(check_window_secs(duration)),
@@ -117,14 +141,171 @@ pub fn run(
         token: token.map(Path::to_owned),
         json_audit: false,
         profile,
-        workload: false,
+        workload: filter_cgroup_id.is_some(),
     };
-    finish_check(
-        run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
-        &policy,
-        stdout,
-        stderr,
-    )
+    let outcome = run_live_capture(&cfg, &crate::runtime_facts::live_runtime());
+    match filter_cgroup_id {
+        Some(id) => {
+            let opts = WorkloadFinishOpts {
+                group_by: GroupBy::None,
+                filter_cgroup_id: Some(id),
+                metadata_file: workload_metadata.map(Path::to_owned),
+                profile: profile.as_str().to_owned(),
+            };
+            finish_check_scoped(outcome, &policy, id, &opts, stdout, stderr)
+        }
+        None => finish_check(outcome, &policy, stdout, stderr),
+    }
+}
+
+/// Finishes a cgroup-scoped check: serve metadata (bounded,
+/// post-capture), assemble the typed report, evaluate the policy over
+/// exactly the report rows (one population, two views), render the
+/// scoped verdict. The stdout verdict mirrors the system-wide shape;
+/// the exact scoped partition always rides stderr (a clean verdict
+/// over an empty selection must say so).
+fn finish_check_scoped(
+    result: Result<LiveOutcome, LiveError>,
+    policy: &Policy,
+    filter_cgroup_id: u64,
+    opts: &WorkloadFinishOpts,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = writeln!(stderr, "check: {err}");
+            return err.exit_code();
+        }
+    };
+    let finished = match finish_workload_report(&outcome, opts) {
+        Ok(finished) => finished,
+        Err(err) => {
+            let _ = writeln!(stderr, "check: {err}");
+            return 1;
+        }
+    };
+    // The capture ran (LiveError mapped above), so integrity reads
+    // the report ledger: an unreconciled gap voids clean, a proven
+    // ledger keeps it.
+    let integrity = if finished.report.ledger.gap_unreconciled {
+        CaptureIntegrity::Partial
+    } else {
+        CaptureIntegrity::Complete
+    };
+    // The assembly above already validated this same id (a 0
+    // refuses there first), so this construction cannot fail after a
+    // successful finish — the arm is defensive (direct-API contract
+    // violations are internal; the argument layer owns exit 2).
+    let selector = match kryprobe_policy::workload::WorkloadSelector::cgroup(filter_cgroup_id) {
+        Ok(selector) => selector,
+        Err(err) => {
+            let _ = writeln!(stderr, "check: {err}");
+            return 1;
+        }
+    };
+    let observations = match observations_for_rows(&finished.rows, &outcome.observations) {
+        Ok(observations) => observations,
+        Err(err) => {
+            let _ = writeln!(stderr, "check: {err}");
+            return 1;
+        }
+    };
+    let scoped: Vec<ScopedRow<'_>> = finished
+        .rows
+        .iter()
+        .zip(observations.iter())
+        .map(|(row, observation)| ScopedRow {
+            calls: row.calls,
+            context: row.context,
+            identity: row.identity.clone(),
+            evidence: row.evidence.clone(),
+            observation,
+        })
+        .collect();
+    let verdict = match evaluate_scoped(policy, &selector, &scoped, integrity) {
+        Ok(verdict) => verdict,
+        Err(err) => {
+            let _ = writeln!(stderr, "check: {err}");
+            return err.exit_intent();
+        }
+    };
+    render_scoped_verdict(&verdict, outcome.interrupted, stdout, stderr)
+}
+
+/// Renders one scoped verdict: the stdout line mirrors the
+/// system-wide shape (VIOLATION/CLEAN/INCONCLUSIVE), the violation
+/// detail and the exact scoped partition ride stderr. An interrupted
+/// window keeps a confirmed violation (10) and degrades anything
+/// else to 3 — a cut window never cleans.
+fn render_scoped_verdict(
+    verdict: &ScopedVerdict<'_>,
+    interrupted: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let partition = match verdict {
+        ScopedVerdict::Violation { partition, .. }
+        | ScopedVerdict::Clean { partition }
+        | ScopedVerdict::Inconclusive { partition, .. } => partition,
+    };
+    let partition_line = format!(
+        "check: scoped partition matched={} nonmatched={} unknown_match={}",
+        partition.matched(),
+        partition.nonmatched(),
+        partition.unknown_match()
+    );
+    match verdict {
+        ScopedVerdict::Violation {
+            rule,
+            obs_ids,
+            algorithm,
+            driver,
+            context,
+            evidence,
+            ..
+        } => {
+            let ids = obs_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                stdout,
+                "VIOLATION rule={rule} observations={}",
+                obs_ids.len()
+            );
+            let _ = writeln!(
+                stderr,
+                "check: violation rule={rule} matched={} algorithm={algorithm} driver={driver} context={context} evidence=obs[{ids}]",
+                obs_ids.len()
+            );
+            if let Some(first) = evidence.first() {
+                let _ = writeln!(stderr, "check: evidence: {}", first.backend_payload);
+            }
+            let _ = writeln!(stderr, "{partition_line}");
+            10
+        }
+        ScopedVerdict::Clean { .. } => {
+            if interrupted {
+                let _ = writeln!(stderr, "check: interrupted by SIGINT — partial window");
+                let _ = writeln!(stdout, "INCONCLUSIVE missing=interrupted-window");
+                let _ = writeln!(stderr, "{partition_line}");
+                3
+            } else {
+                let _ = writeln!(stdout, "CLEAN");
+                let _ = writeln!(stderr, "{partition_line}");
+                0
+            }
+        }
+        ScopedVerdict::Inconclusive { missing, .. } => {
+            let _ = writeln!(stdout, "INCONCLUSIVE missing={}", missing.join(","));
+            let _ = writeln!(stderr, "check: inconclusive: {}", missing.join(","));
+            let _ = writeln!(stderr, "{partition_line}");
+            3
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +489,244 @@ mod tests {
             assert!(stdout.is_empty());
             assert!(String::from_utf8(stderr).expect("utf-8").contains("check:"));
         }
+    }
+
+    fn scoped_opts(filter_cgroup_id: u64) -> WorkloadFinishOpts {
+        WorkloadFinishOpts {
+            group_by: GroupBy::None,
+            filter_cgroup_id: Some(filter_cgroup_id),
+            metadata_file: None,
+            profile: "api-returns".to_owned(),
+        }
+    }
+
+    #[test]
+    fn scoped_violation_stands_despite_gaps() {
+        // M1: the md5 row at cgroup 43 definitely matches the
+        // deny rule — exit 10 even though the ledger is gapped
+        // (spec §5.6: a proven matching violation stands).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(workload_outcome()),
+            &deny_md5(),
+            43,
+            &scoped_opts(43),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 10);
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf-8"),
+            "VIOLATION rule=no-kernel-md5 observations=1\n"
+        );
+        let err_text = String::from_utf8(stderr).expect("utf-8");
+        assert!(
+            err_text.contains("algorithm=md5") && err_text.contains("evidence=obs["),
+            "violation detail: {err_text:?}"
+        );
+        assert!(
+            err_text.contains("scoped partition matched=10 nonmatched=20 unknown_match=0"),
+            "exact partition: {err_text:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_unknown_match_voids_clean() {
+        // M1: 5 calls sit at cgroup 0 (unknown whether they belong
+        // to cgroup 43) — no violation, but clean is unproven (3).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(workload_outcome_with_unknown()),
+            &clean_policy(),
+            43,
+            &scoped_opts(43),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 3);
+        let out_text = String::from_utf8(stdout).expect("utf-8");
+        assert!(
+            out_text.contains("unknown-match") && out_text.contains("capture-gap"),
+            "missing names both gaps: {out_text:?}"
+        );
+        let err_text = String::from_utf8(stderr).expect("utf-8");
+        assert!(
+            err_text.contains("scoped partition matched=10 nonmatched=20 unknown_match=5"),
+            "exact partition: {err_text:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_gap_without_violation_is_inconclusive() {
+        // M1: no deny matches, but the unreconciled ledger gap could
+        // hide the cgroup's calls — clean is unproven (3).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(workload_outcome()),
+            &clean_policy(),
+            43,
+            &scoped_opts(43),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 3);
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf-8"),
+            "INCONCLUSIVE missing=capture-gap\n"
+        );
+    }
+
+    #[test]
+    fn scoped_clean_over_empty_selection_says_so() {
+        // M1: cgroup 99 captures nothing and no deny matches — the
+        // verdict still cannot be clean (capture gap), and the
+        // partition line shows the empty selection.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(workload_outcome()),
+            &clean_policy(),
+            99,
+            &scoped_opts(99),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 3);
+        let err_text = String::from_utf8(stderr).expect("utf-8");
+        assert!(
+            err_text.contains("scoped partition matched=0 nonmatched=30 unknown_match=0"),
+            "empty selection visible: {err_text:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_interrupted_keeps_violation_degrades_rest() {
+        // A confirmed violation stands on a cut window (10);
+        // anything else degrades to 3 (a cut window never cleans).
+        let mut violated = workload_outcome();
+        violated.interrupted = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(violated),
+            &deny_md5(),
+            43,
+            &scoped_opts(43),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 10);
+
+        let mut inconclusive = workload_outcome();
+        inconclusive.interrupted = true;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(inconclusive),
+            &clean_policy(),
+            43,
+            &scoped_opts(43),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 3);
+    }
+
+    #[test]
+    fn scoped_render_shapes_mirror_system_wide() {
+        use kryprobe_core::workload::ScopePartition;
+        use kryprobe_policy::workload::ScopedVerdict;
+        // Direct render tests (live scoped checks always carry the
+        // ledger gap, so Clean only renders here — the shape still
+        // pins byte-exact for the day the fence proves out).
+        let partition = ScopePartition::from_counts(10, 20, 0).expect("partition");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = render_scoped_verdict(
+            &ScopedVerdict::Clean { partition },
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8(stdout).expect("utf-8"), "CLEAN\n");
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("scoped partition matched=10 nonmatched=20 unknown_match=0")
+        );
+        // Interrupted clean degrades (a cut window never cleans).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = render_scoped_verdict(
+            &ScopedVerdict::Clean { partition },
+            true,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 3);
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf-8"),
+            "INCONCLUSIVE missing=interrupted-window\n"
+        );
+    }
+
+    #[test]
+    fn scoped_refusals_map_2_and_1() {
+        // Direct-API refusals (the argument layer owns exit 2 for
+        // these): cgroup 0 is not selectable (internal here — the
+        // assembly refuses it first), a missing capture is internal
+        // (1), metadata without a scope is usage (2).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(workload_outcome()),
+            &deny_md5(),
+            0,
+            &scoped_opts(0),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(md5_outcome()),
+            &deny_md5(),
+            43,
+            &scoped_opts(43),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+
+        let scratch = kryprobe_testkit::TempDir::named("check-meta-scope").expect("scratch");
+        let policy_path = scratch.path().join("p.yaml");
+        std::fs::write(&policy_path, "version: 1\nrules: []\n").expect("policy");
+        let meta_path = scratch.path().join("m.json");
+        std::fs::write(&meta_path, "{}").expect("metadata");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            "kernel-crypto",
+            Some(60),
+            &policy_path,
+            None,
+            kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+            None,
+            Some(&meta_path),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 2);
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("--workload-metadata needs --filter-cgroup-id")
+        );
     }
 }

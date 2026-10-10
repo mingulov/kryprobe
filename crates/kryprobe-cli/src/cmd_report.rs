@@ -2,6 +2,11 @@
 //! `report`: validate a stream, then render its summary (exit 0 or 2);
 //! plus `report --system`: one live capture rendered human or JSON
 //! (exit 0 complete, 3 partial, 4 unusable, 1 internal).
+//!
+//! M1 adds the typed workload report on both sides: live workload
+//! mode renders it from capture, and `report FILE` replays stored
+//! `workload-report-v2` bytes identically (no host queries) or
+//! renders legacy v1 reports with their limitations.
 
 use crate::args::{FilterArgs, ReportFormat};
 use crate::live::{
@@ -11,8 +16,12 @@ use crate::live::{
 use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
 };
+use crate::workload::{
+    WorkloadFinishOpts, finish_workload_report, precheck_metadata_file, workload_exit_code,
+};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
+use kryprobe_report::workload::{GroupBy, render_legacy_v1, report_from_bytes};
 use kryprobe_report::{
     KCRYPTO_LIFECYCLE_SESSION_V1, ReportError, SessionWriteError, SessionWriter,
     lifecycle_v1_payload, validate_and_render_file, write_str_atomic,
@@ -23,12 +32,111 @@ use std::path::Path;
 /// Default live window when `--duration` is absent (brief-exact).
 const DEFAULT_REPORT_SECS: u64 = 60;
 
+/// `report FILE` peek budget: the frozen v2 report budget plus one
+/// probe byte. Files beyond the v2 budget are never v2 (the codec
+/// refuses them) and route to the streaming legacy path, which has
+/// no size cap.
+const FILE_PEEK_BUDGET: usize = kryprobe_core::workload::MAX_REPORT_V2_BYTES + 1;
+
+/// `report FILE` dispatch: exact `schema` markers route to the typed
+/// workload paths; anything else (JSONL streams, unreadable files,
+/// over-budget files) keeps the legacy streaming path byte-identical.
+enum FileKind {
+    /// JSONL stream (or unreadable/over-budget): legacy path.
+    Legacy,
+    /// Stored `workload-report-v2` bytes: typed replay.
+    WorkloadV2(Vec<u8>),
+    /// Stored `workload-report-v1` doc: legacy render.
+    WorkloadV1(serde_json::Value),
+}
+
+/// Peek one file for a workload schema marker (bounded read, no
+/// streaming side effects — the legacy path re-reads the file
+/// itself, so the peek never disturbs it).
+fn peek_report_file(file: &Path) -> FileKind {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(file).and_then(|f| {
+        f.take(FILE_PEEK_BUDGET as u64).read_to_end(&mut bytes)?;
+        Ok(())
+    });
+    if read.is_err() || bytes.len() > kryprobe_core::workload::MAX_REPORT_V2_BYTES {
+        return FileKind::Legacy;
+    }
+    // A JSONL stream never parses as one JSON value (trailing
+    // records); a single JSON doc routes only on the exact schema
+    // marker — misroutes are impossible by construction.
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return FileKind::Legacy;
+    };
+    match value.get("schema").and_then(serde_json::Value::as_str) {
+        Some(schema) if schema == kryprobe_report::validate::workload_v2::SCHEMA_ID => {
+            FileKind::WorkloadV2(bytes)
+        }
+        Some(schema) if schema == kryprobe_report::validate::workload_v1::SCHEMA_ID => {
+            FileKind::WorkloadV1(value)
+        }
+        _ => FileKind::Legacy,
+    }
+}
+
 /// Runs `report`: findings (or an unreadable file) exit 2 with detail.
 ///
 /// One streaming pass feeds both validation and rendering, so
 /// million-record sessions render with bounded memory and the summary
 /// always describes exactly the bytes validated (no TOCTOU window).
+///
+/// Stored workload reports dispatch on their schema marker: v2 bytes
+/// replay through the common typed report (render + 0/3 on the stored
+/// evidence — complete is 0, named gaps are 3), v1 docs render their
+/// stored partition plus limitations (3) or refuse (2).
 pub fn run(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    match peek_report_file(file) {
+        FileKind::WorkloadV2(bytes) => run_report_file_v2(&bytes, stdout, stderr),
+        FileKind::WorkloadV1(value) => run_report_file_v1(&value, stdout, stderr),
+        FileKind::Legacy => run_report_file_legacy(file, stdout, stderr),
+    }
+}
+
+/// Replays stored v2 bytes: invalid bytes exit 2 (nothing renders),
+/// valid reports render exactly as live and exit on the stored
+/// evidence. No host queries — replay works after workloads exit.
+fn run_report_file_v2(bytes: &[u8], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    let report = match report_from_bytes(bytes) {
+        Ok(report) => report,
+        Err(err) => {
+            let _ = writeln!(stderr, "report: workload-report-v2 invalid: {err}");
+            return 2;
+        }
+    };
+    let text = report.render_text();
+    emit_stdout_text(
+        stdout,
+        stderr,
+        "report",
+        &text,
+        workload_exit_code(&report, false),
+    )
+}
+
+/// Renders a stored v1 doc: limitations always ride along (3), and
+/// scoped v1 docs refuse (2 — the v1 evidence cannot answer a scope).
+fn run_report_file_v1(
+    value: &serde_json::Value,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    match render_legacy_v1(value) {
+        Ok(text) => emit_stdout_text(stdout, stderr, "report", &text, 3),
+        Err(err) => {
+            let _ = writeln!(stderr, "report: workload-report-v1 refused: {err}");
+            2
+        }
+    }
+}
+
+/// The historical streaming JSONL path, byte-identical.
+fn run_report_file_legacy(file: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
     let (findings, summary) = validate_and_render_file(file);
     if !findings.is_empty() {
         let _ = writeln!(
@@ -267,6 +375,67 @@ pub fn render_lifecycle_session_with_id(
     Ok(writer.into_string())
 }
 
+/// Finishes a workload-mode live capture: serve metadata (bounded,
+/// post-capture), assemble the typed report, render its text (human)
+/// or bytes (`workload-json`) to `--out` (atomic) or stdout. Exit
+/// follows the report evidence (0 complete, 3 named gaps); assembly
+/// or render failures exit 1.
+fn finish_report_workload(
+    outcome: &LiveOutcome,
+    opts: &WorkloadFinishOpts,
+    format: ReportFormat,
+    out: Option<&Path>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let t_render = std::time::Instant::now();
+    let finished = match finish_workload_report(outcome, opts) {
+        Ok(finished) => finished,
+        Err(err) => {
+            let _ = writeln!(stderr, "report: {err}");
+            return 1;
+        }
+    };
+    let text = match format {
+        ReportFormat::WorkloadJson => match finished.report.to_json_bytes() {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    let _ = writeln!(stderr, "report: workload report is not valid UTF-8");
+                    return 1;
+                }
+            },
+            Err(err) => {
+                let _ = writeln!(stderr, "report: cannot encode workload report: {err}");
+                return 1;
+            }
+        },
+        // Human renders workload text in workload mode (the argument
+        // layer refused json/jsonl pairings, so no other format
+        // reaches here).
+        _ => finished.report.render_text(),
+    };
+    let code = workload_exit_code(&finished.report, outcome.interrupted);
+    match out {
+        Some(path) => match write_str_atomic(path, &text) {
+            Ok(()) => {
+                let _ = writeln!(stderr, "wrote {}", path.display());
+                crate::live::emit_stop_line(outcome, t_render, stderr);
+                code
+            }
+            Err(err) => {
+                let _ = writeln!(stderr, "report: cannot write {}: {err}", path.display());
+                1
+            }
+        },
+        None => {
+            let code = emit_stdout_text(stdout, stderr, "report", &text, code);
+            crate::live::emit_stop_line(outcome, t_render, stderr);
+            code
+        }
+    }
+}
+
 /// Finishes a live capture: human tables, the JSON doc, or the
 /// validated JSONL stream to `--out` (atomic) or stdout — the frozen
 /// event-v0 envelope for aggregate outcomes, the versioned
@@ -277,11 +446,14 @@ pub fn render_lifecycle_session_with_id(
 /// non-wire-spellable row. An active CLI filter applies
 /// post-ingestion first (P6-N3): filtered-out rows hide from every
 /// format, tallies ride coverage + the FILTER line + the envelope.
+/// `workload` carries the M1 view when workload mode is on (typed
+/// report instead of the historical formats).
 fn finish_report_live(
     result: Result<LiveOutcome, LiveError>,
     format: ReportFormat,
     out: Option<&Path>,
     filter: &FilterArgs,
+    workload: Option<&WorkloadFinishOpts>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -292,6 +464,9 @@ fn finish_report_live(
             return err.exit_code();
         }
     };
+    if let Some(opts) = workload {
+        return finish_report_workload(&outcome, opts, format, out, stdout, stderr);
+    }
     // P6-N3: post-ingestion filter (inactive filters skip entirely —
     // unfiltered sessions keep their exact existing bytes).
     let mut filter_counts = None;
@@ -348,6 +523,13 @@ fn finish_report_live(
                 return 1;
             }
         },
+        ReportFormat::WorkloadJson => {
+            // Defensive: `run_report_live` always pairs
+            // workload-json with workload mode (the branch above),
+            // so the historical path never renders this format.
+            let _ = writeln!(stderr, "report: workload-json needs workload mode");
+            return 1;
+        }
         ReportFormat::Jsonl => {
             // T11/P6: lifecycle outcomes export the versioned
             // session envelope (validated observations + coverage
@@ -426,7 +608,9 @@ fn preflight_out_writable(out: &Path) -> Option<String> {
 }
 
 /// Runs `report --system`: one bounded capture (default 60s), rendered
-/// human (same tables as `watch`, plus the verdict exit) or JSON.
+/// human (same tables as `watch`, plus the verdict exit) or JSON —
+/// or the typed workload report when any workload flag selects
+/// workload mode.
 #[allow(clippy::too_many_arguments)]
 pub fn run_report_live(
     source: &str,
@@ -436,6 +620,9 @@ pub fn run_report_live(
     token: Option<&Path>,
     profile: LifecycleProfile,
     filter: &FilterArgs,
+    group_by: GroupBy,
+    filter_cgroup_id: Option<u64>,
+    workload_metadata: Option<&Path>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
@@ -451,9 +638,17 @@ pub fn run_report_live(
             format,
             out,
             filter,
+            None,
             stdout,
             stderr,
         );
+    }
+    // Usage errors (exit 2) precede the --out precheck (exit 1): the
+    // metadata gate stats the file (never reads it) before capture.
+    if let Some(path) = workload_metadata
+        && let Err(code) = precheck_metadata_file("report", path, stderr)
+    {
+        return code;
     }
     // P6-N8: the --out precheck refuses BEFORE any capture (exit 1,
     // handler verdict — deterministic on every host).
@@ -469,6 +664,14 @@ pub fn run_report_live(
     // capture instead of refusing. The frozen event-v0 envelope
     // still carries no lifecycle payload and stays byte-untouched;
     // the outcome selects the envelope at render time.
+    // Any workload flag selects workload mode (the argument layer
+    // already refused unsupported combinations, including json/jsonl
+    // pairings); historical sessions keep exact bytes and never
+    // spawn the helper.
+    let workload_mode = group_by != GroupBy::None
+        || filter_cgroup_id.is_some()
+        || workload_metadata.is_some()
+        || format == ReportFormat::WorkloadJson;
     // 4B-M5: SIGINT finalizes and renders the partial window (exit 3),
     // with a per-tick stderr progress line while the capture runs.
     let cfg = LiveConfig {
@@ -480,13 +683,20 @@ pub fn run_report_live(
         // trail (object load + attach); human mode stays silent.
         json_audit: !matches!(format, ReportFormat::Human),
         profile,
-        workload: false,
+        workload: workload_mode,
+    };
+    let opts = WorkloadFinishOpts {
+        group_by,
+        filter_cgroup_id,
+        metadata_file: workload_metadata.map(Path::to_owned),
+        profile: profile.as_str().to_owned(),
     };
     finish_report_live(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
         format,
         out,
         filter,
+        workload_mode.then_some(&opts),
         stdout,
         stderr,
     )
@@ -779,6 +989,9 @@ mod tests {
             None,
             LifecycleProfile::RequestLifecycle,
             &FilterArgs::default(),
+            kryprobe_report::workload::GroupBy::None,
+            None,
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -923,6 +1136,7 @@ mod tests {
             ReportFormat::Human,
             None,
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -946,6 +1160,7 @@ mod tests {
             ReportFormat::Human,
             None,
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -966,6 +1181,7 @@ mod tests {
             ReportFormat::Human,
             None,
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -983,6 +1199,7 @@ mod tests {
             ReportFormat::Json,
             None,
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1005,6 +1222,7 @@ mod tests {
                     ReportFormat::Human,
                     None,
                     &FilterArgs::default(),
+                    None,
                     &mut stdout,
                     &mut stderr
                 ),
@@ -1030,6 +1248,7 @@ mod tests {
             ReportFormat::Json,
             Some(&file),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1057,6 +1276,7 @@ mod tests {
             ReportFormat::Human,
             Some(&human),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1082,6 +1302,7 @@ mod tests {
             ReportFormat::Json,
             Some(&missing),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1108,6 +1329,7 @@ mod tests {
                 format,
                 None,
                 &FilterArgs::default(),
+                None,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1132,6 +1354,7 @@ mod tests {
             ReportFormat::Jsonl,
             None,
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1157,6 +1380,7 @@ mod tests {
             ReportFormat::Jsonl,
             None,
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1185,6 +1409,7 @@ mod tests {
             ReportFormat::Json,
             None,
             &filter,
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1256,6 +1481,7 @@ mod tests {
             ReportFormat::Jsonl,
             None,
             &filter,
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1292,6 +1518,9 @@ mod tests {
             None,
             LifecycleProfile::RequestLifecycle,
             &FilterArgs::default(),
+            kryprobe_report::workload::GroupBy::None,
+            None,
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1371,6 +1600,9 @@ mod tests {
             None,
             LifecycleProfile::RequestLifecycle,
             &FilterArgs::default(),
+            kryprobe_report::workload::GroupBy::None,
+            None,
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -1382,5 +1614,270 @@ mod tests {
             "report: live session unusable: unsupported live source 'bogus-source': only 'kernel-crypto' is captured live\n"
         );
         assert!(!good.exists());
+    }
+
+    fn report_workload_opts() -> WorkloadFinishOpts {
+        WorkloadFinishOpts {
+            group_by: GroupBy::Cgroup,
+            filter_cgroup_id: None,
+            metadata_file: None,
+            profile: "api-returns".to_owned(),
+        }
+    }
+
+    #[test]
+    fn workload_report_finish_exits_on_evidence() {
+        // M1: live workload finishes render text (human) or bytes
+        // (workload-json) and exit on the report evidence (0
+        // complete, 3 named gaps — the raw-ID fixture gaps).
+        for format in [ReportFormat::Human, ReportFormat::WorkloadJson] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = finish_report_live(
+                Ok(workload_outcome()),
+                format,
+                None,
+                &FilterArgs::default(),
+                Some(&report_workload_opts()),
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, 3, "raw-ID fixture gaps name exit 3");
+            let text = String::from_utf8(stdout).expect("utf-8");
+            if format == ReportFormat::Human {
+                assert!(text.contains("workload-report v2 session"), "{text}");
+                assert!(text.contains("gap unreconciled"), "{text}");
+            } else {
+                // Stored bytes replay identically (the FILE path
+                // below consumes this same shape).
+                let replay =
+                    kryprobe_report::workload::report_from_bytes(text.as_bytes()).expect("replays");
+                assert_eq!(replay.rows.len(), 2);
+                assert!(replay.ledger.gap_unreconciled);
+            }
+        }
+    }
+
+    #[test]
+    fn workload_report_out_writes_atomically() {
+        let scratch = kryprobe_testkit::TempDir::named("k3-report-out").expect("scratch");
+        let out = scratch.path().join("report.json");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(workload_outcome()),
+            ReportFormat::WorkloadJson,
+            Some(&out),
+            &FilterArgs::default(),
+            Some(&report_workload_opts()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 3);
+        assert!(stdout.is_empty());
+        let bytes = std::fs::read(&out).expect("written");
+        kryprobe_report::workload::report_from_bytes(&bytes).expect("stored bytes replay");
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains(&format!("wrote {}", out.display()))
+        );
+    }
+
+    #[test]
+    fn workload_report_without_capture_is_internal() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(json_fixture()),
+            ReportFormat::Human,
+            None,
+            &FilterArgs::default(),
+            Some(&report_workload_opts()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        // The defensive historical arm (unreachable via the CLI —
+        // workload-json always pairs with workload mode there).
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_report_live(
+            Ok(json_fixture()),
+            ReportFormat::WorkloadJson,
+            None,
+            &FilterArgs::default(),
+            None,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+    }
+
+    fn write_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("fixture written");
+        path
+    }
+
+    #[test]
+    fn report_file_replays_v2_identically() {
+        // M1: stored v2 bytes render exactly as live and exit on the
+        // stored evidence (3 here — the fixture gaps) with no host
+        // queries (replay works after workloads disappear).
+        let finished =
+            crate::workload::finish_workload_report(&workload_outcome(), &report_workload_opts())
+                .expect("assembles");
+        let bytes = finished.report.to_json_bytes().expect("encodes");
+        let live_text = finished.report.render_text();
+        let scratch = kryprobe_testkit::TempDir::named("k3-file-v2").expect("scratch");
+        let path = write_file(scratch.path(), "stored.json", &bytes);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(&path, &mut stdout, &mut stderr);
+        assert_eq!(code, 3);
+        assert_eq!(String::from_utf8(stdout).expect("utf-8"), live_text);
+    }
+
+    #[test]
+    fn report_file_complete_v2_exits_zero() {
+        // A stored COMPLETE report (quiescent, all coverage
+        // complete) replays to 0 — the exit reads the stored
+        // evidence, and replay honors bytes the live path cannot
+        // currently produce (fence proof pending).
+        use kryprobe_core::workload::{ScopePartition, SnapshotConsistency};
+        use kryprobe_report::workload::{
+            CoverageLevel, MetadataAvailability, ReportCoverage, ReportInterval, ReportLedger,
+            ReportScope, ReportSession, WorkloadReport, WorkloadSelector,
+        };
+        let report = WorkloadReport {
+            session: ReportSession {
+                session_id: "0123456789abcdef0123456789abcdef".to_string(),
+                kernel_identity: "test-release/test-boot-id".to_string(),
+            },
+            interval: ReportInterval {
+                start_ns: 100,
+                end_ns: 1000,
+                consistency: SnapshotConsistency::Quiescent,
+            },
+            profile: "api-returns".to_string(),
+            boundary: kryprobe_core::workload::ObservationBoundary::ApiReturn,
+            rows: Vec::new(),
+            ledger: ReportLedger {
+                system_total: 0,
+                per_context_sum: 0,
+                unknown: 0,
+                consistency: SnapshotConsistency::Quiescent,
+                gap_unreconciled: false,
+                system_saturated: false,
+                per_context_saturated: false,
+                refused_inserts: 0,
+            },
+            partition: ScopePartition::from_counts(0, 0, 0).expect("partition"),
+            selector: WorkloadSelector::None,
+            scope: ReportScope::Unscoped,
+            group_by: GroupBy::None,
+            metadata: MetadataAvailability::Available,
+            coverage: ReportCoverage {
+                capture: CoverageLevel::Complete,
+                attribution: CoverageLevel::Complete,
+                metadata: CoverageLevel::Complete,
+                correlation: CoverageLevel::Complete,
+            },
+        };
+        let bytes = report.to_json_bytes().expect("encodes");
+        let scratch = kryprobe_testkit::TempDir::named("k3-file-v2c").expect("scratch");
+        let path = write_file(scratch.path(), "complete.json", &bytes);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run(&path, &mut stdout, &mut stderr), 0);
+        assert!(
+            String::from_utf8(stdout)
+                .expect("utf-8")
+                .contains("workload-report v2 session")
+        );
+    }
+
+    #[test]
+    fn report_file_v1_renders_limitations_or_refuses() {
+        // Legacy v1 docs render their stored partition plus four
+        // limitations (3); scoped v1 docs refuse (2).
+        let scratch = kryprobe_testkit::TempDir::named("k3-file-v1").expect("scratch");
+        let unscoped = serde_json::json!({
+            "schema": kryprobe_report::validate::workload_v1::SCHEMA_ID,
+            "session": {"session_id": "0123456789abcdef0123456789abcdef", "kernel_identity": "7.0.14"},
+            "interval": {"start_ns": "100", "end_ns": "200", "consistency": "quiescent"},
+            "profile": "api-returns",
+            "boundary": "api_return",
+            "contexts": [],
+            "partition": {"matched": "10", "nonmatched": "0", "unknown_match": "0"},
+            "selectors": {},
+            "coverage": {"capture": "complete", "attribution": "complete", "metadata": "unavailable", "correlation": "complete"},
+        });
+        let path = write_file(
+            scratch.path(),
+            "legacy.json",
+            serde_json::to_string(&unscoped).expect("json").as_bytes(),
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run(&path, &mut stdout, &mut stderr), 3);
+        let text = String::from_utf8(stdout).expect("utf-8");
+        assert!(text.contains("workload-report v1 (legacy)"), "{text}");
+        assert!(text.contains("limitations"), "{text}");
+
+        let mut scoped = unscoped.clone();
+        scoped["selectors"] = serde_json::json!({"kind": "cgroup-id"});
+        let path = write_file(
+            scratch.path(),
+            "scoped.json",
+            serde_json::to_string(&scoped).expect("json").as_bytes(),
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run(&path, &mut stdout, &mut stderr), 2);
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("workload-report-v1 refused")
+        );
+    }
+
+    #[test]
+    fn report_file_invalid_v2_is_usage_not_render() {
+        // The v2 marker with a broken body exits 2 and renders
+        // nothing (never a partial render).
+        let scratch = kryprobe_testkit::TempDir::named("k3-file-v2x").expect("scratch");
+        let broken = serde_json::json!({
+            "schema": kryprobe_report::validate::workload_v2::SCHEMA_ID,
+            "session": {"session_id": "short", "kernel_identity": "k"},
+        });
+        let path = write_file(
+            scratch.path(),
+            "broken.json",
+            serde_json::to_string(&broken).expect("json").as_bytes(),
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(run(&path, &mut stdout, &mut stderr), 2);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("workload-report-v2 invalid")
+        );
+        // A small non-schema JSON doc keeps the legacy path (findings,
+        // not a workload refusal).
+        let path = write_file(scratch.path(), "other.json", b"{\"hello\": 1}");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(&path, &mut stdout, &mut stderr);
+        assert_eq!(code, 2);
+        assert!(
+            !String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("workload-report-v2")
+        );
     }
 }

@@ -28,6 +28,7 @@
 //! [`register_kcrypto_profile`], so they can never choose different
 //! profiles/decoders.
 
+use crate::workload::{TerminalWorkload, WorkloadCapture, execution_kind_for_ctx, join_capture};
 use kryprobe_abi::kcrypto_agg::kh_of;
 use kryprobe_core::backend::{
     Backend, BackendRegistry, BackendSummary, ConfigureContext, DecodeContext, DetectContext,
@@ -64,7 +65,6 @@ use kryprobe_privilege::kcrypto_snapshot::{
 };
 use kryprobe_privilege::workload_launch::{WorkloadPreflight, preflight_helper};
 use kryprobe_report::workload::NativeIdentity;
-use crate::workload::{TerminalWorkload, WorkloadCapture, execution_kind_for_ctx, join_capture};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::Write;
@@ -1889,6 +1889,7 @@ fn terminal_workload(sample: &AggregateTerminalSample) -> Result<TerminalWorkloa
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_session_inner(
     cfg: &LiveConfig,
     backend: &dyn Backend,
@@ -2912,9 +2913,10 @@ fn run_live_session_inner(
             let (ctx_rows, refused) = concrete
                 .session_ctx_rows(generation)
                 .map_err(|err| LiveError::Unusable(format!("workload ctx rows: {err}")))?;
-            let terminal = outcome.workload_terminal.as_ref().ok_or_else(|| {
-                LiveError::Internal("workload terminal missing".to_owned())
-            })?;
+            let terminal = outcome
+                .workload_terminal
+                .as_ref()
+                .ok_or_else(|| LiveError::Internal("workload terminal missing".to_owned()))?;
             outcome.workload_capture = Some(
                 join_capture(terminal, &ctx_rows, refused)
                     .map_err(|err| LiveError::Internal(format!("workload join: {err}")))?,

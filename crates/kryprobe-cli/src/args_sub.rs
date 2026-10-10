@@ -128,15 +128,48 @@ pub(crate) fn parse_report(args: &[String]) -> Result<Command, ArgsError> {
 /// need attribution semantics first). Name the deferral instead of a
 /// bare "unexpected" so callers learn the boundary.
 fn is_deferred_selector(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--pid" | "--tree" | "--cgroup" | "--cgroup-id" | "--unit" | "--comm"
-    )
+    matches!(arg, "--pid" | "--tree" | "--unit" | "--comm")
 }
 
 fn deferred(what: &str, arg: &str) -> ArgsError {
     usage(format!(
         "{what}: {arg} is deferred in v0.1 (system scope only)"
+    ))
+}
+
+/// Pod/runtime/container workload selectors are not M1 CLI views:
+/// pod and runtime selectors refuse until M2, and the container
+/// selector is not exposed (container grouping via `--group-by
+/// container` is the M1 container view).
+fn is_m2_selector(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--filter-pod" | "--filter-runtime" | "--filter-container"
+    )
+}
+
+fn m2_refusal(what: &str, arg: &str) -> ArgsError {
+    if arg == "--filter-container" {
+        usage(format!(
+            "{what}: {arg} is not supported in M1 (M1 views: --filter-cgroup-id only; container grouping via --group-by container)"
+        ))
+    } else {
+        usage(format!(
+            "{what}: {arg} is refused until M2 (M1 supports cgroup-id views only)"
+        ))
+    }
+}
+
+/// The old scope-ish spellings are superseded by the explicit
+/// post-ingestion view flag: name the supported spelling instead of a
+/// bare "unexpected" so callers learn the boundary.
+fn is_cgroup_hint(arg: &str) -> bool {
+    matches!(arg, "--cgroup" | "--cgroup-id")
+}
+
+fn cgroup_hint(what: &str, arg: &str) -> ArgsError {
+    usage(format!(
+        "{what}: {arg} is not supported (use --filter-cgroup-id ID for cgroup views)"
     ))
 }
 
@@ -195,9 +228,75 @@ fn parse_filter_id(value: &str, flag: &str, what: &str) -> Result<u32, ArgsError
     })
 }
 
+/// Workload row grouping by exact name; anything else is invalid
+/// input (exit 2), never a silent default.
+fn parse_group_by(
+    value: &str,
+    what: &str,
+) -> Result<kryprobe_report::workload::GroupBy, ArgsError> {
+    use kryprobe_report::workload::GroupBy;
+    match value {
+        "none" => Ok(GroupBy::None),
+        "cgroup" => Ok(GroupBy::Cgroup),
+        "container" => Ok(GroupBy::Container),
+        _ => Err(usage(format!(
+            "{what}: unsupported --group-by '{value}' (none|cgroup|container)"
+        ))),
+    }
+}
+
+/// Exact cgroup-id view: unparseable or 0 is a usage error (the
+/// unreadable marker is never selectable, even as a view).
+fn parse_filter_cgroup_id(value: &str, what: &str) -> Result<u64, ArgsError> {
+    let id: u64 = value.parse().map_err(|_| {
+        usage(format!(
+            "{what}: invalid --filter-cgroup-id '{value}' (exact cgroup id)"
+        ))
+    })?;
+    if id == 0 {
+        return Err(usage(format!(
+            "{what}: --filter-cgroup-id refuses 0 (unreadable marker, never selectable)"
+        )));
+    }
+    Ok(id)
+}
+
+/// M1 workload/profile combination rule: workload views need the
+/// api-returns `KCTX` maps (the lifecycle profile carries none).
+fn check_workload_profile(
+    what: &str,
+    workload: bool,
+    profile: LifecycleProfile,
+) -> Result<(), ArgsError> {
+    if workload && profile != LifecycleProfile::ApiReturns {
+        return Err(usage(format!(
+            "{what}: workload views need the api-returns profile (request-lifecycle carries no workload maps)"
+        )));
+    }
+    Ok(())
+}
+
+/// M1 workload/filter combination rule: submitter filters constrain
+/// per-request submitter identity, which workload context rows do
+/// not carry — combining them would misfilter, so it refuses.
+fn check_workload_filters(
+    what: &str,
+    workload: bool,
+    filter: &FilterArgs,
+) -> Result<(), ArgsError> {
+    if workload && filter.is_active() {
+        return Err(usage(format!(
+            "{what}: workload views cannot combine with --filter-pid/--filter-uid/--filter-comm (submitter filters need request rows)"
+        )));
+    }
+    Ok(())
+}
+
 /// `watch --system [--source S] [--duration N] [--token PATH]`:
 /// continuous system-wide observe. `--system` is required (select-all
-/// is the only v0.1 scope).
+/// is the only v0.1 scope). M1 workload flags (`--group-by`,
+/// `--filter-cgroup-id`, `--workload-metadata`) select the typed
+/// workload render instead of the historical tables.
 pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
@@ -205,6 +304,9 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     let mut token = None;
     let mut profile = LifecycleProfile::default();
     let mut filter = FilterArgs::default();
+    let mut group_by = kryprobe_report::workload::GroupBy::None;
+    let mut filter_cgroup_id = None;
+    let mut workload_metadata = None;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -247,6 +349,23 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
                 filter.comm = Some(value.to_owned());
                 rest = next;
             }
+            "--group-by" => {
+                let (value, next) = take_value(tail, "--group-by", "watch")?;
+                group_by = parse_group_by(value, "watch")?;
+                rest = next;
+            }
+            "--filter-cgroup-id" => {
+                let (value, next) = take_value(tail, "--filter-cgroup-id", "watch")?;
+                filter_cgroup_id = Some(parse_filter_cgroup_id(value, "watch")?);
+                rest = next;
+            }
+            "--workload-metadata" => {
+                let (value, next) = take_value(tail, "--workload-metadata", "watch")?;
+                workload_metadata = Some(PathBuf::from(value));
+                rest = next;
+            }
+            other if is_m2_selector(other) => return Err(m2_refusal("watch", other)),
+            other if is_cgroup_hint(other) => return Err(cgroup_hint("watch", other)),
             other if is_deferred_selector(other) => return Err(deferred("watch", other)),
             other => return Err(usage(format!("watch: unexpected '{other}'"))),
         }
@@ -254,17 +373,28 @@ pub(crate) fn parse_watch(args: &[String]) -> Result<Command, ArgsError> {
     if !system {
         return Err(usage("watch: missing --system (system scope only in v0.1)"));
     }
+    let workload = group_by != kryprobe_report::workload::GroupBy::None
+        || filter_cgroup_id.is_some()
+        || workload_metadata.is_some();
+    check_workload_profile("watch", workload, profile)?;
+    check_workload_filters("watch", workload, &filter)?;
     Ok(Command::Watch {
         source,
         duration,
         token,
         profile,
         filter,
+        group_by,
+        filter_cgroup_id,
+        workload_metadata,
     })
 }
 
 /// `report --system [--duration N] [--format human|json] [--out F]
 /// [--source S] [--token PATH]`: bounded system-wide capture + render.
+/// M1 workload flags (`--group-by`, `--filter-cgroup-id`,
+/// `--workload-metadata`, `--format workload-json`) select the typed
+/// workload report instead of the historical formats.
 fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
@@ -274,6 +404,9 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     let mut token = None;
     let mut profile = LifecycleProfile::default();
     let mut filter = FilterArgs::default();
+    let mut group_by = kryprobe_report::workload::GroupBy::None;
+    let mut filter_cgroup_id = None;
+    let mut workload_metadata = None;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -302,9 +435,10 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
                     "human" => ReportFormat::Human,
                     "json" => ReportFormat::Json,
                     "jsonl" => ReportFormat::Jsonl,
+                    "workload-json" => ReportFormat::WorkloadJson,
                     _ => {
                         return Err(usage(format!(
-                            "report: unsupported --format '{value}' (human|json|jsonl)"
+                            "report: unsupported --format '{value}' (human|json|jsonl|workload-json)"
                         )));
                     }
                 };
@@ -335,6 +469,23 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
                 filter.comm = Some(value.to_owned());
                 rest = next;
             }
+            "--group-by" => {
+                let (value, next) = take_value(tail, "--group-by", "report")?;
+                group_by = parse_group_by(value, "report")?;
+                rest = next;
+            }
+            "--filter-cgroup-id" => {
+                let (value, next) = take_value(tail, "--filter-cgroup-id", "report")?;
+                filter_cgroup_id = Some(parse_filter_cgroup_id(value, "report")?);
+                rest = next;
+            }
+            "--workload-metadata" => {
+                let (value, next) = take_value(tail, "--workload-metadata", "report")?;
+                workload_metadata = Some(PathBuf::from(value));
+                rest = next;
+            }
+            other if is_m2_selector(other) => return Err(m2_refusal("report", other)),
+            other if is_cgroup_hint(other) => return Err(cgroup_hint("report", other)),
             other if is_deferred_selector(other) => return Err(deferred("report", other)),
             other => return Err(usage(format!("report: unexpected '{other}'"))),
         }
@@ -342,6 +493,20 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
     if !system {
         return Err(usage(
             "report: missing --system (live report needs --system; 'report FILE' renders a file)",
+        ));
+    }
+    let workload = group_by != kryprobe_report::workload::GroupBy::None
+        || filter_cgroup_id.is_some()
+        || workload_metadata.is_some()
+        || format == ReportFormat::WorkloadJson;
+    check_workload_profile("report", workload, profile)?;
+    check_workload_filters("report", workload, &filter)?;
+    // The brief-exact JSON doc and the JSONL envelopes render live
+    // observations, which carry no workload rows: workload flags
+    // combine only with human (workload text) or workload-json.
+    if workload && matches!(format, ReportFormat::Json | ReportFormat::Jsonl) {
+        return Err(usage(
+            "report: --group-by/--filter-cgroup-id/--workload-metadata need --format human or --format workload-json".to_string(),
         ));
     }
     Ok(Command::ReportLive {
@@ -352,12 +517,16 @@ fn parse_report_live(args: &[String]) -> Result<Command, ArgsError> {
         token,
         profile,
         filter,
+        group_by,
+        filter_cgroup_id,
+        workload_metadata,
     })
 }
 
 /// `check --system --policy F [--duration N] [--source S] [--token PATH]`:
 /// system-wide policy check. `--policy` is required (v0.1 has no
-/// default policy).
+/// default policy). `--filter-cgroup-id` scopes the check to one
+/// exact cgroup view over the typed workload report.
 pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
     let mut system = false;
     let mut source = KERNEL_CRYPTO_SOURCE.to_owned();
@@ -365,6 +534,8 @@ pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
     let mut policy = None;
     let mut token = None;
     let mut profile = LifecycleProfile::default();
+    let mut filter_cgroup_id = None;
+    let mut workload_metadata = None;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         match arg.as_str() {
@@ -397,6 +568,24 @@ pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
                 profile = parse_profile(value, "check")?;
                 rest = next;
             }
+            "--filter-cgroup-id" => {
+                let (value, next) = take_value(tail, "--filter-cgroup-id", "check")?;
+                filter_cgroup_id = Some(parse_filter_cgroup_id(value, "check")?);
+                rest = next;
+            }
+            "--workload-metadata" => {
+                let (value, next) = take_value(tail, "--workload-metadata", "check")?;
+                workload_metadata = Some(PathBuf::from(value));
+                rest = next;
+            }
+            "--group-by" => {
+                return Err(usage(
+                    "check: --group-by is not supported (grouping is a report rendering axis)"
+                        .to_string(),
+                ));
+            }
+            other if is_m2_selector(other) => return Err(m2_refusal("check", other)),
+            other if is_cgroup_hint(other) => return Err(cgroup_hint("check", other)),
             other if is_deferred_selector(other) => return Err(deferred("check", other)),
             other => return Err(usage(format!("check: unexpected '{other}'"))),
         }
@@ -407,12 +596,23 @@ pub(crate) fn parse_check(args: &[String]) -> Result<Command, ArgsError> {
     let Some(policy) = policy else {
         return Err(usage("check: missing --policy FILE"));
     };
+    // System-wide checks evaluate live observations, which take no
+    // metadata: the file only feeds scoped checks.
+    if workload_metadata.is_some() && filter_cgroup_id.is_none() {
+        return Err(usage(
+            "check: --workload-metadata needs --filter-cgroup-id (system-wide checks take no metadata)"
+                .to_string(),
+        ));
+    }
+    check_workload_profile("check", filter_cgroup_id.is_some(), profile)?;
     Ok(Command::Check {
         source,
         duration,
         policy,
         token,
         profile,
+        filter_cgroup_id,
+        workload_metadata,
     })
 }
 

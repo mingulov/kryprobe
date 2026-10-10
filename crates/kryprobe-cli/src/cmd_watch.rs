@@ -19,7 +19,9 @@ use crate::live::{
 use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
 };
+use crate::workload::{WorkloadFinishOpts, finish_workload_report, precheck_metadata_file};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
+use kryprobe_report::workload::GroupBy;
 use std::io::Write;
 use std::path::Path;
 
@@ -27,14 +29,19 @@ use std::path::Path;
 /// was SIGINT-cut) or the named failure to stderr (`Unusable` → 4,
 /// `Internal` → 1 via [`LiveError::exit_code`]). An active CLI filter
 /// applies post-ingestion first (P6-N3): filtered-out rows hide,
-/// tallies ride coverage + the FILTER line.
+/// tallies ride coverage + the FILTER line. `workload` carries the
+/// M1 view when workload mode is on (typed report instead of tables).
 fn finish_watch(
     result: Result<LiveOutcome, LiveError>,
     filter: &FilterArgs,
+    workload: Option<&WorkloadFinishOpts>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
     match result {
+        Ok(outcome) if workload.is_some() => {
+            finish_watch_workload(&outcome, workload.expect("workload opts"), stdout, stderr)
+        }
         Ok(mut outcome) => {
             // P6-N3: post-ingestion filter (inactive filters skip
             // entirely — unfiltered sessions keep exact bytes).
@@ -89,16 +96,31 @@ fn finish_watch(
 }
 
 /// Runs `watch --system`: one capture (`None` runs until stdin closes),
-/// then the aggregated tables to stdout.
+/// then the aggregated tables to stdout — or the typed workload
+/// report when any workload flag selects workload mode.
+#[allow(clippy::too_many_arguments)]
 pub fn run_watch(
     source: &str,
     duration: Option<u64>,
     token: Option<&Path>,
     profile: LifecycleProfile,
     filter: &FilterArgs,
+    group_by: GroupBy,
+    filter_cgroup_id: Option<u64>,
+    workload_metadata: Option<&Path>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    if let Some(path) = workload_metadata
+        && let Err(code) = precheck_metadata_file("watch", path, stderr)
+    {
+        return code;
+    }
+    // Any workload flag selects workload mode (the argument layer
+    // already refused unsupported combinations); historical sessions
+    // keep exact bytes and never spawn the helper.
+    let workload_mode =
+        group_by != GroupBy::None || filter_cgroup_id.is_some() || workload_metadata.is_some();
     // 4B-M5: SIGINT finalizes and renders the partial window (exit 3),
     // with a per-tick stderr progress line while the capture runs.
     let cfg = LiveConfig {
@@ -108,14 +130,51 @@ pub fn run_watch(
         token: token.map(Path::to_owned),
         json_audit: false,
         profile,
-        workload: false,
+        workload: workload_mode,
+    };
+    let opts = WorkloadFinishOpts {
+        group_by,
+        filter_cgroup_id,
+        metadata_file: workload_metadata.map(Path::to_owned),
+        profile: profile.as_str().to_owned(),
     };
     finish_watch(
         run_live_capture(&cfg, &crate::runtime_facts::live_runtime()),
         filter,
+        workload_mode.then_some(&opts),
         stdout,
         stderr,
     )
+}
+
+/// Finishes a workload-mode capture: serve metadata (bounded,
+/// post-capture), assemble the typed report, render its text. Exit
+/// keeps the historical watch rule (0 completed, 3 interrupted) —
+/// gaps ride the report text, which names them.
+fn finish_watch_workload(
+    outcome: &LiveOutcome,
+    opts: &WorkloadFinishOpts,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> i32 {
+    let t_render = std::time::Instant::now();
+    let finished = match finish_workload_report(outcome, opts) {
+        Ok(finished) => finished,
+        Err(err) => {
+            let _ = writeln!(stderr, "watch: {err}");
+            return 1;
+        }
+    };
+    let text = finished.report.render_text();
+    let code = if outcome.interrupted {
+        let _ = writeln!(stderr, "watch: interrupted by SIGINT — partial window");
+        3
+    } else {
+        0
+    };
+    let code = emit_stdout_text(stdout, stderr, "watch", &text, code);
+    crate::live::emit_stop_line(outcome, t_render, stderr);
+    code
 }
 
 /// Hand-fed `LiveOutcome` fixtures shared by this crate's unit tests
@@ -452,6 +511,129 @@ pub(crate) mod fixtures {
         ];
         outcome_with(observations, healthy_coverage(2))
     }
+
+    /// M1 workload fixtures: one joined native identity.
+    pub(crate) fn workload_native(
+        algorithm: &str,
+        driver: Option<&str>,
+    ) -> kryprobe_report::workload::NativeIdentity {
+        kryprobe_report::workload::NativeIdentity::new(1, 2, 0, 0, algorithm, driver)
+    }
+
+    /// M1 workload fixtures: one joined capture row.
+    pub(crate) fn workload_row(
+        kh: u64,
+        cgroup: u64,
+        tgid: u32,
+        calls: u64,
+        native: kryprobe_report::workload::NativeIdentity,
+    ) -> crate::workload::JoinedRow {
+        crate::workload::JoinedRow {
+            context: kryprobe_core::workload::ContextIdentity::new(
+                kh,
+                cgroup,
+                tgid,
+                1000,
+                555,
+                kryprobe_core::workload::ExecutionKind::Proc,
+            ),
+            calls,
+            native,
+        }
+    }
+
+    /// M1 workload fixtures: one joined capture over the rows.
+    pub(crate) fn workload_capture(
+        rows: Vec<crate::workload::JoinedRow>,
+        system_total: u64,
+    ) -> crate::workload::WorkloadCapture {
+        crate::workload::WorkloadCapture {
+            rows,
+            system_total,
+            system_saturated: false,
+            refused_inserts: 0,
+            interval_start_ns: 100,
+            interval_end_ns: 1000,
+        }
+    }
+
+    /// M1 workload fixtures: an unavailable preflight (typed reason,
+    /// established principal + kernel scope — never serves).
+    pub(crate) fn workload_preflight_unavailable(
+        kind: kryprobe_core::workload::MetadataUnavailable,
+    ) -> kryprobe_privilege::workload_launch::WorkloadPreflight {
+        kryprobe_privilege::workload_launch::WorkloadPreflight {
+            helper: None,
+            principal: Some(kryprobe_privilege::workload_launch::Principal {
+                uid: 1000,
+                euid: 1000,
+                gid: 1000,
+                egid: 1000,
+                groups: vec![1000],
+            }),
+            kernel_scope: Some("test-release/test-boot-id".to_owned()),
+            unavailable: Some(kind),
+        }
+    }
+
+    /// M1 workload fixture: two rows (`cbc(aes)` @ cgroup 42 via kh 7,
+    /// `md5` @ cgroup 43 via kh 9) with matching aggregate observations
+    /// (`key_hash` stamped), raw-ID preflight (`NoPrincipal` — finish
+    /// tests never serve a helper).
+    pub(crate) fn workload_outcome() -> crate::live::LiveOutcome {
+        let mut cbc = agg_obs(
+            1, "skcipher", "encrypt", "ok", "cbc(aes)", "aesni", "process", 20, 200, 20, 0, 0,
+        );
+        cbc.backend_payload["key_hash"] = serde_json::json!(7u64);
+        let mut md5 = agg_obs(
+            2,
+            "hash",
+            "digest",
+            "ok",
+            "md5",
+            "md5-generic",
+            "process",
+            10,
+            100,
+            10,
+            0,
+            0,
+        );
+        md5.backend_payload["key_hash"] = serde_json::json!(9u64);
+        let mut outcome = outcome_with(vec![cbc, md5], healthy_coverage(2));
+        outcome.workload_capture = Some(workload_capture(
+            vec![
+                workload_row(7, 42, 100, 20, workload_native("cbc(aes)", Some("aesni"))),
+                workload_row(9, 43, 101, 10, workload_native("md5", Some("md5-generic"))),
+            ],
+            30,
+        ));
+        outcome.workload_preflight = Some(workload_preflight_unavailable(
+            kryprobe_core::workload::MetadataUnavailable::NoPrincipal,
+        ));
+        outcome
+    }
+
+    /// M1 workload fixture with an unreadable-cgroup row: the two rows
+    /// above plus 5 calls at cgroup 0 (kh 11) for unknown-match tests.
+    pub(crate) fn workload_outcome_with_unknown() -> crate::live::LiveOutcome {
+        let mut outcome = workload_outcome();
+        let mut unknown = agg_obs(
+            3, "skcipher", "encrypt", "ok", "cbc(aes)", "aesni", "process", 5, 50, 5, 0, 0,
+        );
+        unknown.backend_payload["key_hash"] = serde_json::json!(11u64);
+        outcome.observations.push(unknown);
+        let capture = outcome.workload_capture.as_mut().expect("capture");
+        capture.rows.push(workload_row(
+            11,
+            0,
+            102,
+            5,
+            workload_native("cbc(aes)", Some("aesni")),
+        ));
+        capture.system_total = 35;
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +763,7 @@ mod tests {
         let code = finish_watch(
             Ok(watch_fixture()),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -596,6 +779,7 @@ mod tests {
         let code = finish_watch(
             Err(LiveError::Unusable("btf gate".to_owned())),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -612,6 +796,7 @@ mod tests {
         let code = finish_watch(
             Err(LiveError::Internal("boom".to_owned())),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -642,6 +827,7 @@ mod tests {
         let code = finish_watch(
             Ok(watch_fixture()),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -665,6 +851,7 @@ mod tests {
         let code = finish_watch(
             Ok(outcome),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -696,6 +883,7 @@ mod tests {
             let code = finish_watch(
                 Ok(outcome),
                 &FilterArgs::default(),
+                None,
                 &mut stdout,
                 &mut stderr,
             );
@@ -737,7 +925,13 @@ mod tests {
         ] {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let code = finish_watch(Err(err), &FilterArgs::default(), &mut stdout, &mut stderr);
+            let code = finish_watch(
+                Err(err),
+                &FilterArgs::default(),
+                None,
+                &mut stdout,
+                &mut stderr,
+            );
             assert_eq!(code, code_want);
             assert!(stdout.is_empty());
             let err_text = String::from_utf8(stderr).expect("utf-8");
@@ -761,7 +955,7 @@ mod tests {
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let code = finish_watch(Ok(watch_fixture()), &filter, &mut stdout, &mut stderr);
+        let code = finish_watch(Ok(watch_fixture()), &filter, None, &mut stdout, &mut stderr);
         assert_eq!(code, 0);
         let text = String::from_utf8(stdout).expect("utf-8");
         assert!(
@@ -783,6 +977,7 @@ mod tests {
         let code = finish_watch(
             Ok(watch_fixture()),
             &FilterArgs::default(),
+            None,
             &mut stdout,
             &mut stderr,
         );
@@ -796,5 +991,95 @@ mod tests {
             text.contains("python3") && text.contains("bash"),
             "both rows:\n{text}"
         );
+    }
+
+    fn workload_opts() -> WorkloadFinishOpts {
+        WorkloadFinishOpts {
+            group_by: GroupBy::Cgroup,
+            filter_cgroup_id: None,
+            metadata_file: None,
+            profile: "api-returns".to_owned(),
+        }
+    }
+
+    #[test]
+    fn workload_watch_renders_typed_report_and_keeps_watch_exits() {
+        // M1: workload mode renders the common typed report (raw-ID
+        // rows + typed unavailability here — no helper serves) and
+        // keeps the historical watch exit rule (0 completed, 3
+        // interrupted — gaps ride the text, which names them).
+        for interrupted in [false, true] {
+            let mut outcome = workload_outcome();
+            outcome.interrupted = interrupted;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = finish_watch(
+                Ok(outcome),
+                &FilterArgs::default(),
+                Some(&workload_opts()),
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(code, if interrupted { 3 } else { 0 });
+            let text = String::from_utf8(stdout).expect("utf-8");
+            assert!(
+                text.contains("workload-report v2 session"),
+                "typed render:\n{text}"
+            );
+            assert!(text.contains("gap unreconciled"), "gap named:\n{text}");
+            assert!(
+                text.contains("unavailable (no_principal)"),
+                "typed unavailability:\n{text}"
+            );
+            let err_text = String::from_utf8(stderr).expect("utf-8");
+            assert!(
+                err_text.contains("\"stop\":{"),
+                "stop line rides stderr: {err_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_watch_without_capture_is_internal() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_watch(
+            Ok(watch_fixture()),
+            &FilterArgs::default(),
+            Some(&workload_opts()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        assert!(
+            String::from_utf8(stderr)
+                .expect("utf-8")
+                .contains("watch: "),
+            "internal reason surfaces"
+        );
+    }
+
+    #[test]
+    fn workload_watch_broken_stdout_reports_terminal_failure() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _chunk: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stdout = BrokenPipe;
+        let mut stderr = Vec::new();
+        let code = finish_watch(
+            Ok(workload_outcome()),
+            &FilterArgs::default(),
+            Some(&workload_opts()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1, "torn stream never reports the capture code");
     }
 }

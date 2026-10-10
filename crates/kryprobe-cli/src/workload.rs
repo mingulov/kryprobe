@@ -19,14 +19,17 @@
 //!
 //! [`WorkloadReport`]: kryprobe_report::workload::WorkloadReport
 
+use crate::live::LiveOutcome;
 use kryprobe_core::evidence::NativeObservation;
 use kryprobe_core::ids::ObservationId;
 use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, ContextIdentity, CountOperand, ExecutionKind,
-    MAX_SNAPSHOT_ASSOCIATIONS, Relationship, ScopePartition, SnapshotConsistency, SnapshotKey,
-    SnapshotResponse, WorkloadIdentity,
+    MAX_SNAPSHOT_ASSOCIATIONS, MetadataUnavailable, Relationship, ScopePartition,
+    SnapshotConsistency, SnapshotInterval, SnapshotKey, SnapshotRequest, SnapshotResponse,
+    WorkloadIdentity,
 };
 use kryprobe_privilege::kcrypto_backend::CtxSnapshot;
+use kryprobe_privilege::workload_launch::serve_snapshot;
 use kryprobe_report::workload::{
     AssemblyInput, CoverageLevel, GroupBy, MetadataAvailability, NativeIdentity, ReportCoverage,
     ReportRowInput, WorkloadBuildError, WorkloadReport, WorkloadSelector as ReportSelector,
@@ -289,11 +292,7 @@ pub fn resolutions_from_response(
         .iter()
         .map(|assoc| {
             (
-                (
-                    assoc.key.cgroup,
-                    assoc.key.tgid,
-                    assoc.key.start_ns,
-                ),
+                (assoc.key.cgroup, assoc.key.tgid, assoc.key.start_ns),
                 (assoc.identity.clone(), assoc.evidence.clone()),
             )
         })
@@ -330,7 +329,10 @@ pub fn input_rows(
     rows.iter()
         .map(|row| {
             let triple = (row.context.cgroup, row.context.tgid, row.context.start_ns);
-            let (identity, evidence) = resolutions.get(&triple).cloned().unwrap_or_else(unresolved_row);
+            let (identity, evidence) = resolutions
+                .get(&triple)
+                .cloned()
+                .unwrap_or_else(unresolved_row);
             ReportRowInput {
                 context: row.context,
                 calls: row.calls,
@@ -491,6 +493,185 @@ pub fn observations_for_rows(
     Ok(out)
 }
 
+/// One command's post-capture workload view: grouping, optional
+/// cgroup filter, optional metadata file, and the capture profile
+/// name the report declares.
+#[derive(Debug, Clone)]
+pub struct WorkloadFinishOpts {
+    /// Declared row grouping (a rendering axis, never a recount).
+    pub group_by: GroupBy,
+    /// Exact cgroup-id view (`None` reports the whole population).
+    pub filter_cgroup_id: Option<u64>,
+    /// Optional metadata file feeding the helper serve.
+    pub metadata_file: Option<std::path::PathBuf>,
+    /// Capture profile name (`api-returns`).
+    pub profile: String,
+}
+
+/// Finished workload evidence: the typed report plus the exact
+/// assembly input rows behind it (scoped checks evaluate the same
+/// rows the report renders — one population, two views).
+#[derive(Debug, Clone)]
+pub struct WorkloadFinish {
+    /// The assembled typed report.
+    pub report: WorkloadReport,
+    /// The assembly input rows (for scoped evaluation).
+    pub rows: Vec<ReportRowInput>,
+}
+
+/// Serve metadata and assemble one typed report (post-capture only):
+/// the helper serve is bounded and separate from BPF drain/stop (the
+/// drain stopped inside the session before this runs). Missing
+/// capture, an unmintable session, or an inconsistent join refuses
+/// [`WorkloadError`] (exit 1 at integration); helper failure is data
+/// (raw-ID rows + typed unavailability), never an error here.
+pub fn finish_workload_report(
+    outcome: &LiveOutcome,
+    opts: &WorkloadFinishOpts,
+) -> Result<WorkloadFinish, WorkloadError> {
+    let Some(capture) = outcome.workload_capture.as_ref() else {
+        return Err(WorkloadError::Scope("workload capture missing".to_string()));
+    };
+    // The preflight pins helper + principal + kernel scope (or names
+    // why metadata is unavailable); a missing preflight fails closed
+    // to an unavailable helper (raw-ID rows, never a guess). The
+    // kernel scope tag is required either way: the report cannot
+    // exist without its execution-kernel binding.
+    let preflight = outcome.workload_preflight.as_ref();
+    let launchable = preflight.is_some_and(|p| p.launchable());
+    let kernel_scope = preflight
+        .and_then(|p| p.kernel_scope.clone())
+        .unwrap_or_default();
+    if kernel_scope.is_empty() {
+        return Err(WorkloadError::Scope("kernel scope unreadable".to_string()));
+    }
+    let session_id = mint_session_id()?;
+    let (batch, keys_truncated) = request_keys(&capture.rows, &kernel_scope, &session_id);
+    let mut availability = match preflight {
+        Some(p) => p
+            .unavailable
+            .map(MetadataAvailability::Unavailable)
+            .unwrap_or(MetadataAvailability::Available),
+        None => MetadataAvailability::Unavailable(MetadataUnavailable::HelperRefused),
+    };
+    let mut response: Option<SnapshotResponse> = None;
+    if launchable {
+        let preflight = preflight.expect("launchable preflight");
+        let helper = preflight.helper.as_ref().expect("launchable helper");
+        let principal = preflight.principal.as_ref().expect("launchable principal");
+        let request = SnapshotRequest {
+            session_id: batch.session_id.clone(),
+            keys: batch.keys,
+            capture_interval: Some(SnapshotInterval {
+                start_ns: capture.interval_start_ns,
+                end_ns: capture.interval_end_ns,
+            }),
+        };
+        match serve_snapshot(helper, principal, opts.metadata_file.as_deref(), &request) {
+            Ok(served) => {
+                response = Some(served);
+                availability = MetadataAvailability::Available;
+            }
+            Err(kind) => {
+                availability = MetadataAvailability::Unavailable(kind);
+            }
+        }
+    }
+    finish_with_response(
+        capture,
+        opts,
+        batch.session_id,
+        &kernel_scope,
+        response.as_ref(),
+        &availability,
+        keys_truncated,
+        outcome,
+    )
+}
+
+/// Fold one helper outcome (response or typed unavailability) into
+/// the typed report: resolutions attach to rows, coverage reads the
+/// outcome, the selector partitions the observed population.
+#[allow(clippy::too_many_arguments)]
+fn finish_with_response(
+    capture: &WorkloadCapture,
+    opts: &WorkloadFinishOpts,
+    session_id: String,
+    kernel_scope: &str,
+    response: Option<&SnapshotResponse>,
+    availability: &MetadataAvailability,
+    keys_truncated: bool,
+    outcome: &LiveOutcome,
+) -> Result<WorkloadFinish, WorkloadError> {
+    let resolutions = response.map(resolutions_from_response).unwrap_or_default();
+    let rows = input_rows(&capture.rows, &resolutions);
+    // Capture coverage is partial by construction while the ledger
+    // is unproven (Stage 1 disposition: the exact unknown is
+    // unavailable, so the capture account is incomplete); correlation
+    // is complete for the declared M1 boundary (one observation
+    // boundary — nothing to correlate across).
+    let coverage = kryprobe_report::workload::ReportCoverage {
+        capture: CoverageLevel::Partial,
+        attribution: attribution_coverage(&rows),
+        metadata: metadata_coverage(availability, response, keys_truncated),
+        correlation: CoverageLevel::Complete,
+    };
+    let (selector, partition) = match opts.filter_cgroup_id {
+        None => {
+            let sum: u64 = rows.iter().map(|row| row.calls).sum();
+            (
+                ReportSelector::None,
+                ScopePartition::from_counts(sum, 0, 0).map_err(WorkloadError::Scope)?,
+            )
+        }
+        Some(id) => (
+            ReportSelector::CgroupId(id),
+            scope_for_filter(&rows, &outcome.observations, id)?,
+        ),
+    };
+    let report = assemble_live(LiveAssembly {
+        session_id,
+        kernel_scope: kernel_scope.to_string(),
+        profile: opts.profile.clone(),
+        capture: capture.clone(),
+        rows: rows.clone(),
+        selector,
+        partition,
+        group_by: opts.group_by,
+        metadata: *availability,
+        coverage,
+    })?;
+    Ok(WorkloadFinish { report, rows })
+}
+
+/// Pre-capture metadata gate: the file must exist, be a regular
+/// file, and fit the metadata byte budget. Stats only — content is
+/// NEVER read here (the helper reads and validates it; the
+/// privileged CLI never parses metadata bytes). Failure is a usage
+/// error (exit 2), reported before capture starts.
+pub fn precheck_metadata_file(
+    tool: &str,
+    path: &std::path::Path,
+    stderr: &mut dyn std::io::Write,
+) -> Result<(), i32> {
+    use kryprobe_core::workload::MAX_METADATA_BYTES;
+    let meta = std::fs::symlink_metadata(path);
+    let usable = meta.as_ref().is_ok_and(|m| m.file_type().is_file())
+        && meta
+            .as_ref()
+            .is_ok_and(|m| m.len() <= MAX_METADATA_BYTES as u64);
+    if usable {
+        Ok(())
+    } else {
+        let _ = writeln!(
+            stderr,
+            "{tool}: cannot use workload metadata '{}' (missing, not a regular file, or over the size budget)",
+            path.display()
+        );
+        Err(2)
+    }
+}
+
 /// Exit intent for one rendered workload report: 0 when the evidence
 /// is complete, 3 when the window was cut short or the report names
 /// gaps (unreconciled ledger gap or any non-complete coverage
@@ -516,8 +697,8 @@ mod tests {
     use crate::cmd_watch::fixtures::agg_obs;
     use kryprobe_abi::kcrypto_ctx::{KCtxKey, VCtx};
     use kryprobe_core::workload::{
-        ContainerRef, KernelIdentity, MetadataEntry, MetadataSnapshot, MetadataUnavailable,
-        Relationship, SnapshotInterval, SnapshotRequest, ValidityInterval, validate_session_id,
+        ContainerRef, KernelIdentity, MetadataEntry, MetadataSnapshot, Relationship,
+        SnapshotInterval, SnapshotRequest, ValidityInterval, validate_session_id,
     };
     use kryprobe_report::workload::{ReportLedger, ReportScope, ReportSession, report_from_bytes};
 
@@ -657,10 +838,7 @@ mod tests {
         (capture, natives)
     }
 
-    fn assemble_two_rows(
-        capture: &WorkloadCapture,
-        rows: Vec<ReportRowInput>,
-    ) -> WorkloadReport {
+    fn assemble_two_rows(capture: &WorkloadCapture, rows: Vec<ReportRowInput>) -> WorkloadReport {
         let sum: u64 = rows.iter().map(|row| row.calls).sum();
         assemble_live(LiveAssembly {
             session_id: SESSION.to_string(),

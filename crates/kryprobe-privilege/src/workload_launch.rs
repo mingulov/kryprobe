@@ -249,14 +249,9 @@ pub fn preflight_helper(helper_override: Option<&Path>) -> WorkloadPreflight {
         Ok(principal) => principal,
         Err(kind) => return fail(kind),
     };
-    // M1 has no principal-passing mechanism: root invocation cannot
-    // name a trustworthy non-root principal (SUDO_* is untrusted), so
-    // root keeps raw-ID capture. The helper enforces the same rule.
-    if principal.uid == 0 || principal.euid == 0 {
-        let mut refused = fail(MetadataUnavailable::NoPrincipal);
-        refused.principal = Some(principal);
-        return refused;
-    }
+    // The kernel scope tag is kernel state (readable at any uid):
+    // establish it before the root refusal so raw-ID capture keeps
+    // its execution-kernel binding even without a principal.
     let kernel_scope = match current_kernel_scope() {
         Ok(scope) => scope,
         Err(kind) => {
@@ -265,6 +260,15 @@ pub fn preflight_helper(helper_override: Option<&Path>) -> WorkloadPreflight {
             return refused;
         }
     };
+    // M1 has no principal-passing mechanism: root invocation cannot
+    // name a trustworthy non-root principal (SUDO_* is untrusted), so
+    // root keeps raw-ID capture. The helper enforces the same rule.
+    if principal.uid == 0 || principal.euid == 0 {
+        let mut refused = fail(MetadataUnavailable::NoPrincipal);
+        refused.principal = Some(principal);
+        refused.kernel_scope = Some(kernel_scope);
+        return refused;
+    }
     let helper = match helper_override {
         Some(path) => path.to_path_buf(),
         None => match discover_helper() {
@@ -1334,5 +1338,6 @@ honest_attestation() {
         );
         assert!(!missing.launchable());
         assert!(missing.principal.is_some());
+        assert!(missing.kernel_scope.is_some());
     }
 }
