@@ -30,6 +30,13 @@ const SYS_ALLOW: &[&str] = &[
     "crates/kryprobe-privilege/src/probe/bpf_sys.rs",
     "crates/kryprobe-privilege/src/inspect.rs",
     "crates/kryprobe-privilege/src/token/mint.rs",
+    // M1 Stage 3 (worker E2): the confined helper child clears its
+    // own capabilities with raw SYS_capset (libc 0.2 has no capset
+    // binding) plus no-new-privs — the launch boundary that moves
+    // across the broker with the rest of the privilege crate. One
+    // call site, self-creds only (downward, no privilege needed),
+    // proven zero by the launch fixtures' /proc attestation.
+    "crates/kryprobe-privilege/src/workload_launch.rs",
 ];
 
 /// `libc::name(` calls allowed outside `crates/kryprobe-privilege/`.
