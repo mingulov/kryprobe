@@ -621,6 +621,48 @@ fn byte_budget_splits_snapshot_requests() {
     );
 }
 
+/// C5 oracle (Codex C2): zero captured keys split into zero
+/// requests — the finish preserves the frozen empty-request refusal
+/// (`SnapshotRequest::validate`: empty keys → `ParseFailed`) instead
+/// of answering `Available` with COMPLETE coverage. No helper
+/// invocation serves nothing.
+/// (RED pre-fix: `answered = true` + `Available` + COMPLETE.)
+#[test]
+fn empty_capture_finish_preserves_empty_request_refusal() {
+    let scratch = kryprobe_testkit::TempDir::named("cli-empty-capture").expect("scratch");
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"echo_unresolved": true, "count": "count"}),
+    );
+    let mut outcome = finish_outcome(launchable_preflight(&helper));
+    outcome.workload_capture = Some(WorkloadCapture {
+        rows: vec![],
+        system_total: 0,
+        system_saturated: false,
+        refused_inserts: 0,
+        interval_start_ns: 100,
+        interval_end_ns: 1000,
+    });
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(
+        finished.report.metadata,
+        kryprobe_report::workload::MetadataAvailability::Unavailable(
+            kryprobe_core::workload::MetadataUnavailable::ParseFailed
+        ),
+        "empty capture refuses like the frozen empty request"
+    );
+    assert_eq!(
+        finished.report.coverage.metadata,
+        kryprobe_report::workload::CoverageLevel::Unavailable,
+        "no-answer state, never COMPLETE coverage"
+    );
+    assert!(
+        !scratch.path().join("count").exists(),
+        "zero requests serve zero invocations"
+    );
+}
+
 /// C4 oracle: the human workload report carries the terminal
 /// miss telemetry — per-program join detail, per-operation run
 /// qualification, and unavailable reasons — or explicit

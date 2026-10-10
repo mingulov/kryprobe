@@ -641,7 +641,16 @@ pub fn finish_workload_report(
         let batches = split_request_batches(&batch.session_id, batch.keys, interval);
         let mut merged: HashMap<KeyTriple, (WorkloadIdentity, AttributionEvidence)> =
             HashMap::new();
+        // Zero captured keys split into zero requests: preserve the
+        // frozen empty-request refusal (C2 C5) — an empty key set is
+        // what `SnapshotRequest::validate` refuses with `ParseFailed`
+        // (snapshot.rs), so the finish degrades exactly as if that
+        // single empty request had been encoded: typed refusal, no
+        // answer, never `Available`.
         let mut failed: Option<MetadataUnavailable> = None;
+        if batches.is_empty() {
+            failed = Some(MetadataUnavailable::ParseFailed);
+        }
         for request in &batches {
             match serve_pinned_snapshot(&pinned, principal, opts.metadata_file.as_deref(), request)
             {
