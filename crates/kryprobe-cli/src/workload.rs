@@ -26,7 +26,7 @@ use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, ContextIdentity, CountOperand, ExecutionKind,
     MAX_SNAPSHOT_ASSOCIATIONS, MetadataUnavailable, Relationship, ScopePartition,
     SnapshotConsistency, SnapshotInterval, SnapshotKey, SnapshotRequest, SnapshotResponse,
-    WorkloadIdentity,
+    WorkloadIdentity, encode_request,
 };
 use kryprobe_privilege::kcrypto_backend::CtxSnapshot;
 use kryprobe_privilege::workload_launch::{PinnedHelper, serve_pinned_snapshot};
@@ -254,6 +254,56 @@ pub fn request_keys(
     )
 }
 
+/// Split keys into request batches that each fit the frozen 4 KiB
+/// encoder budget (finding C3): greedy pack using `encode_request`
+/// itself as the measure, so the split tracks the contract exactly
+/// (byte budget, not just the 256-association count). Batches keep
+/// the input order; every emitted batch encodes within budget. A
+/// lone key always fits (bounded key + envelope ≪ budget); if one
+/// ever did not, it ships alone and the serve refuses it typed —
+/// the split never invents a refusal of its own.
+fn split_request_batches(
+    session_id: &str,
+    keys: Vec<SnapshotKey>,
+    interval: SnapshotInterval,
+) -> Vec<SnapshotRequest> {
+    let mut batches = Vec::new();
+    let mut current: Vec<SnapshotKey> = Vec::new();
+    for key in keys {
+        current.push(key);
+        let probe = SnapshotRequest {
+            session_id: session_id.to_string(),
+            keys: current.clone(),
+            capture_interval: Some(interval),
+        };
+        if encode_request(&probe).is_err() {
+            let overflow = current.pop().expect("probed non-empty");
+            if current.is_empty() {
+                batches.push(SnapshotRequest {
+                    session_id: session_id.to_string(),
+                    keys: vec![overflow],
+                    capture_interval: Some(interval),
+                });
+            } else {
+                batches.push(SnapshotRequest {
+                    session_id: session_id.to_string(),
+                    keys: std::mem::take(&mut current),
+                    capture_interval: Some(interval),
+                });
+                current.push(overflow);
+            }
+        }
+    }
+    if !current.is_empty() {
+        batches.push(SnapshotRequest {
+            session_id: session_id.to_string(),
+            keys: current,
+            capture_interval: Some(interval),
+        });
+    }
+    batches
+}
+
 /// Helper request keys plus their session binding (the caller adds the
 /// counted capture interval when established).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,22 +398,25 @@ pub fn input_rows(
 }
 
 /// Metadata coverage for one session: unavailable availability
-/// reads unavailable; answered with every key resolved is complete;
-/// answered with per-key errors or key truncation is partial.
+/// reads unavailable; answered clean (no per-key errors across any
+/// chunk, no key truncation) is complete; answered with per-key
+/// errors, key truncation, or no answer at all is partial.
 #[must_use]
 pub fn metadata_coverage(
     availability: &MetadataAvailability,
-    response: Option<&SnapshotResponse>,
+    answered: bool,
+    response_errors: bool,
     keys_truncated: bool,
 ) -> CoverageLevel {
     match availability {
         MetadataAvailability::Unavailable(_) => CoverageLevel::Unavailable,
-        MetadataAvailability::Available => match response {
-            Some(response) if response.errors.is_empty() && !keys_truncated => {
+        MetadataAvailability::Available => {
+            if answered && !response_errors && !keys_truncated {
                 CoverageLevel::Complete
+            } else {
+                CoverageLevel::Partial
             }
-            _ => CoverageLevel::Partial,
-        },
+        }
     }
 }
 
@@ -557,7 +610,10 @@ pub fn finish_workload_report(
             .unwrap_or(MetadataAvailability::Available),
         None => MetadataAvailability::Unavailable(MetadataUnavailable::HelperRefused),
     };
-    let mut response: Option<SnapshotResponse> = None;
+    let mut resolutions: HashMap<KeyTriple, (WorkloadIdentity, AttributionEvidence)> =
+        HashMap::new();
+    let mut answered = false;
+    let mut response_errors = false;
     if launchable {
         let preflight = preflight.expect("launchable preflight");
         let helper = preflight.helper.as_ref().expect("launchable helper");
@@ -572,20 +628,42 @@ pub fn finish_workload_report(
             identity: *identity,
         };
         let principal = preflight.principal.as_ref().expect("launchable principal");
-        let request = SnapshotRequest {
-            session_id: batch.session_id.clone(),
-            keys: batch.keys,
-            capture_interval: Some(SnapshotInterval {
-                start_ns: capture.interval_start_ns,
-                end_ns: capture.interval_end_ns,
-            }),
+        // Byte-budget batches (finding C3): every chunk encodes
+        // within budget, binds to its own request inside the serve,
+        // and merges here (keys disjoint across chunks, total bounded
+        // by the input keys). Any chunk failure degrades the whole
+        // serve, exactly as the old single request did.
+        let interval = SnapshotInterval {
+            start_ns: capture.interval_start_ns,
+            end_ns: capture.interval_end_ns,
         };
-        match serve_pinned_snapshot(&pinned, principal, opts.metadata_file.as_deref(), &request) {
-            Ok(served) => {
-                response = Some(served);
+        let batches = split_request_batches(&batch.session_id, batch.keys, interval);
+        let mut merged: HashMap<KeyTriple, (WorkloadIdentity, AttributionEvidence)> =
+            HashMap::new();
+        let mut failed: Option<MetadataUnavailable> = None;
+        for request in &batches {
+            match serve_pinned_snapshot(&pinned, principal, opts.metadata_file.as_deref(), request)
+            {
+                Ok(served) => {
+                    response_errors |= !served.errors.is_empty();
+                    merged.extend(resolutions_from_response(&served));
+                }
+                Err(kind) => {
+                    failed = Some(kind);
+                    break;
+                }
+            }
+        }
+        match failed {
+            None => {
+                // All-or-nothing: partial chunk answers never reach
+                // the rows (a failed serve folds raw-ID rows, as
+                // before — enrichment degrades, never half-applies).
+                resolutions = merged;
+                answered = true;
                 availability = MetadataAvailability::Available;
             }
-            Err(kind) => {
+            Some(kind) => {
                 availability = MetadataAvailability::Unavailable(kind);
             }
         }
@@ -595,29 +673,33 @@ pub fn finish_workload_report(
         opts,
         batch.session_id,
         &kernel_scope,
-        response.as_ref(),
+        &resolutions,
         &availability,
+        answered,
+        response_errors,
         keys_truncated,
         outcome,
     )
 }
 
-/// Fold one helper outcome (response or typed unavailability) into
-/// the typed report: resolutions attach to rows, coverage reads the
-/// outcome, the selector partitions the observed population.
+/// Fold one helper outcome (merged chunk resolutions or typed
+/// unavailability) into the typed report: resolutions attach to
+/// rows, coverage reads the outcome, the selector partitions the
+/// observed population.
 #[allow(clippy::too_many_arguments)]
 fn finish_with_response(
     capture: &WorkloadCapture,
     opts: &WorkloadFinishOpts,
     session_id: String,
     kernel_scope: &str,
-    response: Option<&SnapshotResponse>,
+    resolutions: &HashMap<KeyTriple, (WorkloadIdentity, AttributionEvidence)>,
     availability: &MetadataAvailability,
+    answered: bool,
+    response_errors: bool,
     keys_truncated: bool,
     outcome: &LiveOutcome,
 ) -> Result<WorkloadFinish, WorkloadError> {
-    let resolutions = response.map(resolutions_from_response).unwrap_or_default();
-    let rows = input_rows(&capture.rows, &resolutions);
+    let rows = input_rows(&capture.rows, resolutions);
     // Capture coverage is partial by construction while the ledger
     // is unproven (Stage 1 disposition: the exact unknown is
     // unavailable, so the capture account is incomplete); correlation
@@ -626,7 +708,7 @@ fn finish_with_response(
     let coverage = kryprobe_report::workload::ReportCoverage {
         capture: CoverageLevel::Partial,
         attribution: attribution_coverage(&rows),
-        metadata: metadata_coverage(availability, response, keys_truncated),
+        metadata: metadata_coverage(availability, answered, response_errors, keys_truncated),
         correlation: CoverageLevel::Complete,
     };
     let (selector, partition) = match opts.filter_cgroup_id {
@@ -978,22 +1060,82 @@ mod tests {
         assert_eq!(attribution_coverage(&all), CoverageLevel::Complete);
         assert_eq!(attribution_coverage(&[]), CoverageLevel::Complete);
         // Metadata coverage follows the helper outcome, never the rows.
+        assert!(response.errors.is_empty());
         assert_eq!(
-            metadata_coverage(&MetadataAvailability::Available, Some(&response), false),
+            metadata_coverage(&MetadataAvailability::Available, true, false, false),
             CoverageLevel::Complete
         );
         assert_eq!(
-            metadata_coverage(&MetadataAvailability::Available, Some(&response), true),
+            metadata_coverage(&MetadataAvailability::Available, true, false, true),
+            CoverageLevel::Partial
+        );
+        assert_eq!(
+            metadata_coverage(&MetadataAvailability::Available, true, true, false),
+            CoverageLevel::Partial
+        );
+        assert_eq!(
+            metadata_coverage(&MetadataAvailability::Available, false, false, false),
             CoverageLevel::Partial
         );
         assert_eq!(
             metadata_coverage(
                 &MetadataAvailability::Unavailable(MetadataUnavailable::NoPrincipal),
-                None,
+                false,
+                false,
                 false
             ),
             CoverageLevel::Unavailable
         );
+    }
+
+    #[test]
+    fn splitter_packs_by_byte_budget() {
+        // 256 max-scope keys: every emitted batch fits the budget,
+        // their union covers the input exactly once, in order.
+        let keys: Vec<SnapshotKey> = (0..256u64)
+            .map(|i| SnapshotKey {
+                kernel_scope: "s".repeat(128),
+                cgroup: i,
+                tgid: i as u32,
+                start_ns: i,
+            })
+            .collect();
+        let batches = split_request_batches(
+            "0123456789abcdef0123456789abcdef",
+            keys,
+            SnapshotInterval {
+                start_ns: 100,
+                end_ns: 1000,
+            },
+        );
+        assert!(batches.len() > 1, "max-scope keys split: {}", batches.len());
+        let mut seen = Vec::new();
+        for batch in &batches {
+            encode_request(batch).expect("batch fits the budget");
+            assert_eq!(batch.session_id, "0123456789abcdef0123456789abcdef");
+            seen.extend(batch.keys.iter().map(|key| key.cgroup));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..256u64).collect::<Vec<_>>());
+        // A small batch stays whole.
+        let small: Vec<SnapshotKey> = (0..3u64)
+            .map(|i| SnapshotKey {
+                kernel_scope: "test-scope".to_string(),
+                cgroup: i,
+                tgid: i as u32,
+                start_ns: i,
+            })
+            .collect();
+        let single = split_request_batches(
+            "0123456789abcdef0123456789abcdef",
+            small,
+            SnapshotInterval {
+                start_ns: 100,
+                end_ns: 1000,
+            },
+        );
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].keys.len(), 3);
     }
 
     #[test]

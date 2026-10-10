@@ -525,6 +525,90 @@ fn stale_metadata_keeps_identity_marks_row() {
     );
 }
 
+/// C3 oracle: a workload crossing the 4 KiB request byte budget
+/// resolves via multiple bounded requests — never a whole-batch
+/// refusal. The fixture echoes every chunk's keys as unresolved
+/// (binding to any chunk) and counts serves.
+#[test]
+fn byte_budget_splits_snapshot_requests() {
+    use kryprobe_core::workload::{SnapshotInterval, SnapshotKey, SnapshotRequest, encode_request};
+    let scratch = kryprobe_testkit::TempDir::named("cli-byte-split").expect("scratch");
+    // 120 distinct triples: under the 256-count cap, over the byte
+    // budget as one request.
+    let keys: Vec<SnapshotKey> = (0..120u64)
+        .map(|i| SnapshotKey {
+            kernel_scope: "test-scope".to_string(),
+            cgroup: 1000 + i,
+            tgid: 2000 + i as u32,
+            start_ns: 555,
+        })
+        .collect();
+    // Prove the workload crosses the budget as ONE request (the old
+    // code built exactly this shape and refused the whole batch).
+    let single = SnapshotRequest {
+        session_id: "0123456789abcdef0123456789abcdef".to_string(),
+        keys,
+        capture_interval: Some(SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        }),
+    };
+    assert_eq!(
+        encode_request(&single),
+        Err(kryprobe_core::workload::MetadataUnavailable::BudgetExceeded),
+        "one request would cross the byte budget"
+    );
+    let rows: Vec<JoinedRow> = single
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(n, key)| joined_row(n as u64, key.cgroup, key.tgid, 1, "cbc(aes)"))
+        .collect();
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"echo_unresolved": true, "count": "count"}),
+    );
+    let mut outcome = finish_outcome(launchable_preflight(&helper));
+    outcome.workload_capture = Some(WorkloadCapture {
+        rows,
+        system_total: 120,
+        system_saturated: false,
+        refused_inserts: 0,
+        interval_start_ns: 100,
+        interval_end_ns: 1000,
+    });
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    // Resolved (multi-request), not whole-batch refused.
+    assert_eq!(
+        finished.report.metadata,
+        kryprobe_report::workload::MetadataAvailability::Available,
+        "byte-crossing workload resolves"
+    );
+    let serves = std::fs::read_to_string(scratch.path().join("count"))
+        .expect("serves counted")
+        .lines()
+        .count();
+    assert!(serves > 1, "more than one bounded request served: {serves}");
+    // Every chunk's answers combined: all 120 rows, echoed
+    // unresolved, metadata complete, attribution partial.
+    assert_eq!(finished.rows.len(), 120);
+    assert!(
+        finished.rows.iter().all(
+            |row| row.evidence.status == kryprobe_core::workload::AttributionStatus::Unresolved
+        ),
+        "echo answers every row unresolved"
+    );
+    assert_eq!(
+        finished.report.coverage.metadata,
+        kryprobe_report::workload::CoverageLevel::Complete
+    );
+    assert_eq!(
+        finished.report.coverage.attribution,
+        kryprobe_report::workload::CoverageLevel::Partial
+    );
+}
+
 /// Helper crash at CLI level: the serve retries, then the finish
 /// degrades to raw-ID rows plus typed unavailability — data, never
 /// an error (enrichment cannot stall capture).

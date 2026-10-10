@@ -20,8 +20,13 @@
 //! - `refuse`: serve prints `{"error":NAME}` on stderr, exits 1.
 //! - `crash`: serve SIGKILLs itself (after the count below).
 //! - `stall_secs`: serve sleeps this long, then exits 0.
+//! - `echo_unresolved`: serve answers EVERY request key with an
+//!   unresolved echo association (key verbatim + empty identity +
+//!   unresolved hook-context evidence), binding to any chunk — the
+//!   C3 multi-request oracle (a fixed canned file cannot bind to
+//!   more than one chunk).
 //! - `canned`: serve file to substitute + emit (REQUIRED unless
-//!   refuse/crash/stall is set).
+//!   refuse/crash/stall/echo/retainer is set).
 //! - `session_placeholder`: substituted with the request session
 //!   (default: 32 zeros).
 //! - `argv_log`: append `argv` one-per-line here (serve path).
@@ -283,9 +288,16 @@ fn run_serve(dir: &Path, argv: &[String], sidecar: &serde_json::Value) -> i32 {
         eprintln!("{{\"error\":\"{name}\"}}");
         return 1;
     }
+    if sidecar
+        .get("echo_unresolved")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return run_echo_unresolved(&request);
+    }
     let canned_path = sidecar.get("canned").and_then(|v| resolve(dir, v));
     let Some(canned_path) = canned_path else {
-        eprintln!("launch-fixture: serve needs canned, refuse, crash, or stall_secs");
+        eprintln!("launch-fixture: serve needs canned, refuse, crash, stall_secs, or echo");
         return 3;
     };
     let session = serde_json::from_str::<serde_json::Value>(&request)
@@ -310,5 +322,72 @@ fn run_serve(dir: &Path, argv: &[String], sidecar: &serde_json::Value) -> i32 {
     eprintln!("{}", attestation_line(&attestation));
     print!("{}", canned.replace(placeholder, &session));
     eprintln!("{{\"helper_counters\":{{}}}}");
+    0
+}
+
+/// Echo every request key back as an unresolved association: the
+/// response binds to ANY chunk (session match, keys drawn from the
+/// request, single-chunk exact coverage, matching counters).
+fn run_echo_unresolved(request: &str) -> i32 {
+    let parsed = serde_json::from_str::<serde_json::Value>(request).unwrap_or_else(|_| {
+        eprintln!("launch-fixture: request is not JSON");
+        std::process::exit(3);
+    });
+    let session = parsed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            eprintln!("launch-fixture: request carries no session_id");
+            std::process::exit(3);
+        });
+    let keys = parsed
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| {
+            eprintln!("launch-fixture: request carries no keys");
+            std::process::exit(3);
+        });
+    let scope = keys
+        .first()
+        .and_then(|key| key.get("kernel_scope"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            eprintln!("launch-fixture: request keys carry no kernel_scope");
+            std::process::exit(3);
+        });
+    let associations: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|key| {
+            serde_json::json!({
+                "key": key,
+                "identity": {
+                    "container": null, "pod": null, "cluster": null,
+                    "node": null, "ancestor_container": null,
+                },
+                "evidence": {
+                    "relationship": "hook_context",
+                    "method": "unresolved",
+                    "source": "unknown",
+                    "status": "unresolved",
+                },
+            })
+        })
+        .collect();
+    let response = serde_json::json!({
+        "session_id": session,
+        "kernel_identity": {"known": scope},
+        "associations": associations,
+        "errors": [],
+        "status": "complete",
+        "chunk": {"index": 0, "total": 1},
+        "counters": {
+            "resolved": 0,
+            "unresolved": associations.len(),
+            "refused": 0,
+        },
+    });
+    let attestation = collect().unwrap_or_else(|| std::process::exit(3));
+    eprintln!("{}", attestation_line(&attestation));
+    print!("{response}");
     0
 }
