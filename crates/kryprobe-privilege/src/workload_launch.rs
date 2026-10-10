@@ -17,7 +17,7 @@
 //!   the running CLI executable. No `PATH` search, no metadata-selected
 //!   paths, no environment override. Missing/non-regular files refuse.
 //! - Identity pinning (C1 A1, hardened C2 A1): preflight opens
-//!   the helper (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`), enforces the
+//!   the helper (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`), enforces the
 //!   trusted-image rule (owner root-or-euid, no group/other write —
 //!   the installed and dev layouts alike), and pins its file
 //!   identity (device, inode, owner, mode, size, sha256 content
@@ -30,12 +30,15 @@
 //!   check and the exec share one open file description). Stat
 //!   fields alone cannot see an equal-length in-place rewrite of a
 //!   writable inode; the digest can.
-//! - Confinement (child `pre_exec`, before `exec`): clear ambient caps,
-//!   empty every capability set, set `no_new_privs`, close every fd
-//!   except stdio and the pinned executable fd (which is `CLOEXEC`,
-//!   so it never survives `exec` into the helper — the attested fd
-//!   set stays stdio-only). Dropping privilege is always permitted,
-//!   so this works identically with or without file caps on the CLI.
+//! - Confinement (child `pre_exec`, before `exec`): found its own
+//!   process group (group id == child pid; the parent claims it too,
+//!   so kill paths SIGKILL descendants with precise membership),
+//!   clear ambient caps, empty every capability set, set
+//!   `no_new_privs`, close every fd except stdio and the pinned
+//!   executable fd (which is `CLOEXEC`, so it never survives `exec`
+//!   into the helper — the attested fd set stays stdio-only).
+//!   Dropping privilege is always permitted, so this works
+//!   identically with or without file caps on the CLI.
 //! - Verification: `--attest --require-no-new-privs` first (the helper
 //!   reports its boundary without touching metadata or stdin), then the
 //!   serve run. The launcher checks uid/euid/gid/egid against the pinned
@@ -47,8 +50,13 @@
 //!   covering spawn, writes, reads, and reap. No wait-before-drain
 //!   stall (a legal response larger than the pipe streams through)
 //!   and no unbounded EOF read (a descendant retaining a pipe
-//!   cannot outlive the deadline). Caps keep the old `cap + 1`
-//!   refusals; outcome classification is unchanged.
+//!   cannot outlive the deadline: every kill path SIGKILLs the
+//!   child's process group — child plus descendants — then reaps
+//!   the direct child; status peeks never reap, so the zombie
+//!   anchors the group until disposition). Caps keep the old `cap +
+//!   1` refusals; outcome classification is unchanged. Residual,
+//!   documented not claimed: detached descendants of a SUCCESSFUL
+//!   run (no pipes held) and new-session escapees are not killed.
 //! - Retries: [`MAX_HELPER_RETRIES`] past the initial attempt, on
 //!   transport failures only (stall/crash). Typed helper refusals —
 //!   including identity-mismatch refusals — are deterministic and
@@ -280,8 +288,8 @@ pub struct PinnedHelper {
 
 impl PinnedHelper {
     /// Reopen the path and require the pinned identity: same open
-    /// flags as the pin (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`), same
-    /// file-type gate, every identity field equal. A mismatch (or a
+    /// flags as the pin (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`),
+    /// same file-type gate, every identity field equal. A mismatch (or a
     /// symlink, or a non-regular file) refuses
     /// [`MetadataUnavailable::HelperRefused`] — deterministic, never
     /// retried. The returned file is the `exec` target itself, so no
@@ -296,9 +304,10 @@ impl PinnedHelper {
     }
 }
 
-/// Open one verified helper image: `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
+/// Open one verified helper image: `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`
 /// (a trailing symlink refuses — the fixed sibling is a regular
-/// file), regular-file gate, `CLOEXEC` pinned explicitly, the fd
+/// file; a FIFO opens without blocking and refuses below),
+/// regular-file gate, `CLOEXEC` pinned explicitly, the fd
 /// parked at 3+ (never a stdio number), the trusted-image rule
 /// (owner root-or-euid, no group/other write), and the sha256
 /// content digest read from the same open file description that
@@ -306,9 +315,14 @@ impl PinnedHelper {
 /// [`MetadataUnavailable::HelperRefused`] without echoing the path).
 fn open_verified(path: &Path) -> std::io::Result<(std::fs::File, HelperIdentity)> {
     use std::os::unix::fs::OpenOptionsExt;
+    // `O_NONBLOCK`: a FIFO swapped in for the sibling must refuse
+    // via the regular-file gate below, never hang this open (C2 C1 —
+    // the open precedes any deadline, so blocking here is
+    // unbounded). Regular files ignore the flag (reads and the
+    // digest behave identically; the fd is `CLOEXEC`, gone at exec).
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     // Defense in depth: `std` already sets `CLOEXEC`; pin it
     // explicitly so the keep-fd can never survive `exec` into the
@@ -655,6 +669,17 @@ pub fn parse_error_line(line: &str) -> Result<MetadataUnavailable, MetadataUnava
 /// Called by `std` in the child after `fork`; the body uses raw
 /// syscalls only.
 fn confine_child(keep: RawFd, child_soft_limit: Option<u64>) -> std::io::Result<()> {
+    // Process group first: the child founds its own group (group id
+    // == child pid) so the launcher can SIGKILL the whole group —
+    // child plus any descendants — without ever signaling its own
+    // group. The parent runs the same `setpgid` after spawn (either
+    // may win; `EACCES` after `exec` means the other's ran).
+    // Failure here aborts before `exec`, so no descendant can ever
+    // exist outside the group.
+    // SAFETY: raw setpgid on self (async-signal-safe).
+    if unsafe { libc::setpgid(0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     if let Some(soft) = child_soft_limit {
         // SAFETY: getrlimit/setrlimit by value on stack memory only.
         let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -828,7 +853,18 @@ fn spawn_confined(
     unsafe {
         command.pre_exec(move || confine_child(fd, child_soft_limit));
     }
-    command.spawn()
+    let child = command.spawn()?;
+    // Claim the child's process group from the parent side too (the
+    // child claims it in `pre_exec`; either may win — see
+    // `confine_child`). Errors ignored: `EACCES` means the child
+    // already `exec`'d (its claim ran); `ESRCH` means it already
+    // exited (no descendant is possible without a prior `exec`,
+    // which implies the child's claim ran).
+    // SAFETY: setpgid on a direct child pid, no pointers.
+    unsafe {
+        libc::setpgid(child.id() as libc::pid_t, child.id() as libc::pid_t);
+    }
+    Ok(child)
 }
 
 /// One bounded stdin write: the pipe plus the bytes still to send.
@@ -863,10 +899,59 @@ enum DrainOutcome {
     ReadFailed,
 }
 
-/// Kill and reap unconditionally (never a hang, never an orphan).
+/// Kill the whole child process group and reap the direct child
+/// (never a hang, never an orphan, never a lingering descendant).
+/// The child is ALWAYS unreaped here (exit peeks never reap —
+/// see [`peek_child_exited`]), so its pid is still valid and the
+/// group it founded in [`confine_child`] holds only our own
+/// descendants: precise membership, never our own group. Callers
+/// must never call this after a reap (every call site below is
+/// peek-only until this runs).
 fn kill_and_reap(child: &mut std::process::Child) {
+    // The group dies first (descendants), then the child, then the
+    // reap. `killpg` errors ignored: while unreaped the group
+    // exists (the zombie itself holds membership) and its members
+    // are all our own descendants — and `kill`+`wait` still run.
+    // SAFETY: killpg on the unreaped child's own group id.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Peek whether one child exited WITHOUT reaping (raw `waitid`
+/// with `WEXITED|WNOHANG|WNOWAIT` — `WNOWAIT` is honored by
+/// `waitid` only; `waitpid` rejects it with `EINVAL`): the zombie
+/// stays unreaped, so its pid — and hence its process group — is
+/// still provably ours when a kill path fires. The peek is a pure
+/// boolean gate; the caller reaps at disposition and takes the
+/// authoritative status from the reap. `Err` on wait failure.
+fn peek_child_exited(child: &std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: zeroed siginfo out-param; `waitid` with `WNOHANG`
+    // leaves `si_pid` zero when nothing exited.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid on a direct child pid; WNOWAIT never reaps.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if waited < 0 {
+        let err = std::io::Error::last_os_error();
+        // Interrupted: report still-running; the sliced poll loop
+        // re-peeks within milliseconds.
+        if err.raw_os_error() == Some(libc::EINTR) {
+            return Ok(false);
+        }
+        return Err(err);
+    }
+    // SAFETY: reading the union field `waitid` just filled (or
+    // the zero it left untouched when nothing exited).
+    Ok(unsafe { info.si_pid() } != 0)
 }
 
 /// Mark one parent-side pipe fd nonblocking.
@@ -923,9 +1008,11 @@ fn drain_pipe(
 /// No wait-before-drain stall (a legal response larger than the pipe
 /// streams through while the child still runs) and no unbounded EOF
 /// read (a descendant retaining a pipe cannot outlive the deadline:
-/// the child is already reaped and the pipes drain until the lapse).
-/// Done requires the reaped status AND both EOFs AND a finished
-/// stdin write; anything else ends by cap or by deadline.
+/// every kill path SIGKILLs the child's process group, then reaps
+/// the direct child). Status peeks never reap, so the zombie anchors
+/// the group until disposition. Done requires the reaped status AND
+/// both EOFs AND a finished stdin write; anything else ends by cap
+/// or by deadline.
 #[allow(clippy::too_many_arguments)]
 fn drain_bounded(
     child: &mut std::process::Child,
@@ -950,25 +1037,34 @@ fn drain_bounded(
     let mut err = Vec::new();
     let mut out_eof = false;
     let mut err_eof = false;
-    let mut status: Option<std::process::ExitStatus> = None;
+    let mut exited = false;
     let mut chunk = [0u8; 8192];
     loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exited)) => status = Some(exited),
-                Ok(None) => {}
+        if !exited {
+            match peek_child_exited(child) {
+                Ok(done) => exited = done,
                 Err(_) => {
                     kill_and_reap(child);
                     return DrainOutcome::WaitFailed;
                 }
             }
         }
-        if out_eof
-            && err_eof
-            && stdin.is_none()
-            && let Some(status) = status
-        {
-            return DrainOutcome::Done { status, out, err };
+        if out_eof && err_eof && stdin.is_none() && exited {
+            // Reap at disposition: the peek left a zombie (which
+            // anchored the group until now); `wait` cannot block —
+            // the child is already dead.
+            let reaped = match child.wait() {
+                Ok(reaped) => reaped,
+                Err(_) => {
+                    kill_and_reap(child);
+                    return DrainOutcome::WaitFailed;
+                }
+            };
+            return DrainOutcome::Done {
+                status: reaped,
+                out,
+                err,
+            };
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2331,6 +2427,58 @@ mod tests {
         );
     }
 
+    /// C1 oracle (Codex C2): replacing the sibling with a FIFO
+    /// (no writer) refuses fast — the verified open never blocks on
+    /// a FIFO; the regular-file gate refuses it. The serve runs on a
+    /// thread with a hard join bound, so a blocking-open regression
+    /// FAILS instead of hanging the suite (the leaked thread dies
+    /// with the test process).
+    /// (RED pre-fix: the open blocks; the join times out.)
+    #[test]
+    fn fifo_sibling_replacement_refuses_without_hang() {
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = kryprobe_testkit::TempDir::named("launch-fifo").expect("scratch");
+        let helper_path = stage_fixture(scratch.path(), "helper", serde_json::json!({}));
+        let principal = current_principal().expect("test principal");
+        let pinned = pin_helper(&helper_path).expect("pins");
+        std::fs::remove_file(&helper_path).expect("staged image removed");
+        // A writerless FIFO at the sibling path: a blocking open
+        // hangs here forever (pre-fix RED).
+        let path_c = std::ffi::CString::new(helper_path.as_os_str().as_bytes()).expect("c path");
+        // SAFETY: mkfifo on a scratch path; no writer ever opens it.
+        assert_eq!(
+            unsafe { libc::mkfifo(path_c.as_ptr(), 0o644) },
+            0,
+            "fifo swaps in"
+        );
+        let request = test_request();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            let outcome = serve_pinned_snapshot_with_bound(
+                &pinned,
+                &principal,
+                None,
+                &request,
+                Duration::from_millis(300),
+            );
+            let _ = done_tx.send(outcome);
+        });
+        let outcome = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("serve returns without hanging on the FIFO open");
+        assert_eq!(
+            outcome,
+            Err(MetadataUnavailable::HelperRefused),
+            "FIFO sibling refuses"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "refusal is fast (no hang): {:?}",
+            start.elapsed()
+        );
+    }
+
     /// C1 oracle (a): a legal response larger than a shrunk pipe
     /// streams through concurrent drain. Wait-before-drain deadlocks
     /// it (the child blocks filling the pipe while the parent waits
@@ -2448,7 +2596,11 @@ mod tests {
     /// C1 oracle (b): an exited child whose descendant retains the
     /// pipes terminates by the deadline — refusal, never hang. The
     /// old EOF read after the wait blocks forever here (no EOF ever
-    /// arrives), so this hangs pre-fix (RED via timeout).
+    /// arrives), so this hangs pre-fix (RED via timeout). The
+    /// launcher also kills the pipe-retaining descendants
+    /// (process-group kill at the deadline): the oracle asserts
+    /// every recorded retainer is dead — the old test-side SIGKILL
+    /// sweep proved nothing about the launcher.
     #[test]
     fn exited_child_with_pipe_retaining_descendant_terminates_by_deadline() {
         let scratch = kryprobe_testkit::TempDir::named("launch-retainer").expect("scratch");
@@ -2485,8 +2637,36 @@ mod tests {
             1 + MAX_HELPER_RETRIES,
             "every attempt spawned (and outlived) its child"
         );
-        // Hygiene: reap the orphaned sleepers we own (best effort —
-        // they self-exit after 30 s regardless).
+        // Launcher-cleanup proof (Codex C2): every retainer must
+        // be DEAD — the launcher SIGKILLs the child's process group
+        // at each attempt's deadline. The sleepers cannot self-exit
+        // before 30 s and the serve above returned in ~1 s, so death
+        // here proves launcher cleanup, not self-exit. Poll briefly:
+        // SIGKILL delivery is async and the reparented orphans reap
+        // via init. (RED pre-group-kill: the sleepers outlive the
+        // serve; the poll times out.)
+        for line in pids.lines() {
+            let pid: i32 = line.trim().parse().expect("retainer pid parses");
+            let gone_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                // SAFETY: kill(pid, 0) probes existence only. Our
+                // own same-uid descendants: 0 means alive-or-zombie;
+                // any error (ESRCH, or a stranger's reused pid we
+                // cannot signal) means OUR retainer is gone.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                assert!(
+                    Instant::now() < gone_deadline,
+                    "launcher kills retainer {pid} (still alive 5 s after the serve)"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Hygiene (NOT the guarantee — the assertion above is):
+        // sweep any unexpected survivor (e.g. a new-session escapee,
+        // which process-group kill cannot reach by design).
         for line in pids.lines() {
             if let Ok(pid) = line.trim().parse::<i32>() {
                 // SAFETY: SIGKILL to a recorded direct grandchild pid.
