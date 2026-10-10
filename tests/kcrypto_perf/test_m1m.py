@@ -169,8 +169,10 @@ class FinalManifestTests(unittest.TestCase):
 
     def test_mr_shape(self):
         entry = CLI.find_set(self.manifest, "m1-P-1M-single-mr")
-        self.assertEqual((entry["obs_a"], entry["mode_a"]), ("R", "aggregation"))
-        self.assertEqual((entry["obs_b"], entry["mode_b"]), ("M", "aggregation"))
+        self.assertEqual((entry["obs_a"], entry["mode_a"]),
+                         ("R", "aggregation"))
+        self.assertEqual((entry["obs_b"], entry["mode_b"]),
+                         ("M", "aggregation"))
         self.assertTrue(entry["budgeted"])
         self.assertEqual((entry["pairs"], entry["max_attempted"]),
                          (10, 12))
@@ -179,7 +181,8 @@ class FinalManifestTests(unittest.TestCase):
         entry = CLI.find_set(self.manifest, "m1-P-1M-n_cgroup-md")
         self.assertEqual((entry["obs_a"], entry["mode_a"]),
                          ("D", "disabled"))
-        self.assertEqual((entry["obs_b"], entry["mode_b"]), ("M", "aggregation"))
+        self.assertEqual((entry["obs_b"], entry["mode_b"]),
+                         ("M", "aggregation"))
         self.assertEqual((entry["pairs"], entry["max_attempted"]),
                          (10, 12))
 
@@ -701,7 +704,7 @@ class MEvidenceTests(unittest.TestCase):
 
 
 class FloorTests(unittest.TestCase):
-    """G7: the ADR-0019 0.80 4K disabled-relative floor (ENVELOPE-only)."""
+    """G7: the 0.80 4K disabled-relative floor (ENVELOPE-only)."""
 
     def setUp(self):
         self.manifest = m1manifest.load_manifest(M1_MANIFEST)
