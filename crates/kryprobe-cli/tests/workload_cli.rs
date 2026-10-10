@@ -506,11 +506,23 @@ fn stale_metadata_keeps_identity_marks_row() {
         "helper",
         serde_json::json!({"canned": "canned.json"}),
     );
+    // Counted-unresolved (ADR-0012): the producer counts the
+    // stale row unresolved, never resolved.
+    assert_eq!(response.counters.resolved, 0);
+    assert_eq!(response.counters.unresolved, 1);
+    assert_eq!(response.counters.refused, 0);
     let outcome = finish_outcome(launchable_preflight(&helper));
     let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
     assert_eq!(finished.rows.len(), 1);
     assert!(finished.rows[0].identity.is_resolved());
     assert_eq!(finished.rows[0].evidence.status, AttributionStatus::Stale);
+    // C2 oracle: stale identity is KEPT but never qualifies as
+    // complete attribution — the report reads PARTIAL.
+    assert_eq!(
+        finished.report.coverage.attribution,
+        kryprobe_report::workload::CoverageLevel::Partial,
+        "stale bindings report PARTIAL attribution"
+    );
 }
 
 /// Helper crash at CLI level: the serve retries, then the finish

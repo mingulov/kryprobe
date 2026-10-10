@@ -310,12 +310,15 @@ fn unresolved_row() -> (WorkloadIdentity, AttributionEvidence) {
 }
 
 /// Whether an attribution status establishes workload identity for
-/// coverage purposes: usable statuses (verified/asserted/stale) count
-/// as attributed; unresolved/ambiguous/unsupported do not.
+/// coverage purposes: verified/asserted count as attributed;
+/// unresolved/ambiguous/unsupported do not — and neither does stale
+/// (finding C2): a stale binding keeps its identity on the row but
+/// never qualifies as complete attribution, so the report reads
+/// PARTIAL and the row stays counted-unresolved per ADR-0012.
 fn status_is_attributed(status: AttributionStatus) -> bool {
     matches!(
         status,
-        AttributionStatus::Verified | AttributionStatus::Asserted | AttributionStatus::Stale
+        AttributionStatus::Verified | AttributionStatus::Asserted
     )
 }
 
