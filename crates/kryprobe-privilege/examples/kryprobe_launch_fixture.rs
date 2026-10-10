@@ -44,12 +44,14 @@
 //! Relative paths resolve against the sidecar directory. A missing
 //! or unparsable sidecar exits 3 loudly (tests always write one).
 //!
-//! Test-only Cargo gate: this file lives in `examples/`, so Cargo
-//! NEVER builds it for `cargo build` (dev or release) and NEVER
-//! installs it (`cargo install` ships `[[bin]]` targets only) —
-//! `src/bin/` autodiscovery was the hole (a normal build produced a
-//! shippable artifact). `cargo test` DOES build it (to
-//! `<profile>/examples/`), which is the only build that spawns it.
+//! Test-only Cargo gate: this file lives in `examples/`, so the
+//! DEFAULT `cargo build` (dev or release) never builds it and the
+//! default `cargo install` never ships it (it installs `[[bin]]`
+//! targets only) — `src/bin/` autodiscovery was the hole (a normal
+//! build produced a shippable artifact). Explicit example selection
+//! (`--example kryprobe_launch_fixture`) still can build it;
+//! `cargo test` DOES (to `<profile>/examples/`), which is the only
+//! build that spawns it.
 //!
 //! Anti-confusion (why its real-IPC wire output cannot be mistaken
 //! for the real helper): (1) path separation — production discovery

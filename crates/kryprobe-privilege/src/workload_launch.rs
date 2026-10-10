@@ -680,6 +680,22 @@ fn confine_child(keep: RawFd, child_soft_limit: Option<u64>) -> std::io::Result<
     if unsafe { libc::setpgid(0, 0) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // Waitable-child ownership (child side): an inherited
+    // `SIGCHLD=SIG_IGN` survives `exec` and would auto-reap this
+    // child's own children — reset to `SIG_DFL` so the helper never
+    // inherits auto-reap (the parent normalizes pre-spawn as well;
+    // both ends pin ownership where it is required).
+    // SAFETY: sigaction install of SIG_DFL on SIGCHLD only
+    // (async-signal-safe).
+    unsafe {
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut dfl.sa_mask);
+        dfl.sa_flags = 0;
+        if libc::sigaction(libc::SIGCHLD, &dfl, std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     if let Some(soft) = child_soft_limit {
         // SAFETY: getrlimit/setrlimit by value on stack memory only.
         let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -831,6 +847,8 @@ impl CapData {
 /// vocabulary only; `--metadata FILE` carries a launcher-CLI-selected
 /// path (never helper- or file-selected): the helper takes no
 /// executable paths and the launcher takes no metadata content.
+/// Establishes waitable-child ownership BEFORE spawning (see
+/// [`ensure_waitable_sigchld`]).
 fn spawn_confined(
     pinned: &std::fs::File,
     arg0: &Path,
@@ -838,6 +856,10 @@ fn spawn_confined(
     stdin_mode: Stdio,
     child_soft_limit: Option<u64>,
 ) -> std::io::Result<std::process::Child> {
+    // Ownership BEFORE spawning: normalize an inherited auto-reaping
+    // SIGCHLD disposition so this child is always waitable — the
+    // zombie anchors every kill path.
+    ensure_waitable_sigchld();
     let fd = pinned.as_raw_fd();
     debug_assert!(fd >= 3, "image fd parks above stdio");
     let exec_path = format!("/proc/self/fd/{fd}");
@@ -899,15 +921,84 @@ enum DrainOutcome {
     ReadFailed,
 }
 
+/// Require waitable children (parent side): an inherited
+/// `SIGCHLD=SIG_IGN` survives `exec`, and while it (or
+/// `SA_NOCLDWAIT`) is set every exiting child auto-reaps — no zombie
+/// survives to anchor the kill paths, and `waitid` reports `ECHILD`
+/// on plain numbers PID/PGID reuse can reassign. Reset exactly the
+/// auto-reaping configurations to plain `SIG_DFL` before spawning;
+/// any other disposition (including a handler without `NOCLDWAIT`)
+/// is already waitable and stays untouched. Permanent by design: the
+/// disposition at child-exit time governs auto-reap, so restoring
+/// `SIG_IGN` before the reap would lose ownership again. `SIG_DFL`
+/// for `SIGCHLD` discards the signal yet keeps the zombie waitable.
+fn ensure_waitable_sigchld() {
+    // SAFETY: sigaction query, then (only for auto-reaping
+    // configurations) install of plain SIG_DFL on SIGCHLD.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction != libc::SIG_IGN
+            && (current.sa_flags & libc::SA_NOCLDWAIT) == 0
+        {
+            return;
+        }
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut dfl.sa_mask);
+        dfl.sa_flags = 0;
+        let _ = libc::sigaction(libc::SIGCHLD, &dfl, std::ptr::null_mut());
+    }
+}
+
+/// Whether the child is still waitable (owned): raw `waitid` with
+/// `WNOWAIT` never reaps, so only an already-reaped child reports
+/// `ECHILD` — ownership lost (an external reap; inherited auto-reap
+/// cannot happen once [`spawn_confined`] normalizes the
+/// disposition), after which its pid/pgid are plain numbers reuse
+/// can reassign. Every other outcome (running, zombie, transient
+/// `EINTR`) keeps ownership: only a reap destroys it, and this probe
+/// never reaps.
+fn child_still_waitable(child: &std::process::Child) -> bool {
+    // SAFETY: zeroed siginfo out-param; `WNOHANG` leaves `si_pid`
+    // zero when nothing exited; `WNOWAIT` never reaps.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid on a direct child pid; WNOWAIT never reaps.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if waited == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ECHILD)
+}
+
 /// Kill the whole child process group and reap the direct child
 /// (never a hang, never an orphan, never a lingering descendant).
-/// The child is ALWAYS unreaped here (exit peeks never reap —
+/// The child is normally unreaped here (exit peeks never reap —
 /// see [`peek_child_exited`]), so its pid is still valid and the
 /// group it founded in [`confine_child`] holds only our own
-/// descendants: precise membership, never our own group. Callers
-/// must never call this after a reap (every call site below is
-/// peek-only until this runs).
+/// descendants: precise membership, never our own group. After
+/// ownership loss (`ECHILD`: already reaped) the pid/pgid are plain
+/// numbers — this MUST NOT signal them (PID/PGID reuse could aim at
+/// unrelated processes), so the ownership probe below downgrades to
+/// reap-only. Callers must never call this after a reap they
+/// performed themselves (every call site below is peek-only until
+/// this runs); the probe is the backstop for reaps this code did not
+/// perform.
 fn kill_and_reap(child: &mut std::process::Child) {
+    // Ownership gate: after ECHILD the numeric pid/pgid may already
+    // name strangers — NEVER signal them. Reap-only (the `Child`
+    // may still hold a cached status; `wait` then succeeds).
+    if !child_still_waitable(child) {
+        let _ = child.wait();
+        return;
+    }
     // The group dies first (descendants), then the child, then the
     // reap. `killpg` errors ignored: while unreaped the group
     // exists (the zombie itself holds membership) and its members
@@ -2664,17 +2755,224 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        // Hygiene (NOT the guarantee — the assertion above is):
-        // sweep any unexpected survivor (e.g. a new-session escapee,
-        // which process-group kill cannot reach by design).
-        for line in pids.lines() {
-            if let Ok(pid) = line.trim().parse::<i32>() {
-                // SAFETY: SIGKILL to a recorded direct grandchild pid.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
+    }
+
+    /// C3-G blocker oracle (a): a serve under an inherited
+    /// `SIGCHLD=SIG_IGN` still answers. The disposition survives
+    /// exec, so without launcher-side normalization every exited
+    /// helper auto-reaps: `waitid` reports `ECHILD`, the drain
+    /// refuses, and the serve degrades to `HelperRefused`. The probe
+    /// re-execs this test binary (unique filter + one thread, like
+    /// the closed-stdio oracle); the `pre_exec` installs `SIG_IGN`
+    /// post-fork so the child INHERITS it across `exec` — the
+    /// parent's own disposition is never touched (this suite shares
+    /// one process; a process-global `SIG_IGN` window would
+    /// auto-reap sibling tests' children). The child asserts the
+    /// hostile disposition arrived (no vacuous green), then serves.
+    /// (RED pre-fix: the child serve refuses and the probe exits
+    /// nonzero.)
+    #[test]
+    fn sigchld_ignored_inheritance_still_serves() {
+        if std::env::var("KRYPROBE_LAUNCH_SIGCHLD_CHILD").is_ok() {
+            sigchld_ignored_child();
+            return;
         }
+        sigchld_ignored_parent();
+    }
+
+    /// SIGCHLD-ignored child: prove the hostile disposition arrived
+    /// across exec, serve one canned request, log the verdict for
+    /// the parent to quote.
+    fn sigchld_ignored_child() {
+        let helper = std::env::var("KRYPROBE_LAUNCH_SIGCHLD_HELPER").expect("helper path");
+        let log = std::env::var("KRYPROBE_LAUNCH_SIGCHLD_LOG").expect("log path");
+        // SAFETY: sigaction query only.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) },
+            0,
+            "can query SIGCHLD disposition"
+        );
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "hostile SIGCHLD=SIG_IGN survived exec (no vacuous green)"
+        );
+        let principal = current_principal().expect("test principal");
+        let request = test_request();
+        let result = serve_snapshot_with_bound(
+            Path::new(&helper),
+            &principal,
+            None,
+            &request,
+            Duration::from_secs(10),
+        );
+        std::fs::write(&log, format!("{result:?}")).expect("probe log");
+        let response = result.expect("serve answers under inherited SIGCHLD=SIG_IGN");
+        assert_eq!(response.session_id, SESSION);
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, 42);
+    }
+
+    /// SIGCHLD-ignored parent: stage the canned fixture, re-exec
+    /// this test binary with `SIG_IGN` installed post-fork (inherited
+    /// across exec), bound the wait, quote the probe log.
+    fn sigchld_ignored_parent() {
+        const PROBE: &str = "sigchld_ignored_inheritance_still_serves";
+        let scratch = kryprobe_testkit::TempDir::named("launch-sigchld").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json"}),
+        );
+        let log_path = scratch.path().join("probe.log");
+        let test_exe = std::env::current_exe().expect("test exe");
+        let mut command = Command::new(&test_exe);
+        command
+            .arg(PROBE)
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env("KRYPROBE_LAUNCH_SIGCHLD_CHILD", "1")
+            .env("KRYPROBE_LAUNCH_SIGCHLD_HELPER", &helper)
+            .env("KRYPROBE_LAUNCH_SIGCHLD_LOG", &log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: pre_exec installs SIG_IGN for SIGCHLD only (raw
+        // sigaction, async-signal-safe); exec preserves SIG_IGN.
+        unsafe {
+            command.pre_exec(|| {
+                let mut ign: libc::sigaction = std::mem::zeroed();
+                ign.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut ign.sa_mask);
+                ign.sa_flags = 0;
+                if libc::sigaction(libc::SIGCHLD, &ign, std::ptr::null_mut()) != 0 {
+                    std::process::abort();
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("probe child spawns");
+        let status = wait_bounded(&mut child, Duration::from_secs(30));
+        let probe_log =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|_| "(no probe log)".to_string());
+        let Some(status) = status else {
+            panic!("sigchld-ignored probe child timed out (log: {probe_log})");
+        };
+        assert!(
+            status.success(),
+            "serve stays waitable under inherited SIGCHLD=SIG_IGN (child {status}, probe: {probe_log})"
+        );
+    }
+
+    /// C3-G blocker oracle (b): cleanup after ownership loss NEVER
+    /// signals numeric IDs. A production-spawned `sleep` leader is
+    /// killed and reaped (the post-`ECHILD` state: its pid/pgid are
+    /// plain numbers again) while a second `sleep` — spawned raw
+    /// with a `pre_exec` that joins the leader's group (a parent
+    /// cannot `setpgid` a child after its `exec`) — holds membership
+    /// in that group. `kill_and_reap` on the reaped leader must send
+    /// nothing: the canary stays alive. (RED pre-fix: `killpg` on
+    /// the dead leader's pgid SIGKILLs the canary.)
+    #[test]
+    fn cleanup_after_ownership_loss_signals_nothing() {
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["30".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("leader spawns");
+        let leader_id = leader.id();
+        let leader_pid = leader_id as libc::pid_t;
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader really alive"
+        );
+        // Canary: raw spawn (test scaffolding, not the launcher —
+        // only its group membership matters), joining the leader's
+        // group in `pre_exec` (before its own exec).
+        let mut canary_command = Command::new(&leader_bin.path);
+        canary_command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: pre_exec setpgid-on-self only (async-signal-safe).
+        unsafe {
+            canary_command.pre_exec(move || {
+                if libc::setpgid(0, leader_pid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut canary = canary_command.spawn().expect("canary spawns");
+        // Setup proof (no vacuous green): the canary really joined
+        // the leader's group ...
+        assert_eq!(
+            // SAFETY: getpgid on a live direct child pid.
+            unsafe { libc::getpgid(canary.id() as libc::pid_t) },
+            leader_pid,
+            "canary holds membership in the leader's group"
+        );
+        // ... then the leader is killed and reaped: ownership lost.
+        leader.kill().expect("leader dies");
+        leader.wait().expect("leader reaps");
+        // SAFETY: zeroed siginfo out-param; WNOWAIT never reaps.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid on the reaped leader pid; WNOWAIT never reaps.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                leader_id,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, -1, "reaped leader is no longer waitable");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "post-reap state is ECHILD (ownership lost)"
+        );
+        // The oracle: cleanup of the ownership-less leader sends no
+        // signal — the canary must stay alive for a full window
+        // (SIGKILL delivery is near-instant, so any signaling would
+        // show long before the window lapses).
+        kill_and_reap(&mut leader);
+        let window = Instant::now() + Duration::from_secs(1);
+        loop {
+            assert_eq!(
+                canary.try_wait().expect("try_wait"),
+                None,
+                "canary survives cleanup-after-ownership-loss (killpg hit a dead pgid)"
+            );
+            if Instant::now() >= window {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = canary.kill();
+        let _ = canary.wait();
+    }
+
+    /// A pinnable `sleep` for the ownership-loss oracle (same
+    /// test-only resolution as [`pinnable_ls`]: absolute path, never
+    /// a `PATH` search; symlinks resolved first).
+    fn pinnable_sleep() -> PinnedHelper {
+        ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .find_map(|path| pin_helper(&path).ok())
+            .expect("a pinnable sleep exists")
     }
 
     #[test]
