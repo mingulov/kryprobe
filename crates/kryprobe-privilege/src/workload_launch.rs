@@ -922,6 +922,11 @@ enum DrainOutcome {
     WaitFailed,
     /// A pipe read failed (child killed and reaped, deterministic).
     ReadFailed,
+    /// Cleanup could not finish by the deadline: ownership unproven,
+    /// the child possibly still alive — nothing signaled, nothing
+    /// reaped (unknown liveness; a deterministic refusal, never a
+    /// transport retry — see the `serve_once` mapping).
+    CleanupIncomplete,
 }
 
 /// Require waitable children (parent side): an inherited
@@ -1004,9 +1009,11 @@ fn sigchld_install_fault_injected() -> bool {
 /// interruptions retry to a verdict; `ECHILD`, `ESRCH`, and EVERY
 /// other errno fail closed (no signals): ownership is lost or —
 /// worse — unproven, and an unproven pid/pgid may already name
-/// strangers.
-fn child_still_waitable(child: &std::process::Child) -> bool {
-    converge_ownership(|| probe_child_once(child.id()))
+/// strangers. Interruptions retry only within `deadline`; sustained
+/// past it, they fail closed to unowned (see
+/// [`converge_ownership`]).
+fn child_still_waitable(child: &std::process::Child, deadline: Instant) -> bool {
+    converge_ownership(|| probe_child_once(child.id()), deadline)
 }
 
 /// Meaning of one failed ownership probe: interruptions carry no
@@ -1062,13 +1069,23 @@ fn probe_child_once(pid: u32) -> Result<(), ProbeFailure> {
 }
 
 /// Retry one-shot ownership probes through interruptions to a
-/// verdict: only a clean probe proves ownership; a lost-or-unproven
-/// verdict fails closed.
-fn converge_ownership(mut probe: impl FnMut() -> Result<(), ProbeFailure>) -> bool {
+/// verdict WITHIN `deadline`: only a clean probe proves ownership;
+/// a lost-or-unproven verdict fails closed — and so do
+/// interruptions sustained past the deadline (an unproven pid/pgid
+/// may already name strangers, so no verdict is worth an unbounded
+/// wait; the caller reaps without signaling instead).
+fn converge_ownership(
+    mut probe: impl FnMut() -> Result<(), ProbeFailure>,
+    deadline: Instant,
+) -> bool {
     loop {
         match probe() {
             Ok(()) => return true,
-            Err(ProbeFailure::Interrupted) => continue,
+            Err(ProbeFailure::Interrupted) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+            }
             Err(ProbeFailure::Unowned) => return false,
         }
     }
@@ -1086,23 +1103,31 @@ fn converge_ownership(mut probe: impl FnMut() -> Result<(), ProbeFailure>) -> bo
 /// reap-only. Callers must never call this after a reap they
 /// performed themselves (every call site below is peek-only until
 /// this runs); the probe is the backstop for reaps this code did not
-/// perform.
-fn kill_and_reap(child: &mut std::process::Child) {
-    kill_and_reap_gated(child, child_still_waitable(child))
+/// perform. Cleanup runs within `deadline` and reports
+/// [`CleanupOutcome`]: the owned path kills and reaps; the unowned
+/// path reaps without signaling only until the deadline, then
+/// reports incomplete (unknown liveness) instead of blocking past
+/// it.
+fn kill_and_reap(child: &mut std::process::Child, deadline: Instant) -> CleanupOutcome {
+    kill_and_reap_gated(child, child_still_waitable(child, deadline), deadline)
 }
 
 /// Kill path with a pre-converged ownership verdict: `false` (lost
-/// OR unproven) NEVER signals — reap-only (the `Child` may still
-/// hold a cached status; `wait` then succeeds). The verdict
-/// parameter is the canary-family seam: production always passes the
-/// real converged probe; tests drive `false` verdicts derived from
-/// each classified `errno` through this real gating code.
-fn kill_and_reap_gated(child: &mut std::process::Child, owned: bool) {
+/// OR unproven) NEVER signals — bounded reap-only (see
+/// [`reap_unowned_bounded`]). The verdict parameter is the
+/// canary-family seam: production always passes the real converged
+/// probe; tests drive `false` verdicts derived from each classified
+/// `errno` through this real gating code. Returns whether cleanup
+/// finished by `deadline`.
+fn kill_and_reap_gated(
+    child: &mut std::process::Child,
+    owned: bool,
+    deadline: Instant,
+) -> CleanupOutcome {
     // Ownership gate: after ownership loss the numeric pid/pgid may
     // already name strangers — NEVER signal them.
     if !owned {
-        let _ = child.wait();
-        return;
+        return reap_unowned_bounded(child, deadline);
     }
     // The group dies first (descendants), then the child, then the
     // reap. `killpg` errors ignored: while unreaped the group
@@ -1114,6 +1139,75 @@ fn kill_and_reap_gated(child: &mut std::process::Child, owned: bool) {
     }
     let _ = child.kill();
     let _ = child.wait();
+    CleanupOutcome::Complete
+}
+
+/// Whether bounded cleanup finished: the reap-only path reports
+/// honestly instead of blocking past the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupOutcome {
+    /// Nothing outstanding: reaped, or already reaped elsewhere.
+    Complete,
+    /// The deadline lapsed with ownership unproven and the child
+    /// possibly still alive — nothing signaled, nothing reaped
+    /// (unknown liveness: a refusal state, never a transport retry,
+    /// never reported as success).
+    Incomplete,
+}
+
+/// Reap-only bounded cleanup for lost-or-unproven ownership: poll a
+/// non-signaling reap until the child exits or `deadline` lapses.
+/// Never signals (the pid may name strangers); never blocks past
+/// the deadline. A zombie reaps promptly — still ours to reap:
+/// `try_wait` aims at our own `Child` handle, never a bare number.
+/// Only `ECHILD` (already reaped: provably nothing outstanding)
+/// completes early; any other wait failure holds to the deadline
+/// like a live child (a denied `wait` proves nothing about
+/// liveness), then reports [`CleanupOutcome::Incomplete`].
+fn reap_unowned_bounded(child: &mut std::process::Child, deadline: Instant) -> CleanupOutcome {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return CleanupOutcome::Complete,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return CleanupOutcome::Incomplete;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    return CleanupOutcome::Incomplete;
+                }
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ECHILD) => {
+                return CleanupOutcome::Complete;
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return CleanupOutcome::Incomplete;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// Bounded cleanup mapped onto a disposition: `complete` stands when
+/// cleanup finished by `deadline`; an incomplete cleanup (deadline
+/// lapsed with ownership unproven — liveness unknown, nothing
+/// signaled, nothing reaped) overrides it. Unknown liveness
+/// dominates every co-occurring verdict: reporting a content
+/// verdict — or a retryable stall — while a possibly-live child
+/// escapes containment would overclaim what this attempt proved.
+fn kill_and_reap_mapped(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    complete: DrainOutcome,
+) -> DrainOutcome {
+    match kill_and_reap(child, deadline) {
+        CleanupOutcome::Complete => complete,
+        CleanupOutcome::Incomplete => DrainOutcome::CleanupIncomplete,
+    }
 }
 
 /// Peek whether one child exited WITHOUT reaping (raw `waitid`
@@ -1225,8 +1319,7 @@ fn drain_bounded(
             .as_ref()
             .is_some_and(|job| set_nonblocking(job.pipe.as_raw_fd()).is_err())
     {
-        kill_and_reap(child);
-        return DrainOutcome::WaitFailed;
+        return kill_and_reap_mapped(child, deadline, DrainOutcome::WaitFailed);
     }
     let mut stdin = stdin;
     let mut out = Vec::new();
@@ -1240,8 +1333,7 @@ fn drain_bounded(
             match peek_child_exited(child) {
                 Ok(done) => exited = done,
                 Err(_) => {
-                    kill_and_reap(child);
-                    return DrainOutcome::WaitFailed;
+                    return kill_and_reap_mapped(child, deadline, DrainOutcome::WaitFailed);
                 }
             }
         }
@@ -1252,8 +1344,7 @@ fn drain_bounded(
             let reaped = match child.wait() {
                 Ok(reaped) => reaped,
                 Err(_) => {
-                    kill_and_reap(child);
-                    return DrainOutcome::WaitFailed;
+                    return kill_and_reap_mapped(child, deadline, DrainOutcome::WaitFailed);
                 }
             };
             return DrainOutcome::Done {
@@ -1264,8 +1355,7 @@ fn drain_bounded(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            kill_and_reap(child);
-            return DrainOutcome::Stalled;
+            return kill_and_reap_mapped(child, deadline, DrainOutcome::Stalled);
         }
         // Poll what is still live (readers until EOF, stdin until
         // written); an empty set sleeps until the deadline.
@@ -1321,8 +1411,7 @@ fn drain_bounded(
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            kill_and_reap(child);
-            return DrainOutcome::WaitFailed;
+            return kill_and_reap_mapped(child, deadline, DrainOutcome::WaitFailed);
         }
         if stdin_slot.is_some_and(|slot| watched[slot].revents != 0)
             && let Some(job) = stdin.as_mut()
@@ -1351,12 +1440,10 @@ fn drain_bounded(
                 PipeOutcome::Open => {}
                 PipeOutcome::Eof => out_eof = true,
                 PipeOutcome::OverCap => {
-                    kill_and_reap(child);
-                    return DrainOutcome::OverCapStdout;
+                    return kill_and_reap_mapped(child, deadline, DrainOutcome::OverCapStdout);
                 }
                 PipeOutcome::Failed => {
-                    kill_and_reap(child);
-                    return DrainOutcome::ReadFailed;
+                    return kill_and_reap_mapped(child, deadline, DrainOutcome::ReadFailed);
                 }
             }
         }
@@ -1365,12 +1452,10 @@ fn drain_bounded(
                 PipeOutcome::Open => {}
                 PipeOutcome::Eof => err_eof = true,
                 PipeOutcome::OverCap => {
-                    kill_and_reap(child);
-                    return DrainOutcome::OverCapStderr;
+                    return kill_and_reap_mapped(child, deadline, DrainOutcome::OverCapStderr);
                 }
                 PipeOutcome::Failed => {
-                    kill_and_reap(child);
-                    return DrainOutcome::ReadFailed;
+                    return kill_and_reap_mapped(child, deadline, DrainOutcome::ReadFailed);
                 }
             }
         }
@@ -1412,7 +1497,8 @@ pub fn attest_helper(
         DrainOutcome::OverCapStderr
         | DrainOutcome::Stalled
         | DrainOutcome::WaitFailed
-        | DrainOutcome::ReadFailed => return Err(MetadataUnavailable::HelperRefused),
+        | DrainOutcome::ReadFailed
+        | DrainOutcome::CleanupIncomplete => return Err(MetadataUnavailable::HelperRefused),
     };
     if !status.success() {
         return Err(MetadataUnavailable::HelperRefused);
@@ -1572,7 +1658,16 @@ fn serve_once(
         DrainOutcome::Stalled | DrainOutcome::WaitFailed => {
             return AttemptOutcome::TransportFailed;
         }
-        DrainOutcome::ReadFailed => {
+        // Cleanup-incomplete is a deterministic refusal, never a
+        // transport retry: the frozen `MetadataUnavailable` taxonomy
+        // (ADR-0008) has no cleanup-incomplete variant — adding one
+        // would be a contract edit — and `HelperRefused` is the
+        // established typed refusal for a failed helper boundary.
+        // Deterministic (not retried) because a denied ownership
+        // probe is environmental, and retrying would stack
+        // unknown-liveness children — each attempt's escapee
+        // outliving its bound.
+        DrainOutcome::ReadFailed | DrainOutcome::CleanupIncomplete => {
             return AttemptOutcome::Refused(MetadataUnavailable::HelperRefused);
         }
     };
@@ -1795,9 +1890,9 @@ mod tests {
     /// `<target>/debug/examples/kryprobe_launch_fixture` next to the
     /// test executable's `deps` dir. The fixture is a Cargo *example*
     /// (test-only by construction: default `cargo build` never
-    /// produces it, default `cargo install` never ships it — only
-    /// explicit `--example` selection builds it). Every all-target
-    /// `cargo test`
+    /// produces it, default `cargo install` never ships it —
+    /// explicit selection (`--example`/`--examples`/`--all-targets`)
+    /// can also build it). Every all-target `cargo test`
     /// builds it (including the `xtask check` gate); focused
     /// `--lib`/`--test` runs must build it first (`cargo build -p
     /// kryprobe-privilege --example kryprobe_launch_fixture`) — the
@@ -2169,7 +2264,11 @@ mod tests {
                 },
             }
         };
-        kill_and_reap(&mut child);
+        assert_eq!(
+            kill_and_reap(&mut child, generous_deadline()),
+            CleanupOutcome::Complete,
+            "owned cleanup of the live child completes"
+        );
         let canonical = std::fs::canonicalize(&helper).expect("canonical helper");
         assert_eq!(
             exe, canonical,
@@ -3054,7 +3153,11 @@ mod tests {
         // signal — the canary must stay alive for a full window
         // (SIGKILL delivery is near-instant, so any signaling would
         // show long before the window lapses).
-        kill_and_reap(&mut leader);
+        assert_eq!(
+            kill_and_reap(&mut leader, generous_deadline()),
+            CleanupOutcome::Complete,
+            "reaped-leader cleanup completes (nothing outstanding)"
+        );
         let window = Instant::now() + Duration::from_secs(1);
         loop {
             assert_eq!(
@@ -3303,6 +3406,14 @@ mod tests {
         }
     }
 
+    /// Generous deadline for verdict-shape tests: their probes
+    /// converge instantly (scripted verdicts, single syscalls), so
+    /// any far-future bound works — the bound ITSELF is pinned by
+    /// the sustained-interruptions and live-child oracles below.
+    fn generous_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
     /// C4-review oracle (item 2): convergence retries interruptions
     /// and still converges — to owned after a clean probe, to
     /// unowned after a terminal verdict — and a terminal verdict
@@ -3316,23 +3427,32 @@ mod tests {
         ]
         .into_iter();
         assert!(
-            converge_ownership(|| script.next().expect("scripted probe")),
+            converge_ownership(
+                || script.next().expect("scripted probe"),
+                generous_deadline()
+            ),
             "interruptions converge to the eventual verdict"
         );
         let mut script = [Err(ProbeFailure::Interrupted), Err(ProbeFailure::Unowned)].into_iter();
         assert!(
-            !converge_ownership(|| script.next().expect("scripted probe")),
+            !converge_ownership(
+                || script.next().expect("scripted probe"),
+                generous_deadline()
+            ),
             "interruption then loss converges to unowned"
         );
         assert!(
-            !converge_ownership({
-                let mut calls = 0u32;
-                move || {
-                    calls += 1;
-                    assert_eq!(calls, 1, "a terminal verdict never re-probes");
-                    Err(classify_probe_failure(libc::ESRCH))
-                }
-            }),
+            !converge_ownership(
+                {
+                    let mut calls = 0u32;
+                    move || {
+                        calls += 1;
+                        assert_eq!(calls, 1, "a terminal verdict never re-probes");
+                        Err(classify_probe_failure(libc::ESRCH))
+                    }
+                },
+                generous_deadline()
+            ),
             "ESRCH converges to unowned without re-probing"
         );
     }
@@ -3351,10 +3471,16 @@ mod tests {
             None,
         )
         .expect("spawns");
-        assert!(child_still_waitable(&child), "live child probes owned");
+        assert!(
+            child_still_waitable(&child, generous_deadline()),
+            "live child probes owned"
+        );
         child.kill().expect("dies");
         child.wait().expect("reaps");
-        assert!(!child_still_waitable(&child), "reaped child probes lost");
+        assert!(
+            !child_still_waitable(&child, generous_deadline()),
+            "reaped child probes lost"
+        );
     }
 
     /// C4-review oracle (item 2, `ESRCH` representative): a
@@ -3448,19 +3574,26 @@ mod tests {
         }
         // The verdict: scripted errno through the REAL classifier +
         // convergence loop (a terminal verdict must not re-probe).
-        let owned = converge_ownership({
-            let mut calls = 0u32;
-            move || {
-                calls += 1;
-                assert_eq!(calls, 1, "{label}: terminal verdict never re-probes");
-                Err(classify_probe_failure(errno))
-            }
-        });
+        let owned = converge_ownership(
+            {
+                let mut calls = 0u32;
+                move || {
+                    calls += 1;
+                    assert_eq!(calls, 1, "{label}: terminal verdict never re-probes");
+                    Err(classify_probe_failure(errno))
+                }
+            },
+            generous_deadline(),
+        );
         assert!(!owned, "{label}: verdict fails closed");
         // The oracle: gated cleanup sends nothing — the canary stays
         // alive for a full window (SIGKILL delivery is near-instant,
         // so any signaling would show long before the window lapses).
-        kill_and_reap_gated(&mut leader, owned);
+        assert_eq!(
+            kill_and_reap_gated(&mut leader, owned, generous_deadline()),
+            CleanupOutcome::Complete,
+            "{label}: zombie reaps under the fail-closed verdict"
+        );
         let window = Instant::now() + Duration::from_secs(1);
         loop {
             assert_eq!(
@@ -3492,6 +3625,156 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let _ = canary.wait();
+    }
+
+    /// C5-review oracle (bounded cleanup, `EPERM` representative): a
+    /// terminal unproven-ownership verdict with a LIVE stalled child
+    /// must still honor the attempt bound — and must still signal
+    /// nothing. The verdict travels the REAL classifier +
+    /// convergence loop; the child is a real confined `sleep 8`
+    /// (alive at cleanup time — setup-proven, no vacuous green).
+    /// (RED pre-fix: the unowned arm's blocking `wait` follows the
+    /// CHILD's 8 s lifetime, failing the 3 s bound assert with an
+    /// ~8 s elapsed.)
+    #[test]
+    fn unproven_ownership_live_child_cleanup_is_bounded() {
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["8".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("spawns");
+        // Setup proof (no vacuous green): the leader is really alive
+        // when cleanup runs — a fast exit would reap promptly and
+        // hand a false boundedness green to the blocking wait.
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader is live (stalled) at cleanup time"
+        );
+        // The verdict: scripted `EPERM` through the REAL classifier +
+        // convergence loop (a terminal verdict never re-probes).
+        let owned = converge_ownership(
+            {
+                let mut calls = 0u32;
+                move || {
+                    calls += 1;
+                    assert_eq!(calls, 1, "terminal verdict never re-probes");
+                    Err(classify_probe_failure(libc::EPERM))
+                }
+            },
+            generous_deadline(),
+        );
+        assert!(!owned, "EPERM fails closed to unowned");
+        // The oracle: cleanup returns within the attempt bound even
+        // though the child stays alive — and signals nothing (the
+        // leader survives; it IS its own group, so survival proves
+        // neither `killpg` nor `kill` fired). The outcome is
+        // incomplete, honestly: liveness unknown, nothing reaped.
+        let start = Instant::now();
+        let outcome = kill_and_reap_gated(&mut leader, owned, start + Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            CleanupOutcome::Incomplete,
+            "live-child cleanup reports incomplete (never success-with-unknown-children)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "unowned cleanup honors the attempt bound (blocked {elapsed:?} on a live child)"
+        );
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader survives fail-closed cleanup (nothing signaled)"
+        );
+        let _ = leader.kill();
+        let _ = leader.wait();
+    }
+
+    /// C5-review oracle (bounded EINTR retry): sustained
+    /// interruptions must still converge within the attempt bound —
+    /// to unowned (fail closed), never by spinning forever. (RED
+    /// pre-fix: the retry loop has no deadline, so the probe thread
+    /// never finishes and the bound assert fails; the spinner dies
+    /// with the test binary.)
+    #[test]
+    fn probe_convergence_sustained_interruptions_stay_bounded() {
+        let start = Instant::now();
+        let owned = converge_ownership(
+            || Err(ProbeFailure::Interrupted),
+            start + Duration::from_millis(200),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            !owned,
+            "sustained interruptions converge to unowned (fail closed)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "sustained interruptions converge within the bound (took {elapsed:?})"
+        );
+    }
+
+    /// Guard (green pre- and post-fix): an unproven-ownership verdict
+    /// over an EXITED child still reaps promptly — bounding the wait
+    /// must not turn reap-only into give-up-always. (`EPERM`
+    /// representative through the REAL classifier + convergence.)
+    #[test]
+    fn unproven_ownership_zombie_still_reaps_promptly() {
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["30".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("spawns");
+        // Setup proof (no vacuous green): really a zombie — dead but
+        // not yet reaped (the peek never reaps) — when cleanup runs.
+        leader.kill().expect("leader dies");
+        let death_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if peek_child_exited(&leader).expect("peek") {
+                break;
+            }
+            assert!(Instant::now() < death_deadline, "leader dies promptly");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let owned = converge_ownership(
+            {
+                let mut calls = 0u32;
+                move || {
+                    calls += 1;
+                    assert_eq!(calls, 1, "terminal verdict never re-probes");
+                    Err(classify_probe_failure(libc::EPERM))
+                }
+            },
+            generous_deadline(),
+        );
+        assert!(!owned, "EPERM fails closed to unowned");
+        let start = Instant::now();
+        let outcome = kill_and_reap_gated(&mut leader, owned, generous_deadline());
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            CleanupOutcome::Complete,
+            "zombie cleanup completes under the fail-closed verdict"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "exited-child cleanup returns promptly (took {elapsed:?})"
+        );
+        assert!(
+            leader.try_wait().expect("try_wait").is_some(),
+            "zombie reaps under the fail-closed verdict (still ours to reap)"
+        );
     }
 
     #[test]
