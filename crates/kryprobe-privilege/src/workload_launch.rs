@@ -16,18 +16,20 @@
 //! - Discovery: the fixed sibling `kryprobe-workload-helper` next to
 //!   the running CLI executable. No `PATH` search, no metadata-selected
 //!   paths, no environment override. Missing/non-regular files refuse.
-//! - Identity pinning (C1 A1): preflight opens the helper
-//!   (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`) and pins its file identity
-//!   (device, inode, owner, mode, size). Every later spawn reopens
-//!   the path the same way, requires the SAME identity, and executes
-//!   the verified open file via `/proc/self/fd/N` — the kernel
-//!   resolves the executable from the open file description, never
-//!   from the pathname, so a replacement/rename/symlink-swap after
-//!   preflight cannot reach `exec`: there is no check-to-exec window
-//!   (the check and the exec share one open file description).
-//!   Ownership is pinned, not restricted: the trust anchor is "the
-//!   file verified at preflight" (production installs root-own the
-//!   sibling at 0755 via `install.sh`).
+//! - Identity pinning (C1 A1, hardened C2 A1): preflight opens
+//!   the helper (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`), enforces the
+//!   trusted-image rule (owner root-or-euid, no group/other write —
+//!   the installed and dev layouts alike), and pins its file
+//!   identity (device, inode, owner, mode, size, sha256 content
+//!   digest). Every later spawn reopens the path the same way,
+//!   requires the SAME identity, and executes the verified open
+//!   file via `/proc/self/fd/N` — the kernel resolves the
+//!   executable from the open file description, never from the
+//!   pathname, so a replacement/rename/symlink-swap after preflight
+//!   cannot reach `exec`: there is no check-to-exec window (the
+//!   check and the exec share one open file description). Stat
+//!   fields alone cannot see an equal-length in-place rewrite of a
+//!   writable inode; the digest can.
 //! - Confinement (child `pre_exec`, before `exec`): clear ambient caps,
 //!   empty every capability set, set `no_new_privs`, close every fd
 //!   except stdio and the pinned executable fd (which is `CLOEXEC`,
@@ -87,6 +89,12 @@ const ATTEST_STDOUT_CAP: usize = 4096;
 /// Stderr drain cap (attest ignores stderr content but must drain it:
 /// an undrained pipe stalls a chatty child exactly like stdout).
 const STDERR_DRAIN_CAP: usize = 65536;
+
+/// Helper image size cap (bytes): the content digest reads the whole
+/// image, so a hostile path must not balloon the read. 16 MiB is
+/// multiples of the real helper; over-cap refuses like any
+/// untrusted image.
+const MAX_HELPER_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Pinned non-root principal: kernel UIDs/GIDs plus supplementary
 /// groups. Groups are pinned-but-retained: dropping them needs
@@ -232,25 +240,31 @@ pub fn discover_helper() -> Result<PathBuf, MetadataUnavailable> {
 
 /// Pinned helper file identity, from the preflight open: the
 /// (device, inode) pair plus ownership, full mode (including the
-/// file-type bits), and size. Reopening the path must reproduce
-/// every field or the image was replaced. A rename-swap always
-/// changes the inode; delete-and-recreate with a reused inode still
-/// trips on size/mode/owner unless the replacement is byte-equal in
-/// every pinned field.
+/// file-type bits), size, and the sha256 content digest. Reopening
+/// the path must reproduce every field or the image was replaced. A
+/// rename-swap always changes the inode; delete-and-recreate with a
+/// reused inode trips on size/mode/owner/digest unless the
+/// replacement is byte-equal in every pinned field; an equal-length
+/// in-place rewrite trips the digest alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelperIdentity {
     /// Device id (`st_dev`).
     pub dev: u64,
     /// Inode number (`st_ino`).
     pub ino: u64,
-    /// Owner uid (`st_uid`, pinned not restricted).
+    /// Owner uid (`st_uid`): root (installed) or euid (dev) —
+    /// anything else refuses at the open.
     pub uid: u32,
-    /// Owner gid (`st_gid`, pinned not restricted).
+    /// Owner gid (`st_gid`, pinned; group-write refuses at the open).
     pub gid: u32,
-    /// Full mode (`st_mode`, type bits included).
+    /// Full mode (`st_mode`, type bits included): group/other write
+    /// refuses at the open.
     pub mode: u32,
     /// File size (`st_size`).
     pub size: u64,
+    /// Content digest (sha256 of the image bytes, read from the same
+    /// open file description that execs).
+    pub sha256: [u8; 32],
 }
 
 /// A helper path plus its pinned preflight identity. Spawns reopen
@@ -284,9 +298,11 @@ impl PinnedHelper {
 
 /// Open one verified helper image: `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
 /// (a trailing symlink refuses — the fixed sibling is a regular
-/// file), regular-file gate, `CLOEXEC` pinned explicitly, and the
-/// fd parked at 3+ (never a stdio number). Static outcome: ok or
-/// I/O error (callers map it to
+/// file), regular-file gate, `CLOEXEC` pinned explicitly, the fd
+/// parked at 3+ (never a stdio number), the trusted-image rule
+/// (owner root-or-euid, no group/other write), and the sha256
+/// content digest read from the same open file description that
+/// execs. Static outcome: ok or I/O error (callers map it to
 /// [`MetadataUnavailable::HelperRefused`] without echoing the path).
 fn open_verified(path: &Path) -> std::io::Result<(std::fs::File, HelperIdentity)> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -336,6 +352,46 @@ fn open_verified(path: &Path) -> std::io::Result<(std::fs::File, HelperIdentity)
             "helper is not a regular file",
         ));
     }
+    // Trusted-image rule (C2 A1): the owner is root (the installed
+    // layout) or the caller's own euid (the dev layout: a
+    // cargo-built helper next to the CLI), and NOBODY ELSE can write
+    // it (no group/other write bits). A foreign-owned or
+    // group/other-writable image refuses: another principal could
+    // rewrite it under the pin. Owner-write stays allowed (0755 in
+    // both layouts): the owner is the trust anchor's own principal,
+    // and the content digest below catches any rewrite regardless.
+    // SAFETY: geteuid takes no pointers and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if (meta.uid() != 0 && meta.uid() != euid) || (meta.mode() & 0o022) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "helper image is not a trusted image",
+        ));
+    }
+    // Content pin (C2 A1): the sha256 of the SAME open file
+    // description that execs. Stat fields cannot see an equal-length
+    // in-place rewrite; the digest can. Bounded (a hostile path must
+    // not balloon the read); over-cap refuses like any untrusted
+    // image. fs-verity was considered and rejected: it needs
+    // filesystem support plus install-time provisioning, while the
+    // digest closes the demonstrated escape portably. Residual: a
+    // writer racing INSIDE one reopen (between this hash and the
+    // exec of the same fd) is outside the M1 model — that writer is
+    // the owner's own principal (installed images are root-owned,
+    // hence not caller-writable at all).
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut content = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_HELPER_IMAGE_BYTES + 1)
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > MAX_HELPER_IMAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "helper image exceeds the size cap",
+        ));
+    }
+    let sha256: [u8; 32] = sha2::Sha256::digest(&content).into();
     Ok((
         file,
         HelperIdentity {
@@ -345,15 +401,17 @@ fn open_verified(path: &Path) -> std::io::Result<(std::fs::File, HelperIdentity)
             gid: meta.gid(),
             mode: meta.mode(),
             size: meta.len(),
+            sha256,
         },
     ))
 }
 
 /// Pin the helper image at `path`: verified open plus its identity.
-/// The pin carries no open file (fstat fields only): each spawn
-/// reopens and re-verifies via [`PinnedHelper::reopen`], then
-/// fd-execs the just-verified file — check and exec share one open
-/// file description, so no replacement window exists.
+/// The pin carries no open file (stat fields plus the content
+/// digest): each spawn reopens and re-verifies via
+/// [`PinnedHelper::reopen`], then fd-execs the just-verified file —
+/// check and exec share one open file description, so no
+/// replacement window exists.
 pub fn pin_helper(path: &Path) -> Result<PinnedHelper, MetadataUnavailable> {
     let (_, identity) = open_verified(path).map_err(|_| MetadataUnavailable::HelperRefused)?;
     Ok(PinnedHelper {
@@ -1647,6 +1705,186 @@ mod tests {
             )
             .is_ok(),
             "the pinned image itself serves"
+        );
+    }
+
+    /// Flip the trailing bytes of a staged image in place: same
+    /// device, inode, owner, mode, and size — only the content
+    /// changes. The window sits in trailing debug/symbol bytes, so
+    /// the image still executes (the oracle's fresh-pin control
+    /// proves it — a flip that broke execution would fail loudly
+    /// there, never pass vacuously here).
+    fn rewrite_image_tail_in_place(path: &Path) {
+        use std::io::{Seek, SeekFrom, Write};
+        const FLIP: usize = 256;
+        let len = std::fs::metadata(path).expect("image stat").len();
+        assert!(len > 512, "image dwarfs the flip window");
+        let mut image = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("image opens for rewrite");
+        image
+            .seek(SeekFrom::Start(len - FLIP as u64))
+            .expect("seeks");
+        image.write_all(&[0x5Au8; FLIP]).expect("tail flips");
+        image.flush().expect("rewrite lands");
+    }
+
+    /// A1 oracle (Codex C2): an equal-length in-place rewrite of a
+    /// writable image refuses. Every stat field (device, inode,
+    /// owner, mode, size) is UNCHANGED by the rewrite — asserted
+    /// below — so only the content pin can refuse it.
+    /// (RED pre-fix: the tampered image serves `Ok`.)
+    #[test]
+    fn in_place_rewrite_of_writable_image_refuses() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-rewrite").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper_path = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json"}),
+        );
+        let principal = current_principal().expect("test principal");
+        assert_ne!(principal.uid, 0, "tests run non-root");
+        let pinned = pin_helper(&helper_path).expect("pins");
+        let before = std::fs::metadata(&helper_path).expect("stat");
+        rewrite_image_tail_in_place(&helper_path);
+        let after = std::fs::metadata(&helper_path).expect("stat");
+        assert_eq!(before.len(), after.len(), "rewrite keeps the size");
+        assert_eq!(before.mode(), after.mode(), "rewrite keeps the mode");
+        assert_eq!(before.uid(), after.uid(), "rewrite keeps the owner");
+        assert_eq!(before.gid(), after.gid(), "rewrite keeps the group");
+        assert_eq!(
+            serve_pinned_snapshot_with_bound(
+                &pinned,
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10)
+            ),
+            Err(MetadataUnavailable::HelperRefused),
+            "in-place rewrite refuses"
+        );
+        // Positive control: the rewritten image still runs and
+        // serves under a FRESH pin — the refusal above is the pin,
+        // not a broken binary.
+        let repinned = pin_helper(&helper_path).expect("rewritten image re-pins");
+        assert!(
+            serve_pinned_snapshot_with_bound(
+                &repinned,
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10)
+            )
+            .is_ok(),
+            "rewritten image serves under a fresh pin"
+        );
+    }
+
+    /// A1 trust oracle (Codex C2): a group/other-writable image is
+    /// not a trusted image — pinning refuses. Owner-writable 0755
+    /// (dev layout) and root-owned 0755 (installed layout) pin fine;
+    /// writability that ANOTHER principal could use never does.
+    /// (RED pre-fix: the writable image pins.)
+    #[test]
+    fn writable_helper_image_refuses_to_pin() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-trust").expect("scratch");
+        let trusted = stage_fixture(scratch.path(), "trusted", serde_json::json!({}));
+        assert!(pin_helper(&trusted).is_ok(), "0755 self-owned pins");
+        // The installed layout pins too: root-owned 0755 while this
+        // process runs non-root (owner differs from euid).
+        assert_ne!(
+            current_principal().expect("test principal").uid,
+            0,
+            "tests run non-root"
+        );
+        let _installed_shape = pinnable_ls();
+        for (name, mode) in [("group-writable", 0o775), ("other-writable", 0o776)] {
+            let path = stage_fixture(scratch.path(), name, serde_json::json!({}));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            assert_eq!(
+                pin_helper(&path),
+                Err(MetadataUnavailable::HelperRefused),
+                "mode {mode:o} refuses to pin"
+            );
+        }
+    }
+
+    /// Executable-identity characterization (Codex C2): the kernel
+    /// resolves the executed file from the open file description —
+    /// `/proc/pid/exe` names the REAL image even when `argv[0]` is a
+    /// forged label naming a nonexistent file. The launcher verifies
+    /// the image, never the label. (Green throughout: pins the
+    /// as-built property for Stage 4.)
+    #[test]
+    fn executed_identity_compares_by_exe_not_argv0() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-exe-label").expect("scratch");
+        let sidecar = serde_json::json!({"stall_secs": 30});
+        let helper = stage_fixture(scratch.path(), "helper", sidecar.clone());
+        // The fixture locates its sidecar from `argv[0]` (test
+        // isolation), so the forged label gets its own sidecar copy;
+        // the label file itself never exists.
+        std::fs::write(
+            scratch.path().join("evil-label.fixture.json"),
+            serde_json::to_string(&sidecar).expect("sidecar"),
+        )
+        .expect("label sidecar written");
+        let forged = scratch.path().join("evil-label");
+        assert!(!forged.exists(), "the label names no file");
+        let pinned = pin_helper(&helper).expect("pins");
+        let image = pinned.reopen().expect("reopens");
+        // Serve path with a held stdin: the child blocks reading its
+        // request (30 s stall backstop), so the parent reads the exe
+        // link at leisure — no race with a fast exit.
+        let mut child = spawn_confined(
+            &image,
+            &forged,
+            &["--require-no-new-privs".to_string()],
+            Stdio::piped(),
+            None,
+        )
+        .expect("spawns");
+        // Wait for the exec first: pre-exec the link still names
+        // this test binary (fork/exec is async). The wait keys on
+        // "no longer us", never on the expected value — the
+        // assertions below then pin the property.
+        let me = std::env::current_exe().expect("test exe");
+        let exec_deadline = Instant::now() + Duration::from_secs(10);
+        let exe = loop {
+            match std::fs::read_link(format!("/proc/{}/exe", child.id())) {
+                Ok(target) if target != me => break target,
+                Ok(_) => {
+                    assert!(
+                        Instant::now() < exec_deadline,
+                        "child execs promptly (still pre-exec at the deadline)"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => match child.try_wait().expect("try_wait") {
+                    Some(status) => panic!("child died before the exe read: {status}"),
+                    None => {
+                        assert!(
+                            Instant::now() < exec_deadline,
+                            "exe link reads while the child lives"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                },
+            }
+        };
+        kill_and_reap(&mut child);
+        let canonical = std::fs::canonicalize(&helper).expect("canonical helper");
+        assert_eq!(
+            exe, canonical,
+            "exe names the executed image, not the argv[0] label"
+        );
+        assert_ne!(
+            exe.file_name(),
+            forged.file_name(),
+            "exe is independent of the label"
         );
     }
 
