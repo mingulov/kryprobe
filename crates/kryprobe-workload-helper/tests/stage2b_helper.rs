@@ -177,12 +177,33 @@ fn run_helper(args: &[&str], stdin_bytes: &[u8]) -> Run {
         .stderr(Stdio::piped())
         .spawn()
         .expect("helper spawns as ordinary user");
-    child
+    let write_result = child
         .stdin
         .as_mut()
         .expect("stdin piped")
-        .write_all(stdin_bytes)
-        .expect("stdin write fits pipe");
+        .write_all(stdin_bytes);
+    if let Err(err) = write_result {
+        // The helper validates metadata BEFORE reading stdin (run_serve
+        // steps 2-3), so on refusal paths it can exit before this write
+        // lands; under full-suite load it wins that race and the write
+        // gets EPIPE. That means "helper already exited", never a pass:
+        // reap and require the typed refusal via the shared oracle, so a
+        // crash (nonzero without a JSON error line, or exit 0) still
+        // fails loudly here instead of masking as EPIPE.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "unexpected stdin write error (only EPIPE is a raced refusal)"
+        );
+        let output = child.wait_with_output().expect("helper reaped");
+        let run = Run {
+            status: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        let _ = stderr_error(&run);
+        return run;
+    }
     let output = child.wait_with_output().expect("helper reaped");
     Run {
         status: output.status.code().unwrap_or(-1),
