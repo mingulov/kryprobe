@@ -1020,6 +1020,59 @@ class LabJourneyTests(unittest.TestCase):
         self.assertTrue(
             common.reconcile_cgroup(ops=100, enc=100, dec=99))
 
+    def _docker_lab(self):
+        import os
+
+        sys.path.insert(0, str(WORKLOAD_LAB))
+        os.environ.setdefault("WORKLOAD_LAB_IMPORT", "1")
+        spec = importlib.util.spec_from_file_location(
+            "workload_lab_docker",
+            str(WORKLOAD_LAB / "docker_lab.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_fixture_security_opts_both(self):
+        lab = self._docker_lab()
+        self.assertEqual(
+            lab.FIXTURE_SECURITY_OPTS,
+            ["--security-opt", "seccomp=unconfined",
+             "--security-opt", "apparmor=unconfined"])
+        argv = lab.fixture_docker_run("-d", "--name", "x")
+        self.assertEqual(
+            argv[:6],
+            ["docker", "run", *lab.FIXTURE_SECURITY_OPTS])
+
+    def test_termination_sleep_argv(self):
+        lab = self._docker_lab()
+        argv = lab.termination_sleep_argv(
+            "kryprobe-m1-05", "kryprobe-m1-05-churn")
+        self.assertIn("--entrypoint", argv)
+        self.assertEqual(
+            argv[argv.index("--entrypoint") + 1], "sleep")
+        image_at = argv.index("kryprobe-m1-05-fixture:latest")
+        # Sleep is the entrypoint override; the driver never sees a
+        # sleep word (the frozen driver has no sleep mode).
+        self.assertEqual(argv[image_at + 1:], ["300"])
+
+    def test_capture_join_timeout_math(self):
+        lab = self._docker_lab()
+        self.assertAlmostEqual(
+            lab.capture_join_timeout(60.0, 1.0), 60.0)
+        self.assertAlmostEqual(
+            lab.capture_join_timeout(30.0, 10.0), 21.0)
+        self.assertAlmostEqual(
+            lab.capture_join_timeout(60.0, 70.0), 1.0)
+
+    def test_lab_dry_run_discloses_relaxed_confinement(self):
+        for journey in ("two-workloads", "termination",
+                        "unavailable-metadata", "tls"):
+            proc = self._run(str(WORKLOAD_LAB / "docker_lab.py"),
+                             "--dry-run", journey)
+            self.assertEqual(proc.returncode, 0,
+                             (journey, proc.stderr))
+            self.assertIn("relaxed seccomp+apparmor", proc.stdout)
+
 
 class LabOracleTests(unittest.TestCase):
     """G11: pure oracle helpers (host-runnable halves)."""

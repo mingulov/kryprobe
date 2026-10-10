@@ -29,6 +29,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -37,6 +38,51 @@ import common as lab  # noqa: E402
 
 JOURNEYS = ("setup", "two-workloads", "termination",
             "unavailable-metadata", "tls", "cleanup")
+
+# F3: fixture containers execute the M1 driver (AF_ALG skcipher),
+# which the default container confinement refuses twice: seccomp
+# blocks the PF_ALG autoload (EPERM) and the AppArmor docker-default
+# profile denies the socket (EACCES) — pairwise isolated in round-1
+# DIAG2b, and both-relaxed proven minimal in DIAG2c (exit 0, 258425
+# ops, fails=0). Every driver-executing `docker run` in the fixture
+# path carries both opts via fixture_docker_run(). Fixtures are test
+# workloads; kryprobe observes from outside, so relaxed fixture
+# confinement does not weaken the observation. Ledger-fetch and
+# sleep-holder runs execute no driver and stay default-confined.
+FIXTURE_SECURITY_OPTS = ["--security-opt", "seccomp=unconfined",
+                         "--security-opt", "apparmor=unconfined"]
+
+# F3: the receipt disclosure carried by every fixture-running
+# journey (two-workloads, termination, unavailable-metadata, tls).
+FIXTURE_CONFINEMENT_NOTE = (
+    "relaxed on driver-executing fixture runs only "
+    "(seccomp=unconfined + apparmor=unconfined, proven minimal "
+    "DIAG2c exit 0 / 258425 ops / fails=0); fixtures are test "
+    "workloads, kryprobe observes from outside")
+
+
+def fixture_docker_run(*rest: str) -> list:
+    """`docker run` argv for driver-executing fixture containers (F3:
+    both security-opts relaxed — proven minimal)."""
+    return ["docker", "run", *FIXTURE_SECURITY_OPTS, *rest]
+
+
+def termination_sleep_argv(tag: str, name: str) -> list:
+    """`docker run` argv for the F4 termination-hold container: the
+    frozen driver has no sleep mode (usage rc=2), so `--entrypoint
+    sleep` keeps sleep semantics while bypassing the driver
+    entrypoint entirely."""
+    return ["docker", "run", "-d", "--rm", "--entrypoint", "sleep",
+            "--name", name, fixture_image_tag(tag), "300"]
+
+
+def capture_join_timeout(duration_s: float, elapsed_s: float) -> float:
+    """Remaining capture-join budget (F3 mask fix): the capture's own
+    duration minus elapsed wall, plus the C7-2 reap grace, floored at
+    the grace (an already-elapsed capture joins immediately). Pure —
+    host-tested."""
+    return max(duration_s - elapsed_s + lab.OWNED_REAP_GRACE_S,
+               lab.OWNED_REAP_GRACE_S)
 
 DRY_RUN_STEPS = {
     "setup": [
@@ -49,19 +95,28 @@ DRY_RUN_STEPS = {
         "docker_two_workloads_stay_distinct: two containers, "
         "identical comm + cbc(aes), distinct cgroups",
         "kryprobe workload-json capture over both fixture runs",
+        "fixture runs carry relaxed seccomp+apparmor (F3: test "
+        "workloads; kryprobe observes from outside)",
         "oracle: per-cgroup enc/dec == fixture self-counted ops",
     ],
     "termination": [
-        "stop/rm one container, recreate under the same name",
+        "stop/rm one --entrypoint-sleep container (F4), recreate "
+        "under the same name",
+        "fixture runs carry relaxed seccomp+apparmor (F3: test "
+        "workloads; kryprobe observes from outside)",
         "oracle: new cgroup id (never reused), fresh traffic "
         "attributes to it, old id absent",
     ],
     "unavailable-metadata": [
         "metadata-less, corrupt-file, and root/no_principal legs",
+        "fixture runs carry relaxed seccomp+apparmor (F3: test "
+        "workloads; kryprobe observes from outside)",
         "oracle: typed unavailable + raw rows + exit 3 on each",
     ],
     "tls": [
         "userspace-TLS transfer in owned cgroups (kTLS evidence)",
+        "fixture runs carry relaxed seccomp+apparmor (F3: test "
+        "workloads; kryprobe observes from outside)",
         "oracle: zero kernel-crypto calls there; AF_ALG positive "
         "control exact",
     ],
@@ -275,8 +330,6 @@ def journey_setup(args) -> int:
 def _running_pid(name: str) -> int:
     """Container PID once the runtime has started it (short
     poll: inspect reports 0 while starting)."""
-    import time
-
     for _ in range(10):
         pid = container_pid(name)
         if pid > 0:
@@ -293,11 +346,10 @@ def _run_fixture(tag: str, name: str, ledger_name: str,
     its self-counted ledger, and remove it. Returns the summary
     with cgroup_id + comm attached."""
     vol = f"{tag}-ledgers"
-    proc = run(["docker", "run", "-d", "--name", name,
-                "-v", f"{vol}:/ledgers",
-                fixture_image_tag(tag), "skcipher", str(size),
-                str(meas), str(warm),
-                f"/ledgers/{ledger_name}"], 60)
+    proc = run(fixture_docker_run(
+        "-d", "--name", name, "-v", f"{vol}:/ledgers",
+        fixture_image_tag(tag), "skcipher", str(size),
+        str(meas), str(warm), f"/ledgers/{ledger_name}"), 60)
     if proc.returncode != 0:
         raise LabError(f"fixture {name} start failed: "
                        f"{proc.stderr.strip()[-300:]}")
@@ -335,16 +387,32 @@ def journey_two_workloads(args) -> int:
         ["kryprobe", "report", "--system", "--duration", "60",
          "--format", "workload-json", "--out", str(report)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    capture_start = time.monotonic()
+    # F3: record fixture errors BEFORE the capture join — the old
+    # fixed 60+1s join measured from failure time could time out
+    # over a fast fixture failure (round-1: 785 ms life) and mask it
+    # as "capture did not exit". The join below only reaps; the
+    # fixture error (the cause) raises first with the join noted.
+    fixture_error = None
     try:
         sum_a = _run_fixture(args.tag, name_a, "a.csv")
         sum_b = _run_fixture(args.tag, name_b, "b.csv")
-    finally:
+    except LabError as err:
+        fixture_error = err
+    join_note = "joined"
+    try:
+        _, _ = capture.communicate(timeout=capture_join_timeout(
+            60.0, time.monotonic() - capture_start))
+    except subprocess.TimeoutExpired:
+        capture.kill()
         try:
-            _, _ = capture.communicate(
-                timeout=60 + lab.OWNED_REAP_GRACE_S)
-        except subprocess.TimeoutExpired as err:
-            capture.kill()
-            raise LabError("capture did not exit") from err
+            capture.wait(timeout=lab.OWNED_REAP_GRACE_S + 5)
+        except subprocess.TimeoutExpired:
+            join_note = "join timed out; capture killed, reap unverified"
+        else:
+            join_note = "join timed out; capture reaped"
+    if fixture_error is not None:
+        raise LabError(f"{fixture_error} (capture {join_note})")
     if capture.returncode != 3:
         raise LabError("capture rc="
                        f"{capture.returncode}, want 3 (named gaps)")
@@ -376,7 +444,9 @@ def journey_two_workloads(args) -> int:
         raise LabError(f"oracle mismatch: {reasons}")
     write_receipt(args.out, "two-workloads",
                   {"started_utc": utcnow(), "ledger": ledger,
-                   "folded": folded, "verdict": "PASS"})
+                   "folded": folded,
+                   "fixture_confinement": FIXTURE_CONFINEMENT_NOTE,
+                   "verdict": "PASS"})
     print(f"two-workloads PASS: cgroups {cg_a} vs {cg_b} distinct, "
           "both reconciled")
     return 0
@@ -384,18 +454,22 @@ def journey_two_workloads(args) -> int:
 
 def journey_termination(args) -> int:
     name = f"{args.tag}-churn"
-    run(["docker", "run", "-d", "--rm", "--name", name,
-         fixture_image_tag(args.tag), "sleep", "300"], 60)
+    started = run(termination_sleep_argv(args.tag, name), 60)
+    if started.returncode != 0:
+        raise LabError(f"start {name} failed: "
+                       f"{started.stderr.strip()[-300:]}")
     try:
-        cg_old = cgroup_id_of_pid(container_pid(name))
+        cg_old = cgroup_id_of_pid(_running_pid(name))
     finally:
         proc = run(["docker", "stop", "-t", "2", name], 30)
     if proc.returncode != 0:
         raise LabError(f"stop {name} failed")
-    run(["docker", "run", "-d", "--rm", "--name", name,
-         fixture_image_tag(args.tag), "sleep", "300"], 60)
+    started = run(termination_sleep_argv(args.tag, name), 60)
+    if started.returncode != 0:
+        raise LabError(f"restart {name} failed: "
+                       f"{started.stderr.strip()[-300:]}")
     try:
-        cg_new = cgroup_id_of_pid(container_pid(name))
+        cg_new = cgroup_id_of_pid(_running_pid(name))
     finally:
         run(["docker", "stop", "-t", "2", name], 30)
     if cg_old == cg_new:
@@ -406,10 +480,10 @@ def journey_termination(args) -> int:
          "--format", "workload-json", "--out", str(report)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        proc = run(["docker", "run", "--rm", "--name",
-                    f"{args.tag}-churn-run",
-                    fixture_image_tag(args.tag), "skcipher", "4096",
-                    "10", "2", "/tmp/t.csv"], 150)
+        proc = run(fixture_docker_run(
+            "--rm", "--name", f"{args.tag}-churn-run",
+            fixture_image_tag(args.tag), "skcipher", "4096",
+            "10", "2", "/tmp/t.csv"), 150)
         if proc.returncode != 0:
             raise LabError("recreated fixture failed")
         _, _ = capture.communicate(
@@ -424,6 +498,7 @@ def journey_termination(args) -> int:
                   {"started_utc": utcnow(), "cgroup_old": cg_old,
                    "cgroup_new": cg_new,
                    "folded_cgroups": sorted(folded),
+                   "fixture_confinement": FIXTURE_CONFINEMENT_NOTE,
                    "verdict": "PASS"})
     print(f"termination PASS: {cg_old} -> {cg_new}, old id absent")
     return 0
@@ -439,9 +514,10 @@ def _unavailable_case(args, case: str, cmd: list,
                       want_reason: str | None) -> dict:
     report = args.out / report_name
     traffic = subprocess.Popen(
-        ["docker", "run", "--rm", "--name", f"{args.tag}-{case}",
-         fixture_image_tag(args.tag), "skcipher", "4096", "8", "2",
-         "/tmp/u.csv"],
+        fixture_docker_run(
+            "--rm", "--name", f"{args.tag}-{case}",
+            fixture_image_tag(args.tag), "skcipher", "4096", "8",
+            "2", "/tmp/u.csv"),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         proc = run(cmd + ["--out", str(report)], 120)
@@ -492,6 +568,7 @@ def journey_unavailable_metadata(args) -> int:
                                     "serve metadata, not refuse it)"}
     write_receipt(args.out, "unavailable-metadata",
                   {"started_utc": utcnow(), "cases": cases,
+                   "fixture_confinement": FIXTURE_CONFINEMENT_NOTE,
                    "verdict": "PASS"})
     print(f"unavailable-metadata PASS: {cases}")
     return 0
@@ -573,6 +650,7 @@ def journey_tls(args) -> int:
                    "tls_client_bytes": len(stdout),
                    "positive_ops": positive["ops_total"],
                    "folded_cgroups": sorted(folded),
+                   "fixture_confinement": FIXTURE_CONFINEMENT_NOTE,
                    "verdict": "PASS"})
     print("tls PASS: userspace-TLS silent at kernel hooks, "
           "positive control observed")
