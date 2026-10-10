@@ -28,8 +28,9 @@ use kryprobe_core::workload::{
     SnapshotConsistency, SnapshotInterval, SnapshotKey, SnapshotRequest, SnapshotResponse,
     WorkloadIdentity, encode_request,
 };
-use kryprobe_privilege::kcrypto_backend::CtxSnapshot;
+use kryprobe_privilege::kcrypto_backend::{CtxSnapshot, MissTerminal};
 use kryprobe_privilege::workload_launch::{PinnedHelper, serve_pinned_snapshot};
+use kryprobe_report::sanitize_cell;
 use kryprobe_report::workload::{
     AssemblyInput, CoverageLevel, GroupBy, MetadataAvailability, NativeIdentity, ReportCoverage,
     ReportRowInput, WorkloadBuildError, WorkloadReport, WorkloadSelector as ReportSelector,
@@ -784,6 +785,53 @@ pub fn workload_exit_code(report: &WorkloadReport, interrupted: bool) -> i32 {
     } else {
         0
     }
+}
+
+/// Terminal miss section for the human workload report (finding
+/// C4): per-program guard skips with the stable (section,
+/// program-ID) join keys, per-operation run qualification, and
+/// unavailable reasons verbatim. Sorted by (section, program ID)
+/// for determinism. Global telemetry only — never distributed
+/// across context rows (rows render from the frozen report, which
+/// this section does not touch).
+pub fn render_miss_section(misses: Option<&MissTerminal>) -> String {
+    let Some(misses) = misses else {
+        return "misses: unavailable (not collected)\n".to_owned();
+    };
+    match misses {
+        MissTerminal::Available(deltas) => {
+            let mut deltas: Vec<_> = deltas.iter().collect();
+            deltas.sort_by(|a, b| (&a.section, a.program_id).cmp(&(&b.section, b.program_id)));
+            let mut text = format!("misses: {} program(s)\n", deltas.len());
+            for delta in deltas {
+                let run = delta
+                    .run_delta
+                    .map_or("unavailable".to_owned(), |run| run.to_string());
+                text.push_str(&format!(
+                    "  {} id={} baseline={} current={} delta={} run={}\n",
+                    sanitize_cell(&delta.section),
+                    delta.program_id,
+                    delta.miss_baseline,
+                    delta.miss_current,
+                    delta.miss_delta,
+                    run,
+                ));
+            }
+            text
+        }
+        MissTerminal::Unavailable { reason } => {
+            format!("misses: unavailable ({})\n", sanitize_cell(reason))
+        }
+    }
+}
+
+/// Human workload report text: the frozen report rendering plus the
+/// terminal miss section (finding C4). The JSON format stays pure
+/// (frozen schema — misses ride text + stderr telemetry only).
+pub fn render_workload_text(outcome: &LiveOutcome, finished: &WorkloadFinish) -> String {
+    let mut text = finished.report.render_text();
+    text.push_str(&render_miss_section(outcome.workload_misses.as_ref()));
+    text
 }
 
 #[cfg(test)]

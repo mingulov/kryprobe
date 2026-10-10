@@ -235,6 +235,7 @@ fn finish_outcome(
             interval_start_ns: 100,
             interval_end_ns: 1000,
         }),
+        workload_misses: None,
     }
 }
 
@@ -606,6 +607,83 @@ fn byte_budget_splits_snapshot_requests() {
     assert_eq!(
         finished.report.coverage.attribution,
         kryprobe_report::workload::CoverageLevel::Partial
+    );
+}
+
+/// C4 oracle: the human workload report carries the terminal
+/// miss telemetry — per-program join detail, per-operation run
+/// qualification, and unavailable reasons — or explicit
+/// unavailability. Global misses never touch context rows.
+/// (RED shown pre-fix as `..._v1`: the report carried neither.)
+#[test]
+fn workload_report_carries_miss_telemetry() {
+    use kryprobe_privilege::kcrypto_backend::{AggProgMissDelta, MissTerminal};
+    let preflight = kryprobe_privilege::workload_launch::WorkloadPreflight {
+        helper: None,
+        helper_identity: None,
+        principal: None,
+        kernel_scope: Some("test-scope".to_string()),
+        unavailable: Some(kryprobe_core::workload::MetadataUnavailable::HelperRefused),
+    };
+    let mut outcome = finish_outcome(preflight);
+    // Capture with program misses: one qualified program, one
+    // stats-gated (run unqualified, never zero-filled).
+    outcome.workload_misses = Some(MissTerminal::Available(vec![
+        AggProgMissDelta {
+            section: "fexit/kcrypto_sendmsg".to_owned(),
+            program_id: 12,
+            miss_baseline: 50,
+            miss_current: 60,
+            miss_delta: 10,
+            run_delta: None,
+        },
+        AggProgMissDelta {
+            section: "fexit/kcrypto_recvmsg".to_owned(),
+            program_id: 11,
+            miss_baseline: 100,
+            miss_current: 115,
+            miss_delta: 15,
+            run_delta: Some(12),
+        },
+    ]));
+    let finished =
+        kryprobe_cli::workload::finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    // Stable section/program-ID join, absolute endpoints, delta,
+    // and per-operation run qualification — sorted for determinism.
+    assert!(text.contains("misses: 2 program(s)"), "got:\n{text}");
+    let recv = "fexit/kcrypto_recvmsg id=11 baseline=100 current=115 delta=15 run=12";
+    let send = "fexit/kcrypto_sendmsg id=12 baseline=50 current=60 delta=10 run=unavailable";
+    assert!(text.contains(recv), "qualified program line, got:\n{text}");
+    assert!(
+        text.contains(send),
+        "stats-gated program line, got:\n{text}"
+    );
+    assert!(
+        text.find(recv) < text.find(send),
+        "sorted by (section, program ID), got:\n{text}"
+    );
+    // Never assigned to contexts: the frozen report text (rows +
+    // ledger) carries no miss data.
+    assert!(
+        !finished.report.render_text().contains("misses:"),
+        "rows/ledger untouched by global misses"
+    );
+    // Explicit unavailability carries the reason verbatim.
+    outcome.workload_misses = Some(MissTerminal::Unavailable {
+        reason: "miss join refused: redeploy".to_owned(),
+    });
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("misses: unavailable (miss join refused: redeploy)"),
+        "unavailable reason, got:\n{text}"
+    );
+    // Never silently absent.
+    outcome.workload_misses = None;
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("misses: unavailable (not collected)"),
+        "explicit not-collected, got:\n{text}"
     );
 }
 

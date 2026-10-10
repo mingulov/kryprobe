@@ -19,7 +19,9 @@ use crate::live::{
 use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
 };
-use crate::workload::{WorkloadFinishOpts, finish_workload_report, precheck_metadata_file};
+use crate::workload::{
+    WorkloadFinishOpts, finish_workload_report, precheck_metadata_file, render_workload_text,
+};
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_report::workload::GroupBy;
 use std::io::Write;
@@ -165,7 +167,7 @@ fn finish_watch_workload(
             return 1;
         }
     };
-    let text = finished.report.render_text();
+    let text = render_workload_text(outcome, &finished);
     let code = if outcome.interrupted {
         let _ = writeln!(stderr, "watch: interrupted by SIGINT — partial window");
         3
@@ -460,6 +462,7 @@ pub(crate) mod fixtures {
             workload_preflight: None,
             workload_terminal: None,
             workload_capture: None,
+            workload_misses: None,
         }
     }
 

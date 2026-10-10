@@ -50,8 +50,8 @@ use kryprobe_privilege::btf_resolve::KCRYPTO_SYMBOLS;
 use kryprobe_privilege::host::{SIGINT_SEEN, monotonic_ns};
 use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms};
 use kryprobe_privilege::kcrypto_backend::{
-    AggregateTerminalSample, KCryptoBackend, KDROP_DESTROY, KDROP_SITES, ProfileBackend,
-    WhoSnapshot, observation_for_who, register_kcrypto_profile,
+    AggregateTerminalSample, KCryptoBackend, KDROP_DESTROY, KDROP_SITES, MissTerminal,
+    ProfileBackend, WhoSnapshot, observation_for_who, register_kcrypto_profile,
 };
 use kryprobe_privilege::kcrypto_lifecycle::backend::{LifecycleBackend, lifecycle_event};
 use kryprobe_privilege::kcrypto_lifecycle::profile::{LifecycleProfile, manifest, max_programs};
@@ -243,6 +243,45 @@ pub fn telemetry_ctx_line(ctx: &CtxTerminal) -> String {
     )
 }
 
+/// M1 terminal miss telemetry line (finding C4): aggregate guard
+/// skips across attached programs. `run_delta` sums only when EVERY
+/// program qualified (statistics at both endpoints) — any
+/// stats-gated program nulls the aggregate rather than zero-filling
+/// it. Per-program detail (stable section/program-ID join,
+/// per-operation qualification, unavailable reasons) rides the
+/// workload report section, never this line; global misses are never
+/// assigned to individual contexts. Shape twinned with the Python
+/// `parse_telemetry` consumer (v1): the `misses` object is
+/// counted-as-a-line, never malformed.
+pub fn telemetry_miss_line(misses: &MissTerminal) -> String {
+    match misses {
+        MissTerminal::Available(deltas) => {
+            let miss_delta: u64 = deltas
+                .iter()
+                .fold(0u64, |acc, delta| acc.saturating_add(delta.miss_delta));
+            let mut run_delta: Option<u64> = Some(0);
+            for delta in deltas {
+                match (run_delta, delta.run_delta) {
+                    (Some(acc), Some(run)) => run_delta = Some(acc.saturating_add(run)),
+                    _ => {
+                        run_delta = None;
+                        break;
+                    }
+                }
+            }
+            format!(
+                "kryprobe: telemetry {{\"v\":1,\"misses\":{{\"programs\":{},\"miss_delta\":{},\"run_delta\":{}}}}}",
+                deltas.len(),
+                miss_delta,
+                count_json(run_delta),
+            )
+        }
+        MissTerminal::Unavailable { .. } => {
+            "kryprobe: telemetry {\"v\":1,\"misses\":{\"unavailable\":true}}".to_owned()
+        }
+    }
+}
+
 /// R1 occupancy telemetry line (lifecycle profile). Cumulative
 /// ledger equation + close backlog bytes (the ring drained at
 /// close, so close-state record counts would read zero — the
@@ -357,6 +396,12 @@ pub struct LiveOutcome {
     /// succeeded): per-context rows plus ledger operands, ready for
     /// the common typed report.
     pub workload_capture: Option<WorkloadCapture>,
+    /// M1 terminal program-miss account (`Some` exactly when
+    /// `LiveConfig.workload` is set): consumed from
+    /// `session_miss_terminal` before backend cleanup, rendered by
+    /// the workload report section. Global/per-program telemetry
+    /// only — never distributed across context rows.
+    pub workload_misses: Option<MissTerminal>,
 }
 
 /// Request-lifecycle terminal totals: the reducer equation plus every
@@ -2095,6 +2140,7 @@ fn drive_session_inner(
         // The post-finish `KCTX` walk joins at the orchestrator (the
         // driver owns ticks, never the terminal map walk).
         workload_capture: None,
+        workload_misses: None,
     })
 }
 
@@ -2527,6 +2573,7 @@ fn drive_lifecycle_session_inner(
         workload_preflight: None,
         workload_terminal: None,
         workload_capture: None,
+        workload_misses: None,
     })
 }
 
@@ -2910,6 +2957,20 @@ fn run_live_session_inner(
         // join is internal. Bounded and separate from BPF drain/stop
         // (the drain stopped inside the session above).
         if cfg.workload {
+            // M1 terminal miss account (finding C4): consumed BEFORE
+            // the backend cleanup below (`finish_capture` drops the
+            // sensor). Fail-soft both ways — an `Err` (fence
+            // unproven, which fails `ctx_rows` below anyway) records
+            // explicit unavailability, and `Unavailable` telemetry
+            // never fails the session on its own account.
+            let misses = match concrete.session_miss_terminal(generation) {
+                Ok(misses) => misses,
+                Err(_) => MissTerminal::Unavailable {
+                    reason: "miss terminal read refused (fence unproven)".to_owned(),
+                },
+            };
+            eprintln!("{}", telemetry_miss_line(&misses));
+            outcome.workload_misses = Some(misses);
             let (ctx_rows, refused) = concrete
                 .session_ctx_rows(generation)
                 .map_err(|err| LiveError::Unusable(format!("workload ctx rows: {err}")))?;
@@ -2990,6 +3051,59 @@ mod tests {
             "kryprobe: telemetry {\"v\":1,\"ctx\":{".to_owned()
                 + "\"rows\":null,\"present_calls\":null,\"system_calls\":null,"
                 + "\"unknown_calls\":null,\"drops\":null}}"
+        );
+    }
+
+    #[test]
+    fn telemetry_miss_line_vectors() {
+        use kryprobe_privilege::kcrypto_backend::AggProgMissDelta;
+        // Twinned with the `parse_telemetry` consumer (v1): exact key
+        // order; the `misses` object is counted-as-a-line, never
+        // malformed.
+        let qualified = MissTerminal::Available(vec![
+            AggProgMissDelta {
+                section: "fexit/kcrypto_recvmsg".to_owned(),
+                program_id: 11,
+                miss_baseline: 100,
+                miss_current: 115,
+                miss_delta: 15,
+                run_delta: Some(12),
+            },
+            AggProgMissDelta {
+                section: "fexit/kcrypto_sendmsg".to_owned(),
+                program_id: 12,
+                miss_baseline: 50,
+                miss_current: 60,
+                miss_delta: 10,
+                run_delta: Some(9),
+            },
+        ]);
+        assert_eq!(
+            telemetry_miss_line(&qualified),
+            "kryprobe: telemetry {\"v\":1,\"misses\":{".to_owned()
+                + "\"programs\":2,\"miss_delta\":25,\"run_delta\":21}}"
+        );
+        // Any stats-gated program nulls the run aggregate (never
+        // zero-filled); the miss aggregate still sums.
+        let gated = MissTerminal::Available(vec![AggProgMissDelta {
+            section: "fexit/kcrypto_recvmsg".to_owned(),
+            program_id: 11,
+            miss_baseline: 100,
+            miss_current: 115,
+            miss_delta: 15,
+            run_delta: None,
+        }]);
+        assert_eq!(
+            telemetry_miss_line(&gated),
+            "kryprobe: telemetry {\"v\":1,\"misses\":{".to_owned()
+                + "\"programs\":1,\"miss_delta\":15,\"run_delta\":null}}"
+        );
+        let unavailable = MissTerminal::Unavailable {
+            reason: "miss join refused: redeploy".to_owned(),
+        };
+        assert_eq!(
+            telemetry_miss_line(&unavailable),
+            "kryprobe: telemetry {\"v\":1,\"misses\":{\"unavailable\":true}}"
         );
     }
 

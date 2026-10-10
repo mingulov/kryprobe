@@ -17,7 +17,8 @@ use crate::request_filter::{
     EVIDENCE_VERSION, apply_request_filter, context_filter, push_filter_counters,
 };
 use crate::workload::{
-    WorkloadFinishOpts, finish_workload_report, precheck_metadata_file, workload_exit_code,
+    WorkloadFinishOpts, finish_workload_report, precheck_metadata_file, render_workload_text,
+    workload_exit_code,
 };
 use kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile;
 use kryprobe_privilege::kcrypto_lifecycle::sensor::EnrichmentStatus;
@@ -413,7 +414,7 @@ fn finish_report_workload(
         // Human renders workload text in workload mode (the argument
         // layer refused json/jsonl pairings, so no other format
         // reaches here).
-        _ => finished.report.render_text(),
+        _ => render_workload_text(outcome, &finished),
     };
     let code = workload_exit_code(&finished.report, outcome.interrupted);
     match out {

@@ -769,6 +769,7 @@ fn outcome_with(
         workload_preflight: None,
         workload_terminal: None,
         workload_capture: None,
+        workload_misses: None,
     }
 }
 
