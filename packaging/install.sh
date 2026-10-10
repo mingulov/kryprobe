@@ -22,6 +22,9 @@
 # Layout (the H-SEC-01 trusted path — the ONLY tier an elevated
 # kryprobe loads from):
 #   $PREFIX/bin/kryprobe
+#   $PREFIX/bin/kryprobe-workload-helper   (metadata reader, dev
+#     flow only — NO file caps: the launcher confines it itself,
+#     so caps would only add ambient authority)
 #   $PREFIX/bin/kryprobe-bpf/kcrypto.bpf.o
 #   $PREFIX/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o
 #
@@ -74,6 +77,12 @@ if [ -n "$STAGE" ]; then
     BIN_SRC="$STAGE/bin/kryprobe"
     OBJ_SRC="$STAGE/bin/kryprobe-bpf/kcrypto.bpf.o"
     LIFECYCLE_SRC="$STAGE/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
+    # The release stage does not carry the helper yet (the Stage-6
+    # release-archive layout owns it): a stage install copies no
+    # helper and never disturbs an installed sibling, until that
+    # layout is frozen. Metadata lookups then refuse typed
+    # (HelperRefused) instead of reading unverified bytes.
+    HELPER_SRC=""
     MANIFEST="$STAGE/manifest.json"
     SUMS="$STAGE/sha256sums.txt"
     for f in "$MANIFEST" "$SUMS" "$BIN_SRC" "$OBJ_SRC" "$LIFECYCLE_SRC"; do
@@ -143,10 +152,17 @@ if [ -n "$STAGE" ]; then
 else
     ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
     echo "install.sh: dev sources, no manifest verification" >&2
-    BIN_SRC="$ROOT/target/debug/kryprobe"
+    # Dev bins come from the caller's Cargo target dir (cargo
+    # semantics: a relative CARGO_TARGET_DIR resolves against the
+    # CWD). BPF objects stay at the xtask lane path — xtask ignores
+    # CARGO_TARGET_DIR, so worktree-local isolation never moves them.
+    TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+    BIN_SRC="$TARGET_DIR/debug/kryprobe"
+    HELPER_SRC="$TARGET_DIR/debug/kryprobe-workload-helper"
     OBJ_SRC="$ROOT/target/kryprobe-bpf/kcrypto.bpf.o"
     LIFECYCLE_SRC="$ROOT/target/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
-    [ -f "$ROOT/target/release/kryprobe" ] && BIN_SRC="$ROOT/target/release/kryprobe"
+    [ -f "$TARGET_DIR/release/kryprobe" ] && BIN_SRC="$TARGET_DIR/release/kryprobe"
+    [ -f "$TARGET_DIR/release/kryprobe-workload-helper" ] && HELPER_SRC="$TARGET_DIR/release/kryprobe-workload-helper"
 fi
 
 if [ ! -f "$BIN_SRC" ]; then
@@ -159,8 +175,16 @@ for source in "$OBJ_SRC" "$LIFECYCLE_SRC"; do
         exit 1
     fi
 done
+# The dev flow ships the helper sibling (`cargo xtask build` emits
+# it); the stage flow leaves HELPER_SRC empty (see above) and skips
+# this — but when a source IS named it must exist, never silently.
+if [ -n "$HELPER_SRC" ] && [ ! -f "$HELPER_SRC" ]; then
+    echo "install.sh: missing $HELPER_SRC (run \`cargo xtask build\` first)" >&2
+    exit 1
+fi
 
 BIN_DST="$DESTDIR$PREFIX/bin/kryprobe"
+HELPER_DST="$DESTDIR$PREFIX/bin/kryprobe-workload-helper"
 OBJ_DIR="$DESTDIR$PREFIX/bin/kryprobe-bpf"
 OBJ_DST="$OBJ_DIR/kcrypto.bpf.o"
 LIFECYCLE_DST="$OBJ_DIR/kcrypto-lifecycle.bpf.o"
@@ -171,9 +195,19 @@ cp -f "$OBJ_SRC" "$OBJ_DST"
 cp -f "$LIFECYCLE_SRC" "$LIFECYCLE_DST"
 chmod 0755 "$BIN_DST"
 chmod 0644 "$OBJ_DST" "$LIFECYCLE_DST"
+# The helper ships WITHOUT file caps and is never `token mint`ed:
+# the launcher drops every capability in the child itself, so caps
+# here would only add ambient authority the helper must not have.
+if [ -n "$HELPER_SRC" ]; then
+    cp -f "$HELPER_SRC" "$HELPER_DST"
+    chmod 0755 "$HELPER_DST"
+fi
 echo "+ installed $BIN_DST"
 echo "+ installed $OBJ_DST"
 echo "+ installed $LIFECYCLE_DST"
+if [ -n "$HELPER_SRC" ]; then
+    echo "+ installed $HELPER_DST (no caps)"
+fi
 if [ -n "$STAGE" ]; then
     # Confirm all destination files match the verified stage before
     # declaring success (F04). On mismatch the destination may hold
