@@ -180,11 +180,12 @@ is the product refusing to guess. Diagnose from the coverage
 trailer:
 
 - `metadata: unavailable` + a `HelperRefused` note: the helper
-  sibling is missing (release-stage installs carry none until
-  the Stage-6 layout freezes; dev installs ship it), crashed,
-  or refused attestation — capture still completes, with raw
-  IDs. Install or repair the sibling and re-run; never
-  hand-fill identities into the stored bytes.
+  sibling is missing (fresh release-stage installs carry none
+  until the Stage-6 layout freezes — a stage install over an
+  existing sibling preserves that file instead; dev installs
+  ship it), crashed, or refused attestation — capture still
+  completes, with raw IDs. Install or repair the sibling and
+  re-run; never hand-fill identities into the stored bytes.
 - `metadata: partial` with `kernel_mismatch` refusals: the
   metadata snapshot came from a different kernel — the keys
   refuse typed and the rows stay unresolved.

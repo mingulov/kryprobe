@@ -89,6 +89,95 @@ impl FakeTree {
     fn dest(&self) -> PathBuf {
         self.root.join("dest/t")
     }
+
+    /// Build a fake release stage under `root/name`: stub objects, a
+    /// stub `kryprobe` answering `doctor --versions --json` with the
+    /// measured pins, byte-exact manifest v2, and the checksum list.
+    /// Returns the stage directory.
+    fn stage(&self, name: &str) -> PathBuf {
+        let stage = self.root.join(name);
+        let obj_dir = stage.join("bin/kryprobe-bpf");
+        std::fs::create_dir_all(&obj_dir).expect("stage dirs");
+        let obj = obj_dir.join("kcrypto.bpf.o");
+        let lifecycle = obj_dir.join("kcrypto-lifecycle.bpf.o");
+        std::fs::write(&obj, b"fake-stage-kcrypto-object\n").expect("stage o");
+        std::fs::write(&lifecycle, b"fake-stage-lifecycle-object\n").expect("stage lo");
+        let obj_digest = sha256_of(&obj);
+        let lifecycle_digest = sha256_of(&lifecycle);
+        // Stub binary: executable, CWD-independent, enforcing the
+        // staged objects' pins (same predicate build-release.sh and
+        // install.sh verify — absolute staged paths).
+        let doctor = format!(
+            "{{\"pins_enforced\":true,\"profile_pins_enforced\":true,\
+             \"objects\":[{{\"sha256\":\"{obj_digest}\",\"path\":\"{obj}\"}},\
+             {{\"sha256\":\"{lifecycle_digest}\",\"path\":\"{lifecycle}\"}}]}}",
+            obj = obj.display(),
+            lifecycle = lifecycle.display(),
+        );
+        let bin = stage.join("bin/kryprobe");
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' '{doctor}'\n")).expect("stage bin");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let bin_digest = sha256_of(&bin);
+        // Byte-exact manifest v2 + trailing newline (template owned
+        // by build-release.sh; mirrored here).
+        std::fs::write(
+            stage.join("manifest.json"),
+            format!(
+                "{{\"kryprobe_release_manifest\":2,\
+                 \"binary\":{{\"path\":\"bin/kryprobe\",\"sha256\":\"{bin_digest}\"}},\
+                 \"objects\":[{{\"name\":\"kcrypto.bpf.o\",\
+                 \"path\":\"bin/kryprobe-bpf/kcrypto.bpf.o\",\
+                 \"sha256\":\"{obj_digest}\"}},\
+                 {{\"name\":\"kcrypto-lifecycle.bpf.o\",\
+                 \"path\":\"bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o\",\
+                 \"sha256\":\"{lifecycle_digest}\"}}],\
+                 \"pins_enforced\":true,\"profile_pins_enforced\":true,\
+                 \"pin_digests\":[\"{obj_digest}\",\"{lifecycle_digest}\"]}}\n"
+            ),
+        )
+        .expect("stage manifest");
+        std::fs::write(
+            stage.join("sha256sums.txt"),
+            format!(
+                "{bin_digest}  bin/kryprobe\n\
+                 {obj_digest}  bin/kryprobe-bpf/kcrypto.bpf.o\n\
+                 {lifecycle_digest}  bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o\n"
+            ),
+        )
+        .expect("stage sums");
+        stage
+    }
+
+    /// DESTDIR staging install from a release stage (verified first,
+    /// `--no-mint` so no cap grant runs).
+    fn install_stage(&self, stage: &Path) -> std::process::Output {
+        let destdir = self.root.join("dest");
+        Command::new("sh")
+            .arg(self.script())
+            .arg("--destdir")
+            .arg(&destdir)
+            .arg("--prefix")
+            .arg("/t")
+            .arg("--no-mint")
+            .arg("--stage")
+            .arg(stage)
+            .output()
+            .expect("runs")
+    }
+}
+
+fn sha256_of(path: &Path) -> String {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("sha256sum runs");
+    assert!(out.status.success(), "sha256sum exits 0");
+    String::from_utf8(out.stdout)
+        .expect("utf-8")
+        .split_whitespace()
+        .next()
+        .expect("digest")
+        .to_owned()
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -238,5 +327,77 @@ fn script_mints_only_the_kryprobe_binary() {
         mints[0].contains("--bin \"$BIN_DST\"") && !mints[0].contains("HELPER"),
         "the mint site grants the kryprobe binary only: {}",
         mints[0]
+    );
+}
+
+/// M2: a fresh `--stage` install copies no helper (pinned actual
+/// behavior — metadata lookups then refuse `HelperRefused`).
+#[test]
+fn stage_fresh_install_ships_no_helper() {
+    let tree = FakeTree::new("cargo-target/debug", b"unused\n", b"unused\n");
+    let stage = tree.stage("stage");
+    let out = tree.install_stage(&stage);
+    assert!(
+        out.status.success(),
+        "exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dest = tree.dest();
+    assert!(dest.join("bin/kryprobe").is_file(), "binary installs");
+    assert!(
+        dest.join("bin/kryprobe-bpf/kcrypto.bpf.o").is_file(),
+        "objects install"
+    );
+    assert!(
+        !dest.join("bin/kryprobe-workload-helper").exists(),
+        "fresh stage ships no helper"
+    );
+}
+
+/// M2: `--stage` over an installed sibling preserves it
+/// byte-identical — its revision keeps serving (NOT a refusal).
+#[test]
+fn stage_upgrade_preserves_sibling_byte_identical() {
+    let tree = FakeTree::new("cargo-target/debug", b"unused\n", b"unused\n");
+    let stage = tree.stage("stage");
+    let sibling = tree.dest().join("bin/kryprobe-workload-helper");
+    std::fs::create_dir_all(sibling.parent().expect("bin dir")).expect("bin dir");
+    std::fs::write(&sibling, b"old-helper-revision-1\n").expect("old sibling");
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out = tree.install_stage(&stage);
+    assert!(
+        out.status.success(),
+        "exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dest = tree.dest();
+    assert!(dest.join("bin/kryprobe").is_file(), "binary updates");
+    assert_eq!(
+        std::fs::read(&sibling).expect("sibling reads"),
+        b"old-helper-revision-1\n",
+        "sibling preserved byte-identical"
+    );
+    assert_eq!(mode_of(&sibling), 0o755, "sibling mode preserved");
+}
+
+/// M2: the installer help pins fresh-vs-upgrade helper behavior
+/// (the old text claimed `HelperRefused` unconditionally, which is
+/// false over an installed sibling).
+#[test]
+fn stage_help_pins_fresh_vs_upgrade_helper_behavior() {
+    let out = Command::new("sh")
+        .arg(script_source())
+        .arg("--help")
+        .output()
+        .expect("help runs");
+    assert!(out.status.success(), "help exits 0");
+    let help = String::from_utf8(out.stdout).expect("utf-8 help");
+    assert!(
+        help.contains("fresh install") && help.contains("no helper"),
+        "fresh wording:\n{help}"
+    );
+    assert!(
+        help.contains("preserved") && help.contains("byte-identical"),
+        "upgrade wording:\n{help}"
     );
 }

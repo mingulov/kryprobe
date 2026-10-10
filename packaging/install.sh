@@ -14,6 +14,10 @@
 #                    objects' named pins, installed files re-hashed after copy.
 #                    Default sources are the worktree target dirs (dev
 #                    flow, explicitly unverified — never a release).
+#   Stage helper rule: --stage copies no helper. A fresh install
+#     ships none (metadata lookups then refuse HelperRefused); over
+#     an installed sibling that file is preserved byte-identical
+#     (its revision keeps serving; Stage 6 owns the archive layout).
 #
 # Tools: POSIX sh, coreutils (sha256sum, cmp), grep — no jq/python.
 # The manifest template is owned by build-release.sh; format drift
@@ -22,9 +26,9 @@
 # Layout (the H-SEC-01 trusted path — the ONLY tier an elevated
 # kryprobe loads from):
 #   $PREFIX/bin/kryprobe
-#   $PREFIX/bin/kryprobe-workload-helper   (metadata reader, dev
-#     flow only — NO file caps: the launcher confines it itself,
-#     so caps would only add ambient authority)
+#   $PREFIX/bin/kryprobe-workload-helper   (metadata reader, copied
+#     by the dev flow only — NO file caps: the launcher confines
+#     it itself, so caps would only add ambient authority)
 #   $PREFIX/bin/kryprobe-bpf/kcrypto.bpf.o
 #   $PREFIX/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o
 #
@@ -52,7 +56,7 @@ while [ $# -gt 0 ]; do
             ;;
         --no-mint) MINT=0; shift ;;
         -h|--help)
-            sed -n '2,29p' "$0"
+            sed -n '2,33p' "$0"
             exit 0
             ;;
         *) echo "install.sh: unknown argument '$1'" >&2; exit 2 ;;
@@ -79,9 +83,10 @@ if [ -n "$STAGE" ]; then
     LIFECYCLE_SRC="$STAGE/bin/kryprobe-bpf/kcrypto-lifecycle.bpf.o"
     # The release stage does not carry the helper yet (the Stage-6
     # release-archive layout owns it): a stage install copies no
-    # helper and never disturbs an installed sibling, until that
-    # layout is frozen. Metadata lookups then refuse typed
-    # (HelperRefused) instead of reading unverified bytes.
+    # helper. A fresh install therefore ships none (metadata lookups
+    # refuse typed HelperRefused); over an installed sibling that
+    # file is preserved byte-identical — never truncated, replaced,
+    # or re-hashed — and its revision keeps serving until Stage 6.
     HELPER_SRC=""
     MANIFEST="$STAGE/manifest.json"
     SUMS="$STAGE/sha256sums.txt"
