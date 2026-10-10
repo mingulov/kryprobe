@@ -1,0 +1,46 @@
+{
+  "collector": "kryprobe-m1-task05-bench/1",
+  "snapshot_interval": {
+    "start_ns": 0,
+    "end_ns": 18446744073709551615
+  },
+  "kernel_identity": "unknown",
+  "entries": [
+    {
+      "display_name": "m1-bench single (descriptive only; no cgroup key)",
+      "cgroup_id": null,
+      "binding": {
+        "method": "metadata_file",
+        "source": "operator_metadata_file",
+        "status": "asserted"
+      }
+    },
+    {
+      "display_name": "m1-bench n_cgroup (descriptive only; no cgroup key)",
+      "cgroup_id": null,
+      "binding": {
+        "method": "metadata_file",
+        "source": "operator_metadata_file",
+        "status": "asserted"
+      }
+    },
+    {
+      "display_name": "m1-bench churn_below (descriptive only; no cgroup key)",
+      "cgroup_id": null,
+      "binding": {
+        "method": "metadata_file",
+        "source": "operator_metadata_file",
+        "status": "asserted"
+      }
+    },
+    {
+      "display_name": "m1-bench churn_full (descriptive only; no cgroup key)",
+      "cgroup_id": null,
+      "binding": {
+        "method": "metadata_file",
+        "source": "operator_metadata_file",
+        "status": "asserted"
+      }
+    }
+  ]
+}
