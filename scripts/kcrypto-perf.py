@@ -2086,6 +2086,30 @@ def audit_m1_attempt_ids(cell_verdicts: list) -> list:
     return reasons
 
 
+M1_FLOOR_4K = 0.80
+
+
+def eval_m1_disabled_floor(entry: dict, ratios_t: list):
+    """ADR-0019 0.80 4K disabled-relative floor (Task05 Stage 4,
+    freeze G7): evaluated on unbudgeted 4K D-vs-observer sets
+    (C/M legs vs disabled), reported alongside the ENVELOPE
+    medians, never a PASS/FAIL. Same median+80% shape as the
+    frozen budgets: the floor holds iff the median is inside
+    [0.80, ∞) AND >= 80% of the pairs are inside. Returns the
+    floor dict, or None when the set is out of scope."""
+    if entry.get("budgeted") or entry.get("class") != "P-4K":
+        return None
+    if entry.get("obs_a") != "D" or \
+            entry.get("obs_b") not in ("C", "M"):
+        return None
+    med = kstats.median(list(ratios_t))
+    frac = sum(1 for ratio in ratios_t
+               if ratio >= M1_FLOOR_4K) / len(ratios_t)
+    return {"threshold": M1_FLOOR_4K, "median": med,
+            "frac_inside": frac,
+            "holds": med >= M1_FLOOR_4K and frac >= 0.8}
+
+
 def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
                  manifest: dict) -> dict:
     """Combine an M1 set's cells into the set verdict (ADR-0016: the
@@ -2174,6 +2198,9 @@ def judge_m1_set(set_id: str, entry: dict, cell_verdicts: list,
     else:
         out.update(verdict="ENVELOPE",
                    reasons=["non-budget set: envelope published"])
+        floor = eval_m1_disabled_floor(entry, ratios_t)
+        if floor is not None:
+            out["floor"] = floor
     return out
 
 
