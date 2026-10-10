@@ -469,7 +469,22 @@ fn confine_child() -> std::io::Result<()> {
     }
     // FD allowlist: stdio survives, everything else closes. Authority
     // fds must never leak into the helper (BPF fds are not all
-    // close-on-exec), so this closes by number, not by trust.
+    // close-on-exec), so this closes by number, not by trust — and by
+    // RANGE, not by the current soft `RLIMIT_NOFILE`: an fd parked
+    // above a subsequently lowered soft limit still closes (C1 M1).
+    // SAFETY: close_range by number only (async-signal-safe).
+    let ranged = unsafe { libc::close_range(3, u32::MAX, 0) };
+    if ranged == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(err);
+    }
+    // Pre-5.9 kernels lack close_range: best-effort close by number
+    // up to the current ceiling (a high fd above a lowered soft
+    // limit survives here — the M1 floor is 6.12+, where the range
+    // path above always runs, so this never executes supported).
     // SAFETY: sysconf+close by number only.
     let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     let max_fd = if max_fd > 0 { max_fd as i32 } else { 1024 };
@@ -1058,6 +1073,106 @@ honest_attestation() {
         assert_eq!(
             attest_helper(&helper, &principal, Duration::from_secs(10)),
             Err(MetadataUnavailable::HelperRefused)
+        );
+    }
+
+    /// M1 oracle (Codex C1): an inherited fd numbered above a
+    /// subsequently lowered `RLIMIT_NOFILE` soft limit still closes.
+    /// The old `sysconf(_SC_OPEN_MAX)` loop stops at the soft limit
+    /// and leaks the high fd into the child; `close_range` does not
+    /// consult the limit at all.
+    #[test]
+    fn spawn_closes_fds_above_lowered_soft_limit() {
+        const HIGH_WANT: i32 = 512;
+        const LOW_SOFT: u64 = 256;
+        // SAFETY: open(2) on /dev/null, no O_CLOEXEC — inheritable
+        // by construction, like a BPF authority fd.
+        let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(devnull >= 0, "leak fixture opens");
+        // A free high number (never clobber another live fd in this
+        // shared test process).
+        let mut high = HIGH_WANT;
+        while unsafe { libc::fcntl(high, libc::F_GETFD) } != -1 {
+            high += 1;
+            assert!(high < 4096, "a free high fd exists");
+        }
+        assert_eq!(
+            unsafe { libc::dup2(devnull, high) },
+            high,
+            "high fd parks above the lowered soft limit"
+        );
+        // RAII: the soft limit is process-global, so it restores on
+        // every exit path (including panic); the parked fds close.
+        // The lowered window is milliseconds and 256 fds still serve
+        // every concurrent test's tempfiles.
+        struct SoftLimitGuard {
+            soft: u64,
+            hard: u64,
+            fds: Vec<i32>,
+        }
+        impl Drop for SoftLimitGuard {
+            fn drop(&mut self) {
+                let restore = libc::rlimit {
+                    rlim_cur: self.soft,
+                    rlim_max: self.hard,
+                };
+                // SAFETY: restores the saved ceiling (soft <= hard).
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &restore);
+                }
+                for fd in &self.fds {
+                    // SAFETY: each fd came from the opens above.
+                    unsafe {
+                        libc::close(*fd);
+                    }
+                }
+            }
+        }
+        let mut saved = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes the struct only.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+            0,
+            "reads the current ceiling"
+        );
+        assert!(
+            saved.rlim_cur > high as u64,
+            "soft limit starts above the probe fd"
+        );
+        let _guard = SoftLimitGuard {
+            soft: saved.rlim_cur,
+            hard: saved.rlim_max,
+            fds: vec![devnull, high],
+        };
+        let lowered = libc::rlimit {
+            rlim_cur: LOW_SOFT,
+            rlim_max: saved.rlim_max,
+        };
+        // SAFETY: lowering the soft ceiling needs no privilege.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) },
+            0,
+            "soft limit lowers below the parked fd"
+        );
+        let mut child = spawn_confined(
+            Path::new("ls"),
+            &["/proc/self/fd".to_string()],
+            Stdio::null(),
+        )
+        .expect("spawns");
+        let stdout = child.stdout.take().expect("piped");
+        assert!(matches!(
+            wait_bounded(&mut child, Duration::from_secs(10)),
+            WaitOutcome::Exited(status) if status.success()
+        ));
+        let out = read_capped(stdout, 4096).expect("reads");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "0\n1\n2\n3\n",
+            "child sees stdio + transient only (high fd closed)"
         );
     }
 
