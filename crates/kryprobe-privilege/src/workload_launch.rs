@@ -71,7 +71,6 @@ use kryprobe_core::workload::{
     MetadataUnavailable, SnapshotRequest, SnapshotResponse, bind_response_to_request,
     decode_response, encode_request,
 };
-use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -1104,10 +1103,11 @@ fn converge_ownership(
 /// performed themselves (every call site below is peek-only until
 /// this runs); the probe is the backstop for reaps this code did not
 /// perform. Cleanup runs within `deadline` and reports
-/// [`CleanupOutcome`]: the owned path kills and reaps; the unowned
-/// path reaps without signaling only until the deadline, then
-/// reports incomplete (unknown liveness) instead of blocking past
-/// it.
+/// [`CleanupOutcome`]: the owned path kills then reaps boundedly
+/// (denied signals/reaps report `Incomplete`, never a false
+/// `Complete`); the unowned path reaps without signaling only until
+/// the deadline, then reports incomplete (unknown liveness) instead
+/// of blocking past it.
 fn kill_and_reap(child: &mut std::process::Child, deadline: Instant) -> CleanupOutcome {
     kill_and_reap_gated(child, child_still_waitable(child, deadline), deadline)
 }
@@ -1130,16 +1130,55 @@ fn kill_and_reap_gated(
         return reap_unowned_bounded(child, deadline);
     }
     // The group dies first (descendants), then the child, then the
-    // reap. `killpg` errors ignored: while unreaped the group
-    // exists (the zombie itself holds membership) and its members
-    // are all our own descendants — and `kill`+`wait` still run.
+    // bounded reap. Signal errors are not trusted: liveness (the
+    // reap) determines the outcome — denied signals leave a live
+    // child, which the bounded reap reports as `Incomplete` (never
+    // a false `Complete`); a zombie still reaps promptly.
     // SAFETY: killpg on the unreaped child's own group id.
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
     let _ = child.kill();
-    let _ = child.wait();
-    CleanupOutcome::Complete
+    // Post-signal reap is bounded and honest like the unowned path
+    // (no further signals; `ECHILD` completes, anything else holds
+    // to the deadline, then `Incomplete`) — plus a minimal 1 s grace
+    // when the attempt deadline already passed (the `Stalled` entry):
+    // a just-`SIGKILL`ed child needs a moment to become reaped, and
+    // zero grace would falsely report `Incomplete` for a prompt reap
+    // (denied signals still end `Incomplete`, bounded by the grace).
+    let reap_deadline = if Instant::now() >= deadline {
+        Instant::now() + Duration::from_secs(1)
+    } else {
+        deadline
+    };
+    reap_unowned_bounded(child, reap_deadline)
+}
+
+/// Sleep up to 1 ms without outliving `deadline` and without
+/// retrying interruptions internally: a SINGLE `nanosleep` attempt
+/// that returns immediately on `EINTR` so the caller re-checks the
+/// deadline. (`std::thread::sleep` retries interrupted `nanosleep`
+/// without consulting `Instant`, so an `EINTR` that leaves the
+/// remainder unchanged traps past the deadline — this helper never
+/// traps: normal sleeps still take the 1 ms slice; interruptions
+/// wake early into the caller's deadline check.)
+fn sleep_slice(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    let slice = remaining.min(Duration::from_millis(1));
+    let req = libc::timespec {
+        tv_sec: slice.as_secs() as libc::time_t,
+        // `subsec_nanos` fits `c_long` (under 1e9); the cast is exact.
+        tv_nsec: libc::c_long::from(slice.subsec_nanos()),
+    };
+    let mut rem: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `nanosleep` with valid `req`/`rem` pointers; the return
+    // (including `EINTR`) is intentionally not retried here.
+    unsafe {
+        libc::nanosleep(&req, &mut rem);
+    }
 }
 
 /// Whether bounded cleanup finished: the reap-only path reports
@@ -1148,10 +1187,10 @@ fn kill_and_reap_gated(
 enum CleanupOutcome {
     /// Nothing outstanding: reaped, or already reaped elsewhere.
     Complete,
-    /// The deadline lapsed with ownership unproven and the child
-    /// possibly still alive — nothing signaled, nothing reaped
-    /// (unknown liveness: a refusal state, never a transport retry,
-    /// never reported as success).
+    /// The deadline lapsed with the child possibly still alive —
+    /// ownership unproven (nothing signaled) or signals/reaps denied
+    /// (nothing proven delivered/reaped). Unknown liveness: a refusal
+    /// state, never a transport retry, never reported as success.
     Incomplete,
 }
 
@@ -1172,7 +1211,7 @@ fn reap_unowned_bounded(child: &mut std::process::Child, deadline: Instant) -> C
                 if Instant::now() >= deadline {
                     return CleanupOutcome::Incomplete;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                sleep_slice(deadline);
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 if Instant::now() >= deadline {
@@ -1186,7 +1225,7 @@ fn reap_unowned_bounded(child: &mut std::process::Child, deadline: Instant) -> C
                 if Instant::now() >= deadline {
                     return CleanupOutcome::Incomplete;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                sleep_slice(deadline);
             }
         }
     }
@@ -1269,8 +1308,11 @@ enum PipeOutcome {
     Failed,
 }
 
-/// Read one pipe until it would block, EOF, over-cap, or failure
-/// (interrupted reads retry, as `read_to_end` did).
+/// Read one pipe until it would block, EOF, over-cap, or failure.
+/// Interrupted reads yield to the outer `poll` loop (`Open`) instead
+/// of retrying inline: the outer loop re-polls (retrying the read)
+/// after its deadline check, so a sustained interruption ends in a
+/// bounded `Stalled` instead of trapping here past the deadline.
 fn drain_pipe(
     pipe: &mut impl std::io::Read,
     acc: &mut Vec<u8>,
@@ -1286,11 +1328,50 @@ fn drain_pipe(
                     return PipeOutcome::OverCap;
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                return PipeOutcome::Open;
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return PipeOutcome::Open,
             Err(_) => return PipeOutcome::Failed,
         }
     }
+}
+
+/// One stdin write step.
+enum StdinOutcome {
+    /// All bytes written, or a fatal write error (drop stdin: a
+    /// broken pipe means the child died early — the exit status
+    /// classifies it, exactly as before).
+    Done,
+    /// Still pending (would-block, zero write, or an interruption
+    /// yielded to the outer loop for its deadline check).
+    Pending,
+}
+
+/// Write stdin bytes until done, would-block, or yield. Interrupted
+/// writes yield to the outer `poll` loop (`Pending`) instead of
+/// retrying inline: the outer loop re-polls (retrying the write)
+/// after its deadline check, so a sustained interruption ends in a
+/// bounded `Stalled` instead of trapping here past the deadline.
+fn write_stdin_chunk(
+    pipe: &mut impl std::io::Write,
+    bytes: &[u8],
+    written: &mut usize,
+) -> StdinOutcome {
+    while *written < bytes.len() {
+        match pipe.write(&bytes[*written..]) {
+            Ok(0) => return StdinOutcome::Pending,
+            Ok(n) => *written += n,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return StdinOutcome::Pending;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                return StdinOutcome::Pending;
+            }
+            Err(_) => return StdinOutcome::Done,
+        }
+    }
+    StdinOutcome::Done
 }
 
 /// Drain one attempt under ONE overall deadline: stdin writes plus
@@ -1339,13 +1420,41 @@ fn drain_bounded(
         }
         if out_eof && err_eof && stdin.is_none() && exited {
             // Reap at disposition: the peek left a zombie (which
-            // anchored the group until now); `wait` cannot block —
-            // the child is already dead.
-            let reaped = match child.wait() {
-                Ok(reaped) => reaped,
-                Err(_) => {
-                    return kill_and_reap_mapped(child, deadline, DrainOutcome::WaitFailed);
+            // anchored the group until now). The reap is bounded to
+            // the attempt deadline — `Child::wait` retries `EINTR`
+            // forever, so a sustained interruption would hang here
+            // even though the child is already dead. A zombie still
+            // reaps promptly (`try_wait` succeeds immediately).
+            let reaped = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            break None;
+                        }
+                        sleep_slice(deadline);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                        if Instant::now() >= deadline {
+                            break None;
+                        }
+                    }
+                    Err(err) if err.raw_os_error() == Some(libc::ECHILD) => {
+                        // Already reaped elsewhere: no status to take —
+                        // fail the reap immediately (cleanup below sees
+                        // `ECHILD` and completes, so `WaitFailed` stands).
+                        break None;
+                    }
+                    Err(_) => {
+                        if Instant::now() >= deadline {
+                            break None;
+                        }
+                        sleep_slice(deadline);
+                    }
                 }
+            };
+            let Some(reaped) = reaped else {
+                return kill_and_reap_mapped(child, deadline, DrainOutcome::WaitFailed);
             };
             return DrainOutcome::Done {
                 status: reaped,
@@ -1416,22 +1525,12 @@ fn drain_bounded(
         if stdin_slot.is_some_and(|slot| watched[slot].revents != 0)
             && let Some(job) = stdin.as_mut()
         {
-            let mut fatal = false;
-            while job.written < job.bytes.len() {
-                match job.pipe.write(&job.bytes[job.written..]) {
-                    Ok(0) => break,
-                    Ok(n) => job.written += n,
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => {
-                        // Broken pipe: the child died early — drop
-                        // stdin and let the exit status decide.
-                        fatal = true;
-                        break;
-                    }
-                }
-            }
-            if fatal || job.written >= job.bytes.len() {
+            // Interruptions yield (`Pending`) so the next loop
+            // iteration re-checks the deadline before retrying.
+            if matches!(
+                write_stdin_chunk(&mut job.pipe, &job.bytes, &mut job.written),
+                StdinOutcome::Done
+            ) {
                 stdin = None;
             }
         }
@@ -3775,6 +3874,691 @@ mod tests {
             leader.try_wait().expect("try_wait").is_some(),
             "zombie reaps under the fail-closed verdict (still ours to reap)"
         );
+    }
+
+    /// Seccomp `AUDIT_ARCH_X86_64` (kernel ABI: `EM_X86_64` +
+    /// 64-bit + little-endian; `libc` 0.2 exposes no audit-arch
+    /// constants, so the value is pinned here — test-only fault
+    /// injection, never production).
+    const SECCOMP_AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+    /// Install one seccomp errno filter in THIS process only (the
+    /// isolated re-exec child — never the shared harness): `prctl`
+    /// `NO_NEW_PRIVS` plus `SECCOMP_MODE_FILTER` with `prog`. Panics
+    /// when the install fails (no silent vacuous green: a missing
+    /// filter would let the faulted syscalls succeed).
+    fn install_seccomp_filter(prog: &[libc::sock_filter]) {
+        // SAFETY: `prctl` by value; `prog` outlives the install call.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0,
+            "test child pins NO_NEW_PRIVS for the seccomp filter"
+        );
+        let prog_struct = libc::sock_fprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: `prctl` install with a live filter pointer.
+        let installed = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &prog_struct as *const libc::sock_fprog as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        assert_eq!(
+            installed,
+            0,
+            "seccomp errno filter installs: {:?}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// C6-review oracle (Blocker 1): an `EINTR` that leaves the
+    /// sleep remainder unchanged must not trap unproven-ownership
+    /// cleanup past the attempt deadline. The probe re-execs this
+    /// test binary (unique filter + one thread): the child spawns a
+    /// live `sleep 8` leader, derives a `false` verdict from a
+    /// scripted `EPERM` through the REAL classifier + convergence,
+    /// installs a seccomp filter faulting `nanosleep` /
+    /// `clock_nanosleep` to `EINTR` in the CHILD ONLY, then runs the
+    /// REAL gated cleanup with a 500 ms deadline. (RED pre-fix:
+    /// `thread::sleep` retries the faulted `nanosleep` forever — the
+    /// child hangs until the parent's 30 s bound kills it.)
+    #[test]
+    fn unowned_cleanup_interrupted_sleep_stays_bounded() {
+        if std::env::var("KRYPROBE_LAUNCH_SLEEP_EINTR_CHILD").is_ok() {
+            interrupted_sleep_child();
+            return;
+        }
+        interrupted_sleep_parent();
+    }
+
+    /// Interrupted-sleep child: live leader, false verdict, faulted
+    /// sleeps, bounded `Incomplete` + leader survival.
+    fn interrupted_sleep_child() {
+        let log = std::env::var("KRYPROBE_LAUNCH_SLEEP_EINTR_LOG").expect("log path");
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["8".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("spawns");
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader is live (stalled) at cleanup time"
+        );
+        // False verdict: scripted `EPERM` through the REAL classifier
+        // + convergence (terminal, never re-probes).
+        let owned = converge_ownership(
+            {
+                let mut calls = 0u32;
+                move || {
+                    calls += 1;
+                    assert_eq!(calls, 1, "terminal verdict never re-probes");
+                    Err(classify_probe_failure(libc::EPERM))
+                }
+            },
+            generous_deadline(),
+        );
+        assert!(!owned, "EPERM fails closed to unowned");
+        // Fault `nanosleep` + `clock_nanosleep` to `EINTR` in THIS
+        // child only (the leader forked before the filter, so it
+        // sleeps normally). BPF indexes: 0:LD arch, 1:JEQ arch,
+        // 2:LD nr, 3:JEQ nanosleep, 4:JEQ clock_nanosleep, 5:ALLOW,
+        // 6:ERRNO|EINTR.
+        let prog = unsafe {
+            [
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    SECCOMP_AUDIT_ARCH_X86_64,
+                    0,
+                    3,
+                ),
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    libc::SYS_nanosleep as u32,
+                    2,
+                    0,
+                ),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    libc::SYS_clock_nanosleep as u32,
+                    1,
+                    0,
+                ),
+                libc::BPF_STMT(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    libc::SECCOMP_RET_ALLOW,
+                ),
+                libc::BPF_STMT(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    libc::SECCOMP_RET_ERRNO | (libc::EINTR as u32),
+                ),
+            ]
+        };
+        install_seccomp_filter(&prog);
+        // No `thread::sleep` past this point (it would trap on the RED
+        // tree inside the filter — the production call below is the
+        // only sleeper, and the fixed tree bounds it).
+        let start = Instant::now();
+        let outcome = kill_and_reap_gated(&mut leader, owned, start + Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            CleanupOutcome::Incomplete,
+            "interrupted-sleep cleanup reports incomplete (never success-with-unknown-children)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "interrupted-sleep cleanup honors the attempt bound (blocked {elapsed:?})"
+        );
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader survives fail-closed cleanup (nothing signaled)"
+        );
+        std::fs::write(&log, format!("incomplete elapsed={elapsed:?}")).expect("probe log");
+        // Hygiene: kills + waits are unfiltered (only sleeps fault),
+        // so the leader dies promptly.
+        let _ = leader.kill();
+        let _ = leader.wait();
+    }
+
+    /// Interrupted-sleep parent: re-exec the probe child, bound the
+    /// wait, quote the log.
+    fn interrupted_sleep_parent() {
+        const PROBE: &str = "unowned_cleanup_interrupted_sleep_stays_bounded";
+        let scratch = kryprobe_testkit::TempDir::named("launch-sleep-eintr").expect("scratch");
+        let log_path = scratch.path().join("probe.log");
+        let test_exe = std::env::current_exe().expect("test exe");
+        let mut child = Command::new(&test_exe)
+            .arg(PROBE)
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env("KRYPROBE_LAUNCH_SLEEP_EINTR_CHILD", "1")
+            .env("KRYPROBE_LAUNCH_SLEEP_EINTR_LOG", &log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("probe child spawns");
+        let status = wait_bounded(&mut child, Duration::from_secs(30));
+        let probe_log =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|_| "(no probe log)".to_string());
+        let Some(status) = status else {
+            panic!("interrupted-sleep probe child timed out (log: {probe_log})");
+        };
+        assert!(
+            status.success(),
+            "interrupted-sleep cleanup stays bounded (child {status}, probe: {probe_log})"
+        );
+    }
+
+    /// C6-review oracle (Blocker 2a): denied signals on a live
+    /// owned child must NOT report `Complete`. The probe re-execs:
+    /// the child spawns a live `sleep 8` leader (proven ownership via
+    /// the REAL probe) plus an unrelated canary, installs a seccomp
+    /// filter faulting `kill` with `SIGKILL` to `EPERM` in the CHILD
+    /// ONLY (`SIGTERM` stays allowed for hygiene), then runs the REAL
+    /// `kill_and_reap` with a 500 ms deadline. (RED pre-fix: the
+    /// blocking wait follows the child's 8 s lifetime, then falsely
+    /// reports `Complete`.)
+    #[test]
+    fn owned_cleanup_denied_signals_report_incomplete() {
+        if std::env::var("KRYPROBE_LAUNCH_KILL_EPERM_CHILD").is_ok() {
+            denied_signals_child();
+            return;
+        }
+        denied_signals_parent();
+    }
+
+    /// Denied-signals child: live leader + canary, faulted `SIGKILL`,
+    /// bounded `Incomplete` + both survive.
+    fn denied_signals_child() {
+        let log = std::env::var("KRYPROBE_LAUNCH_KILL_EPERM_LOG").expect("log path");
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["8".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("spawns");
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader is live (stalled) at cleanup time"
+        );
+        // Unrelated-process sentinel: raw `sleep` in the test child's
+        // group (NOT the leader's group — `killpg` must never reach
+        // it even when signals succeed).
+        let mut canary = Command::new(&leader_bin.path)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("canary spawns");
+        assert_eq!(
+            canary.try_wait().expect("try_wait"),
+            None,
+            "canary is live at cleanup time"
+        );
+        // Proven ownership via the REAL probe (live child).
+        assert!(
+            child_still_waitable(&leader, generous_deadline()),
+            "live leader probes owned (no vacuous unowned green)"
+        );
+        // Fault `kill` with `SIGKILL` to `EPERM` in THIS child only
+        // (`killpg` uses the `kill` syscall, so both fault; `SIGTERM`
+        // stays allowed for hygiene). BPF indexes: 0:LD arch, 1:JEQ
+        // arch, 2:LD nr, 3:JEQ kill, 4:LD sig, 5:JEQ SIGKILL,
+        // 6:ALLOW, 7:ERRNO|EPERM. Signal at `args[1]` low (offset 24).
+        let prog = unsafe {
+            [
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    SECCOMP_AUDIT_ARCH_X86_64,
+                    0,
+                    4,
+                ),
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    libc::SYS_kill as u32,
+                    0,
+                    2,
+                ),
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 24),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    libc::SIGKILL as u32,
+                    1,
+                    0,
+                ),
+                libc::BPF_STMT(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    libc::SECCOMP_RET_ALLOW,
+                ),
+                libc::BPF_STMT(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+                ),
+            ]
+        };
+        install_seccomp_filter(&prog);
+        // Setup proof that the fault bites: `SIGKILL` denied,
+        // `SIGTERM` allowed (raw syscalls, no `Child::kill` past the
+        // filter — it sends the faulted `SIGKILL`).
+        let denied = unsafe { libc::kill(leader.id() as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(denied, -1, "SIGKILL faults under the filter");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM),
+            "the fault errno is EPERM (no vacuous green)"
+        );
+        let start = Instant::now();
+        let outcome = kill_and_reap(&mut leader, start + Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        // Log before asserting (the RED tree fails below — the parent
+        // quotes this log as the timing + false-`Complete` proof).
+        std::fs::write(&log, format!("{outcome:?} elapsed={elapsed:?}")).expect("probe log");
+        assert_eq!(
+            outcome,
+            CleanupOutcome::Incomplete,
+            "denied-signal cleanup reports incomplete (never a false Complete)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "denied-signal cleanup honors the attempt bound (blocked {elapsed:?})"
+        );
+        assert_eq!(
+            leader.try_wait().expect("try_wait"),
+            None,
+            "leader survives denied-signal cleanup (kills denied)"
+        );
+        assert_eq!(
+            canary.try_wait().expect("try_wait"),
+            None,
+            "unrelated canary survives denied-signal cleanup"
+        );
+        // Hygiene via allowed `SIGTERM` (raw — `Child::kill` would
+        // send the faulted `SIGKILL`), then unfiltered waits.
+        unsafe {
+            libc::kill(leader.id() as libc::pid_t, libc::SIGTERM);
+            libc::kill(canary.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let _ = leader.wait();
+        let _ = canary.wait();
+    }
+
+    /// Denied-signals parent: re-exec the probe child, bound the
+    /// wait, quote the log.
+    fn denied_signals_parent() {
+        const PROBE: &str = "owned_cleanup_denied_signals_report_incomplete";
+        let scratch = kryprobe_testkit::TempDir::named("launch-kill-eperm").expect("scratch");
+        let log_path = scratch.path().join("probe.log");
+        let test_exe = std::env::current_exe().expect("test exe");
+        let mut child = Command::new(&test_exe)
+            .arg(PROBE)
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env("KRYPROBE_LAUNCH_KILL_EPERM_CHILD", "1")
+            .env("KRYPROBE_LAUNCH_KILL_EPERM_LOG", &log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("probe child spawns");
+        let status = wait_bounded(&mut child, Duration::from_secs(30));
+        let probe_log =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|_| "(no probe log)".to_string());
+        let Some(status) = status else {
+            panic!("denied-signals probe child timed out (log: {probe_log})");
+        };
+        assert!(
+            status.success(),
+            "denied-signal cleanup reports incomplete (child {status}, probe: {probe_log})"
+        );
+    }
+
+    /// C6-review oracle (Blocker 2b): a sustained `EINTR` on the
+    /// Done-path reap must not hang past the attempt deadline. The
+    /// probe re-execs: the child spawns a `sleep` leader, kills it to
+    /// a zombie (proven via `waitid`, which stays allowed), installs
+    /// a seccomp filter faulting `wait4` to `EINTR` in the CHILD ONLY,
+    /// then runs the REAL `drain_bounded` (EOF pipes, no stdin, 500
+    /// ms deadline). (RED pre-fix: `Child::wait` retries the faulted
+    /// `wait4` forever — the child hangs until the parent's 30 s
+    /// bound kills it.) Liveness past the filter avoids `wait4`
+    /// (`try_wait` faults): the zombie is proven via `waitid`, the
+    /// canary via `kill(pid, 0)`.
+    #[test]
+    fn done_reap_interrupted_wait_stays_bounded() {
+        if std::env::var("KRYPROBE_LAUNCH_WAIT_EINTR_CHILD").is_ok() {
+            interrupted_wait_child();
+            return;
+        }
+        interrupted_wait_parent();
+    }
+
+    /// Interrupted-wait child: zombie leader + canary, faulted
+    /// `wait4`, bounded `CleanupIncomplete` (never `Done`, never a
+    /// hang).
+    fn interrupted_wait_child() {
+        let log = std::env::var("KRYPROBE_LAUNCH_WAIT_EINTR_LOG").expect("log path");
+        let leader_bin = pinnable_sleep();
+        let image = leader_bin.reopen().expect("sleep reopens");
+        let mut leader = spawn_confined(
+            &image,
+            &leader_bin.path,
+            &["30".to_string()],
+            Stdio::null(),
+            None,
+        )
+        .expect("spawns");
+        // Unrelated-process sentinel (raw `sleep`, test-child group).
+        let mut canary = Command::new(&leader_bin.path)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("canary spawns");
+        assert_eq!(
+            canary.try_wait().expect("try_wait"),
+            None,
+            "canary is live at drain time"
+        );
+        // Zombie setup (pre-filter): kill, then prove dead-but-
+        // unreaped via the `waitid` peek (which never reaps).
+        leader.kill().expect("leader dies");
+        let death_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if peek_child_exited(&leader).expect("peek") {
+                break;
+            }
+            assert!(
+                Instant::now() < death_deadline,
+                "leader dies promptly (no vacuous live green)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut stdout = leader.stdout.take().expect("piped stdout");
+        let mut stderr = leader.stderr.take().expect("piped stderr");
+        // Fault `wait4` (61) to `EINTR` in THIS child only (`waitid`
+        // stays allowed for the peek/probe; kills stay allowed).
+        // BPF indexes: 0:LD arch, 1:JEQ arch, 2:LD nr, 3:JEQ wait4,
+        // 4:ALLOW, 5:ERRNO|EINTR.
+        let prog = unsafe {
+            [
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    SECCOMP_AUDIT_ARCH_X86_64,
+                    0,
+                    2,
+                ),
+                libc::BPF_STMT((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0),
+                libc::BPF_JUMP(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    libc::SYS_wait4 as u32,
+                    1,
+                    0,
+                ),
+                libc::BPF_STMT(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    libc::SECCOMP_RET_ALLOW,
+                ),
+                libc::BPF_STMT(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    libc::SECCOMP_RET_ERRNO | (libc::EINTR as u32),
+                ),
+            ]
+        };
+        install_seccomp_filter(&prog);
+        // Setup proof that the fault bites (`try_wait` uses `wait4`)
+        // while the `waitid` peek still works.
+        assert_eq!(
+            leader
+                .try_wait()
+                .expect_err("try_wait faults under the filter")
+                .raw_os_error(),
+            Some(libc::EINTR),
+            "the fault errno is EINTR (no vacuous green)"
+        );
+        assert!(
+            peek_child_exited(&leader).expect("waitid peek stays allowed"),
+            "zombie still visible via waitid past the filter"
+        );
+        // No `wait4` past this point except through the production
+        // drain below (it bounds the fault); liveness uses `waitid`
+        // and `kill(pid, 0)`.
+        let start = Instant::now();
+        let outcome = drain_bounded(
+            &mut leader,
+            &mut stdout,
+            &mut stderr,
+            None,
+            4096,
+            4096,
+            start + Duration::from_millis(500),
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(outcome, DrainOutcome::CleanupIncomplete),
+            "interrupted Done reap refuses boundedly (got {outcome:?}, never Done)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "interrupted Done reap honors the attempt bound (blocked {elapsed:?})"
+        );
+        // The zombie was never reaped (waits faulted) — still visible
+        // via `waitid`; the canary never signaled (drain signals
+        // nothing on this path — still alive via `kill(pid, 0)`).
+        assert!(
+            peek_child_exited(&leader).expect("peek"),
+            "unreaped zombie still visible via waitid"
+        );
+        // SAFETY: `kill(pid, 0)` probes existence without signaling.
+        assert_eq!(
+            unsafe { libc::kill(canary.id() as libc::pid_t, 0) },
+            0,
+            "unrelated canary survives interrupted Done reap"
+        );
+        std::fs::write(&log, format!("cleanup-incomplete elapsed={elapsed:?}")).expect("probe log");
+        // Hygiene without `wait4` (faulted): `SIGTERM` the canary
+        // (allowed) and exit — both zombies orphan to init, which
+        // reaps them. No live strays (leader already dead, canary
+        // dying); no waits attempted.
+        unsafe {
+            libc::kill(canary.id() as libc::pid_t, libc::SIGTERM);
+        }
+        std::mem::forget(canary);
+        std::mem::forget(leader);
+    }
+
+    /// Interrupted-wait parent: re-exec the probe child, bound the
+    /// wait, quote the log.
+    fn interrupted_wait_parent() {
+        const PROBE: &str = "done_reap_interrupted_wait_stays_bounded";
+        let scratch = kryprobe_testkit::TempDir::named("launch-wait-eintr").expect("scratch");
+        let log_path = scratch.path().join("probe.log");
+        let test_exe = std::env::current_exe().expect("test exe");
+        let mut child = Command::new(&test_exe)
+            .arg(PROBE)
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env("KRYPROBE_LAUNCH_WAIT_EINTR_CHILD", "1")
+            .env("KRYPROBE_LAUNCH_WAIT_EINTR_LOG", &log_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("probe child spawns");
+        let status = wait_bounded(&mut child, Duration::from_secs(30));
+        let probe_log =
+            std::fs::read_to_string(&log_path).unwrap_or_else(|_| "(no probe log)".to_string());
+        let Some(status) = status else {
+            panic!("interrupted-wait probe child timed out (log: {probe_log})");
+        };
+        assert!(
+            status.success(),
+            "interrupted Done reap stays bounded (child {status}, probe: {probe_log})"
+        );
+    }
+
+    /// A `Read` that is always interrupted (sustained `EINTR`):
+    /// the pipe-drain oracle's fault source (no syscalls — the
+    /// interruption path is pure logic past the `read` return).
+    struct AlwaysInterruptedRead;
+
+    impl std::io::Read for AlwaysInterruptedRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::EINTR))
+        }
+    }
+
+    /// C6-review oracle (Blocker 3, reads): a sustained interruption
+    /// on a pipe read must yield to the outer loop instead of
+    /// trapping past the deadline. The faulted drain runs on a
+    /// thread with a 3 s join bound: the fixed tree returns `Open`
+    /// immediately (the outer loop re-polls after its deadline
+    /// check); the RED tree spins inline forever (the join times
+    /// out and the spinner dies with the test binary — same shape as
+    /// the J sustained-interruptions RED).
+    #[test]
+    fn interrupted_pipe_read_yields_to_deadline() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            let mut pipe = AlwaysInterruptedRead;
+            let mut acc = Vec::new();
+            let mut chunk = [0u8; 64];
+            let open = matches!(
+                drain_pipe(&mut pipe, &mut acc, &mut chunk, 4096),
+                PipeOutcome::Open
+            );
+            let _ = done_tx.send((open, acc.len()));
+        });
+        let (open, acc_len) = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("interrupted read yields instead of trapping past the bound");
+        let elapsed = start.elapsed();
+        assert!(open, "interrupted read yields Open to the outer loop");
+        assert_eq!(acc_len, 0, "no bytes accumulate across interruptions");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "interrupted read yields promptly (took {elapsed:?})"
+        );
+        // Positive control (no overcorrection): a normal read still
+        // drains — data, then would-block.
+        struct DataThenBlocked {
+            sent: bool,
+        }
+        impl std::io::Read for DataThenBlocked {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    buf[..2].copy_from_slice(b"ok");
+                    return Ok(2);
+                }
+                Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+            }
+        }
+        // `EAGAIN` maps to `WouldBlock`, which the drain treats as
+        // "open, more may come".
+        let mut pipe = DataThenBlocked { sent: false };
+        let mut acc = Vec::new();
+        let mut chunk = [0u8; 64];
+        assert!(
+            matches!(
+                drain_pipe(&mut pipe, &mut acc, &mut chunk, 4096),
+                PipeOutcome::Open
+            ),
+            "normal reads still drain to Open"
+        );
+        assert_eq!(acc, b"ok", "drained bytes preserved");
+    }
+
+    /// A `Write` that is always interrupted (sustained `EINTR`).
+    struct AlwaysInterruptedWrite;
+
+    impl std::io::Write for AlwaysInterruptedWrite {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::EINTR))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// C6-review oracle (Blocker 3, writes): a sustained interruption
+    /// on a stdin write must yield to the outer loop instead of
+    /// trapping past the deadline. Same thread + join-bound shape as
+    /// the read oracle above.
+    #[test]
+    fn interrupted_stdin_write_yields_to_deadline() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            let mut pipe = AlwaysInterruptedWrite;
+            let bytes = vec![7u8; 128];
+            let mut written = 0usize;
+            let pending = matches!(
+                write_stdin_chunk(&mut pipe, &bytes, &mut written),
+                StdinOutcome::Pending
+            );
+            let _ = done_tx.send((pending, written));
+        });
+        let (pending, written) = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("interrupted write yields instead of trapping past the bound");
+        let elapsed = start.elapsed();
+        assert!(
+            pending,
+            "interrupted write yields Pending to the outer loop"
+        );
+        assert_eq!(written, 0, "no bytes advance across interruptions");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "interrupted write yields promptly (took {elapsed:?})"
+        );
+        // Positive control (no overcorrection): a normal write still
+        // completes.
+        struct AcceptAll;
+        impl std::io::Write for AcceptAll {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut pipe = AcceptAll;
+        let bytes = vec![7u8; 128];
+        let mut written = 0usize;
+        assert!(
+            matches!(
+                write_stdin_chunk(&mut pipe, &bytes, &mut written),
+                StdinOutcome::Done
+            ),
+            "normal writes still complete"
+        );
+        assert_eq!(written, 128, "all bytes advance");
     }
 
     #[test]
