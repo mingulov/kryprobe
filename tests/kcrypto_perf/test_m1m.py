@@ -1118,6 +1118,87 @@ class LabJourneyTests(unittest.TestCase):
                                         "still present"):
                 lab._wait_container_gone("x-stuck", timeout_s=0.2)
 
+    def _fold_doc(self):
+        # Guest-C dictionary-form shape (two cgroups, shared
+        # natives n0/n1 + one alloc n2 on the second cgroup).
+        return {
+            "dictionary": [
+                {"dict_id": "n0", "op": 4},
+                {"dict_id": "n1", "op": 3},
+                {"dict_id": "n2", "op": 1}],
+            "contexts": [
+                {"cgroup_id": "118", "calls": "416946",
+                 "native_ref": "n0"},
+                {"cgroup_id": "118", "calls": "416556",
+                 "native_ref": "n1"},
+                {"cgroup_id": "292", "calls": "519128",
+                 "native_ref": "n0"},
+                {"cgroup_id": "292", "calls": "519128",
+                 "native_ref": "n1"},
+                {"cgroup_id": "292", "calls": "1",
+                 "native_ref": "n2"}]}
+
+    def test_fold_dictionary_form(self):
+        lab = self._docker_lab()
+        path = Path(tempfile.mkdtemp()) / "fold.json"
+        path.write_text(json.dumps(self._fold_doc()))
+        folded = lab.fold_cgroup_calls(path)
+        self.assertEqual(folded["118"],
+                         {"enc": 416556, "dec": 416946,
+                          "alloc": 0, "calls": 833502})
+        self.assertEqual(folded["292"],
+                         {"enc": 519128, "dec": 519128,
+                          "alloc": 1, "calls": 1038257})
+
+    def test_fold_inline_native(self):
+        lab = self._docker_lab()
+        path = Path(tempfile.mkdtemp()) / "fold.json"
+        path.write_text(json.dumps({
+            "dictionary": [],
+            "contexts": [
+                {"cgroup_id": "7", "calls": "10",
+                 "native": {"op": 3}},
+                {"cgroup_id": "7", "calls": "10",
+                 "native": {"op": 4}},
+                {"cgroup_id": "7", "calls": "2",
+                 "native": {"op": 1}}]}))
+        self.assertEqual(lab.fold_cgroup_calls(path)["7"],
+                         {"enc": 10, "dec": 10, "alloc": 2,
+                          "calls": 22})
+
+    def test_fold_unknown_ref_counts_calls(self):
+        lab = self._docker_lab()
+        path = Path(tempfile.mkdtemp()) / "fold.json"
+        path.write_text(json.dumps({
+            "dictionary": [{"dict_id": "n0", "op": 3}],
+            "contexts": [
+                {"cgroup_id": "9", "calls": "5",
+                 "native_ref": "nX"}]}))
+        self.assertEqual(lab.fold_cgroup_calls(path)["9"],
+                         {"enc": 0, "dec": 0, "alloc": 0,
+                          "calls": 5})
+
+    def test_wait_capture_tick(self):
+        import types
+
+        lab = self._docker_lab()
+        tmp = Path(tempfile.mkdtemp())
+        log = tmp / "capture.stderr.log"
+        log.write_text('{"audit":"attach"}\n'
+                       "kryprobe: progress tick=1 rows=4 "
+                       "drops=0\n")
+        alive = types.SimpleNamespace(poll=lambda: None)
+        lab._wait_capture_tick(log, alive, timeout_s=5.0)
+        dead = types.SimpleNamespace(poll=lambda: 3)
+        with self.assertRaisesRegex(lab.LabError,
+                                    "died before first tick"):
+            lab._wait_capture_tick(log, dead, timeout_s=5.0)
+        quiet = tmp / "quiet.log"
+        quiet.write_text("kryprobe: startup\n")
+        with self.assertRaisesRegex(lab.LabError,
+                                    "no progress tick"):
+            lab._wait_capture_tick(quiet, alive, timeout_s=0.2)
+
     def test_lab_dry_run_discloses_relaxed_confinement(self):
         for journey in ("two-workloads", "termination",
                         "unavailable-metadata", "tls"):

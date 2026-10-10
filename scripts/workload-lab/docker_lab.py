@@ -111,6 +111,31 @@ def _wait_tcp_listen(host: str, port: int, timeout_s: float,
     raise LabError(f"TLS server not listening on {host}:{port} "
                    f"after {timeout_s:.0f}s")
 
+
+def _wait_capture_tick(stderr_path: Path, capture,
+                       timeout_s: float = 60.0) -> None:
+    """Wait for the capture's first progress tick (two-workloads
+    attach guard: ticks flow only post-attach — the progress closure
+    is installed after production.open() in live.rs — so the first
+    tick proves the sensor is observing before subject traffic
+    starts. Without it the head subject loses its first ~2 s to the
+    attach window and exact reconciliation fails. Fails if the
+    capture dies first or no tick arrives in budget."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if capture.poll() is not None:
+            raise LabError("capture died before first tick "
+                           f"(rc={capture.poll()})")
+        try:
+            text = Path(stderr_path).read_text()
+        except OSError:
+            text = ""
+        if "progress tick=" in text:
+            return
+        time.sleep(0.5)
+    raise LabError(f"capture emitted no progress tick in "
+                   f"{timeout_s:.0f}s")
+
 DRY_RUN_STEPS = {
     "setup": [
         "preflight: docker, installed kryprobe + caps, AF_ALG, "
@@ -121,7 +146,8 @@ DRY_RUN_STEPS = {
     "two-workloads": [
         "docker_two_workloads_stay_distinct: two containers, "
         "identical comm + cbc(aes), distinct cgroups",
-        "kryprobe workload-json capture over both fixture runs",
+        "kryprobe workload-json capture over both fixture runs "
+        "(first progress tick proves attach before subjects run)",
         "fixture runs carry relaxed seccomp+apparmor (F3: test "
         "workloads; kryprobe observes from outside)",
         "oracle: per-cgroup enc/dec == fixture self-counted ops",
@@ -314,12 +340,26 @@ KOP_ALLOC, KOP_ENC, KOP_DEC = 1, 3, 4
 def fold_cgroup_calls(report_path: Path) -> dict:
     """Fold workload-json contexts by cgroup_id into {cgroup:
     {enc, dec, alloc, calls}} by native op numerics (frozen ABI:
-    ALLOC=1, ENC=3, DEC=4)."""
+    ALLOC=1, ENC=3, DEC=4). Live v2 reports use dictionary form
+    (rows carry native_ref; ops live in the dictionary), so refs
+    resolve first; inline native objects are accepted too. An
+    unresolvable op counts its calls but classifies nothing
+    (fail-open on counts, closed on classification). Pure —
+    host-tested."""
     doc = json.loads(Path(report_path).read_text())
+    by_ref: dict = {}
+    dictionary = doc.get("dictionary")
+    if isinstance(dictionary, list):
+        for entry in dictionary:
+            if isinstance(entry, dict) and \
+                    entry.get("dict_id") is not None:
+                by_ref[entry["dict_id"]] = entry
     folded: dict = {}
     for row in doc.get("contexts", []):
         cgroup = row.get("cgroup_id")
         native = row.get("native") or {}
+        if not native and row.get("native_ref") is not None:
+            native = by_ref.get(row["native_ref"]) or {}
         calls = int(row.get("calls", "0"))
         slot = folded.setdefault(
             cgroup, {"enc": 0, "dec": 0, "alloc": 0, "calls": 0})
@@ -411,38 +451,55 @@ def journey_two_workloads(args) -> int:
     algorithm, distinct cgroups, reconciled independently."""
     name_a, name_b = f"{args.tag}-a", f"{args.tag}-b"
     report = args.out / "two-workloads.report.workload-json"
-    capture = subprocess.Popen(
-        ["kryprobe", "report", "--system", "--duration", "60",
-         "--format", "workload-json", "--out", str(report)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    # F3: record fixture errors BEFORE the capture join — the old
-    # fixed 60+1s join measured from failure time could time out
-    # over a fast fixture failure (round-1: 785 ms life) and mask it
-    # as "capture did not exit". The join below only reaps (kept
-    # generous from join time: a healthy 60 s capture runs ~64 s
-    # wall with startup/drain overrun — DW2 — so a remaining-budget
-    # join would kill it); the fixture error (the cause) raises
-    # first with the join noted.
-    fixture_error = None
+    capture_err = args.out / "two-workloads.capture.stderr.log"
+    err_file = open(capture_err, "w")
     try:
-        sum_a = _run_fixture(args.tag, name_a, "a.csv")
-        sum_b = _run_fixture(args.tag, name_b, "b.csv")
-    except LabError as err:
-        fixture_error = err
-    join_note = "joined"
-    try:
-        _, _ = capture.communicate(
-            timeout=60 + lab.OWNED_REAP_GRACE_S)
-    except subprocess.TimeoutExpired:
-        capture.kill()
+        capture = subprocess.Popen(
+            ["kryprobe", "report", "--system", "--duration", "60",
+             "--format", "workload-json", "--out", str(report)],
+            stdout=subprocess.PIPE, stderr=err_file, text=True)
         try:
-            capture.wait(timeout=lab.OWNED_REAP_GRACE_S + 5)
+            _wait_capture_tick(capture_err, capture)
+        except LabError:
+            if capture.poll() is None:
+                capture.kill()
+                try:
+                    capture.wait(
+                        timeout=lab.OWNED_REAP_GRACE_S + 5)
+                except subprocess.TimeoutExpired:
+                    pass
+            raise
+        # F3: record fixture errors BEFORE the capture join — the
+        # old fixed 60+1s join measured from failure time could time
+        # out over a fast fixture failure (round-1: 785 ms life) and
+        # mask it as "capture did not exit". The join below only
+        # reaps (kept generous from join time: a healthy 60 s
+        # capture runs ~64 s wall with startup/drain overrun — DW2
+        # — so a remaining-budget join would kill it); the fixture
+        # error (the cause) raises first with the join noted.
+        fixture_error = None
+        try:
+            sum_a = _run_fixture(args.tag, name_a, "a.csv")
+            sum_b = _run_fixture(args.tag, name_b, "b.csv")
+        except LabError as err:
+            fixture_error = err
+        join_note = "joined"
+        try:
+            _, _ = capture.communicate(
+                timeout=60 + lab.OWNED_REAP_GRACE_S)
         except subprocess.TimeoutExpired:
-            join_note = "join timed out; capture killed, reap unverified"
-        else:
-            join_note = "join timed out; capture reaped"
-    if fixture_error is not None:
-        raise LabError(f"{fixture_error} (capture {join_note})")
+            capture.kill()
+            try:
+                capture.wait(timeout=lab.OWNED_REAP_GRACE_S + 5)
+            except subprocess.TimeoutExpired:
+                join_note = ("join timed out; capture killed, reap "
+                             "unverified")
+            else:
+                join_note = "join timed out; capture reaped"
+        if fixture_error is not None:
+            raise LabError(f"{fixture_error} (capture {join_note})")
+    finally:
+        err_file.close()
     if capture.returncode != 3:
         raise LabError("capture rc="
                        f"{capture.returncode}, want 3 (named gaps)")
