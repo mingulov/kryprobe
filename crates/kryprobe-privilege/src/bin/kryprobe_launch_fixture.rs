@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Launch-boundary test fixture (NEVER shipped): a fake workload
+//! helper driven by a JSON sidecar, speaking the real `--attest` and
+//! serve protocols through real confinement.
+//!
+//! Why a binary: fd-exec with `CLOEXEC` (C1 A1) cannot run scripts —
+//! the interpreter re-opens `/proc/self/fd/N` after `exec`, when the
+//! fd is already gone — while any surviving fd breaks the frozen
+//! stdio-only attestation the real helper enforces on itself. Scripts
+//! are therefore unusable as fixtures; this ELF fixture is.
+//!
+//! Sidecar: `<argv[0]-stem>.fixture.json` next to `argv[0]` (the
+//! launcher sets `argv[0]` to the helper path, so parallel tests
+//! never share state). All fields optional unless noted:
+//!
+//! - `attest_garbage`: print this line instead of an attestation.
+//! - `attest_exit`: exit code for the attest path (default 0;
+//!   without garbage the exit is silent).
+//! - `forge_uid`/`forge_euid`: replace ids in honest attestations.
+//! - `refuse`: serve prints `{"error":NAME}` on stderr, exits 1.
+//! - `crash`: serve SIGKILLs itself (after the count below).
+//! - `stall_secs`: serve sleeps this long, then exits 0.
+//! - `canned`: serve file to substitute + emit (REQUIRED unless
+//!   refuse/crash/stall is set).
+//! - `session_placeholder`: substituted with the request session
+//!   (default: 32 zeros).
+//! - `argv_log`: append `argv` one-per-line here (serve path).
+//! - `count`: append one `x` line here per serve invocation.
+//!
+//! Relative paths resolve against the sidecar directory. A missing
+//! or unparsable sidecar exits 3 loudly (tests always write one).
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// Sidecar defaults: 32-zero session placeholder.
+const PLACEHOLDER: &str = "00000000000000000000000000000000";
+
+/// Collected boundary, same JSON shape as the real helper.
+struct Attestation {
+    uid: u32,
+    euid: u32,
+    gid: u32,
+    egid: u32,
+    caps_zero: bool,
+    no_new_privs: bool,
+    fds: Vec<u32>,
+}
+
+/// Read one `/proc/self/status` field line (`Uid:`/`Gid:`/`CapXxx:`).
+fn status_field(status: &str, key: &str) -> Option<String> {
+    status.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        (name == key).then(|| rest.trim().to_string())
+    })
+}
+
+/// Honest boundary collect (mirrors the real helper: kernel ids,
+/// all-zero caps check, `no_new_privs`, fd set minus the transient
+/// highest lister fd).
+fn collect() -> Option<Attestation> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let ids: Vec<u32> = status_field(&status, "Uid")?
+        .split_whitespace()
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    let gids: Vec<u32> = status_field(&status, "Gid")?
+        .split_whitespace()
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    let zero = |key: &str| status_field(&status, key).as_deref() == Some("0000000000000000");
+    let caps_zero = zero("CapEff") && zero("CapPrm") && zero("CapInh") && zero("CapAmb");
+    let no_new_privs = status_field(&status, "NoNewPrivs").as_deref() == Some("1");
+    let mut fds: Vec<u32> = std::fs::read_dir("/proc/self/fd")
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|name| name.parse().ok())
+        .collect();
+    fds.sort_unstable();
+    fds.pop()?;
+    Some(Attestation {
+        uid: *ids.first()?,
+        euid: *ids.get(1)?,
+        gid: *gids.first()?,
+        egid: *gids.get(1)?,
+        caps_zero,
+        no_new_privs,
+        fds,
+    })
+}
+
+/// Render one `{"attestation":{...}}` line (frozen shape).
+fn attestation_line(attestation: &Attestation) -> String {
+    let caps = if attestation.caps_zero { "0" } else { "1" };
+    let fds = attestation
+        .fds
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"attestation\":{{\"uid\":{},\"euid\":{},\"gid\":{},\"egid\":{},\
+         \"caps\":{{\"eff\":\"{caps}\",\"prm\":\"{caps}\",\"inh\":\"{caps}\",\"amb\":\"{caps}\"}},\
+         \"no_new_privs\":{},\"fds\":[{fds}]}}}}",
+        attestation.uid,
+        attestation.euid,
+        attestation.gid,
+        attestation.egid,
+        attestation.no_new_privs,
+    )
+}
+
+/// Resolve a sidecar path (relative joins the sidecar directory).
+fn resolve(dir: &Path, value: &serde_json::Value) -> Option<PathBuf> {
+    let text = value.as_str()?;
+    let path = PathBuf::from(text);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    })
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    let exe = PathBuf::from(argv.first().map(String::as_str).unwrap_or("fixture"));
+    let dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let stem = exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("fixture");
+    let sidecar_path = dir.join(format!("{stem}.fixture.json"));
+    let sidecar_text = std::fs::read_to_string(&sidecar_path).unwrap_or_else(|_| {
+        eprintln!("launch-fixture: missing sidecar {}", sidecar_path.display());
+        std::process::exit(3);
+    });
+    let sidecar: serde_json::Value = serde_json::from_str(&sidecar_text).unwrap_or_else(|_| {
+        eprintln!(
+            "launch-fixture: unparsable sidecar {}",
+            sidecar_path.display()
+        );
+        std::process::exit(3);
+    });
+    let code = if argv.iter().any(|arg| arg == "--attest") {
+        run_attest(&sidecar)
+    } else {
+        run_serve(&dir, &argv, &sidecar)
+    };
+    std::process::exit(code);
+}
+
+/// Attest path: garbage line, silent exit, or the honest boundary.
+fn run_attest(sidecar: &serde_json::Value) -> i32 {
+    let exit = sidecar
+        .get("attest_exit")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0) as i32;
+    if let Some(garbage) = sidecar.get("attest_garbage").and_then(|v| v.as_str()) {
+        println!("{garbage}");
+        return exit;
+    }
+    if sidecar.get("attest_exit").is_some() {
+        return exit;
+    }
+    let mut attestation = collect().unwrap_or_else(|| std::process::exit(3));
+    if let Some(uid) = sidecar.get("forge_uid").and_then(|v| v.as_u64()) {
+        attestation.uid = uid as u32;
+    }
+    if let Some(euid) = sidecar.get("forge_euid").and_then(|v| v.as_u64()) {
+        attestation.euid = euid as u32;
+    }
+    println!("{}", attestation_line(&attestation));
+    exit
+}
+
+/// Serve path: stdin request in; refusal/crash/stall or the canned
+/// response (session-substituted) plus stderr attestation out.
+fn run_serve(dir: &Path, argv: &[String], sidecar: &serde_json::Value) -> i32 {
+    let mut request = String::new();
+    std::io::stdin()
+        .read_to_string(&mut request)
+        .unwrap_or_else(|_| std::process::exit(3));
+    if let Some(path) = sidecar.get("argv_log").and_then(|v| resolve(dir, v)) {
+        let mut logged = String::new();
+        for arg in argv {
+            logged.push_str(arg);
+            logged.push('\n');
+        }
+        std::fs::write(&path, logged).unwrap_or_else(|_| std::process::exit(3));
+    }
+    if let Some(path) = sidecar.get("count").and_then(|v| resolve(dir, v)) {
+        use std::io::Write;
+        let mut count = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|_| std::process::exit(3));
+        count
+            .write_all(b"x\n")
+            .unwrap_or_else(|_| std::process::exit(3));
+    }
+    if sidecar
+        .get("crash")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        // SAFETY: SIGKILL to self only (never returns).
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        std::process::abort();
+    }
+    if let Some(secs) = sidecar.get("stall_secs").and_then(|v| v.as_u64()) {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return 0;
+    }
+    if let Some(name) = sidecar.get("refuse").and_then(|v| v.as_str()) {
+        eprintln!("{{\"error\":\"{name}\"}}");
+        return 1;
+    }
+    let canned_path = sidecar.get("canned").and_then(|v| resolve(dir, v));
+    let Some(canned_path) = canned_path else {
+        eprintln!("launch-fixture: serve needs canned, refuse, crash, or stall_secs");
+        return 3;
+    };
+    let session = serde_json::from_str::<serde_json::Value>(&request)
+        .ok()
+        .and_then(|parsed| parsed.get("session_id")?.as_str().map(str::to_string));
+    let Some(session) = session else {
+        eprintln!("launch-fixture: request carries no session_id");
+        return 3;
+    };
+    let placeholder = sidecar
+        .get("session_placeholder")
+        .and_then(|v| v.as_str())
+        .unwrap_or(PLACEHOLDER);
+    let canned = std::fs::read_to_string(&canned_path).unwrap_or_else(|_| std::process::exit(3));
+    let mut attestation = collect().unwrap_or_else(|| std::process::exit(3));
+    if let Some(uid) = sidecar.get("forge_uid").and_then(|v| v.as_u64()) {
+        attestation.uid = uid as u32;
+    }
+    if let Some(euid) = sidecar.get("forge_euid").and_then(|v| v.as_u64()) {
+        attestation.euid = euid as u32;
+    }
+    eprintln!("{}", attestation_line(&attestation));
+    print!("{}", canned.replace(placeholder, &session));
+    eprintln!("{{\"helper_counters\":{{}}}}");
+    0
+}

@@ -564,6 +564,7 @@ pub(crate) mod fixtures {
     ) -> kryprobe_privilege::workload_launch::WorkloadPreflight {
         kryprobe_privilege::workload_launch::WorkloadPreflight {
             helper: None,
+            helper_identity: None,
             principal: Some(kryprobe_privilege::workload_launch::Principal {
                 uid: 1000,
                 euid: 1000,

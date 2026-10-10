@@ -29,7 +29,7 @@ use kryprobe_core::workload::{
     WorkloadIdentity,
 };
 use kryprobe_privilege::kcrypto_backend::CtxSnapshot;
-use kryprobe_privilege::workload_launch::serve_snapshot;
+use kryprobe_privilege::workload_launch::{PinnedHelper, serve_pinned_snapshot};
 use kryprobe_report::workload::{
     AssemblyInput, CoverageLevel, GroupBy, MetadataAvailability, NativeIdentity, ReportCoverage,
     ReportRowInput, WorkloadBuildError, WorkloadReport, WorkloadSelector as ReportSelector,
@@ -558,6 +558,16 @@ pub fn finish_workload_report(
     if launchable {
         let preflight = preflight.expect("launchable preflight");
         let helper = preflight.helper.as_ref().expect("launchable helper");
+        let identity = preflight
+            .helper_identity
+            .as_ref()
+            .expect("launchable identity");
+        // The serve re-verifies the preflight pin and fd-execs the
+        // same image (C1 A1): a post-preflight replacement refuses.
+        let pinned = PinnedHelper {
+            path: helper.clone(),
+            identity: *identity,
+        };
         let principal = preflight.principal.as_ref().expect("launchable principal");
         let request = SnapshotRequest {
             session_id: batch.session_id.clone(),
@@ -567,7 +577,7 @@ pub fn finish_workload_report(
                 end_ns: capture.interval_end_ns,
             }),
         };
-        match serve_snapshot(helper, principal, opts.metadata_file.as_deref(), &request) {
+        match serve_pinned_snapshot(&pinned, principal, opts.metadata_file.as_deref(), &request) {
             Ok(served) => {
                 response = Some(served);
                 availability = MetadataAvailability::Available;

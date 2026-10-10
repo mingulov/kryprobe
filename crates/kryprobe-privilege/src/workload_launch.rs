@@ -15,12 +15,25 @@
 //!   capture with typed [`MetadataUnavailable::NoPrincipal`].
 //! - Discovery: the fixed sibling `kryprobe-workload-helper` next to
 //!   the running CLI executable. No `PATH` search, no metadata-selected
-//!   paths, no environment override. Missing/non-regular files refuse;
-//!   a replaced binary fails the `--attest` handshake and refuses.
+//!   paths, no environment override. Missing/non-regular files refuse.
+//! - Identity pinning (C1 A1): preflight opens the helper
+//!   (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`) and pins its file identity
+//!   (device, inode, owner, mode, size). Every later spawn reopens
+//!   the path the same way, requires the SAME identity, and executes
+//!   the verified open file via `/proc/self/fd/N` — the kernel
+//!   resolves the executable from the open file description, never
+//!   from the pathname, so a replacement/rename/symlink-swap after
+//!   preflight cannot reach `exec`: there is no check-to-exec window
+//!   (the check and the exec share one open file description).
+//!   Ownership is pinned, not restricted: the trust anchor is "the
+//!   file verified at preflight" (production installs root-own the
+//!   sibling at 0755 via `install.sh`).
 //! - Confinement (child `pre_exec`, before `exec`): clear ambient caps,
 //!   empty every capability set, set `no_new_privs`, close every fd
-//!   except stdio. Dropping privilege is always permitted, so this
-//!   works identically with or without file caps on the CLI.
+//!   except stdio and the pinned executable fd (which is `CLOEXEC`,
+//!   so it never survives `exec` into the helper — the attested fd
+//!   set stays stdio-only). Dropping privilege is always permitted,
+//!   so this works identically with or without file caps on the CLI.
 //! - Verification: `--attest --require-no-new-privs` first (the helper
 //!   reports its boundary without touching metadata or stdin), then the
 //!   serve run. The launcher checks uid/euid/gid/egid against the pinned
@@ -28,8 +41,9 @@
 //!   before consuming any metadata. The serve response additionally
 //!   binds to its request ([`bind_response_to_request`]).
 //! - Retries: [`MAX_HELPER_RETRIES`] past the initial attempt, on
-//!   transport failures only (stall/crash). Typed helper refusals are
-//!   deterministic and never retried.
+//!   transport failures only (stall/crash). Typed helper refusals —
+//!   including identity-mismatch refusals — are deterministic and
+//!   never retried.
 //!
 //! [`MetadataUnavailable::NoPrincipal`]: kryprobe_core::workload::MetadataUnavailable::NoPrincipal
 //! [`bind_response_to_request`]: kryprobe_core::workload::bind_response_to_request
@@ -41,6 +55,8 @@ use kryprobe_core::workload::{
     decode_response, encode_request,
 };
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -204,14 +220,134 @@ pub fn discover_helper() -> Result<PathBuf, MetadataUnavailable> {
     }
 }
 
+/// Pinned helper file identity, from the preflight open: the
+/// (device, inode) pair plus ownership, full mode (including the
+/// file-type bits), and size. Reopening the path must reproduce
+/// every field or the image was replaced. A rename-swap always
+/// changes the inode; delete-and-recreate with a reused inode still
+/// trips on size/mode/owner unless the replacement is byte-equal in
+/// every pinned field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelperIdentity {
+    /// Device id (`st_dev`).
+    pub dev: u64,
+    /// Inode number (`st_ino`).
+    pub ino: u64,
+    /// Owner uid (`st_uid`, pinned not restricted).
+    pub uid: u32,
+    /// Owner gid (`st_gid`, pinned not restricted).
+    pub gid: u32,
+    /// Full mode (`st_mode`, type bits included).
+    pub mode: u32,
+    /// File size (`st_size`).
+    pub size: u64,
+}
+
+/// A helper path plus its pinned preflight identity. Spawns reopen
+/// the path and require the same identity, then execute the
+/// verified open file itself (fd-exec, never the pathname).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedHelper {
+    /// The verified helper path (also the child's `argv[0]`).
+    pub path: PathBuf,
+    /// The pinned preflight identity it must still match.
+    pub identity: HelperIdentity,
+}
+
+impl PinnedHelper {
+    /// Reopen the path and require the pinned identity: same open
+    /// flags as the pin (`O_RDONLY|O_NOFOLLOW|O_CLOEXEC`), same
+    /// file-type gate, every identity field equal. A mismatch (or a
+    /// symlink, or a non-regular file) refuses
+    /// [`MetadataUnavailable::HelperRefused`] — deterministic, never
+    /// retried. The returned file is the `exec` target itself, so no
+    /// pathname state after this open can affect which image runs.
+    pub fn reopen(&self) -> Result<std::fs::File, MetadataUnavailable> {
+        let (file, identity) =
+            open_verified(&self.path).map_err(|_| MetadataUnavailable::HelperRefused)?;
+        if identity != self.identity {
+            return Err(MetadataUnavailable::HelperRefused);
+        }
+        Ok(file)
+    }
+}
+
+/// Open one verified helper image: `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
+/// (a trailing symlink refuses — the fixed sibling is a regular
+/// file), regular-file gate, `CLOEXEC` pinned explicitly, and the
+/// fd parked at 3+ (never a stdio number). Static outcome: ok or
+/// I/O error (callers map it to
+/// [`MetadataUnavailable::HelperRefused`] without echoing the path).
+fn open_verified(path: &Path) -> std::io::Result<(std::fs::File, HelperIdentity)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    // Defense in depth: `std` already sets `CLOEXEC`; pin it
+    // explicitly so the keep-fd can never survive `exec` into the
+    // helper (the attested fd set stays stdio-only).
+    // SAFETY: `fcntl` `F_SETFD` on a live owned fd.
+    let mut fd = file.as_raw_fd();
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    if fd < 3 {
+        // Only when stdio is closed (never in practice): park the
+        // image fd above stdio so confinement keeps the right fd.
+        // SAFETY: dups a live fd to 3+; the original closes on drop.
+        fd = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fresh owned fd, wrapped exactly once.
+        file = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "helper is not a regular file",
+        ));
+    }
+    Ok((
+        file,
+        HelperIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: meta.mode(),
+            size: meta.len(),
+        },
+    ))
+}
+
+/// Pin the helper image at `path`: verified open plus its identity.
+/// The pin carries no open file (fstat fields only): each spawn
+/// reopens and re-verifies via [`PinnedHelper::reopen`], then
+/// fd-execs the just-verified file — check and exec share one open
+/// file description, so no replacement window exists.
+pub fn pin_helper(path: &Path) -> Result<PinnedHelper, MetadataUnavailable> {
+    let (_, identity) = open_verified(path).map_err(|_| MetadataUnavailable::HelperRefused)?;
+    Ok(PinnedHelper {
+        path: path.to_path_buf(),
+        identity,
+    })
+}
+
 /// Pre-capture helper preflight: either a verified launch target
-/// (helper + pinned principal + kernel scope) or the typed reason
-/// metadata is unavailable. Never fails: enrichment failure is data
-/// (capture proceeds with raw IDs), never a session error.
+/// (helper + pinned identity + pinned principal + kernel scope) or
+/// the typed reason metadata is unavailable. Never fails:
+/// enrichment failure is data (capture proceeds with raw IDs),
+/// never a session error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadPreflight {
     /// Verified helper path (`None` unless every check passed).
     pub helper: Option<PathBuf>,
+    /// Pinned helper identity (`None` unless every check passed).
+    /// The serve re-verifies it and fd-execs the same image.
+    pub helper_identity: Option<HelperIdentity>,
     /// Pinned principal (`None` when even the principal is unusable).
     pub principal: Option<Principal>,
     /// Kernel scope tag for request keys (`None` when unreadable).
@@ -226,6 +362,7 @@ impl WorkloadPreflight {
     pub fn launchable(&self) -> bool {
         self.unavailable.is_none()
             && self.helper.is_some()
+            && self.helper_identity.is_some()
             && self.principal.is_some()
             && self.kernel_scope.is_some()
     }
@@ -241,6 +378,7 @@ impl WorkloadPreflight {
 pub fn preflight_helper(helper_override: Option<&Path>) -> WorkloadPreflight {
     let fail = |unavailable: MetadataUnavailable| WorkloadPreflight {
         helper: None,
+        helper_identity: None,
         principal: None,
         kernel_scope: None,
         unavailable: Some(unavailable),
@@ -282,8 +420,9 @@ pub fn preflight_helper(helper_override: Option<&Path>) -> WorkloadPreflight {
         },
     };
     match attest_helper(&helper, &principal, HELPER_ATTEMPT_TIMEOUT) {
-        Ok(()) => WorkloadPreflight {
+        Ok(identity) => WorkloadPreflight {
             helper: Some(helper),
+            helper_identity: Some(identity),
             principal: Some(principal),
             kernel_scope: Some(kernel_scope),
             unavailable: None,
@@ -416,16 +555,18 @@ pub fn parse_error_line(line: &str) -> Result<MetadataUnavailable, MetadataUnava
 }
 
 /// Confine the child before `exec`: clear ambient caps, empty every
-/// capability set, set `no_new_privs`, close every fd except stdio.
-/// Runs in `pre_exec` (after `fork`, stdio already duped to 0/1/2):
-/// only async-signal-safe calls, no allocation. Any failure aborts
-/// the child before `exec` (the `Err` return blocks the exec).
+/// capability set, set `no_new_privs`, close every fd except stdio
+/// and `keep` (the pinned executable fd — `CLOEXEC`, so it never
+/// survives `exec` into the helper). Runs in `pre_exec` (after
+/// `fork`, stdio already duped to 0/1/2): only async-signal-safe
+/// calls, no allocation. Any failure aborts the child before `exec`
+/// (the `Err` return blocks the exec).
 ///
 /// # Safety
 ///
 /// Called by `std` in the child after `fork`; the body uses raw
 /// syscalls only.
-fn confine_child() -> std::io::Result<()> {
+fn confine_child(keep: RawFd) -> std::io::Result<()> {
     // Ambient first: clearing permitted sets while ambient bits linger
     // fails (ambient must stay within permitted+inheritable).
     // SAFETY: raw prctl numbers, no pointers.
@@ -472,14 +613,34 @@ fn confine_child() -> std::io::Result<()> {
     // close-on-exec), so this closes by number, not by trust — and by
     // RANGE, not by the current soft `RLIMIT_NOFILE`: an fd parked
     // above a subsequently lowered soft limit still closes (C1 M1).
+    // The pinned executable fd survives as two spans around it (it
+    // is `CLOEXEC`, so `exec` drops it right after resolving the
+    // image from it — the helper still sees stdio-only).
     // SAFETY: close_range by number only (async-signal-safe).
-    let ranged = unsafe { libc::close_range(3, u32::MAX, 0) };
-    if ranged == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::ENOSYS) {
-        return Err(err);
+    let close_span = |first: u32, last: u32| -> std::io::Result<()> {
+        if first > last {
+            return Ok(());
+        }
+        // SAFETY: close_range by number only (async-signal-safe).
+        let ranged = unsafe { libc::close_range(first, last, 0) };
+        if ranged == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let ranged: std::io::Result<()> = (|| {
+        if keep < 3 {
+            return close_span(3, u32::MAX);
+        }
+        let kept = keep as u32;
+        close_span(3, kept - 1)?;
+        close_span(kept + 1, u32::MAX)
+    })();
+    match ranged {
+        Ok(()) => return Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ENOSYS) => {}
+        Err(err) => return Err(err),
     }
     // Pre-5.9 kernels lack close_range: best-effort close by number
     // up to the current ceiling (a high fd above a lowered soft
@@ -489,6 +650,9 @@ fn confine_child() -> std::io::Result<()> {
     let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     let max_fd = if max_fd > 0 { max_fd as i32 } else { 1024 };
     for fd in 3..max_fd {
+        if fd == keep {
+            continue;
+        }
         // SAFETY: closing an unowned number is a harmless EBADF.
         unsafe {
             libc::close(fd);
@@ -530,27 +694,37 @@ impl CapData {
     }
 }
 
-/// Spawn the helper with stdio pipes under [`confine_child`].
-/// `stdin_mode` selects a piped stdin (serve) or null stdin (attest).
-/// Callers pass the fixed flag vocabulary only; `--metadata FILE`
-/// carries a launcher-CLI-selected path (never helper- or
-/// file-selected): the helper takes no executable paths and the
-/// launcher takes no metadata content.
+/// Spawn the verified helper image with stdio pipes under
+/// [`confine_child`]. `pinned` is the just-verified open file: the
+/// child execs `/proc/self/fd/N` (the SAME open file description the
+/// identity check statted — pathname state after the open cannot
+/// affect which image runs), with `arg0` as the child's `argv[0]`
+/// (the verified path, never the fd spelling, so diagnostics name
+/// the real sibling). `stdin_mode` selects a piped stdin (serve) or
+/// null stdin (attest). Callers pass the fixed flag vocabulary only;
+/// `--metadata FILE` carries a launcher-CLI-selected path (never
+/// helper- or file-selected): the helper takes no executable paths
+/// and the launcher takes no metadata content.
 fn spawn_confined(
-    helper: &Path,
+    pinned: &std::fs::File,
+    arg0: &Path,
     args: &[String],
     stdin_mode: Stdio,
 ) -> std::io::Result<std::process::Child> {
-    let mut command = Command::new(helper);
+    let fd = pinned.as_raw_fd();
+    debug_assert!(fd >= 3, "image fd parks above stdio");
+    let exec_path = format!("/proc/self/fd/{fd}");
+    let mut command = Command::new(&exec_path);
     command
+        .arg0(arg0)
         .args(args)
         .stdin(stdin_mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // SAFETY: `confine_child` is async-signal-safe (raw syscalls, no
-    // allocation, no locks) as `pre_exec` requires.
+    // allocation, no locks) as `pre_exec` requires; `fd` is `Copy`.
     unsafe {
-        command.pre_exec(confine_child);
+        command.pre_exec(move || confine_child(fd));
     }
     command.spawn()
 }
@@ -606,18 +780,22 @@ fn read_capped(pipe: impl std::io::Read, cap: usize) -> Result<Vec<u8>, Metadata
     Ok(bytes)
 }
 
-/// Run the `--attest` handshake: the helper reports its boundary
-/// without touching metadata or stdin. Verifies exit 0, one parseable
-/// stdout attestation, and the pinned boundary. Any deviation refuses
+/// Run the `--attest` handshake: pin the helper image, fd-exec the
+/// verified open file, and check the reported boundary without
+/// touching metadata or stdin. Verifies exit 0, one parseable
+/// stdout attestation, and the pinned boundary; returns the pinned
+/// identity the serve must reproduce. Any deviation refuses
 /// [`MetadataUnavailable::HelperRefused`]: a missing binary fails at
-/// spawn, a replaced binary fails the handshake.
+/// the pin, a replaced binary fails the handshake.
 pub fn attest_helper(
     helper: &Path,
     principal: &Principal,
     bound: Duration,
-) -> Result<(), MetadataUnavailable> {
+) -> Result<HelperIdentity, MetadataUnavailable> {
+    let pinned = pin_helper(helper)?;
+    let image = pinned.reopen()?;
     let args = ["--attest".to_string(), "--require-no-new-privs".to_string()];
-    let mut child = spawn_confined(helper, &args, Stdio::null())
+    let mut child = spawn_confined(&image, &pinned.path, &args, Stdio::null())
         .map_err(|_| MetadataUnavailable::HelperRefused)?;
     let stdout = child.stdout.take();
     let _stderr = child.stderr.take();
@@ -638,7 +816,7 @@ pub fn attest_helper(
     }
     let attestation = parse_attestation_line(line)?;
     check_helper_attestation(&attestation, principal)?;
-    Ok(())
+    Ok(pinned.identity)
 }
 
 /// Outcome of one serve attempt: either a bound response or a
@@ -658,7 +836,10 @@ enum AttemptOutcome {
 /// response, and verify the stderr attestation against the pinned
 /// boundary before consuming anything. `metadata` is passed through
 /// as `--metadata FILE` (the helper reads and validates it — the
-/// launcher never parses metadata bytes).
+/// launcher never parses metadata bytes). Pins the image fresh at
+/// call time; the preflight-pinned path is
+/// [`serve_pinned_snapshot`] (production serve re-verifies the
+/// preflight pin, so a post-preflight replacement refuses).
 pub fn serve_snapshot(
     helper: &Path,
     principal: &Principal,
@@ -677,9 +858,36 @@ pub fn serve_snapshot_with_bound(
     request: &SnapshotRequest,
     bound: Duration,
 ) -> Result<SnapshotResponse, MetadataUnavailable> {
+    let pinned = pin_helper(helper)?;
+    serve_pinned_snapshot_with_bound(&pinned, principal, metadata, request, bound)
+}
+
+/// Serve one snapshot request through the preflight-pinned helper
+/// image: every attempt (initial plus retries) reopens the path,
+/// requires the pinned identity, and fd-execs the verified file —
+/// the SAME image preflight verified, never a later replacement.
+pub fn serve_pinned_snapshot(
+    pinned: &PinnedHelper,
+    principal: &Principal,
+    metadata: Option<&Path>,
+    request: &SnapshotRequest,
+) -> Result<SnapshotResponse, MetadataUnavailable> {
+    serve_pinned_snapshot_with_bound(pinned, principal, metadata, request, HELPER_ATTEMPT_TIMEOUT)
+}
+
+/// [`serve_pinned_snapshot`] with an explicit per-attempt bound
+/// (tests pin short bounds; production uses
+/// [`HELPER_ATTEMPT_TIMEOUT`]).
+pub fn serve_pinned_snapshot_with_bound(
+    pinned: &PinnedHelper,
+    principal: &Principal,
+    metadata: Option<&Path>,
+    request: &SnapshotRequest,
+    bound: Duration,
+) -> Result<SnapshotResponse, MetadataUnavailable> {
     let mut attempts = 0u32;
     loop {
-        match serve_once(helper, principal, metadata, request, bound) {
+        match serve_once(pinned, principal, metadata, request, bound) {
             AttemptOutcome::Answered(response) => return Ok(response),
             AttemptOutcome::Refused(kind) => return Err(kind),
             AttemptOutcome::TransportFailed => {
@@ -694,7 +902,7 @@ pub fn serve_snapshot_with_bound(
 
 /// One serve attempt (no retries here — the caller owns the budget).
 fn serve_once(
-    helper: &Path,
+    pinned: &PinnedHelper,
     principal: &Principal,
     metadata: Option<&Path>,
     request: &SnapshotRequest,
@@ -712,7 +920,14 @@ fn serve_once(
         args.push("--metadata".to_string());
         args.push(path.to_string_lossy().into_owned());
     }
-    let mut child = match spawn_confined(helper, &args, Stdio::piped()) {
+    // Identity first: a post-pin replacement refuses here,
+    // deterministically (never retried) — the exec below runs the
+    // just-verified file, so no window remains.
+    let image = match pinned.reopen() {
+        Ok(image) => image,
+        Err(kind) => return AttemptOutcome::Refused(kind),
+    };
+    let mut child = match spawn_confined(&image, &pinned.path, &args, Stdio::piped()) {
         Ok(child) => child,
         Err(_) => return AttemptOutcome::Refused(MetadataUnavailable::HelperRefused),
     };
@@ -951,39 +1166,59 @@ mod tests {
         );
     }
 
-    /// Write an executable sh fixture; returns its path.
-    fn fixture_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, body).expect("fixture written");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        path
+    /// Built fixture binary: `<target>/debug/kryprobe_launch_fixture`
+    /// next to the test executable's `deps` dir. Every all-target
+    /// `cargo test` builds it (including the `xtask check` gate);
+    /// focused `--lib`/`--test` runs must build it first
+    /// (`cargo build -p kryprobe-privilege --bin
+    /// kryprobe_launch_fixture`) — the assert says so loudly.
+    fn fixture_binary_path() -> PathBuf {
+        let test_exe = std::env::current_exe().expect("test exe");
+        let bin = test_exe
+            .parent()
+            .expect("deps dir")
+            .parent()
+            .expect("profile dir")
+            .join("kryprobe_launch_fixture");
+        assert!(
+            bin.is_file(),
+            "fixture binary built at {} (run all-target `cargo test -p kryprobe-privilege`)",
+            bin.display()
+        );
+        bin
     }
 
-    /// Honest attestation snippet: uid/euid/gid/egid, all-zero cap
-    /// check (emits "0" iff every mask is all-zero, else "1" — the
-    /// launcher only checks `== 0`), no-new-privs, and the fd set
-    /// minus the highest (transient lister fd, lowest-free
-    /// allocation). A sh child sees only stdio here (no script fd is
-    /// held open during execution), so this is fully honest.
-    const HONEST_ATTEST: &str = r#"
-honest_attestation() {
-    uid=$(awk '/^Uid:/{print $2}' /proc/self/status)
-    euid=$(awk '/^Uid:/{print $3}' /proc/self/status)
-    gid=$(awk '/^Gid:/{print $2}' /proc/self/status)
-    egid=$(awk '/^Gid:/{print $3}' /proc/self/status)
-    caps="1"
-    if [ "$(awk '/^CapEff:/{print $2}' /proc/self/status)" = "0000000000000000" ] \
-        && [ "$(awk '/^CapPrm:/{print $2}' /proc/self/status)" = "0000000000000000" ] \
-        && [ "$(awk '/^CapInh:/{print $2}' /proc/self/status)" = "0000000000000000" ] \
-        && [ "$(awk '/^CapAmb:/{print $2}' /proc/self/status)" = "0000000000000000" ]; then
-        caps="0"
-    fi
-    if [ "$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)" = "1" ]; then nnp="true"; else nnp="false"; fi
-    fds=$(ls /proc/self/fd | sort -n | sed '$d' | paste -sd, -)
-    printf '{"attestation":{"uid":%s,"euid":%s,"gid":%s,"egid":%s,"caps":{"eff":"%s","prm":"%s","inh":"%s","amb":"%s"},"no_new_privs":%s,"fds":[%s]}}\n' \
-        "$uid" "$euid" "$gid" "$egid" "$caps" "$caps" "$caps" "$caps" "$nnp" "$fds"
-}
-"#;
+    /// Stage the fixture binary at `dir/name` with its stem sidecar
+    /// (`<stem>.fixture.json`); returns the helper path. The sidecar
+    /// selects attest/serve behavior (see the fixture's module docs).
+    fn stage_fixture(dir: &Path, name: &str, sidecar: serde_json::Value) -> PathBuf {
+        let dst = dir.join(name);
+        std::fs::copy(fixture_binary_path(), &dst).expect("fixture staged");
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let stem = Path::new(name)
+            .file_stem()
+            .expect("stem")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            dir.join(format!("{stem}.fixture.json")),
+            serde_json::to_string(&sidecar).expect("sidecar"),
+        )
+        .expect("sidecar written");
+        dst
+    }
+
+    /// Rewrite the staged image with trailing padding: still a valid
+    /// ELF (loaders ignore trailing bytes), but a different image by
+    /// every identity field — the A/B replacement for the A1 oracle.
+    fn pad_staged_image(path: &Path) {
+        use std::io::Write;
+        let mut image = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("image opens");
+        image.write_all(&[0xA5u8; 1024]).expect("padding appends");
+    }
 
     /// Hold one inheritable (non-cloexec) fd open like a BPF authority
     /// fd: without the close loop it would leak into the child.
@@ -1018,11 +1253,7 @@ honest_attestation() {
         // pre_exec confinement regresses (caps/nnp/fds) or the
         // principal pinning drifts.
         let scratch = kryprobe_testkit::TempDir::named("launch-attest-ok").expect("scratch");
-        let helper = fixture_script(
-            scratch.path(),
-            "helper",
-            &format!("#!/bin/sh\nset -eu\n{HONEST_ATTEST}\nhonest_attestation\n"),
-        );
+        let helper = stage_fixture(scratch.path(), "helper", serde_json::json!({}));
         let _leaked = LeakedFd::open();
         let principal = current_principal().expect("test principal");
         assert_ne!(principal.uid, 0, "tests run non-root");
@@ -1033,16 +1264,20 @@ honest_attestation() {
     fn attest_replaced_or_missing_helper_refuses() {
         let scratch = kryprobe_testkit::TempDir::named("launch-attest-no").expect("scratch");
         let principal = principal_fixture();
-        let garbage = fixture_script(
+        let garbage = stage_fixture(
             scratch.path(),
             "garbage",
-            "#!/bin/sh\nset -eu\necho 'totally a helper'\n",
+            serde_json::json!({"attest_garbage": "totally a helper"}),
         );
         assert_eq!(
             attest_helper(&garbage, &principal, Duration::from_secs(10)),
             Err(MetadataUnavailable::HelperRefused)
         );
-        let failing = fixture_script(scratch.path(), "failing", "#!/bin/sh\nset -eu\nexit 2\n");
+        let failing = stage_fixture(
+            scratch.path(),
+            "failing",
+            serde_json::json!({"attest_exit": 2}),
+        );
         assert_eq!(
             attest_helper(&failing, &principal, Duration::from_secs(10)),
             Err(MetadataUnavailable::HelperRefused)
@@ -1057,17 +1292,85 @@ honest_attestation() {
         );
     }
 
+    /// A1 oracle (Codex C1): a replacement swapped in after preflight
+    /// — even one emitting a forged VALID handshake (the principal's
+    /// own ids, empty caps, `no_new_privs`, stdio fds) plus a
+    /// bindable canned response — refuses: the serve re-verifies the
+    /// preflight pin and fd-execs the same image, never the pathname.
+    /// (RED shown pre-fix with the script-fixture base-API probe
+    /// `..._unpinned_probe`: the replacement served `Ok`.)
+    #[test]
+    fn replacement_after_preflight_with_forged_handshake_refuses() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-replace").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        let canned_path = scratch.path().join("canned.json");
+        std::fs::write(&canned_path, &canned).expect("canned");
+        let helper_path = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json"}),
+        );
+        let principal = current_principal().expect("test principal");
+        assert_ne!(principal.uid, 0, "tests run non-root");
+        let preflight = preflight_helper(Some(&helper_path));
+        assert!(preflight.launchable(), "honest helper A preflights");
+        let pinned = PinnedHelper {
+            path: helper_path.clone(),
+            identity: preflight.helper_identity.expect("preflight pins"),
+        };
+        // Replacement B: a padded copy of the same fixture — a
+        // different image by every identity field (inode, size)
+        // emitting a forged VALID handshake (the principal's own
+        // real ids, empty caps, `no_new_privs`, stdio fds) plus the
+        // bindable canned response. Handshake and bind both pass, so
+        // only the identity pin can refuse it.
+        std::fs::remove_file(&helper_path).expect("A removed");
+        std::fs::copy(fixture_binary_path(), &helper_path).expect("B staged");
+        std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        pad_staged_image(&helper_path);
+        assert_eq!(
+            serve_pinned_snapshot_with_bound(
+                &pinned,
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10)
+            ),
+            Err(MetadataUnavailable::HelperRefused),
+            "replacement after preflight refuses"
+        );
+        // Positive control: the pinned image itself still serves
+        // through the same pinned path (pin, handshake, and bind all
+        // agree when nothing was replaced).
+        let helper_c = stage_fixture(
+            scratch.path(),
+            "helper-c",
+            serde_json::json!({"canned": "canned.json"}),
+        );
+        let pinned_c = pin_helper(&helper_c).expect("C pins");
+        assert!(
+            serve_pinned_snapshot_with_bound(
+                &pinned_c,
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10)
+            )
+            .is_ok(),
+            "the pinned image itself serves"
+        );
+    }
+
     #[test]
     fn attest_wrong_principal_refuses() {
         let scratch = kryprobe_testkit::TempDir::named("launch-attest-user").expect("scratch");
         // Honest boundary except a fixed foreign uid: the pin holds.
-        let helper = fixture_script(
+        let helper = stage_fixture(
             scratch.path(),
             "helper",
-            &format!(
-                "#!/bin/sh\nset -eu\n{HONEST_ATTEST}\n\
-                 honest_attestation | sed 's/\"uid\":[0-9]*/\"uid\":424242/; s/\"euid\":[0-9]*/\"euid\":424242/'\n"
-            ),
+            serde_json::json!({"forge_uid": 424242, "forge_euid": 424242}),
         );
         let principal = current_principal().expect("test principal");
         assert_eq!(
@@ -1157,8 +1460,11 @@ honest_attestation() {
             0,
             "soft limit lowers below the parked fd"
         );
+        let ls = pinnable_ls();
+        let image = ls.reopen().expect("ls reopens");
         let mut child = spawn_confined(
-            Path::new("ls"),
+            &image,
+            &ls.path,
             &["/proc/self/fd".to_string()],
             Stdio::null(),
         )
@@ -1176,14 +1482,29 @@ honest_attestation() {
         );
     }
 
+    /// A pinnable `ls` for the fd-allowlist proofs (fd-exec needs a
+    /// real path, never a `PATH` search; `ls` may itself be a
+    /// symlink to a coreutils shim, so resolve it first — test-only
+    /// resolution, the pin still verifies the final image).
+    fn pinnable_ls() -> PinnedHelper {
+        ["/bin/ls", "/usr/bin/ls"]
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .find_map(|path| pin_helper(&path).ok())
+            .expect("a pinnable ls exists")
+    }
+
     #[test]
     fn spawn_closes_non_cloexec_fds() {
         // The sharp fd-allowlist proof, no fixture protocol: `ls` sees
         // exactly stdio plus its own transient dir fd (lowest-free 3),
         // even though the parent holds a leaked inheritable fd.
         let _leaked = LeakedFd::open();
+        let ls = pinnable_ls();
+        let image = ls.reopen().expect("ls reopens");
         let mut child = spawn_confined(
-            Path::new("ls"),
+            &image,
+            &ls.path,
             &["/proc/self/fd".to_string()],
             Stdio::null(),
         )
@@ -1243,19 +1564,10 @@ honest_attestation() {
         // (the fixture ignores content; the real helper validates).
         let metadata = scratch.path().join("meta.json");
         std::fs::write(&metadata, b"{ not valid json").expect("garbage metadata");
-        let helper = fixture_script(
+        let helper = stage_fixture(
             scratch.path(),
             "helper",
-            &format!(
-                "#!/bin/sh\nset -eu\n{HONEST_ATTEST}\n\
-                 printf '%s\\n' \"$@\" > '{log}'\n\
-                 cat > /dev/null\n\
-                 honest_attestation >&2\n\
-                 cat '{canned}'\n\
-                 printf '{{\"helper_counters\":{{}}}}\\n' >&2\n",
-                log = argv_log.display(),
-                canned = canned_path.display(),
-            ),
+            serde_json::json!({"canned": "canned.json", "argv_log": "argv.log"}),
         );
         let _leaked = LeakedFd::open();
         let principal = current_principal().expect("test principal");
@@ -1281,13 +1593,10 @@ honest_attestation() {
     fn serve_typed_refusal_is_honored_without_retry() {
         let scratch = kryprobe_testkit::TempDir::named("launch-serve-ref").expect("scratch");
         let counter = scratch.path().join("count");
-        let helper = fixture_script(
+        let helper = stage_fixture(
             scratch.path(),
             "helper",
-            &format!(
-                "#!/bin/sh\nset -eu\necho x >> '{c}'\ncat > /dev/null\nprintf '{{\"error\":\"no_principal\"}}\\n' >&2\nexit 1\n",
-                c = counter.display(),
-            ),
+            serde_json::json!({"refuse": "no_principal", "count": "count"}),
         );
         let principal = current_principal().expect("test principal");
         assert_eq!(
@@ -1314,13 +1623,10 @@ honest_attestation() {
     fn serve_crash_retries_then_refuses() {
         let scratch = kryprobe_testkit::TempDir::named("launch-serve-crash").expect("scratch");
         let counter = scratch.path().join("count");
-        let helper = fixture_script(
+        let helper = stage_fixture(
             scratch.path(),
             "helper",
-            &format!(
-                "#!/bin/sh\nset -eu\necho x >> '{c}'\nkill -9 $$\n",
-                c = counter.display(),
-            ),
+            serde_json::json!({"crash": true, "count": "count"}),
         );
         let principal = current_principal().expect("test principal");
         assert_eq!(
@@ -1347,13 +1653,10 @@ honest_attestation() {
     fn serve_stall_kills_and_stays_bounded() {
         let scratch = kryprobe_testkit::TempDir::named("launch-serve-stall").expect("scratch");
         let counter = scratch.path().join("count");
-        let helper = fixture_script(
+        let helper = stage_fixture(
             scratch.path(),
             "helper",
-            &format!(
-                "#!/bin/sh\nset -eu\necho x >> '{c}'\nsleep 30\n",
-                c = counter.display(),
-            ),
+            serde_json::json!({"stall_secs": 30, "count": "count"}),
         );
         let principal = current_principal().expect("test principal");
         let start = Instant::now();
@@ -1392,18 +1695,10 @@ honest_attestation() {
         let canned_path = scratch.path().join("canned.json");
         std::fs::write(&canned_path, &canned).expect("canned");
         let counter = scratch.path().join("count");
-        let helper = fixture_script(
+        let helper = stage_fixture(
             scratch.path(),
             "helper",
-            &format!(
-                "#!/bin/sh\nset -eu\n{HONEST_ATTEST}\n\
-                 echo x >> '{c}'\n\
-                 cat > /dev/null\n\
-                 honest_attestation >&2\n\
-                 cat '{canned}'\n",
-                c = counter.display(),
-                canned = canned_path.display(),
-            ),
+            serde_json::json!({"canned": "canned.json", "count": "count"}),
         );
         let principal = current_principal().expect("test principal");
         assert_eq!(
@@ -1429,11 +1724,7 @@ honest_attestation() {
     #[test]
     fn preflight_verifies_or_names_unavailability() {
         let scratch = kryprobe_testkit::TempDir::named("launch-preflight").expect("scratch");
-        let helper = fixture_script(
-            scratch.path(),
-            "helper",
-            &format!("#!/bin/sh\nset -eu\n{HONEST_ATTEST}\nhonest_attestation\n"),
-        );
+        let helper = stage_fixture(scratch.path(), "helper", serde_json::json!({}));
         let principal = current_principal().expect("test principal");
         let good = preflight_helper(Some(&helper));
         if principal.uid == 0 || principal.euid == 0 {
@@ -1443,6 +1734,11 @@ honest_attestation() {
             assert_eq!(good.unavailable, None);
             assert!(good.launchable());
             assert_eq!(good.helper.as_deref(), Some(helper.as_path()));
+            assert_eq!(
+                good.helper_identity,
+                Some(pin_helper(&helper).expect("pins").identity),
+                "preflight pins the attested image"
+            );
         }
         let missing = preflight_helper(Some(&scratch.path().join("absent")));
         // Discovery/attestation failure names the typed reason and

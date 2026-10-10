@@ -243,6 +243,11 @@ fn launchable_preflight(
 ) -> kryprobe_privilege::workload_launch::WorkloadPreflight {
     kryprobe_privilege::workload_launch::WorkloadPreflight {
         helper: Some(helper.to_path_buf()),
+        helper_identity: Some(
+            kryprobe_privilege::workload_launch::pin_helper(helper)
+                .expect("fixture pins")
+                .identity,
+        ),
         principal: Some(
             kryprobe_privilege::workload_launch::current_principal().expect("test principal"),
         ),
@@ -260,35 +265,50 @@ fn finish_opts() -> WorkloadFinishOpts {
     }
 }
 
-fn fixture_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, body).expect("fixture written");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    path
+/// Built launch fixture binary (`kryprobe-privilege` bin, next to
+/// this test executable's `deps` dir). Every all-target `cargo test`
+/// builds it (including the `xtask check` gate); focused `--test`
+/// runs must build it first (`cargo build -p kryprobe-privilege
+/// --bin kryprobe_launch_fixture`) — the assert says so loudly.
+fn fixture_binary_path() -> std::path::PathBuf {
+    let test_exe = std::env::current_exe().expect("test exe");
+    let bin = test_exe
+        .parent()
+        .expect("deps dir")
+        .parent()
+        .expect("profile dir")
+        .join("kryprobe_launch_fixture");
+    assert!(
+        bin.is_file(),
+        "fixture binary built at {} (run all-target `cargo test --workspace`)",
+        bin.display()
+    );
+    bin
 }
 
-/// Honest attestation snippet (same shape as the launch-module
-/// fixtures): the launcher verifies the real confinement of every
-/// fixture serve below.
-const HONEST_ATTEST: &str = r#"
-honest_attestation() {
-    uid=$(awk '/^Uid:/{print $2}' /proc/self/status)
-    euid=$(awk '/^Uid:/{print $3}' /proc/self/status)
-    gid=$(awk '/^Gid:/{print $2}' /proc/self/status)
-    egid=$(awk '/^Gid:/{print $3}' /proc/self/status)
-    caps="1"
-    if [ "$(awk '/^CapEff:/{print $2}' /proc/self/status)" = "0000000000000000" ] \
-        && [ "$(awk '/^CapPrm:/{print $2}' /proc/self/status)" = "0000000000000000" ] \
-        && [ "$(awk '/^CapInh:/{print $2}' /proc/self/status)" = "0000000000000000" ] \
-        && [ "$(awk '/^CapAmb:/{print $2}' /proc/self/status)" = "0000000000000000" ]; then
-        caps="0"
-    fi
-    if [ "$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status)" = "1" ]; then nnp="true"; else nnp="false"; fi
-    fds=$(ls /proc/self/fd | sort -n | sed '$d' | paste -sd, -)
-    printf '{"attestation":{"uid":%s,"euid":%s,"gid":%s,"egid":%s,"caps":{"eff":"%s","prm":"%s","inh":"%s","amb":"%s"},"no_new_privs":%s,"fds":[%s]}}\n' \
-        "$uid" "$euid" "$gid" "$egid" "$caps" "$caps" "$caps" "$caps" "$nnp" "$fds"
+/// Stage the fixture binary at `dir/name` with its stem sidecar.
+/// The launcher verifies the real confinement of every fixture
+/// serve below (same shape as the launch-module fixtures).
+fn stage_fixture(
+    dir: &std::path::Path,
+    name: &str,
+    sidecar: serde_json::Value,
+) -> std::path::PathBuf {
+    let dst = dir.join(name);
+    std::fs::copy(fixture_binary_path(), &dst).expect("fixture staged");
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .expect("stem")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        dir.join(format!("{stem}.fixture.json")),
+        serde_json::to_string(&sidecar).expect("sidecar"),
+    )
+    .expect("sidecar written");
+    dst
 }
-"#;
 
 /// Wrong-kernel metadata at CLI level: the helper answers (transport
 /// fine), but the snapshot kernel differs — the key refuses typed,
@@ -299,21 +319,21 @@ fn wrong_kernel_folds_to_partial_metadata() {
     // The request key is fixed by the finish fixture (single row:
     // cgroup 42, tgid 100, start 555, scope test-scope); only the
     // minted session varies, so the fixture substitutes it in.
-    let helper = fixture_script(
+    std::fs::write(
+        scratch.path().join("resp.json"),
+        "{\"session_id\":\"00000000000000000000000000000000\",\
+         \"kernel_identity\":{\"known\":\"other-scope\"},\"associations\":[],\
+         \"errors\":[{\"key\":{\"kernel_scope\":\"test-scope\",\"cgroup\":42,\
+         \"tgid\":100,\"start_ns\":555},\"code\":\"kernel_mismatch\",\
+         \"detail\":\"kernel_differs\"}],\"status\":\"complete\",\
+         \"chunk\":{\"index\":0,\"total\":1},\
+         \"counters\":{\"resolved\":0,\"unresolved\":0,\"refused\":1}}",
+    )
+    .expect("template written");
+    let helper = stage_fixture(
         scratch.path(),
         "helper",
-        &format!(
-            "#!/bin/sh\nset -eu\n{HONEST_ATTEST}\n\
-             req=$(cat)\n\
-             session=$(printf '%s' \"$req\" | sed -n 's/.*\"session_id\":\"\\([0-9a-f]*\\)\".*/\\1/p')\n\
-             honest_attestation >&2\n\
-             printf '{{\"session_id\":\"%s\",\"kernel_identity\":{{\"known\":\"other-scope\"}},\
-\"associations\":[],\
-\"errors\":[{{\"key\":{{\"kernel_scope\":\"test-scope\",\"cgroup\":42,\"tgid\":100,\"start_ns\":555}},\
-\"code\":\"kernel_mismatch\",\"detail\":\"kernel_differs\"}}],\
-\"status\":\"complete\",\"chunk\":{{\"index\":0,\"total\":1}},\
-\"counters\":{{\"resolved\":0,\"unresolved\":0,\"refused\":1}}}}' \"$session\"\n"
-        ),
+        serde_json::json!({"canned": "resp.json"}),
     );
     let outcome = finish_outcome(launchable_preflight(&helper));
     let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
@@ -395,17 +415,10 @@ fn asserted_metadata_resolves_through_serve() {
     let canned = kryprobe_core::workload::encode_response(&response).expect("encodes");
     let canned_path = scratch.path().join("canned.json");
     std::fs::write(&canned_path, &canned).expect("canned");
-    let helper = fixture_script(
+    let helper = stage_fixture(
         scratch.path(),
         "helper",
-        &format!(
-            "#!/bin/sh\nset -eu\n{HONEST_ATTEST}\n\
-             req=$(cat)\n\
-             session=$(printf '%s' \"$req\" | sed -n 's/.*\"session_id\":\"\\([0-9a-f]*\\)\".*/\\1/p')\n\
-             honest_attestation >&2\n\
-             sed \"s/00000000000000000000000000000000/$session/\" '{canned}'\n",
-            canned = canned_path.display(),
-        ),
+        serde_json::json!({"canned": "canned.json"}),
     );
     let outcome = finish_outcome(launchable_preflight(&helper));
     let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
@@ -488,17 +501,10 @@ fn stale_metadata_keeps_identity_marks_row() {
     let canned = kryprobe_core::workload::encode_response(&response).expect("encodes");
     let canned_path = scratch.path().join("canned.json");
     std::fs::write(&canned_path, &canned).expect("canned");
-    let helper = fixture_script(
+    let helper = stage_fixture(
         scratch.path(),
         "helper",
-        &format!(
-            "#!/bin/sh\nset -eu\n{HONEST_ATTEST}\n\
-             req=$(cat)\n\
-             session=$(printf '%s' \"$req\" | sed -n 's/.*\"session_id\":\"\\([0-9a-f]*\\)\".*/\\1/p')\n\
-             honest_attestation >&2\n\
-             sed \"s/00000000000000000000000000000000/$session/\" '{canned}'\n",
-            canned = canned_path.display(),
-        ),
+        serde_json::json!({"canned": "canned.json"}),
     );
     let outcome = finish_outcome(launchable_preflight(&helper));
     let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
@@ -513,7 +519,7 @@ fn stale_metadata_keeps_identity_marks_row() {
 #[test]
 fn helper_crash_degrades_to_raw_ids() {
     let scratch = kryprobe_testkit::TempDir::named("cli-crash").expect("scratch");
-    let helper = fixture_script(scratch.path(), "helper", "#!/bin/sh\nset -eu\nkill -9 $$\n");
+    let helper = stage_fixture(scratch.path(), "helper", serde_json::json!({"crash": true}));
     let outcome = finish_outcome(launchable_preflight(&helper));
     let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes anyway");
     assert_eq!(
