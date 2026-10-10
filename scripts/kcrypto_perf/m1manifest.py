@@ -74,7 +74,11 @@ WORKLOADS = frozenset({"single", "n_cgroup", "churn_below", "churn_full"})
 
 MODES = frozenset({"disabled", "aggregation"})
 
-OBS = frozenset({"R", "C", "D"})
+# Task05 Stage 4 (freeze G1): M joins the observer roles (K bytes +
+# bounded metadata file + helper sibling, workload-json legs). M
+# pairs with aggregation only (the mode/obs mismatch rule below
+# enforces it: disabled ⟺ D).
+OBS = frozenset({"R", "C", "M", "D"})
 
 
 class InputError(ValueError):
@@ -159,7 +163,7 @@ def load_manifest(path: Path) -> dict:
             # observer binary; a DISABLED side B has no binary (loud
             # boot abort). Disabled sides live on side A by design.
             raise InputError(f"set {entry['id']}: side B must be an "
-                             f"observer (R/C), not D")
+                             f"observer (R/C/M), not D")
         if type(entry["pairs"]) is not int or entry["pairs"] < 5:
             raise InputError(f"set {entry['id']}: pairs must be int >= 5")
         if type(entry["max_attempted"]) is not int or \
