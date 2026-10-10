@@ -1049,8 +1049,22 @@ def judge_idle_leg(cell_dir: Path, leg: dict, out: dict) -> dict:
     return out
 
 
+def count_progress_ticks(path: Path):
+    """Count ``kryprobe: progress`` lines in a capture stderr log
+    (Task05 Stage 4, freeze G9: the M-activity poll-cadence
+    dimension — the product exports no helper/request counter, so
+    the sealed progress cadence stands in, recorded never gated).
+    A missing log yields None (unrecorded, never zero)."""
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return None
+    return sum(1 for line in text.splitlines()
+               if line.startswith("kryprobe: progress "))
+
+
 def observer_metrics(cell_dir: Path, leg: dict, parsed_agg,
-                     parsed_lc) -> dict:
+                     parsed_lc, parsed_wl=None) -> dict:
     legs_dir = cell_dir / "legs"
     leg_id = leg["leg_id"]
     metrics: dict = {}
@@ -1075,7 +1089,30 @@ def observer_metrics(cell_dir: Path, leg: dict, parsed_agg,
             metrics["telemetry_malformed"] = tele["malformed"]
     except kparsers.ParseError as err:
         metrics["telemetry_error"] = str(err)
-    if parsed_agg is not None:
+    if parsed_wl is not None:
+        # Freeze G4/G9: M-leg loss equivalents (the workload-json
+        # report carries no api-returns loss counters or verdict)
+        # plus the M-activity dimensions (typed metadata
+        # availability + coverage + poll cadence).
+        ledger = parsed_wl["ledger"]
+        metrics["loss"] = {
+            "gap_unreconciled": ledger["gap_unreconciled"],
+            "refused_inserts": ledger["refused_inserts"],
+            "system_saturated": ledger["system_saturated"],
+            "per_context_saturated":
+                ledger["per_context_saturated"],
+            "ledger_unknown": ledger["unknown"],
+        }
+        metrics["wl_metadata_status"] = \
+            parsed_wl["metadata"]["status"]
+        metrics["wl_metadata_reason"] = \
+            parsed_wl["metadata"]["reason"]
+        metrics["wl_coverage"] = parsed_wl["coverage"]
+        metrics["wl_rows"] = parsed_wl["n_rows"]
+        metrics["progress_ticks"] = count_progress_ticks(
+            legs_dir / f"{leg_id}-capture.stderr.log")
+        report = legs_dir / f"{leg_id}-report.workload-json"
+    elif parsed_agg is not None:
         metrics["loss"] = parsed_agg["loss"]
         metrics["verdict"] = parsed_agg["verdict"]
         metrics["lat_nonzero"] = parsed_agg["lat_nonzero"]
@@ -1118,6 +1155,42 @@ def _read_attach(path: Path):
         return val
 
 
+def judge_m_observed_leg(cell_dir: Path, leg: dict, out: dict) -> dict:
+    """M-leg observer pass (freeze G4): capture-rc gate +
+    workload-json parse + activity metrics. A live workload-json
+    capture always exits 3 (the unproven gap + partial capture
+    coverage name themselves — 0 is impossible on genuine product
+    bytes, so anything but 3 fails closed). The M1 overlay
+    (apply_m1_ctx_overlay) runs the M checks proper (report
+    shape, ledger, metadata, coverage, ctx cross); this pass only
+    establishes that the M-shaped evidence parses. Driver-ledger
+    stats were computed format-independently by judge_leg before
+    dispatch and are untouched."""
+    legs_dir = cell_dir / "legs"
+    leg_id = leg["leg_id"]
+    capture_rc = _read_int_kv(legs_dir / f"{leg_id}-capture-rc.txt",
+                              "capture_rc")
+    out["capture_rc"] = capture_rc
+    if capture_rc != 3:
+        out.update(valid=False,
+                   reasons=[f"M capture rc={capture_rc}, want 3 "
+                            "(live workload-json always names its "
+                            "gap)"],
+                   outcome="invalid")
+        return out
+    try:
+        parsed = kparsers.parse_workload_report(
+            legs_dir / f"{leg_id}-report.workload-json")
+    except kparsers.ParseError as err:
+        out.update(valid=False, reasons=[str(err)], outcome="invalid")
+        return out
+    out["workload"] = parsed
+    out["observer"] = observer_metrics(cell_dir, leg, None, None,
+                                       parsed_wl=parsed)
+    out.update(valid=True, reasons=[], outcome="valid")
+    return out
+
+
 def judge_observed_leg(cell_dir: Path, leg: dict, kernel: str,
                        summary: dict, out: dict) -> dict:
     legs_dir = cell_dir / "legs"
@@ -1126,6 +1199,12 @@ def judge_observed_leg(cell_dir: Path, leg: dict, kernel: str,
                               "capture_rc")
     out["capture_rc"] = capture_rc
     if leg["mode"] == "aggregation":
+        if (legs_dir / f"{leg_id}-report.workload-json").is_file():
+            # Freeze G4: report-format dispatch by sealed
+            # artifact (frozen cells never carry .workload-json);
+            # the M1 overlay verifies the format matches the
+            # declared observer role (fail-closed both ways).
+            return judge_m_observed_leg(cell_dir, leg, out)
         try:
             parsed = kparsers.parse_api_returns(
                 legs_dir / f"{leg_id}-report.json")
@@ -1412,6 +1491,52 @@ def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     return reasons, {"checked": checked, "unverifiable": []}
 
 
+def judge_m1_quiet(cell_dir: Path, obs_b: str) -> dict:
+    """M1 boot-quiet judging (freeze G3/G4): R/C boots parse the
+    api-returns quiet report (zero calls); M boots parse the
+    workload-json quiet report (system_total zero — the metadata
+    state is recorded, never gated: an empty capture answers
+    ParseFailed by construction, so gating availability would
+    fail a clean boot). Either report present on the wrong boot
+    is a mixup (invalid). Returns the quiet verdict dict."""
+    cell_dir = Path(cell_dir)
+    c_path = cell_dir / "quiet-report.json"
+    m_path = cell_dir / "quiet-report.workload-json"
+    if obs_b == "M":
+        if c_path.is_file():
+            return {"valid": False,
+                    "reasons": ["M quiet carries quiet-report.json "
+                                "(format mixup)"]}
+        try:
+            parsed = kparsers.parse_workload_report(m_path)
+        except kparsers.ParseError as err:
+            return {"valid": False,
+                    "reasons": [f"quiet leg: {err}"]}
+        system = parsed["ledger"]["system_total"]
+        out = {"system_total": system,
+               "metadata": parsed["metadata"],
+               "coverage": parsed["coverage"]}
+        if system != 0:
+            out.update(valid=False,
+                       reasons=[f"quiet leg system_total={system}, "
+                                "want 0"])
+        else:
+            out.update(valid=True, reasons=[])
+        return out
+    if m_path.is_file():
+        return {"valid": False,
+                "reasons": [f"{obs_b} quiet carries "
+                            "quiet-report.workload-json "
+                            "(format mixup)"]}
+    try:
+        quiet = kparsers.parse_api_returns(c_path)
+    except kparsers.ParseError as err:
+        return {"valid": False, "reasons": [f"quiet leg: {err}"]}
+    check = kvalidity.check_quiet(quiet["totals"])
+    return {"totals": quiet["totals"], "valid": check["valid"],
+            "reasons": check["reasons"]}
+
+
 def verify_cell(cell_dir: Path, manifest: dict) -> dict:
     """Judge one sealed cell (legs, quiet, seal, receipts, pins)."""
     cell_dir = Path(cell_dir)
@@ -1451,15 +1576,28 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         verdict["errors"].extend(pin_reasons)
         return verdict
     kernel = stage.get("kernel")
-    try:
-        quiet = kparsers.parse_api_returns(cell_dir / "quiet-report.json")
-    except kparsers.ParseError as err:
-        verdict["errors"].append(f"quiet leg: {err}")
-        return verdict
-    quiet_check = kvalidity.check_quiet(quiet["totals"])
-    verdict["quiet"] = {"totals": quiet["totals"],
-                        "valid": quiet_check["valid"],
-                        "reasons": quiet_check["reasons"]}
+    if m1:
+        if stage.get("kind") == "set":
+            quiet_obs = find_set(manifest, stage["set"])["obs_b"]
+        else:
+            quiet_obs = "C"
+        quiet_check = judge_m1_quiet(cell_dir, quiet_obs)
+        verdict["quiet"] = quiet_check
+        if not quiet_check["valid"] and quiet_check["reasons"] and \
+                quiet_check["reasons"][0].startswith("quiet leg: "):
+            verdict["errors"].append(quiet_check["reasons"][0])
+            return verdict
+    else:
+        try:
+            quiet = kparsers.parse_api_returns(
+                cell_dir / "quiet-report.json")
+        except kparsers.ParseError as err:
+            verdict["errors"].append(f"quiet leg: {err}")
+            return verdict
+        quiet_check = kvalidity.check_quiet(quiet["totals"])
+        verdict["quiet"] = {"totals": quiet["totals"],
+                            "valid": quiet_check["valid"],
+                            "reasons": quiet_check["reasons"]}
     try:
         spec = parse_legs_tsv(cell_dir / "legs.tsv")
     except ValueError as err:
@@ -1527,6 +1665,17 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["reasons"] = judged.get("reasons", []) + [
             "R leg carries a ctx object (artifact mixup: C staged as R?)"]
         return judged
+    if obs == "M":
+        return apply_m1_m_overlay(cell_dir, judged, leg, entry,
+                                  manifest)
+    wl_path = legs_dir / f"{leg['leg_id']}-report.workload-json"
+    if wl_path.is_file():
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [
+            "C leg carries a workload-json report (artifact mixup: "
+            "M staged as C?)"]
+        return judged
     try:
         ctx = km1validity.parse_ctx_telemetry(stderr_log)
     except ValueError as err:
@@ -1557,6 +1706,69 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
     reasons = km1validity.check_ctx_leg(
         ctx, parsed["totals"].get("calls"), shape, expected_rows,
         ctx_overflow=ctx_overflow)
+    if reasons:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + reasons
+    return judged
+
+
+def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
+                       entry: dict, manifest: dict) -> dict:
+    """M-leg overlay (freeze G4/G6): the workload-json report must
+    exist (an M-role leg with only C-shaped evidence is a leg run
+    without the metadata path — invalid, never silently a C leg),
+    then the M report rules (shape, ledger, metadata, coverage,
+    refused overflow), the terminal ctx walk, the same-walk
+    ledger↔ctx cross-equalities, and the per-shape ctx exactness
+    rules with refused_inserts as the overflow operand (the
+    workload-json report carries no ctx_overflow_identities
+    counter; refused_inserts is the same KCTX_DROPS counter under
+    both walks)."""
+    legs_dir = cell_dir / "legs"
+    leg_id = leg["leg_id"]
+    wl_path = legs_dir / f"{leg_id}-report.workload-json"
+    if not wl_path.is_file():
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [
+            "M leg has no workload-json report (C staged as M?)"]
+        return judged
+    try:
+        parsed = kparsers.parse_workload_report(wl_path)
+    except kparsers.ParseError as err:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [str(err)]
+        return judged
+    judged["workload"] = parsed
+    shape = leg["workload"]
+    reasons = km1validity.check_m_report(parsed, shape)
+    if reasons:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + reasons
+        return judged
+    stderr_log = legs_dir / f"{leg_id}-capture.stderr.log"
+    try:
+        ctx = km1validity.parse_ctx_telemetry(stderr_log)
+    except ValueError as err:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [str(err)]
+        return judged
+    judged["ctx"] = ctx
+    reasons = km1validity.check_m_cross(parsed, ctx)
+    if reasons:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + reasons
+        return judged
+    expected_rows = manifest["workloads"][shape]["expected_rows"]
+    reasons = km1validity.check_ctx_leg(
+        ctx, parsed["ledger"]["system_total"], shape, expected_rows,
+        ctx_overflow=parsed["ledger"]["refused_inserts"],
+        counter_name="refused_inserts")
     if reasons:
         judged["valid"] = False
         judged["outcome"] = "invalid"

@@ -32,6 +32,164 @@ LOSS_COUNTERS = (
     "predrop_spare_7",
 )
 
+WORKLOAD_REPORT_SCHEMA = "kryprobe.workload-report.v2"
+
+_U64_MAX = 2 ** 64 - 1
+
+
+def _u64_digit(value, path: Path, what: str) -> int:
+    """Strict u64 digit-string (§5.4 integer convention).
+
+    The workload wire emits digit strings (never bare ints —
+    serde); bools, floats, negatives, empty/non-digit strings,
+    and over-u64 magnitudes refuse (mistyped evidence, never a
+    coerced count). ASCII digits only (no unicode-digit trap).
+    """
+    if isinstance(value, bool) or not isinstance(value, str) \
+            or not value:
+        raise ParseError(f"{path}: bad {what} {value!r}")
+    for char in value:
+        if char not in "0123456789":
+            raise ParseError(f"{path}: bad {what} {value!r}")
+    parsed = int(value)
+    if parsed > _U64_MAX:
+        raise ParseError(f"{path}: bad {what} {value!r} (over u64)")
+    return parsed
+
+
+def _wire_str(doc: dict, path: Path, *keys: str):
+    """Nested required wire string (missing/mistyped refuses)."""
+    node = doc
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            raise ParseError(
+                f"{path}: workload report lacks {'.'.join(keys)}")
+        node = node[key]
+    if not isinstance(node, str):
+        raise ParseError(
+            f"{path}: workload {'.'.join(keys)}={node!r} not str")
+    return node
+
+
+def _wire_bool(doc: dict, path: Path, *keys: str) -> bool:
+    """Nested required wire bool (bools only — 0/1 never pass)."""
+    node = doc
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            raise ParseError(
+                f"{path}: workload report lacks {'.'.join(keys)}")
+        node = node[key]
+    if not isinstance(node, bool):
+        raise ParseError(
+            f"{path}: workload {'.'.join(keys)}={node!r} not bool")
+    return node
+
+
+def parse_workload_report(path: Path) -> dict:
+    """Parse one workload-report-v2 ``workload-json`` document (M legs).
+
+    Strict shape parse (required keys + wire types); campaign-value
+    pins (profile, scope, ledger disposition, coverage, metadata)
+    live in ``m1validity.check_m_report``, not here. Every failure
+    raises :class:`ParseError` (loud, never a partial parse).
+    """
+    doc = _read_json(path)
+    if not isinstance(doc, dict):
+        raise ParseError(f"{path} is not a workload report")
+    if doc.get("schema") != WORKLOAD_REPORT_SCHEMA:
+        raise ParseError(
+            f"{path}: schema {doc.get('schema')!r} is not "
+            f"{WORKLOAD_REPORT_SCHEMA}")
+    for key in ("session", "interval", "profile", "boundary",
+                "dictionary", "contexts", "ledger", "partition",
+                "selectors", "scope", "metadata", "coverage"):
+        if key not in doc:
+            raise ParseError(f"{path}: workload report lacks {key!r}")
+    contexts = doc["contexts"]
+    if not isinstance(contexts, list):
+        raise ParseError(f"{path}: workload contexts not a list")
+    rows_sum = 0
+    for idx, row in enumerate(contexts):
+        if not isinstance(row, dict):
+            raise ParseError(
+                f"{path}: workload contexts[{idx}] not an object")
+        if "calls" not in row:
+            raise ParseError(
+                f"{path}: workload contexts[{idx}] lacks calls")
+        rows_sum += _u64_digit(row["calls"], path,
+                               f"contexts[{idx}].calls")
+    ledger = doc["ledger"]
+    if not isinstance(ledger, dict):
+        raise ParseError(f"{path}: workload ledger not an object")
+    partition = doc["partition"]
+    if not isinstance(partition, dict):
+        raise ParseError(f"{path}: workload partition not an object")
+    metadata = doc["metadata"]
+    if not isinstance(metadata, dict):
+        raise ParseError(f"{path}: workload metadata not an object")
+    coverage = doc["coverage"]
+    if not isinstance(coverage, dict):
+        raise ParseError(f"{path}: workload coverage not an object")
+    reason = metadata.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise ParseError(
+            f"{path}: workload metadata.reason={reason!r} not str")
+    return {
+        "profile": _wire_str(doc, path, "profile"),
+        "boundary": _wire_str(doc, path, "boundary"),
+        "interval_consistency": _wire_str(doc, path, "interval",
+                                          "consistency"),
+        "ledger": {
+            "system_total": _u64_digit(ledger.get("system_total"),
+                                       path, "ledger.system_total"),
+            "per_context_sum": _u64_digit(
+                ledger.get("per_context_sum"), path,
+                "ledger.per_context_sum"),
+            "unknown": _u64_digit(ledger.get("unknown"), path,
+                                   "ledger.unknown"),
+            "consistency": _wire_str(doc, path, "ledger",
+                                      "consistency"),
+            "gap_unreconciled": _wire_bool(doc, path, "ledger",
+                                            "gap_unreconciled"),
+            "system_saturated": _wire_bool(doc, path, "ledger",
+                                            "system_saturated"),
+            "per_context_saturated": _wire_bool(
+                doc, path, "ledger", "per_context_saturated"),
+            "refused_inserts": _u64_digit(
+                ledger.get("refused_inserts"), path,
+                "ledger.refused_inserts"),
+        },
+        "partition": {
+            "matched": _u64_digit(partition.get("matched"), path,
+                                   "partition.matched"),
+            "nonmatched": _u64_digit(partition.get("nonmatched"),
+                                      path, "partition.nonmatched"),
+            "unknown_match": _u64_digit(
+                partition.get("unknown_match"), path,
+                "partition.unknown_match"),
+        },
+        "n_rows": len(contexts),
+        "rows_calls_sum": rows_sum,
+        "selectors_kind": _wire_str(doc, path, "selectors", "kind"),
+        "capture_scope": _wire_str(doc, path, "scope",
+                                    "capture_scope"),
+        "report_scope": _wire_str(doc, path, "scope",
+                                   "report_scope"),
+        "group_by": _wire_str(doc, path, "scope", "group_by"),
+        "metadata": {"status": _wire_str(doc, path, "metadata",
+                                         "status"),
+                     "reason": reason},
+        "coverage": {
+            "capture": _wire_str(doc, path, "coverage", "capture"),
+            "attribution": _wire_str(doc, path, "coverage",
+                                      "attribution"),
+            "metadata": _wire_str(doc, path, "coverage",
+                                   "metadata"),
+            "correlation": _wire_str(doc, path, "coverage",
+                                      "correlation"),
+        },
+    }
+
 
 def _read_json(path: Path):
     try:

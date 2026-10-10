@@ -182,14 +182,147 @@ def parse_ctx_overflow_counter(path: Path) -> int:
     return found
 
 
+def check_m_report(parsed: dict, shape: str) -> list:
+    """M-leg workload-json rules (Task05 Stage 4, freeze G4). Returns
+    reasons (empty = valid). Pins the campaign M shape (api-returns
+    profile, unscoped system view, no selector/grouping), the
+    frozen Stage-1 ledger disposition (unproven gap with unknown
+    0 — the exact unknown rides the ctx walk, never the ledger),
+    the coverage dispositions the product hardcodes (capture
+    partial, correlation complete; available metadata must not
+    read unavailable), the partition/sum identities the assembly
+    guarantees (recomputed, never trusted), the typed metadata
+    availability (G6: an M leg without metadata reports
+    unavailable/* — never valid as M), and the refused-inserts
+    overflow equivalent (0 below capacity, > 0 on churn_full —
+    KCTX_DROPS is exact on both walks). No driver-oracle
+    arithmetic (A2): kernel calls per roundtrip are
+    kernel/shape-dependent."""
+    reasons = []
+    if parsed["profile"] != "api-returns":
+        reasons.append(f"M profile={parsed['profile']!r}, "
+                       "want api-returns")
+    if parsed["boundary"] != "api_return":
+        reasons.append(f"M boundary={parsed['boundary']!r}, "
+                       "want api_return")
+    if parsed["capture_scope"] != "system":
+        reasons.append("M capture_scope="
+                       f"{parsed['capture_scope']!r}, want system")
+    if parsed["report_scope"] != "unscoped":
+        reasons.append("M report_scope="
+                       f"{parsed['report_scope']!r}, want unscoped")
+    if parsed["selectors_kind"] != "none":
+        reasons.append("M selectors_kind="
+                       f"{parsed['selectors_kind']!r}, want none")
+    if parsed["group_by"] != "none":
+        reasons.append(f"M group_by={parsed['group_by']!r}, want none")
+    ledger = parsed["ledger"]
+    if ledger["consistency"] != "unproven":
+        reasons.append("M ledger consistency="
+                       f"{ledger['consistency']!r}, want unproven")
+    if parsed["interval_consistency"] != ledger["consistency"]:
+        reasons.append("M interval/ledger consistency disagree: "
+                       f"{parsed['interval_consistency']!r} vs "
+                       f"{ledger['consistency']!r}")
+    if ledger["gap_unreconciled"] is not True:
+        reasons.append("M gap_unreconciled="
+                       f"{ledger['gap_unreconciled']!r}, want true")
+    if ledger["unknown"] != 0:
+        reasons.append(f"M ledger unknown={ledger['unknown']}, "
+                       "want 0 (unproven exports a gap, never an "
+                       "exact unknown)")
+    if ledger["system_saturated"] is not False:
+        reasons.append("M system_saturated=true (u64 cannot "
+                       "saturate in 50 s — anomaly, fail closed)")
+    if ledger["per_context_saturated"] is not False:
+        reasons.append("M per_context_saturated=true (live "
+                       "assembly pins false — anomaly)")
+    if parsed["rows_calls_sum"] != ledger["per_context_sum"]:
+        reasons.append("M rows sum="
+                       f"{parsed['rows_calls_sum']} != "
+                       "per_context_sum="
+                       f"{ledger['per_context_sum']}")
+    partition = parsed["partition"]
+    if partition["matched"] != parsed["rows_calls_sum"] or \
+            partition["nonmatched"] != 0 or \
+            partition["unknown_match"] != 0:
+        reasons.append("M partition matched/nonmatched/"
+                       f"unknown_match={partition['matched']}/"
+                       f"{partition['nonmatched']}/"
+                       f"{partition['unknown_match']}, want "
+                       f"{parsed['rows_calls_sum']}/0/0")
+    metadata = parsed["metadata"]
+    if metadata["status"] != "available":
+        reasons.append(f"M metadata.status={metadata['status']!r} "
+                       f"(reason {metadata['reason']!r}): an M leg "
+                       "without metadata is not an M leg")
+    elif metadata["reason"] is not None:
+        reasons.append(f"M metadata reason={metadata['reason']!r} "
+                       "on an available report")
+    coverage = parsed["coverage"]
+    if coverage["capture"] != "partial":
+        reasons.append(f"M coverage.capture={coverage['capture']!r}"
+                       ", want partial (live disposition)")
+    if coverage["correlation"] != "complete":
+        reasons.append("M coverage.correlation="
+                       f"{coverage['correlation']!r}, want complete")
+    if coverage["metadata"] == "unavailable":
+        reasons.append("M coverage.metadata=unavailable on an "
+                       "available report (contradiction)")
+    refused = ledger["refused_inserts"]
+    if shape == "churn_full":
+        if refused <= 0:
+            reasons.append(f"M churn_full refused_inserts={refused}"
+                           ", want > 0 (saturation must show)")
+    elif refused != 0:
+        reasons.append(f"M {shape} refused_inserts={refused}, "
+                       "want 0")
+    return reasons
+
+
+def check_m_cross(parsed: dict, ctx: dict) -> list:
+    """Same-walk ledger↔ctx cross-equalities for one M leg (freeze
+    G4). The workload join and the terminal ctx line walk the same
+    frozen post-finish maps, so KTOT, ΣKCTX, KCTX_DROPS, and the row
+    count must agree exactly across both encodings. Any
+    disagreement is a flaky-KTOT-class contradiction: invalid with
+    the contradiction named (re-run under a fresh attempt id,
+    never averaged). Unreadable (null) ctx operands are invalid,
+    never skipped."""
+    reasons = []
+    ledger = parsed["ledger"]
+    pairs = (("system_total", "system_calls"),
+             ("per_context_sum", "present_calls"),
+             ("refused_inserts", "drops"))
+    for ledger_key, ctx_key in pairs:
+        ctx_val = ctx[ctx_key]
+        if ctx_val is None:
+            reasons.append(f"M cross: ctx.{ctx_key} unreadable")
+        elif ledger[ledger_key] != ctx_val:
+            reasons.append(f"M cross contradiction: ledger."
+                           f"{ledger_key}={ledger[ledger_key]} != "
+                           f"ctx.{ctx_key}={ctx_val}")
+    if ctx["rows"] is None:
+        reasons.append("M cross: ctx.rows unreadable")
+    elif parsed["n_rows"] != ctx["rows"]:
+        reasons.append(f"M cross contradiction: report rows="
+                       f"{parsed['n_rows']} != ctx.rows="
+                       f"{ctx['rows']}")
+    return reasons
+
+
 def check_ctx_leg(ctx: dict, totals_calls, shape: str,
-                  expected_rows: int, ctx_overflow=None) -> list:
+                  expected_rows: int, ctx_overflow=None,
+                  counter_name="ctx_overflow_identities") -> list:
     """M1 ctx exactness rules for one C leg. Returns reasons (empty =
     valid). ``totals_calls`` is the report TOTALS calls (cross-check);
     ``ctx_overflow`` is the sealed ``ctx_overflow_identities``
     coverage counter (F8: 0 on below-cap shapes, >= 1 on churn_full —
     first-per-kh lower bound, freeze §5). ``None`` means the counter
-    is unreadable (invalid, never skipped).
+    is unreadable (invalid, never skipped). M legs pass the
+    workload-json ``refused_inserts`` (same KCTX_DROPS counter, same
+    0-below-cap/>=1-on-full rule) via ``counter_name`` so reasons
+    name the operand actually judged.
     No driver-oracle arithmetic (A2): kernel calls per roundtrip are
     shape- and kernel-dependent (2 flat, 4 6.12-floor, plus allocs),
     and frozen validity already reconciles driver↔sensor per-op."""
@@ -238,10 +371,10 @@ def check_ctx_leg(ctx: dict, totals_calls, shape: str,
         # (first-per-kh gating: lower bound, so >= 1, never exact).
         if ctx_overflow is None:
             reasons.append(
-                "churn_full ctx_overflow_identities unreadable")
+                f"churn_full {counter_name} unreadable")
         elif ctx_overflow < 1:
             reasons.append(
-                f"churn_full ctx_overflow_identities={ctx_overflow}, "
+                f"churn_full {counter_name}={ctx_overflow}, "
                 "want >= 1 (saturation must show)")
     else:
         # expected_rows=None skips the row pin (6.12 diagnostic: the
@@ -256,9 +389,9 @@ def check_ctx_leg(ctx: dict, totals_calls, shape: str,
         # F8: below capacity nothing may overflow — a nonzero sealed
         # counter contradicts the clean drops/unknown above.
         if ctx_overflow is None:
-            reasons.append(f"{shape} ctx_overflow_identities unreadable")
+            reasons.append(f"{shape} {counter_name} unreadable")
         elif ctx_overflow != 0:
-            reasons.append(f"{shape} ctx_overflow_identities="
+            reasons.append(f"{shape} {counter_name}="
                            f"{ctx_overflow}, want 0")
         if expected_rows is not None and rows != expected_rows:
             reasons.append(
