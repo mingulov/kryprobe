@@ -14,8 +14,16 @@ use std::path::{Path, PathBuf};
 /// +`guest_below_floor_refuses_typed`,
 /// +`guest_enokey_leaves_provider_unentered` — all vng-lane,
 /// staged-guest only; the sudo-lane EXPECTED inventory enrolls the
-/// suite with OTHER_LANE routing under its explicit lane decision).
-const PINNED_IGNORED: usize = 37;
+/// suite with OTHER_LANE routing under its explicit lane decision;
+/// 42 at M1 Stage 3: +5 `kcrypto_ctx` privileged exactness oracles
+/// (`same_process_cgroup_migration_splits_counts`,
+/// `fence_close_freezes_our_ctx_rows`, `ctx_map_full_refuse_new_is_exact`,
+/// `ctx_first_over_capacity_is_exact`, `second_observer_sees_same_ctx_rows`)
+/// from the Stage 1 merge — all `BPF lane: run with
+/// `cargo xtask test bpf``, suite enrolled in the lane table, root+BTF
+/// gated with honest skips; every source branch already carried them
+/// against the stale 37 pin).
+const PINNED_IGNORED: usize = 42;
 
 /// Reason prefix every ignored test must carry.
 const LANE_PREFIX: &str = "BPF lane: ";
