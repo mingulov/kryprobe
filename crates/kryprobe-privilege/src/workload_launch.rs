@@ -1425,12 +1425,15 @@ mod tests {
         );
     }
 
-    /// Built fixture binary: `<target>/debug/kryprobe_launch_fixture`
-    /// next to the test executable's `deps` dir. Every all-target
-    /// `cargo test` builds it (including the `xtask check` gate);
-    /// focused `--lib`/`--test` runs must build it first
-    /// (`cargo build -p kryprobe-privilege --bin
-    /// kryprobe_launch_fixture`) — the assert says so loudly.
+    /// Built fixture binary:
+    /// `<target>/debug/examples/kryprobe_launch_fixture` next to the
+    /// test executable's `deps` dir. The fixture is a Cargo *example*
+    /// (test-only by construction: `cargo build` never produces it,
+    /// `cargo install` never ships it). Every all-target `cargo test`
+    /// builds it (including the `xtask check` gate); focused
+    /// `--lib`/`--test` runs must build it first (`cargo build -p
+    /// kryprobe-privilege --example kryprobe_launch_fixture`) — the
+    /// assert says so loudly.
     fn fixture_binary_path() -> PathBuf {
         let test_exe = std::env::current_exe().expect("test exe");
         let bin = test_exe
@@ -1438,11 +1441,20 @@ mod tests {
             .expect("deps dir")
             .parent()
             .expect("profile dir")
+            .join("examples")
             .join("kryprobe_launch_fixture");
         assert!(
             bin.is_file(),
             "fixture binary built at {} (run all-target `cargo test -p kryprobe-privilege`)",
             bin.display()
+        );
+        // Layout pin: the Cargo test-only gate IS this directory — a
+        // fixture resolving anywhere else (e.g. back in the profile
+        // dir as a `src/bin` target) would ship with normal builds.
+        assert_eq!(
+            bin.parent().and_then(|dir| dir.file_name()),
+            Some(std::ffi::OsStr::new("examples")),
+            "fixture resolves from Cargo examples (test-only)"
         );
         bin
     }

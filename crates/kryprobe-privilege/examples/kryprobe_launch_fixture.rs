@@ -43,6 +43,24 @@
 //!
 //! Relative paths resolve against the sidecar directory. A missing
 //! or unparsable sidecar exits 3 loudly (tests always write one).
+//!
+//! Test-only Cargo gate: this file lives in `examples/`, so Cargo
+//! NEVER builds it for `cargo build` (dev or release) and NEVER
+//! installs it (`cargo install` ships `[[bin]]` targets only) —
+//! `src/bin/` autodiscovery was the hole (a normal build produced a
+//! shippable artifact). `cargo test` DOES build it (to
+//! `<profile>/examples/`), which is the only build that spawns it.
+//!
+//! Anti-confusion (why its real-IPC wire output cannot be mistaken
+//! for the real helper): (1) path separation — production discovery
+//! is the FIXED sibling and the launcher spawns this fixture only
+//! through test-only explicit override paths, never via discovery;
+//! (2) mode separation — without its `<stem>.fixture.json` sidecar
+//! (which production never ships) it exits 3 before printing any
+//! protocol byte, so a stray copy at the sibling path cannot answer;
+//! (3) the wire shapes stay frozen-identical on purpose — no
+//! discriminator field exists because the parsers deny unknown
+//! fields, so the separation above, not the bytes, is the guard.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
