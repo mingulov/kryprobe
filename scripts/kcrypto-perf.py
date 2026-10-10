@@ -323,6 +323,61 @@ def _parse_obs_arg(value: str, side: str) -> tuple:
     return (Path(cli), Path(bpf_dir))
 
 
+def m1_stage_metadata_args(obs_roles: dict, metadata_arg):
+    """Task05 Stage 4 (freeze G2): the --metadata requirement rule.
+
+    The frozen metadata file is required exactly when a staged
+    side has role M (one frozen file for every M leg; per-side
+    copies are staged + pinned from it). Fail-closed both ways:
+    an M side without --metadata, or --metadata without an M
+    side, refuses. Returns the metadata path for M cells, None
+    otherwise.
+    """
+    want = "M" in obs_roles.values()
+    if want and not metadata_arg:
+        raise owned_guest.GuestError(
+            "M1 M side needs --metadata FILE (frozen metadata file)")
+    if metadata_arg and not want:
+        raise owned_guest.GuestError(
+            "--metadata FILE given but no staged side has role M")
+    return metadata_arg if want else None
+
+
+def _precheck_metadata_file(path: Path) -> str:
+    """Stage-time metadata gate (freeze G2): regular JSON file with
+    the workload-metadata-v1 top-level shape inside the ADR-0012
+    §(d) budgets (full schema validation is a host-test gate, not
+    a staging gate). Returns the file sha256. Refuses loudly."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as err:
+        raise owned_guest.GuestError(
+            f"--metadata {path}: unreadable: {err}") from err
+    if len(raw) > 1048576:
+        raise owned_guest.GuestError(
+            f"--metadata {path}: {len(raw)} bytes over 1048576")
+    try:
+        doc = json.loads(raw)
+    except ValueError as err:
+        raise owned_guest.GuestError(
+            f"--metadata {path}: not JSON: {err}") from err
+    if not isinstance(doc, dict):
+        raise owned_guest.GuestError(
+            f"--metadata {path}: top level must be an object")
+    for key in ("collector", "snapshot_interval", "kernel_identity",
+                "entries"):
+        if key not in doc:
+            raise owned_guest.GuestError(
+                f"--metadata {path}: lacks {key!r}")
+    if not isinstance(doc["entries"], list) or \
+            len(doc["entries"]) > 1024:
+        raise owned_guest.GuestError(
+            f"--metadata {path}: entries must be a list <= 1024")
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()
+
+
 def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
                      manifest_sha: str, vng: str, legs: list,
                      cell_id: str) -> tuple:
@@ -341,6 +396,13 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
         obs_roles = {"A": entry["obs_a"], "B": entry["obs_b"]}
     else:
         obs_roles = {"A": "D", "B": "C"}
+    metadata_arg = m1_stage_metadata_args(
+        obs_roles, getattr(args, "metadata", None))
+    metadata_src = None
+    metadata_sha = None
+    if metadata_arg is not None:
+        metadata_src = Path(metadata_arg).resolve(strict=True)
+        metadata_sha = _precheck_metadata_file(metadata_src)
     for side, role in obs_roles.items():
         obs_dir = run_dir / f"obs-{side}"
         obs_dir.mkdir()
@@ -363,6 +425,25 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
             shutil.copyfile(bpf_src / obj, obs_dir / "kryprobe-bpf" / obj)
             pins[f"obs-{side}/kryprobe-bpf/{obj}"] = sha256_file(
                 obs_dir / "kryprobe-bpf" / obj)
+        if role == "M":
+            # Freeze G2: the frozen metadata bytes + the helper
+            # sibling ride the M side (both pinned; the helper is
+            # the fixed sibling next to the staged CLI source).
+            shutil.copyfile(metadata_src,
+                            obs_dir / "workload-metadata.json")
+            pins[f"obs-{side}/workload-metadata.json"] = sha256_file(
+                obs_dir / "workload-metadata.json")
+            helper_src = cli_src.parent / "kryprobe-workload-helper"
+            if not helper_src.is_file():
+                raise owned_guest.GuestError(
+                    f"side {side} role M needs the helper sibling "
+                    f"next to {cli_src} (missing/non-regular)")
+            helper_src = helper_src.resolve()
+            shutil.copyfile(helper_src,
+                            obs_dir / "kryprobe-workload-helper")
+            (obs_dir / "kryprobe-workload-helper").chmod(0o755)
+            pins[f"obs-{side}/kryprobe-workload-helper"] = \
+                sha256_file(obs_dir / "kryprobe-workload-helper")
     driver = Path(args.driver).resolve(strict=True)
     shutil.copyfile(driver, run_dir / "kcrypto_perf.py")
     pins["kcrypto_perf.py"] = sha256_file(run_dir / "kcrypto_perf.py")
@@ -400,6 +481,11 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
         f"WARMUP_S={glob['warmup_s']}\nMEASURE_S={glob['measure_s']}\n"
         f"SETTLE_S={glob['settle_s']}\nQUIET_S={glob['quiet_s']}\n"
         f"NEED_MODULE=0\n"
+        # Freeze G2: per-side observer roles (the scenario picks
+        # the M capture shape from these) + the frozen metadata
+        # digest M legs must run with ("none" without an M side).
+        f"OBS_A={obs_roles['A']}\nOBS_B={obs_roles['B']}\n"
+        f"METADATA_SHA={metadata_sha or 'none'}\n"
         # F-06: quote — multi-word flags (n_cgroup/churn) must
         # survive `set -u` sourcing as one word (re-split at use).
         f"M1_DRIVER_FLAGS=\"{workload['driver_flags']}\"\n")
@@ -421,6 +507,10 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
         f"CLI_B_SHA={_pin_or_none('obs-B/kryprobe')}\n"
         f"BPF_B_AGG_SHA={_pin_or_none('obs-B/kryprobe-bpf/kcrypto.bpf.o')}\n"
         f"BPF_B_LC_SHA={_pin_or_none('obs-B/kryprobe-bpf/kcrypto-lifecycle.bpf.o')}\n"
+        f"META_A_SHA={_pin_or_none('obs-A/workload-metadata.json')}\n"
+        f"HELPER_A_SHA={_pin_or_none('obs-A/kryprobe-workload-helper')}\n"
+        f"META_B_SHA={_pin_or_none('obs-B/workload-metadata.json')}\n"
+        f"HELPER_B_SHA={_pin_or_none('obs-B/kryprobe-workload-helper')}\n"
         f"MODULE_SHA={pins['kcrypto_fixture.ko']}\n"
         f"DRIVER_SHA={pins['kcrypto_perf.py']}\n")
     pins["pins.env"] = sha256_file(run_dir / "pins.env")
@@ -431,6 +521,7 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
              "kernel": entry["kernel"], "head": head,
              "manifest_sha256": manifest_sha, "sha256": pins,
              "obs_a": obs_roles["A"], "obs_b": obs_roles["B"],
+             "metadata_sha256": metadata_sha,
              "scenario": "perf_set_m1.sh", "fixture": "kcrypto_perf_m1.py",
              "legs": [leg["leg_id"] for leg in legs]}
     (run_dir / "stage.json").write_text(json.dumps(stage, indent=2) + "\n")
@@ -1239,6 +1330,10 @@ M1_BASE_PINS = frozenset({
 M1_OBS_PINS = ("kryprobe", "kryprobe-bpf/kcrypto.bpf.o",
                "kryprobe-bpf/kcrypto-lifecycle.bpf.o")
 
+# Freeze G2/G5: M sides additionally pin the frozen metadata file
+# bytes + the helper sibling staged next to the CLI.
+M1_META_PINS = ("workload-metadata.json", "kryprobe-workload-helper")
+
 
 def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     """M1 stage pins: base pins plus per-side observer pins (a DISABLED
@@ -1255,9 +1350,12 @@ def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
         role = stage.get(f"obs_{side.lower()}")
         if role == "D":
             want.add(f"obs-{side}/DISABLED")
-        elif role in ("R", "C"):
+        elif role in ("R", "C", "M"):
             for tail in M1_OBS_PINS:
                 want.add(f"obs-{side}/{tail}")
+            if role == "M":
+                for tail in M1_META_PINS:
+                    want.add(f"obs-{side}/{tail}")
         else:
             reasons.append(f"stage obs_{side.lower()} role {role!r} unknown")
     for name in sorted(want):
@@ -1300,7 +1398,9 @@ def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     for side in ("a", "b"):
         for dim, tail in (("kryprobe", "kryprobe"),
                           ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
-                          ("lc", "kryprobe-bpf/kcrypto-lifecycle.bpf.o")):
+                          ("lc", "kryprobe-bpf/kcrypto-lifecycle.bpf.o"),
+                          ("metadata", "workload-metadata.json"),
+                          ("helper", "kryprobe-workload-helper")):
             pin_name = f"obs-{side.upper()}/{tail}"
             pinned = pins.get(pin_name)
             if pinned is None or pinned == "none":
@@ -2139,6 +2239,9 @@ def main(argv=None) -> int:
                      help="M1 manifest: side-A observer DISABLED or CLI:BPFDIR")
     run.add_argument("--obs-b", default=None,
                      help="M1 manifest: side-B observer DISABLED or CLI:BPFDIR")
+    run.add_argument("--metadata", default=None,
+                     help="M1 manifest: frozen metadata file "
+                     "(required iff a staged side has role M)")
     run.add_argument("--ko", action="append", default=[],
                      help="K=V fixture module, repeatable")
     run.add_argument("--driver", required=True)

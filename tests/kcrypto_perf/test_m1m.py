@@ -334,6 +334,98 @@ class MetadataStagingTests(unittest.TestCase):
                                        "/tmp/meta.json"),
             "/tmp/meta.json")
 
+    def _stage_m_cell(self, with_helper=True):
+        import os
+        from types import SimpleNamespace
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp())
+        home = tmp / "home"
+        boot = home / ".cache" / "virtme-ng" / "vX" / "amd64" / "boot"
+        boot.mkdir(parents=True)
+        (boot / "config-test").write_text("guest-config-bytes")
+        bin_d = tmp / "bin"
+        (bin_d / "bpf").mkdir(parents=True)
+        (bin_d / "kryprobe").write_bytes(b"fake-cli")
+        (bin_d / "bpf" / "kcrypto.bpf.o").write_bytes(b"agg")
+        (bin_d / "bpf" / "kcrypto-lifecycle.bpf.o").write_bytes(b"lc")
+        if with_helper:
+            (bin_d / "kryprobe-workload-helper").write_bytes(
+                b"helper")
+        meta = {"collector": "test",
+                "snapshot_interval": {"start_ns": 0, "end_ns": 1},
+                "kernel_identity": "unknown", "entries": []}
+        (tmp / "meta.json").write_text(json.dumps(meta))
+        (tmp / "driver.py").write_bytes(b"driver")
+        entry = {"id": "fake-mr", "kernel": "7.0.14",
+                 "workload": "single", "obs_a": "R", "obs_b": "M",
+                 "pairs": 10, "max_attempted": 12}
+        manifest = {
+            "global": {"warmup_s": 10, "measure_s": 30,
+                       "capture_s": 50, "settle_s": 5,
+                       "quiet_s": 5},
+            "workloads": {"single": {"driver_flags": "",
+                                     "driver_threads": 1,
+                                     "expected_rows": 3}}}
+        legs = [{"leg_id": f"leg00{side}", "side": side,
+                 "mode": "aggregation", "cls": "P-4K",
+                 "driver": "skcipher", "size": 4096,
+                 "workload": "single", "paced": 0, "bulk": 0,
+                 "threads": 1} for side in ("A", "B")]
+        args = SimpleNamespace(
+            out_root=str(tmp / "out"),
+            obs_a=f"{bin_d}/kryprobe:{bin_d}/bpf",
+            obs_b=f"{bin_d}/kryprobe:{bin_d}/bpf",
+            metadata=str(tmp / "meta.json"),
+            driver=str(tmp / "driver.py"))
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            return CLI.stage_m1_run_dir(
+                args, entry, manifest, "set", "MANIFESTSHA", "vX",
+                legs, "fake-mr")
+
+    def test_stage_m_side_copies_and_pins(self):
+        run_dir, stage, _ = self._stage_m_cell()
+        self.assertTrue(
+            (run_dir / "obs-B" / "workload-metadata.json").is_file())
+        self.assertTrue(
+            (run_dir / "obs-B" /
+             "kryprobe-workload-helper").is_file())
+        self.assertFalse(
+            (run_dir / "obs-A" / "workload-metadata.json").exists())
+        set_env = (run_dir / "set.env").read_text()
+        self.assertIn("OBS_A=R", set_env)
+        self.assertIn("OBS_B=M", set_env)
+        self.assertIn("METADATA_SHA=", set_env)
+        self.assertNotIn("METADATA_SHA=none", set_env)
+        pins_env = (run_dir / "pins.env").read_text()
+        self.assertIn("META_B_SHA=", pins_env)
+        self.assertIn("HELPER_B_SHA=", pins_env)
+        self.assertIsNotNone(stage["metadata_sha256"])
+        # Round trip: a guest env echoing the staged pins passes
+        # the pin check (the scenario writes these dims in-guest).
+        pins = stage["sha256"]
+        env = {"ko": "none", "driver": pins["kcrypto_perf.py"]}
+        for side in ("a", "b"):
+            for dim, tail in (("kryprobe", "kryprobe"),
+                              ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
+                              ("lc", "kryprobe-bpf/kcrypto-lifecycle"
+                                     ".bpf.o"),
+                              ("metadata", "workload-metadata.json"),
+                              ("helper",
+                               "kryprobe-workload-helper")):
+                pin = pins.get(f"obs-{side.upper()}/{tail}")
+                if pin is not None:
+                    env[f"obs_{side}_{dim}"] = pin
+        (run_dir / "environment.txt").write_text(
+            "".join(f"{key}={val}\n"
+                    for key, val in sorted(env.items())))
+        reasons, _ = CLI.check_m1_stage_pins(run_dir, stage)
+        self.assertEqual(reasons, [])
+
+    def test_stage_m_side_missing_helper_refused(self):
+        with self.assertRaises(CLI.owned_guest.GuestError):
+            self._stage_m_cell(with_helper=False)
+
 
 class WorkloadParseTests(unittest.TestCase):
     """G4: workload-json report parsing (totals/loss/coverage)."""
