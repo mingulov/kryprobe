@@ -1725,11 +1725,25 @@ impl kryprobe_cli::live::SessionSensor for MidStopSensor {
     fn snapshot_tick(
         &mut self,
         _barrier_id: u64,
-        _stop: &std::sync::atomic::AtomicBool,
+        stop: &std::sync::atomic::AtomicBool,
     ) -> Result<kryprobe_privilege::kcrypto_snapshot::SnapshotRows, kryprobe_cli::live::LiveError>
     {
-        self.ticks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let served = self
+            .ticks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        // Deterministic rendezvous (Stage 3 item 8): the third tick
+        // waits for the stop flag instead of racing it. The spawner
+        // sets stop exactly when it observes tick 3, so the driver
+        // can serve neither fewer (stop needs tick 3) nor more (stop
+        // lands before tick 3 returns, and nothing clears it). No
+        // timeouts, no sleeps: progress is guaranteed by
+        // construction on both sides of the rendezvous.
+        if served == 3 {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+        }
         Ok(self.tick.clone())
     }
 
@@ -1781,9 +1795,11 @@ impl kryprobe_cli::live::SessionSensor for MidStopSensor {
 
 #[test]
 fn live_stop_mid_run_tears_down_cleanly() {
-    // M-T4: a second thread sets the shared stop flag after the 3rd
-    // tick starts; the driver must end the session (Ok, Finalized,
-    // exactly-once finalize + sensor finish), not hang or error.
+    // M-T4: a second thread sets the shared stop flag exactly when
+    // the 3rd tick starts (rendezvous in `MidStopSensor`), and the
+    // driver must end the session (Ok, Finalized, exactly-once
+    // finalize + sensor finish) after exactly 3 ticks — not hang,
+    // not error, and never a timing window.
     let _suite = suite_guard();
     let mut controller = attached_controller();
     let tick = kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
@@ -1840,9 +1856,9 @@ fn live_stop_mid_run_tears_down_cleanly() {
     })
     .expect("stopped session drives green");
     let served = sensor.ticks.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        (3..=6).contains(&served),
-        "stop lands mid-run, promptly ({served} ticks)"
+    assert_eq!(
+        served, 3,
+        "the rendezvous serves exactly 3 ticks (deterministic, no window)"
     );
     assert_eq!(
         outcome.terminal_state,
@@ -1855,6 +1871,246 @@ fn live_stop_mid_run_tears_down_cleanly() {
     assert!(
         sensor.finished.load(std::sync::atomic::Ordering::Relaxed),
         "sensor finish ran once"
+    );
+}
+
+/// M1 Stage 3: scripted terminal sample with a configurable row set —
+/// one tick (immediate stop), then the scripted terminal.
+struct WorkloadDriveSensor {
+    rows: Vec<kryprobe_privilege::kcrypto_snapshot::RowBytes>,
+    totals: Option<kryprobe_privilege::kcrypto_snapshot::TotalsBytes>,
+}
+
+impl kryprobe_cli::live::SessionSensor for WorkloadDriveSensor {
+    fn snapshot_tick(
+        &mut self,
+        _: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<kryprobe_privilege::kcrypto_snapshot::SnapshotRows, kryprobe_cli::live::LiveError>
+    {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+            rows: Vec::new(),
+            totals: None,
+            idents: Vec::new(),
+            overflow_identities: 0,
+            ctx_overflow_identities: 0,
+            drops: 0,
+            monotonic_ns: 100,
+            lagmax_ns: None,
+        })
+    }
+
+    fn kallsyms_text(&mut self) -> String {
+        String::new()
+    }
+
+    fn snapshot_who(
+        &mut self,
+    ) -> Result<
+        (Vec<kryprobe_privilege::kcrypto_backend::WhoSnapshot>, u64),
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok((Vec::new(), 0))
+    }
+
+    fn finish(
+        &mut self,
+    ) -> Result<
+        kryprobe_privilege::kcrypto_backend::AggregateTerminalSample,
+        kryprobe_cli::live::LiveError,
+    > {
+        Ok(
+            kryprobe_privilege::kcrypto_backend::AggregateTerminalSample {
+                snapshot: kryprobe_privilege::kcrypto_snapshot::SnapshotRows {
+                    rows: self.rows.clone(),
+                    totals: self.totals.clone(),
+                    idents: Vec::new(),
+                    overflow_identities: 0,
+                    ctx_overflow_identities: 0,
+                    drops: 0,
+                    monotonic_ns: 200,
+                    lagmax_ns: None,
+                },
+                who: Vec::new(),
+                who_drops: 0,
+                drops: [0; 8],
+                drain: Default::default(),
+                started_ns: 10,
+                fence: kryprobe_privilege::kcrypto_fence::CloseOutcome::Pending,
+            },
+        )
+    }
+
+    fn cleanup(
+        &mut self,
+    ) -> Result<Option<kryprobe_privilege::drain::DrainStats>, kryprobe_cli::live::LiveError> {
+        Ok(None)
+    }
+}
+
+fn workload_drive_config() -> kryprobe_cli::live::LiveConfig {
+    kryprobe_cli::live::LiveConfig {
+        source: "kernel-crypto".to_owned(),
+        duration_secs: Some(60),
+        tick_ms: 1,
+        token: None,
+        json_audit: false,
+        profile: kryprobe_privilege::kcrypto_lifecycle::profile::LifecycleProfile::ApiReturns,
+        workload: true,
+    }
+}
+
+fn drive_scripted_workload(
+    sensor: &mut dyn kryprobe_cli::live::SessionSensor,
+    cfg: &kryprobe_cli::live::LiveConfig,
+) -> Result<kryprobe_cli::live::LiveOutcome, kryprobe_cli::live::LiveError> {
+    let backend = kryprobe_privilege::kcrypto_backend::KCryptoBackend::new();
+    let mut controller = attached_controller();
+    kryprobe_cli::live::drive_session(
+        cfg,
+        &backend,
+        sensor,
+        &std::sync::atomic::AtomicBool::new(false),
+        9,
+        kryprobe_core::ids::SessionId::new(1),
+        kryprobe_core::ids::PlanGeneration::new(1),
+        &kryprobe_core::ids::IdIssuer::default(),
+        None,
+        &mut controller,
+        None,
+    )
+}
+
+#[test]
+fn workload_drive_parses_terminal_natives_and_ledger() {
+    // M1 Stage 3: workload mode parses the terminal KAGG walk into
+    // native identities (verbatim names, absent driver explicit,
+    // kh join key recomputed identically) plus the KTOT ledger and
+    // capture interval. The KCTX join and helper preflight ride the
+    // orchestrator (concrete backend), so they stay None here.
+    let _suite = suite_guard();
+    let mut sensor = TerminalSensor {
+        cleanups: 0,
+        finishes: 0,
+        ticks: 0,
+        cleanup_error: false,
+    };
+    let outcome = drive_scripted_workload(&mut sensor, &workload_drive_config())
+        .expect("workload drive greens");
+    let terminal = outcome.workload_terminal.expect("terminal essentials");
+    assert_eq!(terminal.natives.len(), 1);
+    assert_eq!(terminal.system_total, 125);
+    assert!(!terminal.system_saturated);
+    assert_eq!(
+        (terminal.interval_start_ns, terminal.interval_end_ns),
+        (10, 200)
+    );
+    let native = &terminal.natives[0];
+    assert_eq!(native.native.family, kryprobe_abi::kcrypto_agg::KFAM_SK);
+    assert_eq!(native.native.algorithm, "cbc(aes)");
+    assert_eq!(native.native.driver, None);
+    assert_eq!(native.kind, kryprobe_core::workload::ExecutionKind::Proc);
+    // The kh join key equals the ABI hash over the same row bytes.
+    let row = script_agg_as(100, b"cbc(aes)");
+    let parsed = kryprobe_privilege::kcrypto_snapshot::parse_snapshot_row(row.as_bytes())
+        .expect("scripted row parses");
+    let kryprobe_privilege::kcrypto_snapshot::ParsedRow::Agg { kagg, .. } = parsed else {
+        panic!("scripted row is agg");
+    };
+    assert_eq!(
+        native.kh,
+        kryprobe_abi::kcrypto_agg::kh_of(
+            kagg.fam(),
+            kagg.op(),
+            kagg.res(),
+            kagg.ctx(),
+            &kagg.alg(),
+            &kagg.drv()
+        )
+    );
+    assert!(outcome.workload_capture.is_none());
+    assert!(outcome.workload_preflight.is_none());
+}
+
+#[test]
+fn workload_drive_absent_without_workload_mode() {
+    // Historical sessions pay no parse cost and carry no workload
+    // state (exact behavior preservation).
+    let _suite = suite_guard();
+    let mut sensor = TerminalSensor {
+        cleanups: 0,
+        finishes: 0,
+        ticks: 0,
+        cleanup_error: false,
+    };
+    let mut cfg = workload_drive_config();
+    cfg.workload = false;
+    let outcome = drive_scripted_workload(&mut sensor, &cfg).expect("historical drive greens");
+    assert!(outcome.workload_terminal.is_none());
+    assert!(outcome.workload_capture.is_none());
+    assert!(outcome.workload_preflight.is_none());
+}
+
+#[test]
+fn workload_drive_refuses_corrupt_terminal() {
+    // A terminal row that fails parsing refuses at ingest (unusable
+    // terminal — the snapshot disagrees with itself); a missing
+    // terminal totals row is unusable capture (no system operand, no
+    // ledger); an all-zero algorithm name passes ingest (renders
+    // unknown there) but cannot establish native identity, so the
+    // workload join refuses internal.
+    let _suite = suite_guard();
+    let row_len = script_agg_as(1, b"cbc(aes)").as_bytes().len();
+    let corrupt = kryprobe_privilege::kcrypto_snapshot::RowBytes::new(vec![0xFF; row_len])
+        .expect("length-valid corrupt row");
+    let mut sensor = WorkloadDriveSensor {
+        rows: vec![corrupt],
+        totals: Some(script_totals(10)),
+    };
+    let err = drive_scripted_workload(&mut sensor, &workload_drive_config())
+        .expect_err("corrupt terminal refuses");
+    assert!(
+        matches!(err, kryprobe_cli::live::LiveError::Unusable(_)),
+        "corrupt row is unusable: {err:?}"
+    );
+
+    let mut sensor = WorkloadDriveSensor {
+        rows: vec![script_agg_as(10, b"cbc(aes)")],
+        totals: None,
+    };
+    let err = drive_scripted_workload(&mut sensor, &workload_drive_config())
+        .expect_err("missing totals refuses");
+    assert!(
+        matches!(err, kryprobe_cli::live::LiveError::Unusable(_)),
+        "missing totals is unusable: {err:?}"
+    );
+
+    let zero_alg =
+        kryprobe_testkit::kcrypto_rows::agg_row_bytes(kryprobe_testkit::kcrypto_rows::AggSpec {
+            family: kryprobe_abi::kcrypto_agg::KFAM_SK,
+            op: kryprobe_abi::kcrypto_agg::KOP_ENC,
+            result: kryprobe_abi::kcrypto_agg::KRES_OK,
+            ctx: kryprobe_abi::kcrypto_agg::KCTX_PROC,
+            name: b"",
+            drv: b"",
+            calls: 10,
+            bytes: 0,
+            ok: 0,
+            errors: 0,
+            queued: 0,
+        });
+    let mut sensor = WorkloadDriveSensor {
+        rows: vec![
+            kryprobe_privilege::kcrypto_snapshot::RowBytes::new(zero_alg).expect("hand row"),
+        ],
+        totals: Some(script_totals(10)),
+    };
+    let err = drive_scripted_workload(&mut sensor, &workload_drive_config())
+        .expect_err("zero algorithm refuses");
+    assert!(
+        matches!(err, kryprobe_cli::live::LiveError::Internal(_)),
+        "zero algorithm is internal: {err:?}"
     );
 }
 
