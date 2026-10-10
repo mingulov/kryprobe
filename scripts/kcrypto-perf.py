@@ -1488,6 +1488,30 @@ def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
                 reasons.append(
                     f"guest obs_{side}_{dim}: in-guest hash differs "
                     "from staged pin")
+    # Task05 Stage 4 (M amendment P-E): M sides run from
+    # guest-local bytes ($M_LOCAL, uid 4242 — the staged 9p bytes
+    # refuse file caps and non-root traversal, C1+C2+C3). The
+    # scenario seals the local hashes as m_local_* dims alongside
+    # the staged 9p dims; each must equal the same staged pin (one
+    # reason line per dim). Non-M sides stage no local bytes, so
+    # their m_local dims are never consulted.
+    for side in ("a", "b"):
+        if (stage.get(f"obs_{side}") or "") != "M":
+            continue
+        for dim, tail in (("kryprobe", "kryprobe"),
+                          ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
+                          ("lc",
+                           "kryprobe-bpf/kcrypto-lifecycle.bpf.o"),
+                          ("metadata", "workload-metadata.json"),
+                          ("helper", "kryprobe-workload-helper")):
+            pin_name = f"obs-{side.upper()}/{tail}"
+            pinned = pins.get(pin_name)
+            if pinned is None or pinned == "none":
+                continue
+            if env.get(f"m_local_{side}_{dim}") != pinned:
+                reasons.append(
+                    f"guest m_local_{side}_{dim}: in-guest hash "
+                    "differs from staged pin")
     return reasons, {"checked": checked, "unverifiable": []}
 
 

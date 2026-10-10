@@ -223,7 +223,7 @@ class FinalManifestTests(unittest.TestCase):
 
 def _m1_stage_cell(tmp, obs_a="R", obs_b="M", with_metadata=True,
                    with_helper=True, guest_metadata="MATCH",
-                   guest_helper="MATCH"):
+                   guest_helper="MATCH", guest_m_local="MATCH"):
     """Minimal synthetic M1 cell dir + stage dict for pin checks."""
     import hashlib
 
@@ -253,7 +253,10 @@ def _m1_stage_cell(tmp, obs_a="R", obs_b="M", with_metadata=True,
                 _file(f"obs-{side}/workload-metadata.json")
             if with_helper:
                 _file(f"obs-{side}/kryprobe-workload-helper")
-    env = {"ko": "none", "driver": pins["kcrypto_perf.py"]}
+    roles = {"a": obs_a, "b": obs_b}
+    env = {"ko": "none", "driver": pins["kcrypto_perf.py"],
+           "m_user": "uid-4242", "m_uid": "4242", "m_gid": "4242",
+           "m_local": "/tmp/kryprobe-m-local"}
     for side in ("a", "b"):
         for dim, tail in (("kryprobe", "kryprobe"),
                           ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
@@ -271,6 +274,18 @@ def _m1_stage_cell(tmp, obs_a="R", obs_b="M", with_metadata=True,
         if helper is not None:
             env[f"obs_{side}_helper"] = (
                 helper if guest_helper == "MATCH" else "0" * 64)
+        if roles[side] == "M":
+            for dim, tail in (("kryprobe", "kryprobe"),
+                              ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
+                              ("lc", "kryprobe-bpf/kcrypto-lifecycle"
+                                     ".bpf.o"),
+                              ("metadata", "workload-metadata.json"),
+                              ("helper",
+                               "kryprobe-workload-helper")):
+                pin = pins.get(f"obs-{side.upper()}/{tail}")
+                if pin is not None:
+                    env[f"m_local_{side}_{dim}"] = (
+                        pin if guest_m_local == "MATCH" else "0" * 64)
     (cell / "environment.txt").write_text(
         "".join(f"{key}={val}\n" for key, val in sorted(env.items())))
     stage = {"sha256": dict(pins), "obs_a": obs_a, "obs_b": obs_b}
@@ -407,7 +422,10 @@ class MetadataStagingTests(unittest.TestCase):
         # Round trip: a guest env echoing the staged pins passes
         # the pin check (the scenario writes these dims in-guest).
         pins = stage["sha256"]
-        env = {"ko": "none", "driver": pins["kcrypto_perf.py"]}
+        env = {"ko": "none", "driver": pins["kcrypto_perf.py"],
+               "m_user": "uid-4242", "m_uid": "4242",
+               "m_gid": "4242",
+               "m_local": "/tmp/kryprobe-m-local"}
         for side in ("a", "b"):
             for dim, tail in (("kryprobe", "kryprobe"),
                               ("agg", "kryprobe-bpf/kcrypto.bpf.o"),
@@ -419,6 +437,8 @@ class MetadataStagingTests(unittest.TestCase):
                 pin = pins.get(f"obs-{side.upper()}/{tail}")
                 if pin is not None:
                     env[f"obs_{side}_{dim}"] = pin
+                    if side == "b":
+                        env[f"m_local_{side}_{dim}"] = pin
         (run_dir / "environment.txt").write_text(
             "".join(f"{key}={val}\n"
                     for key, val in sorted(env.items())))
@@ -1164,6 +1184,232 @@ class VerifyCellMTests(unittest.TestCase):
         self.assertTrue(verdict["spec_boot_invalid"])
         by_id = {leg["leg_id"]: leg for leg in verdict["legs"]}
         self.assertFalse(by_id["leg00B"]["valid"])
+
+
+class MLocalJudgeTests(unittest.TestCase):
+    """M amendment P-E: the m_local_* guest-hash cross-check."""
+
+    DIMS = ("kryprobe", "agg", "lc", "metadata", "helper")
+
+    def _rewrite_env(self, cell, key, value):
+        path = cell / "environment.txt"
+        lines = [f"{key}={value}" if line.startswith(key + "=")
+                 else line
+                 for line in path.read_text().splitlines()]
+        path.write_text("\n".join(lines) + "\n")
+
+    def test_match_accepts(self):
+        tmp = tempfile.mkdtemp()
+        cell, stage = _m1_stage_cell(tmp)
+        env_text = (cell / "environment.txt").read_text()
+        for dim in self.DIMS:
+            self.assertIn(f"m_local_b_{dim}=", env_text)
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(reasons, [])
+
+    def test_mismatch_one_line_per_dim(self):
+        tmp = tempfile.mkdtemp()
+        cell, stage = _m1_stage_cell(tmp, guest_m_local="MISMATCH")
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(len(reasons), 5, reasons)
+        for dim in self.DIMS:
+            hits = [reason for reason in reasons
+                    if f"m_local_b_{dim}" in reason]
+            self.assertEqual(len(hits), 1, (dim, reasons))
+
+    def test_single_dim_mismatch(self):
+        for dim in self.DIMS:
+            with self.subTest(dim=dim):
+                tmp = tempfile.mkdtemp()
+                cell, stage = _m1_stage_cell(tmp)
+                self._rewrite_env(cell, f"m_local_b_{dim}",
+                                  "0" * 64)
+                reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+                self.assertEqual(len(reasons), 1, reasons)
+                self.assertIn(f"m_local_b_{dim}", reasons[0])
+
+    def test_missing_dims_fail_closed(self):
+        tmp = tempfile.mkdtemp()
+        cell, stage = _m1_stage_cell(tmp)
+        path = cell / "environment.txt"
+        path.write_text("".join(
+            line + "\n" for line in path.read_text().splitlines()
+            if not line.startswith("m_local_")))
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(len(reasons), 5, reasons)
+
+    def test_non_m_sides_skipped(self):
+        tmp = tempfile.mkdtemp()
+        cell, stage = _m1_stage_cell(tmp, obs_a="R", obs_b="C")
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(reasons, [])
+
+    def test_m_side_a(self):
+        tmp = tempfile.mkdtemp()
+        cell, stage = _m1_stage_cell(tmp, obs_a="M", obs_b="R")
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(reasons, [])
+        self._rewrite_env(cell, "m_local_a_helper", "0" * 64)
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("m_local_a_helper", reasons[0])
+
+    def test_staged_dim_mismatch_still_named(self):
+        # Control: the staged-9p cross-check is untouched — an
+        # obs_* mismatch names obs_*, never m_local_*.
+        tmp = tempfile.mkdtemp()
+        cell, stage = _m1_stage_cell(tmp, guest_metadata="MISMATCH")
+        reasons, _ = CLI.check_m1_stage_pins(cell, stage)
+        self.assertEqual(len(reasons), 1, reasons)
+        self.assertIn("obs_b_metadata", reasons[0])
+
+
+class MAmendScenarioShapeTests(unittest.TestCase):
+    """M amendment P-A..P-E: static shape of perf_set_m1.sh.
+
+    The guest legs that execute these paths need the quiet
+    window; host-side, the frozen shape is pinned by text: the
+    constants, the gates, the loud FAILs, and the local-vs-9p
+    path split.
+    """
+
+    SCENARIO = (ROOT / "scripts" / "kcrypto_perf" / "scenarios"
+                / "perf_set_m1.sh")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = cls.SCENARIO.read_text()
+
+    def test_preflight_constants(self):
+        for line in ('M_USER="uid-4242"', 'M_UID="4242"',
+                     'M_GID="4242"',
+                     'M_LOCAL="/tmp/kryprobe-m-local"'):
+            self.assertIn(line, self.text)
+
+    def test_preflight_gate_never_bare_id(self):
+        self.assertIn(
+            'setpriv --reuid="$M_UID" --regid="$M_GID" '
+            '--clear-groups true', self.text)
+        for stale in ('M_USER="bench"', "useradd -M",
+                      "chown bench", "id -u bench"):
+            self.assertNotIn(stale, self.text)
+
+    def test_preflight_copies_five_files_hash_vs_pin(self):
+        self.assertEqual(
+            self.text.count('cp -p "$OUT/obs-$side/'), 5)
+        for tail in ("kryprobe", "kryprobe-workload-helper",
+                     "workload-metadata.json",
+                     "kryprobe-bpf/kcrypto.bpf.o",
+                     "kryprobe-bpf/kcrypto-lifecycle.bpf.o"):
+            self.assertIn(
+                f'sha256sum "$M_LOCAL/obs-$side/{tail}"', self.text)
+        self.assertIn('"$M_LOCAL/obs-$side/kryprobe" token mint',
+                      self.text)
+        self.assertIn('"$M_LOCAL/obs-$side/kryprobe" token status',
+                      self.text)
+        self.assertGreaterEqual(
+            self.text.count("FAIL=m-preflight"), 2)
+
+    def test_preflight_rationale_kept(self):
+        for token in ("C1 (", "C2 (", "C3 (",
+                      "security_model=none", "gshadow",
+                      "700 run"):
+            self.assertIn(token, self.text)
+
+    def test_preflight_extraction_markers(self):
+        self.assertIn("# M-PREFLIGHT-BEGIN", self.text)
+        self.assertIn("# M-PREFLIGHT-END", self.text)
+
+    def test_capture_runs_from_m_local(self):
+        for line in ('KP="$M_LOCAL/obs-$4/kryprobe"',
+                     '"$M_LOCAL/obs-$4/workload-metadata.json"',
+                     '"$M_LOCAL/legs/$leg-report.workload-json"',
+                     '"$M_LOCAL/legs/$leg-capture.stdout.log"',
+                     '"$M_LOCAL/legs/$leg-capture.stderr.log"'):
+            self.assertIn(line, self.text)
+        self.assertIn(
+            'KRYPROBE_BPF_DIR="$M_LOCAL/obs-$4/kryprobe-bpf"',
+            self.text)
+        self.assertIn(
+            'KRYPROBE_BPF_DIR="$M_LOCAL/obs-B/kryprobe-bpf"',
+            self.text)
+        for stale in ('"$OUT/obs-$4/workload-metadata.json"',
+                      '"$OUT/legs/$leg-report.workload-json"',
+                      'mv "$OUT/legs/quiet-report.workload-json"'):
+            self.assertNotIn(stale, self.text)
+
+    def test_copyback_loud_and_rc_safe(self):
+        self.assertEqual(
+            self.text.count(
+                'echo "FAIL=m-copyback" > "$OUT/done.txt"; '
+                "exit 2; }"),
+            4)
+        self.assertIn('cp "$M_LOCAL/legs/$f" "$OUT/legs/$f"',
+                      self.text)
+        self.assertIn(
+            'cp "$M_LOCAL/legs/quiet-report.workload-json"',
+            self.text)
+        self.assertEqual(
+            self.text.count(
+                'ATTACH_LOG="$M_LOCAL/legs/$leg-capture.stderr.log"'),
+            2)
+        self.assertEqual(self.text.count("CAP_RC=$?"), 2)
+        self.assertEqual(
+            self.text.count('echo "capture_rc=$CAP_RC"'), 2)
+
+    def test_m_json_hashes_local_numeric_principal(self):
+        self.assertIn(
+            'sha256sum "$M_LOCAL/obs-$2/workload-metadata.json"',
+            self.text)
+        self.assertIn(
+            'sha256sum "$M_LOCAL/obs-$2/kryprobe-workload-helper"',
+            self.text)
+        self.assertIn(r'\"principal_uid\": $M_UID', self.text)
+
+    def test_identity_dims_present_three_files(self):
+        for dim in ("m_local_a_kryprobe=", "m_local_a_agg=",
+                    "m_local_a_lc=", "m_local_a_metadata=",
+                    "m_local_a_helper=", "m_local_b_kryprobe=",
+                    "m_local_b_agg=", "m_local_b_lc=",
+                    "m_local_b_metadata=", "m_local_b_helper=",
+                    "m_uid=$M_UID", "m_gid=$M_GID",
+                    "m_local=$M_LOCAL"):
+            self.assertEqual(self.text.count(dim), 3, dim)
+        for staged in ("obs_a_metadata=", "obs_b_metadata=",
+                       "obs_a_helper=", "obs_b_helper="):
+            self.assertIn(staged, self.text)
+
+
+class MNumericPrincipalTests(unittest.TestCase):
+    """M amendment P-D: the sealed principal is numeric 4242."""
+
+    def _checked(self, uid):
+        evidence = {"schema": "kryprobe-m1-mleg/v1",
+                    "leg_id": "leg00B", "side": "B", "obs": "M",
+                    "metadata_sha256": "m" * 64,
+                    "helper_sha256": "h" * 64,
+                    "principal_uid": uid}
+        tmp = Path(tempfile.mkdtemp())
+        legs = tmp / "legs"
+        legs.mkdir()
+        (legs / "leg00B-m.json").write_text(json.dumps(evidence))
+        stage = {"obs_a": "R", "obs_b": "M",
+                 "sha256": {"obs-B/workload-metadata.json":
+                            "m" * 64,
+                            "obs-B/kryprobe-workload-helper":
+                            "h" * 64}}
+        leg = {"leg_id": "leg00B", "side": "B",
+               "mode": "aggregation"}
+        entry = {"kind": "m1-pairs", "obs_a": "R", "obs_b": "M"}
+        return CLI.check_m_evidence(tmp, leg, entry, stage)
+
+    def test_uid_4242_accepted(self):
+        self.assertEqual(self._checked(4242), [])
+
+    def test_string_uid_refused(self):
+        reasons = self._checked("4242")
+        self.assertTrue(any("uid" in reason for reason in reasons),
+                        reasons)
 
 
 if __name__ == "__main__":
