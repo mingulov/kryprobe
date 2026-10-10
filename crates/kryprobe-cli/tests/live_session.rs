@@ -1745,8 +1745,7 @@ impl kryprobe_cli::live::SessionSensor for MidStopSensor {
         if served == 3 {
             let start = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed)
-                && !kryprobe_privilege::host::SIGINT_SEEN
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                && !kryprobe_privilege::host::SIGINT_SEEN.load(std::sync::atomic::Ordering::Relaxed)
             {
                 assert!(
                     start.elapsed() < std::time::Duration::from_secs(60),
