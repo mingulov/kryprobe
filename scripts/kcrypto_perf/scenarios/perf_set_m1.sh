@@ -157,6 +157,35 @@ if [ "$OBS_A" = "M" ] || [ "$OBS_B" = "M" ]; then
 fi
 # M-PREFLIGHT-END
 
+# M-HELPER-1: the staged helper arrives owned by uid 1000 (`cp -p`
+# preserves the 9p ownership) but the trusted-image rule requires
+# owner root-or-euid -- normalize to root:root (the 4242 principal
+# must not own its trust anchor) and gate on the read-back.
+if [ "$OBS_A" = "M" ] || [ "$OBS_B" = "M" ]; then
+  : > "$OUT/m-helper-owner.txt"
+  for side in A B; do
+    case "$side" in
+      A) OBS="$OBS_A" ;;
+      B) OBS="$OBS_B" ;;
+    esac
+    if [ "$OBS" = "M" ]; then
+      chown root:root \
+        "$M_LOCAL/obs-$side/kryprobe-workload-helper" || {
+        echo "FAIL=m-preflight" > "$OUT/done.txt"; exit 2; }
+      [ "$(stat -c '%u:%g' \
+        "$M_LOCAL/obs-$side/kryprobe-workload-helper")" = "0:0" ] || {
+        echo "FAIL=m-preflight" > "$OUT/done.txt"; exit 2; }
+      case "$side" in
+        A) tag="a" ;;
+        B) tag="b" ;;
+      esac
+      echo "m_local_${tag}_helper_owner=$(stat -c '%u:%g %a' \
+        "$M_LOCAL/obs-$side/kryprobe-workload-helper")" \
+        >> "$OUT/m-helper-owner.txt"
+    fi
+  done
+fi
+
 {
   echo "kernel=$(uname -r)"
   echo "uid=$(id -u)"

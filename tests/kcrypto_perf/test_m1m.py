@@ -1668,6 +1668,16 @@ class MAmendScenarioShapeTests(unittest.TestCase):
         self.assertIn("# M-PREFLIGHT-BEGIN", self.text)
         self.assertIn("# M-PREFLIGHT-END", self.text)
 
+    def test_m_helper_owner_normalized_post_preflight(self):
+        # M-HELPER-1: the staged helper arrives owned by uid 1000
+        # (9p); the post-END block chowns root:root and gates on
+        # the read-back, with a per-side owner/mode audit echo.
+        post = self.text.split("# M-PREFLIGHT-END", 1)[1]
+        self.assertIn("chown root:root", post)
+        self.assertIn('"0:0"', post)
+        self.assertIn("m_local_${tag}_helper_owner=", post)
+        self.assertIn("FAIL=m-preflight", post)
+
     def test_capture_runs_from_m_local(self):
         for line in ('KP="$M_LOCAL/obs-$4/kryprobe"',
                      '"$M_LOCAL/obs-$4/workload-metadata.json"',
