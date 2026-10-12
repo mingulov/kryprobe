@@ -1525,49 +1525,120 @@ class SuccessorOverlayTests(unittest.TestCase):
                             out["reasons"])
 
     def test_v2_r_leg_summary_duplicates_keep_frozen(self):
+        # Frozen preservation through the real decoder: the
+        # frozen json decoder last-wins duplicate members on
+        # v2 (strict JSON is a v3 successor rule only). R
+        # exactness is orthogonal to the pin — assert the
+        # decoded value plus the absence of any v3
+        # strict-summary refusal.
         files = self._r_files(misses=None)
-        files["leg00A-driver.csv.summary.json"] = (
-            '{"ops_total": 999, "ops_total": 100}')
+        files.update(self._driver_files(leg_id="leg00A"))
+        text = files["leg00A-driver.csv.summary.json"]
+        files["leg00A-driver.csv.summary.json"] = text.replace(
+            '"ops_total": 100', '"ops_total": 999, "ops_total": 100', 1)
         cell = self._cell(files)
-        out = self._overlay(cell, self._judged(), self._r_leg(),
+        judged = CLI.judge_leg(cell, self._r_leg(), "7.0.14",
+                               (10.0, 30.0), successor=False)
+        self.assertEqual(judged["driver"]["ops_total"], 100)
+        out = self._overlay(cell, judged, self._r_leg(),
                             self._c_entry(), self._manifest(2))
-        self.assertTrue(out["valid"], out.get("reasons"))
+        self.assertFalse(any("successor driver summary" in r
+                             for r in out["reasons"]),
+                         out["reasons"])
 
     def _d_leg(self):
-        return {"leg_id": "leg00B", "side": "B", "mode": "disabled",
+        return {"leg_id": "leg00A", "side": "A", "mode": "disabled",
                 "cls": "P-4K", "driver": "skcipher",
                 "workload": "single", "bulk": False, "threads": 1}
 
     def _d_entry(self):
-        return {"kind": "m1-pairs", "obs_a": "R", "obs_b": "D"}
+        return {"kind": "m1-pairs", "obs_a": "D", "obs_b": "C"}
 
-    def test_v3_d_leg_summary_duplicates_invalid(self):
+    def _d_files(self):
+        files = self._driver_files(leg_id="leg00A")
+        summary = json.loads(files["leg00A-driver.csv.summary.json"])
+        summary["threads"] = 1
+        files["leg00A-driver.csv.summary.json"] = json.dumps(summary)
+        return files
+
+    def test_v3_d_leg_summary_malformed_invalid(self):
         # A12 D3 covers every successor input including the
         # disabled baseline: a v3 D summary with duplicate
-        # members invalidates (frozen per-op exactness is
-        # vacuous on D, but decoder strictness is not).
-        files = {"leg00B-driver.csv.summary.json":
-                 '{"ops_total": 999, "ops_total": 100}'}
-        cell = self._cell(files)
+        # members, a nonstandard constant, or truncated JSON
+        # invalidates (frozen per-op exactness is vacuous on
+        # D, but decoder strictness is not). Loader-legal
+        # A-side cd shape, full judge + overlay chain.
+        complete = self._d_files()["leg00A-driver.csv.summary.json"]
+        bads = [
+            complete.replace('"ops_total": 100',
+                             '"ops_total": 999, "ops_total": 100', 1),
+            complete.replace('"threads": 1',
+                             '"threads": 1, "extra": NaN', 1),
+            complete[:60]]
         manifest = {"manifest_version": 3,
                     "workloads": {"single": {"expected_rows": 3}}}
-        out = CLI.apply_m1_ctx_overlay(
-            cell, self._judged(), self._d_leg(), self._d_entry(),
-            manifest, kernel="7.0.14")
-        self.assertFalse(out["valid"])
-        self.assertTrue(any("summary" in r for r in out["reasons"]),
-                        out["reasons"])
+        for bad in bads:
+            files = self._d_files()
+            files["leg00A-driver.csv.summary.json"] = bad
+            cell = self._cell(files)
+            judged = CLI.judge_leg(cell, self._d_leg(), "7.0.14",
+                                   (10.0, 30.0), successor=False)
+            out = CLI.apply_m1_ctx_overlay(
+                cell, judged, self._d_leg(), self._d_entry(),
+                manifest, kernel="7.0.14")
+            self.assertFalse(out["valid"], bad)
+            self.assertTrue(any("summary" in r for r in out["reasons"]),
+                            out["reasons"])
 
     def test_v2_d_leg_summary_duplicates_keep_frozen(self):
-        files = {"leg00B-driver.csv.summary.json":
-                 '{"ops_total": 999, "ops_total": 100}'}
+        # Frozen preservation through the real decoder: v2
+        # judges duplicate members by last-wins (the freeze
+        # pins decoder behavior) — strict JSON is a v3
+        # successor rule only. Asserts the decoded value, so
+        # the test fails if last-wins ever stops.
+        files = self._d_files()
+        text = files["leg00A-driver.csv.summary.json"]
+        files["leg00A-driver.csv.summary.json"] = text.replace(
+            '"ops_total": 100', '"ops_total": 999, "ops_total": 100', 1)
         cell = self._cell(files)
         manifest = {"manifest_version": 2,
                     "workloads": {"single": {"expected_rows": 3}}}
+        judged = CLI.judge_leg(cell, self._d_leg(), "7.0.14",
+                               (10.0, 30.0), successor=False)
         out = CLI.apply_m1_ctx_overlay(
-            cell, self._judged(), self._d_leg(), self._d_entry(),
+            cell, judged, self._d_leg(), self._d_entry(),
             manifest, kernel="7.0.14")
         self.assertTrue(out["valid"], out.get("reasons"))
+        self.assertEqual(out["driver"]["ops_total"], 100)
+
+    def test_d_leg_summary_mistyped_member_invalid(self):
+        # Round-7 finding 4: arithmetically consumed summary
+        # members must be honestly typed — a bool/list/str
+        # member either crashes the judge (uncaught
+        # TypeError) or silently becomes a throughput
+        # operand (True == 1). All-epoch fail-closed: every
+        # sealed summary probed type-clean, so no frozen
+        # verdict changes — mistyped members invalidate
+        # instead of crashing or validating.
+        complete = self._d_files()["leg00A-driver.csv.summary.json"]
+        bads = [
+            complete.replace('"ops_meas": 100', '"ops_meas": true', 1),
+            complete.replace('"ops_meas": 100,', '"ops_meas": [],', 1),
+            complete.replace('"meas_window_s": 30.0',
+                             '"meas_window_s": "30"', 1),
+            complete.replace('"t_meas_start_ns": 10000000000',
+                             '"t_meas_start_ns": []', 1),
+            complete.replace('"rows_meas": 4', '"rows_meas": 4.5', 1)]
+        for bad in bads:
+            files = self._d_files()
+            files["leg00A-driver.csv.summary.json"] = bad
+            cell = self._cell(files)
+            judged = CLI.judge_leg(cell, self._d_leg(), "7.0.14",
+                                   (10.0, 30.0), successor=False)
+            self.assertFalse(judged["valid"], bad)
+            self.assertTrue(any("summary member" in r
+                                for r in judged["reasons"]),
+                            judged["reasons"])
 
     def test_v3_r_leg_frozen_exactness_enforced(self):
         # Full chain: a missy v3 R leg (equation-consistent)

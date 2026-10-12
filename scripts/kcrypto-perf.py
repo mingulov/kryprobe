@@ -931,6 +931,30 @@ def judge_leg(cell_dir: Path, leg: dict, kernel: str,
         out.update(valid=False, reasons=[f"driver summary: {err}"],
                    outcome="invalid")
         return out
+    # Round-7 finding 4: arithmetically consumed summary
+    # members must be honestly typed — the decoder yields
+    # whatever JSON carries, and a bool/list/str member
+    # either crashes the judge (uncaught TypeError in
+    # timing/throughput arithmetic) or silently becomes a
+    # throughput operand (True == 1). All-epoch
+    # fail-closed: every sealed driver summary probed
+    # type-clean, so no frozen verdict changes — mistyped
+    # members invalidate instead of crashing or validating.
+    for member in ("ops_total", "ops_meas", "rows_meas",
+                   "threads", "rc", "fails", "late", "offered",
+                   "paced", "t_warm_start_ns", "t_meas_start_ns"):
+        if member in summary and type(summary[member]) is not int:
+            out.update(valid=False, reasons=[
+                f"driver summary member {member}: want int, "
+                f"got {summary[member]!r}"], outcome="invalid")
+            return out
+    if "meas_window_s" in summary and \
+            (isinstance(summary["meas_window_s"], bool)
+             or not isinstance(summary["meas_window_s"], (int, float))):
+        out.update(valid=False, reasons=[
+            "driver summary member meas_window_s: want number, "
+            f"got {summary['meas_window_s']!r}"], outcome="invalid")
+        return out
     out["driver"] = {
         "ops_total": summary.get("ops_total"),
         "ops_meas": summary.get("ops_meas"),
