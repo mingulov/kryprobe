@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Host tests for the M1 successor-epoch judge operands (Task07).
+
+Freeze Amendment A12 (workspace ADR-0021): per observed leg,
+observed + kernel misses = driver truth exact (zero tolerance),
+per-program lane invariants (``ktot_gap == 0``), M-leg truth
+checks. Oracle operands below are extracted verbatim from sealed
+cells (never re-judged here — pure operand fixtures):
+
+- K6-1/K6-2 (fixed bytes ``d151128``, evidence
+  ``kcrypto-m1-06-ktot-fix/k6-reg/``): report counters, totals,
+  stderr miss line, driver ``ops_total``; truth = 2*ops + 64.
+- ``m1-P-4K-n_cgroup-mr`` leg00B (FORENSICS-2 51/51 sample):
+  ledger ``system_total`` + stderr ``miss_delta`` = truth.
+- ``m1-P-1M-n_cgroup-cr`` leg00B (old bytes, KTOT lag):
+  ctx ``present_calls`` - report totals calls = 82 lag; the
+  frozen parser refuses this report outright (no ``ktot_gap``
+  counter) and the successor checker must judge it invalid.
+
+Run from the product worktree root::
+
+    python3 -B -m unittest discover -s tests/kcrypto_perf \
+        -p 'test_successor.py'
+"""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from kcrypto_perf import successorvalidity as succ  # noqa: E402
+
+
+def write_tmp(content, suffix=""):
+    fh = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False)
+    fh.write(content)
+    fh.close()
+    return Path(fh.name)
+
+
+def report_doc(counters):
+    return json.dumps({"coverage": {"aggregate_counts": {
+        "counters": [{"name": n, "value": v} for n, v in counters]}}})
+
+
+# Verbatim K6-1 aggregate_counts counters (fixed bytes d151128).
+K6_1_COUNTERS = [
+    ("uncovered:aggregate_snapshot_not_quiescent", "1"),
+    ("kernel_misses", "22371"),
+    ("snapshot_agg_calls", "8990845"),
+    ("snapshot_totals_calls", "8990845"),
+    ("ktot_gap", "0"),
+    ("snapshot_gap_unreconciled", "0"),
+    ("predrop_cfg_fail", "0"),
+    ("predrop_fret_fail", "0"),
+    ("predrop_arg_null", "0"),
+    ("predrop_chase_fail", "0"),
+    ("predrop_name_fail", "0"),
+    ("predrop_destroy_skip", "64"),
+    ("predrop_spare_6", "0"),
+    ("predrop_spare_7", "0"),
+]
+
+K6_1_MISS_LINE = ('kryprobe: telemetry {"v":1,"misses":{"programs":9,'
+                  '"miss_delta":22371,"run_delta":null}}\n')
+M_LEG00B_MISS_LINE = ('kryprobe: telemetry {"v":1,"misses":{"programs":9,'
+                      '"miss_delta":31340,"run_delta":null}}\n')
+
+K6_1 = {"observed": 8990845, "truth": 9013216, "misses": 22371}
+K6_2 = {"observed": 97977, "truth": 100442, "misses": 2465}
+
+
+class KernelMissesCounterTests(unittest.TestCase):
+    def test_parses_k6_kernel_misses(self):
+        path = write_tmp(report_doc(K6_1_COUNTERS))
+        self.assertEqual(succ.parse_kernel_misses_counter(path), 22371)
+
+    def test_missing_counter_refuses_old_bytes(self):
+        counters = [(n, v) for n, v in K6_1_COUNTERS
+                    if n != "kernel_misses"]
+        path = write_tmp(report_doc(counters))
+        with self.assertRaises(ValueError):
+            succ.parse_kernel_misses_counter(path)
+
+    def test_duplicate_counter_refuses(self):
+        path = write_tmp(report_doc(K6_1_COUNTERS
+                                    + [("kernel_misses", "1")]))
+        with self.assertRaises(ValueError):
+            succ.parse_kernel_misses_counter(path)
+
+    def test_mistyped_counter_refuses(self):
+        for bad in ("-1", 1.5, True, "22x71"):
+            counters = [(n, bad if n == "kernel_misses" else v)
+                        for n, v in K6_1_COUNTERS]
+            path = write_tmp(report_doc(counters))
+            with self.assertRaises(ValueError, msg=f"value {bad!r}"):
+                succ.parse_kernel_misses_counter(path)
+
+    def test_snapshot_counters_k6(self):
+        path = write_tmp(report_doc(K6_1_COUNTERS))
+        snap = succ.parse_snapshot_counters(path)
+        self.assertEqual(snap, {"snapshot_agg_calls": 8990845,
+                                "snapshot_totals_calls": 8990845,
+                                "ktot_gap": 0})
+
+    def test_snapshot_missing_ktot_gap_refuses(self):
+        counters = [(n, v) for n, v in K6_1_COUNTERS if n != "ktot_gap"]
+        path = write_tmp(report_doc(counters))
+        with self.assertRaises(ValueError):
+            succ.parse_snapshot_counters(path)
+
+
+class MissTelemetryTests(unittest.TestCase):
+    def test_parses_k6_miss_line(self):
+        path = write_tmp("noise\n" + K6_1_MISS_LINE)
+        miss = succ.parse_miss_telemetry(path)
+        self.assertEqual(miss, {"programs": 9, "miss_delta": 22371,
+                                "run_delta": None})
+
+    def test_unavailable_refuses(self):
+        path = write_tmp('kryprobe: telemetry {"v":1,"misses":'
+                         '{"unavailable":true}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_missing_line_refuses(self):
+        path = write_tmp('kryprobe: telemetry {"v":1,"ctx":{"rows":192,'
+                         '"present_calls":1,"system_calls":1,'
+                         '"unknown_calls":0,"drops":0}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_mistyped_miss_delta_refuses(self):
+        path = write_tmp('kryprobe: telemetry {"v":1,"misses":'
+                         '{"programs":9,"miss_delta":true,'
+                         '"run_delta":null}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+
+class SuccessorLegTests(unittest.TestCase):
+    def leg(self, **over):
+        args = {"observed": K6_1["observed"], "truth": K6_1["truth"],
+                "report_misses": K6_1["misses"],
+                "stderr_miss_delta": K6_1["misses"],
+                "ktot_gap": 0, "programs": 9}
+        args.update(over)
+        return succ.check_successor_leg(**args)
+
+    def test_k6_1_exact_accounted(self):
+        self.assertEqual(self.leg(), [])
+        self.assertFalse(succ.exact_count_claim(K6_1["misses"]))
+
+    def test_k6_2_exact_accounted(self):
+        reasons = succ.check_successor_leg(
+            observed=K6_2["observed"], truth=K6_2["truth"],
+            report_misses=K6_2["misses"],
+            stderr_miss_delta=K6_2["misses"], ktot_gap=0, programs=9)
+        self.assertEqual(reasons, [])
+
+    def test_zero_misses_is_exact_count(self):
+        reasons = succ.check_successor_leg(
+            observed=K6_2["truth"], truth=K6_2["truth"],
+            report_misses=0, stderr_miss_delta=0, ktot_gap=0,
+            programs=9)
+        self.assertEqual(reasons, [])
+        self.assertTrue(succ.exact_count_claim(0))
+
+    def test_report_stderr_disagreement_invalid(self):
+        reasons = self.leg(stderr_miss_delta=22370)
+        self.assertTrue(any("disagree" in r for r in reasons), reasons)
+
+    def test_unexplained_residual_invalid(self):
+        reasons = self.leg(observed=K6_1["observed"] - 1)
+        self.assertTrue(any("truth" in r for r in reasons), reasons)
+
+    def test_missing_misses_operand_invalid(self):
+        reasons = self.leg(report_misses=None, stderr_miss_delta=None)
+        self.assertTrue(reasons)
+
+    def test_bool_misses_never_coerced(self):
+        reasons = succ.check_successor_leg(
+            observed=99, truth=100, report_misses=True,
+            stderr_miss_delta=True, ktot_gap=0, programs=9)
+        self.assertTrue(reasons)
+
+    def test_negative_misses_invalid(self):
+        reasons = self.leg(report_misses=-1, stderr_miss_delta=-1)
+        self.assertTrue(reasons)
+
+    def test_old_1m_ktot_lag_invalid_by_gap(self):
+        # m1-P-1M-n_cgroup-cr leg00B sealed operands: report
+        # totals calls 101494 (KTOT) vs ctx present 101576
+        # (Sigma-KCTX) = lag 82; implied misses = truth -
+        # present = 103684 - 101576 = 2108. Even crediting
+        # those misses, observed + misses != truth, and the
+        # lane gap itself invalidates (A12 successor 8(8)).
+        reasons = succ.check_successor_leg(
+            observed=101494, truth=103684, report_misses=2108,
+            stderr_miss_delta=2108, ktot_gap=82, programs=9)
+        self.assertTrue(any("ktot_gap" in r for r in reasons), reasons)
+
+    def test_missing_ktot_gap_operand_invalid(self):
+        reasons = self.leg(ktot_gap=None)
+        self.assertTrue(any("ktot_gap" in r for r in reasons), reasons)
+
+    def test_expected_programs_pin(self):
+        self.assertEqual(self.leg(expected_programs=9), [])
+        reasons = self.leg(expected_programs=8)
+        self.assertTrue(any("programs" in r for r in reasons), reasons)
+
+
+class SuccessorMLegTests(unittest.TestCase):
+    # m1-P-4K-n_cgroup-mr leg00B sealed operands (FORENSICS-2):
+    # ledger system_total 8607566 + miss_delta 31340 = 8638906.
+    PARSED = {"ledger": {"system_total": 8607566}}
+    CTX = {"system_calls": 8607566, "present_calls": 8607566}
+
+    def test_forensics_m_leg_truth_exact(self):
+        reasons = succ.check_successor_m_leg(
+            self.PARSED, self.CTX, miss_delta=31340, truth=8638906,
+            programs=9)
+        self.assertEqual(reasons, [])
+
+    def test_m_leg_without_miss_operand_invalid(self):
+        reasons = succ.check_successor_m_leg(
+            self.PARSED, self.CTX, miss_delta=None, truth=8638906,
+            programs=9)
+        self.assertTrue(reasons)
+
+    def test_m_leg_ctx_system_disagreement_invalid(self):
+        ctx = {"system_calls": 8607565, "present_calls": 8607566}
+        reasons = succ.check_successor_m_leg(
+            self.PARSED, ctx, miss_delta=31340, truth=8638906,
+            programs=9)
+        self.assertTrue(reasons)
+
+    def test_m_leg_ktot_lag_invalid(self):
+        # Same-walk lag: present (Sigma-KCTX) exceeds the ledger
+        # system total (KTOT walk) — successor 8(8) gap on M.
+        ctx = {"system_calls": 8607566, "present_calls": 8607648}
+        reasons = succ.check_successor_m_leg(
+            self.PARSED, ctx, miss_delta=31340, truth=8638906,
+            programs=9)
+        self.assertTrue(any("ktot_gap" in r for r in reasons), reasons)
+
+
+if __name__ == "__main__":
+    unittest.main()
