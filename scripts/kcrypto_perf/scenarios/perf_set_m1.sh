@@ -473,14 +473,22 @@ while IFS="$(printf '\t')" read -r leg side mode cls driver size \
       sleep $((WARMUP_S + MEASURE_S))
       wait "$CAP"
       CAP_RC=$?
+      echo "capture_rc=$CAP_RC" > "$OUT/legs/$leg-capture-rc.txt"
       if [ "$OBS" = "M" ]; then
+        # A10: diagnostics-first — the stderr log persists even when the
+        # report copy below fails (best effort, never FAILs by itself).
+        cp "$M_LOCAL/legs/$leg-capture.stderr.log" \
+          "$OUT/legs/$leg-capture.stderr.log" 2>/dev/null || true
         for f in "$leg-report.workload-json" "$leg-capture.stdout.log" \
             "$leg-capture.stderr.log"; do
           cp "$M_LOCAL/legs/$f" "$OUT/legs/$f" || {
+            # A10: preserve the whole guest-local legs dir for diagnosis
+            # (best effort); FAIL is retained regardless.
+            cp -r "$M_LOCAL/legs" "$OUT/legs/m-local-on-failure" \
+              2>/dev/null || true
             echo "FAIL=m-copyback" > "$OUT/done.txt"; exit 2; }
         done
       fi
-      echo "capture_rc=$CAP_RC" > "$OUT/legs/$leg-capture-rc.txt"
       wait "$SAMPLER" 2>/dev/null
       ;;
     aggregation|full-details)
@@ -510,14 +518,22 @@ while IFS="$(printf '\t')" read -r leg side mode cls driver size \
       run_driver "$leg" "$driver" "$size" "$MEASURE_S" "$WARMUP_S" $extra
       wait "$CAP"
       CAP_RC=$?
+      echo "capture_rc=$CAP_RC" > "$OUT/legs/$leg-capture-rc.txt"
       if [ "$OBS" = "M" ]; then
+        # A10: diagnostics-first — the stderr log persists even when the
+        # report copy below fails (best effort, never FAILs by itself).
+        cp "$M_LOCAL/legs/$leg-capture.stderr.log" \
+          "$OUT/legs/$leg-capture.stderr.log" 2>/dev/null || true
         for f in "$leg-report.workload-json" "$leg-capture.stdout.log" \
             "$leg-capture.stderr.log"; do
           cp "$M_LOCAL/legs/$f" "$OUT/legs/$f" || {
+            # A10: preserve the whole guest-local legs dir for diagnosis
+            # (best effort); FAIL is retained regardless.
+            cp -r "$M_LOCAL/legs" "$OUT/legs/m-local-on-failure" \
+              2>/dev/null || true
             echo "FAIL=m-copyback" > "$OUT/done.txt"; exit 2; }
         done
       fi
-      echo "capture_rc=$CAP_RC" > "$OUT/legs/$leg-capture-rc.txt"
       if [ "$OBS" = "M" ]; then
         write_m_json "$leg" "$side"
       fi

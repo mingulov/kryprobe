@@ -1715,6 +1715,29 @@ class MAmendScenarioShapeTests(unittest.TestCase):
         self.assertEqual(
             self.text.count('echo "capture_rc=$CAP_RC"'), 2)
 
+    def test_copyback_a10_diagnostics_first(self):
+        # A10: on M copyback failure the observer diagnostics must
+        # survive — capture_rc persists BEFORE the loop, the stderr
+        # log is pre-copied best-effort, and the whole guest-local
+        # legs dir is preserved before FAIL (both leg blocks).
+        self.assertEqual(
+            self.text.count(
+                'cp "$M_LOCAL/legs/$leg-capture.stderr.log" \\\n'
+                '          "$OUT/legs/$leg-capture.stderr.log"'),
+            2)
+        self.assertEqual(
+            self.text.count(
+                'cp -r "$M_LOCAL/legs" "$OUT/legs/m-local-on-failure"'),
+            2)
+        order = []
+        for i, line in enumerate(self.text.splitlines()):
+            if 'echo "capture_rc=$CAP_RC"' in line:
+                order.append((i, "echo"))
+            if 'for f in "$leg-report.workload-json"' in line:
+                order.append((i, "for"))
+        self.assertEqual([tag for _, tag in order],
+                         ["echo", "for", "echo", "for"])
+
     def test_m_json_hashes_local_numeric_principal(self):
         self.assertIn(
             'sha256sum "$M_LOCAL/obs-$2/workload-metadata.json"',
