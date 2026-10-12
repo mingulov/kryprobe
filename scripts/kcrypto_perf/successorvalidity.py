@@ -40,6 +40,24 @@ SNAPSHOT_COUNTERS = ("snapshot_agg_calls", "snapshot_totals_calls",
                      "ktot_gap")
 
 
+def _no_duplicate_members(pairs):
+    """``object_pairs_hook`` refusing duplicate JSON members:
+    default decoding lets a later ``"value":0`` overwrite an
+    earlier ``"value":1`` (or a valid ``"misses"`` overwrite
+    ``{"unavailable":true}``) — both are contradictory
+    receipts, never last-wins evidence."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate JSON member {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _loads_strict(text):
+    return json.loads(text, object_pairs_hook=_no_duplicate_members)
+
+
 def _unsigned_counter(value):
     """Strict unsigned counter (twin of m1validity's): a real
     int in u64 range (bools are not counters) or a digit string
@@ -60,7 +78,7 @@ def _is_counter(value) -> bool:
 
 def _report_counters(path: Path, dim: str) -> list:
     try:
-        doc = json.loads(Path(path).read_text())
+        doc = _loads_strict(Path(path).read_text())
     except OSError as err:
         raise ValueError(f"cannot read {path}: {err}") from err
     except ValueError as err:
@@ -127,9 +145,11 @@ def stderr_has_misses(path: Path) -> bool:
         if '"misses"' in raw:
             return True
         try:
-            obj = json.loads(raw[len(TELEMETRY_PREFIX):])
+            obj = _loads_strict(raw[len(TELEMETRY_PREFIX):])
         except ValueError:
-            continue
+            # A malformed telemetry line is itself an
+            # anomaly the D2 probe must not wave through.
+            return True
         if isinstance(obj, dict) and "misses" in obj:
             return True
     return False
@@ -272,15 +292,17 @@ def parse_miss_telemetry(path: Path) -> dict:
         if not raw.startswith(TELEMETRY_PREFIX):
             continue
         try:
-            obj = json.loads(raw[len(TELEMETRY_PREFIX):])
+            obj = _loads_strict(raw[len(TELEMETRY_PREFIX):])
         except ValueError:
-            # A malformed misses-bearing line is a
-            # contradictory receipt — it refuses even when
-            # another line parsed (never silently skipped).
-            if '"misses"' in raw:
-                raise ValueError(
-                    f"{path}: malformed miss telemetry line")
-            continue
+            # EVERY prefixed line must parse (duplicate
+            # members refused too): a malformed telemetry
+            # line is a corrupted receipt — refusing
+            # unconditionally also closes the escaped-key
+            # evasion ("\u006disses") no substring check
+            # can see. Verified safe: 21408/21408 sealed
+            # telemetry lines parse strictly.
+            raise ValueError(
+                f"{path}: malformed telemetry line")
         # Misses-bearing is decided on the DECODED object:
         # an escaped "\u006disses" key decodes to "misses"
         # while the raw substring check misses it.

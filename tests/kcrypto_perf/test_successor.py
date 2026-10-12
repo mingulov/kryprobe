@@ -157,6 +157,16 @@ class KernelMissesCounterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             succ.parse_loss_counters_strict(path)
 
+    def test_strict_loss_duplicate_member_refuses(self):
+        # {"value":1,"value":0} decodes to 0 by default —
+        # duplicate members refuse instead.
+        doc = ('{"coverage":{"aggregate_counts":{"counters":['
+               '{"name":"predrop_chase_fail","value":1,'
+               '"value":0}]}}}')
+        path = write_tmp(doc)
+        with self.assertRaises(ValueError):
+            succ.parse_loss_counters_strict(path)
+
     def test_snapshot_agreement_k6(self):
         reasons = succ.check_snapshot_agreement(
             totals=8990845, snapshot_agg=8990845,
@@ -281,6 +291,27 @@ class MissTelemetryTests(unittest.TestCase):
         # both parse (earlier evidence never silently
         # overwritten).
         path = write_tmp(K6_1_MISS_LINE + K6_1_MISS_LINE)
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_any_malformed_telemetry_line_refuses(self):
+        # Every prefixed line must parse — including escaped
+        # forms ("\u006disses") no substring check can see.
+        for bad in ('kryprobe: telemetry {"v":1,'
+                     '"\\u006disses":\n',
+                     'kryprobe: telemetry {"v":1,"ctx":\n'):
+            path = write_tmp(K6_1_MISS_LINE + bad)
+            with self.assertRaises(ValueError, msg=bad[:40]):
+                succ.parse_miss_telemetry(path)
+
+    def test_duplicate_json_members_refuse(self):
+        # Default decoding lets a second "misses" member
+        # overwrite {"unavailable":true} — duplicates refuse.
+        path = write_tmp(
+            'kryprobe: telemetry {"v":1,'
+            '"misses":{"unavailable":true},'
+            '"misses":{"programs":9,"miss_delta":1,'
+            '"run_delta":null}}\n')
         with self.assertRaises(ValueError):
             succ.parse_miss_telemetry(path)
 
