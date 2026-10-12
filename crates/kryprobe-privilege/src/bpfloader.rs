@@ -31,6 +31,8 @@ pub use parse::{
 };
 
 use crate::fd::OwnedFd;
+use kryprobe_abi::kcrypto_agg::{KDROPS_SLOTS, KTOT_SLOTS};
+use kryprobe_abi::kcrypto_ctx::{KCTLCOUNT_SLOTS, KCTX_DROPS_SLOTS};
 use kryprobe_core::ProgramId;
 
 /// Frozen dims of one spine map (ground truth: the built object).
@@ -132,7 +134,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 120,
-            max_entries: 1,
+            max_entries: KTOT_SLOTS,
         },
     ),
     (
@@ -195,7 +197,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 8,
+            max_entries: KDROPS_SLOTS,
         },
     ),
     (
@@ -213,7 +215,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 1,
+            max_entries: KCTX_DROPS_SLOTS,
         },
     ),
     (
@@ -240,7 +242,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             map_type: 6,
             key_size: 4,
             value_size: 8,
-            max_entries: 1,
+            max_entries: KCTLCOUNT_SLOTS,
         },
     ),
 ];
@@ -430,7 +432,8 @@ pub struct KcryptoMaps {
     pub err: OwnedFd,
     /// `KPARAMS` (crypto params per row hash, 256 entries).
     pub params: OwnedFd,
-    /// `KDROPS` (pre-`KTOT` skip sites, 8 per-CPU u64 counters).
+    /// `KDROPS` (pre-`KTOT` skip sites, 8 per-CPU u64 counters per
+    /// program — ADR-0013).
     pub drops: OwnedFd,
     /// `KCTX` (ctx-v1 per-context counters, 1024 entries).
     pub ctx: OwnedFd,
@@ -440,7 +443,8 @@ pub struct KcryptoMaps {
     pub ctl_closed: OwnedFd,
     /// `KCTXOVF` (ctx-v1 first-per-`kh` overflow gate, 256 entries).
     pub ctx_ovf: OwnedFd,
-    /// `KCTLCOUNT` (ctx-v1 per-CPU active-writer count, 1 per-CPU u64).
+    /// `KCTLCOUNT` (ctx-v1 per-CPU active-writer count, one per-CPU
+    /// u64 lane per program — ADR-0013).
     pub ctl_count: OwnedFd,
 }
 

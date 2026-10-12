@@ -28,8 +28,9 @@ pub const KCTX_KEY_SIZE: usize = 32;
 pub const KCTL_CTX_OVERFLOW: u8 = 6;
 
 /// `KCTX_DROPS` value: exact per-CPU refused-insert count (a real u64
-/// count, never a saturating flag). `PerCpuArray<u64>` with 1 slot.
-pub const KCTX_DROPS_SLOTS: u32 = 1;
+/// count, never a saturating flag). `PerCpuArray<u64>` with one slot
+/// per program (ADR-0013; was 1 shared slot).
+pub const KCTX_DROPS_SLOTS: u32 = super::kcrypto_agg::N_KPROGS;
 
 /// `KCTLCLOSED` value (M1 control ABI v1, ADR-0009): fence closed flag,
 /// 0 = open, nonzero = closed. `Array<u8>` with 1 slot, written by
@@ -39,10 +40,11 @@ pub const KCTLCLOSED_OPEN: u8 = 0;
 pub const KCTLCLOSED_CLOSED: u8 = 1;
 
 /// `KCTLCOUNT` value (M1 control ABI v1, ADR-0009): per-CPU
-/// active-writer count. `PerCpuArray<u64>` with 1 slot; BPF owns its
-/// own lane with plain ops (no BPF atomic RMW exists on this target),
-/// userspace folds all lanes at drain-wait.
-pub const KCTLCOUNT_SLOTS: u32 = 1;
+/// active-writer count. `PerCpuArray<u64>` with one slot per program
+/// (ADR-0013; was 1 shared slot); BPF owns its own lane with plain
+/// ops (no BPF atomic RMW exists on this target), userspace folds
+/// all lanes × slots at drain-wait.
+pub const KCTLCOUNT_SLOTS: u32 = super::kcrypto_agg::N_KPROGS;
 
 /// `KCTXOVF` capacity: first-per-`kh` overflow gate entries.
 pub const KCTXOVF_MAX_ENTRIES: u32 = 256;

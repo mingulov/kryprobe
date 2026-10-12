@@ -41,13 +41,13 @@ fn vctx_size_align_and_offsets_pinned() {
 #[test]
 fn capacity_fence_and_overflow_consts_pinned() {
     assert_eq!(KCTX_MAX_ENTRIES, 1024);
-    assert_eq!(KCTX_DROPS_SLOTS, 1);
+    assert_eq!(KCTX_DROPS_SLOTS, 9);
     // New ring kind value; the 48-byte KCtl layout is unchanged.
     assert_eq!(KCTL_CTX_OVERFLOW, 6);
     // Fence control (ADR-0009): closed flag + per-CPU count + gate.
     assert_eq!(KCTLCLOSED_OPEN, 0);
     assert_eq!(KCTLCLOSED_CLOSED, 1);
-    assert_eq!(KCTLCOUNT_SLOTS, 1);
+    assert_eq!(KCTLCOUNT_SLOTS, 9);
     assert_eq!(KCTXOVF_MAX_ENTRIES, 256);
 }
 

@@ -900,6 +900,10 @@ struct SessionMeasurements {
     overflow_identities: u64,
     ctx_overflow_identities: u64,
     drops: [u64; 8],
+    /// Folded kernel trampoline-guard skips (`None` when the miss
+    /// terminal was unreadable — ADR-0013 surfaces it in every
+    /// report format instead of only workload mode).
+    kernel_misses: Option<u64>,
     observations_decoded: u64,
     interval: ValidityInterval,
 }
@@ -916,11 +920,14 @@ fn counter(name: &str, value: u64) -> DimensionCounter {
 /// measurement is absent (never `Complete` on a missing input — the
 /// no-silent-zeros rule). The interval stamps the session wall.
 ///
-/// T02 (api-returns): snapshot consistency, kernel hook delivery and
-/// terminal completion are unproven — so a zero-difference
-/// session still reports `aggregate_counts`, `detailed_events`, and
-/// `completion` as `Unknown` (S04). Exact-count and absence claims
-/// over these sessions are therefore inconclusive, never clean.
+/// T02 (api-returns): snapshot consistency and terminal completion
+/// are unproven — so a zero-difference session still reports
+/// `aggregate_counts`, `detailed_events`, and `completion` as
+/// `Unknown` (S04). Kernel hook delivery is measured since ADR-0013
+/// (the `kernel_misses` counter replaces the `unmeasured` reason
+/// when the miss terminal reads); nonzero misses flip
+/// `aggregate_counts` to `Partial`. Exact-count claims still require
+/// a clean misses read — absence claims stay inconclusive.
 fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     let dim = |status| DimensionCoverage::new(status, m.interval);
     // Attach: counted at bring-up (always measured).
@@ -943,8 +950,13 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
             unexpected_drops = unexpected_drops.saturating_add(*count);
         }
     }
+    let measured_misses = m.kernel_misses.unwrap_or(0);
     let mut aggregate_counts = dim(
-        if unexpected_drops > 0 || m.overflow_identities > 0 || m.ctx_overflow_identities > 0 {
+        if unexpected_drops > 0
+            || m.overflow_identities > 0
+            || m.ctx_overflow_identities > 0
+            || measured_misses > 0
+        {
             CoverageStatus::Partial
         } else {
             CoverageStatus::Unknown
@@ -953,9 +965,16 @@ fn session_coverage(m: &SessionMeasurements) -> CoverageSummary {
     aggregate_counts
         .counters
         .push(counter("uncovered:aggregate_snapshot_not_quiescent", 1));
-    aggregate_counts
-        .counters
-        .push(counter("uncovered:kernel_delivery_unmeasured", 1));
+    match m.kernel_misses {
+        Some(misses) => aggregate_counts
+            .counters
+            .push(counter("kernel_misses", misses)),
+        // Delivery unproven AND unmeasured: keep the reason counter
+        // (never a silent zero).
+        None => aggregate_counts
+            .counters
+            .push(counter("uncovered:kernel_delivery_unmeasured", 1)),
+    }
     if let Some(calls) = m.agg_calls {
         aggregate_counts
             .counters
@@ -1708,7 +1727,7 @@ pub fn drive_session(
     session: SessionId,
     generation: PlanGeneration,
     issuer: &IdIssuer,
-    _concrete: Option<&KCryptoBackend>,
+    concrete: Option<&KCryptoBackend>,
     controller: &mut SessionController,
     progress: Option<&TickProgress>,
 ) -> Result<LiveOutcome, LiveError> {
@@ -1725,6 +1744,7 @@ pub fn drive_session(
             issuer,
             controller,
             progress,
+            concrete,
         )
     })();
     if result.is_err() {
@@ -1946,6 +1966,7 @@ fn drive_session_inner(
     issuer: &IdIssuer,
     controller: &mut SessionController,
     progress: Option<&TickProgress>,
+    concrete: Option<&KCryptoBackend>,
 ) -> Result<LiveOutcome, LiveError> {
     let baseline = IntegritySummary::default();
     let decode_ctx = DecodeContext {
@@ -2091,6 +2112,26 @@ fn drive_session_inner(
         .map_err(|err| LiveError::Internal(format!("live session integrity: {err}")))?;
     let gap = ktot_gap_from_calls(&closing_agg_calls, closing_totals_calls);
     let kdrop_sites = terminal.drops;
+    // ADR-0013: api-returns reports surface the kernel miss terminal
+    // (workload mode keeps its own read + telemetry below — no
+    // double-read). Fail-soft: an unreadable terminal stays `None`
+    // and the coverage keeps its `unmeasured` reason counter.
+    let api_misses = if cfg.workload {
+        None
+    } else {
+        concrete.and_then(|c| c.session_miss_terminal(generation).ok())
+    };
+    if let Some(misses) = &api_misses {
+        eprintln!("{}", telemetry_miss_line(misses));
+    }
+    let kernel_misses = match &api_misses {
+        Some(MissTerminal::Available(deltas)) => Some(
+            deltas
+                .iter()
+                .fold(0u64, |acc, d| acc.saturating_add(d.miss_delta)),
+        ),
+        _ => None,
+    };
     let coverage = session_coverage(&SessionMeasurements {
         attached_points,
         expected_points: KCRYPTO_SYMBOLS.len(),
@@ -2108,6 +2149,7 @@ fn drive_session_inner(
         overflow_identities,
         ctx_overflow_identities,
         drops: kdrop_sites,
+        kernel_misses,
         observations_decoded: report.observations().len() as u64,
         interval: ValidityInterval {
             start_ns: terminal.started_ns,
@@ -3337,6 +3379,7 @@ mod tests {
             overflow_identities: 0,
             ctx_overflow_identities: 0,
             drops: [0; 8],
+            kernel_misses: None,
             observations_decoded: 12,
             interval: ValidityInterval {
                 start_ns: 100,
@@ -3386,6 +3429,54 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "ktot_gap" && c.value == 0),
             "ktot_gap kept: {:?}",
+            coverage.aggregate_counts.counters
+        );
+    }
+
+    #[test]
+    fn coverage_kernel_misses_zero_marks_delivery_measured() {
+        // ADR-0013: a measured zero-miss terminal replaces the
+        // `kernel_delivery_unmeasured` reason with an exact
+        // `kernel_misses` counter (the dimension stays `Unknown` —
+        // completion is still unobserved).
+        let mut m = measurements();
+        m.kernel_misses = Some(0);
+        let coverage = session_coverage(&m);
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "kernel_misses" && c.value == 0),
+            "kernel_misses kept: {:?}",
+            coverage.aggregate_counts.counters
+        );
+        assert!(
+            !coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "uncovered:kernel_delivery_unmeasured"),
+            "unmeasured reason gone: {:?}",
+            coverage.aggregate_counts.counters
+        );
+    }
+
+    #[test]
+    fn coverage_kernel_misses_nonzero_is_partial() {
+        // Measured guard skips are measured loss: the dimension goes
+        // `Partial` with the exact miss count attached.
+        let mut m = measurements();
+        m.kernel_misses = Some(7);
+        let coverage = session_coverage(&m);
+        assert_eq!(coverage.aggregate_counts.status, CoverageStatus::Partial);
+        assert!(
+            coverage
+                .aggregate_counts
+                .counters
+                .iter()
+                .any(|c| c.name == "kernel_misses" && c.value == 7),
+            "kernel_misses kept: {:?}",
             coverage.aggregate_counts.counters
         );
     }

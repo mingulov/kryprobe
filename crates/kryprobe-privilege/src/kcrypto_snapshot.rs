@@ -35,8 +35,8 @@
 //! the ring reuses [`DrainThread`], time is unprivileged `clock_gettime`.
 
 use kryprobe_abi::kcrypto_agg::{
-    KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCtl, KIDN_DROPS, VAgg, fold_vagg, kagg_from_bytes,
-    kctl_from_bytes, try_fold_vagg, vagg_from_bytes,
+    KAgg, KCTL_IDENT, KCTL_OVERFLOW, KCtl, KDROPS_SLOTS, KIDN_DROPS, KTOT_SLOTS, VAgg, fold_vagg,
+    kagg_from_bytes, kctl_from_bytes, try_fold_vagg, vagg_from_bytes,
 };
 use kryprobe_abi::kcrypto_ctx::{KCTL_CTX_OVERFLOW, KCtxKey, VCtx, fold_vctx};
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, RawEventHeader};
@@ -443,36 +443,45 @@ fn walk_kagg(sensor: &ConfiguredKcrypto) -> Result<Vec<RowBytes>, MapOpsError> {
     Ok(rows)
 }
 
-/// `KTOT` read + percpu fold (`None` on `ENOENT` only — any other errno
-/// fails the snapshot).
+/// `KTOT` read + percpu fold over all per-program slots (`None` on
+/// slot-0 `ENOENT` only — any other errno fails the snapshot).
 pub(crate) fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes>, MapOpsError> {
     let (ncpu, value_len) = percpu_buffer_len(120)?;
-    // SAFETY: KTOT is PerCpuArray<VAgg>; VAgg is 120B
-    // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus.
-    let raw = match unsafe {
-        map_lookup_bytes(
-            &sensor.loaded.maps.total,
-            &0u32.to_le_bytes(),
-            value_len,
-            "snapshot/ktot",
-        )
-    } {
-        Ok(raw) => raw,
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
-            return Ok(None);
+    let mut lanes = Vec::with_capacity(ncpu * KTOT_SLOTS as usize);
+    for prog in 0..KTOT_SLOTS {
+        // SAFETY: KTOT is PerCpuArray<VAgg> with one slot per program
+        // (ADR-0013); VAgg is 120B (vagg_to_bytes [u8; 120]); ncpu is
+        // possible_cpus.
+        let raw = match unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.total,
+                &prog.to_le_bytes(),
+                value_len,
+                "snapshot/ktot",
+            )
+        } {
+            Ok(raw) => raw,
+            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
+                if prog == 0 {
+                    return Ok(None);
+                }
+                return Err(MapOpsError::LookupFailed {
+                    stage: "snapshot/ktot-slot".to_owned(),
+                    errno,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        for c in 0..ncpu {
+            let lane = raw
+                .get(c * 120..(c + 1) * 120)
+                .and_then(vagg_from_bytes)
+                .ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "snapshot/ktot-lane".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+            lanes.push(lane);
         }
-        Err(err) => return Err(err),
-    };
-    let mut lanes = Vec::with_capacity(ncpu);
-    for c in 0..ncpu {
-        let lane = raw
-            .get(c * 120..(c + 1) * 120)
-            .and_then(vagg_from_bytes)
-            .ok_or_else(|| MapOpsError::LookupFailed {
-                stage: "snapshot/ktot-lane".to_owned(),
-                errno: libc::EBADMSG,
-            })?;
-        lanes.push(lane);
     }
     let mut bytes = Vec::with_capacity(TOTALS_BYTES_LEN);
     bytes.push(SNAPSHOT_VERSION);
@@ -482,41 +491,51 @@ pub(crate) fn read_ktot(sensor: &ConfiguredKcrypto) -> Result<Option<TotalsBytes
     Ok(Some(TotalsBytes(bytes)))
 }
 
-/// Checked `KTOT` read + percpu fold for the M1 receipt path (N5):
-/// same bytes as [`read_ktot`] when clean, `EOVERFLOW` when the
-/// fold refuses (lane-sum overflow or an already-saturated input
-/// word — ADR-0008 §(e)). Tick/report/legacy-terminal callers keep
-/// [`read_ktot`] (saturating fold, frozen behavior).
+/// Checked `KTOT` read + percpu fold over all per-program slots for
+/// the M1 receipt path (N5): same bytes as [`read_ktot`] when clean,
+/// `EOVERFLOW` when the fold refuses (lane-sum overflow or an
+/// already-saturated input word — ADR-0008 §(e)).
+/// Tick/report/legacy-terminal callers keep [`read_ktot`]
+/// (saturating fold, frozen behavior).
 pub(crate) fn read_ktot_checked(
     sensor: &ConfiguredKcrypto,
 ) -> Result<Option<TotalsBytes>, MapOpsError> {
     let (ncpu, value_len) = percpu_buffer_len(120)?;
-    // SAFETY: KTOT is PerCpuArray<VAgg>; VAgg is 120B
-    // (vagg_to_bytes [u8; 120]); ncpu is possible_cpus.
-    let raw = match unsafe {
-        map_lookup_bytes(
-            &sensor.loaded.maps.total,
-            &0u32.to_le_bytes(),
-            value_len,
-            "snapshot/ktot",
-        )
-    } {
-        Ok(raw) => raw,
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
-            return Ok(None);
+    let mut lanes = Vec::with_capacity(ncpu * KTOT_SLOTS as usize);
+    for prog in 0..KTOT_SLOTS {
+        // SAFETY: KTOT is PerCpuArray<VAgg> with one slot per program
+        // (ADR-0013); VAgg is 120B (vagg_to_bytes [u8; 120]); ncpu is
+        // possible_cpus.
+        let raw = match unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.total,
+                &prog.to_le_bytes(),
+                value_len,
+                "snapshot/ktot",
+            )
+        } {
+            Ok(raw) => raw,
+            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
+                if prog == 0 {
+                    return Ok(None);
+                }
+                return Err(MapOpsError::LookupFailed {
+                    stage: "snapshot/ktot-slot".to_owned(),
+                    errno,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        for c in 0..ncpu {
+            let lane = raw
+                .get(c * 120..(c + 1) * 120)
+                .and_then(vagg_from_bytes)
+                .ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "snapshot/ktot-lane".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+            lanes.push(lane);
         }
-        Err(err) => return Err(err),
-    };
-    let mut lanes = Vec::with_capacity(ncpu);
-    for c in 0..ncpu {
-        let lane = raw
-            .get(c * 120..(c + 1) * 120)
-            .and_then(vagg_from_bytes)
-            .ok_or_else(|| MapOpsError::LookupFailed {
-                stage: "snapshot/ktot-lane".to_owned(),
-                errno: libc::EBADMSG,
-            })?;
-        lanes.push(lane);
     }
     let folded = try_fold_vagg(&lanes).ok_or_else(|| MapOpsError::LookupFailed {
         stage: "snapshot/ktot-checked".to_owned(),
@@ -923,7 +942,7 @@ pub fn snapshot_rows(sensor: &ConfiguredKcrypto) -> Result<SnapshotRows, MapOpsE
 pub struct AggOccupancy {
     /// Resident `KAGG` rows.
     pub kagg: Option<u64>,
-    /// `KTOT` is a 1-entry array by construction.
+    /// `KTOT` slots by construction (one per program, ADR-0013).
     pub ktot: Option<u64>,
     /// Resident `KIDN` keys (first-seen gate + drop counters).
     pub kidn: Option<u64>,
@@ -939,9 +958,9 @@ pub struct AggOccupancy {
     pub kerr: Option<u64>,
     /// Resident `KPARAMS` rows.
     pub kparams: Option<u64>,
-    /// `KDROPS` counter slots: always 8 (an 8-entry array by
-    /// construction). Slot count, NOT drops observed — loss
-    /// accounting rides the snapshot `drops` + integrity fields.
+    /// `KDROPS` counter slots by construction (programs × 8 sites,
+    /// ADR-0013). Slot count, NOT drops observed — loss accounting
+    /// rides the snapshot `drops` + integrity fields.
     pub kdrops_slots: Option<u64>,
     /// Resident `KCTX` rows (ctx-v1).
     pub kctx: Option<u64>,
@@ -1046,14 +1065,14 @@ pub fn snapshot_occupancy(sensor: &ConfiguredKcrypto) -> AggOccupancy {
     let maps = &sensor.loaded.maps;
     AggOccupancy {
         kagg: count_map_entries(&maps.agg, 260, "snapshot/occ-kagg"),
-        ktot: Some(1),
+        ktot: Some(u64::from(KTOT_SLOTS)),
         kidn: count_map_entries(&maps.ident, 8, "snapshot/occ-kidn"),
         kring_pending: None,
         kwho: count_map_entries(&maps.who, 16, "snapshot/occ-kwho"),
         kstack: count_map_entries(&maps.stack, 4, "snapshot/occ-kstack"),
         kerr: count_map_entries(&maps.err, 8, "snapshot/occ-kerr"),
         kparams: count_map_entries(&maps.params, 8, "snapshot/occ-kparams"),
-        kdrops_slots: Some(8),
+        kdrops_slots: Some(u64::from(KDROPS_SLOTS)),
         kctx: count_map_entries(&maps.ctx, 32, "snapshot/occ-kctx"),
     }
 }

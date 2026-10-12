@@ -118,9 +118,10 @@ const KWHO_DROPS: u64 = u64::MAX - 1;
 
 /// `KDROPS` sites: pre-`KTOT` skip accounting (fix wave, G-C1). Every
 /// `return 0` before the `KTOT` update bumps one site (exact per-CPU
-/// `u64` — no saturation, no races); userspace folds lanes and
-/// surfaces per-site coverage counters. Order is a BPF/userspace
-/// contract (`KDROP_SITES` pins it).
+/// `u64` — no saturation; per-program lanes, ADR-0013, so no races).
+/// Userspace folds lanes × programs and surfaces per-site coverage
+/// counters. Order is a BPF/userspace contract (`KDROP_SITES` pins
+/// the 8 sites; slot = program × 8 + site).
 const KDROPS_CFG: u32 = 0;
 const KDROPS_FRET: u32 = 1;
 const KDROPS_ARGNULL: u32 = 2;
@@ -131,6 +132,26 @@ const KDROPS_NAME: u32 = 4;
 /// signal. Excluded from loss verdicts, still counted (never silent).
 const KDROPS_DESTROY: u32 = 5;
 // Sites 6–7 are spare, reserved (BPF never writes them).
+
+/// Per-program lane ordinals (ADR-0013; twin:
+/// `kryprobe-abi/src/kcrypto_agg.rs`, pinned by `kprog_lanes.rs`).
+/// `KTOT`/`KCTLCOUNT`/`KCTX_DROPS` index by ordinal, `KDROPS` by
+/// ordinal × 8 + site. FORENSICS-2 proved shared slots lose
+/// increments when two programs interleave on one CPU
+/// (`KTOT` lag on every 1M n_cgroup leg); disjoint slots restore
+/// exactness because the trampoline guard serializes each program
+/// against itself per CPU (a reentrant same-program entry skips
+/// instead of racing).
+const KPROG_ALLOC: u32 = 0;
+const KPROG_DESTROY: u32 = 1;
+const KPROG_SKENC: u32 = 2;
+const KPROG_SKDEC: u32 = 3;
+const KPROG_AEADENC: u32 = 4;
+const KPROG_AEADDEC: u32 = 5;
+const KPROG_AHASH: u32 = 6;
+const KPROG_SHASH: u32 = 7;
+const KPROG_FINUP: u32 = 8;
+const N_KPROGS: u32 = 9;
 
 /// `BPF_NOEXIST` (`enum bpf_map_update_elem_flags`, UAPI `linux/bpf.h`).
 const BPF_NOEXIST: u64 = 1;
@@ -324,7 +345,7 @@ static KCFG: Array<KConfig> = Array::with_max_entries(1, 0);
 #[map]
 static KAGG: PerCpuHashMap<KAgg, VAgg> = PerCpuHashMap::with_max_entries(256, 0);
 #[map]
-static KTOT: PerCpuArray<VAgg> = PerCpuArray::with_max_entries(1, 0);
+static KTOT: PerCpuArray<VAgg> = PerCpuArray::with_max_entries(N_KPROGS, 0);
 #[map]
 static KIDN: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 #[map]
@@ -338,16 +359,16 @@ static KERR: HashMap<u64, i32> = HashMap::with_max_entries(256, 0);
 #[map]
 static KPARAMS: HashMap<u64, VParams> = HashMap::with_max_entries(256, 0);
 #[map]
-static KDROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
+static KDROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS * 8, 0);
 // ctx-v1 maps (ADR-0008): per-context accounting + fence + overflow gate.
 #[map]
 static KCTX: PerCpuHashMap<KCtxKey, VCtx> = PerCpuHashMap::with_max_entries(1024, 0);
 #[map]
-static KCTX_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static KCTX_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS, 0);
 #[map]
 static KCTLCLOSED: Array<u8> = Array::with_max_entries(1, 0);
 #[map]
-static KCTLCOUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static KCTLCOUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS, 0);
 #[map]
 static KCTXOVF: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
@@ -742,8 +763,8 @@ fn overflow_path(key_hash: u64, head: u64, lens: u64, now: u64) {
 /// ignored: the observation is already skipped, and a counter for the
 /// counter would recurse.
 #[inline(always)]
-fn drop_inc(site: u32) {
-    if let Some(slot) = KDROPS.get_ptr_mut(site) {
+fn drop_inc(prog: u32, site: u32) {
+    if let Some(slot) = KDROPS.get_ptr_mut(prog * 8 + site) {
         unsafe {
             *slot = (*slot).saturating_add(1);
         }
@@ -774,8 +795,8 @@ fn who_drops_inc() {
 /// [`fence_release`] after its last write. An unreadable control word
 /// refuses (fail-closed: same discipline as the `KCFG` miss path).
 #[inline(always)]
-fn fence_admit() -> bool {
-    let Some(slot) = KCTLCOUNT.get_ptr_mut(0) else {
+fn fence_admit(prog: u32) -> bool {
+    let Some(slot) = KCTLCOUNT.get_ptr_mut(prog) else {
         return false;
     };
     unsafe {
@@ -786,7 +807,7 @@ fn fence_admit() -> bool {
         None => true,
     };
     if closed {
-        if let Some(slot) = KCTLCOUNT.get_ptr_mut(0) {
+        if let Some(slot) = KCTLCOUNT.get_ptr_mut(prog) {
             unsafe {
                 *slot = (*slot).saturating_sub(1);
             }
@@ -800,8 +821,8 @@ fn fence_admit() -> bool {
 /// the hook's last write (covers every `KDROPS` early-return path —
 /// they all run inside admission).
 #[inline(always)]
-fn fence_release() {
-    if let Some(slot) = KCTLCOUNT.get_ptr_mut(0) {
+fn fence_release(prog: u32) {
+    if let Some(slot) = KCTLCOUNT.get_ptr_mut(prog) {
         unsafe {
             *slot = (*slot).saturating_sub(1);
         }
@@ -860,8 +881,8 @@ fn vctx_zero_slot(slot: *mut VCtx) {
 /// `KCTXOVF`; a full gate stays silent under the same C9 rationale as
 /// `KIDN`). Refused calls surface via unknown-by-difference.
 #[inline(always)]
-fn ctx_overflow_path(kh: u64, head: u64, lens: u64, now: u64) {
-    if let Some(slot) = KCTX_DROPS.get_ptr_mut(0) {
+fn ctx_overflow_path(prog: u32, kh: u64, head: u64, lens: u64, now: u64) {
+    if let Some(slot) = KCTX_DROPS.get_ptr_mut(prog) {
         unsafe {
             *slot = (*slot).saturating_add(1);
         }
@@ -891,7 +912,17 @@ fn ctx_overflow_path(kh: u64, head: u64, lens: u64, now: u64) {
 /// dead (copied into the map by the insert, or never built on the
 /// hit path).
 #[inline(always)]
-fn ctx_record(kh: u64, now: u64, nbytes: u64, res: u8, head: u64, lens: u64, aux: *mut u8) {
+#[allow(clippy::too_many_arguments)]
+fn ctx_record(
+    prog: u32,
+    kh: u64,
+    now: u64,
+    nbytes: u64,
+    res: u8,
+    head: u64,
+    lens: u64,
+    aux: *mut u8,
+) {
     // SAFETY: `aux` spans 120 bytes; the carves below (0..56, 64..96)
     // are inside it, disjoint, and 8-aligned.
     let key_slot = unsafe { aux.add(64) } as *mut KCtxKey;
@@ -950,7 +981,7 @@ fn ctx_record(kh: u64, now: u64, nbytes: u64, res: u8, head: u64, lens: u64, aux
                 update_ctx_slot(filled, nbytes, now, res);
             },
             None => {
-                ctx_overflow_path(kh, head, lens, now);
+                ctx_overflow_path(prog, kh, head, lens, now);
             }
         }
     }
@@ -1232,6 +1263,7 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn observe(
+    prog: u32,
     fam: u8,
     op: u8,
     res: u8,
@@ -1255,11 +1287,11 @@ fn observe(
         i += 1;
     }
     if !read_name(cra_src, unsafe { base.add(4) }) {
-        drop_inc(KDROPS_NAME);
+        drop_inc(prog, KDROPS_NAME);
         return 0;
     }
     if drv_src != 0 && !read_name(drv_src, unsafe { base.add(132) }) {
-        drop_inc(KDROPS_NAME);
+        drop_inc(prog, KDROPS_NAME);
         return 0;
     }
     let ctx_class = classify_ctx(cfg.task_flags, cfg.pf_kthread);
@@ -1302,7 +1334,7 @@ fn observe(
     // trusted to merge separate slots on this backend).
     let mut aux = MaybeUninit::<[u64; 15]>::uninit();
     // Totals FIRST: always updated, even on attribution overflow.
-    if let Some(tot) = KTOT.get_ptr_mut(0) {
+    if let Some(tot) = KTOT.get_ptr_mut(prog) {
         unsafe {
             update_slot(tot, nbytes, now, res);
         }
@@ -1339,6 +1371,7 @@ fn observe(
     // `VAgg` zero above is dead (copied into the map by the insert,
     // or never built on the hit path).
     ctx_record(
+        prog,
         kh,
         now,
         nbytes,
@@ -1430,27 +1463,27 @@ fn load_cfg() -> Option<Cfg> {
 pub fn kcrypto_alloc(ctx: FExitContext) -> i32 {
     // ctx-v1 fence: admit first (refused entrants touch nothing),
     // single release epilogue after the last write.
-    if !fence_admit() {
+    if !fence_admit(KPROG_ALLOC) {
         return 0;
     }
     let rc = kcrypto_alloc_inner(ctx);
-    fence_release();
+    fence_release(KPROG_ALLOC);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_alloc_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_ALLOC, KDROPS_CFG);
         return 0;
     };
     let name: u64 = ctx.arg(0);
     if name == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_ALLOC, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_ALLOC, KDROPS_FRET);
         return 0;
     };
     let res = classify_alloc_ptr(ret);
@@ -1467,7 +1500,19 @@ fn kcrypto_alloc_inner(ctx: FExitContext) -> i32 {
     } else {
         chase_tfm(ret, cfg.tfm_alg)
     };
-    observe(KFAM_ANY, KOP_ALLOC, res, 0, name, 0, &cfg, alg, kerr, &ctx)
+    observe(
+        KPROG_ALLOC,
+        KFAM_ANY,
+        KOP_ALLOC,
+        res,
+        0,
+        name,
+        0,
+        &cfg,
+        alg,
+        kerr,
+        &ctx,
+    )
 }
 
 /// `crypto_destroy_tfm(mem, tfm)` exit cannot establish a live transform.
@@ -1479,22 +1524,22 @@ fn kcrypto_alloc_inner(ctx: FExitContext) -> i32 {
 /// supplies no destroy identity or return-value observation.
 #[fexit(function = "crypto_destroy_tfm")]
 pub fn kcrypto_destroy(_ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_DESTROY) {
         return 0;
     }
     let rc = kcrypto_destroy_inner();
-    fence_release();
+    fence_release(KPROG_DESTROY);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_destroy_inner() -> i32 {
     if load_cfg().is_none() {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_DESTROY, KDROPS_CFG);
         return 0;
     }
     // Separately keyed expected exclusion, not a measured operation loss.
-    drop_inc(KDROPS_DESTROY);
+    drop_inc(KPROG_DESTROY, KDROPS_DESTROY);
     0
 }
 
@@ -1504,36 +1549,37 @@ fn kcrypto_destroy_inner() -> i32 {
 /// at resolve time and the suite re-verifies).
 #[fexit(function = "crypto_skcipher_encrypt")]
 pub fn kcrypto_skenc(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_SKENC) {
         return 0;
     }
     let rc = kcrypto_skenc_inner(ctx);
-    fence_release();
+    fence_release(KPROG_SKENC);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_skenc_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_SKENC, KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_SKENC, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_SKENC, KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req) as u64;
     let alg = chase_req(req, cfg.sk_req_base, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_SKENC, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_SKENC,
         KFAM_SK,
         KOP_ENC,
         classify_ret(ret as i32),
@@ -1550,36 +1596,37 @@ fn kcrypto_skenc_inner(ctx: FExitContext) -> i32 {
 /// `crypto_skcipher_decrypt(req)` exit: `cryptlen` @ 0 bytes (first member).
 #[fexit(function = "crypto_skcipher_decrypt")]
 pub fn kcrypto_skdec(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_SKDEC) {
         return 0;
     }
     let rc = kcrypto_skdec_inner(ctx);
-    fence_release();
+    fence_release(KPROG_SKDEC);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_skdec_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_SKDEC, KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_SKDEC, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_SKDEC, KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req) as u64;
     let alg = chase_req(req, cfg.sk_req_base, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_SKDEC, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_SKDEC,
         KFAM_SK,
         KOP_DEC,
         classify_ret(ret as i32),
@@ -1597,36 +1644,37 @@ fn kcrypto_skdec_inner(ctx: FExitContext) -> i32 {
 /// the KCFG `aead_cryptlen_off` (C2 — all families fill bytes).
 #[fexit(function = "crypto_aead_encrypt")]
 pub fn kcrypto_aeadenc(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_AEADENC) {
         return 0;
     }
     let rc = kcrypto_aeadenc_inner(ctx);
-    fence_release();
+    fence_release(KPROG_AEADENC);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_aeadenc_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_AEADENC, KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_AEADENC, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_AEADENC, KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req.wrapping_add(cfg.aead_cryptlen_off as u64)) as u64;
     let alg = chase_req(req, 0, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_AEADENC, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_AEADENC,
         KFAM_AEAD,
         KOP_ENC,
         classify_ret(ret as i32),
@@ -1644,36 +1692,37 @@ fn kcrypto_aeadenc_inner(ctx: FExitContext) -> i32 {
 /// the KCFG `aead_cryptlen_off` (C2).
 #[fexit(function = "crypto_aead_decrypt")]
 pub fn kcrypto_aeaddec(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_AEADDEC) {
         return 0;
     }
     let rc = kcrypto_aeaddec_inner(ctx);
-    fence_release();
+    fence_release(KPROG_AEADDEC);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_aeaddec_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_AEADDEC, KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_AEADDEC, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_AEADDEC, KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req.wrapping_add(cfg.aead_cryptlen_off as u64)) as u64;
     let alg = chase_req(req, 0, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_AEADDEC, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_AEADDEC,
         KFAM_AEAD,
         KOP_DEC,
         classify_ret(ret as i32),
@@ -1691,36 +1740,37 @@ fn kcrypto_aeaddec_inner(ctx: FExitContext) -> i32 {
 /// the KCFG `ahash_nbytes_off` (C2).
 #[fexit(function = "crypto_ahash_digest")]
 pub fn kcrypto_ahash(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_AHASH) {
         return 0;
     }
     let rc = kcrypto_ahash_inner(ctx);
-    fence_release();
+    fence_release(KPROG_AHASH);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_ahash_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_AHASH, KDROPS_CFG);
         return 0;
     };
     let req: u64 = ctx.arg(0);
     if req == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_AHASH, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_AHASH, KDROPS_FRET);
         return 0;
     };
     let nbytes = read_u32(req.wrapping_add(cfg.ahash_nbytes_off as u64)) as u64;
     let alg = chase_req(req, 0, cfg.async_tfm, cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_AHASH, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_AHASH,
         KFAM_AHASH,
         KOP_DIGEST,
         classify_ret(ret as i32),
@@ -1740,41 +1790,42 @@ fn kcrypto_ahash_inner(ctx: FExitContext) -> i32 {
 /// `len` = `arg2`.
 #[fexit(function = "crypto_shash_digest")]
 pub fn kcrypto_shash(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_SHASH) {
         return 0;
     }
     let rc = kcrypto_shash_inner(ctx);
-    fence_release();
+    fence_release(KPROG_SHASH);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_shash_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_SHASH, KDROPS_CFG);
         return 0;
     };
     let desc: u64 = ctx.arg(0);
     if desc == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_SHASH, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_SHASH, KDROPS_FRET);
         return 0;
     };
     let len: u64 = ctx.arg(2);
     let shash = read_u64(desc);
     if shash == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_SHASH, KDROPS_CHASE);
         return 0;
     }
     let alg = chase_tfm(shash.wrapping_add(cfg.shash_base as u64), cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_SHASH, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_SHASH,
         KFAM_SHASH,
         KOP_DIGEST,
         classify_ret(ret as i32),
@@ -1791,41 +1842,42 @@ fn kcrypto_shash_inner(ctx: FExitContext) -> i32 {
 /// `crypto_shash_finup(desc, data, len, out)` exit: same chase as digest.
 #[fexit(function = "crypto_shash_finup")]
 pub fn kcrypto_finup(ctx: FExitContext) -> i32 {
-    if !fence_admit() {
+    if !fence_admit(KPROG_FINUP) {
         return 0;
     }
     let rc = kcrypto_finup_inner(ctx);
-    fence_release();
+    fence_release(KPROG_FINUP);
     rc
 }
 
 #[inline(always)]
 fn kcrypto_finup_inner(ctx: FExitContext) -> i32 {
     let Some(cfg) = load_cfg() else {
-        drop_inc(KDROPS_CFG);
+        drop_inc(KPROG_FINUP, KDROPS_CFG);
         return 0;
     };
     let desc: u64 = ctx.arg(0);
     if desc == 0 {
-        drop_inc(KDROPS_ARGNULL);
+        drop_inc(KPROG_FINUP, KDROPS_ARGNULL);
         return 0;
     }
     let Some(ret) = func_ret(&ctx) else {
-        drop_inc(KDROPS_FRET);
+        drop_inc(KPROG_FINUP, KDROPS_FRET);
         return 0;
     };
     let len: u64 = ctx.arg(2);
     let shash = read_u64(desc);
     if shash == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_FINUP, KDROPS_CHASE);
         return 0;
     }
     let alg = chase_tfm(shash.wrapping_add(cfg.shash_base as u64), cfg.tfm_alg);
     if alg == 0 {
-        drop_inc(KDROPS_CHASE);
+        drop_inc(KPROG_FINUP, KDROPS_CHASE);
         return 0;
     }
     observe(
+        KPROG_FINUP,
         KFAM_SHASH,
         KOP_FINUP,
         classify_ret(ret as i32),

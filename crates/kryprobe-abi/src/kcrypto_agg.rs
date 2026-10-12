@@ -68,6 +68,45 @@ pub const KCTX_SOFTIRQ: u8 = 2;
 /// not zero-pin this bucket, it just folds it into the totals).
 pub const KCTX_UNKNOWN: u8 = 3;
 
+// ---------------------------------------------------------------------------
+// Per-program lanes (twinned in kcrypto.rs; pinned by kprog_lanes.rs)
+// ---------------------------------------------------------------------------
+
+/// fexit program ordinals (ADR-0013): index into the per-program lanes
+/// of `KTOT`, `KCTLCOUNT`, `KCTX_DROPS` (slot = ordinal) and `KDROPS`
+/// (slot = ordinal × [`KDROPS_SITES_PER_PROG`] + site). Declaration
+/// order in `kcrypto.rs`; the trampoline guard serializes each program
+/// against itself per CPU, so disjoint slots restore exactness without
+/// BPF atomic RMW.
+pub const KPROG_ALLOC: u32 = 0;
+/// `crypto_destroy_tfm` exit (fence-only: touches no data lane, but
+/// keeps its ordinal so slot math stays uniform).
+pub const KPROG_DESTROY: u32 = 1;
+/// `crypto_skcipher_encrypt` exit.
+pub const KPROG_SKENC: u32 = 2;
+/// `crypto_skcipher_decrypt` exit.
+pub const KPROG_SKDEC: u32 = 3;
+/// `crypto_aead_encrypt` exit.
+pub const KPROG_AEADENC: u32 = 4;
+/// `crypto_aead_decrypt` exit.
+pub const KPROG_AEADDEC: u32 = 5;
+/// `crypto_ahash_digest` exit.
+pub const KPROG_AHASH: u32 = 6;
+/// `crypto_shash_digest` exit.
+pub const KPROG_SHASH: u32 = 7;
+/// `crypto_shash_finup` exit.
+pub const KPROG_FINUP: u32 = 8;
+/// Program count: sizes every per-program lane map.
+pub const N_KPROGS: u32 = 9;
+
+/// `KTOT` slots: one [`VAgg`] lane per program (was 1 shared slot —
+/// cross-program interleavings on one CPU lost increments).
+pub const KTOT_SLOTS: u32 = N_KPROGS;
+/// `KDROPS` sites per program (the 8 `KDROP_SITES` positions).
+pub const KDROPS_SITES_PER_PROG: u32 = 8;
+/// `KDROPS` slots: per-program × per-site (was 8 shared sites).
+pub const KDROPS_SLOTS: u32 = N_KPROGS * KDROPS_SITES_PER_PROG;
+
 /// Ring kind `KCtl.kind`: first-seen identity (references `KAGG` by hash).
 pub const KCTL_IDENT: u8 = 1;
 /// Ring kind: config generation change. RESERVED, never emitted

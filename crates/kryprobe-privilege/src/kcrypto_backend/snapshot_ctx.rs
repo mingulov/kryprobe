@@ -12,7 +12,7 @@ use super::SnapshotError;
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
 use kryprobe_abi::kcrypto_ctx::{
-    KCtxKey, VCtx, kctx_key_from_bytes, try_fold_vctx, vctx_from_bytes,
+    KCTX_DROPS_SLOTS, KCtxKey, VCtx, kctx_key_from_bytes, try_fold_vctx, vctx_from_bytes,
 };
 
 /// One snapshotted context row: the folded `KCTX` value for its key.
@@ -78,25 +78,47 @@ pub fn snapshot_ctx(maps: &ConfiguredKcrypto) -> Result<(Vec<CtxSnapshot>, u64),
 }
 
 /// Read the exact `KCTX_DROPS` refused-insert count (folded over
-/// lanes). Absent key reads healthy-zero; any other errno fails loud
-/// (same rule as the `snapshot_who` tail).
+/// lanes × per-program slots, ADR-0013). Absent slot-0 key reads
+/// healthy-zero; any other errno fails loud (same rule as the
+/// `snapshot_who` tail). Cross-slot accumulation is checked: an
+/// overflow refuses with `EOVERFLOW` (ADR-0008 §(e), same contract
+/// as [`sum_u64_lanes`]).
 pub(crate) fn read_kctx_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotError> {
     let (ncpu, value_len) = percpu_buffer_len(8)?;
-    // SAFETY: KCTX_DROPS is PerCpuArray<u64>, 1 slot (bpf-kcrypto map
-    // def); value_len is ncpu * 8.
-    let raw = match unsafe {
-        map_lookup_bytes(
-            &maps.loaded.maps.ctx_drops,
-            &0u32.to_le_bytes(),
-            value_len,
-            "snapshot/ctx-drops",
-        )
-    } {
-        Ok(raw) => raw,
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => return Ok(0),
-        Err(err) => return Err(err.into()),
-    };
-    sum_u64_lanes(&raw, ncpu)
+    let mut total = 0u64;
+    for prog in 0..KCTX_DROPS_SLOTS {
+        // SAFETY: KCTX_DROPS is PerCpuArray<u64> with one slot per
+        // program (bpf-kcrypto map def); value_len is ncpu * 8.
+        let raw = match unsafe {
+            map_lookup_bytes(
+                &maps.loaded.maps.ctx_drops,
+                &prog.to_le_bytes(),
+                value_len,
+                "snapshot/ctx-drops",
+            )
+        } {
+            Ok(raw) => raw,
+            Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => {
+                if prog == 0 {
+                    return Ok(0);
+                }
+                return Err(MapOpsError::LookupFailed {
+                    stage: "snapshot/ctx-drops-slot".to_owned(),
+                    errno,
+                }
+                .into());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let folded = sum_u64_lanes(&raw, ncpu)?;
+        total = total.checked_add(folded).ok_or_else(|| {
+            SnapshotError::Map(MapOpsError::LookupFailed {
+                stage: "snapshot/ctx-drops-fold".to_owned(),
+                errno: libc::EOVERFLOW,
+            })
+        })?;
+    }
+    Ok(total)
 }
 
 /// Checked sum of one `u64`-per-lane array slice (F8a + M1 lone-MAX):

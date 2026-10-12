@@ -4,6 +4,7 @@
 
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::mapops::{MapOpsError, map_lookup_bytes, percpu_buffer_len};
+use kryprobe_abi::kcrypto_agg::{KDROPS_SITES_PER_PROG, N_KPROGS};
 /// Attribution-snapshot failure: an underlying map walk/read failure
 /// (stage + errno preserved). Per-row join misses degrade instead (empty
 /// `stack_ips`, `None` errno/params — the snapshot caller rule: unjoined
@@ -71,27 +72,31 @@ pub fn fold_drop_lanes(raw: &[u8], ncpu: usize) -> Option<u64> {
 }
 
 /// Snapshot the `KDROPS` pre-`KTOT` drop sites of a configured sensor:
-/// one percpu lookup + fold per site, in [`KDROP_SITES`] order.
-/// Structural failures fail the whole snapshot (the
+/// one percpu lookup + fold per (program, site) slot, sites folded
+/// across programs in [`KDROP_SITES`] order (slot = program × 8 +
+/// site, ADR-0013). Structural failures fail the whole snapshot (the
 /// [`super::snapshot_who`] discipline: loud, never a silent zero).
 pub fn snapshot_drops(sensor: &ConfiguredKcrypto) -> Result<[u64; 8], SnapshotError> {
     let (ncpu, value_len) = percpu_buffer_len(8)?;
     let mut out = [0u64; 8];
-    for (site, slot) in out.iter_mut().enumerate() {
-        // SAFETY: KDROPS is PerCpuArray<u64> (bpf-kcrypto map def);
-        // 8B × possible_cpus matches the kernel's write.
-        let raw = unsafe {
-            map_lookup_bytes(
-                &sensor.loaded.maps.drops,
-                &(site as u32).to_le_bytes(),
-                value_len,
-                "snapshot/drops",
-            )
-        }?;
-        *slot = fold_drop_lanes(&raw, ncpu).ok_or_else(|| MapOpsError::LookupFailed {
-            stage: "snapshot/drops-lane".to_owned(),
-            errno: libc::EBADMSG,
-        })?;
+    for prog in 0..N_KPROGS {
+        for (site, slot) in out.iter_mut().enumerate() {
+            // SAFETY: KDROPS is PerCpuArray<u64> (bpf-kcrypto map def);
+            // 8B × possible_cpus matches the kernel's write.
+            let raw = unsafe {
+                map_lookup_bytes(
+                    &sensor.loaded.maps.drops,
+                    &(prog * KDROPS_SITES_PER_PROG + site as u32).to_le_bytes(),
+                    value_len,
+                    "snapshot/drops",
+                )
+            }?;
+            let folded = fold_drop_lanes(&raw, ncpu).ok_or_else(|| MapOpsError::LookupFailed {
+                stage: "snapshot/drops-lane".to_owned(),
+                errno: libc::EBADMSG,
+            })?;
+            *slot = slot.saturating_add(folded);
+        }
     }
     Ok(out)
 }

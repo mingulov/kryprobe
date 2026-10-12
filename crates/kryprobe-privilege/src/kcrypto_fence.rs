@@ -18,7 +18,7 @@
 
 use crate::bpfloader::KcryptoMaps;
 use crate::mapops::{MapOpsError, map_lookup_bytes, map_update_bytes, percpu_buffer_len};
-use kryprobe_abi::kcrypto_ctx::{KCTLCLOSED_CLOSED, KCTLCLOSED_OPEN};
+use kryprobe_abi::kcrypto_ctx::{KCTLCLOSED_CLOSED, KCTLCLOSED_OPEN, KCTLCOUNT_SLOTS};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -244,30 +244,34 @@ fn close_receipt_decision(now: Instant, deadline: Instant) -> CloseOutcome {
     CloseOutcome::Quiescent(QuiescentReceipt { fence_ns: now_ns() })
 }
 
-/// True when every `KCTLCOUNT` lane reads zero.
+/// True when every `KCTLCOUNT` lane of every per-program slot reads
+/// zero (ADR-0013: one slot per program; the drain sums all slots —
+/// a stuck writer in ANY program blocks quiescence, same as before).
 fn kernel_lanes_drained(maps: &KcryptoMaps) -> Result<bool, MapOpsError> {
     let (ncpu, value_len) = percpu_buffer_len(8)?;
-    // SAFETY: KCTLCOUNT is PerCpuArray<u64>, 1 slot (bpf-kcrypto map
-    // def); value_len is ncpu * 8.
-    let raw = unsafe {
-        map_lookup_bytes(
-            &maps.ctl_count,
-            &0u32.to_le_bytes(),
-            value_len,
-            "fence/drain",
-        )
-    }?;
-    for c in 0..ncpu {
-        let lane = raw
-            .get(c * 8..(c + 1) * 8)
-            .ok_or_else(|| MapOpsError::LookupFailed {
-                stage: "fence/drain-lane".to_owned(),
-                errno: libc::EBADMSG,
-            })?;
-        let mut word = [0u8; 8];
-        word.copy_from_slice(lane);
-        if u64::from_le_bytes(word) != 0 {
-            return Ok(false);
+    for prog in 0..KCTLCOUNT_SLOTS {
+        // SAFETY: KCTLCOUNT is PerCpuArray<u64> with one slot per
+        // program (bpf-kcrypto map def); value_len is ncpu * 8.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &maps.ctl_count,
+                &prog.to_le_bytes(),
+                value_len,
+                "fence/drain",
+            )
+        }?;
+        for c in 0..ncpu {
+            let lane = raw
+                .get(c * 8..(c + 1) * 8)
+                .ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "fence/drain-lane".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(lane);
+            if u64::from_le_bytes(word) != 0 {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
