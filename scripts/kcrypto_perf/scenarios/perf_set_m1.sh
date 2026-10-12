@@ -294,6 +294,19 @@ run_driver() {
   if [ "$rc" -eq 124 ]; then timed=1; fi
   echo "driver_rc=$rc" > "$OUT/legs/$leg-driver-rc.txt"
   echo "driver_timeout=$timed" >> "$OUT/legs/$leg-driver-rc.txt"
+  if [ "$timed" -eq 1 ] && [ -n "${M1_SHARD_DIR:-}" ]; then
+    # A10-style diagnostics-first: copy the guest-local
+    # shards back under their ledger-sibling names so the
+    # sealed legs dir carries the child-hang signature for
+    # timeout_is_child_hang (best effort, never FAILs).
+    for shard in "$M1_SHARD_DIR/$leg"/*; do
+      [ -e "$shard" ] || continue
+      suffix=$(basename "$shard")
+      suffix=${suffix#*.csv.}
+      cp -p "$shard" \
+        "$OUT/legs/$leg-driver.csv.$suffix" 2>/dev/null || true
+    done
+  fi
   return 0
 }
 
