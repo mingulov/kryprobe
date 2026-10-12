@@ -24,6 +24,7 @@ compatible) and adds ``actors``/``cgroups``/``arrivals``/
 (including any child failure or cgroup leftover), 2 on usage error.
 """
 
+import glob
 import json
 import os
 import socket
@@ -378,6 +379,25 @@ def _shard_paths(opts, count, tag):
     """Shard ledger paths ``tag-0..tag-(count-1)`` (see
     ``_shard_path``)."""
     return [_shard_path(opts, tag, idx) for idx in range(count)]
+
+
+def timeout_is_child_hang(legs_dir, leg_id):
+    """Child-hang timeout signature (H-C): shard files exist
+    for the leg but the merged ledger (or its summary) never
+    landed — the 9p child-hang flake shape from FORENSICS-2.
+    The matrix runner owes such a leg a fresh attempt id
+    within budget, never a verdict. ``legs_dir`` is the
+    cell's legs directory (shared side — shards copied back
+    or ledger-sibling mode); pure filesystem probe, no
+    judging."""
+    prefix = os.path.join(str(legs_dir), f"{leg_id}-driver.csv")
+    shards = glob.glob(prefix + ".shard-*") + glob.glob(
+        prefix + ".arrival-*")
+    if not shards:
+        return False
+    merged = os.path.isfile(prefix) and os.path.isfile(
+        prefix + ".summary.json")
+    return not merged
 
 
 class Shared:

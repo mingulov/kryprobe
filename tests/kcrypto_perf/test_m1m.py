@@ -352,7 +352,7 @@ class MetadataStagingTests(unittest.TestCase):
                                        "/tmp/meta.json"),
             "/tmp/meta.json")
 
-    def _stage_m_cell(self, with_helper=True):
+    def _stage_m_cell(self, with_helper=True, shard_dir=None):
         import os
         from types import SimpleNamespace
         from unittest import mock
@@ -385,6 +385,8 @@ class MetadataStagingTests(unittest.TestCase):
             "workloads": {"single": {"driver_flags": "",
                                      "driver_threads": 1,
                                      "expected_rows": 3}}}
+        if shard_dir is not None:
+            manifest["global"]["shard_dir"] = shard_dir
         legs = [{"leg_id": f"leg00{side}", "side": side,
                  "mode": "aggregation", "cls": "P-4K",
                  "driver": "skcipher", "size": 4096,
@@ -444,6 +446,17 @@ class MetadataStagingTests(unittest.TestCase):
                     for key, val in sorted(env.items())))
         reasons, _ = CLI.check_m1_stage_pins(run_dir, stage)
         self.assertEqual(reasons, [])
+
+    def test_stage_shard_dir_defaults_empty(self):
+        run_dir, _, _ = self._stage_m_cell()
+        set_env = (run_dir / "set.env").read_text()
+        self.assertIn('M1_SHARD_DIR=""', set_env)
+
+    def test_stage_shard_dir_staged(self):
+        run_dir, _, _ = self._stage_m_cell(
+            shard_dir="/tmp/kryprobe-shards")
+        set_env = (run_dir / "set.env").read_text()
+        self.assertIn('M1_SHARD_DIR="/tmp/kryprobe-shards"', set_env)
 
     def test_stage_m_side_missing_helper_refused(self):
         with self.assertRaises(CLI.owned_guest.GuestError):

@@ -489,7 +489,12 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
         f"METADATA_SHA={metadata_sha or 'none'}\n"
         # F-06: quote — multi-word flags (n_cgroup/churn) must
         # survive `set -u` sourcing as one word (re-split at use).
-        f"M1_DRIVER_FLAGS=\"{workload['driver_flags']}\"\n")
+        f"M1_DRIVER_FLAGS=\"{workload['driver_flags']}\"\n"
+        # H-C (A12 item 4): guest-absolute shard root, empty
+        # when the manifest carries no shard_dir (frozen
+        # ledger-sibling layout); the scenario creates a
+        # per-leg subdir under it when non-empty.
+        f"M1_SHARD_DIR=\"{glob.get('shard_dir', '')}\"\n")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE.parent,
                           capture_output=True, text=True,
                           check=True).stdout.strip()
@@ -1689,8 +1694,12 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         else:
             m1_entry = find_diag(manifest, stage["diag"])
     legs = []
-    successor = m1 and manifest.get("manifest_version") == 3
     for idx, leg in enumerate(spec):
+        # Frozen R1 manifests also version their schema — the
+        # successor epoch additionally requires an M1 pairs
+        # entry with a C/M role (never R, never diags).
+        successor = m1 and m1_entry is not None and _successor_leg(
+            manifest, leg, m1_entry)
         judged = judge_leg(cell_dir, leg, kernel, windows,
                            successor=successor)
         judged["order"] = idx
@@ -1795,6 +1804,27 @@ def apply_successor_overlay(cell_dir: Path, judged: dict,
     return judged
 
 
+def _m1_leg_obs(leg: dict, entry: dict):
+    """Observer role for one M1 leg (pairs entries only; diag
+    kinds adjudicate separately and return None)."""
+    if entry.get("kind") == "m1-pairs":
+        side = leg["side"]
+        return entry["obs_a"] if side == "A" else entry["obs_b"]
+    return None
+
+
+def _successor_leg(manifest: dict, leg: dict, entry: dict) -> bool:
+    """True when one leg judges under the successor epoch: v3
+    manifest and a C/M pairs role. R legs keep frozen per-op
+    exactness on every epoch (A12 D2: R1 bytes predate miss
+    surfacing, and frozen exactness is the stricter gate —
+    any R-side miss fails it); diag kinds keep their frozen
+    adjudication."""
+    if manifest.get("manifest_version") != 3:
+        return False
+    return _m1_leg_obs(leg, entry) in ("C", "M")
+
+
 def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
                          entry: dict, manifest: dict,
                          kernel: str = None) -> dict:
@@ -1826,9 +1856,8 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         try:
             km1validity.parse_ctx_telemetry(stderr_log)
         except ValueError:
-            if manifest.get("manifest_version") == 3:
-                return apply_successor_overlay(
-                    cell_dir, judged, leg, manifest, kernel, obs)
+            # A12 D2: R keeps frozen per-op exactness (already
+            # judged in the chain) — never the truth equation.
             return judged
         judged["valid"] = False
         judged["outcome"] = "invalid"
@@ -1882,7 +1911,7 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + reasons
         return judged
-    if manifest.get("manifest_version") == 3:
+    if _successor_leg(manifest, leg, entry):
         return apply_successor_overlay(cell_dir, judged, leg,
                                        manifest, kernel, obs)
     return judged
@@ -1951,7 +1980,7 @@ def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + reasons
         return judged
-    if manifest.get("manifest_version") == 3:
+    if _successor_leg(manifest, leg, entry):
         return apply_successor_overlay(cell_dir, judged, leg,
                                        manifest, kernel, "M")
     return judged

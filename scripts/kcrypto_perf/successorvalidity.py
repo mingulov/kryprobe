@@ -179,6 +179,8 @@ def successor_truth(*, ops: int, alloc: int, kernel: str) -> int:
     if not _is_counter(ops) or not _is_counter(alloc):
         raise ValueError(f"successor truth operands unreadable: "
                          f"ops={ops!r} alloc={alloc!r}")
+    ops = _unsigned_counter(ops)
+    alloc = _unsigned_counter(alloc)
     if kernel == "6.12.111":
         return 4 * ops + 2
     if kernel in ("7.0.14", "7.2.6"):
@@ -219,6 +221,21 @@ def check_successor_leg(*, observed, truth, report_misses=None,
             reasons.append(f"successor {name} unreadable: {value!r}")
     if reasons:
         return reasons
+    # Normalize: serde digit strings judge as their int value
+    # (all operands passed _is_counter above, so none of these
+    # is None).
+    observed = _unsigned_counter(observed)
+    truth = _unsigned_counter(truth)
+    if report_misses is not None:
+        report_misses = _unsigned_counter(report_misses)
+    if stderr_miss_delta is not None:
+        stderr_miss_delta = _unsigned_counter(stderr_miss_delta)
+    if _is_counter(ktot_gap):
+        ktot_gap = _unsigned_counter(ktot_gap)
+    if _is_counter(programs):
+        programs = _unsigned_counter(programs)
+    if _is_counter(expected_programs):
+        expected_programs = _unsigned_counter(expected_programs)
     if report_misses is None and stderr_miss_delta is None:
         reasons.append("successor kernel misses unreadable: no "
                        "report counter and no miss telemetry")
@@ -262,12 +279,21 @@ def check_successor_m_leg(parsed: dict, ctx: dict, *, miss_delta,
     wrapper is honest standalone; ``check_m_cross`` remains
     the campaign judge's full same-walk gate."""
     reasons = []
-    system_total = parsed["ledger"]["system_total"]
-    if ctx["system_calls"] != system_total:
+    ledger = parsed.get("ledger", {}) if isinstance(parsed, dict) \
+        else {}
+    ctx = ctx if isinstance(ctx, dict) else {}
+    system_total = ledger.get("system_total")
+    system_calls = ctx.get("system_calls")
+    if not _is_counter(system_total):
+        return [f"successor M ledger.system_total unreadable: "
+                f"{system_total!r}"]
+    system_total = _unsigned_counter(system_total)
+    if not _is_counter(system_calls) or \
+            _unsigned_counter(system_calls) != system_total:
         reasons.append("successor M cross contradiction: ctx."
-                       f"system_calls={ctx['system_calls']} != ledger."
+                       f"system_calls={system_calls!r} != ledger."
                        f"system_total={system_total}")
-    present = ctx["present_calls"]
+    present = ctx.get("present_calls")
     if _is_counter(present) and _is_counter(system_total):
         ktot_gap = present - system_total
         if ktot_gap < 0:

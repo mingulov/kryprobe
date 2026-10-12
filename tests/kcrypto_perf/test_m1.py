@@ -1075,6 +1075,36 @@ class SuccessorShardDirTests(unittest.TestCase):
             M1DRIVER._shard_paths(opts, 1, "arrival"),
             ["/tmp/g/ledger.csv.arrival-0"])
 
+    def _timeout_legs(self, shards=True, merged=True):
+        legs = Path(tempfile.mkdtemp())
+        if shards:
+            (legs / "leg00B-driver.csv.shard-0").write_text(
+                "seq,phase,op,dt_ns\n")
+        if merged:
+            (legs / "leg00B-driver.csv").write_text(
+                "seq,phase,op,dt_ns\n")
+            (legs / "leg00B-driver.csv.summary.json").write_text(
+                "{}")
+        return legs
+
+    def test_timeout_child_hang_signature(self):
+        # H-C in-matrix signature (FORENSICS-2): shard files
+        # exist but the merge never landed — the runner owes
+        # this leg a fresh attempt id, not a verdict.
+        legs = self._timeout_legs(shards=True, merged=False)
+        self.assertTrue(
+            M1DRIVER.timeout_is_child_hang(str(legs), "leg00B"))
+
+    def test_timeout_merged_is_not_child_hang(self):
+        legs = self._timeout_legs(shards=True, merged=True)
+        self.assertFalse(
+            M1DRIVER.timeout_is_child_hang(str(legs), "leg00B"))
+
+    def test_timeout_no_shards_is_not_child_hang(self):
+        legs = self._timeout_legs(shards=False, merged=False)
+        self.assertFalse(
+            M1DRIVER.timeout_is_child_hang(str(legs), "leg00B"))
+
 
 class SuccessorManifestTests(unittest.TestCase):
     """Manifest v3 is the successor epoch switch (A12): same v2
@@ -1111,6 +1141,25 @@ class SuccessorManifestTests(unittest.TestCase):
     def test_version_four_rejects(self):
         doc = self._v3_doc()
         doc["manifest_version"] = 4
+        with self.assertRaises(m1manifest.InputError):
+            m1manifest.load_manifest(self._write(doc))
+
+    def test_shard_dir_loads(self):
+        doc = self._v3_doc()
+        doc["global"]["shard_dir"] = "/tmp/kryprobe-shards"
+        manifest = m1manifest.load_manifest(self._write(doc))
+        self.assertEqual(manifest["global"]["shard_dir"],
+                         "/tmp/kryprobe-shards")
+
+    def test_shard_dir_rejects_relative(self):
+        doc = self._v3_doc()
+        doc["global"]["shard_dir"] = "tmp/relative"
+        with self.assertRaises(m1manifest.InputError):
+            m1manifest.load_manifest(self._write(doc))
+
+    def test_shard_dir_rejects_empty(self):
+        doc = self._v3_doc()
+        doc["global"]["shard_dir"] = ""
         with self.assertRaises(m1manifest.InputError):
             m1manifest.load_manifest(self._write(doc))
 
@@ -1292,31 +1341,149 @@ class SuccessorOverlayTests(unittest.TestCase):
         self.assertTrue(any("ktot_gap" in r for r in out["reasons"]),
                         out["reasons"])
 
-    def test_v3_r_leg_equation_off_invalid(self):
-        files = self._c_files(misses=5)
+    def _r_leg(self):
+        return {"leg_id": "leg00A", "side": "A", "mode": "aggregation",
+                "cls": "P-4K", "driver": "skcipher",
+                "workload": "n_cgroup", "bulk": False, "threads": 2}
+
+    def _r_files(self, misses=2):
+        files = self._c_files(misses=misses)
         files["leg00A-report.json"] = files.pop("leg00B-report.json")
-        files["leg00A-capture.stderr.log"] = _miss_line(9, 5)
+        if misses is None:
+            files["leg00A-capture.stderr.log"] = ""
+        else:
+            files["leg00A-capture.stderr.log"] = _miss_line(9, misses)
+        return files
+
+    def test_v3_r_leg_skips_successor_equation(self):
+        # R disposition (A12 D2): R1 bytes (0c16410) predate miss
+        # surfacing, so v3 R legs keep frozen per-op exactness —
+        # the overlay never gates R on the truth equation (the
+        # frozen check in the judge chain already ran it).
+        cell = self._cell(self._r_files(misses=5))
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertTrue(out["valid"], out.get("reasons"))
+
+    def test_v3_r_leg_frozen_exactness_enforced(self):
+        # Full chain: a missy v3 R leg (equation-consistent)
+        # still fails frozen per-op exactness — the stricter
+        # gate R keeps.
+        files = self._r_files(misses=2)
+        report = json.loads(files["leg00A-report.json"])
+        report["observations"] = [
+            {"backend_payload": {
+                "row": "agg", "family": "skcipher", "op": op,
+                "driver": "flat",
+                "counts": {"calls": 99, "ok": 99, "errors": 0,
+                           "queued": 0}}}
+            for op in ("encrypt", "decrypt")] + report["observations"]
+        files["leg00A-report.json"] = json.dumps(report)
+        files["leg00A-driver.csv.summary.json"] = json.dumps({
+            "ops_total": 100, "ops_meas": 100, "rows_meas": 4,
+            "rc": 0, "fails": 0, "late": 0, "paced": 0, "threads": 2,
+            "meas_window_s": 30.0, "t_warm_start_ns": 0,
+            "t_meas_start_ns": 10_000_000_000,
+            "t_end_ns": 40_000_000_000})
+        files["leg00A-driver-rc.txt"] = \
+            "driver_rc=0\ndriver_timeout=0\n"
+        files["leg00A-driver.csv"] = (
+            "seq,phase,op,dt_ns\n0,meas,encrypt,5\n0,meas,decrypt,7\n"
+            "1,meas,encrypt,5\n1,meas,decrypt,7\n")
+        files["leg00A-capture-rc.txt"] = "capture_rc=0\n"
         cell = self._cell(files)
-        leg = {"leg_id": "leg00A", "side": "A", "mode": "aggregation",
-               "cls": "P-4K", "driver": "skcipher",
-               "workload": "n_cgroup", "bulk": False, "threads": 2}
-        out = self._overlay(cell, self._judged(), leg, self._c_entry(),
-                            self._manifest(3))
+        judged = CLI.judge_leg(cell, self._r_leg(), "7.0.14",
+                               (10.0, 30.0), successor=False)
+        self.assertFalse(judged["valid"])
+        self.assertTrue(any("want 100" in r for r in judged["reasons"]),
+                        judged["reasons"])
+
+    def test_m1_leg_obs_derivation(self):
+        entry = {"kind": "m1-pairs", "obs_a": "R", "obs_b": "C"}
+        self.assertEqual(
+            CLI._m1_leg_obs({"side": "A"}, entry), "R")
+        self.assertEqual(
+            CLI._m1_leg_obs({"side": "B"}, entry), "C")
+        self.assertIsNone(
+            CLI._m1_leg_obs({"side": "B"}, {"kind": "m1-612-ctx"}))
+
+    def test_v3_provisional_loss_gate_pins_kdrops(self):
+        # A12 item 2 (folded form): a nonzero drop-site
+        # counter fails the v3 pre-gate even when the truth
+        # equation would hold — KDROPS sites stay pinned.
+        files = self._c_files()
+        report = json.loads(files["leg00B-report.json"])
+        for counter in report["coverage"]["aggregate_counts"][
+                "counters"]:
+            if counter["name"] == "predrop_chase_fail":
+                counter["value"] = 1
+        files["leg00B-report.json"] = json.dumps(report)
+        files["leg00B-driver.csv.summary.json"] = json.dumps({
+            "ops_total": 100, "ops_meas": 100, "rows_meas": 4,
+            "rc": 0, "fails": 0, "late": 0, "paced": 0, "threads": 2,
+            "meas_window_s": 30.0, "t_warm_start_ns": 0,
+            "t_meas_start_ns": 10_000_000_000,
+            "t_end_ns": 40_000_000_000})
+        files["leg00B-driver-rc.txt"] = \
+            "driver_rc=0\ndriver_timeout=0\n"
+        files["leg00B-driver.csv"] = (
+            "seq,phase,op,dt_ns\n0,meas,encrypt,5\n0,meas,decrypt,7\n"
+            "1,meas,encrypt,5\n1,meas,decrypt,7\n")
+        files["leg00B-capture-rc.txt"] = "capture_rc=0\n"
+        cell = self._cell(files)
+        judged = CLI.judge_leg(cell, self._c_leg(), "7.0.14",
+                               (10.0, 30.0), successor=True)
+        self.assertFalse(judged["valid"])
+        self.assertTrue(any("predrop_chase_fail" in r
+                            for r in judged["reasons"]),
+                        judged["reasons"])
+
+    def test_v3_unavailable_miss_terminal_invalid(self):
+        # A12 item 2 (fence mechanism): a fence-unproven miss
+        # terminal prints unavailable — the successor leg
+        # refuses it, never zero-fills.
+        files = self._c_files()
+        files["leg00B-capture.stderr.log"] = (
+            _ctx_line(192, 200, 200)
+            + 'kryprobe: telemetry {"v":1,"misses":'
+            '{"unavailable":true}}\n')
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(3))
         self.assertFalse(out["valid"])
         self.assertTrue(any("successor" in r for r in out["reasons"]),
                         out["reasons"])
 
-    def test_v3_r_leg_consistent_valid(self):
-        files = self._c_files()
-        files["leg00A-report.json"] = files.pop("leg00B-report.json")
-        files["leg00A-capture.stderr.log"] = _miss_line(9, 2)
-        cell = self._cell(files)
-        leg = {"leg_id": "leg00A", "side": "A", "mode": "aggregation",
-               "cls": "P-4K", "driver": "skcipher",
-               "workload": "n_cgroup", "bulk": False, "threads": 2}
-        out = self._overlay(cell, self._judged(), leg, self._c_entry(),
-                            self._manifest(3))
+    def test_v3_async_leg_refuses(self):
+        leg = dict(self._c_leg(), cls="P-ASYNC")
+        cell = self._cell(self._c_files())
+        out = self._overlay(cell, self._judged(), leg,
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("async" in r for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_floor_kernel_truth(self):
+        cell = self._cell(self._c_files(misses=2, observed=400))
+        judged = {"valid": True, "outcome": "valid", "reasons": [],
+                  "driver": {"ops_total": 100}}
+        out = CLI.apply_m1_ctx_overlay(
+            cell, judged, self._c_leg(), self._c_entry(),
+            self._manifest(3), kernel="6.12.111")
         self.assertTrue(out["valid"], out.get("reasons"))
+
+    def test_successor_epoch_is_per_leg(self):
+        # The v3 truth equation applies to C/M legs only; R
+        # keeps frozen exactness and non-pairs kinds (diags)
+        # keep their frozen adjudication on any epoch.
+        v3 = {"manifest_version": 3}
+        v2 = {"manifest_version": 2}
+        pairs = {"kind": "m1-pairs", "obs_a": "R", "obs_b": "M"}
+        diag = {"kind": "m1-612-ctx"}
+        self.assertTrue(CLI._successor_leg(v3, {"side": "B"}, pairs))
+        self.assertFalse(CLI._successor_leg(v3, {"side": "A"}, pairs))
+        self.assertFalse(CLI._successor_leg(v3, {"side": "B"}, diag))
+        self.assertFalse(CLI._successor_leg(v2, {"side": "B"}, pairs))
 
     def _m_files(self, misses=2, observed=200):
         files = {"leg00B-report.workload-json": json.dumps(

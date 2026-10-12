@@ -128,6 +128,17 @@ def load_manifest(path: Path) -> dict:
             raise InputError("v3 manifest needs global "
                              f"expected_programs (positive int), "
                              f"got {pin!r}")
+    # H-C guest-local shard transport (A12 item 4): optional
+    # on any epoch (transport, not judging) — when present it
+    # must be a guest-absolute path (never relative, never
+    # empty); the scenario creates a per-leg subdir under it.
+    if "shard_dir" in manifest["global"]:
+        shard_dir = manifest["global"]["shard_dir"]
+        if not isinstance(shard_dir, str) or not shard_dir.startswith(
+                "/") or not shard_dir.strip("/"):
+            raise InputError("manifest global shard_dir must be a "
+                             "guest-absolute path, "
+                             f"got {shard_dir!r}")
     for kernel in manifest["global"]["kernels"]:
         if kernel not in KERNELS:
             raise InputError(f"unknown manifest kernel {kernel!r}")

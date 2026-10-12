@@ -215,6 +215,15 @@ class SuccessorLegTests(unittest.TestCase):
         reasons = self.leg(expected_programs=8)
         self.assertTrue(any("programs" in r for r in reasons), reasons)
 
+    def test_digit_string_operands_normalize(self):
+        # Serde digit strings are legitimate evidence: they must
+        # judge, never crash the checker with TypeError.
+        reasons = succ.check_successor_leg(
+            observed="8990845", truth="9013216",
+            report_misses="22371", stderr_miss_delta=22371,
+            ktot_gap="0", programs=9)
+        self.assertEqual(reasons, [])
+
 
 class SuccessorMLegTests(unittest.TestCase):
     # m1-P-4K-n_cgroup-mr leg00B sealed operands (FORENSICS-2):
@@ -249,6 +258,20 @@ class SuccessorMLegTests(unittest.TestCase):
             self.PARSED, ctx, miss_delta=31340, truth=8638906,
             programs=9)
         self.assertTrue(any("ktot_gap" in r for r in reasons), reasons)
+
+    def test_m_leg_malformed_operands_are_reasons(self):
+        # Standalone honesty: mistyped/missing ledger/ctx
+        # operands invalidate with named reasons, never raise.
+        for bad_parsed, bad_ctx in (
+                ({"ledger": {}}, self.CTX),
+                ({"ledger": {"system_total": True}}, self.CTX),
+                (self.PARSED, {"system_calls": None,
+                               "present_calls": 8607566}),
+                (self.PARSED, {})):
+            reasons = succ.check_successor_m_leg(
+                bad_parsed, bad_ctx, miss_delta=31340,
+                truth=8638906, programs=9)
+            self.assertTrue(reasons, (bad_parsed, bad_ctx))
 
 
 if __name__ == "__main__":

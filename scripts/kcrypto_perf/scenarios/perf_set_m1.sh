@@ -271,8 +271,22 @@ run_driver() {
   # $1 = leg id, $2.. driver args; records rc + timeout flag.
   leg="$1"
   shift
+  # H-C (A12 item 4): shards + per-shard summaries go to a
+  # per-leg guest-local subdir when the cell stages one
+  # ($M1_SHARD_DIR from set.env); empty/absent keeps the
+  # frozen ledger-sibling layout. A mkdir failure aborts the
+  # boot (guest env broken — same as attach/ambient).
+  shard_extra=""
+  if [ -n "${M1_SHARD_DIR:-}" ]; then
+    if ! mkdir -p "$M1_SHARD_DIR/$leg"; then
+      echo "FAIL=shard-dir" > "$OUT/done.txt"
+      exit 2
+    fi
+    shard_extra="--shard-dir $M1_SHARD_DIR/$leg"
+  fi
   # shellcheck disable=SC2086
-  timeout -s TERM 150 python3 "$D" "$@" "$OUT/legs/$leg-driver.csv" \
+  timeout -s TERM 150 python3 "$D" "$@" $shard_extra \
+    "$OUT/legs/$leg-driver.csv" \
     > "$OUT/legs/$leg-driver.stdout.log" \
     2> "$OUT/legs/$leg-driver.stderr.log"
   rc=$?
