@@ -1163,6 +1163,25 @@ class SuccessorManifestTests(unittest.TestCase):
         with self.assertRaises(m1manifest.InputError):
             m1manifest.load_manifest(self._write(doc))
 
+    def test_shard_dir_rejects_shell_metacharacters(self):
+        # The staged path is sourced inside double quotes and
+        # word-split at use — only a safe charset is honest.
+        for bad in ("/tmp/$(printf x)", "/tmp/`id`",
+                    "/tmp/a b", "/tmp/a;b", '/tmp/a"b',
+                    "/tmp/a'b", "/tmp/a&b", "/tmp/a|b"):
+            doc = self._v3_doc()
+            doc["global"]["shard_dir"] = bad
+            with self.assertRaises(m1manifest.InputError,
+                                   msg=f"path {bad!r}"):
+                m1manifest.load_manifest(self._write(doc))
+
+    def test_shard_dir_accepts_safe_charset(self):
+        doc = self._v3_doc()
+        doc["global"]["shard_dir"] = "/tmp/kryprobe-shards_v2/x-y"
+        manifest = m1manifest.load_manifest(self._write(doc))
+        self.assertEqual(manifest["global"]["shard_dir"],
+                         "/tmp/kryprobe-shards_v2/x-y")
+
 
 class SuccessorTruthTests(unittest.TestCase):
     """Per-leg driver-truth oracle: n_cgroup K6-1 sealed numbers,
@@ -1207,11 +1226,31 @@ def _api_report(observed, misses, gap=0):
     agg = [{"name": "kernel_misses", "value": misses},
            {"name": "snapshot_agg_calls", "value": observed},
            {"name": "snapshot_totals_calls", "value": observed}]
-    return {
-        "observations": [{"backend_payload": {
+    alloc = 2
+    half = (observed - alloc) // 2
+    rows = [
+        {"backend_payload": {
+            "row": "agg", "family": "skcipher", "op": "encrypt",
+            "driver": "flat",
+            "counts": {"calls": half, "ok": half, "errors": 0,
+                       "queued": 0}}},
+        {"backend_payload": {
+            "row": "agg", "family": "skcipher", "op": "decrypt",
+            "driver": "flat",
+            "counts": {"calls": observed - alloc - half,
+                       "ok": observed - alloc - half, "errors": 0,
+                       "queued": 0}}},
+        {"backend_payload": {
+            "row": "agg", "family": "any", "op": "alloc",
+            "algorithm": "cbc(aes)",
+            "counts": {"calls": alloc, "ok": alloc, "errors": 0,
+                       "queued": 0}}},
+        {"backend_payload": {
             "row": "totals",
             "counts": {"calls": observed, "errors": 0, "ok": observed,
-                       "queued": 0}}}],
+                       "queued": 0}}}]
+    return {
+        "observations": rows,
         "coverage": {
             "aggregate_counts": {"counters": agg + counters},
             "detailed_events": {"counters": [
@@ -1355,30 +1394,31 @@ class SuccessorOverlayTests(unittest.TestCase):
             files["leg00A-capture.stderr.log"] = _miss_line(9, misses)
         return files
 
-    def test_v3_r_leg_skips_successor_equation(self):
-        # R disposition (A12 D2): R1 bytes (0c16410) predate miss
-        # surfacing, so v3 R legs keep frozen per-op exactness —
-        # the overlay never gates R on the truth equation (the
-        # frozen check in the judge chain already ran it).
-        cell = self._cell(self._r_files(misses=5))
+    def test_v3_r_leg_ignores_equation_without_surfaces(self):
+        # R disposition (A12 D2): v3 R legs keep frozen per-op
+        # exactness and never run the truth equation — but any
+        # present miss surface invalidates (R1 bytes cannot
+        # emit one, so presence is an anomaly).
+        cell = self._cell(self._r_files(misses=None))
         out = self._overlay(cell, self._judged(), self._r_leg(),
                             self._c_entry(), self._manifest(3))
         self.assertTrue(out["valid"], out.get("reasons"))
+
+    def test_v3_r_leg_miss_evidence_invalid(self):
+        cell = self._cell(self._r_files(misses=5))
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("miss" in r for r in out["reasons"]),
+                        out["reasons"])
 
     def test_v3_r_leg_frozen_exactness_enforced(self):
         # Full chain: a missy v3 R leg (equation-consistent)
         # still fails frozen per-op exactness — the stricter
         # gate R keeps.
         files = self._r_files(misses=2)
-        report = json.loads(files["leg00A-report.json"])
-        report["observations"] = [
-            {"backend_payload": {
-                "row": "agg", "family": "skcipher", "op": op,
-                "driver": "flat",
-                "counts": {"calls": 99, "ok": 99, "errors": 0,
-                           "queued": 0}}}
-            for op in ("encrypt", "decrypt")] + report["observations"]
-        files["leg00A-report.json"] = json.dumps(report)
+        # _r_files already builds missy per-op rows (99/99 vs
+        # ops 100) with a reconciled aggregate sum.
         files["leg00A-driver.csv.summary.json"] = json.dumps({
             "ops_total": 100, "ops_meas": 100, "rows_meas": 4,
             "rc": 0, "fails": 0, "late": 0, "paced": 0, "threads": 2,
@@ -1406,6 +1446,120 @@ class SuccessorOverlayTests(unittest.TestCase):
             CLI._m1_leg_obs({"side": "B"}, entry), "C")
         self.assertIsNone(
             CLI._m1_leg_obs({"side": "B"}, {"kind": "m1-612-ctx"}))
+
+    def _driver_files(self, leg_id="leg00B"):
+        return {
+            f"{leg_id}-driver.csv.summary.json": json.dumps({
+                "ops_total": 100, "ops_meas": 100, "rows_meas": 4,
+                "rc": 0, "fails": 0, "late": 0, "paced": 0,
+                "threads": 2, "meas_window_s": 30.0,
+                "t_warm_start_ns": 0,
+                "t_meas_start_ns": 10_000_000_000,
+                "t_end_ns": 40_000_000_000}),
+            f"{leg_id}-driver-rc.txt":
+                "driver_rc=0\ndriver_timeout=0\n",
+            f"{leg_id}-driver.csv": (
+                "seq,phase,op,dt_ns\n0,meas,encrypt,5\n"
+                "0,meas,decrypt,7\n1,meas,encrypt,5\n"
+                "1,meas,decrypt,7\n"),
+            f"{leg_id}-capture-rc.txt": "capture_rc=0\n"}
+
+    def test_v3_result_errors_invalid(self):
+        # The v3 provisional gate keeps the frozen
+        # zero-error/zero-queued result checks the count
+        # supersession must not drop.
+        files = self._c_files()
+        report = json.loads(files["leg00B-report.json"])
+        for obs in report["observations"]:
+            payload = obs["backend_payload"]
+            if payload.get("row") == "agg" and \
+                    payload.get("op") == "encrypt":
+                payload["counts"]["errors"] = 1
+        files["leg00B-report.json"] = json.dumps(report)
+        files.update(self._driver_files())
+        cell = self._cell(files)
+        judged = CLI.judge_leg(cell, self._c_leg(), "7.0.14",
+                               (10.0, 30.0), successor=True)
+        self.assertFalse(judged["valid"])
+        self.assertTrue(any("errors" in r for r in judged["reasons"]),
+                        judged["reasons"])
+
+    def test_v3_result_queued_invalid(self):
+        files = self._c_files()
+        report = json.loads(files["leg00B-report.json"])
+        for obs in report["observations"]:
+            payload = obs["backend_payload"]
+            if payload.get("row") == "agg" and \
+                    payload.get("op") == "decrypt":
+                payload["counts"]["queued"] = 1
+        files["leg00B-report.json"] = json.dumps(report)
+        files.update(self._driver_files())
+        cell = self._cell(files)
+        judged = CLI.judge_leg(cell, self._c_leg(), "7.0.14",
+                               (10.0, 30.0), successor=True)
+        self.assertFalse(judged["valid"])
+        self.assertTrue(any("queued" in r for r in judged["reasons"]),
+                        judged["reasons"])
+
+    def test_v3_coerced_loss_counter_invalid(self):
+        # Frozen int(False) == 0: the v3 loss gate must
+        # strict-parse, never inherit the coercion.
+        files = self._c_files()
+        report = json.loads(files["leg00B-report.json"])
+        for counter in report["coverage"]["aggregate_counts"][
+                "counters"]:
+            if counter["name"] == "predrop_chase_fail":
+                counter["value"] = False
+        files["leg00B-report.json"] = json.dumps(report)
+        files.update(self._driver_files())
+        cell = self._cell(files)
+        judged = CLI.judge_leg(cell, self._c_leg(), "7.0.14",
+                               (10.0, 30.0), successor=True)
+        self.assertFalse(judged["valid"])
+
+    def test_v3_snapshot_contradiction_invalid(self):
+        files = self._c_files()
+        report = json.loads(files["leg00B-report.json"])
+        for counter in report["coverage"]["aggregate_counts"][
+                "counters"]:
+            if counter["name"] == "snapshot_agg_calls":
+                counter["value"] = 1
+        files["leg00B-report.json"] = json.dumps(report)
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("snapshot" in r for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_m_leg_churn_full_saturated_valid(self):
+        # Sealed shape (4K-churn_full-mr): 1024 rows, unknown
+        # == drops > 0, refused > 0 — saturation must pass
+        # the M truth gate, never trip a phantom lane gap.
+        rows = [{"calls": "5798"}] + [{"calls": "0"}] * 1023
+        doc = _workload_doc(13600)
+        doc["contexts"] = rows
+        doc["ledger"]["per_context_sum"] = "5798"
+        doc["ledger"]["unknown"] = "0"
+        doc["ledger"]["refused_inserts"] = "7802"
+        doc["partition"]["matched"] = "5798"
+        files = {"leg00B-report.workload-json": json.dumps(doc),
+                 "leg00B-capture.stderr.log": (
+                     'kryprobe: telemetry {"v":1,"ctx":{"rows":1024,'
+                     '"present_calls":5798,"system_calls":13600,'
+                     '"unknown_calls":7802,"drops":7802}}\n'
+                     + _miss_line(9, 0))}
+        cell = self._cell(files)
+        judged = {"valid": True, "outcome": "valid", "reasons": [],
+                  "driver": {"ops_total": 6799}}
+        leg = dict(self._m_leg(), workload="churn_full", threads=2)
+        manifest = {"manifest_version": 3,
+                    "global": {"expected_programs": 9},
+                    "workloads": {"churn_full": {"expected_rows": 1024}}}
+        out = CLI.apply_m1_ctx_overlay(cell, judged, leg,
+                                       self._m_entry(), manifest,
+                                       kernel="7.0.14")
+        self.assertTrue(out["valid"], out.get("reasons"))
 
     def test_v3_provisional_loss_gate_pins_kdrops(self):
         # A12 item 2 (folded form): a nonzero drop-site
@@ -1535,23 +1689,13 @@ class SuccessorOverlayTests(unittest.TestCase):
         # judges it by the truth equation instead.
         files = self._c_files()
         report = json.loads(files["leg00B-report.json"])
+        # Missy per-op rows (99/99 vs ops 100) with a
+        # reconciled aggregate sum (99 + 99 + 2 == 200).
         report["observations"] = [
-            {"backend_payload": {
-                "row": "agg", "family": "skcipher", "op": "encrypt",
-                "driver": "flat",
-                "counts": {"calls": 99, "ok": 99, "errors": 0,
-                           "queued": 0}}},
-            {"backend_payload": {
-                "row": "agg", "family": "skcipher", "op": "decrypt",
-                "driver": "flat",
-                "counts": {"calls": 99, "ok": 99, "errors": 0,
-                           "queued": 0}}},
-            {"backend_payload": {
-                "row": "agg", "family": "any", "op": "alloc",
-                "algorithm": "cbc(aes)",
-                "counts": {"calls": 2, "ok": 2, "errors": 0,
-                           "queued": 0}}},
-        ] + report["observations"]
+            obs for obs in report["observations"]
+            if obs["backend_payload"].get("row") != "totals"
+        ] + [obs for obs in report["observations"]
+             if obs["backend_payload"].get("row") == "totals"]
         files["leg00B-report.json"] = json.dumps(report)
         files["leg00B-driver.csv.summary.json"] = json.dumps({
             "ops_total": 100, "ops_meas": 100, "rows_meas": 4,

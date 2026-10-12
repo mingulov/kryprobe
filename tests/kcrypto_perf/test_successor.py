@@ -44,9 +44,12 @@ def write_tmp(content, suffix=""):
     return Path(fh.name)
 
 
-def report_doc(counters):
-    return json.dumps({"coverage": {"aggregate_counts": {
-        "counters": [{"name": n, "value": v} for n, v in counters]}}})
+def report_doc(counters, detailed=()):
+    return json.dumps({"coverage": {
+        "aggregate_counts": {"counters": [
+            {"name": n, "value": v} for n, v in counters]},
+        "detailed_events": {"counters": [
+            {"name": n, "value": v} for n, v in detailed]}}})
 
 
 # Verbatim K6-1 aggregate_counts counters (fixed bytes d151128).
@@ -115,6 +118,78 @@ class KernelMissesCounterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             succ.parse_snapshot_counters(path)
 
+    def test_report_has_counter(self):
+        path = write_tmp(report_doc(K6_1_COUNTERS))
+        self.assertTrue(succ.report_has_counter(
+            path, "aggregate_counts", "kernel_misses"))
+        self.assertFalse(succ.report_has_counter(
+            path, "aggregate_counts", "no_such_counter"))
+        self.assertFalse(succ.report_has_counter(
+            path, "detailed_events", "kernel_misses"))
+
+    def test_stderr_has_misses(self):
+        self.assertTrue(succ.stderr_has_misses(
+            write_tmp("noise\n" + K6_1_MISS_LINE)))
+        self.assertTrue(succ.stderr_has_misses(
+            write_tmp('kryprobe: telemetry {"v":1,"misses":\n')))
+        self.assertFalse(succ.stderr_has_misses(
+            write_tmp("kryprobe: telemetry {}\n")))
+
+    def test_snapshot_agreement_k6(self):
+        reasons = succ.check_snapshot_agreement(
+            totals=8990845, snapshot_agg=8990845,
+            snapshot_totals=8990845, agg_sum=8990845)
+        self.assertEqual(reasons, [])
+
+    def test_snapshot_contradiction_invalid(self):
+        reasons = succ.check_snapshot_agreement(
+            totals=200, snapshot_agg=1, snapshot_totals=999,
+            agg_sum=200)
+        self.assertTrue(any("snapshot" in r for r in reasons),
+                        reasons)
+
+    def test_agg_rows_unreconciled_invalid(self):
+        reasons = succ.check_snapshot_agreement(
+            totals=8990845, snapshot_agg=8990845,
+            snapshot_totals=8990845, agg_sum=8990844)
+        self.assertTrue(any("agg" in r for r in reasons), reasons)
+
+    def test_agg_calls_sum_k6_shape(self):
+        agg = {("skcipher", "encrypt", "flat"): {"calls": 99},
+               ("skcipher", "decrypt", "flat"): {"calls": 99}}
+        alloc = [{"calls": 2}]
+        self.assertEqual(succ.agg_calls_sum(agg, alloc), 200)
+
+    def test_agg_calls_sum_refuses_mistyped(self):
+        for bad in (True, 9.9, None, -1):
+            with self.assertRaises(ValueError, msg=f"calls {bad!r}"):
+                succ.agg_calls_sum(
+                    {("skcipher", "encrypt", "flat"): {"calls": bad}},
+                    [])
+        self.assertEqual(succ.agg_calls_sum(
+            {("skcipher", "encrypt", "flat"): {"calls": "99"}}, []),
+            99)
+
+    def test_strict_loss_counters_k6(self):
+        path = write_tmp(report_doc(
+            K6_1_COUNTERS,
+            [("ring_drops", "0"), ("overflow_identities", "0")]))
+        loss = succ.parse_loss_counters_strict(path)
+        self.assertEqual(loss["ktot_gap"], 0)
+        self.assertEqual(loss["predrop_destroy_skip"], 64)
+
+    def test_strict_loss_counters_refuse_coercion(self):
+        # The frozen parser's int() maps False->0 and 0.5->0;
+        # the successor loss gate must refuse such evidence.
+        for bad in (False, 0.5, "1.5", None):
+            counters = [(n, bad if n == "predrop_chase_fail" else v)
+                        for n, v in K6_1_COUNTERS]
+            path = write_tmp(report_doc(
+                counters,
+                [("ring_drops", "0"), ("overflow_identities", "0")]))
+            with self.assertRaises(ValueError, msg=f"value {bad!r}"):
+                succ.parse_loss_counters_strict(path)
+
 
 class MissTelemetryTests(unittest.TestCase):
     def test_parses_k6_miss_line(self):
@@ -139,6 +214,31 @@ class MissTelemetryTests(unittest.TestCase):
     def test_mistyped_miss_delta_refuses(self):
         path = write_tmp('kryprobe: telemetry {"v":1,"misses":'
                          '{"programs":9,"miss_delta":true,'
+                         '"run_delta":null}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_malformed_misses_line_refuses_despite_valid(self):
+        # A malformed misses-bearing line is a contradictory
+        # receipt — it refuses even when another line parsed.
+        path = write_tmp(K6_1_MISS_LINE
+                         + 'kryprobe: telemetry {"v":1,"misses":'
+                         '{"programs":9,\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_null_misses_object_refuses(self):
+        path = write_tmp(K6_1_MISS_LINE
+                         + 'kryprobe: telemetry {"v":1,'
+                         '"misses":null}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_bool_version_refuses(self):
+        # True == 1 in Python — the version gate must be
+        # type-strict, never ==.
+        path = write_tmp('kryprobe: telemetry {"v":true,"misses":'
+                         '{"programs":9,"miss_delta":1,'
                          '"run_delta":null}}\n')
         with self.assertRaises(ValueError):
             succ.parse_miss_telemetry(path)
@@ -229,7 +329,8 @@ class SuccessorMLegTests(unittest.TestCase):
     # m1-P-4K-n_cgroup-mr leg00B sealed operands (FORENSICS-2):
     # ledger system_total 8607566 + miss_delta 31340 = 8638906.
     PARSED = {"ledger": {"system_total": 8607566}}
-    CTX = {"system_calls": 8607566, "present_calls": 8607566}
+    CTX = {"system_calls": 8607566, "present_calls": 8607566,
+           "drops": 0}
 
     def test_forensics_m_leg_truth_exact(self):
         reasons = succ.check_successor_m_leg(
@@ -253,11 +354,36 @@ class SuccessorMLegTests(unittest.TestCase):
     def test_m_leg_ktot_lag_invalid(self):
         # Same-walk lag: present (Sigma-KCTX) exceeds the ledger
         # system total (KTOT walk) — successor 8(8) gap on M.
-        ctx = {"system_calls": 8607566, "present_calls": 8607648}
+        ctx = {"system_calls": 8607566, "present_calls": 8607648,
+               "drops": 0}
         reasons = succ.check_successor_m_leg(
             self.PARSED, ctx, miss_delta=31340, truth=8638906,
             programs=9)
-        self.assertTrue(any("ktot_gap" in r for r in reasons), reasons)
+        self.assertTrue(any("ktot_gap=82" in r for r in reasons),
+                        reasons)
+
+    def test_m_leg_churn_full_saturated_valid(self):
+        # Sealed m1-P-4K-churn_full-mr leg00B operands: on
+        # saturation the gap operand is present + drops −
+        # system (5798 + 7802 − 13600 = 0), never present −
+        # system (which misreads attribution overflow as a
+        # lane contradiction). Zero misses: exact-count.
+        parsed = {"ledger": {"system_total": 13600}}
+        ctx = {"system_calls": 13600, "present_calls": 5798,
+               "drops": 7802}
+        reasons = succ.check_successor_m_leg(
+            parsed, ctx, miss_delta=0, truth=13600, programs=9)
+        self.assertEqual(reasons, [])
+        self.assertTrue(succ.exact_count_claim(0))
+
+    def test_m_leg_digit_string_operands_normalize(self):
+        parsed = {"ledger": {"system_total": "8607566"}}
+        ctx = {"system_calls": "8607566",
+               "present_calls": "8607566", "drops": "0"}
+        reasons = succ.check_successor_m_leg(
+            parsed, ctx, miss_delta=31340, truth=8638906,
+            programs=9)
+        self.assertEqual(reasons, [])
 
     def test_m_leg_malformed_operands_are_reasons(self):
         # Standalone honesty: mistyped/missing ledger/ctx

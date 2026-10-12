@@ -1234,7 +1234,34 @@ def judge_successor_provisional(cell_dir: Path, leg: dict,
         destroy = kvalidity.FLOOR_DESTROY_PIN
     else:
         destroy = threads if threads == 1 else None
-    reasons = kvalidity._loss_reasons(parsed.get("loss", {}), destroy)
+    # Strict loss evidence: the frozen parser's int() maps
+    # False->0 and 0.5->0, so the successor gate re-reads
+    # every loss counter strictly instead of trusting the
+    # coerced dict.
+    try:
+        loss = ksucc.parse_loss_counters_strict(
+            cell_dir / "legs" / f"{leg['leg_id']}-report.json")
+    except ValueError as err:
+        out.update(valid=False, reasons=[f"successor loss: {err}"],
+                   outcome="invalid")
+        return out
+    reasons = kvalidity._loss_reasons(loss, destroy)
+    # The count supersession keeps the frozen zero-result
+    # checks: any row error/queue on a sync leg is
+    # unexplained, never absorbed into the equation.
+    for key, row in sorted(parsed.get("agg", {}).items(),
+                           key=lambda item: str(item[0])):
+        if row.get("errors"):
+            reasons.append(f"{key[0]} {key[1]} errors="
+                           f"{row.get('errors')}")
+        if row.get("queued"):
+            reasons.append(f"{key[0]} {key[1]} queued="
+                           f"{row.get('queued')}")
+    for alloc in parsed.get("alloc_rows", []):
+        if alloc.get("errors"):
+            reasons.append(f"alloc errors={alloc.get('errors')}")
+        if alloc.get("queued"):
+            reasons.append(f"alloc queued={alloc.get('queued')}")
     if reasons:
         out.update(valid=False, reasons=reasons, outcome="invalid")
         return out
@@ -1784,9 +1811,22 @@ def apply_successor_overlay(cell_dir: Path, judged: dict,
             parsed = kparsers.parse_api_returns(report_path)
             km = ksucc.parse_kernel_misses_counter(report_path)
             snap = ksucc.parse_snapshot_counters(report_path)
+            agg_sum = ksucc.agg_calls_sum(parsed.get("agg", {}),
+                                          parsed.get("alloc_rows", []))
         except (kparsers.ParseError, ValueError) as err:
             return fail(f"successor report operands: {err}")
         observed = parsed["totals"].get("calls")
+        snap_reasons = ksucc.check_snapshot_agreement(
+            totals=observed,
+            snapshot_agg=snap["snapshot_agg_calls"],
+            snapshot_totals=snap["snapshot_totals_calls"],
+            agg_sum=agg_sum)
+        if snap_reasons:
+            judged["valid"] = False
+            judged["outcome"] = "invalid"
+            judged["reasons"] = judged.get("reasons", []) + \
+                snap_reasons
+            return judged
         reasons = ksucc.check_successor_leg(
             observed=observed, truth=truth, report_misses=km,
             stderr_miss_delta=miss["miss_delta"],
@@ -1858,6 +1898,26 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         except ValueError:
             # A12 D2: R keeps frozen per-op exactness (already
             # judged in the chain) — never the truth equation.
+            # But any present R-side miss surface invalidates:
+            # R1 bytes cannot emit one, so presence is an
+            # anomaly (wrong bytes staged as R, or future
+            # R-side loss that frozen exactness must see).
+            if manifest.get("manifest_version") == 3 and \
+                    entry.get("kind") == "m1-pairs":
+                surfaces = []
+                if ksucc.report_has_counter(
+                        legs_dir / f"{leg['leg_id']}-report.json",
+                        "aggregate_counts", "kernel_misses"):
+                    surfaces.append("report kernel_misses")
+                if ksucc.stderr_has_misses(stderr_log):
+                    surfaces.append("stderr misses")
+                if surfaces:
+                    judged["valid"] = False
+                    judged["outcome"] = "invalid"
+                    judged["reasons"] = judged.get("reasons", []) + [
+                        "successor R-side miss evidence "
+                        f"({' + '.join(surfaces)} present): R1 "
+                        "bytes cannot surface misses"]
             return judged
         judged["valid"] = False
         judged["outcome"] = "invalid"

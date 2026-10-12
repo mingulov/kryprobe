@@ -29,6 +29,8 @@ bpftool map dumps stay localizer evidence, never operands.
 import json
 from pathlib import Path
 
+from kcrypto_perf.parsers import LOSS_COUNTERS
+
 TELEMETRY_PREFIX = "kryprobe: telemetry "
 TELEMETRY_VERSION = 1
 
@@ -93,6 +95,34 @@ def _named_counter(path: Path, dim: str, name: str) -> int:
     return found
 
 
+def report_has_counter(path: Path, dim: str, name: str) -> bool:
+    """True when a report dimension carries an entry with the
+    given counter name — presence only, value unchecked
+    (the A12 D2 R-side anomaly probe: R1 bytes emit no miss
+    surface at all, so any present entry is anomalous even
+    before its value is judged)."""
+    try:
+        counters = _report_counters(path, dim)
+    except ValueError:
+        return False
+    return any(isinstance(entry, dict) and entry.get("name") == name
+               for entry in counters)
+
+
+def stderr_has_misses(path: Path) -> bool:
+    """True when a capture stderr log carries any
+    misses-bearing telemetry line — parseable or not (a
+    malformed misses line is itself miss evidence for the
+    D2 probe, and the strict parser refuses it separately
+    on C/M legs)."""
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return False
+    return any(raw.startswith(TELEMETRY_PREFIX) and '"misses"' in raw
+               for raw in text.splitlines())
+
+
 def parse_kernel_misses_counter(path: Path) -> int:
     """``kernel_misses`` from a sealed api-returns report's
     ``coverage.aggregate_counts.counters`` (fixed bytes only;
@@ -108,6 +138,91 @@ def parse_snapshot_counters(path: Path) -> dict:
     (pre-fix reports without ``ktot_gap`` included)."""
     return {name: _named_counter(path, "aggregate_counts", name)
             for name in SNAPSHOT_COUNTERS}
+
+
+def parse_loss_counters_strict(path: Path) -> dict:
+    """Every frozen loss-counter name under strict unsigned
+    extraction (both coverage dims, like the frozen
+    consumer's scan — but ``_unsigned_counter`` strict, so
+    the frozen ``int()`` coercions ``False -> 0`` and
+    ``0.5 -> 0`` refuse instead of passing as clean). The
+    frozen parser still owns the report shape; the
+    successor loss gate consumes this dict, never the
+    coerced one."""
+    found = {}
+    for dim in ("aggregate_counts", "detailed_events"):
+        try:
+            counters = _report_counters(path, dim)
+        except ValueError:
+            continue
+        for entry in counters:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if name in LOSS_COUNTERS and name not in found:
+                value = _unsigned_counter(entry.get("value"))
+                if value is None:
+                    raise ValueError(
+                        f"{path}: bad loss counter {name}: "
+                        f"{entry.get('value')!r}")
+                found[name] = value
+    missing = [name for name in LOSS_COUNTERS if name not in found]
+    if missing:
+        raise ValueError(f"{path}: missing loss counters {missing}")
+    return found
+
+
+def agg_calls_sum(agg: dict, alloc_rows: list) -> int:
+    """Recomputed aggregate-row call sum (enc + dec + alloc
+    ``calls``) for snapshot reconciliation. Every operand
+    must be a readable unsigned counter — mistyped evidence
+    refuses, never coerces (the frozen parser leaves row
+    counts unvalidated)."""
+    total = 0
+    rows = list(agg.values()) + list(alloc_rows)
+    for entry in rows:
+        calls = entry.get("calls") if isinstance(entry, dict) else None
+        if not _is_counter(calls):
+            raise ValueError(
+                f"agg row calls unreadable: {calls!r}")
+        total += _unsigned_counter(calls)
+    return total
+
+
+def check_snapshot_agreement(*, totals, snapshot_agg,
+                             snapshot_totals, agg_sum) -> list:
+    """End-of-run snapshot coherence for one api-returns leg:
+    the report totals, both snapshot counters, and the
+    recomputed aggregate-row sum (enc + dec + alloc calls)
+    must agree exactly. Any disagreement is an internally
+    contradictory receipt — invalid, never averaged. All
+    four operands must be readable unsigned counters."""
+    reasons = []
+    operands = {"totals": totals, "snapshot_agg_calls": snapshot_agg,
+                "snapshot_totals_calls": snapshot_totals,
+                "agg_sum": agg_sum}
+    for name, value in operands.items():
+        if not _is_counter(value):
+            reasons.append(f"successor {name} unreadable: {value!r}")
+    if reasons:
+        return reasons
+    totals = _unsigned_counter(totals)
+    snapshot_agg = _unsigned_counter(snapshot_agg)
+    snapshot_totals = _unsigned_counter(snapshot_totals)
+    agg_sum = _unsigned_counter(agg_sum)
+    if snapshot_agg != snapshot_totals:
+        reasons.append("successor snapshot contradiction: "
+                       f"snapshot_agg_calls={snapshot_agg} != "
+                       f"snapshot_totals_calls={snapshot_totals}")
+    if totals != snapshot_totals:
+        reasons.append("successor snapshot contradiction: report "
+                       f"totals={totals} != snapshot_totals_calls="
+                       f"{snapshot_totals}")
+    if agg_sum != snapshot_agg:
+        reasons.append("successor agg rows unreconciled: "
+                       f"agg_sum={agg_sum} != snapshot_agg_calls="
+                       f"{snapshot_agg}")
+    return reasons
 
 
 def _telemetry_int(value, path: Path, what: str) -> int:
@@ -137,12 +252,28 @@ def parse_miss_telemetry(path: Path) -> dict:
     for raw in text.splitlines():
         if not raw.startswith(TELEMETRY_PREFIX):
             continue
+        misses_bearing = '"misses"' in raw
         try:
             obj = json.loads(raw[len(TELEMETRY_PREFIX):])
         except ValueError:
+            # A malformed misses-bearing line is a
+            # contradictory receipt — it refuses even when
+            # another line parsed (never silently skipped).
+            if misses_bearing:
+                raise ValueError(
+                    f"{path}: malformed miss telemetry line")
             continue
-        if not isinstance(obj, dict) or obj.get("v") != TELEMETRY_VERSION:
+        if not isinstance(obj, dict) or \
+                type(obj.get("v")) is not int or \
+                obj.get("v") != TELEMETRY_VERSION:
+            if misses_bearing:
+                raise ValueError(
+                    f"{path}: miss telemetry version not 1")
             continue
+        if "misses" in obj and not isinstance(obj["misses"], dict):
+            raise ValueError(
+                f"{path}: misses object malformed "
+                f"({obj['misses']!r})")
         misses = obj.get("misses")
         if isinstance(misses, dict):
             found = misses
@@ -294,11 +425,19 @@ def check_successor_m_leg(parsed: dict, ctx: dict, *, miss_delta,
                        f"system_calls={system_calls!r} != ledger."
                        f"system_total={system_total}")
     present = ctx.get("present_calls")
-    if _is_counter(present) and _is_counter(system_total):
-        ktot_gap = present - system_total
+    drops = ctx.get("drops")
+    if _is_counter(present) and _is_counter(drops):
+        # Attribution-aware gap: below capacity drops == 0 and
+        # this reduces to present − system; on saturation
+        # (churn_full) present + drops == system, so raw
+        # present − system would misread attribution overflow
+        # as a lane contradiction.
+        ktot_gap = _unsigned_counter(present) + \
+            _unsigned_counter(drops) - system_total
         if ktot_gap < 0:
             reasons.append("successor M ktot_gap operand: present="
-                           f"{present} < system_total={system_total} "
+                           f"{present} + drops={drops} < "
+                           f"system_total={system_total} "
                            "(negative lane gap — contradiction)")
             ktot_gap = None
     else:

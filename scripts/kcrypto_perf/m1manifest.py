@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import string
 from pathlib import Path
 
 SCHEMA = "kryprobe-perf-campaign-m1/v1"
@@ -132,12 +133,19 @@ def load_manifest(path: Path) -> dict:
     # on any epoch (transport, not judging) — when present it
     # must be a guest-absolute path (never relative, never
     # empty); the scenario creates a per-leg subdir under it.
+    # The value is sourced inside double quotes and
+    # word-split at use, so only a shell-inert charset is
+    # honest (no $ ` quotes whitespace ; & | or friends).
     if "shard_dir" in manifest["global"]:
         shard_dir = manifest["global"]["shard_dir"]
-        if not isinstance(shard_dir, str) or not shard_dir.startswith(
-                "/") or not shard_dir.strip("/"):
+        safe = set(string.ascii_letters + string.digits +
+                   "_+-,./")
+        if not isinstance(shard_dir, str) or \
+                not shard_dir.startswith("/") or \
+                not shard_dir.strip("/") or \
+                any(ch not in safe for ch in shard_dir):
             raise InputError("manifest global shard_dir must be a "
-                             "guest-absolute path, "
+                             "guest-absolute shell-inert path, "
                              f"got {shard_dir!r}")
     for kernel in manifest["global"]["kernels"]:
         if kernel not in KERNELS:
