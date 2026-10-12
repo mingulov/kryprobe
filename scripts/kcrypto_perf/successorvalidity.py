@@ -54,8 +54,27 @@ def _no_duplicate_members(pairs):
     return obj
 
 
+def _reject_constant(value):
+    raise ValueError(f"nonstandard JSON constant {value!r}")
+
+
 def _loads_strict(text):
-    return json.loads(text, object_pairs_hook=_no_duplicate_members)
+    return json.loads(text, object_pairs_hook=_no_duplicate_members,
+                      parse_constant=_reject_constant)
+
+
+def load_strict_json(path: Path):
+    """Strict-decode any sealed JSON document (reports,
+    summaries, workload-json): duplicate members and
+    nonstandard constants (NaN/Infinity) refuse. The v3
+    successor path re-validates every input the frozen
+    decoders consumed with last-wins semantics."""
+    try:
+        return _loads_strict(Path(path).read_text())
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    except ValueError as err:
+        raise ValueError(f"bad JSON in {path}: {err}") from err
 
 
 def _unsigned_counter(value):
@@ -118,11 +137,21 @@ def report_has_counter(path: Path, dim: str, name: str) -> bool:
     given counter name — presence only, value unchecked
     (the A12 D2 R-side anomaly probe: R1 bytes emit no miss
     surface at all, so any present entry is anomalous even
-    before its value is judged)."""
+    before its value is judged). Decode failures propagate:
+    a malformed report must invalidate the caller, never
+    read as "absent" — except a strictly-decoded document
+    that simply lacks the dimension, which reads False."""
     try:
         counters = _report_counters(path, dim)
     except ValueError:
-        return False
+        # Strictly-decoded but dim-less reads False; anything
+        # malformed propagates (the frozen shape gates live
+        # with the caller's parser, not this probe).
+        doc = load_strict_json(path)
+        cov = doc.get("coverage", {}) if isinstance(doc, dict) else {}
+        if not isinstance(cov, dict) or dim not in cov:
+            return False
+        raise
     return any(isinstance(entry, dict) and entry.get("name") == name
                for entry in counters)
 

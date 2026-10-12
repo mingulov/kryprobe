@@ -1330,7 +1330,9 @@ class SuccessorOverlayTests(unittest.TestCase):
         if misses is not None:
             stderr += _miss_line(9, misses)
         return {"leg00B-report.json": json.dumps(report),
-                "leg00B-capture.stderr.log": stderr}
+                "leg00B-capture.stderr.log": stderr,
+                "leg00B-driver.csv.summary.json": json.dumps(
+                    {"ops_total": 100})}
 
     def _c_entry(self):
         return {"kind": "m1-pairs", "obs_a": "R", "obs_b": "C"}
@@ -1439,6 +1441,70 @@ class SuccessorOverlayTests(unittest.TestCase):
         out = self._overlay(cell, self._judged(), self._c_leg(),
                             self._c_entry(), self._manifest(3))
         self.assertFalse(out["valid"])
+
+    def test_v3_r_leg_duplicate_member_report_invalid(self):
+        # Regression: a decode failure in the presence probe
+        # must invalidate, never read as "absent".
+        files = self._r_files(misses=None)
+        files["leg00A-report.json"] = (
+            '{"observations": [], "coverage": {"aggregate_counts": '
+            '{"counters": [{"name": "kernel_misses", "value": 1, '
+            '"value": 0}]}, "detailed_events": {"counters": []}}}')
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+
+    def test_v3_driver_summary_duplicates_invalid(self):
+        # Frozen truth decoding last-wins; the v3 overlay
+        # re-validates the summary bytes strictly (C and M).
+        for files, leg, entry, manifest in (
+                (self._c_files(), self._c_leg(), self._c_entry(),
+                 self._manifest(3)),
+                (self._m_files(), self._m_leg(), self._m_entry(),
+                 self._m_manifest(3))):
+            files["leg00B-driver.csv.summary.json"] = (
+                '{"ops_total": 999, "ops_total": 100}')
+            cell = self._cell(files)
+            out = self._overlay(cell, self._judged(), leg, entry,
+                                manifest)
+            self.assertFalse(out["valid"], (leg, entry))
+            self.assertTrue(any("summary" in r
+                                for r in out["reasons"]),
+                            out["reasons"])
+
+    def test_v3_m_workload_duplicates_invalid(self):
+        # The frozen workload decoder last-wins; v3
+        # re-validates the raw bytes (system_total and
+        # metadata status twins both refuse).
+        for dup in ('"system_total": "201", "system_total": "200"',
+                    '"status": "unavailable", "status": "available"'):
+            files = self._m_files()
+            text = files["leg00B-report.workload-json"]
+            if "system_total" in dup:
+                text = text.replace('"system_total": "200"', dup, 1)
+            else:
+                text = text.replace('"status": "available"', dup, 1)
+            files["leg00B-report.workload-json"] = text
+            cell = self._cell(files)
+            out = self._overlay(cell, self._judged(), self._m_leg(),
+                                self._m_entry(), self._m_manifest(3))
+            self.assertFalse(out["valid"], dup)
+
+    def test_v2_m_workload_duplicates_keep_frozen(self):
+        # Frozen preservation: v2 judges duplicate members
+        # by last-wins (the freeze pins decoder behavior) —
+        # strict JSON is a v3 successor rule only.
+        files = self._m_files()
+        text = files["leg00B-report.workload-json"]
+        text = text.replace('"system_total": "200"',
+                            '"system_total": "201", '
+                            '"system_total": "200"', 1)
+        files["leg00B-report.workload-json"] = text
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._m_leg(),
+                            self._m_entry(), self._m_manifest(2))
+        self.assertTrue(out["valid"], out.get("reasons"))
 
     def test_v3_r_leg_frozen_exactness_enforced(self):
         # Full chain: a missy v3 R leg (equation-consistent)
@@ -1576,7 +1642,9 @@ class SuccessorOverlayTests(unittest.TestCase):
                      'kryprobe: telemetry {"v":1,"ctx":{"rows":1024,'
                      '"present_calls":5798,"system_calls":13600,'
                      '"unknown_calls":7802,"drops":7802}}\n'
-                     + _miss_line(9, 0))}
+                     + _miss_line(9, 0)),
+                 "leg00B-driver.csv.summary.json": json.dumps(
+                     {"ops_total": 6799})}
         cell = self._cell(files)
         judged = {"valid": True, "outcome": "valid", "reasons": [],
                   "driver": {"ops_total": 6799}}
@@ -1674,6 +1742,8 @@ class SuccessorOverlayTests(unittest.TestCase):
         if misses is not None:
             stderr += _miss_line(9, misses)
         files["leg00B-capture.stderr.log"] = stderr
+        files["leg00B-driver.csv.summary.json"] = json.dumps(
+            {"ops_total": 100})
         return files
 
     def _m_leg(self):

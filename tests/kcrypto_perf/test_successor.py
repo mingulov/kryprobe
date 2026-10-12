@@ -127,6 +127,34 @@ class KernelMissesCounterTests(unittest.TestCase):
         self.assertFalse(succ.report_has_counter(
             path, "detailed_events", "kernel_misses"))
 
+    def test_report_has_counter_propagates_malformed(self):
+        # A decode failure must never read as "absent":
+        # swallowing it let duplicate-member reports pass R.
+        doc = ('{"coverage":{"aggregate_counts":{"counters":['
+               '{"name":"kernel_misses","value":1,'
+               '"value":0}]}}}')
+        path = write_tmp(doc)
+        with self.assertRaises(ValueError):
+            succ.report_has_counter(
+                path, "aggregate_counts", "kernel_misses")
+
+    def test_load_strict_json(self):
+        path = write_tmp('{"ops_total":100}')
+        self.assertEqual(succ.load_strict_json(path),
+                         {"ops_total": 100})
+        for bad in ('{"a":1,"a":2}',
+                     '{"v":NaN}',
+                     '{"v":Infinity}',
+                     '{"v":1,}'):
+            with self.assertRaises(ValueError, msg=bad):
+                succ.load_strict_json(write_tmp(bad))
+
+    def test_nan_telemetry_refuses(self):
+        path = write_tmp(K6_1_MISS_LINE
+                         + 'kryprobe: telemetry {"v":1,"ctx":NaN}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
     def test_stderr_has_misses(self):
         self.assertTrue(succ.stderr_has_misses(
             write_tmp("noise\n" + K6_1_MISS_LINE)))

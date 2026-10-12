@@ -1792,7 +1792,22 @@ def apply_successor_overlay(cell_dir: Path, judged: dict,
         miss = ksucc.parse_miss_telemetry(stderr_log)
     except ValueError as err:
         return fail(f"successor miss telemetry: {err}")
+    # The frozen decoders last-win duplicate members, so the
+    # v3 path re-validates the driver summary (truth source)
+    # and — for M — the workload report bytes strictly. v2
+    # keeps frozen decoder behavior (strict JSON is a v3
+    # successor rule only).
+    try:
+        ksucc.load_strict_json(
+            legs_dir / f"{leg_id}-driver.csv.summary.json")
+    except ValueError as err:
+        return fail(f"successor driver summary: {err}")
     if obs == "M":
+        try:
+            ksucc.load_strict_json(
+                legs_dir / f"{leg_id}-report.workload-json")
+        except ValueError as err:
+            return fail(f"successor workload report: {err}")
         parsed = judged.get("workload")
         ctx = judged.get("ctx")
         if parsed is None or ctx is None:
@@ -1809,8 +1824,12 @@ def apply_successor_overlay(cell_dir: Path, judged: dict,
         report_path = legs_dir / f"{leg_id}-report.json"
         # kernel_misses belongs to aggregate_counts only: a
         # detailed_events twin is a contradictory receipt.
-        if ksucc.report_has_counter(report_path, "detailed_events",
-                                    "kernel_misses"):
+        try:
+            twin = ksucc.report_has_counter(
+                report_path, "detailed_events", "kernel_misses")
+        except ValueError as err:
+            return fail(f"successor report operands: {err}")
+        if twin:
             return fail("successor report operands: kernel_misses "
                         "counter in detailed_events (anomaly)")
         try:
@@ -1912,10 +1931,18 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
                     entry.get("kind") == "m1-pairs":
                 surfaces = []
                 report_path = legs_dir / f"{leg['leg_id']}-report.json"
-                for dim in ("aggregate_counts", "detailed_events"):
-                    if ksucc.report_has_counter(
-                            report_path, dim, "kernel_misses"):
-                        surfaces.append(f"{dim} kernel_misses")
+                try:
+                    for dim in ("aggregate_counts",
+                                "detailed_events"):
+                        if ksucc.report_has_counter(
+                                report_path, dim, "kernel_misses"):
+                            surfaces.append(f"{dim} kernel_misses")
+                except ValueError as err:
+                    judged["valid"] = False
+                    judged["outcome"] = "invalid"
+                    judged["reasons"] = judged.get("reasons", []) + [
+                        f"successor R report malformed: {err}"]
+                    return judged
                 if ksucc.stderr_has_misses(stderr_log):
                     surfaces.append("stderr misses")
                 if surfaces:
