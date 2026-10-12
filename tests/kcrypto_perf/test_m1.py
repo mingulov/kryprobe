@@ -1533,6 +1533,42 @@ class SuccessorOverlayTests(unittest.TestCase):
                             self._c_entry(), self._manifest(2))
         self.assertTrue(out["valid"], out.get("reasons"))
 
+    def _d_leg(self):
+        return {"leg_id": "leg00B", "side": "B", "mode": "disabled",
+                "cls": "P-4K", "driver": "skcipher",
+                "workload": "single", "bulk": False, "threads": 1}
+
+    def _d_entry(self):
+        return {"kind": "m1-pairs", "obs_a": "R", "obs_b": "D"}
+
+    def test_v3_d_leg_summary_duplicates_invalid(self):
+        # A12 D3 covers every successor input including the
+        # disabled baseline: a v3 D summary with duplicate
+        # members invalidates (frozen per-op exactness is
+        # vacuous on D, but decoder strictness is not).
+        files = {"leg00B-driver.csv.summary.json":
+                 '{"ops_total": 999, "ops_total": 100}'}
+        cell = self._cell(files)
+        manifest = {"manifest_version": 3,
+                    "workloads": {"single": {"expected_rows": 3}}}
+        out = CLI.apply_m1_ctx_overlay(
+            cell, self._judged(), self._d_leg(), self._d_entry(),
+            manifest, kernel="7.0.14")
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("summary" in r for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v2_d_leg_summary_duplicates_keep_frozen(self):
+        files = {"leg00B-driver.csv.summary.json":
+                 '{"ops_total": 999, "ops_total": 100}'}
+        cell = self._cell(files)
+        manifest = {"manifest_version": 2,
+                    "workloads": {"single": {"expected_rows": 3}}}
+        out = CLI.apply_m1_ctx_overlay(
+            cell, self._judged(), self._d_leg(), self._d_entry(),
+            manifest, kernel="7.0.14")
+        self.assertTrue(out["valid"], out.get("reasons"))
+
     def test_v3_r_leg_frozen_exactness_enforced(self):
         # Full chain: a missy v3 R leg (equation-consistent)
         # still fails frozen per-op exactness — the stricter

@@ -1906,6 +1906,21 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         obs = "C" if side == "B" else "D"
     judged["obs"] = obs
     if leg["mode"] == "disabled" or obs == "D":
+        # A12 D3 covers every successor input including the
+        # disabled baseline: v3 pairs-D summaries
+        # re-validate strictly (diag fallbacks and v1/v2
+        # keep frozen decoder behavior).
+        if manifest.get("manifest_version") == 3 and \
+                entry.get("kind") == "m1-pairs":
+            try:
+                ksucc.load_strict_json(
+                    cell_dir / "legs" /
+                    f"{leg['leg_id']}-driver.csv.summary.json")
+            except ValueError as err:
+                judged["valid"] = False
+                judged["outcome"] = "invalid"
+                judged["reasons"] = judged.get("reasons", []) + [
+                    f"successor driver summary: {err}"]
         return judged
     if entry.get("kind") == "m1-612-ctx":
         # F3: the diag's C leg is frozen-invalid BY DESIGN — the diag
