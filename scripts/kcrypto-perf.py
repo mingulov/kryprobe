@@ -29,6 +29,7 @@ from kcrypto_perf import validity as kvalidity  # noqa: E402
 from kcrypto_perf import manifest as kmanifest  # noqa: E402
 from kcrypto_perf import m1manifest as km1manifest  # noqa: E402
 from kcrypto_perf import m1validity as km1validity  # noqa: E402
+from kcrypto_perf import successorvalidity as ksucc  # noqa: E402
 
 _SPEC = importlib.util.spec_from_file_location(
     "kcrypto_campaign_cli", str(HERE / "kcrypto-campaign.py"))
@@ -899,11 +900,17 @@ def check_leg_timing(summary: dict, warmup_s: float,
 
 
 def judge_leg(cell_dir: Path, leg: dict, kernel: str,
-              windows: tuple) -> dict:
+              windows: tuple, successor: bool = False) -> dict:
     """Judge one staged leg from sealed files (stats + validity).
 
     ``windows`` is the frozen (warmup_s, measure_s) pair from the
     bound manifest; driver timing must match it (P9R1A-N7).
+    ``successor`` selects the v3 successor epoch (freeze A12):
+    the frozen per-op exactness check is superseded by the
+    truth-equation overlay (misses break per-op equality by
+    construction); driver/receipt/timing/loss gates are
+    unchanged. Default False keeps every frozen/M1-v2 call
+    byte-identical.
     """
     legs_dir = cell_dir / "legs"
     leg_id = leg["leg_id"]
@@ -963,7 +970,8 @@ def judge_leg(cell_dir: Path, leg: dict, kernel: str,
             return out
         if leg["mode"] == "disabled":
             return out
-        return judge_observed_leg(cell_dir, leg, kernel, summary, out)
+        return judge_observed_leg(cell_dir, leg, kernel, summary, out,
+                                  successor=successor)
     try:
         rows = kparsers.parse_ledger_csv(legs_dir / f"{leg_id}-driver.csv")
     except kparsers.ParseError as err:
@@ -1001,7 +1009,8 @@ def judge_leg(cell_dir: Path, leg: dict, kernel: str,
     if leg["mode"] == "disabled":
         out.update(valid=True, reasons=[], outcome="valid")
         return out
-    return judge_observed_leg(cell_dir, leg, kernel, summary, out)
+    return judge_observed_leg(cell_dir, leg, kernel, summary, out,
+                              successor=successor)
 
 
 def judge_bulk_leg(summary: dict, out: dict) -> dict:
@@ -1191,8 +1200,48 @@ def judge_m_observed_leg(cell_dir: Path, leg: dict, out: dict) -> dict:
     return out
 
 
+def judge_successor_provisional(cell_dir: Path, leg: dict,
+                                kernel: str, parsed: dict,
+                                out: dict) -> dict:
+    """Successor-epoch R/C pre-gate (freeze A12): everything the
+    frozen ``check_leg_agg`` enforces EXCEPT per-op exactness
+    (capture rc, class dispatch, destroy-pinned loss gate).
+    Per-op equality cannot hold when guard misses skip fexit
+    execution, so exactness defers to the truth-equation
+    overlay (``apply_successor_overlay``); a leg passing here
+    is provisional, never decided."""
+    cls = leg["cls"]
+    if cls == "P-ASYNC":
+        out.update(valid=False, outcome="invalid", reasons=[
+            "successor has no proven async truth oracle "
+            "(M1 matrix carries no async sets)"])
+        return out
+    if cls not in kvalidity.AFALG_CLASSES:
+        out.update(valid=False, outcome="invalid",
+                   reasons=[f"unknown class {cls}"])
+        return out
+    if out.get("capture_rc") not in kvalidity.VALID_CAPTURE_RC:
+        out.update(valid=False, outcome="invalid", reasons=[
+            f"capture rc={out.get('capture_rc')}"])
+        return out
+    threads = leg.get("threads", 1)
+    if kernel == "6.12.111":
+        destroy = kvalidity.FLOOR_DESTROY_PIN
+    else:
+        destroy = threads if threads == 1 else None
+    reasons = kvalidity._loss_reasons(parsed.get("loss", {}), destroy)
+    if reasons:
+        out.update(valid=False, reasons=reasons, outcome="invalid")
+        return out
+    out["observer"] = observer_metrics(cell_dir, leg, parsed, None)
+    out["successor_epoch"] = True
+    out.update(valid=True, reasons=[], outcome="valid")
+    return out
+
+
 def judge_observed_leg(cell_dir: Path, leg: dict, kernel: str,
-                       summary: dict, out: dict) -> dict:
+                       summary: dict, out: dict,
+                       successor: bool = False) -> dict:
     legs_dir = cell_dir / "legs"
     leg_id = leg["leg_id"]
     capture_rc = _read_int_kv(legs_dir / f"{leg_id}-capture-rc.txt",
@@ -1212,6 +1261,9 @@ def judge_observed_leg(cell_dir: Path, leg: dict, kernel: str,
             out.update(valid=False, reasons=[str(err)], outcome="invalid")
             return out
         threads = leg.get("threads", 1)
+        if successor:
+            return judge_successor_provisional(
+                cell_dir, leg, kernel, parsed, out)
         verdict = kvalidity.check_leg_agg(
             parsed, summary, kernel, leg["cls"], capture_rc,
             expected_alloc=threads, pin_destroy=(threads == 1))
@@ -1637,12 +1689,14 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
         else:
             m1_entry = find_diag(manifest, stage["diag"])
     legs = []
+    successor = m1 and manifest.get("manifest_version") == 3
     for idx, leg in enumerate(spec):
-        judged = judge_leg(cell_dir, leg, kernel, windows)
+        judged = judge_leg(cell_dir, leg, kernel, windows,
+                           successor=successor)
         judged["order"] = idx
         if m1:
             judged = apply_m1_ctx_overlay(cell_dir, judged, leg, m1_entry,
-                                          manifest)
+                                          manifest, kernel=kernel)
             for reason in check_m_evidence(cell_dir, leg, m1_entry,
                                            stage):
                 judged["valid"] = False
@@ -1659,8 +1713,91 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
     return verdict
 
 
+def apply_successor_overlay(cell_dir: Path, judged: dict,
+                            leg: dict, manifest: dict, kernel: str,
+                            obs: str) -> dict:
+    """Successor truth-equation gate (freeze A12, manifest v3
+    only — the caller gates on the epoch). Runs after the M1
+    overlay passes: the driver truth oracle (``successor_truth``
+    over the judged driver summary) against the report +
+    stderr miss operands, with the per-program lane pin from
+    the v3 manifest. Async legs refuse (no proven oracle).
+    Decided operands land on ``judged["successor"]`` for the
+    receipt."""
+    legs_dir = cell_dir / "legs"
+    leg_id = leg["leg_id"]
+
+    def fail(reason):
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + [reason]
+        return judged
+
+    if leg.get("cls") == "P-ASYNC":
+        return fail("successor has no proven async truth oracle "
+                    "(M1 matrix carries no async sets)")
+    ops = judged.get("driver", {}).get("ops_total")
+    if not _is_positive_int(ops):
+        return fail(f"successor driver ops_total unreadable: {ops!r}")
+    alloc = leg.get("threads", 1)
+    if not _is_positive_int(alloc):
+        return fail(f"successor alloc (threads) unreadable: {alloc!r}")
+    try:
+        truth = ksucc.successor_truth(ops=ops, alloc=alloc,
+                                      kernel=kernel)
+    except ValueError as err:
+        return fail(f"successor truth oracle: {err}")
+    pin = manifest.get("global", {}).get("expected_programs")
+    if type(pin) is not int or pin <= 0:
+        return fail("successor v3 manifest lacks global "
+                    f"expected_programs (got {pin!r})")
+    stderr_log = legs_dir / f"{leg_id}-capture.stderr.log"
+    try:
+        miss = ksucc.parse_miss_telemetry(stderr_log)
+    except ValueError as err:
+        return fail(f"successor miss telemetry: {err}")
+    if obs == "M":
+        parsed = judged.get("workload")
+        ctx = judged.get("ctx")
+        if parsed is None or ctx is None:
+            return fail("successor M leg lacks judged workload/ctx "
+                        "(M overlay must run first)")
+        reasons = ksucc.check_successor_m_leg(
+            parsed, ctx, miss_delta=miss["miss_delta"], truth=truth,
+            programs=miss["programs"], expected_programs=pin)
+        judged["successor"] = {
+            "observed": parsed["ledger"]["system_total"],
+            "truth": truth, "miss_delta": miss["miss_delta"],
+            "programs": miss["programs"]}
+    else:
+        report_path = legs_dir / f"{leg_id}-report.json"
+        try:
+            parsed = kparsers.parse_api_returns(report_path)
+            km = ksucc.parse_kernel_misses_counter(report_path)
+            snap = ksucc.parse_snapshot_counters(report_path)
+        except (kparsers.ParseError, ValueError) as err:
+            return fail(f"successor report operands: {err}")
+        observed = parsed["totals"].get("calls")
+        reasons = ksucc.check_successor_leg(
+            observed=observed, truth=truth, report_misses=km,
+            stderr_miss_delta=miss["miss_delta"],
+            ktot_gap=snap["ktot_gap"], programs=miss["programs"],
+            expected_programs=pin)
+        judged["successor"] = {
+            "observed": observed, "truth": truth,
+            "kernel_misses": km, "miss_delta": miss["miss_delta"],
+            "ktot_gap": snap["ktot_gap"],
+            "programs": miss["programs"]}
+    if reasons:
+        judged["valid"] = False
+        judged["outcome"] = "invalid"
+        judged["reasons"] = judged.get("reasons", []) + reasons
+    return judged
+
+
 def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
-                         entry: dict, manifest: dict) -> dict:
+                         entry: dict, manifest: dict,
+                         kernel: str = None) -> dict:
     """M1 ctx attribution overlay on one frozen-judged leg.
 
     C-side observed legs must carry the terminal ctx object and pass
@@ -1689,6 +1826,9 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         try:
             km1validity.parse_ctx_telemetry(stderr_log)
         except ValueError:
+            if manifest.get("manifest_version") == 3:
+                return apply_successor_overlay(
+                    cell_dir, judged, leg, manifest, kernel, obs)
             return judged
         judged["valid"] = False
         judged["outcome"] = "invalid"
@@ -1697,7 +1837,7 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         return judged
     if obs == "M":
         return apply_m1_m_overlay(cell_dir, judged, leg, entry,
-                                  manifest)
+                                  manifest, kernel=kernel)
     wl_path = legs_dir / f"{leg['leg_id']}-report.workload-json"
     if wl_path.is_file():
         judged["valid"] = False
@@ -1741,11 +1881,16 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["valid"] = False
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + reasons
+        return judged
+    if manifest.get("manifest_version") == 3:
+        return apply_successor_overlay(cell_dir, judged, leg,
+                                       manifest, kernel, obs)
     return judged
 
 
 def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
-                       entry: dict, manifest: dict) -> dict:
+                       entry: dict, manifest: dict,
+                       kernel: str = None) -> dict:
     """M-leg overlay (freeze G4/G6): the workload-json report must
     exist (an M-role leg with only C-shaped evidence is a leg run
     without the metadata path — invalid, never silently a C leg),
@@ -1805,6 +1950,10 @@ def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["valid"] = False
         judged["outcome"] = "invalid"
         judged["reasons"] = judged.get("reasons", []) + reasons
+        return judged
+    if manifest.get("manifest_version") == 3:
+        return apply_successor_overlay(cell_dir, judged, leg,
+                                       manifest, kernel, "M")
     return judged
 
 

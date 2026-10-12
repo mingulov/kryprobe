@@ -166,6 +166,26 @@ def parse_miss_telemetry(path: Path) -> dict:
             "run_delta": run_delta}
 
 
+def successor_truth(*, ops: int, alloc: int, kernel: str) -> int:
+    """Per-leg driver-truth oracle for the successor equation.
+
+    Flat kernels (7.x): one encrypt + one decrypt per roundtrip
+    plus the expected alloc population (1 single-socket, thread
+    count for many-submitter legs — the n_cgroup form
+    2*ops_total + actors is FORENSICS-2/K6 proven). The 6.12
+    floor splits each op across two arms and pins 2 allocs
+    (same row arithmetic as the frozen floor checker). Unknown
+    kernels refuse — no invented oracle."""
+    if not _is_counter(ops) or not _is_counter(alloc):
+        raise ValueError(f"successor truth operands unreadable: "
+                         f"ops={ops!r} alloc={alloc!r}")
+    if kernel == "6.12.111":
+        return 4 * ops + 2
+    if kernel in ("7.0.14", "7.2.6"):
+        return 2 * ops + alloc
+    raise ValueError(f"successor truth: unknown kernel {kernel!r}")
+
+
 def exact_count_claim(misses) -> bool:
     """A leg may claim exact counts only when its measured
     kernel misses are exactly 0 (product ADR-0013); measured

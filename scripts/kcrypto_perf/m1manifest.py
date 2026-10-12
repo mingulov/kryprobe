@@ -108,14 +108,26 @@ def load_manifest(path: Path) -> dict:
     # Task05 Stage 4 (freeze G10): v1 is the Task02 24-set
     # early-gate manifest (history, still loadable so sealed
     # early cells re-judge); v2 is the final 40-set matrix.
+    # Task07 (freeze A12): v3 is the successor epoch on the
+    # fixed bytes — same set shape, plus the required
+    # per-program lane-surface pin the successor judge gates
+    # on (miss telemetry ``programs``, 9 on the kcrypto
+    # spine; a v3 manifest without it is not a successor
+    # manifest).
     if type(manifest["manifest_version"]) is not int or \
-            manifest["manifest_version"] not in (1, 2):
-        raise InputError("manifest_version must be 1 or 2")
+            manifest["manifest_version"] not in (1, 2, 3):
+        raise InputError("manifest_version must be 1, 2, or 3")
     if not isinstance(manifest["global"], dict):
         raise InputError("manifest global must be an object")
     missing = REQUIRED_GLOBAL_KEYS - manifest["global"].keys()
     if missing:
         raise InputError(f"manifest global lacks {sorted(missing)}")
+    if manifest["manifest_version"] == 3:
+        pin = manifest["global"].get("expected_programs")
+        if type(pin) is not int or pin <= 0:
+            raise InputError("v3 manifest needs global "
+                             f"expected_programs (positive int), "
+                             f"got {pin!r}")
     for kernel in manifest["global"]["kernels"]:
         if kernel not in KERNELS:
             raise InputError(f"unknown manifest kernel {kernel!r}")

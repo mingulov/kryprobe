@@ -276,6 +276,7 @@ def parse_args(argv):
     cgroups = 1
     churn_every_ms = 0
     churn_ops = 0
+    shard_dir = None
     i = 0
     while i < len(rest):
         if rest[i] == "--bulk":
@@ -332,6 +333,11 @@ def parse_args(argv):
             if churn_ops <= 0:
                 return None
             i += 2
+        elif rest[i] == "--shard-dir" and i + 1 < len(rest):
+            shard_dir = rest[i + 1]
+            if not shard_dir:
+                return None
+            i += 2
         else:
             return None
     if cls == "async" and threads != 1:
@@ -352,7 +358,26 @@ def parse_args(argv):
             "bulk": bulk, "paced": paced, "threads": threads,
             "control": control, "ledger": ledger, "actors": actors,
             "cgroups": cgroups, "churn_every_ms": churn_every_ms,
-            "churn_ops": churn_ops}
+            "churn_ops": churn_ops, "shard_dir": shard_dir}
+
+
+def _shard_path(opts, tag, idx):
+    """One shard ledger path (H-C guest-local transport): with
+    ``--shard-dir`` the shard lives under that directory (guest
+    local); otherwise it is a ledger sibling, exactly the
+    frozen layout. Per-shard ``.summary.json`` files ride
+    alongside automatically (same prefix)."""
+    base = os.path.basename(opts["ledger"])
+    if opts.get("shard_dir"):
+        return os.path.join(opts["shard_dir"],
+                            f"{base}.{tag}-{idx}")
+    return f"{opts['ledger']}.{tag}-{idx}"
+
+
+def _shard_paths(opts, count, tag):
+    """Shard ledger paths ``tag-0..tag-(count-1)`` (see
+    ``_shard_path``)."""
+    return [_shard_path(opts, tag, idx) for idx in range(count)]
 
 
 class Shared:
@@ -595,7 +620,7 @@ def _run_n_cgroup(argv0, opts):
         print(f"m1: cgroup mkdir failed: {exc}", file=sys.stderr)
         return 1
     per_group = actors // cgroups
-    shards = [f"{opts['ledger']}.shard-{i}" for i in range(actors)]
+    shards = _shard_paths(opts, actors, "shard")
     pids = []
     try:
         for i in range(actors):
@@ -706,7 +731,7 @@ def _run_churn(argv0, opts):
                 time.sleep((delay - 1000) / 1e9)
             while time.monotonic_ns() < deadline:
                 pass
-        shard = f"{opts['ledger']}.arrival-{arrival}"
+        shard = _shard_path(opts, "arrival", arrival)
         shards.append(shard)
         pids.append(_spawn_arrival_child(
             opts, shard, t0, opts["churn_ops"]))
