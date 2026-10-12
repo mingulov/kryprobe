@@ -1412,6 +1412,34 @@ class SuccessorOverlayTests(unittest.TestCase):
         self.assertTrue(any("miss" in r for r in out["reasons"]),
                         out["reasons"])
 
+    def test_v3_r_leg_detailed_miss_counter_invalid(self):
+        # The R probe scans both coverage dims: a miss
+        # counter smuggled into detailed_events is the same
+        # anomaly as one in aggregate_counts.
+        files = self._r_files(misses=None)
+        report = json.loads(files["leg00A-report.json"])
+        report["coverage"]["detailed_events"]["counters"].append(
+            {"name": "kernel_misses", "value": 5})
+        files["leg00A-report.json"] = json.dumps(report)
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+
+    def test_v3_c_leg_detailed_miss_counter_invalid(self):
+        # Same anomaly on C: kernel_misses belongs to
+        # aggregate_counts only; a detailed_events twin is a
+        # contradictory receipt.
+        files = self._c_files()
+        report = json.loads(files["leg00B-report.json"])
+        report["coverage"]["detailed_events"]["counters"].append(
+            {"name": "kernel_misses", "value": 5})
+        files["leg00B-report.json"] = json.dumps(report)
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+
     def test_v3_r_leg_frozen_exactness_enforced(self):
         # Full chain: a missy v3 R leg (equation-consistent)
         # still fails frozen per-op exactness — the stricter

@@ -132,8 +132,30 @@ class KernelMissesCounterTests(unittest.TestCase):
             write_tmp("noise\n" + K6_1_MISS_LINE)))
         self.assertTrue(succ.stderr_has_misses(
             write_tmp('kryprobe: telemetry {"v":1,"misses":\n')))
+        self.assertTrue(succ.stderr_has_misses(
+            write_tmp('kryprobe: telemetry {"v":2,'
+                      '"\\u006disses":{"programs":9}}\n')))
         self.assertFalse(succ.stderr_has_misses(
             write_tmp("kryprobe: telemetry {}\n")))
+
+    def test_strict_loss_duplicate_refuses(self):
+        # First-wins would let a later nonzero hide behind
+        # an earlier zero — duplicates are contradictory.
+        counters = (K6_1_COUNTERS
+                    + [("predrop_chase_fail", "1")])
+        path = write_tmp(report_doc(
+            counters,
+            [("ring_drops", "0"), ("overflow_identities", "0")]))
+        with self.assertRaises(ValueError):
+            succ.parse_loss_counters_strict(path)
+
+    def test_strict_loss_cross_dim_duplicate_refuses(self):
+        path = write_tmp(report_doc(
+            K6_1_COUNTERS,
+            [("ring_drops", "0"), ("overflow_identities", "0"),
+             ("predrop_chase_fail", "1")]))
+        with self.assertRaises(ValueError):
+            succ.parse_loss_counters_strict(path)
 
     def test_snapshot_agreement_k6(self):
         reasons = succ.check_snapshot_agreement(
@@ -240,6 +262,25 @@ class MissTelemetryTests(unittest.TestCase):
         path = write_tmp('kryprobe: telemetry {"v":true,"misses":'
                          '{"programs":9,"miss_delta":1,'
                          '"run_delta":null}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_escaped_key_wrong_version_refuses(self):
+        # Detection runs on the decoded object, not the raw
+        # substring: "\u006disses" decodes to "misses".
+        path = write_tmp(K6_1_MISS_LINE
+                         + 'kryprobe: telemetry {"v":2,'
+                         '"\\u006disses":{"programs":9,'
+                         '"miss_delta":5,"run_delta":null}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_miss_telemetry(path)
+
+    def test_two_miss_terminals_refuse(self):
+        # The product prints one terminal line; a second
+        # misses object is a contradictory receipt even when
+        # both parse (earlier evidence never silently
+        # overwritten).
+        path = write_tmp(K6_1_MISS_LINE + K6_1_MISS_LINE)
         with self.assertRaises(ValueError):
             succ.parse_miss_telemetry(path)
 

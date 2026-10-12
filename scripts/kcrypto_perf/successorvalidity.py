@@ -114,13 +114,25 @@ def stderr_has_misses(path: Path) -> bool:
     misses-bearing telemetry line — parseable or not (a
     malformed misses line is itself miss evidence for the
     D2 probe, and the strict parser refuses it separately
-    on C/M legs)."""
+    on C/M legs). Detection runs on the raw substring and
+    the decoded object (an escaped "\\u006disses" key
+    decodes to "misses")."""
     try:
         text = Path(path).read_text()
     except OSError:
         return False
-    return any(raw.startswith(TELEMETRY_PREFIX) and '"misses"' in raw
-               for raw in text.splitlines())
+    for raw in text.splitlines():
+        if not raw.startswith(TELEMETRY_PREFIX):
+            continue
+        if '"misses"' in raw:
+            return True
+        try:
+            obj = json.loads(raw[len(TELEMETRY_PREFIX):])
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "misses" in obj:
+            return True
+    return False
 
 
 def parse_kernel_misses_counter(path: Path) -> int:
@@ -159,7 +171,14 @@ def parse_loss_counters_strict(path: Path) -> dict:
             if not isinstance(entry, dict):
                 continue
             name = entry.get("name")
-            if name in LOSS_COUNTERS and name not in found:
+            if name in LOSS_COUNTERS:
+                # Duplicates (same dim or cross-dim) are
+                # contradictory receipts: first-wins would let
+                # a later nonzero hide, last-wins would let an
+                # earlier nonzero hide. Refuse both.
+                if name in found:
+                    raise ValueError(
+                        f"{path}: duplicate loss counter {name}")
                 value = _unsigned_counter(entry.get("value"))
                 if value is None:
                     raise ValueError(
@@ -252,17 +271,21 @@ def parse_miss_telemetry(path: Path) -> dict:
     for raw in text.splitlines():
         if not raw.startswith(TELEMETRY_PREFIX):
             continue
-        misses_bearing = '"misses"' in raw
         try:
             obj = json.loads(raw[len(TELEMETRY_PREFIX):])
         except ValueError:
             # A malformed misses-bearing line is a
             # contradictory receipt — it refuses even when
             # another line parsed (never silently skipped).
-            if misses_bearing:
+            if '"misses"' in raw:
                 raise ValueError(
                     f"{path}: malformed miss telemetry line")
             continue
+        # Misses-bearing is decided on the DECODED object:
+        # an escaped "\u006disses" key decodes to "misses"
+        # while the raw substring check misses it.
+        misses_bearing = '"misses"' in raw or (
+            isinstance(obj, dict) and "misses" in obj)
         if not isinstance(obj, dict) or \
                 type(obj.get("v")) is not int or \
                 obj.get("v") != TELEMETRY_VERSION:
@@ -276,6 +299,13 @@ def parse_miss_telemetry(path: Path) -> dict:
                 f"({obj['misses']!r})")
         misses = obj.get("misses")
         if isinstance(misses, dict):
+            # The product prints exactly one terminal line:
+            # a second misses object contradicts the first
+            # (earlier evidence is never silently
+            # overwritten).
+            if found is not None:
+                raise ValueError(
+                    f"{path}: multiple miss telemetry objects")
             found = misses
     if found is None:
         raise ValueError(f"{path}: no miss telemetry object")

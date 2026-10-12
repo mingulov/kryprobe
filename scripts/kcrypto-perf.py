@@ -1807,6 +1807,12 @@ def apply_successor_overlay(cell_dir: Path, judged: dict,
             "programs": miss["programs"]}
     else:
         report_path = legs_dir / f"{leg_id}-report.json"
+        # kernel_misses belongs to aggregate_counts only: a
+        # detailed_events twin is a contradictory receipt.
+        if ksucc.report_has_counter(report_path, "detailed_events",
+                                    "kernel_misses"):
+            return fail("successor report operands: kernel_misses "
+                        "counter in detailed_events (anomaly)")
         try:
             parsed = kparsers.parse_api_returns(report_path)
             km = ksucc.parse_kernel_misses_counter(report_path)
@@ -1905,10 +1911,11 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
             if manifest.get("manifest_version") == 3 and \
                     entry.get("kind") == "m1-pairs":
                 surfaces = []
-                if ksucc.report_has_counter(
-                        legs_dir / f"{leg['leg_id']}-report.json",
-                        "aggregate_counts", "kernel_misses"):
-                    surfaces.append("report kernel_misses")
+                report_path = legs_dir / f"{leg['leg_id']}-report.json"
+                for dim in ("aggregate_counts", "detailed_events"):
+                    if ksucc.report_has_counter(
+                            report_path, dim, "kernel_misses"):
+                        surfaces.append(f"{dim} kernel_misses")
                 if ksucc.stderr_has_misses(stderr_log):
                     surfaces.append("stderr misses")
                 if surfaces:
