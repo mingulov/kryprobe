@@ -1390,6 +1390,8 @@ class SuccessorOverlayTests(unittest.TestCase):
     def _r_files(self, misses=2):
         files = self._c_files(misses=misses)
         files["leg00A-report.json"] = files.pop("leg00B-report.json")
+        files["leg00A-driver.csv.summary.json"] = files.pop(
+            "leg00B-driver.csv.summary.json")
         if misses is None:
             files["leg00A-capture.stderr.log"] = ""
         else:
@@ -1504,6 +1506,31 @@ class SuccessorOverlayTests(unittest.TestCase):
         cell = self._cell(files)
         out = self._overlay(cell, self._judged(), self._m_leg(),
                             self._m_entry(), self._m_manifest(2))
+        self.assertTrue(out["valid"], out.get("reasons"))
+
+    def test_v3_r_leg_summary_duplicates_invalid(self):
+        # A12 D3 covers every successor input: a v3 R
+        # summary with duplicate members invalidates even
+        # though R keeps frozen per-op exactness.
+        for bad in ('{"ops_total": 999, "ops_total": 100}',
+                     '{"ops_total": 100, "extra": NaN}'):
+            files = self._r_files(misses=None)
+            files["leg00A-driver.csv.summary.json"] = bad
+            cell = self._cell(files)
+            out = self._overlay(cell, self._judged(), self._r_leg(),
+                                self._c_entry(), self._manifest(3))
+            self.assertFalse(out["valid"], bad)
+            self.assertTrue(any("summary" in r
+                                for r in out["reasons"]),
+                            out["reasons"])
+
+    def test_v2_r_leg_summary_duplicates_keep_frozen(self):
+        files = self._r_files(misses=None)
+        files["leg00A-driver.csv.summary.json"] = (
+            '{"ops_total": 999, "ops_total": 100}')
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(2))
         self.assertTrue(out["valid"], out.get("reasons"))
 
     def test_v3_r_leg_frozen_exactness_enforced(self):

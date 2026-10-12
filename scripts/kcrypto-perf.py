@@ -1952,6 +1952,21 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
                         "successor R-side miss evidence "
                         f"({' + '.join(surfaces)} present): R1 "
                         "bytes cannot surface misses"]
+                    return judged
+                # A12 D3 covers every successor input: the v3
+                # R summary re-validates strictly too (R
+                # keeps frozen per-op exactness, not frozen
+                # decoder behavior).
+                try:
+                    ksucc.load_strict_json(
+                        legs_dir / f"{leg['leg_id']}-driver.csv."
+                        "summary.json")
+                except ValueError as err:
+                    judged["valid"] = False
+                    judged["outcome"] = "invalid"
+                    judged["reasons"] = judged.get("reasons", []) + [
+                        f"successor driver summary: {err}"]
+                    return judged
             return judged
         judged["valid"] = False
         judged["outcome"] = "invalid"
