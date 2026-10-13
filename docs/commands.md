@@ -95,7 +95,14 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
 - M1 workload views (`watch`/`report --system`, `check --system`):
   `--group-by cgroup|container` renders the common typed workload
   report (per-workload crypto call counts joined to kernel
-  context; `none` keeps the historical tables).
+  context; `none` keeps the historical tables). `container`
+  groups are lifetime-qualified (runtime + full id + observed
+  lifetime, mirroring the identity contract; observed lifetimes
+  render quoted (`"..."`, debug-escaped) while unobserved lifetimes
+  render bare `unknown` — apart from every observed value, even one
+  observed as `unknown`): restart lifetimes never merge into
+  one aggregate group. Selection is unaffected — container views
+  still match across lifetimes.
   `--filter-cgroup-id ID` narrows to one exact cgroup (0 refuses —
   the unreadable marker is never selectable).
   `--workload-metadata FILE` binds operator metadata after capture

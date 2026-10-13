@@ -210,7 +210,12 @@ pub enum GroupBy {
     None,
     /// Group by captured cgroup id.
     Cgroup,
-    /// Group by resolved container identity.
+    /// Group by lifetime-qualified container identity (runtime + full
+    /// id + observed lifetime, mirroring
+    /// [`kryprobe_core::workload::IdentityKey::Container`];
+    /// unobserved lifetimes group — and render — apart from every
+    /// known lifetime). Selection is unaffected: the container
+    /// selector still matches across lifetimes (D10).
     Container,
 }
 
