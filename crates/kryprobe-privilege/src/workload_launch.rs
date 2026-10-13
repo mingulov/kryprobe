@@ -863,17 +863,24 @@ pub struct ServedSnapshot {
 /// records, over-cap records, or malformed records yield `None`
 /// while the valid response keeps its existing meaning. Never
 /// echoes input: the outcome is typed values or absence.
-/// Candidacy is textual (any line carrying the marker counts), so a
-/// truncated emission that no longer decodes still voids the result.
+/// Candidacy is textual or decoded-key: any line carrying the
+/// marker counts (so a truncated emission that no longer decodes
+/// still voids the result), as does any line parsing as JSON with a
+/// decoded `helper_counters` key (so an escaped envelope spelling
+/// still counts as a second emission).
 pub fn parse_helper_diagnostics(stderr_text: &str) -> Option<HelperDiagnostics> {
     let mut record: Option<&str> = None;
     for line in stderr_text.lines() {
         // Textual candidacy (P2 wave-e): any stderr line carrying the
         // marker is a counters emission — including a truncated one
-        // that no longer decodes. JSON-first detection skipped
-        // truncated emissions pre-parse, so valid+truncated evaded
-        // the exactly-one rule and surfaced measured.
-        if !line.contains("helper_counters") {
+        // that no longer decodes. Decoded-key candidacy (P2 wave-f):
+        // a line parsing as JSON with a decoded `helper_counters`
+        // key counts too, so an escaped envelope spelling
+        // (`hel\u0070er_counters`) cannot evade the exactly-one rule.
+        let is_candidate = line.contains("helper_counters")
+            || serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|value| value.get("helper_counters").is_some());
+        if !is_candidate {
             continue;
         }
         if record.is_some() {
@@ -2465,6 +2472,55 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_valid_plus_escaped_refuses_both_orders() {
+        // P2 (wave-f): a JSON-escaped envelope spelling
+        // (`hel\u0070er_counters` decodes to `helper_counters`) is
+        // still a counters emission under the decoded-key rule —
+        // valid + escaped in either order refuses.
+        let valid = diagnostics_line(&full_counters_value());
+        let escaped = format!(r#"{{"hel\u0070er_counters":{}}}"#, full_counters_value());
+        assert!(
+            !escaped.contains("helper_counters"),
+            "fixture evades the literal marker"
+        );
+        for stderr in [
+            format!("{valid}\n{escaped}\n"),
+            format!("{escaped}\n{valid}\n"),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "valid+escaped refuses: {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_valid_plus_escaped_bad_refuses_both_orders() {
+        // P2 (wave-f): the escaped second emission poisons even when
+        // its own counters are malformed — any candidate failing
+        // strict parse voids the result to `None`.
+        let valid = diagnostics_line(&full_counters_value());
+        let escaped_bad = r#"{"hel\u0070er_counters":{"denied":1}}"#;
+        assert!(
+            !escaped_bad.contains("helper_counters"),
+            "fixture evades the literal marker"
+        );
+        for stderr in [
+            format!("{valid}\n{escaped_bad}\n"),
+            format!("{escaped_bad}\n{valid}\n"),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "valid+escaped-bad refuses: {stderr:?}"
+            );
+        }
+        // A lone escaped malformed emission is not a measurement.
+        assert_eq!(parse_helper_diagnostics(escaped_bad), None);
+    }
+
+    #[test]
     fn diagnostics_duplicate_keys_refuse() {
         let line = diagnostics_line(&full_counters_value());
         // A repeated counter key (last-wins would silently pick 2).
@@ -3409,6 +3465,48 @@ mod tests {
             assert_eq!(
                 served.diagnostics, None,
                 "valid+truncated marks unavailable ({order})"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_diagnostics_valid_plus_escaped_marks_unavailable_both_orders() {
+        // P2 (wave-f) at the serve boundary: the helper emits a valid
+        // record plus an escaped-envelope counters line (either
+        // order) — the valid response keeps its meaning, diagnostics
+        // go unavailable.
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diagesc").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let valid = diagnostics_line(&full_counters_value());
+        let escaped = format!(r#"{{"hel\u0070er_counters":{}}}"#, full_counters_value());
+        assert!(
+            !escaped.contains("helper_counters"),
+            "fixture evades the literal marker"
+        );
+        for (order, counters_line) in [
+            ("valid-first", format!("{valid}\n{escaped}")),
+            ("escaped-first", format!("{escaped}\n{valid}")),
+        ] {
+            let helper = stage_fixture(
+                scratch.path(),
+                &format!("helper-{order}"),
+                serde_json::json!({"canned": "canned.json", "counters_line": counters_line}),
+            );
+            let principal = current_principal().expect("test principal");
+            let served = serve_pinned_snapshot_with_diagnostics(
+                &pin_helper(&helper).expect("pins"),
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10),
+            )
+            .expect("serves");
+            assert_eq!(served.response.session_id, SESSION);
+            assert_eq!(
+                served.diagnostics, None,
+                "valid+escaped marks unavailable ({order})"
             );
         }
     }
