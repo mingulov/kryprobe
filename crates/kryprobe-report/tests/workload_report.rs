@@ -1122,6 +1122,72 @@ fn container_known_and_unknown_lifetimes_stay_distinct() {
     );
 }
 
+/// SEM03/I01 collision fix (Wave-C P2): an OBSERVED lifetime whose
+/// value is `unknown` must render apart from an UNOBSERVED lifetime.
+/// Grouping already buckets them separately; the regression pins the
+/// labels: observed lifetimes render quoted (`"unknown"`), unobserved
+/// renders bare `unknown` — never byte-identical lines.
+#[test]
+fn container_observed_unknown_lifetime_stays_distinct_from_unobserved() {
+    let report = assemble(two_lifetime_input([Some("unknown"), None])).expect("assembles");
+    let groups = report.grouped_totals();
+    assert_eq!(
+        groups.len(),
+        2,
+        "observed-unknown vs unobserved stay distinct: {groups:?}"
+    );
+    let text = report.render_text();
+    assert!(
+        text.contains("groups (group_by=container, 2):"),
+        "two groups render:\n{text}"
+    );
+    let group_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("container "))
+        .collect();
+    assert_eq!(group_lines.len(), 2, "two group lines render:\n{text}");
+    assert_ne!(
+        group_lines[0], group_lines[1],
+        "observed-unknown and unobserved group lines differ:\n{text}"
+    );
+    assert!(
+        text.contains(":\"unknown\" calls=50"),
+        "observed `unknown` lifetime renders quoted:\n{text}"
+    );
+    assert!(
+        text.contains(":unknown calls=50"),
+        "unobserved lifetime still renders bare `unknown`:\n{text}"
+    );
+    let detail: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("container:"))
+        .collect();
+    assert_eq!(detail.len(), 2, "two detail rows render:\n{text}");
+    assert_ne!(detail[0], detail[1], "detail rows stay distinct:\n{text}");
+    // Adversarial pin: even a lifetime spelling the quoted label
+    // (`"unknown"` with literal quotes) cannot forge the unobserved
+    // line — debug-escaping keeps every observed rendering quoted.
+    let forged = assemble(two_lifetime_input([Some("\"unknown\""), None])).expect("assembles");
+    let forged_text = forged.render_text();
+    let forged_groups: Vec<&str> = forged_text
+        .lines()
+        .filter(|line| line.starts_with("container "))
+        .collect();
+    assert_eq!(
+        forged_groups.len(),
+        2,
+        "two group lines render:\n{forged_text}"
+    );
+    assert_ne!(
+        forged_groups[0], forged_groups[1],
+        "quote-forging lifetime stays apart from unobserved:\n{forged_text}"
+    );
+    assert!(
+        forged_text.contains(":\"\\\"unknown\\\"\" calls=50"),
+        "forging lifetime renders escaped:\n{forged_text}"
+    );
+}
+
 /// SEM03/I01 control: lifetime-qualified grouping changes no counts
 /// and no stored bytes — totals still cover every row, the v2 JSON
 /// round-trips byte-identically, and both lifetime rows survive with

@@ -388,12 +388,16 @@ fn normalize_lifetime(lifetime: &Option<String>) -> Option<String> {
     }
 }
 
-/// Lifetime display: the observed lifetime verbatim, or explicit
-/// `unknown` when unobserved — never blank, so a missing lifetime
-/// cannot be mistaken for a known one.
+/// Lifetime display: an observed lifetime renders quoted (`"..."`,
+/// debug-escaped so quotes, backslashes, and control characters can
+/// neither break the terminal nor forge a colliding label), while an
+/// unobserved lifetime renders bare `unknown` — explicitly apart from
+/// EVERY observed value (no quoted rendering can equal the bare
+/// word), never blank, so a missing lifetime cannot be mistaken for a
+/// known one (not even one observed as `unknown`).
 fn render_lifetime(lifetime: &Option<String>) -> String {
     match normalize_lifetime(lifetime) {
-        Some(seen) => crate::sanitize_cell(&seen),
+        Some(seen) => format!("{seen:?}"),
         None => "unknown".to_string(),
     }
 }

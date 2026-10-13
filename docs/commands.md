@@ -97,8 +97,10 @@ kryprobe plan|observe|run ...   # stub: exit 4, typed marker
   report (per-workload crypto call counts joined to kernel
   context; `none` keeps the historical tables). `container`
   groups are lifetime-qualified (runtime + full id + observed
-  lifetime, mirroring the identity contract; unobserved lifetimes
-  render explicit `unknown`): restart lifetimes never merge into
+  lifetime, mirroring the identity contract; observed lifetimes
+  render quoted (`"..."`, debug-escaped) while unobserved lifetimes
+  render bare `unknown` — apart from every observed value, even one
+  observed as `unknown`): restart lifetimes never merge into
   one aggregate group. Selection is unaffected — container views
   still match across lifetimes.
   `--filter-cgroup-id ID` narrows to one exact cgroup (0 refuses —
