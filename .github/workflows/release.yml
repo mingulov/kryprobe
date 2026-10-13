@@ -42,9 +42,11 @@ jobs:
     timeout-minutes: 75
     permissions:
       actions: read
+      contents: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       peel: ${{ steps.resolve.outputs.peel }}
+      tooling_sha: ${{ steps.tooling.outputs.tooling_sha }}
       ci_run: ${{ steps.wait.outputs.run_id }}
     steps:
       - name: resolve tag
@@ -59,6 +61,31 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "peel=$PEEL" >> "$GITHUB_OUTPUT"
           echo "tag $TAG peels to $PEEL"
+      - name: resolve tooling ref
+        id: tooling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TOOLS_REF="${{ inputs.tools_ref || steps.resolve.outputs.tag }}"
+          if printf '%s' "$TOOLS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            TOOLING_SHA="$TOOLS_REF"
+          else
+            TOOLING_SHA="$(git ls-remote "https://github.com/${{ github.repository }}.git" "refs/tags/$TOOLS_REF" "refs/tags/$TOOLS_REF^{}" "refs/heads/$TOOLS_REF" | awk '/\^\{\}$/{peeled=$1} !/\^\{\}$/{plain=$1} END{if (peeled != "") print peeled; else print plain}')"
+          fi
+          test -n "$TOOLING_SHA" || { echo "tooling ref has no commit" >&2; exit 1; }
+          printf '%s' "$TOOLING_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "tooling SHA malformed" >&2; exit 1; }
+          echo "tooling_sha=$TOOLING_SHA" >> "$GITHUB_OUTPUT"
+          echo "tooling $TOOLS_REF resolves to $TOOLING_SHA"
+      - name: checkout release tooling
+        # Pinned: actions/checkout v4.2.2 (release pipelines pin actions).
+        # The verifier below runs from this trusted checkout at the resolved
+        # full tooling SHA, never from the tag tree or the dispatch default.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ steps.tooling.outputs.tooling_sha }}
+          path: tools
+          fetch-depth: 1
       - name: wait for green ci.yml on the tag commit
         id: wait
         env:
@@ -71,10 +98,10 @@ jobs:
             set -- $ROW
             if [ -n "${1:-}" ] && [ "$2" = completed ]; then
               test "$3" = success || { echo "CI $1 concluded $3; refusing release" >&2; exit 1; }
-              JOBS="$(gh run view "$1" --repo "${{ github.repository }}" --json jobs --jq '[.jobs[] | .conclusion] | sort | join(",")')"
-              test "$JOBS" = "success,success,success" || { echo "CI $1 jobs: $JOBS; refusing release" >&2; exit 1; }
+              gh run view "$1" --repo "${{ github.repository }}" --json headSha,status,conclusion,jobs > run.json
+              python3 tools/packaging/release/verify-ci.py --expected-sha "$PEEL" --run-json run.json
               echo "run_id=$1" >> "$GITHUB_OUTPUT"
-              echo "exact-commit CI green: $1 ($JOBS)"
+              echo "exact-commit CI green: $1"
               exit 0
             fi
             sleep 60
@@ -92,7 +119,7 @@ jobs:
     env:
       TAG: ${{ needs.require-green.outputs.tag }}
       PEEL: ${{ needs.require-green.outputs.peel }}
-      TOOLS_REF: ${{ inputs.tools_ref || needs.require-green.outputs.tag }}
+      TOOLS_REF: ${{ needs.require-green.outputs.tooling_sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: checkout tag sources
@@ -103,11 +130,12 @@ jobs:
           path: src
           fetch-depth: 0
       - name: checkout release tooling
-        # Bootstrap note: v0.1.0 dispatches with TOOLS_REF set to the reviewed
+        # Bootstrap note: v0.1.0 dispatches with tools_ref set to the reviewed
         # main commit carrying packaging/release/*, because the tag predates
-        # the tooling. The resolved SHA is logged below and in the summary;
-        # audit the dispatch against that SHA. Later releases default to the
-        # tag itself (workflow and tools from the tagged tree).
+        # the tooling. require-green resolves that ref (or the tag itself for
+        # later releases) to a full immutable tooling SHA, and publish
+        # consumes the same SHA: this checkout cannot drift from the tree
+        # the verifier ran from. Audit the dispatch against that SHA.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ env.TOOLS_REF }}
@@ -117,6 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C src rev-parse HEAD)" = "$PEEL"
+          test "$(git -C tools rev-parse HEAD)" = "$TOOLS_REF"
           echo "sources: tag $TAG peel $PEEL tree $(git -C src rev-parse 'HEAD^{tree}')"
           echo "tooling: $TOOLS_REF sha $(git -C tools rev-parse HEAD)"
           test -f tools/packaging/release-pins.json

@@ -204,6 +204,12 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    # QUAL-05: explicit v0.1.0-only scope. Every name, pin, note and payload
+    # below is v0.1.0-shaped, so any other selected version is refused here,
+    # before touching sources, staging or outputs. The reason is static:
+    # raw version input is never echoed.
+    if args.tag != "v0.1.0":
+        return fail("only v0.1.0 is supported")
     # Resolve everything: consumer checks run children under foreign cwds,
     # so relative CLI paths would resolve against the wrong directory.
     src = Path(args.src).resolve()
