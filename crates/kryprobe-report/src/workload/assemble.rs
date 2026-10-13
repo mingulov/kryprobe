@@ -40,6 +40,14 @@ use kryprobe_core::workload::{
 /// - The stored partition buckets must equal the selector-weighted
 ///   recompute over the rows (shared core classifier): conservation
 ///   alone cannot establish selection (SEM01).
+/// - A positive-call row with an established (nonzero) process start
+///   refuses when that start follows the capture interval end
+///   (temporal coherence, SEM05): within one monotonic_boot domain a
+///   counted context cannot begin after the capture. start == end
+///   accepts (boundary), start 0 (unreadable) accepts, a pre-capture
+///   (long-lived) start accepts, and zero-call rows carry no counted
+///   context. Refuses as [`WorkloadBuildError::IncoherentRow`]: the
+///   row contradicts the capture it claims.
 pub fn assemble(input: AssemblyInput) -> Result<WorkloadReport, WorkloadBuildError> {
     validate_session_id(&input.session_id).map_err(|_| WorkloadBuildError::BadSession)?;
     if input.kernel_identity.is_empty() || input.kernel_identity.len() > MAX_KERNEL_IDENTITY_BYTES {
@@ -84,6 +92,13 @@ pub fn assemble(input: AssemblyInput) -> Result<WorkloadReport, WorkloadBuildErr
         }
         .validate()
         .map_err(|_| WorkloadBuildError::IncoherentRow)?;
+        // SEM05 (I05): temporal context coherence — a positive-call
+        // row with an established (nonzero) process start refuses when
+        // that start follows the capture end (monotonic_boot domain:
+        // interval bounds and task starts are both boot-time ns).
+        if row.calls > 0 && row.context.start_ns != 0 && row.context.start_ns > interval_end_ns {
+            return Err(WorkloadBuildError::IncoherentRow);
+        }
     }
     rows.sort_by_key(|row| row.context.accounting_key());
     for pair in rows.windows(2) {
