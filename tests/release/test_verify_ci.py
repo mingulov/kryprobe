@@ -41,12 +41,24 @@ def four_green():
             job("privileged sudo lane"), job("supply chain")]
 
 
+def v010_green():
+    """v0.1.0 tag tree lanes (the only supported release): 3 jobs."""
+    return [job("host gate"), job("BPF lane (unprivileged)"),
+            job("supply chain")]
+
+
 class ValidateRequiredJobsTest(unittest.TestCase):
     """Pure verifier fixtures (QUAL-03)."""
 
     def test_four_green_accepts(self):
         self.assertEqual(
             VERIFY_CI.validate_required_jobs(SHA, run_doc(), four_green()), [])
+
+    def test_v010_three_green_accepts(self):
+        """P1 oracle: the supported v0.1.0 tag tree runs exactly 3 lanes;
+        an all-green 3-lane run on the tag peel must ACCEPT."""
+        self.assertEqual(
+            VERIFY_CI.validate_required_jobs(SHA, run_doc(), v010_green()), [])
 
     def test_three_green_missing_required_refuses(self):
         jobs = [j for j in four_green() if j["name"] != "supply chain"]
@@ -94,11 +106,15 @@ class ValidateRequiredJobsTest(unittest.TestCase):
         self.assertEqual(
             VERIFY_CI.validate_required_jobs(SHA, run_doc(), jobs), [])
 
-    def test_required_set_matches_current_ci_yml(self):
-        """The verifier's expected set is exactly the display names emitted
-        by the current ci.yml (rechecked, not assumed)."""
-        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
-        names = re.findall(r"^    name: (.+)$", ci, re.M)
+    def test_required_set_matches_supported_tag_ci_yml(self):
+        """P1: the verifier's expected set is exactly the display names emitted
+        by the SUPPORTED TAG tree ci.yml (v0.1.0), not the current tree.
+        The gate evaluates tag-tree runs; the current tree carries a 4th
+        privileged lane that no v0.1.0-peel run can contain."""
+        tag_ci = subprocess.check_output(
+            ["git", "show", "v0.1.0^{}:.github/workflows/ci.yml"],
+            cwd=ROOT, text=True, timeout=60)
+        names = re.findall(r"^    name: (.+)$", tag_ci, re.M)
         self.assertEqual(sorted(names), sorted(VERIFY_CI.REQUIRED_JOBS))
 
 
@@ -155,6 +171,20 @@ class ReleaseWorkflowWiringTest(unittest.TestCase):
         publish = self.text[self.text.index("\n  publish:"):]
         self.assertIn("needs.require-green.outputs.tooling_sha", publish)
         self.assertIn("tooling_sha", self.require_green)
+
+    def test_tooling_resolution_accepts_qualified_refs(self):
+        """P2: an already-qualified tools_ref (refs/heads/..., refs/tags/...)
+        must resolve via unprefixed passthrough, not double-prefix and abort.
+        The unqualified bootstrap scope (short tag/branch names) is preserved."""
+        self.assertIn("refs/tags/$TOOLS_REF", self.require_green)
+        self.assertIn("refs/heads/$TOOLS_REF", self.require_green)
+        self.assertRegex(self.require_green, r"\^refs/")
+        ls_remotes = [line for line in self.require_green.splitlines()
+                      if "git ls-remote" in line]
+        self.assertTrue(ls_remotes, "no ls-remote in require-green")
+        self.assertTrue(
+            any('"$TOOLS_REF"' in line for line in ls_remotes),
+            "no ls-remote passes the qualified ref through unprefixed")
 
 
 class VersionScopeTest(unittest.TestCase):

@@ -70,6 +70,8 @@ jobs:
           TOOLS_REF="${{ inputs.tools_ref || steps.resolve.outputs.tag }}"
           if printf '%s' "$TOOLS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
             TOOLING_SHA="$TOOLS_REF"
+          elif printf '%s' "$TOOLS_REF" | grep -Eq '^refs/'; then
+            TOOLING_SHA="$(git ls-remote "https://github.com/${{ github.repository }}.git" "$TOOLS_REF" "$TOOLS_REF^{}" | awk '/\^\{\}$/{peeled=$1} !/\^\{\}$/{plain=$1} END{if (peeled != "") print peeled; else print plain}')"
           else
             TOOLING_SHA="$(git ls-remote "https://github.com/${{ github.repository }}.git" "refs/tags/$TOOLS_REF" "refs/tags/$TOOLS_REF^{}" "refs/heads/$TOOLS_REF" | awk '/\^\{\}$/{peeled=$1} !/\^\{\}$/{plain=$1} END{if (peeled != "") print peeled; else print plain}')"
           fi

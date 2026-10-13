@@ -8,9 +8,12 @@ required set are ignored (a completed-success run conclusion already covers
 the whole run). All refusal reasons are static strings: raw run/job input is
 never echoed.
 
-The required set mirrors the display names (`name:`) emitted by the current
-.github/workflows/ci.yml; tests/release/test_verify_ci.py pins the two
-together so CI renames fail loudly instead of silently widening the gate.
+The required set mirrors the display names (`name:`) emitted by the SUPPORTED
+TAG tree .github/workflows/ci.yml (v0.1.0, peel
+bd127cf5e90e7863b2b52a6d3d2685d12d4f8113), not the current tree;
+tests/release/test_verify_ci.py pins the two together so tag-tree renames
+fail loudly instead of silently widening the gate. Any future supported tag
+needs its own lane-set decision; never assume the current tree lanes.
 
 Usage: verify-ci.py --expected-sha SHA --run-json FILE
 FILE is one JSON object shaped like `gh run view --json
@@ -22,12 +25,14 @@ import re
 import sys
 from pathlib import Path
 
-# Current ci.yml display names (host gate, unprivileged BPF lane, privileged
-# sudo lane, supply chain). Recheck against ci.yml on any CI change.
+# v0.1.0 tag tree ci.yml display names (host gate, unprivileged BPF lane,
+# supply chain). Peel bd127cf5e90e7863b2b52a6d3d2685d12d4f8113. The current
+# tree carries a 4th privileged sudo lane that no v0.1.0-peel run can contain;
+# scoping to the tag lanes is the P1 deadlock fix. Recheck against the
+# supported tag tree on any scope decision, never the current tree.
 REQUIRED_JOBS = (
     "host gate",
     "BPF lane (unprivileged)",
-    "privileged sudo lane",
     "supply chain",
 )
 
