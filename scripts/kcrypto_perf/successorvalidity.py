@@ -29,6 +29,7 @@ bpftool map dumps stay localizer evidence, never operands.
 import json
 from pathlib import Path
 
+from kcrypto_perf.m1validity import CTX_KEYS
 from kcrypto_perf.parsers import LOSS_COUNTERS
 
 TELEMETRY_PREFIX = "kryprobe: telemetry "
@@ -376,6 +377,86 @@ def parse_miss_telemetry(path: Path) -> dict:
             "miss_delta": _telemetry_int(found["miss_delta"], path,
                                           "miss_delta"),
             "run_delta": run_delta}
+
+
+def parse_ctx_telemetry_strict(path: Path) -> dict:
+    """Exactly one ``{"v": 1, "ctx": {...}}`` terminal object
+    from a capture stderr log (F08/QUAL-02: called ONLY by the
+    v3/successor branch).
+
+    Returns the ctx dict with exactly ``CTX_KEYS`` counters:
+    unsigned ints (bools, floats, strings, negatives, and
+    above-u64 values refuse) or null for an unreadable walk
+    (the downstream ctx rules name unreadable operands
+    explicitly). Raises ``ValueError`` when no ctx object
+    exists, when a second terminal contradicts the first
+    (earlier evidence is never silently overwritten), when
+    any telemetry line is malformed, or when a ctx-bearing
+    line carries a version other than 1 — the caller converts
+    this to a leg-invalid reason (fail-closed). The frozen
+    ``m1validity.parse_ctx_telemetry`` last-wins by design and
+    stays pinned for v1/v2 and diag adjudication.
+    """
+    try:
+        text = Path(path).read_text()
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    found = None
+    for raw in text.splitlines():
+        if not raw.startswith(TELEMETRY_PREFIX):
+            continue
+        try:
+            obj = _loads_strict(raw[len(TELEMETRY_PREFIX):])
+        except ValueError:
+            # EVERY prefixed line must parse (duplicate
+            # members refused too): a malformed telemetry
+            # line is a corrupted receipt, never skippable
+            # absence — the miss-parser convention.
+            raise ValueError(
+                f"{path}: malformed telemetry line")
+        # Ctx-bearing is decided on the DECODED object: an
+        # escaped "\u0063tx" key decodes to "ctx" while the
+        # raw substring check misses it.
+        ctx_bearing = '"ctx"' in raw or (
+            isinstance(obj, dict) and "ctx" in obj)
+        if not isinstance(obj, dict) or \
+                type(obj.get("v")) is not int or \
+                obj.get("v") != TELEMETRY_VERSION:
+            if ctx_bearing:
+                raise ValueError(
+                    f"{path}: ctx telemetry version not 1")
+            continue
+        if "ctx" in obj and not isinstance(obj["ctx"], dict):
+            raise ValueError(
+                f"{path}: ctx object malformed "
+                f"({obj['ctx']!r})")
+        ctx = obj.get("ctx")
+        if isinstance(ctx, dict):
+            # The product prints exactly one terminal line:
+            # a second ctx object contradicts the first
+            # (earlier evidence is never silently
+            # overwritten).
+            if found is not None:
+                raise ValueError(
+                    f"{path}: multiple ctx telemetry objects")
+            found = ctx
+    if found is None:
+        raise ValueError(f"{path}: no ctx telemetry object")
+    out = {}
+    for key in CTX_KEYS:
+        if key not in found:
+            raise ValueError(f"{path}: ctx.{key} missing")
+        val = found[key]
+        if val is None:
+            out[key] = None
+        elif isinstance(val, bool) or not isinstance(val, int) \
+                or not 0 <= val <= _U64_MAX:
+            raise ValueError(
+                f"{path}: ctx.{key}={val!r} not an unsigned "
+                "int or null")
+        else:
+            out[key] = val
+    return out
 
 
 def successor_truth(*, ops: int, alloc: int, kernel: str) -> int:

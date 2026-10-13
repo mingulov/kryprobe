@@ -1856,6 +1856,174 @@ class SuccessorOverlayTests(unittest.TestCase):
             self._manifest(3), kernel="6.12.111")
         self.assertTrue(out["valid"], out.get("reasons"))
 
+    def test_duplicate_ctx_terminal_refuses_successor(self):
+        # F08 (QUAL-02 review repro through the judge): a
+        # contradictory first ctx {rows:7,present:1,system:999}
+        # followed by a clean terminal plus valid misses was
+        # valid=true on v3 C (frozen last-wins) — the v3 path
+        # now requires exactly one terminal ctx object. Both
+        # orders and byte-identical repetition refuse.
+        base = self._c_files()["leg00B-capture.stderr.log"]
+        bad_first = _ctx_line(7, 1, 999) + base
+        good_first = base + _ctx_line(7, 1, 999)
+        identical = base + base
+        for stderr in (bad_first, good_first, identical):
+            files = self._c_files()
+            files["leg00B-capture.stderr.log"] = stderr
+            cell = self._cell(files)
+            out = self._overlay(cell, self._judged(), self._c_leg(),
+                                self._c_entry(), self._manifest(3))
+            self.assertFalse(out["valid"], stderr[:60])
+            self.assertTrue(any("multiple ctx telemetry objects" in r
+                                for r in out["reasons"]),
+                            out["reasons"])
+
+    def test_malformed_ctx_then_valid_refuses(self):
+        # A malformed ctx line is never skipped as absent on
+        # v3 — it refuses at ctx extraction even beside a
+        # valid terminal (before the successor overlay runs,
+        # so no successor-stage reason appears).
+        files = self._c_files()
+        files["leg00B-capture.stderr.log"] = (
+            'kryprobe: telemetry {"v":1,"ctx":\n'
+            + files["leg00B-capture.stderr.log"])
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("malformed telemetry line" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+        self.assertFalse(any("successor" in r
+                             for r in out["reasons"]),
+                         out["reasons"])
+
+    def test_ctx_bool_counter_refuses(self):
+        # True == 1 in Python — a bool ctx counter is
+        # mistyped evidence on v3, never a count.
+        files = self._c_files()
+        stderr = files["leg00B-capture.stderr.log"]
+        files["leg00B-capture.stderr.log"] = stderr.replace(
+            '"rows":192', '"rows":true', 1)
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("not an unsigned int or null" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_ctx_unknown_version_refuses(self):
+        # A ctx-bearing line with v != 1 refuses on v3 (miss
+        # convention) — it must not read as absent.
+        files = self._c_files()
+        stderr = files["leg00B-capture.stderr.log"]
+        files["leg00B-capture.stderr.log"] = stderr.replace(
+            '{"v":1,"ctx":', '{"v":2,"ctx":', 1)
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("ctx telemetry version not 1" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_m_duplicate_ctx_terminal_refuses(self):
+        # Every C/M successor operand route is strict: the M
+        # route refuses repeated terminals like the C route.
+        files = self._m_files()
+        files["leg00B-capture.stderr.log"] = (
+            _ctx_line(7, 1, 999)
+            + files["leg00B-capture.stderr.log"])
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._m_leg(),
+                            self._m_entry(), self._m_manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("multiple ctx telemetry objects" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_r_malformed_ctx_refuses(self):
+        # R-side anomaly check: a malformed v3 ctx line
+        # refuses — it must not read as R-absence. Plain
+        # absence still passes (existing control above).
+        files = self._r_files(misses=None)
+        files["leg00A-capture.stderr.log"] = (
+            'kryprobe: telemetry {"v":1,"ctx":\n')
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("successor R-side ctx evidence" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_r_duplicate_ctx_refuses(self):
+        # Repeated v3 ctx terminals on R refuse as malformed
+        # R-side evidence (not silent last-wins absence).
+        files = self._r_files(misses=None)
+        files["leg00A-capture.stderr.log"] = (
+            _ctx_line(192, 200, 200) + _ctx_line(192, 200, 200))
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("successor R-side ctx evidence" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v3_r_ctx_echoing_absence_refuses(self):
+        # A hostile ctx value echoing the absence phrase must
+        # still refuse — absence detection matches the full
+        # reason, never a substring.
+        files = self._r_files(misses=None)
+        files["leg00A-capture.stderr.log"] = (
+            'kryprobe: telemetry {"v":1,'
+            '"ctx":"no ctx telemetry object"}\n')
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(3))
+        self.assertFalse(out["valid"])
+        self.assertTrue(any("successor R-side ctx evidence" in r
+                            for r in out["reasons"]),
+                        out["reasons"])
+
+    def test_v2_duplicate_ctx_keeps_last_wins(self):
+        # Frozen preservation: v2 judges repeated ctx by
+        # last-wins (the freeze pins decoder behavior) —
+        # strict one-terminal ctx is a v3 successor rule only.
+        files = self._c_files()
+        files["leg00B-capture.stderr.log"] = (
+            _ctx_line(7, 1, 999)
+            + files["leg00B-capture.stderr.log"])
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._c_leg(),
+                            self._c_entry(), self._manifest(2))
+        self.assertTrue(out["valid"], out.get("reasons"))
+
+    def test_v2_m_duplicate_ctx_keeps_last_wins(self):
+        # Same frozen pin through the M route on v2.
+        files = self._m_files()
+        files["leg00B-capture.stderr.log"] = (
+            _ctx_line(7, 1, 999)
+            + files["leg00B-capture.stderr.log"])
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._m_leg(),
+                            self._m_entry(), self._m_manifest(2))
+        self.assertTrue(out["valid"], out.get("reasons"))
+
+    def test_v2_r_malformed_ctx_keeps_frozen_absence(self):
+        # Same frozen pin through the R route on v2: a
+        # malformed line reads as R-absence (no ctx object),
+        # never a strict refusal.
+        files = self._r_files(misses=None)
+        files["leg00A-capture.stderr.log"] = (
+            'kryprobe: telemetry {"v":1,"ctx":\n')
+        cell = self._cell(files)
+        out = self._overlay(cell, self._judged(), self._r_leg(),
+                            self._c_entry(), self._manifest(2))
+        self.assertTrue(out["valid"], out.get("reasons"))
+
     def test_successor_epoch_is_per_leg(self):
         # The v3 truth equation applies to C/M legs only; R
         # keeps frozen exactness and non-pairs kinds (diags)
