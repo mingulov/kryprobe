@@ -1696,7 +1696,9 @@ def check_imported_cell_spec(stage: dict, spec: list,
     Opt-in imported/resealed-cell boundary: the sealed stage
     kernel/roles and every sealed legs.tsv row must equal what
     the manifest entry generates (role/mode/workload/size/order).
-    Sealed leg subsets (spares) bind; sealed extras, field flips,
+    Sealed leg subsets bind, including M1 runner spares within
+    the 0..max_attempted-1 window (field-exact per pair index,
+    order-aware); sealed extras beyond the window, field flips,
     order swaps, and unresolvable entries refuse. Returns reasons
     (empty means bound).
     """
@@ -1716,18 +1718,33 @@ def check_imported_cell_spec(stage: dict, spec: list,
             f"imported spec: kernel sealed {stage.get('kernel')!r} != "
             f"manifest {entry.get('kernel')!r}")
     for side in ("a", "b"):
-        if f"obs_{side}" in entry and \
-                stage.get(f"obs_{side}") != entry[f"obs_{side}"]:
+        if f"obs_{side}" in entry:
+            want_role = entry[f"obs_{side}"]
+        elif kind == "diag" and is_m1_manifest(manifest):
+            # P2-F1: M1 diag entries carry no obs_*; staging pins
+            # the implicit D/C roles, so the checker binds them.
+            want_role = "D" if side == "a" else "C"
+        else:
+            continue
+        if stage.get(f"obs_{side}") != want_role:
             reasons.append(
                 f"imported spec: role obs_{side} sealed "
                 f"{stage.get(f'obs_{side}')!r} != manifest "
-                f"{entry[f'obs_{side}']!r}")
+                f"{want_role!r}")
     if not spec:
         reasons.append("imported spec unbound: sealed legs.tsv "
                        "carries no legs")
         return reasons
     try:
-        expected = gen_legs(entry, manifest, kind)
+        if kind == "set" and entry.get("kind") == "m1-pairs" \
+                and "max_attempted" in entry:
+            # P2-F2: the runner stages spares via --start-pair
+            # within the attempt budget, so bind the sealed legs
+            # against the full 0..max_attempted-1 window.
+            expected = gen_legs(entry, manifest, kind, 0,
+                                entry["max_attempted"])
+        else:
+            expected = gen_legs(entry, manifest, kind)
     except (ValueError, KeyError, TypeError) as err:
         return reasons + [f"imported spec unbound: {err}"]
     by_id = {leg["leg_id"]: leg for leg in expected}

@@ -202,6 +202,78 @@ class ImportedSpecTests(unittest.TestCase):
         self.assertTrue(reasons, "unknown set must not bind")
         self.assertTrue(any("unbound" in r for r in reasons), reasons)
 
+    def test_diag_roles_bound(self):
+        # P2-F1 positive control: staged D/C diag binds its manifest legs.
+        manifest = _v3_manifest()
+        entry = CLI.find_diag(manifest, "m1-diag-612-ctx")
+        stage = {"kind": "diag", "diag": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        spec = CLI.gen_legs(entry, manifest, "diag")
+        self.assertEqual(CLI.check_imported_cell_spec(stage, spec, manifest),
+                         [])
+
+    def test_diag_role_mismatch_refused(self):
+        # P2-F1: resealed D/R diagnostic must refuse the role boundary
+        # (manifest diag carries no obs_*; staging pins implicit D/C).
+        manifest = _v3_manifest()
+        entry = CLI.find_diag(manifest, "m1-diag-612-ctx")
+        stage = {"kind": "diag", "diag": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "R"}
+        spec = CLI.gen_legs(entry, manifest, "diag")
+        reasons = CLI.check_imported_cell_spec(stage, spec, manifest)
+        self.assertTrue(reasons, "diag role flip must refuse binding")
+        self.assertTrue(any("obs_b" in r or "role" in r for r in reasons),
+                        reasons)
+
+    def test_spare_window_bound(self):
+        # P2-F2: runner spare legs (start_pair=10 within max_attempted)
+        # bind field-exact against the 0..max_attempted-1 window.
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        spares = CLI.gen_legs(entry, manifest, "set", 10, 2)
+        self.assertEqual(CLI.check_imported_cell_spec(stage, spares,
+                                                      manifest),
+                         [])
+
+    def test_spare_over_budget_refused(self):
+        # P2-F2 guard: pair indices at/above max_attempted still refuse.
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        over = CLI.gen_legs(entry, manifest, "set",
+                            entry["max_attempted"], 1)
+        reasons = CLI.check_imported_cell_spec(stage, over, manifest)
+        self.assertTrue(reasons, "over-budget legs must not bind")
+        self.assertTrue(any("not declared" in r for r in reasons), reasons)
+
+    def test_spare_field_flip_refused(self):
+        # P2-F2 field-exact: a mode flip inside the spare window names
+        # the field (not merely "not declared").
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        spares = _mutate(CLI.gen_legs(entry, manifest, "set", 10, 2),
+                         "leg10B", mode="disabled")
+        reasons = CLI.check_imported_cell_spec(stage, spares, manifest)
+        self.assertTrue(reasons, "spare mode flip must refuse")
+        self.assertTrue(any("mode" in r for r in reasons), reasons)
+
+    def test_spare_order_swap_refused(self):
+        # P2-F2 order-aware: swapped spare legs refuse on order.
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        spares = CLI.gen_legs(entry, manifest, "set", 10, 2)
+        spares[0], spares[1] = spares[1], spares[0]
+        reasons = CLI.check_imported_cell_spec(stage, spares, manifest)
+        self.assertTrue(reasons, "spare order swap must refuse")
+        self.assertTrue(any("order" in r for r in reasons), reasons)
+
 
 class ImportedVerifyTests(unittest.TestCase):
     """QUAL-01 end to end: mismatched sealed cells through verify_cell."""
