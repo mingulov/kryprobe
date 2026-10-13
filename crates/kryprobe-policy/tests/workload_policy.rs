@@ -857,3 +857,85 @@ fn violation_carries_partition_and_obs_ids() {
     }
     assert_eq!(intent(&verdict), 10);
 }
+
+/// SEM02 at the scoped-policy ingress: a cgroup-zero row carrying a
+/// resolved identity is invalid input (exit 2), never a silent
+/// non-match — scoped rows reuse the shared observation rule.
+#[test]
+fn cgroup_zero_identity_refuses_scoped_rows() {
+    let obs = agg_obs(1, "cbc(aes)", "cbc-aes-aesni", "ok");
+    let bad = row(
+        50,
+        0,
+        WorkloadIdentity::container(RUNTIME, ID_A, Some("lifetime-a")),
+        asserted(),
+        &obs,
+    );
+    let selector = WorkloadSelector::cgroup(43812).expect("cgroup selector");
+    let err = scope_rows(&selector, &[bad]).expect_err("resolved cgroup-zero refuses");
+    assert_eq!(err.exit_intent(), 2);
+    // Positive control: the same shape unresolved scopes to unknown.
+    let unknown_obs = agg_obs(2, "cbc(aes)", "cbc-aes-aesni", "ok");
+    let rows = [row(
+        10,
+        0,
+        WorkloadIdentity::none(),
+        unresolved(),
+        &unknown_obs,
+    )];
+    let scoped = scope_rows(&selector, &rows).expect("unresolved cgroup-zero scopes");
+    assert_eq!(scoped.partition.unknown_match(), 10);
+}
+
+/// F04 shared-classifier pin: `scope_rows` partitions exactly as the
+/// shared core classifier decides per row, so scoped policy, report
+/// assembly, and replay decode recompute from one rule.
+#[test]
+fn scope_rows_agrees_with_shared_classifier() {
+    use kryprobe_core::workload::{ScopeDecision, ScopePartition, decide_workload_scope};
+    let owned = agg_obs(1, "cbc(aes)", "cbc-aes-aesni", "ok");
+    let other = agg_obs(2, "cbc(aes)", "cbc-aes-aesni", "ok");
+    let unknown = agg_obs(3, "cbc(aes)", "cbc-aes-aesni", "ok");
+    let rows = [
+        row(
+            20,
+            43812,
+            WorkloadIdentity::container(RUNTIME, ID_A, Some("lifetime-a")),
+            asserted(),
+            &owned,
+        ),
+        row(
+            30,
+            43813,
+            WorkloadIdentity::container(RUNTIME, ID_B, Some("lifetime-b")),
+            asserted(),
+            &other,
+        ),
+        row(10, 0, WorkloadIdentity::none(), unresolved(), &unknown),
+    ];
+    for selector in [
+        WorkloadSelector::cgroup(43812).expect("cgroup selector"),
+        WorkloadSelector::container(RUNTIME, ID_A, None).expect("container selector"),
+    ] {
+        let scoped = scope_rows(&selector, &rows).expect("scopes");
+        let (mut matched, mut nonmatched, mut unknown_match) = (0u64, 0u64, 0u64);
+        for (row, decision) in rows.iter().zip(scoped.decisions.iter()) {
+            let shared =
+                decide_workload_scope(&selector, &row.context, &row.identity, &row.evidence);
+            assert_eq!(
+                *decision, shared,
+                "per-row decision matches the shared rule"
+            );
+            match shared {
+                ScopeDecision::Match => matched += row.calls,
+                ScopeDecision::NonMatch => nonmatched += row.calls,
+                ScopeDecision::Unknown => unknown_match += row.calls,
+            }
+        }
+        assert_eq!(
+            scoped.partition,
+            ScopePartition::from_counts(matched, nonmatched, unknown_match).expect("valid"),
+            "partition matches the shared fold under {selector:?}"
+        );
+    }
+}

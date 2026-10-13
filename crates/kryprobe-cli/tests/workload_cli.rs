@@ -767,3 +767,242 @@ fn helper_crash_degrades_to_raw_ids() {
         kryprobe_report::workload::CoverageLevel::Unavailable
     );
 }
+
+// ---------------------------------------------------------------------------
+// F04 shared replay invariants (SEM01/SEM02)
+// ---------------------------------------------------------------------------
+
+fn f04_fixture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../kryprobe-report/tests/fixtures/workload-v2")
+}
+
+fn f04_fixture_value(name: &str) -> serde_json::Value {
+    let bytes = std::fs::read(f04_fixture_dir().join(name)).expect("frozen fixture ships");
+    serde_json::from_slice(&bytes).expect("fixture parses")
+}
+
+fn f04_stage(name: &str, value: &serde_json::Value) -> (kryprobe_testkit::TempDir, String) {
+    let scratch = kryprobe_testkit::TempDir::named(name).expect("scratch");
+    let path = scratch.path().join(format!("{name}.json"));
+    std::fs::write(&path, serde_json::to_vec(value).expect("encodes")).expect("staged");
+    let display = path.display().to_string();
+    (scratch, display)
+}
+
+/// SEM01 at the public surface: selector-contradictory scoped
+/// partitions refuse through `report FILE` (exit 2, nothing renders);
+/// the derived buckets replay with exits on the stored evidence.
+#[test]
+fn scoped_partition_conservation_is_not_selection() {
+    // Case 1: selector 999 claims 50/0/0 although rows derive 0/40/10.
+    let mut hostile = f04_fixture_value("unknown-match.json");
+    hostile["selectors"]["cgroup_id"] = serde_json::json!("999");
+    hostile["partition"]["matched"] = serde_json::json!("50");
+    hostile["partition"]["nonmatched"] = serde_json::json!("0");
+    hostile["partition"]["unknown_match"] = serde_json::json!("0");
+    let (_scratch, path) = f04_stage("cli-f04-partition-hostile", &hostile);
+    let (code, stdout, stderr) = run_cli(&["kryprobe", "report", &path]);
+    assert_eq!(code, 2, "partition-hostile refuses: {stdout}{stderr}");
+    assert!(
+        !stdout.contains("matched=50"),
+        "nothing renders on refusal: {stdout}"
+    );
+    // The derived 0/40/10 replays (exit 3 on the stored partial
+    // attribution, like the frozen fixture it mutates).
+    let mut derived = f04_fixture_value("unknown-match.json");
+    derived["selectors"]["cgroup_id"] = serde_json::json!("999");
+    derived["partition"]["matched"] = serde_json::json!("0");
+    derived["partition"]["nonmatched"] = serde_json::json!("40");
+    derived["partition"]["unknown_match"] = serde_json::json!("10");
+    let (_scratch, path) = f04_stage("cli-f04-partition-derived", &derived);
+    let (code, stdout, _) = run_cli(&["kryprobe", "report", &path]);
+    assert_eq!(code, 3, "derived 0/40/10 replays");
+    assert!(stdout.contains("matched=0"), "derived renders:\n{stdout}");
+    // Case 2: selector 43812 with stored 0/50/0 refuses; the frozen
+    // 20/20/10 replays (positive control).
+    let mut hostile2 = f04_fixture_value("unknown-match.json");
+    hostile2["partition"]["matched"] = serde_json::json!("0");
+    hostile2["partition"]["nonmatched"] = serde_json::json!("50");
+    hostile2["partition"]["unknown_match"] = serde_json::json!("0");
+    let (_scratch, path) = f04_stage("cli-f04-partition-hostile2", &hostile2);
+    let (code, _, _) = run_cli(&["kryprobe", "report", &path]);
+    assert_eq!(code, 2, "selector-43812 0/50/0 refuses");
+    let frozen = f04_fixture_dir().join("unknown-match.json");
+    let (code, stdout, _) = run_cli(&["kryprobe", "report", &frozen.display().to_string()]);
+    assert_eq!(code, 3, "frozen 20/20/10 replays");
+    assert!(stdout.contains("matched=20"), "frozen renders:\n{stdout}");
+}
+
+/// SEM02 across every ingress: resolved cgroup-zero refuses under
+/// verified/asserted/stale through observation, snapshot, assembly,
+/// decode, and `report FILE`; unresolved cgroup-zero passes each.
+#[test]
+fn cgroup_zero_identity_refuses_every_ingress() {
+    use kryprobe_core::workload::{
+        AttributionEvidence, AttributionStatus, ChunkInfo, ContextIdentity, CountOperand,
+        ExecutionKind, KernelIdentity, Relationship, ResolvedAssociation, ResponseStatus,
+        SnapshotCounters, SnapshotKey, SnapshotResponse, ValidityInterval, WorkloadIdentity,
+        WorkloadObservation,
+    };
+    const ID_A: &str = "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57";
+    const RUNTIME: &str = "docker://host-a";
+    const SESSION: &str = "0123456789abcdef0123456789abcdef";
+    let usable = |status: AttributionStatus| match status {
+        AttributionStatus::Verified => AttributionEvidence::verified_kernel_capture(
+            Relationship::HookContext,
+            ValidityInterval::monotonic(100, 1000),
+        ),
+        AttributionStatus::Asserted => AttributionEvidence::asserted_metadata(
+            Relationship::HookContext,
+            kryprobe_core::workload::METHOD_METADATA_FILE,
+            Some(ValidityInterval::monotonic(100, 1000)),
+        ),
+        _ => AttributionEvidence::new(
+            Relationship::HookContext,
+            kryprobe_core::workload::METHOD_METADATA_FILE,
+            kryprobe_core::workload::WorkloadOrigin::OperatorMetadataFile,
+            AttributionStatus::Stale,
+            Some(ValidityInterval::monotonic(100, 1000)),
+        ),
+    };
+    let wire_status = |status: AttributionStatus| match status {
+        AttributionStatus::Verified => "verified",
+        AttributionStatus::Asserted => "asserted",
+        _ => "stale",
+    };
+    for status in [
+        AttributionStatus::Verified,
+        AttributionStatus::Asserted,
+        AttributionStatus::Stale,
+    ] {
+        let tag = wire_status(status);
+        let identity = WorkloadIdentity::container(RUNTIME, ID_A, Some("lifetime-a"));
+        let evidence = usable(status);
+        assert!(evidence.validate().is_ok(), "usable evidence coheres");
+        // Ingress 1: shared observation validation.
+        let observation = WorkloadObservation {
+            context: ContextIdentity::new(7, 0, 1000, 1000, 555, ExecutionKind::Proc),
+            identity: identity.clone(),
+            evidence: evidence.clone(),
+        };
+        assert!(
+            observation.validate().is_err(),
+            "observation refuses resolved cgroup-zero under {tag}"
+        );
+        // Ingress 2: snapshot response validation (positive pin: the
+        // pre-existing rule every other ingress must match).
+        let response = SnapshotResponse {
+            session_id: SESSION.to_string(),
+            kernel_identity: KernelIdentity::Known("kernel-A/boot-A".to_string()),
+            associations: vec![ResolvedAssociation {
+                key: SnapshotKey {
+                    kernel_scope: "kernel-A/boot-A".to_string(),
+                    cgroup: 0,
+                    tgid: 1000,
+                    start_ns: 555,
+                },
+                identity: identity.clone(),
+                evidence: evidence.clone(),
+            }],
+            errors: vec![],
+            status: ResponseStatus::Complete,
+            chunk: ChunkInfo::single(),
+            counters: if status == AttributionStatus::Stale {
+                SnapshotCounters {
+                    resolved: 0,
+                    unresolved: 1,
+                    refused: 0,
+                }
+            } else {
+                SnapshotCounters {
+                    resolved: 1,
+                    unresolved: 0,
+                    refused: 0,
+                }
+            },
+        };
+        assert!(
+            response.validate().is_err(),
+            "snapshot refuses resolved cgroup-zero under {tag}"
+        );
+        // Ingress 3: typed report assembly.
+        let input = kryprobe_report::workload::AssemblyInput {
+            session_id: SESSION.to_string(),
+            kernel_identity: "7.0.0-38-generic/boot-A".to_string(),
+            interval_start_ns: 100,
+            interval_end_ns: 1000,
+            consistency: kryprobe_core::workload::SnapshotConsistency::Quiescent,
+            profile: "api-returns".to_string(),
+            system_total: CountOperand {
+                value: 50,
+                saturated: false,
+                population: "global".to_string(),
+            },
+            per_context_saturated: false,
+            refused_inserts: 0,
+            rows: vec![kryprobe_report::workload::ReportRowInput {
+                context: ContextIdentity::new(7, 0, 1000, 1000, 555, ExecutionKind::Proc),
+                calls: 50,
+                native: kryprobe_report::workload::NativeIdentity::new(
+                    1,
+                    2,
+                    0,
+                    0,
+                    "cbc(aes)",
+                    Some("cbc-aes-aesni"),
+                ),
+                identity: identity.clone(),
+                evidence: evidence.clone(),
+            }],
+            partition: kryprobe_core::workload::ScopePartition::from_counts(50, 0, 0)
+                .expect("valid"),
+            selector: kryprobe_report::workload::WorkloadSelector::None,
+            group_by: kryprobe_report::workload::GroupBy::None,
+            metadata: kryprobe_report::workload::MetadataAvailability::Available,
+            coverage: kryprobe_report::workload::ReportCoverage {
+                capture: kryprobe_report::workload::CoverageLevel::Complete,
+                attribution: kryprobe_report::workload::CoverageLevel::Complete,
+                metadata: kryprobe_report::workload::CoverageLevel::Complete,
+                correlation: kryprobe_report::workload::CoverageLevel::Complete,
+            },
+        };
+        assert!(
+            kryprobe_report::workload::assemble(input).is_err(),
+            "assembly refuses resolved cgroup-zero under {tag}"
+        );
+        // Ingresses 4+5: replay decode and `report FILE`.
+        let mut hostile = f04_fixture_value("asserted-metadata.json");
+        hostile["contexts"][0]["cgroup_id"] = serde_json::json!("0");
+        hostile["contexts"][0]["attribution"]["status"] = serde_json::json!(tag);
+        if status == AttributionStatus::Verified {
+            hostile["contexts"][0]["attribution"]["method"] = serde_json::json!("captured_cgroup");
+            hostile["contexts"][0]["attribution"]["source"] = serde_json::json!("kernel_capture");
+        }
+        let bytes = serde_json::to_vec(&hostile).expect("encodes");
+        assert!(
+            kryprobe_report::workload::report_from_bytes(&bytes).is_err(),
+            "decode refuses resolved cgroup-zero under {tag}"
+        );
+        let (_scratch, path) = f04_stage(&format!("cli-f04-cgroup-zero-{tag}"), &hostile);
+        let (code, stdout, _) = run_cli(&["kryprobe", "report", &path]);
+        assert_eq!(code, 2, "replay refuses resolved cgroup-zero under {tag}");
+        assert!(stdout.is_empty(), "nothing renders on refusal: {stdout}");
+    }
+    // Positive controls: unresolved cgroup-zero passes every typed
+    // ingress and replays; the frozen asserted fixture is untouched.
+    let unresolved = WorkloadObservation {
+        context: ContextIdentity::new(7, 0, 1000, 1000, 555, ExecutionKind::Proc),
+        identity: WorkloadIdentity::none(),
+        evidence: AttributionEvidence::unresolved(Relationship::HookContext),
+    };
+    assert!(unresolved.validate().is_ok());
+    let raw = std::fs::read(f04_fixture_dir().join("unknown-context.json")).expect("ships");
+    kryprobe_report::workload::report_from_bytes(&raw).expect("unresolved cgroup-zero decodes");
+    let path = f04_fixture_dir().join("unknown-context.json");
+    let (code, _, _) = run_cli(&["kryprobe", "report", &path.display().to_string()]);
+    assert_eq!(code, 3, "unresolved cgroup-zero replays");
+    let path = f04_fixture_dir().join("asserted-metadata.json");
+    let (code, _, _) = run_cli(&["kryprobe", "report", &path.display().to_string()]);
+    assert_eq!(code, 0, "asserted fixture keeps replaying");
+}

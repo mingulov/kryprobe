@@ -30,7 +30,9 @@ pub use metadata::{
 };
 pub use observation::WorkloadObservation;
 pub use resolve::{bind_response_to_request, chunk_sequence_complete, resolve};
-pub use scope::{ScopeDecision, ScopePartition};
+pub use scope::{
+    ScopeDecision, ScopePartition, SelectorError, WorkloadSelector, decide_workload_scope,
+};
 pub use snapshot::{
     ChunkInfo, CountOperand, DifferenceError, MetadataUnavailable, QualifiedDifference,
     ResolvedAssociation, ResponseStatus, SnapshotConsistency, SnapshotCounters, SnapshotErrorCode,

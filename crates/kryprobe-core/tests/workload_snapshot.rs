@@ -838,6 +838,66 @@ fn ingress_cgroup_zero_with_identity_refuses() {
     );
 }
 
+/// SEM02 shared invariant, snapshot side: the cgroup-zero refusal holds
+/// for every usable status (verified/asserted/stale), not just the
+/// asserted escape payload above. Positive pin: this already refuses
+/// today and must keep refusing.
+#[test]
+fn snapshot_cgroup_zero_refuses_all_usable_statuses() {
+    let cases = [
+        (
+            AttributionEvidence::verified_kernel_capture(
+                Relationship::HookContext,
+                ValidityInterval::monotonic(500, 2500),
+            ),
+            SnapshotCounters {
+                resolved: 1,
+                unresolved: 0,
+                refused: 0,
+            },
+        ),
+        (
+            AttributionEvidence::new(
+                Relationship::HookContext,
+                METHOD_METADATA_FILE,
+                WorkloadOrigin::OperatorMetadataFile,
+                AttributionStatus::Stale,
+                Some(ValidityInterval::monotonic(500, 2500)),
+            ),
+            SnapshotCounters {
+                resolved: 0,
+                unresolved: 1,
+                refused: 0,
+            },
+        ),
+    ];
+    for (evidence, counters) in cases {
+        assert!(evidence.validate().is_ok(), "usable evidence is coherent");
+        let response = SnapshotResponse {
+            session_id: SESSION.to_string(),
+            kernel_identity: KernelIdentity::Known(KERNEL_A.to_string()),
+            associations: vec![ResolvedAssociation {
+                key: key(KERNEL_A, 0),
+                identity: container_identity(),
+                evidence: evidence.clone(),
+            }],
+            errors: vec![],
+            status: ResponseStatus::Complete,
+            chunk: ChunkInfo::single(),
+            counters,
+        };
+        assert!(
+            response.validate().is_err(),
+            "cgroup-zero with identity refuses under {evidence:?}"
+        );
+        let bytes = serde_json::to_vec(&response).expect("encodes");
+        assert!(
+            kryprobe_core::workload::decode_response(&bytes).is_err(),
+            "cgroup-zero with identity refuses decode under {evidence:?}"
+        );
+    }
+}
+
 /// Receiving-boundary temporal validation: a coherent Asserted reply whose
 /// validity does not cover the request capture interval validates as a
 /// value but refuses binding; a covering reply binds. (Round-3 oracle.)
