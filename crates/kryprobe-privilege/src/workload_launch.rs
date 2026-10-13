@@ -863,14 +863,17 @@ pub struct ServedSnapshot {
 /// records, over-cap records, or malformed records yield `None`
 /// while the valid response keeps its existing meaning. Never
 /// echoes input: the outcome is typed values or absence.
+/// Candidacy is textual (any line carrying the marker counts), so a
+/// truncated emission that no longer decodes still voids the result.
 pub fn parse_helper_diagnostics(stderr_text: &str) -> Option<HelperDiagnostics> {
     let mut record: Option<&str> = None;
     for line in stderr_text.lines() {
-        let candidate = serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .and_then(|value| value.get("helper_counters").cloned())
-            .is_some();
-        if !candidate {
+        // Textual candidacy (P2 wave-e): any stderr line carrying the
+        // marker is a counters emission — including a truncated one
+        // that no longer decodes. JSON-first detection skipped
+        // truncated emissions pre-parse, so valid+truncated evaded
+        // the exactly-one rule and surfaced measured.
+        if !line.contains("helper_counters") {
             continue;
         }
         if record.is_some() {
@@ -2441,6 +2444,27 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_valid_plus_truncated_refuses_both_orders() {
+        // P2 (wave-e): a truncated counters emission is still a
+        // counters emission — valid + truncated in either order is
+        // ambiguous input, never a measurement.
+        let valid = diagnostics_line(&full_counters_value());
+        let truncated = r#"{"helper_counters":{"#;
+        for stderr in [
+            format!("{valid}\n{truncated}\n"),
+            format!("{truncated}\n{valid}\n"),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "valid+truncated refuses: {stderr:?}"
+            );
+        }
+        // A lone truncated emission is not a measurement either.
+        assert_eq!(parse_helper_diagnostics(truncated), None);
+    }
+
+    #[test]
     fn diagnostics_duplicate_keys_refuse() {
         let line = diagnostics_line(&full_counters_value());
         // A repeated counter key (last-wins would silently pick 2).
@@ -3346,6 +3370,45 @@ mod tests {
             assert_eq!(
                 served.diagnostics, None,
                 "malformed record marks unavailable: {counters_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_diagnostics_valid_plus_truncated_marks_unavailable_both_orders() {
+        // P2 (wave-e) at the serve boundary: the helper emits a valid
+        // record plus a truncated counters line (either order) — the
+        // valid response keeps its meaning, diagnostics go unavailable.
+        // The verbatim `counters_line` sidecar carries an embedded
+        // newline, so the fixture emits two stderr lines.
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diagtrunc").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let valid = diagnostics_line(&full_counters_value());
+        let truncated = r#"{"helper_counters":{"#;
+        for (order, counters_line) in [
+            ("valid-first", format!("{valid}\n{truncated}")),
+            ("truncated-first", format!("{truncated}\n{valid}")),
+        ] {
+            let helper = stage_fixture(
+                scratch.path(),
+                &format!("helper-{order}"),
+                serde_json::json!({"canned": "canned.json", "counters_line": counters_line}),
+            );
+            let principal = current_principal().expect("test principal");
+            let served = serve_pinned_snapshot_with_diagnostics(
+                &pin_helper(&helper).expect("pins"),
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10),
+            )
+            .expect("serves");
+            assert_eq!(served.response.session_id, SESSION);
+            assert_eq!(
+                served.diagnostics, None,
+                "valid+truncated marks unavailable ({order})"
             );
         }
     }
