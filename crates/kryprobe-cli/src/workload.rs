@@ -308,6 +308,29 @@ fn split_request_batches(
     batches
 }
 
+/// Report-wide helper-launch budget (I02, PRIV03 option b): at most
+/// this many chunk serves per report. Derivation: request keys are
+/// capped at [`MAX_SNAPSHOT_ASSOCIATIONS`] and every batch carries
+/// at least one key, so legitimate reports never exceed the key
+/// count in chunks — a breach means the key-cap backstop failed and
+/// the finish degrades typed instead of launching unbounded
+/// helpers. Per-chunk attempts stay separately bounded (one initial
+/// attempt plus the frozen retry bound), so report-wide launches
+/// stay under `MAX_REPORT_CHUNKS * (1 + retries)` and unthrottled
+/// scans under `MAX_REPORT_CHUNKS` (one per chunk at most).
+pub const MAX_REPORT_CHUNKS: usize = MAX_SNAPSHOT_ASSOCIATIONS;
+
+/// Check one report's chunk count against [`MAX_REPORT_CHUNKS`]:
+/// within budget is `Ok`, past it is the frozen typed refusal —
+/// the finish folds that into unavailable metadata with zero
+/// launches, never a silent skip and never an error.
+pub fn check_report_chunk_budget(chunk_count: usize) -> Result<(), MetadataUnavailable> {
+    if chunk_count > MAX_REPORT_CHUNKS {
+        return Err(MetadataUnavailable::BudgetExceeded);
+    }
+    Ok(())
+}
+
 /// Helper request keys plus their session binding (the caller adds the
 /// counted capture interval when established).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,12 +756,26 @@ pub fn finish_workload_report(
         let mut failed: Option<MetadataUnavailable> = None;
         if batches.is_empty() {
             failed = Some(MetadataUnavailable::ParseFailed);
+        } else if let Err(breach) = check_report_chunk_budget(batches.len()) {
+            // Report-wide launch budget (I02, PRIV03 option b): past
+            // the bound the whole serve degrades typed with ZERO
+            // launches (the loop below is skipped) — raw-ID rows
+            // plus unavailable metadata, exactly as any other chunk
+            // failure. All-or-nothing preserved: partial chunk
+            // answers never reach the rows.
+            failed = Some(breach);
         }
         // Chunk diagnostics fold checked (overflow saturates with
         // the explicit marker); any chunk without a well-formed
         // record voids the aggregate — a partial sum would mislabel.
         let mut folded: Option<HelperDiagnostics> = Some(HelperDiagnostics::new());
         for request in &batches {
+            // A pre-set failure (empty request or budget breach)
+            // serves nothing: the breach path launches zero
+            // helpers, then folds the typed refusal below.
+            if failed.is_some() {
+                break;
+            }
             match serve_pinned_snapshot_with_diagnostics(
                 &pinned,
                 principal,
@@ -1339,6 +1376,63 @@ mod tests {
         );
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].keys.len(), 3);
+    }
+
+    /// I02 (PRIV03) report-wide launch budget: at most
+    /// [`MAX_REPORT_CHUNKS`] chunk serves per report; the check
+    /// accepts the boundary exactly.
+    #[test]
+    fn report_chunk_budget_accepts_within_max() {
+        assert_eq!(check_report_chunk_budget(0), Ok(()));
+        assert_eq!(check_report_chunk_budget(1), Ok(()));
+        assert_eq!(check_report_chunk_budget(MAX_REPORT_CHUNKS), Ok(()));
+    }
+
+    /// I02 (PRIV03): past the budget the check degrades typed
+    /// ([`MetadataUnavailable::BudgetExceeded`]) — the finish folds
+    /// that into unavailable metadata with zero launches, never a
+    /// silent skip and never an error.
+    #[test]
+    fn report_chunk_budget_refuses_beyond_max() {
+        assert_eq!(
+            check_report_chunk_budget(MAX_REPORT_CHUNKS + 1),
+            Err(MetadataUnavailable::BudgetExceeded)
+        );
+        assert_eq!(
+            check_report_chunk_budget(usize::MAX),
+            Err(MetadataUnavailable::BudgetExceeded)
+        );
+    }
+
+    /// I02 (PRIV03) margin pin: 256 max-size keys (the key-cap worst
+    /// case) split within the report budget — the bound is a
+    /// backstop behind the key cap, never a trip on legitimate
+    /// reports. If key encoding ever grows past this, the pin fails
+    /// loudly here instead of degrading production reports.
+    #[test]
+    fn splitter_256_max_keys_within_report_budget() {
+        let keys: Vec<SnapshotKey> = (0..256u64)
+            .map(|i| SnapshotKey {
+                kernel_scope: "s".repeat(128),
+                cgroup: i,
+                tgid: i as u32,
+                start_ns: i,
+            })
+            .collect();
+        let batches = split_request_batches(
+            "0123456789abcdef0123456789abcdef",
+            keys,
+            SnapshotInterval {
+                start_ns: 100,
+                end_ns: 1000,
+            },
+        );
+        assert!(
+            batches.len() <= MAX_REPORT_CHUNKS,
+            "256 max-size keys split within budget: {}",
+            batches.len()
+        );
+        check_report_chunk_budget(batches.len()).expect("within budget");
     }
 
     #[test]

@@ -743,6 +743,183 @@ fn workload_report_carries_miss_telemetry() {
     );
 }
 
+/// I02 (PRIV03) measurement: ONE cgroup with 120 distinct TGIDs
+/// crosses the 4 KiB request budget, so one report serves several
+/// bounded chunks — each chunk its own helper launch through the real
+/// confinement boundary. Measurement only: pins the current
+/// launches-per-report for the omit-vs-bounded-scheduling decision;
+/// the follow-up track replaces this baseline pin with the selected
+/// budget. No product behavior changes here.
+#[test]
+fn one_cgroup_report_counts_launches_per_chunk() {
+    use kryprobe_core::workload::{SnapshotInterval, SnapshotKey, SnapshotRequest, encode_request};
+    let scratch = kryprobe_testkit::TempDir::named("cli-i02-launches").expect("scratch");
+    // One cgroup, 120 distinct TGID/lifetime triples: under the
+    // 256-count cap, over the byte budget as one request.
+    let keys: Vec<SnapshotKey> = (0..120u64)
+        .map(|i| SnapshotKey {
+            kernel_scope: "test-scope".to_string(),
+            cgroup: 42,
+            tgid: 2000 + i as u32,
+            start_ns: 555,
+        })
+        .collect();
+    let single = SnapshotRequest {
+        session_id: "0123456789abcdef0123456789abcdef".to_string(),
+        keys,
+        capture_interval: Some(SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        }),
+    };
+    assert_eq!(
+        encode_request(&single),
+        Err(kryprobe_core::workload::MetadataUnavailable::BudgetExceeded),
+        "one request would cross the byte budget"
+    );
+    let rows: Vec<JoinedRow> = single
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(n, key)| joined_row(n as u64, key.cgroup, key.tgid, 1, "cbc(aes)"))
+        .collect();
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"echo_unresolved": true, "count": "count"}),
+    );
+    let mut outcome = finish_outcome(launchable_preflight(&helper));
+    outcome.workload_capture = Some(WorkloadCapture {
+        rows,
+        system_total: 120,
+        system_saturated: false,
+        refused_inserts: 0,
+        interval_start_ns: 100,
+        interval_end_ns: 1000,
+    });
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(
+        finished.report.metadata,
+        kryprobe_report::workload::MetadataAvailability::Available,
+        "one-cgroup multi-chunk workload resolves"
+    );
+    let serves = std::fs::read_to_string(scratch.path().join("count"))
+        .expect("serves counted")
+        .lines()
+        .count();
+    assert!(serves > 1, "more than one bounded request served: {serves}");
+    assert_eq!(finished.rows.len(), 120);
+    assert!(
+        finished.rows.iter().all(
+            |row| row.evidence.status == kryprobe_core::workload::AttributionStatus::Unresolved
+        ),
+        "echo answers every row unresolved"
+    );
+    eprintln!(
+        "I02_CLI_MEASUREMENT {}",
+        serde_json::json!({
+            "keys": 120,
+            "cgroups": 1,
+            "launches": serves,
+            "rows_answered": finished.rows.len(),
+        })
+    );
+}
+
+/// I02 (PRIV03) option (b): the measured one-cgroup shape stays
+/// within the report-wide launch budget, and the F07 typed
+/// per-chunk diagnostics fold into the exact expected aggregate —
+/// launches bounded, useful attribution unchanged (echo answers
+/// every row unresolved, metadata available).
+#[test]
+fn report_pins_launch_budget_with_typed_diagnostics() {
+    use kryprobe_cli::workload::MAX_REPORT_CHUNKS;
+    use kryprobe_core::workload::{SnapshotInterval, SnapshotKey, SnapshotRequest};
+    use kryprobe_privilege::workload_launch::HelperDiagnostics;
+    let scratch = kryprobe_testkit::TempDir::named("cli-i02-budget").expect("scratch");
+    // One cgroup, 120 distinct TGID/lifetime triples: under the
+    // 256-count cap, over the byte budget as one request.
+    let keys: Vec<SnapshotKey> = (0..120u64)
+        .map(|i| SnapshotKey {
+            kernel_scope: "test-scope".to_string(),
+            cgroup: 42,
+            tgid: 2000 + i as u32,
+            start_ns: 555,
+        })
+        .collect();
+    let single = SnapshotRequest {
+        session_id: "0123456789abcdef0123456789abcdef".to_string(),
+        keys,
+        capture_interval: Some(SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        }),
+    };
+    let rows: Vec<JoinedRow> = single
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(n, key)| joined_row(n as u64, key.cgroup, key.tgid, 1, "cbc(aes)"))
+        .collect();
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({
+            "echo_unresolved": true,
+            "count": "count",
+            "counters": f07_counters(),
+        }),
+    );
+    let mut outcome = finish_outcome(launchable_preflight(&helper));
+    outcome.workload_capture = Some(WorkloadCapture {
+        rows,
+        system_total: 120,
+        system_saturated: false,
+        refused_inserts: 0,
+        interval_start_ns: 100,
+        interval_end_ns: 1000,
+    });
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(
+        finished.report.metadata,
+        kryprobe_report::workload::MetadataAvailability::Available,
+        "one-cgroup multi-chunk workload resolves"
+    );
+    let launches = std::fs::read_to_string(scratch.path().join("count"))
+        .expect("serves counted")
+        .lines()
+        .count();
+    // Measured scheduling pinned: 3 chunks, 3 launches — and the
+    // launches stay within the report-wide budget.
+    assert_eq!(launches, 3, "one launch per chunk");
+    assert!(
+        launches <= MAX_REPORT_CHUNKS,
+        "launches within report budget: {launches} <= {MAX_REPORT_CHUNKS}"
+    );
+    // Typed per-chunk diagnostics (F07) fold exactly: every chunk
+    // measured the canned counters, so the aggregate is the
+    // three-fold checked sum.
+    let chunk = HelperDiagnostics {
+        positive_misses: 1,
+        denied: 1,
+        migration_skipped: 1,
+        ..HelperDiagnostics::new()
+    };
+    let mut expected = HelperDiagnostics::new();
+    expected.accumulate(&chunk);
+    expected.accumulate(&chunk);
+    expected.accumulate(&chunk);
+    assert_eq!(finished.diagnostics, Some(expected));
+    // No attribution change: echo answers every row unresolved.
+    assert_eq!(finished.rows.len(), 120);
+    assert!(
+        finished.rows.iter().all(
+            |row| row.evidence.status == kryprobe_core::workload::AttributionStatus::Unresolved
+        ),
+        "echo answers every row unresolved"
+    );
+}
+
 /// Helper crash at CLI level: the serve retries, then the finish
 /// degrades to raw-ID rows plus typed unavailability — data, never
 /// an error (enrichment cannot stall capture).
