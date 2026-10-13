@@ -649,6 +649,25 @@ class MLegValidityTests(unittest.TestCase):
                                        self._manifest())
         self.assertTrue(out["valid"], out.get("reasons"))
 
+    def test_m_duplicate_ctx_keeps_last_wins_off_v3(self):
+        # F08 frozen pin: off the v3 successor epoch the M
+        # route keeps frozen last-wins ctx (strict
+        # one-terminal ctx is a v3 successor rule only).
+        first = _ctx(7, 1, 999, 0, 0)
+        cell = self._m_cell(_wreport(), first)
+        line = ("kryprobe: telemetry "
+                + json.dumps({"v": 1,
+                              "ctx": _ctx(3, 100, 100, 0, 0)})
+                + "\n")
+        with open(cell / "legs" / "leg00B-capture.stderr.log",
+                  "a") as fh:
+            fh.write(line)
+        out = CLI.apply_m1_ctx_overlay(cell, self._judged(),
+                                       self._leg(), self._entry("M"),
+                                       self._manifest())
+        self.assertTrue(out["valid"], out.get("reasons"))
+        self.assertEqual(out["ctx"]["rows"], 3)
+
 
 class MEvidenceTests(unittest.TestCase):
     """G6: per-leg M-active proof (sealed launch audit)."""

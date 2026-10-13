@@ -344,6 +344,193 @@ class MissTelemetryTests(unittest.TestCase):
             succ.parse_miss_telemetry(path)
 
 
+GOOD_CTX_LINE = ('kryprobe: telemetry {"v":1,"ctx":{"rows":192,'
+                 '"present_calls":200,"system_calls":200,'
+                 '"unknown_calls":0,"drops":0}}\n')
+BAD_CTX_LINE = ('kryprobe: telemetry {"v":1,"ctx":{"rows":7,'
+                '"present_calls":1,"system_calls":999,'
+                '"unknown_calls":0,"drops":0}}\n')
+
+
+class CtxStrictTelemetryTests(unittest.TestCase):
+    """F08 (QUAL-02): v3-only strict one-terminal ctx parser.
+
+    The frozen ``m1validity.parse_ctx_telemetry`` last-wins
+    repeated objects and skips malformed lines by design (its
+    ``test_happy_path_last_wins`` pin stays green); the
+    successor path instead requires exactly one valid terminal
+    ctx object, an honest version, and unsigned/null counters.
+    """
+
+    def test_valid_terminal_control(self):
+        # One valid terminal among noise, a tick line, and a
+        # miss line parses to exactly the five ctx counters.
+        content = ("noise\n"
+                   'kryprobe: telemetry {"v":1,"tick":3}\n'
+                   + GOOD_CTX_LINE + K6_1_MISS_LINE)
+        ctx = succ.parse_ctx_telemetry_strict(write_tmp(content))
+        self.assertEqual(ctx, {"rows": 192, "present_calls": 200,
+                               "system_calls": 200, "unknown_calls": 0,
+                               "drops": 0})
+
+    def test_nulls_allowed(self):
+        # An unreadable walk (all null) still parses — the
+        # downstream ctx rules name the unreadable operands.
+        line = ('kryprobe: telemetry {"v":1,"ctx":{"rows":null,'
+                '"present_calls":null,"system_calls":null,'
+                '"unknown_calls":null,"drops":null}}\n')
+        ctx = succ.parse_ctx_telemetry_strict(write_tmp(line))
+        self.assertIsNone(ctx["rows"])
+        self.assertIsNone(ctx["drops"])
+
+    def test_identical_duplicate_terminals_refuse(self):
+        # Even byte-identical repetition is a contradictory
+        # receipt: the product prints one terminal object.
+        path = write_tmp(GOOD_CTX_LINE + GOOD_CTX_LINE)
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_contradictory_terminals_both_orders_refuse(self):
+        # QUAL-02 repro order (bad then good) and its mirror:
+        # neither direction may silently last-win.
+        for content in (BAD_CTX_LINE + GOOD_CTX_LINE,
+                        GOOD_CTX_LINE + BAD_CTX_LINE):
+            path = write_tmp(content)
+            with self.assertRaises(ValueError, msg=content[:60]):
+                succ.parse_ctx_telemetry_strict(path)
+
+    def test_malformed_ctx_then_valid_refuses(self):
+        # A malformed ctx line is never skipped as absent —
+        # it refuses even beside a valid terminal.
+        path = write_tmp('kryprobe: telemetry {"v":1,"ctx":\n'
+                         + GOOD_CTX_LINE)
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_any_malformed_telemetry_line_refuses(self):
+        # Every prefixed line must parse strictly (misses
+        # convention): truncated/escaped forms included.
+        for bad in ('kryprobe: telemetry {"v":1,"ctx":{"rows":\n',
+                     'kryprobe: telemetry {"v":1,'
+                     '"\\u0063tx":{"rows":1}\n'):
+            path = write_tmp(GOOD_CTX_LINE + bad)
+            with self.assertRaises(ValueError, msg=bad[:40]):
+                succ.parse_ctx_telemetry_strict(path)
+
+    def test_bool_counter_refuses(self):
+        # True == 1 in Python — counters must be real ints.
+        for bad_key, bad_val in (("rows", True),
+                                 ("drops", False),
+                                 ("present_calls", True)):
+            line = GOOD_CTX_LINE.replace(
+                f'"{bad_key}":' +
+                ("192" if bad_key == "rows"
+                 else "200" if "calls" in bad_key else "0"),
+                f'"{bad_key}":' +
+                ("true" if bad_val else "false"), 1)
+            path = write_tmp(line)
+            with self.assertRaises(ValueError,
+                                   msg=f"{bad_key}={bad_val!r}"):
+                succ.parse_ctx_telemetry_strict(path)
+
+    def test_negative_and_oversized_counter_refuse(self):
+        for bad_val in (-1, 2 ** 64):
+            line = GOOD_CTX_LINE.replace('"rows":192',
+                                         f'"rows":{bad_val}', 1)
+            path = write_tmp(line)
+            with self.assertRaises(ValueError,
+                                   msg=f"rows={bad_val!r}"):
+                succ.parse_ctx_telemetry_strict(path)
+
+    def test_float_and_string_counter_refuse(self):
+        for bad_val in ("1.5", '"200"'):
+            line = GOOD_CTX_LINE.replace('"system_calls":200',
+                                         f'"system_calls":{bad_val}',
+                                         1)
+            path = write_tmp(line)
+            with self.assertRaises(ValueError,
+                                   msg=f"system_calls={bad_val}"):
+                succ.parse_ctx_telemetry_strict(path)
+
+    def test_bool_version_refuses(self):
+        path = write_tmp(GOOD_CTX_LINE.replace('{"v":1,',
+                                               '{"v":true,', 1))
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_unknown_version_ctx_refuses(self):
+        # A ctx-bearing line with v != 1 refuses (miss
+        # convention) — it must not read as absent.
+        for version in ("2", "0", '"1"', "1.0", "null"):
+            line = GOOD_CTX_LINE.replace('{"v":1,',
+                                         '{"v":%s,' % version, 1)
+            path = write_tmp(line)
+            with self.assertRaises(ValueError,
+                                   msg=f"v={version!r}"):
+                succ.parse_ctx_telemetry_strict(path)
+
+    def test_unknown_version_without_ctx_skipped(self):
+        # Non-ctx lines keep miss-parser routing: a wrong
+        # version without a ctx member is not ctx evidence.
+        content = ('kryprobe: telemetry {"v":2,"tick":9}\n'
+                   + GOOD_CTX_LINE)
+        ctx = succ.parse_ctx_telemetry_strict(write_tmp(content))
+        self.assertEqual(ctx["rows"], 192)
+
+    def test_missing_ctx_refuses(self):
+        content = ('kryprobe: telemetry {"v":1,"tick":1}\n'
+                   + K6_1_MISS_LINE)
+        path = write_tmp(content)
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_null_ctx_object_refuses(self):
+        path = write_tmp(GOOD_CTX_LINE
+                         + 'kryprobe: telemetry {"v":1,'
+                         '"ctx":null}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_non_dict_ctx_refuses(self):
+        path = write_tmp('kryprobe: telemetry {"v":1,'
+                         '"ctx":[1,2]}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_missing_counter_key_refuses(self):
+        line = GOOD_CTX_LINE.replace('"drops":0', '"dropped":0', 1)
+        path = write_tmp(line)
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_escaped_ctx_key_counts_as_terminal(self):
+        # Detection runs on the decoded object: an escaped
+        # "\\u0063tx" key decodes to "ctx", so a lone escaped
+        # terminal parses and an escaped+plain pair refuses.
+        lone = GOOD_CTX_LINE.replace('"ctx":', '"\\u0063tx":', 1)
+        ctx = succ.parse_ctx_telemetry_strict(write_tmp(lone))
+        self.assertEqual(ctx["rows"], 192)
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(
+                write_tmp(GOOD_CTX_LINE + lone))
+
+    def test_duplicate_json_members_refuse(self):
+        # Default decoding lets a second "rows" member
+        # overwrite the first — duplicates refuse instead.
+        path = write_tmp(
+            'kryprobe: telemetry {"v":1,"ctx":{"rows":7,'
+            '"rows":192,"present_calls":200,"system_calls":200,'
+            '"unknown_calls":0,"drops":0}}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+    def test_nan_ctx_refuses(self):
+        path = write_tmp(
+            'kryprobe: telemetry {"v":1,"ctx":NaN}\n')
+        with self.assertRaises(ValueError):
+            succ.parse_ctx_telemetry_strict(path)
+
+
 class SuccessorLegTests(unittest.TestCase):
     def leg(self, **over):
         args = {"observed": K6_1["observed"], "truth": K6_1["truth"],

@@ -1957,9 +1957,27 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
     legs_dir = cell_dir / "legs"
     stderr_log = legs_dir / f"{leg['leg_id']}-capture.stderr.log"
     if obs == "R":
+        # F08 (QUAL-02): on v3 pairs, R-side ctx evidence
+        # parses strictly -- a malformed/duplicate ctx
+        # terminal is an anomaly, never silent absence. Only
+        # genuine absence (no ctx object at all) reaches the
+        # D2 miss-surface checks below. The endswith match
+        # keeps a hostile ctx value echoing the absence
+        # phrase fail-closed.
+        strict_r = manifest.get("manifest_version") == 3 and \
+            entry.get("kind") == "m1-pairs"
+        parse_ctx = ksucc.parse_ctx_telemetry_strict if strict_r \
+            else km1validity.parse_ctx_telemetry
         try:
-            km1validity.parse_ctx_telemetry(stderr_log)
-        except ValueError:
+            parse_ctx(stderr_log)
+        except ValueError as err:
+            if strict_r and not str(err).endswith(
+                    "no ctx telemetry object"):
+                judged["valid"] = False
+                judged["outcome"] = "invalid"
+                judged["reasons"] = judged.get("reasons", []) + [
+                    f"successor R-side ctx evidence: {err}"]
+                return judged
             # A12 D2: R keeps frozen per-op exactness (already
             # judged in the chain) — never the truth equation.
             # But any present R-side miss surface invalidates:
@@ -2023,8 +2041,14 @@ def apply_m1_ctx_overlay(cell_dir: Path, judged: dict, leg: dict,
             "C leg carries a workload-json report (artifact mixup: "
             "M staged as C?)"]
         return judged
+    # F08 (QUAL-02): successor-epoch legs require exactly one
+    # valid terminal ctx object -- the frozen parser last-wins
+    # by design and stays pinned off the v3 epoch.
+    parse_ctx = ksucc.parse_ctx_telemetry_strict \
+        if _successor_leg(manifest, leg, entry) \
+        else km1validity.parse_ctx_telemetry
     try:
-        ctx = km1validity.parse_ctx_telemetry(stderr_log)
+        ctx = parse_ctx(stderr_log)
     except ValueError as err:
         judged["valid"] = False
         judged["outcome"] = "invalid"
@@ -2103,8 +2127,13 @@ def apply_m1_m_overlay(cell_dir: Path, judged: dict, leg: dict,
         judged["reasons"] = judged.get("reasons", []) + reasons
         return judged
     stderr_log = legs_dir / f"{leg_id}-capture.stderr.log"
+    # F08 (QUAL-02): same strict one-terminal ctx rule as the
+    # C successor route -- frozen last-wins stays pinned off v3.
+    parse_ctx = ksucc.parse_ctx_telemetry_strict \
+        if _successor_leg(manifest, leg, entry) \
+        else km1validity.parse_ctx_telemetry
     try:
-        ctx = km1validity.parse_ctx_telemetry(stderr_log)
+        ctx = parse_ctx(stderr_log)
     except ValueError as err:
         judged["valid"] = False
         judged["outcome"] = "invalid"
