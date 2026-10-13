@@ -47,7 +47,8 @@ pub use snapshot_drops::{
 };
 pub use snapshot_misses::{
     AggProgMissAbs, AggProgMissDelta, MissError, MissTerminal, join_agg_miss_deltas,
-    miss_sections_for_object, snapshot_agg_misses,
+    miss_sections_for_object, miss_terminal_from_join, miss_terminal_no_baseline,
+    run_bringup_with_baseline, snapshot_agg_misses,
 };
 pub use snapshot_who::{WhoCache, WhoJoins, WhoSnapshot, snapshot_who, snapshot_who_cached};
 // 1A-M10: unit-test-only helpers (the tests mod stayed whole in
@@ -67,7 +68,7 @@ use std::os::fd::AsRawFd;
 use crate::bpfloader::PointStatus;
 use crate::btf_resolve::{
     AttachOutcome, BtfError, ConfiguredError, ConfiguredKcrypto, ConfiguredPoint, KCRYPTO_SYMBOLS,
-    load_kcrypto_configured, resolve_btf_ids,
+    StagedKcrypto, attach_kcrypto_staged, load_kcrypto_staged, resolve_btf_ids,
 };
 use crate::kcrypto_lifecycle::profile::{LifecycleProfile, SessionGuard, acquire_kcrypto_session};
 #[cfg(test)]
@@ -516,15 +517,27 @@ impl Backend for KCryptoBackend {
         let token_fd = staged.token.as_ref().map(File::as_raw_fd);
         let started_ns = crate::host::monotonic_ns()
             .map_err(|err| session::protocol("kcrypto_attach_clock", &err.to_string()))?;
-        let (sensor, _points) =
-            load_kcrypto_configured(&bytes, token_fd).map_err(configured_error_to_backend)?;
-        // Miss-telemetry labels + attach-time baseline (M1 Stage 1):
-        // sections come from the actually loaded bytes (single parse,
-        // no loader-knowledge duplication); the baseline read is
-        // fail-soft — an unreadable counter yields unavailable
-        // telemetry, never a failed configure.
+        // Miss-telemetry labels (M1 Stage 1): sections come from
+        // the actually loaded bytes (single parse, no
+        // loader-knowledge duplication).
         let miss_sections = miss_sections_for_object(&bytes).unwrap_or_default();
-        let miss_baseline = snapshot_agg_misses(&sensor.loaded.progs, &miss_sections).ok();
+        // Staged bring-up through the F03 sequencing seam (BPF1):
+        // load (unattached) → baseline-read → attach. The baseline
+        // reads the loaded-but-unattached programs — before
+        // fence-open and the first attach, so no admitted execution
+        // precedes it and bring-up misses share the capture's start.
+        // Fail-soft — an unreadable counter yields unavailable
+        // telemetry, never a failed configure.
+        // (`loader`, not `staged`: the `StagedBringup` inputs above
+        // hold the borrowed token file open across the load — a
+        // shadow here would close it mid-bring-up.)
+        let loader = load_kcrypto_staged(&bytes, token_fd).map_err(configured_error_to_backend)?;
+        let ((sensor, _points), miss_baseline) = run_bringup_with_baseline(
+            loader,
+            |loader: &StagedKcrypto| snapshot_agg_misses(&loader.loaded.progs, &miss_sections).ok(),
+            attach_kcrypto_staged,
+        )
+        .map_err(configured_error_to_backend)?;
         // Charge only after the load succeeds (a failed configure charges
         // nothing); the sensor stashes only after the charges land, so a
         // refused charge drops the fresh sensor and leaves state unconfigured.

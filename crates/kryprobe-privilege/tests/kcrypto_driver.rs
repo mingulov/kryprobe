@@ -1967,3 +1967,67 @@ fn decode_snapshot_totals_via_parse(snap: &SnapshotRows) -> VAgg {
         _ => panic!("totals bytes decoded off-kind"),
     }
 }
+
+#[test]
+fn driver_bringup_misses_share_admission_interval() {
+    use kryprobe_privilege::kcrypto_backend::{
+        AggProgMissAbs, MissTerminal, join_agg_miss_deltas, miss_terminal_from_join,
+        run_bringup_with_baseline,
+    };
+    use std::cell::RefCell;
+
+    // Driver-level F03/BPF1 oracle: the PUBLIC bring-up sequencing +
+    // join + terminal mapping over two scripted programs. The
+    // bring-up window injects 5 guard misses (one program) plus known
+    // admitted calls (both), with no later misses; the terminal must
+    // count the five or declare unavailability — never measured zero.
+    // (The pre-F03 attach-then-baseline order fails this.)
+    const SECTIONS: [(&str, u32); 2] = [("fexit/enc", 41), ("fexit/dec", 42)];
+    let snap = |kernel: &RefCell<Vec<(u64, u64, u64)>>| {
+        let got = kernel.borrow();
+        SECTIONS
+            .iter()
+            .zip(got.iter())
+            .map(|((section, id), (misses, run, _))| AggProgMissAbs {
+                section: section.to_string(),
+                program_id: *id,
+                misses: *misses,
+                run_cnt: *run,
+                stats_enabled: Some(false),
+            })
+            .collect::<Vec<_>>()
+    };
+    let kernel = RefCell::new(vec![(0u64, 0u64, 0u64); 2]);
+    let (sensor, baseline) = run_bringup_with_baseline(
+        &kernel,
+        |staged: &&RefCell<Vec<(u64, u64, u64)>>| Some(snap(staged)),
+        |staged: &RefCell<Vec<(u64, u64, u64)>>| -> Result<_, std::convert::Infallible> {
+            let mut got = staged.borrow_mut();
+            got[0].0 += 5;
+            got[0].1 += 11;
+            got[0].2 += 11;
+            got[1].1 += 13;
+            got[1].2 += 13;
+            Ok(staged)
+        },
+    )
+    .expect("scripted bring-up");
+    let current = snap(sensor);
+    let admitted: u64 = sensor.borrow().iter().map(|k| k.2).sum();
+    assert_eq!(admitted, 24, "window must admit known calls");
+    let terminal = miss_terminal_from_join(join_agg_miss_deltas(
+        baseline.as_ref().expect("baseline read"),
+        &current,
+    ));
+    match terminal {
+        MissTerminal::Available(deltas) => {
+            assert_eq!(deltas.len(), 2, "both programs join");
+            let total: u64 = deltas.iter().map(|d| d.miss_delta).sum();
+            assert_eq!(
+                total, 5,
+                "bring-up misses must be counted, got measured {total}"
+            );
+        }
+        MissTerminal::Unavailable { reason } => assert!(!reason.is_empty()),
+    }
+}
