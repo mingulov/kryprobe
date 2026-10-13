@@ -1023,9 +1023,10 @@ mod tests {
         let start = NOW;
         let tripped = start + HELPER_REQUEST_TIMEOUT_NS + 1;
         // 1 request now + 2 pid pre-checks + 1 pre-scan + 1 pre-walk + 1
-        // loop-top + 2 confirm checks: live. Post-scan read: crossed.
+        // loop-top + 1 pre-sort collection gate + 2 confirm checks: live.
+        // Post-scan read: crossed.
         let clock = ScriptedClock::new(vec![
-            start, start, start, start, start, start, start, start, tripped,
+            start, start, start, start, start, start, start, start, start, tripped,
         ]);
         let keys = vec![key(asserted_cgroup, 4240), key(a, 4242), key(b, 4243)];
         let response = resolver

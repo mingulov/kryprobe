@@ -35,7 +35,16 @@ use std::path::{Path, PathBuf};
 pub trait ScanFs {
     /// List a directory's children in sorted order, preserving per-entry
     /// errors (a racy child refuses typed, never silently dropped).
-    fn read_dir_sorted(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>;
+    /// Consults `deadline` while collecting (every 64 entries) and once
+    /// more before sorting; an expired deadline refuses with an
+    /// [`std::io::ErrorKind::TimedOut`] I/O error (mapped to
+    /// [`HostReadError::DeadlineExceeded`] at the call site) instead of
+    /// collecting or sorting further.
+    fn read_dir_sorted(
+        &self,
+        dir: &Path,
+        deadline: &dyn Fn() -> bool,
+    ) -> std::io::Result<Vec<std::io::Result<PathBuf>>>;
 
     /// Metadata without following a trailing symlink.
     fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata>;
@@ -50,7 +59,11 @@ pub trait ScanFs {
 pub struct RealFs;
 
 impl ScanFs for RealFs {
-    fn read_dir_sorted(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+    fn read_dir_sorted(
+        &self,
+        dir: &Path,
+        deadline: &dyn Fn() -> bool,
+    ) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
         let mut entries: Vec<std::io::Result<PathBuf>> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             if entries.len() >= MAX_SCAN_LISTING {
@@ -63,6 +76,27 @@ impl ScanFs for RealFs {
                 ));
             }
             entries.push(entry.map(|e| e.path()));
+            // Wide listings re-check the deadline as they collect, so an
+            // expired deadline stops collection within one slice instead
+            // of sweeping every child before any gate runs.
+            if entries
+                .len()
+                .is_multiple_of(COLLECTION_DEADLINE_CHECK_EVERY_ENTRIES)
+                && deadline()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "directory listing collection crossed the deadline",
+                ));
+            }
+        }
+        // Refuse before sorting: an expired deadline skips the sort
+        // entirely rather than ordering a listing that will be refused.
+        if deadline() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "directory listing collection crossed the deadline",
+            ));
         }
         entries.sort_by(|a, b| match (a, b) {
             (Ok(left), Ok(right)) => left.cmp(right),
@@ -109,6 +143,13 @@ pub const MAX_SCAN_LISTING: usize = 65_536;
 /// Entries examined between in-scan deadline checks (the per-directory
 /// check plus this cadence bound post-deadline work to one slice).
 const DEADLINE_CHECK_EVERY_ENTRIES: u64 = 256;
+
+/// Entries collected between in-collection deadline checks inside
+/// [`ScanFs::read_dir_sorted`] (plus one check before sorting, so the
+/// sort never runs post-deadline). Tighter than the examination
+/// cadence, so a wide listing stops well within one examination slice
+/// past expiry.
+const COLLECTION_DEADLINE_CHECK_EVERY_ENTRIES: usize = 64;
 
 /// Per-scan work budget: entries examined plus directories queued, each
 /// capped (see [`MAX_SCAN_ENTRIES_EXAMINED`], [`MAX_SCAN_QUEUED_DIRS`]).
@@ -240,8 +281,8 @@ pub enum HostReadError {
     /// A scan/read budget was exceeded.
     BudgetExceeded,
     /// The request deadline crossed mid-scan (explicit trip/refusal path;
-    /// checked before the walk, per directory, during long enumerations,
-    /// and before confirming candidates).
+    /// checked before the walk, per directory, during listing collection
+    /// and long enumerations, and before confirming candidates).
     DeadlineExceeded,
     /// The host view is unusable (missing roots, cgroup v1-only, …).
     Unsupported,
@@ -430,9 +471,10 @@ impl HostView {
     /// the walk never leaves the root device.
     ///
     /// The walk is bounded three ways, checked in this order: the request
-    /// `deadline` predicate (before the walk, per directory, during long
-    /// enumerations, and before confirming candidates — trips refuse
-    /// typed [`HostReadError::DeadlineExceeded`]), the per-scan
+    /// `deadline` predicate (before the walk, per directory, during
+    /// listing collection and long enumerations, and before confirming
+    /// candidates — trips refuse typed [`HostReadError::DeadlineExceeded`]),
+    /// the per-scan
     /// [`ScanBudget`] (entries examined and directories queued, charged
     /// before the work — trips refuse [`HostReadError::BudgetExceeded`]),
     /// and the visited-directory backstop ([`MAX_CGROUP_SCAN_DIRS`]).
@@ -484,7 +526,7 @@ impl HostView {
                 counters.note_host_error(&err);
                 return Err(err);
             }
-            let entries = match fs.read_dir_sorted(&dir) {
+            let entries = match fs.read_dir_sorted(&dir, deadline) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     counters.note_host_error(&HostReadError::GoneDuringScan);
@@ -499,6 +541,14 @@ impl HostView {
                     // budget refusal, never a silent truncation.
                     counters.note_host_error(&HostReadError::BudgetExceeded);
                     return Err(HostReadError::BudgetExceeded);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Collection crossed the deadline mid-listing: a
+                    // deadline refusal, never a silent truncation.
+                    // (Local directory iteration never times out on its
+                    // own; this kind only signals the collection gate.)
+                    counters.note_host_error(&HostReadError::DeadlineExceeded);
+                    return Err(HostReadError::DeadlineExceeded);
                 }
                 Err(_) => {
                     counters.note_host_error(&HostReadError::Invalid);
@@ -818,9 +868,13 @@ mod tests {
     }
 
     impl ScanFs for CountingFs {
-        fn read_dir_sorted(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+        fn read_dir_sorted(
+            &self,
+            dir: &Path,
+            deadline: &dyn Fn() -> bool,
+        ) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
             Self::bump(&self.read_dirs);
-            self.inner.read_dir_sorted(dir)
+            self.inner.read_dir_sorted(dir, deadline)
         }
 
         fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
@@ -1106,7 +1160,18 @@ mod tests {
             fn read_dir_sorted(
                 &self,
                 _dir: &Path,
+                deadline: &dyn Fn() -> bool,
             ) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+                // Mirror `RealFs` precedence: an expired deadline preempts
+                // the listing (a 65k listing trips the 64-entry collection
+                // gate long before the quota). The test's live deadline
+                // still reaches the quota refusal below.
+                if deadline() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "directory listing collection crossed the deadline",
+                    ));
+                }
                 Err(std::io::Error::new(
                     std::io::ErrorKind::QuotaExceeded,
                     "listing exceeds scan bound",
@@ -1138,6 +1203,109 @@ mod tests {
         assert_eq!(outcome, Err(HostReadError::BudgetExceeded));
         assert_eq!(counters.scan_budget_trips, 1);
         assert_eq!(budget.entries_examined(), 0, "nothing examined");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2 oracle: the deadline is honored DURING listing collection,
+    /// not only during examination. A 5000-entry listing whose clock
+    /// expires after the 10th collected entry must stop promptly:
+    /// post-expiry collection stays within one slice, refusing typed
+    /// [`HostReadError::DeadlineExceeded`] (deadline counter exactly 1).
+    /// Regression for the review P2 (codex oracle: 4990 entries
+    /// collected post-expiry).
+    #[test]
+    fn scan_deadline_stops_mid_listing_collection() {
+        /// Deterministic wide listing: yields `total` synthetic
+        /// children, counting every push, so the test measures
+        /// collection work itself — not just the examined prefix.
+        /// Mirrors `RealFs` exactly (quota cap, 64-entry collection
+        /// gate, pre-sort gate, then sort).
+        struct ExpiringListFs {
+            total: usize,
+            collected: std::cell::Cell<usize>,
+        }
+
+        impl ExpiringListFs {
+            fn new(total: usize) -> Self {
+                Self {
+                    total,
+                    collected: std::cell::Cell::new(0),
+                }
+            }
+        }
+
+        impl ScanFs for ExpiringListFs {
+            fn read_dir_sorted(
+                &self,
+                dir: &Path,
+                deadline: &dyn Fn() -> bool,
+            ) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+                let mut entries: Vec<std::io::Result<PathBuf>> = Vec::new();
+                for i in 0..self.total {
+                    if entries.len() >= MAX_SCAN_LISTING {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::QuotaExceeded,
+                            "directory listing exceeds scan bound",
+                        ));
+                    }
+                    entries.push(Ok(dir.join(format!("entry-{i:05}"))));
+                    self.collected.set(self.collected.get().saturating_add(1));
+                    if entries
+                        .len()
+                        .is_multiple_of(COLLECTION_DEADLINE_CHECK_EVERY_ENTRIES)
+                        && deadline()
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "directory listing collection crossed the deadline",
+                        ));
+                    }
+                }
+                if deadline() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "directory listing collection crossed the deadline",
+                    ));
+                }
+                entries.sort_by(|a, b| match (a, b) {
+                    (Ok(left), Ok(right)) => left.cmp(right),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+                });
+                Ok(entries)
+            }
+
+            fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+                RealFs.symlink_metadata(path)
+            }
+
+            fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+                RealFs.metadata(path)
+            }
+        }
+
+        let dir = scratch("listing-deadline");
+        let root = dir.join("cgroup");
+        mkdir(&root);
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let mut budget = ScanBudget::new();
+        let fs = ExpiringListFs::new(5000);
+        // The clock expires once 10 entries have been collected —
+        // mid-listing for a 5000-entry directory.
+        let outcome = view.find_cgroups(&[u64::MAX - 11], &mut counters, &fs, &mut budget, &|| {
+            fs.collected.get() >= 10
+        });
+        let collected = fs.collected.get();
+        let post_expiry = collected.saturating_sub(10);
+        assert_eq!(outcome, Err(HostReadError::DeadlineExceeded));
+        assert_eq!(counters.deadline_trips, 1);
+        assert_eq!(counters.scan_budget_trips, 0);
+        assert!(
+            post_expiry <= DEADLINE_CHECK_EVERY_ENTRIES as usize,
+            "collection must stop within one slice past expiry, collected {collected} (post-expiry {post_expiry})"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
