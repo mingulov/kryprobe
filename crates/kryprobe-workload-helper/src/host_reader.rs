@@ -1206,105 +1206,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P2 oracle: the deadline is honored DURING listing collection,
-    /// not only during examination. A 5000-entry listing whose clock
-    /// expires after the 10th collected entry must stop promptly:
-    /// post-expiry collection stays within one slice, refusing typed
-    /// [`HostReadError::DeadlineExceeded`] (deadline counter exactly 1).
+    /// P2 oracle: the deadline is honored DURING `RealFs` listing
+    /// collection, not only during examination. A 5000-entry live
+    /// directory plus a call-counting predicate proves the production
+    /// gate itself runs — this test drives `RealFs` directly, never a
+    /// reimplementation, so removing the production periodic check
+    /// fails it (see `evidence/.../red-mutant-new-oracle.log`).
     /// Regression for the review P2 (codex oracle: 4990 entries
     /// collected post-expiry).
     #[test]
     fn scan_deadline_stops_mid_listing_collection() {
-        /// Deterministic wide listing: yields `total` synthetic
-        /// children, counting every push, so the test measures
-        /// collection work itself — not just the examined prefix.
-        /// Mirrors `RealFs` exactly (quota cap, 64-entry collection
-        /// gate, pre-sort gate, then sort).
-        struct ExpiringListFs {
-            total: usize,
-            collected: std::cell::Cell<usize>,
-        }
-
-        impl ExpiringListFs {
-            fn new(total: usize) -> Self {
-                Self {
-                    total,
-                    collected: std::cell::Cell::new(0),
-                }
-            }
-        }
-
-        impl ScanFs for ExpiringListFs {
-            fn read_dir_sorted(
-                &self,
-                dir: &Path,
-                deadline: &dyn Fn() -> bool,
-            ) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
-                let mut entries: Vec<std::io::Result<PathBuf>> = Vec::new();
-                for i in 0..self.total {
-                    if entries.len() >= MAX_SCAN_LISTING {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::QuotaExceeded,
-                            "directory listing exceeds scan bound",
-                        ));
-                    }
-                    entries.push(Ok(dir.join(format!("entry-{i:05}"))));
-                    self.collected.set(self.collected.get().saturating_add(1));
-                    if entries
-                        .len()
-                        .is_multiple_of(COLLECTION_DEADLINE_CHECK_EVERY_ENTRIES)
-                        && deadline()
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "directory listing collection crossed the deadline",
-                        ));
-                    }
-                }
-                if deadline() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "directory listing collection crossed the deadline",
-                    ));
-                }
-                entries.sort_by(|a, b| match (a, b) {
-                    (Ok(left), Ok(right)) => left.cmp(right),
-                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                    (Err(_), Err(_)) => std::cmp::Ordering::Equal,
-                });
-                Ok(entries)
-            }
-
-            fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
-                RealFs.symlink_metadata(path)
-            }
-
-            fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
-                RealFs.metadata(path)
-            }
-        }
-
         let dir = scratch("listing-deadline");
         let root = dir.join("cgroup");
         mkdir(&root);
+        for i in 0..5000 {
+            touch(&root.join(format!("entry-{i:05}")));
+        }
+
+        // Live deadline: every periodic check plus the pre-sort check
+        // must run on the production path — 5000 / 64 = 78 periodic
+        // consultations, then 1 pre-sort consultation. A mutant without
+        // the periodic gate consults exactly once.
+        let consultations = std::cell::Cell::new(0usize);
+        let entries = RealFs
+            .read_dir_sorted(&root, &|| {
+                consultations.set(consultations.get().saturating_add(1));
+                false
+            })
+            .expect("live listing collects");
+        let paths: Vec<PathBuf> = entries
+            .into_iter()
+            .map(|entry| entry.expect("live child reads"))
+            .collect();
+        assert_eq!(paths.len(), 5000);
+        assert!(
+            paths.windows(2).all(|pair| pair[0] <= pair[1]),
+            "live listing stays sorted"
+        );
+        assert_eq!(
+            consultations.get(),
+            78 + 1,
+            "5000 live entries must consult the deadline 78 periodic + 1 pre-sort times"
+        );
+
+        // Expired mid-collection: the clock trips on the 11th
+        // consultation — 704 of 5000 entries collected — and
+        // collection stops at that check instead of sweeping the rest.
+        let consultations = std::cell::Cell::new(0usize);
+        let outcome = RealFs.read_dir_sorted(&root, &|| {
+            consultations.set(consultations.get().saturating_add(1));
+            consultations.get() >= 11
+        });
+        let err = outcome.expect_err("expired listing must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            consultations.get(),
+            11,
+            "collection must stop at the trip consultation, not sweep on"
+        );
+
+        // End to end on the live path: `find_cgroups` over `RealFs`
+        // with a clock expiring on its 2nd read (the pre-walk check
+        // stays live, the first periodic collection check trips)
+        // refuses typed [`HostReadError::DeadlineExceeded`] after
+        // consulting exactly twice — proof the 5000-entry collection
+        // stopped at 64 instead of sweeping.
         let view = HostView::new(&dir.join("proc"), &root);
         let mut counters = HelperCounters::new();
         let mut budget = ScanBudget::new();
-        let fs = ExpiringListFs::new(5000);
-        // The clock expires once 10 entries have been collected —
-        // mid-listing for a 5000-entry directory.
-        let outcome = view.find_cgroups(&[u64::MAX - 11], &mut counters, &fs, &mut budget, &|| {
-            fs.collected.get() >= 10
-        });
-        let collected = fs.collected.get();
-        let post_expiry = collected.saturating_sub(10);
+        let consultations = std::cell::Cell::new(0usize);
+        let outcome = view.find_cgroups(
+            &[u64::MAX - 11],
+            &mut counters,
+            &RealFs,
+            &mut budget,
+            &|| {
+                consultations.set(consultations.get().saturating_add(1));
+                consultations.get() >= 2
+            },
+        );
         assert_eq!(outcome, Err(HostReadError::DeadlineExceeded));
         assert_eq!(counters.deadline_trips, 1);
         assert_eq!(counters.scan_budget_trips, 0);
-        assert!(
-            post_expiry <= DEADLINE_CHECK_EVERY_ENTRIES as usize,
-            "collection must stop within one slice past expiry, collected {collected} (post-expiry {post_expiry})"
+        assert_eq!(
+            consultations.get(),
+            2,
+            "live-path collection must stop at the first periodic check"
+        );
+        assert_eq!(
+            budget.entries_examined(),
+            0,
+            "nothing examined past the refused listing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
