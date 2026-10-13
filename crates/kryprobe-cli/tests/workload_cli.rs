@@ -1006,3 +1006,222 @@ fn cgroup_zero_identity_refuses_every_ingress() {
     let (code, _, _) = run_cli(&["kryprobe", "report", &path.display().to_string()]);
     assert_eq!(code, 0, "asserted fixture keeps replaying");
 }
+
+// ---------------------------------------------------------------------------
+// F05 scoped policy evidence (SEM04)
+// ---------------------------------------------------------------------------
+
+/// Production-shaped aggregate template: one `kh` with system-wide
+/// tallies (`calls=100`, `bytes=409600`) shared by two contexts.
+fn f05_template() -> NativeObservation {
+    use kryprobe_core::enums::{BackendId, CallKind, EvidencePhase, OperationClass};
+    NativeObservation {
+        id: kryprobe_core::ids::ObservationId::new(1),
+        backend: BackendId::KCrypto,
+        target: None,
+        object: None,
+        implementation: None,
+        phase: EvidencePhase::Completed,
+        call_kind: CallKind::Operation,
+        operation_class: OperationClass::Encrypt,
+        native_name: None,
+        native_code: None,
+        native_result: kryprobe_core::evidence::NativeResult::KCrypto { status: 0 },
+        started_ns: Some(100),
+        ended_ns: Some(200),
+        correlation: None,
+        integrity: kryprobe_core::evidence::IntegrityRef::new(0),
+        backend_payload: serde_json::json!({
+            "row": "agg",
+            "key_hash": 7,
+            "family": "skcipher",
+            "op": "encrypt",
+            "result": "ok",
+            "algorithm": "cbc(aes)",
+            "driver": "aesni",
+            "context": "process",
+            "counts": {"calls": 100, "ok": 100, "errors": 0, "queued": 2},
+            "bytes": 409600,
+            "lat": [1, 2, 3],
+            "window": {"first_ns": 100, "last_ns": 200},
+            "status_canonical": true,
+            "capture_profile": "api-returns",
+            "count_unit": "api_invocation_return",
+            "completion_coverage": "unobserved",
+        }),
+    }
+}
+
+fn f05_row(
+    cgroup: u64,
+    tgid: u32,
+    uid: u32,
+    calls: u64,
+) -> kryprobe_report::workload::ReportRowInput {
+    kryprobe_report::workload::ReportRowInput {
+        context: kryprobe_core::workload::ContextIdentity::new(
+            7,
+            cgroup,
+            tgid,
+            uid,
+            555,
+            kryprobe_core::workload::ExecutionKind::Proc,
+        ),
+        calls,
+        native: kryprobe_report::workload::NativeIdentity::new(
+            1,
+            2,
+            0,
+            0,
+            "cbc(aes)",
+            Some("aesni"),
+        ),
+        identity: kryprobe_core::workload::WorkloadIdentity::none(),
+        evidence: kryprobe_core::workload::AttributionEvidence::unresolved(
+            kryprobe_core::workload::Relationship::HookContext,
+        ),
+    }
+}
+
+/// SEM04: a deny verdict on a selected row attributes that row's
+/// quantities. Two contexts share one `kh` (system `calls=100`,
+/// `bytes=409600`); the selected row carries `calls=5` under
+/// `uid=1234`. The deny rule matches algorithm + UID, so the
+/// violation evidence must show 5 calls with the row's event
+/// context — never the system-wide 100/409600 stamped `uid=1234`.
+/// (RED pre-fix: evidence `counts.calls` is 100 with system bytes.)
+#[test]
+fn scoped_violation_evidence_uses_row_population() {
+    use kryprobe_policy::workload::{CaptureIntegrity, ScopedRow, ScopedVerdict};
+    let rows = vec![f05_row(42, 1000, 1234, 5), f05_row(43, 1001, 1000, 95)];
+    let template = f05_template();
+    let projected =
+        kryprobe_cli::workload::observations_for_rows(&rows, &[template]).expect("projects");
+    assert_eq!(projected.len(), 2);
+    let policy = kryprobe_policy::parse_policy(
+        "version: 1\nrules:\n  - id: no-uid-cbc\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: cbc(aes)\n      uid: 1234\n    decision: deny\n",
+    )
+    .expect("deny parses");
+    let selector = kryprobe_policy::workload::WorkloadSelector::cgroup(42).expect("selector");
+    let scoped: Vec<ScopedRow<'_>> = rows
+        .iter()
+        .zip(projected.iter())
+        .map(|(row, observation)| ScopedRow {
+            calls: row.calls,
+            context: row.context,
+            identity: row.identity.clone(),
+            evidence: row.evidence.clone(),
+            observation,
+        })
+        .collect();
+    let verdict = kryprobe_policy::workload::evaluate_scoped(
+        &policy,
+        &selector,
+        &scoped,
+        CaptureIntegrity::Complete,
+    )
+    .expect("evaluates");
+    let ScopedVerdict::Violation {
+        partition,
+        evidence,
+        obs_ids,
+        ..
+    } = &verdict
+    else {
+        panic!("deny on the selected row violates: {verdict:?}");
+    };
+    assert_eq!(verdict.exit_intent(), 10);
+    assert_eq!(partition.matched(), 5);
+    assert_eq!(partition.nonmatched(), 95);
+    assert_eq!(partition.unknown_match(), 0);
+    // Only the uid-1234 row matches: one finding, one observation.
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(obs_ids.len(), 1);
+    let payload = &evidence[0].backend_payload;
+    // The row's population: 5 calls, never the system 100.
+    assert_eq!(
+        payload["counts"]["calls"],
+        serde_json::json!(5),
+        "{payload}"
+    );
+    // The row's event context rides the evidence.
+    assert_eq!(payload["uid"], serde_json::json!(1234), "{payload}");
+    assert_eq!(
+        payload["event"]["cgroup"],
+        serde_json::json!(42),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["event"]["tgid"],
+        serde_json::json!(1000),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["event"]["start_ns"],
+        serde_json::json!(555),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["event"]["uid"],
+        serde_json::json!(1234),
+        "{payload}"
+    );
+    // Explicitly scoped, with the system template kept as separately
+    // labeled evidence — never merged into the row's quantities.
+    assert_eq!(
+        payload["evidence_scope"],
+        serde_json::json!("row"),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["aggregate_obs"],
+        serde_json::json!("observation:1"),
+        "{payload}"
+    );
+    // System-only quantities stay out: no bytes/latency/window and no
+    // result tallies beyond the row's own calls.
+    for key in ["bytes", "lat", "window", "ok", "errors", "queued"] {
+        assert!(
+            payload.get(key).is_none(),
+            "system-only `{key}` omitted: {payload}"
+        );
+    }
+    assert!(
+        payload["counts"].get("ok").is_none(),
+        "system ok omitted: {payload}"
+    );
+    // Native tuple and capture labels survive the projection.
+    for (key, want) in [
+        ("row", "agg"),
+        ("family", "skcipher"),
+        ("op", "encrypt"),
+        ("result", "ok"),
+        ("algorithm", "cbc(aes)"),
+        ("driver", "aesni"),
+        ("context", "process"),
+        ("capture_profile", "api-returns"),
+        ("count_unit", "api_invocation_return"),
+        ("completion_coverage", "unobserved"),
+    ] {
+        assert_eq!(payload[key], serde_json::json!(want), "{payload}");
+    }
+    assert_eq!(payload["key_hash"], serde_json::json!(7), "{payload}");
+    // System window timestamps are not row facts.
+    assert_eq!(evidence[0].started_ns, None);
+    assert_eq!(evidence[0].ended_ns, None);
+    // The sibling row projects its own 95 calls under its own uid —
+    // quantities differ per row from the one shared template.
+    assert_eq!(
+        projected[1].backend_payload["counts"]["calls"],
+        serde_json::json!(95)
+    );
+    assert_eq!(projected[1].backend_payload["uid"], serde_json::json!(1000));
+    assert_eq!(
+        projected[1].backend_payload["event"]["cgroup"],
+        serde_json::json!(43)
+    );
+    // Fresh positional session-scoped ids number the projection in
+    // row order.
+    assert_eq!(projected[0].id, kryprobe_core::ids::ObservationId::new(1));
+    assert_eq!(projected[1].id, kryprobe_core::ids::ObservationId::new(2));
+}

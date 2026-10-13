@@ -532,6 +532,72 @@ mod tests {
     }
 
     #[test]
+    fn scoped_violation_renders_row_scoped_evidence() {
+        // SEM04 render pin: one aggregate template (calls=100,
+        // bytes=409600) shared by two contexts; the deny rule matches
+        // algorithm + uid 1234, so only the 5-call row convicts — and
+        // the printed evidence shows that row's 5 calls with its event
+        // context, never the system-wide counts under uid 1234.
+        use crate::workload::JoinedRow;
+        use kryprobe_core::workload::{ContextIdentity, ExecutionKind, MetadataUnavailable};
+        let mut template = agg_obs(
+            1, "skcipher", "encrypt", "ok", "cbc(aes)", "aesni", "process", 100, 409600, 100, 0, 2,
+        );
+        template.backend_payload["key_hash"] = serde_json::json!(7u64);
+        let row = |cgroup: u64, tgid: u32, uid: u32, calls: u64| JoinedRow {
+            context: ContextIdentity::new(7, cgroup, tgid, uid, 555, ExecutionKind::Proc),
+            calls,
+            native: workload_native("cbc(aes)", Some("aesni")),
+        };
+        let mut outcome = outcome_with(vec![template], healthy_coverage(1));
+        outcome.workload_capture = Some(workload_capture(
+            vec![row(42, 1000, 1234, 5), row(43, 1001, 1000, 95)],
+            100,
+        ));
+        outcome.workload_preflight = Some(workload_preflight_unavailable(
+            MetadataUnavailable::NoPrincipal,
+        ));
+        let policy = parse_policy(
+            "version: 1\nrules:\n  - id: no-uid-cbc\n    source: kernel-crypto\n    match:\n      stage: executed\n      algorithm: cbc(aes)\n      uid: 1234\n    decision: deny\n",
+        )
+        .expect("deny parses");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = finish_check_scoped(
+            Ok(outcome),
+            &policy,
+            42,
+            &scoped_opts(42),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 10);
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf-8"),
+            "VIOLATION rule=no-uid-cbc observations=1\n"
+        );
+        let err_text = String::from_utf8(stderr).expect("utf-8");
+        assert!(
+            err_text.contains("scoped partition matched=5 nonmatched=95 unknown_match=0"),
+            "exact partition: {err_text:?}"
+        );
+        let evidence = err_text
+            .lines()
+            .find(|line| line.starts_with("check: evidence: "))
+            .expect("evidence line");
+        let doc: serde_json::Value =
+            serde_json::from_str(evidence.strip_prefix("check: evidence: ").expect("prefix"))
+                .expect("evidence json parses");
+        assert_eq!(doc["counts"]["calls"], serde_json::json!(5), "{doc}");
+        assert_eq!(doc["uid"], serde_json::json!(1234), "{doc}");
+        assert_eq!(doc["event"]["cgroup"], serde_json::json!(42), "{doc}");
+        assert_eq!(doc["evidence_scope"], serde_json::json!("row"), "{doc}");
+        for key in ["bytes", "lat", "window", "ok", "errors", "queued"] {
+            assert!(doc.get(key).is_none(), "system-only `{key}` omitted: {doc}");
+        }
+    }
+
+    #[test]
     fn scoped_unknown_match_voids_clean() {
         // M1: 5 calls sit at cgroup 0 (unknown whether they belong
         // to cgroup 43) — no violation, but clean is unproven (3).
