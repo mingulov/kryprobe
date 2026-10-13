@@ -1225,3 +1225,338 @@ fn scoped_violation_evidence_uses_row_population() {
     assert_eq!(projected[0].id, kryprobe_core::ids::ObservationId::new(1));
     assert_eq!(projected[1].id, kryprobe_core::ids::ObservationId::new(2));
 }
+
+/// F07 RED: canned helper valid unresolved response plus
+/// `denied=1`/`migration_skipped=1` — the public completion must
+/// surface the approved counters. Pre-fix the launcher discards the
+/// counters line, so the observation assertion fails.
+#[test]
+fn helper_denied_and_migration_counters_surface_in_completion() {
+    use kryprobe_core::workload::{
+        AttributionStatus, KernelIdentity, MetadataSnapshot, SnapshotInterval, SnapshotKey,
+        SnapshotRequest,
+    };
+    let scratch = kryprobe_testkit::TempDir::named("cli-helper-diag").expect("scratch");
+    // Canned response via the frozen pure resolver (empty entries:
+    // the key stays Unresolved — still bound). Placeholder session
+    // is valid 32-hex (binds after fixture substitution).
+    let request = SnapshotRequest {
+        session_id: "00000000000000000000000000000000".to_string(),
+        keys: vec![SnapshotKey {
+            kernel_scope: "test-scope".to_string(),
+            cgroup: 42,
+            tgid: 100,
+            start_ns: 555,
+        }],
+        capture_interval: Some(SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        }),
+    };
+    let snapshot = MetadataSnapshot {
+        collector: "cli-test".to_string(),
+        snapshot_interval: SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        },
+        kernel_identity: KernelIdentity::Known("test-scope".to_string()),
+        entries: Vec::new(),
+    };
+    let response = kryprobe_core::workload::resolve(&request, &snapshot).expect("resolves");
+    assert_eq!(
+        response.associations[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    let canned = kryprobe_core::workload::encode_response(&response).expect("encodes");
+    std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({
+            "canned": "canned.json",
+            "counters": {
+                "positive_hits": 0, "positive_misses": 1, "negative_hits": 0,
+                "inserts": 0, "insert_refused_full": 0,
+                "negative_inserts": 0, "negative_refused_full": 0,
+                "tombstone_inserts": 0, "tombstone_refused_full": 0,
+                "expired_evictions": 0, "reuse_detected": 0,
+                "refresh_throttled": 0, "deadline_trips": 0,
+                "scan_budget_trips": 0, "symlink_refused": 0,
+                "denied": 1, "not_host_path": 0, "gone_during_scan": 0,
+                "migration_skipped": 1, "pid_lifetime_refused_full": 0,
+                "saturated": false,
+            },
+        }),
+    );
+    let outcome = finish_outcome(launchable_preflight(&helper));
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    // Positive control: the valid response keeps its meaning.
+    assert_eq!(finished.rows.len(), 1);
+    assert_eq!(
+        finished.rows[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    // The typed aggregate carries the approved counters.
+    let diagnostics = finished.diagnostics.as_ref().expect("diagnostics measured");
+    assert_eq!(diagnostics.denied, 1);
+    assert_eq!(diagnostics.migration_skipped, 1);
+    assert_eq!(diagnostics.positive_misses, 1);
+    assert!(!diagnostics.saturated);
+    // The approved counters surface on the public completion.
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("denied=1"),
+        "completion surfaces denied=1:\n{text}"
+    );
+    assert!(
+        text.contains("migration_skipped=1"),
+        "completion surfaces migration_skipped=1:\n{text}"
+    );
+    assert!(
+        text.contains("helper-diagnostics: positive_hits="),
+        "completion carries the diagnostics section:\n{text}"
+    );
+}
+
+/// F07 shared canned bytes: a valid unresolved response for the
+/// finish fixture key (cgroup 42, tgid 100, start 555), via the
+/// frozen pure resolver with empty entries.
+fn f07_unresolved_canned(dir: &std::path::Path) {
+    use kryprobe_core::workload::{
+        KernelIdentity, MetadataSnapshot, SnapshotInterval, SnapshotKey, SnapshotRequest,
+    };
+    let request = SnapshotRequest {
+        session_id: "00000000000000000000000000000000".to_string(),
+        keys: vec![SnapshotKey {
+            kernel_scope: "test-scope".to_string(),
+            cgroup: 42,
+            tgid: 100,
+            start_ns: 555,
+        }],
+        capture_interval: Some(SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        }),
+    };
+    let snapshot = MetadataSnapshot {
+        collector: "cli-test".to_string(),
+        snapshot_interval: SnapshotInterval {
+            start_ns: 100,
+            end_ns: 1000,
+        },
+        kernel_identity: KernelIdentity::Known("test-scope".to_string()),
+        entries: Vec::new(),
+    };
+    let response = kryprobe_core::workload::resolve(&request, &snapshot).expect("resolves");
+    let canned = kryprobe_core::workload::encode_response(&response).expect("encodes");
+    std::fs::write(dir.join("canned.json"), &canned).expect("canned");
+}
+
+/// F07 shared golden counters: every approved field present.
+fn f07_counters() -> serde_json::Value {
+    serde_json::json!({
+        "positive_hits": 0, "positive_misses": 1, "negative_hits": 0,
+        "inserts": 0, "insert_refused_full": 0,
+        "negative_inserts": 0, "negative_refused_full": 0,
+        "tombstone_inserts": 0, "tombstone_refused_full": 0,
+        "expired_evictions": 0, "reuse_detected": 0,
+        "refresh_throttled": 0, "deadline_trips": 0,
+        "scan_budget_trips": 0, "symlink_refused": 0,
+        "denied": 1, "not_host_path": 0, "gone_during_scan": 0,
+        "migration_skipped": 1, "pid_lifetime_refused_full": 0,
+        "saturated": false,
+    })
+}
+
+/// Malformed diagnostics at CLI level: the valid response keeps its
+/// meaning while the completion marks diagnostics unavailable —
+/// never echoing the raw line — and the unresolved row keeps its
+/// numeric context.
+#[test]
+fn malformed_helper_diagnostics_keep_response_mark_unavailable() {
+    use kryprobe_core::workload::AttributionStatus;
+    let scratch = kryprobe_testkit::TempDir::named("cli-diag-malformed").expect("scratch");
+    f07_unresolved_canned(scratch.path());
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"canned": "canned.json", "counters_line": "GARBAGE-COUNT\x00ERS{"}),
+    );
+    let outcome = finish_outcome(launchable_preflight(&helper));
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(finished.rows.len(), 1);
+    assert_eq!(
+        finished.rows[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert_eq!(finished.diagnostics, None);
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("helper-diagnostics: unavailable"),
+        "completion marks diagnostics unavailable:\n{text}"
+    );
+    assert!(
+        !text.contains("GARBAGE-COUNT"),
+        "raw record never echoes:\n{text}"
+    );
+    assert!(
+        text.contains("7 42 100 1000 555 proc 20"),
+        "unavailable row keeps numeric context:\n{text}"
+    );
+}
+
+/// Unknown counters at CLI level: not approved fields, so the
+/// aggregate marks unavailable while the response stays valid.
+#[test]
+fn unknown_helper_counter_marks_unavailable() {
+    use kryprobe_core::workload::AttributionStatus;
+    let scratch = kryprobe_testkit::TempDir::named("cli-diag-unknown").expect("scratch");
+    f07_unresolved_canned(scratch.path());
+    let mut counters = f07_counters();
+    counters["mystery_counter"] = serde_json::json!(9);
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"canned": "canned.json", "counters": counters}),
+    );
+    let outcome = finish_outcome(launchable_preflight(&helper));
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(
+        finished.rows[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert_eq!(finished.diagnostics, None);
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("helper-diagnostics: unavailable"),
+        "completion marks diagnostics unavailable:\n{text}"
+    );
+    assert!(
+        !text.contains("mystery_counter"),
+        "unknown field never surfaces:\n{text}"
+    );
+}
+
+/// Forged private paths at CLI level: a path string smuggled into
+/// the counters record is not a measurement, and the forged string
+/// never reaches CLI output.
+#[test]
+fn forged_helper_path_never_reaches_cli_output() {
+    use kryprobe_core::workload::AttributionStatus;
+    let scratch = kryprobe_testkit::TempDir::named("cli-diag-forged").expect("scratch");
+    f07_unresolved_canned(scratch.path());
+    let mut counters = f07_counters();
+    counters["denied"] = serde_json::json!("/proc/self/root/etc/shadow-f07");
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"canned": "canned.json", "counters": counters}),
+    );
+    let outcome = finish_outcome(launchable_preflight(&helper));
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(
+        finished.rows[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert_eq!(finished.diagnostics, None);
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("helper-diagnostics: unavailable"),
+        "completion marks diagnostics unavailable:\n{text}"
+    );
+    assert!(
+        !text.contains("shadow-f07"),
+        "forged path never reaches output:\n{text}"
+    );
+    assert!(
+        text.contains("7 42 100 1000 555 proc 20"),
+        "unavailable row keeps numeric context:\n{text}"
+    );
+}
+
+/// Absent diagnostics at CLI level: the echo helper emits no record,
+/// so the completion marks unavailable while rows keep numerics.
+#[test]
+fn absent_helper_diagnostics_mark_unavailable() {
+    use kryprobe_core::workload::AttributionStatus;
+    let scratch = kryprobe_testkit::TempDir::named("cli-diag-absent").expect("scratch");
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({"echo_unresolved": true}),
+    );
+    let outcome = finish_outcome(launchable_preflight(&helper));
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    assert_eq!(
+        finished.rows[0].evidence.status,
+        AttributionStatus::Unresolved
+    );
+    assert_eq!(finished.diagnostics, None);
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains("helper-diagnostics: unavailable"),
+        "completion marks diagnostics unavailable:\n{text}"
+    );
+    assert!(
+        text.contains("7 42 100 1000 555 proc 20"),
+        "unavailable row keeps numeric context:\n{text}"
+    );
+}
+
+/// Multi-chunk aggregation at CLI level: every chunk's `denied=1`
+/// folds into the completion aggregate (checked sum over serves).
+#[test]
+fn helper_diagnostics_aggregate_across_chunks() {
+    use kryprobe_core::workload::SnapshotKey;
+    let scratch = kryprobe_testkit::TempDir::named("cli-diag-chunks").expect("scratch");
+    // 120 distinct triples: under the count cap, over the byte
+    // budget as one request (proven split shape).
+    let keys: Vec<SnapshotKey> = (0..120u64)
+        .map(|i| SnapshotKey {
+            kernel_scope: "test-scope".to_string(),
+            cgroup: 1000 + i,
+            tgid: 2000 + i as u32,
+            start_ns: 555,
+        })
+        .collect();
+    let rows: Vec<JoinedRow> = keys
+        .iter()
+        .enumerate()
+        .map(|(n, key)| joined_row(n as u64, key.cgroup, key.tgid, 1, "cbc(aes)"))
+        .collect();
+    let helper = stage_fixture(
+        scratch.path(),
+        "helper",
+        serde_json::json!({
+            "echo_unresolved": true,
+            "count": "count",
+            "counters": f07_counters(),
+        }),
+    );
+    let mut outcome = finish_outcome(launchable_preflight(&helper));
+    outcome.workload_capture = Some(WorkloadCapture {
+        rows,
+        system_total: 120,
+        system_saturated: false,
+        refused_inserts: 0,
+        interval_start_ns: 100,
+        interval_end_ns: 1000,
+    });
+    let finished = finish_workload_report(&outcome, &finish_opts()).expect("finishes");
+    let serves = std::fs::read_to_string(scratch.path().join("count"))
+        .expect("serves counted")
+        .lines()
+        .count() as u64;
+    assert!(serves > 1, "more than one bounded request served: {serves}");
+    assert_eq!(finished.rows.len(), 120);
+    // Each chunk measured denied=1: the aggregate sums the serves.
+    let diagnostics = finished.diagnostics.as_ref().expect("diagnostics measured");
+    assert_eq!(diagnostics.denied, serves);
+    assert_eq!(diagnostics.migration_skipped, serves);
+    assert!(!diagnostics.saturated);
+    let text = kryprobe_cli::workload::render_workload_text(&outcome, &finished);
+    assert!(
+        text.contains(&format!("denied={serves}")),
+        "completion surfaces the aggregate:\n{text}"
+    );
+}

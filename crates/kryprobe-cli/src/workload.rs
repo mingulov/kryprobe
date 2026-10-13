@@ -30,7 +30,9 @@ use kryprobe_core::workload::{
     WorkloadIdentity, encode_request,
 };
 use kryprobe_privilege::kcrypto_backend::{CtxSnapshot, MissTerminal};
-use kryprobe_privilege::workload_launch::{PinnedHelper, serve_pinned_snapshot};
+use kryprobe_privilege::workload_launch::{
+    HELPER_ATTEMPT_TIMEOUT, HelperDiagnostics, PinnedHelper, serve_pinned_snapshot_with_diagnostics,
+};
 use kryprobe_report::sanitize_cell;
 use kryprobe_report::workload::{
     AssemblyInput, CoverageLevel, GroupBy, MetadataAvailability, NativeIdentity, ReportCoverage,
@@ -648,6 +650,12 @@ pub struct WorkloadFinish {
     pub report: WorkloadReport,
     /// The assembly input rows (for scoped evaluation).
     pub rows: Vec<ReportRowInput>,
+    /// Typed helper diagnostics aggregated across every served
+    /// chunk (`None` means unavailable — unlaunchable helper,
+    /// failed serve, or any chunk without a well-formed record —
+    /// never all-zero measured). Rendered on the human completion
+    /// only; the frozen report bytes never carry it.
+    pub diagnostics: Option<HelperDiagnostics>,
 }
 
 /// Serve metadata and assemble one typed report (post-capture only):
@@ -689,6 +697,7 @@ pub fn finish_workload_report(
         HashMap::new();
     let mut answered = false;
     let mut response_errors = false;
+    let mut diagnostics: Option<HelperDiagnostics> = None;
     if launchable {
         let preflight = preflight.expect("launchable preflight");
         let helper = preflight.helper.as_ref().expect("launchable helper");
@@ -725,12 +734,25 @@ pub fn finish_workload_report(
         if batches.is_empty() {
             failed = Some(MetadataUnavailable::ParseFailed);
         }
+        // Chunk diagnostics fold checked (overflow saturates with
+        // the explicit marker); any chunk without a well-formed
+        // record voids the aggregate — a partial sum would mislabel.
+        let mut folded: Option<HelperDiagnostics> = Some(HelperDiagnostics::new());
         for request in &batches {
-            match serve_pinned_snapshot(&pinned, principal, opts.metadata_file.as_deref(), request)
-            {
+            match serve_pinned_snapshot_with_diagnostics(
+                &pinned,
+                principal,
+                opts.metadata_file.as_deref(),
+                request,
+                HELPER_ATTEMPT_TIMEOUT,
+            ) {
                 Ok(served) => {
-                    response_errors |= !served.errors.is_empty();
-                    merged.extend(resolutions_from_response(&served));
+                    response_errors |= !served.response.errors.is_empty();
+                    merged.extend(resolutions_from_response(&served.response));
+                    match (&mut folded, served.diagnostics) {
+                        (Some(acc), Some(chunk)) => acc.accumulate(&chunk),
+                        _ => folded = None,
+                    }
                 }
                 Err(kind) => {
                     failed = Some(kind);
@@ -746,6 +768,7 @@ pub fn finish_workload_report(
                 resolutions = merged;
                 answered = true;
                 availability = MetadataAvailability::Available;
+                diagnostics = folded;
             }
             Some(kind) => {
                 availability = MetadataAvailability::Unavailable(kind);
@@ -762,6 +785,7 @@ pub fn finish_workload_report(
         answered,
         response_errors,
         keys_truncated,
+        diagnostics,
         outcome,
     )
 }
@@ -781,6 +805,7 @@ fn finish_with_response(
     answered: bool,
     response_errors: bool,
     keys_truncated: bool,
+    diagnostics: Option<HelperDiagnostics>,
     outcome: &LiveOutcome,
 ) -> Result<WorkloadFinish, WorkloadError> {
     let rows = input_rows(&capture.rows, resolutions);
@@ -820,7 +845,11 @@ fn finish_with_response(
         metadata: *availability,
         coverage,
     })?;
-    Ok(WorkloadFinish { report, rows })
+    Ok(WorkloadFinish {
+        report,
+        rows,
+        diagnostics,
+    })
 }
 
 /// Pre-capture metadata gate: the file must exist, be a regular
@@ -908,12 +937,55 @@ pub fn render_miss_section(misses: Option<&MissTerminal>) -> String {
     }
 }
 
+/// Helper-diagnostics section for the human workload report
+/// (finding PRIV04): the approved fixed counters in declaration
+/// order plus the saturation marker, or an explicit unavailable
+/// marker — never all-zero for missing. Numeric-only rendering
+/// (no helper strings, paths, or payload bytes can reach it — the
+/// typed boundary carries numbers alone).
+pub fn render_diagnostics_section(diagnostics: Option<&HelperDiagnostics>) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return "helper-diagnostics: unavailable\n".to_owned();
+    };
+    format!(
+        "helper-diagnostics: positive_hits={} positive_misses={} negative_hits={} \
+         inserts={} insert_refused_full={} negative_inserts={} negative_refused_full={} \
+         tombstone_inserts={} tombstone_refused_full={} expired_evictions={} \
+         reuse_detected={} refresh_throttled={} deadline_trips={} scan_budget_trips={} \
+         symlink_refused={} denied={} not_host_path={} gone_during_scan={} \
+         migration_skipped={} pid_lifetime_refused_full={} saturated={}\n",
+        diagnostics.positive_hits,
+        diagnostics.positive_misses,
+        diagnostics.negative_hits,
+        diagnostics.inserts,
+        diagnostics.insert_refused_full,
+        diagnostics.negative_inserts,
+        diagnostics.negative_refused_full,
+        diagnostics.tombstone_inserts,
+        diagnostics.tombstone_refused_full,
+        diagnostics.expired_evictions,
+        diagnostics.reuse_detected,
+        diagnostics.refresh_throttled,
+        diagnostics.deadline_trips,
+        diagnostics.scan_budget_trips,
+        diagnostics.symlink_refused,
+        diagnostics.denied,
+        diagnostics.not_host_path,
+        diagnostics.gone_during_scan,
+        diagnostics.migration_skipped,
+        diagnostics.pid_lifetime_refused_full,
+        diagnostics.saturated,
+    )
+}
+
 /// Human workload report text: the frozen report rendering plus the
-/// terminal miss section (finding C4). The JSON format stays pure
-/// (frozen schema — misses ride text + stderr telemetry only).
+/// terminal miss section (finding C4) and the helper-diagnostics
+/// section (finding PRIV04). The JSON format stays pure (frozen
+/// schema — misses and diagnostics ride text only).
 pub fn render_workload_text(outcome: &LiveOutcome, finished: &WorkloadFinish) -> String {
     let mut text = finished.report.render_text();
     text.push_str(&render_miss_section(outcome.workload_misses.as_ref()));
+    text.push_str(&render_diagnostics_section(finished.diagnostics.as_ref()));
     text
 }
 

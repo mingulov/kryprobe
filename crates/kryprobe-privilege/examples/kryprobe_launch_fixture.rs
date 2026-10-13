@@ -25,6 +25,12 @@
 //!   unresolved hook-context evidence), binding to any chunk — the
 //!   C3 multi-request oracle (a fixed canned file cannot bind to
 //!   more than one chunk).
+//! - `counters`: serve emits `{"helper_counters":<value>}` on stderr
+//!   (the canned path defaults to `{}`, the echo path defaults to
+//!   no counters line — both mark diagnostics unavailable).
+//! - `counters_line`: serve emits this stderr line verbatim instead
+//!   of the `counters` form (malformed/duplicate/unknown-counter
+//!   and forged-string oracles).
 //! - `canned`: serve file to substitute + emit (REQUIRED unless
 //!   refuse/crash/stall/echo/retainer is set).
 //! - `session_placeholder`: substituted with the request session
@@ -313,7 +319,7 @@ fn run_serve(dir: &Path, argv: &[String], sidecar: &serde_json::Value) -> i32 {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        return run_echo_unresolved(&request);
+        return run_echo_unresolved(&request, sidecar);
     }
     let canned_path = sidecar.get("canned").and_then(|v| resolve(dir, v));
     let Some(canned_path) = canned_path else {
@@ -341,14 +347,30 @@ fn run_serve(dir: &Path, argv: &[String], sidecar: &serde_json::Value) -> i32 {
     }
     eprintln!("{}", attestation_line(&attestation));
     print!("{}", canned.replace(placeholder, &session));
-    eprintln!("{{\"helper_counters\":{{}}}}");
+    emit_counters(sidecar, true);
     0
+}
+
+/// Emit the stderr diagnostics record: a verbatim `counters_line`
+/// when present, else `{"helper_counters":<counters>}`. The canned
+/// path defaults to `{}` (unavailable, response unaffected); the
+/// echo path defaults to no line (absent diagnostics).
+fn emit_counters(sidecar: &serde_json::Value, canned_default_empty: bool) {
+    if let Some(line) = sidecar.get("counters_line").and_then(|v| v.as_str()) {
+        eprintln!("{line}");
+        return;
+    }
+    match sidecar.get("counters") {
+        Some(counters) => eprintln!("{{\"helper_counters\":{counters}}}"),
+        None if canned_default_empty => eprintln!("{{\"helper_counters\":{{}}}}"),
+        None => {}
+    }
 }
 
 /// Echo every request key back as an unresolved association: the
 /// response binds to ANY chunk (session match, keys drawn from the
 /// request, single-chunk exact coverage, matching counters).
-fn run_echo_unresolved(request: &str) -> i32 {
+fn run_echo_unresolved(request: &str, sidecar: &serde_json::Value) -> i32 {
     let parsed = serde_json::from_str::<serde_json::Value>(request).unwrap_or_else(|_| {
         eprintln!("launch-fixture: request is not JSON");
         std::process::exit(3);
@@ -409,5 +431,6 @@ fn run_echo_unresolved(request: &str) -> i32 {
     let attestation = collect().unwrap_or_else(|| std::process::exit(3));
     eprintln!("{}", attestation_line(&attestation));
     print!("{response}");
+    emit_counters(sidecar, false);
     0
 }
