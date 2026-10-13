@@ -1266,11 +1266,12 @@ mod tests {
         );
 
         // End to end on the live path: `find_cgroups` over `RealFs`
-        // with a clock expiring on its 2nd read (the pre-walk check
-        // stays live, the first periodic collection check trips)
-        // refuses typed [`HostReadError::DeadlineExceeded`] after
-        // consulting exactly twice — proof the 5000-entry collection
-        // stopped at 64 instead of sweeping.
+        // with a clock expiring on its 3rd read (the pre-walk and
+        // per-directory checks stay live, the first periodic
+        // collection check trips) refuses typed
+        // [`HostReadError::DeadlineExceeded`] after consulting exactly
+        // three times — proof the 5000-entry collection stopped at 64
+        // instead of sweeping.
         let view = HostView::new(&dir.join("proc"), &root);
         let mut counters = HelperCounters::new();
         let mut budget = ScanBudget::new();
@@ -1282,7 +1283,7 @@ mod tests {
             &mut budget,
             &|| {
                 consultations.set(consultations.get().saturating_add(1));
-                consultations.get() >= 2
+                consultations.get() >= 3
             },
         );
         assert_eq!(outcome, Err(HostReadError::DeadlineExceeded));
@@ -1290,7 +1291,7 @@ mod tests {
         assert_eq!(counters.scan_budget_trips, 0);
         assert_eq!(
             consultations.get(),
-            2,
+            3,
             "live-path collection must stop at the first periodic check"
         );
         assert_eq!(
