@@ -161,6 +161,11 @@ fn run_serve(args: &Args) -> i32 {
     };
 
     // 4. Conservative join: frozen pure answer plus liveness corroboration.
+    // The resolver's work budgets and deadline checks are cooperative
+    // (they run between syscalls; one issued read_dir/stat runs to
+    // completion), so the parent launcher's independent 30 s kill
+    // backstop stays necessary and is retained: it bounds syscalls that
+    // stall past every helper-side check.
     let clock = UptimeClock { view: &view };
     let mut resolver = Resolver::new(view.clone(), snapshot);
     let response = match resolver.resolve(&request, &clock, start_ns) {
