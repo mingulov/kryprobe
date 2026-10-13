@@ -267,11 +267,8 @@ def stage_run_dir(args, entry: dict, manifest: dict, kind: str,
     # pin named a file that was never staged).
     judge_dir = run_dir / "judge"
     judge_dir.mkdir()
-    for src, name in ((HERE / "kcrypto-perf.py", "kcrypto-perf.py"),
-                      (HERE / "kcrypto_perf" / "validity.py",
-                       "validity.py"),
-                      (HERE / "kcrypto_perf" / "stats.py", "stats.py")):
-        shutil.copyfile(src, judge_dir / name)
+    for src, name in JUDGE_CLOSURE_SOURCES:
+        shutil.copyfile(HERE / src, judge_dir / name)
         pins[f"judge/{name}"] = sha256_file(judge_dir / name)
     with (run_dir / "legs.tsv").open("w") as fh:
         for leg in legs:
@@ -460,13 +457,8 @@ def stage_m1_run_dir(args, entry: dict, manifest: dict, kind: str,
     pins["inner.sh"] = sha256_file(run_dir / "inner.sh")
     judge_dir = run_dir / "judge"
     judge_dir.mkdir()
-    for src, name in ((HERE / "kcrypto-perf.py", "kcrypto-perf.py"),
-                      (HERE / "kcrypto_perf" / "validity.py",
-                       "validity.py"),
-                      (HERE / "kcrypto_perf" / "m1validity.py",
-                       "m1validity.py"),
-                      (HERE / "kcrypto_perf" / "stats.py", "stats.py")):
-        shutil.copyfile(src, judge_dir / name)
+    for src, name in JUDGE_CLOSURE_SOURCES:
+        shutil.copyfile(HERE / src, judge_dir / name)
         pins[f"judge/{name}"] = sha256_file(judge_dir / name)
     with (run_dir / "legs.tsv").open("w") as fh:
         for leg in legs:
@@ -1407,6 +1399,28 @@ def check_run_receipts(cell_dir: Path) -> tuple:
     return reasons, observed
 
 
+# I06 (QUAL-04): the archived judge dependency closure — the
+# driver plus every kcrypto_perf module it imports at judging
+# time (successor operands, both manifest loaders, parsers).
+# Newly staged cells ship all of these flat under judge/ with
+# pins; legacy cells without them stay verifiable (their
+# closure is explicitly unbound, never silently assumed). The
+# campaign receipt/seal modules stay under head-sha custody.
+JUDGE_CLOSURE_SOURCES = (
+    ("kcrypto-perf.py", "kcrypto-perf.py"),
+    ("kcrypto_perf/validity.py", "validity.py"),
+    ("kcrypto_perf/m1validity.py", "m1validity.py"),
+    ("kcrypto_perf/stats.py", "stats.py"),
+    ("kcrypto_perf/successorvalidity.py", "successorvalidity.py"),
+    ("kcrypto_perf/parsers.py", "parsers.py"),
+    ("kcrypto_perf/manifest.py", "manifest.py"),
+    ("kcrypto_perf/m1manifest.py", "m1manifest.py"),
+)
+
+JUDGE_CLOSURE_PINS = frozenset(
+    f"judge/{name}" for _src, name in JUDGE_CLOSURE_SOURCES)
+
+
 # P9R2A-N01: every staged cell ships these artifacts, so their
 # pin rows are mandatory — a removed pin row fails exactly like
 # a removed file. ``kcrypto_fixture.ko`` may pin "none" on
@@ -1623,6 +1637,179 @@ def check_m1_stage_pins(cell_dir: Path, stage: dict) -> tuple:
     return reasons, {"checked": checked, "unverifiable": []}
 
 
+def check_judge_closure(cell_dir: Path, stage: dict) -> tuple:
+    """I06 (QUAL-04): strict replay binding for the archived judge.
+
+    Every closure pin must be present and match the sealed bytes.
+    A missing pin row leaves the closure explicitly unbound (the
+    legacy verdict, never an assumed match); a missing or
+    modified file refuses. Returns (reasons, observed).
+    """
+    cell_dir = Path(cell_dir)
+    pins = stage.get("sha256", {}) or {}
+    reasons = []
+    checked = []
+    unbound = []
+    for name in sorted(JUDGE_CLOSURE_PINS):
+        pinned = pins.get(name)
+        if pinned is None:
+            unbound.append(name)
+            continue
+        if pinned == "none":
+            reasons.append(
+                f"judge closure {name}: unexpected \"none\" pin "
+                "value (fail closed)")
+            continue
+        target = cell_dir / name
+        if not target.is_file():
+            reasons.append(
+                f"judge closure {name}: staged file missing from "
+                "sealed cell")
+            continue
+        try:
+            actual = sha256_file(target)
+        except OSError as err:
+            reasons.append(f"judge closure {name}: unreadable: {err}")
+            continue
+        if actual != pinned:
+            reasons.append(
+                f"judge closure {name}: sealed bytes differ from "
+                "staged pin")
+        else:
+            checked.append(name)
+    if unbound:
+        reasons.append(
+            f"judge closure unbound: {len(unbound)} archived "
+            f"dependencies missing from stage pins "
+            f"({', '.join(unbound)})")
+    return reasons, {"checked": checked, "unbound": unbound}
+
+
+IMPORTED_SPEC_FIELDS = ("side", "mode", "cls", "driver", "size",
+                        "workload", "paced", "bulk", "threads")
+
+
+def _sealed_pair_index(leg_id):
+    """Parse the pair index from a sealed ``legNN[A|B]`` id.
+
+    Returns the int index, or None when the id is missing or
+    malformed (the caller refuses such legs as not-declared).
+    """
+    if not isinstance(leg_id, str) or not leg_id.startswith("leg"):
+        return None
+    if len(leg_id) < 5 or leg_id[-1] not in ("A", "B"):
+        return None
+    digits = leg_id[3:-1]
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def check_imported_cell_spec(stage: dict, spec: list,
+                             manifest: dict) -> list:
+    """I06 (QUAL-01): reconcile a sealed spec to the declared manifest.
+
+    Opt-in imported/resealed-cell boundary: the sealed stage
+    kernel/roles and every sealed legs.tsv row must equal what
+    the manifest entry generates (role/mode/workload/size/order).
+    Sealed leg subsets bind, including M1 runner spares within
+    the 0..max_attempted-1 window (field-exact per pair index,
+    order-aware; expectations regen only the sealed pairs, so the
+    window never materializes); sealed extras beyond the window,
+    field flips, order swaps, and unresolvable entries refuse.
+    Returns reasons (empty means bound).
+    """
+    kind = stage.get("kind")
+    try:
+        if kind == "set":
+            entry = find_set(manifest, stage.get("set"))
+        elif kind == "diag":
+            entry = find_diag(manifest, stage.get("diag"))
+        else:
+            return [f"imported spec unbound: unknown stage kind {kind!r}"]
+    except (ValueError, KeyError, TypeError) as err:
+        return [f"imported spec unbound: {err}"]
+    reasons = []
+    if stage.get("kernel") != entry.get("kernel"):
+        reasons.append(
+            f"imported spec: kernel sealed {stage.get('kernel')!r} != "
+            f"manifest {entry.get('kernel')!r}")
+    for side in ("a", "b"):
+        if f"obs_{side}" in entry:
+            want_role = entry[f"obs_{side}"]
+        elif kind == "diag" and is_m1_manifest(manifest):
+            # P2-F1: M1 diag entries carry no obs_*; staging pins
+            # the implicit D/C roles, so the checker binds them.
+            want_role = "D" if side == "a" else "C"
+        else:
+            continue
+        if stage.get(f"obs_{side}") != want_role:
+            reasons.append(
+                f"imported spec: role obs_{side} sealed "
+                f"{stage.get(f'obs_{side}')!r} != manifest "
+                f"{want_role!r}")
+    if not spec:
+        reasons.append("imported spec unbound: sealed legs.tsv "
+                       "carries no legs")
+        return reasons
+    try:
+        if kind == "set" and entry.get("kind") == "m1-pairs" \
+                and "max_attempted" in entry:
+            # P2-F2/P3-window: the runner stages spares via
+            # --start-pair within the attempt budget, so bind the
+            # sealed legs against the 0..max_attempted-1 window —
+            # but regen expectations ONLY for the sealed pair
+            # indices (bounded by the sealed spec, never by
+            # max_attempted). Out-of-window indices refuse as
+            # not-declared below (budget kept); per-pair regen
+            # preserves field-exactness, alternation parity, and
+            # canonical order.
+            budget = entry["max_attempted"]
+            pairs = set()
+            for leg in spec:
+                pair = _sealed_pair_index(leg.get("leg_id"))
+                if pair is not None and pair < budget:
+                    pairs.add(pair)
+            expected = []
+            for pair in sorted(pairs):
+                expected.extend(gen_legs(entry, manifest, kind, pair, 1))
+        else:
+            expected = gen_legs(entry, manifest, kind)
+    except (ValueError, KeyError, TypeError, MemoryError) as err:
+        return reasons + [f"imported spec unbound: {err}"]
+    by_id = {leg["leg_id"]: leg for leg in expected}
+    seen: set = set()
+    sealed_order: list = []
+    for leg in spec:
+        leg_id = leg.get("leg_id")
+        if leg_id in seen:
+            reasons.append(
+                f"imported spec: sealed {leg_id} carried twice")
+            continue
+        seen.add(leg_id)
+        want = by_id.get(leg_id)
+        if want is None:
+            reasons.append(
+                f"imported spec: sealed {leg_id} not declared by "
+                f"manifest entry {entry.get('id')!r}")
+            continue
+        sealed_order.append(leg_id)
+        for field in IMPORTED_SPEC_FIELDS:
+            if leg.get(field) != want.get(field):
+                reasons.append(
+                    f"imported spec: {leg_id} {field} sealed "
+                    f"{leg.get(field)!r} != manifest {want.get(field)!r}")
+    want_order = [leg["leg_id"] for leg in expected
+                  if leg["leg_id"] in set(sealed_order)]
+    if sealed_order != want_order:
+        reasons.append("imported spec: sealed leg order differs from "
+                       "manifest order")
+    if len(reasons) > 10:
+        reasons = reasons[:10] + [
+            f"imported spec: ... and {len(reasons) - 10} more mismatches"]
+    return reasons
+
+
 def judge_m1_quiet(cell_dir: Path, obs_b: str) -> dict:
     """M1 boot-quiet judging (freeze G3/G4): R/C boots parse the
     api-returns quiet report (zero calls); M boots parse the
@@ -1669,8 +1856,15 @@ def judge_m1_quiet(cell_dir: Path, obs_b: str) -> dict:
             "reasons": check["reasons"]}
 
 
-def verify_cell(cell_dir: Path, manifest: dict) -> dict:
-    """Judge one sealed cell (legs, quiet, seal, receipts, pins)."""
+def verify_cell(cell_dir: Path, manifest: dict, check_imported: bool = False,
+                require_judge_closure: bool = False) -> dict:
+    """Judge one sealed cell (legs, quiet, seal, receipts, pins).
+
+    I06 opt-ins (both default off, sealed verdicts unchanged):
+    ``require_judge_closure`` strictly binds the archived judge
+    dependency closure before judging; ``check_imported``
+    reconciles the sealed spec to the declared manifest entry
+    before judging (imported/resealed-cell boundary)."""
     cell_dir = Path(cell_dir)
     verdict: dict = {"cell": cell_dir.name, "errors": []}
     seal_ok, seal_info = _CLI.verify_cell_seal(cell_dir)
@@ -1707,6 +1901,24 @@ def verify_cell(cell_dir: Path, manifest: dict) -> dict:
     if pin_reasons:
         verdict["errors"].extend(pin_reasons)
         return verdict
+    if require_judge_closure:
+        closure_reasons, closure_obs = check_judge_closure(cell_dir, stage)
+        verdict["judge_closure"] = closure_obs
+        if closure_reasons:
+            verdict["errors"].extend(closure_reasons)
+            return verdict
+    if check_imported:
+        try:
+            import_spec = parse_legs_tsv(cell_dir / "legs.tsv")
+        except ValueError as err:
+            verdict["errors"].append(f"imported spec: legs.tsv: {err}")
+            return verdict
+        import_reasons = check_imported_cell_spec(stage, import_spec,
+                                                  manifest)
+        verdict["import_check"] = {"reasons": import_reasons}
+        if import_reasons:
+            verdict["errors"].extend(import_reasons)
+            return verdict
     kernel = stage.get("kernel")
     if m1:
         if stage.get("kind") == "set":
@@ -2795,7 +3007,11 @@ def cmd_verify(args) -> int:
     for cell in sorted(cells_dir.iterdir()):
         if not cell.is_dir() or cell.name == "verdicts":
             continue
-        verdict = verify_cell(cell, manifest)
+        verdict = verify_cell(
+            cell, manifest,
+            check_imported=getattr(args, "check_imported", False),
+            require_judge_closure=getattr(args, "require_judge_closure",
+                                          False))
         krecept.atomic_write_json(verdicts_dir / f"{cell.name}.json",
                                   {"cell": verdict})
         if verdict.get("errors"):
@@ -2947,6 +3163,12 @@ def main(argv=None) -> int:
     verify.add_argument("--in-place", action="store_true",
                         help="legacy: write verdicts/ + campaign.json "
                         "inside --evidence-dir (disturbs seals)")
+    verify.add_argument("--check-imported", action="store_true",
+                        help="I06: refuse cells whose sealed spec does "
+                        "not reconcile to the declared manifest entry")
+    verify.add_argument("--require-judge-closure", action="store_true",
+                        help="I06: refuse cells whose archived judge "
+                        "dependency closure is missing or modified")
     analyze = sub.add_parser("analyze", help="campaign report")
     analyze.add_argument("--evidence-dir", required=True)
     analyze.add_argument("--campaign", default=None,
