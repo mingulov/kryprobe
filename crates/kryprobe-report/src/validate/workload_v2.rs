@@ -4,15 +4,19 @@
 //! Enforces `schemas/workload-report-v2.schema.json` on a standalone
 //! report value: required keys, wire shapes, the version const, native
 //! identity (inline or collision-qualified dictionary), the authoritative
-//! ledger, the partition/ledger link, selector/metadata/coverage typing,
-//! and count budgets. Unknown schema values fail closed. The schema bytes
+//! ledger, the partition/ledger link, the selector-weighted partition
+//! recompute (SEM01), the unreadable-cgroup identity refusal (SEM02),
+//! selector/metadata/coverage typing, and count budgets. Unknown schema
+//! values fail closed. The schema bytes
 //! are freeze-pinned (FNV over the compiled-in copy) with dev-tree drift
 //! detection, mirroring event-v0. Findings never echo untrusted input
 //! bytes (positions such as `contexts[3]` are safe and included).
 
 use kryprobe_core::workload::{
-    AttributionEvidence, AttributionStatus, MAX_REPORT_V2_BYTES, MAX_STRING_FIELD_BYTES,
-    MAX_V2_CONTEXT_ROWS, MAX_V2_DICTIONARY_ENTRIES, Relationship, ValidityInterval, WorkloadOrigin,
+    AttributionEvidence, AttributionStatus, ContainerRef, ContextIdentity, ExecutionKind,
+    MAX_REPORT_V2_BYTES, MAX_STRING_FIELD_BYTES, MAX_V2_CONTEXT_ROWS, MAX_V2_DICTIONARY_ENTRIES,
+    PodRef, Relationship, ScopeDecision, ValidityInterval, WorkloadIdentity, WorkloadOrigin,
+    decide_workload_scope,
 };
 use serde_json::Value;
 
@@ -1273,6 +1277,292 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
             detail: "ledger magnitudes do not parse as u64".to_string(),
         }),
     }
+
+    // Shared replay invariants (SEM01/SEM02): cgroup-zero rows carry
+    // no resolved identity, and the stored partition equals the
+    // selector-weighted recompute over the decoded rows. Both reuse
+    // the shared core contracts; rows or selectors that fail typed
+    // conversion skip the check (those defects already refuse above —
+    // no cascade).
+    validate_replay_invariants(obj, findings);
+}
+
+/// One context row decoded to the shared core types for invariant
+/// checks. The decoders mirror the codec's (same defaults: absent
+/// workload is [`WorkloadIdentity::none`], absent attribution is the
+/// unresolved hook-context default); shapes run before combinations,
+/// so conversion is total in practice and `None` only skips.
+struct TypedRow {
+    context: ContextIdentity,
+    calls: u64,
+    identity: WorkloadIdentity,
+    evidence: AttributionEvidence,
+}
+
+fn typed_execution_kind(value: Option<&Value>) -> Option<ExecutionKind> {
+    match value?.as_str()? {
+        "proc" => Some(ExecutionKind::Proc),
+        "kthread" => Some(ExecutionKind::Kthread),
+        "softirq" => Some(ExecutionKind::Softirq),
+        "unknown" => Some(ExecutionKind::Unknown),
+        _ => None,
+    }
+}
+
+fn typed_small(value: Option<&Value>) -> Option<u32> {
+    u32::try_from(value?.as_u64()?).ok()
+}
+
+fn typed_relationship(value: Option<&Value>) -> Option<Relationship> {
+    match value?.as_str()? {
+        "hook_context" => Some(Relationship::HookContext),
+        "submitter" => Some(Relationship::Submitter),
+        "completion_context" => Some(Relationship::CompletionContext),
+        "workload_origin" => Some(Relationship::WorkloadOrigin),
+        "consumer" => Some(Relationship::Consumer),
+        _ => None,
+    }
+}
+
+fn typed_origin(value: Option<&Value>) -> Option<WorkloadOrigin> {
+    match value?.as_str()? {
+        "kernel_capture" => Some(WorkloadOrigin::KernelCapture),
+        "operator_metadata_file" => Some(WorkloadOrigin::OperatorMetadataFile),
+        "runtime_adapter" => Some(WorkloadOrigin::RuntimeAdapter),
+        "host_proc" => Some(WorkloadOrigin::HostProc),
+        "unknown" => Some(WorkloadOrigin::Unknown),
+        _ => None,
+    }
+}
+
+fn typed_status(value: Option<&Value>) -> Option<AttributionStatus> {
+    match value?.as_str()? {
+        "verified" => Some(AttributionStatus::Verified),
+        "asserted" => Some(AttributionStatus::Asserted),
+        "unresolved" => Some(AttributionStatus::Unresolved),
+        "ambiguous" => Some(AttributionStatus::Ambiguous),
+        "stale" => Some(AttributionStatus::Stale),
+        "unsupported" => Some(AttributionStatus::Unsupported),
+        _ => None,
+    }
+}
+
+fn typed_container(obj: &serde_json::Map<String, Value>) -> Option<ContainerRef> {
+    Some(ContainerRef {
+        runtime: obj.get("runtime")?.as_str()?.to_string(),
+        id: obj.get("id")?.as_str()?.to_string(),
+        lifetime: obj
+            .get("lifetime")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn typed_identity(workload: Option<&Value>) -> Option<WorkloadIdentity> {
+    let workload = match workload {
+        None => return Some(WorkloadIdentity::none()),
+        Some(value) => value.as_object()?,
+    };
+    let container = match workload.get("container") {
+        None => None,
+        Some(value) => Some(typed_container(value.as_object()?)?),
+    };
+    let pod = match workload.get("pod") {
+        None => None,
+        Some(value) => {
+            let pod = value.as_object()?;
+            Some(PodRef {
+                cluster: pod.get("cluster")?.as_str()?.to_string(),
+                uid: pod.get("uid")?.as_str()?.to_string(),
+                name: pod.get("name")?.as_str()?.to_string(),
+                namespace: pod.get("namespace")?.as_str()?.to_string(),
+            })
+        }
+    };
+    let ancestor = match workload.get("ancestor_container") {
+        None => None,
+        Some(value) => Some(typed_container(value.as_object()?)?),
+    };
+    Some(WorkloadIdentity {
+        container,
+        pod,
+        cluster: workload
+            .get("cluster")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        node: workload
+            .get("node")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ancestor_container: ancestor,
+    })
+}
+
+fn typed_evidence(attribution: Option<&Value>) -> Option<AttributionEvidence> {
+    let attribution = match attribution {
+        None => {
+            return Some(AttributionEvidence::unresolved(Relationship::HookContext));
+        }
+        Some(value) => value.as_object()?,
+    };
+    let validity = match attribution.get("validity") {
+        None => None,
+        Some(window) => {
+            let window = window.as_object()?;
+            Some(ValidityInterval::monotonic(
+                parse_digit(window.get("start_ns")?)?,
+                parse_digit(window.get("end_ns")?)?,
+            ))
+        }
+    };
+    Some(AttributionEvidence {
+        relationship: typed_relationship(attribution.get("relationship"))?,
+        method: attribution.get("method")?.as_str()?.to_string(),
+        source: typed_origin(attribution.get("source"))?,
+        status: typed_status(attribution.get("status"))?,
+        validity,
+    })
+}
+
+fn typed_row(row: &serde_json::Map<String, Value>) -> Option<TypedRow> {
+    Some(TypedRow {
+        context: ContextIdentity::new(
+            parse_digit(row.get("kh")?)?,
+            parse_digit(row.get("cgroup_id")?)?,
+            typed_small(row.get("tgid"))?,
+            typed_small(row.get("uid"))?,
+            parse_digit(row.get("start_ns")?)?,
+            typed_execution_kind(row.get("execution_kind"))?,
+        ),
+        calls: parse_digit(row.get("calls")?)?,
+        identity: typed_identity(row.get("workload"))?,
+        evidence: typed_evidence(row.get("attribution"))?,
+    })
+}
+
+fn validate_replay_invariants(obj: &serde_json::Map<String, Value>, findings: &mut Vec<V2Finding>) {
+    let contexts = obj
+        .get("contexts")
+        .and_then(Value::as_array)
+        .expect("shapes checked");
+    let typed: Vec<Option<TypedRow>> = contexts
+        .iter()
+        .map(|context| context.as_object().and_then(typed_row))
+        .collect();
+    // SEM02: an unreadable-cgroup row carries no resolved identity,
+    // whatever usable status it claims — the shared
+    // `WorkloadObservation` invariant, enforced on bytes. Unresolved
+    // cgroup-zero rows stay valid.
+    for (index, row) in typed.iter().enumerate() {
+        if let Some(row) = row
+            && row.context.cgroup == 0
+            && row.identity.is_resolved()
+        {
+            findings.push(V2Finding::InvalidCombination {
+                detail: format!("contexts[{index}] unreadable cgroup carries a resolved identity"),
+            });
+        }
+    }
+    // SEM01: the stored buckets must equal the selector-weighted
+    // recompute (shared core classifier, checked row weights) —
+    // conservation alone cannot establish selection.
+    let selectors = obj
+        .get("selectors")
+        .and_then(Value::as_object)
+        .expect("shapes checked");
+    let partition = obj
+        .get("partition")
+        .and_then(Value::as_object)
+        .expect("shapes checked");
+    let (Some(matched), Some(nonmatched), Some(unknown_match)) = (
+        parse_digit(partition.get("matched").expect("shapes checked")),
+        parse_digit(partition.get("nonmatched").expect("shapes checked")),
+        parse_digit(partition.get("unknown_match").expect("shapes checked")),
+    ) else {
+        return;
+    };
+    let rows: Vec<&TypedRow> = typed.iter().flatten().collect();
+    if rows.len() != contexts.len() {
+        return;
+    }
+    let mut derived = (0u64, 0u64, 0u64);
+    match selectors.get("kind").and_then(Value::as_str) {
+        Some("none") => {
+            for row in &rows {
+                let Some(sum) = derived.0.checked_add(row.calls) else {
+                    return;
+                };
+                derived.0 = sum;
+            }
+        }
+        Some("cgroup-id") => {
+            let Some(id) = parse_digit(selectors.get("cgroup_id").expect("shapes checked")) else {
+                return;
+            };
+            if id == 0 {
+                findings.push(V2Finding::InvalidCombination {
+                    detail: "cgroup selector refuses id 0 (unreadable marker, never selectable)"
+                        .to_string(),
+                });
+                return;
+            }
+            let Ok(selector) = kryprobe_core::workload::WorkloadSelector::cgroup(id) else {
+                return;
+            };
+            if !fold_recomputed(&selector, &rows, &mut derived) {
+                return;
+            }
+        }
+        Some("container-id") => {
+            let container = selectors
+                .get("container")
+                .and_then(Value::as_object)
+                .expect("shapes checked");
+            let (Some(runtime), Some(id)) = (
+                container.get("runtime").and_then(Value::as_str),
+                container.get("id").and_then(Value::as_str),
+            ) else {
+                return;
+            };
+            let Ok(selector) =
+                kryprobe_core::workload::WorkloadSelector::container(runtime, id, None)
+            else {
+                return;
+            };
+            if !fold_recomputed(&selector, &rows, &mut derived) {
+                return;
+            }
+        }
+        _ => return,
+    }
+    if derived != (matched, nonmatched, unknown_match) {
+        findings.push(V2Finding::InvalidCombination {
+            detail: "stored partition contradicts its selector and rows".to_string(),
+        });
+    }
+}
+
+/// Fold row call weights into `buckets` under one shared selector with
+/// the shared core classifier. `false` on unrepresentable sums (the
+/// caller's sums already refuse — no cascade).
+fn fold_recomputed(
+    selector: &kryprobe_core::workload::WorkloadSelector,
+    rows: &[&TypedRow],
+    buckets: &mut (u64, u64, u64),
+) -> bool {
+    for row in rows {
+        let bucket =
+            match decide_workload_scope(selector, &row.context, &row.identity, &row.evidence) {
+                ScopeDecision::Match => &mut buckets.0,
+                ScopeDecision::NonMatch => &mut buckets.1,
+                ScopeDecision::Unknown => &mut buckets.2,
+            };
+        let Some(sum) = bucket.checked_add(row.calls) else {
+            return false;
+        };
+        *bucket = sum;
+    }
+    true
 }
 
 /// Evidence cross-rules for one context attribution: reuse the frozen
@@ -1916,6 +2206,127 @@ mod tests {
                 .any(|f| matches!(f, V2Finding::InvalidCombination { detail }
                     if detail.contains("does not cover the report interval"))),
             "expired Asserted binding on a valid interval must still refuse on coverage"
+        );
+    }
+
+    #[test]
+    fn scoped_partition_must_match_selector_and_rows() {
+        // SEM01: conservation alone cannot establish selection — the
+        // stored buckets must equal the selector-weighted recompute,
+        // never just sum to the observed total.
+        fn scoped(
+            mut v: Value,
+            cgroup: &str,
+            matched: &str,
+            nonmatched: &str,
+            unknown: &str,
+        ) -> Value {
+            v["selectors"] = json!({"kind": "cgroup-id", "cgroup_id": cgroup});
+            v["scope"]["report_scope"] = json!("scoped");
+            v["partition"]["matched"] = json!(matched);
+            v["partition"]["nonmatched"] = json!(nonmatched);
+            v["partition"]["unknown_match"] = json!(unknown);
+            v
+        }
+        // minimal_valid rows: (43812, 50) + (43813, 50), both
+        // non-cgroup-zero, so selector 43812 derives 50/50/0.
+        let hostile = scoped(minimal_valid(), "43812", "100", "0", "0");
+        assert!(
+            validate_workload_v2(&hostile)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "conserving but selector-contradictory partition must refuse"
+        );
+        let corrected = scoped(minimal_valid(), "43812", "50", "50", "0");
+        assert!(
+            validate_workload_v2(&corrected).is_empty(),
+            "derived 50/50/0 must validate: {:?}",
+            validate_workload_v2(&corrected)
+        );
+        // Selector 999 matches nothing: derived 0/100/0.
+        let hostile999 = scoped(minimal_valid(), "999", "100", "0", "0");
+        assert!(
+            validate_workload_v2(&hostile999)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "cgroup-999 100/0/0 must refuse"
+        );
+        let corrected999 = scoped(minimal_valid(), "999", "0", "100", "0");
+        assert!(
+            validate_workload_v2(&corrected999).is_empty(),
+            "derived 0/100/0 must validate: {:?}",
+            validate_workload_v2(&corrected999)
+        );
+        // Refusals never echo input bytes.
+        for finding in validate_workload_v2(&hostile) {
+            assert!(
+                !format!("{finding:?}").contains("43812"),
+                "refusal withholds input bytes: {finding:?}"
+            );
+        }
+        // Container selectors recompute too: row 0 carries the selected
+        // key (lifetime-a never narrows the lifetime-less selector),
+        // row 1 carries no container key — derived 50/0/50.
+        let mut container = minimal_valid();
+        container["selectors"] = json!(
+            {"kind": "container-id", "container": {"runtime": "docker://host-a", "id": CONTAINER_ID}}
+        );
+        container["scope"]["report_scope"] = json!("scoped");
+        container["partition"]["matched"] = json!("100");
+        container["partition"]["nonmatched"] = json!("0");
+        container["partition"]["unknown_match"] = json!("0");
+        assert!(
+            validate_workload_v2(&container)
+                .iter()
+                .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+            "container-selector 100/0/0 must refuse"
+        );
+        container["partition"]["matched"] = json!("50");
+        container["partition"]["nonmatched"] = json!("0");
+        container["partition"]["unknown_match"] = json!("50");
+        assert!(
+            validate_workload_v2(&container).is_empty(),
+            "derived 50/0/50 must validate: {:?}",
+            validate_workload_v2(&container)
+        );
+    }
+
+    #[test]
+    fn cgroup_zero_with_identity_refuses() {
+        // SEM02: a cgroup-zero row carrying a resolved identity refuses
+        // at the wire validator, whatever usable status it claims —
+        // the shared WorkloadObservation invariant, enforced on bytes.
+        for status in ["verified", "asserted", "stale"] {
+            let mut v = minimal_valid();
+            v["contexts"][0]["cgroup_id"] = json!("0");
+            v["contexts"][0]["attribution"]["status"] = json!(status);
+            if status == "verified" {
+                v["contexts"][0]["attribution"]["method"] = json!("captured_cgroup");
+                v["contexts"][0]["attribution"]["source"] = json!("kernel_capture");
+            }
+            assert!(
+                validate_workload_v2(&v)
+                    .iter()
+                    .any(|f| matches!(f, V2Finding::InvalidCombination { .. })),
+                "resolved cgroup-zero with status {status} must refuse"
+            );
+        }
+        // Positive control: unresolved cgroup-zero (no workload, no
+        // attribution) stays valid.
+        let mut v = minimal_valid();
+        v["contexts"][0]["cgroup_id"] = json!("0");
+        v["contexts"][0]
+            .as_object_mut()
+            .expect("row")
+            .remove("workload");
+        v["contexts"][0]
+            .as_object_mut()
+            .expect("row")
+            .remove("attribution");
+        assert!(
+            validate_workload_v2(&v).is_empty(),
+            "unresolved cgroup-zero must validate: {:?}",
+            validate_workload_v2(&v)
         );
     }
 

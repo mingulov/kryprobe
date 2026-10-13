@@ -8,7 +8,7 @@ use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, BindingProvenance, ContextIdentity, ExecutionKind,
     KernelIdentity, METHOD_METADATA_FILE, MetadataEntry, MetadataSnapshot, Relationship,
     ScopeDecision, ScopePartition, SnapshotErrorCode, SnapshotInterval, SnapshotKey,
-    SnapshotRequest, ValidityInterval, WorkloadIdentity, WorkloadOrigin,
+    SnapshotRequest, ValidityInterval, WorkloadIdentity, WorkloadObservation, WorkloadOrigin,
 };
 
 /// An unknown selector match is its own population: it never counts as a
@@ -139,4 +139,61 @@ fn wrong_kernel_metadata_is_rejected() {
             .is_none()
     );
     assert!(candidate.promote_candidate_unchecked().is_err());
+}
+
+/// SEM02 at the shared observation contract: cgroup 0 (the unreadable
+/// marker) carries no resolved identity under any usable status. The
+/// snapshot ingress already refuses this shape; the observation rule
+/// must agree so report assembly, replay decode, and scoped policy
+/// inherit the same refusal.
+#[test]
+fn cgroup_zero_identity_refuses_at_observation() {
+    let usable = [
+        AttributionEvidence::verified_kernel_capture(
+            Relationship::HookContext,
+            ValidityInterval::monotonic(100, 200),
+        ),
+        AttributionEvidence::asserted_metadata(
+            Relationship::HookContext,
+            METHOD_METADATA_FILE,
+            Some(ValidityInterval::monotonic(100, 200)),
+        ),
+        AttributionEvidence::new(
+            Relationship::HookContext,
+            METHOD_METADATA_FILE,
+            WorkloadOrigin::OperatorMetadataFile,
+            AttributionStatus::Stale,
+            Some(ValidityInterval::monotonic(100, 200)),
+        ),
+    ];
+    for evidence in &usable {
+        assert!(evidence.validate().is_ok(), "usable evidence is coherent");
+        let bad = WorkloadObservation {
+            context: ContextIdentity::new(7, 0, 1000, 1000, 555, ExecutionKind::Proc),
+            identity: WorkloadIdentity::container("rt", "id", Some("life")),
+            evidence: evidence.clone(),
+        };
+        assert!(
+            bad.validate().is_err(),
+            "resolved cgroup-zero refuses under usable evidence {evidence:?}"
+        );
+    }
+    // Positive controls: unresolved cgroup-zero stays valid, and an
+    // ordinary resolved row is unaffected.
+    let unresolved_zero = WorkloadObservation {
+        context: ContextIdentity::new(7, 0, 1000, 1000, 555, ExecutionKind::Proc),
+        identity: WorkloadIdentity::none(),
+        evidence: AttributionEvidence::unresolved(Relationship::HookContext),
+    };
+    assert!(unresolved_zero.validate().is_ok());
+    let ordinary = WorkloadObservation {
+        context: ContextIdentity::new(7, 43812, 1000, 1000, 555, ExecutionKind::Proc),
+        identity: WorkloadIdentity::container("rt", "id", Some("life")),
+        evidence: AttributionEvidence::asserted_metadata(
+            Relationship::HookContext,
+            METHOD_METADATA_FILE,
+            Some(ValidityInterval::monotonic(100, 200)),
+        ),
+    };
+    assert!(ordinary.validate().is_ok());
 }

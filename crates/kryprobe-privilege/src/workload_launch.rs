@@ -61,6 +61,14 @@
 //!   transport failures only (stall/crash). Typed helper refusals —
 //!   including identity-mismatch refusals — are deterministic and
 //!   never retried.
+//! - Diagnostics: each answered serve additionally parses exactly one
+//!   bounded `{"helper_counters":{...}}` stderr record into the
+//!   internal typed [`HelperDiagnostics`] (approved fixed numeric
+//!   fields plus the saturation marker). Zero, duplicate, over-cap,
+//!   or malformed records mark diagnostics unavailable ([`ServedSnapshot`]
+//!   carries `None`) without weakening the valid response; no helper
+//!   stderr text, path, payload byte, secret, or metadata string
+//!   ever reaches the typed surface.
 //!
 //! [`MetadataUnavailable::NoPrincipal`]: kryprobe_core::workload::MetadataUnavailable::NoPrincipal
 //! [`bind_response_to_request`]: kryprobe_core::workload::bind_response_to_request
@@ -648,6 +656,354 @@ pub fn parse_error_line(line: &str) -> Result<MetadataUnavailable, MetadataUnava
         Some("unsupported_environment") => Ok(MetadataUnavailable::UnsupportedEnvironment),
         Some("parse_failed") => Ok(MetadataUnavailable::ParseFailed),
         _ => Err(MetadataUnavailable::HelperRefused),
+    }
+}
+
+/// Maximum bytes of one `{"helper_counters":{...}}` stderr record
+/// the launcher parses (the honest full-field emission is under 1
+/// KiB even with every counter at `u64::MAX`; past the cap the
+/// record marks diagnostics unavailable, never a refusal).
+pub const MAX_HELPER_DIAGNOSTICS_BYTES: usize = 4096;
+
+/// Typed helper diagnostics: the approved fixed numeric counter
+/// fields plus the explicit saturation marker, parsed at the
+/// launcher boundary from exactly one bounded stderr record. Every
+/// field is a `u64` counter or the saturation flag — IDs-only, never
+/// paths, payload bytes, secrets, or metadata strings. `None` at the
+/// serve boundary means unavailable, never all-zero measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperDiagnostics {
+    /// Fresh positive-cache hits.
+    pub positive_hits: u64,
+    /// Positive-cache misses (absent or expired).
+    pub positive_misses: u64,
+    /// Fresh negative-cache hits (throttled re-scans).
+    pub negative_hits: u64,
+    /// Positive inserts accepted.
+    pub inserts: u64,
+    /// Positive inserts refused: cache full.
+    pub insert_refused_full: u64,
+    /// Negative inserts accepted.
+    pub negative_inserts: u64,
+    /// Negative inserts refused: cache full.
+    pub negative_refused_full: u64,
+    /// Tombstone inserts accepted.
+    pub tombstone_inserts: u64,
+    /// Tombstone inserts refused: store full.
+    pub tombstone_refused_full: u64,
+    /// Expired entries evicted on lookup.
+    pub expired_evictions: u64,
+    /// Pid lifetimes or objects changed under us.
+    pub reuse_detected: u64,
+    /// Scans skipped by the minimum refresh interval.
+    pub refresh_throttled: u64,
+    /// Keys left un-upgraded by the resolution deadline.
+    pub deadline_trips: u64,
+    /// Cgroup scans aborted at the directory budget.
+    pub scan_budget_trips: u64,
+    /// Symlink components refused during traversal.
+    pub symlink_refused: u64,
+    /// Permission denials observed.
+    pub denied: u64,
+    /// Non-host (relative/escaping/cross-device) paths refused.
+    pub not_host_path: u64,
+    /// Objects vanishing mid-traversal.
+    pub gone_during_scan: u64,
+    /// Pids whose hint no longer matches the captured cgroup (moved on).
+    pub migration_skipped: u64,
+    /// Pid lifetime records refused: table full.
+    pub pid_lifetime_refused_full: u64,
+    /// Whether any counter saturated (sticky).
+    pub saturated: bool,
+}
+
+/// Generate the per-field checked-add folds inside
+/// [`HelperDiagnostics::accumulate`].
+macro_rules! accumulate_fields {
+    ($acc:ident, $chunk:ident, $($field:ident;)*) => {
+        $(
+            HelperDiagnostics::sat_add(
+                &mut $acc.$field,
+                &mut $acc.saturated,
+                $chunk.$field,
+            );
+        )*
+    };
+}
+
+impl HelperDiagnostics {
+    /// Zeroed diagnostics (the aggregation identity, never a
+    /// measurement claim — only `Some` values reach the surface).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            positive_hits: 0,
+            positive_misses: 0,
+            negative_hits: 0,
+            inserts: 0,
+            insert_refused_full: 0,
+            negative_inserts: 0,
+            negative_refused_full: 0,
+            tombstone_inserts: 0,
+            tombstone_refused_full: 0,
+            expired_evictions: 0,
+            reuse_detected: 0,
+            refresh_throttled: 0,
+            deadline_trips: 0,
+            scan_budget_trips: 0,
+            symlink_refused: 0,
+            denied: 0,
+            not_host_path: 0,
+            gone_during_scan: 0,
+            migration_skipped: 0,
+            pid_lifetime_refused_full: 0,
+            saturated: false,
+        }
+    }
+
+    /// Checked add of one counter with saturation: overflow pins the
+    /// slot at `u64::MAX` and sets the sticky marker instead of
+    /// wrapping.
+    fn sat_add(slot: &mut u64, saturated: &mut bool, add: u64) {
+        match slot.checked_add(add) {
+            Some(next) => *slot = next,
+            None => {
+                *slot = u64::MAX;
+                *saturated = true;
+            }
+        }
+    }
+
+    /// Fold one chunk's diagnostics into this aggregate: every
+    /// counter adds checked (overflow saturates with the explicit
+    /// marker), and either side's saturation sticks.
+    pub fn accumulate(&mut self, chunk: &Self) {
+        accumulate_fields! {
+            self, chunk,
+            positive_hits;
+            positive_misses;
+            negative_hits;
+            inserts;
+            insert_refused_full;
+            negative_inserts;
+            negative_refused_full;
+            tombstone_inserts;
+            tombstone_refused_full;
+            expired_evictions;
+            reuse_detected;
+            refresh_throttled;
+            deadline_trips;
+            scan_budget_trips;
+            symlink_refused;
+            denied;
+            not_host_path;
+            gone_during_scan;
+            migration_skipped;
+            pid_lifetime_refused_full;
+        }
+        self.saturated |= chunk.saturated;
+    }
+
+    /// Strictly build the typed record from a parsed counters
+    /// object: exactly the approved fields (no missing, no unknown),
+    /// every counter a `u64`, the marker a `bool`. Anything else is
+    /// not a measurement (`None`), never a refusal.
+    fn from_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        if map.len() != 21 {
+            return None;
+        }
+        let num = |key: &str| map.get(key).and_then(serde_json::Value::as_u64);
+        Some(Self {
+            positive_hits: num("positive_hits")?,
+            positive_misses: num("positive_misses")?,
+            negative_hits: num("negative_hits")?,
+            inserts: num("inserts")?,
+            insert_refused_full: num("insert_refused_full")?,
+            negative_inserts: num("negative_inserts")?,
+            negative_refused_full: num("negative_refused_full")?,
+            tombstone_inserts: num("tombstone_inserts")?,
+            tombstone_refused_full: num("tombstone_refused_full")?,
+            expired_evictions: num("expired_evictions")?,
+            reuse_detected: num("reuse_detected")?,
+            refresh_throttled: num("refresh_throttled")?,
+            deadline_trips: num("deadline_trips")?,
+            scan_budget_trips: num("scan_budget_trips")?,
+            symlink_refused: num("symlink_refused")?,
+            denied: num("denied")?,
+            not_host_path: num("not_host_path")?,
+            gone_during_scan: num("gone_during_scan")?,
+            migration_skipped: num("migration_skipped")?,
+            pid_lifetime_refused_full: num("pid_lifetime_refused_full")?,
+            saturated: map.get("saturated").and_then(serde_json::Value::as_bool)?,
+        })
+    }
+}
+
+impl Default for HelperDiagnostics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One served snapshot: the bound response plus the helper's typed
+/// diagnostics for that serve (`None` means unavailable — the
+/// helper emitted no record, or the record was not exactly one
+/// bounded well-formed measurement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedSnapshot {
+    /// The bound, verified snapshot response.
+    pub response: SnapshotResponse,
+    /// Typed helper diagnostics for this serve, if measured.
+    pub diagnostics: Option<HelperDiagnostics>,
+}
+
+/// Parse the typed diagnostics from one serve's stderr: exactly one
+/// bounded `{"helper_counters":{...}}` record parses (strict fields,
+/// no duplicates, no unknown keys); zero records, duplicate
+/// records, over-cap records, or malformed records yield `None`
+/// while the valid response keeps its existing meaning. Never
+/// echoes input: the outcome is typed values or absence.
+/// Candidacy is textual or decoded-key: any line carrying the
+/// marker counts (so a truncated emission that no longer decodes
+/// still voids the result), as does any line parsing as JSON with a
+/// decoded `helper_counters` key (so an escaped envelope spelling
+/// still counts as a second emission).
+pub fn parse_helper_diagnostics(stderr_text: &str) -> Option<HelperDiagnostics> {
+    let mut record: Option<&str> = None;
+    for line in stderr_text.lines() {
+        // Textual candidacy (P2 wave-e): any stderr line carrying the
+        // marker is a counters emission — including a truncated one
+        // that no longer decodes. Decoded-key candidacy (P2 wave-f):
+        // a line parsing as JSON with a decoded `helper_counters`
+        // key counts too, so an escaped envelope spelling
+        // (`hel\u0070er_counters`) cannot evade the exactly-one rule.
+        let is_candidate = line.contains("helper_counters")
+            || serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|value| value.get("helper_counters").is_some());
+        if !is_candidate {
+            continue;
+        }
+        if record.is_some() {
+            return None;
+        }
+        record = Some(line);
+    }
+    let line = record?;
+    if line.len() > MAX_HELPER_DIAGNOSTICS_BYTES {
+        return None;
+    }
+    if json_has_duplicate_keys(line) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let top = value.as_object()?;
+    if top.len() != 1 {
+        return None;
+    }
+    let counters = top.get("helper_counters")?.as_object()?;
+    HelperDiagnostics::from_object(counters)
+}
+
+/// Whether one JSON line repeats an object key anywhere (envelope or
+/// counters): `serde_json::Value` keeps last-wins, but a duplicated
+/// counter is malformed input, never a measurement. The line passed
+/// `serde_json` validation before this walk, so the structure walk
+/// below agrees with the parsed value; keys compare decoded (an
+/// escaped spelling of a repeated key still collides).
+fn json_has_duplicate_keys(line: &str) -> bool {
+    /// One open frame: objects collect decoded keys, arrays only
+    /// nest (no keys to collide).
+    enum Frame {
+        Object(Vec<String>),
+        Array,
+    }
+    let mut chars = line.chars().peekable();
+    let mut stack: Vec<Frame> = Vec::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => stack.push(Frame::Object(Vec::new())),
+            '[' => stack.push(Frame::Array),
+            '}' | ']' => match stack.pop() {
+                Some(Frame::Object(keys)) if ch == '}' => {
+                    let mut seen = std::collections::HashSet::new();
+                    for key in &keys {
+                        if !seen.insert(key) {
+                            return true;
+                        }
+                    }
+                }
+                Some(Frame::Array) if ch == ']' => {}
+                _ => return true,
+            },
+            '"' => {
+                let Some(text) = json_unescape_string(&mut chars) else {
+                    return true;
+                };
+                // Key position: the next non-space character is `:`.
+                let mut probe = chars.clone();
+                let is_key = matches!(probe.find(|c| !c.is_whitespace()), Some(':'));
+                if is_key {
+                    match stack.last_mut() {
+                        Some(Frame::Object(keys)) => keys.push(text),
+                        _ => return true,
+                    }
+                }
+            }
+            _ => {
+                // Structural punctuation, whitespace, numbers and
+                // literals carry no strings or braces; validation
+                // already passed, so anything else just advances.
+            }
+        }
+    }
+    !stack.is_empty()
+}
+
+/// Consume one JSON string body (past the opening quote) into its
+/// decoded value, handling every escape including `\u` pairs (an
+/// escaped spelling of a repeated key still collides). Returns
+/// `None` on truncation or a bad escape.
+fn json_unescape_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    fn hex4(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u32> {
+        let mut unit = 0u32;
+        for _ in 0..4 {
+            unit = unit * 16 + chars.next()?.to_digit(16)?;
+        }
+        Some(unit)
+    }
+    let mut text = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(text),
+            '\\' => match chars.next()? {
+                '"' => text.push('"'),
+                '\\' => text.push('\\'),
+                '/' => text.push('/'),
+                'b' => text.push('\u{0008}'),
+                'f' => text.push('\u{000C}'),
+                'n' => text.push('\n'),
+                'r' => text.push('\r'),
+                't' => text.push('\t'),
+                'u' => {
+                    let high = hex4(chars)?;
+                    let point = if (0xD800..0xDC00).contains(&high) {
+                        let (Some('\\'), Some('u')) = (chars.next(), chars.next()) else {
+                            return None;
+                        };
+                        let low = hex4(chars)?;
+                        if !(0xDC00..0xE000).contains(&low) {
+                            return None;
+                        }
+                        0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                    } else {
+                        high
+                    };
+                    text.push(char::from_u32(point)?);
+                }
+                _ => return None,
+            },
+            ch => text.push(ch),
+        }
     }
 }
 
@@ -1621,8 +1977,10 @@ pub fn attest_helper(
 /// classified failure (retryable transport failure vs deterministic
 /// typed refusal).
 enum AttemptOutcome {
-    /// Bound, verified response.
-    Answered(SnapshotResponse),
+    /// Bound, verified response plus this serve's typed helper
+    /// diagnostics (`None` when unavailable — never a refusal).
+    /// Boxed: the served value dwarfs the other variants.
+    Answered(Box<ServedSnapshot>),
     /// Retryable transport failure (stall/crash/wait failure).
     TransportFailed,
     /// Deterministic typed refusal (never retried).
@@ -1683,10 +2041,25 @@ pub fn serve_pinned_snapshot_with_bound(
     request: &SnapshotRequest,
     bound: Duration,
 ) -> Result<SnapshotResponse, MetadataUnavailable> {
+    serve_pinned_snapshot_with_diagnostics(pinned, principal, metadata, request, bound)
+        .map(|served| served.response)
+}
+
+/// [`serve_pinned_snapshot_with_bound`] returning the typed helper
+/// diagnostics alongside the bound response: the same bound/retry
+/// machinery (retries, pinning, cleanup, IO bounds unchanged) —
+/// diagnostics ride the answered outcome and never fail it.
+pub fn serve_pinned_snapshot_with_diagnostics(
+    pinned: &PinnedHelper,
+    principal: &Principal,
+    metadata: Option<&Path>,
+    request: &SnapshotRequest,
+    bound: Duration,
+) -> Result<ServedSnapshot, MetadataUnavailable> {
     let mut attempts = 0u32;
     loop {
         match serve_once(pinned, principal, metadata, request, bound) {
-            AttemptOutcome::Answered(response) => return Ok(response),
+            AttemptOutcome::Answered(served) => return Ok(*served),
             AttemptOutcome::Refused(kind) => return Err(kind),
             AttemptOutcome::TransportFailed => {
                 if attempts >= MAX_HELPER_RETRIES {
@@ -1799,7 +2172,13 @@ fn serve_once(
         .find_map(|line| parse_attestation_line(line).ok());
     match attested {
         Some(attestation) => match check_helper_attestation(&attestation, principal) {
-            Ok(()) => AttemptOutcome::Answered(response),
+            // The typed diagnostics ride the verified answer: a
+            // missing or malformed record marks diagnostics
+            // unavailable (`None`) without touching the response.
+            Ok(()) => AttemptOutcome::Answered(Box::new(ServedSnapshot {
+                response,
+                diagnostics: parse_helper_diagnostics(&stderr_text),
+            })),
             Err(kind) => AttemptOutcome::Refused(kind),
         },
         None => AttemptOutcome::Refused(MetadataUnavailable::HelperRefused),
@@ -1983,6 +2362,298 @@ mod tests {
             parse_error_line("garbage"),
             Err(MetadataUnavailable::HelperRefused)
         );
+    }
+
+    /// Golden full-field counters object (the honest helper shape:
+    /// every approved field present, `denied=1`/`migration_skipped=1`
+    /// measured, saturation clear).
+    fn full_counters_value() -> serde_json::Value {
+        serde_json::json!({
+            "positive_hits": 0, "positive_misses": 1, "negative_hits": 0,
+            "inserts": 0, "insert_refused_full": 0,
+            "negative_inserts": 0, "negative_refused_full": 0,
+            "tombstone_inserts": 0, "tombstone_refused_full": 0,
+            "expired_evictions": 0, "reuse_detected": 0,
+            "refresh_throttled": 0, "deadline_trips": 0,
+            "scan_budget_trips": 0, "symlink_refused": 0,
+            "denied": 1, "not_host_path": 0, "gone_during_scan": 0,
+            "migration_skipped": 1, "pid_lifetime_refused_full": 0,
+            "saturated": false,
+        })
+    }
+
+    /// One stderr diagnostics record over `counters`.
+    fn diagnostics_line(counters: &serde_json::Value) -> String {
+        format!(r#"{{"helper_counters":{counters}}}"#)
+    }
+
+    #[test]
+    fn diagnostics_valid_full_record_parses() {
+        let line = diagnostics_line(&full_counters_value());
+        let stderr = format!("{}\n{line}\n", attestation_line(1000, "0", true, "0,1,2"));
+        let parsed = parse_helper_diagnostics(&stderr).expect("parses");
+        assert_eq!(
+            parsed,
+            HelperDiagnostics {
+                positive_misses: 1,
+                denied: 1,
+                migration_skipped: 1,
+                ..HelperDiagnostics::new()
+            }
+        );
+        // A saturated honest record keeps its marker.
+        let mut counters = full_counters_value();
+        counters["saturated"] = serde_json::json!(true);
+        counters["denied"] = serde_json::json!(18446744073709551615u64);
+        let parsed = parse_helper_diagnostics(&diagnostics_line(&counters)).expect("parses");
+        assert!(parsed.saturated);
+        assert_eq!(parsed.denied, u64::MAX);
+        // Byte-exact emission captured from the real helper (exit 0,
+        // kernel-mismatch short-circuit, alphabetical key order):
+        // every counter genuinely zero — a well-formed record still
+        // parses to `Some` (absence is `None`; all-zero measured is
+        // data, never confused with unavailable).
+        let real = r#"{"helper_counters":{"deadline_trips":0,"denied":0,"expired_evictions":0,"gone_during_scan":0,"insert_refused_full":0,"inserts":0,"migration_skipped":0,"negative_hits":0,"negative_inserts":0,"negative_refused_full":0,"not_host_path":0,"pid_lifetime_refused_full":0,"positive_hits":0,"positive_misses":0,"refresh_throttled":0,"reuse_detected":0,"saturated":false,"scan_budget_trips":0,"symlink_refused":0,"tombstone_inserts":0,"tombstone_refused_full":0}}"#;
+        assert_eq!(
+            parse_helper_diagnostics(real),
+            Some(HelperDiagnostics::new())
+        );
+    }
+
+    #[test]
+    fn diagnostics_absent_is_unavailable() {
+        // Attestation and error lines are not diagnostics records.
+        for stderr in [
+            attestation_line(1000, "0", true, "0,1,2"),
+            format!(
+                "{}\n{}\n",
+                attestation_line(1000, "0", true, "0,1,2"),
+                r#"{"error":"helper_refused"}"#,
+            ),
+            String::new(),
+            "not json\n".to_string(),
+            diagnostics_line(&serde_json::json!({})),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "no well-formed record: {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_duplicate_records_refuse() {
+        let line = diagnostics_line(&full_counters_value());
+        // Two records — even two identical honest ones — are not
+        // exactly one measurement.
+        assert_eq!(parse_helper_diagnostics(&format!("{line}\n{line}\n")), None);
+    }
+
+    #[test]
+    fn diagnostics_valid_plus_truncated_refuses_both_orders() {
+        // P2 (wave-e): a truncated counters emission is still a
+        // counters emission — valid + truncated in either order is
+        // ambiguous input, never a measurement.
+        let valid = diagnostics_line(&full_counters_value());
+        let truncated = r#"{"helper_counters":{"#;
+        for stderr in [
+            format!("{valid}\n{truncated}\n"),
+            format!("{truncated}\n{valid}\n"),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "valid+truncated refuses: {stderr:?}"
+            );
+        }
+        // A lone truncated emission is not a measurement either.
+        assert_eq!(parse_helper_diagnostics(truncated), None);
+    }
+
+    #[test]
+    fn diagnostics_valid_plus_escaped_refuses_both_orders() {
+        // P2 (wave-f): a JSON-escaped envelope spelling
+        // (`hel\u0070er_counters` decodes to `helper_counters`) is
+        // still a counters emission under the decoded-key rule —
+        // valid + escaped in either order refuses.
+        let valid = diagnostics_line(&full_counters_value());
+        let escaped = format!(r#"{{"hel\u0070er_counters":{}}}"#, full_counters_value());
+        assert!(
+            !escaped.contains("helper_counters"),
+            "fixture evades the literal marker"
+        );
+        for stderr in [
+            format!("{valid}\n{escaped}\n"),
+            format!("{escaped}\n{valid}\n"),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "valid+escaped refuses: {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_valid_plus_escaped_bad_refuses_both_orders() {
+        // P2 (wave-f): the escaped second emission poisons even when
+        // its own counters are malformed — any candidate failing
+        // strict parse voids the result to `None`.
+        let valid = diagnostics_line(&full_counters_value());
+        let escaped_bad = r#"{"hel\u0070er_counters":{"denied":1}}"#;
+        assert!(
+            !escaped_bad.contains("helper_counters"),
+            "fixture evades the literal marker"
+        );
+        for stderr in [
+            format!("{valid}\n{escaped_bad}\n"),
+            format!("{escaped_bad}\n{valid}\n"),
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&stderr),
+                None,
+                "valid+escaped-bad refuses: {stderr:?}"
+            );
+        }
+        // A lone escaped malformed emission is not a measurement.
+        assert_eq!(parse_helper_diagnostics(escaped_bad), None);
+    }
+
+    #[test]
+    fn diagnostics_duplicate_keys_refuse() {
+        let line = diagnostics_line(&full_counters_value());
+        // A repeated counter key (last-wins would silently pick 2).
+        let dup = line.replacen(r#""denied":1"#, r#""denied":1,"denied":2"#, 1);
+        assert_ne!(dup, line, "fixture carries the replaced key");
+        assert_eq!(parse_helper_diagnostics(&dup), None);
+        // An escaped spelling of the repeated key still collides.
+        let escaped = line.replacen(r#""denied":1"#, r#""denied":1,"\u0064denied":2"#, 1);
+        assert_ne!(escaped, line, "fixture carries the replaced key");
+        assert_eq!(parse_helper_diagnostics(&escaped), None);
+        // A repeated envelope key refuses too.
+        let envelope = format!(
+            r#"{{"helper_counters":{c},"helper_counters":{c}}}"#,
+            c = full_counters_value()
+        );
+        assert_eq!(parse_helper_diagnostics(&envelope), None);
+    }
+
+    #[test]
+    fn diagnostics_unknown_or_missing_counters_refuse() {
+        let line = diagnostics_line(&full_counters_value());
+        // An unknown counter is not an approved field.
+        let unknown = line.replacen(r#""saturated":false"#, r#""saturated":false,"evil":1"#, 1);
+        assert_ne!(unknown, line, "fixture carries the replaced key");
+        assert_eq!(parse_helper_diagnostics(&unknown), None);
+        // A missing counter is not a complete measurement.
+        let missing = line.replacen(r#""denied":1,"#, "", 1);
+        assert_ne!(missing, line, "fixture carries the replaced key");
+        assert_eq!(parse_helper_diagnostics(&missing), None);
+        // An unknown envelope field refuses.
+        let envelope = format!(
+            r#"{{"helper_counters":{c},"x":1}}"#,
+            c = full_counters_value()
+        );
+        assert_eq!(parse_helper_diagnostics(&envelope), None);
+    }
+
+    #[test]
+    fn diagnostics_mistyped_counters_refuse() {
+        let line = diagnostics_line(&full_counters_value());
+        for bad in [
+            line.replacen(r#""denied":1"#, r#""denied":true"#, 1),
+            line.replacen(r#""denied":1"#, r#""denied":1.5"#, 1),
+            line.replacen(r#""denied":1"#, r#""denied":"1""#, 1),
+            line.replacen(r#""denied":1"#, r#""denied":-1"#, 1),
+            line.replacen(r#""denied":1"#, r#""denied":null"#, 1),
+            line.replacen(r#""saturated":false"#, r#""saturated":0"#, 1),
+            line.replacen(r#""saturated":false"#, r#""saturated":"no""#, 1),
+        ] {
+            assert_ne!(bad, line, "fixture carries the replaced key");
+            assert_eq!(parse_helper_diagnostics(&bad), None, "line: {bad}");
+        }
+        // A non-object counters value refuses.
+        for counters in [
+            serde_json::json!([]),
+            serde_json::json!("x"),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                parse_helper_diagnostics(&diagnostics_line(&counters)),
+                None,
+                "counters: {counters}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_oversized_record_refuses() {
+        let line = diagnostics_line(&full_counters_value());
+        assert!(
+            line.len() < MAX_HELPER_DIAGNOSTICS_BYTES,
+            "honest record fits the cap: {} bytes",
+            line.len()
+        );
+        let padded = format!("{}{line}", " ".repeat(MAX_HELPER_DIAGNOSTICS_BYTES));
+        assert_eq!(parse_helper_diagnostics(&padded), None);
+        // Small padding still parses (JSON whitespace, under cap).
+        assert!(
+            parse_helper_diagnostics(&format!("  {line}  ")).is_some(),
+            "whitespace-padded record parses"
+        );
+    }
+
+    #[test]
+    fn diagnostics_forged_strings_never_parse() {
+        // A forged private path smuggled as a counter value or an
+        // unknown field is not a measurement — and the typed
+        // boundary returns absence, never the string.
+        let line = diagnostics_line(&full_counters_value());
+        let forged_value = line.replacen(
+            r#""denied":1"#,
+            r#""denied":"/proc/self/root/etc/shadow""#,
+            1,
+        );
+        assert_eq!(parse_helper_diagnostics(&forged_value), None);
+        let forged_field = line.replacen(
+            r#""saturated":false"#,
+            r#""saturated":false,"path":"/proc/self/root/etc/shadow""#,
+            1,
+        );
+        assert_eq!(parse_helper_diagnostics(&forged_field), None);
+    }
+
+    #[test]
+    fn diagnostics_accumulate_sums_and_saturates() {
+        let mut acc = HelperDiagnostics::new();
+        // Zero is the aggregation identity.
+        acc.accumulate(&HelperDiagnostics::new());
+        assert_eq!(acc, HelperDiagnostics::new());
+        let mut chunk = HelperDiagnostics::new();
+        chunk.denied = 1;
+        chunk.migration_skipped = 2;
+        acc.accumulate(&chunk);
+        acc.accumulate(&chunk);
+        assert_eq!(acc.denied, 2);
+        assert_eq!(acc.migration_skipped, 4);
+        assert_eq!(acc.positive_hits, 0);
+        assert!(!acc.saturated);
+        // Either side's saturation sticks.
+        chunk.saturated = true;
+        acc.accumulate(&chunk);
+        assert!(acc.saturated);
+        // Count overflow saturates with the explicit marker instead
+        // of wrapping — never a small wrong sum.
+        let mut full = HelperDiagnostics::new();
+        full.denied = u64::MAX;
+        let mut one = HelperDiagnostics::new();
+        one.denied = 1;
+        full.accumulate(&one);
+        assert_eq!(full.denied, u64::MAX);
+        assert!(full.saturated);
+        assert_eq!(full.migration_skipped, 0);
     }
 
     /// Built fixture binary:
@@ -2689,6 +3360,216 @@ mod tests {
             argv.contains("--metadata") && argv.contains("meta.json"),
             "metadata path passes through: {argv}"
         );
+    }
+
+    #[test]
+    fn serve_with_diagnostics_surfaces_denied_and_migration() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diag").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json", "counters": full_counters_value()}),
+        );
+        let principal = current_principal().expect("test principal");
+        let served = serve_pinned_snapshot_with_diagnostics(
+            &pin_helper(&helper).expect("pins"),
+            &principal,
+            None,
+            &request,
+            Duration::from_secs(10),
+        )
+        .expect("serves");
+        // The valid unresolved response keeps its meaning.
+        assert_eq!(served.response.session_id, SESSION);
+        assert_eq!(served.response.associations.len(), 1);
+        assert_eq!(
+            served.response.associations[0].evidence.status,
+            kryprobe_core::workload::AttributionStatus::Unresolved
+        );
+        // The approved counters surface typed.
+        let diagnostics = served.diagnostics.expect("diagnostics measured");
+        assert_eq!(diagnostics.denied, 1);
+        assert_eq!(diagnostics.migration_skipped, 1);
+        assert_eq!(diagnostics.positive_misses, 1);
+        assert!(!diagnostics.saturated);
+    }
+
+    #[test]
+    fn serve_diagnostics_malformed_keeps_valid_response() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diagbad").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        for counters_line in [
+            "not json at all",
+            r#"{"helper_counters":{"denied":1}}"#,
+            &diagnostics_line(&serde_json::json!({"denied": "x"})),
+        ] {
+            let helper = stage_fixture(
+                scratch.path(),
+                "helper",
+                serde_json::json!({"canned": "canned.json", "counters_line": counters_line}),
+            );
+            let principal = current_principal().expect("test principal");
+            let served = serve_pinned_snapshot_with_diagnostics(
+                &pin_helper(&helper).expect("pins"),
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10),
+            )
+            .expect("serves");
+            assert_eq!(served.response.session_id, SESSION);
+            assert_eq!(
+                served.diagnostics, None,
+                "malformed record marks unavailable: {counters_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_diagnostics_valid_plus_truncated_marks_unavailable_both_orders() {
+        // P2 (wave-e) at the serve boundary: the helper emits a valid
+        // record plus a truncated counters line (either order) — the
+        // valid response keeps its meaning, diagnostics go unavailable.
+        // The verbatim `counters_line` sidecar carries an embedded
+        // newline, so the fixture emits two stderr lines.
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diagtrunc").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let valid = diagnostics_line(&full_counters_value());
+        let truncated = r#"{"helper_counters":{"#;
+        for (order, counters_line) in [
+            ("valid-first", format!("{valid}\n{truncated}")),
+            ("truncated-first", format!("{truncated}\n{valid}")),
+        ] {
+            let helper = stage_fixture(
+                scratch.path(),
+                &format!("helper-{order}"),
+                serde_json::json!({"canned": "canned.json", "counters_line": counters_line}),
+            );
+            let principal = current_principal().expect("test principal");
+            let served = serve_pinned_snapshot_with_diagnostics(
+                &pin_helper(&helper).expect("pins"),
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10),
+            )
+            .expect("serves");
+            assert_eq!(served.response.session_id, SESSION);
+            assert_eq!(
+                served.diagnostics, None,
+                "valid+truncated marks unavailable ({order})"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_diagnostics_valid_plus_escaped_marks_unavailable_both_orders() {
+        // P2 (wave-f) at the serve boundary: the helper emits a valid
+        // record plus an escaped-envelope counters line (either
+        // order) — the valid response keeps its meaning, diagnostics
+        // go unavailable.
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diagesc").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let valid = diagnostics_line(&full_counters_value());
+        let escaped = format!(r#"{{"hel\u0070er_counters":{}}}"#, full_counters_value());
+        assert!(
+            !escaped.contains("helper_counters"),
+            "fixture evades the literal marker"
+        );
+        for (order, counters_line) in [
+            ("valid-first", format!("{valid}\n{escaped}")),
+            ("escaped-first", format!("{escaped}\n{valid}")),
+        ] {
+            let helper = stage_fixture(
+                scratch.path(),
+                &format!("helper-{order}"),
+                serde_json::json!({"canned": "canned.json", "counters_line": counters_line}),
+            );
+            let principal = current_principal().expect("test principal");
+            let served = serve_pinned_snapshot_with_diagnostics(
+                &pin_helper(&helper).expect("pins"),
+                &principal,
+                None,
+                &request,
+                Duration::from_secs(10),
+            )
+            .expect("serves");
+            assert_eq!(served.response.session_id, SESSION);
+            assert_eq!(
+                served.diagnostics, None,
+                "valid+escaped marks unavailable ({order})"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_diagnostics_absent_is_unavailable() {
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-diagabs").expect("scratch");
+        let request = test_request();
+        // The echo path emits no counters line at all.
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"echo_unresolved": true}),
+        );
+        let principal = current_principal().expect("test principal");
+        let served = serve_pinned_snapshot_with_diagnostics(
+            &pin_helper(&helper).expect("pins"),
+            &principal,
+            None,
+            &request,
+            Duration::from_secs(10),
+        )
+        .expect("serves");
+        assert_eq!(served.response.session_id, SESSION);
+        assert_eq!(served.diagnostics, None);
+        // The canned default (`{}`) is not a measurement either.
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json"}),
+        );
+        let served = serve_pinned_snapshot_with_diagnostics(
+            &pin_helper(&helper).expect("pins"),
+            &principal,
+            None,
+            &request,
+            Duration::from_secs(10),
+        )
+        .expect("serves");
+        assert_eq!(served.diagnostics, None);
+    }
+
+    #[test]
+    fn serve_response_only_caller_preserved_with_counters() {
+        // Old response-only callers keep their shape (bare
+        // `SnapshotResponse`) even when the helper emits counters.
+        let scratch = kryprobe_testkit::TempDir::named("launch-serve-compat").expect("scratch");
+        let request = test_request();
+        let canned = canned_response_bytes(&request);
+        std::fs::write(scratch.path().join("canned.json"), &canned).expect("canned");
+        let helper = stage_fixture(
+            scratch.path(),
+            "helper",
+            serde_json::json!({"canned": "canned.json", "counters": full_counters_value()}),
+        );
+        let principal = current_principal().expect("test principal");
+        let response: SnapshotResponse =
+            serve_snapshot_with_bound(&helper, &principal, None, &request, Duration::from_secs(10))
+                .expect("serves");
+        assert_eq!(response.session_id, SESSION);
+        assert_eq!(response.associations.len(), 1);
     }
 
     #[test]

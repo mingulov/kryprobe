@@ -23,8 +23,8 @@ use super::model::{
 use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, ContainerRef, ContextIdentity, ExecutionKind,
     MAX_REPORT_V2_BYTES, MAX_V2_CONTEXT_ROWS, MAX_V2_DICTIONARY_ENTRIES, MetadataUnavailable,
-    ObservationBoundary, PodRef, Relationship, ScopePartition, SnapshotConsistency,
-    ValidityInterval, WorkloadIdentity, WorkloadObservation, WorkloadOrigin,
+    ObservationBoundary, PodRef, Relationship, ScopeDecision, ScopePartition, SnapshotConsistency,
+    ValidityInterval, WorkloadIdentity, WorkloadObservation, WorkloadOrigin, decide_workload_scope,
 };
 use serde_json::{Map, Value};
 use std::io::{Read, Write};
@@ -51,6 +51,12 @@ pub enum WorkloadDecodeError {
     /// Two rows share one accounting key (refused symmetric with
     /// assembly: merging would corrupt rows).
     DuplicateContext,
+    /// The stored partition (or the selector behind it) contradicts
+    /// the selector-weighted recompute over the decoded rows (SEM01):
+    /// conservation alone cannot establish selection, and claimed
+    /// input is never silently repaired. The frozen validator refuses
+    /// these shapes first; this is the typed-conversion backstop.
+    PartitionContradictsSelector,
     /// A validated value still fails typed conversion (defensive: the
     /// validator accepts only convertible shapes).
     Inconsistent,
@@ -67,6 +73,9 @@ impl std::fmt::Display for WorkloadDecodeError {
             }
             Self::IncoherentRow => write!(f, "row identity contradicts its evidence"),
             Self::DuplicateContext => write!(f, "two rows share one accounting key"),
+            Self::PartitionContradictsSelector => {
+                write!(f, "stored partition contradicts its selector and rows")
+            }
             Self::Inconsistent => write!(f, "report value contradicts its validated shape"),
         }
     }
@@ -699,10 +708,12 @@ fn decode_availability(metadata: &Map<String, Value>) -> Option<MetadataAvailabi
 /// Convert a validator-accepted value into its typed report. Returns
 /// `Err` when the value contradicts its validated shape (defensive —
 /// the validator accepts only convertible shapes), when a row breaks
-/// identity/evidence coherence, or when two rows share one accounting
-/// key. Rows normalize to accounting-key order (symmetric with
-/// assembly), so live and replay renders agree regardless of file row
-/// order.
+/// identity/evidence coherence, when two rows share one accounting
+/// key, or when the stored partition contradicts the selector-weighted
+/// recompute over the decoded rows (SEM01 — conservation alone cannot
+/// establish selection). Rows normalize to accounting-key order
+/// (symmetric with assembly), so live and replay renders agree
+/// regardless of file row order.
 fn convert_validated(value: &Value) -> Result<WorkloadReport, WorkloadDecodeError> {
     let obj = value.as_object().ok_or(WorkloadDecodeError::Inconsistent)?;
     let session = obj.get("session").and_then(Value::as_object);
@@ -734,7 +745,25 @@ fn convert_validated(value: &Value) -> Result<WorkloadReport, WorkloadDecodeErro
         return Err(WorkloadDecodeError::Inconsistent);
     };
 
+    let selector = decode_selector(selectors).ok_or(WorkloadDecodeError::Inconsistent)?;
+    // SEM01: the shared core selector behind the stored one. An
+    // unmappable selector (cgroup 0 — never selectable — or a
+    // malformed container key, defensive post-validator) refuses: the
+    // stored partition cannot be recomputed under it.
+    let shared = match &selector {
+        WorkloadSelector::None => None,
+        WorkloadSelector::CgroupId(id) => Some(
+            kryprobe_core::workload::WorkloadSelector::cgroup(*id)
+                .map_err(|_| WorkloadDecodeError::PartitionContradictsSelector)?,
+        ),
+        WorkloadSelector::ContainerId { runtime, id, .. } => Some(
+            kryprobe_core::workload::WorkloadSelector::container(runtime, id, None)
+                .map_err(|_| WorkloadDecodeError::PartitionContradictsSelector)?,
+        ),
+    };
+
     let mut rows = Vec::with_capacity(contexts.len());
+    let (mut matched, mut nonmatched, mut unknown_match) = (0u64, 0u64, 0u64);
     for context in contexts {
         let row = context
             .as_object()
@@ -787,11 +816,29 @@ fn convert_validated(value: &Value) -> Result<WorkloadReport, WorkloadDecodeErro
         }
         .validate()
         .map_err(|_| WorkloadDecodeError::IncoherentRow)?;
+        let calls = parse_digit(row.get("calls")).ok_or(WorkloadDecodeError::Inconsistent)?;
+        // SEM01: fold the validated row's weight into the recomputed
+        // buckets with the shared core classifier (unscoped rows all
+        // match their whole observed population). Checked: the
+        // validator refuses overflowing call sums first.
+        let bucket = match &shared {
+            None => &mut matched,
+            Some(shared) => {
+                match decide_workload_scope(shared, &context_id, &identity, &evidence) {
+                    ScopeDecision::Match => &mut matched,
+                    ScopeDecision::NonMatch => &mut nonmatched,
+                    ScopeDecision::Unknown => &mut unknown_match,
+                }
+            }
+        };
+        *bucket = bucket
+            .checked_add(calls)
+            .ok_or(WorkloadDecodeError::Inconsistent)?;
         let bare_default = !identity.is_resolved()
             && evidence == AttributionEvidence::unresolved(Relationship::HookContext);
         rows.push(ReportRow {
             context: context_id,
-            calls: parse_digit(row.get("calls")).ok_or(WorkloadDecodeError::Inconsistent)?,
+            calls,
             native,
             workload: super::model::identity_has_association(&identity).then(|| identity.clone()),
             evidence: (!bare_default).then(|| evidence.clone()),
@@ -805,7 +852,19 @@ fn convert_validated(value: &Value) -> Result<WorkloadReport, WorkloadDecodeErro
         }
     }
 
-    let selector = decode_selector(selectors).ok_or(WorkloadDecodeError::Inconsistent)?;
+    // SEM01: the stored buckets must equal the recompute — claimed
+    // input is never silently repaired.
+    let stored = ScopePartition::from_counts(
+        parse_digit(partition.get("matched")).ok_or(WorkloadDecodeError::Inconsistent)?,
+        parse_digit(partition.get("nonmatched")).ok_or(WorkloadDecodeError::Inconsistent)?,
+        parse_digit(partition.get("unknown_match")).ok_or(WorkloadDecodeError::Inconsistent)?,
+    )
+    .map_err(|_| WorkloadDecodeError::Inconsistent)?;
+    let derived = ScopePartition::from_counts(matched, nonmatched, unknown_match)
+        .map_err(|_| WorkloadDecodeError::Inconsistent)?;
+    if stored != derived {
+        return Err(WorkloadDecodeError::PartitionContradictsSelector);
+    }
 
     let report_scope = match scope.get("report_scope").and_then(Value::as_str) {
         Some("unscoped") => Some(ReportScope::Unscoped),
@@ -875,12 +934,7 @@ fn convert_validated(value: &Value) -> Result<WorkloadReport, WorkloadDecodeErro
             refused_inserts: parse_digit(ledger.get("refused_inserts"))
                 .ok_or(WorkloadDecodeError::Inconsistent)?,
         },
-        partition: ScopePartition::from_counts(
-            parse_digit(partition.get("matched")).ok_or(WorkloadDecodeError::Inconsistent)?,
-            parse_digit(partition.get("nonmatched")).ok_or(WorkloadDecodeError::Inconsistent)?,
-            parse_digit(partition.get("unknown_match")).ok_or(WorkloadDecodeError::Inconsistent)?,
-        )
-        .map_err(|_| WorkloadDecodeError::Inconsistent)?,
+        partition: stored,
         scope: report_scope,
         selector,
         group_by,

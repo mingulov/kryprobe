@@ -3,6 +3,10 @@
 //! (ADR-0008 §(g), spec F05): `observed = matched + nonmatched +
 //! unknown_match` with checked arithmetic.
 
+use super::{
+    AttributionEvidence, AttributionStatus, ContextIdentity, MAX_STRING_FIELD_BYTES,
+    WorkloadIdentity,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Selector outcome for one observation: `Unknown` is neither match nor
@@ -109,6 +113,198 @@ impl ScopePartition {
     }
 }
 
+/// Full container id shape (frozen): 64 lowercase hex chars — the
+/// same shape [`ContextIdentity::qualified_container_candidate`]
+/// admits and the v2 report schema enforces.
+const CONTAINER_ID_HEX_CHARS: usize = 64;
+
+/// A workload selector: the M1 post-ingestion view kinds. Pod,
+/// runtime, subtree, name, and path selectors do not exist in M1 and
+/// refuse via [`WorkloadSelector::unsupported_kind`] (exit 2 at
+/// integration), never silently degrading to another scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadSelector {
+    /// Exact cgroup id: matches only rows captured in this cgroup.
+    /// Descendants never join; `0` refuses at construction (the
+    /// unreadable marker is not selectable).
+    Cgroup(u64),
+    /// Full container identity: runtime instance + full id ONLY. M1
+    /// selectors carry no lifetime (D10: the amended v2 report wire
+    /// `selectors.container` allows runtime+id only), so the selector
+    /// always matches the container across lifetimes (frozen by the
+    /// `matching-violation` fixture: the lifetime-less selector
+    /// matches the lifetime-a row). Lifetime narrowing is not
+    /// representable in M1 and refuses at construction — never
+    /// silently dropped (dropping would change scope).
+    Container {
+        /// Runtime instance identity (non-empty, bounded).
+        runtime: String,
+        /// Full container id (64 lowercase hex; abbreviations refuse).
+        id: String,
+    },
+}
+
+/// Selector refusal: invalid or unsupported selection (exit 2 at
+/// integration). Messages are static (D09): they name the rule, never
+/// echo input bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorError {
+    message: String,
+}
+
+impl SelectorError {
+    fn new(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+        }
+    }
+
+    /// Exit intent for every selector refusal: invalid input (2).
+    #[must_use]
+    pub fn exit_intent(&self) -> i32 {
+        2
+    }
+}
+
+impl std::fmt::Display for SelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for SelectorError {}
+
+impl WorkloadSelector {
+    /// Exact-cgroup selector. Refuses `0`: the unreadable marker is
+    /// not a selectable cgroup (frozen zero convention).
+    pub fn cgroup(id: u64) -> Result<Self, SelectorError> {
+        if id == 0 {
+            return Err(SelectorError::new(
+                "cgroup selector refuses id 0 (unreadable marker, never selectable)",
+            ));
+        }
+        Ok(Self::Cgroup(id))
+    }
+
+    /// Full-container-identity selector: non-empty bounded runtime
+    /// and a full 64-char lowercase-hex id (abbreviated, non-hex, or
+    /// uppercase ids refuse). The `lifetime` argument must be `None`:
+    /// any present lifetime refuses, because lifetime narrowing is not
+    /// representable on the amended M1 report wire (D10:
+    /// `selectors.container` carries runtime+id only) and silently
+    /// dropping it would change scope.
+    pub fn container(
+        runtime: &str,
+        id: &str,
+        lifetime: Option<&str>,
+    ) -> Result<Self, SelectorError> {
+        if runtime.is_empty() || runtime.len() > MAX_STRING_FIELD_BYTES {
+            return Err(SelectorError::new(
+                "container selector requires a non-empty runtime within 256 bytes",
+            ));
+        }
+        if !is_full_container_id(id) {
+            return Err(SelectorError::new(
+                "container selector requires a full 64-character lowercase-hex id (abbreviations refuse)",
+            ));
+        }
+        if lifetime.is_some() {
+            return Err(SelectorError::new(
+                "container selector refuses a lifetime (M1 selectors are runtime + id only)",
+            ));
+        }
+        Ok(Self::Container {
+            runtime: runtime.to_string(),
+            id: id.to_string(),
+        })
+    }
+
+    /// Explicit refusal for selector kinds M1 does not support (pod,
+    /// runtime, subtree, name, path). The kind names the caller's
+    /// request; the message stays static and names the supported set.
+    #[must_use]
+    pub fn unsupported_kind(kind: &str) -> SelectorError {
+        let _ = kind;
+        SelectorError::new(
+            "unsupported selector kind (M1 supports cgroup-id and container-id only)",
+        )
+    }
+}
+
+/// Full-id shape check: exactly 64 lowercase hex chars.
+fn is_full_container_id(id: &str) -> bool {
+    id.len() == CONTAINER_ID_HEX_CHARS
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Whether an association status supports definite comparison: the
+/// usable statuses (verified/asserted/stale) cohere with resolved
+/// identities per [`WorkloadObservation::validate`](super::WorkloadObservation::validate);
+/// unresolved, ambiguous, and unsupported rows can never establish a
+/// definite container match.
+fn status_is_definite(status: AttributionStatus) -> bool {
+    matches!(
+        status,
+        AttributionStatus::Verified | AttributionStatus::Asserted | AttributionStatus::Stale
+    )
+}
+
+/// Shared scope decision for one captured row: `Match` only when the
+/// row definitely belongs to the selection, `NonMatch` only when it
+/// definitely does not, `Unknown` whenever match-ness cannot be
+/// established. Unknown is neither match nor non-match and never
+/// collapses into either.
+///
+/// Pure over caller values: no policy-rule evaluation enters core.
+/// Scoped policy evaluation, report assembly, and replay decode all
+/// share this classifier so a stored partition is always recomputed
+/// from the same rule (SEM01).
+#[must_use]
+pub fn decide_workload_scope(
+    selector: &WorkloadSelector,
+    context: &ContextIdentity,
+    identity: &WorkloadIdentity,
+    evidence: &AttributionEvidence,
+) -> ScopeDecision {
+    match selector {
+        WorkloadSelector::Cgroup(id) => {
+            if context.cgroup == 0 {
+                // Unreadable cgroup: cannot establish match-ness.
+                ScopeDecision::Unknown
+            } else if context.cgroup == *id {
+                ScopeDecision::Match
+            } else {
+                ScopeDecision::NonMatch
+            }
+        }
+        WorkloadSelector::Container { runtime, id } => {
+            let Some(container) = identity.container.as_ref() else {
+                // No container association (none, or pod-only): no
+                // container key is established — unknown.
+                return ScopeDecision::Unknown;
+            };
+            if !status_is_definite(evidence.status) {
+                return ScopeDecision::Unknown;
+            }
+            if container.runtime.is_empty() || container.id.is_empty() {
+                // Empty components establish no key (frozen
+                // `identity_keys` rule) — unknown.
+                return ScopeDecision::Unknown;
+            }
+            if container.runtime != *runtime || container.id != *id {
+                return ScopeDecision::NonMatch;
+            }
+            // Runtime+id equality is the whole M1 match: observed row
+            // lifetimes never narrow the selection (D10 — the selector
+            // wire carries runtime+id only, so matching spans
+            // lifetimes by construction).
+            ScopeDecision::Match
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +332,115 @@ mod tests {
             u64::MAX
         );
         assert!(serde_json::from_str::<ScopePartition>(&overflow).is_err());
+    }
+
+    #[test]
+    fn container_id_shape_is_exact() {
+        assert!(is_full_container_id(
+            "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57"
+        ));
+        assert!(!is_full_container_id("70f16eb35cd4"));
+        assert!(!is_full_container_id(&"g".repeat(64)));
+        assert!(!is_full_container_id(
+            "70F16EB35CD4991D07A1545BEB8522E7F3F59B6642AA2F2AFECFF68F2BE2EB57"
+        ));
+        assert!(!is_full_container_id(""));
+    }
+
+    #[test]
+    fn cgroup_decision_needs_a_readable_equal_cgroup() {
+        use super::super::{ExecutionKind, Relationship};
+        let selector = WorkloadSelector::cgroup(43812).expect("selector");
+        let identity = WorkloadIdentity::none();
+        let evidence = AttributionEvidence::unresolved(Relationship::HookContext);
+        let decide = |cgroup| {
+            decide_workload_scope(
+                &selector,
+                &ContextIdentity::new(7, cgroup, 1000, 1000, 555, ExecutionKind::Proc),
+                &identity,
+                &evidence,
+            )
+        };
+        assert_eq!(decide(43812), ScopeDecision::Match);
+        assert_eq!(decide(43813), ScopeDecision::NonMatch);
+        assert_eq!(decide(0), ScopeDecision::Unknown);
+    }
+
+    #[test]
+    fn container_decision_needs_a_definite_equal_key() {
+        use super::super::{ExecutionKind, METHOD_METADATA_FILE, Relationship, ValidityInterval};
+        const ID: &str = "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57";
+        const OTHER: &str = "9c4d2f7a8b1e4a6c9d0f3b5a7c8e1d2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b1c3d";
+        let selector = WorkloadSelector::container("docker://host-a", ID, None).expect("selector");
+        let context = ContextIdentity::new(7, 43812, 1000, 1000, 555, ExecutionKind::Proc);
+        let asserted = AttributionEvidence::asserted_metadata(
+            Relationship::HookContext,
+            METHOD_METADATA_FILE,
+            Some(ValidityInterval::monotonic(100, 200)),
+        );
+        let decide = |identity: &WorkloadIdentity, evidence: &AttributionEvidence| {
+            decide_workload_scope(&selector, &context, identity, evidence)
+        };
+        // Exact key matches, and observed lifetimes never narrow it.
+        assert_eq!(
+            decide(
+                &WorkloadIdentity::container("docker://host-a", ID, Some("lifetime-a")),
+                &asserted
+            ),
+            ScopeDecision::Match
+        );
+        assert_eq!(
+            decide(
+                &WorkloadIdentity::container("docker://host-a", ID, Some("lifetime-b")),
+                &asserted
+            ),
+            ScopeDecision::Match
+        );
+        // A different key is a definite non-match.
+        assert_eq!(
+            decide(
+                &WorkloadIdentity::container("docker://host-a", OTHER, Some("lifetime-b")),
+                &asserted
+            ),
+            ScopeDecision::NonMatch
+        );
+        // No key, an indefinite status, or empty components: unknown.
+        assert_eq!(
+            decide(
+                &WorkloadIdentity::none(),
+                &AttributionEvidence::unresolved(Relationship::HookContext)
+            ),
+            ScopeDecision::Unknown
+        );
+        assert_eq!(
+            decide(
+                &WorkloadIdentity::container("docker://host-a", ID, Some("lifetime-a")),
+                &AttributionEvidence::unresolved(Relationship::HookContext)
+            ),
+            ScopeDecision::Unknown
+        );
+        assert_eq!(
+            decide(&WorkloadIdentity::container("", "", None), &asserted),
+            ScopeDecision::Unknown
+        );
+    }
+
+    #[test]
+    fn selector_constructors_refuse_without_input_echo() {
+        assert_eq!(
+            WorkloadSelector::cgroup(0)
+                .expect_err("cgroup 0 refuses")
+                .exit_intent(),
+            2
+        );
+        let id = "70f16eb35cd4";
+        let err = WorkloadSelector::container("docker://host-a", id, None)
+            .expect_err("abbreviation refuses");
+        assert_eq!(err.exit_intent(), 2);
+        assert!(
+            !err.to_string().contains(id),
+            "refusal withholds input bytes: {err}"
+        );
+        assert_eq!(WorkloadSelector::unsupported_kind("pod").exit_intent(), 2);
     }
 }

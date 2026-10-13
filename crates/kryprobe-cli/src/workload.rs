@@ -12,8 +12,9 @@
 //!   disposition: the fence F1/F3 soundness proof is pending, so
 //!   snapshots export `gap_unreconciled`, never an exact unknown).
 //! - [`scope_for_filter`] computes the exact partition behind a
-//!   `--filter-cgroup-id` view over cloned aggregate observations
-//!   (same D8 mapping as the system-wide check, per-row uid added).
+//!   `--filter-cgroup-id` view over row-scoped projected observations
+//!   (native tuple from the aggregate dictionary, quantities and
+//!   event context from each row, system tallies omitted).
 //! - [`workload_exit_code`] maps a rendered report to 0/3: complete
 //!   evidence is 0, named gaps are 3.
 //!
@@ -29,7 +30,9 @@ use kryprobe_core::workload::{
     WorkloadIdentity, encode_request,
 };
 use kryprobe_privilege::kcrypto_backend::{CtxSnapshot, MissTerminal};
-use kryprobe_privilege::workload_launch::{PinnedHelper, serve_pinned_snapshot};
+use kryprobe_privilege::workload_launch::{
+    HELPER_ATTEMPT_TIMEOUT, HelperDiagnostics, PinnedHelper, serve_pinned_snapshot_with_diagnostics,
+};
 use kryprobe_report::sanitize_cell;
 use kryprobe_report::workload::{
     AssemblyInput, CoverageLevel, GroupBy, MetadataAvailability, NativeIdentity, ReportCoverage,
@@ -494,10 +497,10 @@ pub fn assemble_live(input: LiveAssembly) -> Result<WorkloadReport, WorkloadErro
 
 /// Compute the exact partition behind a `--filter-cgroup-id` view:
 /// each report row decides exactly once (match/non-match/unknown)
-/// over per-row observations cloned from the live aggregate rows (the
-/// same D8 mapping the system-wide check evaluates, plus the row's
-/// event-time uid — `KCTX` carries no comm, so comm-constrained rules
-/// stay honestly unevaluable downstream).
+/// over per-row observations projected from the live aggregate rows
+/// (native tuple from the aggregate dictionary, quantities and event
+/// context from the row — `KCTX` carries no comm, so comm-constrained
+/// rules stay honestly unevaluable downstream).
 pub fn scope_for_filter(
     rows: &[ReportRowInput],
     agg_obs: &[NativeObservation],
@@ -523,14 +526,34 @@ pub fn scope_for_filter(
         .map_err(|err| WorkloadError::Scope(err.to_string()))
 }
 
-/// Clone one aggregate observation per report row (matched by the
-/// `key_hash` payload both paths derive from the same `kh`), with the
-/// row's event-time uid stamped in. Fresh session-scoped ids keep the
-/// clone set disjoint from the live observations.
+/// Scoped-evidence marker key (SEM04): this payload describes one
+/// report row's population, never the system aggregate.
+pub const SCOPED_SCOPE_KEY: &str = "evidence_scope";
+/// Scoped-evidence marker value: row-scoped evidence.
+pub const SCOPED_SCOPE_ROW: &str = "row";
+/// Captured event context block of one scoped row.
+pub const SCOPED_EVENT_KEY: &str = "event";
+/// Separately labeled back-reference to the system template
+/// observation one scoped row was projected from.
+pub const SCOPED_AGGREGATE_KEY: &str = "aggregate_obs";
+
+/// Project one scoped observation per report row (matched by the
+/// `key_hash` payload both paths derive from the same `kh`). The
+/// native tuple (row discriminator, hash, family/op/result,
+/// algorithm/driver/context) and the capture labels come from the
+/// aggregate template dictionary; quantities (`counts.calls`) and
+/// the event context (cgroup/tgid/start/uid) come from the row.
+/// System-only tallies (`bytes`, latency, window, `ok`/`errors`/
+/// `queued`) and the system window timestamps are omitted, never
+/// restamped under the row's uid — and the template survives only as
+/// the separately labeled [`SCOPED_AGGREGATE_KEY`] back-reference.
+/// Fresh positional session-scoped ids number the projection in row
+/// order.
 pub fn observations_for_rows(
     rows: &[ReportRowInput],
     agg_obs: &[NativeObservation],
 ) -> Result<Vec<NativeObservation>, WorkloadError> {
+    use kryprobe_core::evidence::payload_keys as K;
     let mut by_kh: HashMap<u64, &NativeObservation> = HashMap::with_capacity(agg_obs.len());
     for obs in agg_obs {
         if let Some(kh) = obs.backend_payload.get("key_hash").and_then(|v| v.as_u64()) {
@@ -544,7 +567,60 @@ pub fn observations_for_rows(
         };
         let mut obs = (*template).clone();
         obs.id = ObservationId::new(index as u64 + 1);
-        obs.backend_payload["uid"] = serde_json::json!(row.context.uid);
+        let dictionary = &template.backend_payload;
+        let mut scoped = serde_json::Map::new();
+        // Native tuple, status annotation, and capture labels: the
+        // template dictionary's allowed facts (copied only when the
+        // template carries them — never invented).
+        for key in [
+            K::ROW,
+            K::KEY_HASH,
+            K::FAMILY,
+            K::OP,
+            K::RESULT,
+            K::ALGORITHM,
+            K::DRIVER,
+            K::CONTEXT,
+            K::STATUS_CANONICAL,
+            K::CAPTURE_PROFILE,
+            K::COUNT_UNIT,
+            K::COMPLETION_COVERAGE,
+            K::EXECUTION,
+            K::RESULT_NOTE,
+        ] {
+            if let Some(value) = dictionary.get(key) {
+                scoped.insert(key.to_owned(), value.clone());
+            }
+        }
+        // Quantities and event context: the row's own facts. Every
+        // other template key (system tallies, latency, window, flat
+        // legacy quantities) stays out.
+        scoped.insert(
+            K::COUNTS.to_owned(),
+            serde_json::json!({"calls": row.calls}),
+        );
+        scoped.insert(K::UID.to_owned(), serde_json::json!(row.context.uid));
+        scoped.insert(
+            SCOPED_SCOPE_KEY.to_owned(),
+            serde_json::json!(SCOPED_SCOPE_ROW),
+        );
+        scoped.insert(
+            SCOPED_EVENT_KEY.to_owned(),
+            serde_json::json!({
+                "cgroup": row.context.cgroup,
+                "tgid": row.context.tgid,
+                "start_ns": row.context.start_ns,
+                "uid": row.context.uid,
+            }),
+        );
+        scoped.insert(
+            SCOPED_AGGREGATE_KEY.to_owned(),
+            serde_json::json!(template.id.to_string()),
+        );
+        obs.backend_payload = serde_json::Value::Object(scoped);
+        // The system window timestamps are not row facts.
+        obs.started_ns = None;
+        obs.ended_ns = None;
         out.push(obs);
     }
     Ok(out)
@@ -574,6 +650,12 @@ pub struct WorkloadFinish {
     pub report: WorkloadReport,
     /// The assembly input rows (for scoped evaluation).
     pub rows: Vec<ReportRowInput>,
+    /// Typed helper diagnostics aggregated across every served
+    /// chunk (`None` means unavailable — unlaunchable helper,
+    /// failed serve, or any chunk without a well-formed record —
+    /// never all-zero measured). Rendered on the human completion
+    /// only; the frozen report bytes never carry it.
+    pub diagnostics: Option<HelperDiagnostics>,
 }
 
 /// Serve metadata and assemble one typed report (post-capture only):
@@ -615,6 +697,7 @@ pub fn finish_workload_report(
         HashMap::new();
     let mut answered = false;
     let mut response_errors = false;
+    let mut diagnostics: Option<HelperDiagnostics> = None;
     if launchable {
         let preflight = preflight.expect("launchable preflight");
         let helper = preflight.helper.as_ref().expect("launchable helper");
@@ -651,12 +734,25 @@ pub fn finish_workload_report(
         if batches.is_empty() {
             failed = Some(MetadataUnavailable::ParseFailed);
         }
+        // Chunk diagnostics fold checked (overflow saturates with
+        // the explicit marker); any chunk without a well-formed
+        // record voids the aggregate — a partial sum would mislabel.
+        let mut folded: Option<HelperDiagnostics> = Some(HelperDiagnostics::new());
         for request in &batches {
-            match serve_pinned_snapshot(&pinned, principal, opts.metadata_file.as_deref(), request)
-            {
+            match serve_pinned_snapshot_with_diagnostics(
+                &pinned,
+                principal,
+                opts.metadata_file.as_deref(),
+                request,
+                HELPER_ATTEMPT_TIMEOUT,
+            ) {
                 Ok(served) => {
-                    response_errors |= !served.errors.is_empty();
-                    merged.extend(resolutions_from_response(&served));
+                    response_errors |= !served.response.errors.is_empty();
+                    merged.extend(resolutions_from_response(&served.response));
+                    match (&mut folded, served.diagnostics) {
+                        (Some(acc), Some(chunk)) => acc.accumulate(&chunk),
+                        _ => folded = None,
+                    }
                 }
                 Err(kind) => {
                     failed = Some(kind);
@@ -672,6 +768,7 @@ pub fn finish_workload_report(
                 resolutions = merged;
                 answered = true;
                 availability = MetadataAvailability::Available;
+                diagnostics = folded;
             }
             Some(kind) => {
                 availability = MetadataAvailability::Unavailable(kind);
@@ -688,6 +785,7 @@ pub fn finish_workload_report(
         answered,
         response_errors,
         keys_truncated,
+        diagnostics,
         outcome,
     )
 }
@@ -707,6 +805,7 @@ fn finish_with_response(
     answered: bool,
     response_errors: bool,
     keys_truncated: bool,
+    diagnostics: Option<HelperDiagnostics>,
     outcome: &LiveOutcome,
 ) -> Result<WorkloadFinish, WorkloadError> {
     let rows = input_rows(&capture.rows, resolutions);
@@ -746,7 +845,11 @@ fn finish_with_response(
         metadata: *availability,
         coverage,
     })?;
-    Ok(WorkloadFinish { report, rows })
+    Ok(WorkloadFinish {
+        report,
+        rows,
+        diagnostics,
+    })
 }
 
 /// Pre-capture metadata gate: the file must exist, be a regular
@@ -834,12 +937,55 @@ pub fn render_miss_section(misses: Option<&MissTerminal>) -> String {
     }
 }
 
+/// Helper-diagnostics section for the human workload report
+/// (finding PRIV04): the approved fixed counters in declaration
+/// order plus the saturation marker, or an explicit unavailable
+/// marker — never all-zero for missing. Numeric-only rendering
+/// (no helper strings, paths, or payload bytes can reach it — the
+/// typed boundary carries numbers alone).
+pub fn render_diagnostics_section(diagnostics: Option<&HelperDiagnostics>) -> String {
+    let Some(diagnostics) = diagnostics else {
+        return "helper-diagnostics: unavailable\n".to_owned();
+    };
+    format!(
+        "helper-diagnostics: positive_hits={} positive_misses={} negative_hits={} \
+         inserts={} insert_refused_full={} negative_inserts={} negative_refused_full={} \
+         tombstone_inserts={} tombstone_refused_full={} expired_evictions={} \
+         reuse_detected={} refresh_throttled={} deadline_trips={} scan_budget_trips={} \
+         symlink_refused={} denied={} not_host_path={} gone_during_scan={} \
+         migration_skipped={} pid_lifetime_refused_full={} saturated={}\n",
+        diagnostics.positive_hits,
+        diagnostics.positive_misses,
+        diagnostics.negative_hits,
+        diagnostics.inserts,
+        diagnostics.insert_refused_full,
+        diagnostics.negative_inserts,
+        diagnostics.negative_refused_full,
+        diagnostics.tombstone_inserts,
+        diagnostics.tombstone_refused_full,
+        diagnostics.expired_evictions,
+        diagnostics.reuse_detected,
+        diagnostics.refresh_throttled,
+        diagnostics.deadline_trips,
+        diagnostics.scan_budget_trips,
+        diagnostics.symlink_refused,
+        diagnostics.denied,
+        diagnostics.not_host_path,
+        diagnostics.gone_during_scan,
+        diagnostics.migration_skipped,
+        diagnostics.pid_lifetime_refused_full,
+        diagnostics.saturated,
+    )
+}
+
 /// Human workload report text: the frozen report rendering plus the
-/// terminal miss section (finding C4). The JSON format stays pure
-/// (frozen schema — misses ride text + stderr telemetry only).
+/// terminal miss section (finding C4) and the helper-diagnostics
+/// section (finding PRIV04). The JSON format stays pure (frozen
+/// schema — misses and diagnostics ride text only).
 pub fn render_workload_text(outcome: &LiveOutcome, finished: &WorkloadFinish) -> String {
     let mut text = finished.report.render_text();
     text.push_str(&render_miss_section(outcome.workload_misses.as_ref()));
+    text.push_str(&render_diagnostics_section(finished.diagnostics.as_ref()));
     text
 }
 
@@ -1225,6 +1371,91 @@ mod tests {
         assert_eq!(partition.observed(), 65);
         // The unreadable marker is not selectable, even as a view.
         assert!(scope_for_filter(&rows, &[], 0).is_err());
+    }
+
+    #[test]
+    fn observations_for_rows_projects_scoped_row_evidence() {
+        // SEM04 unit pin: a flat legacy template (top-level
+        // quantities, the review-probe shape) projects exactly like a
+        // nested one — row calls in, system tallies out, marker +
+        // event context on, absent template keys never invented.
+        let row = ReportRowInput {
+            context: ContextIdentity::new(7, 42, 1000, 1234, 555, ExecutionKind::Proc),
+            calls: 5,
+            native: native(1, "cbc(aes)", Some("aesni")),
+            identity: WorkloadIdentity::none(),
+            evidence: AttributionEvidence::unresolved(Relationship::HookContext),
+        };
+        let mut template = agg_obs(
+            1, "skcipher", "encrypt", "ok", "cbc(aes)", "aesni", "process", 100, 409600, 100, 0, 2,
+        );
+        template.backend_payload = serde_json::json!({
+            "row": "agg",
+            "key_hash": 7,
+            "family": "skcipher",
+            "op": "encrypt",
+            "result": "ok",
+            "algorithm": "cbc(aes)",
+            "driver": "aesni",
+            "context": "process",
+            "calls": 100,
+            "bytes": 409600,
+            "ok": 100,
+            "errors": 0,
+            "queued": 2,
+            "capture_profile": "api-returns",
+        });
+        let projected =
+            observations_for_rows(std::slice::from_ref(&row), &[template]).expect("projects");
+        assert_eq!(projected.len(), 1);
+        let payload = &projected[0].backend_payload;
+        assert_eq!(
+            payload["counts"]["calls"],
+            serde_json::json!(5),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["counts"].as_object().expect("counts block").len(),
+            1,
+            "counts carries the row's calls only: {payload}"
+        );
+        for key in ["calls", "bytes", "ok", "errors", "queued", "lat", "window"] {
+            assert!(
+                payload.get(key).is_none(),
+                "system-only `{key}` omitted: {payload}"
+            );
+        }
+        assert_eq!(
+            payload["evidence_scope"],
+            serde_json::json!("row"),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["event"]["cgroup"],
+            serde_json::json!(42),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["aggregate_obs"],
+            serde_json::json!("observation:1"),
+            "{payload}"
+        );
+        assert_eq!(
+            payload["algorithm"],
+            serde_json::json!("cbc(aes)"),
+            "{payload}"
+        );
+        assert!(
+            payload.get("status_canonical").is_none(),
+            "absent template keys stay absent: {payload}"
+        );
+        assert_eq!(projected[0].started_ns, None);
+        assert_eq!(projected[0].ended_ns, None);
+        // A row without a template still refuses typed.
+        assert_eq!(
+            observations_for_rows(std::slice::from_ref(&row), &[]),
+            Err(WorkloadError::ObservationMissing(7))
+        );
     }
 
     #[test]

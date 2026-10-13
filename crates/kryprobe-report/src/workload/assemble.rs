@@ -37,6 +37,9 @@ use kryprobe_core::workload::{
 ///   unknown 0, never an exact unknown.
 /// - The partition's observed population must equal the summed calls,
 ///   and the report scope derives from the selector (never mismatched).
+/// - The stored partition buckets must equal the selector-weighted
+///   recompute over the rows (shared core classifier): conservation
+///   alone cannot establish selection (SEM01).
 pub fn assemble(input: AssemblyInput) -> Result<WorkloadReport, WorkloadBuildError> {
     validate_session_id(&input.session_id).map_err(|_| WorkloadBuildError::BadSession)?;
     if input.kernel_identity.is_empty() || input.kernel_identity.len() > MAX_KERNEL_IDENTITY_BYTES {
@@ -98,6 +101,14 @@ pub fn assemble(input: AssemblyInput) -> Result<WorkloadReport, WorkloadBuildErr
     if partition.observed() != per_context_sum {
         return Err(WorkloadBuildError::PartitionMismatch);
     }
+    // SEM01: the stored buckets must equal the selector-weighted
+    // recompute over the validated rows (shared core classifier,
+    // checked row weights) — conservation alone cannot establish
+    // selection. A contradiction refuses; claimed input is never
+    // silently repaired.
+    if derive_partition(&selector, &rows)? != partition {
+        return Err(WorkloadBuildError::PartitionMismatch);
+    }
 
     let ledger = build_ledger(
         consistency,
@@ -132,6 +143,65 @@ pub fn assemble(input: AssemblyInput) -> Result<WorkloadReport, WorkloadBuildErr
         metadata,
         coverage,
     })
+}
+
+/// Recompute the selector-weighted partition over validated assembly
+/// rows with the shared core classifier: unscoped reports match
+/// their whole observed population; cgroup/container selectors map
+/// to the shared selector (an unmappable selector — cgroup 0, a
+/// malformed container key — refuses as [`WorkloadBuildError::BadSelector`])
+/// and every row decides exactly once with checked call weights.
+/// Container matching spans observed lifetimes (D10): the report
+/// lifetime, when present, never narrows the selection.
+fn derive_partition(
+    selector: &WorkloadSelector,
+    rows: &[super::model::ReportRowInput],
+) -> Result<kryprobe_core::workload::ScopePartition, WorkloadBuildError> {
+    use kryprobe_core::workload::ScopePartition;
+    match selector {
+        WorkloadSelector::None => {
+            let mut sum: u64 = 0;
+            for row in rows {
+                sum = sum
+                    .checked_add(row.calls)
+                    .ok_or(WorkloadBuildError::CallsOverflow)?;
+            }
+            ScopePartition::from_counts(sum, 0, 0).map_err(|_| WorkloadBuildError::CallsOverflow)
+        }
+        WorkloadSelector::CgroupId(id) => {
+            let shared = kryprobe_core::workload::WorkloadSelector::cgroup(*id)
+                .map_err(|_| WorkloadBuildError::BadSelector)?;
+            fold_partition(&shared, rows)
+        }
+        WorkloadSelector::ContainerId { runtime, id, .. } => {
+            let shared = kryprobe_core::workload::WorkloadSelector::container(runtime, id, None)
+                .map_err(|_| WorkloadBuildError::BadSelector)?;
+            fold_partition(&shared, rows)
+        }
+    }
+}
+
+/// Fold row call weights into the checked partition under one shared
+/// selector: each row decides exactly once (no double count).
+fn fold_partition(
+    selector: &kryprobe_core::workload::WorkloadSelector,
+    rows: &[super::model::ReportRowInput],
+) -> Result<kryprobe_core::workload::ScopePartition, WorkloadBuildError> {
+    use kryprobe_core::workload::{ScopeDecision, ScopePartition, decide_workload_scope};
+    let (mut matched, mut nonmatched, mut unknown_match) = (0u64, 0u64, 0u64);
+    for row in rows {
+        let bucket =
+            match decide_workload_scope(selector, &row.context, &row.identity, &row.evidence) {
+                ScopeDecision::Match => &mut matched,
+                ScopeDecision::NonMatch => &mut nonmatched,
+                ScopeDecision::Unknown => &mut unknown_match,
+            };
+        *bucket = bucket
+            .checked_add(row.calls)
+            .ok_or(WorkloadBuildError::CallsOverflow)?;
+    }
+    ScopePartition::from_counts(matched, nonmatched, unknown_match)
+        .map_err(|_| WorkloadBuildError::CallsOverflow)
 }
 
 /// Split one validated input row into its typed resolved/unknown form:
