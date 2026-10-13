@@ -34,12 +34,19 @@ pub enum GroupKey {
     Observed,
     /// One captured cgroup id.
     Cgroup(u64),
-    /// One resolved container identity.
+    /// One lifetime-qualified container identity: mirrors
+    /// [`kryprobe_core::workload::IdentityKey::Container`] (I01/SEM03),
+    /// so distinct runtimes, ids, or observed lifetimes each split and
+    /// restart lifetimes never merge into one aggregate group.
     Container {
         /// Runtime instance identity.
         runtime: String,
         /// Full container id.
         id: String,
+        /// Observed lifetime, or `None` when unobserved (an explicit
+        /// unknown that groups — and renders — apart from every known
+        /// lifetime).
+        lifetime: Option<String>,
     },
     /// Rows with no groupable identity (unknown cgroup, or no resolved
     /// container under container grouping). Sorts last.
@@ -81,13 +88,17 @@ impl WorkloadReport {
                 totals
             }
             GroupBy::Container => {
-                let mut groups: BTreeMap<(String, String), u64> = BTreeMap::new();
+                let mut groups: BTreeMap<(String, String, Option<String>), u64> = BTreeMap::new();
                 let mut unknown: u64 = 0;
                 for row in &self.rows {
                     match row.workload.as_ref().and_then(|w| w.container.as_ref()) {
                         Some(container) => {
                             let total = groups
-                                .entry((container.runtime.clone(), container.id.clone()))
+                                .entry((
+                                    container.runtime.clone(),
+                                    container.id.clone(),
+                                    normalize_lifetime(&container.lifetime),
+                                ))
                                 .or_insert(0);
                             *total = total
                                 .checked_add(row.calls)
@@ -102,7 +113,16 @@ impl WorkloadReport {
                 }
                 let mut totals: Vec<(GroupKey, u64)> = groups
                     .into_iter()
-                    .map(|((runtime, id), calls)| (GroupKey::Container { runtime, id }, calls))
+                    .map(|((runtime, id, lifetime), calls)| {
+                        (
+                            GroupKey::Container {
+                                runtime,
+                                id,
+                                lifetime,
+                            },
+                            calls,
+                        )
+                    })
                     .collect();
                 if unknown > 0 {
                     totals.push((GroupKey::Unknown, unknown));
@@ -303,9 +323,10 @@ fn render_workload(row: &super::model::ReportRow) -> String {
     let mut cells = Vec::new();
     if let Some(container) = &workload.container {
         cells.push(format!(
-            "container:{}:{}",
+            "container:{}:{}:{}",
             crate::sanitize_cell(&container.runtime),
-            crate::sanitize_cell(&container.id)
+            crate::sanitize_cell(&container.id),
+            render_lifetime(&container.lifetime),
         ));
     }
     if let Some(pod) = &workload.pod {
@@ -356,14 +377,40 @@ fn render_ancestor(row: &super::model::ReportRow) -> String {
     }
 }
 
+/// Lifetime key normalization, mirroring the frozen identity rule
+/// (`identity_keys` in `kryprobe_core::workload`): only a non-empty
+/// observed lifetime participates in the key; `None` (or empty, which
+/// normalizes to unobserved) groups apart from every known lifetime.
+fn normalize_lifetime(lifetime: &Option<String>) -> Option<String> {
+    match lifetime {
+        Some(seen) if !seen.is_empty() => Some(seen.clone()),
+        _ => None,
+    }
+}
+
+/// Lifetime display: the observed lifetime verbatim, or explicit
+/// `unknown` when unobserved — never blank, so a missing lifetime
+/// cannot be mistaken for a known one.
+fn render_lifetime(lifetime: &Option<String>) -> String {
+    match normalize_lifetime(lifetime) {
+        Some(seen) => crate::sanitize_cell(&seen),
+        None => "unknown".to_string(),
+    }
+}
+
 fn render_group(key: &GroupKey) -> String {
     match key {
         GroupKey::Observed => "observed".to_string(),
         GroupKey::Cgroup(id) => format!("cgroup {id}"),
-        GroupKey::Container { runtime, id } => format!(
-            "container {}:{}",
+        GroupKey::Container {
+            runtime,
+            id,
+            lifetime,
+        } => format!(
+            "container {}:{}:{}",
             crate::sanitize_cell(runtime),
-            crate::sanitize_cell(id)
+            crate::sanitize_cell(id),
+            render_lifetime(lifetime),
         ),
         GroupKey::Unknown => "unknown".to_string(),
     }

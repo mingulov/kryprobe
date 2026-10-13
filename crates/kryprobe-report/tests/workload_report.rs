@@ -1011,3 +1011,172 @@ fn absent_driver_renders_explicitly() {
     let replayed = report_from_bytes(&bytes).expect("replays");
     assert_eq!(replayed.render_text(), text);
 }
+
+/// SEM03 helper: asserted container identity under a chosen lifetime
+/// (`None` = explicitly unobserved lifetime, never a wildcard).
+fn asserted_lifetime(
+    container_id: &str,
+    lifetime: Option<&str>,
+) -> (WorkloadIdentity, AttributionEvidence) {
+    (
+        WorkloadIdentity::container(RUNTIME, container_id, lifetime),
+        AttributionEvidence::asserted_metadata(
+            Relationship::HookContext,
+            METHOD_METADATA_FILE,
+            Some(ValidityInterval::monotonic(100, 200)),
+        ),
+    )
+}
+
+/// Two rows sharing one runtime/id under one `AssemblyInput` with
+/// container grouping: `lifetimes` supplies each row's lifetime.
+fn two_lifetime_input(lifetimes: [Option<&str>; 2]) -> AssemblyInput {
+    let (id_a, ev_a) = asserted_lifetime(CID_A, lifetimes[0]);
+    let (id_b, ev_b) = asserted_lifetime(CID_A, lifetimes[1]);
+    let mut input = base_input(
+        vec![
+            row(7, 43812, 1000, 555, 50, native(), id_a, ev_a),
+            row(7, 43813, 1001, 556, 50, native(), id_b, ev_b),
+        ],
+        100,
+    );
+    input.group_by = GroupBy::Container;
+    input
+}
+
+/// SEM03/I01: same runtime/id under two known lifetimes yields two
+/// separately labeled container groups — human output must not merge
+/// lifetime-distinct identities into one aggregate.
+#[test]
+fn container_groups_split_by_lifetime() {
+    let report =
+        assemble(two_lifetime_input([Some("lifetime-a"), Some("lifetime-b")])).expect("assembles");
+    let groups = report.grouped_totals();
+    assert_eq!(groups.len(), 2, "lifetimes A/B stay distinct: {groups:?}");
+    assert_eq!(
+        groups,
+        vec![
+            (
+                GroupKey::Container {
+                    runtime: RUNTIME.to_string(),
+                    id: CID_A.to_string(),
+                    lifetime: Some("lifetime-a".to_string()),
+                },
+                50,
+            ),
+            (
+                GroupKey::Container {
+                    runtime: RUNTIME.to_string(),
+                    id: CID_A.to_string(),
+                    lifetime: Some("lifetime-b".to_string()),
+                },
+                50,
+            ),
+        ],
+        "groups carry lifetime-qualified identity keys"
+    );
+    assert_eq!(
+        groups.iter().map(|(_, calls)| calls).sum::<u64>(),
+        100,
+        "split groups still cover every row: {groups:?}"
+    );
+    let text = report.render_text();
+    assert!(
+        text.contains("groups (group_by=container, 2):"),
+        "two groups render:\n{text}"
+    );
+    assert!(text.contains("lifetime-a"), "lifetime-a labeled:\n{text}");
+    assert!(text.contains("lifetime-b"), "lifetime-b labeled:\n{text}");
+    // The two detail WORKLOAD cells must differ: identical cells erase
+    // the restart distinction the stored report preserves.
+    let detail: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("container:"))
+        .collect();
+    assert_eq!(detail.len(), 2, "two detail rows render:\n{text}");
+    assert_ne!(detail[0], detail[1], "detail rows stay distinct:\n{text}");
+}
+
+/// SEM03/I01: a known lifetime and an unobserved lifetime under one
+/// runtime/id stay distinct; the unobserved side renders an explicit
+/// `unknown` lifetime, never blank and never merged into the known
+/// group.
+#[test]
+fn container_known_and_unknown_lifetimes_stay_distinct() {
+    let report = assemble(two_lifetime_input([Some("lifetime-a"), None])).expect("assembles");
+    let groups = report.grouped_totals();
+    assert_eq!(
+        groups.len(),
+        2,
+        "known vs unknown lifetimes stay distinct: {groups:?}"
+    );
+    let text = report.render_text();
+    assert!(
+        text.contains("groups (group_by=container, 2):"),
+        "two groups render:\n{text}"
+    );
+    assert!(text.contains("lifetime-a"), "lifetime-a labeled:\n{text}");
+    assert!(
+        text.contains(":unknown calls=50"),
+        "unobserved lifetime renders explicitly:\n{text}"
+    );
+}
+
+/// SEM03/I01 control: lifetime-qualified grouping changes no counts
+/// and no stored bytes — totals still cover every row, the v2 JSON
+/// round-trips byte-identically, and both lifetime rows survive with
+/// their own calls.
+#[test]
+fn container_lifetime_grouping_preserves_totals_and_json() {
+    let report =
+        assemble(two_lifetime_input([Some("lifetime-a"), Some("lifetime-b")])).expect("assembles");
+    assert_eq!(report.ledger.per_context_sum, 100);
+    let text = report.render_text();
+    assert!(
+        text.contains("total: 100 calls across 2 rows"),
+        "totals cover every row:\n{text}"
+    );
+    let bytes = report.to_json_bytes().expect("encodes");
+    let replayed = report_from_bytes(&bytes).expect("replays");
+    assert_eq!(
+        replayed.to_json_bytes().expect("re-encodes"),
+        bytes,
+        "stored JSON round-trips byte-identically"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let contexts = value
+        .get("contexts")
+        .and_then(serde_json::Value::as_array)
+        .expect("contexts array");
+    assert_eq!(contexts.len(), 2, "both rows stored");
+    let lifetimes: Vec<Option<&str>> = contexts
+        .iter()
+        .map(|row| {
+            row.get("workload")
+                .and_then(|w| w.get("container"))
+                .and_then(|c| c.get("lifetime"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert!(
+        lifetimes.contains(&Some("lifetime-a")) && lifetimes.contains(&Some("lifetime-b")),
+        "both lifetimes stored: {lifetimes:?}"
+    );
+}
+
+/// SEM03/I01 control (D10): the container selector still matches both
+/// lifetimes — grouping splits presentation, never selection.
+#[test]
+fn container_selector_matches_both_lifetimes() {
+    let mut input = two_lifetime_input([Some("lifetime-a"), Some("lifetime-b")]);
+    input.selector = WorkloadSelector::ContainerId {
+        runtime: RUNTIME.to_string(),
+        id: CID_A.to_string(),
+        lifetime: None,
+    };
+    input.group_by = GroupBy::None;
+    let report = assemble(input).expect("assembles");
+    assert_eq!(report.partition.matched(), 100);
+    assert_eq!(report.partition.nonmatched(), 0);
+    assert_eq!(report.partition.unknown_match(), 0);
+}
