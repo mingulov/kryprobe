@@ -991,6 +991,41 @@ fn aead_exactness_and_bad_tag_errors() {
     assert_ident_join(&rows, &ring, "aead");
 }
 
+/// KWHO per-lane stride for the live `hash/who-value` reader below.
+/// The kernel writes `stride * possible_cpus` bytes with no userspace
+/// length (`map_lookup_bytes` takes none), so an undersized stride is
+/// a kernel heap overwrite (L-SEC-02). Pinned to the ABI `VWho` twin
+/// by `kwho_live_stride_matches_abi_twin`.
+const KWHO_LIVE_STRIDE: usize = 88;
+
+#[test]
+fn kwho_live_stride_matches_abi_twin() {
+    // INT-1: the privileged `hash/who-value` reader sizes its kernel
+    // buffer AND its lane split from KWHO_LIVE_STRIDE; the kernel
+    // writes the full ABI `VWho` per possible CPU. Any drift between
+    // the live stride and the twin is a heap overwrite live, so this
+    // unprivileged pin must fail before any privileged run can.
+    use kryprobe_abi::kcrypto_agg::{VWho, vwho_from_bytes};
+    assert_eq!(
+        KWHO_LIVE_STRIDE,
+        std::mem::size_of::<VWho>(),
+        "live KWHO stride must equal the ABI VWho twin size"
+    );
+    assert_eq!(
+        KWHO_LIVE_STRIDE, 88,
+        "ABI VWho is 88B (F01 provenance tail)"
+    );
+    assert_eq!(KWHO_LIVE_STRIDE % 8, 0, "percpu lanes stay 8-aligned");
+    assert!(
+        vwho_from_bytes(&[0u8; KWHO_LIVE_STRIDE]).is_some(),
+        "exactly-stride lanes must decode"
+    );
+    assert!(
+        vwho_from_bytes(&[0u8; 80]).is_none(),
+        "stale-80B lanes must refuse"
+    );
+}
+
 #[test]
 #[ignore = "BPF lane: run with `cargo xtask test bpf`"]
 fn hash_points_observed() {
@@ -1069,7 +1104,9 @@ fn hash_points_observed() {
         let mut key = None;
         let mut owned_calls = 0;
         loop {
-            // SAFETY: KWHO keys are 16 bytes, values 80 bytes per possible CPU.
+            // SAFETY: KWHO keys are 16 bytes, values KWHO_LIVE_STRIDE bytes per
+            // possible CPU (pinned to the ABI VWho twin by
+            // kwho_live_stride_matches_abi_twin).
             let next = unsafe {
                 map_get_next_key(&sensor.loaded.maps.who, key.as_deref(), 16, "hash/who-key")
             }
@@ -1081,13 +1118,14 @@ fn hash_points_observed() {
                     map_lookup_bytes(
                         &sensor.loaded.maps.who,
                         &k,
-                        80 * possible_cpus().expect("trusted possible CPU topology") as usize,
+                        KWHO_LIVE_STRIDE
+                            * possible_cpus().expect("trusted possible CPU topology") as usize,
                         "hash/who-value",
                     )
                 }
                 .expect("caller values");
                 let calls: u64 = raw
-                    .as_chunks::<80>()
+                    .as_chunks::<KWHO_LIVE_STRIDE>()
                     .0
                     .iter()
                     .map(|lane| vwho_from_bytes(lane).expect("caller value layout").calls)

@@ -605,7 +605,7 @@ impl Backend for KCryptoBackend {
 mod tests {
     use super::*;
     use crate::bpfloader::LoaderError;
-    use kryprobe_abi::kcrypto_agg::kctl_pack_head;
+    use kryprobe_abi::kcrypto_agg::{KWHO_IDENTITY_PRESENT, kctl_pack_head};
     use kryprobe_core::ids::{IdIssuer, SessionId};
 
     fn unsupported_reason(err: &BackendError) -> (&'static str, Option<String>) {
@@ -775,74 +775,109 @@ mod tests {
         assert_eq!(symbol_for(KFAM_AEAD, KOP_FINUP), None);
     }
 
-    fn vwho_lane(comm0: u8, tid: u32, stack: i32, calls: u64, first_ns: u64, last_ns: u64) -> VWho {
+    /// One `VWho` lane: first `comm` byte, `tid`, `(uid, stack)`
+    /// identity, `(calls, first_ns, last_ns)` tallies, and the
+    /// provenance marker (mirrors the ABI `who_lane` tuple shape).
+    fn vwho_lane(
+        comm0: u8,
+        tid: u32,
+        id: (u32, i32),
+        tally: (u64, u64, u64),
+        marked: bool,
+    ) -> VWho {
         let mut comm = [0u8; 16];
         comm[0] = comm0;
         VWho {
             comm,
             tid,
-            uid: 1000,
+            uid: id.0,
             cgroup: 7,
             ppid: 1,
             pcomm: [b'p'; 16],
-            stack,
-            calls,
-            first_ns,
-            last_ns,
+            stack: id.1,
+            calls: tally.0,
+            first_ns: tally.1,
+            last_ns: tally.2,
+            identity_present: if marked { KWHO_IDENTITY_PRESENT } else { 0 },
+            _rsv: 0,
         }
     }
 
     #[test]
     fn fold_vwho_sums_calls_and_folds_stamps() {
-        // 3 lanes: one idle (calls 0 — must not poison the first-min
-        // even with nonzero stamps; live idle lanes are zero-stamped
-        // since the Task-2 I-1 fix, so this pins the exclusion rule
-        // beyond the current BPF shape), two busy. calls sums; first is
-        // the min over BUSY lanes; last is the max; identity rides the
-        // most-recent-writer lane (greatest last_ns).
+        // Insertion-frozen identity: uid/cgroup/ppid/pcomm/stack ride the
+        // UNIQUE marked lane (per-key insertion-time meaning), while
+        // tid/comm ride the latest-writer lane (greatest last_ns). The
+        // marked lane here is deliberately NOT the latest writer, and
+        // the idle lane carries a below-min first_ns to pin the
+        // busy-only first-min exclusion beyond the live BPF shape
+        // (live idle lanes are zero-stamped since the Task-2 I-1 fix).
         let lanes = [
-            vwho_lane(b'a', 11, 5, 0, 100, 100), // idle lane
-            vwho_lane(b'b', 12, 5, 3, 100, 300),
-            vwho_lane(b'c', 13, 5, 7, 100, 200),
+            vwho_lane(b'm', 11, (1000, 5), (3, 100, 200), true), // inserting lane
+            vwho_lane(b'w', 12, (2000, 9), (7, 100, 300), false), // latest writer
+            vwho_lane(b'i', 13, (3000, 11), (0, 50, 150), false), // idle lane
         ];
-        let folded = fold_vwho(&lanes);
+        let folded = fold_vwho(&lanes).expect("unique mark qualifies");
         assert_eq!(folded.calls, 10);
         assert_eq!(folded.first_ns, 100);
         assert_eq!(folded.last_ns, 300);
-        assert_eq!(folded.comm[0], b'b', "identity from the last_ns=300 lane");
+        assert_eq!(
+            (folded.uid, folded.stack),
+            (1000, 5),
+            "insertion-frozen identity rides the marked lane, not the latest"
+        );
+        assert_eq!(folded.comm[0], b'w', "tid/comm ride the latest lane");
         assert_eq!(folded.tid, 12);
-        assert_eq!(folded.uid, 1000);
-        assert_eq!(folded.stack, 5);
+        assert_eq!(folded.identity_present, KWHO_IDENTITY_PRESENT);
+        assert_eq!(folded._rsv, 0);
     }
 
     #[test]
     fn fold_vwho_all_idle_folds_to_zero_stamps() {
-        // No busy lane: stamps are 0 (never the insert-time min), calls 0.
-        let lanes = [vwho_lane(b'a', 11, 5, 0, 100, 100)];
-        let folded = fold_vwho(&lanes);
+        // A marked all-idle key still qualifies (insertion observed,
+        // nothing attributed yet): calls 0, first 0 (no busy lane),
+        // last maxed, identity from the marked lane.
+        let lanes = [vwho_lane(b'a', 11, (1000, 5), (0, 100, 100), true)];
+        let folded = fold_vwho(&lanes).expect("marked idle qualifies");
         assert_eq!(folded.calls, 0);
         assert_eq!(folded.first_ns, 0);
         assert_eq!(folded.last_ns, 100);
         assert_eq!((folded.tid, folded.uid), (11, 1000));
-        // Empty lane slice (defensive: callers pass >= 1): all zero.
-        let folded = fold_vwho(&[]);
-        assert_eq!(folded.calls, 0);
-        assert_eq!((folded.first_ns, folded.last_ns), (0, 0));
+        assert_eq!(folded.identity_present, KWHO_IDENTITY_PRESENT);
+        // Missing provenance refuses: empty lanes, or no marked lane.
+        assert_eq!(fold_vwho(&[]), None);
+        let unmarked = [vwho_lane(b'b', 12, (1000, 5), (3, 100, 200), false)];
+        assert_eq!(fold_vwho(&unmarked), None);
+        // Conflicting provenance refuses: two marked lanes.
+        let marked = vwho_lane(b'a', 11, (1000, 5), (3, 100, 200), true);
+        assert_eq!(fold_vwho(&[marked, marked]), None);
     }
 
     #[test]
     fn fold_vwho_scales_to_2048_lanes() {
         // Audit #9/R1: per-tick fold cost must stay sane at lane scale.
         // Generous wall bound (a linear fold takes ~us) — trips only on
-        // pathological blowup, never flakes.
+        // pathological blowup, never flakes. Exactly one lane marked
+        // (insertion provenance); identity rides it, tid/comm the latest.
         let lanes: Vec<_> = (0..2048u64)
-            .map(|i| vwho_lane(b'x', 100 + (i % 97) as u32, 5, 3, 100, 200 + i))
+            .map(|i| {
+                vwho_lane(
+                    b'x',
+                    100 + (i % 97) as u32,
+                    (1000, 5),
+                    (3, 100, 200 + i),
+                    i == 0,
+                )
+            })
             .collect();
         let start = std::time::Instant::now();
-        let folded = fold_vwho(&lanes);
+        let folded = fold_vwho(&lanes).expect("unique mark qualifies");
         let elapsed = start.elapsed();
         assert_eq!(folded.calls, 3 * 2048);
         assert_eq!(folded.last_ns, 200 + 2047);
+        assert_eq!((folded.uid, folded.stack), (1000, 5));
+        assert_eq!(folded.tid, 100 + (2047 % 97) as u32);
+        assert_eq!(folded.identity_present, KWHO_IDENTITY_PRESENT);
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "2048-lane fold took {elapsed:?}"
