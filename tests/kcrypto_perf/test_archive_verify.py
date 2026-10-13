@@ -274,6 +274,70 @@ class ImportedSpecTests(unittest.TestCase):
         self.assertTrue(reasons, "spare order swap must refuse")
         self.assertTrue(any("order" in r for r in reasons), reasons)
 
+    def test_window_bounded_by_sealed_spec(self):
+        # P3-window: expectations must be bounded by the sealed spec
+        # (2 dicts per sealed pair), never by max_attempted (5000 ->
+        # 10000 dicts pre-fix for this same 20-row spec).
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        entry["max_attempted"] = 5000
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        spec = CLI.gen_legs(entry, manifest, "set")
+        calls = []
+        orig = CLI.gen_legs
+
+        def counting(e, m, k, s=0, n=-1):
+            self.assertLessEqual(n, len(spec),
+                                 f"unbounded window regen n_pairs={n}")
+            legs = orig(e, m, k, s, n)
+            calls.append(len(legs))
+            return legs
+
+        CLI.gen_legs = counting
+        try:
+            reasons = CLI.check_imported_cell_spec(stage, spec, manifest)
+        finally:
+            CLI.gen_legs = orig
+        self.assertEqual(reasons, [])
+        self.assertLessEqual(sum(calls), 2 * len(spec),
+                             f"materialized {sum(calls)} for "
+                             f"{len(spec)} sealed rows")
+
+    def test_window_memory_error_refused(self):
+        # P3-window: MemoryError during expectation regen must refuse
+        # (unbound), never propagate out of the opt-in checker.
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        spec = CLI.gen_legs(entry, manifest, "set")
+        orig = CLI.gen_legs
+
+        def oom(e, m, k, s=0, n=-1):
+            raise MemoryError("simulated window OOM")
+
+        CLI.gen_legs = oom
+        try:
+            reasons = CLI.check_imported_cell_spec(stage, spec, manifest)
+        finally:
+            CLI.gen_legs = orig
+        self.assertTrue(reasons, "OOM must refuse, not propagate")
+        self.assertTrue(any("unbound" in r for r in reasons), reasons)
+
+    def test_inflated_budget_over_window_refused(self):
+        # P3-window guard: budget semantics kept — pair indices at or
+        # above an inflated max_attempted still refuse as not-declared.
+        manifest = _v3_manifest()
+        entry = _cd_entry(manifest)
+        entry["max_attempted"] = 5000
+        stage = {"kind": "set", "set": entry["id"],
+                 "kernel": entry["kernel"], "obs_a": "D", "obs_b": "C"}
+        over = CLI.gen_legs(entry, manifest, "set", 5000, 1)
+        reasons = CLI.check_imported_cell_spec(stage, over, manifest)
+        self.assertTrue(reasons, "over-budget legs must not bind")
+        self.assertTrue(any("not declared" in r for r in reasons), reasons)
+
 
 class ImportedVerifyTests(unittest.TestCase):
     """QUAL-01 end to end: mismatched sealed cells through verify_cell."""
@@ -379,6 +443,25 @@ class ImportedVerifyTests(unittest.TestCase):
             cell = _sealed_m1_cell(tmp, manifest, entry, bad)
             got = CLI.verify_cell(cell, manifest)
         self.assertEqual(got.get("errors"), [])
+
+    def test_verify_cell_window_memory_error_refused(self):
+        # P3-window: MemoryError inside the opt-in import check must
+        # land in verify_cell errors, never propagate (call at :1886).
+        with tempfile.TemporaryDirectory(prefix="t14i06") as tmp:
+            manifest, _entry, cell = self._consistent(tmp)
+            orig = CLI.gen_legs
+
+            def oom(e, m, k, s=0, n=-1):
+                raise MemoryError("simulated window OOM")
+
+            CLI.gen_legs = oom
+            try:
+                got = CLI.verify_cell(cell, manifest, check_imported=True)
+            finally:
+                CLI.gen_legs = orig
+        self.assertTrue(got.get("errors"), "OOM must refuse, not raise")
+        self.assertTrue(any("unbound" in e for e in got["errors"]),
+                        got["errors"])
 
 
 class JudgeClosureTests(unittest.TestCase):

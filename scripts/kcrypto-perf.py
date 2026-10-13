@@ -1689,6 +1689,22 @@ IMPORTED_SPEC_FIELDS = ("side", "mode", "cls", "driver", "size",
                         "workload", "paced", "bulk", "threads")
 
 
+def _sealed_pair_index(leg_id):
+    """Parse the pair index from a sealed ``legNN[A|B]`` id.
+
+    Returns the int index, or None when the id is missing or
+    malformed (the caller refuses such legs as not-declared).
+    """
+    if not isinstance(leg_id, str) or not leg_id.startswith("leg"):
+        return None
+    if len(leg_id) < 5 or leg_id[-1] not in ("A", "B"):
+        return None
+    digits = leg_id[3:-1]
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
 def check_imported_cell_spec(stage: dict, spec: list,
                              manifest: dict) -> list:
     """I06 (QUAL-01): reconcile a sealed spec to the declared manifest.
@@ -1698,9 +1714,10 @@ def check_imported_cell_spec(stage: dict, spec: list,
     the manifest entry generates (role/mode/workload/size/order).
     Sealed leg subsets bind, including M1 runner spares within
     the 0..max_attempted-1 window (field-exact per pair index,
-    order-aware); sealed extras beyond the window, field flips,
-    order swaps, and unresolvable entries refuse. Returns reasons
-    (empty means bound).
+    order-aware; expectations regen only the sealed pairs, so the
+    window never materializes); sealed extras beyond the window,
+    field flips, order swaps, and unresolvable entries refuse.
+    Returns reasons (empty means bound).
     """
     kind = stage.get("kind")
     try:
@@ -1738,14 +1755,27 @@ def check_imported_cell_spec(stage: dict, spec: list,
     try:
         if kind == "set" and entry.get("kind") == "m1-pairs" \
                 and "max_attempted" in entry:
-            # P2-F2: the runner stages spares via --start-pair
-            # within the attempt budget, so bind the sealed legs
-            # against the full 0..max_attempted-1 window.
-            expected = gen_legs(entry, manifest, kind, 0,
-                                entry["max_attempted"])
+            # P2-F2/P3-window: the runner stages spares via
+            # --start-pair within the attempt budget, so bind the
+            # sealed legs against the 0..max_attempted-1 window —
+            # but regen expectations ONLY for the sealed pair
+            # indices (bounded by the sealed spec, never by
+            # max_attempted). Out-of-window indices refuse as
+            # not-declared below (budget kept); per-pair regen
+            # preserves field-exactness, alternation parity, and
+            # canonical order.
+            budget = entry["max_attempted"]
+            pairs = set()
+            for leg in spec:
+                pair = _sealed_pair_index(leg.get("leg_id"))
+                if pair is not None and pair < budget:
+                    pairs.add(pair)
+            expected = []
+            for pair in sorted(pairs):
+                expected.extend(gen_legs(entry, manifest, kind, pair, 1))
         else:
             expected = gen_legs(entry, manifest, kind)
-    except (ValueError, KeyError, TypeError) as err:
+    except (ValueError, KeyError, TypeError, MemoryError) as err:
         return reasons + [f"imported spec unbound: {err}"]
     by_id = {leg["leg_id"]: leg for leg in expected}
     seen: set = set()
