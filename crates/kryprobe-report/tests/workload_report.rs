@@ -90,6 +90,10 @@ fn coverage_complete() -> ReportCoverage {
     }
 }
 
+// I05: row starts in this file sit inside the 100..200 capture.
+// They were 555/556/557 (future starts) before the SEM05
+// temporal-coherence invariant; normalized deliberately, not silently.
+// The v1 JSON below keeps its stored start (legacy render path).
 fn base_input(rows: Vec<ReportRowInput>, observed: u64) -> AssemblyInput {
     AssemblyInput {
         session_id: SESSION.to_string(),
@@ -122,14 +126,14 @@ fn workload_roundtrip_retains_native_identity() {
     let (no_id, no_ev) = unresolved();
     let (no_id2, no_ev2) = unresolved();
     let rows = vec![
-        row(7, 43812, 1000, 555, 20, native(), no_id, no_ev),
+        row(7, 43812, 1000, 150, 20, native(), no_id, no_ev),
         // Same kh, different native tuple: a collision the dictionary
         // must qualify with two entries, not merge.
         row(
             7,
             43813,
             1001,
-            556,
+            151,
             30,
             NativeIdentity::new(2, 4, 0, 1, "gcm(aes)", Some("gcm-aes-aesni")),
             no_id2,
@@ -228,13 +232,13 @@ fn parent_child_totals_are_not_additive() {
     let (parent_id, parent_ev) = asserted(CID_B);
     let rows = vec![
         ReportRowInput {
-            context: context(7, 100, 1000, 555),
+            context: context(7, 100, 1000, 150),
             calls: 20,
             native: native(),
             identity: child_identity,
             evidence: child_evidence,
         },
-        row(7, 200, 1001, 556, 30, native(), parent_id, parent_ev),
+        row(7, 200, 1001, 151, 30, native(), parent_id, parent_ev),
     ];
     let mut input = base_input(rows, 50);
     input.group_by = GroupBy::Container;
@@ -260,7 +264,7 @@ fn parent_child_totals_are_not_additive() {
                 7,
                 100,
                 1000,
-                555,
+                150,
                 20,
                 native(),
                 {
@@ -276,7 +280,7 @@ fn parent_child_totals_are_not_additive() {
                 7,
                 200,
                 1001,
-                556,
+                151,
                 30,
                 native(),
                 {
@@ -325,7 +329,7 @@ fn unknown_rows_survive_rendering() {
             7,
             43813,
             1001,
-            556,
+            151,
             20,
             native(),
             WorkloadIdentity::none(),
@@ -335,7 +339,7 @@ fn unknown_rows_survive_rendering() {
             7,
             43814,
             1002,
-            557,
+            152,
             30,
             native(),
             WorkloadIdentity::none(),
@@ -511,7 +515,9 @@ fn live_assembly_matches_decoded_fixture_render() {
     let (u1, e1) = unresolved();
     let (u2, e2) = unresolved();
     // Mirror the corrected fixture (R2: proc native context 0,
-    // capture end 1000 past the row starts).
+    // capture end 1000 past the row starts). The mirrored starts stay
+    // 555/556: they match the frozen fixture and sit inside its
+    // 100..1000 capture (I05 keeps in-capture starts untouched).
     let proc_native = NativeIdentity::new(1, 2, 0, 0, "cbc(aes)", Some("cbc-aes-aesni"));
     let mut input = base_input(
         vec![
@@ -541,8 +547,8 @@ fn assembly_orders_rows_deterministically() {
         let (u1, e1) = unresolved();
         let (u2, e2) = unresolved();
         vec![
-            row(9, 43813, 1001, 556, 30, native(), u1, e1),
-            row(7, 43812, 1000, 555, 20, native(), u2, e2),
+            row(9, 43813, 1001, 151, 30, native(), u1, e1),
+            row(7, 43812, 1000, 150, 20, native(), u2, e2),
         ]
     };
     let mut rows = mk();
@@ -562,7 +568,7 @@ fn assembly_orders_rows_deterministically() {
 fn assembly_enforces_conservation() {
     let mk = || {
         let (u1, e1) = unresolved();
-        vec![row(7, 43812, 1000, 555, 50, native(), u1, e1)]
+        vec![row(7, 43812, 1000, 150, 50, native(), u1, e1)]
     };
     // Partition observed must equal the summed context calls.
     let mut input = base_input(mk(), 50);
@@ -607,8 +613,8 @@ fn assembly_enforces_conservation() {
     let (u1, e1) = unresolved();
     let (u2, e2) = unresolved();
     let dupes = vec![
-        row(7, 43812, 1000, 555, 25, native(), u1, e1),
-        row(7, 43812, 1000, 555, 25, native(), u2, e2),
+        row(7, 43812, 1000, 150, 25, native(), u1, e1),
+        row(7, 43812, 1000, 150, 25, native(), u2, e2),
     ];
     assert!(matches!(
         assemble(base_input(dupes, 50)),
@@ -618,7 +624,7 @@ fn assembly_enforces_conservation() {
     let many: Vec<ReportRowInput> = (0..(MAX_V2_CONTEXT_ROWS + 1) as u64)
         .map(|c| {
             let (id, ev) = unresolved();
-            row(7, 1000 + c, 1000, 555, 1, native(), id, ev)
+            row(7, 1000 + c, 1000, 150, 1, native(), id, ev)
         })
         .collect();
     assert!(matches!(
@@ -629,8 +635,8 @@ fn assembly_enforces_conservation() {
     let (u1, e1) = unresolved();
     let (u2, e2) = unresolved();
     let overflowing = vec![
-        row(7, 43812, 1000, 555, u64::MAX, native(), u1, e1),
-        row(7, 43813, 1001, 556, 1, native(), u2, e2),
+        row(7, 43812, 1000, 150, u64::MAX, native(), u1, e1),
+        row(7, 43813, 1001, 151, 1, native(), u2, e2),
     ];
     assert!(matches!(
         assemble(base_input(overflowing, 0)),
@@ -638,7 +644,7 @@ fn assembly_enforces_conservation() {
     ));
     // Unproven exports a gap with unknown 0, never an exact unknown.
     let (u1, e1) = unresolved();
-    let mut input = base_input(vec![row(7, 43812, 1000, 555, 50, native(), u1, e1)], 50);
+    let mut input = base_input(vec![row(7, 43812, 1000, 150, 50, native(), u1, e1)], 50);
     input.consistency = SnapshotConsistency::Unproven;
     let report = assemble(input).expect("unproven assembles");
     assert_eq!(report.ledger.unknown, 0);
@@ -689,7 +695,7 @@ impl Write for KindWriter {
 fn small_report() -> kryprobe_report::workload::WorkloadReport {
     let (u1, e1) = unresolved();
     assemble(base_input(
-        vec![row(7, 43812, 1000, 555, 50, native(), u1, e1)],
+        vec![row(7, 43812, 1000, 150, 50, native(), u1, e1)],
         50,
     ))
     .expect("assembles")
@@ -870,7 +876,7 @@ fn pendant_cluster_association_is_preserved() {
             7,
             43812,
             1000,
-            555,
+            150,
             50,
             native(),
             identity.clone(),
@@ -930,7 +936,7 @@ fn driverless_allocation_record_round_trips() {
     let driverless = NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", None);
     driverless.validate().expect("absent driver validates");
     let report = assemble(base_input(
-        vec![row(7, 43812, 1000, 555, 50, driverless, no_id, no_ev)],
+        vec![row(7, 43812, 1000, 150, 50, driverless, no_id, no_ev)],
         50,
     ))
     .expect("driverless assembles");
@@ -964,7 +970,7 @@ fn empty_driver_refuses() {
         Err(WorkloadBuildError::BadNativeIdentity)
     ));
     let (no_id, no_ev) = unresolved();
-    let rows = vec![row(7, 43812, 1000, 555, 50, empty, no_id, no_ev)];
+    let rows = vec![row(7, 43812, 1000, 150, 50, empty, no_id, no_ev)];
     assert!(matches!(
         assemble(base_input(rows, 50)),
         Err(WorkloadBuildError::BadNativeIdentity)
@@ -972,7 +978,7 @@ fn empty_driver_refuses() {
     // Wire bytes with a present-but-empty driver refuse decode.
     let (u_id, u_ev) = unresolved();
     let report = assemble(base_input(
-        vec![row(7, 43812, 1000, 555, 50, native(), u_id, u_ev)],
+        vec![row(7, 43812, 1000, 150, 50, native(), u_id, u_ev)],
         50,
     ))
     .expect("assembles");
@@ -993,7 +999,7 @@ fn absent_driver_renders_explicitly() {
     let (no_id, no_ev) = unresolved();
     let driverless = NativeIdentity::new(1, 2, 0, 1, "cbc(aes)", None);
     let report = assemble(base_input(
-        vec![row(7, 43812, 1000, 555, 50, driverless, no_id, no_ev)],
+        vec![row(7, 43812, 1000, 150, 50, driverless, no_id, no_ev)],
         50,
     ))
     .expect("assembles");

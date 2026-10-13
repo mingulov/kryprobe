@@ -496,3 +496,106 @@ fn cgroup_zero_identity_refuses_report_ingress() {
     let raw = std::fs::read(fixture_path("asserted-metadata.json")).expect("fixture present");
     report_from_bytes(&raw).expect("asserted fixture keeps decoding");
 }
+
+// ---------------------------------------------------------------------------
+// I05 temporal context coherence (SEM05)
+//
+// New invariant (defined here before enforcement): within one
+// monotonic_boot clock domain, a positive-call row with an established
+// (nonzero) process start refuses when that start follows the capture
+// interval end. start == end is the boundary accept; start == 0 is the
+// unreadable marker and stays valid; a start before the capture start
+// is an ordinary long-lived process and stays valid; a zero-call row
+// carries no counted context and is unaffected by this rule.
+// ---------------------------------------------------------------------------
+
+/// SEM05: a positive-call row whose established start (1001) follows
+/// the capture end (1000) refuses at validation, decode, and assembly
+/// alike. RED on the F04 base: all three ingresses accept it.
+#[test]
+fn positive_call_future_start_refuses_at_every_ingress() {
+    let bytes = std::fs::read(fixture_path("asserted-metadata.json")).expect("fixture present");
+    let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture parses");
+    assert_eq!(
+        v["interval"]["end_ns"], "1000",
+        "fixture pins the capture end"
+    );
+    v["contexts"][0]["start_ns"] = serde_json::json!("1001");
+    assert!(
+        !workload_v2::validate_workload_v2(&v).is_empty(),
+        "future-start positive call refuses at validation"
+    );
+    assert!(
+        report_from_bytes(&serde_json::to_vec(&v).expect("encodes")).is_err(),
+        "future-start positive call refuses at decode"
+    );
+    let (id, ev) = f04_unresolved();
+    assert!(
+        assemble(f04_assembly_input(
+            vec![f04_row(43812, 1000, 1001, 50, id, ev)],
+            50,
+            f04_partition(50, 0, 0),
+            ReportSelector::None,
+        ))
+        .is_err(),
+        "future-start positive call refuses at assembly"
+    );
+}
+
+/// SEM05 boundary and pass cases: start == capture end accepts; a
+/// pre-capture (long-lived) start accepts; start 0 (unreadable) accepts;
+/// a zero-call future-start row accepts (no counted context). Frozen
+/// fixtures keep validating and decoding untouched.
+#[test]
+fn temporal_coherence_boundary_cases_pass() {
+    // Assembly: interval 100..1000; each row carries a distinct key.
+    let (id0, ev0) = f04_unresolved();
+    let (id1, ev1) = f04_unresolved();
+    let (id2, ev2) = f04_unresolved();
+    let (id3, ev3) = f04_unresolved();
+    assemble(f04_assembly_input(
+        vec![
+            f04_row(43812, 1000, 1000, 20, id0, ev0),
+            f04_row(43813, 1001, 50, 20, id1, ev1),
+            f04_row(43814, 1002, 0, 20, id2, ev2),
+            f04_row(43815, 1003, 1001, 0, id3, ev3),
+        ],
+        60,
+        f04_partition(60, 0, 0),
+        ReportSelector::None,
+    ))
+    .expect("boundary/unreadable/pre-capture/zero-call rows assemble");
+    // Validation + decode: boundary and pre-capture starts validate.
+    for start in ["1000", "50"] {
+        let bytes = std::fs::read(fixture_path("asserted-metadata.json")).expect("fixture present");
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).expect("fixture parses");
+        v["contexts"][0]["start_ns"] = serde_json::json!(start);
+        assert!(
+            workload_v2::validate_workload_v2(&v).is_empty(),
+            "start {start} validates: {:?}",
+            workload_v2::validate_workload_v2(&v)
+        );
+        report_from_bytes(&serde_json::to_vec(&v).expect("encodes"))
+            .expect("boundary start decodes");
+    }
+    // Positive controls: the start-0 frozen fixture and every frozen
+    // fixture keep validating and decoding.
+    let raw = std::fs::read(fixture_path("unknown-context.json")).expect("fixture present");
+    report_from_bytes(&raw).expect("start-0 fixture keeps decoding");
+    for name in [
+        "complete-raw-ids.json",
+        "asserted-metadata.json",
+        "unknown-context.json",
+        "unknown-match.json",
+        "full-map.json",
+        "stale-metadata.json",
+        "partial-capture.json",
+        "matching-violation.json",
+    ] {
+        let bytes = std::fs::read(fixture_path(name)).expect("fixture present");
+        assert!(
+            workload_v2::validate_bytes(&bytes).is_ok(),
+            "{name} keeps validating"
+        );
+    }
+}

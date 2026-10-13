@@ -1278,12 +1278,13 @@ fn validate_combinations(obj: &serde_json::Map<String, Value>, findings: &mut Ve
         }),
     }
 
-    // Shared replay invariants (SEM01/SEM02): cgroup-zero rows carry
-    // no resolved identity, and the stored partition equals the
-    // selector-weighted recompute over the decoded rows. Both reuse
-    // the shared core contracts; rows or selectors that fail typed
-    // conversion skip the check (those defects already refuse above —
-    // no cascade).
+    // Shared replay invariants (SEM01/SEM02/SEM05): cgroup-zero
+    // rows carry no resolved identity, the stored partition equals the
+    // selector-weighted recompute over the decoded rows, and a
+    // positive-call row with an established start at or before the
+    // capture end (temporal coherence). All reuse the shared core
+    // contracts; rows or selectors that fail typed conversion skip the
+    // check (those defects already refuse above — no cascade).
     validate_replay_invariants(obj, findings);
 }
 
@@ -1461,6 +1462,40 @@ fn validate_replay_invariants(obj: &serde_json::Map<String, Value>, findings: &m
             findings.push(V2Finding::InvalidCombination {
                 detail: format!("contexts[{index}] unreadable cgroup carries a resolved identity"),
             });
+        }
+    }
+    // SEM05 (I05): temporal context coherence. Within one
+    // monotonic_boot clock domain, a positive-call row with an
+    // established (nonzero) process start refuses when that start
+    // follows the capture interval end: a counted context cannot begin
+    // after the capture. start == end accepts (boundary), start 0 is
+    // the unreadable marker and stays valid, a pre-capture
+    // (long-lived) start stays valid, and zero-call rows carry no
+    // counted context. The interval must be ordered and parseable with
+    // the clock pinned — otherwise the interval finding above already
+    // refuses (no cascade).
+    let capture_end: Option<u64> = obj
+        .get("interval")
+        .and_then(Value::as_object)
+        .filter(|interval| interval.get("clock").and_then(Value::as_str) == Some("monotonic_boot"))
+        .and_then(|interval| {
+            let start = parse_digit(interval.get("start_ns")?)?;
+            let end = parse_digit(interval.get("end_ns")?)?;
+            (start <= end).then_some(end)
+        });
+    if let Some(end) = capture_end {
+        for (index, row) in typed.iter().enumerate() {
+            if let Some(row) = row
+                && row.calls > 0
+                && row.context.start_ns != 0
+                && row.context.start_ns > end
+            {
+                findings.push(V2Finding::InvalidCombination {
+                    detail: format!(
+                        "contexts[{index}] process start follows the capture end with positive calls"
+                    ),
+                });
+            }
         }
     }
     // SEM01: the stored buckets must equal the selector-weighted
@@ -1664,6 +1699,9 @@ mod tests {
     const SESSION: &str = "0123456789abcdef0123456789abcdef";
     const CONTAINER_ID: &str = "70f16eb35cd4991d07a1545beb8522e7f3f59b6642aa2f2afecff68f2be2eb57";
 
+    // I05: row starts sit inside the capture (100..200). They were
+    // 555/556 (future starts) before the SEM05 temporal-coherence
+    // invariant; normalized deliberately, not silently.
     fn minimal_valid() -> Value {
         json!({
             "schema": SCHEMA_ID,
@@ -1675,11 +1713,11 @@ mod tests {
                 {"dict_id": "n0", "kh": "7", "family": 1, "op": 2, "result": 0, "context": 0, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}
             ],
             "contexts": [
-                {"kh": "7", "cgroup_id": "43812", "tgid": 1000, "uid": 1000, "start_ns": "555", "execution_kind": "proc", "calls": "50", "native_ref": "n0",
+                {"kh": "7", "cgroup_id": "43812", "tgid": 1000, "uid": 1000, "start_ns": "150", "execution_kind": "proc", "calls": "50", "native_ref": "n0",
                  "workload": {"container": {"runtime": "docker://host-a", "id": CONTAINER_ID, "lifetime": "lifetime-a"}},
                  "attribution": {"relationship": "hook_context", "method": "metadata_file", "source": "operator_metadata_file", "status": "asserted",
                                  "validity": {"start_ns": "100", "end_ns": "200", "clock": "monotonic_boot"}}},
-                {"kh": "7", "cgroup_id": "43813", "tgid": 1001, "uid": 1000, "start_ns": "556", "execution_kind": "proc", "calls": "50",
+                {"kh": "7", "cgroup_id": "43813", "tgid": 1001, "uid": 1000, "start_ns": "151", "execution_kind": "proc", "calls": "50",
                  "native": {"family": 1, "op": 2, "result": 0, "context": 0, "algorithm": "cbc(aes)", "driver": "cbc-aes-aesni"}}
             ],
             "ledger": {"system_total": "100", "per_context_sum": "100", "unknown": "0", "consistency": "quiescent", "gap_unreconciled": false, "system_saturated": false, "per_context_saturated": false, "refused_inserts": "0"},
