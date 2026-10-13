@@ -73,11 +73,11 @@ pub const KCTX_UNKNOWN: u8 = 3;
 // ---------------------------------------------------------------------------
 
 /// fexit program ordinals (ADR-0013): index into the per-program lanes
-/// of `KTOT`, `KCTLCOUNT`, `KCTX_DROPS` (slot = ordinal) and `KDROPS`
-/// (slot = ordinal × [`KDROPS_SITES_PER_PROG`] + site). Declaration
-/// order in `kcrypto.rs`; the trampoline guard serializes each program
-/// against itself per CPU, so disjoint slots restore exactness without
-/// BPF atomic RMW.
+/// of `KTOT`, `KCTLCOUNT`, `KCTX_DROPS`, `KATTRLOSS` (slot = ordinal)
+/// and `KDROPS` (slot = ordinal × [`KDROPS_SITES_PER_PROG`] + site).
+/// Declaration order in `kcrypto.rs`; the trampoline guard serializes
+/// each program against itself per CPU, so disjoint slots restore
+/// exactness without BPF atomic RMW.
 pub const KPROG_ALLOC: u32 = 0;
 /// `crypto_destroy_tfm` exit (fence-only: touches no data lane, but
 /// keeps its ordinal so slot math stays uniform).
@@ -129,11 +129,35 @@ pub const KCTL_HEALTH: u8 = 5;
 /// corrupt (the value only ever saturates upward).
 pub const KIDN_DROPS: u64 = u64::MAX;
 
-/// Reserved `KIDN` key: K5 attribution-insert-failure counter
-/// (`KWHO`/`KERR`/`KPARAMS` insert failed while the key stayed absent —
-/// saturating `u8`, surfaced as `who_drops`). Separate from
+/// `KATTRLOSS` slots: one per fexit program ordinal (F02/BPF2 —
+/// the K5 attribution-insert-failure flag lives in its own
+/// `PerCpuArray<u64>` instead of a lazily inserted `KIDN` marker, so a
+/// full identity gate can no longer hide caller-map insertion loss).
+/// Disjoint per-program lanes (ADR-0013, same argument as
+/// `KCTX_DROPS`): the trampoline guard serializes each program
+/// against itself per CPU, so no BPF atomic RMW is needed.
+pub const KATTRLOSS_SLOTS: u32 = N_KPROGS;
+
+/// `KATTRLOSS` saturation cap: every BPF lane increment saturates
+/// here and the host CPU x program fold saturates here too. The folded
+/// `who_drops` diagnostic is a 0..=255 flag (nonzero = caller loss
+/// occurred), NEVER an exact lost-call count. Separate from
 /// [`KIDN_DROPS`] so ring loss and attribution loss stay distinguishable.
-pub const KWHO_DROPS: u64 = u64::MAX - 1;
+pub const KATTRLOSS_CAP: u64 = 255;
+
+/// Fold `KATTRLOSS` lane values (CPU x program slots, each already
+/// BPF-capped at [`KATTRLOSS_CAP`]) into the `who_drops` diagnostic:
+/// saturating accumulation capped at [`KATTRLOSS_CAP`]. Pure (the BPF
+/// lane increment and the host reader both mirror this cap): unittests
+/// drive it directly, live reads decode LE `u64` lanes first.
+#[must_use]
+pub fn kattrloss_fold(values: &[u64]) -> u64 {
+    let mut total = 0u64;
+    for &v in values {
+        total = total.saturating_add(v).min(KATTRLOSS_CAP);
+    }
+    total
+}
 
 /// `VWho.identity_present` marker: the lane whose `BPF_NOEXIST`
 /// insert created the `KWHO` key carries this value; every other lane

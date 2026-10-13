@@ -209,10 +209,18 @@ faults.
 | `min_keysize` | u32 | per-family min-keysize member | kernel/build metadata (a bound, never key bytes) |
 | `max_keysize` | u32 | per-family max-keysize member | kernel/build metadata (a bound, never key bytes) |
 
-Reserved key `KWHO_DROPS` (`u64::MAX - 1`) in `KIDN`:
-`KWHO`/`KERR`/`KPARAMS` insert-failure counter, saturating (kp2 §8:
-attribution loss surfaces here instead of vanishing; separate from
-`KIDN_DROPS` so ring loss and attribution loss stay distinguishable).
+## `KATTRLOSS`: WHO-loss flag (F02; per-CPU `u64` x 9 program slots)
+
+`KWHO`/`KERR`/`KPARAMS` insert-failure flag: each failure bumps the
+failing program's slot on the current CPU, each increment saturating
+at 255; the host folds CPU x program slots with saturation at 255
+into the `who_drops` diagnostic (kp2 §8: attribution loss surfaces
+here instead of vanishing; separate from `KIDN_DROPS` so ring loss
+and attribution loss stay distinguishable). The flag is independent
+of `KIDN` capacity (a full identity gate no longer hides caller-map
+insertion loss), and it is a flag, never an exact lost-call count —
+`KIDN` keeps all 256 entries for identity gating. A missing or
+unreadable map refuses measurement (never healthy-zero).
 
 ## `KCTX` key: accounting identity (32B `KCtxKey`, ctx-v1)
 

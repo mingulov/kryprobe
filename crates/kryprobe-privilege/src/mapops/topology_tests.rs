@@ -59,6 +59,7 @@ pub(crate) fn sensor() -> crate::btf_resolve::ConfiguredKcrypto {
                 ctl_closed: bad_fd(),
                 ctx_ovf: bad_fd(),
                 ctl_count: bad_fd(),
+                attr_loss: bad_fd(),
             },
             progs: Vec::new(),
         },

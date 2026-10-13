@@ -5,8 +5,8 @@ use super::SnapshotError;
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
 use kryprobe_abi::kcrypto_agg::{
-    KWHO_DROPS, KWhoKey, VParams, VWho, kwho_key_from_bytes, try_fold_vwho, vparams_from_bytes,
-    vwho_from_bytes,
+    KATTRLOSS_SLOTS, KWhoKey, VParams, VWho, kattrloss_fold, kwho_key_from_bytes, try_fold_vwho,
+    vparams_from_bytes, vwho_from_bytes,
 };
 use std::collections::HashMap;
 
@@ -66,24 +66,42 @@ pub(crate) fn stack_ips_from_bytes(bytes: &[u8]) -> Vec<u64> {
     out
 }
 
-/// Read the `KIDN[KWHO_DROPS]` identity-drop indicator as part of the
-/// terminal sample (a capped u8, not an unbounded lost-call count). Absent key reads
-/// healthy-zero; any other errno fails loud (same rule as the
-/// `snapshot_who` tail this was extracted from).
+/// Read the `KATTRLOSS` WHO-loss flag as part of the terminal
+/// sample: CPU lanes x per-program slots folded with saturation at
+/// 255 into the `who_drops` diagnostic (F02/BPF2 — a flag, never an
+/// exact lost-call count). Unlike the retired lazy `KIDN` marker, the
+/// indication survives a full identity gate. Any lookup failure —
+/// including a missing map/slot (`ENOENT`) — refuses loud: a
+/// `PerCpuArray` slot always exists on a live map, so absence means a
+/// wrong map, never healthy-zero (a short lane buffer likewise
+/// refuses with `EBADMSG`).
 pub(crate) fn read_kwho_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotError> {
-    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
-    match unsafe {
-        map_lookup_bytes(
-            &maps.loaded.maps.ident,
-            &KWHO_DROPS.to_le_bytes(),
-            1,
-            "snapshot/who-drops",
-        )
-    } {
-        Ok(value) => Ok(u64::from(value.first().copied().unwrap_or(0))),
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
-        Err(err) => Err(err.into()),
+    let (ncpu, value_len) = percpu_buffer_len(8)?;
+    let mut values = Vec::with_capacity(ncpu * KATTRLOSS_SLOTS as usize);
+    for prog in 0..KATTRLOSS_SLOTS {
+        // SAFETY: KATTRLOSS is PerCpuArray<u64> with one slot per
+        // program (bpf-kcrypto map def); value_len is ncpu * 8.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &maps.loaded.maps.attr_loss,
+                &prog.to_le_bytes(),
+                value_len,
+                "snapshot/who-drops",
+            )
+        }?;
+        for c in 0..ncpu {
+            let lane = raw
+                .get(c * 8..(c + 1) * 8)
+                .ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "snapshot/who-drops-lane".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(lane);
+            values.push(u64::from_le_bytes(word));
+        }
     }
+    Ok(kattrloss_fold(&values))
 }
 
 /// Joined attribution for one who row: the three map joins
@@ -149,7 +167,7 @@ impl WhoCache {
 
 /// Snapshot the K5 attribution maps of a configured sensor: full `KWHO`
 /// walk (key iteration + percpu fold) with per-row `KSTACK`/`KERR`/
-/// `KPARAMS` joins, plus the `KWHO_DROPS` insert-loss count. Map order.
+/// `KPARAMS` joins, plus the `KATTRLOSS` insert-loss flag. Map order.
 ///
 /// Join-miss discipline (fail-soft, never fatal): a negative `stack`
 /// (raw helper errno — no `KSTACK` row) or an absent `KSTACK` row yields
@@ -325,4 +343,26 @@ pub fn snapshot_who_cached(
     }
     let drops = read_kwho_drops(maps)?;
     Ok((out, drops))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kattrloss_read_refuses_on_unreadable_map() {
+        // F02: a missing/unreadable `KATTRLOSS` map refuses measurement
+        // (never healthy-zero): bad-fd lookups fail before any byte is
+        // read, and the error surfaces typed (topology first when the
+        // host topology itself is unreadable).
+        let sensor = crate::mapops::topology_tests::sensor();
+        let err = read_kwho_drops(&sensor).expect_err("unreadable KATTRLOSS must refuse");
+        match err {
+            SnapshotError::Map(MapOpsError::LookupFailed { stage, .. }) => assert!(
+                stage == "snapshot/who-drops" || stage.starts_with("percpu/"),
+                "typed read refusal, got stage {stage:?}"
+            ),
+            other => panic!("expected a typed map refusal, got {other:?}"),
+        }
+    }
 }

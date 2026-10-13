@@ -1336,6 +1336,7 @@ mod tests {
                     ctl_closed: fd(),
                     ctx_ovf: fd(),
                     ctl_count: fd(),
+                    attr_loss: fd(),
                 },
                 progs: Vec::new(),
             },

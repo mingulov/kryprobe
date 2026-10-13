@@ -7,9 +7,11 @@
 //! frozen [`Backend`](kryprobe_core::backend::Backend) trait.
 
 use kryprobe_abi::kcrypto_agg::{
-    KCTX_PROC, KFAM_SK, KOP_ENC, KRES_OK, KWHO_IDENTITY_PRESENT, KWhoKey, VParams, VWho, kh_of,
-    try_fold_vwho,
+    KATTRLOSS_CAP, KATTRLOSS_SLOTS, KCTX_PROC, KFAM_SK, KIDN_DROPS, KOP_ENC, KPROG_AEADDEC,
+    KPROG_SHASH, KPROG_SKENC, KRES_OK, KWHO_IDENTITY_PRESENT, KWhoKey, N_KPROGS, VParams, VWho,
+    kattrloss_fold, kh_of, try_fold_vwho,
 };
+use kryprobe_abi::kcrypto_ctx::{KCTX_MAX_ENTRIES, VCtx, try_fold_vctx};
 use kryprobe_core::backend::{Backend, DecodeContext};
 use kryprobe_core::enums::EvidencePhase;
 use kryprobe_core::evidence::{IntegritySummary, NativeObservation};
@@ -18,7 +20,7 @@ use kryprobe_privilege::kallsyms::{SymTable, read_kallsyms, symbolize, symbolize
 use kryprobe_privilege::kcrypto_backend::{KCryptoBackend, WhoSnapshot, observation_for_who};
 use kryprobe_privilege::kcrypto_snapshot::{RowBytes, raw_event_for_agg};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Tiny map for unit symbolization (the brief's verbatim shape).
 const TINY_MAP: &str = "ffffffff81000000 T _stext\n\
@@ -687,6 +689,377 @@ fn who_fold_refuses_missing_and_conflicting_provenance() {
     conflicting.insert(0, who_init(comm, 4243, 1000, 123, 12, pcomm, 7));
     conflicting.insert(1, who_init(comm, 4243, 1000, 123, 12, pcomm, 7));
     assert_eq!(conflicting.fold(), None, "double-marked lanes refuse");
+}
+
+// ---------------------------------------------------------------------------
+// F02/BPF2: WHO loss indication independent of KIDN capacity.
+// ---------------------------------------------------------------------------
+
+/// `KIDN` capacity mirror (BPF `KIDN` + loader `KCRYPTO_MAPS` pin 256;
+/// F02 keeps it — no silent identity-capacity reduction).
+const KIDN_CAP: usize = 256;
+/// `KWHO` capacity mirror (BPF `KWHO` + loader pin 2048; F02 keeps it).
+const KWHO_CAP: usize = 2048;
+
+/// Finite-capacity `KIDN` gate model: 256-entry `u64 -> u8` with
+/// `BPF_NOEXIST` insert discipline (an insert into a full map fails
+/// and the key stays absent — the kernel premise BPF2 turns on).
+#[derive(Default)]
+struct SimKidn {
+    entries: HashMap<u64, u8>,
+}
+
+/// Finite-capacity `KWHO` key model: 2048-entry `(kh, tgid)` set.
+#[derive(Default)]
+struct SimKwho {
+    keys: HashSet<(u64, u32)>,
+}
+
+impl SimKwho {
+    /// `BPF_NOEXIST` insert: `false` when the key is new but the map
+    /// is full (the re-lookup then misses and the miss path counts
+    /// the loss channel — never the aggregates, which already counted).
+    fn insert_noexist(&mut self, key: (u64, u32)) -> bool {
+        if self.keys.contains(&key) {
+            return true;
+        }
+        if self.keys.len() >= KWHO_CAP {
+            return false;
+        }
+        self.keys.insert(key)
+    }
+}
+
+/// `KERR` capacity mirror (BPF `KERR` + loader pin 256).
+const KERR_CAP: usize = 256;
+/// `KPARAMS` capacity mirror (BPF `KPARAMS` + loader pin 256).
+const KPARAMS_CAP: usize = 256;
+
+/// `KATTRLOSS` producer/reader oracle: `ncpu` lanes x per-program
+/// slots (slot-major: `slots[prog * ncpu + cpu]`, the host lookup
+/// order). Producer increments mirror BPF `who_drops_inc` (this
+/// CPU's lane of the failing program's slot, each increment
+/// saturating at 255); the READ under test is always the real
+/// shipped [`kattrloss_fold`], never a re-implementation.
+struct SimAttrLoss {
+    ncpu: usize,
+    slots: Vec<u64>,
+}
+
+impl SimAttrLoss {
+    fn new(ncpu: usize) -> Self {
+        assert_eq!(KATTRLOSS_SLOTS, N_KPROGS, "oracle sizes by the ABI twin");
+        Self {
+            ncpu,
+            slots: vec![0; ncpu * KATTRLOSS_SLOTS as usize],
+        }
+    }
+
+    /// One attribution-insert failure on `cpu` from program `prog`
+    /// (mirrors BPF `who_drops_inc`: lane increment saturating at
+    /// [`KATTRLOSS_CAP`]).
+    fn inc(&mut self, cpu: usize, prog: u32) {
+        assert!(prog < KATTRLOSS_SLOTS, "program ordinal indexes a slot");
+        let lane = &mut self.slots[prog as usize * self.ncpu + cpu];
+        if *lane < KATTRLOSS_CAP {
+            *lane += 1;
+        }
+    }
+
+    /// Host read: the real shipped fold over every lane x slot.
+    fn read(&self) -> u64 {
+        kattrloss_fold(&self.slots)
+    }
+}
+
+/// Caller-attribution verdict mirror (`kryprobe-cli/src/live.rs`
+/// `session_coverage`: `Partial` iff `who_drops > 0`, else
+/// `CompleteForDeclaredBoundary`).
+fn attribution_is_partial(who_drops: u64) -> bool {
+    who_drops > 0
+}
+
+#[test]
+fn who_loss_survives_full_identity_map() {
+    // BPF2 flagship: 256 identity-gate entries (no reserved key
+    // consumed — all 256 stay identity-usable), then 2048 WHO keys
+    // for one retained KAGG identity, then one more WHO key. The WHO
+    // insert fails; the `KATTRLOSS` indication must survive the full
+    // gate (nonzero `who_drops` + Partial attribution) while the
+    // aggregate totals stay exact. (RED pre-F02: the lazy `KIDN`
+    // marker insert failed on the full gate and the host read
+    // absent-as-zero; see evidence/red-who-loss.log.)
+    let mut kidn = SimKidn::default();
+    for gate in 0..KIDN_CAP as u64 {
+        assert_ne!(gate, KIDN_DROPS, "gate keys never take the ring key");
+        kidn.entries.insert(gate, 0);
+    }
+    assert_eq!(kidn.entries.len(), KIDN_CAP, "gate is exactly full");
+    // One retained KAGG identity (fixed crypto identity — the 256
+    // natural algorithms are a fixture problem, solved by preloading
+    // the gate directly instead).
+    let kh = 0x0123_4567_89ab_cdefu64;
+    let mut kwho = SimKwho::default();
+    let mut loss = SimAttrLoss::new(2);
+    let (mut kagg_calls, mut ktot_calls) = (0u64, 0u64);
+    for tgid in 0..KWHO_CAP as u32 {
+        assert!(kwho.insert_noexist((kh, tgid)), "WHO fills to capacity");
+        kagg_calls += 1;
+        ktot_calls += 1;
+    }
+    assert_eq!(kwho.keys.len(), KWHO_CAP, "WHO is exactly full");
+    // One more caller: the WHO insert fails (map full) while the
+    // aggregates still record (totals always); the WHO failure site
+    // (`who_upsert` re-lookup miss) flags this CPU's lane of the
+    // failing program's slot.
+    assert!(
+        !kwho.insert_noexist((kh, KWHO_CAP as u32)),
+        "overflow WHO key refuses"
+    );
+    kagg_calls += 1;
+    ktot_calls += 1;
+    loss.inc(0, KPROG_SKENC);
+    let folded = loss.read();
+    assert_eq!(
+        kagg_calls, ktot_calls,
+        "aggregate totals reconcile despite WHO loss"
+    );
+    assert_ne!(folded, 0, "WHO loss survives a full identity map");
+    assert!(
+        attribution_is_partial(folded),
+        "attribution degrades to Partial on WHO loss"
+    );
+}
+
+#[test]
+fn who_loss_below_capacity_control() {
+    // Positive control: gate and WHO below capacity, no insert
+    // failure — the loss flag reads healthy-zero (Complete) while
+    // aggregates reconcile.
+    let mut kidn = SimKidn::default();
+    for gate in 0..128u64 {
+        kidn.entries.insert(gate, 0);
+    }
+    let kh = 0x0123_4567_89ab_cdefu64;
+    let mut kwho = SimKwho::default();
+    let loss = SimAttrLoss::new(2);
+    let (mut kagg_calls, mut ktot_calls) = (0u64, 0u64);
+    for tgid in 0..128u32 {
+        assert!(kwho.insert_noexist((kh, tgid)));
+        kagg_calls += 1;
+        ktot_calls += 1;
+    }
+    let folded = loss.read();
+    assert_eq!(kagg_calls, ktot_calls);
+    assert_eq!(folded, 0, "no failure means no loss");
+    assert!(
+        !attribution_is_partial(folded),
+        "clean WHO attribution stays Complete"
+    );
+}
+
+#[test]
+fn who_loss_already_nonzero_control() {
+    // Positive control: a flag recorded BEFORE the gate fills remains
+    // visible and saturates upward rather than disappearing — a
+    // further failure on the full gate keeps the indication nonzero.
+    let mut kidn = SimKidn::default();
+    for gate in 0..KIDN_CAP as u64 {
+        kidn.entries.insert(gate, 0);
+    }
+    assert_eq!(kidn.entries.len(), KIDN_CAP, "gate is exactly full");
+    let mut loss = SimAttrLoss::new(2);
+    loss.inc(0, KPROG_SKENC);
+    assert_eq!(loss.read(), 1, "early flag is visible");
+    let kh = 0x0123_4567_89ab_cdefu64;
+    let mut kwho = SimKwho::default();
+    for tgid in 0..KWHO_CAP as u32 {
+        assert!(kwho.insert_noexist((kh, tgid)));
+    }
+    assert!(!kwho.insert_noexist((kh, KWHO_CAP as u32)));
+    loss.inc(0, KPROG_SKENC);
+    let folded = loss.read();
+    assert_eq!(folded, 2, "present flag saturates upward");
+    assert!(
+        attribution_is_partial(folded),
+        "visible loss degrades attribution to Partial"
+    );
+}
+
+#[test]
+fn who_loss_repeated_failures_saturate_at_cap() {
+    // Repeated failures on one lane saturate at 255: the diagnostic
+    // is a flag, never an exact lost-call count (300 failures fold
+    // to 255, not 300).
+    let mut loss = SimAttrLoss::new(2);
+    for _ in 0..300 {
+        loss.inc(1, KPROG_AEADDEC);
+    }
+    assert_eq!(loss.slots[KPROG_AEADDEC as usize * 2 + 1], 255);
+    assert_eq!(loss.read(), 255, "flag saturates, never counts exact");
+    assert!(attribution_is_partial(loss.read()));
+}
+
+#[test]
+fn who_loss_saturated_lane_stays_capped() {
+    // An already-saturated lane stays capped under further failures
+    // (idempotent at the cap — no wrap, no growth past 255).
+    let mut loss = SimAttrLoss::new(2);
+    for _ in 0..255 {
+        loss.inc(0, KPROG_SHASH);
+    }
+    assert_eq!(loss.read(), 255);
+    for _ in 0..10 {
+        loss.inc(0, KPROG_SHASH);
+    }
+    assert_eq!(loss.read(), 255, "saturated flag stays at the cap");
+}
+
+#[test]
+fn who_loss_cross_cpu_failures_fold() {
+    // Simultaneous cross-CPU failures accumulate across lanes: one
+    // failure on each of 4 CPUs (same program) folds to 4 while
+    // every other lane stays zero.
+    let mut loss = SimAttrLoss::new(4);
+    for cpu in 0..4 {
+        loss.inc(cpu, KPROG_SKENC);
+    }
+    assert_eq!(loss.read(), 4, "cross-CPU lanes accumulate");
+    assert!(attribution_is_partial(loss.read()));
+}
+
+#[test]
+fn who_loss_cross_program_failures_fold() {
+    // Simultaneous cross-program failures accumulate across slots:
+    // one failure on each of 3 programs folds to 3, and idle program
+    // slots contribute nothing.
+    let mut loss = SimAttrLoss::new(2);
+    loss.inc(0, KPROG_SKENC);
+    loss.inc(1, KPROG_AEADDEC);
+    loss.inc(0, KPROG_SHASH);
+    assert_eq!(loss.read(), 3, "cross-program slots accumulate");
+    let idle: u64 = loss
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            let prog = i / 2;
+            prog != KPROG_SKENC as usize
+                && prog != KPROG_AEADDEC as usize
+                && prog != KPROG_SHASH as usize
+        })
+        .map(|(_, &v)| v)
+        .sum();
+    assert_eq!(idle, 0, "idle program slots stay zero");
+}
+
+#[test]
+fn who_loss_kerr_site_routes_to_flag() {
+    // `KERR` loss site (`record_kerr`): a zero return records nothing
+    // (no row, no loss), while a nonzero return past the full 256
+    // rows flags the loss channel.
+    let mut kerr: HashSet<u64> = HashSet::new();
+    let mut loss = SimAttrLoss::new(2);
+    // Zero return: no row, no loss (BPF `kerr != 0` guard).
+    let zero_kerr = 0i32;
+    if zero_kerr != 0 {
+        loss.inc(0, KPROG_SKENC);
+    }
+    assert_eq!(loss.read(), 0, "zero return records nothing");
+    for kh in 0..KERR_CAP as u64 {
+        kerr.insert(kh);
+    }
+    assert_eq!(kerr.len(), KERR_CAP, "KERR is exactly full");
+    // Nonzero return for a new identity past capacity: insert fails,
+    // re-lookup misses, the KERR site flags.
+    let kh = KERR_CAP as u64;
+    let inserted = if kerr.contains(&kh) {
+        true
+    } else if kerr.len() >= KERR_CAP {
+        false
+    } else {
+        kerr.insert(kh)
+    };
+    assert!(!inserted, "overflow KERR key refuses");
+    loss.inc(0, KPROG_SKENC);
+    assert_eq!(loss.read(), 1, "KERR loss routes to the flag");
+    assert!(attribution_is_partial(loss.read()));
+}
+
+#[test]
+fn who_loss_kparams_site_routes_to_flag() {
+    // `KPARAMS` loss site (`record_params`): no `alg` means no row
+    // (never zero-filled, no loss), while a chased `alg` past the
+    // full 256 rows flags the loss channel.
+    let mut kparams: HashSet<u64> = HashSet::new();
+    let mut loss = SimAttrLoss::new(2);
+    // Failed alloc (`alg == 0`): no row, no loss.
+    let alg = 0u64;
+    if alg != 0 {
+        loss.inc(0, KPROG_SKENC);
+    }
+    assert_eq!(loss.read(), 0, "missing alg records nothing");
+    for kh in 0..KPARAMS_CAP as u64 {
+        kparams.insert(kh);
+    }
+    assert_eq!(kparams.len(), KPARAMS_CAP, "KPARAMS is exactly full");
+    let kh = KPARAMS_CAP as u64;
+    let inserted = if kparams.contains(&kh) {
+        true
+    } else if kparams.len() >= KPARAMS_CAP {
+        false
+    } else {
+        kparams.insert(kh)
+    };
+    assert!(!inserted, "overflow KPARAMS key refuses");
+    loss.inc(1, KPROG_AEADDEC);
+    assert_eq!(loss.read(), 1, "KPARAMS loss routes to the flag");
+    assert!(attribution_is_partial(loss.read()));
+}
+
+#[test]
+fn who_loss_kctx_refusal_stays_separate() {
+    // KCTX refusal stays an independent channel: a full `KCTX`
+    // (1024 rows) counts its own exact refused-insert tally while a
+    // simultaneous WHO loss flags `KATTRLOSS` — neither masks the
+    // other. And the fold contracts stay distinct: the ctx checked
+    // fold REFUSES saturated input while the loss flag SATURATES
+    // (never refuses on magnitude).
+    let mut kctx: HashSet<u64> = HashSet::new();
+    for kh in 0..KCTX_MAX_ENTRIES as u64 {
+        kctx.insert(kh);
+    }
+    assert_eq!(kctx.len(), KCTX_MAX_ENTRIES as usize, "KCTX is full");
+    // Refused ctx insert: exact `KCTX_DROPS`-style tally (a real u64
+    // count, never a saturating flag).
+    let mut ctx_exact_drops = 0u64;
+    let kh = KCTX_MAX_ENTRIES as u64;
+    if kctx.contains(&kh) || (kctx.len() as u32) < KCTX_MAX_ENTRIES {
+        kctx.insert(kh);
+    } else {
+        ctx_exact_drops += 1;
+    }
+    // Simultaneous WHO loss on the same event.
+    let mut loss = SimAttrLoss::new(2);
+    loss.inc(0, KPROG_SKENC);
+    assert_eq!(ctx_exact_drops, 1, "ctx refusal counts exactly");
+    assert_eq!(loss.read(), 1, "WHO loss flags independently");
+    // Contract separation on shipped folds: saturated ctx input
+    // refuses the receipt; saturated loss lanes fold to the cap.
+    let saturated = VCtx {
+        calls: u64::MAX,
+        ..Default::default()
+    };
+    assert_eq!(
+        try_fold_vctx(&[saturated]),
+        None,
+        "saturated ctx input refuses"
+    );
+    assert_eq!(
+        kattrloss_fold(&[KATTRLOSS_CAP, KATTRLOSS_CAP]),
+        KATTRLOSS_CAP,
+        "saturated loss lanes fold to the cap, never refuse"
+    );
 }
 
 #[test]

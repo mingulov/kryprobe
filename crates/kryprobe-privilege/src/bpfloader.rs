@@ -31,7 +31,7 @@ pub use parse::{
 };
 
 use crate::fd::OwnedFd;
-use kryprobe_abi::kcrypto_agg::{KDROPS_SLOTS, KTOT_SLOTS};
+use kryprobe_abi::kcrypto_agg::{KATTRLOSS_SLOTS, KDROPS_SLOTS, KTOT_SLOTS};
 use kryprobe_abi::kcrypto_ctx::{KCTLCOUNT_SLOTS, KCTX_DROPS_SLOTS};
 use kryprobe_core::ProgramId;
 
@@ -107,7 +107,8 @@ pub const SPINE_MAPS: &[(&str, MapDims)] = &[
 /// `planning/kryprobe-phaseK5-attribution-token-design.md` §2.1) plus
 /// the fix-wave `KDROPS` pre-`KTOT` site counters (G-C1) plus the five
 /// ctx-v1 maps (`KCTX`/`KCTX_DROPS`/`KCTLCLOSED`/`KCTXOVF`/`KCTLCOUNT`
-/// — ADR-0008/ADR-0009);
+/// — ADR-0008/ADR-0009) plus the F02 `KATTRLOSS` WHO-loss flag
+/// (BPF2: loss indication independent of `KIDN` capacity);
 /// names dot-free per R3 (`evidence/k0/P1-attach-matrix.txt`).
 pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
     (
@@ -243,6 +244,15 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
             key_size: 4,
             value_size: 8,
             max_entries: KCTLCOUNT_SLOTS,
+        },
+    ),
+    (
+        "KATTRLOSS",
+        MapDims {
+            map_type: 6,
+            key_size: 4,
+            value_size: 8,
+            max_entries: KATTRLOSS_SLOTS,
         },
     ),
 ];
@@ -446,6 +456,10 @@ pub struct KcryptoMaps {
     /// `KCTLCOUNT` (ctx-v1 per-CPU active-writer count, one per-CPU
     /// u64 lane per program — ADR-0013).
     pub ctl_count: OwnedFd,
+    /// `KATTRLOSS` (F02 WHO-loss flag, one per-CPU u64 lane per
+    /// program — ADR-0013; each lane saturates at 255 and the host
+    /// fold saturates at 255 into `who_drops`).
+    pub attr_loss: OwnedFd,
 }
 
 /// Fully loaded kcrypto object: maps + per-program fds, all RAII-owned.

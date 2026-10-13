@@ -7,11 +7,11 @@
 //! exactness suite is the cross-workspace backstop).
 
 use kryprobe_abi::kcrypto_agg::{
-    KAgg, KCTL_GAP, KCTL_GENCHANGE, KCTL_HEALTH, KCTL_IDENT, KCTL_OVERFLOW, KCTX_KTHREAD,
-    KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KConfig, KCtl, KFAM_AEAD, KFAM_AHASH, KFAM_ANY,
-    KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC, KOP_DESTROY, KOP_DIGEST, KOP_ENC,
-    KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED, KWHO_DROPS, KWHO_IDENTITY_PRESENT,
-    KWhoKey, VAgg, VParams, VWho,
+    KATTRLOSS_CAP, KATTRLOSS_SLOTS, KAgg, KCTL_GAP, KCTL_GENCHANGE, KCTL_HEALTH, KCTL_IDENT,
+    KCTL_OVERFLOW, KCTX_KTHREAD, KCTX_PROC, KCTX_SOFTIRQ, KCTX_UNKNOWN, KConfig, KCtl, KFAM_AEAD,
+    KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC, KOP_DEC, KOP_DESTROY,
+    KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KRES_QUEUED, KRES_UNOBSERVED,
+    KWHO_IDENTITY_PRESENT, KWhoKey, N_KPROGS, VAgg, VParams, VWho, kattrloss_fold,
 };
 
 #[test]
@@ -137,10 +137,28 @@ fn k5_params_mirror_sizes() {
     assert_eq!(std::mem::offset_of!(VParams, ivsize), 4);
     assert_eq!(std::mem::offset_of!(VParams, min_keysize), 8);
     assert_eq!(std::mem::offset_of!(VParams, max_keysize), 12);
-    // Attribution drops ride their own reserved KIDN key, distinct
-    // from the ring-reserve counter.
-    assert_eq!(KWHO_DROPS, u64::MAX - 1);
-    assert_ne!(KWHO_DROPS, KIDN_DROPS);
+}
+
+#[test]
+fn kattrloss_flag_pins() {
+    // F02/BPF2: attribution loss rides its own per-program
+    // `PerCpuArray<u64>` (one slot per program ordinal), folded with
+    // saturation at 255 into `who_drops` — a flag, never an exact
+    // lost-call count. The fold units below pin the cap contract the
+    // BPF lane increment and the host reader both mirror.
+    assert_eq!(KATTRLOSS_SLOTS, N_KPROGS);
+    assert_eq!(KATTRLOSS_SLOTS, 9);
+    assert_eq!(KATTRLOSS_CAP, 255);
+    assert_eq!(kattrloss_fold(&[]), 0);
+    assert_eq!(kattrloss_fold(&[0, 0, 0]), 0);
+    assert_eq!(kattrloss_fold(&[1]), 1);
+    assert_eq!(kattrloss_fold(&[1, 2, 3]), 6);
+    assert_eq!(kattrloss_fold(&[255, 1]), 255, "fold saturates at the cap");
+    assert_eq!(
+        kattrloss_fold(&[u64::MAX, u64::MAX]),
+        255,
+        "fold never wraps, however large the lanes"
+    );
 }
 
 #[test]

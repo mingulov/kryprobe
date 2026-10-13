@@ -111,10 +111,10 @@ const KCTL_CTX_OVERFLOW: u8 = 6;
 /// Reserved `KIDN` key: ring-reserve-failure counter (saturating `u8`).
 const KIDN_DROPS: u64 = u64::MAX;
 
-/// Reserved `KIDN` key: K5 attribution-insert-failure counter
-/// (`KWHO`/`KERR`/`KPARAMS` insert failed while the key stayed absent —
-/// saturating `u8`, surfaced as `who_drops`).
-const KWHO_DROPS: u64 = u64::MAX - 1;
+// (F02/BPF2: the K5 attribution-insert-failure counter left `KIDN`
+// for its own `KATTRLOSS` array — a lazily inserted marker went blind
+// exactly when the identity gate filled. `KIDN` keeps all 256 entries
+// for identity gating; no silent capacity reduction.)
 
 /// `VWho.identity_present` marker: `who_upsert` writes this into the
 /// insert value, so the kernel lands it on exactly the inserting
@@ -141,9 +141,9 @@ const KDROPS_DESTROY: u32 = 5;
 
 /// Per-program lane ordinals (ADR-0013; twin:
 /// `kryprobe-abi/src/kcrypto_agg.rs`, pinned by `kprog_lanes.rs`).
-/// `KTOT`/`KCTLCOUNT`/`KCTX_DROPS` index by ordinal, `KDROPS` by
-/// ordinal × 8 + site. FORENSICS-2 proved shared slots lose
-/// increments when two programs interleave on one CPU
+/// `KTOT`/`KCTLCOUNT`/`KCTX_DROPS`/`KATTRLOSS` index by ordinal,
+/// `KDROPS` by ordinal × 8 + site. FORENSICS-2 proved shared slots
+/// lose increments when two programs interleave on one CPU
 /// (`KTOT` lag on every 1M n_cgroup leg); disjoint slots restore
 /// exactness because the trampoline guard serializes each program
 /// against itself per CPU (a reentrant same-program entry skips
@@ -381,6 +381,12 @@ static KCTLCLOSED: Array<u8> = Array::with_max_entries(1, 0);
 static KCTLCOUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS, 0);
 #[map]
 static KCTXOVF: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+// F02/BPF2: dedicated WHO-loss flag, one slot per program ordinal
+// (a lazy `KIDN` marker went blind exactly when the identity gate
+// filled, so caller-map insertion loss rides its own fixed-capacity
+// map; host folds lanes × slots saturating at 255).
+#[map]
+static KATTRLOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers (all #[inline(always)]: R4 call-free)
@@ -781,19 +787,26 @@ fn drop_inc(prog: u32, site: u32) {
     }
 }
 
-/// Attribution-drop counter: `KWHO`/`KERR`/`KPARAMS` insert failed
-/// while the key stayed absent (saturating `u8` at the `KWHO_DROPS`
-/// reserved `KIDN` key — never silent, distinct from ring drops).
+/// Attribution-loss flag: `KWHO`/`KERR`/`KPARAMS` insert failed
+/// while the key stayed absent. Bumps this CPU's lane of the `prog`
+/// slot in the dedicated `KATTRLOSS` array, each increment saturating
+/// at 255 (F02/BPF2: a lazily inserted `KIDN` marker went blind
+/// exactly when the identity gate filled, so loss rides its own
+/// fixed-capacity map — never silent, distinct from ring drops, and
+/// never an exact lost-call count). A missing slot
+/// (live-impossible on a `PerCpuArray`) is ignored, same as
+/// [`drop_inc`]: the observation is already lost, and a counter for
+/// the counter would recurse.
 #[inline(always)]
-fn who_drops_inc() {
-    let drops = KWHO_DROPS;
-    if let Some(slot) = KIDN.get_ptr_mut(drops) {
+fn who_drops_inc(prog: u32) {
+    if let Some(slot) = KATTRLOSS.get_ptr_mut(prog) {
         unsafe {
-            *slot = (*slot).saturating_add(1);
+            // Lane increment saturating at 255 (twin: `KATTRLOSS_CAP`
+            // in `kryprobe-abi/src/kcrypto_agg.rs`).
+            if *slot < 255 {
+                *slot = (*slot).saturating_add(1);
+            }
         }
-    } else {
-        let one: u8 = 1;
-        let _ = KIDN.insert(drops, one, BPF_NOEXIST);
     }
 }
 
@@ -1082,6 +1095,7 @@ unsafe fn chase_parent(base: *mut VWho) {
 /// `comm` must be live across the call.
 #[inline(always)]
 unsafe fn who_upsert(
+    prog: u32,
     base: *mut VWho,
     ctx: &FExitContext,
     wkey: &KWhoKey,
@@ -1157,7 +1171,7 @@ unsafe fn who_upsert(
             update_who_slot(filled, tid, comm, now);
         },
         None => {
-            who_drops_inc();
+            who_drops_inc(prog);
         }
     }
 }
@@ -1172,7 +1186,7 @@ unsafe fn who_upsert(
 /// `scratch` @ 0 must span 88 writable bytes; the who init value
 /// there must be dead (copied into the map by the insert).
 #[inline(always)]
-unsafe fn record_params(scratch: *mut u8, kh: u64, alg: u64) {
+unsafe fn record_params(prog: u32, scratch: *mut u8, kh: u64, alg: u64) {
     if alg != 0
         && let Some(row) = KCFG.get(0)
         && row.params_ok != 0
@@ -1196,18 +1210,18 @@ unsafe fn record_params(scratch: *mut u8, kh: u64, alg: u64) {
             let _ = KPARAMS.insert(kh, params_ref, BPF_NOEXIST);
         }
         if KPARAMS.get_ptr(kh).is_none() {
-            who_drops_inc();
+            who_drops_inc(prog);
         }
     }
 }
 
 /// First nonzero return per kh, insert-if-absent only (1A-M8).
 #[inline(always)]
-fn record_kerr(kh: u64, kerr: i32) {
+fn record_kerr(prog: u32, kh: u64, kerr: i32) {
     if kerr != 0 && KERR.get_ptr(kh).is_none() {
         let _ = KERR.insert(kh, kerr, BPF_NOEXIST);
         if KERR.get_ptr(kh).is_none() {
-            who_drops_inc();
+            who_drops_inc(prog);
         }
     }
 }
@@ -1234,7 +1248,16 @@ fn record_kerr(kh: u64, kerr: i32) {
 ///
 /// `scratch` must span 120 exclusive stack bytes, 8-aligned.
 #[inline(always)]
-fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratch: *mut u8) {
+#[allow(clippy::too_many_arguments)]
+fn who_record(
+    prog: u32,
+    ctx: &FExitContext,
+    kh: u64,
+    now: u64,
+    alg: u64,
+    kerr: i32,
+    scratch: *mut u8,
+) {
     // SAFETY: helper with no pointer arguments.
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
@@ -1264,15 +1287,15 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
         // SAFETY: `base` is the scratch head (a writable `VWho`);
         // `wkey`/`comm` carves are live across the call.
         unsafe {
-            who_upsert(base, ctx, wkey, tid, comm, now);
+            who_upsert(prog, base, ctx, wkey, tid, comm, now);
         }
         // SAFETY: scratch @ 0 spans 88 bytes; the who init value is
         // dead (copied into the map by the insert above).
         unsafe {
-            record_params(scratch, kh, alg);
+            record_params(prog, scratch, kh, alg);
         }
     }
-    record_kerr(kh, kerr);
+    record_kerr(prog, kh, kerr);
 }
 
 /// Record one attributed observation: build the key (volatile-zeroed,
@@ -1427,7 +1450,7 @@ fn observe(
     // SAFETY: `aux` spans 120 exclusive stack bytes, 8-aligned; the
     // `VAgg` zero above is dead (copied into the map by the insert, or
     // never built on the hit path).
-    who_record(ctx, kh, now, alg, kerr, aux.as_mut_ptr() as *mut u8);
+    who_record(prog, ctx, kh, now, alg, kerr, aux.as_mut_ptr() as *mut u8);
     0
 }
 
