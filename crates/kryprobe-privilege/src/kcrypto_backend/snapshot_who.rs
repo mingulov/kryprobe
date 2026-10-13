@@ -5,7 +5,8 @@ use super::SnapshotError;
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
 use kryprobe_abi::kcrypto_agg::{
-    KWHO_DROPS, KWhoKey, VParams, VWho, kwho_key_from_bytes, vparams_from_bytes, vwho_from_bytes,
+    KWHO_DROPS, KWhoKey, VParams, VWho, kwho_key_from_bytes, try_fold_vwho, vparams_from_bytes,
+    vwho_from_bytes,
 };
 use std::collections::HashMap;
 
@@ -21,7 +22,8 @@ pub struct WhoSnapshot {
     /// The `KWHO` key (row hash + tgid).
     pub key: KWhoKey,
     /// The percpu-folded `KWHO` value (calls summed, stamps min/maxed,
-    /// identity from the most-recent-writer lane).
+    /// insertion-frozen identity from the unique marked lane,
+    /// `tid`/`comm` from the latest-writer lane).
     pub val: VWho,
     /// Kernel stack IPs for `val.stack` (truncated at the first zero;
     /// empty when `stack` is negative or the `KSTACK` row is absent).
@@ -35,44 +37,16 @@ pub struct WhoSnapshot {
     pub params: Option<VParams>,
 }
 
-/// Fold per-CPU `VWho` lanes into one total (the [`fold_vagg`](kryprobe_abi::kcrypto_agg::fold_vagg)
-/// contract for who rows): `calls` sums saturating; `first_ns` is the
-/// minimum over lanes with `calls > 0` (idle lanes hold `calls == 0`
-/// with zero stamps — the BPF broadcasts a zero tallies+stamps insert
-/// to every lane, then the re-lookup stamps only the inserting CPU's
-/// lane — and must not poison the min); `last_ns` is the maximum; both
-/// stamps are 0 when no lane observed anything. Identity fields come
-/// from the most-recent-writer lane (greatest `last_ns`, first on
-/// ties): `tid`/`comm` are last-writer per lane, the rest are
-/// insert-identical across lanes. Total over any lane slice (empty
-/// folds to zero).
-pub(crate) fn fold_vwho(lanes: &[VWho]) -> VWho {
-    let mut out = VWho::default();
-    let mut first = u64::MAX;
-    let mut any = false;
-    let mut best = 0usize;
-    for (i, lane) in lanes.iter().enumerate() {
-        out.calls = out.calls.saturating_add(lane.calls);
-        if lane.calls > 0 {
-            any = true;
-            first = first.min(lane.first_ns);
-        }
-        if lane.last_ns > out.last_ns {
-            out.last_ns = lane.last_ns;
-            best = i;
-        }
-    }
-    out.first_ns = if any { first } else { 0 };
-    if let Some(winner) = lanes.get(best) {
-        out.comm = winner.comm;
-        out.tid = winner.tid;
-        out.uid = winner.uid;
-        out.cgroup = winner.cgroup;
-        out.ppid = winner.ppid;
-        out.pcomm = winner.pcomm;
-        out.stack = winner.stack;
-    }
-    out
+/// Fold per-CPU `VWho` lanes into one qualified total (the checked
+/// [`try_fold_vwho`](kryprobe_abi::kcrypto_agg::try_fold_vwho)
+/// contract for who rows): insertion-frozen identity from the unique
+/// marked lane, `tid`/`comm` from the latest writer, `calls` summed
+/// checked, stamps min/maxed over busy lanes. `None` refuses missing
+/// or conflicting provenance (and saturated `calls`) — callers fail
+/// the snapshot loud via `snapshot/who-provenance`, never guess from
+/// numeric zeros.
+pub(crate) fn fold_vwho(lanes: &[VWho]) -> Option<VWho> {
+    try_fold_vwho(lanes)
 }
 
 /// Decode one `KSTACK` value (1016B = 127 LE u64 frames, zero-padded)
@@ -268,7 +242,7 @@ pub fn snapshot_who_cached(
     maps: &ConfiguredKcrypto,
     cache: &mut WhoCache,
 ) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
-    let (ncpu, value_len) = percpu_buffer_len(80)?;
+    let (ncpu, value_len) = percpu_buffer_len(88)?;
     let mut out = Vec::new();
     let mut lanes: Vec<VWho> = Vec::with_capacity(ncpu);
     let mut tick_err: HashMap<u64, (Option<i32>, Option<VParams>)> = HashMap::new();
@@ -288,14 +262,14 @@ pub fn snapshot_who_cached(
             stage: "snapshot/who-key".to_owned(),
             errno: libc::EBADMSG,
         })?;
-        // SAFETY: KWHO is PerCpuHashMap<KWhoKey, VWho>; VWho is 80B
+        // SAFETY: KWHO is PerCpuHashMap<KWhoKey, VWho>; VWho is 88B
         // (vwho_from_bytes); ncpu is possible_cpus.
         let raw =
             unsafe { map_lookup_bytes(&maps.loaded.maps.who, &k, value_len, "snapshot/who-val") }?;
         lanes.clear();
         for c in 0..ncpu {
             let lane = raw
-                .get(c * 80..(c + 1) * 80)
+                .get(c * 88..(c + 1) * 88)
                 .and_then(vwho_from_bytes)
                 .ok_or_else(|| MapOpsError::LookupFailed {
                     stage: "snapshot/who-lane".to_owned(),
@@ -303,7 +277,13 @@ pub fn snapshot_who_cached(
                 })?;
             lanes.push(lane);
         }
-        let val = fold_vwho(&lanes);
+        // Missing/conflicting insertion provenance (or saturated
+        // calls) refuses the whole snapshot: a broken post-attach
+        // read must be loud, never a silent zero identity.
+        let val = fold_vwho(&lanes).ok_or_else(|| MapOpsError::LookupFailed {
+            stage: "snapshot/who-provenance".to_owned(),
+            errno: libc::EBADMSG,
+        })?;
         let joins = match cache.lookup(who_key.kh, who_key.tgid, val.last_ns, val.stack) {
             Some(joins) => joins,
             None => {

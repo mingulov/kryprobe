@@ -135,6 +135,12 @@ pub const KIDN_DROPS: u64 = u64::MAX;
 /// [`KIDN_DROPS`] so ring loss and attribution loss stay distinguishable.
 pub const KWHO_DROPS: u64 = u64::MAX - 1;
 
+/// `VWho.identity_present` marker: the lane whose `BPF_NOEXIST`
+/// insert created the `KWHO` key carries this value; every other lane
+/// carries 0 (kernel-zeroed at insert, never marked by the hit path).
+/// Twinned in `kcrypto.rs` (`KWHO_IDENTITY_PRESENT`).
+pub const KWHO_IDENTITY_PRESENT: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // Structs (twinned in kcrypto.rs; sizes pinned by kcrypto_layout.rs)
 // ---------------------------------------------------------------------------
@@ -475,15 +481,24 @@ impl KWhoKey {
     pub const FIELDS: &[&str] = &["kh", "tgid", "_pad"];
 }
 
-/// `KWHO` value: caller identity + call tallies (80B).
+/// `KWHO` value: caller identity + call tallies (88B).
 ///
 /// First-seen fields (`comm` initial, `uid`, `cgroup`, `ppid`, `pcomm`,
 /// `stack`) are written once at insert; the hit path updates only
 /// `calls`, `last_ns`, and the last-writer `tid`/`comm`. Per-CPU lanes
-/// (like [`VAgg`]): the insert broadcasts the identity with `calls == 0`
-/// to every lane and the inserting CPU's lane is updated in place, so
-/// idle lanes hold `calls == 0` and must be skipped by the
-/// `first_ns`-min fold (same contract as [`fold_vagg`]).
+/// (like [`VAgg`]): the kernel initializes ONLY the inserting CPU's
+/// lane from the insert value and zeroes every other lane (Linux 6.12
+/// `pcpu_init_value` — an insert is NOT a broadcast), so secondary
+/// lanes hold zeroed identity until their first hit, and stay
+/// unmarked even after count updates.
+///
+/// Insertion provenance: `identity_present` is
+/// [`KWHO_IDENTITY_PRESENT`] on exactly the lane whose
+/// `BPF_NOEXIST` insert created the key (a losing racer must never
+/// mark its lane). [`try_fold_vwho`] sources insertion-frozen
+/// identity from that unique marked lane and folds `tid`/`comm`
+/// from the latest writer; missing or conflicting provenance
+/// refuses — an unmarked numeric zero is never an observed identity.
 ///
 /// Twin: `VWho` in `crates/bpf-kcrypto/src/bin/kcrypto.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -513,13 +528,29 @@ pub struct VWho {
     pub first_ns: u64,
     /// Last-observation time per lane (max-folded).
     pub last_ns: u64,
+    /// Insertion provenance: [`KWHO_IDENTITY_PRESENT`] on the lane
+    /// whose `BPF_NOEXIST` insert created the key, 0 elsewhere.
+    pub identity_present: u32,
+    /// Reserved, zero.
+    pub _rsv: u32,
 }
 
 impl VWho {
     /// Manually-maintained field list (allowlist tripwire, declaration
     /// order — see [`KConfig::FIELDS`]).
     pub const FIELDS: &[&str] = &[
-        "comm", "tid", "uid", "cgroup", "ppid", "pcomm", "stack", "calls", "first_ns", "last_ns",
+        "comm",
+        "tid",
+        "uid",
+        "cgroup",
+        "ppid",
+        "pcomm",
+        "stack",
+        "calls",
+        "first_ns",
+        "last_ns",
+        "identity_present",
+        "_rsv",
     ];
 }
 
@@ -749,6 +780,69 @@ pub fn try_fold_vagg(lanes: &[VAgg]) -> Option<VAgg> {
     Some(out)
 }
 
+/// Fold per-CPU `VWho` lanes into one qualified total.
+///
+/// Insertion-frozen identity (`uid`, `cgroup`, `ppid`, `pcomm`,
+/// `stack`) comes from the UNIQUE lane carrying
+/// [`KWHO_IDENTITY_PRESENT`] (per-key insertion-time meaning);
+/// `tid`/`comm` fold separately from the latest-writer lane
+/// (greatest `last_ns`, first on ties); `calls` sums checked (the
+/// [`try_fold_vagg`] N5 contract: a saturated input word or an
+/// overflowing sum refuses); `first_ns` is the minimum over lanes
+/// with `calls > 0` (0 when no lane observed anything); `last_ns`
+/// is the maximum. The folded value carries
+/// [`KWHO_IDENTITY_PRESENT`] (qualified insertion-observed
+/// identity) with zero reserved padding.
+///
+/// `None` (refuse — callers fail loud, never guess): no lane
+/// marked, more than one lane marked, a non-marker nonzero
+/// `identity_present` value, or a saturated/overflowing `calls`
+/// sum. Stamps stay exempt (min/max-folded, never summed).
+pub fn try_fold_vwho(lanes: &[VWho]) -> Option<VWho> {
+    let mut marked: Option<usize> = None;
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.identity_present == KWHO_IDENTITY_PRESENT {
+            if marked.is_some() {
+                return None;
+            }
+            marked = Some(i);
+        } else if lane.identity_present != 0 {
+            return None;
+        }
+    }
+    let source = lanes.get(marked?)?;
+    let mut out = VWho::default();
+    let mut first = u64::MAX;
+    let mut any = false;
+    let mut best = 0usize;
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.calls == u64::MAX {
+            return None;
+        }
+        out.calls = out.calls.checked_add(lane.calls)?;
+        if lane.calls > 0 {
+            any = true;
+            first = first.min(lane.first_ns);
+        }
+        if lane.last_ns > out.last_ns {
+            out.last_ns = lane.last_ns;
+            best = i;
+        }
+    }
+    out.first_ns = if any { first } else { 0 };
+    out.uid = source.uid;
+    out.cgroup = source.cgroup;
+    out.ppid = source.ppid;
+    out.pcomm = source.pcomm;
+    out.stack = source.stack;
+    if let Some(winner) = lanes.get(best) {
+        out.comm = winner.comm;
+        out.tid = winner.tid;
+    }
+    out.identity_present = KWHO_IDENTITY_PRESENT;
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // Wire codecs (little-endian, x86-64 target; alignment-safe by construction)
 // ---------------------------------------------------------------------------
@@ -859,10 +953,10 @@ pub fn kwho_key_from_bytes(bytes: &[u8]) -> Option<KWhoKey> {
     })
 }
 
-/// Decode a `VWho` map value from exactly 80 bytes (`None` otherwise).
+/// Decode a `VWho` map value from exactly 88 bytes (`None` otherwise).
 #[must_use]
 pub fn vwho_from_bytes(bytes: &[u8]) -> Option<VWho> {
-    if bytes.len() != 80 {
+    if bytes.len() != 88 {
         return None;
     }
     let mut comm = [0u8; 16];
@@ -880,6 +974,8 @@ pub fn vwho_from_bytes(bytes: &[u8]) -> Option<VWho> {
         calls: lane_word(bytes, 56)?,
         first_ns: lane_word(bytes, 64)?,
         last_ns: lane_word(bytes, 72)?,
+        identity_present: lane_u32(bytes, 80)?,
+        _rsv: lane_u32(bytes, 84)?,
     })
 }
 
@@ -1029,6 +1125,96 @@ mod tests {
         assert_eq!(folded.last_ns, u64::MAX);
     }
 
+    /// One `VWho` lane: `(uid, cgroup, stack)` identity, `tid`,
+    /// `(calls, first_ns, last_ns)` tallies, and the provenance marker.
+    fn who_lane(id: (u32, u64, i32), tid: u32, tally: (u64, u64, u64), marked: bool) -> VWho {
+        VWho {
+            comm: [b'c'; 16],
+            tid,
+            uid: id.0,
+            cgroup: id.1,
+            ppid: 12,
+            pcomm: [b'p'; 16],
+            stack: id.2,
+            calls: tally.0,
+            first_ns: tally.1,
+            last_ns: tally.2,
+            identity_present: if marked { KWHO_IDENTITY_PRESENT } else { 0 },
+            _rsv: 0,
+        }
+    }
+
+    #[test]
+    fn try_fold_vwho_sources_identity_from_unique_marked_lane() {
+        // Migration shape: inserting lane marked with identity, the
+        // latest-writer secondary lane unmarked with zeroed identity.
+        // Identity rides the marked lane; tid/comm ride the latest.
+        let inserting = who_lane((1000, 123, 7), 4243, (1, 100, 100), true);
+        let mut secondary = who_lane((0, 0, 0), 4244, (1, 200, 200), false);
+        secondary.comm = [b'w'; 16];
+        let folded = try_fold_vwho(&[inserting, secondary]).expect("unique mark qualifies");
+        assert_eq!(folded.calls, 2);
+        assert_eq!((folded.uid, folded.cgroup, folded.stack), (1000, 123, 7));
+        assert_eq!(folded.ppid, 12);
+        assert_eq!(
+            (folded.tid, folded.first_ns, folded.last_ns),
+            (4244, 100, 200)
+        );
+        assert_eq!(folded.comm, [b'w'; 16]);
+        assert_eq!(folded.identity_present, KWHO_IDENTITY_PRESENT);
+        assert_eq!(folded._rsv, 0);
+    }
+
+    #[test]
+    fn try_fold_vwho_refuses_missing_and_conflicting_provenance() {
+        let marked = who_lane((1000, 123, 7), 4243, (1, 100, 100), true);
+        let unmarked = who_lane((0, 0, 0), 4244, (1, 200, 200), false);
+        // Missing: no lane marked (busy or idle) refuses.
+        assert_eq!(try_fold_vwho(&[unmarked, VWho::default()]), None);
+        assert_eq!(try_fold_vwho(&[]), None);
+        // Conflicting: two marked lanes refuse, even with identical identity.
+        assert_eq!(try_fold_vwho(&[marked, marked]), None);
+        // Unknown marker values refuse (only 0 and the marker exist).
+        let mut odd = marked;
+        odd.identity_present = 2;
+        assert_eq!(try_fold_vwho(&[odd]), None);
+        assert_eq!(try_fold_vwho(&[marked, odd]), None);
+    }
+
+    #[test]
+    fn try_fold_vwho_accepts_genuine_root_and_stack_zero() {
+        // Validity comes from the marker, never from numeric zeros:
+        // a MARKED uid 0 / stack 0 is genuine root identity and a
+        // genuine stack-id 0 (both legitimate), never a refusal.
+        let root = who_lane((0, 5, 0), 1, (3, 100, 300), true);
+        let idle = VWho::default();
+        let folded = try_fold_vwho(&[idle, root, idle]).expect("marked zeros qualify");
+        assert_eq!((folded.uid, folded.cgroup, folded.stack), (0, 5, 0));
+        assert_eq!(folded.calls, 3);
+        // The same zeros UNMARKED refuse (no observed identity).
+        let unmarked_root = who_lane((0, 5, 0), 1, (3, 100, 300), false);
+        assert_eq!(try_fold_vwho(&[unmarked_root]), None);
+    }
+
+    #[test]
+    fn try_fold_vwho_refuses_saturated_calls() {
+        // The try_ N5 contract (same as try_fold_vagg): a saturated
+        // input word or an overflowing sum refuses; stamps exempt.
+        let marked = who_lane((1000, 123, 7), 4243, (1, 100, 100), true);
+        let mut full = who_lane((0, 0, 0), 9, (u64::MAX, 0, 0), false);
+        full.last_ns = u64::MAX;
+        assert_eq!(try_fold_vwho(&[marked, full]), None);
+        let mut big = who_lane((1000, 123, 7), 4243, (u64::MAX - 1, 50, 60), true);
+        big.last_ns = u64::MAX;
+        let small = who_lane((0, 0, 0), 9, (5, 70, 80), false);
+        let folded = try_fold_vwho(&[marked, small]).expect("clean lanes qualify");
+        assert_eq!(
+            (folded.calls, folded.first_ns, folded.last_ns),
+            (6, 70, 100)
+        );
+        assert_eq!(try_fold_vwho(&[big, small]), None);
+    }
+
     #[test]
     fn ident_hash_is_stable_and_identity_scoped() {
         // Golden: FNV-1a over (fam=1, op=3, alg="cbc(aes)"+pad, drv=zeros)
@@ -1143,7 +1329,7 @@ mod tests {
         assert!(kwho_key_from_bytes(&key_bytes[..15]).is_none());
         assert!(kwho_key_from_bytes(&[0u8; 17]).is_none());
 
-        let mut who_bytes = [0u8; 80];
+        let mut who_bytes = [0u8; 88];
         who_bytes[0..7].copy_from_slice(b"python3");
         who_bytes[16..20].copy_from_slice(&4243u32.to_le_bytes());
         who_bytes[20..24].copy_from_slice(&1000u32.to_le_bytes());
@@ -1154,7 +1340,9 @@ mod tests {
         who_bytes[56..64].copy_from_slice(&7u64.to_le_bytes());
         who_bytes[64..72].copy_from_slice(&111u64.to_le_bytes());
         who_bytes[72..80].copy_from_slice(&222u64.to_le_bytes());
-        let who = vwho_from_bytes(&who_bytes).expect("80B decodes");
+        who_bytes[80..84].copy_from_slice(&KWHO_IDENTITY_PRESENT.to_le_bytes());
+        who_bytes[84..88].copy_from_slice(&0u32.to_le_bytes());
+        let who = vwho_from_bytes(&who_bytes).expect("88B decodes");
         assert_eq!(&who.comm[..7], b"python3");
         assert_eq!(who.tid, 4243);
         assert_eq!(who.uid, 1000);
@@ -1165,8 +1353,12 @@ mod tests {
         assert_eq!(who.calls, 7);
         assert_eq!(who.first_ns, 111);
         assert_eq!(who.last_ns, 222);
-        assert!(vwho_from_bytes(&who_bytes[..79]).is_none());
-        assert!(vwho_from_bytes(&[0u8; 81]).is_none());
+        assert_eq!(who.identity_present, KWHO_IDENTITY_PRESENT);
+        assert_eq!(who._rsv, 0);
+        assert!(vwho_from_bytes(&who_bytes[..87]).is_none());
+        assert!(vwho_from_bytes(&[0u8; 89]).is_none());
+        // The pre-F01 80B shape no longer decodes (layout pin moved).
+        assert!(vwho_from_bytes(&[0u8; 80]).is_none());
 
         let mut params_bytes = [0u8; 16];
         params_bytes[0..4].copy_from_slice(&16u32.to_le_bytes());

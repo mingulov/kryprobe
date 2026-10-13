@@ -160,7 +160,7 @@ pub const KCRYPTO_MAPS: &[(&str, MapDims)] = &[
         MapDims {
             map_type: 5,
             key_size: 16,
-            value_size: 80,
+            value_size: 88,
             max_entries: 2048,
         },
     ),

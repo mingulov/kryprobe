@@ -116,6 +116,12 @@ const KIDN_DROPS: u64 = u64::MAX;
 /// saturating `u8`, surfaced as `who_drops`).
 const KWHO_DROPS: u64 = u64::MAX - 1;
 
+/// `VWho.identity_present` marker: `who_upsert` writes this into the
+/// insert value, so the kernel lands it on exactly the inserting
+/// CPU's lane (other lanes stay 0 — never set by `update_who_slot`).
+/// Twin: `KWHO_IDENTITY_PRESENT` in `kryprobe-abi/src/kcrypto_agg.rs`.
+const KWHO_IDENTITY_PRESENT: u32 = 1;
+
 /// `KDROPS` sites: pre-`KTOT` skip accounting (fix wave, G-C1). Every
 /// `return 0` before the `KTOT` update bumps one site (exact per-CPU
 /// `u64` — no saturation; per-program lanes, ADR-0013, so no races).
@@ -277,9 +283,11 @@ pub struct KWhoKey {
     pub _pad: u32,
 }
 
-/// `KWHO` value: caller identity + call tallies (80B). First-seen
+/// `KWHO` value: caller identity + call tallies (88B). First-seen
 /// fields are insert-frozen; the hit path touches only `tid`/`comm`
-/// (last-writer), `calls`, `last_ns`.
+/// (last-writer), `calls`, `last_ns` — never `identity_present`
+/// (only the `BPF_NOEXIST` inserting lane carries the marker; the
+/// kernel zeroes every other lane at insert).
 #[repr(C)]
 pub struct VWho {
     pub comm: [u8; 16],
@@ -292,6 +300,8 @@ pub struct VWho {
     pub calls: u64,
     pub first_ns: u64,
     pub last_ns: u64,
+    pub identity_present: u32,
+    pub _rsv: u32,
 }
 
 /// `KPARAMS` value: per-`kh` crypto parameters (16B).
@@ -335,7 +345,7 @@ const _: () = assert!(size_of::<KAgg>() == 260);
 const _: () = assert!(size_of::<VAgg>() == 120);
 const _: () = assert!(size_of::<KCtl>() == 48);
 const _: () = assert!(size_of::<KWhoKey>() == 16);
-const _: () = assert!(size_of::<VWho>() == 80);
+const _: () = assert!(size_of::<VWho>() == 88);
 const _: () = assert!(size_of::<VParams>() == 16);
 const _: () = assert!(size_of::<KCtxKey>() == 32);
 const _: () = assert!(size_of::<VCtx>() == 56);
@@ -989,8 +999,13 @@ fn ctx_record(
 
 /// In-place per-CPU who-lane update (current CPU's copy, exclusive):
 /// first-touch stamps `first_ns` when the lane was fresh (`calls == 0`
-/// — the broadcast insert carries `calls == 0`); `tid`/`comm` refresh
-/// last-writer; identity fields are insert-frozen.
+/// — the insert value carries `calls == 0`, and the kernel zeroes
+/// non-inserting lanes); `tid`/`comm` refresh last-writer; identity
+/// fields are insert-frozen. MUST NOT touch `identity_present` (or
+/// any identity field): a secondary lane — including a losing
+/// `BPF_NOEXIST` racer's lane — stays unmarked even after count
+/// updates, so the fold keeps sourcing identity from the unique
+/// inserting lane.
 ///
 /// # Safety
 ///
@@ -1052,11 +1067,14 @@ unsafe fn chase_parent(base: *mut VWho) {
 }
 
 /// Who-miss upsert (1A-M8): populate the identity value at `base`
-/// (comm/tid/uid/cgroup, parent chase, stack id, zero tallies) and
-/// insert with `calls == 0` (the percpu insert broadcasts to every
-/// lane; the re-lookup below updates this CPU's lane in place — the
-/// KAGG insert-zero precedent, so idle lanes stay zero and the fold
-/// stays exact).
+/// (comm/tid/uid/cgroup, parent chase, stack id, zero tallies, the
+/// `identity_present` marker) and insert with `calls == 0` (the
+/// percpu insert lands this value on the inserting CPU's lane ONLY —
+/// the kernel zeroes every other lane — so the marker identifies
+/// exactly the inserting lane; the re-lookup below updates this
+/// CPU's lane in place via `update_who_slot`, which never marks —
+/// so a losing `BPF_NOEXIST` racer's lane stays unmarked and the
+/// fold stays exact).
 ///
 /// # Safety
 ///
@@ -1072,7 +1090,7 @@ unsafe fn who_upsert(
     now: u64,
 ) {
     // SAFETY: every field written below before any read/insert
-    // (`scratch` contract: `VWho` @ 0 spans 80 bytes).
+    // (`scratch` contract: `VWho` @ 0 spans 88 bytes).
     unsafe {
         let mut dst = core::ptr::addr_of_mut!((*base).comm).cast::<u8>();
         let mut src = comm as *const [u8; 16] as *const u8;
@@ -1114,14 +1132,22 @@ unsafe fn who_upsert(
             stack_map,
             BPF_F_FAST_STACK_CMP,
         ) as i32);
-        // Zero tallies + stamps: the percpu insert broadcasts this
-        // value to every lane, so idle lanes must hold calls == 0
-        // with zero stamps (the KAGG `vagg_zero_slot` precedent);
-        // the re-lookup below stamps the inserting lane via
-        // `update_who_slot` (first_ns = last_ns = now, calls = 1).
+        // Zero tallies + stamps: the percpu insert lands this
+        // value on the inserting lane only (the kernel zeroes the
+        // rest), so idle lanes hold calls == 0 with zero stamps
+        // (the KAGG `vagg_zero_slot` precedent); the re-lookup
+        // below stamps the inserting lane via `update_who_slot`
+        // (first_ns = last_ns = now, calls = 1).
         core::ptr::addr_of_mut!((*base).calls).write_volatile(0);
         core::ptr::addr_of_mut!((*base).first_ns).write_volatile(0);
         core::ptr::addr_of_mut!((*base).last_ns).write_volatile(0);
+        // Insertion provenance: this insert value carries the
+        // marker, so exactly the inserting lane is marked (a losing
+        // `BPF_NOEXIST` racer never inserts, hence never marks).
+        // Reserved padding initialized to zero (volatile, so no
+        // zero chain fuses into memset).
+        core::ptr::addr_of_mut!((*base).identity_present).write(KWHO_IDENTITY_PRESENT);
+        core::ptr::addr_of_mut!((*base)._rsv).write_volatile(0);
     }
     // SAFETY: fully initialized above.
     let who_ref: &VWho = unsafe { &*base };
@@ -1143,7 +1169,7 @@ unsafe fn who_upsert(
 ///
 /// # Safety
 ///
-/// `scratch` @ 0 must span 80 writable bytes; the who init value
+/// `scratch` @ 0 must span 88 writable bytes; the who init value
 /// there must be dead (copied into the map by the insert).
 #[inline(always)]
 unsafe fn record_params(scratch: *mut u8, kh: u64, alg: u64) {
@@ -1152,7 +1178,7 @@ unsafe fn record_params(scratch: *mut u8, kh: u64, alg: u64) {
         && row.params_ok != 0
         && KPARAMS.get_ptr(kh).is_none()
     {
-        // SAFETY: `scratch` @ 0 spans 80 bytes; the who init
+        // SAFETY: `scratch` @ 0 spans 88 bytes; the who init
         // value above is dead (copied into the map by the
         // insert).
         unsafe {
@@ -1197,12 +1223,12 @@ fn record_kerr(kh: u64, kerr: i32) {
 /// chases (parent, stack, params) run on miss only, never per event.
 ///
 /// `scratch` is the caller's 120B init scratch (the shared `aux`
-/// slot in `observe()`), carved as `VWho` @ 0 (miss init, then
+/// slot in `observe()`), carved as `VWho` @ 0 (88B miss init, then
 /// `VParams` @ 0 — disjoint: the who insert copies the value into the
-/// map first), `KWhoKey` @ 80, `comm` @ 96 (112B used). No separate
-/// allocas: the 512B frame fits no more slots (every `let`-bound
-/// pointer/temporary below is one the backend keeps — bind nothing
-/// cheaply recomputed).
+/// map first), `KWhoKey` @ 88, `comm` @ 104 (120B used exactly). No
+/// separate allocas: the 512B frame fits no more slots (every
+/// `let`-bound pointer/temporary below is one the backend keeps —
+/// bind nothing cheaply recomputed).
 ///
 /// # Safety
 ///
@@ -1214,8 +1240,8 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
     // SAFETY: `scratch` spans 120 bytes; the key/comm carves below are
-    // inside it (80..112), disjoint from the `VWho` head.
-    let wkey_ptr = unsafe { scratch.add(80) } as *mut KWhoKey;
+    // inside it (88..120), disjoint from the `VWho` head.
+    let wkey_ptr = unsafe { scratch.add(88) } as *mut KWhoKey;
     unsafe {
         core::ptr::addr_of_mut!((*wkey_ptr).kh).write(kh);
         core::ptr::addr_of_mut!((*wkey_ptr).tgid).write(tgid);
@@ -1223,9 +1249,9 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
     }
     // SAFETY: fully initialized above.
     let wkey: &KWhoKey = unsafe { &*wkey_ptr };
-    current_comm(unsafe { scratch.add(96) });
+    current_comm(unsafe { scratch.add(104) });
     // SAFETY: `current_comm` writes all 16 bytes.
-    let comm: &[u8; 16] = unsafe { &*(scratch.add(96) as *const [u8; 16]) };
+    let comm: &[u8; 16] = unsafe { &*(scratch.add(104) as *const [u8; 16]) };
     if let Some(found) = KWHO.get_ptr_mut(wkey) {
         unsafe {
             update_who_slot(found, tid, comm, now);
@@ -1240,7 +1266,7 @@ fn who_record(ctx: &FExitContext, kh: u64, now: u64, alg: u64, kerr: i32, scratc
         unsafe {
             who_upsert(base, ctx, wkey, tid, comm, now);
         }
-        // SAFETY: scratch @ 0 spans 80 bytes; the who init value is
+        // SAFETY: scratch @ 0 spans 88 bytes; the who init value is
         // dead (copied into the map by the insert above).
         unsafe {
             record_params(scratch, kh, alg);
@@ -1328,7 +1354,7 @@ fn observe(
     // SAFETY: helper with no pointer arguments.
     let now = unsafe { bpf_ktime_get_ns() };
     // Shared 120B init scratch (the 512B frame fits no second large
-    // slot): the `VAgg` insert-zero below, then the `VWho` (80B) and
+    // slot): the `VAgg` insert-zero below, then the `VWho` (88B) and
     // `VParams` (16B) init values in `who_record` — disjoint lifetimes,
     // raw-pointer-typed at each use (LLVM stack coloring is not
     // trusted to merge separate slots on this backend).
