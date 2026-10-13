@@ -815,6 +815,45 @@ fn rebooted_host_skips_verification() {
 }
 
 #[test]
+fn wide_tree_scan_stays_bounded() {
+    // PRIV01 end to end over the real subprocess: 5000 readable child
+    // directories with a missing target refuse as a TYPED partial
+    // response (the key converts to `Unsupported`, the budget trip is
+    // counted exactly once), never a hang, a crash, or a silent sweep —
+    // and no directory name reaches stderr.
+    let fixture = Fixture::create("wide-tree");
+    let marker = "WIDE_MARKER_K7Q2";
+    for i in 0..5000 {
+        fixture.cgroup_dir(&format!("child-{marker}-{i:05}"));
+    }
+    let run = run_serve(
+        &fixture,
+        None,
+        &request_json(&[key(KERNEL_A, 0x0BAD_C0DE, 4242)]),
+    );
+    let response = decode_stdout(&run);
+    assert!(response.validate().is_ok());
+    assert_eq!(response.associations.len(), 0);
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(response.errors[0].code, SnapshotErrorCode::Unsupported);
+    assert_eq!(response.errors[0].key.cgroup, 0x0BAD_C0DE);
+    assert_eq!(response.errors[0].key.tgid, 4242);
+    let counters = stderr_counters(&run.stderr);
+    assert_eq!(
+        counter_value(&counters, "scan_budget_trips"),
+        1,
+        "exactly one budget trip, stderr: {}",
+        run.stderr
+    );
+    assert_eq!(counter_value(&counters, "deadline_trips"), 0);
+    assert!(
+        !run.stderr.contains(marker),
+        "stderr leaked directory names: {}",
+        run.stderr
+    );
+}
+
+#[test]
 fn live_cgroup_without_metadata_stays_unresolved() {
     // No metadata file at all: a captured cgroup bound to a live object
     // stays `Unresolved` — R3 coherence (ADR-0012 (c6)) requires an

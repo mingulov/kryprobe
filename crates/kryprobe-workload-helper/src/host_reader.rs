@@ -16,8 +16,11 @@
 //! - The tree walk never follows symlinks (refused + counted) and never
 //!   leaves the root device (mount crossings refused).
 //! - All reads are bounded ([`MAX_CGROUP_SCAN_DIRS`],
-//!   [`MAX_PID_FILE_BYTES`]); all errors are typed with numeric ids only
-//!   — paths and file bytes never appear in diagnostics.
+//!   [`MAX_SCAN_ENTRIES_EXAMINED`], [`MAX_SCAN_QUEUED_DIRS`],
+//!   [`MAX_SCAN_LISTING`], [`MAX_PID_FILE_BYTES`]) plus the request
+//!   deadline predicate during the walk; all errors are typed with
+//!   numeric ids only — paths and file bytes never appear in
+//!   diagnostics.
 //! - Deletion or replacement mid-traversal refuses typed (`Gone…`,
 //!   `ReuseDetected`) with the captured ids preserved; permission denial
 //!   refuses typed (`Denied…`), never silently.
@@ -26,9 +29,153 @@ use crate::cache::HelperCounters;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+/// Filesystem seam for the cgroup inode scan: production walks the live
+/// tree ([`RealFs`]); tests inject counting walkers to prove work bounds.
+/// Directory listings are sorted so scans iterate deterministically.
+pub trait ScanFs {
+    /// List a directory's children in sorted order, preserving per-entry
+    /// errors (a racy child refuses typed, never silently dropped).
+    fn read_dir_sorted(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>;
+
+    /// Metadata without following a trailing symlink.
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata>;
+
+    /// Metadata following symlinks (stability re-stats only).
+    fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata>;
+}
+
+/// Production walker: the live `std::fs` tree, listings sorted for
+/// deterministic iteration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealFs;
+
+impl ScanFs for RealFs {
+    fn read_dir_sorted(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+        let mut entries: Vec<std::io::Result<PathBuf>> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            if entries.len() >= MAX_SCAN_LISTING {
+                // Pathological listing: refuse typed (mapped to
+                // `BudgetExceeded` at the call site) rather than growing
+                // the collection without bound or truncating silently.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::QuotaExceeded,
+                    "directory listing exceeds scan bound",
+                ));
+            }
+            entries.push(entry.map(|e| e.path()));
+        }
+        entries.sort_by(|a, b| match (a, b) {
+            (Ok(left), Ok(right)) => left.cmp(right),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+        });
+        Ok(entries)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        std::fs::metadata(path)
+    }
+}
+
 /// Helper-local pin: maximum cgroup directories visited in one inode
 /// scan. Exhaustion refuses [`HostReadError::BudgetExceeded`].
 pub const MAX_CGROUP_SCAN_DIRS: usize = 4096;
+
+/// Helper-local pin: maximum child entries examined in one inode scan,
+/// across all visited directories. Charged before any metadata work on
+/// the entry; exhaustion refuses [`HostReadError::BudgetExceeded`].
+/// Independent of the visited-directory count: a single wide directory
+/// trips this bound while barely moving the visited count.
+pub const MAX_SCAN_ENTRIES_EXAMINED: usize = 4096;
+
+/// Helper-local pin: maximum directories queued for descent in one inode
+/// scan. Charged before each push; exhaustion refuses
+/// [`HostReadError::BudgetExceeded`]. Independent of the visited count:
+/// the pending set never grows past this.
+pub const MAX_SCAN_QUEUED_DIRS: usize = 4096;
+
+/// Helper-local pin: maximum children collected from one directory
+/// listing. A listing past this refuses [`HostReadError::BudgetExceeded`]
+/// before examination (no silent truncation: skipped children must never
+/// read as absent). Far above the charge bounds so ordinary trees list
+/// fully and deterministically.
+pub const MAX_SCAN_LISTING: usize = 65_536;
+
+/// Entries examined between in-scan deadline checks (the per-directory
+/// check plus this cadence bound post-deadline work to one slice).
+const DEADLINE_CHECK_EVERY_ENTRIES: u64 = 256;
+
+/// Per-scan work budget: entries examined plus directories queued, each
+/// capped (see [`MAX_SCAN_ENTRIES_EXAMINED`], [`MAX_SCAN_QUEUED_DIRS`]).
+/// Charges happen BEFORE the work they pay for (metadata stat, queue
+/// push), so a refusal means the work never ran. Counters saturate —
+/// they never wrap past the bound check. Internal to one
+/// [`HostView::find_cgroups`] call; never serialized (counter DTO fields
+/// are F07 scope).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanBudget {
+    entries_examined: u64,
+    queued_dirs: u64,
+}
+
+impl ScanBudget {
+    /// Empty budget for one scan.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries_examined: 0,
+            queued_dirs: 0,
+        }
+    }
+
+    /// Entries charged so far (saturating, never wraps).
+    #[must_use]
+    pub const fn entries_examined(&self) -> u64 {
+        self.entries_examined
+    }
+
+    /// Directories queued so far (saturating, never wraps). Observed
+    /// by tests; production enforces the bound through the charges.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn queued_dirs(&self) -> u64 {
+        self.queued_dirs
+    }
+
+    /// Charge one examined child entry BEFORE any metadata work on it.
+    /// Refuses [`HostReadError::BudgetExceeded`] past
+    /// [`MAX_SCAN_ENTRIES_EXAMINED`]; exactly at the bound is allowed.
+    fn charge_entry(&mut self) -> Result<(), HostReadError> {
+        if self.entries_examined >= MAX_SCAN_ENTRIES_EXAMINED as u64 {
+            return Err(HostReadError::BudgetExceeded);
+        }
+        self.entries_examined = self.entries_examined.saturating_add(1);
+        Ok(())
+    }
+
+    /// Charge one queued directory BEFORE pushing it. Refuses
+    /// [`HostReadError::BudgetExceeded`] past [`MAX_SCAN_QUEUED_DIRS`];
+    /// exactly at the bound is allowed. (The walked root itself is the
+    /// seed, never a queued child.)
+    fn charge_enqueue(&mut self) -> Result<(), HostReadError> {
+        if self.queued_dirs >= MAX_SCAN_QUEUED_DIRS as u64 {
+            return Err(HostReadError::BudgetExceeded);
+        }
+        self.queued_dirs = self.queued_dirs.saturating_add(1);
+        Ok(())
+    }
+}
+
+impl Default for ScanBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Helper-local pin: maximum bytes read from one `/proc/<tgid>/` file.
 pub const MAX_PID_FILE_BYTES: usize = 4096;
@@ -92,6 +239,10 @@ pub enum HostReadError {
     ReuseDetected,
     /// A scan/read budget was exceeded.
     BudgetExceeded,
+    /// The request deadline crossed mid-scan (explicit trip/refusal path;
+    /// checked before the walk, per directory, during long enumerations,
+    /// and before confirming candidates).
+    DeadlineExceeded,
     /// The host view is unusable (missing roots, cgroup v1-only, …).
     Unsupported,
     /// Malformed host content (bad stat/uptime shape, wrong node type).
@@ -110,6 +261,7 @@ impl HostReadError {
             Self::SymlinkRefused => "symlink_refused",
             Self::ReuseDetected => "reuse_detected",
             Self::BudgetExceeded => "budget_exceeded",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::Unsupported => "unsupported",
             Self::Invalid => "invalid",
         }
@@ -129,6 +281,7 @@ impl std::fmt::Display for HostReadError {
             Self::SymlinkRefused => write!(f, "symlink component refused"),
             Self::ReuseDetected => write!(f, "identity changed during traversal"),
             Self::BudgetExceeded => write!(f, "host scan budget exceeded"),
+            Self::DeadlineExceeded => write!(f, "resolution deadline exceeded"),
             Self::Unsupported => write!(f, "host view is unsupported"),
             Self::Invalid => write!(f, "host content is malformed"),
         }
@@ -275,25 +428,49 @@ impl HostView {
     /// whether any denial made coverage incomplete (unfound targets are
     /// then unknown, not absent). Symlinks are refused, never followed;
     /// the walk never leaves the root device.
+    ///
+    /// The walk is bounded three ways, checked in this order: the request
+    /// `deadline` predicate (before the walk, per directory, during long
+    /// enumerations, and before confirming candidates — trips refuse
+    /// typed [`HostReadError::DeadlineExceeded`]), the per-scan
+    /// [`ScanBudget`] (entries examined and directories queued, charged
+    /// before the work — trips refuse [`HostReadError::BudgetExceeded`]),
+    /// and the visited-directory backstop ([`MAX_CGROUP_SCAN_DIRS`]).
+    /// Finding every target stops the walk immediately, even
+    /// mid-directory. All refusals are typed with numeric ids only.
+    ///
+    /// These gates are cooperative: each check runs between syscalls, and
+    /// one `read_dir`/stat runs to completion once issued. The parent
+    /// launcher's independent 30 s kill backstop stays necessary and is
+    /// retained for syscalls that stall past every helper-side check.
     pub fn find_cgroups(
         &self,
         targets: &[u64],
         counters: &mut HelperCounters,
+        fs: &dyn ScanFs,
+        budget: &mut ScanBudget,
+        deadline: &dyn Fn() -> bool,
     ) -> Result<(std::collections::HashMap<u64, CgroupObject>, bool), HostReadError> {
         use std::collections::{HashMap, HashSet};
-        let root_meta =
-            std::fs::metadata(&self.cgroup_root).map_err(|_| HostReadError::Unsupported)?;
+        if deadline() {
+            let err = HostReadError::DeadlineExceeded;
+            counters.note_host_error(&err);
+            return Err(err);
+        }
+        let root_meta = fs
+            .metadata(&self.cgroup_root)
+            .map_err(|_| HostReadError::Unsupported)?;
         let root_dev = root_meta.dev();
         let wanted: HashSet<u64> = targets.iter().copied().collect();
         let mut found: HashMap<u64, CgroupObject> = HashMap::new();
         // The root itself is a bindable object (host root cgroup).
-        if let Some(object) = check_candidate(&self.cgroup_root, root_dev, &wanted, counters)? {
+        if let Some(object) = check_candidate(&self.cgroup_root, root_dev, &wanted, counters, fs)? {
             found.insert(object.cgroup, object);
         }
         let denied_before = counters.denied;
         let mut visited: usize = 0;
         let mut stack = vec![self.cgroup_root.clone()];
-        while let Some(dir) = stack.pop() {
+        'scan: while let Some(dir) = stack.pop() {
             if found.len() == wanted.len() {
                 break;
             }
@@ -302,7 +479,12 @@ impl HostView {
                 counters.inc_scan_budget_trips();
                 return Err(HostReadError::BudgetExceeded);
             }
-            let entries = match std::fs::read_dir(&dir) {
+            if deadline() {
+                let err = HostReadError::DeadlineExceeded;
+                counters.note_host_error(&err);
+                return Err(err);
+            }
+            let entries = match fs.read_dir_sorted(&dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     counters.note_host_error(&HostReadError::GoneDuringScan);
@@ -312,14 +494,37 @@ impl HostView {
                     counters.inc_denied();
                     continue;
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::QuotaExceeded => {
+                    // Pathological listing past MAX_SCAN_LISTING: a
+                    // budget refusal, never a silent truncation.
+                    counters.note_host_error(&HostReadError::BudgetExceeded);
+                    return Err(HostReadError::BudgetExceeded);
+                }
                 Err(_) => {
                     counters.note_host_error(&HostReadError::Invalid);
                     continue;
                 }
             };
             for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
+                // Charge before any metadata work on this child.
+                if let Err(err) = budget.charge_entry() {
+                    counters.note_host_error(&err);
+                    return Err(err);
+                }
+                // Long enumerations re-check the deadline as they go, so
+                // a single wide directory cannot outrun it for the whole
+                // slice.
+                if budget
+                    .entries_examined()
+                    .is_multiple_of(DEADLINE_CHECK_EVERY_ENTRIES)
+                    && deadline()
+                {
+                    let err = HostReadError::DeadlineExceeded;
+                    counters.note_host_error(&err);
+                    return Err(err);
+                }
+                let path = match entry {
+                    Ok(path) => path,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         counters.note_host_error(&HostReadError::GoneDuringScan);
                         continue;
@@ -329,7 +534,7 @@ impl HostView {
                         continue;
                     }
                 };
-                let meta = match std::fs::symlink_metadata(entry.path()) {
+                let meta = match fs.symlink_metadata(&path) {
                     Ok(meta) => meta,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         counters.note_host_error(&HostReadError::GoneDuringScan);
@@ -352,8 +557,13 @@ impl HostView {
                     continue;
                 }
                 if wanted.contains(&meta.ino()) && !found.contains_key(&meta.ino()) {
+                    if deadline() {
+                        let err = HostReadError::DeadlineExceeded;
+                        counters.note_host_error(&err);
+                        return Err(err);
+                    }
                     // Confirm stability: re-stat before binding.
-                    let confirm = std::fs::metadata(entry.path()).map_err(|e| {
+                    let confirm = fs.metadata(&path).map_err(|e| {
                         let err = host_io_error(e, false);
                         counters.note_host_error(&err);
                         err
@@ -370,9 +580,18 @@ impl HostView {
                             ino: confirm.ino(),
                         },
                     );
+                    if found.len() == wanted.len() {
+                        // Every target bound: stop now, even mid-directory.
+                        break 'scan;
+                    }
                     // Still descend: wanted inodes may nest.
                 }
-                stack.push(entry.path());
+                // Charge before queueing.
+                if let Err(err) = budget.charge_enqueue() {
+                    counters.note_host_error(&err);
+                    return Err(err);
+                }
+                stack.push(path);
             }
         }
         Ok((found, counters.denied != denied_before))
@@ -385,8 +604,9 @@ fn check_candidate(
     root_dev: u64,
     wanted: &std::collections::HashSet<u64>,
     counters: &mut HelperCounters,
+    fs: &dyn ScanFs,
 ) -> Result<Option<CgroupObject>, HostReadError> {
-    let meta = std::fs::metadata(dir).map_err(|e| {
+    let meta = fs.metadata(dir).map_err(|e| {
         let err = host_io_error(e, false);
         counters.note_host_error(&err);
         err
@@ -573,6 +793,79 @@ mod tests {
         ))
     }
 
+    /// Counting walker: delegates to the live tree while recording every
+    /// read/stat operation, so tests prove work bounds on real syscalls.
+    struct CountingFs {
+        inner: RealFs,
+        read_dirs: std::cell::Cell<usize>,
+        symlink_stats: std::cell::Cell<usize>,
+        stats: std::cell::Cell<usize>,
+    }
+
+    impl CountingFs {
+        fn new() -> Self {
+            Self {
+                inner: RealFs,
+                read_dirs: std::cell::Cell::new(0),
+                symlink_stats: std::cell::Cell::new(0),
+                stats: std::cell::Cell::new(0),
+            }
+        }
+
+        fn bump(cell: &std::cell::Cell<usize>) {
+            cell.set(cell.get().saturating_add(1));
+        }
+    }
+
+    impl ScanFs for CountingFs {
+        fn read_dir_sorted(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+            Self::bump(&self.read_dirs);
+            self.inner.read_dir_sorted(dir)
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+            Self::bump(&self.symlink_stats);
+            self.inner.symlink_metadata(path)
+        }
+
+        fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+            Self::bump(&self.stats);
+            self.inner.metadata(path)
+        }
+    }
+
+    /// One counted scan: the outcome, the real (read_dir, symlink_stat,
+    /// stat) operation counts, and the charged (entries, queued) budget
+    /// totals.
+    type CountedScan = (
+        Result<(std::collections::HashMap<u64, CgroupObject>, bool), HostReadError>,
+        (usize, usize, usize),
+        (u64, u64),
+    );
+
+    /// Run one scan under a counting walker with a fresh budget and a
+    /// live deadline.
+    fn scan(
+        view: &HostView,
+        targets: &[u64],
+        counters: &mut HelperCounters,
+        fs: &CountingFs,
+    ) -> CountedScan {
+        let mut budget = ScanBudget::new();
+        let outcome = view.find_cgroups(targets, counters, fs, &mut budget, &|| false);
+        let ops = (fs.read_dirs.get(), fs.symlink_stats.get(), fs.stats.get());
+        let charged = (budget.entries_examined(), budget.queued_dirs());
+        (outcome, ops, charged)
+    }
+
+    fn mkdir(path: &Path) {
+        std::fs::create_dir_all(path).expect("mkdir");
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"x").expect("write");
+    }
+
     /// A hint into a concurrently deleted subtree refuses
     /// `GoneDuringScan` (typed, counted) instead of resolving half a path.
     #[test]
@@ -606,6 +899,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// PRIV01: child enumeration and pending descent are bounded
+    /// independently of the visited-directory count. A wide tree (5000
+    /// readable children, missing target, deterministic sorted iteration)
+    /// refuses typed [`HostReadError::BudgetExceeded`] with real read/stat
+    /// work capped; a wanted-first target stops the scan early instead of
+    /// sweeping the whole tree.
+    #[test]
+    fn wide_scan_bounds_entries_and_pending() {
+        // Case 1: 5000 plain files. No directory is ever queued or
+        // visited, so a visited-only budget never trips — yet every child
+        // costs a stat. The entries bound must refuse before that work
+        // runs away.
+        let dir = scratch("wide-files");
+        let root = dir.join("cgroup");
+        mkdir(&root);
+        for i in 0..5000 {
+            touch(&root.join(format!("file-{i:05}")));
+        }
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let (outcome, (read_dirs, symlink_stats, _), (entries, queued)) =
+            scan(&view, &[u64::MAX - 7], &mut counters, &CountingFs::new());
+        assert_eq!(outcome, Err(HostReadError::BudgetExceeded));
+        assert_eq!(counters.scan_budget_trips, 1);
+        assert!(
+            symlink_stats <= MAX_SCAN_ENTRIES_EXAMINED,
+            "stat work must stop at the entries bound, did {symlink_stats}"
+        );
+        assert_eq!(read_dirs, 1, "one directory listed, did {read_dirs}");
+        assert_eq!((entries, queued), (4096, 0), "exact charges, no overflow");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Case 2: 5000 readable child directories, missing target. The
+        // queue must not grow past its bound (no pending-path overflow)
+        // and charged work must stop — a handful of operations, not a
+        // thousands-deep stack drained one pop at a time.
+        let dir = scratch("wide-dirs");
+        let root = dir.join("cgroup");
+        mkdir(&root);
+        for i in 0..5000 {
+            mkdir(&root.join(format!("child-{i:05}")));
+        }
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let (outcome, (read_dirs, symlink_stats, _), (entries, queued)) =
+            scan(&view, &[u64::MAX - 7], &mut counters, &CountingFs::new());
+        assert_eq!(outcome, Err(HostReadError::BudgetExceeded));
+        assert_eq!(counters.scan_budget_trips, 1);
+        assert!(
+            symlink_stats <= MAX_SCAN_ENTRIES_EXAMINED,
+            "stat work must stop at the entries bound, did {symlink_stats}"
+        );
+        assert!(
+            read_dirs <= 2,
+            "descent must stop at the queue bound, listed {read_dirs} dirs"
+        );
+        assert_eq!(
+            (entries, queued),
+            (4096, 4096),
+            "exact charges, no overflow"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Case 3: wanted-first early stop. The single target sorts before
+        // 5000 siblings; finding it must end the scan, not merely skip
+        // the remaining pops.
+        let dir = scratch("wide-first");
+        let root = dir.join("cgroup");
+        mkdir(&root);
+        for i in 0..5000 {
+            mkdir(&root.join(format!("child-{i:05}")));
+        }
+        let wanted_path = root.join("aaa-wanted");
+        mkdir(&wanted_path);
+        let wanted_ino = std::fs::metadata(&wanted_path).expect("stat").ino();
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let (outcome, (read_dirs, symlink_stats, _), (entries, queued)) =
+            scan(&view, &[wanted_ino], &mut counters, &CountingFs::new());
+        let (found, denied) = outcome.expect("wanted-first scan binds");
+        assert!(!denied);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[&wanted_ino].ino, wanted_ino);
+        assert_eq!(counters.scan_budget_trips, 0);
+        assert!(
+            symlink_stats <= 4,
+            "early stop must skip the siblings, statted {symlink_stats}"
+        );
+        assert_eq!(read_dirs, 1, "one directory listed, did {read_dirs}");
+        assert_eq!((entries, queued), (1, 0), "one charge, then stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exact-boundary positive control: 4096 children with the target
+    /// sorting last are all examined and queued without tripping (the
+    /// bounds refuse only past 4096), and the deep-tree control binds a
+    /// target nested 300 levels down with small bounded work.
+    #[test]
+    fn scan_boundary_and_depth_controls() {
+        // Exactly at the bound: allowed.
+        let dir = scratch("exact-bound");
+        let root = dir.join("cgroup");
+        mkdir(&root);
+        for i in 0..4095 {
+            mkdir(&root.join(format!("child-{i:05}")));
+        }
+        let wanted_path = root.join("zzz-wanted");
+        mkdir(&wanted_path);
+        let wanted_ino = std::fs::metadata(&wanted_path).expect("stat").ino();
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let (outcome, (read_dirs, symlink_stats, _), (entries, queued)) =
+            scan(&view, &[wanted_ino], &mut counters, &CountingFs::new());
+        let (found, denied) = outcome.expect("exact-bound scan binds");
+        assert!(!denied);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[&wanted_ino].ino, wanted_ino);
+        assert_eq!(counters.scan_budget_trips, 0);
+        assert_eq!(symlink_stats, 4096, "every child examined once");
+        assert_eq!(read_dirs, 1);
+        assert_eq!(
+            (entries, queued),
+            (4096, 4095),
+            "exact charges, no overflow"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Deep narrow tree: bounded work, no trip.
+        let dir = scratch("deep-tree");
+        let root = dir.join("cgroup");
+        let mut deep = root.clone();
+        for level in 0..300 {
+            deep = deep.join(format!("l{level:03}"));
+        }
+        mkdir(&deep);
+        let wanted_ino = std::fs::metadata(&deep).expect("stat").ino();
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let (outcome, (read_dirs, symlink_stats, _), (entries, queued)) =
+            scan(&view, &[wanted_ino], &mut counters, &CountingFs::new());
+        let (found, denied) = outcome.expect("deep scan binds");
+        assert!(!denied);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[&wanted_ino].ino, wanted_ino);
+        assert_eq!(counters.scan_budget_trips, 0);
+        assert_eq!(symlink_stats, 300, "one stat per level");
+        assert_eq!(read_dirs, 300, "one listing per level");
+        assert_eq!((entries, queued), (300, 299), "exact charges, no overflow");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PRIV02 at the walk: the deadline predicate is honored before any
+    /// metadata work and during the walk, refusing typed
+    /// [`HostReadError::DeadlineExceeded`] (deadline counter exactly 1,
+    /// no path strings anywhere in the refusal).
+    #[test]
+    fn scan_deadline_trip_refuses_typed() {
+        let dir = scratch("deadline");
+        let root = dir.join("cgroup");
+        mkdir(&root.join("child"));
+        let view = HostView::new(&dir.join("proc"), &root);
+
+        // Tripped before the walk: nothing is read.
+        let mut counters = HelperCounters::new();
+        let fs = CountingFs::new();
+        let mut budget = ScanBudget::new();
+        let outcome = view.find_cgroups(&[1], &mut counters, &fs, &mut budget, &|| true);
+        assert_eq!(outcome, Err(HostReadError::DeadlineExceeded));
+        assert_eq!(counters.deadline_trips, 1);
+        assert_eq!(counters.scan_budget_trips, 0);
+        assert_eq!(fs.read_dirs.get(), 0, "no directory listed");
+        assert_eq!(fs.symlink_stats.get(), 0, "nothing statted");
+        assert_eq!(budget.entries_examined(), 0);
+        assert_eq!(budget.queued_dirs(), 0);
+
+        // Tripped during the walk (third predicate read): partial work,
+        // then the typed refusal.
+        let mut counters = HelperCounters::new();
+        let fs = CountingFs::new();
+        let mut budget = ScanBudget::new();
+        let reads = std::cell::Cell::new(0u32);
+        let outcome = view.find_cgroups(&[u64::MAX - 3], &mut counters, &fs, &mut budget, &|| {
+            reads.set(reads.get() + 1);
+            reads.get() >= 3
+        });
+        assert_eq!(outcome, Err(HostReadError::DeadlineExceeded));
+        assert_eq!(counters.deadline_trips, 1);
+        assert_eq!(counters.scan_budget_trips, 0);
+
+        // The refusal carries no paths.
+        let text = HostReadError::DeadlineExceeded.to_string();
+        assert!(!text.contains('/'), "refusal must carry no path: {text}");
+        assert_eq!(HostReadError::DeadlineExceeded.kind(), "deadline_exceeded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pathological single listing (past [`MAX_SCAN_LISTING`]) refuses
+    /// typed [`HostReadError::BudgetExceeded`] instead of growing the
+    /// collection without bound or truncating silently (skipped children
+    /// must never read as absent).
+    #[test]
+    fn scan_pathological_listing_refuses_budget() {
+        struct CappedFs;
+        impl ScanFs for CappedFs {
+            fn read_dir_sorted(
+                &self,
+                _dir: &Path,
+            ) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::QuotaExceeded,
+                    "listing exceeds scan bound",
+                ))
+            }
+
+            fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+                RealFs.symlink_metadata(path)
+            }
+
+            fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+                RealFs.metadata(path)
+            }
+        }
+
+        let dir = scratch("listing-cap");
+        let root = dir.join("cgroup");
+        mkdir(&root.join("child"));
+        let view = HostView::new(&dir.join("proc"), &root);
+        let mut counters = HelperCounters::new();
+        let mut budget = ScanBudget::new();
+        let outcome = view.find_cgroups(
+            &[u64::MAX - 5],
+            &mut counters,
+            &CappedFs,
+            &mut budget,
+            &|| false,
+        );
+        assert_eq!(outcome, Err(HostReadError::BudgetExceeded));
+        assert_eq!(counters.scan_budget_trips, 1);
+        assert_eq!(budget.entries_examined(), 0, "nothing examined");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn error_kinds_and_displays_carry_no_paths() {
         let errors = [
@@ -617,6 +1152,7 @@ mod tests {
             HostReadError::SymlinkRefused,
             HostReadError::ReuseDetected,
             HostReadError::BudgetExceeded,
+            HostReadError::DeadlineExceeded,
             HostReadError::Unsupported,
             HostReadError::Invalid,
         ];

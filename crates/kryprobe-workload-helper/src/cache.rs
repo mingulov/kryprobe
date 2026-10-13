@@ -172,6 +172,7 @@ impl HelperCounters {
             E::SymlinkRefused => self.inc_symlink_refused(),
             E::ReuseDetected => self.inc_reuse_detected(),
             E::BudgetExceeded => self.inc_scan_budget_trips(),
+            E::DeadlineExceeded => self.inc_deadline_trips(),
             E::GonePid { .. } | E::Unsupported | E::Invalid => {}
         }
     }

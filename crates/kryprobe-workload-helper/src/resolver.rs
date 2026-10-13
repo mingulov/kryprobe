@@ -23,7 +23,13 @@
 //!   gate host work; saturation and failures surface in
 //!   [`HelperCounters`], never silently. A tripped deadline converts
 //!   still-pending unresolved associations to `Unsupported` (partial
-//!   response); already-established results stand.
+//!   response); already-established results stand. The deadline is
+//!   checked during the pid phase, before/during the scan (via the
+//!   walk's deadline predicate), and once more before serialization;
+//!   scan work itself is capped by an internal [`ScanBudget`]
+//!   (entries examined plus queued directories).
+//!
+//! [`ScanBudget`]: crate::host_reader::ScanBudget
 //! - The response is recounted exactly, tail-truncated to the byte budget
 //!   (mirroring the frozen truncation semantics), revalidated, and its
 //!   outcome retained in bounded history.
@@ -32,7 +38,7 @@
 //! [`HelperCounters`]: crate::cache::HelperCounters
 
 use crate::cache::{HelperCounters, LiveBinding, OutcomeRecord, ResolverCache, span_elapsed};
-use crate::host_reader::{HostReadError, HostView};
+use crate::host_reader::{HostReadError, HostView, RealFs, ScanBudget};
 use kryprobe_core::workload::{
     AttributionEvidence, AttributionStatus, HELPER_REQUEST_TIMEOUT_NS, KernelIdentity,
     METHOD_METADATA_FILE, MetadataSnapshot, MetadataUnavailable, Relationship, ResolvedAssociation,
@@ -201,20 +207,36 @@ impl Resolver {
         }
         // Pid phase (cheap, bounded work per key: two small file reads
         // plus one depth-bounded confined resolution): liveness hints,
-        // lifetime stability, and hint/cgroup agreement.
+        // lifetime stability, and hint/cgroup agreement. The resolution
+        // deadline gates each key's work: a trip converts every
+        // still-pending key (worked or not) to `Unsupported`, counted
+        // once; established results stand.
         let mut need_scan: Vec<usize> = Vec::new();
-        for index in need_host {
-            if self.pid_consistent(index, response, now_ns) {
-                need_scan.push(index);
+        let mut pid_tripped_at: Option<usize> = None;
+        for (pos, index) in need_host.iter().enumerate() {
+            if span_elapsed(start_ns, clock.now_ns(), HELPER_REQUEST_TIMEOUT_NS) {
+                pid_tripped_at = Some(pos);
+                break;
             }
+            if self.pid_consistent(*index, response, now_ns) {
+                need_scan.push(*index);
+            }
+        }
+        if let Some(pos) = pid_tripped_at {
+            self.cache.counters().inc_deadline_trips();
+            let mut pending = need_scan;
+            pending.extend_from_slice(&need_host[pos..]);
+            convert_list_to_unsupported(response, &pending);
+            return;
         }
         if need_scan.is_empty() {
             return;
         }
         // Scan phase: one batched walk for the whole request, gated by
-        // the resolution deadline. A trip converts the still-pending
-        // keys to `Unsupported` (partial response); every established
-        // result stands.
+        // the resolution deadline before, during (the walk re-checks the
+        // predicate as it goes), and after. A trip converts the
+        // still-pending keys to `Unsupported` (partial response); every
+        // established result stands.
         if span_elapsed(start_ns, clock.now_ns(), HELPER_REQUEST_TIMEOUT_NS) {
             self.cache.counters().inc_deadline_trips();
             convert_list_to_unsupported(response, &need_scan);
@@ -227,10 +249,18 @@ impl Resolver {
             .iter()
             .map(|i| response.associations[*i].key.cgroup)
             .collect();
-        let scan = self.view.find_cgroups(&targets, self.cache.counters());
+        let mut budget = ScanBudget::new();
+        let scan = self.view.find_cgroups(
+            &targets,
+            self.cache.counters(),
+            &RealFs,
+            &mut budget,
+            &|| span_elapsed(start_ns, clock.now_ns(), HELPER_REQUEST_TIMEOUT_NS),
+        );
         match scan {
             Ok((found, _denied)) => {
-                for index in need_scan {
+                for index in &need_scan {
+                    let index = *index;
                     let cgroup = response.associations[index].key.cgroup;
                     match found.get(&cgroup) {
                         Some(object) => {
@@ -256,8 +286,19 @@ impl Resolver {
                         }
                     }
                 }
+                // Post-scan gate, before serialization: a deadline crossed
+                // after the last in-scan check still converts the
+                // still-pending keys (partial response); associations the
+                // scan established (e.g. identity-held `Verified`) stand.
+                if span_elapsed(start_ns, clock.now_ns(), HELPER_REQUEST_TIMEOUT_NS) {
+                    self.cache.counters().inc_deadline_trips();
+                    convert_list_to_unsupported(response, &need_scan);
+                }
             }
-            Err(HostReadError::BudgetExceeded) => {
+            Err(HostReadError::BudgetExceeded) | Err(HostReadError::DeadlineExceeded) => {
+                // Scan work or the in-scan deadline gave out (already
+                // counted exactly once inside the walk): the still-pending
+                // keys convert to `Unsupported` (partial response).
                 convert_list_to_unsupported(response, &need_scan);
             }
             Err(HostReadError::ReuseDetected) => {
@@ -843,6 +884,184 @@ mod tests {
         assert_eq!(response.errors[0].code, SnapshotErrorCode::Unsupported);
         assert_eq!(response.errors[0].key.cgroup, b);
         assert_eq!(resolver.counters().deadline_trips, 1);
+    }
+
+    /// PRIV02: the deadline is checked DURING the scan, not only before
+    /// it. Pre-scan clock reads see a live deadline; the scan-phase read
+    /// trips. Still-pending keys convert to `Unsupported` (partial
+    /// response, deadline counter exactly 1, no scan inserts); the
+    /// established asserted association stands untouched.
+    #[test]
+    fn deadline_crossed_during_scan() {
+        let fixture = TFixture::create("deadline-scan");
+        let a = fixture.cgroup_dir("a");
+        let b = fixture.cgroup_dir("b");
+        let asserted_cgroup = fixture.cgroup_dir("asserted-live");
+        let mut meta = metadata_for(asserted_cgroup);
+        meta.entries[0].binding.validity = Some(ValidityInterval::monotonic(500, 2500));
+        let mut resolver = Resolver::new(fixture.view(), Some(meta));
+        let start = NOW;
+        let tripped = start + HELPER_REQUEST_TIMEOUT_NS + 1;
+        // Request now, pid pre-checks, pre-scan check: live. First
+        // scan-phase read: crossed.
+        let clock = ScriptedClock::new(vec![start, start, start, start, tripped]);
+        let keys = vec![key(asserted_cgroup, 4240), key(a, 4242), key(b, 4243)];
+        let response = resolver
+            .resolve(
+                &request_with_capture(keys.clone(), 1000, 2000),
+                &clock,
+                start,
+            )
+            .expect("partial resolves");
+        assert!(response.validate().is_ok());
+        assert!(
+            kryprobe_core::workload::bind_response_to_request(
+                &request_with_capture(keys, 1000, 2000),
+                &response
+            )
+            .is_ok()
+        );
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, asserted_cgroup);
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Asserted
+        );
+        assert_eq!(response.errors.len(), 2);
+        assert!(
+            response
+                .errors
+                .iter()
+                .all(|e| e.code == SnapshotErrorCode::Unsupported),
+            "pending keys must convert to Unsupported: {:?}",
+            response.errors
+        );
+        let mut err_cgroups: Vec<u64> = response.errors.iter().map(|e| e.key.cgroup).collect();
+        err_cgroups.sort_unstable();
+        let mut wanted = vec![a, b];
+        wanted.sort_unstable();
+        assert_eq!(err_cgroups, wanted);
+        assert_eq!(resolver.counters().deadline_trips, 1);
+        assert_eq!(resolver.counters().inserts, 0);
+        assert_eq!(resolver.counters().tombstone_inserts, 0);
+    }
+
+    /// PRIV02: the deadline is checked DURING the pid phase. The first
+    /// key's pre-check sees a live deadline; the second key's trips. Both
+    /// pending keys (worked and unworked alike) convert to `Unsupported`
+    /// with the deadline counter exactly 1 and no scan at all; the
+    /// established asserted association stands untouched.
+    #[test]
+    fn deadline_crossed_during_pid_phase() {
+        let fixture = TFixture::create("deadline-pid");
+        let a = fixture.cgroup_dir("a");
+        let b = fixture.cgroup_dir("b");
+        let asserted_cgroup = fixture.cgroup_dir("asserted-live");
+        let mut meta = metadata_for(asserted_cgroup);
+        meta.entries[0].binding.validity = Some(ValidityInterval::monotonic(500, 2500));
+        let mut resolver = Resolver::new(fixture.view(), Some(meta));
+        let start = NOW;
+        let tripped = start + HELPER_REQUEST_TIMEOUT_NS + 1;
+        // Request now, first pid pre-check: live. Second pid pre-check:
+        // crossed.
+        let clock = ScriptedClock::new(vec![start, start, tripped]);
+        let keys = vec![key(asserted_cgroup, 4240), key(a, 4242), key(b, 4243)];
+        let response = resolver
+            .resolve(
+                &request_with_capture(keys.clone(), 1000, 2000),
+                &clock,
+                start,
+            )
+            .expect("partial resolves");
+        assert!(response.validate().is_ok());
+        assert!(
+            kryprobe_core::workload::bind_response_to_request(
+                &request_with_capture(keys, 1000, 2000),
+                &response
+            )
+            .is_ok()
+        );
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, asserted_cgroup);
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Asserted
+        );
+        assert_eq!(response.errors.len(), 2);
+        assert!(
+            response
+                .errors
+                .iter()
+                .all(|e| e.code == SnapshotErrorCode::Unsupported),
+            "pending keys must convert to Unsupported: {:?}",
+            response.errors
+        );
+        let mut err_cgroups: Vec<u64> = response.errors.iter().map(|e| e.key.cgroup).collect();
+        err_cgroups.sort_unstable();
+        let mut wanted = vec![a, b];
+        wanted.sort_unstable();
+        assert_eq!(err_cgroups, wanted);
+        assert_eq!(resolver.counters().deadline_trips, 1);
+        assert_eq!(resolver.counters().inserts, 0);
+        assert_eq!(resolver.counters().tombstone_inserts, 0);
+    }
+
+    /// PRIV02: the deadline is checked once more after the scan,
+    /// before serialization. Every in-scan read sees a live deadline; the
+    /// post-scan read trips. The still-pending keys convert to
+    /// `Unsupported` (deadline counter exactly 1) while the scan's
+    /// established cache work and the asserted association stand.
+    #[test]
+    fn deadline_crossed_after_scan_converts_pending() {
+        let fixture = TFixture::create("deadline-post");
+        let a = fixture.cgroup_dir("a");
+        let b = fixture.cgroup_dir("b");
+        let asserted_cgroup = fixture.cgroup_dir("asserted-live");
+        let mut meta = metadata_for(asserted_cgroup);
+        meta.entries[0].binding.validity = Some(ValidityInterval::monotonic(500, 2500));
+        let mut resolver = Resolver::new(fixture.view(), Some(meta));
+        let start = NOW;
+        let tripped = start + HELPER_REQUEST_TIMEOUT_NS + 1;
+        // 1 request now + 2 pid pre-checks + 1 pre-scan + 1 pre-walk + 1
+        // loop-top + 2 confirm checks: live. Post-scan read: crossed.
+        let clock = ScriptedClock::new(vec![
+            start, start, start, start, start, start, start, start, tripped,
+        ]);
+        let keys = vec![key(asserted_cgroup, 4240), key(a, 4242), key(b, 4243)];
+        let response = resolver
+            .resolve(
+                &request_with_capture(keys.clone(), 1000, 2000),
+                &clock,
+                start,
+            )
+            .expect("partial resolves");
+        assert!(response.validate().is_ok());
+        assert!(
+            kryprobe_core::workload::bind_response_to_request(
+                &request_with_capture(keys, 1000, 2000),
+                &response
+            )
+            .is_ok()
+        );
+        assert_eq!(response.associations.len(), 1);
+        assert_eq!(response.associations[0].key.cgroup, asserted_cgroup);
+        assert_eq!(
+            response.associations[0].evidence.status,
+            AttributionStatus::Asserted
+        );
+        assert_eq!(response.errors.len(), 2);
+        assert!(
+            response
+                .errors
+                .iter()
+                .all(|e| e.code == SnapshotErrorCode::Unsupported),
+            "pending keys must convert to Unsupported: {:?}",
+            response.errors
+        );
+        assert_eq!(resolver.counters().deadline_trips, 1);
+        // The completed scan's liveness observations stand in the cache
+        // (bounding re-scans) even though the response went partial.
+        assert_eq!(resolver.counters().inserts, 2);
     }
 
     #[test]
