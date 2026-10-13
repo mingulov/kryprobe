@@ -669,6 +669,8 @@ mod tests {
             calls: 9,
             first_ns: 10,
             last_ns: 20,
+            identity_present: 0,
+            _rsv: 0,
         }
     }
 

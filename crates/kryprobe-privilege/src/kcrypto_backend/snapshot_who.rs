@@ -5,7 +5,8 @@ use super::SnapshotError;
 use crate::btf_resolve::ConfiguredKcrypto;
 use crate::mapops::{MapOpsError, map_get_next_key, map_lookup_bytes, percpu_buffer_len};
 use kryprobe_abi::kcrypto_agg::{
-    KWHO_DROPS, KWhoKey, VParams, VWho, kwho_key_from_bytes, vparams_from_bytes, vwho_from_bytes,
+    KATTRLOSS_SLOTS, KWhoKey, VParams, VWho, kattrloss_fold, kwho_key_from_bytes, try_fold_vwho,
+    vparams_from_bytes, vwho_from_bytes,
 };
 use std::collections::HashMap;
 
@@ -21,7 +22,8 @@ pub struct WhoSnapshot {
     /// The `KWHO` key (row hash + tgid).
     pub key: KWhoKey,
     /// The percpu-folded `KWHO` value (calls summed, stamps min/maxed,
-    /// identity from the most-recent-writer lane).
+    /// insertion-frozen identity from the unique marked lane,
+    /// `tid`/`comm` from the latest-writer lane).
     pub val: VWho,
     /// Kernel stack IPs for `val.stack` (truncated at the first zero;
     /// empty when `stack` is negative or the `KSTACK` row is absent).
@@ -35,44 +37,16 @@ pub struct WhoSnapshot {
     pub params: Option<VParams>,
 }
 
-/// Fold per-CPU `VWho` lanes into one total (the [`fold_vagg`](kryprobe_abi::kcrypto_agg::fold_vagg)
-/// contract for who rows): `calls` sums saturating; `first_ns` is the
-/// minimum over lanes with `calls > 0` (idle lanes hold `calls == 0`
-/// with zero stamps — the BPF broadcasts a zero tallies+stamps insert
-/// to every lane, then the re-lookup stamps only the inserting CPU's
-/// lane — and must not poison the min); `last_ns` is the maximum; both
-/// stamps are 0 when no lane observed anything. Identity fields come
-/// from the most-recent-writer lane (greatest `last_ns`, first on
-/// ties): `tid`/`comm` are last-writer per lane, the rest are
-/// insert-identical across lanes. Total over any lane slice (empty
-/// folds to zero).
-pub(crate) fn fold_vwho(lanes: &[VWho]) -> VWho {
-    let mut out = VWho::default();
-    let mut first = u64::MAX;
-    let mut any = false;
-    let mut best = 0usize;
-    for (i, lane) in lanes.iter().enumerate() {
-        out.calls = out.calls.saturating_add(lane.calls);
-        if lane.calls > 0 {
-            any = true;
-            first = first.min(lane.first_ns);
-        }
-        if lane.last_ns > out.last_ns {
-            out.last_ns = lane.last_ns;
-            best = i;
-        }
-    }
-    out.first_ns = if any { first } else { 0 };
-    if let Some(winner) = lanes.get(best) {
-        out.comm = winner.comm;
-        out.tid = winner.tid;
-        out.uid = winner.uid;
-        out.cgroup = winner.cgroup;
-        out.ppid = winner.ppid;
-        out.pcomm = winner.pcomm;
-        out.stack = winner.stack;
-    }
-    out
+/// Fold per-CPU `VWho` lanes into one qualified total (the checked
+/// [`try_fold_vwho`](kryprobe_abi::kcrypto_agg::try_fold_vwho)
+/// contract for who rows): insertion-frozen identity from the unique
+/// marked lane, `tid`/`comm` from the latest writer, `calls` summed
+/// checked, stamps min/maxed over busy lanes. `None` refuses missing
+/// or conflicting provenance (and saturated `calls`) — callers fail
+/// the snapshot loud via `snapshot/who-provenance`, never guess from
+/// numeric zeros.
+pub(crate) fn fold_vwho(lanes: &[VWho]) -> Option<VWho> {
+    try_fold_vwho(lanes)
 }
 
 /// Decode one `KSTACK` value (1016B = 127 LE u64 frames, zero-padded)
@@ -92,24 +66,42 @@ pub(crate) fn stack_ips_from_bytes(bytes: &[u8]) -> Vec<u64> {
     out
 }
 
-/// Read the `KIDN[KWHO_DROPS]` identity-drop indicator as part of the
-/// terminal sample (a capped u8, not an unbounded lost-call count). Absent key reads
-/// healthy-zero; any other errno fails loud (same rule as the
-/// `snapshot_who` tail this was extracted from).
+/// Read the `KATTRLOSS` WHO-loss flag as part of the terminal
+/// sample: CPU lanes x per-program slots folded with saturation at
+/// 255 into the `who_drops` diagnostic (F02/BPF2 — a flag, never an
+/// exact lost-call count). Unlike the retired lazy `KIDN` marker, the
+/// indication survives a full identity gate. Any lookup failure —
+/// including a missing map/slot (`ENOENT`) — refuses loud: a
+/// `PerCpuArray` slot always exists on a live map, so absence means a
+/// wrong map, never healthy-zero (a short lane buffer likewise
+/// refuses with `EBADMSG`).
 pub(crate) fn read_kwho_drops(maps: &ConfiguredKcrypto) -> Result<u64, SnapshotError> {
-    // SAFETY: KIDN is HashMap<u64, u8>; value_len 1 is exact.
-    match unsafe {
-        map_lookup_bytes(
-            &maps.loaded.maps.ident,
-            &KWHO_DROPS.to_le_bytes(),
-            1,
-            "snapshot/who-drops",
-        )
-    } {
-        Ok(value) => Ok(u64::from(value.first().copied().unwrap_or(0))),
-        Err(MapOpsError::LookupFailed { errno, .. }) if errno == libc::ENOENT => Ok(0),
-        Err(err) => Err(err.into()),
+    let (ncpu, value_len) = percpu_buffer_len(8)?;
+    let mut values = Vec::with_capacity(ncpu * KATTRLOSS_SLOTS as usize);
+    for prog in 0..KATTRLOSS_SLOTS {
+        // SAFETY: KATTRLOSS is PerCpuArray<u64> with one slot per
+        // program (bpf-kcrypto map def); value_len is ncpu * 8.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &maps.loaded.maps.attr_loss,
+                &prog.to_le_bytes(),
+                value_len,
+                "snapshot/who-drops",
+            )
+        }?;
+        for c in 0..ncpu {
+            let lane = raw
+                .get(c * 8..(c + 1) * 8)
+                .ok_or_else(|| MapOpsError::LookupFailed {
+                    stage: "snapshot/who-drops-lane".to_owned(),
+                    errno: libc::EBADMSG,
+                })?;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(lane);
+            values.push(u64::from_le_bytes(word));
+        }
     }
+    Ok(kattrloss_fold(&values))
 }
 
 /// Joined attribution for one who row: the three map joins
@@ -175,7 +167,7 @@ impl WhoCache {
 
 /// Snapshot the K5 attribution maps of a configured sensor: full `KWHO`
 /// walk (key iteration + percpu fold) with per-row `KSTACK`/`KERR`/
-/// `KPARAMS` joins, plus the `KWHO_DROPS` insert-loss count. Map order.
+/// `KPARAMS` joins, plus the `KATTRLOSS` insert-loss flag. Map order.
 ///
 /// Join-miss discipline (fail-soft, never fatal): a negative `stack`
 /// (raw helper errno — no `KSTACK` row) or an absent `KSTACK` row yields
@@ -268,7 +260,7 @@ pub fn snapshot_who_cached(
     maps: &ConfiguredKcrypto,
     cache: &mut WhoCache,
 ) -> Result<(Vec<WhoSnapshot>, u64), SnapshotError> {
-    let (ncpu, value_len) = percpu_buffer_len(80)?;
+    let (ncpu, value_len) = percpu_buffer_len(88)?;
     let mut out = Vec::new();
     let mut lanes: Vec<VWho> = Vec::with_capacity(ncpu);
     let mut tick_err: HashMap<u64, (Option<i32>, Option<VParams>)> = HashMap::new();
@@ -288,14 +280,14 @@ pub fn snapshot_who_cached(
             stage: "snapshot/who-key".to_owned(),
             errno: libc::EBADMSG,
         })?;
-        // SAFETY: KWHO is PerCpuHashMap<KWhoKey, VWho>; VWho is 80B
+        // SAFETY: KWHO is PerCpuHashMap<KWhoKey, VWho>; VWho is 88B
         // (vwho_from_bytes); ncpu is possible_cpus.
         let raw =
             unsafe { map_lookup_bytes(&maps.loaded.maps.who, &k, value_len, "snapshot/who-val") }?;
         lanes.clear();
         for c in 0..ncpu {
             let lane = raw
-                .get(c * 80..(c + 1) * 80)
+                .get(c * 88..(c + 1) * 88)
                 .and_then(vwho_from_bytes)
                 .ok_or_else(|| MapOpsError::LookupFailed {
                     stage: "snapshot/who-lane".to_owned(),
@@ -303,7 +295,13 @@ pub fn snapshot_who_cached(
                 })?;
             lanes.push(lane);
         }
-        let val = fold_vwho(&lanes);
+        // Missing/conflicting insertion provenance (or saturated
+        // calls) refuses the whole snapshot: a broken post-attach
+        // read must be loud, never a silent zero identity.
+        let val = fold_vwho(&lanes).ok_or_else(|| MapOpsError::LookupFailed {
+            stage: "snapshot/who-provenance".to_owned(),
+            errno: libc::EBADMSG,
+        })?;
         let joins = match cache.lookup(who_key.kh, who_key.tgid, val.last_ns, val.stack) {
             Some(joins) => joins,
             None => {
@@ -345,4 +343,26 @@ pub fn snapshot_who_cached(
     }
     let drops = read_kwho_drops(maps)?;
     Ok((out, drops))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kattrloss_read_refuses_on_unreadable_map() {
+        // F02: a missing/unreadable `KATTRLOSS` map refuses measurement
+        // (never healthy-zero): bad-fd lookups fail before any byte is
+        // read, and the error surfaces typed (topology first when the
+        // host topology itself is unreadable).
+        let sensor = crate::mapops::topology_tests::sensor();
+        let err = read_kwho_drops(&sensor).expect_err("unreadable KATTRLOSS must refuse");
+        match err {
+            SnapshotError::Map(MapOpsError::LookupFailed { stage, .. }) => assert!(
+                stage == "snapshot/who-drops" || stage.starts_with("percpu/"),
+                "typed read refusal, got stage {stage:?}"
+            ),
+            other => panic!("expected a typed map refusal, got {other:?}"),
+        }
+    }
 }

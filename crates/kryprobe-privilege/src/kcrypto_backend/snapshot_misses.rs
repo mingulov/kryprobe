@@ -399,6 +399,55 @@ pub fn join_agg_miss_deltas(
     Ok(out)
 }
 
+/// Map a miss join verdict to the terminal account (the ONE
+/// join→terminal mapping: [`crate::kcrypto_backend::KCryptoBackend::session_miss_terminal`]
+/// and the F03 interval oracles share it, so tests assert the
+/// production meaning — never a re-derived copy).
+pub fn miss_terminal_from_join(joined: Result<Vec<AggProgMissDelta>, MissError>) -> MissTerminal {
+    match joined {
+        Ok(deltas) => MissTerminal::Available(deltas),
+        Err(err) => MissTerminal::Unavailable {
+            reason: format!("miss join refused: {err}"),
+        },
+    }
+}
+
+/// Terminal account when the bring-up baseline read failed (the
+/// fail-soft arm shared by
+/// [`crate::kcrypto_backend::KCryptoBackend::session_miss_terminal`]
+/// and the F03 interval oracles — an unreadable baseline is explicit
+/// unavailability, never measured zero).
+pub fn miss_terminal_no_baseline() -> MissTerminal {
+    MissTerminal::Unavailable {
+        reason: "miss baseline unavailable (pre-attach read failed)".to_owned(),
+    }
+}
+
+/// Bring-up sequencing: load → baseline-read → attach (F03/BPF1).
+///
+/// The miss baseline reads the loaded-but-unattached `staged` state
+/// by shared borrow; `attach` then consumes it into the live sensor.
+/// The borrow-then-move boundary makes baseline-after-attach
+/// unrepresentable: no execution can precede the baseline because no
+/// link exists yet, so bring-up misses share the admitted capture's
+/// start — counted or unavailable, never subtracted into a measured
+/// zero (`bringup_misses_share_admission_interval` pins this; the
+/// pre-F03 attach-then-baseline order fails it).
+///
+/// Generic over the staged (`S`) and attached (`T`) states so the
+/// production loader path and the scripted oracles run the same
+/// sequence: production passes the staged loader halves, tests pass
+/// scripted stages with injected bring-up-window activity.
+pub fn run_bringup_with_baseline<S, T, E>(
+    staged: S,
+    read_baseline: impl FnOnce(&S) -> Option<Vec<AggProgMissAbs>>,
+    attach: impl FnOnce(S) -> Result<T, E>,
+) -> Result<(T, Option<Vec<AggProgMissAbs>>), E> {
+    let baseline = read_baseline(&staged);
+    let sensor = attach(staged)?;
+    Ok((sensor, baseline))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +616,145 @@ mod tests {
         let err = snapshot_agg_misses(&[("mystery".to_owned(), fd)], &table)
             .expect_err("unlabeled refuses");
         assert!(matches!(err, MissError::Unlabeled { .. }), "{err:?}");
+    }
+
+    // F03/BPF1 interval oracles: scripted bring-up stages through the
+    // REAL production sequencing (`run_bringup_with_baseline`) + the
+    // REAL join + the REAL terminal mapping. The scripted "kernel" is
+    // (misses, run_cnt, admitted): guard skips, accepted executions,
+    // and the KTOT-like admitted count proving the window is real.
+    type Scripted = std::cell::RefCell<(u64, u64, u64)>;
+
+    fn scripted_abs(kernel: &Scripted, id: u32) -> AggProgMissAbs {
+        let got = kernel.borrow();
+        abs("fexit/scripted", id, got.0, got.1, Some(false))
+    }
+
+    #[test]
+    fn bringup_misses_share_admission_interval() {
+        // Five guard misses + seven known admitted calls injected
+        // between first attach and end of setup (the BPF1 window),
+        // with NO later misses (the finding's static model: early
+        // misses only). Terminal output must count the five or
+        // declare measurement unavailable — never measured zero.
+        // (The pre-F03 attach-then-baseline order fails this: the
+        // baseline read swallows the five and the join reports
+        // measured 0.)
+        let kernel = Scripted::new((0, 0, 0));
+        let (sensor, baseline) = run_bringup_with_baseline(
+            &kernel,
+            |staged: &&Scripted| Some(vec![scripted_abs(staged, 41)]),
+            |staged: &Scripted| -> Result<&Scripted, std::convert::Infallible> {
+                // First attach: kernel crypto fires while remaining
+                // setup runs — 5 guard misses + 7 admitted calls land
+                // AFTER the pre-attach baseline, so the join counts
+                // them.
+                let mut got = staged.borrow_mut();
+                got.0 += 5;
+                got.1 += 7;
+                got.2 += 7;
+                Ok(staged)
+            },
+        )
+        .expect("scripted bring-up");
+        let current = vec![scripted_abs(sensor, 41)];
+        // Non-vacuity: the window really admitted executions, so a
+        // measured zero would contradict known activity.
+        assert_eq!(sensor.borrow().2, 7, "window must admit known calls");
+        let terminal = miss_terminal_from_join(join_agg_miss_deltas(
+            baseline.as_ref().expect("baseline read"),
+            &current,
+        ));
+        match terminal {
+            MissTerminal::Available(deltas) => {
+                let total: u64 = deltas.iter().map(|d| d.miss_delta).sum();
+                assert_eq!(
+                    total, 5,
+                    "bring-up misses must be counted, got measured {total}"
+                );
+            }
+            MissTerminal::Unavailable { reason } => assert!(!reason.is_empty()),
+        }
+    }
+
+    #[test]
+    fn bringup_no_miss_control_stays_clean() {
+        // Control: zero misses in the window with admitted calls — a
+        // TRUE zero from read counters stays Available (the fix must
+        // not overcorrect into Unavailable).
+        let kernel = Scripted::new((0, 0, 0));
+        let (sensor, baseline) = run_bringup_with_baseline(
+            &kernel,
+            |staged: &&Scripted| Some(vec![scripted_abs(staged, 41)]),
+            |staged: &Scripted| -> Result<&Scripted, std::convert::Infallible> {
+                staged.borrow_mut().2 += 7;
+                staged.borrow_mut().1 += 7;
+                Ok(staged)
+            },
+        )
+        .expect("scripted bring-up");
+        let current = vec![scripted_abs(sensor, 41)];
+        assert_eq!(sensor.borrow().2, 7, "window must admit known calls");
+        let terminal = miss_terminal_from_join(join_agg_miss_deltas(
+            baseline.as_ref().expect("baseline read"),
+            &current,
+        ));
+        match terminal {
+            MissTerminal::Available(deltas) => {
+                let total: u64 = deltas.iter().map(|d| d.miss_delta).sum();
+                assert_eq!(total, 0, "true zero stays a clean zero");
+            }
+            MissTerminal::Unavailable { reason } => {
+                panic!("true zero must stay Available, got unavailable: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn bringup_program_replacement_is_unavailable() {
+        // Control: program replaced between baseline and current (id
+        // 41 -> 42) — the join refuses and the terminal reads
+        // Unavailable through the shared production mapping, never
+        // zero.
+        let baseline = vec![abs("fexit/scripted", 41, 0, 0, Some(false))];
+        let current = vec![abs("fexit/scripted", 42, 5, 7, Some(false))];
+        let terminal = miss_terminal_from_join(join_agg_miss_deltas(&baseline, &current));
+        match terminal {
+            MissTerminal::Available(deltas) => {
+                panic!("replacement must refuse, got {deltas:?}")
+            }
+            MissTerminal::Unavailable { reason } => {
+                assert!(reason.contains("replaced"), "reason names it: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn bringup_unreadable_baseline_is_unavailable() {
+        // Control: baseline read refused (the GET_INFO errno path) —
+        // a missing baseline is explicit unavailability through the
+        // shared production arm, never measured zero.
+        let kernel = Scripted::new((0, 0, 0));
+        let (_sensor, baseline) = run_bringup_with_baseline(
+            &kernel,
+            |_staged: &&Scripted| None,
+            |staged: &Scripted| -> Result<&Scripted, std::convert::Infallible> {
+                let mut got = staged.borrow_mut();
+                got.0 += 5;
+                got.2 += 7;
+                Ok(staged)
+            },
+        )
+        .expect("scripted bring-up");
+        assert!(baseline.is_none(), "unreadable baseline stays None");
+        let terminal = miss_terminal_no_baseline();
+        match terminal {
+            MissTerminal::Available(deltas) => {
+                panic!("missing baseline must not join, got {deltas:?}")
+            }
+            MissTerminal::Unavailable { reason } => {
+                assert!(reason.contains("baseline"), "reason names it: {reason}")
+            }
+        }
     }
 }

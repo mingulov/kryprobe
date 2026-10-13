@@ -465,6 +465,8 @@ mod tests {
             calls: 7,
             first_ns: 1,
             last_ns: 2,
+            identity_present: 0,
+            _rsv: 0,
         };
         let visible = SubmitterContext::from_who(&key, &val, Some(1))
             .comm

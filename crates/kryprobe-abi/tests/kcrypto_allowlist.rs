@@ -50,7 +50,18 @@ const VAGG_WANT: &[&str] = &[
 const KCTL_WANT: &[&str] = &["kind", "_p", "key_hash", "val0", "val1", "val2", "val3"];
 const KWHOKEY_WANT: &[&str] = &["kh", "tgid", "_pad"];
 const VWHO_WANT: &[&str] = &[
-    "comm", "tid", "uid", "cgroup", "ppid", "pcomm", "stack", "calls", "first_ns", "last_ns",
+    "comm",
+    "tid",
+    "uid",
+    "cgroup",
+    "ppid",
+    "pcomm",
+    "stack",
+    "calls",
+    "first_ns",
+    "last_ns",
+    "identity_present",
+    "_rsv",
 ];
 const VPARAMS_WANT: &[&str] = &["blocksize", "ivsize", "min_keysize", "max_keysize"];
 const KCTXKEY_WANT: &[&str] = &["kh", "cgroup", "tgid", "uid", "start_ns"];
@@ -285,9 +296,22 @@ fn field_lists_match_declarations() {
         calls,
         first_ns,
         last_ns,
+        identity_present,
+        _rsv,
     } = VWho::default();
     let _ = (
-        comm, tid, uid, cgroup, ppid, pcomm, stack, calls, first_ns, last_ns,
+        comm,
+        tid,
+        uid,
+        cgroup,
+        ppid,
+        pcomm,
+        stack,
+        calls,
+        first_ns,
+        last_ns,
+        identity_present,
+        _rsv,
     );
     let VParams {
         blocksize,

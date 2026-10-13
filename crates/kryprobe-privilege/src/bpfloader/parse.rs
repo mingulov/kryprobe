@@ -587,8 +587,8 @@ mod tests {
             .collect();
         // 5 K1 maps + 4 K5 attribution maps + KDROPS (fix wave) +
         // 5 ctx-v1 maps (KCTX, KCTX_DROPS, KCTLCLOSED, KCTLCOUNT,
-        // KCTXOVF; ADR-0009).
-        assert_eq!(good.len(), 15);
+        // KCTXOVF; ADR-0009) + KATTRLOSS (F02 WHO-loss flag).
+        assert_eq!(good.len(), 16);
         assert!(valid_kcrypto_dims(&good));
         for ctx in ["KCTX", "KCTX_DROPS", "KCTLCLOSED", "KCTLCOUNT", "KCTXOVF"] {
             assert!(
@@ -596,6 +596,10 @@ mod tests {
                 "ctx-v1 map {ctx} missing from KCRYPTO_MAPS"
             );
         }
+        assert!(
+            good.iter().any(|m| m.name == "KATTRLOSS"),
+            "F02 map KATTRLOSS missing from KCRYPTO_MAPS"
+        );
         // Spine shape is NOT kcrypto shape (discrimination).
         let spineish = vec![ParsedMap {
             name: "CONFIG".to_owned(),

@@ -86,8 +86,8 @@ fn parse_reports_kcrypto_dims() {
         assert_eq!(got.name, *want_name);
         assert_eq!(got.dims, *want_dims, "dims drifted for {want_name}");
     }
-    // 10 pre-ctx maps + 5 ctx-v1 maps (ADR-0009).
-    assert_eq!(parsed.maps.len(), 15);
+    // 10 pre-ctx maps + 5 ctx-v1 maps (ADR-0009) + KATTRLOSS (F02).
+    assert_eq!(parsed.maps.len(), 16);
 }
 
 #[test]

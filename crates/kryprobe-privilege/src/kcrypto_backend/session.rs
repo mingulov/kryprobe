@@ -102,7 +102,7 @@ pub(super) struct ConfiguredSession {
     /// bytes at configure time (miss-telemetry labels; empty when the
     /// table was unbuildable — telemetry then reads unavailable).
     pub(super) miss_sections: HashMap<String, String>,
-    /// Attach-time miss absolutes (`None` when the baseline read
+    /// Pre-attach miss absolutes (`None` when the baseline read
     /// failed — fail-soft: the capture still runs, telemetry reads
     /// unavailable rather than failing the session).
     pub(super) miss_baseline: Option<Vec<AggProgMissAbs>>,
@@ -421,7 +421,7 @@ impl KCryptoBackend {
 
     /// Terminal program-miss account from one post-finish read (M1
     /// Stage 1): per-program guard-skip deltas joined by (`section`,
-    /// `program_id`) bijection against the attach-time baseline.
+    /// `program_id`) bijection against the pre-attach baseline.
     /// Fail-closed on the fence receipt (same F-01 rule as ctx):
     /// `Pending` (or no fence attempt yet) is a protocol error, never
     /// a terminal read. Fail-SOFT on the telemetry itself: an
@@ -446,9 +446,7 @@ impl KCryptoBackend {
             )),
             Some(_) => {
                 let Some(baseline) = state.miss_baseline.as_ref() else {
-                    return Ok(MissTerminal::Unavailable {
-                        reason: "miss baseline unavailable (attach-time read failed)".to_owned(),
-                    });
+                    return Ok(miss_terminal_no_baseline());
                 };
                 let current =
                     match snapshot_agg_misses(&state.sensor.loaded.progs, &state.miss_sections) {
@@ -459,12 +457,9 @@ impl KCryptoBackend {
                             });
                         }
                     };
-                match join_agg_miss_deltas(baseline, &current) {
-                    Ok(deltas) => Ok(MissTerminal::Available(deltas)),
-                    Err(err) => Ok(MissTerminal::Unavailable {
-                        reason: format!("miss join refused: {err}"),
-                    }),
-                }
+                Ok(miss_terminal_from_join(join_agg_miss_deltas(
+                    baseline, &current,
+                )))
             }
         }
     }

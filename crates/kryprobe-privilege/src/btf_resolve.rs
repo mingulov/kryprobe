@@ -21,7 +21,9 @@
 //! K1 Task 3 adds the CONFIG injection: [`kconfig_from_offsets`] (pure
 //! 9-offsets + K5 attribution offsets + ctx-v1 pairs → 92B projection) and
 //! [`load_kcrypto_configured`] (the single resolve → load → write-KCFG
-//! → attach entry K2 calls). K5 Task 3 adds [`resolve_kcrypto_offsets`]
+//! → attach entry; F03 splits it into [`load_kcrypto_staged`] +
+//! [`attach_kcrypto_staged`] so K2 reads the miss baseline between
+//! load and first attach). K5 Task 3 adds [`resolve_kcrypto_offsets`]
 //! (fail-soft parent/params offsets + flags for the KCFG tail).
 
 use crate::attach::OwnedLink;
@@ -717,18 +719,68 @@ pub(crate) fn system_object() -> ObjectRef {
     }
 }
 
-/// Single configured entry for K2: resolve BTF ids + offsets (+ K5
-/// attribution offsets, fail-soft) → load → write KCFG → attach every
-/// loaded point system-wide.
+/// Aggregate programs loaded (and KCFG-written) but NOT yet
+/// attached: the F03 staged bring-up state (BPF1). Holds the exact
+/// loaded maps + program handles; the miss baseline reads HERE,
+/// after program load and before the first attach can admit any
+/// execution (no program runs before its link exists, so the
+/// baseline shares the admitted capture's start — never a
+/// post-attach subtraction window). Consumed by
+/// [`attach_kcrypto_staged`]; drop closes progs/maps with no links.
+#[derive(Debug)]
+pub struct StagedKcrypto {
+    /// Loaded maps + programs (only the programs that loaded).
+    pub loaded: LoadedKcrypto,
+    /// Per-point load verdicts in parsed-program order (the attach
+    /// half joins these with per-point attach outcomes).
+    pub statuses: Vec<PointStatus>,
+}
+
+/// Staged bring-up, first half: resolve BTF ids + offsets (+ K5
+/// attribution offsets, fail-soft) → load → write KCFG. No fence
+/// open, no attach: nothing executes yet, so the caller reads the
+/// miss baseline from [`StagedKcrypto::loaded`] before arming.
 ///
-/// Physical order is resolve → load → write → attach (the KCFG write
-/// needs the loaded map fd, so it cannot precede the load): KCFG lands
+/// Physical order is resolve → load → write (the KCFG write needs
+/// the loaded map fd, so it cannot precede the load): KCFG lands
 /// BEFORE any attach, so no observation runs unconfigured (the BPF
 /// `pf_kthread` gate would skip it anyway).
 ///
 /// `token_fd` reuses the [`load_kcrypto`] convention (`None` loads with
 /// privilege, `Some` with a borrowed BPF token fd — threaded to map
 /// create + prog load; `None` preserves today's behavior byte-for-byte).
+pub fn load_kcrypto_staged(
+    object_bytes: &[u8],
+    token_fd: Option<RawFd>,
+) -> Result<StagedKcrypto, ConfiguredError> {
+    // H1(a): one shared image read (cached) + ONE parse serves all
+    // three resolutions (was: 3 reads + 3 parses per load, 7 per
+    // session with detect).
+    let bytes =
+        vmlinux_btf_bytes().map_err(|detail| ConfiguredError::Resolve(BtfError::Io { detail }))?;
+    let (ids, off, k5) = resolve_kcrypto_bringup_from(bytes).map_err(ConfiguredError::Resolve)?;
+    let entries: Vec<(String, u32)> = KCRYPTO_SYMBOLS
+        .iter()
+        .map(|name| ((*name).to_owned(), ids[*name]))
+        .collect();
+    let (loaded, statuses) =
+        load_kcrypto(object_bytes, &entries, token_fd).map_err(ConfiguredError::Load)?;
+    let cfg = kconfig_from_offsets(off, k5);
+    map_update_bytes(
+        &loaded.maps.config,
+        &0u32.to_le_bytes(),
+        &cfg.to_bytes(),
+        "kcrypto_configured/kcfg",
+    )
+    .map_err(ConfiguredError::Configure)?;
+    Ok(StagedKcrypto { loaded, statuses })
+}
+
+/// Staged bring-up, second half: fence-open + attach every loaded
+/// point system-wide. Consumes the [`StagedKcrypto`] (the SAME
+/// program handles — program identities are exact across the stage
+/// boundary, never re-loaded).
+///
 /// The attach step carries no token field of its own (UAPI provides
 /// none, and Task 1 proved the kernel demands no `link_create`
 /// delegation: `DELEGATE_CMDS=map_create:prog_load`): a token-loaded
@@ -750,30 +802,10 @@ pub(crate) fn system_object() -> ObjectRef {
 /// Succeeds iff at least one point attaches (the load rule, mapped
 /// forward); a total attach failure drops everything (RAII) and
 /// returns the per-point outcomes in the error.
-pub fn load_kcrypto_configured(
-    object_bytes: &[u8],
-    token_fd: Option<RawFd>,
+pub fn attach_kcrypto_staged(
+    staged: StagedKcrypto,
 ) -> Result<(ConfiguredKcrypto, Vec<ConfiguredPoint>), ConfiguredError> {
-    // H1(a): one shared image read (cached) + ONE parse serves all
-    // three resolutions (was: 3 reads + 3 parses per load, 7 per
-    // session with detect).
-    let bytes =
-        vmlinux_btf_bytes().map_err(|detail| ConfiguredError::Resolve(BtfError::Io { detail }))?;
-    let (ids, off, k5) = resolve_kcrypto_bringup_from(bytes).map_err(ConfiguredError::Resolve)?;
-    let entries: Vec<(String, u32)> = KCRYPTO_SYMBOLS
-        .iter()
-        .map(|name| ((*name).to_owned(), ids[*name]))
-        .collect();
-    let (loaded, statuses) =
-        load_kcrypto(object_bytes, &entries, token_fd).map_err(ConfiguredError::Load)?;
-    let cfg = kconfig_from_offsets(off, k5);
-    map_update_bytes(
-        &loaded.maps.config,
-        &0u32.to_le_bytes(),
-        &cfg.to_bytes(),
-        "kcrypto_configured/kcfg",
-    )
-    .map_err(ConfiguredError::Configure)?;
+    let StagedKcrypto { loaded, statuses } = staged;
     // ctx-v1 fence open (ADR-0009): explicit `CLOSED = 0` before the
     // first attach — admission is open by construction from here on.
     crate::kcrypto_fence::open_kernel_fence(&loaded.maps).map_err(ConfiguredError::Configure)?;
@@ -826,6 +858,21 @@ pub fn load_kcrypto_configured(
         return Err(ConfiguredError::NoPointAttached { points });
     }
     Ok((ConfiguredKcrypto { loaded, links }, points))
+}
+
+/// Single configured entry for K2: staged load (see
+/// [`load_kcrypto_staged`]) followed by immediate attach (see
+/// [`attach_kcrypto_staged`]). Order-preserving: resolve, load,
+/// write-KCFG, fence-open, attach — byte-for-byte the pre-F03
+/// sequence. Callers that read a miss baseline (BPF1) use the staged
+/// halves directly so the baseline lands between load and first
+/// attach; doctor/canary/ctx callers keep this atomic entry.
+pub fn load_kcrypto_configured(
+    object_bytes: &[u8],
+    token_fd: Option<RawFd>,
+) -> Result<(ConfiguredKcrypto, Vec<ConfiguredPoint>), ConfiguredError> {
+    let staged = load_kcrypto_staged(object_bytes, token_fd)?;
+    attach_kcrypto_staged(staged)
 }
 
 /// Resolve one struct-member byte offset from live vmlinux BTF.

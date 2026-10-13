@@ -4355,3 +4355,66 @@ fn stdout_write_failure_cannot_be_clean() {
         "stderr names stdout: {stderr_text}"
     );
 }
+
+#[test]
+fn live_bringup_misses_share_admission_interval() {
+    use kryprobe_cli::live::telemetry_miss_line;
+    use kryprobe_privilege::kcrypto_backend::{
+        AggProgMissAbs, MissTerminal, join_agg_miss_deltas, miss_terminal_from_join,
+        run_bringup_with_baseline,
+    };
+    use std::cell::RefCell;
+
+    // CLI-level F03/BPF1 oracle: scripted bring-up through the public
+    // sequencing + join + terminal mapping, rendered by the REAL
+    // `telemetry_miss_line` (the stderr shape twinned with the Python
+    // `parse_telemetry` consumer). Five misses + seven known admitted
+    // calls in the bring-up window, no later misses: the terminal
+    // line must count the five or declare unavailability — never a
+    // measured zero. (The pre-F03 attach-then-baseline order fails
+    // this.)
+    let snap = |kernel: &RefCell<(u64, u64, u64)>| {
+        let got = kernel.borrow();
+        vec![AggProgMissAbs {
+            section: "fexit/scripted".to_owned(),
+            program_id: 41,
+            misses: got.0,
+            run_cnt: got.1,
+            stats_enabled: Some(false),
+        }]
+    };
+    let kernel = RefCell::new((0u64, 0u64, 0u64));
+    let (sensor, baseline) = run_bringup_with_baseline(
+        &kernel,
+        |staged: &&RefCell<(u64, u64, u64)>| Some(snap(staged)),
+        |staged: &RefCell<(u64, u64, u64)>| -> Result<_, std::convert::Infallible> {
+            let mut got = staged.borrow_mut();
+            got.0 += 5;
+            got.1 += 7;
+            got.2 += 7;
+            Ok(staged)
+        },
+    )
+    .expect("scripted bring-up");
+    let current = snap(sensor);
+    assert_eq!(sensor.borrow().2, 7, "window must admit known calls");
+    let terminal = miss_terminal_from_join(join_agg_miss_deltas(
+        baseline.as_ref().expect("baseline read"),
+        &current,
+    ));
+    // Fail-soft shape holds at every layer: Available carries the
+    // joined deltas, Unavailable carries a reason.
+    match &terminal {
+        MissTerminal::Available(deltas) => assert_eq!(deltas.len(), 1),
+        MissTerminal::Unavailable { reason } => assert!(!reason.is_empty()),
+    }
+    let line = telemetry_miss_line(&terminal);
+    assert!(
+        line.contains("\"miss_delta\":5") || line.contains("\"unavailable\":true"),
+        "terminal must count bring-up misses, got: {line}"
+    );
+    assert!(
+        !line.contains("\"miss_delta\":0"),
+        "terminal must never report measured zero for known misses, got: {line}"
+    );
+}

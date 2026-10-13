@@ -279,6 +279,7 @@ pub fn load_kcrypto(
                 ctl_closed: take("KCTLCLOSED")?,
                 ctx_ovf: take("KCTXOVF")?,
                 ctl_count: take("KCTLCOUNT")?,
+                attr_loss: take("KATTRLOSS")?,
             },
             progs,
         },

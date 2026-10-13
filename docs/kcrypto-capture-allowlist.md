@@ -153,10 +153,17 @@ Per-CPU hash, 2048 entries. One row per (`kh`, `tgid`).
 | `tgid` | u32 | `bpf_get_current_pid_tgid` high 32 | PID/TGID metadata (kp2 §9; raw identity is owner-approved for K5, superseding the v0.1 no-raw-IDs hardening below) |
 | `_pad` | u32 | zero | padding, always 0 |
 
-## `KWHO` value: caller identity + tallies (80B `VWho`, K5)
+## `KWHO` value: caller identity + tallies (88B `VWho`, K5)
 
 First-seen fields are written once at insert; the hit path updates
-only `calls`, `last_ns`, `tid`, `comm` (last-writer).
+only `calls`, `last_ns`, `tid`, `comm` (last-writer). The kernel
+initializes only the inserting CPU lane from the insert value and
+zeroes every other lane, so `identity_present` marks exactly the
+lane whose `BPF_NOEXIST` insert created the key (other lanes stay
+unmarked even after count updates); userspace folds
+insertion-frozen identity from that unique marked lane and refuses
+missing/conflicting provenance rather than reading unmarked zeros
+as observed identity.
 
 | Field | Bytes | Source | WHY (kp2 §9) |
 |---|---|---|---|
@@ -170,6 +177,8 @@ only `calls`, `last_ns`, `tid`, `comm` (last-writer).
 | `calls` | u64 | observations attributed to this row | return/error class tallies (kp2 §9) |
 | `first_ns` | u64 | first seen-edge `ktime` per lane | timestamps (kp2 §9) |
 | `last_ns` | u64 | last seen-edge `ktime` per lane | timestamps (kp2 §9) |
+| `identity_present` | u32 | `1` on the inserting lane only, else `0` | provenance tag (kp2 §9: qualifies which lane carries observed identity) |
+| `_rsv` | u32 | zero | reserved, always 0 |
 
 ## `KSTACK`: kernel stacks by id (K5)
 
@@ -200,10 +209,18 @@ faults.
 | `min_keysize` | u32 | per-family min-keysize member | kernel/build metadata (a bound, never key bytes) |
 | `max_keysize` | u32 | per-family max-keysize member | kernel/build metadata (a bound, never key bytes) |
 
-Reserved key `KWHO_DROPS` (`u64::MAX - 1`) in `KIDN`:
-`KWHO`/`KERR`/`KPARAMS` insert-failure counter, saturating (kp2 §8:
-attribution loss surfaces here instead of vanishing; separate from
-`KIDN_DROPS` so ring loss and attribution loss stay distinguishable).
+## `KATTRLOSS`: WHO-loss flag (F02; per-CPU `u64` x 9 program slots)
+
+`KWHO`/`KERR`/`KPARAMS` insert-failure flag: each failure bumps the
+failing program's slot on the current CPU, each increment saturating
+at 255; the host folds CPU x program slots with saturation at 255
+into the `who_drops` diagnostic (kp2 §8: attribution loss surfaces
+here instead of vanishing; separate from `KIDN_DROPS` so ring loss
+and attribution loss stay distinguishable). The flag is independent
+of `KIDN` capacity (a full identity gate no longer hides caller-map
+insertion loss), and it is a flag, never an exact lost-call count —
+`KIDN` keeps all 256 entries for identity gating. A missing or
+unreadable map refuses measurement (never healthy-zero).
 
 ## `KCTX` key: accounting identity (32B `KCtxKey`, ctx-v1)
 

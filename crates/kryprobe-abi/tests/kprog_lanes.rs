@@ -2,18 +2,19 @@
 //! M1 Task 06: per-program lane pins (ADR-0013).
 //!
 //! The 9 fexit programs own disjoint lanes in the formerly shared
-//! per-CPU slots (`KTOT`, `KCTLCOUNT`, `KDROPS`, `KCTX_DROPS`), which
-//! restores exactness without BPF atomic RMW: the trampoline guard
-//! serializes each program against itself per CPU, and distinct
-//! programs touch disjoint slots. Ordinals follow BPF declaration
-//! order; the BPF twin + `max_entries` expressions are pinned below
-//! (twin direction per `kcrypto_agg.rs` module docs: duplication +
-//! backstops, since the BPF crate is GPL-2.0-only and cannot link
-//! this GPL-3.0 crate).
+//! per-CPU slots (`KTOT`, `KCTLCOUNT`, `KDROPS`, `KCTX_DROPS`,
+//! `KATTRLOSS`), which restores exactness without BPF atomic RMW: the
+//! trampoline guard serializes each program against itself per CPU,
+//! and distinct programs touch disjoint slots. Ordinals follow BPF
+//! declaration order; the BPF twin + `max_entries` expressions are
+//! pinned below (twin direction per `kcrypto_agg.rs` module docs:
+//! duplication + backstops, since the BPF crate is GPL-2.0-only and
+//! cannot link this GPL-3.0 crate).
 
 use kryprobe_abi::kcrypto_agg::{
-    KDROPS_SITES_PER_PROG, KDROPS_SLOTS, KPROG_AEADDEC, KPROG_AEADENC, KPROG_AHASH, KPROG_ALLOC,
-    KPROG_DESTROY, KPROG_FINUP, KPROG_SHASH, KPROG_SKDEC, KPROG_SKENC, KTOT_SLOTS, N_KPROGS,
+    KATTRLOSS_SLOTS, KDROPS_SITES_PER_PROG, KDROPS_SLOTS, KPROG_AEADDEC, KPROG_AEADENC,
+    KPROG_AHASH, KPROG_ALLOC, KPROG_DESTROY, KPROG_FINUP, KPROG_SHASH, KPROG_SKDEC, KPROG_SKENC,
+    KTOT_SLOTS, N_KPROGS,
 };
 use kryprobe_abi::kcrypto_ctx::{KCTLCOUNT_SLOTS, KCTX_DROPS_SLOTS};
 
@@ -36,6 +37,7 @@ fn per_program_slot_counts_pinned() {
     assert_eq!(KTOT_SLOTS, N_KPROGS);
     assert_eq!(KCTLCOUNT_SLOTS, N_KPROGS);
     assert_eq!(KCTX_DROPS_SLOTS, N_KPROGS);
+    assert_eq!(KATTRLOSS_SLOTS, N_KPROGS);
     assert_eq!(KDROPS_SITES_PER_PROG, 8);
     assert_eq!(KDROPS_SLOTS, N_KPROGS * KDROPS_SITES_PER_PROG);
     assert_eq!(KDROPS_SLOTS, 72);
@@ -79,6 +81,12 @@ fn bpf_twin_matches_abi_consts() {
             "static KCTX_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS, 0);"
         ),
         "KCTX_DROPS must size by N_KPROGS"
+    );
+    assert!(
+        src.contains(
+            "static KATTRLOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_KPROGS, 0);"
+        ),
+        "KATTRLOSS must size by N_KPROGS"
     );
     assert!(
         src.contains(
