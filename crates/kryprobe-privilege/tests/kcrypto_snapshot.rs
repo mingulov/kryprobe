@@ -24,8 +24,8 @@
 
 use kryprobe_abi::kcrypto_agg::{
     KCTL_IDENT, KCTL_OVERFLOW, KCtl, KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK,
-    KIDN_DROPS, KOP_ALLOC, KOP_DEC, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, VAgg,
-    fold_vagg, kagg_from_bytes, kcrypto_ident_hash, kctl_from_bytes, kctl_pack_head,
+    KIDN_DROPS, KOP_ALLOC, KOP_DEC, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KTOT_SLOTS,
+    VAgg, fold_vagg, kagg_from_bytes, kcrypto_ident_hash, kctl_from_bytes, kctl_pack_head,
     kctl_pack_lens, vagg_from_bytes,
 };
 use kryprobe_abi::{ABI_VERSION, BACKEND_KCRYPTO, EVENT_OBSERVATION, split_header};
@@ -1056,24 +1056,39 @@ fn assert_snapshot_fold_matches_raw_maps(sensor: &ConfiguredKcrypto, rows: &[Sna
         key = Some(k);
     }
     assert_eq!(raw_rows, rows.len(), "oracle sees every snapshot row");
-    // SAFETY: KTOT value is VAgg, 120B × possible_cpus.
-    let raw = unsafe {
-        map_lookup_bytes(
-            &sensor.loaded.maps.total,
-            &0u32.to_le_bytes(),
-            120 * ncpu,
-            "snapshot-twin/ktot",
-        )
-    }
-    .expect("KTOT lookup");
-    let mut lanes = Vec::with_capacity(ncpu);
-    for c in 0..ncpu {
-        lanes.push(vagg_from_bytes(&raw[c * 120..(c + 1) * 120]).expect("KTOT lane"));
+    // Oracle KTOT fold over ALL per-program slots (ADR-0013; mirrors
+    // the product `read_ktot` fold exactly).
+    let mut lanes = Vec::with_capacity(ncpu * KTOT_SLOTS as usize);
+    for prog in 0..KTOT_SLOTS {
+        // SAFETY: KTOT value is VAgg, 120B × possible_cpus, one slot per program.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.total,
+                &prog.to_le_bytes(),
+                120 * ncpu,
+                "snapshot-twin/ktot",
+            )
+        }
+        .expect("KTOT lookup");
+        for c in 0..ncpu {
+            lanes.push(vagg_from_bytes(&raw[c * 120..(c + 1) * 120]).expect("KTOT lane"));
+        }
     }
     assert_eq!(
         fold_vagg(&lanes),
         *tot,
         "oracle KTOT fold == snapshot totals"
+    );
+}
+
+/// F-B1e regression pin: `KTOT` holds one slot per program (ADR-0013);
+/// the oracle fold must cover all of them. A slot-count change fails
+/// here loudly instead of silently diverging the oracle again.
+#[test]
+fn ktot_slot_count_pinned() {
+    assert_eq!(
+        KTOT_SLOTS, 9,
+        "KTOT per-program slot count drifted; update the oracle fold"
     );
 }
 

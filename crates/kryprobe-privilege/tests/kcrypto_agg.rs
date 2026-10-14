@@ -23,8 +23,9 @@
 use kryprobe_abi::kcrypto_agg::{
     KCTL_GAP, KCTL_GENCHANGE, KCTL_HEALTH, KCTL_IDENT, KCTL_OVERFLOW, KCTX_PROC, KCTX_SOFTIRQ,
     KConfig, KCtl, KFAM_AEAD, KFAM_AHASH, KFAM_ANY, KFAM_SHASH, KFAM_SK, KIDN_DROPS, KOP_ALLOC,
-    KOP_DEC, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, VAgg, fold_vagg, kagg_from_bytes,
-    kcrypto_ident_hash, kctl_from_bytes, kctl_pack_head, kctl_pack_lens, vagg_from_bytes,
+    KOP_DEC, KOP_DIGEST, KOP_ENC, KOP_FINUP, KRES_ERR, KRES_OK, KTOT_SLOTS, VAgg, fold_vagg,
+    kagg_from_bytes, kcrypto_ident_hash, kctl_from_bytes, kctl_pack_head, kctl_pack_lens,
+    vagg_from_bytes,
 };
 use kryprobe_core::attach::{CookieAllocator, GenerationGuard, LinkGroup};
 use kryprobe_core::authority::AttachAuthority;
@@ -262,24 +263,38 @@ fn dump_kagg(sensor: &Sensor) -> Vec<AggRow> {
     rows
 }
 
-/// Fold the single `KTOT` row.
+/// Fold ALL `KTOT` per-program slots (ADR-0013: one slot per program;
+/// mirrors the product `read_ktot` fold exactly).
 fn dump_ktot(sensor: &Sensor) -> VAgg {
     let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
-    // SAFETY: KTOT value is VAgg, 120B × possible_cpus.
-    let raw = unsafe {
-        map_lookup_bytes(
-            &sensor.loaded.maps.total,
-            &0u32.to_le_bytes(),
-            120 * ncpu,
-            "ktot/val",
-        )
-    }
-    .expect("KTOT lookup");
-    let mut lanes = Vec::with_capacity(ncpu);
-    for c in 0..ncpu {
-        lanes.push(vagg_from_bytes(&raw[c * 120..(c + 1) * 120]).expect("KTOT lane"));
+    let mut lanes = Vec::with_capacity(ncpu * KTOT_SLOTS as usize);
+    for prog in 0..KTOT_SLOTS {
+        // SAFETY: KTOT value is VAgg, 120B × possible_cpus, one slot per program.
+        let raw = unsafe {
+            map_lookup_bytes(
+                &sensor.loaded.maps.total,
+                &prog.to_le_bytes(),
+                120 * ncpu,
+                "ktot/val",
+            )
+        }
+        .expect("KTOT lookup");
+        for c in 0..ncpu {
+            lanes.push(vagg_from_bytes(&raw[c * 120..(c + 1) * 120]).expect("KTOT lane"));
+        }
     }
     fold_vagg(&lanes)
+}
+
+/// F-B1 regression pin: `KTOT` holds one slot per program (ADR-0013);
+/// `dump_ktot` must fold all of them. A slot-count change fails here
+/// loudly instead of silently diverging the test reader again.
+#[test]
+fn ktot_slot_count_pinned() {
+    assert_eq!(
+        KTOT_SLOTS, 9,
+        "KTOT per-program slot count drifted; update dump_ktot"
+    );
 }
 
 /// Count `KIDN` entries (+ read the drops counter, 0 when absent).
