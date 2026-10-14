@@ -2003,10 +2003,14 @@ fn host_alloc_capture_assigns_generations() {
             + (post.edge_hits[14] - pre.edge_hits[14]),
         "every submit admitted exactly once"
     );
+    // One completion per alloc attempt, skcipher AND aead
+    // (complete_alloc runs for both frontend families) — tied to
+    // the alloc-submit edges both are already pinned exact above.
     assert_eq!(
         stats.completed - pre_stats.completed,
-        5,
-        "5 attempts completed"
+        (post.edge_hits[4] - pre.edge_hits[4])
+            + (post.edge_hits[12] - pre.edge_hits[12]),
+        "every alloc attempt completed exactly once"
     );
     for miss in &post.prog_misses {
         assert_eq!(miss.delta(), 0, "zero miss delta on {}", miss.section);
