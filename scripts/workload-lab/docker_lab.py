@@ -25,6 +25,7 @@ import argparse
 import datetime
 import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -337,6 +338,38 @@ def container_pid(name: str) -> int:
 KOP_ALLOC, KOP_ENC, KOP_DEC = 1, 3, 4
 
 
+def oracle_shape_for_kernel(release: str) -> str:
+    """Pinned D2 oracle shape for a kernel release (uname -r):
+    the 6.12 floor is nested 1:1 outer+inner, 7.x is flat
+    (1 call per op per direction). Unpinned kernels refuse
+    loudly — never a silent fallback shape."""
+    parts = release.split(".")
+    try:
+        major, minor = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError) as err:
+        raise LabError(f"no pinned oracle shape for kernel "
+                       f"{release!r}") from err
+    if (major, minor) == (6, 12):
+        return "nested"
+    if major == 7:
+        return "flat"
+    raise LabError(f"no pinned oracle shape for kernel "
+                   f"{release!r}")
+
+
+def _native_by_ref(doc: dict) -> dict:
+    """Index a workload-json dictionary by dict_id ({} when
+    the report carries inline natives only)."""
+    by_ref: dict = {}
+    dictionary = doc.get("dictionary")
+    if isinstance(dictionary, list):
+        for entry in dictionary:
+            if isinstance(entry, dict) and \
+                    entry.get("dict_id") is not None:
+                by_ref[entry["dict_id"]] = entry
+    return by_ref
+
+
 def fold_cgroup_calls(report_path: Path) -> dict:
     """Fold workload-json contexts by cgroup_id into {cgroup:
     {enc, dec, alloc, calls}} by native op numerics (frozen ABI:
@@ -347,13 +380,7 @@ def fold_cgroup_calls(report_path: Path) -> dict:
     (fail-open on counts, closed on classification). Pure —
     host-tested."""
     doc = json.loads(Path(report_path).read_text())
-    by_ref: dict = {}
-    dictionary = doc.get("dictionary")
-    if isinstance(dictionary, list):
-        for entry in dictionary:
-            if isinstance(entry, dict) and \
-                    entry.get("dict_id") is not None:
-                by_ref[entry["dict_id"]] = entry
+    by_ref = _native_by_ref(doc)
     folded: dict = {}
     for row in doc.get("contexts", []):
         cgroup = row.get("cgroup_id")
@@ -371,6 +398,45 @@ def fold_cgroup_calls(report_path: Path) -> dict:
             slot["dec"] += calls
         elif op == KOP_ALLOC:
             slot["alloc"] += calls
+    return folded
+
+
+def fold_cgroup_layer_calls(report_path: Path) -> dict:
+    """Fold workload-json contexts by cgroup_id into {cgroup:
+    {enc_layers, dec_layers}} with per-native call counts
+    (frozen ABI: ALLOC=1, ENC=3, DEC=4; refs resolve through
+    the dictionary, inline natives accepted). Layers key on
+    the native algorithm name (dict_id when the native
+    carries none); every context row keeps its own entry —
+    same-name repeats stay distinct under a #n suffix so
+    the nested oracle sees the true split and fails closed
+    on anything but the pinned layers. Pure — host-tested."""
+    doc = json.loads(Path(report_path).read_text())
+    by_ref = _native_by_ref(doc)
+    folded: dict = {}
+    for row in doc.get("contexts", []):
+        cgroup = row.get("cgroup_id")
+        native = row.get("native") or {}
+        ref = row.get("native_ref")
+        if not native and ref is not None:
+            native = by_ref.get(ref) or {}
+        op = native.get("op")
+        if op != KOP_ENC and op != KOP_DEC:
+            continue
+        calls = int(row.get("calls", "0"))
+        slot = folded.setdefault(
+            cgroup, {"enc_layers": {}, "dec_layers": {}})
+        layers = slot["enc_layers"] if op == KOP_ENC \
+            else slot["dec_layers"]
+        base = native.get("algorithm")
+        if not base:
+            base = f"ref:{ref}" if ref is not None \
+                else "unknown"
+        name, idx = base, 2
+        while name in layers:
+            name = f"{base}#{idx}"
+            idx += 1
+        layers[name] = calls
     return folded
 
 
@@ -516,21 +582,37 @@ def journey_two_workloads(args) -> int:
          "ops": sum_b["ops_total"],
          "allocs": sum_b.get("allocs", 1)}]}
     lab.write_ledger(args.out / "two-workloads.ledger.json", ledger)
-    folded = fold_cgroup_calls(report)
+    release = platform.uname().release
+    shape = oracle_shape_for_kernel(release)
     reasons = []
-    for entry in ledger["workloads"]:
-        slot = folded.get(entry["cgroup_id"])
-        if slot is None:
-            reasons.append(f"cgroup {entry['cgroup_id']} "
-                           f"({entry['name']}) unobserved")
-            continue
-        reasons.extend(lab.reconcile_cgroup(entry["ops"],
-                                            slot["enc"],
-                                            slot["dec"]))
+    if shape == "nested":
+        folded = fold_cgroup_layer_calls(report)
+        for entry in ledger["workloads"]:
+            slot = folded.get(entry["cgroup_id"])
+            if slot is None:
+                reasons.append(f"cgroup {entry['cgroup_id']} "
+                               f"({entry['name']}) unobserved")
+                continue
+            reasons.extend(lab.reconcile_cgroup_nested(
+                entry["ops"], slot["enc_layers"],
+                slot["dec_layers"]))
+    else:
+        folded = fold_cgroup_calls(report)
+        for entry in ledger["workloads"]:
+            slot = folded.get(entry["cgroup_id"])
+            if slot is None:
+                reasons.append(f"cgroup {entry['cgroup_id']} "
+                               f"({entry['name']}) unobserved")
+                continue
+            reasons.extend(lab.reconcile_cgroup(entry["ops"],
+                                                slot["enc"],
+                                                slot["dec"]))
     if reasons:
         raise LabError(f"oracle mismatch: {reasons}")
     write_receipt(args.out, "two-workloads",
                   {"started_utc": utcnow(), "ledger": ledger,
+                   "kernel_release": release,
+                   "oracle_shape": shape,
                    "folded": folded,
                    "fixture_confinement": FIXTURE_CONFINEMENT_NOTE,
                    "verdict": "PASS"})

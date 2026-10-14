@@ -1080,6 +1080,41 @@ class LabJourneyTests(unittest.TestCase):
         self.assertTrue(
             common.reconcile_cgroup(ops=100, enc=100, dec=99))
 
+    def test_reconcile_nested_oracle_math(self):
+        # D2: 6.12 floor nested 1:1 outer+inner (R01-floor-612
+        # seal pin) — each pinned layer == ops exactly, and the
+        # split itself is asserted, so this is stricter than
+        # the flat equation, not weaker.
+        spec = importlib.util.spec_from_file_location(
+            "workload_lab_common",
+            str(WORKLOAD_LAB / "common.py"))
+        common = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(common)
+        even = {"cbc(aes)": 100, "__cbc(aes)": 100}
+        self.assertEqual(
+            common.reconcile_cgroup_nested(
+                ops=100, enc_layers=dict(even),
+                dec_layers=dict(even)), [])
+        self.assertTrue(
+            common.reconcile_cgroup_nested(
+                ops=100, enc_layers={"cbc(aes)": 100,
+                                     "__cbc(aes)": 99},
+                dec_layers=dict(even)))
+        self.assertTrue(
+            common.reconcile_cgroup_nested(
+                ops=100, enc_layers={"cbc(aes)": 100},
+                dec_layers=dict(even)))
+        self.assertTrue(
+            common.reconcile_cgroup_nested(
+                ops=100, enc_layers={"cbc(aes)": 200},
+                dec_layers=dict(even)))
+        self.assertTrue(
+            common.reconcile_cgroup_nested(
+                ops=100, enc_layers=dict(even),
+                dec_layers={"cbc(aes)": 100,
+                            "__cbc(aes)": 100,
+                            "cbc(des)": 0}))
+
     def _docker_lab(self):
         import os
 
@@ -1226,6 +1261,105 @@ class LabJourneyTests(unittest.TestCase):
         self.assertEqual(lab.fold_cgroup_calls(path)["9"],
                          {"enc": 0, "dec": 0, "alloc": 0,
                           "calls": 5})
+
+    def _nested_doc(self):
+        # D2 6.12-floor shape (mirrors the retained
+        # attempt3-d2fail report: two cgroups, two enc +
+        # two dec natives each at 1:1 with fixture ops,
+        # plus one alloc each).
+        return {
+            "dictionary": [
+                {"dict_id": "n0", "op": 3,
+                 "algorithm": "__cbc(aes)"},
+                {"dict_id": "n1", "op": 4,
+                 "algorithm": "cbc(aes)"},
+                {"dict_id": "n2", "op": 4,
+                 "algorithm": "__cbc(aes)"},
+                {"dict_id": "n3", "op": 1,
+                 "algorithm": "cryptd(__cbc-aes-aesni)"},
+                {"dict_id": "n4", "op": 3,
+                 "algorithm": "cbc(aes)"},
+                {"dict_id": "n5", "op": 1,
+                 "algorithm": "cbc(aes)"}],
+            "contexts": [
+                {"cgroup_id": "75", "calls": "286521",
+                 "native_ref": "n0"},
+                {"cgroup_id": "75", "calls": "286521",
+                 "native_ref": "n4"},
+                {"cgroup_id": "75", "calls": "286521",
+                 "native_ref": "n1"},
+                {"cgroup_id": "75", "calls": "286521",
+                 "native_ref": "n2"},
+                {"cgroup_id": "75", "calls": "1",
+                 "native_ref": "n3"},
+                {"cgroup_id": "75", "calls": "1",
+                 "native_ref": "n5"},
+                {"cgroup_id": "183", "calls": "325676",
+                 "native_ref": "n0"},
+                {"cgroup_id": "183", "calls": "325676",
+                 "native_ref": "n4"},
+                {"cgroup_id": "183", "calls": "325676",
+                 "native_ref": "n1"},
+                {"cgroup_id": "183", "calls": "325676",
+                 "native_ref": "n2"},
+                {"cgroup_id": "183", "calls": "1",
+                 "native_ref": "n3"},
+                {"cgroup_id": "183", "calls": "1",
+                 "native_ref": "n5"}]}
+
+    def test_fold_layer_calls_nested(self):
+        lab = self._docker_lab()
+        path = Path(tempfile.mkdtemp()) / "nested.json"
+        path.write_text(json.dumps(self._nested_doc()))
+        layers = lab.fold_cgroup_layer_calls(path)
+        self.assertEqual(
+            layers["75"]["enc_layers"],
+            {"__cbc(aes)": 286521, "cbc(aes)": 286521})
+        self.assertEqual(
+            layers["75"]["dec_layers"],
+            {"cbc(aes)": 286521, "__cbc(aes)": 286521})
+        self.assertEqual(
+            layers["183"]["enc_layers"],
+            {"__cbc(aes)": 325676, "cbc(aes)": 325676})
+        self.assertEqual(
+            layers["183"]["dec_layers"],
+            {"cbc(aes)": 325676, "__cbc(aes)": 325676})
+
+    def test_nested_oracle_reconciles_attempt3_figures(self):
+        # The exact retained D2 RED figures reconcile under
+        # the nested oracle (both cgroups, both directions).
+        spec = importlib.util.spec_from_file_location(
+            "workload_lab_common",
+            str(WORKLOAD_LAB / "common.py"))
+        common = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(common)
+        lab = self._docker_lab()
+        path = Path(tempfile.mkdtemp()) / "nested.json"
+        path.write_text(json.dumps(self._nested_doc()))
+        layers = lab.fold_cgroup_layer_calls(path)
+        for cgroup, ops in (("75", 286521),
+                            ("183", 325676)):
+            self.assertEqual(
+                common.reconcile_cgroup_nested(
+                    ops=ops,
+                    enc_layers=layers[cgroup]["enc_layers"],
+                    dec_layers=layers[cgroup]["dec_layers"]),
+                [])
+
+    def test_oracle_shape_pins_kernel(self):
+        lab = self._docker_lab()
+        self.assertEqual(
+            lab.oracle_shape_for_kernel("6.12.112-virtme"),
+            "nested")
+        self.assertEqual(
+            lab.oracle_shape_for_kernel("7.0.14-070014-generic"),
+            "flat")
+        self.assertEqual(
+            lab.oracle_shape_for_kernel("7.2.6-virtme"),
+            "flat")
+        with self.assertRaisesRegex(lab.LabError,
+                                    "no pinned oracle"):
+            lab.oracle_shape_for_kernel("6.9.0-odd")
 
     def test_wait_capture_tick(self):
         import types

@@ -82,12 +82,45 @@ def reconcile_cgroup(ops: int, enc: int, dec: int) -> list:
     self-counted ops exactly (early-gate equivalence: enc == dec
     == driver ops_total). Userspace counting vs BPF observation
     are independent paths — agreement reconciles them. Returns
-    reasons (empty = reconciled)."""
+    reasons (empty = reconciled). See reconcile_cgroup_nested
+    for the 6.12 floor."""
     reasons = []
     if enc != ops:
         reasons.append(f"cgroup enc={enc} != fixture ops={ops}")
     if dec != ops:
         reasons.append(f"cgroup dec={dec} != fixture ops={ops}")
+    return reasons
+
+
+NESTED_SKCIPHER_LAYERS = ("cbc(aes)", "__cbc(aes)")
+
+
+def reconcile_cgroup_nested(ops: int, enc_layers: dict,
+                            dec_layers: dict) -> list:
+    """Nested-shape per-cgroup oracle (6.12 floor): the BPF
+    per-operation per-cgroup counts show one outer + one
+    cryptd-nested inner call per op per direction (2x issued
+    in total; the R01-floor-612 seal pins the
+    cbc(aes)/__cbc(aes) split at issued/issued per
+    direction). Each pinned layer must equal the fixture
+    self-counted ops exactly, and the split itself is
+    asserted: a missing, extra, or short layer fails.
+    Returns reasons (empty = reconciled)."""
+    reasons = []
+    for direction, layers in (("enc", enc_layers),
+                              ("dec", dec_layers)):
+        for name in NESTED_SKCIPHER_LAYERS:
+            if name not in layers:
+                reasons.append(f"cgroup {direction} layer "
+                               f"{name} missing")
+            elif layers[name] != ops:
+                reasons.append(
+                    f"cgroup {direction} layer {name}="
+                    f"{layers[name]} != fixture ops={ops}")
+        for name in sorted(layers):
+            if name not in NESTED_SKCIPHER_LAYERS:
+                reasons.append(f"cgroup {direction} layer "
+                               f"{name} unpinned")
     return reasons
 
 
