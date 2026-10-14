@@ -6,7 +6,7 @@
 //! pad per C2 plus the K5 attribution tail, from live BTF).
 //! `configured_entry_writes_kcfg_from_
 //! resolver` is the privileged half: `load_kcrypto_configured` writes
-//! the 76B KCFG row the live resolver dictates, attaches all 9 points,
+//! the 92B KCFG row the live resolver dictates, attaches all 9 points,
 //! and the row reads back byte-identical (from the map fd, then again
 //! after a real bpffs pin). `canary_kcrypto` plants `KPROBE-CANARY-*`
 //! markers in key, IV, and plaintext fixture buffers and byte-scans
@@ -21,9 +21,9 @@
 //! sensors cannot race each other's assertions.
 
 use kryprobe_abi::kcrypto_agg::{
-    KFAM_SK, KOP_DEC, KOP_ENC, KRES_OK, VAgg, fold_vagg, kagg_from_bytes, vagg_from_bytes,
+    KConfig, KFAM_SK, KOP_DEC, KOP_ENC, KRES_OK, VAgg, fold_vagg, kagg_from_bytes, vagg_from_bytes,
 };
-use kryprobe_privilege::bpfloader::{PointStatus, pin_fd};
+use kryprobe_privilege::bpfloader::{KCRYPTO_MAPS, PointStatus, pin_fd};
 use kryprobe_privilege::btf_resolve::{
     AttachOutcome, ConfiguredKcrypto, kconfig_from_offsets, load_kcrypto_configured,
     resolve_aggregate_offsets, resolve_kcrypto_offsets,
@@ -225,13 +225,16 @@ fn drain_ring_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
 fn dump_all_bytes(sensor: &ConfiguredKcrypto) -> Vec<u8> {
     let ncpu = possible_cpus().expect("trusted possible CPU topology") as usize;
     let mut out = Vec::new();
-    // SAFETY: KCFG wire is exactly 76B.
+    // SAFETY: KCFG wire is exactly `size_of::<KConfig>()` (92B:
+    // BPF `size_of::<KConfig>() == 92` static assert + loader
+    // `KCRYPTO_MAPS` KCFG `value_size` 92 + host `to_bytes` `[u8; 92]`;
+    // pinned by `kcfg_read_size_matches_wire`).
     out.extend_from_slice(
         &unsafe {
             map_lookup_bytes(
                 &sensor.loaded.maps.config,
                 &0u32.to_le_bytes(),
-                76,
+                std::mem::size_of::<KConfig>(),
                 "canary/kcfg",
             )
         }
@@ -363,6 +366,38 @@ fn kconfig_bytes_match_live_resolver() {
     assert_eq!(&bytes[89..92], &[0, 0, 0], "F5 tail zero pad");
 }
 
+/// F-B2 regression pin: the KCFG test reads size their kernel
+/// buffer from `size_of::<KConfig>()`, which must equal the 92B wire
+/// (BPF `size_of::<KConfig>() == 92` static assert + host `to_bytes`
+/// `[u8; 92]`) AND the loader `KCRYPTO_MAPS` KCFG `value_size` the
+/// kernel instantiates. Any drift between the type and the manifest
+/// fails here, unprivileged, before a short buffer can reach the
+/// kernel (the stale literal 76 was an L-SEC-02 heap overwrite that
+/// SIGABRTed both privileged bodies on fedora lane 1).
+#[test]
+fn kcfg_read_size_matches_wire() {
+    assert_eq!(
+        std::mem::size_of::<KConfig>(),
+        92,
+        "KCFG wire is 92B (C2 + shash_base + K5 tail + ctx-v1 tail + F5 tail)"
+    );
+    assert_eq!(
+        KConfig::default().to_bytes().len(),
+        std::mem::size_of::<KConfig>(),
+        "host to_bytes must cover the whole KConfig wire value"
+    );
+    let (_, dims) = KCRYPTO_MAPS
+        .iter()
+        .find(|(name, _)| *name == "KCFG")
+        .expect("KCFG in loader manifest");
+    assert_eq!(
+        dims.value_size as usize,
+        std::mem::size_of::<KConfig>(),
+        "loader KCFG value_size must equal the KConfig wire size"
+    );
+    assert_eq!(dims.key_size, 4, "KCFG key is u32");
+}
+
 /// Our bpffs pin dir (pid-suffixed: never collides, never shared).
 fn pin_dir() -> PathBuf {
     PathBuf::from("/sys/fs/bpf").join(format!("k1t3probe-{}", std::process::id()))
@@ -416,12 +451,14 @@ fn configured_entry_writes_kcfg_from_resolver() {
         resolve_kcrypto_offsets().expect("K5 offsets resolve fail-soft"),
     )
     .to_bytes();
-    // SAFETY: KCFG wire is exactly 76B.
+    // SAFETY: KCFG wire is exactly `size_of::<KConfig>()` (92B:
+    // BPF static assert + loader `KCRYPTO_MAPS` `value_size` 92 + host
+    // `to_bytes` `[u8; 92]`; pinned by `kcfg_read_size_matches_wire`).
     let got = unsafe {
         map_lookup_bytes(
             &sensor.loaded.maps.config,
             &0u32.to_le_bytes(),
-            76,
+            std::mem::size_of::<KConfig>(),
             "configured/kcfg",
         )
     }
@@ -446,12 +483,13 @@ fn configured_entry_writes_kcfg_from_resolver() {
         pin_fd(&sensor.loaded.maps.config, &dir, "KCFG")
             .unwrap_or_else(|err| panic!("pin KCFG failed: {err}"));
         assert!(dir.join("KCFG").exists(), "pin file must exist after pin");
-        // SAFETY: KCFG wire is exactly 76B.
+        // SAFETY: KCFG wire is exactly `size_of::<KConfig>()` (92B:
+        // same provenance as the fd read-back above).
         let pinned = unsafe {
             map_lookup_bytes(
                 &sensor.loaded.maps.config,
                 &0u32.to_le_bytes(),
-                76,
+                std::mem::size_of::<KConfig>(),
                 "configured/kcfg-pinned",
             )
         }
