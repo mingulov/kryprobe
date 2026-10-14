@@ -194,13 +194,12 @@ def body_verdict(code, output, key=None, body=None):
     if not skipped(output):
         return "PASS"
     marker = env_gate_marker(key, body)
-    if marker is None:
+    # Substring match: libtest pretty framing prefixes the body's line
+    # ("test <body> ... <marker>"), so the marker rarely starts a line.
+    # Everything besides the exact marker must still be skip-free.
+    if marker is None or marker not in output:
         return "FAIL"
-    lines = output.splitlines()
-    if not any(line.startswith(marker) for line in lines):
-        return "FAIL"
-    residual = "\n".join(line for line in lines if not line.startswith(marker))
-    if skipped(residual):
+    if skipped(output.replace(marker, "")):
         return "FAIL"
     return "ENV_GATED_SKIP"
 

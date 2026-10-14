@@ -104,6 +104,11 @@ class BodyAccounting(unittest.TestCase):
                          "ENV_GATED_SKIP")
         self.assertEqual(lane.body_verdict(0, marker2 + "\n" + PASS, key, "setcap_roundtrip_unpriv"),
                          "ENV_GATED_SKIP")
+        # libtest pretty framing: the body's marker lands inline after
+        # "test <body> ... " (observed on fedora) — still gated.
+        inline = "test attribution_golden_python ... " + marker + "\nok\n" + PASS
+        self.assertEqual(lane.body_verdict(0, inline, key, "attribution_golden_python"),
+                         "ENV_GATED_SKIP")
         for name, output in [
             # allowlisted body, plain SKIP without the loud marker
             ("attribution_golden_python", "SKIP: requires bpftrace\n" + PASS),
