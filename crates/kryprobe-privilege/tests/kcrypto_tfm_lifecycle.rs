@@ -1903,9 +1903,10 @@ fn host_alloc_capture_assigns_generations() {
     for fd in &held {
         afalg_set_key(*fd, &key32);
     }
-    // One AEAD socket: `crypto_alloc_aead` is unhooked (out of
-    // scope — first-seen admits it), but its setkey + setauthsize
-    // run on hooked sites.
+    // One AEAD socket: `crypto_alloc_aead` is a required hooked
+    // program (P5 manifest), so its alloc submit + return fire
+    // edges 12/13 and its generation is alloc-assigned (never
+    // first-seen); its setkey + setauthsize run on hooked sites.
     held.push(afalg_bind("aead", "gcm(aes)"));
     afalg_set_key(*held.last().unwrap(), &key32[..16]);
     afalg_set_authsize(*held.last().unwrap(), 16);
@@ -1918,6 +1919,7 @@ fn host_alloc_capture_assigns_generations() {
     // The oracle reads the live inventory (fds held), then the
     // sockets close — all assertions run after release.
     let expected_drv = proc_crypto_winning_driver("cbc(aes)");
+    let expected_aead_drv = proc_crypto_winning_driver("gcm(aes)");
     for fd in held {
         unsafe {
             libc::close(fd);
@@ -1989,14 +1991,15 @@ fn host_alloc_capture_assigns_generations() {
         "no resubmits"
     );
     // T07.3+: `admitted` counts EVERY submit half (alloc +
-    // destroy + config attempts) — the equation, not a fixed 5,
-    // is the invariant.
+    // destroy + config attempts, INCLUDING the hooked aead-alloc
+    // submit) — the equation, not a fixed 5, is the invariant.
     assert_eq!(
         stats.admitted - pre_stats.admitted,
         (post.edge_hits[4] - pre.edge_hits[4])
             + (post.edge_hits[6] - pre.edge_hits[6])
             + (post.edge_hits[8] - pre.edge_hits[8])
             + (post.edge_hits[10] - pre.edge_hits[10])
+            + (post.edge_hits[12] - pre.edge_hits[12])
             + (post.edge_hits[14] - pre.edge_hits[14]),
         "every submit admitted exactly once"
     );
@@ -2008,12 +2011,13 @@ fn host_alloc_capture_assigns_generations() {
     for miss in &post.prog_misses {
         assert_eq!(miss.delta(), 0, "zero miss delta on {}", miss.section);
     }
-    // Generations: the 5 socket tfms carry the requested name +
-    // a resolved driver; config-admitted first-seen gens (the AEAD
-    // socket, whose alloc is unhooked, plus any template-inner
-    // layer the config path observed) carry EMPTY provenance —
-    // unknown, never fabricated. (Op-admitted first-seen gens
-    // carry the submit's driver instead — F05, pinned by
+    // Generations: the 5 cbc socket tfms + the 1 AEAD socket
+    // tfm are alloc-assigned (aead-alloc is hooked) and carry the
+    // requested name + a resolved driver; any config-admitted
+    // first-seen gens (template-inner layers the config path
+    // observed) carry EMPTY provenance — unknown, never
+    // fabricated. (Op-admitted first-seen gens carry the submit's
+    // driver instead — F05, pinned by
     // `host_op_first_seen_carries_selected_driver`; this E2E runs
     // no ops, so every first-seen gen here is config-admitted.)
     let gens = sensor.tfm().generations();
@@ -2022,15 +2026,23 @@ fn host_alloc_capture_assigns_generations() {
         new_gens >= 6,
         "5 socket tfms + the AEAD tfm at least: {new_gens}"
     );
-    let mut socket_gens = 0;
+    let mut cbc_socket_gens = 0;
+    let mut aead_socket_gens = 0;
     for g in gens.iter().skip(pre_gens) {
         if g.first_seen {
             assert!(
                 g.req_name.is_empty() && g.drv_name.is_empty(),
                 "config-admitted first-seen carries no provenance: {g:?}"
             );
+        } else if g.req_name == "gcm(aes)" {
+            aead_socket_gens += 1;
+            assert_eq!(
+                g.drv_name, expected_aead_drv,
+                "aead driver matches /proc/crypto winner: {g:?}"
+            );
+            assert!(!g.name_truncated, "short name never truncates: {g:?}");
         } else {
-            socket_gens += 1;
+            cbc_socket_gens += 1;
             assert_eq!(g.req_name, "cbc(aes)", "requested name verbatim");
             assert_eq!(
                 g.drv_name, expected_drv,
@@ -2039,7 +2051,14 @@ fn host_alloc_capture_assigns_generations() {
             assert!(!g.name_truncated, "short name never truncates: {g:?}");
         }
     }
-    assert_eq!(socket_gens, 5, "5 alloc-assigned socket tfms");
+    assert_eq!(
+        cbc_socket_gens, 5,
+        "5 alloc-assigned cbc socket tfms"
+    );
+    assert_eq!(
+        aead_socket_gens, 1,
+        "1 alloc-assigned aead socket tfm"
+    );
     // T07.3 destroy lane: the 5 closes above ran
     // `crypto_destroy_tfm` synchronously (close returns after the
     // put). The destroy COUNT is driver-shaped — cryptd-wrapped
@@ -2157,13 +2176,13 @@ fn host_alloc_capture_assigns_generations() {
     assert!(aead_ret >= 1, "aead setkey ran: {aead_ret}");
     assert_eq!(
         post.edge_hits[12] - pre.edge_hits[12],
-        0,
-        "aead-alloc lane stays dark (unhooked)"
+        1,
+        "one aead bind → one alloc submit (hooked, P5)"
     );
     assert_eq!(
         post.edge_hits[13] - pre.edge_hits[13],
-        0,
-        "aead-alloc lane stays dark (unhooked)"
+        1,
+        "one aead bind → one alloc return (hooked, P5)"
     );
     assert_eq!(
         stats.configs_joined - pre_stats.configs_joined,
