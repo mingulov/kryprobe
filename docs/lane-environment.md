@@ -40,6 +40,30 @@ deviations in the lane evidence.
   traffic fixtures; `cbc(aes)`, `ecb(aes)`, `gcm(aes)`,
   `sha256`, `md5` transforms loadable.
 
+## Test-body prerequisites (env-gated, F-C3)
+
+Two `live_k5` bodies need host prerequisites beyond root + BTF. When a
+prerequisite is missing the body skips LOUDLY — it prints
+`SKIP (env-gated): <body> requires <prereq>; see
+docs/lane-environment.md` and exits 0 with its 1-passed summary. The
+sudo runner accepts ONLY these two bodies' markers
+(`scripts/sudo_lane.py::ENV_GATED_BODIES`); any other skip text, on
+any body, still FAILs. The lane never installs prerequisites (no
+shared-machine mutation); operators satisfy them out of band.
+
+- `attribution_golden_python` requires `bpftrace` (the live oracle
+  that counts digest returns alongside kryprobe for the EXACT
+  equality golden). Debian/Ubuntu: `apt install bpftrace`;
+  Fedora: `dnf install bpftrace`.
+- `setcap_roundtrip_unpriv` requires the `nogroup` group: the
+  unprivileged leg drops via
+  `setpriv --reuid nobody --regid nogroup --clear-groups`.
+  Debian-family systems provide `nogroup` (gid 65533); Fedora has
+  no `nogroup` (there `nobody`'s group is `nobody`), so the body
+  env-skips there. Do NOT rename the group per-distro in the
+  test — the nobody-leg attestation pins `Uid: 65534` and the
+  group is part of that pinned identity.
+
 ## What is NOT pinned (ambient, record in evidence)
 
 - Exact kernel release past the applicable floor (6.12 base,

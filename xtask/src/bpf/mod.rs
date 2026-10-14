@@ -361,7 +361,22 @@ pub(crate) fn test_bpf() -> i32 {
     if code != 0 {
         return code;
     }
-    for (package, suite) in [
+    for (package, suite) in bpf_lane_suites() {
+        let mut args = vec!["test", "--locked", "-p", package, "--test", suite];
+        args.extend(suite_libtest_tail(suite));
+        let code = run_child("cargo", &args);
+        if code != 0 {
+            return code;
+        }
+    }
+    0
+}
+
+/// BPF lane suites. Keep the `("pkg", "suite"),` line shape: the
+/// `lane_guard` integration test enrolls suites by parsing these
+/// lines textually.
+fn bpf_lane_suites() -> [(&'static str, &'static str); 12] {
+    [
         ("kryprobe-privilege", "bpf_pipeline"),
         ("kryprobe-privilege", "decoy_pid"),
         ("kryprobe-privilege", "token_plumbing"),
@@ -374,20 +389,32 @@ pub(crate) fn test_bpf() -> i32 {
         ("kryprobe-privilege", "kcrypto_lifecycle_sensor"),
         ("kryprobe-privilege", "kcrypto_tfm_lifecycle"),
         ("kryprobe-cli", "cli_bpf_e2e"),
-    ] {
-        let mut args = vec!["test", "--locked", "-p", package, "--test", suite];
-        // The TFM suite's three live bodies need a successful runtime
-        // fsession probe. The sudo runner accounts for those individually;
-        // this lane always runs the suite's host and fixture bodies.
-        if suite != "kcrypto_tfm_lifecycle" {
-            args.extend(["--", "--include-ignored"]);
-        }
-        let code = run_child("cargo", &args);
-        if code != 0 {
-            return code;
-        }
+    ]
+}
+
+/// Suites that run single-threaded (`--test-threads=1`).
+///
+/// `kcrypto_ctx` only: libtest threads share a tgid and the ctx
+/// sensors are system-wide, so parallel bodies land in each other's
+/// per-tgid rows (F-B3 — parallel-only failures; serial 11/11 +
+/// sudo-lane --exact 5/5 prove the bodies, not the shape).
+const SERIAL_SUITES: &[&str] = &["kcrypto_ctx"];
+
+/// libtest tail for one lane suite (pure for tests): the TFM suite's
+/// three live bodies need a successful runtime fsession probe, so the
+/// sudo runner accounts for those individually and this lane always
+/// runs the suite's host and fixture bodies (no libtest tail at
+/// all); every other suite runs `--include-ignored`, serial suites
+/// additionally single-threaded.
+fn suite_libtest_tail(suite: &str) -> Vec<&'static str> {
+    if suite == "kcrypto_tfm_lifecycle" {
+        return Vec::new();
     }
-    0
+    let mut tail = vec!["--", "--include-ignored"];
+    if SERIAL_SUITES.contains(&suite) {
+        tail.push("--test-threads=1");
+    }
+    tail
 }
 
 /// True when `rustup run <channel> <args...>` succeeds.
@@ -424,6 +451,34 @@ mod tests {
         assert_eq!(lockfile_sync_key(spine), lockfile_sync_key(&kcrypto));
         let drifted = spine.replace("0.2.1", "0.2.2");
         assert_ne!(lockfile_sync_key(spine), lockfile_sync_key(&drifted));
+    }
+
+    #[test]
+    fn kctx_suite_runs_serial() {
+        // F-B3: libtest threads share a tgid and the ctx sensors are
+        // system-wide, so only the kctx suite runs serially
+        // (--test-threads=1); every other suite keeps the parallel
+        // shape (serial 11/11 + sudo-lane --exact 5/5 prove the bodies).
+        assert_eq!(SERIAL_SUITES, &["kcrypto_ctx"]);
+        for serial in SERIAL_SUITES {
+            assert!(
+                bpf_lane_suites().iter().any(|(_, suite)| suite == serial),
+                "serial suite enrolled in the lane table: {serial}"
+            );
+        }
+        assert_eq!(
+            suite_libtest_tail("kcrypto_ctx"),
+            ["--", "--include-ignored", "--test-threads=1"]
+        );
+    }
+
+    #[test]
+    fn other_suites_keep_parallel_shape() {
+        assert_eq!(
+            suite_libtest_tail("kcrypto_agg"),
+            ["--", "--include-ignored"]
+        );
+        assert!(suite_libtest_tail("kcrypto_tfm_lifecycle").is_empty());
     }
 
     #[test]

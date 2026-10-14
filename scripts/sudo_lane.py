@@ -5,6 +5,9 @@
 Python standard library only. Staged files are presented read-only at Cargo's
 compiled-in fixture paths inside a private mount namespace. No source or host
 mount is replaced. Build failures, missing bodies and unexplained skips fail.
+Skips are accepted only from the documented env-gate allowlist
+(ENV_GATED_BODIES), each with its exact loud marker; those bodies report
+ENV_GATED_SKIP (recorded in results/summary counts, never silent).
 """
 import argparse
 import collections
@@ -88,6 +91,26 @@ DEV_PIN_WARNING = (
     "kryprobe: BPF object pin check SKIPPED (empty pins in dev build); "
     "set KRYPROBE_PIN_OBJECTS at compile time or KRYPROBE_REQUIRE_PINS=1 to fail closed"
 )
+# F-C1: request-lifecycle manifest (P5): 10 required fsession sites +
+# 2 optional fentry callbacks, attach-if-present, never gating
+# (`profile.rs::manifest(RequestLifecycle)`). Bring-up is
+# all-or-nothing on the required set, so a live sensor reports
+# attached in 10..12 against expected 12.
+LIFECYCLE_REQUIRED = 10
+LIFECYCLE_CALLBACKS = 2
+LIFECYCLE_EXPECTED = LIFECYCLE_REQUIRED + LIFECYCLE_CALLBACKS
+# F-C3: environment-gated bodies. Each entry maps (package, target,
+# body) to the prerequisite token the body's loud env-gate marker
+# must name. ONLY these bodies may skip, and ONLY by printing the
+# exact `SKIP (env-gated): <body> requires <prereq>` marker (with the
+# doc pointer); any other skip text, on any body, still FAILs.
+# Prerequisites live in docs/lane-environment.md; the lane never
+# installs them (no shared-machine mutation).
+ENV_GATED_BODIES = {
+    ("kryprobe-cli", "live_k5", "attribution_golden_python"): "bpftrace",
+    ("kryprobe-cli", "live_k5", "setcap_roundtrip_unpriv"): "nogroup",
+}
+ENV_GATE_DOC = "docs/lane-environment.md"
 _CANCEL_REQUESTED = False
 
 
@@ -151,16 +174,35 @@ def reconcile(observed, expected=EXPECTED):
         raise ValueError(f"privileged body inventory drift: {differences}")
 
 
-def body_verdict(code, output):
+def env_gate_marker(key, body):
+    """The loud env-gate marker an allowlisted body must print, or None."""
+    if key is None or body is None:
+        return None
+    prereq = ENV_GATED_BODIES.get((*key, body))
+    if prereq is None:
+        return None
+    return f"SKIP (env-gated): {body} requires {prereq}"
+
+
+def body_verdict(code, output, key=None, body=None):
     summaries = re.findall(
         r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; \d+ filtered out; finished in .+$",
         output, re.MULTILINE,
     )
     if code != 0 or summaries != [("1", "0", "0", "0")]:
         return "FAIL"
-    if skipped(output):
+    if not skipped(output):
+        return "PASS"
+    marker = env_gate_marker(key, body)
+    if marker is None:
         return "FAIL"
-    return "PASS"
+    lines = output.splitlines()
+    if not any(line.startswith(marker) for line in lines):
+        return "FAIL"
+    residual = "\n".join(line for line in lines if not line.startswith(marker))
+    if skipped(residual):
+        return "FAIL"
+    return "ENV_GATED_SKIP"
 
 
 def skipped(output):
@@ -176,7 +218,13 @@ def lifecycle_verdict(code, output):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if code in (0, 3) and row == {"audit": "attach", "attached": 7, "expected": 7}:
+            if not isinstance(row, dict):
+                continue
+            attached = row.get("attached")
+            if (code in (0, 3) and set(row) == {"audit", "attached", "expected"}
+                    and row["audit"] == "attach" and row["expected"] == LIFECYCLE_EXPECTED
+                    and type(attached) is int
+                    and LIFECYCLE_REQUIRED <= attached <= LIFECYCLE_EXPECTED):
                 return "PASS"
     return "FAIL"
 
@@ -632,7 +680,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                    "print(json.dumps({'runner_identity':{'euid':os.geteuid(),'egid':os.getegid()}}),flush=True); "
                                    "os.execv(sys.argv[1],sys.argv[1:])", *command]
                     code, timed_out = run_logged(command, log, 180, cwd=root, env=env)
-                    result.update(status=body_verdict(code, log.read_text(errors="replace")),
+                    result.update(status=body_verdict(code, log.read_text(errors="replace"), key, body),
                                   exit=code, timed_out=timed_out, euid=uid, egid=gid, log=str(log.relative_to(out)))
                 results.append(result)
                 dump(out / "results.json", results)

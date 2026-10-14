@@ -6,6 +6,12 @@
 //! absent (the `live_session.rs` harness convention — `lane_ready`).
 //! Test 4 refuses pre-load, never attaches, and runs everywhere: as root
 //! it drops to `nobody` via `setpriv`, unprivileged it runs directly.
+//!
+//! Environment prerequisites (F-C3): the attribution oracle needs
+//! `bpftrace`, the setcap nobody leg needs the `nogroup` group (see
+//! `docs/lane-environment.md`). Missing prerequisites skip LOUDLY via
+//! the env-gate marker — the only skips the sudo runner accepts
+//! (`scripts/sudo_lane.py::ENV_GATED_BODIES`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read};
@@ -311,6 +317,29 @@ fn setpriv_nobody_ready() -> bool {
     setpriv && nobody
 }
 
+/// True when the `nogroup` group resolves (the nobody leg drops to
+/// `--regid nogroup`; Debian-family name, absent on Fedora — F-C3).
+fn nogroup_ready() -> bool {
+    if Command::new("getent")
+        .args(["group", "nogroup"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        return true;
+    }
+    // `getent` missing (non-glibc): fall back to the file tier.
+    std::fs::read_to_string("/etc/group")
+        .is_ok_and(|text| text.lines().any(|line| line.starts_with("nogroup:")))
+}
+
+/// Loud env-gate marker (F-C3): the sudo runner accepts a skip ONLY
+/// from an allowlisted body printing this exact line
+/// (`scripts/sudo_lane.py::ENV_GATED_BODIES`; prerequisites in
+/// `docs/lane-environment.md`). Never silent, never general.
+fn print_env_gate_skip(test: &str, prereq: &str) {
+    println!("SKIP (env-gated): {test} requires {prereq}; see docs/lane-environment.md");
+}
+
 /// Spawn `args` on `binary` as `nobody` (root-only path): options
 /// first, then the program — `setpriv` passes our explicit env through
 /// (the dir-or-file `bpf_dir` tier + no token, hermetic either way).
@@ -354,6 +383,10 @@ fn setcap_roundtrip_unpriv() {
     }
     if !generator_path().is_file() {
         println!("SKIP: {TEST} requires {}", generator_path().display());
+        return;
+    }
+    if !nogroup_ready() {
+        print_env_gate_skip(TEST, "nogroup");
         return;
     }
     let object = kcrypto_object_path();
@@ -533,7 +566,7 @@ fn attribution_golden_python() {
         return;
     }
     if Command::new("bpftrace").arg("--version").output().is_err() {
-        println!("SKIP: {TEST} requires bpftrace");
+        print_env_gate_skip(TEST, "bpftrace");
         return;
     }
     let object = kcrypto_object_path();

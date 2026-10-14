@@ -62,6 +62,12 @@ pub(super) fn assert_report(doc: &Value) {
         for (&name, &value) in &counters {
             match name {
                 "probes_attached" | "probes_expected" => assert_eq!(value, 9),
+                // F-C2: post-ADR-0013 the miss terminal reads, so the
+                // measured `kernel_misses` counter replaces the
+                // `unmeasured` reason in `aggregate_counts`. Exact zero
+                // is a quiet-fixture acceptance condition (same class
+                // as `ktot_gap` 0 — never an insertion-loss claim).
+                "kernel_misses" => assert_eq!(value, 0, "quiet fixture measures zero misses"),
                 "uncovered:kernel_delivery_unmeasured"
                 | "uncovered:completion_unobserved"
                 | "uncovered:aggregate_snapshot_not_quiescent" => {
@@ -84,7 +90,7 @@ pub(super) fn assert_report(doc: &Value) {
                 ("ktot_gap", 0),
                 ("snapshot_gap_unreconciled", 0),
                 ("uncovered:aggregate_snapshot_not_quiescent", 1),
-                ("uncovered:kernel_delivery_unmeasured", 1),
+                ("kernel_misses", 0),
                 ("predrop_cfg_fail", 0),
                 ("predrop_fret_fail", 0),
                 ("predrop_arg_null", 0),
@@ -189,7 +195,7 @@ fn partial_acceptance_rejects_loss_and_fabricated_completeness() {
                 ("snapshot_totals_calls", 2),
                 ("snapshot_gap_unreconciled", 0),
                 ("uncovered:aggregate_snapshot_not_quiescent", 1),
-                ("uncovered:kernel_delivery_unmeasured", 1),
+                ("kernel_misses", 0),
                 ("predrop_cfg_fail", 0),
                 ("predrop_fret_fail", 0),
                 ("predrop_arg_null", 0),
@@ -260,6 +266,7 @@ fn partial_acceptance_rejects_loss_and_fabricated_completeness() {
         ("/coverage/aggregate_counts/counters/1/value", json!("1")),
         ("/coverage/aggregate_counts/counters/2/value", json!("1")),
         ("/coverage/aggregate_counts/counters/4/value", json!("0")),
+        ("/coverage/aggregate_counts/counters/5/value", json!("1")),
         ("/coverage/detailed_events/counters/2/value", json!("1")),
         ("/coverage/detailed_events/counters/3/value", json!("1")),
         ("/coverage/detailed_events/counters/4/value", json!("1")),
@@ -289,6 +296,16 @@ fn partial_acceptance_rejects_loss_and_fabricated_completeness() {
             "accepted {pointer}"
         );
     }
+    // F-C2: the pre-surfacing shape (unmeasured reason instead of
+    // the measured counter) is refused — the fedora RED case.
+    let mut stale = doc.clone();
+    stale["coverage"]["aggregate_counts"]["counters"][5]["name"] =
+        json!("uncovered:kernel_delivery_unmeasured");
+    stale["coverage"]["aggregate_counts"]["counters"][5]["value"] = json!("1");
+    assert!(
+        std::panic::catch_unwind(|| assert_report(&stale)).is_err(),
+        "stale unmeasured shape refused"
+    );
     let mut inventory_only = doc.clone();
     inventory_only["observations"]
         .as_array_mut()

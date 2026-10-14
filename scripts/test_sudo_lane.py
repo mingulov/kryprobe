@@ -88,6 +88,40 @@ class BodyAccounting(unittest.TestCase):
             with self.subTest(code=code, output=output):
                 self.assertEqual(lane.body_verdict(code, output), "FAIL")
 
+    def test_env_gate_allowlist_is_exactly_the_two_documented_bodies(self):
+        self.assertEqual(lane.ENV_GATED_BODIES, {
+            ("kryprobe-cli", "live_k5", "attribution_golden_python"): "bpftrace",
+            ("kryprobe-cli", "live_k5", "setcap_roundtrip_unpriv"): "nogroup",
+        })
+
+    def test_env_gated_skip_needs_allowlist_marker_and_clean_residual(self):
+        key = ("kryprobe-cli", "live_k5")
+        marker = ("SKIP (env-gated): attribution_golden_python requires bpftrace; "
+                  "see docs/lane-environment.md")
+        marker2 = ("SKIP (env-gated): setcap_roundtrip_unpriv requires nogroup; "
+                   "see docs/lane-environment.md")
+        self.assertEqual(lane.body_verdict(0, marker + "\n" + PASS, key, "attribution_golden_python"),
+                         "ENV_GATED_SKIP")
+        self.assertEqual(lane.body_verdict(0, marker2 + "\n" + PASS, key, "setcap_roundtrip_unpriv"),
+                         "ENV_GATED_SKIP")
+        for name, output in [
+            # allowlisted body, plain SKIP without the loud marker
+            ("attribution_golden_python", "SKIP: requires bpftrace\n" + PASS),
+            # marker for the wrong prerequisite
+            ("attribution_golden_python", marker2 + "\n" + PASS),
+            # marker plus unexplained skip text
+            ("attribution_golden_python", marker + "\ndecoy: cell denied; skipping\n" + PASS),
+            # non-allowlisted body printing the marker
+            ("stack_symbol_smoke", marker + "\n" + PASS),
+        ]:
+            with self.subTest(name=name, output=output):
+                self.assertEqual(lane.body_verdict(0, output, key, name), "FAIL")
+        # unidentified caller (legacy shape): any skip fails
+        self.assertEqual(lane.body_verdict(0, marker + "\n" + PASS), "FAIL")
+        # nonzero exit never env-gates
+        self.assertEqual(lane.body_verdict(1, marker + "\n" + PASS, key, "attribution_golden_python"),
+                         "FAIL")
+
 
 class GuestInventory(unittest.TestCase):
     def test_vng_guest_suite_inventory_is_explicit(self):
@@ -171,9 +205,25 @@ class PreparedIntegrity(unittest.TestCase):
     def test_only_the_runtime_fsession_refusal_counts_as_supported_refusal(self):
         reason = "report: unsupported: kcrypto_fsession_unavailable (attach type 58 refused (errno 22) despite session kfuncs)"
         self.assertEqual(lane.lifecycle_verdict(4, reason), "SUPPORTED_REFUSAL")
-        self.assertEqual(lane.lifecycle_verdict(3, '{"attached":7,"audit":"attach","expected":7}\n'), "PASS")
+        # F-C1: P5 manifest is 10 required fsession + 2 optional fentry
+        # callbacks (attach-if-present, never gating); bring-up is
+        # all-or-nothing on the required set, so a live sensor reports
+        # attached in 10..12 against expected 12.
+        for attached in (10, 11, 12):
+            with self.subTest(attached=attached):
+                line = json.dumps({"attached": attached, "audit": "attach", "expected": 12}) + "\n"
+                self.assertEqual(lane.lifecycle_verdict(3, line), "PASS")
+        self.assertEqual(lane.lifecycle_verdict(
+            0, '{"attached":12,"audit":"attach","expected":12}\n'), "PASS")
         for code, output in [(0, reason), (4, "kernel 6.12"), (4, "object missing"),
-                             (4, "permission denied"), (3, "partial without attach proof")]:
+                             (4, "permission denied"), (3, "partial without attach proof"),
+                             (3, '{"attached":9,"audit":"attach","expected":12}\n'),
+                             (3, '{"attached":13,"audit":"attach","expected":12}\n'),
+                             (3, '{"attached":10,"audit":"attach","expected":11}\n'),
+                             (3, '{"attached":7,"audit":"attach","expected":7}\n'),
+                             (1, '{"attached":10,"audit":"attach","expected":12}\n'),
+                             (3, '{"attached":10,"audit":"attach"}\n'),
+                             (3, '{"attached":10,"audit":"attach","expected":12,"extra":1}\n')]:
             with self.subTest(code=code, output=output):
                 self.assertEqual(lane.lifecycle_verdict(code, output), "FAIL")
 
