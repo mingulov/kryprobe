@@ -1855,12 +1855,34 @@ fn host_alloc_capture_assigns_generations() {
     let bytes = std::fs::read(&object).expect("test fixture must be readable");
     let (mut sensor, points) =
         LifecycleSensor::bring_up(&bytes, None).expect("host sensor must attach");
+    // P5 manifest: 10 fsession (required) + 2 fentry callbacks
+    // (optional, attach-if-present). `points` carries one entry per
+    // parsed program INCLUDING unattached optionals; bring-up already
+    // refused unless every required fsession point attached.
+    use kryprobe_privilege::btf_resolve::AttachOutcome;
     assert_eq!(
         points.len(),
-        7,
-        "seven session links (op/sub+ret, alloc, destroy, 3x config)"
+        12,
+        "twelve configured points (10 fsession + 2 fentry callbacks)"
     );
-    assert_eq!(sensor.attached_points(), 7);
+    let attached = sensor.attached_points();
+    assert!(
+        (10..=12).contains(&attached),
+        "all 10 required attached, optionals attach-if-present: {attached}"
+    );
+    for point in &points {
+        if !matches!(&point.attach, Some(AttachOutcome::Attached)) {
+            assert!(
+                [
+                    "fentry/cryptd_skcipher_complete",
+                    "fentry/kxc_complete"
+                ]
+                .contains(&point.name.as_str()),
+                "unattached point must be an optional callback: {}",
+                point.name
+            );
+        }
+    }
     let pre = sensor.ledger().expect("pre-bind ledger");
     let pre_stats = sensor.tfm().stats();
     let pre_gens = sensor.tfm().generations().len();
