@@ -37,23 +37,41 @@ fn scrub_inherited_fds_inner() {
         if fd <= 2 {
             continue;
         }
-        // SAFETY: fcntl F_SETFD/F_GETFD on a numeric /proc/self/fd entry
-        // touches only that descriptor's flags; no memory effects. A
-        // racing close surfaces as EBADF, which means "already clean".
+        // SAFETY: F_GETFD only reads the descriptor flags word; no
+        // memory effects. A racing close surfaces as EBADF below.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if flags < 0 {
+            assert_vanished(fd, "F_GETFD");
             continue;
         }
         if flags & libc::FD_CLOEXEC == 0 {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            // SAFETY: F_SETFD only replaces the flags word read above;
+            // no memory effects. A racing close surfaces as EBADF below.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            if rc != 0 {
+                assert_vanished(fd, "F_SETFD");
             }
         }
     }
 }
 
+/// Panic unless `fd` vanished under us (closed by a racing sibling
+/// thread): a closed fd cannot leak, but any other fcntl failure must
+/// fail loudly instead of masking as a later `helper_refused`.
+#[cfg(target_os = "linux")]
+fn assert_vanished(fd: std::os::unix::io::RawFd, op: &str) {
+    let err = std::io::Error::last_os_error();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EBADF),
+        "{op} on fd {fd} failed unexpectedly: {err}"
+    );
+}
+
 #[cfg(not(target_os = "linux"))]
 fn scrub_inherited_fds_inner() {
-    // No /proc/self/fd elsewhere; the helper's attestation is
-    // Linux-only too, so spawns there cannot hit the fd check.
+    // No /proc/self/fd elsewhere, and the helper refuses there with
+    // unsupported_environment before any fd check runs — so spawns
+    // there cannot reach this path meaningfully. The regression suite
+    // is gated Linux-only; nothing else calls this off Linux.
 }

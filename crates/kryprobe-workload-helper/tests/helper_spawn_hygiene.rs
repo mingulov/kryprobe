@@ -4,6 +4,11 @@
 //! helper, whose stdio-only attestation refuses them. GH host-gate run
 //! 38811851719 went red on exactly this: every i02 helper spawn
 //! refused with single-line `{"error":"helper_refused"}`.
+//!
+//! Linux-only: the helper refuses with unsupported_environment where
+//! /proc/self/{status,fd} is absent, so neither test can pass there.
+
+#![cfg(target_os = "linux")]
 
 #[path = "support/mod.rs"]
 mod support;
@@ -52,7 +57,7 @@ fn helper_bin() -> std::path::PathBuf {
 
 #[test]
 fn scrubbed_spawn_serves_despite_dirty_parent() {
-    let _guard = SPAWN_GUARD.lock().expect("guard");
+    let _guard = SPAWN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let _dirty = hold_dirty_fds();
     support::scrub_inherited_fds();
     let output = Command::new(helper_bin())
@@ -64,15 +69,22 @@ fn scrubbed_spawn_serves_despite_dirty_parent() {
         .expect("helper spawns");
     assert_eq!(output.status.code(), Some(0), "scrubbed spawn serves");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("\"attestation\""),
-        "attestation line on stdout: {stdout}"
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("attestation JSON on stdout");
+    assert_eq!(
+        parsed["attestation"]["fds"],
+        serde_json::json!([0, 1, 2]),
+        "child sees stdio only: {stdout}"
     );
 }
 
 #[test]
 fn unscrubbed_spawn_inherits_fds_and_refuses() {
-    let _guard = SPAWN_GUARD.lock().expect("guard");
+    // NOTE: the refusal path prints no attestation values by design, so
+    // this control cannot name the offending fds; the single error line
+    // pins the step-1 (pre-attestation) timing instead. The dirty-fd
+    // setup asserts above rule out a vacuous pass.
+    let _guard = SPAWN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let _dirty = hold_dirty_fds();
     // NO scrub here: this control pins the hazard the other test fixes.
     let output = Command::new(helper_bin())

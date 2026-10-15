@@ -49,20 +49,36 @@ const CALL_ALLOW: &[&str] = &["geteuid", "getegid", "getpid", "getppid"];
 /// so the seam's privilege-containment intent is preserved. Scoped to
 /// the one justified file (K1 Task-2 brief mandates the testkit
 /// placement); anything else there still trips.
-const FILE_CALL_ALLOW: &[(&str, &[&str])] = &[(
-    "crates/kryprobe-testkit/src/alg_fixture.rs",
-    &[
-        "accept",
-        "bind",
-        "clock_gettime",
-        "close",
-        "read",
-        "send",
-        "sendmsg",
-        "setsockopt",
-        "socket",
-    ],
-)];
+const FILE_CALL_ALLOW: &[(&str, &[&str])] = &[
+    (
+        "crates/kryprobe-testkit/src/alg_fixture.rs",
+        &[
+            "accept",
+            "bind",
+            "clock_gettime",
+            "close",
+            "read",
+            "send",
+            "sendmsg",
+            "setsockopt",
+            "socket",
+        ],
+    ),
+    // Helper integration-test spawn hygiene: `fcntl` F_GETFD/F_SETFD
+    // marks inherited non-stdio fds CLOEXEC (and the regression test
+    // clears CLOEXEC to simulate runner pipes). Flag-only ops on the
+    // test's own descriptors — no privilege, no BPF, no cross-process
+    // effect beyond exec inheritance. Scoped to the two test files;
+    // production helper code stays fcntl-free (GH run 38811851719).
+    (
+        "crates/kryprobe-workload-helper/tests/support/mod.rs",
+        &["fcntl"],
+    ),
+    (
+        "crates/kryprobe-workload-helper/tests/helper_spawn_hygiene.rs",
+        &["fcntl"],
+    ),
+];
 
 /// True when `name` is allowed in `rel` by the per-file exceptions.
 fn file_allows(rel: &str, name: &str) -> bool {
