@@ -52,6 +52,10 @@ fn clear_cloexec(fd: std::os::unix::io::RawFd) {
 fn hold_dirty_fds() -> DirtyFds {
     let a = File::open("/dev/null").expect("open /dev/null");
     let b = File::open("/dev/null").expect("open /dev/null");
+    assert!(
+        a.as_raw_fd() > 2 && b.as_raw_fd() > 2,
+        "dirty fds must sit above stdio (stdio closed would pass vacuously)"
+    );
     clear_cloexec(a.as_raw_fd());
     clear_cloexec(b.as_raw_fd());
     DirtyFds { a, b }
