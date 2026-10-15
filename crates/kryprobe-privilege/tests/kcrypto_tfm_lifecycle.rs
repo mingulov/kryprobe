@@ -1873,11 +1873,8 @@ fn host_alloc_capture_assigns_generations() {
     for point in &points {
         if !matches!(&point.attach, Some(AttachOutcome::Attached)) {
             assert!(
-                [
-                    "fentry/cryptd_skcipher_complete",
-                    "fentry/kxc_complete"
-                ]
-                .contains(&point.name.as_str()),
+                ["fentry/cryptd_skcipher_complete", "fentry/kxc_complete"]
+                    .contains(&point.name.as_str()),
                 "unattached point must be an optional callback: {}",
                 point.name
             );
@@ -2008,8 +2005,7 @@ fn host_alloc_capture_assigns_generations() {
     // the alloc-submit edges both are already pinned exact above.
     assert_eq!(
         stats.completed - pre_stats.completed,
-        (post.edge_hits[4] - pre.edge_hits[4])
-            + (post.edge_hits[12] - pre.edge_hits[12]),
+        (post.edge_hits[4] - pre.edge_hits[4]) + (post.edge_hits[12] - pre.edge_hits[12]),
         "every alloc attempt completed exactly once"
     );
     for miss in &post.prog_misses {
@@ -2055,14 +2051,8 @@ fn host_alloc_capture_assigns_generations() {
             assert!(!g.name_truncated, "short name never truncates: {g:?}");
         }
     }
-    assert_eq!(
-        cbc_socket_gens, 5,
-        "5 alloc-assigned cbc socket tfms"
-    );
-    assert_eq!(
-        aead_socket_gens, 1,
-        "1 alloc-assigned aead socket tfm"
-    );
+    assert_eq!(cbc_socket_gens, 5, "5 alloc-assigned cbc socket tfms");
+    assert_eq!(aead_socket_gens, 1, "1 alloc-assigned aead socket tfm");
     // T07.3 destroy lane: the 5 closes above ran
     // `crypto_destroy_tfm` synchronously (close returns after the
     // put). The destroy COUNT is driver-shaped — cryptd-wrapped
