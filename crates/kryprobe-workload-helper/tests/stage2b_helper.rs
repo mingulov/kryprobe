@@ -15,6 +15,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "support/mod.rs"]
+mod support;
+
 const SESSION: &str = "0123456789abcdef0123456789abcdef";
 const OS_RELEASE: &str = "7.0.0-test";
 const BOOT_ID: &str = "test-boot-id-001";
@@ -170,6 +173,7 @@ struct Run {
 }
 
 fn run_helper(args: &[&str], stdin_bytes: &[u8]) -> Run {
+    support::scrub_inherited_fds();
     let mut child = Command::new(helper_bin())
         .args(args)
         .stdin(Stdio::piped())

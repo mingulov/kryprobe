@@ -22,6 +22,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "support/mod.rs"]
+mod support;
+
 const SESSION: &str = "0123456789abcdef0123456789abcdef";
 const OS_RELEASE: &str = "7.0.0-test";
 const BOOT_ID: &str = "test-boot-id-001";
@@ -185,6 +188,7 @@ fn run_chunk(
     request: &SnapshotRequest,
 ) -> (SnapshotResponse, serde_json::Map<String, serde_json::Value>) {
     let stdin_bytes = serde_json::to_vec(request).expect("request encodes");
+    support::scrub_inherited_fds();
     let mut child = Command::new(helper_bin())
         .arg("--proc-root")
         .arg(fixture.proc_root())

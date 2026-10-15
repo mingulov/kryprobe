@@ -18,6 +18,9 @@ kryprobe-core.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+libc = "0.2"
+
 # Local lint table (not `[lints] workspace = true`): binary-private
 # modules use `pub` for the intended library surface, which the
 # workspace `unreachable_pub` lint would deny under `-D warnings`.
