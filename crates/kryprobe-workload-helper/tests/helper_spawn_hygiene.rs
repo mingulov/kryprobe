@@ -26,8 +26,14 @@ static SPAWN_GUARD: Mutex<()> = Mutex::new(());
 /// inherited runner pipes. Panics unless the fds are REALLY non-CLOEXEC
 /// (a vacuous setup would pass without proving anything).
 struct DirtyFds {
-    _a: File,
-    _b: File,
+    a: File,
+    b: File,
+}
+
+impl DirtyFds {
+    fn numbers(&self) -> [std::os::unix::io::RawFd; 2] {
+        [self.a.as_raw_fd(), self.b.as_raw_fd()]
+    }
 }
 
 fn clear_cloexec(fd: std::os::unix::io::RawFd) {
@@ -48,7 +54,7 @@ fn hold_dirty_fds() -> DirtyFds {
     let b = File::open("/dev/null").expect("open /dev/null");
     clear_cloexec(a.as_raw_fd());
     clear_cloexec(b.as_raw_fd());
-    DirtyFds { _a: a, _b: b }
+    DirtyFds { a, b }
 }
 
 fn helper_bin() -> std::path::PathBuf {
@@ -80,13 +86,11 @@ fn scrubbed_spawn_serves_despite_dirty_parent() {
 
 #[test]
 fn unscrubbed_spawn_inherits_fds_and_refuses() {
-    // NOTE: the refusal path prints no attestation values by design, so
-    // this control cannot name the offending fds; the single error line
-    // pins the step-1 (pre-attestation) timing instead. The dirty-fd
-    // setup asserts above rule out a vacuous pass.
     let _guard = SPAWN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let _dirty = hold_dirty_fds();
+    let dirty = hold_dirty_fds();
     // NO scrub here: this control pins the hazard the other test fixes.
+    // --attest prints the attestation line before checking, so the
+    // leaked descriptor numbers are observable on stdout.
     let output = Command::new(helper_bin())
         .arg("--attest")
         .stdin(Stdio::null())
@@ -99,6 +103,24 @@ fn unscrubbed_spawn_inherits_fds_and_refuses() {
     assert_eq!(
         stderr.trim(),
         r#"{"error":"helper_refused"}"#,
-        "single-line refusal, no attestation: {stderr:?}"
+        "single-line refusal: {stderr:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("attestation JSON on stdout");
+    let fds: Vec<u64> = parsed["attestation"]["fds"]
+        .as_array()
+        .expect("fds array")
+        .iter()
+        .map(|v| v.as_u64().expect("fd number"))
+        .collect();
+    // The attestation drops its highest entry as the read_dir transient,
+    // which can eat the higher dirty fd — but never the lower one, so
+    // the lower number deterministically proves the leak.
+    let [a, b] = dirty.numbers();
+    let lower = (a as u64).min(b as u64);
+    assert!(
+        fds.contains(&lower),
+        "child inherited dirty fd {lower}: {fds:?}"
     );
 }

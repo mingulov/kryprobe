@@ -70,8 +70,8 @@ fn assert_vanished(fd: std::os::unix::io::RawFd, op: &str) {
 
 #[cfg(not(target_os = "linux"))]
 fn scrub_inherited_fds_inner() {
-    // No /proc/self/fd elsewhere, and the helper refuses there with
-    // unsupported_environment before any fd check runs — so spawns
-    // there cannot reach this path meaningfully. The regression suite
-    // is gated Linux-only; nothing else calls this off Linux.
+    // Deliberate no-op: no /proc/self/fd elsewhere. Callers in every
+    // helper suite invoke this unconditionally (including off Linux);
+    // the helper refuses there with unsupported_environment before any
+    // fd state matters, and the regression suite is gated Linux-only.
 }
