@@ -208,6 +208,38 @@ def skipped(output):
     return re.search(r"\b(?:skip(?:ped|ping)?|not_run)\b", output.replace(DEV_PIN_WARNING, ""), re.I) is not None
 
 
+def selftest_verdict(code, output, name):
+    """Verdict for the `selftest-*` support bodies.
+
+    Exit 0 passes when skip-free. `selftest-bpf` exit 3 passes only for
+    a fully-accounted partial (P7/T12: receipted coverage gaps are not
+    defects): exactly one `reconcile: partial` marker plus one ledger
+    line whose receipts add up to the missing count. Everything else —
+    defects, marker/exit mismatches, unparsable logs, skips at any
+    exit, other bodies — fails closed.
+    """
+    if skipped(output):
+        return "FAIL"
+    if code == 0:
+        return "PASS"
+    if code == 3 and name == "selftest-bpf":
+        markers = re.findall(r"^reconcile: (\w+)$", output, re.MULTILINE)
+        if markers != ["partial"]:
+            return "FAIL"
+        ledgers = re.findall(
+            r"^selftest bpf: partial \((\d+) missing; ring=(\d+) drop=(\d+)"
+            r" trunc=(\d+) queue=(\d+)\)$",
+            output,
+            re.MULTILINE,
+        )
+        if len(ledgers) != 1:
+            return "FAIL"
+        missing, ring, drop, trunc, queue = (int(v) for v in ledgers[0])
+        if missing > 0 and ring + drop + trunc + queue == missing:
+            return "PASS"
+    return "FAIL"
+
+
 def lifecycle_verdict(code, output):
     if code == 4 and "kcrypto_fsession_unavailable" in output and "attach type 58 refused (errno 22)" in output:
         return "SUPPORTED_REFUSAL"
@@ -689,7 +721,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             log = logs / f"{name}.log"
             code, timed_out = run_logged([str(cli), *args], log, 180, cwd=root, env=env)
             output = log.read_text(errors="replace")
-            status = "PASS" if code == 0 and not skipped(output) else "FAIL"
+            status = selftest_verdict(code, output, name)
             results.append({"test": name, "status": status, "exit": code,
                             "timed_out": timed_out, "log": str(log.relative_to(out))})
         verify_stage(runtime, manifest)

@@ -128,6 +128,65 @@ class BodyAccounting(unittest.TestCase):
                          "FAIL")
 
 
+class SelftestBpfVerdict(unittest.TestCase):
+    # Real Oct-13 GH log excerpt (run 38385103973): fully-accounted
+    # partial, exit 3, refused by the old code==0 rule.
+    PARTIAL_RING = (
+        "selftest bpf: partial (581 missing; ring=581 drop=0 trunc=0 queue=0)\n"
+        "selftest bpf: entries=19707 returns=19712 received=39419 ring=581 drop=0 trunc=0 queue=0\n"
+        "reconcile: partial\n"
+    )
+    PARTIAL_SPLIT = (
+        "selftest bpf: partial (10 missing; ring=7 drop=3 trunc=0 queue=0)\n"
+        "reconcile: partial\n"
+    )
+
+    def test_clean_exits_pass(self):
+        self.assertEqual(
+            lane.selftest_verdict(0, "reconcile: clean\n", "selftest-bpf"), "PASS")
+        self.assertEqual(
+            lane.selftest_verdict(0, "token roundtrip ok\n", "selftest-token-smoke"),
+            "PASS",
+        )
+
+    def test_accounted_partial_passes(self):
+        for output in [self.PARTIAL_RING, self.PARTIAL_SPLIT]:
+            with self.subTest(output=output):
+                self.assertEqual(
+                    lane.selftest_verdict(3, output, "selftest-bpf"), "PASS")
+
+    def test_unaccounted_defect_or_mismatch_fails(self):
+        bad = [
+            (3, ""),  # no accounting at all
+            (3, "reconcile: partial\n"),  # marker without the ledger line
+            # receipts do not add up (9 != 10)
+            (3, "selftest bpf: partial (10 missing; ring=7 drop=2 trunc=0 queue=0)\n"
+                "reconcile: partial\n"),
+            # vacuous: exit 3 must carry missing records
+            (3, "selftest bpf: partial (0 missing; ring=0 drop=0 trunc=0 queue=0)\n"
+                "reconcile: partial\n"),
+            # marker disagrees with the exit
+            (3, "selftest bpf: partial (10 missing; ring=7 drop=3 trunc=0 queue=0)\n"
+                "reconcile: defect\n"),
+            (3, "selftest bpf: partial (10 missing; ring=7 drop=3 trunc=0 queue=0)\n"
+                "reconcile: clean\n"),
+            (1, self.PARTIAL_RING),  # defect exit keeps failing
+            (4, self.PARTIAL_RING),  # denied exit keeps failing
+            (0, "SKIP: banned\n"),  # skip markers still fail at exit 0
+            (3, self.PARTIAL_RING + "decoy: cell denied; skipping\n"),  # skips fail at 3 too
+        ]
+        for code, output in bad:
+            with self.subTest(code=code, output=output):
+                self.assertEqual(
+                    lane.selftest_verdict(code, output, "selftest-bpf"), "FAIL")
+
+    def test_partial_carveout_is_bpf_only(self):
+        self.assertEqual(
+            lane.selftest_verdict(3, self.PARTIAL_RING, "selftest-token-smoke"),
+            "FAIL",
+        )
+
+
 class GuestInventory(unittest.TestCase):
     def test_vng_guest_suite_inventory_is_explicit(self):
         # P3r narrowed (c): the vng-only suite stays inventoried
