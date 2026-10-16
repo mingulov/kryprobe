@@ -129,7 +129,9 @@ def dump(path, value):
     rename): the CI summary check opens them unprivileged. A
     failed write or replace closes the pre-transfer descriptor,
     removes the temp, and raises the original error; cleanup
-    never masks it and leaks nothing."""
+    never masks it and leaks nothing. A write/flush error stays
+    primary when the close retry fails too (the close error is
+    kept as its context); a close-only failure propagates."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
                                dir=str(path.parent))
@@ -138,11 +140,26 @@ def dump(path, value):
         os.fchmod(fd, 0o644)
         stream = os.fdopen(fd, "w", encoding="utf-8")
         transferred = True
-        with stream:
+        try:
             stream.write(text)
+            stream.flush()
+        except BaseException as write_error:
+            try:
+                stream.close()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as close_error:
+                write_error.__context__ = close_error
+            raise
+        else:
+            stream.close()
         os.replace(tmp, path)
     except BaseException:
         if not transferred:
+            # io.open closes fd itself on wrapper-stage failure
+            # (EBADF here, suppressed); nothing in-process reuses
+            # descriptor numbers (the watcher and signal handlers
+            # never open), so this cannot close a foreign fd.
             try:
                 os.close(fd)
             except OSError:
@@ -152,6 +169,23 @@ def dump(path, value):
         except OSError:
             pass
         raise
+
+
+def _publish_json(path, value):
+    """dump() that reports instead of raising.
+
+    Cleanup-time publishing must never abort the unmount /
+    ownership sequence: a hostile directory planted at the
+    target name, or a full disk, returns the error string so
+    the caller can record it and proceed. Success returns None.
+    Only OSError is contained — anything else (interrupts,
+    programming errors) still propagates.
+    """
+    try:
+        dump(path, value)
+    except OSError as error:
+        return str(error)
+    return None
 
 
 def digest(path):
@@ -478,6 +512,25 @@ def summarize_partials(results):
 _COMMITTED_READ_CAP = 1024 * 1024
 
 
+def _exact_json_equal(a, b):
+    """Deep equality with exact scalar types.
+
+    Plain == conflates True/1/1.0 and False/0, so a loosened
+    persisted row would validate. Genuine rows roundtrip
+    losslessly (dict order aside), so strictness rejects only
+    foreign content. NaN never validates (and rows never hold it).
+    """
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(
+            _exact_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _exact_json_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return False
+    return type(a) is type(b) and a == b
+
+
 def committed_prefix(out, results):
     """Prefix of `results` atomically committed to results.json on disk.
 
@@ -486,17 +539,20 @@ def committed_prefix(out, results):
     list, so its row count — read at summary time, after the dust
     settles — is immune to interruption between append and persist.
     Missing/unreadable/non-list file: no rows are claimed. The read
-    is size-bounded and never raises: the descriptor is opened
-    O_NOFOLLOW (a planted symlink claims nothing), non-regular
-    files are refused without blocking on FIFOs, at most cap+1
-    bytes are read, and oversize input is rejected outright —
-    never parsed as a truncated prefix. Only the row COUNT comes
-    from disk, so persisted rows must equal the in-memory prefix
-    exactly (length and content): a foreign list claims nothing.
+    is size-bounded and never raises on file content: the
+    descriptor is opened O_NOFOLLOW (a planted symlink claims
+    nothing), non-regular files are refused without blocking on
+    FIFOs, at most cap+1 bytes are read, and oversize input is
+    rejected outright — never parsed as a truncated prefix. Only
+    the row COUNT comes from disk, so persisted rows must equal
+    the in-memory prefix exactly (length, content, scalar types;
+    duplicate keys reject): a foreign list claims nothing.
     Decoded allocation is unbounded by the byte cap (1MB of
     [{},{}...] is ~25MB), so a recoverable MemoryError is caught
     too — this function holds no state, so [] stays fail-closed
-    and cleanup still proceeds. The directory stays writable
+    and cleanup still proceeds. (Allocation failure while opening
+    the fixed pathname is outside this contract: nothing
+    input-driven can trigger it.) The directory stays writable
     by the preparer for the whole run.
     """
     try:
@@ -518,14 +574,17 @@ def committed_prefix(out, results):
         raw = b"".join(chunks)
         if len(raw) > _COMMITTED_READ_CAP:
             return []
-        committed = json.loads(raw)
+        committed = json.loads(raw, object_pairs_hook=_no_dup_object)
         if (isinstance(committed, list) and len(committed) <= len(results)
-                and committed == results[:len(committed)]):
+                and _exact_json_equal(committed, results[:len(committed)])):
             return results[:len(committed)]
     except (OSError, ValueError, RecursionError, MemoryError):
         pass
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     return []
 
 
@@ -714,6 +773,24 @@ def _exclusive_sink(path):
     return fd
 
 
+def _owned_wrap(fd):
+    """Binary stream owning a duplicate of `fd`.
+
+    The duplicate has no owner until fdopen succeeds, so a
+    failed wrap must close it — otherwise one descriptor leaks
+    per failure. (The original stays owned by the caller.)
+    """
+    dup = os.dup(fd)
+    try:
+        return os.fdopen(dup, "wb")
+    except BaseException:
+        try:
+            os.close(dup)
+        except OSError:
+            pass
+        raise
+
+
 def _read_back(fd):
     """Whole content of a sink after its child is done.
 
@@ -758,11 +835,11 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     with contextlib.ExitStack() as stack:
         sink = _exclusive_sink(log)
         stack.callback(os.close, sink)
-        stream = stack.enter_context(os.fdopen(os.dup(sink), "wb"))
+        stream = stack.enter_context(_owned_wrap(sink))
         if stderr_path:
             err_sink = _exclusive_sink(stderr_path)
             stack.callback(os.close, err_sink)
-            stderr = stack.enter_context(os.fdopen(os.dup(err_sink), "wb"))
+            stderr = stack.enter_context(_owned_wrap(err_sink))
         else:
             stderr = subprocess.STDOUT
         proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream, stdin=subprocess.DEVNULL,
@@ -1142,11 +1219,16 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         raise
     finally:
         # Children must be reaped before mounts or the exclusive lock go.
+        # Publishing inside cleanup reports instead of raising: a
+        # hostile planted directory or a full disk must not skip
+        # the unmounts, the ownership receipt, or the lock close.
         reap_owned()
+        publish_errors = []
         if _CANCEL_REQUESTED:
             receipt.update(status="failed", exit=1, error="cancelled")
-            dump(out / "summary.json", {"exit": 1, "complete": False, "error": "cancelled",
-                                       "accepted_partials": summarize_partials(committed_prefix(out, results))})
+            publish_errors.append(_publish_json(out / "summary.json", {
+                "exit": 1, "complete": False, "error": "cancelled",
+                "accepted_partials": summarize_partials(committed_prefix(out, results))}))
         cleanup_errors = []
         for target in reversed(mounts):
             cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
@@ -1156,17 +1238,23 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             runtime.rmdir()
         if cleanup_errors:
             receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
-            dump(out / "summary.json", {"exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
-                                       "accepted_partials": summarize_partials(committed_prefix(out, results))})
+            publish_errors.append(_publish_json(out / "summary.json", {
+                "exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
+                "accepted_partials": summarize_partials(committed_prefix(out, results))}))
         receipt["children_reaped"] = not children()
         receipt["owned_mounts_removed"] = not cleanup_errors
         receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        dump(out / "ownership.json", receipt)
+        publish_errors.append(_publish_json(out / "ownership.json", receipt))
+        publish_errors = [error for error in publish_errors if error is not None]
+        if publish_errors:
+            print(f"sudo-lane: evidence publishing failed: {publish_errors}", flush=True)
         os.close(lane_fd)
         if cleanup_errors:
             raise ValueError(f"owned mount cleanup failed: {cleanup_errors}")
         if _CANCEL_REQUESTED:
             raise InterruptedError("cancelled; lane cleanup complete")
+        if publish_errors:
+            raise ValueError(f"lane evidence publishing failed: {publish_errors}")
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
     lab_bodies = len(EXPECTED[LAB_SUITE])

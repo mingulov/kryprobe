@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Adversarial runner checks; no privilege or kernel support required."""
+import ast
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ from unittest import mock
 import sys
 import copy
 import ctypes
+import errno
 import fcntl
 import signal
 import subprocess
@@ -710,16 +712,23 @@ class CommittedPrefix(unittest.TestCase):
             big = out / "results.json"
             with open(big, "wb") as stream:
                 stream.truncate(100 * 1024 * 1024)
-            tracemalloc.start()
+            # baseline-subtracted and state-preserving: start()
+            # does not reset an existing peak, and stop() must not
+            # kill outer tracing (PYTHONTRACEMALLOC).
+            was_tracing = tracemalloc.is_tracing()
+            if not was_tracing:
+                tracemalloc.start()
             try:
+                _, baseline = tracemalloc.get_traced_memory()
                 self.assertEqual(
                     lane.committed_prefix(out, self.RESULTS), [])
                 _, window_peak = tracemalloc.get_traced_memory()
             finally:
-                tracemalloc.stop()
+                if not was_tracing:
+                    tracemalloc.stop()
+            growth = (window_peak - baseline) / (1024 * 1024)
             self.assertLess(
-                window_peak / (1024 * 1024), 20,
-                f"traced peak {window_peak / 1024 / 1024:.0f} MiB")
+                growth, 20, f"read allocated {growth:.0f} MiB")
             big.unlink()
             os.mkfifo(big)
             # a regressed blocking read must fail the test, not
@@ -787,6 +796,27 @@ class CommittedPrefix(unittest.TestCase):
             self.assertEqual(lane.committed_prefix(out, self.RESULTS),
                              self.RESULTS[:1])
 
+    def test_committed_rows_must_match_types_exactly(self):
+        # Python == conflates True/1/1.0 and False/0, and duplicate
+        # keys collapse before comparison: none of these are the
+        # in-memory rows.
+        rows = [{"test": "a", "ring": 1, "timed_out": False}]
+        hostile = [
+            json.dumps([{"test": "a", "ring": True, "timed_out": False}]),
+            json.dumps([{"test": "a", "ring": 1.0, "timed_out": False}]),
+            json.dumps([{"test": "a", "ring": 1, "timed_out": 0}]),
+            '[{"test": "x", "test": "a", "ring": 1, "timed_out": false}]',
+            json.dumps([{"test": "a", "ring": 1}]),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for payload in hostile:
+                with self.subTest(payload=payload[:40]):
+                    (out / "results.json").write_text(payload)
+                    self.assertEqual(lane.committed_prefix(out, rows), [])
+            (out / "results.json").write_text(json.dumps(rows))
+            self.assertEqual(lane.committed_prefix(out, rows), rows)
+
     def test_fifo_with_live_writer_claims_nothing(self):
         # the only input distinguishing the regular-file check:
         # a FIFO streaming bytes that WOULD validate. A held
@@ -809,6 +839,17 @@ class CommittedPrefix(unittest.TestCase):
                     lane.committed_prefix(out, self.RESULTS), [])
             finally:
                 os.close(reader)
+
+    def test_close_failure_does_not_escape(self):
+        # a read-only descriptor has nothing to flush: EIO on
+        # close must not break the never-raises contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text(json.dumps(self.RESULTS[:1]))
+            with mock.patch("os.close", side_effect=OSError("eio")):
+                self.assertEqual(
+                    lane.committed_prefix(out, self.RESULTS),
+                    self.RESULTS[:1])
 
     def test_memory_error_during_parse_claims_nothing(self):
         # 1MB of [{},{}...] decodes to ~25MB: a constrained
@@ -878,6 +919,49 @@ class DumpAtomicity(unittest.TestCase):
                             lane.dump(out / "summary.json",
                                       {"complete": True})
                     self.assertIs(caught.exception, boom)
+
+    def test_write_error_stays_primary_when_close_also_fails(self):
+        # a real TextIOWrapper retries the flush on close: the
+        # close error must not demote the write error to context.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            stream = mock.MagicMock()
+            stream.flush.side_effect = OSError(errno.ENOSPC, "no space")
+            stream.close.side_effect = OSError(errno.EIO, "i/o error")
+            stream.__exit__.side_effect = lambda *exc: (
+                stream.close(), False)[1]
+            with mock.patch("os.fdopen", return_value=stream):
+                with self.assertRaises(OSError) as caught:
+                    lane.dump(out / "summary.json", {"complete": True})
+            self.assertEqual(caught.exception.errno, errno.ENOSPC)
+            self.assertIsNotNone(caught.exception.__context__)
+            self.assertEqual(caught.exception.__context__.errno, errno.EIO)
+
+    def test_close_only_failure_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            stream = mock.MagicMock()
+            stream.close.side_effect = OSError(errno.EIO, "i/o error")
+            stream.__exit__.side_effect = lambda *exc: (
+                stream.close(), False)[1]
+            with mock.patch("os.fdopen", return_value=stream):
+                with self.assertRaises(OSError) as caught:
+                    lane.dump(out / "summary.json", {"complete": True})
+            self.assertEqual(caught.exception.errno, errno.EIO)
+
+    def test_publish_reports_instead_of_raising(self):
+        # cleanup-time publishing must not abort the unmount /
+        # ownership sequence: hostile FS conditions report.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.assertIsNone(
+                lane._publish_json(out / "summary.json", {"a": 1}))
+            self.assertEqual(
+                json.loads((out / "summary.json").read_text()), {"a": 1})
+            (out / "blocked.json").mkdir()
+            error = lane._publish_json(out / "blocked.json", {"a": 1})
+            self.assertIsInstance(error, str)
+            self.assertTrue(error)
 
     def test_failed_dump_leaks_no_descriptor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1070,6 +1154,46 @@ class PreparedIntegrity(unittest.TestCase):
                 self.assertEqual(lane.lifecycle_verdict(code, output), "FAIL")
 
 
+class CapturedBytesBinding(unittest.TestCase):
+    def test_verdict_sites_never_reopen_log_paths(self):
+        # the substitution fix is structural: verdicts hash and
+        # parse fd-captured bytes. A call site reverted to path
+        # reads stays green functionally, so pin the shape: no
+        # log path re-reads, no deleted reader, and every
+        # run_logged call unpacks the captured third element.
+        tree = ast.parse(Path(lane.__file__).read_text())
+        violations = []
+        run_logged_calls = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "read_body_log":
+                violations.append(f"deleted reader at line {node.lineno}")
+            if isinstance(func, ast.Name) and func.id == "digest":
+                if node.args and isinstance(node.args[0], ast.Name) \
+                        and node.args[0].id == "log":
+                    violations.append(f"digest(log) at line {node.lineno}")
+            if isinstance(func, ast.Attribute) \
+                    and func.attr in ("read_text", "read_bytes"):
+                if isinstance(func.value, ast.Name) and func.value.id == "log":
+                    violations.append(
+                        f"log.{func.attr}() at line {node.lineno}")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) \
+                    and isinstance(node.value, ast.Call) \
+                    and isinstance(node.value.func, ast.Name) \
+                    and node.value.func.id == "run_logged":
+                run_logged_calls += 1
+                targets = node.targets[0]
+                if not (isinstance(targets, ast.Tuple)
+                        and len(targets.elts) == 3):
+                    violations.append(
+                        f"run_logged not 3-unpacked at line {node.lineno}")
+        self.assertGreater(run_logged_calls, 0)
+        self.assertEqual(violations, [])
+
+
 class LoggedPaths(unittest.TestCase):
     def test_planted_log_symlink_is_not_followed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1137,6 +1261,29 @@ class LoggedPaths(unittest.TestCase):
                 os.umask(old)
             mode = (root / "body.log").stat().st_mode & 0o777
             self.assertEqual(oct(mode), oct(0o644))
+
+    def test_failed_sink_wrap_leaks_no_descriptor(self):
+        # the os.dup has no owner until fdopen succeeds: both
+        # paths must close it. dump's own fdopen (call 1) and,
+        # for the stderr case, the stdout wrap (call 2) succeed.
+        real_fdopen = os.fdopen
+        for fail_at, stderr in ((2, False), (3, True)):
+            with self.subTest(fail_at=fail_at), \
+                    tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                calls = []
+                def flaky(fd, *args, **kwargs):
+                    calls.append(fd)
+                    if len(calls) == fail_at:
+                        raise MemoryError("injected")
+                    return real_fdopen(fd, *args, **kwargs)
+                before = len(os.listdir("/proc/self/fd"))
+                kwargs = {"stderr_path": root / "body.stderr"} if stderr else {}
+                with mock.patch("os.fdopen", side_effect=flaky):
+                    with self.assertRaises(MemoryError):
+                        lane.run_logged(["true"], root / "body.log", 30,
+                                        **kwargs)
+                self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
 
 class ProcessCustody(unittest.TestCase):
