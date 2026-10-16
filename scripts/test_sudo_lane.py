@@ -172,6 +172,9 @@ def _cargo_echo(*args, **kwargs):
 NBSP = chr(0xA0)
 BOM = chr(0xFEFF)
 PAIR_ESCAPE = chr(92) + "uD83D" + chr(92) + "uDE00"
+USCORE_ESCAPE = chr(92) + "u005f"
+NUL = chr(0)
+VT = chr(11)
 
 
 class PartialReceipt(unittest.TestCase):
@@ -238,9 +241,11 @@ class PartialReceipt(unittest.TestCase):
 
     def test_over_count_rejected(self):
         # otherwise-valid: only the over-count rejects (mutant-killing;
-        # verified by disabling the check and observing acceptance)
+        # verified by disabling each half and observing acceptance)
         self.assertIsNone(lane.partial_receipt(
             _partial_output(101, 97, 198, 2, 0, 0, 0, 2), 100))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(97, 101, 198, 2, 0, 0, 0, 2), 100))
 
     def test_kind_sum_mismatch_rejected(self):
         self.assertIsNone(lane.partial_receipt(
@@ -386,7 +391,7 @@ class PartialReceipt(unittest.TestCase):
             '"payload":{"verdict":"PARTIAL","child_exit_code":0.0,"child_signal":null}',
             '"payload":{"verdict":"PARTIAL","child_exit_code":0}',
             '"payload":{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null},"x":NaN',
-            '"payload":{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null},"x":"\ud800"'
+            '"payload":{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null},"x":"\\ud800"'
         ]
         for payload in bad_payloads:
             with self.subTest(payload=payload):
@@ -424,6 +429,20 @@ class PartialReceipt(unittest.TestCase):
         base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
         self.assertIsNone(lane.partial_receipt(base + forged, 10))
 
+    def test_integer_range_matches_serde(self):
+        # serde takes i64/u64 only; auxiliary out-of-range ints reject
+        stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
+        head = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+                '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",'
+                '"payload":{"verdict":"PARTIAL","child_exit_code":0,'
+                '"child_signal":null},')
+        good = head + '"x":18446744073709551615,"y":-9223372036854775808}\n'
+        self.assertIsNotNone(lane.partial_receipt(stem + good, 10))
+        for raw in ["9" * 309, "-170141183460469231731687303715884105729"]:
+            with self.subTest(raw=raw[:12]):
+                bad = head + f'"x":{raw}' + "}\n"
+                self.assertIsNone(lane.partial_receipt(stem + bad, 10))
+
     def test_negative_zero_and_infinite_float_rejected(self):
         stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
         head = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
@@ -436,11 +455,14 @@ class PartialReceipt(unittest.TestCase):
             '"child_signal":null},"x":1e400}\n', 10))
 
     def test_nesting_depth_capped_like_serde(self):
+        # serde allows 127 nested containers (probed: 127 ok, 128 err)
         base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
-        shallow = '{"a":' * 100 + '1' + '}' * 100 + "\n"
+        shallow = '{"a":' * 127 + '1' + '}' * 127 + "\n"
         self.assertIsNotNone(lane.partial_receipt(base + shallow, 10))
-        deep = '{"a":' * 129 + '1' + '}' * 129 + "\n"
+        deep = '{"a":' * 128 + '1' + '}' * 128 + "\n"
         self.assertIsNone(lane.partial_receipt(base + deep, 10))
+        hollow = '{"a":' * 127 + '{}' + '}' * 127 + "\n"
+        self.assertIsNone(lane.partial_receipt(base + hollow, 10))
 
     def test_exotic_prefixed_contradictory_end_rejected(self):
         base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
@@ -450,6 +472,39 @@ class PartialReceipt(unittest.TestCase):
                   '"child_signal":null}}\n')
         self.assertIsNone(lane.partial_receipt(base + NBSP + forged, 10))
         self.assertIsNone(lane.partial_receipt(base + BOM + forged, 10))
+
+    def test_escaped_kind_forgeries_rejected(self):
+        # escape-spelled kinds miss the raw spelling count, so these
+        # exercise the JSON scan itself (mutant-killing for the
+        # uniqueness check and the space/tab narrowing; verified by
+        # disabling each and observing acceptance)
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        forged = ('{"schema":"kryprobe.event/v0","kind":"session' + USCORE_ESCAPE
+                  + 'end","session_id":"s","record_id":"record:9","monotonic_ns":"9",'
+                  '"payload":{"verdict":"FAILED","child_exit_code":1,'
+                  '"child_signal":null}}\n')
+        self.assertIsNone(lane.partial_receipt(base + forged, 10))
+        self.assertIsNone(lane.partial_receipt(base + " " + forged, 10))
+        self.assertIsNone(lane.partial_receipt(base + "\t" + forged, 10))
+
+    def test_exotic_framing_with_escaped_kind_rejected(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        forged = ('{"kind":"session' + USCORE_ESCAPE
+                  + 'end","payload":{"verdict":"FAILED","child_exit_code":1,'
+                  '"child_signal":null}}\n')
+        for prefix in [NBSP, BOM, VT, NUL, "  " + NBSP]:
+            with self.subTest(prefix=ord(prefix.lstrip(" ")[0])):
+                self.assertIsNone(lane.partial_receipt(base + prefix + forged, 10))
+
+    def test_exotic_prefixed_valid_end_rejected(self):
+        # a valid end under an exotic prefix is unsupported framing,
+        # not a parseable record
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
+        end = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+               '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",'
+               '"payload":{"verdict":"PARTIAL","child_exit_code":0,'
+               '"child_signal":null}}\n')
+        self.assertIsNone(lane.partial_receipt(base + NBSP + end, 10))
 
     def test_valid_surrogate_pair_accepted(self):
         stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
@@ -524,13 +579,13 @@ class CargoLogFraming(unittest.TestCase):
     # toolchain): the announcement absorbs the inline `test ... `
     # prefix; echoed lines start at column 0.
     BODY = "selftest_bpf_clean_partial_or_denied"
-    # filtered-out count is the current cli_bpf_e2e body count minus one
+    # filtered-out count tracks the cli_bpf_e2e body count minus one
     # (shape-checked only; the probe binary with one test prints 0).
     LOG = ("\nrunning 1 test\n"
            f"test {BODY} ... {ANNOUNCEMENT}"
            + _cargo_echo(9, 9, 18, 2, 0, 0, 0, 2)
            + "ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
-             " 22 filtered out; finished in 2.21s\n\n")
+             " 26 filtered out; finished in 2.21s\n\n")
 
     def test_framed_log_verdicts_and_guards(self):
         key = ("kryprobe-cli", "cli_bpf_e2e")
@@ -561,6 +616,32 @@ class SummarizePartials(unittest.TestCase):
         self.assertEqual(lane.summarize_partials([{"test": "x"}]), [])
         json.dumps(lane.summarize_partials([
             {"test": "selftest-bpf", "accepted_partial": {"exit": 3}}]))
+
+
+class CommittedPrefix(unittest.TestCase):
+    RESULTS = [{"test": "a"}, {"test": "b", "accepted_partial": {"exit": 3}}]
+
+    def test_slices_to_committed_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            # nothing committed yet
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            # partial commit (interruption after the first row persisted)
+            (out / "results.json").write_text(json.dumps(self.RESULTS[:1]))
+            self.assertEqual(
+                lane.committed_prefix(out, self.RESULTS), self.RESULTS[:1])
+            # full commit
+            (out / "results.json").write_text(json.dumps(self.RESULTS))
+            self.assertEqual(
+                lane.committed_prefix(out, self.RESULTS), self.RESULTS)
+
+    def test_unreadable_or_foreign_file_claims_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("not json {{{")
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            (out / "results.json").write_text(json.dumps({"test": "a"}))
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
 
 
 class SelftestBpfVerdict(unittest.TestCase):

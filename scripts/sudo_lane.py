@@ -120,7 +120,8 @@ _CANCEL_REQUESTED = False
 
 
 def dump(path, value):
-    """Atomic JSON write (temp + rename): readers never see a partial file."""
+    """Atomic JSON write (temp + rename): readers see the old or the new
+    file, never a partial one. Atomicity, not fsync durability."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -253,9 +254,13 @@ def _no_dup_object(pairs):
 
 def _strict_int(text):
     # "-0" parses as int 0 here but float in serde: reject the token.
+    # Otherwise serde takes i64/u64 only, so out-of-range rejects.
     if text == "-0":
         raise ValueError("negative zero")
-    return int(text)
+    value = int(text)
+    if value < -(1 << 63) or value > _U64MAX:
+        raise ValueError(f"integer out of range: {text[:24]}")
+    return value
 
 
 def _finite_float(text):
@@ -265,17 +270,18 @@ def _finite_float(text):
     return value
 
 
-def _depth_exceeds(value, limit=128):
-    """Nesting past limit (serde stops at 128). Iterative, never raises."""
+def _depth_exceeds(value, limit=127):
+    """More than limit nested containers (serde allows 127: probed
+    127-ok/128-err). Scalars add no depth. Iterative, never raises."""
     stack = [(value, 0)]
     while stack:
         item, depth = stack.pop()
-        if depth > limit:
+        if not isinstance(item, (list, dict)):
+            continue
+        if depth >= limit:
             return True
-        if isinstance(item, list):
-            stack.extend((child, depth + 1) for child in item)
-        elif isinstance(item, dict):
-            stack.extend((child, depth + 1) for child in item.values())
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children)
     return False
 
 
@@ -318,9 +324,11 @@ def partial_receipt(output, calls):
     exactly one session_end in the whole stream (whitespace-prefixed
     candidates included, raw spelling counted too), no duplicate
     keys, strict constants (no NaN/Infinity), finite floats, no
-    negative zero, no lone surrogates, nesting capped at 128,
-    object payload, exact field types. Numbers ignore leading zeros
-    like Rust's u64 parse. Never raises on malformed input.
+    negative zero, i64/u64 integers, no lone surrogates, nesting
+    capped at 127 containers like serde, object payload, exact
+    field types. Record-looking lines under unsupported framing
+    reject. Numbers ignore leading zeros like Rust's u64 parse.
+    Never raises on malformed input.
     """
     if "\r" in output or "\ufffd" in output:
         return None
@@ -367,6 +375,12 @@ def partial_receipt(output, calls):
     for line in lines:
         candidate = line.lstrip(" \t")
         if not candidate.startswith("{"):
+            # A record-looking line under unsupported framing (exotic
+            # prefix, mid-line object): the scan cannot see it, so the
+            # raw spelling count cannot be trusted — reject instead of
+            # ignoring. Real logs only carry '{"' inside candidates.
+            if '{"' in line:
+                return None
             continue
         try:
             record = json.loads(
@@ -428,6 +442,24 @@ def summarize_partials(results):
             f"{row['package']}/{row['target']}::{row['test']}")
         partials.append({"test": ident, **accepted})
     return partials
+
+
+def committed_prefix(out, results):
+    """Prefix of `results` atomically committed to results.json on disk.
+
+    Crash truth for incomplete summaries: the file is written
+    atomically from ever-longer prefixes of the append-only results
+    list, so its row count — read at summary time, after the dust
+    settles — is immune to interruption between append and persist.
+    Missing/unreadable/non-list file: no rows are claimed.
+    """
+    try:
+        committed = json.loads((out / "results.json").read_text(encoding="utf-8"))
+        if isinstance(committed, list):
+            return results[:len(committed)]
+    except (OSError, ValueError):
+        pass
+    return []
 
 
 def selftest_verdict(code, output, name, calls):
@@ -861,9 +893,6 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         os.close(lane_fd)
         raise
     results, mounts = [], []
-    # Rows durably in results.json; incomplete summaries report this
-    # prefix so they never outrun the persisted file on interruption.
-    persisted = 0
     runtime = None
     try:
         # Copy into a root-owned tmpfs whose parent cannot be renamed by
@@ -953,7 +982,6 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                   exit=code, timed_out=timed_out, euid=uid, egid=gid, log=str(log.relative_to(out)))
                 results.append(result)
                 dump(out / "results.json", results)
-                persisted = len(results)
                 print(f"sudo-lane: {key[0]}/{key[1]}::{body}: {result['status']}", flush=True)
         for name, args in [("selftest-bpf", ["selftest", "bpf", "--calls", str(calls)]),
                            ("selftest-token-smoke", ["selftest", "token-smoke"])]:
@@ -969,17 +997,15 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                     result["accepted_partial"] = accepted
             results.append(result)
             dump(out / "results.json", results)
-            persisted = len(results)
         verify_stage(runtime, manifest)
         dump(out / "results.json", results)
-        persisted = len(results)
         counts = dict(collections.Counter(result["status"] for result in results))
         code = 1 if counts.get("FAIL") else (4 if counts.get("SUPPORTED_REFUSAL") else 0)
         receipt.update(status="finished", exit=code, counts=counts, staged_hashes_unchanged=True)
     except BaseException as error:
         receipt.update(status="failed", exit=1, error=str(error))
         dump(out / "summary.json", {"exit": 1, "error": str(error), "complete": False,
-                                       "accepted_partials": summarize_partials(results[:persisted])})
+                                       "accepted_partials": summarize_partials(committed_prefix(out, results))})
         raise
     finally:
         # Children must be reaped before mounts or the exclusive lock go.
@@ -987,7 +1013,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         if _CANCEL_REQUESTED:
             receipt.update(status="failed", exit=1, error="cancelled")
             dump(out / "summary.json", {"exit": 1, "complete": False, "error": "cancelled",
-                                       "accepted_partials": summarize_partials(results[:persisted])})
+                                       "accepted_partials": summarize_partials(committed_prefix(out, results))})
         cleanup_errors = []
         for target in reversed(mounts):
             cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
@@ -998,7 +1024,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         if cleanup_errors:
             receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
             dump(out / "summary.json", {"exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
-                                       "accepted_partials": summarize_partials(results[:persisted])})
+                                       "accepted_partials": summarize_partials(committed_prefix(out, results))})
         receipt["children_reaped"] = not children()
         receipt["owned_mounts_removed"] = not cleanup_errors
         receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()

@@ -161,7 +161,9 @@ impl<'de> serde::Deserialize<'de> for NoDup {
             fn visit_f64<E: de::Error>(self, v: f64) -> Result<NoDup, E> {
                 match serde_json::Number::from_f64(v) {
                     Some(n) => Ok(NoDup(serde_json::Value::Number(n))),
-                    None => Ok(NoDup(serde_json::Value::Null)),
+                    // Unreachable (serde rejects non-finite at tokenize),
+                    // but Null must never stand in for a number.
+                    None => Err(de::Error::custom("non-finite float")),
                 }
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<NoDup, E> {
@@ -324,9 +326,13 @@ mod lane_policy_tests {
     #[test]
     fn defects_reject() {
         // otherwise-valid: only the over-count rejects (mutant-killing;
-        // verified by disabling the check and observing acceptance)
+        // verified by disabling each half and observing acceptance)
         assert_eq!(
             accounted_partial(&output([101, 97, 198, 2, 0, 0, 0, 2]), 100),
+            Err("over-count")
+        );
+        assert_eq!(
+            accounted_partial(&output([97, 101, 198, 2, 0, 0, 0, 2]), 100),
             Err("over-count")
         );
         assert_eq!(
