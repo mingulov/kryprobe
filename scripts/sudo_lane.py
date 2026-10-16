@@ -14,6 +14,7 @@ import collections
 import contextlib
 import ctypes
 import datetime
+import errno
 import fcntl
 import functools
 import hashlib
@@ -127,6 +128,13 @@ _CANCEL_REQUESTED = False
 # never a failure record — so running it on a raise path is
 # a no-op read, never a root-cause clobber.
 _CANCELLATION_REPAIR = None
+# Outer-custody outcome for the repair above: set by
+# cancellation's finally before the repair runs (every
+# run sets it fresh), reset by execute on entry. The
+# repair reads it to invalidate the published custody
+# claim and name the failure; direct repair callers see
+# False (the cancel-only text), as before.
+_CANCELLATION_REAP_FAILED = False
 # Wait slice for cancel polling: run_logged and
 # launch_supervised re-check the flag this often, so a
 # flag-only cancel takes effect within ~a slice instead of
@@ -988,15 +996,25 @@ def cancellation():
     try:
         yield
     finally:
-        global _CANCELLATION_REPAIR
+        global _CANCELLATION_REPAIR, _CANCELLATION_REAP_FAILED
         repair, _CANCELLATION_REPAIR = _CANCELLATION_REPAIR, None
+        reap_failed = False
+        reap_error = None
         try:
             reap_owned()
         except OSError as error:
             # Custody unverifiable (a /proc read failed):
-            # the repair and the raise below still run —
-            # an unverified reap must not leak either.
-            _say(f"sudo-lane: reap failed: {error}")
+            # tracked independently of cancellation — the
+            # repair below still runs (invalidating the
+            # published success), and the failure
+            # propagates after the handler restore: an
+            # unverified reap must fail the lane, never
+            # exit 0 past it. Announced on stderr: a
+            # parsed stdout must not ingest it.
+            reap_failed = True
+            reap_error = error
+            _say_err(f"sudo-lane: reap failed: {error}")
+        _CANCELLATION_REAP_FAILED = reap_failed
         # One read governs both repair and raise: separate
         # checks would race a delivery landing between them
         # (raise without repair). Repair before restoring the
@@ -1004,13 +1022,19 @@ def cancellation():
         # can interrupt it, while a restored raising handler
         # could. A repair failure must never break the raise.
         cancelled = _CANCEL_REQUESTED
-        if cancelled and repair is not None:
+        if (cancelled or reap_failed) and repair is not None:
             try:
                 repair()
             except (OSError, ValueError, MemoryError) as error:
                 _say(f"sudo-lane: cancel repair failed: {error}")
         for sig, handler in saved.items():
             signal.signal(sig, handler)
+        if reap_failed:
+            # Dominates the cancel raise: the evidence
+            # records both facts, the raise names the
+            # worst one. (Both are OSError family, so
+            # the __main__ handler exits 1 either way.)
+            raise reap_error
         if cancelled:
             raise InterruptedError("cancelled; owned descendants reaped")
 
@@ -1219,6 +1243,71 @@ def _copytree_fd_cancel(parent_fd, target, display):
             raise ValueError(f"refusing exotic stage entry: {shown}")
 
 
+def _open_pinned(path):
+    """Open a directory refusing symlinks at EVERY level.
+
+    O_NOFOLLOW on the final open guards one component
+    only: a symlink swapped into an ancestor before the
+    open resolves redirects the whole resolution. The
+    caller passes an already-resolved absolute path
+    (execute's out arrives strict-resolved from main);
+    the walk re-opens it component by component from
+    the root, each level O_NOFOLLOW relative to its
+    pinned parent plus an fstat directory pin, so any
+    symlink — at the top or in any ancestor — fails
+    loud (ELOOP) instead of redirecting the
+    privileged read. (O_DIRECTORY is deliberately
+    NOT combined with O_NOFOLLOW: the kernel
+    reports a symlink as ENOTDIR then, blurring
+    the refusal; the fstat pin keeps ELOOP exact
+    for links and raises ENOTDIR for swapped-in
+    non-directories.) A swapped-in real directory
+    (rename, no symlink) still resolves: that
+    residue is gated by content (the stage hashes),
+    not by identity. The whole walk runs shielded
+    so no signal can strand an intermediate
+    descriptor. Returns the open descriptor; the
+    caller owns (closes) it.
+    """
+    absolute = os.path.abspath(os.fspath(path))
+    with _deferred_cancel():
+        owned = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for component in absolute.split("/")[1:]:
+                if not component:
+                    continue
+                # abspath normalizes lexically (. and ..
+                # resolved), so every nonempty component
+                # is a plain name; each level refuses
+                # symlinks, pinning the next resolution
+                # to the acquired parent.
+                child = os.open(component,
+                                os.O_RDONLY | os.O_NOFOLLOW,
+                                dir_fd=owned)
+                try:
+                    if not stat.S_ISDIR(
+                            os.fstat(child).st_mode):
+                        raise NotADirectoryError(
+                            errno.ENOTDIR,
+                            "pinned component is not a "
+                            f"directory: {component!r}")
+                except OSError:
+                    try:
+                        os.close(child)
+                    except OSError:
+                        pass
+                    raise
+                os.close(owned)
+                owned = child
+        except OSError:
+            try:
+                os.close(owned)
+            except OSError:
+                pass
+            raise
+        return owned
+
+
 def _copytree_cancel(source, target, *, dir_fd=None, display=None):
     """copytree(symlinks=True) honoring flag-only cancellation.
 
@@ -1308,6 +1397,16 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     Returns (exit code, timed out, captured stdout bytes), read back
     through the sink descriptor: callers must verdict on these bytes,
     never re-open the pathname (the directory stays preparer-writable).
+
+    Custody residual (documented, loud): children() and
+    reap_owned(proc) in the completion path, plus the
+    children() inside the result.json dump dict, are NOT
+    contained — a /proc read failure there raises through
+    execute (a failed receipt, never green) instead of
+    recording locally. Containing them needs a
+    leaked-flag design (the runner result is already
+    being built when they run); until then the loud
+    raise is the contract.
     """
     subreaper()
     if _CANCEL_REQUESTED:
@@ -1392,6 +1491,9 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
             cancelled = True
             raise
         finally:
+            # Uncontained by design (see the docstring):
+            # a custody failure here raises loud through
+            # execute — a failed receipt, never green.
             leaked = not timed_out and not cancelled and bool(children())
             reap_owned(proc)
             cancelled = cancelled or _CANCEL_REQUESTED
@@ -1406,6 +1508,8 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
                 "exit": code, "raw_exit": raw_exit, "reaped_status": proc.returncode,
                 "timed_out": timed_out, "cancelled": cancelled,
                 "leaked_children": leaked, "pid": proc.pid, "reaped": True,
+                # Uncontained like the completion path
+                # above (see the docstring).
                 "descendants_reaped": not children(),
                 "wall_seconds": time.monotonic() - start,
                 "log_sha256": hashlib.sha256(captured).hexdigest(),
@@ -1612,8 +1716,9 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     # the slot repair rewrites unconditionally, so a stale
     # closure must never survive into a new execution (its
     # raise paths return before any registration).
-    global _CANCELLATION_REPAIR
+    global _CANCELLATION_REPAIR, _CANCELLATION_REAP_FAILED
     _CANCELLATION_REPAIR = None
+    _CANCELLATION_REAP_FAILED = False
     if os.geteuid() != 0:
         raise PermissionError("privileged lane needs root or passwordless sudo")
     if not parent_mount_ns or os.readlink("/proc/self/ns/mnt") == parent_mount_ns:
@@ -1675,12 +1780,14 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         mounts.append(runtime)
         # Pin the staging parent before the privileged
         # copy: out/'s ancestors stay preparer-writable,
-        # so the top opens relative to this descriptor
-        # (a single atomic resolution) — a rename above
-        # it cannot redirect the read outside. The
+        # so the top opens relative to this descriptor —
+        # and the descriptor itself is acquired by a
+        # component walk refusing symlinks at every
+        # level (a final-component O_NOFOLLOW alone
+        # would sail through a swapped ancestor). The
         # manifest digest above and the stage hashes
         # below still gate the content itself.
-        out_fd = os.open(out, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        out_fd = _open_pinned(out)
         try:
             _copytree_cancel("stage", runtime / "stage",
                              dir_fd=out_fd,
@@ -2029,26 +2136,39 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
 
 
 def _repair_cancelled_evidence(out, receipt, accepted_partials):
-    """Rewrite the complete summary as cancelled, unconditionally.
+    """Rewrite the complete summary as failed, unconditionally.
 
     Called only with a registered slot, which implies the
-    complete dump succeeded. Decided from control flow, not
-    from disk: the out directory stays preparer-writable, so
-    reading the summary back would follow symlinks, block on
+    complete dump succeeded. Runs on cancellation AND on an
+    outer custody failure without cancel (invalidating the
+    published success either way). Decided from control flow,
+    not from disk: the out directory stays preparer-writable,
+    so reading the summary back would follow symlinks, block on
     FIFOs, and allocate without bound. Values come from the
     bound in-memory receipt and the accepted-partials
     snapshot taken at registration: this function performs
-    zero reads (writes only).
+    zero reads (writes only). The error text names the
+    trigger (cancel, reap failure, or both); a reap failure
+    additionally flips the published children_reaped — a true
+    custody claim must not survive an unverified reap.
     """
+    if _CANCELLATION_REAP_FAILED and _CANCEL_REQUESTED:
+        error_text = "cancelled; owned-descendant reap failed"
+    elif _CANCELLATION_REAP_FAILED:
+        error_text = "owned-descendant reap failed"
+    else:
+        error_text = "cancelled"
     repair_receipt = dict(receipt)
-    repair_receipt.update(status="failed", exit=1, error="cancelled")
+    repair_receipt.update(status="failed", exit=1, error=error_text)
+    if _CANCELLATION_REAP_FAILED:
+        repair_receipt["children_reaped"] = False
     repair_errors = []
     repair_deferred = []
     try:
         _guarded_publish(out / "ownership.json", repair_receipt,
                          repair_errors, repair_deferred)
         _guarded_publish(out / "summary.json", {
-            "exit": 1, "complete": False, "error": "cancelled",
+            "exit": 1, "complete": False, "error": error_text,
             "accepted_partials": accepted_partials},
             repair_errors, repair_deferred)
     except BaseException as error:
