@@ -271,6 +271,8 @@ def digest(path):
     sha = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if _CANCEL_REQUESTED:
+                raise InterruptedError("cancelled during digest")
             sha.update(chunk)
     return sha.hexdigest()
 
@@ -837,11 +839,19 @@ def _say(message):
     OSError/ValueError (broken pipe, closed stream) are
     swallowed so cleanup reports never abort the sequence;
     MemoryError stays uncatchable-narrow (see _guarded_publish
-    for the deferred escape)."""
+    for the deferred escape). On OSError the broken stdout
+    fd is repointed at /dev/null, so interpreter shutdown
+    cannot retry the failing flush and turn exit 0 into
+    exit 120 (a closed file object needs no recovery:
+    its shutdown flush is already a no-op)."""
     try:
         print(message, flush=True)
-    except (OSError, ValueError):
+    except ValueError:
         pass
+    except OSError:
+        with contextlib.suppress(OSError):
+            with open("/dev/null", "wb") as null:
+                os.dup2(null.fileno(), 1)
 
 
 @contextlib.contextmanager
@@ -854,10 +864,11 @@ def cancellation():
     delivery between a finally's entry and its shield aborts
     the whole cleanup, and any delivery after the last
     checkpoint escapes the evidence repair. With flag-only
-    semantics there is no unshielded raising window at all —
-    the completion boundary is exact: a flag set before
-    execute returns is repaired and raises (exit 1); a flag
-    set after is a post-completion cancel (exit 0 stands).
+    semantics there is no unshielded raising window at all.
+    The completion boundary is this scope's single flag read
+    below: a flag set before it is repaired (when a repair
+    is registered) and raises (exit 1); a flag set after it
+    is a post-completion cancel (exit 0 stands).
     """
     def noted(sig, _frame):
         global _CANCEL_REQUESTED
@@ -870,19 +881,21 @@ def cancellation():
         global _CANCELLATION_REPAIR
         repair, _CANCELLATION_REPAIR = _CANCELLATION_REPAIR, None
         reap_owned()
-        # Repair before restoring the foreign handlers: under
-        # flag-only semantics nothing can interrupt it, while
-        # a restored raising handler could. Absent or already
-        # non-complete evidence repairs to a no-op, and a
-        # repair failure must never break the cancel raise.
-        if _CANCEL_REQUESTED and repair is not None:
+        # One read governs both repair and raise: separate
+        # checks would race a delivery landing between them
+        # (raise without repair). Repair before restoring the
+        # foreign handlers: under flag-only semantics nothing
+        # can interrupt it, while a restored raising handler
+        # could. A repair failure must never break the raise.
+        cancelled = _CANCEL_REQUESTED
+        if cancelled and repair is not None:
             try:
                 repair()
             except (OSError, ValueError, MemoryError) as error:
                 _say(f"sudo-lane: cancel repair failed: {error}")
         for sig, handler in saved.items():
             signal.signal(sig, handler)
-        if _CANCEL_REQUESTED:
+        if cancelled:
             raise InterruptedError("cancelled; owned descendants reaped")
 
 
@@ -943,6 +956,96 @@ def launch_supervised(command):
         # the executor to release custody instead of abandoning its session.
         proc.stdin.close()
         proc.wait()
+
+
+def _wait_cancel(proc):
+    """Sliced Popen.wait honoring flag-only cancellation.
+
+    A set flag kills the child, reaps it, and raises; the
+    wait itself is unbounded (a D-state child still hangs,
+    exactly as under a raising handler).
+    """
+    while True:
+        if _CANCEL_REQUESTED:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            proc.wait()
+            raise InterruptedError("cancelled during wait")
+        try:
+            return proc.wait(timeout=_WAIT_SLICE)
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _check_output_cancel(command, *, cwd=None, env=None, text=False):
+    """check_output honoring flag-only cancellation.
+
+    Same bytes/exit contract as subprocess.check_output
+    (stdout captured, stderr inherited, CalledProcessError
+    on nonzero exit); a set flag kills the child and raises
+    instead of waiting it out.
+    """
+    if _CANCEL_REQUESTED:
+        raise InterruptedError("cancelled before next command")
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                            cwd=cwd, env=env, text=text)
+    while True:
+        if _CANCEL_REQUESTED:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            proc.communicate()
+            raise InterruptedError("cancelled during wait")
+        try:
+            stdout, _ = proc.communicate(timeout=_WAIT_SLICE)
+        except subprocess.TimeoutExpired:
+            continue
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode, command, output=stdout)
+        return stdout
+
+
+def _run_cancel(command, **kwargs):
+    """subprocess.run honoring flag-only cancellation (no capture)."""
+    if _CANCEL_REQUESTED:
+        raise InterruptedError("cancelled before next command")
+    check = kwargs.pop("check", False)
+    proc = subprocess.Popen(command, **kwargs)
+    code = _wait_cancel(proc)
+    if check and code != 0:
+        raise subprocess.CalledProcessError(code, command)
+    return subprocess.CompletedProcess(command, code, None, None)
+
+
+def _copyfile_cancel(source, target):
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+            if _CANCEL_REQUESTED:
+                raise InterruptedError("cancelled during prepare")
+            writer.write(chunk)
+    shutil.copymode(source, target)
+
+
+def _copytree_cancel(source, target):
+    """copytree(symlinks=True) honoring flag-only cancellation.
+
+    Modes need not be preserved (the execute chmod pass
+    normalizes everything after); exotic entries fail closed
+    instead of hanging a fifo open like copyfile would.
+    """
+    target.mkdir(parents=True, exist_ok=False)
+    for entry in sorted(source.iterdir()):
+        if _CANCEL_REQUESTED:
+            raise InterruptedError("cancelled during prepare")
+        dest = target / entry.name
+        if entry.is_symlink():
+            dest.symlink_to(os.readlink(entry))
+        elif entry.is_dir():
+            _copytree_cancel(entry, dest)
+        elif entry.is_file():
+            _copyfile_cancel(entry, dest)
+        else:
+            raise ValueError(f"refusing exotic stage entry: {entry}")
 
 
 def _exclusive_sink(path):
@@ -1040,16 +1143,27 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
         try:
             # Sliced wait against the deadline: the flag-only
             # handler cannot break a blocking wait, so each
-            # slice re-checks the flag first. Timeout
-            # semantics are unchanged (deadline expiry still
-            # yields 124); a flag at any slice — including one
-            # set as the child exits — takes the same cancel
-            # path a raising delivery used to take.
-            deadline = start + timeout
+            # slice re-checks the flag first. The budget
+            # starts at spawn (sink setup is not charged),
+            # and terminal status is observed before expiry
+            # is declared — an exited child is never
+            # mislabeled 124. A flag at any slice —
+            # including one set as the child exits — takes
+            # the same cancel path a raising delivery used
+            # to take.
+            deadline = time.monotonic() + timeout
             while True:
                 if _CANCEL_REQUESTED:
                     cancelled = True
                     raise InterruptedError("cancelled during wait")
+                status = proc.poll()
+                if status is not None:
+                    code = status
+                    if _CANCEL_REQUESTED:
+                        cancelled = True
+                        raise InterruptedError(
+                            "cancelled during wait")
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
@@ -1092,7 +1206,7 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
 
 
 def source_identity(root):
-    paths = subprocess.check_output(
+    paths = _check_output_cancel(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=root,
     ).split(b"\0")
     hashes = {}
@@ -1102,7 +1216,7 @@ def source_identity(root):
             if (root / path).is_file():
                 hashes[str(path)] = digest(root / path)
     return {
-        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+        "head": _check_output_cancel(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "files": hashes,
     }
 
@@ -1133,7 +1247,7 @@ def prepare(root, out, cargo, traffic_generator):
             raise ValueError(f"{name} failed ({code}); no privileged execution; see {log}")
         if name != "bpf-build":
             artifacts.extend(cargo_artifacts(captured.decode("utf-8")))
-    metadata = json.loads(subprocess.check_output(
+    metadata = json.loads(_check_output_cancel(
         [cargo, "metadata", "--locked", "--no-deps", "--format-version=1"], cwd=root, env=env,
     ))
     package_names = {package["id"]: package["name"] for package in metadata["packages"]}
@@ -1173,6 +1287,8 @@ def prepare(root, out, cargo, traffic_generator):
             selected.append(row)
     reconcile(observed)
     for row in selected:
+        if _CANCEL_REQUESTED:
+            raise InterruptedError("cancelled during prepare")
         original = Path(row["executable"])
         target = out / "stage/debug" / original.relative_to(host_debug)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1183,6 +1299,8 @@ def prepare(root, out, cargo, traffic_generator):
         if row["sha256"] != digest(original):
             raise ValueError(f"artifact changed while staging: {original}")
     for directory in OBJECT_DIRS:
+        if _CANCEL_REQUESTED:
+            raise InterruptedError("cancelled during prepare")
         target = out / directory
         target.mkdir(parents=True, exist_ok=True)
         for name in OBJECTS:
@@ -1205,8 +1323,8 @@ def prepare(root, out, cargo, traffic_generator):
         "traffic_generator_source": str(traffic_generator),
         "prepared_uid": os.getuid(), "prepared_gid": os.getgid(),
         "tools": {"python": sys.version,
-                  "cargo": subprocess.check_output([cargo, "--version"], cwd=root, env=env, text=True).strip(),
-                  "rustc": subprocess.check_output(["rustc", "--version"], cwd=root, env=env, text=True).strip()},
+                  "cargo": _check_output_cancel([cargo, "--version"], cwd=root, env=env, text=True).strip(),
+                  "rustc": _check_output_cancel(["rustc", "--version"], cwd=root, env=env, text=True).strip()},
     }
     dump(out / "manifest.json", manifest)
     lab_bodies = len(EXPECTED[LAB_SUITE])
@@ -1264,9 +1382,9 @@ def verify_stage(out, manifest):
 def bind_readonly(source, target, mounts):
     if not target.exists():
         raise ValueError(f"mount target missing: {target}")
-    subprocess.run(["mount", "--bind", str(source), str(target)], check=True)
+    _run_cancel(["mount", "--bind", str(source), str(target)], check=True)
     mounts.append(target)
-    subprocess.run(["mount", "-o", "remount,bind,ro", str(target)], check=True)
+    _run_cancel(["mount", "-o", "remount,bind,ro", str(target)], check=True)
 
 
 def assert_fresh_execution(out):
@@ -1276,6 +1394,12 @@ def assert_fresh_execution(out):
 
 
 def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
+    # Drop any repair from an earlier run in this process:
+    # the slot repair rewrites unconditionally, so a stale
+    # closure must never survive into a new execution (its
+    # raise paths return before any registration).
+    global _CANCELLATION_REPAIR
+    _CANCELLATION_REPAIR = None
     if os.geteuid() != 0:
         raise PermissionError("privileged lane needs root or passwordless sudo")
     if not parent_mount_ns or os.readlink("/proc/self/ns/mnt") == parent_mount_ns:
@@ -1331,10 +1455,10 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         byte_count = sum((out / relative).stat().st_size for relative in manifest["sha256"])
         if byte_count > 2 * 1024**3:
             raise ValueError("prepared payload exceeds the 2 GiB lane budget")
-        subprocess.run(["mount", "-t", "tmpfs", "-o", f"size={byte_count + 256 * 1024**2},mode=0755,nodev",
+        _run_cancel(["mount", "-t", "tmpfs", "-o", f"size={byte_count + 256 * 1024**2},mode=0755,nodev",
                         "kryprobe-sudo-lane", str(runtime)], check=True)
         mounts.append(runtime)
-        shutil.copytree(out / "stage", runtime / "stage", symlinks=True)
+        _copytree_cancel(out / "stage", runtime / "stage")
         verify_stage(runtime, manifest)
         for path in (runtime / "stage").rglob("*"):
             path.chmod(0o555 if path.is_dir() or str(path.relative_to(runtime)) in {
@@ -1576,24 +1700,42 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
     #
-    # Backstop for a flag landing after the post-dump check
-    # below: register an evidence repair for the enclosing
-    # cancellation scope, consumed exactly once there (bound
-    # to these in-memory values — never from disk, which the
-    # preparer can still write). Completion boundary (exact):
-    # a flag set before execute returns is repaired and
-    # raises (exit 1); a flag set after is post-completion.
-    global _CANCELLATION_REPAIR
-    _CANCELLATION_REPAIR = functools.partial(
-        _repair_cancelled_evidence, out, receipt, results)
     lab_bodies = len(EXPECTED[LAB_SUITE])
     vng_bodies = len(EXPECTED[VNG_SUITE])
     lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
-    dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
-                                "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
-                                "accepted_partials": summarize_partials(results), "complete": True})
+    try:
+        dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
+                                    "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
+                                    "accepted_partials": summarize_partials(results), "complete": True})
+    except BaseException as error:
+        # A failed complete dump must not leave a finished
+        # receipt over missing evidence: republish as failed
+        # (mirroring the L6 cancel branch), then re-raise.
+        receipt.update(status="failed", exit=1, error=str(error))
+        try:
+            _guarded_publish(out / "ownership.json", receipt,
+                             publish_errors, deferred)
+        except BaseException as nested:
+            deferred.append(nested)
+        if publish_errors or deferred:
+            _say("sudo-lane: evidence publishing problems: "
+                 f"{publish_errors + [type(e).__name__ for e in deferred]}")
+        raise
     if _CANCEL_REQUESTED:
         publish_cancelled_and_raise()
+    # Backstop for a flag landing after the post-dump check
+    # above: register an evidence repair for the enclosing
+    # cancellation scope, consumed exactly once there. The
+    # repair is unconditional and memory-only — reaching
+    # this line implies a complete summary is on disk (the
+    # dump would have raised otherwise, before any
+    # registration), so no disk read is needed to decide,
+    # and a preparer-swapped summary is overwritten rather
+    # than trusted. The post-check repair needs no clearing:
+    # it runs before any registration, when the slot cannot
+    # be this run's (slot declared global at function entry).
+    _CANCELLATION_REPAIR = functools.partial(
+        _repair_cancelled_evidence, out, receipt, results)
     # Contained: a broken stdout must not turn a completed
     # lane into a failed one (complete:true with exit 1).
     _say(f"sudo-lane: {counts}; exit {code}; evidence {out}")
@@ -1601,21 +1743,15 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
 
 
 def _repair_cancelled_evidence(out, receipt, results):
-    """Rewrite an existing complete:true summary as cancelled.
+    """Rewrite the complete summary as cancelled, unconditionally.
 
-    Only a complete:true summary is touched (plus the
-    receipt): absent, malformed, or already non-complete
-    evidence repairs to a no-op, so a failure record's root
-    cause is never clobbered — running this on a raise path
-    can only re-read, never overwrite.
+    Called only with a registered slot, which implies the
+    complete dump succeeded. Decided from control flow, not
+    from disk: the out directory stays preparer-writable, so
+    reading the summary back would follow symlinks, block on
+    FIFOs, and allocate without bound. Values come from the
+    bound in-memory receipt and results.
     """
-    try:
-        summary = json.loads((out / "summary.json").read_text())
-    except (OSError, ValueError):
-        return
-    if not isinstance(summary, dict) \
-            or summary.get("complete") is not True:
-        return
     repair_receipt = dict(receipt)
     repair_receipt.update(status="failed", exit=1, error="cancelled")
     repair_errors = []
