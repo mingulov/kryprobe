@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Adversarial runner checks; no privilege or kernel support required."""
 import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -16,6 +17,8 @@ import copy
 import ctypes
 import errno
 import fcntl
+import io
+import shutil
 import signal
 import subprocess
 import time
@@ -179,6 +182,25 @@ PAIR_ESCAPE = chr(92) + "uD83D" + chr(92) + "uDE00"
 USCORE_ESCAPE = chr(92) + "u005f"
 NUL = chr(0)
 VT = chr(11)
+
+
+@contextlib.contextmanager
+def _owned_mkstemp():
+    # capture mkstemp descriptors so tests that stub the stream
+    # owner (_text_sink) can close the real fds afterwards.
+    made = []
+    real_mkstemp = tempfile.mkstemp
+    def capture(*args, **kwargs):
+        fd, tmp = real_mkstemp(*args, **kwargs)
+        made.append(fd)
+        return fd, tmp
+    with mock.patch("tempfile.mkstemp", side_effect=capture):
+        yield
+        for fd in made:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def failed_tail_spaced():
@@ -712,21 +734,24 @@ class CommittedPrefix(unittest.TestCase):
             big = out / "results.json"
             with open(big, "wb") as stream:
                 stream.truncate(100 * 1024 * 1024)
-            # baseline-subtracted and state-preserving: start()
-            # does not reset an existing peak, and stop() must not
-            # kill outer tracing (PYTHONTRACEMALLOC).
+            # reset_peak + current-baseline: peak-subtraction
+            # cannot isolate the window from a taller freed peak
+            # (160MB freed hides a 100MB unbounded read). Resetting
+            # the diagnostic peak is acceptable; killing outer
+            # tracing is not, so start/stop stay conditional.
             was_tracing = tracemalloc.is_tracing()
             if not was_tracing:
                 tracemalloc.start()
             try:
-                _, baseline = tracemalloc.get_traced_memory()
+                tracemalloc.reset_peak()
+                current_before, _ = tracemalloc.get_traced_memory()
                 self.assertEqual(
                     lane.committed_prefix(out, self.RESULTS), [])
                 _, window_peak = tracemalloc.get_traced_memory()
             finally:
                 if not was_tracing:
                     tracemalloc.stop()
-            growth = (window_peak - baseline) / (1024 * 1024)
+            growth = (window_peak - current_before) / (1024 * 1024)
             self.assertLess(
                 growth, 20, f"read allocated {growth:.0f} MiB")
             big.unlink()
@@ -842,14 +867,22 @@ class CommittedPrefix(unittest.TestCase):
 
     def test_close_failure_does_not_escape(self):
         # a read-only descriptor has nothing to flush: EIO on
-        # close must not break the never-raises contract.
+        # close must not break the never-raises contract. The
+        # mock closes for real first, so the test itself holds
+        # the no-leak invariant it pins.
+        real_close = os.close
+        def close_then_fail(fd):
+            real_close(fd)
+            raise OSError("eio")
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             (out / "results.json").write_text(json.dumps(self.RESULTS[:1]))
-            with mock.patch("os.close", side_effect=OSError("eio")):
+            before = len(os.listdir("/proc/self/fd"))
+            with mock.patch("os.close", side_effect=close_then_fail):
                 self.assertEqual(
                     lane.committed_prefix(out, self.RESULTS),
                     self.RESULTS[:1])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_memory_error_during_parse_claims_nothing(self):
         # 1MB of [{},{}...] decodes to ~25MB: a constrained
@@ -909,16 +942,22 @@ class DumpAtomicity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             boom = ValueError("boom")
+            before = len(os.listdir("/proc/self/fd"))
             for cleanup_error in (FileNotFoundError("raced"),
                                   PermissionError("denied")):
                 with self.subTest(cleanup_error=type(cleanup_error).__name__):
-                    with mock.patch("os.fdopen", side_effect=boom), \
+                    stream = mock.MagicMock()
+                    stream.write.side_effect = boom
+                    with _owned_mkstemp(), \
+                         mock.patch.object(lane, "_text_sink",
+                                           return_value=stream), \
                          mock.patch("os.unlink",
                                     side_effect=cleanup_error):
                         with self.assertRaises(ValueError) as caught:
                             lane.dump(out / "summary.json",
                                       {"complete": True})
                     self.assertIs(caught.exception, boom)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_write_error_stays_primary_when_close_also_fails(self):
         # a real TextIOWrapper retries the flush on close: the
@@ -928,26 +967,30 @@ class DumpAtomicity(unittest.TestCase):
             stream = mock.MagicMock()
             stream.flush.side_effect = OSError(errno.ENOSPC, "no space")
             stream.close.side_effect = OSError(errno.EIO, "i/o error")
-            stream.__exit__.side_effect = lambda *exc: (
-                stream.close(), False)[1]
-            with mock.patch("os.fdopen", return_value=stream):
+            before = len(os.listdir("/proc/self/fd"))
+            with _owned_mkstemp(), \
+                    mock.patch.object(lane, "_text_sink",
+                                      return_value=stream):
                 with self.assertRaises(OSError) as caught:
                     lane.dump(out / "summary.json", {"complete": True})
             self.assertEqual(caught.exception.errno, errno.ENOSPC)
             self.assertIsNotNone(caught.exception.__context__)
             self.assertEqual(caught.exception.__context__.errno, errno.EIO)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_close_only_failure_propagates(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             stream = mock.MagicMock()
             stream.close.side_effect = OSError(errno.EIO, "i/o error")
-            stream.__exit__.side_effect = lambda *exc: (
-                stream.close(), False)[1]
-            with mock.patch("os.fdopen", return_value=stream):
+            before = len(os.listdir("/proc/self/fd"))
+            with _owned_mkstemp(), \
+                    mock.patch.object(lane, "_text_sink",
+                                      return_value=stream):
                 with self.assertRaises(OSError) as caught:
                     lane.dump(out / "summary.json", {"complete": True})
             self.assertEqual(caught.exception.errno, errno.EIO)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_publish_reports_instead_of_raising(self):
         # cleanup-time publishing must not abort the unmount /
@@ -963,6 +1006,25 @@ class DumpAtomicity(unittest.TestCase):
             self.assertIsInstance(error, str)
             self.assertTrue(error)
 
+    def test_guarded_publish_defers_non_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            publish_errors, deferred = [], []
+            lane._guarded_publish(out / "ok.json", {"a": 1},
+                                  publish_errors, deferred)
+            self.assertEqual((publish_errors, deferred), ([], []))
+            (out / "blocked.json").mkdir()
+            lane._guarded_publish(out / "blocked.json", {"a": 1},
+                                  publish_errors, deferred)
+            self.assertEqual(len(publish_errors), 1)
+            self.assertEqual(deferred, [])
+            boom = MemoryError("injected")
+            with mock.patch.object(lane, "dump", side_effect=boom):
+                lane._guarded_publish(out / "ok.json", {"a": 1},
+                                      publish_errors, deferred)
+            self.assertEqual(len(publish_errors), 1)
+            self.assertEqual(deferred, [boom])
+
     def test_failed_dump_leaks_no_descriptor(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -972,7 +1034,8 @@ class DumpAtomicity(unittest.TestCase):
             with mock.patch("os.fchmod", side_effect=OSError("nope")):
                 with self.assertRaises(OSError):
                     lane.dump(out / "a.json", {})
-            with mock.patch("os.fdopen", side_effect=OSError("nope")):
+            with mock.patch.object(lane, "_text_sink",
+                                   side_effect=OSError("nope")):
                 with self.assertRaises(OSError):
                     lane.dump(out / "b.json", {})
             self.assertEqual(fds(), before)
@@ -1155,43 +1218,158 @@ class PreparedIntegrity(unittest.TestCase):
 
 
 class CapturedBytesBinding(unittest.TestCase):
+    READ_ATTRS = ("open", "read_text", "read_bytes", "read")
+    PATH_CONSUMERS = ("run_logged",)
+
     def test_verdict_sites_never_reopen_log_paths(self):
         # the substitution fix is structural: verdicts hash and
         # parse fd-captured bytes. A call site reverted to path
-        # reads stays green functionally, so pin the shape: no
-        # log path re-reads, no deleted reader, and every
-        # run_logged call unpacks the captured third element.
+        # reads stays green functionally, so pin the shape with a
+        # narrow tripwire (taint over execute/prepare): no reads
+        # through the log path or its aliases, no other consumer
+        # of the path, every run_logged 3-unpacked with the bytes
+        # used, and the deleted reader gone module-wide. The
+        # mock-driven ExecuteWiring scenarios prove the behavior;
+        # this guard only catches mechanical reverts.
         tree = ast.parse(Path(lane.__file__).read_text())
+        funcs = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef)
+                 and node.name in ("execute", "prepare")]
+        self.assertEqual(len(funcs), 2)
         violations = []
-        run_logged_calls = 0
+        for func in funcs:
+            tainted = {"log"}
+            changed = True
+            while changed:
+                changed = False
+                for node in ast.walk(func):
+                    if isinstance(node, ast.Assign) \
+                            and isinstance(node.value, ast.Name) \
+                            and node.value.id in tainted:
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) \
+                                    and target.id not in tainted:
+                                tainted.add(target.id)
+                                changed = True
+            used = {node.id for node in ast.walk(func)
+                    if isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Load)}
+            run_logged_calls = 0
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = node.func
+                if isinstance(called, ast.Attribute) \
+                        and called.attr in self.READ_ATTRS \
+                        and isinstance(called.value, ast.Name) \
+                        and called.value.id in tainted:
+                    violations.append(
+                        f"{func.name}:{node.lineno} reads tainted path")
+                if isinstance(called, ast.Name) \
+                        and called.id not in self.PATH_CONSUMERS \
+                        and any(isinstance(arg, ast.Name)
+                                and arg.id in tainted for arg in node.args):
+                    violations.append(
+                        f"{func.name}:{node.lineno} tainted path escapes "
+                        f"to {called.id}()")
+            for node in ast.walk(func):
+                if isinstance(node, ast.Assign) \
+                        and isinstance(node.value, ast.Call) \
+                        and isinstance(node.value.func, ast.Name) \
+                        and node.value.func.id == "run_logged":
+                    run_logged_calls += 1
+                    targets = node.targets[0]
+                    elts = targets.elts \
+                        if isinstance(targets, (ast.Tuple, ast.List)) else []
+                    if len(elts) != 3:
+                        violations.append(
+                            f"{func.name}:{node.lineno} run_logged "
+                            "not 3-unpacked")
+                    elif isinstance(elts[2], ast.Name) \
+                            and elts[2].id not in used:
+                        violations.append(
+                            f"{func.name}:{node.lineno} captured "
+                            "bytes unused")
+            self.assertGreater(run_logged_calls, 0, func.name)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if isinstance(func, ast.Name) and func.id == "read_body_log":
+            if isinstance(node, ast.Call) \
+                    and isinstance(node.func, ast.Name) \
+                    and node.func.id == "read_body_log":
                 violations.append(f"deleted reader at line {node.lineno}")
-            if isinstance(func, ast.Name) and func.id == "digest":
-                if node.args and isinstance(node.args[0], ast.Name) \
-                        and node.args[0].id == "log":
-                    violations.append(f"digest(log) at line {node.lineno}")
-            if isinstance(func, ast.Attribute) \
-                    and func.attr in ("read_text", "read_bytes"):
-                if isinstance(func.value, ast.Name) and func.value.id == "log":
-                    violations.append(
-                        f"log.{func.attr}() at line {node.lineno}")
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) \
-                    and isinstance(node.value, ast.Call) \
-                    and isinstance(node.value.func, ast.Name) \
-                    and node.value.func.id == "run_logged":
-                run_logged_calls += 1
-                targets = node.targets[0]
-                if not (isinstance(targets, ast.Tuple)
-                        and len(targets.elts) == 3):
-                    violations.append(
-                        f"run_logged not 3-unpacked at line {node.lineno}")
-        self.assertGreater(run_logged_calls, 0)
         self.assertEqual(violations, [])
+
+
+class DeferredCancel(unittest.TestCase):
+    def test_signal_inside_window_sets_flag_without_raising(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(sig=sig):
+                def boom(signum, frame):
+                    raise InterruptedError("should be deferred")
+                saved_flag = lane._CANCEL_REQUESTED
+                old = signal.signal(sig, boom)
+                try:
+                    lane._CANCEL_REQUESTED = False
+                    with lane._deferred_cancel():
+                        os.kill(os.getpid(), sig)
+                        deadline = time.monotonic() + 5
+                        while not lane._CANCEL_REQUESTED \
+                                and time.monotonic() < deadline:
+                            pass
+                        self.assertTrue(lane._CANCEL_REQUESTED)
+                    self.assertIs(signal.getsignal(sig), boom)
+                finally:
+                    signal.signal(sig, old)
+                    lane._CANCEL_REQUESTED = saved_flag
+
+    def test_off_main_thread_is_plain_yield(self):
+        errors = []
+        def worker():
+            try:
+                with lane._deferred_cancel():
+                    pass
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+
+class TextSink(unittest.TestCase):
+    def test_fileio_failure_closes_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "f.txt")
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+            before = len(os.listdir("/proc/self/fd"))
+            with mock.patch.object(lane.io, "FileIO",
+                                   side_effect=OSError("no FileIO")):
+                with self.assertRaises(OSError):
+                    lane._text_sink(fd)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before - 1)
+
+    def test_chain_failure_leaks_nothing(self):
+        for target in ("BufferedWriter", "TextIOWrapper"):
+            with self.subTest(target=target), \
+                    tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp) / "f.txt")
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+                before = len(os.listdir("/proc/self/fd"))
+                with mock.patch.object(lane.io, target,
+                                       side_effect=MemoryError("no mem")):
+                    with self.assertRaises(MemoryError):
+                        lane._text_sink(fd)
+                self.assertEqual(len(os.listdir("/proc/self/fd")), before - 1)
+
+    def test_roundtrip_matches_fdopen_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "f.txt")
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+            stream = lane._text_sink(fd)
+            stream.write('{"a": 1}\nline2\n')
+            stream.close()
+            with open(path, "rb") as check:
+                self.assertEqual(check.read(), b'{"a": 1}\nline2\n')
 
 
 class LoggedPaths(unittest.TestCase):
@@ -1262,28 +1440,266 @@ class LoggedPaths(unittest.TestCase):
             mode = (root / "body.log").stat().st_mode & 0o777
             self.assertEqual(oct(mode), oct(0o644))
 
-    def test_failed_sink_wrap_leaks_no_descriptor(self):
-        # the os.dup has no owner until fdopen succeeds: both
-        # paths must close it. dump's own fdopen (call 1) and,
-        # for the stderr case, the stdout wrap (call 2) succeed.
-        real_fdopen = os.fdopen
-        for fail_at, stderr in ((2, False), (3, True)):
-            with self.subTest(fail_at=fail_at), \
-                    tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                calls = []
-                def flaky(fd, *args, **kwargs):
-                    calls.append(fd)
-                    if len(calls) == fail_at:
-                        raise MemoryError("injected")
-                    return real_fdopen(fd, *args, **kwargs)
-                before = len(os.listdir("/proc/self/fd"))
-                kwargs = {"stderr_path": root / "body.stderr"} if stderr else {}
-                with mock.patch("os.fdopen", side_effect=flaky):
-                    with self.assertRaises(MemoryError):
-                        lane.run_logged(["true"], root / "body.log", 30,
-                                        **kwargs)
-                self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+    def test_failed_spawn_leaks_no_sink(self):
+        # raw descriptors go to Popen (no wrap stage to fail);
+        # a spawn failure must still unwind both sinks.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            before = len(os.listdir("/proc/self/fd"))
+            with mock.patch.object(lane.subprocess, "Popen",
+                                   side_effect=OSError("noexec")):
+                with self.assertRaises(OSError):
+                    lane.run_logged(["true"], root / "body.log", 30,
+                                    stderr_path=root / "body.stderr")
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+
+class ExecuteWiring(unittest.TestCase):
+    """Mock-driven execute() scenarios: finally wiring, publish
+    precedence, signal shielding, and captured-bytes binding.
+
+    Mocks replace only the privilege boundary (euid, mounts,
+    stage verification, inventory reconciliation, child runs);
+    the execute/finally control flow, verdicts, and publishing
+    under test are real.
+    """
+
+    def _prepared_out(self, root):
+        out = root / "out"
+        (out / "stage").mkdir(parents=True)
+        (out / "logs").mkdir()
+        manifest = {"schema": "kryprobe-privileged-lane/v1", "artifacts": [],
+                    "sha256": {}, "host_debug": str(root / "host" / "debug"),
+                    "root": str(root), "prepared_uid": 0, "prepared_gid": 0}
+        (out / "manifest.json").write_text(json.dumps(manifest))
+        for target in (root / "host" / "debug", root / "host" / "kryprobe-bpf",
+                       root / "target" / "debug", root / "target" / "kryprobe-bpf"):
+            target.mkdir(parents=True)
+        lock = root / "lane.lock"
+        lock.write_text("")
+        return out, lock
+
+    def _drive(self, root, out, lock, *, run_logged, run_hook=None,
+               dump_hook=None):
+        saved_flag = lane._CANCEL_REQUESTED
+        calls = []
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:1] == ["umount"]:
+                # emulate the postcondition real unmount provides:
+                # the mountpoint survives, its contents are gone.
+                target = Path(cmd[1])
+                if target.is_relative_to(root) and target.is_dir() \
+                        and not target.is_symlink():
+                    for child in target.iterdir():
+                        if child.is_dir() and not child.is_symlink():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+            if run_hook is not None:
+                verdict = run_hook(cmd)
+                if verdict is not None:
+                    return verdict
+            return mock.Mock(returncode=0, stderr="")
+        runtime_base = root / "rt"
+        runtime_base.mkdir(exist_ok=True)
+        counter = [0]
+        def fake_mkdtemp(*args, **kwargs):
+            counter[0] += 1
+            staged = runtime_base / f"r{counter[0]}"
+            staged.mkdir()
+            return str(staged)
+        real_dump = lane.dump
+        def fake_dump(path, value):
+            if dump_hook is not None:
+                override = dump_hook(path, value)
+                if override is not None:
+                    return override
+            return real_dump(path, value)
+        captured_stdout = io.StringIO()
+        patches = [
+            mock.patch("os.geteuid", return_value=0),
+            mock.patch.object(lane, "verify_stage"),
+            mock.patch.object(lane, "reconcile"),
+            mock.patch.object(lane.subprocess, "run", side_effect=fake_run),
+            mock.patch("tempfile.mkdtemp", side_effect=fake_mkdtemp),
+            mock.patch.object(lane, "run_logged", side_effect=run_logged),
+        ]
+        if dump_hook is not None:
+            patches.append(
+                mock.patch.object(lane, "dump", side_effect=fake_dump))
+        try:
+            with contextlib.ExitStack() as stack:
+                for entered in patches:
+                    stack.enter_context(entered)
+                stack.enter_context(contextlib.redirect_stdout(captured_stdout))
+                try:
+                    result = lane.execute(out, lock, "ns:fake", 20000)
+                    return ("returned", result, calls,
+                            captured_stdout.getvalue())
+                except BaseException as error:
+                    return ("raised", error, calls,
+                            captured_stdout.getvalue())
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+
+    def _assert_lock_released(self, lock):
+        fd = os.open(lock, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.fail("lane lock still held after cleanup")
+        finally:
+            os.close(fd)
+
+    def _umount_targets(self, calls):
+        return [cmd[1] for cmd in calls if cmd[:1] == ["umount"]]
+
+    def _mount_targets(self, calls):
+        targets = []
+        for cmd in calls:
+            if cmd[:2] == ["mount", "--bind"]:
+                targets.append(cmd[3])
+            elif cmd[:2] == ["mount", "-t"]:
+                targets.append(cmd[-1])
+        return targets
+
+    def test_failed_publish_keeps_cleanup_and_root_cause(self):
+        # mid-run publish failures (ENOSPC-style) at both evidence
+        # names: unmounts, ownership attempt, and lock close still
+        # proceed, and the original failure (not the publish error)
+        # propagates.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def nospace(path, value):
+                if Path(path).name in ("summary.json", "ownership.json"):
+                    raise OSError(errno.ENOSPC, "no space on device")
+                return None
+            def boom(*args, **kwargs):
+                raise FileNotFoundError("stage binary gone")
+            outcome, error, calls, printed = self._drive(
+                root, out, lock, run_logged=boom, dump_hook=nospace)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, FileNotFoundError)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self.assertGreater(len(self._umount_targets(calls)), 0)
+            self.assertIn("failure summary not published", printed)
+            self.assertIn("evidence publishing problems", printed)
+            # the preamble reservation survives; the finished
+            # receipt (children_reaped) never landed.
+            preamble = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(preamble["status"], "running")
+            self.assertNotIn("children_reaped", preamble)
+            self._assert_lock_released(lock)
+
+    def test_publish_failure_on_success_path_fails_lane(self):
+        # nothing else pending: a lost ownership receipt must not
+        # pass silently.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def nospace(path, value):
+                if Path(path).name == "ownership.json":
+                    raise OSError(errno.ENOSPC, "no space on device")
+                return None
+            outcome, error, calls, printed = self._drive(
+                root, out, lock,
+                run_logged=lambda *a, **k: (0, False, b""),
+                dump_hook=nospace)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("lane evidence publishing failed", str(error))
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self._assert_lock_released(lock)
+
+    def test_verdicts_follow_captured_bytes_not_paths(self):
+        # the mock writes conflicting bytes to the log path while
+        # returning the OCT13 partial log as captured: the PASS +
+        # receipt must come from the descriptor, not the pathname.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            oct13 = PartialReceipt.OCT13_LOG.encode()
+            def routed(command, log, *args, **kwargs):
+                if command[1:3] == ["selftest", "bpf"]:
+                    Path(log).write_bytes(
+                        b"conflict: verdicts must ignore this\n")
+                    return (3, False, oct13)
+                if command[1:3] == ["selftest", "token-smoke"]:
+                    return (0, False, b"token roundtrip ok\n")
+                return (0, False, b"")
+            outcome, code, calls, printed = self._drive(
+                root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertTrue(summary["complete"])
+            rows = {row["test"]: row for row in json.loads(
+                (out / "results.json").read_text())}
+            self.assertEqual(rows["selftest-bpf"]["status"], "PASS")
+            accepted = rows["selftest-bpf"]["accepted_partial"]
+            self.assertEqual(
+                (accepted["exit"], accepted["calls"], accepted["missing"]),
+                (3, 20000, 581))
+            found = [row for row in summary["accepted_partials"]
+                     if row.get("exit") == 3]
+            self.assertEqual(len(found), 1)
+
+    def test_signal_during_cleanup_defers_to_end(self):
+        # SIGTERM on the first umount: every unmount + ownership
+        # still attempted, cancellation raised at the end.
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError(f"cancelled by signal {signum}")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            killed = []
+            def kill_once(cmd):
+                if cmd[:1] == ["umount"] and not killed:
+                    killed.append(cmd)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return None
+            old = signal.signal(signal.SIGTERM, raising)
+            try:
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""),
+                    run_hook=kill_once)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self.assertGreater(len(self._umount_targets(calls)), 0)
+            self.assertTrue((out / "ownership.json").is_file())
+            self._assert_lock_released(lock)
+
+    def test_deferred_publish_escape_surfaces_after_cleanup(self):
+        # MemoryError inside the ownership publish: unmounts and
+        # the lock close still happen; the error surfaces gated
+        # (nothing else pending here).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def oom(path, value):
+                if Path(path).name == "ownership.json":
+                    raise MemoryError("injected")
+                return None
+            outcome, error, calls, printed = self._drive(
+                root, out, lock,
+                run_logged=lambda *a, **k: (0, False, b""),
+                dump_hook=oom)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, MemoryError)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self.assertGreater(len(self._umount_targets(calls)), 0)
+            self._assert_lock_released(lock)
 
 
 class ProcessCustody(unittest.TestCase):

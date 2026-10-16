@@ -16,6 +16,7 @@ import ctypes
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -120,6 +121,34 @@ ENV_GATE_DOC = "docs/lane-environment.md"
 _CANCEL_REQUESTED = False
 
 
+def _text_sink(fd):
+    """UTF-8 text stream owning `fd`, with ownership-safe setup.
+
+    io.FileIO never owns the descriptor on setup failure
+    (verified: a failed FileIO leaves the fd open), so the
+    raw fd is closed in that case; later-stage failures close
+    the raw OBJECT, which is idempotent-safe — unlike closing
+    the fd number twice, it can never touch a reused number.
+    Matches os.fdopen(fd, "w", encoding="utf-8") semantics.
+    """
+    try:
+        raw = io.FileIO(fd, "w")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    try:
+        return io.TextIOWrapper(io.BufferedWriter(raw), encoding="utf-8")
+    except BaseException:
+        try:
+            raw.close()
+        except OSError:
+            pass
+        raise
+
+
 def dump(path, value):
     """Atomic JSON write (temp + rename): readers see the old or the new
     file, never a partial one. Atomicity, not fsync durability. The
@@ -127,48 +156,58 @@ def dump(path, value):
     a reused prepared directory is never followed. Published files
     are world-readable (mkstemp's 0600 is widened before the
     rename): the CI summary check opens them unprivileged. A
-    failed write or replace closes the pre-transfer descriptor,
-    removes the temp, and raises the original error; cleanup
-    never masks it and leaks nothing. A write/flush error stays
-    primary when the close retry fails too (the close error is
-    kept as its context); a close-only failure propagates."""
+    failed write or replace removes the temp and raises the
+    original error; cleanup never masks it and leaks nothing.
+    A write/flush error stays primary when the close retry
+    fails too (the close error is kept as its context, except
+    that KeyboardInterrupt/SystemExit from close propagate
+    immediately); a close-only failure propagates. The lane's
+    own cancel signal is InterruptedError, an OSError: if one
+    arrives during the close retry it is kept as context, with
+    cancellation taking effect via _CANCEL_REQUESTED."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
-                               dir=str(path.parent))
-    transferred = False
-    try:
-        os.fchmod(fd, 0o644)
-        stream = os.fdopen(fd, "w", encoding="utf-8")
-        transferred = True
+    # The whole body runs deferred: small bounded regfile writes
+    # never block, so no async window can strand the temp or fd.
+    with _deferred_cancel():
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                   dir=str(path.parent))
         try:
-            stream.write(text)
-            stream.flush()
-        except BaseException as write_error:
-            try:
-                stream.close()
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as close_error:
-                write_error.__context__ = close_error
-            raise
-        else:
-            stream.close()
-        os.replace(tmp, path)
-    except BaseException:
-        if not transferred:
-            # io.open closes fd itself on wrapper-stage failure
-            # (EBADF here, suppressed); nothing in-process reuses
-            # descriptor numbers (the watcher and signal handlers
-            # never open), so this cannot close a foreign fd.
+            os.fchmod(fd, 0o644)
+            stream = _text_sink(fd)
+        except BaseException:
+            # _text_sink closes on its own failures, so this close
+            # is a no-op EBADF on that path (suppressed); the
+            # fchmod path still owns the descriptor.
             try:
                 os.close(fd)
             except OSError:
                 pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            try:
+                stream.write(text)
+                stream.flush()
+            except BaseException as write_error:
+                try:
+                    stream.close()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as close_error:
+                    write_error.__context__ = close_error
+                raise
+            else:
+                stream.close()
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def _publish_json(path, value):
@@ -178,14 +217,34 @@ def _publish_json(path, value):
     ownership sequence: a hostile directory planted at the
     target name, or a full disk, returns the error string so
     the caller can record it and proceed. Success returns None.
-    Only OSError is contained — anything else (interrupts,
-    programming errors) still propagates.
+    OSError is contained — including the lane's own
+    InterruptedError cancel signal, which stays effective
+    through _CANCEL_REQUESTED at the next checkpoint.
+    Anything else (programming errors, genuine termination)
+    still propagates.
     """
     try:
         dump(path, value)
     except OSError as error:
         return str(error)
     return None
+
+
+def _guarded_publish(path, value, publish_errors, deferred):
+    """_publish_json that also defers non-OSError escapes past cleanup.
+
+    OSError (planted names, full disk) is recorded; anything else
+    (allocation failure class — genuine interrupts arrive as
+    OSError or are deferred by the caller) is queued for a gated
+    re-raise after unmounts, ownership, and lock close complete.
+    """
+    try:
+        error = _publish_json(path, value)
+    except BaseException as error:
+        deferred.append(error)
+    else:
+        if error is not None:
+            publish_errors.append(error)
 
 
 def digest(path):
@@ -556,8 +615,9 @@ def committed_prefix(out, results):
     by the preparer for the whole run.
     """
     try:
-        fd = os.open(out / "results.json",
-                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with _deferred_cancel():
+            fd = os.open(out / "results.json",
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return []
     try:
@@ -704,6 +764,40 @@ def reap_owned(proc=None):
 
 
 @contextlib.contextmanager
+def _deferred_cancel():
+    """Defer SIGTERM/SIGINT to the flag across a non-interruptible window.
+
+    A raising handler firing between fd acquisition and ownership
+    transfer would leak the descriptor; shielding publishes and
+    the cleanup sequence lets them complete, with cancellation
+    taking effect at the next checkpoint via _CANCEL_REQUESTED.
+    Off the main thread this is a plain yield: signals only
+    deliver to the main thread, so no window exists elsewhere
+    (and signal.signal would raise there).
+    """
+    if threading.get_ident() != threading.main_thread().ident:
+        yield
+        return
+    def defer(_sig, _frame):
+        global _CANCEL_REQUESTED
+        _CANCEL_REQUESTED = True
+    saved = {sig: signal.signal(sig, defer) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+
+def _say(message):
+    """Diagnostic print that can never abort cleanup (broken pipe)."""
+    try:
+        print(message, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+@contextlib.contextmanager
 def cancellation():
     def cancelled(sig, _frame):
         global _CANCEL_REQUESTED
@@ -759,36 +853,22 @@ def _exclusive_sink(path):
     the preparer-writable pathname. The mode is forced (not
     umask-dependent) so failure-uploaded logs stay readable.
     """
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                 0o644)
+    with _deferred_cancel():
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o644)
     try:
         os.fchmod(fd, 0o644)
     except BaseException:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(path)
         except OSError:
             pass
         raise
     return fd
-
-
-def _owned_wrap(fd):
-    """Binary stream owning a duplicate of `fd`.
-
-    The duplicate has no owner until fdopen succeeds, so a
-    failed wrap must close it — otherwise one descriptor leaks
-    per failure. (The original stays owned by the caller.)
-    """
-    dup = os.dup(fd)
-    try:
-        return os.fdopen(dup, "wb")
-    except BaseException:
-        try:
-            os.close(dup)
-        except OSError:
-            pass
-        raise
 
 
 def _read_back(fd):
@@ -833,16 +913,19 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     code = 1
     captured = b""
     with contextlib.ExitStack() as stack:
+        # Raw descriptors go to the child: no dup/wrap stage means
+        # no transfer to fail. (Registration follows acquisition
+        # on the next statement; the residual one-statement
+        # window matches every fd in the program, lane_fd included.)
         sink = _exclusive_sink(log)
         stack.callback(os.close, sink)
-        stream = stack.enter_context(_owned_wrap(sink))
         if stderr_path:
             err_sink = _exclusive_sink(stderr_path)
             stack.callback(os.close, err_sink)
-            stderr = stack.enter_context(_owned_wrap(err_sink))
+            stderr = err_sink
         else:
             stderr = subprocess.STDOUT
-        proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=sink, stdin=subprocess.DEVNULL,
                                 stderr=stderr, start_new_session=True)
         try:
             code = proc.wait(timeout=timeout)
@@ -862,7 +945,6 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
             # (negative when the child died on a signal).
             raw_exit = code
             code = normalize_leak(code, leaked)
-            stream.flush()
             captured = _read_back(sink)
             dump(log.with_suffix(log.suffix + ".result.json"), {
                 "exit": code, "raw_exit": raw_exit, "reaped_status": proc.returncode,
@@ -1214,47 +1296,61 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         receipt.update(status="finished", exit=code, counts=counts, staged_hashes_unchanged=True)
     except BaseException as error:
         receipt.update(status="failed", exit=1, error=str(error))
-        dump(out / "summary.json", {"exit": 1, "error": str(error), "complete": False,
-                                       "accepted_partials": summarize_partials(committed_prefix(out, results))})
+        summary_error = _publish_json(out / "summary.json", {
+            "exit": 1, "error": str(error), "complete": False,
+            "accepted_partials": summarize_partials(committed_prefix(out, results))})
+        if summary_error is not None:
+            _say(f"sudo-lane: failure summary not published: {summary_error}")
         raise
     finally:
         # Children must be reaped before mounts or the exclusive lock go.
-        # Publishing inside cleanup reports instead of raising: a
-        # hostile planted directory or a full disk must not skip
-        # the unmounts, the ownership receipt, or the lock close.
-        reap_owned()
-        publish_errors = []
-        if _CANCEL_REQUESTED:
-            receipt.update(status="failed", exit=1, error="cancelled")
-            publish_errors.append(_publish_json(out / "summary.json", {
-                "exit": 1, "complete": False, "error": "cancelled",
-                "accepted_partials": summarize_partials(committed_prefix(out, results))}))
-        cleanup_errors = []
-        for target in reversed(mounts):
-            cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
-            if cleanup.returncode:
-                cleanup_errors.append({"target": str(target), "stderr": cleanup.stderr})
-        if runtime is not None and not cleanup_errors:
-            runtime.rmdir()
-        if cleanup_errors:
-            receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
-            publish_errors.append(_publish_json(out / "summary.json", {
-                "exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
-                "accepted_partials": summarize_partials(committed_prefix(out, results))}))
-        receipt["children_reaped"] = not children()
-        receipt["owned_mounts_removed"] = not cleanup_errors
-        receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        publish_errors.append(_publish_json(out / "ownership.json", receipt))
-        publish_errors = [error for error in publish_errors if error is not None]
-        if publish_errors:
-            print(f"sudo-lane: evidence publishing failed: {publish_errors}", flush=True)
-        os.close(lane_fd)
-        if cleanup_errors:
-            raise ValueError(f"owned mount cleanup failed: {cleanup_errors}")
-        if _CANCEL_REQUESTED:
-            raise InterruptedError("cancelled; lane cleanup complete")
-        if publish_errors:
-            raise ValueError(f"lane evidence publishing failed: {publish_errors}")
+        # The sequence runs shielded: a signal here would otherwise
+        # strand mounts, the runtime dir, the ownership receipt, or
+        # the lock. Cancellation takes effect through the flag at
+        # the end of the sequence.
+        with _deferred_cancel():
+            reap_owned()
+            publish_errors = []
+            deferred = []
+            if _CANCEL_REQUESTED:
+                receipt.update(status="failed", exit=1, error="cancelled")
+                _guarded_publish(out / "summary.json", {
+                    "exit": 1, "complete": False, "error": "cancelled",
+                    "accepted_partials": summarize_partials(committed_prefix(out, results))},
+                    publish_errors, deferred)
+            cleanup_errors = []
+            for target in reversed(mounts):
+                cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
+                if cleanup.returncode:
+                    cleanup_errors.append({"target": str(target), "stderr": cleanup.stderr})
+            if runtime is not None and not cleanup_errors:
+                runtime.rmdir()
+            if cleanup_errors:
+                receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
+                _guarded_publish(out / "summary.json", {
+                    "exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
+                    "accepted_partials": summarize_partials(committed_prefix(out, results))},
+                    publish_errors, deferred)
+            receipt["children_reaped"] = not children()
+            receipt["owned_mounts_removed"] = not cleanup_errors
+            receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _guarded_publish(out / "ownership.json", receipt, publish_errors, deferred)
+            if publish_errors or deferred:
+                _say("sudo-lane: evidence publishing problems: "
+                     f"{publish_errors + [type(e).__name__ for e in deferred]}")
+            os.close(lane_fd)
+            if cleanup_errors:
+                raise ValueError(f"owned mount cleanup failed: {cleanup_errors}")
+            if _CANCEL_REQUESTED:
+                raise InterruptedError("cancelled; lane cleanup complete")
+            # A new failure here must not mask an in-flight one: the
+            # operator already lost the evidence write; keep the root
+            # cause (and any termination semantics) intact.
+            if sys.exception() is None:
+                if deferred:
+                    raise deferred[0]
+                if publish_errors:
+                    raise ValueError(f"lane evidence publishing failed: {publish_errors}")
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
     lab_bodies = len(EXPECTED[LAB_SUITE])
