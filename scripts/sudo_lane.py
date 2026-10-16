@@ -121,10 +121,18 @@ _CANCEL_REQUESTED = False
 
 def dump(path, value):
     """Atomic JSON write (temp + rename): readers see the old or the new
-    file, never a partial one. Atomicity, not fsync durability."""
+    file, never a partial one. Atomicity, not fsync durability. The
+    temp name is random-exclusive (mkstemp), so a planted symlink in
+    a reused prepared directory is never followed."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                               dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+    except BaseException:
+        os.unlink(tmp)
+        raise
     os.replace(tmp, path)
 
 
@@ -254,7 +262,9 @@ def _no_dup_object(pairs):
 
 def _strict_int(text):
     # "-0" parses as int 0 here but float in serde: reject the token.
-    # Otherwise serde takes i64/u64 only, so out-of-range rejects.
+    # Otherwise integers are restricted to i64/u64 — intentionally
+    # stricter than serde, which floats overflows and errors only
+    # past f64::MAX.
     if text == "-0":
         raise ValueError("negative zero")
     value = int(text)
@@ -326,9 +336,9 @@ def partial_receipt(output, calls):
     keys, strict constants (no NaN/Infinity), finite floats, no
     negative zero, i64/u64 integers, no lone surrogates, nesting
     capped at 127 containers like serde, object payload, exact
-    field types. Record-looking lines under unsupported framing
-    reject. Numbers ignore leading zeros like Rust's u64 parse.
-    Never raises on malformed input.
+    field types. Any '{' outside a parsed candidate rejects
+    (unsupported framing). Numbers ignore leading zeros like
+    Rust's u64 parse. Never raises on malformed input.
     """
     if "\r" in output or "\ufffd" in output:
         return None
@@ -375,11 +385,12 @@ def partial_receipt(output, calls):
     for line in lines:
         candidate = line.lstrip(" \t")
         if not candidate.startswith("{"):
-            # A record-looking line under unsupported framing (exotic
-            # prefix, mid-line object): the scan cannot see it, so the
-            # raw spelling count cannot be trusted — reject instead of
-            # ignoring. Real logs only carry '{"' inside candidates.
-            if '{"' in line:
+            # A brace outside a parsed candidate: a record under
+            # unsupported framing (exotic prefix, mid-line object,
+            # spaced opener) that the scan cannot see, so the raw
+            # spelling count cannot be trusted — reject instead of
+            # ignoring. Real logs only carry '{' inside candidates.
+            if "{" in line:
                 return None
             continue
         try:
@@ -451,13 +462,16 @@ def committed_prefix(out, results):
     atomically from ever-longer prefixes of the append-only results
     list, so its row count — read at summary time, after the dust
     settles — is immune to interruption between append and persist.
-    Missing/unreadable/non-list file: no rows are claimed.
+    Missing/unreadable/non-list file: no rows are claimed. The read
+    is size-capped and never raises: the directory stays writable
+    by the preparer for the whole run.
     """
     try:
-        committed = json.loads((out / "results.json").read_text(encoding="utf-8"))
+        raw = (out / "results.json").read_bytes()[:1024 * 1024]
+        committed = json.loads(raw)
         if isinstance(committed, list):
             return results[:len(committed)]
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         pass
     return []
 

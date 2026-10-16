@@ -429,8 +429,10 @@ class PartialReceipt(unittest.TestCase):
         base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
         self.assertIsNone(lane.partial_receipt(base + forged, 10))
 
-    def test_integer_range_matches_serde(self):
-        # serde takes i64/u64 only; auxiliary out-of-range ints reject
+    def test_integer_range_stricter_than_serde(self):
+        # serde floats out-of-range ints and errors only past f64::MAX;
+        # Python restricts auxiliaries to i64/u64 (fail-closed).
+        # True parity: in-range accepts, past-f64 rejects on both.
         stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
         head = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
                 '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",'
@@ -438,7 +440,11 @@ class PartialReceipt(unittest.TestCase):
                 '"child_signal":null},')
         good = head + '"x":18446744073709551615,"y":-9223372036854775808}\n'
         self.assertIsNotNone(lane.partial_receipt(stem + good, 10))
-        for raw in ["9" * 309, "-170141183460469231731687303715884105729"]:
+        self.assertIsNone(
+            lane.partial_receipt(stem + head + '"x":' + "9" * 309 + "}\n", 10))
+        # Documented strictness: serde would float-accept these.
+        for raw in ["18446744073709551616", "-9223372036854775809",
+                    "-170141183460469231731687303715884105729"]:
             with self.subTest(raw=raw[:12]):
                 bad = head + f'"x":{raw}' + "}\n"
                 self.assertIsNone(lane.partial_receipt(stem + bad, 10))
@@ -489,12 +495,32 @@ class PartialReceipt(unittest.TestCase):
 
     def test_exotic_framing_with_escaped_kind_rejected(self):
         base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
-        forged = ('{"kind":"session' + USCORE_ESCAPE
-                  + 'end","payload":{"verdict":"FAILED","child_exit_code":1,'
-                  '"child_signal":null}}\n')
+        bodies = [
+            # compact, spaced, and tabbed object openers: JSON allows
+            # whitespace after '{', so the framing rule cannot rely on
+            # quote adjacency
+            '{"kind":"session',
+            '{ "kind": "session',
+            '{\t"kind":\t"session',
+        ]
+        tail = ('end", "payload": { "verdict": "FAILED", "child_exit_code": 1, '
+                '"child_signal": null } }\n')
         for prefix in [NBSP, BOM, VT, NUL, "  " + NBSP]:
-            with self.subTest(prefix=ord(prefix.lstrip(" ")[0])):
-                self.assertIsNone(lane.partial_receipt(base + prefix + forged, 10))
+            for body in bodies:
+                forged = body + USCORE_ESCAPE + tail
+                with self.subTest(prefix=ord(prefix.lstrip(" ")[0]),
+                                  body=body[:4]):
+                    if body != bodies[0]:
+                        # spaced openers carry no '{"': the r6 token
+                        # rule cannot see these forgeries
+                        self.assertNotIn('{"', prefix + forged)
+                    self.assertIsNone(
+                        lane.partial_receipt(base + prefix + forged, 10))
+        # mid-line object under an exotic prefix
+        forged = ('note { "kind": "session' + USCORE_ESCAPE
+                  + 'end", "payload": {"verdict": "FAILED", "child_exit_code": 1, '
+                    '"child_signal": null} }\n')
+        self.assertIsNone(lane.partial_receipt(base + NBSP + forged, 10))
 
     def test_exotic_prefixed_valid_end_rejected(self):
         # a valid end under an exotic prefix is unsupported framing,
@@ -642,6 +668,41 @@ class CommittedPrefix(unittest.TestCase):
             self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
             (out / "results.json").write_text(json.dumps({"test": "a"}))
             self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+
+    def test_hostile_file_never_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[" * 5000)
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            big = json.dumps([{"test": f"t{i}"} for i in range(60000)])
+            assert len(big) > 1024 * 1024
+            (out / "results.json").write_text(big)
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            (out / "results.json").write_text("[]")
+            with mock.patch.object(lane.json, "loads", side_effect=RecursionError):
+                self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+
+
+class DumpAtomicity(unittest.TestCase):
+    def test_planted_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            victim = out / "victim.txt"
+            victim.write_text("untouched")
+            (out / "results.json.tmp").symlink_to(victim)
+            lane.dump(out / "results.json", [{"test": "a"}])
+            self.assertEqual(victim.read_text(), "untouched")
+            self.assertEqual(
+                json.loads((out / "results.json").read_text()), [{"test": "a"}])
+
+    def test_roundtrip_replaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            lane.dump(out / "results.json", [{"test": "a"}])
+            lane.dump(out / "results.json", [{"test": "a"}, {"test": "b"}])
+            self.assertEqual(
+                json.loads((out / "results.json").read_text()),
+                [{"test": "a"}, {"test": "b"}])
 
 
 class SelftestBpfVerdict(unittest.TestCase):
