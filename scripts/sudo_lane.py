@@ -121,12 +121,15 @@ ENV_GATED_BODIES = {
 }
 ENV_GATE_DOC = "docs/lane-environment.md"
 _CANCEL_REQUESTED = False
-# Evidence repair for a cancel that lands after execute's last
-# checkpoint: set by execute just before the complete summary
-# is published, consumed (take-and-clear) by cancellation's
-# finally. Repairs only an existing complete:true summary —
-# never a failure record — so running it on a raise path is
-# a no-op read, never a root-cause clobber.
+# Evidence repair for a cancel (or outer custody
+# failure) landing after execute's last checkpoint: a
+# failure-exit custody invalidator while the run is in
+# flight, swapped for the cancel backstop by the success
+# tail just before the complete summary is published;
+# consumed (take-and-clear) by cancellation's finally.
+# Each closure only amends its own record kind, so
+# running the slot on a foreign path is a no-op read,
+# never a root-cause clobber.
 _CANCELLATION_REPAIR = None
 # Outer-custody outcome for the repair above: set by
 # cancellation's finally before the repair runs (every
@@ -256,6 +259,44 @@ def _publish_json(path, value):
     except OSError as error:
         return str(error)
     return None
+
+
+# A manifest lists one digest per staged body (~10 KiB
+# for the whole lane): 1 MiB is ~100x headroom and
+# still bounds a never-ending writer.
+_MANIFEST_MAX_BYTES = 1 << 20
+
+
+def _read_manifest_bytes(path):
+    """Read a manifest without following, hanging, or gorging.
+
+    The manifest name sits in preparer-writable space up to
+    the privileged read: a blocking read_bytes() there hangs
+    root on a writerless FIFO, follows a swapped-in symlink,
+    and allocates without limit on a streaming writer. So
+    the open is O_NONBLOCK|O_NOFOLLOW, the target must be a
+    regular file, and the body is capped (see above): each
+    violation raises ValueError, the manifest-problem class
+    the callers already treat as a hard refusal. A missing
+    file still raises FileNotFoundError unchanged.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(
+                f"prepared manifest is not a regular file: {path}")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > _MANIFEST_MAX_BYTES:
+                raise ValueError(
+                    "prepared manifest exceeds the 1 MiB lane budget")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
 
 
 def _guarded_publish(path, value, publish_errors, deferred):
@@ -993,14 +1034,21 @@ def cancellation():
         _CANCEL_REQUESTED = True
     saved = {sig: signal.signal(sig, noted) for sig in (signal.SIGTERM, signal.SIGINT)}
     subreaper()
+    # The body's OWN error, captured explicitly as it
+    # escapes the yield: sys.exception() here would also
+    # see an exception the CALLER is handling, and the
+    # gate below would mistake it for this body's —
+    # wrongly suppressing a custody failure after a
+    # clean body (an ambient ValueError is not a body
+    # error the reap failure must defer to).
+    body_error = None
     try:
         yield
+    except BaseException as error:
+        body_error = error
+        raise
     finally:
         global _CANCELLATION_REPAIR, _CANCELLATION_REAP_FAILED
-        # The body's error, captured before the repair can
-        # observe anything else: it decides whether the
-        # custody failure may replace it below.
-        body_error = sys.exception()
         repair, _CANCELLATION_REPAIR = _CANCELLATION_REPAIR, None
         reap_failed = False
         reap_error = None
@@ -1273,7 +1321,10 @@ def _open_pinned(path):
     kernel reports a symlink as ENOTDIR then,
     blurring the refusal; the fstat pin keeps ELOOP
     exact for links and raises ENOTDIR for
-    swapped-in non-directories. O_NONBLOCK is what
+    swapped-in non-directories (other nodes surface
+    their own errnos, e.g. ENXIO for sockets — the
+    pin refuses by shape, not by errno). O_NONBLOCK
+    is what
     keeps a swapped-in FIFO from hanging the open:
     a blocking FIFO open would outwait flag-only
     cancel — PEP 475 retries it — with the lock and
@@ -1317,7 +1368,11 @@ def _open_pinned(path):
                             errno.ENOTDIR,
                             "pinned component is not a "
                             f"directory: {component!r}")
-                except OSError:
+                except BaseException:
+                    # Any failure between acquiring the
+                    # child and handing it over (even a
+                    # MemoryError mid-message) releases
+                    # it: OSError-only would strand it.
                     try:
                         os.close(child)
                     except OSError:
@@ -1333,7 +1388,10 @@ def _open_pinned(path):
                         pass
                     owned = None
                     raise
-        except OSError:
+        except BaseException:
+            # Same widening for the outer arm: a
+            # non-OSError mid-walk still releases the
+            # owned descriptor before propagating.
             if owned is not None:
                 try:
                     os.close(owned)
@@ -1748,9 +1806,8 @@ def assert_fresh_execution(out):
 
 def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     # Drop any repair from an earlier run in this process:
-    # the slot repair rewrites unconditionally, so a stale
-    # closure must never survive into a new execution (its
-    # raise paths return before any registration).
+    # this run registers its own invalidator below, so a
+    # stale closure must never survive into a new execution.
     global _CANCELLATION_REPAIR, _CANCELLATION_REAP_FAILED
     _CANCELLATION_REPAIR = None
     _CANCELLATION_REAP_FAILED = False
@@ -1759,7 +1816,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     if not parent_mount_ns or os.readlink("/proc/self/ns/mnt") == parent_mount_ns:
         raise ValueError("refusing mounts outside a fresh private mount namespace")
     assert_fresh_execution(out)
-    manifest_bytes = (out / "manifest.json").read_bytes()
+    manifest_bytes = _read_manifest_bytes(out / "manifest.json")
     actual_manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
     if manifest_sha256 is not None and manifest_sha256 != actual_manifest_sha:
         raise ValueError("prepared manifest changed before privileged execution")
@@ -2164,10 +2221,11 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     # and a preparer-swapped summary is overwritten rather
     # than trusted. The accepted partials are snapshotted
     # here, while the disk is known healthy: the repair
-    # itself performs zero reads. The post-check repair
-    # needs no clearing: it runs before any registration,
-    # when the slot cannot be this run's (slot declared
-    # global at function entry).
+    # itself performs zero reads. This overwrites the
+    # in-flight invalidator registered above: reaching
+    # this line implies a complete summary is on disk,
+    # so the cancel backstop replaces the failure-exit
+    # invalidator (same slot, same take-and-clear).
     _CANCELLATION_REPAIR = functools.partial(
         _repair_cancelled_evidence, out, receipt,
         summarize_partials(committed_prefix(out, results)))
@@ -2286,7 +2344,7 @@ def main():
     if args.run_prepared:
         out = args.run_prepared.resolve(strict=True)
         assert_fresh_execution(out)
-        manifest = json.loads((out / "manifest.json").read_text())
+        manifest = json.loads(_read_manifest_bytes(out / "manifest.json"))
     else:
         if args.out:
             out = args.out.resolve()
@@ -2302,7 +2360,7 @@ def main():
     if args.prepare_only:
         verify_stage(out, manifest)
         return 0
-    manifest_bytes = (out / "manifest.json").read_bytes()
+    manifest_bytes = _read_manifest_bytes(out / "manifest.json")
     if json.loads(manifest_bytes) != manifest:
         raise ValueError("prepared manifest changed before launch")
     # Freeze the bootstrap bytes in argv before privilege elevation. The
