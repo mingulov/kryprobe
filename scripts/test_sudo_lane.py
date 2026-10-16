@@ -1986,6 +1986,87 @@ class ExecuteWiring(unittest.TestCase):
             self.assertIn(b"1 failed",
                           (out / cargo[0]["log"]).read_bytes())
 
+    def test_signal_between_shield_installs_defers(self):
+        # a real SIGINT placed deterministically between the two
+        # installs of the OUTERMOST-open shield (the finally's —
+        # a nested entry would already see deferred handlers):
+        # the masked install pends it, cleanup completes, and
+        # cancellation raises at the end with the table intact.
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError("real-signal")
+        real_dc = lane._deferred_cancel
+        counter = [0]
+        stack = []
+        @contextlib.contextmanager
+        def tracking():
+            counter[0] += 1
+            index = counter[0]
+            stack.append(index)
+            try:
+                with real_dc():
+                    yield
+            finally:
+                stack.pop()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            seen = {}
+            def mark(cmd):
+                if cmd[:1] == ["umount"] and "target" not in seen:
+                    seen["target"] = min(stack)
+                return None
+            with mock.patch.object(lane, "_deferred_cancel",
+                                   side_effect=lambda: tracking()):
+                self._drive(root, out, lock,
+                            run_logged=lambda *a, **k: (0, False, b""),
+                            run_hook=mark)
+            target = seen["target"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            count = [0]
+            @contextlib.contextmanager
+            def armed():
+                count[0] += 1
+                if count[0] == target:
+                    real_signal = signal.signal
+                    def installs(sig, handler):
+                        if sig == signal.SIGINT:
+                            os.kill(os.getpid(), signal.SIGINT)
+                        return real_signal(sig, handler)
+                    with mock.patch.object(lane.signal, "signal",
+                                           side_effect=installs):
+                        with real_dc():
+                            yield
+                else:
+                    with real_dc():
+                        yield
+            saved_flag = lane._CANCEL_REQUESTED
+            old_term = signal.signal(signal.SIGTERM, raising)
+            old_int = signal.signal(signal.SIGINT, raising)
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+            try:
+                lane._CANCEL_REQUESTED = False
+                with mock.patch.object(lane, "_deferred_cancel",
+                                       side_effect=lambda: armed()):
+                    outcome, error, calls, printed = self._drive(
+                        root, out, lock,
+                        run_logged=lambda *a, **k: (0, False, b""))
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self.assertGreater(len(self._umount_targets(calls)), 0)
+            self.assertTrue((out / "ownership.json").is_file())
+            self._assert_lock_released(lock)
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, ()), old_mask)
+
     def test_signal_during_cleanup_defers_to_end(self):
         # SIGTERM on the first umount: every unmount + ownership
         # still attempted, cancellation raised at the end.
@@ -2173,6 +2254,68 @@ class ExecuteWiring(unittest.TestCase):
 
 
 class ProcessCustody(unittest.TestCase):
+    def test_watcher_thread_blocks_cancel_signals(self):
+        # per-thread masks: the watcher must block SIGTERM/SIGINT
+        # or a delivery there schedules the Python handler on
+        # main mid-swap, defeating the install mask. Pinned via
+        # /proc SigBlk of the live watcher thread.
+        before = len(os.listdir("/proc/self/fd"))
+        reader, writer = os.pipe()
+        saved_stdin = os.dup(0)
+        instances = []
+        real_thread = threading.Thread
+        def capture(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            instances.append(thread)
+            return thread
+        got_term = []
+        old_term = signal.signal(
+            signal.SIGTERM, lambda s, f: got_term.append(s))
+        try:
+            os.dup2(reader, 0)
+            with mock.patch.object(lane.threading, "Thread",
+                                   side_effect=capture):
+                lane.watch_parent_pipe()
+            self.assertEqual(len(instances), 1)
+            watcher = instances[0]
+            deadline = time.monotonic() + 5
+            while watcher.native_id is None \
+                    and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertIsNotNone(watcher.native_id)
+            sigblk = 0
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                status = Path(
+                    f"/proc/self/task/{watcher.native_id}/status"
+                ).read_text()
+                sigblk = int([line for line in status.splitlines()
+                              if line.startswith("SigBlk:")][0].split()[1],
+                             16)
+                if sigblk & (1 << (signal.SIGTERM - 1)) \
+                        and sigblk & (1 << (signal.SIGINT - 1)):
+                    break
+            self.assertNotEqual(sigblk & (1 << (signal.SIGTERM - 1)), 0)
+            self.assertNotEqual(sigblk & (1 << (signal.SIGINT - 1)), 0)
+            os.close(writer)  # EOF: watcher sends SIGTERM to self
+            watcher.join(timeout=5)
+            self.assertFalse(watcher.is_alive())
+            self.assertEqual(got_term, [signal.SIGTERM])
+        finally:
+            # Stop the watcher BEFORE restoring fd 0 / the SIGTERM
+            # handler: otherwise a live watcher sees EOF on the
+            # restored /dev/null and kills the suite with the
+            # default disposition.
+            with contextlib.suppress(OSError):
+                os.close(writer)
+            for thread in instances:
+                thread.join(timeout=5)
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+            os.close(reader)
+            signal.signal(signal.SIGTERM, old_term)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_timeout_kills_and_reaps_owned_process_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             late = Path(tmp) / "late"

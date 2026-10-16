@@ -851,6 +851,14 @@ def watch_parent_pipe():
     # signal arbitrary privileged PIDs. EOF, even after wrapper SIGKILL,
     # cancels the executor. Test bodies never inherit this descriptor.
     def watch():
+        # Block the cancel signals on THIS thread: pthread_sigmask
+        # is per-thread, and a signal delivered here would still
+        # schedule the Python handler on the main thread — possibly
+        # mid-swap inside _deferred_cancel's install, defeating
+        # its mask. Every non-main thread must block these; the
+        # watcher is the lane's only one.
+        signal.pthread_sigmask(signal.SIG_BLOCK,
+                               (signal.SIGTERM, signal.SIGINT))
         try:
             while os.read(0, 1):
                 pass
