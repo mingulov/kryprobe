@@ -130,14 +130,30 @@ class BodyAccounting(unittest.TestCase):
 
 
 def _partial_output(entries, returns, received, ring, drop, trunc, queue,
-                     printed_missing, marker="reconcile: partial\n"):
-    return (
+                     printed_missing, marker="reconcile: partial\n",
+                     verdict="PARTIAL", child_code=0, child_signal=None,
+                     session=True):
+    out = (
         f"selftest bpf: partial ({printed_missing} missing; ring={ring} drop={drop}"
         f" trunc={trunc} queue={queue})\n"
         f"selftest bpf: entries={entries} returns={returns} received={received}"
         f" ring={ring} drop={drop} trunc={trunc} queue={queue}\n"
         + marker
     )
+    if session:
+        signal = "null" if child_signal is None else f'"{child_signal}"'
+        out += (
+            '{"schema":"kryprobe.event/v0","kind":"session_start",'
+            '"session_id":"s","record_id":"record:1","monotonic_ns":"0","payload":{}}\n'
+            '{"schema":"kryprobe.event/v0","kind":"session_end",'
+            '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",'
+            f'"payload":{{"verdict":"{verdict}","child_exit_code":{child_code},'
+            f'"child_signal":{signal}}}}}\n'
+        )
+    return out
+
+
+ANNOUNCEMENT = "selftest bpf: accounted partial (2 missing); child output follows:\n"
 
 
 class PartialReceipt(unittest.TestCase):
@@ -184,7 +200,7 @@ class PartialReceipt(unittest.TestCase):
 
     def test_split_receipts_accepted(self):
         receipt = lane.partial_receipt(
-            _partial_output(9, 9, 18, 1, 1, 0, 0, 2), 10)
+            _partial_output(9, 9, 18, 1, 0, 0, 1, 2), 10)
         self.assertEqual(receipt["missing"], 2)
 
     def test_queue_receipted_partial_accepted(self):
@@ -219,7 +235,7 @@ class PartialReceipt(unittest.TestCase):
             _partial_output(100, 100, 200, 0, 0, 0, 0, 0), 100))
 
     def test_marker_shapes_rejected(self):
-        base = _partial_output(9, 9, 18, 1, 1, 0, 0, 2)
+        base = _partial_output(9, 9, 18, 1, 0, 0, 1, 2)
         bad = [
             base + "reconcile: partial\n",  # duplicated marker
             base.replace("reconcile: partial\n", "reconcile: clean\n"),
@@ -232,8 +248,8 @@ class PartialReceipt(unittest.TestCase):
                 self.assertIsNone(lane.partial_receipt(output, 10))
 
     def test_line_count_shapes_rejected(self):
-        entries = "selftest bpf: entries=9 returns=9 received=18 ring=1 drop=1 trunc=0 queue=0\n"
-        partial = "selftest bpf: partial (2 missing; ring=1 drop=1 trunc=0 queue=0)\n"
+        entries = "selftest bpf: entries=9 returns=9 received=18 ring=1 drop=0 trunc=0 queue=1\n"
+        partial = "selftest bpf: partial (2 missing; ring=1 drop=0 trunc=0 queue=1)\n"
         marker = "reconcile: partial\n"
         bad = [
             partial + entries + marker + entries,  # duplicated entries line
@@ -247,9 +263,140 @@ class PartialReceipt(unittest.TestCase):
                 self.assertIsNone(lane.partial_receipt(output, 10))
 
     def test_unicode_digits_rejected(self):
-        output = _partial_output(9, 9, 18, 1, 1, 0, 0, 2)
+        output = _partial_output(9, 9, 18, 1, 0, 0, 1, 2)
         output = output.replace("entries=9", "entries=\uff19")
         self.assertIsNone(lane.partial_receipt(output, 10))
+
+    def test_anomaly_receipts_rejected(self):
+        # drop/trunc are anomaly buckets (spine.rs: pre-arm hits,
+        # generation/TGID mismatch, wide CONFIG) — pressure only.
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(99, 99, 198, 1, 1, 0, 0, 2), 100))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(99, 99, 198, 1, 0, 1, 0, 2), 100))
+        # all-anomaly wipeout satisfies the bare equation
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(0, 0, 0, 0, 40000, 0, 0, 40000), 20000))
+
+    def test_delivery_floor(self):
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(0, 10, 10, 10, 0, 0, 0, 10), 10))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(10, 0, 10, 10, 0, 0, 0, 10), 10))
+
+    def test_malformed_extra_lines_rejected(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        bad = [
+            base + "selftest bpf: entries=0 returns=0 received=0 ring=0 drop=0 trunc=0 queue=0 CORRUPT\n",
+            base + "selftest bpf: partial (bogus)\n",
+            base + "reconcile:defect\n",
+        ]
+        for output in bad:
+            with self.subTest(output=output):
+                self.assertIsNone(lane.partial_receipt(output, 10))
+
+    def test_control_and_replacement_characters_rejected(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        self.assertIsNone(lane.partial_receipt(base.replace("\n", "\r\n"), 10))
+        self.assertIsNone(lane.partial_receipt(base + "noise�\n", 10))
+
+    def test_huge_digits_rejected_without_raising(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        self.assertIsNone(lane.partial_receipt(
+            base.replace("entries=9", "entries=" + "9" * 5000), 10))
+
+    def test_partial_line_values_u64_ranged(self):
+        huge = str(2 ** 64)
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        out = base.replace("partial (2 missing;", f"partial ({huge} missing;")
+        self.assertIsNone(lane.partial_receipt(out, 10))
+        out = base.replace("partial (2 missing; ring=2 ",
+                           f"partial (2 missing; ring={huge} ")
+        self.assertIsNone(lane.partial_receipt(out, 10))
+
+    def test_receipt_lines_must_agree(self):
+        # both lines print the same producer fields; the entries side
+        # still satisfies the equation, isolating the cross-check
+        out = _partial_output(9, 9, 18, 1, 0, 0, 1, 2).split("\n")
+        out[0] = out[0].replace("ring=1", "ring=2").replace("queue=1", "queue=0")
+        self.assertIsNone(lane.partial_receipt("\n".join(out), 10))
+
+    def test_session_end_cross_check(self):
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False), 10))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(9, 9, 18, 2, 0, 0, 0, 2, verdict="FAILED"), 10))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(9, 9, 18, 2, 0, 0, 0, 2, child_code=1), 10))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(9, 9, 18, 2, 0, 0, 0, 2, child_signal="TERM"), 10))
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(9, 9, 18, 2, 0, 0, 0, 2) + "{oops\n", 10))
+        dup = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        end = [line for line in dup.split("\n") if "session_end" in line][0]
+        self.assertIsNone(lane.partial_receipt(dup + end + "\n", 10))
+
+    def test_calls_bound(self):
+        out = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        self.assertIsNone(lane.partial_receipt(out, 0))
+        huge = 2 ** 63
+        out = _partial_output(huge - 1, huge - 1, 2 * huge - 2, 2, 0, 0, 0, 2)
+        # the equation holds but calls exceeds u64::MAX/2
+        self.assertIsNone(lane.partial_receipt(out, huge))
+
+
+class E2EGuard(unittest.TestCase):
+    LOG = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+
+    def test_unclaimed_passthrough(self):
+        self.assertEqual(lane.e2e_partial_guard("ok\n", 10, "PASS"),
+                         ("PASS", None))
+        self.assertEqual(lane.e2e_partial_guard("ok\n", 10, "FAIL"),
+                         ("FAIL", None))
+
+    def test_claimed_receipted(self):
+        status, receipt = lane.e2e_partial_guard(ANNOUNCEMENT + self.LOG, 10, "PASS")
+        self.assertEqual(status, "PASS")
+        self.assertEqual(receipt["missing"], 2)
+
+    def test_claimed_unparseable_fails(self):
+        # announcement without the echo
+        self.assertEqual(
+            lane.e2e_partial_guard(ANNOUNCEMENT + "ok\n", 10, "PASS"),
+            ("FAIL", None))
+        # echo without full accounting
+        self.assertEqual(
+            lane.e2e_partial_guard("reconcile: partial\n", 10, "PASS"),
+            ("FAIL", None))
+
+    def test_rejected_body_not_listed(self):
+        # the receipt parses but the body failed (e.g. leak-normalized)
+        self.assertEqual(
+            lane.e2e_partial_guard(ANNOUNCEMENT + self.LOG, 10, "FAIL"),
+            ("FAIL", None))
+
+
+class SummarizePartials(unittest.TestCase):
+    def test_collects_and_identifies(self):
+        results = [
+            {"test": "selftest-bpf", "status": "PASS",
+             "accepted_partial": {"exit": 3, "missing": 2}},
+            {"package": "kryprobe-cli", "target": "cli_bpf_e2e",
+             "test": "selftest_bpf_clean_partial_or_denied", "status": "PASS",
+             "accepted_partial": {"exit": 3, "missing": 2}},
+            {"test": "other", "status": "PASS"},
+        ]
+        self.assertEqual(lane.summarize_partials(results), [
+            {"test": "selftest-bpf", "exit": 3, "missing": 2},
+            {"test": "kryprobe-cli/cli_bpf_e2e::selftest_bpf_clean_partial_or_denied",
+             "exit": 3, "missing": 2},
+        ])
+
+    def test_empty_and_serializable(self):
+        self.assertEqual(lane.summarize_partials([]), [])
+        self.assertEqual(lane.summarize_partials([{"test": "x"}]), [])
+        json.dumps(lane.summarize_partials([
+            {"test": "selftest-bpf", "accepted_partial": {"exit": 3}}]))
 
 
 class SelftestBpfVerdict(unittest.TestCase):
@@ -278,7 +425,7 @@ class SelftestBpfVerdict(unittest.TestCase):
             # vacuous: exit 3 with nothing missing
             (3, _partial_output(100, 100, 200, 0, 0, 0, 0, 0)),
             # marker disagrees with the exit
-            (3, _partial_output(9, 9, 18, 1, 1, 0, 0, 2,
+            (3, _partial_output(9, 9, 18, 1, 0, 0, 1, 2,
                                 marker="reconcile: defect\n")),
             (1, self.LOG),  # defect exit keeps failing
             (4, self.LOG),  # denied exit keeps failing

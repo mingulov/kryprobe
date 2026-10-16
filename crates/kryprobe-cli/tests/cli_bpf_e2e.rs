@@ -17,6 +17,10 @@ fn parse_calls(var: Option<&str>) -> u64 {
         .parse()
         .expect("KRYPROBE_BPF_CALLS u64");
     assert!(calls > 0, "KRYPROBE_BPF_CALLS must be positive");
+    assert!(
+        calls <= u64::MAX / 2,
+        "KRYPROBE_BPF_CALLS exceeds u64::MAX/2"
+    );
     calls
 }
 
@@ -24,18 +28,20 @@ fn parse_calls(var: Option<&str>) -> u64 {
 /// an exit-3 `selftest bpf` run is an accounted partial (not a
 /// defect) iff stderr carries exactly one `reconcile: partial`
 /// marker, one partial line, and one entries line whose counts
-/// re-derive full accounting against `calls`. Returns true missing
-/// (ground truth minus delivered). The printed partial-line number
-/// is arm-dependent and only its shape is checked.
+/// re-derive full accounting against `calls`. Pressure-only: drop
+/// and trunc are anomaly buckets and never accepted. Returns true
+/// missing (ground truth minus delivered). The printed
+/// partial-line number is arm-dependent; only its shape, u64 range,
+/// and agreement with the entries line are checked.
 fn accounted_partial(stderr: &str, calls: u64) -> Result<u64, &'static str> {
     if stderr.contains('\r') {
         return Err("carriage return");
     }
     let markers: Vec<&str> = stderr
         .lines()
-        .filter_map(|line| line.strip_prefix("reconcile: "))
+        .filter(|line| line.starts_with("reconcile:"))
         .collect();
-    if markers != ["partial"] {
+    if markers != ["reconcile: partial"] {
         return Err("reconcile marker");
     }
     let partials: Vec<&str> = stderr
@@ -53,8 +59,10 @@ fn accounted_partial(stderr: &str, calls: u64) -> Result<u64, &'static str> {
     if printed.is_empty() || !printed.bytes().all(|b| b.is_ascii_digit()) {
         return Err("partial line shape");
     }
+    let _: u64 = printed.parse().map_err(|_| "partial line shape")?;
     let receipts = rest.strip_prefix("missing; ").ok_or("partial line shape")?;
-    parse_kv_line(receipts, &["ring", "drop", "trunc", "queue"]).ok_or("partial line shape")?;
+    let prounds =
+        parse_kv_line(receipts, &["ring", "drop", "trunc", "queue"]).ok_or("partial line shape")?;
     let entries: Vec<&str> = stderr
         .lines()
         .filter(|line| line.starts_with("selftest bpf: entries="))
@@ -76,18 +84,27 @@ fn accounted_partial(stderr: &str, calls: u64) -> Result<u64, &'static str> {
     let [e, r, v, ring, drop, trunc, queue] = counts[..] else {
         return Err("entries line shape");
     };
+    if prounds[..] != [ring, drop, trunc, queue] {
+        return Err("receipt mismatch");
+    }
+    if drop != 0 || trunc != 0 {
+        return Err("anomaly receipts");
+    }
     if (e as u128) + (r as u128) != v as u128 {
         return Err("kind sum");
     }
     if e > calls || r > calls {
         return Err("over-count");
     }
+    if e == 0 || r == 0 {
+        return Err("delivery floor");
+    }
     if (v as u128) + (ring as u128) + (drop as u128) + (trunc as u128) + (queue as u128)
         != 2 * (calls as u128)
     {
         return Err("accounting equation");
     }
-    if ring + drop + trunc + queue == 0 {
+    if (ring as u128) + (queue as u128) == 0 {
         return Err("vacuous partial");
     }
     Ok(2 * calls - v)
@@ -121,7 +138,12 @@ fn session_end(stdout: &str) -> serde_json::Value {
 #[test]
 #[ignore = "BPF lane: run with `cargo xtask test bpf`"]
 fn selftest_bpf_clean_partial_or_denied() {
-    let calls = parse_calls(std::env::var("KRYPROBE_BPF_CALLS").ok().as_deref());
+    let calls = match std::env::var_os("KRYPROBE_BPF_CALLS") {
+        None => parse_calls(None),
+        Some(raw) => parse_calls(Some(
+            raw.to_str().expect("KRYPROBE_BPF_CALLS must be UTF-8"),
+        )),
+    };
     let output = Command::new(kryprobe())
         .args(["selftest", "bpf", "--calls", &calls.to_string()])
         .output()
@@ -145,10 +167,12 @@ fn selftest_bpf_clean_partial_or_denied() {
             assert_eq!(end["payload"]["verdict"], "PARTIAL", "stdout: {stdout}");
             assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
             assert!(end["payload"]["child_signal"].is_null(), "stdout: {stdout}");
-            // Echo the child stderr so the lane re-verifies the same
-            // accounting from this body log (sudo_lane SELFTEST_BPF_E2E).
-            eprintln!("selftest bpf: accounted partial ({missing} missing); child stderr follows:");
+            // Echo the child output so the lane re-verifies the same
+            // accounting from this body log (sudo_lane SELFTEST_BPF_E2E;
+            // the session cross-check needs the stdout JSONL too).
+            eprintln!("selftest bpf: accounted partial ({missing} missing); child output follows:");
             eprintln!("{stderr}");
+            eprintln!("{stdout}");
         }
         Some(4) => {
             assert!(stderr.contains("Denied{"), "stderr: {stderr}");
@@ -234,15 +258,16 @@ mod accounted_partial_tests {
 
     #[test]
     fn malformed_shapes_reject() {
-        let base = output([9, 9, 18, 1, 1, 0, 0, 2]);
+        let base = output([9, 9, 18, 1, 0, 0, 1, 2]);
         let bad = [
             format!("{base}reconcile: partial\n"),
             base.replace("reconcile: partial\n", "reconcile: clean\n"),
             base.replace("reconcile: partial\n", "reconcile: defect\n"),
             format!("{base}reconcile: defect (corrupt)\n"),
+            format!("{base}reconcile:defect\n"),
             base.replace("reconcile: partial\n", ""),
             format!(
-                "{base}selftest bpf: entries=9 returns=9 received=18 ring=1 drop=1 trunc=0 queue=0\n"
+                "{base}selftest bpf: entries=9 returns=9 received=18 ring=1 drop=0 trunc=0 queue=1\n"
             ),
             base.replace("entries=9", "entries=\u{ff19}"),
             base.replace('\n', "\r\n"),
@@ -253,9 +278,58 @@ mod accounted_partial_tests {
     }
 
     #[test]
+    fn anomaly_receipts_reject() {
+        // drop/trunc are anomaly buckets, never pressure receipts.
+        assert_eq!(
+            accounted_partial(&output([99, 99, 198, 1, 1, 0, 0, 2]), 100),
+            Err("anomaly receipts")
+        );
+        assert_eq!(
+            accounted_partial(&output([99, 99, 198, 1, 0, 1, 0, 2]), 100),
+            Err("anomaly receipts")
+        );
+        assert_eq!(
+            accounted_partial(&output([0, 0, 0, 0, 40000, 0, 0, 40000]), 20000),
+            Err("anomaly receipts")
+        );
+    }
+
+    #[test]
+    fn delivery_floor_rejects() {
+        assert_eq!(
+            accounted_partial(&output([0, 10, 10, 10, 0, 0, 0, 10]), 10),
+            Err("delivery floor")
+        );
+        assert_eq!(
+            accounted_partial(&output([10, 0, 10, 10, 0, 0, 0, 10]), 10),
+            Err("delivery floor")
+        );
+    }
+
+    #[test]
+    fn receipt_mismatch_rejects() {
+        // both lines print the same producer fields; the entries
+        // side still satisfies the equation, isolating the cross-check
+        let stderr = output([9, 9, 18, 1, 0, 0, 1, 2])
+            .replacen("ring=1", "ring=2", 1)
+            .replacen("queue=1", "queue=0", 1);
+        assert_eq!(accounted_partial(&stderr, 10), Err("receipt mismatch"));
+    }
+
+    #[test]
     fn calls_default_and_value() {
         assert_eq!(parse_calls(None), 20000);
         assert_eq!(parse_calls(Some("5000")), 5000);
+        assert_eq!(
+            parse_calls(Some("9223372036854775807")),
+            9223372036854775807
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "u64::MAX/2")]
+    fn calls_above_half_max_panics() {
+        parse_calls(Some("9223372036854775808"));
     }
 
     #[test]

@@ -213,48 +213,129 @@ def skipped(output):
 
 
 _PARTIAL_LINE_RE = re.compile(
-    r"^selftest bpf: partial \(\d+ missing; ring=\d+ drop=\d+ trunc=\d+ queue=\d+\)$",
-    re.ASCII | re.MULTILINE,
+    r"^selftest bpf: partial \((\d+) missing; ring=(\d+) drop=(\d+) trunc=(\d+) queue=(\d+)\)$",
+    re.ASCII,
 )
 _ENTRIES_LINE_RE = re.compile(
     r"^selftest bpf: entries=(\d+) returns=(\d+) received=(\d+)"
     r" ring=(\d+) drop=(\d+) trunc=(\d+) queue=(\d+)$",
-    re.ASCII | re.MULTILINE,
+    re.ASCII,
 )
-_RECONCILE_LINE_RE = re.compile(r"^reconcile: (.*)$", re.ASCII | re.MULTILINE)
+_U64MAX = (1 << 64) - 1
+# The Rust e2e body announces accepted partials with this prefix and
+# echoes the child output for lane re-verification (cli_bpf_e2e.rs).
+E2E_PARTIAL_ANNOUNCEMENT = "selftest bpf: accounted partial"
 
 
 def partial_receipt(output, calls):
     """Accounted-partial receipt for a `selftest bpf --calls` log, or None.
 
-    The printed `partial (N missing; ...)` number is arm-dependent (the
-    loss ledger excludes queue drops, so on the ledger-Partial arm it
-    is the post-receipt remainder, not total loss) and proves nothing
-    alone. The receipt re-derives full accounting from the entries
-    line against the invoked `calls`: every generated record
-    (2·calls) is delivered or carries a stage receipt, neither kind
-    over-counts, and the shortfall is non-vacuous. All terms are
-    unsigned and sum to 2·calls, so no value cap is needed.
+    Pressure-only receipts (P7/T12): the ring/queue shortfall is not a
+    defect, but drop/trunc are anomaly buckets (spine.rs: pre-arm
+    hits, generation/TGID mismatch, wide CONFIG) and never accepted.
+    The printed `partial (N missing; ...)` number is arm-dependent
+    (the loss ledger excludes queue drops, so on the ledger-Partial
+    arm it is the post-receipt remainder) and proves nothing alone;
+    only its shape, u64 range, and agreement with the entries line
+    are checked. The receipt re-derives full accounting from the
+    entries line against the invoked `calls`: every generated record
+    (2·calls) is delivered or carries a pressure receipt, neither
+    kind over-counts, both kinds were observed, and the session
+    record agrees (PARTIAL, fixture exit 0). Candidate lines are
+    counted by reserved prefix first, so malformed extras reject
+    instead of being ignored. Never raises on malformed input.
     """
-    if _RECONCILE_LINE_RE.findall(output) != ["partial"]:
+    if "\r" in output or "\ufffd" in output:
         return None
-    if len(_PARTIAL_LINE_RE.findall(output)) != 1:
+    if not isinstance(calls, int) or not 0 < calls <= _U64MAX // 2:
         return None
-    rows = _ENTRIES_LINE_RE.findall(output)
-    if len(rows) != 1:
+    lines = output.split("\n")
+    if [line for line in lines if line.startswith("reconcile:")] != ["reconcile: partial"]:
         return None
-    entries, returns, received, ring, drop, trunc, queue = (int(v) for v in rows[0])
+    partials = [line for line in lines if line.startswith("selftest bpf: partial (")]
+    if len(partials) != 1:
+        return None
+    match = _PARTIAL_LINE_RE.match(partials[0])
+    if not match:
+        return None
+    found = [line for line in lines if line.startswith("selftest bpf: entries=")]
+    if len(found) != 1:
+        return None
+    counts = _ENTRIES_LINE_RE.match(found[0])
+    if not counts:
+        return None
+    try:
+        printed = [int(v) for v in match.groups()]
+        entries, returns, received, ring, drop, trunc, queue = (
+            int(v) for v in counts.groups())
+    except ValueError:
+        return None
+    if any(v > _U64MAX for v in printed):
+        return None
+    if printed[1:] != [ring, drop, trunc, queue]:
+        return None
+    if drop != 0 or trunc != 0:
+        return None
     if entries + returns != received:
         return None
-    if entries > calls or returns > calls:
+    if entries > calls or returns > calls or entries == 0 or returns == 0:
         return None
     if received + ring + drop + trunc + queue != 2 * calls:
         return None
-    if ring + drop + trunc + queue == 0:
+    if ring + queue == 0:
+        return None
+    ends = []
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return None
+        if isinstance(record, dict) and record.get("kind") == "session_end":
+            ends.append(record)
+    if len(ends) != 1:
+        return None
+    payload = ends[0].get("payload", {})
+    if payload.get("verdict") != "PARTIAL":
+        return None
+    if payload.get("child_exit_code") != 0:
+        return None
+    if payload.get("child_signal") is not None:
         return None
     return {"exit": 3, "calls": calls, "missing": 2 * calls - received,
             "entries": entries, "returns": returns, "received": received,
             "ring": ring, "drop": drop, "trunc": trunc, "queue": queue}
+
+
+def e2e_partial_guard(output, calls, status):
+    """(status, receipt-or-None) for the SELFTEST_BPF_E2E cargo body log.
+
+    The Rust test announces accepted partials; the lane must receipt
+    them from the echoed child output — a missing/truncated echo or
+    unparseable accounting fails closed. Only PASS bodies contribute
+    receipts, so `accepted_partials` never names a failed body.
+    """
+    claimed = E2E_PARTIAL_ANNOUNCEMENT in output or "reconcile: partial" in output
+    if not claimed:
+        return status, None
+    receipt = partial_receipt(output, calls)
+    if receipt is None or status != "PASS":
+        return "FAIL", None
+    return status, receipt
+
+
+def summarize_partials(results):
+    """`accepted_partials` entries for summary.json from body results."""
+    partials = []
+    for row in results:
+        accepted = row.get("accepted_partial")
+        if accepted is None:
+            continue
+        ident = row["test"] if "package" not in row else (
+            f"{row['package']}/{row['target']}::{row['test']}")
+        partials.append({"test": ident, **accepted})
+    return partials
 
 
 def selftest_verdict(code, output, name, calls):
@@ -437,10 +518,11 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
             leaked = not timed_out and not cancelled and bool(children())
             reap_owned(proc)
             cancelled = cancelled or _CANCEL_REQUESTED
+            raw_exit = code
             code = normalize_leak(code, leaked)
             stream.flush()
             dump(log.with_suffix(log.suffix + ".result.json"), {
-                "exit": code, "timed_out": timed_out, "cancelled": cancelled,
+                "exit": code, "raw_exit": raw_exit, "timed_out": timed_out, "cancelled": cancelled,
                 "leaked_children": leaked, "pid": proc.pid, "reaped": True,
                 "descendants_reaped": not children(),
                 "wall_seconds": time.monotonic() - start, "log_sha256": digest(log),
@@ -754,12 +836,10 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                     code, timed_out = run_logged(command, log, 180, cwd=root, env=env)
                     output = log.read_text(errors="replace")
                     status = body_verdict(code, output, key, body)
-                    if (key[0], key[1], body) == SELFTEST_BPF_E2E and "reconcile: partial" in output:
-                        receipt = partial_receipt(output, calls)
-                        if receipt is None:
-                            status = "FAIL"
-                        else:
-                            result["accepted_partial"] = receipt
+                    if (key[0], key[1], body) == SELFTEST_BPF_E2E:
+                        status, accepted = e2e_partial_guard(output, calls, status)
+                        if accepted is not None:
+                            result["accepted_partial"] = accepted
                     result.update(status=status,
                                   exit=code, timed_out=timed_out, euid=uid, egid=gid, log=str(log.relative_to(out)))
                 results.append(result)
@@ -773,10 +853,10 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             status = selftest_verdict(code, output, name, calls)
             result = {"test": name, "status": status, "exit": code,
                       "timed_out": timed_out, "log": str(log.relative_to(out))}
-            if code == 3 and name == "selftest-bpf":
-                receipt = partial_receipt(output, calls)
-                if receipt is not None:
-                    result["accepted_partial"] = receipt
+            if status == "PASS" and code == 3 and name == "selftest-bpf":
+                accepted = partial_receipt(output, calls)
+                if accepted is not None:
+                    result["accepted_partial"] = accepted
             results.append(result)
         verify_stage(runtime, manifest)
         dump(out / "results.json", results)
@@ -785,14 +865,16 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         receipt.update(status="finished", exit=code, counts=counts, staged_hashes_unchanged=True)
     except BaseException as error:
         receipt.update(status="failed", exit=1, error=str(error))
-        dump(out / "summary.json", {"exit": 1, "error": str(error), "complete": False})
+        dump(out / "summary.json", {"exit": 1, "error": str(error), "complete": False,
+                                       "accepted_partials": summarize_partials(results)})
         raise
     finally:
         # Children must be reaped before mounts or the exclusive lock go.
         reap_owned()
         if _CANCEL_REQUESTED:
             receipt.update(status="failed", exit=1, error="cancelled")
-            dump(out / "summary.json", {"exit": 1, "complete": False, "error": "cancelled"})
+            dump(out / "summary.json", {"exit": 1, "complete": False, "error": "cancelled",
+                                       "accepted_partials": summarize_partials(results)})
         cleanup_errors = []
         for target in reversed(mounts):
             cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
@@ -802,7 +884,8 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             runtime.rmdir()
         if cleanup_errors:
             receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
-            dump(out / "summary.json", {"exit": 1, "complete": False, "cleanup_errors": cleanup_errors})
+            dump(out / "summary.json", {"exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
+                                       "accepted_partials": summarize_partials(results)})
         receipt["children_reaped"] = not children()
         receipt["owned_mounts_removed"] = not cleanup_errors
         receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -817,17 +900,9 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     lab_bodies = len(EXPECTED[LAB_SUITE])
     vng_bodies = len(EXPECTED[VNG_SUITE])
     lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
-    partials = []
-    for row in results:
-        receipt = row.get("accepted_partial")
-        if receipt is None:
-            continue
-        ident = row["test"] if "package" not in row else (
-            f"{row['package']}/{row['target']}::{row['test']}")
-        partials.append({"test": ident, **receipt})
     dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
                                 "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
-                                "accepted_partials": partials, "complete": True})
+                                "accepted_partials": summarize_partials(results), "complete": True})
     print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
     return code
 
