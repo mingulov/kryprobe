@@ -621,39 +621,42 @@ def committed_prefix(out, results):
     input-driven can trigger it.) The directory stays writable
     by the preparer for the whole run.
     """
-    # fd is None until open succeeds, and every later statement
-    # sits inside the try: a signal anywhere past acquisition
-    # still runs the finally (no shield gap, no ownership
-    # window). The open itself cannot leaf (O_RDONLY).
+    # The whole body runs shielded (like _exclusive_sink): even
+    # the return-to-assignment step after os.open is covered, so
+    # no signal can strand the descriptor between acquisition
+    # and ownership. A signal here defers to the flag, acted on
+    # at the caller's checkpoint; the except below only sees
+    # genuine I/O and parse failures.
     fd = None
-    try:
-        fd = os.open(out / "results.json",
-                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return []
-        chunks = []
-        remaining = _COMMITTED_READ_CAP + 1
-        while remaining > 0:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        if len(raw) > _COMMITTED_READ_CAP:
-            return []
-        committed = json.loads(raw, object_pairs_hook=_no_dup_object)
-        if (isinstance(committed, list) and len(committed) <= len(results)
-                and _exact_json_equal(committed, results[:len(committed)])):
-            return results[:len(committed)]
-    except (OSError, ValueError, RecursionError, MemoryError):
-        pass
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    with _deferred_cancel():
+        try:
+            fd = os.open(out / "results.json",
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return []
+            chunks = []
+            remaining = _COMMITTED_READ_CAP + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > _COMMITTED_READ_CAP:
+                return []
+            committed = json.loads(raw, object_pairs_hook=_no_dup_object)
+            if (isinstance(committed, list) and len(committed) <= len(results)
+                    and _exact_json_equal(committed, results[:len(committed)])):
+                return results[:len(committed)]
+        except (OSError, ValueError, RecursionError, MemoryError):
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     return []
 
 
@@ -851,12 +854,14 @@ def watch_parent_pipe():
     # signal arbitrary privileged PIDs. EOF, even after wrapper SIGKILL,
     # cancels the executor. Test bodies never inherit this descriptor.
     def watch():
-        # Block the cancel signals on THIS thread: pthread_sigmask
-        # is per-thread, and a signal delivered here would still
-        # schedule the Python handler on the main thread — possibly
-        # mid-swap inside _deferred_cancel's install, defeating
-        # its mask. Every non-main thread must block these; the
-        # watcher is the lane's only one.
+        # Block the cancel signals on THIS thread too (defense in
+        # depth; the thread is already born blocked — see below).
+        # pthread_sigmask is per-thread: a signal delivered to an
+        # unmasked thread still schedules the Python handler on
+        # the main thread — possibly mid-swap inside
+        # _deferred_cancel's install, defeating its mask. Every
+        # non-main thread must block these; the watcher is the
+        # lane's only one.
         signal.pthread_sigmask(signal.SIG_BLOCK,
                                (signal.SIGTERM, signal.SIGINT))
         try:
@@ -865,7 +870,15 @@ def watch_parent_pipe():
         except OSError:
             pass  # lost custody is cancellation, including a hung-up tty
         os.kill(os.getpid(), signal.SIGTERM)
-    threading.Thread(target=watch, daemon=True).start()
+    # Spawn masked: threads inherit the creator's mask, so the
+    # watcher is protected from birth. Masking only at watch()
+    # entry would leave the spawn-to-entry interval open.
+    old_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, (signal.SIGTERM, signal.SIGINT))
+    try:
+        threading.Thread(target=watch, daemon=True).start()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def launch_supervised(command):
@@ -1404,14 +1417,19 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                         publish_errors, deferred)
                 except BaseException as error:
                     deferred.append(error)
-            # A cancel that arrived after the entry check (e.g.
-            # during the unmounts) must still reach the receipt:
-            # re-check before publishing it.
-            if _CANCEL_REQUESTED:
-                receipt.update(status="failed", exit=1, error="cancelled")
             receipt["children_reaped"] = not children()
             receipt["owned_mounts_removed"] = not cleanup_errors
             receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            # A cancel that arrived after the entry check (e.g.
+            # during the unmounts) must still reach the receipt.
+            # The check sits adjacent to the publish; the
+            # residual check-act race (a deferred signal landing
+            # between the two statements) still cancels the exit
+            # at the end — only the receipt status could lag by
+            # one publish, and the final checkpoint below
+            # corrects even that.
+            if _CANCEL_REQUESTED:
+                receipt.update(status="failed", exit=1, error="cancelled")
             try:
                 _guarded_publish(out / "ownership.json", receipt, publish_errors, deferred)
             except BaseException as error:
@@ -1438,6 +1456,34 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                     raise deferred[0]
                 if publish_errors:
                     raise ValueError(f"lane evidence publishing failed: {publish_errors}")
+    # Final checkpoints: a cancel that landed after the ownership
+    # publish — or inside the final dump's own shield — must not
+    # leave a complete summary over a cancelled lane. Rewrite the
+    # evidence as cancelled through the same guards, then raise;
+    # the outer cancellation context observes it too. (Reaching
+    # here implies empty problem lists: any finally problem or
+    # try failure would already have raised.)
+    def publish_cancelled_and_raise():
+        receipt.update(status="failed", exit=1, error="cancelled")
+        try:
+            _guarded_publish(out / "ownership.json", receipt,
+                             publish_errors, deferred)
+            _guarded_publish(out / "summary.json", {
+                "exit": 1, "complete": False, "error": "cancelled",
+                "accepted_partials": summarize_partials(
+                    committed_prefix(out, results))},
+                publish_errors, deferred)
+        except BaseException as error:
+            deferred.append(error)
+        if publish_errors or deferred:
+            _say("sudo-lane: evidence publishing problems: "
+                 f"{publish_errors + [type(e).__name__ for e in deferred]}")
+        error = InterruptedError("cancelled; lane cleanup complete")
+        if deferred:
+            error.__cause__ = deferred[0]
+        raise error
+    if _CANCEL_REQUESTED:
+        publish_cancelled_and_raise()
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
     lab_bodies = len(EXPECTED[LAB_SUITE])
@@ -1446,6 +1492,8 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
                                 "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
                                 "accepted_partials": summarize_partials(results), "complete": True})
+    if _CANCEL_REQUESTED:
+        publish_cancelled_and_raise()
     print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
     return code
 

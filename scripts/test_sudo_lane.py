@@ -727,10 +727,10 @@ class CommittedPrefix(unittest.TestCase):
             with mock.patch.object(lane.json, "loads", side_effect=RecursionError):
                 self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
 
-    def test_signal_past_acquisition_still_closes(self):
-        # fd-None + try/finally (no shield gap): SIGTERM after
-        # the open runs the finally — fail-closed [] with no
-        # leak and the cancel flag set.
+    def test_signal_during_prefix_read_defers_without_leak(self):
+        # the whole body runs shielded: SIGTERM during the read
+        # defers (flag set, read completes, fd owned) instead of
+        # raising through the parse.
         def raising(signum, frame):
             lane._CANCEL_REQUESTED = True
             raise InterruptedError("cancelled")
@@ -755,10 +755,42 @@ class CommittedPrefix(unittest.TestCase):
                 lane._CANCEL_REQUESTED = saved_flag
             self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
+    def test_signal_between_open_return_and_assignment_defers(self):
+        # the exact STORE_FAST window: kill after the real open
+        # returns, before the caller assigns. Shielded: defers
+        # and completes with the fd owned. (Unshielded, the
+        # raise lands with fd still None: silent leak.)
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError("cancelled")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            saved_flag = lane._CANCEL_REQUESTED
+            old = signal.signal(signal.SIGTERM, raising)
+            before = len(os.listdir("/proc/self/fd"))
+            real_open = os.open
+            def killer(*args, **kwargs):
+                fd = real_open(*args, **kwargs)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return fd
+            try:
+                lane._CANCEL_REQUESTED = False
+                with mock.patch("os.open", side_effect=killer):
+                    self.assertEqual(
+                        lane.committed_prefix(out, self.RESULTS), [])
+                self.assertTrue(lane._CANCEL_REQUESTED)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_no_shield_exit_window_before_ownership(self):
         # structural pin: a kill placed exactly at shield exit
-        # must find no ownership gap. Any reintroduction of a
-        # shield-around-open-only shape leaks here.
+        # fires after the body (fd already closed) — it raises
+        # without leaking. A shield-around-open-only shape leaks
+        # here instead; a shield-less shape never fires and
+        # returns instead of raising.
         def raising(signum, frame):
             lane._CANCEL_REQUESTED = True
             raise InterruptedError("cancelled")
@@ -778,8 +810,8 @@ class CommittedPrefix(unittest.TestCase):
                 lane._CANCEL_REQUESTED = False
                 with mock.patch.object(lane, "_deferred_cancel",
                                        side_effect=lambda: killer_shield()):
-                    self.assertEqual(
-                        lane.committed_prefix(out, self.RESULTS), [])
+                    with self.assertRaises(InterruptedError):
+                        lane.committed_prefix(out, self.RESULTS)
             finally:
                 signal.signal(signal.SIGTERM, old)
                 lane._CANCEL_REQUESTED = saved_flag
@@ -1320,127 +1352,221 @@ class PreparedIntegrity(unittest.TestCase):
                 self.assertEqual(lane.lifecycle_verdict(code, output), "FAIL")
 
 
-class CapturedBytesBinding(unittest.TestCase):
-    READ_ATTRS = ("open", "read_text", "read_bytes", "read")
-    PATH_CONSUMERS = ("run_logged",)
+def _binding_violations(source):
+    """Tripwire violations for `source` (taint over execute/prepare).
 
-    def test_verdict_sites_never_reopen_log_paths(self):
-        # the substitution fix is structural: verdicts hash and
-        # parse fd-captured bytes. A call site reverted to path
-        # reads stays green functionally, so pin the shape with a
-        # narrow tripwire (taint over execute/prepare): no reads
-        # through the log path or its aliases (positional or
-        # keyword, bare or os./io.-attribute opens), every
-        # run_logged 3-unpacked with the bytes used past the
-        # call site, and the deleted reader gone module-wide.
-        # Known-narrow (documented, not missed): constructor or
-        # method-chain laundering (Path(log), log.as_posix(),
-        # f"{log}", (log.parent / log.name)), reads through
-        # non-Name receivers, and new helper functions. The
-        # mock-driven ExecuteWiring behavioral tests (selftest
-        # + Cargo conflicting-bytes fixtures) are the backstop
-        # for those; this guard only catches mechanical reverts.
-        tree = ast.parse(Path(lane.__file__).read_text())
-        funcs = [node for node in ast.walk(tree)
-                 if isinstance(node, ast.FunctionDef)
-                 and node.name in ("execute", "prepare")]
-        self.assertEqual(len(funcs), 2)
-        violations = []
-        for func in funcs:
-            tainted = {"log"}
-            changed = True
-            while changed:
-                changed = False
-                for node in ast.walk(func):
-                    if isinstance(node, ast.Assign):
-                        values = [node.value]
-                        targets = list(node.targets)
-                    elif isinstance(node, ast.AnnAssign) \
-                            and node.value is not None:
-                        values = [node.value]
-                        targets = [node.target]
-                    else:
-                        continue
-                    hit = any(isinstance(value, ast.Name)
-                              and value.id in tainted
-                              for value in values) or any(
-                                  isinstance(value, (ast.Tuple, ast.List))
-                                  and any(isinstance(elt, ast.Name)
-                                          and elt.id in tainted
-                                          for elt in value.elts)
-                                  for value in values)
-                    if hit:
-                        for target in targets:
-                            if isinstance(target, ast.Name) \
-                                    and target.id not in tainted:
-                                tainted.add(target.id)
-                                changed = True
-                            elif isinstance(target, (ast.Tuple, ast.List)):
-                                for elt in target.elts:
-                                    if isinstance(elt, ast.Name) \
-                                            and elt.id not in tainted:
-                                        tainted.add(elt.id)
-                                        changed = True
-            loads = {(node.id, node.lineno) for node in ast.walk(func)
-                     if isinstance(node, ast.Name)
-                     and isinstance(node.ctx, ast.Load)}
-            run_logged_calls = 0
+    No reads through the log path or its aliases (positional or
+    keyword, bare or os./io.-attribute opens), every run_logged
+    3-unpacked with the bytes used past the call site but before
+    the next rebinding of that name (a later site reusing the
+    name must not mask a discard), and the deleted reader gone
+    module-wide.
+    """
+    read_attrs = ("open", "read_text", "read_bytes", "read")
+    consumers = ("run_logged",)
+    tree = ast.parse(source)
+    funcs = [node for node in ast.walk(tree)
+             if isinstance(node, ast.FunctionDef)
+             and node.name in ("execute", "prepare")]
+    violations = []
+    if len(funcs) != 2:
+        violations.append(f"expected execute+prepare, found {len(funcs)}")
+        return violations
+    for func in funcs:
+        tainted = {"log"}
+        changed = True
+        while changed:
+            changed = False
             for node in ast.walk(func):
-                if not isinstance(node, ast.Call):
-                    continue
-                called = node.func
-                if isinstance(called, ast.Attribute) \
-                        and called.attr in self.READ_ATTRS \
-                        and isinstance(called.value, ast.Name) \
-                        and called.value.id in tainted:
-                    violations.append(
-                        f"{func.name}:{node.lineno} reads tainted path")
-                    continue
-                if isinstance(called, ast.Attribute) \
-                        and called.attr == "open" \
-                        and isinstance(called.value, ast.Name):
-                    opener = f"{called.value.id}.{called.attr}"
-                elif isinstance(called, ast.Name):
-                    opener = called.id
+                if isinstance(node, ast.Assign):
+                    values = [node.value]
+                    targets = list(node.targets)
+                elif isinstance(node, ast.AnnAssign) \
+                        and node.value is not None:
+                    values = [node.value]
+                    targets = [node.target]
                 else:
                     continue
-                if opener in self.PATH_CONSUMERS:
-                    continue
-                carried = [arg for arg in node.args]
-                carried.extend(keyword.value
-                               for keyword in node.keywords)
-                if any(isinstance(arg, ast.Name)
-                       and arg.id in tainted for arg in carried):
+                hit = any(isinstance(value, ast.Name)
+                          and value.id in tainted
+                          for value in values) or any(
+                              isinstance(value, (ast.Tuple, ast.List))
+                              and any(isinstance(elt, ast.Name)
+                                      and elt.id in tainted
+                                      for elt in value.elts)
+                              for value in values)
+                if hit:
+                    for target in targets:
+                        if isinstance(target, ast.Name) \
+                                and target.id not in tainted:
+                            tainted.add(target.id)
+                            changed = True
+                        elif isinstance(target, (ast.Tuple, ast.List)):
+                            for elt in target.elts:
+                                if isinstance(elt, ast.Name) \
+                                        and elt.id not in tainted:
+                                    tainted.add(elt.id)
+                                    changed = True
+        loads = {(node.id, node.lineno) for node in ast.walk(func)
+                 if isinstance(node, ast.Name)
+                 and isinstance(node.ctx, ast.Load)}
+        rebinds = {}
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign) \
+                    and node.value is not None:
+                targets = [node.target]
+            else:
+                continue
+            for target in targets:
+                elts = target.elts \
+                    if isinstance(target, (ast.Tuple, ast.List)) \
+                    else [target]
+                for elt in elts:
+                    if isinstance(elt, ast.Name):
+                        rebinds.setdefault(elt.id, []).append(node.lineno)
+        run_logged_calls = 0
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            if isinstance(called, ast.Attribute) \
+                    and called.attr in read_attrs \
+                    and isinstance(called.value, ast.Name) \
+                    and called.value.id in tainted:
+                violations.append(
+                    f"{func.name}:{node.lineno} reads tainted path")
+                continue
+            if isinstance(called, ast.Attribute) \
+                    and called.attr == "open" \
+                    and isinstance(called.value, ast.Name):
+                opener = f"{called.value.id}.{called.attr}"
+            elif isinstance(called, ast.Name):
+                opener = called.id
+            else:
+                continue
+            if opener in consumers:
+                continue
+            carried = [arg for arg in node.args]
+            carried.extend(keyword.value for keyword in node.keywords)
+            if any(isinstance(arg, ast.Name)
+                   and arg.id in tainted for arg in carried):
+                violations.append(
+                    f"{func.name}:{node.lineno} tainted path escapes "
+                    f"to {opener}()")
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) \
+                    and isinstance(node.value, ast.Call) \
+                    and isinstance(node.value.func, ast.Name) \
+                    and node.value.func.id == "run_logged":
+                run_logged_calls += 1
+                targets = node.targets[0]
+                elts = targets.elts \
+                    if isinstance(targets, (ast.Tuple, ast.List)) else []
+                if len(elts) != 3:
                     violations.append(
-                        f"{func.name}:{node.lineno} tainted path escapes "
-                        f"to {opener}()")
-            for node in ast.walk(func):
-                if isinstance(node, ast.Assign) \
-                        and isinstance(node.value, ast.Call) \
-                        and isinstance(node.value.func, ast.Name) \
-                        and node.value.func.id == "run_logged":
-                    run_logged_calls += 1
-                    targets = node.targets[0]
-                    elts = targets.elts \
-                        if isinstance(targets, (ast.Tuple, ast.List)) else []
-                    if len(elts) != 3:
-                        violations.append(
-                            f"{func.name}:{node.lineno} run_logged "
-                            "not 3-unpacked")
-                    elif isinstance(elts[2], ast.Name) \
-                            and not any(name == elts[2].id
-                                        and line > node.lineno
-                                        for name, line in loads):
+                        f"{func.name}:{node.lineno} run_logged "
+                        "not 3-unpacked")
+                elif isinstance(elts[2], ast.Name):
+                    bound = elts[2].id
+                    later = [line for line in rebinds.get(bound, [])
+                             if line > node.lineno]
+                    horizon = min(later) if later else float("inf")
+                    if not any(name == bound
+                               and node.lineno < line < horizon
+                               for name, line in loads):
                         violations.append(
                             f"{func.name}:{node.lineno} captured "
                             "bytes unused past the call site")
-            self.assertGreater(run_logged_calls, 0, func.name)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) \
-                    and isinstance(node.func, ast.Name) \
-                    and node.func.id == "read_body_log":
-                violations.append(f"deleted reader at line {node.lineno}")
-        self.assertEqual(violations, [])
+        if not run_logged_calls:
+            violations.append(f"{func.name}: no run_logged calls")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) \
+                and isinstance(node.func, ast.Name) \
+                and node.func.id == "read_body_log":
+            violations.append(f"deleted reader at line {node.lineno}")
+    return violations
+
+
+class CapturedBytesBinding(unittest.TestCase):
+    def test_verdict_sites_never_reopen_log_paths(self):
+        # the substitution fix is structural: verdicts hash and
+        # parse fd-captured bytes. A call site reverted to path
+        # reads stays green functionally, so pin the shape with
+        # the narrow tripwire (see _binding_violations).
+        # Known-narrow (documented, not missed): expression
+        # laundering of the argument (Path(f"{log}"),
+        # log.as_posix(), (log.parent / log.name)), reads
+        # through non-Name receivers, and new helper
+        # functions. Direct constructor calls (Path(log))
+        # ARE caught (tainted-arg escape). The mock-driven
+        # ExecuteWiring behavioral tests (selftest + Cargo +
+        # e2e conflicting-bytes fixtures) are the backstop
+        # for the rest; this guard only catches mechanical
+        # reverts.
+        self.assertEqual(
+            _binding_violations(Path(lane.__file__).read_text()), [])
+
+    def test_tripwire_catches_documented_revert_shapes(self):
+        # the guard's power, not just its passivity: each
+        # revert shape must produce its violation. (AST-only;
+        # mutants are never executed.)
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        cases = [
+            ("kwargs",
+             anchor,
+             head + "            output = decode_body_log("
+             "open(file=log, mode=\"rb\").read())\n",
+             "tainted path escapes to open()"),
+            ("attribute-open",
+             anchor,
+             head + "            output = decode_body_log("
+             "os.read(os.open(log, 0), 9))\n",
+             "tainted path escapes to os.open()"),
+            ("annotated-alias",
+             anchor,
+             head + "            pth: str = log\n"
+             "            output = decode_body_log("
+             "open(pth, \"rb\").read())\n",
+             "tainted path escapes to open()"),
+            ("tuple-alias",
+             anchor,
+             head + "            pth, _n = log, 0\n"
+             "            output = decode_body_log("
+             "open(pth, \"rb\").read())\n",
+             "tainted path escapes to open()"),
+            ("direct-constructor",
+             anchor,
+             head + "            output = decode_body_log("
+             "Path(log).read_bytes())\n",
+             "tainted path escapes to Path()"),
+            ("unused-site",
+             anchor,
+             head + "            output = decode_body_log(b\"\")\n",
+             "captured bytes unused past the call site"),
+            ("discard-before-rebind",
+             "            bodies = parse_test_list("
+             "captured.decode(\"utf-8\")) if code == 0 else []",
+             "            bodies = []",
+             "captured bytes unused past the call site"),
+        ]
+        for name, find, repl, fragment in cases:
+            with self.subTest(shape=name):
+                self.assertEqual(source.count(find), 1, name)
+                violations = _binding_violations(
+                    source.replace(find, repl))
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
 
 
 class DeferredCancel(unittest.TestCase):
@@ -1949,29 +2075,48 @@ class ExecuteWiring(unittest.TestCase):
 
     def test_body_verdicts_follow_captured_bytes_not_paths(self):
         # the Cargo body loop runs with a nonempty inventory
-        # (runtime-list reconciliation + one body): conflicting
-        # bytes at the log path must not move the verdict off
-        # the captured bytes.
+        # (runtime-list reconciliation + bodies): conflicting
+        # bytes at the log path must not move verdicts — or
+        # the e2e accepted receipt — off the captured bytes.
         key = ("kryprobe-policy", "rule_unit")
         row = {"package": key[0], "target": key[1],
                "test": "probe_bin", "staged": "stage/debug/probe_bin",
                "bodies": ["cargo_binding_probe"], "features": [],
                "sha256": "0" * 64}
+        e2e_body = "selftest_bpf_clean_partial_or_denied"
+        e2e = {"package": "kryprobe-cli", "target": "cli_bpf_e2e",
+               "test": "e2e_bin", "staged": "stage/debug/e2e_bin",
+               "bodies": [e2e_body], "features": [],
+               "sha256": "0" * 64}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            out, lock = self._prepared_out(root, artifacts=[row])
+            out, lock = self._prepared_out(root, artifacts=[row, e2e])
             listing = b"cargo_binding_probe: test\n1 test, 0 benchmarks\n"
+            e2e_listing = (e2e_body + ": test\n1 test, 0 benchmarks\n").encode()
             passing = (b"test cargo_binding_probe ... ok\n"
                        b"test result: ok. 1 passed; 0 failed; 0 ignored; "
                        b"0 measured; 0 filtered out; finished in 0.01s\n")
             failing = (b"test result: ok. 0 passed; 1 failed; 0 ignored; "
                        b"0 measured; 0 filtered out; finished in 0.01s\n")
+            e2e_passing = (
+                ("test %s ... ok\n"
+                 "test result: ok. 1 passed; 0 failed; 0 ignored; "
+                 "0 measured; 0 filtered out; finished in 0.01s\n"
+                 "selftest bpf: accounted partial\n" % e2e_body).encode()
+                + PartialReceipt.OCT13_LOG.encode())
             def routed(command, log, *args, **kwargs):
                 if "--list" in command:
-                    return (0, False, listing)
+                    if command[0].endswith("probe_bin"):
+                        return (0, False, listing)
+                    return (0, False, e2e_listing)
                 if "--exact" in command:
-                    Path(log).write_bytes(failing)
-                    return (0, False, passing)
+                    body = command[command.index("--exact") + 1]
+                    if body == "cargo_binding_probe":
+                        Path(log).write_bytes(failing)
+                        return (0, False, passing)
+                    Path(log).write_bytes(
+                        b"conflict: no announcement here\n")
+                    return (0, False, e2e_passing)
                 return (0, False, b"")
             outcome, code, calls, printed = self._drive(
                 root, out, lock, run_logged=routed)
@@ -1985,6 +2130,18 @@ class ExecuteWiring(unittest.TestCase):
             # the mock really did plant the conflict.
             self.assertIn(b"1 failed",
                           (out / cargo[0]["log"]).read_bytes())
+            e2e_rows = [row for row in rows
+                        if row.get("test") == e2e_body]
+            self.assertEqual(len(e2e_rows), 1)
+            self.assertEqual(e2e_rows[0]["status"], "PASS")
+            accepted = e2e_rows[0]["accepted_partial"]
+            self.assertEqual(
+                (accepted["exit"], accepted["calls"], accepted["missing"]),
+                (3, 20000, 581))
+            # the receipt came from captured bytes: the path
+            # never carried the announcement.
+            self.assertNotIn(b"accounted partial",
+                             (out / e2e_rows[0]["log"]).read_bytes())
 
     def test_signal_between_shield_installs_defers(self):
         # a real SIGINT placed deterministically between the two
@@ -2230,6 +2387,99 @@ class ExecuteWiring(unittest.TestCase):
             self.assertIsInstance(error.__cause__, MemoryError)
             self._assert_lock_released(lock)
 
+    def test_cancel_during_final_publish_rewrites_evidence(self):
+        # the flag set mid-dump of the complete summary (the
+        # dump's own shield defers the signal): no complete:true
+        # survives — ownership + summary are rewritten as
+        # cancelled and the lane raises.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            real_dump = lane.dump
+            def flag_on_complete(path, value):
+                if Path(path).name == "summary.json" \
+                        and value.get("complete") is True:
+                    lane._CANCEL_REQUESTED = True
+                return real_dump(path, value)
+            with mock.patch.object(lane, "dump", side_effect=flag_on_complete):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertEqual(summary["error"], "cancelled")
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            self._assert_lock_released(lock)
+
+    def test_cancel_before_final_publish_skips_complete_write(self):
+        # the flag set after the shielded finally exits but before
+        # the final dump: the pre-dump checkpoint raises before
+        # any complete:true payload is even built — none is
+        # recorded, evidence is rewritten as cancelled.
+        real_dc = lane._deferred_cancel
+        counter = [0]
+        stack = []
+        @contextlib.contextmanager
+        def tracking():
+            counter[0] += 1
+            index = counter[0]
+            stack.append(index)
+            try:
+                with real_dc():
+                    yield
+            finally:
+                stack.pop()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            seen = {}
+            def mark(cmd):
+                if cmd[:1] == ["umount"] and "target" not in seen:
+                    seen["target"] = min(stack)
+                return None
+            with mock.patch.object(lane, "_deferred_cancel",
+                                   side_effect=lambda: tracking()):
+                self._drive(root, out, lock,
+                            run_logged=lambda *a, **k: (0, False, b""),
+                            run_hook=mark)
+            target = seen["target"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            seen_payloads = []
+            real_dump = lane.dump
+            def record(path, value):
+                if Path(path).name == "summary.json":
+                    seen_payloads.append(value.get("complete"))
+                return real_dump(path, value)
+            count = [0]
+            @contextlib.contextmanager
+            def flag_after_outer():
+                count[0] += 1
+                index = count[0]
+                with real_dc():
+                    yield
+                if index == target:
+                    lane._CANCEL_REQUESTED = True
+            with mock.patch.object(lane, "dump", side_effect=record), \
+                    mock.patch.object(lane, "_deferred_cancel",
+                                      side_effect=lambda: flag_after_outer()):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertNotIn(True, seen_payloads)
+            self.assertEqual(seen_payloads, [False])
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+
     def test_deferred_publish_escape_surfaces_after_cleanup(self):
         # MemoryError inside the ownership publish: unmounts and
         # the lock close still happen; the error surfaces gated
@@ -2306,6 +2556,66 @@ class ProcessCustody(unittest.TestCase):
             # handler: otherwise a live watcher sees EOF on the
             # restored /dev/null and kills the suite with the
             # default disposition.
+            with contextlib.suppress(OSError):
+                os.close(writer)
+            for thread in instances:
+                thread.join(timeout=5)
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+            os.close(reader)
+            signal.signal(signal.SIGTERM, old_term)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_watcher_born_blocked_before_first_mask_call(self):
+        # the spawn mask (not the entry mask) covers birth:
+        # pause the watcher before its first pthread_sigmask
+        # and assert the cancel signals are already blocked.
+        # Without inherited masking this reads zero.
+        before = len(os.listdir("/proc/self/fd"))
+        reader, writer = os.pipe()
+        saved_stdin = os.dup(0)
+        instances = []
+        real_thread = threading.Thread
+        def capture(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            instances.append(thread)
+            return thread
+        entered = threading.Event()
+        release = threading.Event()
+        real_mask = signal.pthread_sigmask
+        def gate(op, sigs):
+            if threading.get_ident() != threading.main_thread().ident:
+                entered.set()
+                self.assertTrue(release.wait(10))
+            return real_mask(op, sigs)
+        got_term = []
+        old_term = signal.signal(
+            signal.SIGTERM, lambda s, f: got_term.append(s))
+        try:
+            os.dup2(reader, 0)
+            with mock.patch.object(lane.threading, "Thread",
+                                   side_effect=capture), \
+                    mock.patch.object(lane.signal, "pthread_sigmask",
+                                      side_effect=gate):
+                lane.watch_parent_pipe()
+                self.assertEqual(len(instances), 1)
+                watcher = instances[0]
+                self.assertTrue(entered.wait(10))
+                deadline = time.monotonic() + 5
+                while watcher.native_id is None \
+                        and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertIsNotNone(watcher.native_id)
+                status = Path(
+                    f"/proc/self/task/{watcher.native_id}/status"
+                ).read_text()
+                sigblk = int([line for line in status.splitlines()
+                              if line.startswith("SigBlk:")][0].split()[1],
+                             16)
+                self.assertNotEqual(sigblk & (1 << (signal.SIGTERM - 1)), 0)
+                self.assertNotEqual(sigblk & (1 << (signal.SIGINT - 1)), 0)
+                release.set()
+        finally:
             with contextlib.suppress(OSError):
                 os.close(writer)
             for thread in instances:
