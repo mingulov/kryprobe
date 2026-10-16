@@ -5,9 +5,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import resource
 import tempfile
 import threading
+import tracemalloc
 import unittest
 from unittest import mock
 import sys
@@ -702,19 +702,24 @@ class CommittedPrefix(unittest.TestCase):
                 self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
 
     def test_read_is_bounded_before_parsing(self):
-        # read_bytes()[:cap] loads the whole file first: RSS
-        # must stay flat on a 100MB sparse file, and a FIFO
-        # must not block the summary path.
+        # the read budget is measured with tracemalloc inside the
+        # test window: ru_maxrss is a high-water mark, so a prior
+        # 160MB allocation lets an unbounded mutant pass (r8 gap).
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             big = out / "results.json"
             with open(big, "wb") as stream:
                 stream.truncate(100 * 1024 * 1024)
-            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
-            growth = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                      - before) / 1024
-            self.assertLess(growth, 20, f"RSS grew {growth:.0f} MiB")
+            tracemalloc.start()
+            try:
+                self.assertEqual(
+                    lane.committed_prefix(out, self.RESULTS), [])
+                _, window_peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertLess(
+                window_peak / (1024 * 1024), 20,
+                f"traced peak {window_peak / 1024 / 1024:.0f} MiB")
             big.unlink()
             os.mkfifo(big)
             # a regressed blocking read must fail the test, not
@@ -754,6 +759,68 @@ class CommittedPrefix(unittest.TestCase):
             (out / "results.json").write_bytes(exact + b"INVALID")
             self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
 
+    def test_boundary_pins_cap_plus_one(self):
+        # precisely cap+1 bytes of VALID json must reject: the
+        # cap+7 INVALID case above cannot catch a cap raised by one.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            inner = json.dumps(self.RESULTS[0]).encode()
+            over = b"[" + inner + b" " * (1024 * 1024 - len(inner) - 1) + b"]"
+            assert len(over) == 1024 * 1024 + 1
+            (out / "results.json").write_bytes(over)
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+
+    def test_committed_rows_must_match_memory(self):
+        # only the count comes from disk: a foreign-length or
+        # foreign-content list must not claim in-memory rows.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[null,null]")
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            (out / "results.json").write_text(
+                json.dumps(self.RESULTS + [{"test": "c"}]))
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            mutated = [dict(self.RESULTS[0], test="forged")]
+            (out / "results.json").write_text(json.dumps(mutated))
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            (out / "results.json").write_text(json.dumps(self.RESULTS[:1]))
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS),
+                             self.RESULTS[:1])
+
+    def test_fifo_with_live_writer_claims_nothing(self):
+        # the only input distinguishing the regular-file check:
+        # a FIFO streaming bytes that WOULD validate. A held
+        # reader keeps the written bytes buffered while the
+        # writer end is closed, so the read sees data-then-EOF
+        # (an open writer would EAGAIN and mask the mutant).
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            fifo = out / "results.json"
+            os.mkfifo(fifo)
+            prefix = json.dumps(self.RESULTS[:1]).encode()
+            reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                writer = os.open(fifo, os.O_WRONLY)
+                try:
+                    os.write(writer, prefix)
+                finally:
+                    os.close(writer)
+                self.assertEqual(
+                    lane.committed_prefix(out, self.RESULTS), [])
+            finally:
+                os.close(reader)
+
+    def test_memory_error_during_parse_claims_nothing(self):
+        # 1MB of [{},{}...] decodes to ~25MB: a constrained
+        # address space raises a RECOVERABLE MemoryError that
+        # must not skip cleanup (r8 decline refuted by bytes).
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            with mock.patch.object(lane.json, "loads",
+                                   side_effect=MemoryError):
+                self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+
 
 class DumpAtomicity(unittest.TestCase):
     def test_planted_symlink_is_not_followed(self):
@@ -790,7 +857,8 @@ class DumpAtomicity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             (out / "summary.json").mkdir()
-            with self.assertRaises(OSError):
+            # IsADirectoryError, not a cleanup error: identity matters
+            with self.assertRaises(IsADirectoryError):
                 lane.dump(out / "summary.json", {"complete": True})
             leftovers = [p.name for p in out.iterdir()
                          if p.name.startswith("summary.json.")]
@@ -800,12 +868,30 @@ class DumpAtomicity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             boom = ValueError("boom")
-            with mock.patch("os.fdopen", side_effect=boom), \
-                 mock.patch("os.unlink",
-                            side_effect=FileNotFoundError("raced")):
-                with self.assertRaises(ValueError) as caught:
-                    lane.dump(out / "summary.json", {"complete": True})
-            self.assertIs(caught.exception, boom)
+            for cleanup_error in (FileNotFoundError("raced"),
+                                  PermissionError("denied")):
+                with self.subTest(cleanup_error=type(cleanup_error).__name__):
+                    with mock.patch("os.fdopen", side_effect=boom), \
+                         mock.patch("os.unlink",
+                                    side_effect=cleanup_error):
+                        with self.assertRaises(ValueError) as caught:
+                            lane.dump(out / "summary.json",
+                                      {"complete": True})
+                    self.assertIs(caught.exception, boom)
+
+    def test_failed_dump_leaks_no_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            def fds():
+                return len(os.listdir("/proc/self/fd"))
+            before = fds()
+            with mock.patch("os.fchmod", side_effect=OSError("nope")):
+                with self.assertRaises(OSError):
+                    lane.dump(out / "a.json", {})
+            with mock.patch("os.fdopen", side_effect=OSError("nope")):
+                with self.assertRaises(OSError):
+                    lane.dump(out / "b.json", {})
+            self.assertEqual(fds(), before)
 
 
 class SelftestBpfVerdict(unittest.TestCase):
@@ -857,12 +943,14 @@ class SelftestBpfVerdict(unittest.TestCase):
 class ReadBodyLog(unittest.TestCase):
     def test_cr_preserved_end_to_end(self):
         out = _partial_output(9, 9, 18, 2, 0, 0, 0, 2).replace("\n", "\r\n")
-        with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / "body.log"
-            log.write_bytes(out.encode())
-            text = lane.read_body_log(log)
-            self.assertIn("\r", text)
-            self.assertIsNone(lane.partial_receipt(text, 10))
+        text = lane.decode_body_log(out.encode())
+        self.assertIn("\r", text)
+        self.assertIsNone(lane.partial_receipt(text, 10))
+
+    def test_decode_is_explicit_utf8_with_replacement(self):
+        text = lane.decode_body_log(b"ok \xff\xfe end")
+        self.assertIn("ok ", text)
+        self.assertIn("\ufffd", text)
 
 
 class LeakNormalization(unittest.TestCase):
@@ -1017,12 +1105,45 @@ class LoggedPaths(unittest.TestCase):
                                 stderr_path=err)
             self.assertEqual(victim.read_text(), "untouched")
 
+    def test_captured_bytes_survive_post_write_path_swap(self):
+        # the child renames a forged file over its own log path:
+        # verdict bytes and the recorded hash must come from the
+        # open descriptor, not from a re-read of the pathname.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "body.log"
+            code, timed_out, captured = lane.run_logged(
+                ["sh", "-c",
+                 'printf "true-output"; printf "forged" > "$1.staged"; '
+                 'mv "$1.staged" "$1"', "swapper", str(log)],
+                log, 30)
+            self.assertEqual((code, timed_out), (0, False))
+            self.assertEqual(captured, b"true-output")
+            self.assertEqual(log.read_bytes(), b"forged",
+                             "positive control: the swap happened")
+            result = json.loads(
+                (root / "body.log.result.json").read_text())
+            self.assertEqual(
+                result["log_sha256"],
+                hashlib.sha256(b"true-output").hexdigest())
+
+    def test_log_sink_readable_under_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = os.umask(0o077)
+            try:
+                lane.run_logged(["true"], root / "body.log", 30)
+            finally:
+                os.umask(old)
+            mode = (root / "body.log").stat().st_mode & 0o777
+            self.assertEqual(oct(mode), oct(0o644))
+
 
 class ProcessCustody(unittest.TestCase):
     def test_timeout_kills_and_reaps_owned_process_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             late = Path(tmp) / "late"
-            code, timed_out = lane.run_logged(
+            code, timed_out, _captured = lane.run_logged(
                 ["sh", "-c", 'sleep 2; touch "$1"', "fixture", str(late)],
                 Path(tmp) / "timeout.log", timeout=0.05,
             )
@@ -1053,7 +1174,7 @@ class ProcessCustody(unittest.TestCase):
             )
             pid = None
             try:
-                code, timed_out = lane.run_logged(
+                code, timed_out, _captured = lane.run_logged(
                     [sys.executable, "-c", parent], root / "timeout.log", timeout=0.4,
                 )
                 self.assertTrue(child.exists(), "positive control: detached child started")

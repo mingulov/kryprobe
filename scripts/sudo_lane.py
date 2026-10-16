@@ -127,20 +127,29 @@ def dump(path, value):
     a reused prepared directory is never followed. Published files
     are world-readable (mkstemp's 0600 is widened before the
     rename): the CI summary check opens them unprivileged. A
-    failed write or replace removes the temp and raises the
-    original error; cleanup never masks it."""
+    failed write or replace closes the pre-transfer descriptor,
+    removes the temp, and raises the original error; cleanup
+    never masks it and leaks nothing."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
                                dir=str(path.parent))
+    transferred = False
     try:
         os.fchmod(fd, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        transferred = True
+        with stream:
             stream.write(text)
         os.replace(tmp, path)
     except BaseException:
+        if not transferred:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp)
-        except FileNotFoundError:
+        except OSError:
             pass
         raise
 
@@ -481,8 +490,14 @@ def committed_prefix(out, results):
     O_NOFOLLOW (a planted symlink claims nothing), non-regular
     files are refused without blocking on FIFOs, at most cap+1
     bytes are read, and oversize input is rejected outright —
-    never parsed as a truncated prefix. The directory stays
-    writable by the preparer for the whole run.
+    never parsed as a truncated prefix. Only the row COUNT comes
+    from disk, so persisted rows must equal the in-memory prefix
+    exactly (length and content): a foreign list claims nothing.
+    Decoded allocation is unbounded by the byte cap (1MB of
+    [{},{}...] is ~25MB), so a recoverable MemoryError is caught
+    too — this function holds no state, so [] stays fail-closed
+    and cleanup still proceeds. The directory stays writable
+    by the preparer for the whole run.
     """
     try:
         fd = os.open(out / "results.json",
@@ -504,9 +519,10 @@ def committed_prefix(out, results):
         if len(raw) > _COMMITTED_READ_CAP:
             return []
         committed = json.loads(raw)
-        if isinstance(committed, list):
+        if (isinstance(committed, list) and len(committed) <= len(results)
+                and committed == results[:len(committed)]):
             return results[:len(committed)]
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RecursionError, MemoryError):
         pass
     finally:
         os.close(fd)
@@ -537,13 +553,13 @@ def normalize_leak(code, leaked):
     return 1 if leaked else code
 
 
-def read_body_log(log):
+def decode_body_log(data):
     """Body log text with raw newlines preserved (a CR must stay visible).
 
     UTF-8 is explicit: the U+FFFD guard must not depend on root's locale.
+    bytes.decode performs no newline translation (the newline="" half).
     """
-    with log.open("r", errors="replace", newline="", encoding="utf-8") as stream:
-        return stream.read()
+    return data.decode("utf-8", errors="replace")
 
 
 def lifecycle_verdict(code, output):
@@ -672,21 +688,60 @@ def launch_supervised(command):
 
 
 def _exclusive_sink(path):
-    """Write stream to a freshly created regular file.
+    """Readable fd to a freshly created world-readable regular file.
 
-    O_CREAT|O_EXCL|O_NOFOLLOW: a planted symlink or a
+    O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW: a planted symlink or a
     pre-existing name fails instead of being followed or
     truncated as root. Every call site uses a fresh unique
     name and re-execution into a used directory is refused
     upstream, so refusal always signals tampering or a bug.
+    O_RDWR (not O_WRONLY) so the bytes are read back through
+    this same descriptor: verdicts and hashes never re-open
+    the preparer-writable pathname. The mode is forced (not
+    umask-dependent) so failure-uploaded logs stay readable.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                  0o644)
-    return os.fdopen(fd, "wb")
+    try:
+        os.fchmod(fd, 0o644)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return fd
+
+
+def _read_back(fd):
+    """Whole content of a sink after its child is done.
+
+    pread() pins the inode: a renamed-over pathname cannot
+    substitute the bytes the verdict and the hash use. The
+    child is reaped before this runs, so the size is final;
+    a short read can only truncate, and truncated logs fail
+    every receipt shape.
+    """
+    size = os.fstat(fd).st_size
+    chunks = []
+    offset = 0
+    while offset < size:
+        chunk = os.pread(fd, size - offset, offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
 
 
 def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
-    """No shell expansion; deadlines and cancellation reap the owned tree."""
+    """No shell expansion; deadlines and cancellation reap the owned tree.
+
+    Returns (exit code, timed out, captured stdout bytes), read back
+    through the sink descriptor: callers must verdict on these bytes,
+    never re-open the pathname (the directory stays preparer-writable).
+    """
     subreaper()
     if _CANCEL_REQUESTED:
         raise InterruptedError("cancelled before next command")
@@ -699,9 +754,17 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     start = time.monotonic()
     timed_out, cancelled, leaked = False, False, False
     code = 1
+    captured = b""
     with contextlib.ExitStack() as stack:
-        stream = stack.enter_context(_exclusive_sink(log))
-        stderr = stack.enter_context(_exclusive_sink(stderr_path)) if stderr_path else subprocess.STDOUT
+        sink = _exclusive_sink(log)
+        stack.callback(os.close, sink)
+        stream = stack.enter_context(os.fdopen(os.dup(sink), "wb"))
+        if stderr_path:
+            err_sink = _exclusive_sink(stderr_path)
+            stack.callback(os.close, err_sink)
+            stderr = stack.enter_context(os.fdopen(os.dup(err_sink), "wb"))
+        else:
+            stderr = subprocess.STDOUT
         proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream, stdin=subprocess.DEVNULL,
                                 stderr=stderr, start_new_session=True)
         try:
@@ -723,16 +786,18 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
             raw_exit = code
             code = normalize_leak(code, leaked)
             stream.flush()
+            captured = _read_back(sink)
             dump(log.with_suffix(log.suffix + ".result.json"), {
                 "exit": code, "raw_exit": raw_exit, "reaped_status": proc.returncode,
                 "timed_out": timed_out, "cancelled": cancelled,
                 "leaked_children": leaked, "pid": proc.pid, "reaped": True,
                 "descendants_reaped": not children(),
-                "wall_seconds": time.monotonic() - start, "log_sha256": digest(log),
+                "wall_seconds": time.monotonic() - start,
+                "log_sha256": hashlib.sha256(captured).hexdigest(),
             })
             if cancelled:
                 raise InterruptedError("cancelled; command and descendants reaped")
-    return code, timed_out
+    return code, timed_out, captured
 
 
 def source_identity(root):
@@ -770,12 +835,13 @@ def prepare(root, out, cargo, traffic_generator):
     for name, command in steps:
         print(f"sudo-lane: {name}", flush=True)
         log = logs / f"{name}.log"
-        code, _ = run_logged(command, log, 600, cwd=root, env=env,
-                             stderr_path=log.with_suffix(".stderr") if name != "bpf-build" else None)
+        code, _, captured = run_logged(
+            command, log, 600, cwd=root, env=env,
+            stderr_path=log.with_suffix(".stderr") if name != "bpf-build" else None)
         if code:
             raise ValueError(f"{name} failed ({code}); no privileged execution; see {log}")
         if name != "bpf-build":
-            artifacts.extend(cargo_artifacts(log.read_text()))
+            artifacts.extend(cargo_artifacts(captured.decode("utf-8")))
     metadata = json.loads(subprocess.check_output(
         [cargo, "metadata", "--locked", "--no-deps", "--format-version=1"], cwd=root, env=env,
     ))
@@ -801,10 +867,10 @@ def prepare(root, out, cargo, traffic_generator):
     for index, row in enumerate(combined.values()):
         if row["test"]:
             log = logs / f"list-{index}.log"
-            code, _ = run_logged([row["executable"], "--ignored", "--list", "--format", "terse"], log, 30, cwd=root)
+            code, _, captured = run_logged([row["executable"], "--ignored", "--list", "--format", "terse"], log, 30, cwd=root)
             if code:
                 raise ValueError(f"cannot inventory {row['target']}: {log}")
-            row["bodies"] = parse_test_list(log.read_text())
+            row["bodies"] = parse_test_list(captured.decode("utf-8"))
             key = (row["package"], row["target"])
             if row["bodies"]:
                 if key in observed:
@@ -998,17 +1064,19 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             if not row["test"]:
                 continue
             log = logs / f"runtime-list-{index}.log"
-            code, _ = run_logged([str(runtime / row["staged"]), "--ignored", "--list", "--format", "terse"],
-                                 log, 30, cwd=root, env=env)
-            bodies = parse_test_list(log.read_text()) if code == 0 else []
+            code, _, captured = run_logged(
+                [str(runtime / row["staged"]), "--ignored", "--list", "--format", "terse"],
+                log, 30, cwd=root, env=env)
+            bodies = parse_test_list(captured.decode("utf-8")) if code == 0 else []
             if bodies != row["bodies"]:
                 raise ValueError(f"runtime body inventory changed: {row['target']}")
             observed[(row["package"], row["target"])] = bodies
         reconcile(observed)
         log = logs / "lifecycle-support.log"
-        code, _ = run_logged([str(cli), "report", "--system", "--kcrypto-profile", "request-lifecycle",
-                              "--duration", "1", "--format", "json"], log, 30, cwd=Path("/"), env=env)
-        support = lifecycle_verdict(code, log.read_text())
+        code, _, captured = run_logged(
+            [str(cli), "report", "--system", "--kcrypto-profile", "request-lifecycle",
+             "--duration", "1", "--format", "json"], log, 30, cwd=Path("/"), env=env)
+        support = lifecycle_verdict(code, captured.decode("utf-8"))
         results.append({"test": "lifecycle-support", "status": support, "log": str(log.relative_to(out))})
         for row in manifest["artifacts"]:
             key = (row["package"], row["target"])
@@ -1036,8 +1104,8 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                    f"assert os.geteuid()=={uid} and os.getegid()=={gid}; "
                                    "print(json.dumps({'runner_identity':{'euid':os.geteuid(),'egid':os.getegid()}}),flush=True); "
                                    "os.execv(sys.argv[1],sys.argv[1:])", *command]
-                    code, timed_out = run_logged(command, log, 180, cwd=root, env=env)
-                    output = read_body_log(log)
+                    code, timed_out, captured = run_logged(command, log, 180, cwd=root, env=env)
+                    output = decode_body_log(captured)
                     status = body_verdict(code, output, key, body)
                     if (key[0], key[1], body) == SELFTEST_BPF_E2E:
                         status, accepted = e2e_partial_guard(output, calls, status)
@@ -1051,8 +1119,8 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         for name, args in [("selftest-bpf", ["selftest", "bpf", "--calls", str(calls)]),
                            ("selftest-token-smoke", ["selftest", "token-smoke"])]:
             log = logs / f"{name}.log"
-            code, timed_out = run_logged([str(cli), *args], log, 180, cwd=root, env=env)
-            output = read_body_log(log)
+            code, timed_out, captured = run_logged([str(cli), *args], log, 180, cwd=root, env=env)
+            output = decode_body_log(captured)
             status = selftest_verdict(code, output, name, calls)
             result = {"test": name, "status": status, "exit": code,
                       "timed_out": timed_out, "log": str(log.relative_to(out))}
