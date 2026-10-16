@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! T10: privileged CLI lane (`#[ignore]`, run via `cargo xtask test bpf`).
 
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use std::fmt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -130,10 +132,77 @@ fn parse_kv_line(line: &str, keys: &[&str]) -> Option<Vec<u64>> {
     (out.len() == keys.len()).then_some(out)
 }
 
+/// `serde_json::Value` that rejects duplicate object keys at every
+/// level (plain `Value` keeps the last, which smuggles forged
+/// terminal fields). serde's tokenizer decodes keys first, so
+/// escaped spellings hide nothing; array repeats stay legal.
+struct NoDup(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for NoDup {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NoDupVisitor;
+        impl<'de> Visitor<'de> for NoDupVisitor {
+            type Value = NoDup;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("JSON without duplicate object keys")
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<NoDup, E> {
+                Ok(NoDup(serde_json::Value::Bool(v)))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<NoDup, E> {
+                Ok(NoDup(serde_json::Value::Number(v.into())))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<NoDup, E> {
+                Ok(NoDup(serde_json::Value::Number(v.into())))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<NoDup, E> {
+                match serde_json::Number::from_f64(v) {
+                    Some(n) => Ok(NoDup(serde_json::Value::Number(n))),
+                    None => Ok(NoDup(serde_json::Value::Null)),
+                }
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<NoDup, E> {
+                Ok(NoDup(serde_json::Value::String(v.to_owned())))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<NoDup, E> {
+                Ok(NoDup(serde_json::Value::Null))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<NoDup, E> {
+                Ok(NoDup(serde_json::Value::Null))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<NoDup, A::Error> {
+                let mut out = Vec::new();
+                while let Some(item) = seq.next_element::<NoDup>()? {
+                    out.push(item.0);
+                }
+                Ok(NoDup(serde_json::Value::Array(out)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<NoDup, A::Error> {
+                let mut obj = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if obj.contains_key(&key) {
+                        return Err(de::Error::custom(format!("duplicate key `{key}`")));
+                    }
+                    obj.insert(key, map.next_value::<NoDup>()?.0);
+                }
+                Ok(NoDup(serde_json::Value::Object(obj)))
+            }
+        }
+        deserializer.deserialize_any(NoDupVisitor)
+    }
+}
+
+fn parse_line(line: &str) -> serde_json::Value {
+    serde_json::from_str::<NoDup>(line).expect("jsonl").0
+}
+
 fn session_end(stdout: &str) -> serde_json::Value {
     let ends: Vec<serde_json::Value> = stdout
         .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("jsonl"))
+        .map(parse_line)
         .filter(|record| record["kind"] == "session_end")
         .collect();
     assert_eq!(ends.len(), 1, "exactly one session_end: {stdout}");
@@ -254,8 +323,10 @@ mod lane_policy_tests {
 
     #[test]
     fn defects_reject() {
+        // otherwise-valid: only the over-count rejects (mutant-killing;
+        // verified by disabling the check and observing acceptance)
         assert_eq!(
-            accounted_partial(&output([101, 99, 200, 0, 0, 0, 0, 0]), 100),
+            accounted_partial(&output([101, 97, 198, 2, 0, 0, 0, 2]), 100),
             Err("over-count")
         );
         assert_eq!(
@@ -294,6 +365,7 @@ mod lane_policy_tests {
             base.replace("entries=9", &format!("entries={}", "9".repeat(5000))),
             base.replace("entries=9", "entries=\u{ff19}"),
             base.replace('\n', "\r\n"),
+            format!("{base}\u{fffd}\n"),
         ];
         for stderr in &bad {
             assert!(accounted_partial(stderr, 10).is_err(), "stderr: {stderr}");
@@ -393,6 +465,43 @@ mod lane_policy_tests {
     #[should_panic(expected = "exactly one session_end")]
     fn session_end_missing_panics() {
         session_end("{\"kind\":\"session_start\"}\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate key")]
+    fn session_end_duplicate_field_panics() {
+        let stdout = session_stdout(
+            r#"{"verdict":"PARTIAL","child_exit_code":1,"child_exit_code":0,"child_signal":null}"#,
+        );
+        session_end(&stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate key")]
+    fn session_end_duplicate_kind_panics() {
+        session_end(
+            "{\"kind\":\"session_end\",\"kind\":\"noise\",\"payload\":{\"verdict\":\"PARTIAL\",\
+             \"child_exit_code\":0,\"child_signal\":null}}\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate key")]
+    fn session_end_escaped_duplicate_key_panics() {
+        // serde decodes keys before visiting: the escape hides nothing
+        let stdout = session_stdout(
+            r#"{"verdict":"PARTIAL","child_exit_code":1,"child_\u0065xit_code":0,"child_signal":null}"#,
+        );
+        session_end(&stdout);
+    }
+
+    #[test]
+    fn session_end_repeated_array_values_pass() {
+        let stdout = session_stdout(
+            r#"{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null,"ids":[1,1]}"#,
+        );
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
     }
 
     #[test]

@@ -24,6 +24,8 @@ kryprobe-testkit.workspace = true
 # never touch libc (ADR-0002 Rule B — absence here enforces it).
 libc = "0.2"
 proptest = "1.11.0"
+# cli_bpf_e2e duplicate-key-rejecting JSON visitor (no derive needed).
+serde = "1"
 
 [lints]
 workspace = true

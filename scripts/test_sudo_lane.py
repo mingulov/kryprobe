@@ -136,6 +136,8 @@ def _partial_output(entries, returns, received, ring, drop, trunc, queue,
     out = (
         f"selftest bpf: partial ({printed_missing} missing; ring={ring} drop={drop}"
         f" trunc={trunc} queue={queue})\n"
+        "session session:bpf-selftest: 2 records\n"
+        "phase completed: no completed-phase operations observed during 0..1000ns; event_transport: complete\n"
         f"selftest bpf: entries={entries} returns={returns} received={received}"
         f" ring={ring} drop={drop} trunc={trunc} queue={queue}\n"
         + marker
@@ -154,6 +156,22 @@ def _partial_output(entries, returns, received, ring, drop, trunc, queue,
 
 
 ANNOUNCEMENT = "selftest bpf: accounted partial (2 missing); child output follows:\n"
+
+
+def _cargo_echo(*args, **kwargs):
+    """Cargo-body echo: child stderr + blank + child stdout + blank.
+
+    Production eprintln!s each already-newline-terminated stream,
+    adding the separators (empirically confirmed with a bare libtest
+    probe run under the lane-exact flags)."""
+    full = _partial_output(*args, session=True, **kwargs)
+    head, sep, tail = full.partition('{"schema"')
+    return head + "\n" + sep + tail + "\n"
+
+# Escape-sensitive fixtures (built from chr() so no decoder mangles them).
+NBSP = chr(0xA0)
+BOM = chr(0xFEFF)
+PAIR_ESCAPE = chr(92) + "uD83D" + chr(92) + "uDE00"
 
 
 class PartialReceipt(unittest.TestCase):
@@ -219,8 +237,10 @@ class PartialReceipt(unittest.TestCase):
             _partial_output(97, 97, 194, 3, 0, 0, 0, 3), 100))
 
     def test_over_count_rejected(self):
+        # otherwise-valid: only the over-count rejects (mutant-killing;
+        # verified by disabling the check and observing acceptance)
         self.assertIsNone(lane.partial_receipt(
-            _partial_output(101, 99, 200, 0, 0, 0, 0, 0), 100))
+            _partial_output(101, 97, 198, 2, 0, 0, 0, 2), 100))
 
     def test_kind_sum_mismatch_rejected(self):
         self.assertIsNone(lane.partial_receipt(
@@ -375,17 +395,75 @@ class PartialReceipt(unittest.TestCase):
         self.assertIsNotNone(
             lane.partial_receipt(stem + head + good_payload + "}\n", 10))
 
-    def test_nested_nonsession_json_ignored(self):
-        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
-        nested = '{"a":' * 500 + '1' + '}' * 500 + "\n"
-        receipt = lane.partial_receipt(base + nested, 10)
-        self.assertIsNotNone(receipt)
-
     def test_surrogate_walk_is_depth_robust(self):
         value = 0
         for _ in range(5000):
             value = [value]
         self.assertFalse(lane._has_surrogate(value))
+
+    def test_duplicate_json_keys_rejected(self):
+        stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
+        head = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+                '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",')
+        bad_payloads = [
+            # last-wins would smuggle a passing exit code
+            '"payload":{"verdict":"PARTIAL","child_exit_code":1,"child_exit_code":0,'
+            '"child_signal":null}',
+            # last-wins would smuggle a passing verdict
+            '"payload":{"verdict":"FAILED","verdict":"PARTIAL","child_exit_code":0,'
+            '"child_signal":null}',
+        ]
+        for payload in bad_payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(
+                    lane.partial_receipt(stem + head + payload + "}\n", 10))
+        # duplicate kind hides a contradictory end from uniqueness
+        forged = ('{"kind":"session_end","kind":"noise",'
+                  '"payload":{"verdict":"FAILED","child_exit_code":1,'
+                  '"child_signal":null}}\n')
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        self.assertIsNone(lane.partial_receipt(base + forged, 10))
+
+    def test_negative_zero_and_infinite_float_rejected(self):
+        stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
+        head = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+                '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",')
+        self.assertIsNone(lane.partial_receipt(
+            stem + head + '"payload":{"verdict":"PARTIAL","child_exit_code":-0,'
+            '"child_signal":null}}\n', 10))
+        self.assertIsNone(lane.partial_receipt(
+            stem + head + '"payload":{"verdict":"PARTIAL","child_exit_code":0,'
+            '"child_signal":null},"x":1e400}\n', 10))
+
+    def test_nesting_depth_capped_like_serde(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        shallow = '{"a":' * 100 + '1' + '}' * 100 + "\n"
+        self.assertIsNotNone(lane.partial_receipt(base + shallow, 10))
+        deep = '{"a":' * 129 + '1' + '}' * 129 + "\n"
+        self.assertIsNone(lane.partial_receipt(base + deep, 10))
+
+    def test_exotic_prefixed_contradictory_end_rejected(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        forged = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+                  '"session_id":"s","record_id":"record:9","monotonic_ns":"9",'
+                  '"payload":{"verdict":"FAILED","child_exit_code":1,'
+                  '"child_signal":null}}\n')
+        self.assertIsNone(lane.partial_receipt(base + NBSP + forged, 10))
+        self.assertIsNone(lane.partial_receipt(base + BOM + forged, 10))
+
+    def test_valid_surrogate_pair_accepted(self):
+        stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
+        line = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+                '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",'
+                '"payload":{"verdict":"PARTIAL","child_exit_code":0,'
+                '"child_signal":null},"x":"' + PAIR_ESCAPE + '"}\n')
+        receipt = lane.partial_receipt(stem + line, 10)
+        self.assertIsNotNone(receipt)
+
+    def test_recursion_error_branch_never_raises(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        with mock.patch.object(lane.json, "loads", side_effect=RecursionError):
+            self.assertIsNone(lane.partial_receipt(base, 10))
 
     def test_zero_padded_numbers_accepted(self):
         out = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
@@ -410,7 +488,7 @@ class PartialReceipt(unittest.TestCase):
 
 
 class E2EGuard(unittest.TestCase):
-    LOG = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+    LOG = _cargo_echo(9, 9, 18, 2, 0, 0, 0, 2)
 
     def test_unclaimed_passthrough(self):
         self.assertEqual(lane.e2e_partial_guard("ok\n", 10, "PASS"),
@@ -446,11 +524,13 @@ class CargoLogFraming(unittest.TestCase):
     # toolchain): the announcement absorbs the inline `test ... `
     # prefix; echoed lines start at column 0.
     BODY = "selftest_bpf_clean_partial_or_denied"
+    # filtered-out count is the current cli_bpf_e2e body count minus one
+    # (shape-checked only; the probe binary with one test prints 0).
     LOG = ("\nrunning 1 test\n"
            f"test {BODY} ... {ANNOUNCEMENT}"
-           + _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+           + _cargo_echo(9, 9, 18, 2, 0, 0, 0, 2)
            + "ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
-             " 0 filtered out; finished in 2.21s\n\n")
+             " 22 filtered out; finished in 2.21s\n\n")
 
     def test_framed_log_verdicts_and_guards(self):
         key = ("kryprobe-cli", "cli_bpf_e2e")
@@ -527,6 +607,17 @@ class SelftestBpfVerdict(unittest.TestCase):
             lane.selftest_verdict(3, self.LOG, "selftest-token-smoke", 20000),
             "FAIL",
         )
+
+
+class ReadBodyLog(unittest.TestCase):
+    def test_cr_preserved_end_to_end(self):
+        out = _partial_output(9, 9, 18, 2, 0, 0, 0, 2).replace("\n", "\r\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "body.log"
+            log.write_bytes(out.encode())
+            text = lane.read_body_log(log)
+            self.assertIn("\r", text)
+            self.assertIsNone(lane.partial_receipt(text, 10))
 
 
 class LeakNormalization(unittest.TestCase):
@@ -657,6 +748,11 @@ class ProcessCustody(unittest.TestCase):
             self.assertTrue(timed_out)
             self.assertEqual(code, 124)
             self.assertFalse(late.exists())
+            result = json.loads((Path(tmp) / "timeout.log.result.json").read_text())
+            self.assertEqual(result["exit"], 124)
+            self.assertEqual(result["raw_exit"], 124)
+            # killed on TERM: the true OS status, never the 124 sentinel
+            self.assertEqual(result["reaped_status"], -signal.SIGTERM)
 
     def test_timeout_reaps_a_descendant_that_changed_session(self):
         # Adopt a surviving regression child so the RED case itself can

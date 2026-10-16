@@ -241,6 +241,7 @@ dependencies = [
  "kryprobe-testkit",
  "libc",
  "proptest",
+ "serde",
  "serde_json",
 ]
 
