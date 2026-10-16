@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -123,17 +124,25 @@ def dump(path, value):
     """Atomic JSON write (temp + rename): readers see the old or the new
     file, never a partial one. Atomicity, not fsync durability. The
     temp name is random-exclusive (mkstemp), so a planted symlink in
-    a reused prepared directory is never followed."""
+    a reused prepared directory is never followed. Published files
+    are world-readable (mkstemp's 0600 is widened before the
+    rename): the CI summary check opens them unprivileged. A
+    failed write or replace removes the temp and raises the
+    original error; cleanup never masks it."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
                                dir=str(path.parent))
     try:
+        os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
+        os.replace(tmp, path)
     except BaseException:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
         raise
-    os.replace(tmp, path)
 
 
 def digest(path):
@@ -334,9 +343,11 @@ def partial_receipt(output, calls):
     exactly one session_end in the whole stream (whitespace-prefixed
     candidates included, raw spelling counted too), no duplicate
     keys, strict constants (no NaN/Infinity), finite floats, no
-    negative zero, i64/u64 integers, no lone surrogates, nesting
-    capped at 127 containers like serde, object payload, exact
-    field types. Any '{' outside a parsed candidate rejects
+    lone surrogates, nesting capped at 127 containers like serde,
+    object payload, exact field types — plus two rules
+    intentionally stricter than serde, which floats -0 and
+    overflows: no negative zero, i64/u64 integers. Any '{'
+    outside a parsed candidate rejects
     (unsupported framing). Numbers ignore leading zeros like
     Rust's u64 parse. Never raises on malformed input.
     """
@@ -455,6 +466,9 @@ def summarize_partials(results):
     return partials
 
 
+_COMMITTED_READ_CAP = 1024 * 1024
+
+
 def committed_prefix(out, results):
     """Prefix of `results` atomically committed to results.json on disk.
 
@@ -463,16 +477,39 @@ def committed_prefix(out, results):
     list, so its row count — read at summary time, after the dust
     settles — is immune to interruption between append and persist.
     Missing/unreadable/non-list file: no rows are claimed. The read
-    is size-capped and never raises: the directory stays writable
-    by the preparer for the whole run.
+    is size-bounded and never raises: the descriptor is opened
+    O_NOFOLLOW (a planted symlink claims nothing), non-regular
+    files are refused without blocking on FIFOs, at most cap+1
+    bytes are read, and oversize input is rejected outright —
+    never parsed as a truncated prefix. The directory stays
+    writable by the preparer for the whole run.
     """
     try:
-        raw = (out / "results.json").read_bytes()[:1024 * 1024]
+        fd = os.open(out / "results.json",
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return []
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return []
+        chunks = []
+        remaining = _COMMITTED_READ_CAP + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _COMMITTED_READ_CAP:
+            return []
         committed = json.loads(raw)
         if isinstance(committed, list):
             return results[:len(committed)]
     except (OSError, ValueError, RecursionError):
         pass
+    finally:
+        os.close(fd)
     return []
 
 
@@ -634,6 +671,20 @@ def launch_supervised(command):
         proc.wait()
 
 
+def _exclusive_sink(path):
+    """Write stream to a freshly created regular file.
+
+    O_CREAT|O_EXCL|O_NOFOLLOW: a planted symlink or a
+    pre-existing name fails instead of being followed or
+    truncated as root. Every call site uses a fresh unique
+    name and re-execution into a used directory is refused
+    upstream, so refusal always signals tampering or a bug.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o644)
+    return os.fdopen(fd, "wb")
+
+
 def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     """No shell expansion; deadlines and cancellation reap the owned tree."""
     subreaper()
@@ -649,8 +700,8 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     timed_out, cancelled, leaked = False, False, False
     code = 1
     with contextlib.ExitStack() as stack:
-        stream = stack.enter_context(log.open("wb"))
-        stderr = stack.enter_context(stderr_path.open("wb")) if stderr_path else subprocess.STDOUT
+        stream = stack.enter_context(_exclusive_sink(log))
+        stderr = stack.enter_context(_exclusive_sink(stderr_path)) if stderr_path else subprocess.STDOUT
         proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream, stdin=subprocess.DEVNULL,
                                 stderr=stderr, start_new_session=True)
         try:

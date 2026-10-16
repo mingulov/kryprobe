@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import sys
@@ -175,6 +177,13 @@ PAIR_ESCAPE = chr(92) + "uD83D" + chr(92) + "uDE00"
 USCORE_ESCAPE = chr(92) + "u005f"
 NUL = chr(0)
 VT = chr(11)
+
+
+def failed_tail_spaced():
+    # every object opener spaced: carries no '{"', so only the
+    # any-brace rule (not r6's token rule) can reject it
+    return ('end", "payload": { "verdict": "FAILED", "child_exit_code": 1, '
+            '"child_signal": null } }\n')
 
 
 class PartialReceipt(unittest.TestCase):
@@ -516,11 +525,21 @@ class PartialReceipt(unittest.TestCase):
                         self.assertNotIn('{"', prefix + forged)
                     self.assertIsNone(
                         lane.partial_receipt(base + prefix + forged, 10))
-        # mid-line object under an exotic prefix
+        # mid-line object under an exotic prefix: every opener
+        # spaced, or r6's '{"' rule already rejects it and the case
+        # proves nothing (r7 gap)
         forged = ('note { "kind": "session' + USCORE_ESCAPE
-                  + 'end", "payload": {"verdict": "FAILED", "child_exit_code": 1, '
-                    '"child_signal": null} }\n')
+                  + failed_tail_spaced())
+        self.assertNotIn('{"', NBSP + forged)
         self.assertIsNone(lane.partial_receipt(base + NBSP + forged, 10))
+        # split-line forgery: the brace dangles at end-of-line and
+        # the record continues on the next line
+        line1 = NBSP + "frag {\n"
+        line2 = '"kind": "session' + USCORE_ESCAPE + failed_tail_spaced()
+        self.assertNotIn('{"', line1)
+        self.assertNotIn('{"', line2)
+        self.assertIsNone(
+            lane.partial_receipt(base + line1 + line2, 10))
 
     def test_exotic_prefixed_valid_end_rejected(self):
         # a valid end under an exotic prefix is unsupported framing,
@@ -682,6 +701,59 @@ class CommittedPrefix(unittest.TestCase):
             with mock.patch.object(lane.json, "loads", side_effect=RecursionError):
                 self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
 
+    def test_read_is_bounded_before_parsing(self):
+        # read_bytes()[:cap] loads the whole file first: RSS
+        # must stay flat on a 100MB sparse file, and a FIFO
+        # must not block the summary path.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            big = out / "results.json"
+            with open(big, "wb") as stream:
+                stream.truncate(100 * 1024 * 1024)
+            before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            growth = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                      - before) / 1024
+            self.assertLess(growth, 20, f"RSS grew {growth:.0f} MiB")
+            big.unlink()
+            os.mkfifo(big)
+            # a regressed blocking read must fail the test, not
+            # hang the suite: run it off-thread with a deadline.
+            outcome = []
+            worker = threading.Thread(
+                target=lambda: outcome.append(
+                    lane.committed_prefix(out, self.RESULTS)),
+                daemon=True)
+            worker.start()
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "read blocked on FIFO")
+            self.assertEqual(outcome, [[]])
+
+    def test_symlink_and_nonregular_files_claim_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            target = out / "target.json"
+            target.write_text(json.dumps(self.RESULTS))
+            (out / "results.json").symlink_to(target)
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+            (out / "results.json").unlink()
+            (out / "results.json").mkdir()
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+
+    def test_oversize_is_rejected_not_truncated(self):
+        # a valid list at exactly the cap parses; one byte of
+        # trailing garbage must reject, not claim a prefix.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            inner = json.dumps(self.RESULTS[0]).encode()
+            exact = b"[" + inner + b" " * (1024 * 1024 - len(inner) - 2) + b"]"
+            assert len(exact) == 1024 * 1024
+            (out / "results.json").write_bytes(exact)
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS),
+                             self.RESULTS[:1])
+            (out / "results.json").write_bytes(exact + b"INVALID")
+            self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
+
 
 class DumpAtomicity(unittest.TestCase):
     def test_planted_symlink_is_not_followed(self):
@@ -703,6 +775,37 @@ class DumpAtomicity(unittest.TestCase):
             self.assertEqual(
                 json.loads((out / "results.json").read_text()),
                 [{"test": "a"}, {"test": "b"}])
+
+    def test_published_files_stay_world_readable(self):
+        # mkstemp is 0600: without an explicit fchmod the CI
+        # summary check (unprivileged open as the runner user)
+        # fails on every privileged run.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            lane.dump(out / "summary.json", {"complete": True})
+            mode = (out / "summary.json").stat().st_mode & 0o777
+            self.assertEqual(oct(mode), oct(0o644))
+
+    def test_failed_replace_leaves_no_temp_and_raises_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "summary.json").mkdir()
+            with self.assertRaises(OSError):
+                lane.dump(out / "summary.json", {"complete": True})
+            leftovers = [p.name for p in out.iterdir()
+                         if p.name.startswith("summary.json.")]
+            self.assertEqual(leftovers, [])
+
+    def test_failed_write_unlinks_without_masking_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            boom = ValueError("boom")
+            with mock.patch("os.fdopen", side_effect=boom), \
+                 mock.patch("os.unlink",
+                            side_effect=FileNotFoundError("raced")):
+                with self.assertRaises(ValueError) as caught:
+                    lane.dump(out / "summary.json", {"complete": True})
+            self.assertIs(caught.exception, boom)
 
 
 class SelftestBpfVerdict(unittest.TestCase):
@@ -877,6 +980,42 @@ class PreparedIntegrity(unittest.TestCase):
                              (3, '{"attached":10,"audit":"attach","expected":12,"extra":1}\n')]:
             with self.subTest(code=code, output=output):
                 self.assertEqual(lane.lifecycle_verdict(code, output), "FAIL")
+
+
+class LoggedPaths(unittest.TestCase):
+    def test_planted_log_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim.txt"
+            victim.write_text("untouched")
+            log = root / "body.log"
+            log.symlink_to(victim)
+            marker = root / "spawned"
+            with self.assertRaises(OSError):
+                lane.run_logged(["touch", str(marker)], log, 30)
+            self.assertEqual(victim.read_text(), "untouched")
+            self.assertFalse(marker.exists(), "no child may spawn")
+
+    def test_preexisting_log_name_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "body.log"
+            log.write_text("previous attempt")
+            with self.assertRaises(OSError):
+                lane.run_logged(["true"], log, 30)
+            self.assertEqual(log.read_text(), "previous attempt")
+
+    def test_planted_stderr_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim.txt"
+            victim.write_text("untouched")
+            err = root / "body.stderr"
+            err.symlink_to(victim)
+            with self.assertRaises(OSError):
+                lane.run_logged(["true"], root / "body.log", 30,
+                                stderr_path=err)
+            self.assertEqual(victim.read_text(), "untouched")
 
 
 class ProcessCustody(unittest.TestCase):
