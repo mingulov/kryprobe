@@ -161,10 +161,10 @@ def dump(path, value):
     A write/flush error stays primary when the close retry
     fails too (the close error is kept as its context, except
     that KeyboardInterrupt/SystemExit from close propagate
-    immediately); a close-only failure propagates. The lane's
-    own cancel signal is InterruptedError, an OSError: if one
-    arrives during the close retry it is kept as context, with
-    cancellation taking effect via _CANCEL_REQUESTED."""
+    immediately); a close-only failure propagates. The body
+    runs shielded, so the lane's own cancel signal only sets
+    _CANCEL_REQUESTED (acted on at the caller's checkpoint)
+    and never surfaces here as InterruptedError."""
     text = json.dumps(value, indent=2, sort_keys=True) + "\n"
     # The whole body runs deferred: small bounded regfile writes
     # never block, so no async window can strand the temp or fd.
@@ -173,15 +173,22 @@ def dump(path, value):
                                    dir=str(path.parent))
         try:
             os.fchmod(fd, 0o644)
-            stream = _text_sink(fd)
         except BaseException:
-            # _text_sink closes on its own failures, so this close
-            # is a no-op EBADF on that path (suppressed); the
-            # fchmod path still owns the descriptor.
             try:
                 os.close(fd)
             except OSError:
                 pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            stream = _text_sink(fd)
+        except BaseException:
+            # _text_sink owns all its failures (the descriptor is
+            # already closed): closing the number again could hit
+            # a reused fd, so only the temp goes.
             try:
                 os.unlink(tmp)
             except OSError:
@@ -614,13 +621,14 @@ def committed_prefix(out, results):
     input-driven can trigger it.) The directory stays writable
     by the preparer for the whole run.
     """
+    # fd is None until open succeeds, and every later statement
+    # sits inside the try: a signal anywhere past acquisition
+    # still runs the finally (no shield gap, no ownership
+    # window). The open itself cannot leaf (O_RDONLY).
+    fd = None
     try:
-        with _deferred_cancel():
-            fd = os.open(out / "results.json",
-                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return []
-    try:
+        fd = os.open(out / "results.json",
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return []
         chunks = []
@@ -641,10 +649,11 @@ def committed_prefix(out, results):
     except (OSError, ValueError, RecursionError, MemoryError):
         pass
     finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return []
 
 
@@ -721,14 +730,13 @@ def reap_owned(proc=None):
     Only a current direct child may be signalled, via a pidfd. Repeated
     interrupts cannot break cleanup and release the BPF lease early.
     """
-    def defer_cancel(_sig, _frame):
-        global _CANCEL_REQUESTED
-        _CANCEL_REQUESTED = True
-    saved = {sig: signal.signal(sig, defer_cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
+    # The reaping loop runs under the shared shield (mask-blocked
+    # install/restore): a signal mid-loop defers to the flag,
+    # which the caller acts on at its checkpoint.
     start = time.monotonic()
     announced = False
     signalled = set()
-    try:
+    with _deferred_cancel():
         while True:
             if proc is not None:
                 proc.poll()
@@ -758,9 +766,6 @@ def reap_owned(proc=None):
             time.sleep(0.01)
         if proc is not None:
             proc.wait()
-    finally:
-        for sig, handler in saved.items():
-            signal.signal(sig, handler)
 
 
 @contextlib.contextmanager
@@ -771,9 +776,15 @@ def _deferred_cancel():
     transfer would leak the descriptor; shielding publishes and
     the cleanup sequence lets them complete, with cancellation
     taking effect at the next checkpoint via _CANCEL_REQUESTED.
-    Off the main thread this is a plain yield: signals only
-    deliver to the main thread, so no window exists elsewhere
-    (and signal.signal would raise there).
+    Handler install and restore run under a blocked signal mask
+    (a signal between the two installs would otherwise escape
+    the shield with a half-installed table); arrivals during
+    the swap pend and are deferred on unmask. The old mask is
+    saved/restored so nesting is safe — though install windows
+    never actually nest (each completes before any other code
+    runs). Off the main thread this is a plain yield: signals
+    only deliver to the main thread, so no window exists
+    elsewhere (and signal.signal would raise there).
     """
     if threading.get_ident() != threading.main_thread().ident:
         yield
@@ -781,16 +792,36 @@ def _deferred_cancel():
     def defer(_sig, _frame):
         global _CANCEL_REQUESTED
         _CANCEL_REQUESTED = True
-    saved = {sig: signal.signal(sig, defer) for sig in (signal.SIGTERM, signal.SIGINT)}
+    sigs = (signal.SIGTERM, signal.SIGINT)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+    saved = {}
+    try:
+        for sig in sigs:
+            saved[sig] = signal.signal(sig, defer)
+    except BaseException:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        raise
+    signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     try:
         yield
     finally:
-        for sig, handler in saved.items():
-            signal.signal(sig, handler)
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+        try:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def _say(message):
-    """Diagnostic print that can never abort cleanup (broken pipe)."""
+    """Diagnostic print contained against stream failure.
+
+    OSError/ValueError (broken pipe, closed stream) are
+    swallowed so cleanup reports never abort the sequence;
+    MemoryError stays uncatchable-narrow (see _guarded_publish
+    for the deferred escape)."""
     try:
         print(message, flush=True)
     except (OSError, ValueError):
@@ -853,21 +884,25 @@ def _exclusive_sink(path):
     the preparer-writable pathname. The mode is forced (not
     umask-dependent) so failure-uploaded logs stay readable.
     """
+    # The shield covers acquisition through the ownership arm: a
+    # signal between them would otherwise leak the descriptor
+    # (and a leaf path on the create path). Deferral only
+    # delays cancellation to the caller's checkpoint.
     with _deferred_cancel():
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o644)
-    try:
-        os.fchmod(fd, 0o644)
-    except BaseException:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        raise
+            os.fchmod(fd, 0o644)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
     return fd
 
 
@@ -914,17 +949,18 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
     captured = b""
     with contextlib.ExitStack() as stack:
         # Raw descriptors go to the child: no dup/wrap stage means
-        # no transfer to fail. (Registration follows acquisition
-        # on the next statement; the residual one-statement
-        # window matches every fd in the program, lane_fd included.)
-        sink = _exclusive_sink(log)
-        stack.callback(os.close, sink)
-        if stderr_path:
-            err_sink = _exclusive_sink(stderr_path)
-            stack.callback(os.close, err_sink)
-            stderr = err_sink
-        else:
-            stderr = subprocess.STDOUT
+        # no transfer to fail. Acquisition and ExitStack
+        # registration share one shield: a signal between them
+        # would otherwise leak the sink with no owner.
+        with _deferred_cancel():
+            sink = _exclusive_sink(log)
+            stack.callback(os.close, sink)
+            if stderr_path:
+                err_sink = _exclusive_sink(stderr_path)
+                stack.callback(os.close, err_sink)
+                stderr = err_sink
+            else:
+                stderr = subprocess.STDOUT
         proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=sink, stdin=subprocess.DEVNULL,
                                 stderr=stderr, start_new_session=True)
         try:
@@ -1184,6 +1220,12 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         raise
     results, mounts = [], []
     runtime = None
+    # This invocation's own failure flag: the end-raise gate must
+    # not consult sys.exception(), which also sees exceptions a
+    # caller is handling (a caller in `except` would wrongly
+    # suppress the publish-failure raise and fall through to a
+    # complete summary).
+    failed = False
     try:
         # Copy into a root-owned tmpfs whose parent cannot be renamed by
         # the preparer. Verify THAT copy, then mount it read-only. A mutable
@@ -1296,11 +1338,24 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         receipt.update(status="finished", exit=code, counts=counts, staged_hashes_unchanged=True)
     except BaseException as error:
         receipt.update(status="failed", exit=1, error=str(error))
-        summary_error = _publish_json(out / "summary.json", {
-            "exit": 1, "error": str(error), "complete": False,
-            "accepted_partials": summarize_partials(committed_prefix(out, results))})
-        if summary_error is not None:
-            _say(f"sudo-lane: failure summary not published: {summary_error}")
+        failed = True
+        try:
+            summary_error = _publish_json(out / "summary.json", {
+                "exit": 1, "error": str(error), "complete": False,
+                "accepted_partials": summarize_partials(committed_prefix(out, results))})
+            if summary_error is not None:
+                _say(f"sudo-lane: failure summary not published: {summary_error}")
+        except (KeyboardInterrupt, SystemExit):
+            # Genuine termination (the lane's own cancel arrives
+            # as InterruptedError, never this): propagate
+            # immediately, like dump's close path. Cleanup still
+            # runs — the finally executes regardless.
+            raise
+        except BaseException as publish_error:
+            # A non-OSError escape (allocation class) must not
+            # replace the root cause or its termination
+            # semantics: chain it and re-raise the original.
+            error.__context__ = publish_error
         raise
     finally:
         # Children must be reaped before mounts or the exclusive lock go.
@@ -1314,10 +1369,17 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             deferred = []
             if _CANCEL_REQUESTED:
                 receipt.update(status="failed", exit=1, error="cancelled")
-                _guarded_publish(out / "summary.json", {
-                    "exit": 1, "complete": False, "error": "cancelled",
-                    "accepted_partials": summarize_partials(committed_prefix(out, results))},
-                    publish_errors, deferred)
+                # The site try covers payload evaluation too: the
+                # dict build + summarize run before _guarded_publish
+                # is entered, and an escape there must defer like
+                # any other publish failure.
+                try:
+                    _guarded_publish(out / "summary.json", {
+                        "exit": 1, "complete": False, "error": "cancelled",
+                        "accepted_partials": summarize_partials(committed_prefix(out, results))},
+                        publish_errors, deferred)
+                except BaseException as error:
+                    deferred.append(error)
             cleanup_errors = []
             for target in reversed(mounts):
                 cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
@@ -1327,26 +1389,43 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                 runtime.rmdir()
             if cleanup_errors:
                 receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
-                _guarded_publish(out / "summary.json", {
-                    "exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
-                    "accepted_partials": summarize_partials(committed_prefix(out, results))},
-                    publish_errors, deferred)
+                try:
+                    _guarded_publish(out / "summary.json", {
+                        "exit": 1, "complete": False, "cleanup_errors": cleanup_errors,
+                        "accepted_partials": summarize_partials(committed_prefix(out, results))},
+                        publish_errors, deferred)
+                except BaseException as error:
+                    deferred.append(error)
+            # A cancel that arrived after the entry check (e.g.
+            # during the unmounts) must still reach the receipt:
+            # re-check before publishing it.
+            if _CANCEL_REQUESTED:
+                receipt.update(status="failed", exit=1, error="cancelled")
             receipt["children_reaped"] = not children()
             receipt["owned_mounts_removed"] = not cleanup_errors
             receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            _guarded_publish(out / "ownership.json", receipt, publish_errors, deferred)
+            try:
+                _guarded_publish(out / "ownership.json", receipt, publish_errors, deferred)
+            except BaseException as error:
+                deferred.append(error)
             if publish_errors or deferred:
                 _say("sudo-lane: evidence publishing problems: "
                      f"{publish_errors + [type(e).__name__ for e in deferred]}")
             os.close(lane_fd)
             if cleanup_errors:
-                raise ValueError(f"owned mount cleanup failed: {cleanup_errors}")
+                error = ValueError(f"owned mount cleanup failed: {cleanup_errors}")
+                if deferred:
+                    error.__cause__ = deferred[0]
+                raise error
             if _CANCEL_REQUESTED:
-                raise InterruptedError("cancelled; lane cleanup complete")
+                error = InterruptedError("cancelled; lane cleanup complete")
+                if deferred:
+                    error.__cause__ = deferred[0]
+                raise error
             # A new failure here must not mask an in-flight one: the
             # operator already lost the evidence write; keep the root
             # cause (and any termination semantics) intact.
-            if sys.exception() is None:
+            if not failed:
                 if deferred:
                     raise deferred[0]
                 if publish_errors:

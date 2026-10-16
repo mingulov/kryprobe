@@ -195,12 +195,14 @@ def _owned_mkstemp():
         made.append(fd)
         return fd, tmp
     with mock.patch("tempfile.mkstemp", side_effect=capture):
-        yield
-        for fd in made:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        try:
+            yield
+        finally:
+            for fd in made:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def failed_tail_spaced():
@@ -725,6 +727,64 @@ class CommittedPrefix(unittest.TestCase):
             with mock.patch.object(lane.json, "loads", side_effect=RecursionError):
                 self.assertEqual(lane.committed_prefix(out, self.RESULTS), [])
 
+    def test_signal_past_acquisition_still_closes(self):
+        # fd-None + try/finally (no shield gap): SIGTERM after
+        # the open runs the finally — fail-closed [] with no
+        # leak and the cancel flag set.
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError("cancelled")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            saved_flag = lane._CANCEL_REQUESTED
+            old = signal.signal(signal.SIGTERM, raising)
+            before = len(os.listdir("/proc/self/fd"))
+            real_fstat = os.fstat
+            def killer(fd):
+                os.kill(os.getpid(), signal.SIGTERM)
+                return real_fstat(fd)
+            try:
+                lane._CANCEL_REQUESTED = False
+                with mock.patch("os.fstat", side_effect=killer):
+                    self.assertEqual(
+                        lane.committed_prefix(out, self.RESULTS), [])
+                self.assertTrue(lane._CANCEL_REQUESTED)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_no_shield_exit_window_before_ownership(self):
+        # structural pin: a kill placed exactly at shield exit
+        # must find no ownership gap. Any reintroduction of a
+        # shield-around-open-only shape leaks here.
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError("cancelled")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            saved_flag = lane._CANCEL_REQUESTED
+            old = signal.signal(signal.SIGTERM, raising)
+            before = len(os.listdir("/proc/self/fd"))
+            real_dc = lane._deferred_cancel
+            @contextlib.contextmanager
+            def killer_shield():
+                with real_dc():
+                    yield
+                os.kill(os.getpid(), signal.SIGTERM)
+            try:
+                lane._CANCEL_REQUESTED = False
+                with mock.patch.object(lane, "_deferred_cancel",
+                                       side_effect=lambda: killer_shield()):
+                    self.assertEqual(
+                        lane.committed_prefix(out, self.RESULTS), [])
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_read_is_bounded_before_parsing(self):
         # the read budget is measured with tracemalloc inside the
         # test window: ru_maxrss is a high-water mark, so a prior
@@ -739,6 +799,11 @@ class CommittedPrefix(unittest.TestCase):
             # (160MB freed hides a 100MB unbounded read). Resetting
             # the diagnostic peak is acceptable; killing outer
             # tracing is not, so start/stop stay conditional.
+            # Boundary (Codex r11-8): a release of caller ballast
+            # INSIDE the window would conceal the same way — the
+            # window therefore holds a single committed_prefix
+            # call, which allocates but releases no caller
+            # memory, so no such release can occur here.
             was_tracing = tracemalloc.is_tracing()
             if not was_tracing:
                 tracemalloc.start()
@@ -992,6 +1057,16 @@ class DumpAtomicity(unittest.TestCase):
             self.assertEqual(caught.exception.errno, errno.EIO)
             self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
+    def test_owned_mkstemp_cleans_up_on_unexpected_failure(self):
+        # helper cleanup is in a finally: an unexpected test
+        # failure inside must not contaminate later fd counts.
+        before = len(os.listdir("/proc/self/fd"))
+        with self.assertRaises(AssertionError):
+            with _owned_mkstemp():
+                tempfile.mkstemp()
+                raise AssertionError("unexpected")
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_publish_reports_instead_of_raising(self):
         # cleanup-time publishing must not abort the unmount /
         # ownership sequence: hostile FS conditions report.
@@ -1034,11 +1109,39 @@ class DumpAtomicity(unittest.TestCase):
             with mock.patch("os.fchmod", side_effect=OSError("nope")):
                 with self.assertRaises(OSError):
                     lane.dump(out / "a.json", {})
+            # close-then-raise mirrors _text_sink's contract (it
+            # owns all its failures); a raise-without-close mock
+            # would contradict it and lock in a double close.
+            def close_then_raise(fd):
+                os.close(fd)
+                raise OSError("nope")
             with mock.patch.object(lane, "_text_sink",
-                                   side_effect=OSError("nope")):
+                                   side_effect=close_then_raise):
                 with self.assertRaises(OSError):
                     lane.dump(out / "b.json", {})
             self.assertEqual(fds(), before)
+
+    def test_sink_failure_never_recloses_the_descriptor(self):
+        # the number _text_sink closed may already be reused: a
+        # witness fd opened in the mock deterministically takes
+        # it (lowest-free reuse, single-threaded). dump must not
+        # touch it.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            witness = []
+            def close_and_track(fd):
+                os.close(fd)
+                witness.append(os.open(out / "witness",
+                                       os.O_RDWR | os.O_CREAT, 0o644))
+                raise OSError("no sink")
+            before = len(os.listdir("/proc/self/fd"))
+            with mock.patch.object(lane, "_text_sink",
+                                   side_effect=close_and_track):
+                with self.assertRaises(OSError):
+                    lane.dump(out / "c.json", {})
+            os.fstat(witness[0])
+            os.close(witness[0])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
 
 class SelftestBpfVerdict(unittest.TestCase):
@@ -1226,11 +1329,17 @@ class CapturedBytesBinding(unittest.TestCase):
         # parse fd-captured bytes. A call site reverted to path
         # reads stays green functionally, so pin the shape with a
         # narrow tripwire (taint over execute/prepare): no reads
-        # through the log path or its aliases, no other consumer
-        # of the path, every run_logged 3-unpacked with the bytes
-        # used, and the deleted reader gone module-wide. The
-        # mock-driven ExecuteWiring scenarios prove the behavior;
-        # this guard only catches mechanical reverts.
+        # through the log path or its aliases (positional or
+        # keyword, bare or os./io.-attribute opens), every
+        # run_logged 3-unpacked with the bytes used past the
+        # call site, and the deleted reader gone module-wide.
+        # Known-narrow (documented, not missed): constructor or
+        # method-chain laundering (Path(log), log.as_posix(),
+        # f"{log}", (log.parent / log.name)), reads through
+        # non-Name receivers, and new helper functions. The
+        # mock-driven ExecuteWiring behavioral tests (selftest
+        # + Cargo conflicting-bytes fixtures) are the backstop
+        # for those; this guard only catches mechanical reverts.
         tree = ast.parse(Path(lane.__file__).read_text())
         funcs = [node for node in ast.walk(tree)
                  if isinstance(node, ast.FunctionDef)
@@ -1243,17 +1352,38 @@ class CapturedBytesBinding(unittest.TestCase):
             while changed:
                 changed = False
                 for node in ast.walk(func):
-                    if isinstance(node, ast.Assign) \
-                            and isinstance(node.value, ast.Name) \
-                            and node.value.id in tainted:
-                        for target in node.targets:
+                    if isinstance(node, ast.Assign):
+                        values = [node.value]
+                        targets = list(node.targets)
+                    elif isinstance(node, ast.AnnAssign) \
+                            and node.value is not None:
+                        values = [node.value]
+                        targets = [node.target]
+                    else:
+                        continue
+                    hit = any(isinstance(value, ast.Name)
+                              and value.id in tainted
+                              for value in values) or any(
+                                  isinstance(value, (ast.Tuple, ast.List))
+                                  and any(isinstance(elt, ast.Name)
+                                          and elt.id in tainted
+                                          for elt in value.elts)
+                                  for value in values)
+                    if hit:
+                        for target in targets:
                             if isinstance(target, ast.Name) \
                                     and target.id not in tainted:
                                 tainted.add(target.id)
                                 changed = True
-            used = {node.id for node in ast.walk(func)
-                    if isinstance(node, ast.Name)
-                    and isinstance(node.ctx, ast.Load)}
+                            elif isinstance(target, (ast.Tuple, ast.List)):
+                                for elt in target.elts:
+                                    if isinstance(elt, ast.Name) \
+                                            and elt.id not in tainted:
+                                        tainted.add(elt.id)
+                                        changed = True
+            loads = {(node.id, node.lineno) for node in ast.walk(func)
+                     if isinstance(node, ast.Name)
+                     and isinstance(node.ctx, ast.Load)}
             run_logged_calls = 0
             for node in ast.walk(func):
                 if not isinstance(node, ast.Call):
@@ -1265,13 +1395,25 @@ class CapturedBytesBinding(unittest.TestCase):
                         and called.value.id in tainted:
                     violations.append(
                         f"{func.name}:{node.lineno} reads tainted path")
-                if isinstance(called, ast.Name) \
-                        and called.id not in self.PATH_CONSUMERS \
-                        and any(isinstance(arg, ast.Name)
-                                and arg.id in tainted for arg in node.args):
+                    continue
+                if isinstance(called, ast.Attribute) \
+                        and called.attr == "open" \
+                        and isinstance(called.value, ast.Name):
+                    opener = f"{called.value.id}.{called.attr}"
+                elif isinstance(called, ast.Name):
+                    opener = called.id
+                else:
+                    continue
+                if opener in self.PATH_CONSUMERS:
+                    continue
+                carried = [arg for arg in node.args]
+                carried.extend(keyword.value
+                               for keyword in node.keywords)
+                if any(isinstance(arg, ast.Name)
+                       and arg.id in tainted for arg in carried):
                     violations.append(
                         f"{func.name}:{node.lineno} tainted path escapes "
-                        f"to {called.id}()")
+                        f"to {opener}()")
             for node in ast.walk(func):
                 if isinstance(node, ast.Assign) \
                         and isinstance(node.value, ast.Call) \
@@ -1286,10 +1428,12 @@ class CapturedBytesBinding(unittest.TestCase):
                             f"{func.name}:{node.lineno} run_logged "
                             "not 3-unpacked")
                     elif isinstance(elts[2], ast.Name) \
-                            and elts[2].id not in used:
+                            and not any(name == elts[2].id
+                                        and line > node.lineno
+                                        for name, line in loads):
                         violations.append(
                             f"{func.name}:{node.lineno} captured "
-                            "bytes unused")
+                            "bytes unused past the call site")
             self.assertGreater(run_logged_calls, 0, func.name)
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) \
@@ -1335,6 +1479,68 @@ class DeferredCancel(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
 
+    def test_failed_install_restores_partial_table_and_mask(self):
+        # a fault between the two installs must not escape
+        # with a half-installed table or a stuck mask.
+        def boom(signum, frame):
+            raise AssertionError("must not fire")
+        saved_flag = lane._CANCEL_REQUESTED
+        old_term = signal.signal(signal.SIGTERM, boom)
+        old_int = signal.signal(signal.SIGINT, boom)
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        real_signal = signal.signal
+        def flaky(sig, handler):
+            if sig == signal.SIGINT:
+                raise OSError("install fault")
+            return real_signal(sig, handler)
+        try:
+            lane._CANCEL_REQUESTED = False
+            with mock.patch.object(lane.signal, "signal",
+                                   side_effect=flaky):
+                with self.assertRaises(OSError):
+                    with lane._deferred_cancel():
+                        pass
+            self.assertIs(signal.getsignal(signal.SIGTERM), boom)
+            self.assertIs(signal.getsignal(signal.SIGINT), boom)
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, ()), old_mask)
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+            signal.signal(signal.SIGINT, old_int)
+            lane._CANCEL_REQUESTED = saved_flag
+
+    def test_install_and_restore_run_masked(self):
+        # the mask order is the whole fix: block, swap, unmask
+        # on the way in and on the way out.
+        events = []
+        real_mask = signal.pthread_sigmask
+        real_signal = signal.signal
+        def mask(op, sigs):
+            events.append(("mask", op))
+            return real_mask(op, sigs)
+        def install(sig, handler):
+            events.append(("swap", sig))
+            return real_signal(sig, handler)
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        try:
+            with mock.patch.object(lane.signal, "pthread_sigmask",
+                                   side_effect=mask), \
+                    mock.patch.object(lane.signal, "signal",
+                                      side_effect=install):
+                with lane._deferred_cancel():
+                    pass
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+            signal.signal(signal.SIGINT, old_int)
+        kinds = [kind for kind, _ in events]
+        self.assertEqual(kinds, ["mask", "swap", "swap", "mask",
+                                 "mask", "swap", "swap", "mask"])
+        self.assertEqual(
+            [op for kind, op in events if kind == "mask"],
+            [signal.SIG_BLOCK, signal.SIG_SETMASK,
+             signal.SIG_BLOCK, signal.SIG_SETMASK])
+
 
 class TextSink(unittest.TestCase):
     def test_fileio_failure_closes_descriptor(self):
@@ -1360,6 +1566,18 @@ class TextSink(unittest.TestCase):
                     with self.assertRaises(MemoryError):
                         lane._text_sink(fd)
                 self.assertEqual(len(os.listdir("/proc/self/fd")), before - 1)
+
+    def test_fileio_setup_failure_keeps_descriptor_open(self):
+        # pins _text_sink's founding premise against a real
+        # FileIO (not a mock): setup failure never owns the fd.
+        with tempfile.TemporaryDirectory() as tmp:
+            dfd = os.open(tmp, os.O_RDONLY)
+            before = len(os.listdir("/proc/self/fd"))
+            with self.assertRaises(OSError):
+                lane.io.FileIO(dfd, "w")
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+            os.fstat(dfd)
+            os.close(dfd)
 
     def test_roundtrip_matches_fdopen_semantics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1453,6 +1671,70 @@ class LoggedPaths(unittest.TestCase):
                                     stderr_path=root / "body.stderr")
             self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
+    def test_signal_during_sink_setup_defers_without_leak(self):
+        # acquisition and the ownership arm share one shield:
+        # SIGTERM inside fchmod defers (flag set, setup
+        # completes, caller owns the fd) instead of leaking.
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError("cancelled")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved_flag = lane._CANCEL_REQUESTED
+            old = signal.signal(signal.SIGTERM, raising)
+            before = len(os.listdir("/proc/self/fd"))
+            real_fchmod = os.fchmod
+            def killer(fd, mode):
+                os.kill(os.getpid(), signal.SIGTERM)
+                return real_fchmod(fd, mode)
+            try:
+                lane._CANCEL_REQUESTED = False
+                with mock.patch("os.fchmod", side_effect=killer):
+                    fd = lane._exclusive_sink(root / "w.log")
+                self.assertTrue(lane._CANCEL_REQUESTED)
+                os.close(fd)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_signal_during_sink_registration_defers_without_leak(self):
+        # acquisition and ExitStack registration share one
+        # shield: SIGTERM between them defers instead of
+        # leaking, and the run_logged checkpoint then raises
+        # with both sinks owned and unwound.
+        def raising(signum, frame):
+            lane._CANCEL_REQUESTED = True
+            raise InterruptedError("cancelled")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved_flag = lane._CANCEL_REQUESTED
+            old = signal.signal(signal.SIGTERM, raising)
+            before = len(os.listdir("/proc/self/fd"))
+            real_callback = contextlib.ExitStack.callback
+            fired = []
+            def killer(self, *args, **kwargs):
+                # only the two sink registrations (subprocess
+                # uses ExitStack.callback internally too).
+                if len(fired) < 2:
+                    fired.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real_callback(self, *args, **kwargs)
+            try:
+                lane._CANCEL_REQUESTED = False
+                with mock.patch.object(contextlib.ExitStack, "callback",
+                                       autospec=True,
+                                       side_effect=killer):
+                    with self.assertRaises(InterruptedError):
+                        lane.run_logged(
+                            ["true"], root / "c.log", 30,
+                            stderr_path=root / "c.stderr")
+                self.assertTrue(lane._CANCEL_REQUESTED)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
 
 class ExecuteWiring(unittest.TestCase):
     """Mock-driven execute() scenarios: finally wiring, publish
@@ -1464,11 +1746,12 @@ class ExecuteWiring(unittest.TestCase):
     under test are real.
     """
 
-    def _prepared_out(self, root):
+    def _prepared_out(self, root, artifacts=()):
         out = root / "out"
         (out / "stage").mkdir(parents=True)
         (out / "logs").mkdir()
-        manifest = {"schema": "kryprobe-privileged-lane/v1", "artifacts": [],
+        manifest = {"schema": "kryprobe-privileged-lane/v1",
+                    "artifacts": list(artifacts),
                     "sha256": {}, "host_debug": str(root / "host" / "debug"),
                     "root": str(root), "prepared_uid": 0, "prepared_gid": 0}
         (out / "manifest.json").write_text(json.dumps(manifest))
@@ -1483,14 +1766,27 @@ class ExecuteWiring(unittest.TestCase):
                dump_hook=None):
         saved_flag = lane._CANCEL_REQUESTED
         calls = []
+        tmpfs_targets = []
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
+            if cmd[:2] == ["mount", "-t"]:
+                tmpfs_targets.append(cmd[-1])
             if cmd[:1] == ["umount"]:
                 # emulate the postcondition real unmount provides:
                 # the mountpoint survives, its contents are gone.
+                # Precondition (asserted): only the tmpfs runtime
+                # may be nonempty — its contents lived on the
+                # mount. A real bind-unmount would REVEAL
+                # underlying contents instead of deleting them,
+                # so a nonempty bind target fails the fixture.
                 target = Path(cmd[1])
                 if target.is_relative_to(root) and target.is_dir() \
                         and not target.is_symlink():
+                    if any(target.iterdir()) \
+                            and str(target) not in tmpfs_targets:
+                        raise AssertionError(
+                            "unmount emulation fed nonempty bind "
+                            f"target: {target}")
                     for child in target.iterdir():
                         if child.is_dir() and not child.is_symlink():
                             shutil.rmtree(child)
@@ -1505,6 +1801,9 @@ class ExecuteWiring(unittest.TestCase):
         runtime_base.mkdir(exist_ok=True)
         counter = [0]
         def fake_mkdtemp(*args, **kwargs):
+            # pin the custody property the mock stands in for: the
+            # runtime must live under /run, never a writable dir.
+            assert kwargs.get("dir") == "/run", kwargs
             counter[0] += 1
             staged = runtime_base / f"r{counter[0]}"
             staged.mkdir()
@@ -1648,6 +1947,45 @@ class ExecuteWiring(unittest.TestCase):
                      if row.get("exit") == 3]
             self.assertEqual(len(found), 1)
 
+    def test_body_verdicts_follow_captured_bytes_not_paths(self):
+        # the Cargo body loop runs with a nonempty inventory
+        # (runtime-list reconciliation + one body): conflicting
+        # bytes at the log path must not move the verdict off
+        # the captured bytes.
+        key = ("kryprobe-policy", "rule_unit")
+        row = {"package": key[0], "target": key[1],
+               "test": "probe_bin", "staged": "stage/debug/probe_bin",
+               "bodies": ["cargo_binding_probe"], "features": [],
+               "sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root, artifacts=[row])
+            listing = b"cargo_binding_probe: test\n1 test, 0 benchmarks\n"
+            passing = (b"test cargo_binding_probe ... ok\n"
+                       b"test result: ok. 1 passed; 0 failed; 0 ignored; "
+                       b"0 measured; 0 filtered out; finished in 0.01s\n")
+            failing = (b"test result: ok. 0 passed; 1 failed; 0 ignored; "
+                       b"0 measured; 0 filtered out; finished in 0.01s\n")
+            def routed(command, log, *args, **kwargs):
+                if "--list" in command:
+                    return (0, False, listing)
+                if "--exact" in command:
+                    Path(log).write_bytes(failing)
+                    return (0, False, passing)
+                return (0, False, b"")
+            outcome, code, calls, printed = self._drive(
+                root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            rows = json.loads((out / "results.json").read_text())
+            cargo = [row for row in rows
+                     if row.get("package") == key[0]
+                     and row.get("test") == "cargo_binding_probe"]
+            self.assertEqual(len(cargo), 1)
+            self.assertEqual(cargo[0]["status"], "PASS")
+            # the mock really did plant the conflict.
+            self.assertIn(b"1 failed",
+                          (out / cargo[0]["log"]).read_bytes())
+
     def test_signal_during_cleanup_defers_to_end(self):
         # SIGTERM on the first umount: every unmount + ownership
         # still attempted, cancellation raised at the end.
@@ -1676,7 +2014,139 @@ class ExecuteWiring(unittest.TestCase):
             self.assertEqual(self._umount_targets(calls),
                              list(reversed(self._mount_targets(calls))))
             self.assertGreater(len(self._umount_targets(calls)), 0)
+            # the late cancel reaches the receipt (a bare
+            # is_file check would pass on the preamble).
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            self.assertIn("children_reaped", receipt)
+            self._assert_lock_released(lock)
+
+    def test_caller_except_context_does_not_suppress_publish_failure(self):
+        # the end-raise gate keys on this invocation's own
+        # failure flag: a caller-handled exception must not
+        # produce a complete summary over a lost receipt.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def nospace(path, value):
+                if Path(path).name == "ownership.json":
+                    raise OSError(errno.ENOSPC, "no space on device")
+                return None
+            try:
+                raise LookupError("unrelated, caller-handled")
+            except LookupError:
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""),
+                    dump_hook=nospace)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("lane evidence publishing failed", str(error))
+            summary_path = out / "summary.json"
+            if summary_path.exists():
+                self.assertIsNot(
+                    json.loads(summary_path.read_text()).get("complete"),
+                    True)
+            self._assert_lock_released(lock)
+
+    def test_except_arm_oom_chains_instead_of_replacing(self):
+        # SystemExit(23) in flight + MemoryError from the
+        # failure summary publish: the exit survives with its
+        # code, the escape chained as context.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def oom(path, value):
+                if Path(path).name == "summary.json":
+                    raise MemoryError("summary-fault")
+                return None
+            def die(*args, **kwargs):
+                raise SystemExit(23)
+            outcome, error, calls, printed = self._drive(
+                root, out, lock, run_logged=die, dump_hook=oom)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, SystemExit)
+            self.assertEqual(error.code, 23)
+            self.assertIsInstance(error.__context__, MemoryError)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self._assert_lock_released(lock)
+
+    def test_except_arm_termination_propagates_immediately(self):
+        # genuine termination during failure reporting (the
+        # lane's own cancel arrives as InterruptedError, never
+        # this) is not chained-and-swallowed: it propagates,
+        # with cleanup still running through the finally.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def intr(path, value):
+                if Path(path).name == "summary.json":
+                    raise KeyboardInterrupt()
+                return None
+            def fail(*args, **kwargs):
+                raise ValueError("root cause")
+            outcome, error, calls, printed = self._drive(
+                root, out, lock, run_logged=fail, dump_hook=intr)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, KeyboardInterrupt)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self.assertGreater(len(self._umount_targets(calls)), 0)
+            self._assert_lock_released(lock)
+
+    def test_cancel_payload_escape_defers_like_publish_failure(self):
+        # the cancel-summary payload (dict + summarize) is
+        # evaluated under the site guard: a MemoryError there
+        # defers past cleanup and chains onto the cancel raise
+        # instead of aborting the sequence.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def flaky(results):
+                raise MemoryError("payload-fault")
+            def flag_on_mount(cmd):
+                if cmd[:2] == ["mount", "-t"]:
+                    lane._CANCEL_REQUESTED = True
+                return None
+            with mock.patch.object(lane, "summarize_partials",
+                                   side_effect=flaky):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""),
+                    run_hook=flag_on_mount)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertIsInstance(error.__cause__, MemoryError)
+            self.assertEqual(self._umount_targets(calls),
+                             list(reversed(self._mount_targets(calls))))
+            self.assertGreater(len(self._umount_targets(calls)), 0)
             self.assertTrue((out / "ownership.json").is_file())
+            self._assert_lock_released(lock)
+
+    def test_cleanup_failure_chains_deferred_publish_escape(self):
+        # failing unmount + ownership MemoryError: the cleanup
+        # error stays primary with the escape chained as cause.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def oom(path, value):
+                if Path(path).name == "ownership.json":
+                    raise MemoryError("injected")
+                return None
+            def fail_umount(cmd):
+                if cmd[:1] == ["umount"]:
+                    return mock.Mock(returncode=1, stderr="busy")
+                return None
+            outcome, error, calls, printed = self._drive(
+                root, out, lock,
+                run_logged=lambda *a, **k: (0, False, b""),
+                run_hook=fail_umount, dump_hook=oom)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("owned mount cleanup failed", str(error))
+            self.assertIsInstance(error.__cause__, MemoryError)
             self._assert_lock_released(lock)
 
     def test_deferred_publish_escape_surfaces_after_cleanup(self):
