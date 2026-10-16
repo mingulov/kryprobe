@@ -45,7 +45,10 @@ runner seed the baseline and never alert.
 alerts unless the output reads `reconcile: clean` (exit 0).
 `reconcile: partial` (exit 3) and `Denied{stage}` (exit 4) are
 regressions once the runner is green — the lane's kernel surface
-changed or broke.
+changed or broke. (The privileged lane itself accepts a
+fully-accounted partial as PASS per P7/T12, but bench baselines
+still require clean runs: a partial run's observations are
+incomplete.)
 
 ## Status
 

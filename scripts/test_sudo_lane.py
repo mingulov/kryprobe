@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Adversarial runner checks; no privilege or kernel support required."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -128,63 +129,185 @@ class BodyAccounting(unittest.TestCase):
                          "FAIL")
 
 
+def _partial_output(entries, returns, received, ring, drop, trunc, queue,
+                     printed_missing, marker="reconcile: partial\n"):
+    return (
+        f"selftest bpf: partial ({printed_missing} missing; ring={ring} drop={drop}"
+        f" trunc={trunc} queue={queue})\n"
+        f"selftest bpf: entries={entries} returns={returns} received={received}"
+        f" ring={ring} drop={drop} trunc={trunc} queue={queue}\n"
+        + marker
+    )
+
+
+class PartialReceipt(unittest.TestCase):
+    # Full Oct-13 GH log (run 38385103973, exit 3): fully-accounted
+    # partial refused by the old code==0 rule. Byte-exact (see the
+    # receipt-hash test); the phase/coverage/JSONL lines prove the
+    # skip filter stays clean on real output.
+    OCT13_LOG = (
+        'selftest bpf: partial (581 missing; ring=581 drop=0 trunc=0 queue=0)\n'
+        'session session:bpf-selftest: 2 records\n'
+        'phase discovered: no discovered-phase operations observed during 0..1000ns; event_transport: complete\n'
+        'phase selected: no selected-phase operations observed during 0..1000ns; event_transport: complete\n'
+        'phase entered: no entered-phase operations observed during 0..1000ns; event_transport: complete\n'
+        'phase returned: no returned-phase operations observed during 0..1000ns; event_transport: complete\n'
+        'phase completed: no completed-phase operations observed during 0..1000ns; event_transport: complete\n'
+        'coverage:\n'
+        '  target_enumeration: complete; no gaps recorded during 0..1000ns\n'
+        '  executable_discovery: complete; no gaps recorded during 0..1000ns\n'
+        '  attachment: complete; no gaps recorded during 0..1000ns\n'
+        '  semantic_resolution: complete; no gaps recorded during 0..1000ns\n'
+        '  attribution: complete; no gaps recorded during 0..1000ns\n'
+        '  aggregate_counts: complete; no gaps recorded during 0..1000ns\n'
+        '  event_transport: complete; no gaps recorded during 0..1000ns\n'
+        '  correlation: complete; no gaps recorded during 0..1000ns\n'
+        '  observation_continuity: complete; no gaps recorded during 0..1000ns\n'
+        'integrity: no aggregate snapshots observed during 0..1000ns; aggregate_counts: complete\n'
+        'selftest bpf: entries=19707 returns=19712 received=39419 ring=581 drop=0 trunc=0 queue=0\n'
+        'reconcile: partial\n'
+        '{"schema":"kryprobe.event/v0","kind":"session_start","session_id":"session:bpf-selftest","record_id":"record:1","monotonic_ns":"0","payload":{"target_selector":"owned_run","capture_mode":"trace","requested_backends":[],"contract_version":"v0-proposed","qualification_id":"qualification:bpf-selftest-20000"}}\n'
+        '{"schema":"kryprobe.event/v0","kind":"session_end","session_id":"session:bpf-selftest","record_id":"record:2","monotonic_ns":"1000","payload":{"verdict":"PARTIAL","final_barrier":"validated","unresolved_gap_ids":[],"child_exit_code":0,"child_signal":null}}\n'
+    )
+    OCT13_SHA256 = "b9f3c48a6a86b4c9aefb4ec58989a27d13621714632f65b291bcc070aa882632"
+
+    def test_fixture_matches_archived_receipt(self):
+        self.assertEqual(hashlib.sha256(self.OCT13_LOG.encode()).hexdigest(),
+                         self.OCT13_SHA256)
+
+    def test_oct13_full_log_receipts(self):
+        receipt = lane.partial_receipt(self.OCT13_LOG, 20000)
+        self.assertEqual(receipt, {"exit": 3, "calls": 20000, "missing": 581,
+                                   "entries": 19707, "returns": 19712,
+                                   "received": 39419, "ring": 581, "drop": 0,
+                                   "trunc": 0, "queue": 0})
+
+    def test_split_receipts_accepted(self):
+        receipt = lane.partial_receipt(
+            _partial_output(9, 9, 18, 1, 1, 0, 0, 2), 10)
+        self.assertEqual(receipt["missing"], 2)
+
+    def test_queue_receipted_partial_accepted(self):
+        # The ledger excludes queue drops, so the producer prints the
+        # remainder (10) while every record is receipted; the lane
+        # equation counts queue and accepts.
+        receipt = lane.partial_receipt(
+            _partial_output(90, 90, 180, 10, 0, 0, 10, 10), 100)
+        self.assertEqual(receipt["missing"], 20)
+
+    def test_silent_loss_rejected(self):
+        # calls=100, 6 records lost, only 3 receipted by ring: the
+        # producer prints `partial (3 missing; ring=3 ...)` (remainder
+        # semantics) and the old sum rule passed it.
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(97, 97, 194, 3, 0, 0, 0, 3), 100))
+
+    def test_over_count_rejected(self):
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(101, 99, 200, 0, 0, 0, 0, 0), 100))
+
+    def test_kind_sum_mismatch_rejected(self):
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(90, 89, 180, 10, 0, 0, 10, 10), 100))
+
+    def test_equation_shortfall_rejected(self):
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(90, 90, 180, 9, 0, 0, 0, 11), 100))
+
+    def test_vacuous_partial_rejected(self):
+        self.assertIsNone(lane.partial_receipt(
+            _partial_output(100, 100, 200, 0, 0, 0, 0, 0), 100))
+
+    def test_marker_shapes_rejected(self):
+        base = _partial_output(9, 9, 18, 1, 1, 0, 0, 2)
+        bad = [
+            base + "reconcile: partial\n",  # duplicated marker
+            base.replace("reconcile: partial\n", "reconcile: clean\n"),
+            base.replace("reconcile: partial\n", "reconcile: defect\n"),
+            base + "reconcile: defect (corrupt)\n",  # contradictory extra line
+            base.replace("reconcile: partial\n", ""),  # missing marker
+        ]
+        for output in bad:
+            with self.subTest(output=output):
+                self.assertIsNone(lane.partial_receipt(output, 10))
+
+    def test_line_count_shapes_rejected(self):
+        entries = "selftest bpf: entries=9 returns=9 received=18 ring=1 drop=1 trunc=0 queue=0\n"
+        partial = "selftest bpf: partial (2 missing; ring=1 drop=1 trunc=0 queue=0)\n"
+        marker = "reconcile: partial\n"
+        bad = [
+            partial + entries + marker + entries,  # duplicated entries line
+            partial + partial + entries + marker,  # duplicated partial line
+            entries + marker,  # partial line missing
+            partial + marker,  # entries line missing
+            partial + entries + marker + "reconcile: partial \n",  # trailing space
+        ]
+        for output in bad:
+            with self.subTest(output=output):
+                self.assertIsNone(lane.partial_receipt(output, 10))
+
+    def test_unicode_digits_rejected(self):
+        output = _partial_output(9, 9, 18, 1, 1, 0, 0, 2)
+        output = output.replace("entries=9", "entries=\uff19")
+        self.assertIsNone(lane.partial_receipt(output, 10))
+
+
 class SelftestBpfVerdict(unittest.TestCase):
-    # Real Oct-13 GH log excerpt (run 38385103973): fully-accounted
-    # partial, exit 3, refused by the old code==0 rule.
-    PARTIAL_RING = (
-        "selftest bpf: partial (581 missing; ring=581 drop=0 trunc=0 queue=0)\n"
-        "selftest bpf: entries=19707 returns=19712 received=39419 ring=581 drop=0 trunc=0 queue=0\n"
-        "reconcile: partial\n"
-    )
-    PARTIAL_SPLIT = (
-        "selftest bpf: partial (10 missing; ring=7 drop=3 trunc=0 queue=0)\n"
-        "reconcile: partial\n"
-    )
+    LOG = PartialReceipt.OCT13_LOG
 
     def test_clean_exits_pass(self):
         self.assertEqual(
-            lane.selftest_verdict(0, "reconcile: clean\n", "selftest-bpf"), "PASS")
+            lane.selftest_verdict(0, "reconcile: clean\n", "selftest-bpf", 20000),
+            "PASS")
         self.assertEqual(
-            lane.selftest_verdict(0, "token roundtrip ok\n", "selftest-token-smoke"),
+            lane.selftest_verdict(0, "token roundtrip ok\n", "selftest-token-smoke",
+                                  20000),
             "PASS",
         )
 
     def test_accounted_partial_passes(self):
-        for output in [self.PARTIAL_RING, self.PARTIAL_SPLIT]:
-            with self.subTest(output=output):
-                self.assertEqual(
-                    lane.selftest_verdict(3, output, "selftest-bpf"), "PASS")
+        self.assertEqual(
+            lane.selftest_verdict(3, self.LOG, "selftest-bpf", 20000), "PASS")
 
     def test_unaccounted_defect_or_mismatch_fails(self):
         bad = [
             (3, ""),  # no accounting at all
-            (3, "reconcile: partial\n"),  # marker without the ledger line
-            # receipts do not add up (9 != 10)
-            (3, "selftest bpf: partial (10 missing; ring=7 drop=2 trunc=0 queue=0)\n"
-                "reconcile: partial\n"),
-            # vacuous: exit 3 must carry missing records
-            (3, "selftest bpf: partial (0 missing; ring=0 drop=0 trunc=0 queue=0)\n"
-                "reconcile: partial\n"),
+            (3, "reconcile: partial\n"),  # marker without the count lines
+            # silent loss: 6 gone, 3 receipted
+            (3, _partial_output(97, 97, 194, 3, 0, 0, 0, 3)),
+            # vacuous: exit 3 with nothing missing
+            (3, _partial_output(100, 100, 200, 0, 0, 0, 0, 0)),
             # marker disagrees with the exit
-            (3, "selftest bpf: partial (10 missing; ring=7 drop=3 trunc=0 queue=0)\n"
-                "reconcile: defect\n"),
-            (3, "selftest bpf: partial (10 missing; ring=7 drop=3 trunc=0 queue=0)\n"
-                "reconcile: clean\n"),
-            (1, self.PARTIAL_RING),  # defect exit keeps failing
-            (4, self.PARTIAL_RING),  # denied exit keeps failing
+            (3, _partial_output(9, 9, 18, 1, 1, 0, 0, 2,
+                                marker="reconcile: defect\n")),
+            (1, self.LOG),  # defect exit keeps failing
+            (4, self.LOG),  # denied exit keeps failing
             (0, "SKIP: banned\n"),  # skip markers still fail at exit 0
-            (3, self.PARTIAL_RING + "decoy: cell denied; skipping\n"),  # skips fail at 3 too
+            (3, self.LOG + "decoy: cell denied; skipping\n"),  # skips fail at 3 too
         ]
         for code, output in bad:
             with self.subTest(code=code, output=output):
                 self.assertEqual(
-                    lane.selftest_verdict(code, output, "selftest-bpf"), "FAIL")
+                    lane.selftest_verdict(code, output, "selftest-bpf", 20000),
+                    "FAIL")
 
     def test_partial_carveout_is_bpf_only(self):
         self.assertEqual(
-            lane.selftest_verdict(3, self.PARTIAL_RING, "selftest-token-smoke"),
+            lane.selftest_verdict(3, self.LOG, "selftest-token-smoke", 20000),
             "FAIL",
         )
+
+
+class LeakNormalization(unittest.TestCase):
+    def test_leak_fails_every_exit(self):
+        for code in [0, 1, 3, 4, 124]:
+            with self.subTest(code=code):
+                self.assertEqual(lane.normalize_leak(code, True), 1)
+
+    def test_no_leak_preserves_exit(self):
+        for code in [0, 1, 3, 4, 124]:
+            with self.subTest(code=code):
+                self.assertEqual(lane.normalize_leak(code, False), code)
 
 
 class GuestInventory(unittest.TestCase):

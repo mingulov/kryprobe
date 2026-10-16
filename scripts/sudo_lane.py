@@ -32,7 +32,7 @@ import time
 # Reviewed inventory. Additions/removals need an explicit lane decision.
 EXPECTED = {
     ("kryprobe-cli", "cli_bpf_e2e"): [
-        "selftest_bpf_clean_or_denied", "selftest_token_smoke_needs_root"],
+        "selftest_bpf_clean_partial_or_denied", "selftest_token_smoke_needs_root"],
     ("kryprobe-cli", "cli_e2e"): [
         "watch_live_proves_traffic_case", "report_live_proves_json_case",
         "check_live_violation_exit10_case", "check_live_clean_exit3_inconclusive_case"],
@@ -86,6 +86,10 @@ LIFECYCLE_SUITE = ("kryprobe-privilege", "kcrypto_tfm_lifecycle")
 OBJECTS = ("spine.bpf.o", "kcrypto.bpf.o", "kcrypto-lifecycle.bpf.o")
 OBJECT_DIRS = ("stage/kryprobe-bpf", "stage/debug/kryprobe-bpf", "stage/debug/deps/kryprobe-bpf")
 NONROOT_BODY = ("kryprobe-cli", "cli_bpf_e2e", "selftest_token_smoke_needs_root")
+# The cargo-test path that runs `selftest bpf --calls`: accounted
+# partials accepted inside it must re-verify from its log (fail closed
+# on divergence) and land in summary.json like the direct body.
+SELFTEST_BPF_E2E = ("kryprobe-cli", "cli_bpf_e2e", "selftest_bpf_clean_partial_or_denied")
 # This one informational warning does not mean a test body was skipped.
 DEV_PIN_WARNING = (
     "kryprobe: BPF object pin check SKIPPED (empty pins in dev build); "
@@ -208,36 +212,73 @@ def skipped(output):
     return re.search(r"\b(?:skip(?:ped|ping)?|not_run)\b", output.replace(DEV_PIN_WARNING, ""), re.I) is not None
 
 
-def selftest_verdict(code, output, name):
+_PARTIAL_LINE_RE = re.compile(
+    r"^selftest bpf: partial \(\d+ missing; ring=\d+ drop=\d+ trunc=\d+ queue=\d+\)$",
+    re.ASCII | re.MULTILINE,
+)
+_ENTRIES_LINE_RE = re.compile(
+    r"^selftest bpf: entries=(\d+) returns=(\d+) received=(\d+)"
+    r" ring=(\d+) drop=(\d+) trunc=(\d+) queue=(\d+)$",
+    re.ASCII | re.MULTILINE,
+)
+_RECONCILE_LINE_RE = re.compile(r"^reconcile: (.*)$", re.ASCII | re.MULTILINE)
+
+
+def partial_receipt(output, calls):
+    """Accounted-partial receipt for a `selftest bpf --calls` log, or None.
+
+    The printed `partial (N missing; ...)` number is arm-dependent (the
+    loss ledger excludes queue drops, so on the ledger-Partial arm it
+    is the post-receipt remainder, not total loss) and proves nothing
+    alone. The receipt re-derives full accounting from the entries
+    line against the invoked `calls`: every generated record
+    (2·calls) is delivered or carries a stage receipt, neither kind
+    over-counts, and the shortfall is non-vacuous. All terms are
+    unsigned and sum to 2·calls, so no value cap is needed.
+    """
+    if _RECONCILE_LINE_RE.findall(output) != ["partial"]:
+        return None
+    if len(_PARTIAL_LINE_RE.findall(output)) != 1:
+        return None
+    rows = _ENTRIES_LINE_RE.findall(output)
+    if len(rows) != 1:
+        return None
+    entries, returns, received, ring, drop, trunc, queue = (int(v) for v in rows[0])
+    if entries + returns != received:
+        return None
+    if entries > calls or returns > calls:
+        return None
+    if received + ring + drop + trunc + queue != 2 * calls:
+        return None
+    if ring + drop + trunc + queue == 0:
+        return None
+    return {"exit": 3, "calls": calls, "missing": 2 * calls - received,
+            "entries": entries, "returns": returns, "received": received,
+            "ring": ring, "drop": drop, "trunc": trunc, "queue": queue}
+
+
+def selftest_verdict(code, output, name, calls):
     """Verdict for the `selftest-*` support bodies.
 
     Exit 0 passes when skip-free. `selftest-bpf` exit 3 passes only for
     a fully-accounted partial (P7/T12: receipted coverage gaps are not
-    defects): exactly one `reconcile: partial` marker plus one ledger
-    line whose receipts add up to the missing count. Everything else —
-    defects, marker/exit mismatches, unparsable logs, skips at any
-    exit, other bodies — fails closed.
+    defects): `partial_receipt` must re-derive full accounting from
+    the entries line against `calls`. Everything else — defects,
+    marker/exit mismatches, unparsable logs, skips at any exit, other
+    bodies — fails closed.
     """
     if skipped(output):
         return "FAIL"
     if code == 0:
         return "PASS"
-    if code == 3 and name == "selftest-bpf":
-        markers = re.findall(r"^reconcile: (\w+)$", output, re.MULTILINE)
-        if markers != ["partial"]:
-            return "FAIL"
-        ledgers = re.findall(
-            r"^selftest bpf: partial \((\d+) missing; ring=(\d+) drop=(\d+)"
-            r" trunc=(\d+) queue=(\d+)\)$",
-            output,
-            re.MULTILINE,
-        )
-        if len(ledgers) != 1:
-            return "FAIL"
-        missing, ring, drop, trunc, queue = (int(v) for v in ledgers[0])
-        if missing > 0 and ring + drop + trunc + queue == missing:
-            return "PASS"
+    if code == 3 and name == "selftest-bpf" and partial_receipt(output, calls):
+        return "PASS"
     return "FAIL"
+
+
+def normalize_leak(code, leaked):
+    """A leaked child is an execution defect at any exit code."""
+    return 1 if leaked else code
 
 
 def lifecycle_verdict(code, output):
@@ -396,8 +437,7 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
             leaked = not timed_out and not cancelled and bool(children())
             reap_owned(proc)
             cancelled = cancelled or _CANCEL_REQUESTED
-            if leaked and code == 0:
-                code = 1
+            code = normalize_leak(code, leaked)
             stream.flush()
             dump(log.with_suffix(log.suffix + ".result.json"), {
                 "exit": code, "timed_out": timed_out, "cancelled": cancelled,
@@ -664,7 +704,8 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                      root / "target/kryprobe-bpf"]):
             bind_readonly(runtime / "stage/kryprobe-bpf", target, mounts)
         env = dict(os.environ, TMPDIR=str(runtime / "tmp"),
-                   KRYPROBE_TEST_TRAFFIC_GENERATOR=str(runtime / "stage/kcrypto_gen.py"))
+                   KRYPROBE_TEST_TRAFFIC_GENERATOR=str(runtime / "stage/kcrypto_gen.py"),
+                   KRYPROBE_BPF_CALLS=str(calls))
         cli = runtime / "stage/debug/kryprobe"
         logs = out / "logs"
         observed = {}
@@ -711,7 +752,15 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                    "print(json.dumps({'runner_identity':{'euid':os.geteuid(),'egid':os.getegid()}}),flush=True); "
                                    "os.execv(sys.argv[1],sys.argv[1:])", *command]
                     code, timed_out = run_logged(command, log, 180, cwd=root, env=env)
-                    result.update(status=body_verdict(code, log.read_text(errors="replace"), key, body),
+                    output = log.read_text(errors="replace")
+                    status = body_verdict(code, output, key, body)
+                    if (key[0], key[1], body) == SELFTEST_BPF_E2E and "reconcile: partial" in output:
+                        receipt = partial_receipt(output, calls)
+                        if receipt is None:
+                            status = "FAIL"
+                        else:
+                            result["accepted_partial"] = receipt
+                    result.update(status=status,
                                   exit=code, timed_out=timed_out, euid=uid, egid=gid, log=str(log.relative_to(out)))
                 results.append(result)
                 dump(out / "results.json", results)
@@ -721,9 +770,14 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             log = logs / f"{name}.log"
             code, timed_out = run_logged([str(cli), *args], log, 180, cwd=root, env=env)
             output = log.read_text(errors="replace")
-            status = selftest_verdict(code, output, name)
-            results.append({"test": name, "status": status, "exit": code,
-                            "timed_out": timed_out, "log": str(log.relative_to(out))})
+            status = selftest_verdict(code, output, name, calls)
+            result = {"test": name, "status": status, "exit": code,
+                      "timed_out": timed_out, "log": str(log.relative_to(out))}
+            if code == 3 and name == "selftest-bpf":
+                receipt = partial_receipt(output, calls)
+                if receipt is not None:
+                    result["accepted_partial"] = receipt
+            results.append(result)
         verify_stage(runtime, manifest)
         dump(out / "results.json", results)
         counts = dict(collections.Counter(result["status"] for result in results))
@@ -763,9 +817,17 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     lab_bodies = len(EXPECTED[LAB_SUITE])
     vng_bodies = len(EXPECTED[VNG_SUITE])
     lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
+    partials = []
+    for row in results:
+        receipt = row.get("accepted_partial")
+        if receipt is None:
+            continue
+        ident = row["test"] if "package" not in row else (
+            f"{row['package']}/{row['target']}::{row['test']}")
+        partials.append({"test": ident, **receipt})
     dump(out / "summary.json", {"counts": counts, "exit": code, "expected_bodies": lane_bodies,
                                 "root_bodies": lane_bodies - 1, "nonroot_bodies": 1, "other_lane_bodies": lab_bodies + vng_bodies,
-                                "complete": True})
+                                "accepted_partials": partials, "complete": True})
     print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
     return code
 
