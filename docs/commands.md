@@ -213,7 +213,7 @@ scripts/sudo-lane.sh
 The equivalent manual steps (what the script runs):
 
 ```sh
-sudo ./target/debug/kryprobe selftest bpf --calls 20000  # expect exit 0, reconcile: clean — or exit 3, reconcile: partial with fully-accounted loss (lane PASS)
+sudo ./target/debug/kryprobe selftest bpf --calls 20000  # expect exit 0, reconcile: clean — or exit 3, reconcile: partial with pressure-only receipted loss, both kinds observed, and session agreement (lane PASS)
 sudo ./target/debug/kryprobe selftest token-smoke        # exit 0 (pass) or 4 (Denied, kernel-dependent)
 ```
 

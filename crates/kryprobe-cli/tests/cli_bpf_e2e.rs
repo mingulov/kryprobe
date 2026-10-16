@@ -37,6 +37,9 @@ fn accounted_partial(stderr: &str, calls: u64) -> Result<u64, &'static str> {
     if stderr.contains('\r') {
         return Err("carriage return");
     }
+    if stderr.contains('\u{fffd}') {
+        return Err("replacement character");
+    }
     let markers: Vec<&str> = stderr
         .lines()
         .filter(|line| line.starts_with("reconcile:"))
@@ -128,11 +131,27 @@ fn parse_kv_line(line: &str, keys: &[&str]) -> Option<Vec<u64>> {
 }
 
 fn session_end(stdout: &str) -> serde_json::Value {
-    stdout
+    let ends: Vec<serde_json::Value> = stdout
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("jsonl"))
-        .find(|record| record["kind"] == "session_end")
-        .expect("session_end record")
+        .filter(|record| record["kind"] == "session_end")
+        .collect();
+    assert_eq!(ends.len(), 1, "exactly one session_end: {stdout}");
+    ends.into_iter().next().expect("session_end record")
+}
+
+/// Terminal-record agreement for one exit arm: the expected session
+/// verdict, a fixture exit of exactly 0, and an explicit null
+/// signal. Missing fields fail (absent is not null).
+fn check_session_end(end: &serde_json::Value, verdict: &str, stdout: &str) {
+    assert_eq!(end["payload"]["verdict"], verdict, "stdout: {stdout}");
+    assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
+    assert!(
+        end["payload"]
+            .get("child_signal")
+            .is_some_and(|signal| signal.is_null()),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -155,8 +174,7 @@ fn selftest_bpf_clean_partial_or_denied() {
             // The owned fixture exited 0: session_end must say so.
             let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
             let end = session_end(&stdout);
-            assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
-            assert!(end["payload"]["child_signal"].is_null(), "stdout: {stdout}");
+            check_session_end(&end, "OBSERVED", &stdout);
         }
         Some(3) => {
             let missing = accounted_partial(&stderr, calls).expect("accounted partial");
@@ -164,9 +182,7 @@ fn selftest_bpf_clean_partial_or_denied() {
             // producer match arm: session_end must agree.
             let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
             let end = session_end(&stdout);
-            assert_eq!(end["payload"]["verdict"], "PARTIAL", "stdout: {stdout}");
-            assert_eq!(end["payload"]["child_exit_code"], 0, "stdout: {stdout}");
-            assert!(end["payload"]["child_signal"].is_null(), "stdout: {stdout}");
+            check_session_end(&end, "PARTIAL", &stdout);
             // Echo the child output so the lane re-verifies the same
             // accounting from this body log (sudo_lane SELFTEST_BPF_E2E;
             // the session cross-check needs the stdout JSONL too).
@@ -201,8 +217,8 @@ fn selftest_token_smoke_needs_root() {
 }
 
 #[cfg(test)]
-mod accounted_partial_tests {
-    use super::{accounted_partial, parse_calls};
+mod lane_policy_tests {
+    use super::{accounted_partial, check_session_end, parse_calls, session_end};
 
     /// [entries, returns, received, ring, drop, trunc, queue, printed_missing].
     fn output(c: [u64; 8]) -> String {
@@ -259,6 +275,7 @@ mod accounted_partial_tests {
     #[test]
     fn malformed_shapes_reject() {
         let base = output([9, 9, 18, 1, 0, 0, 1, 2]);
+        assert_eq!(accounted_partial(&base, 10), Ok(2));
         let bad = [
             format!("{base}reconcile: partial\n"),
             base.replace("reconcile: partial\n", "reconcile: clean\n"),
@@ -269,6 +286,12 @@ mod accounted_partial_tests {
             format!(
                 "{base}selftest bpf: entries=9 returns=9 received=18 ring=1 drop=0 trunc=0 queue=1\n"
             ),
+            format!(
+                "{base}selftest bpf: entries=0 returns=0 received=0 ring=0 drop=0 trunc=0 queue=0 CORRUPT\n"
+            ),
+            format!("{base}selftest bpf: partial (bogus)\n"),
+            base.replace("(2 missing;", "(18446744073709551616 missing;"),
+            base.replace("entries=9", &format!("entries={}", "9".repeat(5000))),
             base.replace("entries=9", "entries=\u{ff19}"),
             base.replace('\n', "\r\n"),
         ];
@@ -342,5 +365,86 @@ mod accounted_partial_tests {
     #[should_panic(expected = "u64")]
     fn calls_non_numeric_panics() {
         parse_calls(Some("abc"));
+    }
+
+    fn session_stdout(payload: &str) -> String {
+        format!(
+            "{{\"kind\":\"session_start\"}}\n{{\"kind\":\"session_end\",\"payload\":{payload}}}\n"
+        )
+    }
+
+    const GOOD_PAYLOAD: &str = r#"{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null}"#;
+
+    #[test]
+    fn session_end_unique_record_checks() {
+        let stdout = session_stdout(GOOD_PAYLOAD);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one session_end")]
+    fn session_end_duplicate_panics() {
+        let one = session_stdout(GOOD_PAYLOAD);
+        session_end(&(one.clone() + &one));
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one session_end")]
+    fn session_end_missing_panics() {
+        session_end("{\"kind\":\"session_start\"}\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "stdout: ")]
+    fn session_check_wrong_verdict_panics() {
+        let stdout =
+            session_stdout(r#"{"verdict":"FAILED","child_exit_code":0,"child_signal":null}"#);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "stdout: ")]
+    fn session_check_nonzero_exit_panics() {
+        let stdout =
+            session_stdout(r#"{"verdict":"PARTIAL","child_exit_code":1,"child_signal":null}"#);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "stdout: ")]
+    fn session_check_bool_exit_panics() {
+        let stdout =
+            session_stdout(r#"{"verdict":"PARTIAL","child_exit_code":false,"child_signal":null}"#);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "stdout: ")]
+    fn session_check_float_exit_panics() {
+        let stdout =
+            session_stdout(r#"{"verdict":"PARTIAL","child_exit_code":0.0,"child_signal":null}"#);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "stdout: ")]
+    fn session_check_signalled_panics() {
+        let stdout =
+            session_stdout(r#"{"verdict":"PARTIAL","child_exit_code":0,"child_signal":"TERM"}"#);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
+    }
+
+    #[test]
+    #[should_panic(expected = "stdout: ")]
+    fn session_check_missing_signal_panics() {
+        let stdout = session_stdout(r#"{"verdict":"PARTIAL","child_exit_code":0}"#);
+        let end = session_end(&stdout);
+        check_session_end(&end, "PARTIAL", &stdout);
     }
 }

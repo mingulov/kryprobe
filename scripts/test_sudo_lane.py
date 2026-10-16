@@ -248,15 +248,16 @@ class PartialReceipt(unittest.TestCase):
                 self.assertIsNone(lane.partial_receipt(output, 10))
 
     def test_line_count_shapes_rejected(self):
-        entries = "selftest bpf: entries=9 returns=9 received=18 ring=1 drop=0 trunc=0 queue=1\n"
-        partial = "selftest bpf: partial (2 missing; ring=1 drop=0 trunc=0 queue=1)\n"
-        marker = "reconcile: partial\n"
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        self.assertIsNotNone(lane.partial_receipt(base, 10))
+        entries = "selftest bpf: entries=9 returns=9 received=18 ring=2 drop=0 trunc=0 queue=0\n"
+        partial = "selftest bpf: partial (2 missing; ring=2 drop=0 trunc=0 queue=0)\n"
         bad = [
-            partial + entries + marker + entries,  # duplicated entries line
-            partial + partial + entries + marker,  # duplicated partial line
-            entries + marker,  # partial line missing
-            partial + marker,  # entries line missing
-            partial + entries + marker + "reconcile: partial \n",  # trailing space
+            base + entries,  # duplicated entries line
+            base + partial,  # duplicated partial line
+            base.replace(partial, ""),  # partial line missing
+            base.replace(entries, ""),  # entries line missing
+            base + "reconcile: partial \n",  # trailing space
         ]
         for output in bad:
             with self.subTest(output=output):
@@ -344,6 +345,69 @@ class PartialReceipt(unittest.TestCase):
         # the equation holds but calls exceeds u64::MAX/2
         self.assertIsNone(lane.partial_receipt(out, huge))
 
+    def test_whitespace_prefixed_contradictory_end_rejected(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        forged = ('  {"schema":"kryprobe.event/v0","kind":"session_end",'
+                  '"session_id":"s","record_id":"record:9","monotonic_ns":"9",'
+                  '"payload":{"verdict":"FAILED","child_exit_code":1,'
+                  '"child_signal":null}}\n')
+        self.assertIsNone(lane.partial_receipt(base + forged, 10))
+
+    def test_payload_must_be_object_with_exact_types(self):
+        stem = _partial_output(9, 9, 18, 2, 0, 0, 0, 2, session=False)
+        head = ('{"schema":"kryprobe.event/v0","kind":"session_end",'
+                '"session_id":"s","record_id":"record:2","monotonic_ns":"1000",')
+        good_payload = ('"payload":{"verdict":"PARTIAL","child_exit_code":0,'
+                        '"child_signal":null}')
+        bad_payloads = [
+            '"payload":null',
+            '"payload":[]',
+            '"payload":{"verdict":"PARTIAL","child_exit_code":false,"child_signal":null}',
+            '"payload":{"verdict":"PARTIAL","child_exit_code":0.0,"child_signal":null}',
+            '"payload":{"verdict":"PARTIAL","child_exit_code":0}',
+            '"payload":{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null},"x":NaN',
+            '"payload":{"verdict":"PARTIAL","child_exit_code":0,"child_signal":null},"x":"\ud800"'
+        ]
+        for payload in bad_payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(
+                    lane.partial_receipt(stem + head + payload + "}\n", 10))
+        self.assertIsNotNone(
+            lane.partial_receipt(stem + head + good_payload + "}\n", 10))
+
+    def test_nested_nonsession_json_ignored(self):
+        base = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        nested = '{"a":' * 500 + '1' + '}' * 500 + "\n"
+        receipt = lane.partial_receipt(base + nested, 10)
+        self.assertIsNotNone(receipt)
+
+    def test_surrogate_walk_is_depth_robust(self):
+        value = 0
+        for _ in range(5000):
+            value = [value]
+        self.assertFalse(lane._has_surrogate(value))
+
+    def test_zero_padded_numbers_accepted(self):
+        out = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+        for plain, padded in [("entries=9 ", "entries=0009 "),
+                              ("returns=9 ", "returns=0009 "),
+                              ("received=18 ", "received=00018 "),
+                              ("(2 missing;", "(0002 missing;"),
+                              ("ring=2 ", "ring=0002 "),
+                              ("drop=0 ", "drop=0000 "),
+                              ("trunc=0 ", "trunc=0000 "),
+                              ("queue=0)", "queue=0000)"),
+                              ("queue=0\n", "queue=0000\n")]:
+            out = out.replace(plain, padded)
+        receipt = lane.partial_receipt(out, 10)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["missing"], 2)
+        # thousands of leading zeros: same value as Rust's u64 parse
+        padded = out.replace("entries=0009 ", "entries=" + "0" * 5000 + "9 ")
+        receipt = lane.partial_receipt(padded, 10)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["entries"], 9)
+
 
 class E2EGuard(unittest.TestCase):
     LOG = _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
@@ -374,6 +438,26 @@ class E2EGuard(unittest.TestCase):
         self.assertEqual(
             lane.e2e_partial_guard(ANNOUNCEMENT + self.LOG, 10, "FAIL"),
             ("FAIL", None))
+
+
+class CargoLogFraming(unittest.TestCase):
+    # Empirical libtest `--format pretty --nocapture --exact
+    # --test-threads=1` framing (bare libtest probe binary, same
+    # toolchain): the announcement absorbs the inline `test ... `
+    # prefix; echoed lines start at column 0.
+    BODY = "selftest_bpf_clean_partial_or_denied"
+    LOG = ("\nrunning 1 test\n"
+           f"test {BODY} ... {ANNOUNCEMENT}"
+           + _partial_output(9, 9, 18, 2, 0, 0, 0, 2)
+           + "ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
+             " 0 filtered out; finished in 2.21s\n\n")
+
+    def test_framed_log_verdicts_and_guards(self):
+        key = ("kryprobe-cli", "cli_bpf_e2e")
+        self.assertEqual(lane.body_verdict(0, self.LOG, key, self.BODY), "PASS")
+        status, receipt = lane.e2e_partial_guard(self.LOG, 10, "PASS")
+        self.assertEqual(status, "PASS")
+        self.assertEqual(receipt["missing"], 2)
 
 
 class SummarizePartials(unittest.TestCase):

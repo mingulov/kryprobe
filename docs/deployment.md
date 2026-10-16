@@ -162,9 +162,10 @@ reported as pending; the enclosing VM supervisor supplies the final bound.
 
 `results.json`, `summary.json`, `ownership.json`, Cargo messages and
 per-body commands/logs remain in the run directory. Exit 0 means every
-required privileged body passed (an accounted selftest-bpf partial —
-exit 3 with its receipt in summary.json `accepted_partials` — passes
-its body). Exit 1 means failure. Exit 4 means
+required privileged body passed (a pressure-only selftest-bpf partial —
+exit 3, both kinds observed, session_end PARTIAL, receipt in
+summary.json `accepted_partials`; drop/trunc anomaly receipts still
+fail — passes its body). Exit 1 means failure. Exit 4 means
 the lane lock is held or the runtime proves lifecycle fsession refusal;
 each affected body is explicitly `SUPPORTED_REFUSAL`, never `PASS`.
 The aggregate results remain visible on that kernel. No mount outside

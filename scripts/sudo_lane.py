@@ -227,6 +227,34 @@ _U64MAX = (1 << 64) - 1
 E2E_PARTIAL_ANNOUNCEMENT = "selftest bpf: accounted partial"
 
 
+def _u64(text):
+    """Decimal value ignoring leading zeros (aligns with Rust's u64 parse)."""
+    return int(text.lstrip("0") or "0")
+
+
+def _reject_constant(value):
+    raise ValueError(f"non-JSON constant: {value}")
+
+
+def _has_surrogate(value):
+    """Lone UTF-16 surrogates (serde rejects them; valid pairs decode clean).
+
+    Iterative: deeply nested input must reject, never raise.
+    """
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if any(0xD800 <= ord(ch) <= 0xDFFF for ch in item):
+                return True
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+    return False
+
+
 def partial_receipt(output, calls):
     """Accounted-partial receipt for a `selftest bpf --calls` log, or None.
 
@@ -243,7 +271,12 @@ def partial_receipt(output, calls):
     kind over-counts, both kinds were observed, and the session
     record agrees (PARTIAL, fixture exit 0). Candidate lines are
     counted by reserved prefix first, so malformed extras reject
-    instead of being ignored. Never raises on malformed input.
+    instead of being ignored. Shared JSON policy with the Rust arm:
+    exactly one session_end in the whole stream (whitespace-prefixed
+    candidates included), strict constants (no NaN/Infinity), no
+    lone surrogates, object payload, exact field types. Numbers
+    ignore leading zeros like Rust's u64 parse. Never raises on
+    malformed input.
     """
     if "\r" in output or "\ufffd" in output:
         return None
@@ -265,9 +298,9 @@ def partial_receipt(output, calls):
     if not counts:
         return None
     try:
-        printed = [int(v) for v in match.groups()]
+        printed = [_u64(v) for v in match.groups()]
         entries, returns, received, ring, drop, trunc, queue = (
-            int(v) for v in counts.groups())
+            _u64(v) for v in counts.groups())
     except ValueError:
         return None
     if any(v > _U64MAX for v in printed):
@@ -286,22 +319,28 @@ def partial_receipt(output, calls):
         return None
     ends = []
     for line in lines:
-        if not line.startswith("{"):
+        candidate = line.lstrip()
+        if not candidate.startswith("{"):
             continue
         try:
-            record = json.loads(line)
-        except ValueError:
+            record = json.loads(candidate, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
             return None
-        if isinstance(record, dict) and record.get("kind") == "session_end":
+        if not isinstance(record, dict) or _has_surrogate(record):
+            return None
+        if record.get("kind") == "session_end":
             ends.append(record)
     if len(ends) != 1:
         return None
-    payload = ends[0].get("payload", {})
+    payload = ends[0].get("payload")
+    if not isinstance(payload, dict):
+        return None
     if payload.get("verdict") != "PARTIAL":
         return None
-    if payload.get("child_exit_code") != 0:
+    code = payload.get("child_exit_code")
+    if type(code) is not int or code != 0:
         return None
-    if payload.get("child_signal") is not None:
+    if "child_signal" not in payload or payload["child_signal"] is not None:
         return None
     return {"exit": 3, "calls": calls, "missing": 2 * calls - received,
             "entries": entries, "returns": returns, "received": received,
@@ -360,6 +399,12 @@ def selftest_verdict(code, output, name, calls):
 def normalize_leak(code, leaked):
     """A leaked child is an execution defect at any exit code."""
     return 1 if leaked else code
+
+
+def read_body_log(log):
+    """Body log text with raw newlines preserved (a CR must stay visible)."""
+    with log.open("r", errors="replace", newline="") as stream:
+        return stream.read()
 
 
 def lifecycle_verdict(code, output):
@@ -518,11 +563,15 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
             leaked = not timed_out and not cancelled and bool(children())
             reap_owned(proc)
             cancelled = cancelled or _CANCEL_REQUESTED
+            # raw_exit is the runner result pre-leak-normalization (124 on
+            # timeout, the 1 initializer on cancellation); reaped_status is
+            # the true OS wait status once owned children are reaped.
             raw_exit = code
             code = normalize_leak(code, leaked)
             stream.flush()
             dump(log.with_suffix(log.suffix + ".result.json"), {
-                "exit": code, "raw_exit": raw_exit, "timed_out": timed_out, "cancelled": cancelled,
+                "exit": code, "raw_exit": raw_exit, "reaped_status": proc.returncode,
+                "timed_out": timed_out, "cancelled": cancelled,
                 "leaked_children": leaked, "pid": proc.pid, "reaped": True,
                 "descendants_reaped": not children(),
                 "wall_seconds": time.monotonic() - start, "log_sha256": digest(log),
@@ -834,7 +883,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                    "print(json.dumps({'runner_identity':{'euid':os.geteuid(),'egid':os.getegid()}}),flush=True); "
                                    "os.execv(sys.argv[1],sys.argv[1:])", *command]
                     code, timed_out = run_logged(command, log, 180, cwd=root, env=env)
-                    output = log.read_text(errors="replace")
+                    output = read_body_log(log)
                     status = body_verdict(code, output, key, body)
                     if (key[0], key[1], body) == SELFTEST_BPF_E2E:
                         status, accepted = e2e_partial_guard(output, calls, status)
@@ -849,7 +898,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                            ("selftest-token-smoke", ["selftest", "token-smoke"])]:
             log = logs / f"{name}.log"
             code, timed_out = run_logged([str(cli), *args], log, 180, cwd=root, env=env)
-            output = log.read_text(errors="replace")
+            output = read_body_log(log)
             status = selftest_verdict(code, output, name, calls)
             result = {"test": name, "status": status, "exit": code,
                       "timed_out": timed_out, "log": str(log.relative_to(out))}
@@ -858,6 +907,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                 if accepted is not None:
                     result["accepted_partial"] = accepted
             results.append(result)
+            dump(out / "results.json", results)
         verify_stage(runtime, manifest)
         dump(out / "results.json", results)
         counts = dict(collections.Counter(result["status"] for result in results))
