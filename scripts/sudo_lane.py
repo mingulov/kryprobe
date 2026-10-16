@@ -261,39 +261,43 @@ def _publish_json(path, value):
     return None
 
 
-# A manifest lists one digest per staged body (~10 KiB
-# for the whole lane): 1 MiB is ~100x headroom and
-# still bounds a never-ending writer.
-_MANIFEST_MAX_BYTES = 1 << 20
+# Small lane files (manifest: one digest per staged
+# body, ~10 KiB for the whole lane; stage runner: a few
+# KiB of bootstrap) share one budget: 1 MiB is ~100x
+# headroom and still bounds a never-ending writer.
+_BOUNDED_READ_MAX = 1 << 20
 
 
-def _read_manifest_bytes(path):
-    """Read a manifest without following, hanging, or gorging.
+def _read_bounded_bytes(path, what="prepared manifest"):
+    """Read a small lane file without following, hanging, or gorging.
 
-    The manifest name sits in preparer-writable space up to
-    the privileged read: a blocking read_bytes() there hangs
-    root on a writerless FIFO, follows a swapped-in symlink,
-    and allocates without limit on a streaming writer. So
-    the open is O_NONBLOCK|O_NOFOLLOW, the target must be a
-    regular file, and the body is capped (see above): each
-    violation raises ValueError, the manifest-problem class
-    the callers already treat as a hard refusal. A missing
-    file still raises FileNotFoundError unchanged.
+    The manifest/runner names sit in preparer-writable space
+    up to the privileged read: a blocking read_bytes() there
+    hangs root on a writerless FIFO, follows a swapped-in
+    symlink, and allocates without limit on a streaming
+    writer. So the open is O_NONBLOCK|O_NOFOLLOW, the target
+    must be a regular file, and the body is capped (see
+    above). Non-regular and over-cap bodies raise
+    ValueError, the refusal class the callers already treat
+    as a hard refusal; a swapped-in symlink surfaces ELOOP
+    and a socket ENXIO from the open itself; a missing file
+    still raises FileNotFoundError unchanged. `what` names
+    the file in refusal messages.
     """
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(
-                f"prepared manifest is not a regular file: {path}")
+                f"{what} is not a regular file: {path}")
         chunks, total = [], 0
         while True:
             chunk = os.read(fd, 65536)
             if not chunk:
                 return b"".join(chunks)
             total += len(chunk)
-            if total > _MANIFEST_MAX_BYTES:
+            if total > _BOUNDED_READ_MAX:
                 raise ValueError(
-                    "prepared manifest exceeds the 1 MiB lane budget")
+                    f"{what} exceeds the 1 MiB lane budget")
             chunks.append(chunk)
     finally:
         os.close(fd)
@@ -1382,11 +1386,14 @@ def _open_pinned(path):
                 try:
                     os.close(parent)
                 except OSError:
+                    # take-and-clear: a non-OSError from
+                    # this close must not leave owned set
+                    # for the outer arm to close again.
+                    doomed, owned = owned, None
                     try:
-                        os.close(owned)
+                        os.close(doomed)
                     except OSError:
                         pass
-                    owned = None
                     raise
         except BaseException:
             # Same widening for the outer arm: a
@@ -1816,7 +1823,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     if not parent_mount_ns or os.readlink("/proc/self/ns/mnt") == parent_mount_ns:
         raise ValueError("refusing mounts outside a fresh private mount namespace")
     assert_fresh_execution(out)
-    manifest_bytes = _read_manifest_bytes(out / "manifest.json")
+    manifest_bytes = _read_bounded_bytes(out / "manifest.json")
     actual_manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
     if manifest_sha256 is not None and manifest_sha256 != actual_manifest_sha:
         raise ValueError("prepared manifest changed before privileged execution")
@@ -2344,7 +2351,7 @@ def main():
     if args.run_prepared:
         out = args.run_prepared.resolve(strict=True)
         assert_fresh_execution(out)
-        manifest = json.loads(_read_manifest_bytes(out / "manifest.json"))
+        manifest = json.loads(_read_bounded_bytes(out / "manifest.json"))
     else:
         if args.out:
             out = args.out.resolve()
@@ -2360,14 +2367,14 @@ def main():
     if args.prepare_only:
         verify_stage(out, manifest)
         return 0
-    manifest_bytes = _read_manifest_bytes(out / "manifest.json")
+    manifest_bytes = _read_bounded_bytes(out / "manifest.json")
     if json.loads(manifest_bytes) != manifest:
         raise ValueError("prepared manifest changed before launch")
     # Freeze the bootstrap bytes in argv before privilege elevation. The
     # interpreter does not reopen a host-mutable script after this check.
     # The child verifies the full root-owned copy once, and again at exit.
     runner = out / "stage/runner.py"
-    runner_bytes = runner.read_bytes()
+    runner_bytes = _read_bounded_bytes(runner, "prepared runner")
     if hashlib.sha256(runner_bytes).hexdigest() != manifest["sha256"]["stage/runner.py"]:
         raise ValueError("prepared runner changed")
     bootstrap = f"__file__={str(runner)!r}; exec(compile({runner_bytes!r},__file__,'exec'))"

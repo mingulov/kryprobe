@@ -1379,31 +1379,23 @@ def _match_names(pattern):
 _NAMESPACE_FUNCS = ("globals", "locals", "vars")
 
 
-def _namespace_store(target):
-    # globals()["name"] = ... (locals/vars likewise)
-    # rebinds "name" without an assignment-ish target.
-    # Returns (found, key): key None means a dynamic
-    # (non-constant) key — unresolvable, fail-closed
-    # at the call site.
-    if isinstance(target, ast.Subscript) \
-            and isinstance(target.value, ast.Call) \
-            and isinstance(target.value.func, ast.Name) \
-            and target.value.func.id in _NAMESPACE_FUNCS:
-        key = target.slice
-        if isinstance(key, ast.Constant) \
-                and isinstance(key.value, str):
-            return True, key.value
-        return True, None
-    return False, None
-
-
 def _store_root(target):
     # container root a subscript/attribute store lands
     # in (box for box["k"]/box.attr, None when the
-    # target binds plain names instead).
+    # target binds plain names instead). Descends
+    # through getter chains (box.get("rows") is owned
+    # by box — mutating through it mutates box), but
+    # not through computed calls (get_box() has no
+    # resolvable owner): those stay a documented miss.
     root = target
-    while isinstance(root, (ast.Subscript, ast.Attribute)):
-        root = root.value
+    while True:
+        if isinstance(root, (ast.Subscript, ast.Attribute)):
+            root = root.value
+        elif isinstance(root, ast.Call) \
+                and isinstance(root.func, ast.Attribute):
+            root = root.func.value
+        else:
+            break
     return root.id if isinstance(root, ast.Name) else None
 
 
@@ -1423,9 +1415,10 @@ def _target_leaves(target):
 
 def _walk_pairs(target, value):
     # (leaf-target, corresponding-value) pairs for a
-    # destructured assignment; uneven shapes pair the
+    # destructured assignment; uneven shapes pair each
     # leaf with the whole value (fail-closed: the
-    # value is judged, not skipped).
+    # value is judged, not skipped — and no leaf
+    # hides inside the unvisited target).
     if isinstance(target, ast.Starred):
         yield from _walk_pairs(target.value, value)
     elif isinstance(target, (ast.Tuple, ast.List)) \
@@ -1434,6 +1427,9 @@ def _walk_pairs(target, value):
         for sub_target, sub_value in zip(target.elts,
                                          value.elts):
             yield from _walk_pairs(sub_target, sub_value)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for leaf in _target_leaves(target):
+            yield leaf, value
     else:
         yield target, value
 
@@ -1455,7 +1451,8 @@ _NAMESPACE_MUTATORS = ("update", "setdefault", "__setitem__")
 _PATH_BUILDERS = frozenset({
     "str", "join", "joinpath", "fspath", "format",
     "dirname", "basename", "normpath", "abspath",
-    "realpath", "relpath",
+    "realpath", "relpath", "expanduser", "expandvars",
+    "fsdecode", "fsencode", "normcase", "split",
 })
 
 
@@ -1468,51 +1465,6 @@ def _call_simple_name(func):
     if isinstance(func, ast.Attribute):
         return func.attr
     return None
-
-
-def _namespace_mutator_keys(node):
-    # globals().update(_say=open) / .setdefault("k",
-    # v) / .__setitem__("k", v) rebind names without
-    # an assignment target (locals/vars likewise).
-    # Returns (is_mutator, keys, dynamic): keys are
-    # the resolved constant names; dynamic means a key
-    # is computed (fail-closed at the call site).
-    if not isinstance(node, ast.Call) \
-            or not isinstance(node.func, ast.Attribute) \
-            or node.func.attr not in _NAMESPACE_MUTATORS \
-            or not isinstance(node.func.value, ast.Call) \
-            or not isinstance(node.func.value.func, ast.Name) \
-            or node.func.value.func.id not in _NAMESPACE_FUNCS:
-        return False, [], False
-    keys, dynamic = [], False
-    if node.func.attr in ("setdefault", "__setitem__"):
-        if not node.args:
-            return True, [], True
-        key = node.args[0]
-        if isinstance(key, ast.Constant) \
-                and isinstance(key.value, str):
-            keys.append(key.value)
-        else:
-            dynamic = True
-    else:
-        for keyword in node.keywords:
-            if keyword.arg is None:
-                dynamic = True
-            else:
-                keys.append(keyword.arg)
-        for arg in node.args:
-            if isinstance(arg, ast.Dict):
-                for key in arg.keys:
-                    if key is None:
-                        dynamic = True
-                    elif isinstance(key, ast.Constant) \
-                            and isinstance(key.value, str):
-                        keys.append(key.value)
-                    else:
-                        dynamic = True
-            else:
-                dynamic = True
-    return True, keys, dynamic
 
 
 def _binding_violations(source):
@@ -1533,39 +1485,50 @@ def _binding_violations(source):
     the diagnostic sinks (print, _say) and the bare
     run_logged consumer, both voided when rebound
     anywhere, by any form (plain, globals()/setattr/
-    namespace-mutator, or dynamic — a dynamic
-    namespace rebind fails closed outright; a dotted
+    namespace-mutator incl. aliases and unbound
+    forms, or dynamic — a dynamic namespace rebind,
+    or a namespace object handed to an arbitrary
+    callee, fails closed outright; a dotted
     .run_logged call is never the consumer), and a
     call through a rebound method
     (Path.run_logged = Path.read_bytes, destructured
-    binds included) fires on a tainted receiver; a
-    computed read reference (getattr/__dict__/...)
-    fails closed as a read capability; and
+    binds, loop/with targets and plain-name-held
+    capabilities included) fires on a tainted
+    receiver; a computed read reference
+    (getattr/__dict__/...) fails closed as a read
+    capability; and
     except the results.append publish sink narrowed
     to a CLEAN dict display or a CLEAN dict-bound-
     only name — dict targets must be direct Names
     (unpacking yields keys), mutations and nested
     def/class/global bindings void, tainted stores
     (subscript, attribute, or known-mutating method,
-    nested receivers climbed to the root) taint the
-    container root, and data positions must carry no
-    taint (a bare path, raw, keyed, or read back
-    through a subscript, fires right at the append;
-    dict keys count, and only
-    str(x.relative_to(...)) — with trustworthy str/
-    relative_to names — survives in a call
-    position, as does a bare name holding that
-    proven string through a binding; recombining it
-    (out/tag) rebuilds the raw path and fires); or
+    receivers climbed through nesting and getter
+    calls to the root) taint the container root,
+    and data positions must carry no taint (a bare
+    path, raw, keyed, or read back through a
+    subscript, fires right at the append; dict keys
+    count, and only str(x.relative_to(...)) — with
+    str unrebound and relative_to neither
+    attribute-bound nor rebound (a method def voids
+    it) — survives in a call position, as does a
+    bare name proven to hold that string at that use
+    (binds strictly before the use count; copies in
+    one statement read the pre-statement state);
+    recombining it (out/tag) rebuilds the raw path
+    and fires); or
     nested inside a larger argument to a read/exec
     primitive (copy/getoutput shapes included, so
     derived-path bookkeeping through publish sinks
     stays allowed but laundered reads fire).
-    Bare-name copies form alias groups (line-ordered
-    events, any other binding kills membership): taint
-    and dict-exemption voids propagate within the
-    group, so a store through one alias voids them
-    all. Containers (Tuple/List/Dict/Set displays)
+    Bare-name copies form alias groups
+    (line-ordered events, rebinding detaches first
+    so a retarget never merges objects, any other
+    binding kills membership except AugAssign, which
+    may mutate in place): taint and dict-exemption
+    voids propagate within the group, so a store
+    through one alias voids them all. Containers
+    (Tuple/List/Dict/Set displays)
     propagate taint, so a container round-trip back
     into a read fires; calls with an unrecognized
     callee (a call, a subscript, any other computed
@@ -1582,7 +1545,9 @@ def _binding_violations(source):
     read_attrs = ("open", "read_text", "read_bytes", "read")
     consumers = ("run_logged",)
     diagnostic_sinks = ("print", "_say")
-    nested_denied = ("open", "Path", "PurePath", "fspath",
+    nested_denied = ("open", "Path", "PurePath", "PosixPath",
+                     "PurePosixPath", "WindowsPath",
+                     "PureWindowsPath", "fspath",
                      "check_output", "check_call", "run",
                      "Popen", "execv", "execve", "execl",
                      "execlp", "execvp", "execvpe", "system",
@@ -1606,14 +1571,16 @@ def _binding_violations(source):
     module_rebound_methods = set()
     module_attr_binds = set()
 
-    def read_ref(value):
+    def read_ref(value, readcaps):
         # a read capability by shape alone (no taint
-        # needed): a read-primitive name or a method
+        # needed): a read-primitive name, a name
+        # tracked as holding one, or a method
         # reference off one. Functions retrieved this
         # way bind their receiver when called through
         # an attribute, so the receiver's taint reads.
         if isinstance(value, ast.Name):
-            return value.id in read_attrs
+            return value.id in read_attrs \
+                or value.id in readcaps
         if isinstance(value, ast.Attribute):
             return value.attr in read_attrs
         if isinstance(value, ast.Constant):
@@ -1626,6 +1593,151 @@ def _binding_violations(source):
         # unresolvable, fail closed — the bound
         # attribute is treated as a read capability.
         return True
+
+    def collect_readcaps(root, seed):
+        # names bound to read capabilities (rb =
+        # Path.read_bytes), closed to a fixpoint so
+        # chains (rb2 = rb) resolve. Assign/AnnAssign
+        # with paired values plus walrus binds; loops,
+        # params and comprehensions never seed (a
+        # documented miss — an exotic rebind of a
+        # capability through them stays silent).
+        caps = set(seed)
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(root):
+                pairs = []
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        pairs.extend(
+                            _walk_pairs(target, node.value))
+                elif isinstance(node, ast.AnnAssign) \
+                        and node.value is not None:
+                    pairs.extend(
+                        _walk_pairs(node.target, node.value))
+                elif isinstance(node, ast.NamedExpr):
+                    pairs.append((node.target, node.value))
+                for target, value in pairs:
+                    if isinstance(target, ast.Name) \
+                            and target.id not in caps \
+                            and read_ref(value, caps):
+                        caps.add(target.id)
+                        changed = True
+        return caps
+
+    module_readcaps = collect_readcaps(tree, ())
+
+    def _namespace_expr(value):
+        # a namespace object: a globals()/locals()/
+        # vars() call or a name ever bound to one (no
+        # kill — over-tracking a dead alias only voids
+        # exemptions, never misses a rebind).
+        if isinstance(value, ast.Call) \
+                and isinstance(value.func, ast.Name) \
+                and value.func.id in _NAMESPACE_FUNCS:
+            return True
+        return isinstance(value, ast.Name) \
+            and value.id in ns_aliases
+
+    ns_aliases = set()
+    changed_alias = True
+    while changed_alias:
+        changed_alias = False
+        for node in ast.walk(tree):
+            pairs = []
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    pairs.extend(_walk_pairs(target, node.value))
+            elif isinstance(node, ast.AnnAssign) \
+                    and node.value is not None:
+                pairs.extend(
+                    _walk_pairs(node.target, node.value))
+            elif isinstance(node, ast.NamedExpr):
+                pairs.append((node.target, node.value))
+            for target, value in pairs:
+                if isinstance(target, ast.Name) \
+                        and target.id not in ns_aliases \
+                        and _namespace_expr(value):
+                    ns_aliases.add(target.id)
+                    changed_alias = True
+
+    def _namespace_store(target):
+        # globals()["name"] = ... (locals/vars likewise,
+        # or through a namespace alias) rebinds "name"
+        # without an assignment-ish target. Returns
+        # (found, key): key None means a dynamic
+        # (non-constant) key — unresolvable, fail-closed
+        # at the call site.
+        if isinstance(target, ast.Subscript) \
+                and _namespace_expr(target.value):
+            key = target.slice
+            if isinstance(key, ast.Constant) \
+                    and isinstance(key.value, str):
+                return True, key.value
+            return True, None
+        return False, None
+
+    def _namespace_mutator_keys(node):
+        # globals().update(_say=open) / .setdefault("k",
+        # v) / .__setitem__("k", v) rebind names without
+        # an assignment target (locals/vars likewise,
+        # or through a namespace alias; unbound
+        # dict.update(ns, ...) forms count with the
+        # namespace as the first argument). Returns
+        # (is_mutator, keys, dynamic): keys are the
+        # resolved constant names; dynamic means a key
+        # is computed (fail-closed at the call site).
+        if not isinstance(node, ast.Call) \
+                or not isinstance(node.func, ast.Attribute) \
+                or node.func.attr not in _NAMESPACE_MUTATORS:
+            return False, [], False
+        args = node.args
+        if _namespace_expr(node.func.value):
+            pass
+        elif args and _namespace_expr(args[0]):
+            args = args[1:]
+        else:
+            return False, [], False
+        keys, dynamic = [], False
+        if node.func.attr in ("setdefault", "__setitem__"):
+            if not args:
+                return True, [], True
+            key = args[0]
+            if isinstance(key, ast.Constant) \
+                    and isinstance(key.value, str):
+                keys.append(key.value)
+            else:
+                dynamic = True
+        else:
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    dynamic = True
+                else:
+                    keys.append(keyword.arg)
+            for arg in args:
+                if isinstance(arg, ast.Dict):
+                    for key in arg.keys:
+                        if key is None:
+                            dynamic = True
+                        elif isinstance(key, ast.Constant) \
+                                and isinstance(key.value, str):
+                            keys.append(key.value)
+                        else:
+                            dynamic = True
+                else:
+                    dynamic = True
+        return True, keys, dynamic
+
+    def _passes_namespace(node):
+        # a namespace object handed to an arbitrary
+        # callee (evil(globals())): the callee could
+        # stash or mutate it, so the call site fails
+        # closed (a resolved mutator above takes
+        # precedence — this is the unresolvable rest).
+        return any(_namespace_expr(arg) for arg in node.args) \
+            or any(_namespace_expr(keyword.value)
+                   for keyword in node.keywords)
 
     for top in ast.walk(tree):
         if isinstance(top, ast.Assign):
@@ -1666,9 +1778,28 @@ def _binding_violations(source):
                                                    stored):
                         if isinstance(leaf, ast.Attribute):
                             module_attr_binds.add(leaf.attr)
-                            if read_ref(value):
+                            if read_ref(value, module_readcaps):
                                 module_rebound_methods.add(
                                     leaf.attr)
+        # For/With bind fresh values to attribute
+        # targets too (for P.r in ... / with X as P.r):
+        # the element is unknowable, so the bind joins
+        # unconditionally (fail-closed). AugAssign is
+        # read-modify-write, never a fresh capability,
+        # and every other form binds plain names only.
+        if isinstance(top, (ast.For, ast.AsyncFor)):
+            for leaf in _target_leaves(top.target):
+                if isinstance(leaf, ast.Attribute):
+                    module_attr_binds.add(leaf.attr)
+                    module_rebound_methods.add(leaf.attr)
+        if isinstance(top, (ast.With, ast.AsyncWith)):
+            for item in top.items:
+                if item.optional_vars is not None:
+                    for leaf in _target_leaves(
+                            item.optional_vars):
+                        if isinstance(leaf, ast.Attribute):
+                            module_attr_binds.add(leaf.attr)
+                            module_rebound_methods.add(leaf.attr)
         if isinstance(top, ast.Call):
             is_mutator, keys, dynamic = \
                 _namespace_mutator_keys(top)
@@ -1676,6 +1807,8 @@ def _binding_violations(source):
                 if dynamic:
                     dynamic_rebinds.append(top)
                 rebound.update(keys)
+            elif _passes_namespace(top):
+                dynamic_rebinds.append(top)
         if isinstance(top, ast.Call) \
                 and isinstance(top.func, ast.Name) \
                 and top.func.id == "setattr" \
@@ -1686,7 +1819,7 @@ def _binding_violations(source):
                 module_attr_binds.add(named.value)
                 if not isinstance(top.args[0], ast.Name):
                     rebound.add(named.value)
-                elif read_ref(top.args[2]):
+                elif read_ref(top.args[2], module_readcaps):
                     module_rebound_methods.add(named.value)
             else:
                 dynamic_rebinds.append(top)
@@ -1840,6 +1973,17 @@ def _binding_violations(source):
                     for leaf in _target_leaves(target):
                         if isinstance(leaf, ast.Attribute):
                             func_attr_binds.add(leaf.attr)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                for leaf in _target_leaves(node.target):
+                    if isinstance(leaf, ast.Attribute):
+                        func_attr_binds.add(leaf.attr)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for leaf in _target_leaves(
+                                item.optional_vars):
+                            if isinstance(leaf, ast.Attribute):
+                                func_attr_binds.add(leaf.attr)
             elif isinstance(node, ast.Call) \
                     and isinstance(node.func, ast.Name) \
                     and node.func.id == "setattr" \
@@ -1853,7 +1997,9 @@ def _binding_violations(source):
             # the exact sanctioned call:
             # str(x.relative_to(...)) with trustworthy
             # names (a rebound str/relative_to voids the
-            # shape here and at the publish check alike).
+            # shape here and at the publish check alike;
+            # a method def named relative_to lands in
+            # rebound, so it voids too).
             return isinstance(value, ast.Call) \
                 and isinstance(value.func, ast.Name) \
                 and value.func.id == "str" \
@@ -1863,7 +2009,8 @@ def _binding_violations(source):
                 and isinstance(value.args[0].func, ast.Attribute) \
                 and value.args[0].func.attr == "relative_to" \
                 and "str" not in rebound \
-                and "relative_to" not in attr_binds
+                and "relative_to" not in attr_binds \
+                and "relative_to" not in rebound
 
         alias_events = []
         sanction_events = []
@@ -1921,18 +2068,42 @@ def _binding_violations(source):
                                 sanction_events.append(
                                     pos + ("kill", name, None))
             elif isinstance(node, ast.NamedExpr):
+                pos = (node.lineno, node.col_offset)
                 if isinstance(node.value, ast.Name):
-                    pos = (node.lineno, node.col_offset)
                     alias_events.append(
                         pos + ("alias", node.target.id,
                                node.value.id))
                     sanction_events.append(
                         pos + ("copy", node.target.id,
                                node.value.id))
+                elif sanctioned_shape(node.value):
+                    alias_events.append(
+                        pos + ("kill", node.target.id, None))
+                    sanction_events.append(
+                        pos + ("seed", node.target.id, None))
                 else:
                     kill_binding(node.target.id, node)
             elif isinstance(node, ast.AugAssign):
-                kill_target(node.target, node)
+                # Augmented assignment may rebind
+                # (immutables) or mutate in place
+                # (containers): for object identity the
+                # sound direction keeps the group (no
+                # alias event — a tainted store through
+                # it still spreads and voids via the
+                # fixpoint), while the proven sanctioned
+                # string no longer holds (kill).
+                for leaf in _target_leaves(node.target):
+                    found, key = _namespace_store(leaf)
+                    if found:
+                        if key is None:
+                            continue
+                        names = [key]
+                    else:
+                        names = list(_bound_names(leaf))
+                    for name in names:
+                        sanction_events.append(
+                            (node.lineno, node.col_offset,
+                             "kill", name, None))
             elif isinstance(node, (ast.For, ast.AsyncFor)):
                 kill_target(node.target, node)
             elif isinstance(node, (ast.With, ast.AsyncWith)):
@@ -1973,49 +2144,77 @@ def _binding_violations(source):
                 owned = groups.pop(name, None)
                 if owned is not None:
                     owned.discard(name)
-            elif name in groups and peer in groups \
-                    and groups[name] is groups[peer]:
-                continue
-            elif name not in groups and peer not in groups:
-                both = {name, peer}
-                groups[name] = both
-                groups[peer] = both
-            elif name not in groups:
-                groups[peer].add(name)
-                groups[name] = groups[peer]
-            elif peer not in groups:
-                groups[name].add(peer)
-                groups[peer] = groups[name]
             else:
-                mine, theirs = groups[name], groups[peer]
-                mine.update(theirs)
-                for member in theirs:
-                    groups[member] = mine
+                # A rebind detaches first: alias = fresh
+                # leaves the old group (alias = box is
+                # dead) instead of merging both objects
+                # into one group (a false positive on
+                # the abandoned peer).
+                owned = groups.pop(name, None)
+                if owned is not None:
+                    owned.discard(name)
+                theirs = groups.get(peer)
+                if theirs is None:
+                    both = {name, peer}
+                    groups[name] = both
+                    groups[peer] = both
+                else:
+                    theirs.add(name)
+                    groups[name] = theirs
         alias_groups = [members for members in
                         {frozenset(members)
                          for members in groups.values()}
                         if len(members) > 1]
 
+        # Sanction snapshots: one set per bind
+        # position, each group applied atomically
+        # (copies in one statement read the
+        # pre-statement state — no same-statement
+        # laundering like tag, alt = alt, tag). A use
+        # sees membership strictly before its own
+        # position: a later re-seed never retroactively
+        # permits an earlier raw publish.
         sanction_events.sort()
-        sanctioned = set()
-        for _, _, kind, name, peer in sanction_events:
-            if kind == "kill":
-                sanctioned.discard(name)
-            elif kind == "seed":
-                sanctioned.add(name)
-            elif peer in sanctioned:
-                sanctioned.add(name)
-            else:
-                sanctioned.discard(name)
+        sanction_snapshots = []
+        membership = set()
+        index = 0
+        while index < len(sanction_events):
+            pos = sanction_events[index][:2]
+            adds, drops = set(), set()
+            while index < len(sanction_events) \
+                    and sanction_events[index][:2] == pos:
+                _, _, kind, name, peer = sanction_events[index]
+                if kind == "kill":
+                    drops.add(name)
+                elif kind == "seed":
+                    adds.add(name)
+                elif peer in membership:
+                    adds.add(name)
+                else:
+                    drops.add(name)
+                index += 1
+            membership = (membership - drops) | adds
+            sanction_snapshots.append((pos, frozenset(membership)))
 
-        def sanction_value(value):
-            # safe string content: a bare sanctioned name
-            # or the inline sanctioned call itself (its
-            # value is a relative path string, never the
-            # raw path). Recombinations (out/tag) are NOT
-            # exempt — rejoining rebuilds the raw path.
+        def sanctioned_at(name, line, col):
+            seen = False
+            for (sline, scol), members in sanction_snapshots:
+                if (sline, scol) < (line, col):
+                    seen = name in members
+                else:
+                    break
+            return seen
+
+        def sanction_value(value, node):
+            # safe string content: a bare name sanctioned
+            # at this use, or the inline sanctioned call
+            # itself (its value is a relative path
+            # string, never the raw path).
+            # Recombinations (out/tag) are NOT exempt —
+            # rejoining rebuilds the raw path.
             if isinstance(value, ast.Name):
-                return value.id in sanctioned
+                return sanctioned_at(value.id, node.lineno,
+                                     node.col_offset)
             return sanctioned_shape(value)
 
         changed = True
@@ -2033,7 +2232,7 @@ def _binding_violations(source):
                             tainted.add(name)
                             changed = True
 
-            def taint_store(value, targets):
+            def taint_store(value, targets, node):
                 # A tainted store into a container taints
                 # the container root: the path survives
                 # inside (a later append publishes it, a
@@ -2049,7 +2248,7 @@ def _binding_violations(source):
                 nonlocal changed
                 stored = (direct_hit(value)
                           or laundered(value)) \
-                    and not sanction_value(value)
+                    and not sanction_value(value, node)
                 for target in targets:
                     for sub in ast.walk(target):
                         if not isinstance(sub, (ast.Subscript,
@@ -2059,8 +2258,10 @@ def _binding_violations(source):
                             continue
                         hit = stored
                         if isinstance(sub, ast.Subscript):
-                            hit = hit or tainted_in(
-                                sub.slice, tainted)
+                            hit = hit or (
+                                tainted_in(sub.slice, tainted)
+                                and not sanction_value(
+                                    sub.slice, node))
                         if hit:
                             root = _store_root(sub)
                             if root is not None \
@@ -2100,7 +2301,7 @@ def _binding_violations(source):
                 carried.extend(keyword.value
                                for keyword in node.keywords)
                 if any((direct_hit(arg) or laundered(arg))
-                       and not sanction_value(arg)
+                       and not sanction_value(arg, node)
                        for arg in carried):
                     if receiver not in tainted:
                         tainted.add(receiver)
@@ -2109,17 +2310,18 @@ def _binding_violations(source):
             for node in ast.walk(func):
                 if isinstance(node, ast.Assign):
                     spread(node.value, list(node.targets))
-                    taint_store(node.value, list(node.targets))
+                    taint_store(node.value, list(node.targets),
+                                node)
                 elif isinstance(node, ast.AnnAssign) \
                         and node.value is not None:
                     spread(node.value, [node.target])
-                    taint_store(node.value, [node.target])
+                    taint_store(node.value, [node.target], node)
                 elif isinstance(node, ast.AugAssign):
                     spread(node.value, [node.target])
-                    taint_store(node.value, [node.target])
+                    taint_store(node.value, [node.target], node)
                 elif isinstance(node, (ast.For, ast.AsyncFor)):
                     spread(node.iter, [node.target])
-                    taint_store(node.iter, [node.target])
+                    taint_store(node.iter, [node.target], node)
                 elif isinstance(node, ast.Call):
                     taint_receiver(node)
                 elif isinstance(node, ast.NamedExpr):
@@ -2170,8 +2372,21 @@ def _binding_violations(source):
         # Path.read_bytes. Module-level read-ref
         # bindings join the per-function tainted ones.
         func_rebound_methods = set()
+        func_readcaps = collect_readcaps(func, module_readcaps)
         for node in ast.walk(func):
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                for leaf in _target_leaves(node.target):
+                    if isinstance(leaf, ast.Attribute):
+                        func_rebound_methods.add(leaf.attr)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for leaf in _target_leaves(
+                                item.optional_vars):
+                            if isinstance(leaf, ast.Attribute):
+                                func_rebound_methods.add(
+                                    leaf.attr)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
                 stored = node.value
                 if stored is None:
                     continue
@@ -2182,7 +2397,7 @@ def _binding_violations(source):
                                                    stored):
                         if not isinstance(leaf, ast.Attribute):
                             continue
-                        if read_ref(value) \
+                        if read_ref(value, func_readcaps) \
                                 or tainted_in(value, tainted):
                             func_rebound_methods.add(leaf.attr)
             elif isinstance(node, ast.Call) \
@@ -2193,7 +2408,7 @@ def _binding_violations(source):
                 named = node.args[1]
                 if isinstance(named, ast.Constant) \
                         and isinstance(named.value, str) \
-                        and (read_ref(node.args[2])
+                        and (read_ref(node.args[2], func_readcaps)
                              or tainted_in(node.args[2],
                                            tainted)):
                     func_rebound_methods.add(named.value)
@@ -2273,9 +2488,11 @@ def _binding_violations(source):
                                 and value is not None \
                                 and ((arg_tainted(value)
                                       and not sanction_value(
-                                          value))
-                                     or tainted_in(leaf.slice,
-                                                   tainted)):
+                                          value, node))
+                                     or (tainted_in(leaf.slice,
+                                                    tainted)
+                                         and not sanction_value(
+                                             leaf.slice, node))):
                             void_root(leaf)
                         else:
                             void_names(leaf)
@@ -2285,8 +2502,10 @@ def _binding_violations(source):
                     voided.add(key)
                 elif isinstance(node.target, ast.Subscript) \
                         and (arg_tainted(node.value)
-                             or tainted_in(node.target.slice,
-                                           tainted)):
+                             or (tainted_in(node.target.slice,
+                                            tainted)
+                                 and not sanction_value(
+                                     node.target.slice, node))):
                     void_root(node.target)
                 else:
                     void_names(node.target)
@@ -2297,8 +2516,10 @@ def _binding_violations(source):
                         voided.add(key)
                     elif isinstance(leaf, ast.Subscript) \
                             and (arg_tainted(node.iter)
-                                 or tainted_in(leaf.slice,
-                                               tainted)):
+                                 or (tainted_in(leaf.slice,
+                                                tainted)
+                                     and not sanction_value(
+                                         leaf.slice, node))):
                         void_root(leaf)
                     else:
                         void_names(leaf)
@@ -2343,7 +2564,7 @@ def _binding_violations(source):
                 root = _store_root(node.func.value)
                 if root is not None and any(
                         arg_tainted(arg)
-                        and not sanction_value(arg)
+                        and not sanction_value(arg, node)
                         for arg in carried):
                     voided.add(root)
                 is_mutator, keys, dynamic = \
@@ -2389,7 +2610,8 @@ def _binding_violations(source):
             # count like values (**unpacking checks the
             # mapping itself).
             if isinstance(value, ast.Name) \
-                    and value.id in sanctioned:
+                    and sanctioned_at(value.id, value.lineno,
+                                      value.col_offset):
                 return True
             if isinstance(value, ast.Call):
                 if sanctioned_shape(value):
@@ -2544,7 +2766,9 @@ def _binding_violations(source):
                     if append_clean(only):
                         continue
                     if isinstance(only, ast.Name) \
-                            and only.id in sanctioned:
+                            and sanctioned_at(
+                                only.id, only.lineno,
+                                only.col_offset):
                         continue
                     if isinstance(only, ast.Name) \
                             and only.id in tainted:
@@ -2647,7 +2871,14 @@ class CapturedBytesBinding(unittest.TestCase):
         # appends don't bind; but a tainted container
         # reaching results.append fires at the append,
         # and subscript/attribute/known-mutator stores
-        # propagate taint to the root), setattr through
+        # propagate taint to the root), receivers
+        # through computed calls (get_box().extend —
+        # no resolvable owner), read capabilities
+        # rebound through loops/params/comprehensions,
+        # namespace identity through computed wrappers
+        # (ns = get_ns()), sanction through
+        # AugAssign targets (tag += suffix voids —
+        # fail-closed), setattr through
         # a Name-held module (indistinguishable from an
         # attribute rebind), new helper functions,
         # nested-function scopes, and wholesale
@@ -3131,6 +3362,125 @@ class CapturedBytesBinding(unittest.TestCase):
              "str(out.relative_to(root))})\n"
              "            output = decode_body_log(captured)\n",
              "tainted path escapes to results.append()"),
+            ("sanction-retro-publish",
+             anchor,
+             head + "            tag = log\n"
+             "            results.append({\"raw\": tag})\n"
+             "            tag = str(log.relative_to(out))\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("sanction-swap-laundering",
+             anchor,
+             head + "            tag = str(log.relative_to(out))\n"
+             "            alt = log\n"
+             "            tag, alt = alt, tag\n"
+             "            results.append({\"p\": tag})\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("destructured-starred-rebind",
+             anchor,
+             head + "            Path.r, *unused = "
+             "(Path.read_bytes, None, None)\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("destructured-conditional-rhs",
+             anchor,
+             head + "            Path.r, unused = "
+             "(Path.read_bytes if flag else None), None\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("for-attribute-rebind",
+             anchor,
+             head + "            for Path.relative_to in "
+             "[lambda self, other: self]:\n"
+             "                results.append({\"raw\": "
+             "str(log.relative_to(out))})\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("with-attribute-rebind",
+             anchor,
+             head + "            with open(\"x\") as Path.r:\n"
+             "                pass\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("augassign-alias-store",
+             anchor,
+             head + "            box = {}\n"
+             "            alias = box\n"
+             "            alias |= {\"raw\": log}\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("call-receiver-mutation",
+             anchor,
+             head + "            box = {\"rows\": []}\n"
+             "            box.get(\"rows\").extend([log])\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("readcap-plain-name",
+             anchor,
+             head + "            rb = Path.read_bytes\n"
+             "            Path.r = rb\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("readcap-chain",
+             anchor,
+             head + "            rb = Path.read_bytes\n"
+             "            rb2 = rb\n"
+             "            Path.r = rb2\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("namespace-unbound-update",
+             anchor,
+             head + "            dict.update(globals(), "
+             "_say=Path.read_bytes)\n"
+             "            with _say(log):\n"
+             "                pass\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to _say()"),
+            ("namespace-alias-store",
+             anchor,
+             head + "            ns = globals()\n"
+             "            ns[\"_say\"] = open\n"
+             "            with _say(log):\n"
+             "                pass\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to _say()"),
+            ("namespace-arg-dynamic",
+             anchor,
+             head + "            evil(globals())\n"
+             "            output = decode_body_log(captured)\n",
+             "dynamic namespace rebind"),
+            ("sanction-method-def-rebind",
+             anchor,
+             head + "            class _Rel(str):\n"
+             "                def relative_to(self, _o): "
+             "return self\n"
+             "            tag = str(_Rel(f\"{log}\")"
+             ".relative_to(out))\n"
+             "            results.append({\"p\": tag})\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("plain-call-expanduser-spread",
+             anchor,
+             head + "            p = os.path.expanduser(f\"{log}\")\n"
+             "            output = decode_body_log("
+             "open(p, \"rb\").read())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to open()"),
+            ("nested-posixpath-construction",
+             anchor,
+             head + "            p = PosixPath(str(log.parent))\n"
+             "            output = decode_body_log("
+             "open(p, \"rb\").read())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to PosixPath()"),
         ]
         for name, find, repl, fragment in cases:
             with self.subTest(shape=name):
@@ -3245,6 +3595,30 @@ class CapturedBytesBinding(unittest.TestCase):
              anchor,
              head + "            results.append({\"p\": "
              "str(out.relative_to(root))})\n" + use),
+            ("alias-retarget-clean",
+             anchor,
+             head + "            box = {}\n"
+             "            alias = box\n"
+             "            fresh = {}\n"
+             "            alias = fresh\n"
+             "            alias[\"raw\"] = log\n"
+             "            results.append(box)\n" + use),
+            ("sanction-reseed-publish",
+             anchor,
+             head + "            tag = log\n"
+             "            tag = str(log.relative_to(out))\n"
+             "            results.append({\"p\": tag})\n" + use),
+            ("sanctioned-slice-store",
+             anchor,
+             head + "            tag = str(log.relative_to(out))\n"
+             "            box = {}\n"
+             "            box[tag] = 1\n"
+             "            results.append(box)\n" + use),
+            ("sanction-walrus-seed",
+             anchor,
+             head + "            if (tag := "
+             "str(log.relative_to(out))):\n"
+             "                results.append({\"p\": tag})\n" + use),
         ]
         for name, find, repl in cases:
             with self.subTest(shape=name):
@@ -4907,7 +5281,7 @@ class ExecuteWiring(unittest.TestCase):
             def attempt():
                 try:
                     opened.append(
-                        lane._read_manifest_bytes(path))
+                        lane._read_bounded_bytes(path))
                 except BaseException as error:
                     errors.append(error)
 
@@ -4938,22 +5312,22 @@ class ExecuteWiring(unittest.TestCase):
             link = Path(tmp) / "manifest.json"
             link.symlink_to(target)
             with self.assertRaises(OSError) as caught:
-                lane._read_manifest_bytes(link)
+                lane._read_bounded_bytes(link)
             self.assertEqual(caught.exception.errno, errno.ELOOP)
             with self.assertRaises(ValueError):
-                lane._read_manifest_bytes(Path(tmp))
+                lane._read_bounded_bytes(Path(tmp))
             self.assertEqual(
-                lane._read_manifest_bytes(target), b"{}")
+                lane._read_bounded_bytes(target), b"{}")
 
     def test_manifest_reader_bounds_oversized_body(self):
         # a streaming writer cannot gorge root: past
         # 1 MiB the read fails closed (ValueError).
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "manifest.json"
-            path.write_bytes(b"x" * (lane._MANIFEST_MAX_BYTES + 1))
+            path.write_bytes(b"x" * (lane._BOUNDED_READ_MAX + 1))
             before = set(os.listdir("/proc/self/fd"))
             with self.assertRaises(ValueError) as caught:
-                lane._read_manifest_bytes(path)
+                lane._read_bounded_bytes(path)
             self.assertIn("exceeds", str(caught.exception))
             self.assertEqual(set(os.listdir("/proc/self/fd")), before)
 
@@ -4963,11 +5337,11 @@ class ExecuteWiring(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "manifest.json"
             path.write_bytes(b'{"schema": 1}')
-            self.assertEqual(lane._read_manifest_bytes(path),
+            self.assertEqual(lane._read_bounded_bytes(path),
                              b'{"schema": 1}')
             path.unlink()
             with self.assertRaises(FileNotFoundError):
-                lane._read_manifest_bytes(path)
+                lane._read_bounded_bytes(path)
 
     def test_execute_fifo_manifest_refuses_fast(self):
         # the privileged manifest read goes through the
@@ -5002,6 +5376,140 @@ class ExecuteWiring(unittest.TestCase):
             outcome, error, calls, printed = outcomes[0]
             self.assertEqual(outcome, "raised")
             self.assertIsInstance(error, ValueError)
+
+    def test_main_run_prepared_fifo_manifest_refuses_fast(self):
+        # the --run-prepared manifest read goes through
+        # the bounded reader: a planted FIFO fails main
+        # closed (ValueError) instead of hanging it.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            fifo = out / "manifest.json"
+            os.mkfifo(fifo)
+            errors = []
+
+            def attempt():
+                try:
+                    lane.main()
+                except BaseException as error:
+                    errors.append(error)
+
+            argv = ["sudo_lane.py", "--run-prepared", str(out)]
+            with mock.patch.object(sys, "argv", argv):
+                worker = threading.Thread(target=attempt,
+                                          daemon=True)
+                worker.start()
+                worker.join(10)
+                rescued = worker.is_alive()
+                if rescued:
+                    with contextlib.suppress(OSError):
+                        release = os.open(
+                            fifo, os.O_WRONLY | os.O_NONBLOCK)
+                        os.close(release)
+                    worker.join(10)
+            self.assertFalse(
+                rescued, "main blocked on a FIFO manifest")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ValueError)
+
+    def test_main_manifest_reread_fifo_refuses_fast(self):
+        # the pre-launch manifest re-read (after a
+        # mocked prepare) refuses a FIFO the same way.
+        # main creates --out itself, so the mocked
+        # prepare plants the FIFO (a preparer that left
+        # one behind).
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            manifest = {"sha256": {"stage/runner.py": "00" * 32}}
+
+            def fake_prepare(*args, **kwargs):
+                os.mkfifo(out / "manifest.json")
+                return manifest
+
+            errors = []
+
+            def attempt():
+                try:
+                    lane.main()
+                except BaseException as error:
+                    errors.append(error)
+
+            argv = ["sudo_lane.py", "--out", str(out)]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(lane, "prepare",
+                                      side_effect=fake_prepare), \
+                    mock.patch.object(fcntl, "flock"):
+                worker = threading.Thread(target=attempt,
+                                          daemon=True)
+                worker.start()
+                worker.join(10)
+                rescued = worker.is_alive()
+                if rescued:
+                    with contextlib.suppress(OSError):
+                        release = os.open(
+                            out / "manifest.json",
+                            os.O_WRONLY | os.O_NONBLOCK)
+                        os.close(release)
+                    worker.join(10)
+            self.assertFalse(
+                rescued, "main blocked on a FIFO re-read")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ValueError)
+
+    def test_main_runner_fifo_refuses_fast(self):
+        # the stage-runner freeze read (root when main
+        # itself runs as root) refuses a FIFO runner.
+        # The mocked prepare stages a consistent
+        # manifest plus the FIFO runner.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            manifest = {"sha256": {"stage/runner.py": "ab" * 32}}
+
+            def fake_prepare(*args, **kwargs):
+                (out / "manifest.json").write_text(
+                    json.dumps(manifest))
+                (out / "stage").mkdir()
+                os.mkfifo(out / "stage/runner.py")
+                return manifest
+
+            errors = []
+
+            def attempt():
+                try:
+                    lane.main()
+                except BaseException as error:
+                    errors.append(error)
+
+            argv = ["sudo_lane.py", "--out", str(out)]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(lane, "prepare",
+                                      side_effect=fake_prepare), \
+                    mock.patch.object(fcntl, "flock"):
+                worker = threading.Thread(target=attempt,
+                                          daemon=True)
+                worker.start()
+                worker.join(10)
+                rescued = worker.is_alive()
+                if rescued:
+                    with contextlib.suppress(OSError):
+                        release = os.open(
+                            out / "stage/runner.py",
+                            os.O_WRONLY | os.O_NONBLOCK)
+                        os.close(release)
+                    worker.join(10)
+            self.assertFalse(
+                rescued, "main blocked on a FIFO runner")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ValueError)
+            self.assertIn("runner", str(errors[0]))
+
+    def test_bounded_reader_exact_cap_reads_ok(self):
+        # the cap is strict greater-than: exactly 1 MiB
+        # reads fully (pins > against >=).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            path.write_bytes(b"y" * lane._BOUNDED_READ_MAX)
+            self.assertEqual(lane._read_bounded_bytes(path),
+                             b"y" * lane._BOUNDED_READ_MAX)
 
     def test_open_pinned_memory_error_releases_both_fds(self):
         # a MemoryError between acquiring the child and
@@ -5053,6 +5561,36 @@ class ExecuteWiring(unittest.TestCase):
                 with self.assertRaises(MemoryError):
                     lane._open_pinned(deep)
             self.assertFalse(state["fail"])
+            self.assertEqual(set(os.listdir("/proc/self/fd")), before)
+
+    def test_open_pinned_parent_fail_closes_owned_once(self):
+        # take-and-clear in the parent-failure arm: the
+        # parent close fails (OSError), then the owned
+        # close raises MemoryError — owned is attempted
+        # exactly once (clearing before the close), so
+        # the outer arm cannot close the number again.
+        with tempfile.TemporaryDirectory() as tmp:
+            deep = Path(tmp) / "a" / "b"
+            deep.mkdir(parents=True)
+            real_close = os.close
+            closed, state = [], {"step": 0}
+
+            def flaky_close(fd):
+                closed.append(fd)
+                real_close(fd)
+                state["step"] += 1
+                if state["step"] == 1:
+                    raise OSError(errno.EIO, "parent lost")
+                if state["step"] == 2:
+                    raise MemoryError("owned close path")
+
+            before = set(os.listdir("/proc/self/fd"))
+            with mock.patch.object(os, "close",
+                                   side_effect=flaky_close):
+                with self.assertRaises(MemoryError):
+                    lane._open_pinned(deep)
+            self.assertEqual(len(closed), 2)
+            self.assertEqual(len(set(closed)), 2)
             self.assertEqual(set(os.listdir("/proc/self/fd")), before)
 
     def test_execute_copy_aborts_mid_tree_on_cancel(self):
@@ -6889,7 +7427,7 @@ class ProcessCustody(unittest.TestCase):
             # dup2 onto these numbers: closing them here
             # could hand a reused number to that dup2, so
             # the already-failed path leaks rather than
-            # corrupts (the :6120 assertion above fired).
+            # corrupts (the join assertion above fired).
             if worker is None or not worker.is_alive():
                 for fd in held:
                     with contextlib.suppress(OSError):
@@ -7305,11 +7843,11 @@ class ProcessCustody(unittest.TestCase):
 
     def test_cancellation_interrupted_body_still_fails_on_reap(
             self):
-        # the gate's InterruptedError arm is pinned even
-        # though no production path raises it from a body
-        # today (flag-only cancel never surfaces it): a
-        # body InterruptedError plus an outer custody
-        # failure propagates the OSError, like SystemExit.
+        # the gate's InterruptedError arm is live:
+        # a cancel landing during digest raises it from
+        # the body, so a body InterruptedError plus an
+        # outer custody failure must propagate the
+        # OSError, like SystemExit.
         saved_flag = lane._CANCEL_REQUESTED
         saved_slot = lane._CANCELLATION_REPAIR
         saved_reap = lane._CANCELLATION_REAP_FAILED
