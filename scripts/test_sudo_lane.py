@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Adversarial runner checks; no privilege or kernel support required."""
 import ast
+import builtins
 import contextlib
 import hashlib
 import json
@@ -1352,18 +1353,53 @@ class PreparedIntegrity(unittest.TestCase):
                 self.assertEqual(lane.lifecycle_verdict(code, output), "FAIL")
 
 
+def _bound_names(target):
+    # names bound by an assignment-ish target.
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, ast.Starred):
+        yield from _bound_names(target.value)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _bound_names(elt)
+
+
+def _match_names(pattern):
+    # names bound by a match-case pattern.
+    for node in ast.walk(pattern):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                yield node.name
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                yield node.rest
+
+
 def _binding_violations(source):
     """Tripwire violations for `source` (taint over execute/prepare).
 
-    No reads through the log path or its aliases (positional or
-    keyword, bare or os./io.-attribute opens), every run_logged
-    3-unpacked with the bytes used past the call site but before
-    the next rebinding of that name (a later site reusing the
-    name must not mask a discard), and the deleted reader gone
-    module-wide.
+    No reads through the log path or its aliases: taint seeds
+    from the `log` name and from each run_logged call's log
+    argument (a renamed seed must not launder it), flows
+    through every rebinding form (assign, for, walrus, match;
+    with/except names rebind but carry __enter__/exception
+    values, never the path), and must not reach a read or
+    exec primitive — directly as a bare argument to any call,
+    or nested inside a larger argument to a read/exec
+    primitive (diagnostic and publish sinks stay allowed, so
+    derived-path bookkeeping never fires). Every run_logged
+    is 3-unpacked (a discarded bare call is a violation too)
+    with the bytes used past the call site but before the
+    next rebinding of that name, and the deleted reader is
+    gone module-wide.
     """
     read_attrs = ("open", "read_text", "read_bytes", "read")
     consumers = ("run_logged",)
+    nested_denied = ("open", "Path", "PurePath", "fspath",
+                     "check_output", "check_call", "run",
+                     "Popen", "execv", "execve", "execl",
+                     "execlp", "execvp", "execvpe", "system",
+                     "popen")
     tree = ast.parse(source)
     funcs = [node for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef)
@@ -1372,60 +1408,105 @@ def _binding_violations(source):
     if len(funcs) != 2:
         violations.append(f"expected execute+prepare, found {len(funcs)}")
         return violations
+
+    def tainted_in(node, tainted):
+        return any(isinstance(found, ast.Name)
+                   and found.id in tainted
+                   for found in ast.walk(node))
+
     for func in funcs:
         tainted = {"log"}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            if not isinstance(called, ast.Name) \
+                    or called.id != "run_logged":
+                continue
+            log_arg = node.args[1] if len(node.args) > 1 else None
+            if log_arg is None:
+                for keyword in node.keywords:
+                    if keyword.arg == "log":
+                        log_arg = keyword.value
+            if isinstance(log_arg, ast.Name):
+                tainted.add(log_arg.id)
         changed = True
         while changed:
             changed = False
+
+            def direct_hit(value):
+                # direct shapes only (a bare name or a tuple/list
+                # of bare names): anything deeper fires at its own
+                # construction site, so tainting through it would
+                # only mislabel bookkeeping dicts like `result`.
+                if isinstance(value, ast.Name):
+                    return value.id in tainted
+                if isinstance(value, (ast.Tuple, ast.List)):
+                    return any(isinstance(elt, ast.Name)
+                               and elt.id in tainted
+                               for elt in value.elts)
+                return False
+
+            def spread(value, targets):
+                nonlocal changed
+                if not direct_hit(value):
+                    return
+                for target in targets:
+                    for name in _bound_names(target):
+                        if name not in tainted:
+                            tainted.add(name)
+                            changed = True
+
             for node in ast.walk(func):
                 if isinstance(node, ast.Assign):
-                    values = [node.value]
-                    targets = list(node.targets)
+                    spread(node.value, list(node.targets))
                 elif isinstance(node, ast.AnnAssign) \
                         and node.value is not None:
-                    values = [node.value]
-                    targets = [node.target]
-                else:
-                    continue
-                hit = any(isinstance(value, ast.Name)
-                          and value.id in tainted
-                          for value in values) or any(
-                              isinstance(value, (ast.Tuple, ast.List))
-                              and any(isinstance(elt, ast.Name)
-                                      and elt.id in tainted
-                                      for elt in value.elts)
-                              for value in values)
-                if hit:
-                    for target in targets:
-                        if isinstance(target, ast.Name) \
-                                and target.id not in tainted:
-                            tainted.add(target.id)
-                            changed = True
-                        elif isinstance(target, (ast.Tuple, ast.List)):
-                            for elt in target.elts:
-                                if isinstance(elt, ast.Name) \
-                                        and elt.id not in tainted:
-                                    tainted.add(elt.id)
+                    spread(node.value, [node.target])
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    spread(node.iter, [node.target])
+                elif isinstance(node, ast.NamedExpr):
+                    spread(node.value, [node.target])
+                elif isinstance(node, ast.Match):
+                    if direct_hit(node.subject):
+                        for case in node.cases:
+                            for name in _match_names(case.pattern):
+                                if name not in tainted:
+                                    tainted.add(name)
                                     changed = True
         loads = {(node.id, node.lineno) for node in ast.walk(func)
                  if isinstance(node, ast.Name)
                  and isinstance(node.ctx, ast.Load)}
         rebinds = {}
+
+        def note(target, lineno):
+            for name in _bound_names(target):
+                rebinds.setdefault(name, []).append(lineno)
+
         for node in ast.walk(func):
             if isinstance(node, ast.Assign):
-                targets = list(node.targets)
+                for target in node.targets:
+                    note(target, node.lineno)
             elif isinstance(node, ast.AnnAssign) \
                     and node.value is not None:
-                targets = [node.target]
-            else:
-                continue
-            for target in targets:
-                elts = target.elts \
-                    if isinstance(target, (ast.Tuple, ast.List)) \
-                    else [target]
-                for elt in elts:
-                    if isinstance(elt, ast.Name):
-                        rebinds.setdefault(elt.id, []).append(node.lineno)
+                note(node.target, node.lineno)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                note(node.target, node.lineno)
+            elif isinstance(node, ast.NamedExpr):
+                note(node.target, node.lineno)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        note(item.optional_vars, node.lineno)
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name:
+                    rebinds.setdefault(node.name, []).append(
+                        node.lineno)
+            elif isinstance(node, ast.Match):
+                for case in node.cases:
+                    for name in _match_names(case.pattern):
+                        rebinds.setdefault(name, []).append(
+                            node.lineno)
         run_logged_calls = 0
         for node in ast.walk(func):
             if not isinstance(node, ast.Call):
@@ -1438,20 +1519,35 @@ def _binding_violations(source):
                 violations.append(
                     f"{func.name}:{node.lineno} reads tainted path")
                 continue
-            if isinstance(called, ast.Attribute) \
-                    and called.attr == "open" \
-                    and isinstance(called.value, ast.Name):
-                opener = f"{called.value.id}.{called.attr}"
-            elif isinstance(called, ast.Name):
+            if isinstance(called, ast.Name):
                 opener = called.id
+                simple = called.id
+            elif isinstance(called, ast.Attribute):
+                dotted = [called.attr]
+                value = called.value
+                while isinstance(value, ast.Attribute):
+                    dotted.append(value.attr)
+                    value = value.value
+                if not isinstance(value, ast.Name):
+                    continue
+                dotted.append(value.id)
+                opener = ".".join(reversed(dotted))
+                simple = called.attr
             else:
                 continue
-            if opener in consumers:
+            if opener in consumers \
+                    or opener.endswith(".run_logged"):
                 continue
             carried = [arg for arg in node.args]
             carried.extend(keyword.value for keyword in node.keywords)
             if any(isinstance(arg, ast.Name)
                    and arg.id in tainted for arg in carried):
+                violations.append(
+                    f"{func.name}:{node.lineno} tainted path escapes "
+                    f"to {opener}()")
+                continue
+            if simple in nested_denied and any(
+                    tainted_in(arg, tainted) for arg in carried):
                 violations.append(
                     f"{func.name}:{node.lineno} tainted path escapes "
                     f"to {opener}()")
@@ -1479,6 +1575,13 @@ def _binding_violations(source):
                         violations.append(
                             f"{func.name}:{node.lineno} captured "
                             "bytes unused past the call site")
+            elif isinstance(node, ast.Expr) \
+                    and isinstance(node.value, ast.Call) \
+                    and isinstance(node.value.func, ast.Name) \
+                    and node.value.func.id == "run_logged":
+                violations.append(
+                    f"{func.name}:{node.lineno} run_logged "
+                    "return discarded")
         if not run_logged_calls:
             violations.append(f"{func.name}: no run_logged calls")
     for node in ast.walk(tree):
@@ -1495,16 +1598,20 @@ class CapturedBytesBinding(unittest.TestCase):
         # parse fd-captured bytes. A call site reverted to path
         # reads stays green functionally, so pin the shape with
         # the narrow tripwire (see _binding_violations).
-        # Known-narrow (documented, not missed): expression
-        # laundering of the argument (Path(f"{log}"),
-        # log.as_posix(), (log.parent / log.name)), reads
-        # through non-Name receivers, and new helper
-        # functions. Direct constructor calls (Path(log))
-        # ARE caught (tainted-arg escape). The mock-driven
-        # ExecuteWiring behavioral tests (selftest + Cargo +
-        # e2e conflicting-bytes fixtures) are the backstop
-        # for the rest; this guard only catches mechanical
-        # reverts.
+        # Known-narrow (documented, not missed): novel
+        # primitives reached only through nested laundering
+        # (evil(deep(log))), reads through non-Name
+        # receivers, new helper functions, nested-function
+        # scopes, and import bindings. Direct constructor
+        # calls (Path(log), pathlib.Path(log)) ARE caught,
+        # as is nesting inside read/exec primitives. The
+        # mock-driven ExecuteWiring behavioral tests
+        # (selftest + Cargo + e2e + runtime-list +
+        # lifecycle-support conflicting-bytes fixtures) are
+        # the backstop for the execute verdict sites; the
+        # prepare inventory sites ride the guard only
+        # (driving prepare needs git+cargo scaffolding).
+        # This guard only catches mechanical reverts.
         self.assertEqual(
             _binding_violations(Path(lane.__file__).read_text()), [])
 
@@ -1557,6 +1664,85 @@ class CapturedBytesBinding(unittest.TestCase):
              "captured.decode(\"utf-8\")) if code == 0 else []",
              "            bodies = []",
              "captured bytes unused past the call site"),
+            ("discard-expr",
+             "            code, _, captured = run_logged(\n"
+             "                [str(runtime / row[\"staged\"]), \"--ignored\", "
+             "\"--list\", \"--format\", \"terse\"],\n"
+             "                log, 30, cwd=root, env=env)\n"
+             "            bodies = parse_test_list("
+             "captured.decode(\"utf-8\")) if code == 0 else []",
+             "            run_logged([str(runtime / row[\"staged\"]), "
+             "\"--ignored\", \"--list\", \"--format\", \"terse\"],\n"
+             "                       log, 30, cwd=root, env=env)\n"
+             "            bodies = row[\"bodies\"]",
+             "run_logged return discarded"),
+            ("for-rebind",
+             anchor,
+             head + "            for captured in [b\"x\"]:\n"
+             "                pass\n"
+             "            output = decode_body_log(captured)\n",
+             "captured bytes unused past the call site"),
+            ("walrus-rebind",
+             anchor,
+             head + "            print(captured := b\"x\")\n"
+             "            output = decode_body_log(captured)\n",
+             "captured bytes unused past the call site"),
+            ("with-rebind",
+             anchor,
+             head + "            with open(\"x\") as captured:\n"
+             "                pass\n"
+             "            output = decode_body_log(captured)\n",
+             "captured bytes unused past the call site"),
+            ("except-rebind",
+             anchor,
+             head + "            try:\n"
+             "                pass\n"
+             "            except OSError as captured:\n"
+             "                pass\n"
+             "            output = decode_body_log(captured)\n",
+             "captured bytes unused past the call site"),
+            ("match-rebind",
+             anchor,
+             head + "            match code:\n"
+             "                case int() as captured:\n"
+             "                    pass\n"
+             "            output = decode_body_log(captured)\n",
+             "captured bytes unused past the call site"),
+            ("attribute-direct-fspath",
+             anchor,
+             head + "            tag = os.fspath(log)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to os.fspath()"),
+            ("attribute-direct-pathlib",
+             anchor,
+             head + "            tag = pathlib.Path(log)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to pathlib.Path()"),
+            ("nested-open-fspath",
+             anchor,
+             head + "            output = decode_body_log("
+             "open(os.fspath(log), \"rb\").read())\n",
+             "tainted path escapes to open()"),
+            ("nested-exec-list",
+             anchor,
+             head + "            tag = "
+             "subprocess.check_output([\"cat\", log])\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to "
+             "subprocess.check_output()"),
+            ("renamed-seed",
+             "            log = logs / f\"{name}.log\"\n"
+             "            code, timed_out, captured = "
+             "run_logged([str(cli), *args], log, 180, "
+             "cwd=root, env=env)\n"
+             "            output = decode_body_log(captured)\n",
+             "            slog = logs / f\"{name}.log\"\n"
+             "            code, timed_out, captured = "
+             "run_logged([str(cli), *args], slog, 180, "
+             "cwd=root, env=env)\n"
+             "            output = "
+             "decode_body_log(slog.read_bytes())\n",
+             "reads tainted path"),
         ]
         for name, find, repl, fragment in cases:
             with self.subTest(shape=name):
@@ -1567,6 +1753,47 @@ class CapturedBytesBinding(unittest.TestCase):
                     any(fragment in violation
                         for violation in violations),
                     f"{name}: {violations}")
+
+    def test_tripwire_allows_legitimate_shapes(self):
+        # the guard's precision: derived-path bookkeeping and
+        # uses before a rebinding must stay silent. Each case
+        # must produce no violation at all.
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        cases = [
+            ("alias-derived-write",
+             anchor,
+             head + "            pth = log\n"
+             "            dump(pth.with_suffix(\".x\"), {})\n" + use),
+            ("nested-allow-str",
+             anchor,
+             head + "            tag = "
+             "str(log.relative_to(out))\n" + use),
+            ("print-fstring",
+             anchor,
+             head + "            print(f\"wrote {log}\")\n" + use),
+            ("use-before-for-rebind",
+             anchor,
+             anchor + "            for captured in [b\"x\"]:\n"
+             "                pass\n"),
+            ("use-before-with-rebind",
+             anchor,
+             anchor + "            with open(\"x\") as captured:\n"
+             "                pass\n"),
+        ]
+        for name, find, repl in cases:
+            with self.subTest(shape=name):
+                self.assertEqual(source.count(find), 1, name)
+                self.assertEqual(
+                    _binding_violations(source.replace(find, repl)),
+                    [], name)
 
 
 class DeferredCancel(unittest.TestCase):
@@ -1784,6 +2011,37 @@ class LoggedPaths(unittest.TestCase):
             mode = (root / "body.log").stat().st_mode & 0o777
             self.assertEqual(oct(mode), oct(0o644))
 
+    def test_cancel_during_wait_raises_promptly(self):
+        # flag-only cancel must break a long wait within
+        # slices, not at child exit: a 10 s sleeper with
+        # the flag set at 0.5 s raises in well under 8 s.
+        # (On the single-wait shape this takes the full
+        # 10 s: the flag is only honored in the finally.)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "sleep.log"
+            saved_flag = lane._CANCEL_REQUESTED
+            lane._CANCEL_REQUESTED = False
+            def setter():
+                lane._CANCEL_REQUESTED = True
+            timer = threading.Timer(0.5, setter)
+            timer.start()
+            try:
+                start = time.monotonic()
+                with self.assertRaises(InterruptedError):
+                    lane.run_logged(
+                        [sys.executable, "-c",
+                         "import time; time.sleep(10)"],
+                        log, 30)
+                self.assertLess(time.monotonic() - start, 8)
+            finally:
+                timer.cancel()
+                timer.join(timeout=5)
+                lane._CANCEL_REQUESTED = saved_flag
+            result = json.loads(
+                (Path(tmp) / "sleep.log.result.json").read_text())
+            self.assertTrue(result["cancelled"])
+            self.assertTrue(result["descendants_reaped"])
+
     def test_failed_spawn_leaks_no_sink(self):
         # raw descriptors go to Popen (no wrap stage to fail);
         # a spawn failure must still unwind both sinks.
@@ -1966,6 +2224,12 @@ class ExecuteWiring(unittest.TestCase):
                     return ("raised", error, calls,
                             captured_stdout.getvalue())
         finally:
+            # The flag restore is test hygiene (production
+            # leaves it set for the enclosing scope); the
+            # repair slot is deliberately NOT cleared — a
+            # drive under cancellation() needs it to survive
+            # until that scope consumes it, and every drive
+            # overwrites it before it can matter.
             lane._CANCEL_REQUESTED = saved_flag
 
     def _assert_lock_released(self, lock):
@@ -2142,6 +2406,86 @@ class ExecuteWiring(unittest.TestCase):
             # never carried the announcement.
             self.assertNotIn(b"accounted partial",
                              (out / e2e_rows[0]["log"]).read_bytes())
+
+    def test_runtime_list_mismatch_with_manifest_raises(self):
+        # the runtime-listing inventory is bound to captured
+        # bytes: a listing that disagrees with the manifest
+        # raises instead of executing. A discard mutant
+        # (bodies = row["bodies"]) sails through and stays
+        # green here — this fixture is its red.
+        key = ("kryprobe-policy", "rule_unit")
+        row = {"package": key[0], "target": key[1],
+               "test": "probe_bin", "staged": "stage/debug/probe_bin",
+               "bodies": ["listed_body"], "features": [],
+               "sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root, artifacts=[row])
+            def routed(command, log, *args, **kwargs):
+                if "--list" in command:
+                    return (0, False, b"other_body: test\n"
+                            b"1 test, 0 benchmarks\n")
+                return (0, False, b"")
+            outcome, error, calls, printed = self._drive(
+                root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("runtime body inventory changed",
+                          str(error))
+
+    def test_runtime_list_failure_with_manifest_raises(self):
+        # a nonzero listing exit invents no bodies: with a
+        # nonempty manifest the empty inventory still raises.
+        key = ("kryprobe-policy", "rule_unit")
+        row = {"package": key[0], "target": key[1],
+               "test": "probe_bin", "staged": "stage/debug/probe_bin",
+               "bodies": ["listed_body"], "features": [],
+               "sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root, artifacts=[row])
+            def routed(command, log, *args, **kwargs):
+                if "--list" in command:
+                    return (1, False, b"")
+                return (0, False, b"")
+            outcome, error, calls, printed = self._drive(
+                root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("runtime body inventory changed",
+                          str(error))
+
+    def test_lifecycle_verdict_follows_captured_bytes_not_path(self):
+        # the lifecycle-support site reads captured bytes: a
+        # failing log path next to passing bytes still
+        # passes. (The evasive path-reading mutant survived
+        # all 129 without this fixture.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            passing = json.dumps(
+                {"audit": "attach",
+                 "attached": lane.LIFECYCLE_REQUIRED,
+                 "expected": lane.LIFECYCLE_EXPECTED}).encode() + b"\n"
+            failing = b"no lifecycle announcement here\n"
+            self.assertEqual(
+                lane.lifecycle_verdict(0, failing.decode()), "FAIL")
+            def routed(command, log, *args, **kwargs):
+                if command[1:2] == ["report"]:
+                    Path(log).write_bytes(failing)
+                    return (0, False, passing)
+                return (0, False, b"")
+            outcome, code, calls, printed = self._drive(
+                root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            rows = {row["test"]: row for row in json.loads(
+                (out / "results.json").read_text())}
+            self.assertEqual(rows["lifecycle-support"]["status"],
+                             "PASS")
+            # the mock really did plant the conflict.
+            self.assertIn(b"no lifecycle announcement",
+                          (out / rows["lifecycle-support"]["log"])
+                          .read_bytes())
 
     def test_signal_between_shield_installs_defers(self):
         # a real SIGINT placed deterministically between the two
@@ -2480,6 +2824,398 @@ class ExecuteWiring(unittest.TestCase):
             receipt = json.loads((out / "ownership.json").read_text())
             self.assertEqual(receipt["status"], "failed")
 
+    def test_signal_at_cleanup_entry_completes_cleanup(self):
+        # inversion of the r14 hole: a real SIGTERM placed
+        # exactly at the finally's shield entry, under the
+        # lane's own flag-only cancellation. The shield
+        # still installs, every unmount is attempted, the
+        # lock is released, and the cancel is recorded
+        # through the flag — no raise can abort the entry.
+        # (On the raising shape this strands 0 unmounts,
+        # a running receipt, and a held lock.)
+        tree = ast.parse(Path(lane.__file__).read_text())
+        func = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "execute")
+        entries = []
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Try) or not node.finalbody:
+                continue
+            for stmt in node.finalbody:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.With):
+                        for item in sub.items:
+                            called = item.context_expr
+                            if isinstance(called, ast.Call) \
+                                    and isinstance(called.func, ast.Name) \
+                                    and called.func.id == "_deferred_cancel":
+                                entries.append(sub.lineno)
+        self.assertEqual(len(entries), 1)
+        entry_line = entries[0]
+        real_dc = lane._deferred_cancel
+        seen = []
+        fired = []
+        flagged = []
+        @contextlib.contextmanager
+        def killer_dc():
+            frame = sys._getframe(1)
+            while frame is not None:
+                if frame.f_code.co_name == "execute" and \
+                        frame.f_code.co_filename.endswith(
+                            "sudo_lane.py"):
+                    seen.append(frame.f_lineno)
+                    if frame.f_lineno == entry_line \
+                            and not fired:
+                        fired.append(1)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        flagged.append(lane._CANCEL_REQUESTED)
+                    break
+                frame = frame.f_back
+            with real_dc():
+                yield
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            saved_flag = lane._CANCEL_REQUESTED
+            lane._CANCEL_REQUESTED = False
+            try:
+                with lane.cancellation():
+                    with mock.patch.object(
+                            lane, "_deferred_cancel",
+                            side_effect=lambda: killer_dc()):
+                        outcome, error, calls, printed = self._drive(
+                            root, out, lock, run_logged=lambda *a, **k: (
+                                0, False, b""))
+                    # _drive's flag save/restore is test
+                    # hygiene; in production the flag set by
+                    # the kill persists into this scope.
+                    lane._CANCEL_REQUESTED = True
+            except InterruptedError as outer:
+                self.assertIn("owned descendants reaped", str(outer))
+            else:
+                self.fail("cancel flag lost at cleanup entry")
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(fired, [1])
+            self.assertEqual(flagged, [True])
+            self.assertIn(entry_line, seen)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertEqual(
+                self._umount_targets(calls),
+                list(reversed(self._mount_targets(calls))))
+            self.assertTrue(self._mount_targets(calls))
+            self._assert_lock_released(lock)
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+
+    def test_cancel_between_receipt_check_and_publish_republishes(self):
+        # a flag landing after the adjacent L6 check but
+        # before the ownership publish: the cancel-raise
+        # branch republishes the receipt as cancelled
+        # instead of leaving finished (the r14 comment
+        # claimed the post-finally checkpoint corrects
+        # this — it never runs on the raise path).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            real_gp = lane._guarded_publish
+            hit = []
+            def flag_on_publish(path, value, *args):
+                if Path(path).name == "ownership.json" \
+                        and not hit:
+                    hit.append(value.get("status"))
+                    lane._CANCEL_REQUESTED = True
+                return real_gp(path, value, *args)
+            with mock.patch.object(lane, "_guarded_publish",
+                                   side_effect=flag_on_publish):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(hit, ["finished"])
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            self._assert_lock_released(lock)
+
+    def test_cancel_after_post_dump_check_repairs_evidence(self):
+        # a real signal after the post-dump checkpoint, under
+        # the lane's own cancellation: the completion
+        # boundary holds — the slot repair rewrites the
+        # complete summary as cancelled and the scope
+        # raises. (On the raising shape the signal escapes
+        # with complete:true retained.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            fired = []
+            flagged = []
+            real_print = print
+            def killer_print(*args, **kwargs):
+                if not fired and any("evidence" in str(part)
+                                     for part in args):
+                    fired.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    flagged.append(lane._CANCEL_REQUESTED)
+                return real_print(*args, **kwargs)
+            saved_flag = lane._CANCEL_REQUESTED
+            lane._CANCEL_REQUESTED = False
+            try:
+                with lane.cancellation():
+                    with mock.patch.object(builtins, "print",
+                                           side_effect=killer_print):
+                        outcome, code, calls, printed = self._drive(
+                            root, out, lock,
+                            run_logged=lambda *a, **k: (0, False, b""))
+                    # _drive's flag save/restore is test
+                    # hygiene; in production the flag set by
+                    # the kill persists into this scope, where
+                    # the consumed repair slot rewrites the
+                    # evidence before the raise.
+                    lane._CANCEL_REQUESTED = True
+            except InterruptedError as outer:
+                self.assertIn("owned descendants reaped", str(outer))
+            else:
+                self.fail("post-check cancel lost")
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(fired, [1])
+            self.assertEqual(flagged, [True])
+            self.assertEqual(outcome, "returned")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertEqual(summary["error"], "cancelled")
+            self.assertIn("accepted_partials", summary)
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            self._assert_lock_released(lock)
+
+    def test_second_signal_during_repair_still_repairs(self):
+        # the flag set on the complete dump (post-check
+        # fires) plus a second real signal between the
+        # ownership and summary rewrites: under flag-only
+        # semantics the second delivery only re-sets the
+        # flag, so the repair completes anyway. (On the
+        # raising shape the summary rewrite is skipped and
+        # complete:true survives next to failed/cancelled.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            real_dump = lane.dump
+            def flag_on_complete(path, value):
+                if Path(path).name == "summary.json" \
+                        and value.get("complete") is True:
+                    lane._CANCEL_REQUESTED = True
+                return real_dump(path, value)
+            real_gp = lane._guarded_publish
+            owners = []
+            def in_rewrite():
+                frame = sys._getframe(1)
+                while frame is not None:
+                    if frame.f_code.co_name == \
+                            "publish_cancelled_and_raise":
+                        return True
+                    frame = frame.f_back
+                return False
+            def second_kill(path, value, *args):
+                result = real_gp(path, value, *args)
+                if Path(path).name == "ownership.json" \
+                        and value.get("error") == "cancelled" \
+                        and in_rewrite() and not owners:
+                    owners.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return result
+            saved_flag = lane._CANCEL_REQUESTED
+            lane._CANCEL_REQUESTED = False
+            try:
+                with lane.cancellation():
+                    with mock.patch.object(
+                            lane, "dump",
+                            side_effect=flag_on_complete), \
+                            mock.patch.object(
+                                lane, "_guarded_publish",
+                                side_effect=second_kill):
+                        outcome, error, calls, printed = self._drive(
+                            root, out, lock,
+                            run_logged=lambda *a, **k: (0, False, b""))
+                    # _drive's flag save/restore is test
+                    # hygiene; in production the flag that
+                    # fired the post-check repair persists
+                    # into this scope.
+                    lane._CANCEL_REQUESTED = True
+            except InterruptedError as outer:
+                self.assertIn("owned descendants reaped", str(outer))
+            else:
+                self.fail("repair-path cancel lost")
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(owners, [1])
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertEqual(summary["error"], "cancelled")
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self._assert_lock_released(lock)
+
+    def test_signal_during_slot_repair_still_repairs(self):
+        # a real signal between the slot repair's two
+        # publishes, under the lane's own cancellation: the
+        # flag-only delivery cannot interrupt the backstop,
+        # so the complete summary is still rewritten. (On
+        # the raising shape the summary rewrite is skipped
+        # and complete:true survives.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            fired = []
+            flagged = []
+            real_print = print
+            def killer_print(*args, **kwargs):
+                if not fired and any("evidence" in str(part)
+                                     for part in args):
+                    fired.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    flagged.append(lane._CANCEL_REQUESTED)
+                return real_print(*args, **kwargs)
+            real_gp = lane._guarded_publish
+            owners = []
+            def in_slot_repair():
+                frame = sys._getframe(1)
+                while frame is not None:
+                    if frame.f_code.co_name == \
+                            "_repair_cancelled_evidence":
+                        return True
+                    frame = frame.f_back
+                return False
+            def second_kill(path, value, *args):
+                result = real_gp(path, value, *args)
+                if Path(path).name == "ownership.json" \
+                        and value.get("error") == "cancelled" \
+                        and in_slot_repair() and not owners:
+                    owners.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return result
+            saved_flag = lane._CANCEL_REQUESTED
+            lane._CANCEL_REQUESTED = False
+            try:
+                # the publish mock outlives the drive: the
+                # slot repair runs at scope exit, after it.
+                with mock.patch.object(
+                        lane, "_guarded_publish",
+                        side_effect=second_kill):
+                    with lane.cancellation():
+                        with mock.patch.object(
+                                builtins, "print",
+                                side_effect=killer_print):
+                            outcome, code, calls, printed = \
+                                self._drive(
+                                    root, out, lock,
+                                    run_logged=lambda *a, **k: (
+                                        0, False, b""))
+                        # _drive hygiene clears the flag the
+                        # kill set; production persists it
+                        # here, where the consumed slot
+                        # rewrites the evidence.
+                        lane._CANCEL_REQUESTED = True
+            except InterruptedError as outer:
+                self.assertIn("owned descendants reaped", str(outer))
+            else:
+                self.fail("post-check cancel lost")
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(fired, [1])
+            self.assertEqual(flagged, [True])
+            self.assertEqual(owners, [1])
+            self.assertEqual(outcome, "returned")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertEqual(summary["error"], "cancelled")
+            receipt = json.loads((out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self._assert_lock_released(lock)
+
+    def test_repair_only_rewrites_complete_summaries(self):
+        # the slot repair's gate: a complete:true summary is
+        # rewritten as cancelled, while absent, malformed, or
+        # already non-complete evidence repairs to a no-op —
+        # a failure record's root cause is never clobbered.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            receipt = {"status": "finished", "exit": 0}
+            (out / "summary.json").write_text(json.dumps(
+                {"exit": 0, "complete": True,
+                 "accepted_partials": []}))
+            lane._repair_cancelled_evidence(out, receipt, [])
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertEqual(summary["error"], "cancelled")
+            repaired = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(repaired["status"], "failed")
+            # the in-memory receipt is not mutated.
+            self.assertEqual(receipt["status"], "finished")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            failure = {"exit": 1, "complete": False,
+                       "error": "stage binary gone"}
+            (out / "summary.json").write_text(json.dumps(failure))
+            before = (out / "summary.json").read_bytes()
+            lane._repair_cancelled_evidence(
+                out, {"status": "failed"}, [])
+            self.assertEqual((out / "summary.json").read_bytes(),
+                             before)
+            self.assertFalse((out / "ownership.json").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            lane._repair_cancelled_evidence(
+                out, {"status": "failed"}, [])
+            self.assertFalse((out / "summary.json").exists())
+            self.assertFalse((out / "ownership.json").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / "results.json").write_text("[]")
+            (out / "summary.json").write_text("not json{")
+            lane._repair_cancelled_evidence(
+                out, {"status": "failed"}, [])
+            self.assertEqual((out / "summary.json").read_text(),
+                             "not json{")
+
+    def test_broken_final_print_keeps_completed_lane(self):
+        # the final diagnostic print is contained: EPIPE on
+        # exactly that line must not fail a completed lane
+        # (complete:true with exit 1). (On the bare-print
+        # shape this raises out of execute.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            real_print = print
+            fired = []
+            def final_broken(*args, **kwargs):
+                if any("evidence" in str(part) for part in args):
+                    fired.append(1)
+                    raise BrokenPipeError("stdout closed")
+                return real_print(*args, **kwargs)
+            with mock.patch.object(builtins, "print",
+                                   side_effect=final_broken):
+                outcome, code, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(fired, [1])
+            self.assertEqual(outcome, "returned")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], True)
+
     def test_deferred_publish_escape_surfaces_after_cleanup(self):
         # MemoryError inside the ownership publish: unmounts and
         # the lock close still happen; the error surfaces gated
@@ -2504,6 +3240,80 @@ class ExecuteWiring(unittest.TestCase):
 
 
 class ProcessCustody(unittest.TestCase):
+    def test_cancellation_repair_slot_consumed_once(self):
+        # the repair slot is take-and-clear: a registered
+        # repair runs exactly when the flag is set, and never
+        # leaks into a later scope.
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        calls = []
+        try:
+            lane._CANCEL_REQUESTED = False
+            lane._CANCELLATION_REPAIR = lambda: calls.append(1)
+            with lane.cancellation():
+                pass
+            self.assertEqual(calls, [])
+            self.assertIsNone(lane._CANCELLATION_REPAIR)
+            lane._CANCEL_REQUESTED = True
+            lane._CANCELLATION_REPAIR = lambda: calls.append(1)
+            with self.assertRaises(InterruptedError):
+                with lane.cancellation():
+                    pass
+            self.assertEqual(calls, [1])
+            self.assertIsNone(lane._CANCELLATION_REPAIR)
+            with self.assertRaises(InterruptedError):
+                with lane.cancellation():
+                    pass
+            self.assertEqual(calls, [1])
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+            lane._CANCELLATION_REPAIR = saved_slot
+
+    def test_cancellation_failed_repair_keeps_cancel_raise(self):
+        # a repair that fails (disk gone) is reported, never
+        # fatal: the cancel raise still propagates.
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        def boom():
+            raise OSError("disk gone")
+        try:
+            lane._CANCEL_REQUESTED = True
+            lane._CANCELLATION_REPAIR = boom
+            with self.assertRaises(InterruptedError) as raised:
+                with lane.cancellation():
+                    pass
+            self.assertIn("owned descendants reaped",
+                          str(raised.exception))
+            self.assertIsNone(lane._CANCELLATION_REPAIR)
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+            lane._CANCELLATION_REPAIR = saved_slot
+
+    def test_supervised_wait_notices_cancel_promptly(self):
+        # like the run_logged slice: a supervised child that
+        # would idle past the test must still release on a
+        # flag within slices (EOF on stdin wakes it), not at
+        # its own 10 s self-timeout. (On the single-wait
+        # shape the flag is ignored and the child times
+        # itself out, returning instead of raising.)
+        helper = ("import sys, select; "
+                  "select.select([sys.stdin], [], [], 10)")
+        saved_flag = lane._CANCEL_REQUESTED
+        lane._CANCEL_REQUESTED = False
+        def setter():
+            lane._CANCEL_REQUESTED = True
+        timer = threading.Timer(0.5, setter)
+        timer.start()
+        try:
+            start = time.monotonic()
+            with self.assertRaises(InterruptedError):
+                lane.launch_supervised([sys.executable, "-c", helper])
+            self.assertLess(time.monotonic() - start, 8)
+        finally:
+            timer.cancel()
+            timer.join(timeout=5)
+            lane._CANCEL_REQUESTED = saved_flag
+
     def test_watcher_thread_blocks_cancel_signals(self):
         # per-thread masks: the watcher must block SIGTERM/SIGINT
         # or a delivery there schedules the Python handler on

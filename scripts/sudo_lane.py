@@ -15,6 +15,7 @@ import contextlib
 import ctypes
 import datetime
 import fcntl
+import functools
 import hashlib
 import io
 import json
@@ -119,6 +120,18 @@ ENV_GATED_BODIES = {
 }
 ENV_GATE_DOC = "docs/lane-environment.md"
 _CANCEL_REQUESTED = False
+# Evidence repair for a cancel that lands after execute's last
+# checkpoint: set by execute just before the complete summary
+# is published, consumed (take-and-clear) by cancellation's
+# finally. Repairs only an existing complete:true summary —
+# never a failure record — so running it on a raise path is
+# a no-op read, never a root-cause clobber.
+_CANCELLATION_REPAIR = None
+# Wait slice for cancel polling: run_logged and
+# launch_supervised re-check the flag this often, so a
+# flag-only cancel takes effect within ~a slice instead of
+# at child exit. Well under the 5 s custody deadlines.
+_WAIT_SLICE = 0.25
 
 
 def _text_sink(fd):
@@ -833,16 +846,40 @@ def _say(message):
 
 @contextlib.contextmanager
 def cancellation():
-    def cancelled(sig, _frame):
+    """Flag-only cancel scope: the handler notes the signal and
+    returns; cancellation takes effect at checkpoints (wait
+    slices, explicit flag checks) as explicit InterruptedError.
+
+    A raising handler can never be safe to install here: any
+    delivery between a finally's entry and its shield aborts
+    the whole cleanup, and any delivery after the last
+    checkpoint escapes the evidence repair. With flag-only
+    semantics there is no unshielded raising window at all —
+    the completion boundary is exact: a flag set before
+    execute returns is repaired and raises (exit 1); a flag
+    set after is a post-completion cancel (exit 0 stands).
+    """
+    def noted(sig, _frame):
         global _CANCEL_REQUESTED
         _CANCEL_REQUESTED = True
-        raise InterruptedError(f"cancelled by signal {sig}")
-    saved = {sig: signal.signal(sig, cancelled) for sig in (signal.SIGTERM, signal.SIGINT)}
+    saved = {sig: signal.signal(sig, noted) for sig in (signal.SIGTERM, signal.SIGINT)}
     subreaper()
     try:
         yield
     finally:
+        global _CANCELLATION_REPAIR
+        repair, _CANCELLATION_REPAIR = _CANCELLATION_REPAIR, None
         reap_owned()
+        # Repair before restoring the foreign handlers: under
+        # flag-only semantics nothing can interrupt it, while
+        # a restored raising handler could. Absent or already
+        # non-complete evidence repairs to a no-op, and a
+        # repair failure must never break the cancel raise.
+        if _CANCEL_REQUESTED and repair is not None:
+            try:
+                repair()
+            except (OSError, ValueError, MemoryError) as error:
+                _say(f"sudo-lane: cancel repair failed: {error}")
         for sig, handler in saved.items():
             signal.signal(sig, handler)
         if _CANCEL_REQUESTED:
@@ -884,7 +921,23 @@ def watch_parent_pipe():
 def launch_supervised(command):
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, start_new_session=True)
     try:
-        return proc.wait()
+        # Sliced wait: the flag-only handler cannot break a
+        # blocking wait, so poll it. A flag at any slice —
+        # including one set as the child exits — raises
+        # through the same EOF-and-wait path a raising
+        # delivery used to take.
+        while True:
+            if _CANCEL_REQUESTED:
+                raise InterruptedError(
+                    "cancelled; requesting privileged cleanup")
+            try:
+                code = proc.wait(timeout=_WAIT_SLICE)
+            except subprocess.TimeoutExpired:
+                continue
+            if _CANCEL_REQUESTED:
+                raise InterruptedError(
+                    "cancelled; requesting privileged cleanup")
+            return code
     finally:
         # EOF requests cooperative privileged cleanup; the wrapper waits for
         # the executor to release custody instead of abandoning its session.
@@ -985,10 +1038,32 @@ def run_logged(command, log, timeout, cwd=None, env=None, stderr_path=None):
         proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=sink, stdin=subprocess.DEVNULL,
                                 stderr=stderr, start_new_session=True)
         try:
-            code = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            code = 124
+            # Sliced wait against the deadline: the flag-only
+            # handler cannot break a blocking wait, so each
+            # slice re-checks the flag first. Timeout
+            # semantics are unchanged (deadline expiry still
+            # yields 124); a flag at any slice — including one
+            # set as the child exits — takes the same cancel
+            # path a raising delivery used to take.
+            deadline = start + timeout
+            while True:
+                if _CANCEL_REQUESTED:
+                    cancelled = True
+                    raise InterruptedError("cancelled during wait")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    code = 124
+                    break
+                try:
+                    code = proc.wait(
+                        timeout=min(_WAIT_SLICE, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
+                if _CANCEL_REQUESTED:
+                    cancelled = True
+                    raise InterruptedError("cancelled during wait")
+                break
         except BaseException:
             cancelled = True
             raise
@@ -1422,12 +1497,12 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             # A cancel that arrived after the entry check (e.g.
             # during the unmounts) must still reach the receipt.
-            # The check sits adjacent to the publish; the
-            # residual check-act race (a deferred signal landing
-            # between the two statements) still cancels the exit
-            # at the end — only the receipt status could lag by
-            # one publish, and the final checkpoint below
-            # corrects even that.
+            # The check sits adjacent to the publish; a flag
+            # landing between the two statements is caught by
+            # the cancel-raise branch below, which republishes
+            # the receipt as cancelled before raising (the
+            # post-finally checkpoint never runs on that path,
+            # so the correction must happen here).
             if _CANCEL_REQUESTED:
                 receipt.update(status="failed", exit=1, error="cancelled")
             try:
@@ -1444,6 +1519,20 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                     error.__cause__ = deferred[0]
                 raise error
             if _CANCEL_REQUESTED:
+                # The receipt above may say finished: the flag
+                # can land after the adjacent check. Republish
+                # as cancelled so the receipt never
+                # contradicts the raise (idempotent when the
+                # entry check already rewrote it).
+                receipt.update(status="failed", exit=1, error="cancelled")
+                try:
+                    _guarded_publish(out / "ownership.json", receipt,
+                                     publish_errors, deferred)
+                except BaseException as error:
+                    deferred.append(error)
+                if publish_errors or deferred:
+                    _say("sudo-lane: evidence publishing problems: "
+                         f"{publish_errors + [type(e).__name__ for e in deferred]}")
                 error = InterruptedError("cancelled; lane cleanup complete")
                 if deferred:
                     error.__cause__ = deferred[0]
@@ -1486,6 +1575,17 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         publish_cancelled_and_raise()
     # A complete summary is published only after owned processes and
     # mounts are gone. An interrupted cleanup cannot leave a green receipt.
+    #
+    # Backstop for a flag landing after the post-dump check
+    # below: register an evidence repair for the enclosing
+    # cancellation scope, consumed exactly once there (bound
+    # to these in-memory values — never from disk, which the
+    # preparer can still write). Completion boundary (exact):
+    # a flag set before execute returns is repaired and
+    # raises (exit 1); a flag set after is post-completion.
+    global _CANCELLATION_REPAIR
+    _CANCELLATION_REPAIR = functools.partial(
+        _repair_cancelled_evidence, out, receipt, results)
     lab_bodies = len(EXPECTED[LAB_SUITE])
     vng_bodies = len(EXPECTED[VNG_SUITE])
     lane_bodies = sum(len(names) for names in EXPECTED.values()) - lab_bodies - vng_bodies
@@ -1494,8 +1594,45 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                                 "accepted_partials": summarize_partials(results), "complete": True})
     if _CANCEL_REQUESTED:
         publish_cancelled_and_raise()
-    print(f"sudo-lane: {counts}; exit {code}; evidence {out}", flush=True)
+    # Contained: a broken stdout must not turn a completed
+    # lane into a failed one (complete:true with exit 1).
+    _say(f"sudo-lane: {counts}; exit {code}; evidence {out}")
     return code
+
+
+def _repair_cancelled_evidence(out, receipt, results):
+    """Rewrite an existing complete:true summary as cancelled.
+
+    Only a complete:true summary is touched (plus the
+    receipt): absent, malformed, or already non-complete
+    evidence repairs to a no-op, so a failure record's root
+    cause is never clobbered — running this on a raise path
+    can only re-read, never overwrite.
+    """
+    try:
+        summary = json.loads((out / "summary.json").read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(summary, dict) \
+            or summary.get("complete") is not True:
+        return
+    repair_receipt = dict(receipt)
+    repair_receipt.update(status="failed", exit=1, error="cancelled")
+    repair_errors = []
+    repair_deferred = []
+    try:
+        _guarded_publish(out / "ownership.json", repair_receipt,
+                         repair_errors, repair_deferred)
+        _guarded_publish(out / "summary.json", {
+            "exit": 1, "complete": False, "error": "cancelled",
+            "accepted_partials": summarize_partials(
+                committed_prefix(out, results))},
+            repair_errors, repair_deferred)
+    except BaseException as error:
+        repair_deferred.append(error)
+    if repair_errors or repair_deferred:
+        _say("sudo-lane: evidence publishing problems: "
+             f"{repair_errors + [type(e).__name__ for e in repair_deferred]}")
 
 
 def main():
