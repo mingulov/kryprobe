@@ -873,12 +873,20 @@ def _say(message):
     undiscoverable descriptor, or one aliased to
     stdio (0/2), is left strictly alone: touching fd
     1 there would only destroy healthy output while
-    the broken stream still fails at shutdown. That
-    residual exit 120 is unfixable from here and
-    documented, not silent (see the proxy and
-    fd2alias dispositions). Only the stream's own
-    discovered descriptor is ever redirected; the
-    conventional fd is never used as a fallback."""
+    the broken stream is still broken. The shutdown
+    outcome then depends on the runtime: bytes
+    pending at shutdown fail the final flush (exit
+    120), while a failed flush may or may not retain
+    its buffer for a retry depending on the version
+    (3.12 exits 0 on the bare alias shape, 3.14
+    exits 120) — either way unfixable from here and
+    documented, not silent (see the proxy
+    disposition, deterministic through an
+    always-raising write, and the fd2alias
+    disposition, which forces the pending state).
+    Only the stream's own discovered descriptor is
+    ever redirected; the conventional fd is never
+    used as a fallback."""
     try:
         print(message, flush=True)
     except ValueError:

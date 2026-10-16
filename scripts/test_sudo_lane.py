@@ -4966,10 +4966,16 @@ class ProcessCustody(unittest.TestCase):
         # sys.stdout rebound to a broken fd-2 stream while
         # fd 1 stays healthy: the line is swallowed but fd
         # 1 is never redirected — later output lands. The
-        # residual exit 120 (the broken stream still fails
-        # at shutdown) is defined, not silent. (On the
-        # blind-fallback shape fd 1 is nulled and AFTER
-        # is lost.)
+        # residual shutdown failure (the broken stream is
+        # still broken — nothing was redirected) exits
+        # 120. The extra buffered write forces bytes to
+        # be pending at shutdown: whether a failed flush
+        # retains its buffer is version-dependent (3.12
+        # exits 0 without it, 3.14 exits 120), but
+        # pending bytes fail the shutdown flush on every
+        # version. (On the blind-fallback shape fd 1 is
+        # nulled and AFTER is lost; if fd 2 were
+        # redirected the shutdown would exit 0.)
         reader, writer = os.pipe()
         os.close(reader)
         proc = subprocess.Popen(
@@ -4978,6 +4984,7 @@ class ProcessCustody(unittest.TestCase):
              "import sudo_lane as lane; "
              "sys.stdout = os.fdopen(2, 'w', closefd=False); "
              "lane._say('x' * 100000); "
+             "sys.stdout.write('z' * 100); "
              "os.write(1, b'AFTER\\n'); sys.exit(0)",
              str(Path(lane.__file__).parent)],
             stdout=subprocess.PIPE, stderr=writer)
