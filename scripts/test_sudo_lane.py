@@ -1388,14 +1388,17 @@ def _binding_violations(source):
     attribute access, and method calls on a tainted
     receiver), and must not reach a read or exec primitive
     — directly as a bare argument to any call except the
-    diagnostic sinks (print, _say), or nested inside a
-    larger argument to a read/exec primitive (publish
-    sinks stay allowed, so derived-path bookkeeping
-    never fires). Containers (Dict/List/Set displays)
-    do NOT propagate taint: the result dicts carry log
-    strings to the publish sinks by design, so a
-    container round-trip back into a read is a
-    documented residual. Every run_logged is 3-unpacked
+    diagnostic sinks (print, _say, voided when rebound
+    anywhere) and the results.append publish sink, or
+    nested inside a larger argument to a read/exec
+    primitive (publish sinks stay allowed, so
+    derived-path bookkeeping never fires). Containers
+    (Tuple/List/Dict/Set displays) propagate taint, so
+    a container round-trip back into a read fires;
+    calls whose callee is itself a call are unknown
+    sinks (a bare tainted argument fires), and read
+    methods on tainted-containing receivers fire.
+    Every run_logged is 3-unpacked
     (a discarded bare call is a violation too) with the
     bytes used past the call site but before the next
     rebinding of that name — positions are (line, col)
@@ -1411,6 +1414,70 @@ def _binding_violations(source):
                      "execlp", "execvp", "execvpe", "system",
                      "popen")
     tree = ast.parse(source)
+    # A rebound diagnostic name is no diagnostic: any
+    # binding of print/_say voids the exemption for the
+    # whole module — anywhere, by any form, except the
+    # single top-level def that IS the real sink (a
+    # wholesale replacement of that def is body
+    # verification, out of scope like any new helper).
+    top_level_defs = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            top_level_defs.add(id(stmt))
+    rebound_diagnostics = set()
+    for top in ast.walk(tree):
+        if isinstance(top, ast.Assign):
+            maybe = list(top.targets)
+        elif isinstance(top, ast.AnnAssign) \
+                and top.value is not None:
+            maybe = [top.target]
+        elif isinstance(top, (ast.For, ast.AsyncFor)):
+            maybe = [top.target]
+        elif isinstance(top, ast.AugAssign):
+            maybe = [top.target]
+        elif isinstance(top, ast.NamedExpr):
+            maybe = [top.target]
+        elif isinstance(top, (ast.With, ast.AsyncWith)):
+            maybe = [item.optional_vars for item in top.items
+                     if item.optional_vars is not None]
+        elif isinstance(top, ast.comprehension):
+            maybe = [top.target]
+        else:
+            maybe = []
+        for target in maybe:
+            for name in _bound_names(target):
+                if name in diagnostic_sinks:
+                    rebound_diagnostics.add(name)
+        if isinstance(top, ast.ExceptHandler) \
+                and top.name in diagnostic_sinks:
+            rebound_diagnostics.add(top.name)
+        if isinstance(top, ast.Match):
+            for case in top.cases:
+                for name in _match_names(case.pattern):
+                    if name in diagnostic_sinks:
+                        rebound_diagnostics.add(name)
+        if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.ClassDef)) \
+                and id(top) not in top_level_defs \
+                and top.name in diagnostic_sinks:
+            rebound_diagnostics.add(top.name)
+        if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef,
+                            ast.Lambda)):
+            args = top.args
+            params = list(args.args) + list(args.kwonlyargs)
+            params += list(getattr(args, "posonlyargs", []))
+            for extra in (args.vararg, args.kwarg):
+                if extra is not None:
+                    params.append(extra)
+            for param in params:
+                if param.arg in diagnostic_sinks:
+                    rebound_diagnostics.add(param.arg)
+        if isinstance(top, (ast.Import, ast.ImportFrom)):
+            for alias in top.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if bound in diagnostic_sinks:
+                    rebound_diagnostics.add(bound)
     funcs = [node for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef)
              and node.name in ("execute", "prepare")]
@@ -1449,33 +1516,31 @@ def _binding_violations(source):
             changed = False
 
             def direct_hit(value):
-                # direct shapes only (a bare name or a tuple/list
-                # of bare names): anything deeper fires at its own
-                # construction site, so tainting through it would
-                # only mislabel bookkeeping dicts like `result`.
-                if isinstance(value, ast.Name):
-                    return value.id in tainted
-                if isinstance(value, (ast.Tuple, ast.List)):
-                    return any(isinstance(elt, ast.Name)
-                               and elt.id in tainted
-                               for elt in value.elts)
-                return False
+                # a bare name only: every deeper shape goes
+                # through laundered() containment below.
+                return isinstance(value, ast.Name) \
+                    and value.id in tainted
 
             def laundered(value):
                 # targeted value-shape spread: the path
                 # survives these launderings, so a binding
-                # through any of them stays tainted. A
+                # through any of them stays tainted.
+                # Containers (Tuple/List/Dict/Set) propagate
+                # too: the result-dict bookkeeping this
+                # taints flows only to the results.append
+                # publish sink, which stays allowed. A
                 # method call on a tainted receiver counts;
                 # a plain call with tainted arguments
                 # already fires at its own construction
                 # site (bare tainted argument), so
                 # spreading through it would add nothing.
-                # Containers are deliberately excluded
-                # (see the docstring residual).
                 if isinstance(value, (ast.IfExp, ast.BoolOp,
                                       ast.BinOp, ast.Subscript,
                                       ast.JoinedStr,
-                                      ast.Attribute)):
+                                      ast.Attribute,
+                                      ast.Tuple, ast.List,
+                                      ast.Set, ast.Dict,
+                                      ast.NamedExpr)):
                     return tainted_in(value, tainted)
                 if isinstance(value, ast.Call) and isinstance(
                         value.func, ast.Attribute):
@@ -1499,6 +1564,8 @@ def _binding_violations(source):
                     spread(node.value, list(node.targets))
                 elif isinstance(node, ast.AnnAssign) \
                         and node.value is not None:
+                    spread(node.value, [node.target])
+                elif isinstance(node, ast.AugAssign):
                     spread(node.value, [node.target])
                 elif isinstance(node, (ast.For, ast.AsyncFor)):
                     spread(node.iter, [node.target])
@@ -1530,6 +1597,8 @@ def _binding_violations(source):
             elif isinstance(node, ast.AnnAssign) \
                     and node.value is not None:
                 note(node.target, node)
+            elif isinstance(node, ast.AugAssign):
+                note(node.target, node)
             elif isinstance(node, (ast.For, ast.AsyncFor)):
                 note(node.target, node)
             elif isinstance(node, ast.NamedExpr):
@@ -1554,8 +1623,7 @@ def _binding_violations(source):
             called = node.func
             if isinstance(called, ast.Attribute) \
                     and called.attr in read_attrs \
-                    and isinstance(called.value, ast.Name) \
-                    and called.value.id in tainted:
+                    and tainted_in(called.value, tainted):
                 violations.append(
                     f"{func.name}:{node.lineno} reads tainted path")
                 continue
@@ -1573,12 +1641,32 @@ def _binding_violations(source):
                 dotted.append(value.id)
                 opener = ".".join(reversed(dotted))
                 simple = called.attr
+            elif isinstance(called, ast.Call):
+                # Unknown sink (a call returning the
+                # callee, e.g. getattr(P, "m")): a bare
+                # tainted argument still escapes to it.
+                carried = [arg for arg in node.args]
+                carried.extend(keyword.value
+                               for keyword in node.keywords)
+                if any(isinstance(arg, ast.Name)
+                       and arg.id in tainted
+                       for arg in carried):
+                    violations.append(
+                        f"{func.name}:{node.lineno} tainted "
+                        "path escapes to call()")
+                continue
             else:
                 continue
             if opener in consumers \
                     or opener.endswith(".run_logged"):
                 continue
-            if opener in diagnostic_sinks:
+            if opener in diagnostic_sinks \
+                    and opener not in rebound_diagnostics:
+                continue
+            if opener == "results.append":
+                # Publish sink: the result-dict
+                # bookkeeping (tainted via the log strings
+                # it carries by design) flows here.
                 continue
             carried = [arg for arg in node.args]
             carried.extend(keyword.value for keyword in node.keywords)
@@ -1644,21 +1732,23 @@ class CapturedBytesBinding(unittest.TestCase):
         # the narrow tripwire (see _binding_violations).
         # Known-narrow (documented, not missed): novel
         # primitives reached only through nested laundering
-        # (evil(deep(log))), reads through non-Name
-        # receivers, container round-trips (d = {"p": log};
-        # open(d["p"]) — Dict displays don't propagate, so
-        # the result-dict bookkeeping stays silent), new
-        # helper functions, nested-function scopes, and
-        # import bindings. Direct constructor
+        # into unknown sinks (evil(deep(log)) with no bare
+        # tainted argument anywhere), comprehension and
+        # lambda bindings, container append round-trips
+        # (x.append(log) then open(x[0]) — appends don't
+        # bind), new helper functions, nested-function
+        # scopes, and wholesale replacement of the sink
+        # defs. Direct constructor
         # calls (Path(log), pathlib.Path(log)) ARE caught,
         # as is nesting inside read/exec primitives. The
         # mock-driven ExecuteWiring behavioral tests
         # (selftest + Cargo + e2e + runtime-list +
         # lifecycle-support conflicting-bytes fixtures) are
         # the backstop for the execute verdict sites; the
-        # prepare inventory sites ride the guard only
-        # (driving prepare needs git+cargo scaffolding).
-        # This guard only catches mechanical reverts.
+        # prepare inventory sites have their own
+        # mocked-subprocess drive (PrepareDriving) with
+        # planted-path fixtures. This guard only catches
+        # mechanical reverts.
         self.assertEqual(
             _binding_violations(Path(lane.__file__).read_text()), [])
 
@@ -1839,6 +1929,52 @@ class CapturedBytesBinding(unittest.TestCase):
              "cwd=root, env=env); captured = b\"x\"\n"
              "            output = decode_body_log(captured)\n",
              "captured bytes unused past the call site"),
+            ("rebound-say",
+             anchor,
+             head + "            _say = open\n"
+             "            output = decode_body_log(captured)\n"
+             "            _d = _say(log, \"rb\").read()\n",
+             "tainted path escapes to _say()"),
+            ("dict-roundtrip",
+             anchor,
+             head + "            box = {\"p\": log}\n"
+             "            output = decode_body_log(captured)\n"
+             "            _d = open(box[\"p\"], \"rb\").read()\n",
+             "tainted path escapes to open()"),
+            ("list-roundtrip",
+             anchor,
+             head + "            box = [log]\n"
+             "            output = decode_body_log(captured)\n"
+             "            _d = open(box[0], \"rb\").read()\n",
+             "tainted path escapes to open()"),
+            ("tuple-call-elt",
+             anchor,
+             head + "            pth, _n = log.absolute(), 0\n"
+             "            output = decode_body_log(captured)\n"
+             "            _d = open(pth, \"rb\").read()\n",
+             "tainted path escapes to open()"),
+            ("augassign-spread",
+             anchor,
+             head + "            pth = Path(\"/x\")\n"
+             "            pth /= log\n"
+             "            output = decode_body_log(captured)\n"
+             "            _d = open(pth, \"rb\").read()\n",
+             "tainted path escapes to open()"),
+            ("augassign-horizon",
+             anchor,
+             head + "            captured += b\"x\"\n"
+             "            output = decode_body_log(captured)\n",
+             "captured bytes unused past the call site"),
+            ("call-of-call",
+             anchor,
+             head + "            output = decode_body_log(captured)\n"
+             "            _d = getattr(Path, \"read_bytes\")(log)\n",
+             "tainted path escapes to call()"),
+            ("chained-read",
+             anchor,
+             head + "            output = decode_body_log(captured)\n"
+             "            _d = log.absolute().read_bytes()\n",
+             "reads tainted path"),
         ]
         for name, find, repl, fragment in cases:
             with self.subTest(shape=name):
@@ -2171,24 +2307,58 @@ class LoggedPaths(unittest.TestCase):
 
     def test_sink_setup_is_not_charged_to_timeout(self):
         # the wait budget starts at spawn: a 0.3 s sink
-        # setup with timeout=0.2 and an instant child still
-        # reports the child's code. (On the pre-spawn
-        # deadline this yields 124.)
+        # setup with timeout=0.2 and a LIVE instant child
+        # still reports the child's code. (On the pre-spawn
+        # deadline this yields 124. A pre-reaped child
+        # cannot tell the shapes apart — the poll-first
+        # branch returns before the deadline matters — so
+        # the child must be really spawned.)
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "slow-sink.log"
-            proc = subprocess.Popen(["true"])
-            self.assertEqual(proc.wait(), 0)
             real_sink = lane._exclusive_sink
             def slow_sink(*args, **kwargs):
                 time.sleep(0.3)
                 return real_sink(*args, **kwargs)
-            with mock.patch.object(lane.subprocess, "Popen",
-                                   return_value=proc), \
-                    mock.patch.object(lane, "_exclusive_sink",
-                                      side_effect=slow_sink):
+            with mock.patch.object(lane, "_exclusive_sink",
+                                   side_effect=slow_sink):
                 code, timed_out, captured = lane.run_logged(
                     ["true"], log, 0.2)
             self.assertEqual((code, timed_out), (0, False))
+
+    def test_expiry_repolls_before_declaring_timeout(self):
+        # terminal status is re-observed at the expiry
+        # edge: a child that exits inside the budget is
+        # reported exited even when the runner was
+        # preempted after a stale poll. (Without the
+        # re-poll this reports code 124 with
+        # reaped_status 0.)
+        real_popen = subprocess.Popen
+        class Preempted(real_popen):
+            def poll(self):
+                result = super().poll()
+                if result is None and not getattr(
+                        self, "_once", False) \
+                        and time.monotonic() - self._t0 > 0.05:
+                    self._once = True
+                    time.sleep(0.4)
+                return result
+
+            def __init__(self, *args, **kwargs):
+                self._t0 = time.monotonic()
+                super().__init__(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "race.log"
+            with mock.patch.object(lane.subprocess, "Popen",
+                                   Preempted), \
+                    mock.patch.object(lane, "_WAIT_SLICE", 0.06):
+                code, timed_out, captured = lane.run_logged(
+                    ["sleep", "0.1"], log, 0.3)
+            self.assertEqual((code, timed_out), (0, False))
+            result = json.loads(
+                log.with_suffix(".log.result.json").read_text())
+            self.assertEqual(result["reaped_status"], 0)
+            self.assertEqual(result["raw_exit"], 0)
 
     def test_failed_spawn_leaks_no_sink(self):
         # raw descriptors go to Popen (no wrap stage to fail);
@@ -2268,6 +2438,262 @@ class LoggedPaths(unittest.TestCase):
             self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
 
+class PrepareDriving(unittest.TestCase):
+    # prepare() with a mocked subprocess layer (git, cargo,
+    # test-list children) and real filesystem effects in a
+    # tmp root: the prepare inventory sites get behavioral
+    # conflicting-bytes fixtures instead of riding the
+    # guard alone.
+    CLI_ID = "kryprobe-cli 0.1.0 (path+file:///src)"
+    POLICY_ID = "kryprobe-policy 0.1.0 (path+file:///src)"
+
+    def _scaffold(self, root):
+        host_debug = root / "host" / "debug"
+        host_debug.mkdir(parents=True)
+        (host_debug / "kryprobe").write_bytes(b"cli-binary")
+        (host_debug / "probe_bin").write_bytes(b"probe-binary")
+        for name in lane.OBJECTS:
+            target = root / "target/kryprobe-bpf" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"object:" + name.encode())
+        gen = root / "gen.py"
+        gen.write_text("x = 1\n")
+        out = root / "out"
+        out.mkdir()
+        return host_debug, gen, out
+
+    def _cargo_payload(self, host_debug):
+        def row(package_id, target, kind, test, exe):
+            return {"reason": "compiler-artifact",
+                    "package_id": package_id,
+                    "target": {"name": target, "kind": kind},
+                    "profile": {"test": test}, "features": [],
+                    "executable": str(exe)}
+        lines = [
+            row(self.CLI_ID, "kryprobe", ["bin"], False,
+                host_debug / "kryprobe"),
+            row(self.POLICY_ID, "rule_unit", ["test"], True,
+                host_debug / "probe_bin"),
+            {"reason": "build-finished", "success": True},
+        ]
+        return ("\n".join(json.dumps(line) for line in lines)
+                + "\n").encode()
+
+    def _drive_prepare(self, root, out, cargo_bytes, listing,
+                       run_hook=None, check_hook=None,
+                       forbid_plain_check_output=False):
+        saved_flag = lane._CANCEL_REQUESTED
+        info = {"planted": [], "observed": [], "check_calls": []}
+        metadata = json.dumps({"packages": [
+            {"id": self.CLI_ID, "name": "kryprobe-cli"},
+            {"id": self.POLICY_ID, "name": "kryprobe-policy"},
+        ]}).encode()
+
+        def fake_check_output(command, *, cwd=None, env=None,
+                              text=False):
+            info["check_calls"].append(list(command))
+            if check_hook is not None:
+                check_hook(command)
+            if command[:2] == ["git", "ls-files"]:
+                return b""
+            if command[:2] == ["git", "rev-parse"]:
+                return "deadbeef\n" if text else b"deadbeef\n"
+            if command[1:2] == ["metadata"]:
+                return metadata.decode() if text else metadata
+            if command[-1:] == ["--version"]:
+                return "tool 1.0\n" if text else b"tool 1.0\n"
+            raise AssertionError(
+                f"unexpected prepare call: {command}")
+
+        def fake_run_logged(command, log, *args, **kwargs):
+            if run_hook is not None:
+                run_hook(command, log)
+            if "--list" in command:
+                return (0, False, listing)
+            if command[1] == "xtask":
+                return (0, False, b"")
+            return (0, False, cargo_bytes)
+
+        def fake_check_output_plain(*args, **kwargs):
+            raise AssertionError("plain check_output used")
+
+        patches = [
+            mock.patch.object(lane, "_check_output_cancel",
+                              side_effect=fake_check_output),
+            mock.patch.object(lane, "run_logged",
+                              side_effect=fake_run_logged),
+            mock.patch.object(
+                lane, "reconcile",
+                side_effect=lambda observed: info[
+                    "observed"].append(observed)),
+        ]
+        if forbid_plain_check_output:
+            patches.append(mock.patch.object(
+                lane.subprocess, "check_output",
+                side_effect=fake_check_output_plain))
+        try:
+            with contextlib.ExitStack() as stack:
+                for entered in patches:
+                    stack.enter_context(entered)
+                try:
+                    manifest = lane.prepare(
+                        root, out, "cargo", root / "gen.py")
+                    return ("returned", manifest, info)
+                except BaseException as error:
+                    return ("raised", error, info)
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+
+    def test_prepare_cargo_uses_captured_bytes_not_planted_path(self):
+        # the cargo-artifact site never reads the step log:
+        # failed-build bytes planted there must not change
+        # the inventory (the M8/G1 shape parses the log
+        # path instead and dies on them). A divergent but
+        # valid plant would break benign cross-step
+        # agreement, so the plant is a meaningful failure
+        # (cargo_artifacts rejects it), not a nominating
+        # rival.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            cargo_bytes = self._cargo_payload(host_debug)
+            planted = json.dumps(
+                {"reason": "build-finished",
+                 "success": False}) + "\n"
+            planted_paths = []
+
+            def plant(command, log):
+                if command[1:2] == ["build"]:
+                    Path(log).write_bytes(planted.encode())
+                    planted_paths.append(Path(log))
+
+            listing = b"listed_body: test\n1 test, 0 benchmarks\n"
+            outcome, manifest, info = self._drive_prepare(
+                root, out, cargo_bytes, listing, run_hook=plant)
+            self.assertEqual(outcome, "returned")
+            by_target = {row["target"]: row
+                         for row in manifest["artifacts"]}
+            self.assertEqual(by_target["kryprobe"]["executable"],
+                             str(host_debug / "kryprobe"))
+            # the mock really did plant the conflict.
+            self.assertEqual(len(planted_paths), 1)
+            self.assertEqual(planted_paths[0].read_bytes(),
+                             planted.encode())
+
+    def test_prepare_list_uses_captured_bytes_not_planted_path(self):
+        # the prepare-listing site reads captured bytes: a
+        # divergent listing planted at the list log must not
+        # change the inventory (the M9/G2 shape reads it).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            cargo_bytes = self._cargo_payload(host_debug)
+            planted = b"planted_body: test\n1 test, 0 benchmarks\n"
+            listing = b"listed_body: test\n1 test, 0 benchmarks\n"
+            planted_paths = []
+
+            def plant(command, log):
+                if "--list" in command:
+                    Path(log).write_bytes(planted)
+                    planted_paths.append(Path(log))
+
+            outcome, manifest, info = self._drive_prepare(
+                root, out, cargo_bytes, listing, run_hook=plant)
+            self.assertEqual(outcome, "returned")
+            by_target = {row["target"]: row
+                         for row in manifest["artifacts"]}
+            self.assertEqual(by_target["rule_unit"]["bodies"],
+                             ["listed_body"])
+            self.assertEqual(
+                info["observed"],
+                [{("kryprobe-policy", "rule_unit"):
+                  ["listed_body"]}])
+            self.assertEqual(len(planted_paths), 1)
+            self.assertEqual(planted_paths[0].read_bytes(),
+                             planted)
+
+    def test_prepare_checkpoint_aborts_between_staged_rows(self):
+        # the per-row staging checkpoint (N6): the flag set
+        # after the first row's digests raises at the second
+        # row's checkpoint — with the prepare message, not
+        # the digest one.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            cargo_bytes = self._cargo_payload(host_debug)
+            listing = b"listed_body: test\n1 test, 0 benchmarks\n"
+            real_digest = lane.digest
+            calls = []
+
+            def counting_digest(path):
+                result = real_digest(path)
+                calls.append(path)
+                if len(calls) == 2:
+                    lane._CANCEL_REQUESTED = True
+                return result
+
+            with mock.patch.object(lane, "digest",
+                                   side_effect=counting_digest):
+                outcome, error, info = self._drive_prepare(
+                    root, out, cargo_bytes, listing)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertEqual(str(error), "cancelled during prepare")
+            self.assertGreaterEqual(len(calls), 2)
+
+    def test_prepare_checkpoint_aborts_between_object_dirs(self):
+        # the per-object-dir checkpoint (N7): the flag set
+        # once staging copies finish raises at the first
+        # object dir — before any object copy.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            cargo_bytes = self._cargo_payload(host_debug)
+            listing = b"listed_body: test\n1 test, 0 benchmarks\n"
+            real_digest = lane.digest
+            digests = []
+            copies = []
+            real_copyfile = lane.shutil.copyfile
+
+            def counting_digest(path):
+                result = real_digest(path)
+                digests.append(path)
+                if len(digests) == 4:
+                    lane._CANCEL_REQUESTED = True
+                return result
+
+            def counting_copyfile(source, target):
+                copies.append((source, target))
+                return real_copyfile(source, target)
+
+            with mock.patch.object(lane, "digest",
+                                   side_effect=counting_digest), \
+                    mock.patch.object(lane.shutil, "copyfile",
+                                      side_effect=counting_copyfile):
+                outcome, error, info = self._drive_prepare(
+                    root, out, cargo_bytes, listing)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            self.assertEqual(str(error), "cancelled during prepare")
+            self.assertEqual(len(copies), 2)
+
+    def test_prepare_metadata_uses_cancel_aware_helper(self):
+        # the cargo-metadata call routes through the
+        # cancel-aware helper (N13): plain check_output is
+        # never used.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            cargo_bytes = self._cargo_payload(host_debug)
+            listing = b"listed_body: test\n1 test, 0 benchmarks\n"
+            outcome, manifest, info = self._drive_prepare(
+                root, out, cargo_bytes, listing,
+                forbid_plain_check_output=True)
+            self.assertEqual(outcome, "returned")
+            self.assertTrue(any(command[1:2] == ["metadata"]
+                                for command in info["check_calls"]))
+
+
 class ExecuteWiring(unittest.TestCase):
     """Mock-driven execute() scenarios: finally wiring, publish
     precedence, signal shielding, and captured-bytes binding.
@@ -2295,7 +2721,7 @@ class ExecuteWiring(unittest.TestCase):
         return out, lock
 
     def _drive(self, root, out, lock, *, run_logged, run_hook=None,
-               dump_hook=None):
+               dump_hook=None, passthrough_run_cancel=False):
         saved_flag = lane._CANCEL_REQUESTED
         calls = []
         tmpfs_targets = []
@@ -2314,8 +2740,16 @@ class ExecuteWiring(unittest.TestCase):
                 target = Path(cmd[1])
                 if target.is_relative_to(root) and target.is_dir() \
                         and not target.is_symlink():
-                    if any(target.iterdir()) \
-                            and str(target) not in tmpfs_targets:
+                    # In passthrough mode mounts bypass this
+                    # mock (the test's Popen mock owns them),
+                    # so tmpfs runtimes — always direct
+                    # children of rt/ — are recognized by
+                    # position. Anywhere else a bypassing
+                    # mount is a harness bug and must fail.
+                    known_tmpfs = str(target) in tmpfs_targets \
+                        or (passthrough_run_cancel
+                            and target.parent == runtime_base)
+                    if any(target.iterdir()) and not known_tmpfs:
                         raise AssertionError(
                             "unmount emulation fed nonempty bind "
                             f"target: {target}")
@@ -2362,11 +2796,16 @@ class ExecuteWiring(unittest.TestCase):
             mock.patch.object(lane, "verify_stage"),
             mock.patch.object(lane, "reconcile"),
             mock.patch.object(lane.subprocess, "run", side_effect=fake_run),
-            mock.patch.object(lane, "_run_cancel",
-                              side_effect=fake_run_cancel),
             mock.patch("tempfile.mkdtemp", side_effect=fake_mkdtemp),
             mock.patch.object(lane, "run_logged", side_effect=run_logged),
         ]
+        if not passthrough_run_cancel:
+            # Mounts emulated (instant, so no poll window).
+            # Passthrough runs the real _run_cancel with the
+            # test's own Popen mock for wait-out coverage.
+            patches.append(
+                mock.patch.object(lane, "_run_cancel",
+                                  side_effect=fake_run_cancel))
         if dump_hook is not None:
             patches.append(
                 mock.patch.object(lane, "dump", side_effect=fake_dump))
@@ -2711,6 +3150,161 @@ class ExecuteWiring(unittest.TestCase):
             self.assertIn(b"no lifecycle announcement",
                           (out / rows["lifecycle-support"]["log"])
                           .read_bytes())
+
+    def test_cancel_during_tmpfs_mount_still_unmounts(self):
+        # wait-out mounts: the flag landing mid-mount does
+        # not strand the effect — the tmpfs mount registers,
+        # cleanup unmounts it, and the cancel raises at the
+        # next checkpoint with the receipt rewritten. (On
+        # the kill shape the mount never registers and no
+        # unmount is attempted.) Runs the real _run_cancel
+        # with a recording Popen mock.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            spawned = []
+
+            def recording_popen(cmd, **kwargs):
+                spawned.append(cmd)
+                if cmd[:2] == ["mount", "-t"]:
+                    lane._CANCEL_REQUESTED = True
+                proc = mock.Mock()
+                proc.wait.return_value = 0
+                return proc
+
+            with mock.patch.object(lane.subprocess, "Popen",
+                                   side_effect=recording_popen):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""),
+                    passthrough_run_cancel=True)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            tmpfs = [cmd[-1] for cmd in spawned
+                     if cmd[:2] == ["mount", "-t"]]
+            self.assertEqual(len(tmpfs), 1)
+            self.assertEqual(self._umount_targets(calls), tmpfs)
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            self._assert_lock_released(lock)
+
+    def test_cancel_during_bind_mount_still_unmounts(self):
+        # the same wait-out ownership for the bind path:
+        # the flag landing during the first bind mount
+        # registers it; the remount's pre-launch check
+        # raises; cleanup unmounts both effects.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            spawned = []
+
+            def recording_popen(cmd, **kwargs):
+                spawned.append(cmd)
+                if cmd[:2] == ["mount", "--bind"]:
+                    lane._CANCEL_REQUESTED = True
+                proc = mock.Mock()
+                proc.wait.return_value = 0
+                return proc
+
+            with mock.patch.object(lane.subprocess, "Popen",
+                                   side_effect=recording_popen):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""),
+                    passthrough_run_cancel=True)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
+            tmpfs = [cmd[-1] for cmd in spawned
+                     if cmd[:2] == ["mount", "-t"]]
+            binds = [cmd[3] for cmd in spawned
+                     if cmd[:2] == ["mount", "--bind"]]
+            self.assertEqual((len(tmpfs), len(binds)), (1, 1))
+            self.assertEqual(set(self._umount_targets(calls)),
+                             set(tmpfs + binds))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(receipt["error"], "cancelled")
+            self._assert_lock_released(lock)
+
+    def test_bind_mount_checks_cancel_before_spawn(self):
+        # mount pre-launch pin (N12): a set flag raises
+        # before any mount child spawns.
+        saved_flag = lane._CANCEL_REQUESTED
+        lane._CANCEL_REQUESTED = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "mnt"
+                target.mkdir()
+                with mock.patch.object(
+                        lane.subprocess, "Popen") as popen:
+                    with self.assertRaises(InterruptedError):
+                        lane.bind_readonly(Path(tmp), target, [])
+                popen.assert_not_called()
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+
+    def test_busy_runtime_records_cleanup_error_not_skip(self):
+        # rmdir containment: a busy runtime dir records a
+        # cleanup error and the finalization still runs —
+        # receipt, summary rewrite, and lock release. (On
+        # the bare shape the OSError escapes with a stale
+        # running receipt, no summary, and a held lock.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            with mock.patch.object(
+                    Path, "rmdir",
+                    side_effect=OSError(16, "Device or "
+                                           "resource busy")):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("owned mount cleanup failed",
+                          str(error))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertTrue(any("rmdir failed" in entry.get(
+                "stderr", "") for entry in receipt[
+                    "cleanup_errors"]))
+            summary = json.loads(
+                (out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertIn("cleanup_errors", summary)
+            self._assert_lock_released(lock)
+
+    def test_execute_copy_aborts_mid_tree_on_cancel(self):
+        # the execute-site copy honors the flag mid-tree
+        # (N14): shutil.copytree would run to completion.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            for index in range(5):
+                (out / "stage" / f"f{index}").write_bytes(
+                    b"data")
+            real_is_symlink = Path.is_symlink
+            fired = []
+
+            def flag_on_third(self):
+                result = real_is_symlink(self)
+                if self.name == "f2":
+                    fired.append(1)
+                    lane._CANCEL_REQUESTED = True
+                return result
+
+            with mock.patch.object(Path, "is_symlink",
+                                   flag_on_third):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(fired, [1])
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, InterruptedError)
 
     def test_signal_between_shield_installs_defers(self):
         # a real SIGINT placed deterministically between the two
@@ -3221,6 +3815,90 @@ class ExecuteWiring(unittest.TestCase):
             self.assertEqual(receipt["error"], "cancelled")
             self._assert_lock_released(lock)
 
+    def test_repair_carries_snapshot_partials_not_raw_results(self):
+        # the accepted partials are snapshotted at slot
+        # registration: a cancel repair over nonempty
+        # results writes the summarized partials, not the
+        # raw result rows. (On the pass-results shape the
+        # repair publishes rows without calls/missing.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            oct13 = PartialReceipt.OCT13_LOG.encode()
+            fired = []
+            real_print = print
+            def killer_print(*args, **kwargs):
+                if not fired and any("evidence" in str(part)
+                                     for part in args):
+                    fired.append(1)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real_print(*args, **kwargs)
+            def routed(command, log, *args, **kwargs):
+                if command[1:3] == ["selftest", "bpf"]:
+                    return (3, False, oct13)
+                if command[1:3] == ["selftest", "token-smoke"]:
+                    return (0, False, b"token roundtrip ok\n")
+                return (0, False, b"")
+            saved_flag = lane._CANCEL_REQUESTED
+            lane._CANCEL_REQUESTED = False
+            try:
+                with lane.cancellation():
+                    with mock.patch.object(builtins, "print",
+                                           side_effect=killer_print):
+                        outcome, code, calls, printed = self._drive(
+                            root, out, lock, run_logged=routed)
+                    lane._CANCEL_REQUESTED = True
+            except InterruptedError:
+                pass
+            else:
+                self.fail("post-check cancel lost")
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+            self.assertEqual(fired, [1])
+            self.assertEqual(outcome, "returned")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            found = [row for row in summary["accepted_partials"]
+                     if row.get("exit") == 3]
+            self.assertEqual(len(found), 1)
+            self.assertEqual((found[0].get("calls"),
+                              found[0].get("missing")),
+                             (20000, 581))
+
+    def test_broken_body_print_keeps_lane_running(self):
+        # stdout progress prints fail open: EPIPE on the
+        # per-body line must not abort the run. (On the
+        # bare-print shape this raises out of execute.)
+        key = ("kryprobe-policy", "rule_unit")
+        row = {"package": key[0], "target": key[1],
+               "test": "probe_bin", "staged": "stage/debug/probe_bin",
+               "bodies": ["b1"], "features": [],
+               "sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root, artifacts=[row])
+            real_print = print
+            fired = []
+            def flaky_print(*args, **kwargs):
+                if any("rule_unit" in str(part) for part in args):
+                    fired.append(1)
+                    raise BrokenPipeError("stdout closed")
+                return real_print(*args, **kwargs)
+            def routed(command, log, *args, **kwargs):
+                if "--list" in command:
+                    return (0, False,
+                            b"b1: test\n1 test, 0 benchmarks\n")
+                return (0, False, b"")
+            with mock.patch.object(builtins, "print",
+                                   side_effect=flaky_print):
+                outcome, code, calls, printed = self._drive(
+                    root, out, lock, run_logged=routed)
+            self.assertEqual(fired, [1])
+            self.assertEqual(outcome, "returned")
+            summary = json.loads((out / "summary.json").read_text())
+            self.assertIs(summary["complete"], True)
+            self._assert_lock_released(lock)
+
     def test_second_signal_during_repair_still_repairs(self):
         # the flag set on the complete dump (post-check
         # fires) plus a second real signal between the
@@ -3374,7 +4052,11 @@ class ExecuteWiring(unittest.TestCase):
         # itself instead of following it (a disk-reading
         # repair would trust the planted bytes and skip).
         # FIFOs and /dev/zero links are closed by the same
-        # absence of any read.
+        # absence of any read — enforced here with traps:
+        # results.json must never be opened at all, and
+        # the evidence names never for read (temp writes
+        # carry random suffixes, so exact-name matches
+        # cannot false-fire).
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             (out / "results.json").write_text("[]")
@@ -3383,7 +4065,41 @@ class ExecuteWiring(unittest.TestCase):
                  "error": "planted"}))
             os.symlink(out / "real.json", out / "summary.json")
             receipt = {"status": "finished", "exit": 0}
-            lane._repair_cancelled_evidence(out, receipt, [])
+            real_open = open
+            real_os_open = os.open
+
+            def no_evidence_read(path, *args, **kwargs):
+                mode = args[0] if args else kwargs.get(
+                    "mode", "r")
+                if Path(path).name in (
+                        "results.json", "summary.json",
+                        "ownership.json") \
+                        and ("r" in mode or "+" in mode):
+                    raise AssertionError(
+                        f"repair read evidence: {path}")
+                return real_open(path, *args, **kwargs)
+
+            def no_evidence_os_read(path, flags, *args,
+                                    **kwargs):
+                readable = flags & os.O_ACCMODE in (
+                    os.O_RDONLY, os.O_RDWR)
+                if Path(path).name == "results.json":
+                    raise AssertionError(
+                        f"repair touched results: {path}")
+                if Path(path).name in (
+                        "summary.json",
+                        "ownership.json") and readable:
+                    raise AssertionError(
+                        f"repair read evidence: {path}")
+                return real_os_open(path, flags, *args,
+                                    **kwargs)
+
+            with mock.patch.object(builtins, "open",
+                                   side_effect=no_evidence_read), \
+                    mock.patch.object(
+                        os, "open",
+                        side_effect=no_evidence_os_read):
+                lane._repair_cancelled_evidence(out, receipt, [])
             self.assertFalse((out / "summary.json").is_symlink())
             summary = json.loads((out / "summary.json").read_text())
             self.assertIs(summary["complete"], False)
@@ -3673,6 +4389,134 @@ class CancelHelper(unittest.TestCase):
                 lane._CANCEL_REQUESTED = saved_flag
             self.assertEqual((root / "dst.bin").read_bytes(), b"")
 
+    def test_check_output_cancel_reaps_despite_pipe_holder(self):
+        # no drain on the cancel path: a grandchild holding
+        # the pipe open 10 s must not delay the raise (the
+        # output is discarded; our end is closed and the
+        # direct child reaped). (On the communicate shape
+        # this waits the full 10 s.)
+        saved_flag = lane._CANCEL_REQUESTED
+        lane._CANCEL_REQUESTED = False
+        kid = [sys.executable, "-c",
+               "import os, sys, time\n"
+               "sys.stdout.write('hi\\n'); sys.stdout.flush()\n"
+               "if os.fork() == 0:\n"
+               "    time.sleep(10)\n"
+               "else:\n"
+               "    sys.exit(0)\n"]
+        timer = threading.Timer(
+            0.5, lambda: setattr(lane, "_CANCEL_REQUESTED",
+                                 True))
+        timer.start()
+        try:
+            start = time.monotonic()
+            with self.assertRaises(InterruptedError):
+                lane._check_output_cancel(kid)
+            self.assertLess(time.monotonic() - start, 8)
+        finally:
+            timer.cancel()
+            timer.join(timeout=5)
+            lane._CANCEL_REQUESTED = saved_flag
+        # no children assertion: the orphaned grandchild
+        # sleeps out its budget outside our custody.
+
+    def test_run_cancel_skips_spawn_when_flagged(self):
+        # pre-launch check: a set flag raises before any
+        # child spawns (N8).
+        saved_flag = lane._CANCEL_REQUESTED
+        lane._CANCEL_REQUESTED = True
+        try:
+            with mock.patch.object(lane.subprocess, "Popen") as popen:
+                with self.assertRaises(InterruptedError):
+                    lane._run_cancel(["true"])
+            popen.assert_not_called()
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+
+    def test_wait_cancel_waits_out_mounts(self):
+        # wait-out shape: with kill_on_cancel=False a set
+        # flag does not raise mid-wait — the effect
+        # completes, the code returns for registration,
+        # and the still-set flag acts at the next
+        # checkpoint. (On the kill shape this raises and
+        # the mount this guarded never registers.)
+        proc = subprocess.Popen(["true"])
+        self.assertEqual(proc.wait(), 0)
+        saved_flag = lane._CANCEL_REQUESTED
+        lane._CANCEL_REQUESTED = True
+        try:
+            self.assertEqual(
+                lane._wait_cancel(proc, kill_on_cancel=False), 0)
+            self.assertTrue(lane._CANCEL_REQUESTED)
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+
+    def test_copyfile_cancel_refuses_swapped_fifo(self):
+        # TOCTOU: a FIFO swapped in after the is_file()
+        # check fails closed without hanging (the open is
+        # O_NONBLOCK and fstat-pinned regular).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            (src / "bin").write_bytes(b"payload")
+            real_is_file = Path.is_file
+
+            def racing_is_file(self):
+                result = real_is_file(self)
+                if self.name == "bin" and result:
+                    os.unlink(self)
+                    os.mkfifo(self)
+                return result
+
+            res = []
+
+            def run():
+                try:
+                    lane._copytree_cancel(src, root / "dst")
+                    res.append("returned")
+                except BaseException as error:
+                    res.append(
+                        f"{type(error).__name__}: {error}")
+
+            with mock.patch.object(Path, "is_file",
+                                   racing_is_file):
+                worker = threading.Thread(target=run,
+                                          daemon=True)
+                worker.start()
+                worker.join(5)
+                alive = worker.is_alive()
+            self.assertFalse(alive, f"copy hung on FIFO: {res}")
+            self.assertEqual(len(res), 1)
+            self.assertTrue(res[0].startswith("ValueError"),
+                            res)
+
+    def test_copyfile_cancel_refuses_swapped_symlink(self):
+        # TOCTOU: a symlink swapped in after the
+        # is_symlink() check fails closed (O_NOFOLLOW) —
+        # the link target is never copied.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            (src / "bin").write_bytes(b"payload")
+            secret = root / "secret"
+            secret.write_text("SECRET")
+            real_is_symlink = Path.is_symlink
+
+            def racing_is_symlink(self):
+                result = real_is_symlink(self)
+                if self.name == "bin" and not result:
+                    os.unlink(self)
+                    os.symlink(secret, self)
+                return result
+
+            with mock.patch.object(Path, "is_symlink",
+                                   racing_is_symlink):
+                with self.assertRaises(OSError):
+                    lane._copytree_cancel(src, root / "dst")
+            self.assertFalse((root / "dst/bin").exists())
+
 
 class ProcessCustody(unittest.TestCase):
     def test_cancellation_repair_slot_consumed_once(self):
@@ -3718,6 +4562,40 @@ class ProcessCustody(unittest.TestCase):
              "lane._say('x' * 100000); sys.exit(0)",
              str(Path(lane.__file__).parent)],
             stdout=writer, stderr=subprocess.DEVNULL)
+        os.close(writer)
+        self.assertEqual(proc.wait(timeout=30), 0)
+
+    def test_closed_stdout_subprocess_still_exits_zero(self):
+        # fd 1 closed outright (EBADF, not EPIPE): the
+        # recovery's /dev/null open reuses fd 1 itself and
+        # must leave it there — closing it again reopens
+        # the hole and shutdown exits 120.
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, sys; sys.path.insert(0, sys.argv[1]); "
+             "import sudo_lane as lane; "
+             "os.close(1); lane._say('x'); sys.exit(0)",
+             str(Path(lane.__file__).parent)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertEqual(proc.wait(timeout=30), 0)
+
+    def test_dup_stdout_subprocess_still_exits_zero(self):
+        # sys.stdout rebound to a broken descriptor that is
+        # not fd 1: recovery must redirect the stream's own
+        # descriptor — fd 1 alone leaves the shutdown
+        # flush failing (exit 120).
+        reader, writer = os.pipe()
+        os.close(reader)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, sys; sys.path.insert(0, sys.argv[1]); "
+             "import sudo_lane as lane; "
+             "sys.stdout = os.fdopen(int(sys.argv[2]), 'w', "
+             "closefd=False); "
+             "lane._say('y'); sys.exit(0)",
+             str(Path(lane.__file__).parent), str(writer)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=(writer,))
         os.close(writer)
         self.assertEqual(proc.wait(timeout=30), 0)
 
