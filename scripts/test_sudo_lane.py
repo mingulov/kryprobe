@@ -3532,15 +3532,23 @@ class ExecuteWiring(unittest.TestCase):
                 return None
             def boom(*args, **kwargs):
                 raise FileNotFoundError("stage binary gone")
-            outcome, error, calls, printed = self._drive(
-                root, out, lock, run_logged=boom, dump_hook=nospace)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock, run_logged=boom, dump_hook=nospace)
             self.assertEqual(outcome, "raised")
             self.assertIsInstance(error, FileNotFoundError)
             self.assertEqual(self._umount_targets(calls),
                              list(reversed(self._mount_targets(calls))))
             self.assertGreater(len(self._umount_targets(calls)), 0)
-            self.assertIn("failure summary not published", printed)
-            self.assertIn("evidence publishing problems", printed)
+            # failure/repair diagnostics go to stderr — a
+            # parsed stdout must not ingest them.
+            self.assertIn("failure summary not published",
+                          stderr.getvalue())
+            self.assertIn("evidence publishing problems",
+                          stderr.getvalue())
+            self.assertNotIn("failure summary not published", printed)
+            self.assertNotIn("evidence publishing problems", printed)
             # the preamble reservation survives; the finished
             # receipt (children_reaped) never landed.
             preamble = json.loads((out / "ownership.json").read_text())
@@ -4185,7 +4193,11 @@ class ExecuteWiring(unittest.TestCase):
         # (same identity as the path), a symlink at the
         # top or in any ancestor raises ELOOP exactly,
         # and a swapped-in non-directory raises ENOTDIR
-        # — no descriptor leaks on any refusal.
+        # — no descriptor leaks on any refusal. The
+        # final-component file pins the fstat check
+        # itself: the kernel open succeeds there, so
+        # only the pin can refuse it (the mid-path file
+        # dies in the next openat regardless).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             deep = root / "a" / "b"
@@ -4214,6 +4226,81 @@ class ExecuteWiring(unittest.TestCase):
             with self.assertRaises(OSError) as caught:
                 lane._open_pinned(root / "file" / "leaf")
             self.assertEqual(caught.exception.errno, errno.ENOTDIR)
+            with self.assertRaises(OSError) as caught:
+                lane._open_pinned(root / "file")
+            self.assertEqual(caught.exception.errno, errno.ENOTDIR)
+            self.assertEqual(set(os.listdir("/proc/self/fd")), before)
+
+    def test_open_pinned_refuses_fifo_without_hang(self):
+        # a FIFO swapped into the path refuses fast
+        # (ENOTDIR): the component open must never
+        # block on a writerless FIFO — the lane holds
+        # its lock and mount there, and flag-only
+        # cancel cannot release a blocking open (PEP 475
+        # retries it). The watchdog rescues a hanging
+        # worker with a writer end, then fails: a
+        # rescue always means the shape regressed.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "block"
+            os.mkfifo(path)
+            errors, opened = [], []
+            before = set(os.listdir("/proc/self/fd"))
+
+            def attempt():
+                try:
+                    lane._open_pinned(path)
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    opened.append(1)
+
+            worker = threading.Thread(target=attempt, daemon=True)
+            worker.start()
+            worker.join(10)
+            rescued = worker.is_alive()
+            if rescued:
+                with contextlib.suppress(OSError):
+                    release = os.open(
+                        path, os.O_WRONLY | os.O_NONBLOCK)
+                    os.close(release)
+                worker.join(10)
+            self.assertFalse(
+                rescued, "pin walk blocked on a writerless FIFO")
+            self.assertEqual(opened, [])
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], OSError)
+            self.assertEqual(errors[0].errno, errno.ENOTDIR)
+            self.assertEqual(set(os.listdir("/proc/self/fd")), before)
+
+    def test_open_pinned_parent_close_failure_releases_child(self):
+        # a parent close failing mid-walk (EIO) releases
+        # the owned child and never retries the parent
+        # number: a failed close leaves the number's
+        # state unknown (released-and-reused is
+        # possible). (Retrying closes whatever reused
+        # the number, and strands the child.)
+        with tempfile.TemporaryDirectory() as tmp:
+            deep = Path(tmp) / "a" / "b"
+            deep.mkdir(parents=True)
+            real_close = os.close
+            attempts = []
+            state = {"fail": True}
+
+            def flaky_close(fd):
+                attempts.append(fd)
+                real_close(fd)
+                if state["fail"]:
+                    state["fail"] = False
+                    raise OSError(errno.EIO, "EIO")
+
+            before = set(os.listdir("/proc/self/fd"))
+            with mock.patch.object(os, "close",
+                                   side_effect=flaky_close):
+                with self.assertRaises(OSError) as caught:
+                    lane._open_pinned(deep)
+            self.assertEqual(caught.exception.errno, errno.EIO)
+            self.assertEqual(len(attempts), len(set(attempts)),
+                             attempts)
             self.assertEqual(set(os.listdir("/proc/self/fd")), before)
 
     def test_execute_copy_aborts_mid_tree_on_cancel(self):
@@ -5055,7 +5142,9 @@ class ExecuteWiring(unittest.TestCase):
     def test_execute_entry_clears_stale_repair_slot(self):
         # the unconditional repair must never run a stale
         # closure: execute drops the slot on entry, so a
-        # raise before the tail leaves nothing behind.
+        # raise before the tail leaves at most the
+        # failure invalidator behind — never the stale
+        # closure, never the cancel backstop.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             out, lock = self._prepared_out(root)
@@ -5066,14 +5155,21 @@ class ExecuteWiring(unittest.TestCase):
                 outcome, error, calls, printed = self._drive(
                     root, out, lock, run_logged=boom)
                 self.assertEqual(outcome, "raised")
-                self.assertIsNone(lane._CANCELLATION_REPAIR)
+                slot = lane._CANCELLATION_REPAIR
+                self.assertIs(
+                    slot.func,
+                    lane._invalidate_custody_on_reap_failure)
             finally:
                 lane._CANCELLATION_REPAIR = None
 
-    def test_post_check_repair_registers_no_slot(self):
-        # the front-line repair runs before any registration:
-        # a flag at the post-dump check raises with the slot
-        # still empty (the backstop cannot double-repair).
+    def test_post_check_repair_registers_no_cancel_backstop(self):
+        # the front-line repair runs before any backstop
+        # registration: a flag at the post-dump check
+        # raises with only the failure invalidator in the
+        # slot — and the invalidator no-ops without a
+        # reap failure, so the backstop cannot
+        # double-repair. (Renamed: the slot is no longer
+        # empty; it holds the custody invalidator.)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             out, lock = self._prepared_out(root)
@@ -5083,14 +5179,84 @@ class ExecuteWiring(unittest.TestCase):
                         and value.get("complete") is True:
                     lane._CANCEL_REQUESTED = True
                 return real_dump(path, value)
-            with mock.patch.object(lane, "dump",
-                                   side_effect=flag_on_complete):
-                outcome, error, calls, printed = self._drive(
-                    root, out, lock,
-                    run_logged=lambda *a, **k: (0, False, b""))
-            self.assertEqual(outcome, "raised")
-            self.assertIsInstance(error, InterruptedError)
-            self.assertIsNone(lane._CANCELLATION_REPAIR)
+            saved_flag = lane._CANCEL_REQUESTED
+            saved_slot = lane._CANCELLATION_REPAIR
+            saved_reap = lane._CANCELLATION_REAP_FAILED
+            try:
+                with mock.patch.object(lane, "dump",
+                                       side_effect=flag_on_complete):
+                    outcome, error, calls, printed = self._drive(
+                        root, out, lock,
+                        run_logged=lambda *a, **k: (0, False, b""))
+                self.assertEqual(outcome, "raised")
+                self.assertIsInstance(error, InterruptedError)
+                slot = lane._CANCELLATION_REPAIR
+                self.assertIs(
+                    slot.func,
+                    lane._invalidate_custody_on_reap_failure)
+                snapshot = (out / "ownership.json").read_bytes()
+                lane._CANCEL_REQUESTED = True
+                with self.assertRaises(InterruptedError):
+                    with lane.cancellation():
+                        pass
+                self.assertEqual(
+                    (out / "ownership.json").read_bytes(), snapshot)
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+                lane._CANCELLATION_REPAIR = saved_slot
+                lane._CANCELLATION_REAP_FAILED = saved_reap
+
+    def test_cancelled_drive_plus_outer_reap_failure_invalidates(self):
+        # a failed execution (no success slot) plus an
+        # outer custody failure: the OSError propagates
+        # and the stale children_reaped:true is amended —
+        # preserving the original failure text. (Without
+        # the failure invalidator, the OSError escapes
+        # over an untouched true claim.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            real_dump = lane.dump
+            def flag_on_complete(path, value):
+                if Path(path).name == "summary.json" \
+                        and value.get("complete") is True:
+                    lane._CANCEL_REQUESTED = True
+                return real_dump(path, value)
+            saved_flag = lane._CANCEL_REQUESTED
+            saved_slot = lane._CANCELLATION_REPAIR
+            saved_reap = lane._CANCELLATION_REAP_FAILED
+            try:
+                with mock.patch.object(lane, "dump",
+                                       side_effect=flag_on_complete):
+                    outcome, error, calls, printed = self._drive(
+                        root, out, lock,
+                        run_logged=lambda *a, **k: (0, False, b""))
+                self.assertEqual(outcome, "raised")
+                self.assertIsInstance(error, InterruptedError)
+                pre = json.loads(
+                    (out / "ownership.json").read_text())
+                self.assertIs(pre["children_reaped"], True)
+                lane._CANCEL_REQUESTED = True
+                with mock.patch.object(
+                        lane, "children",
+                        side_effect=OSError(5, "Input/output "
+                                               "error")):
+                    with self.assertRaises(OSError):
+                        with lane.cancellation():
+                            pass
+                post = json.loads(
+                    (out / "ownership.json").read_text())
+                self.assertEqual(post["status"], "failed")
+                self.assertIs(post["children_reaped"], False)
+                self.assertIn("cancelled", post["error"])
+                self.assertIn("reap failed", post["error"])
+                summary = json.loads(
+                    (out / "summary.json").read_text())
+                self.assertIs(summary["complete"], False)
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+                lane._CANCELLATION_REPAIR = saved_slot
+                lane._CANCELLATION_REAP_FAILED = saved_reap
 
     def test_broken_final_print_keeps_completed_lane(self):
         # the final diagnostic print is contained: EPIPE on
@@ -5876,20 +6042,23 @@ class ProcessCustody(unittest.TestCase):
                     def fileno(self, _value=value):
                         return _value
 
-                saved_fd = os.dup(1)
-                reader, writer = os.pipe()
+                saved_fd = reader = writer = None
                 saved_stream = sys.stdout
                 try:
+                    saved_fd = os.dup(1)
+                    reader, writer = os.pipe()
                     os.dup2(writer, 1)
                     sys.stdout = OddFileno()
                     lane._say("x")
                     target = os.readlink("/proc/self/fd/1")
                 finally:
                     sys.stdout = saved_stream
-                    os.dup2(saved_fd, 1)
-                    os.close(saved_fd)
-                    os.close(reader)
-                    os.close(writer)
+                    if saved_fd is not None:
+                        os.dup2(saved_fd, 1)
+                    for fd in (saved_fd, reader, writer):
+                        if fd is not None:
+                            with contextlib.suppress(OSError):
+                                os.close(fd)
                 self.assertTrue(target.startswith("pipe:["),
                                 target)
 
@@ -5916,12 +6085,6 @@ class ProcessCustody(unittest.TestCase):
             def fileno(self):
                 return self._fd
 
-        reader, writer = os.pipe()
-        replacement = os.fdopen(writer, "w", closefd=False)
-        owned_r, owned_w = os.pipe()
-        sentinel_r, sentinel_w = os.pipe()
-        saved = sys.stdout
-        sys.stdout = BlockingBroken(owned_w)
         errors = []
 
         def caller():
@@ -5930,26 +6093,47 @@ class ProcessCustody(unittest.TestCase):
             except BaseException as error:
                 errors.append(error)
 
-        worker = threading.Thread(target=caller, daemon=True)
-        worker.start()
-        self.assertTrue(entered.wait(10))
-        sys.stdout = replacement
-        release.set()
-        worker.join(10)
-        sys.stdout = saved
+        # Cleanup from the first acquisition: every pipe,
+        # the stdout swap, and the worker join are owned
+        # by the finally — a setup failure (thread start
+        # raising, a wait timing out) errors without
+        # sticking sys.stdout or leaking descriptors.
+        held = []
+        worker = None
+        replacement = None
+        saved = sys.stdout
         try:
+            reader, writer = os.pipe()
+            held += [reader, writer]
+            replacement = os.fdopen(writer, "w", closefd=False)
+            owned_r, owned_w = os.pipe()
+            held += [owned_r, owned_w]
+            sentinel_r, sentinel_w = os.pipe()
+            held += [sentinel_r, sentinel_w]
+            sys.stdout = BlockingBroken(owned_w)
+            worker = threading.Thread(target=caller, daemon=True)
+            worker.start()
+            self.assertTrue(entered.wait(10))
+            sys.stdout = replacement
+            release.set()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
             target = os.readlink(f"/proc/self/fd/{writer}")
             owned_target = os.readlink(f"/proc/self/fd/{owned_w}")
             sentinel_target = os.readlink(
                 f"/proc/self/fd/{sentinel_w}")
         finally:
-            replacement.close()
-            os.close(reader)
-            os.close(writer)
-            os.close(owned_r)
-            os.close(owned_w)
-            os.close(sentinel_r)
-            os.close(sentinel_w)
+            sys.stdout = saved
+            release.set()
+            if worker is not None:
+                with contextlib.suppress(RuntimeError):
+                    worker.join(10)
+            if replacement is not None:
+                with contextlib.suppress(OSError):
+                    replacement.close()
+            for fd in held:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(target.startswith("pipe:["),
@@ -5960,6 +6144,27 @@ class ProcessCustody(unittest.TestCase):
         self.assertEqual(owned_target, "/dev/null")
         self.assertTrue(sentinel_target.startswith("pipe:["),
                         sentinel_target)
+
+    def test_stream_replacement_setup_failure_releases_everything(
+            self):
+        # a setup failure inside the committed
+        # stream-replacement fixture (thread start
+        # raising) errors the test but restores
+        # sys.stdout and closes every owned descriptor —
+        # never sticking the stream or leaking fds into
+        # later tests.
+        saved = sys.stdout
+        before = set(os.listdir("/proc/self/fd"))
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("boom")):
+            case = type(self)(
+                "test_say_stream_replacement_keeps_captured_object")
+            result = unittest.TestResult()
+            case.run(result)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("boom", result.errors[0][1])
+        self.assertIs(sys.stdout, saved)
+        self.assertEqual(set(os.listdir("/proc/self/fd")), before)
 
     def test_say_none_stdout_returns_silently(self):
         # a None stream returns at once: print is never
@@ -6123,9 +6328,15 @@ class ProcessCustody(unittest.TestCase):
                     lane, "children",
                     side_effect=OSError(12, "Cannot allocate "
                                             "memory")):
-                with self.assertRaises(OSError):
+                with self.assertRaises(OSError) as raised:
                     with lane.cancellation():
                         pass
+            # exact type + errno: a bare assertRaises
+            # would also accept the cancel raise
+            # (InterruptedError subclasses OSError),
+            # leaving dominance untested.
+            self.assertIs(type(raised.exception), OSError)
+            self.assertEqual(raised.exception.errno, 12)
         finally:
             lane._CANCEL_REQUESTED = saved_flag
             lane._CANCELLATION_REPAIR = saved_slot
@@ -6168,9 +6379,11 @@ class ProcessCustody(unittest.TestCase):
                                                "error")), \
                         contextlib.redirect_stdout(stdout), \
                         contextlib.redirect_stderr(stderr):
-                    with self.assertRaises(OSError):
+                    with self.assertRaises(OSError) as raised:
                         with lane.cancellation():
                             pass
+                self.assertIs(type(raised.exception), OSError)
+                self.assertEqual(raised.exception.errno, 5)
             finally:
                 lane._CANCEL_REQUESTED = saved_flag
                 lane._CANCELLATION_REPAIR = saved_slot
@@ -6189,6 +6402,141 @@ class ProcessCustody(unittest.TestCase):
         self.assertIsNone(lane._CANCELLATION_REPAIR)
         self.assertIs(signal.getsignal(signal.SIGTERM), old_term)
         self.assertIs(signal.getsignal(signal.SIGINT), old_int)
+
+    def test_cancellation_body_error_survives_reap_failure(self):
+        # a body error plus an outer custody failure (no
+        # cancel): the body error propagates — the reap
+        # failure must not swallow the root cause. The
+        # repair still runs and the handlers restore.
+        # (Ungated, the OSError replaces the body error
+        # and __main__ prints only its line.)
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        saved_reap = lane._CANCELLATION_REAP_FAILED
+        calls = []
+        lane._CANCEL_REQUESTED = False
+        lane._CANCELLATION_REPAIR = lambda: calls.append(1)
+        try:
+            with mock.patch.object(
+                    lane, "children",
+                    side_effect=OSError(5, "Input/output "
+                                           "error")):
+                with self.assertRaises(ValueError) as raised:
+                    with lane.cancellation():
+                        raise ValueError("root-cause")
+            self.assertEqual(str(raised.exception), "root-cause")
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+            lane._CANCELLATION_REPAIR = saved_slot
+            lane._CANCELLATION_REAP_FAILED = saved_reap
+        self.assertEqual(calls, [1])
+
+    def test_cancellation_sysexit_zero_still_fails_on_reap_failure(
+            self):
+        # SystemExit(0) — the sys.exit(main()) success
+        # path — plus an outer custody failure: the
+        # OSError wins, failing the lane closed (exit 1),
+        # never 0. (Order pin: the reap error wins over
+        # lane-control-flow bodies.)
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        saved_reap = lane._CANCELLATION_REAP_FAILED
+        calls = []
+        lane._CANCEL_REQUESTED = False
+        lane._CANCELLATION_REPAIR = lambda: calls.append(1)
+        try:
+            with mock.patch.object(
+                    lane, "children",
+                    side_effect=OSError(5, "Input/output "
+                                           "error")):
+                with self.assertRaises(OSError) as raised:
+                    with lane.cancellation():
+                        raise SystemExit(0)
+            self.assertIs(type(raised.exception), OSError)
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+            lane._CANCELLATION_REPAIR = saved_slot
+            lane._CANCELLATION_REAP_FAILED = saved_reap
+        self.assertEqual(calls, [1])
+
+    def test_cancellation_reap_beats_cancel_with_body_error(self):
+        # total order reap > cancel > body: a body error
+        # with cancel pending plus a custody failure
+        # propagates the OSError — the cancel was going
+        # to clobber the body error anyway (documented
+        # cancel dominance), and the OSError reports the
+        # worst fact truthfully. (Order pin.)
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        saved_reap = lane._CANCELLATION_REAP_FAILED
+        calls = []
+        lane._CANCEL_REQUESTED = True
+        lane._CANCELLATION_REPAIR = lambda: calls.append(1)
+        try:
+            with mock.patch.object(
+                    lane, "children",
+                    side_effect=OSError(5, "Input/output "
+                                           "error")):
+                with self.assertRaises(OSError) as raised:
+                    with lane.cancellation():
+                        raise ValueError("root-cause")
+            self.assertIs(type(raised.exception), OSError)
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+            lane._CANCELLATION_REPAIR = saved_slot
+            lane._CANCELLATION_REAP_FAILED = saved_reap
+        self.assertEqual(calls, [1])
+
+    def test_cancellation_reap_failure_with_surviving_child(self):
+        # the failure reaches the scope with a real owned
+        # child still alive: custody is genuinely
+        # unverified (not just unreadable) — the OSError
+        # propagates and the published claim flips, with
+        # the child demonstrably unreaped. (First-call
+        # mocks never prove the live-child shape.)
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        saved_reap = lane._CANCELLATION_REAP_FAILED
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            receipt = {"status": "finished", "exit": 0,
+                       "children_reaped": True}
+            (out / "ownership.json").write_text(json.dumps(receipt))
+            (out / "summary.json").write_text(json.dumps(
+                {"exit": 0, "complete": True}))
+            child = subprocess.Popen(["sleep", "30"])
+            try:
+                real_children = lane.children
+                calls = []
+
+                def flaky():
+                    calls.append(1)
+                    if len(calls) > 1:
+                        raise OSError(5, "Input/output error")
+                    return real_children()
+
+                lane._CANCEL_REQUESTED = False
+                lane._CANCELLATION_REPAIR = functools.partial(
+                    lane._repair_cancelled_evidence, out, receipt, [])
+                with mock.patch.object(lane, "children",
+                                       side_effect=flaky):
+                    with self.assertRaises(OSError):
+                        with lane.cancellation():
+                            pass
+                self.assertTrue(calls)
+                self.assertIsNone(child.poll())
+                self.assertIn(child.pid, real_children())
+                repaired = json.loads(
+                    (out / "ownership.json").read_text())
+                self.assertIs(repaired["children_reaped"], False)
+            finally:
+                lane._CANCEL_REQUESTED = saved_flag
+                lane._CANCELLATION_REPAIR = saved_slot
+                lane._CANCELLATION_REAP_FAILED = saved_reap
+                with contextlib.suppress(ProcessLookupError):
+                    child.kill()
+                child.wait(timeout=30)
 
     def test_cancellation_reap_failure_cancelled_invalidates_custody(
             self):
@@ -6215,9 +6563,11 @@ class ProcessCustody(unittest.TestCase):
                         lane, "children",
                         side_effect=OSError(5, "Input/output "
                                                "error")):
-                    with self.assertRaises(OSError):
+                    with self.assertRaises(OSError) as raised:
                         with lane.cancellation():
                             pass
+                self.assertIs(type(raised.exception), OSError)
+                self.assertEqual(raised.exception.errno, 5)
             finally:
                 lane._CANCEL_REQUESTED = saved_flag
                 lane._CANCELLATION_REPAIR = saved_slot

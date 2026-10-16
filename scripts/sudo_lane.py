@@ -997,6 +997,10 @@ def cancellation():
         yield
     finally:
         global _CANCELLATION_REPAIR, _CANCELLATION_REAP_FAILED
+        # The body's error, captured before the repair can
+        # observe anything else: it decides whether the
+        # custody failure may replace it below.
+        body_error = sys.exception()
         repair, _CANCELLATION_REPAIR = _CANCELLATION_REPAIR, None
         reap_failed = False
         reap_error = None
@@ -1026,14 +1030,22 @@ def cancellation():
             try:
                 repair()
             except (OSError, ValueError, MemoryError) as error:
-                _say(f"sudo-lane: cancel repair failed: {error}")
+                _say_err(f"sudo-lane: cancel repair failed: {error}")
         for sig, handler in saved.items():
             signal.signal(sig, handler)
-        if reap_failed:
-            # Dominates the cancel raise: the evidence
-            # records both facts, the raise names the
-            # worst one. (Both are OSError family, so
-            # the __main__ handler exits 1 either way.)
+        # Total order reap > cancel > body: the custody
+        # failure wins over a clean body, lane-control
+        # flow (SystemExit — including the sys.exit(0)
+        # success path, which must fail closed — and the
+        # in-flight cancel raise), and anything the
+        # cancel was going to clobber anyway. A genuine
+        # body error with no cancel pending propagates
+        # untouched: the reap failure is already on
+        # stderr and in the repaired evidence, and the
+        # one-line diagnostic keeps its root cause.
+        if reap_failed and (body_error is None or cancelled
+                            or isinstance(body_error, (SystemExit,
+                                                      InterruptedError))):
             raise reap_error
         if cancelled:
             raise InterruptedError("cancelled; owned descendants reaped")
@@ -1252,22 +1264,35 @@ def _open_pinned(path):
     caller passes an already-resolved absolute path
     (execute's out arrives strict-resolved from main);
     the walk re-opens it component by component from
-    the root, each level O_NOFOLLOW relative to its
-    pinned parent plus an fstat directory pin, so any
-    symlink — at the top or in any ancestor — fails
-    loud (ELOOP) instead of redirecting the
-    privileged read. (O_DIRECTORY is deliberately
-    NOT combined with O_NOFOLLOW: the kernel
-    reports a symlink as ENOTDIR then, blurring
-    the refusal; the fstat pin keeps ELOOP exact
-    for links and raises ENOTDIR for swapped-in
-    non-directories.) A swapped-in real directory
-    (rename, no symlink) still resolves: that
-    residue is gated by content (the stage hashes),
-    not by identity. The whole walk runs shielded
-    so no signal can strand an intermediate
-    descriptor. Returns the open descriptor; the
-    caller owns (closes) it.
+    the root, each level O_NOFOLLOW|O_NONBLOCK
+    relative to its pinned parent plus an fstat
+    directory pin, so any symlink — at the top or in
+    any ancestor — fails loud (ELOOP) instead of
+    redirecting the privileged read. (O_DIRECTORY is
+    deliberately NOT combined with O_NOFOLLOW: the
+    kernel reports a symlink as ENOTDIR then,
+    blurring the refusal; the fstat pin keeps ELOOP
+    exact for links and raises ENOTDIR for
+    swapped-in non-directories. O_NONBLOCK is what
+    keeps a swapped-in FIFO from hanging the open:
+    a blocking FIFO open would outwait flag-only
+    cancel — PEP 475 retries it — with the lock and
+    mount held. An unprivileged preparer cannot
+    mknod, so no worse-than-FIFO node is
+    placeable; O_PATH would additionally dodge
+    root-squash traverse denials, but at the cost
+    of hand-mapped errnos.) A swapped-in real
+    directory (rename, no symlink) still resolves:
+    that residue is gated by content (the stage
+    hashes), not by identity. The whole walk runs
+    shielded so no signal can strand an
+    intermediate descriptor. Ownership transfers
+    to the child before the parent closes: a
+    parent-close failure releases the owned child
+    and never retries the parent number (a failed
+    close leaves it possibly released-and-reused).
+    Returns the open descriptor; the caller owns
+    (closes) it.
     """
     absolute = os.path.abspath(os.fspath(path))
     with _deferred_cancel():
@@ -1282,7 +1307,8 @@ def _open_pinned(path):
                 # symlinks, pinning the next resolution
                 # to the acquired parent.
                 child = os.open(component,
-                                os.O_RDONLY | os.O_NOFOLLOW,
+                                os.O_RDONLY | os.O_NOFOLLOW
+                                | os.O_NONBLOCK,
                                 dir_fd=owned)
                 try:
                     if not stat.S_ISDIR(
@@ -1297,13 +1323,22 @@ def _open_pinned(path):
                     except OSError:
                         pass
                     raise
-                os.close(owned)
-                owned = child
+                parent, owned = owned, child
+                try:
+                    os.close(parent)
+                except OSError:
+                    try:
+                        os.close(owned)
+                    except OSError:
+                        pass
+                    owned = None
+                    raise
         except OSError:
-            try:
-                os.close(owned)
-            except OSError:
-                pass
+            if owned is not None:
+                try:
+                    os.close(owned)
+                except OSError:
+                    pass
             raise
         return owned
 
@@ -1757,6 +1792,13 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     except BaseException:
         os.close(lane_fd)
         raise
+    # Failure exits keep a custody invalidator in the slot
+    # (the success tail swaps in the cancel backstop): an
+    # outer reap failure over a failed execute must still
+    # amend the stale claim. Binds the live receipt — the
+    # amendment sees its final failed state.
+    _CANCELLATION_REPAIR = functools.partial(
+        _invalidate_custody_on_reap_failure, out, receipt)
     results, mounts = [], []
     runtime = None
     # This invocation's own failure flag: the end-raise gate must
@@ -1899,7 +1941,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                 "exit": 1, "error": str(error), "complete": False,
                 "accepted_partials": summarize_partials(committed_prefix(out, results))})
             if summary_error is not None:
-                _say(f"sudo-lane: failure summary not published: {summary_error}")
+                _say_err(f"sudo-lane: failure summary not published: {summary_error}")
         except (KeyboardInterrupt, SystemExit):
             # Genuine termination (the lane's own cancel arrives
             # as InterruptedError, never this): propagate
@@ -2023,7 +2065,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
             except BaseException as error:
                 deferred.append(error)
             if publish_errors or deferred:
-                _say("sudo-lane: evidence publishing problems: "
+                _say_err("sudo-lane: evidence publishing problems: "
                      f"{publish_errors + [type(e).__name__ for e in deferred]}")
             os.close(lane_fd)
             if cleanup_errors:
@@ -2044,7 +2086,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                 except BaseException as error:
                     deferred.append(error)
                 if publish_errors or deferred:
-                    _say("sudo-lane: evidence publishing problems: "
+                    _say_err("sudo-lane: evidence publishing problems: "
                          f"{publish_errors + [type(e).__name__ for e in deferred]}")
                 error = InterruptedError("cancelled; lane cleanup complete")
                 if deferred:
@@ -2078,7 +2120,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         except BaseException as error:
             deferred.append(error)
         if publish_errors or deferred:
-            _say("sudo-lane: evidence publishing problems: "
+            _say_err("sudo-lane: evidence publishing problems: "
                  f"{publish_errors + [type(e).__name__ for e in deferred]}")
         error = InterruptedError("cancelled; lane cleanup complete")
         if deferred:
@@ -2107,7 +2149,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         except BaseException as nested:
             deferred.append(nested)
         if publish_errors or deferred:
-            _say("sudo-lane: evidence publishing problems: "
+            _say_err("sudo-lane: evidence publishing problems: "
                  f"{publish_errors + [type(e).__name__ for e in deferred]}")
         raise
     if _CANCEL_REQUESTED:
@@ -2133,6 +2175,46 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
     # lane into a failed one (complete:true with exit 1).
     _say(f"sudo-lane: {counts}; exit {code}; evidence {out}")
     return code
+
+
+def _invalidate_custody_on_reap_failure(out, receipt):
+    """Amend a failed record's custody claim, on reap failure only.
+
+    Registered in the repair slot right after the running
+    receipt publishes (over the LIVE receipt dict, so the
+    final failed state is visible) and replaced by the
+    cancel backstop at the success tail. A failed execute
+    otherwise leaves no slot: an outer custody failure
+    would then propagate over a stale children_reaped:true
+    with no amendment. No-ops without a reap failure, so a
+    merely-cancelled failure keeps its front-line record
+    byte-identical (no double-repair). On a reap failure
+    it preserves the root-cause text (appending, never
+    overwriting) and flips the claim; the summary keeps
+    its failed shape (complete:false stands) — the
+    custody record of truth is ownership.json plus the
+    stderr announcement. Zero reads: values come from the
+    bound in-memory receipt.
+    """
+    if not _CANCELLATION_REAP_FAILED:
+        return
+    suffix = "owned-descendant reap failed"
+    prior = receipt.get("error")
+    invalidated = dict(receipt)
+    invalidated.update(
+        status="failed", exit=1,
+        error=f"{prior}; {suffix}" if prior else suffix,
+        children_reaped=False)
+    repair_errors = []
+    repair_deferred = []
+    try:
+        _guarded_publish(out / "ownership.json", invalidated,
+                         repair_errors, repair_deferred)
+    except BaseException as error:
+        repair_deferred.append(error)
+    if repair_errors or repair_deferred:
+        _say_err("sudo-lane: evidence publishing problems: "
+                 f"{repair_errors + [type(e).__name__ for e in repair_deferred]}")
 
 
 def _repair_cancelled_evidence(out, receipt, accepted_partials):
@@ -2174,7 +2256,7 @@ def _repair_cancelled_evidence(out, receipt, accepted_partials):
     except BaseException as error:
         repair_deferred.append(error)
     if repair_errors or repair_deferred:
-        _say("sudo-lane: evidence publishing problems: "
+        _say_err("sudo-lane: evidence publishing problems: "
              f"{repair_errors + [type(e).__name__ for e in repair_deferred]}")
 
 
