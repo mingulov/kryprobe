@@ -2325,7 +2325,10 @@ def _repair_cancelled_evidence(out, receipt, accepted_partials):
              f"{repair_errors + [type(e).__name__ for e in repair_deferred]}")
 
 
-def main():
+def main(_root=None):
+    # _root overrides the checkout root (test seam for
+    # the build-release lock directory; production
+    # always passes None).
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, help="new owned evidence/staging directory")
     parser.add_argument("--prepare-only", action="store_true", help="build and seal; no privileged tests")
@@ -2347,7 +2350,10 @@ def main():
         watch_parent_pipe()
         return execute(args.execute.resolve(strict=True), args.lock, args.parent_mount_ns, args.calls,
                        args.manifest_sha256)
-    root = Path(__file__).resolve().parent.parent
+    if _root is None:
+        root = Path(__file__).resolve().parent.parent
+    else:
+        root = _root
     if args.run_prepared:
         out = args.run_prepared.resolve(strict=True)
         assert_fresh_execution(out)
