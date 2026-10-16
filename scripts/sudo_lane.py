@@ -853,18 +853,27 @@ def _deferred_cancel():
 def _say(message):
     """Diagnostic print contained against stream failure.
 
-    ValueError (closed stream) and BlockingIOError
-    (transiently full nonblocking pipe) are swallowed
-    bare: the descriptor is healthy and must survive
-    for later output, so discovery is not even
-    consulted — the stream retains its buffer for a
-    later flush. On any other OSError the failure is
-    contained in two ordered phases. Discovery asks
-    the stream for its
-    own descriptor OUTSIDE the recovery suppression,
-    so a fileno that raises (a fileno-less proxy) or
-    returns nothing usable cannot skip into a blind
-    fd-1 redirect. Recovery repoints the discovered
+    The stream is captured once: printing and
+    discovery use the same object, so a concurrent
+    replacement of sys.stdout between the failed
+    print and discovery cannot redirect a healthy
+    stranger's descriptor. A missing stream (None)
+    returns at once. ValueError (closed stream) and
+    BlockingIOError (transiently full nonblocking
+    pipe) are swallowed bare: the descriptor is
+    healthy and must survive for later output, so
+    discovery is not even consulted — the stream
+    retains its buffer for a later flush. On any
+    other OSError the failure is contained in two
+    ordered phases. Discovery asks the stream for
+    its own descriptor OUTSIDE the recovery
+    suppression, so a fileno that raises (a
+    fileno-less proxy) or returns nothing usable
+    cannot skip into a blind fd-1 redirect; only a
+    genuine int survives (a str, float, bool, or
+    absurd value leaves the stream alone instead of
+    raising TypeError/OverflowError out of a
+    diagnostic). Recovery repoints the discovered
     descriptor at /dev/null, so interpreter shutdown
     cannot retry the failing flush and turn exit 0
     into exit 120; when the null open itself reuses
@@ -887,21 +896,25 @@ def _say(message):
     Only the stream's own discovered descriptor is
     ever redirected; the conventional fd is never
     used as a fallback."""
+    stream = sys.stdout
+    if stream is None:
+        return
     try:
-        print(message, flush=True)
+        print(message, file=stream, flush=True)
     except ValueError:
         pass
     except BlockingIOError:
         pass
     except OSError:
         try:
-            stream_fd = sys.stdout.fileno()
+            stream_fd = stream.fileno()
         except (OSError, ValueError, AttributeError):
             return
-        if stream_fd is None or stream_fd < 0 \
+        if type(stream_fd) is not int or stream_fd < 0 \
                 or stream_fd in (0, 2):
             return
-        with contextlib.suppress(OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError,
+                                 OverflowError):
             null_fd = os.open("/dev/null", os.O_WRONLY)
             try:
                 if null_fd != stream_fd:
@@ -912,29 +925,36 @@ def _say(message):
 
 
 def _say_err(message):
-    """stderr twin of _say: same dispositions (swallow
-    ValueError/BlockingIOError bare, without
-    consulting discovery; redirect only the stream's
-    own discovered descriptor; leave unknown or
-    0/1-aliased descriptors alone). Cleanup and
-    last-chance diagnostics must never abort their
-    sequence on a broken stderr — and must never
-    redirect a descriptor they did not discover."""
+    """stderr twin of _say: same dispositions (capture
+    the stream once; return at once on None — print
+    with file=None would otherwise fall back to
+    stdout; swallow ValueError/BlockingIOError bare,
+    without consulting discovery; redirect only the
+    stream's own discovered int descriptor; leave
+    unknown, non-int, or 0/1-aliased descriptors
+    alone). Cleanup and last-chance diagnostics must
+    never abort their sequence on a broken stderr —
+    and must never redirect a descriptor they did
+    not discover."""
+    stream = sys.stderr
+    if stream is None:
+        return
     try:
-        print(message, file=sys.stderr, flush=True)
+        print(message, file=stream, flush=True)
     except ValueError:
         pass
     except BlockingIOError:
         pass
     except OSError:
         try:
-            stream_fd = sys.stderr.fileno()
+            stream_fd = stream.fileno()
         except (OSError, ValueError, AttributeError):
             return
-        if stream_fd is None or stream_fd < 0 \
+        if type(stream_fd) is not int or stream_fd < 0 \
                 or stream_fd in (0, 1):
             return
-        with contextlib.suppress(OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError,
+                                 OverflowError):
             null_fd = os.open("/dev/null", os.O_WRONLY)
             try:
                 if null_fd != stream_fd:
@@ -970,7 +990,13 @@ def cancellation():
     finally:
         global _CANCELLATION_REPAIR
         repair, _CANCELLATION_REPAIR = _CANCELLATION_REPAIR, None
-        reap_owned()
+        try:
+            reap_owned()
+        except OSError as error:
+            # Custody unverifiable (a /proc read failed):
+            # the repair and the raise below still run —
+            # an unverified reap must not leak either.
+            _say(f"sudo-lane: reap failed: {error}")
         # One read governs both repair and raise: separate
         # checks would race a delivery landing between them
         # (raise without repair). Repair before restoring the
@@ -1193,24 +1219,29 @@ def _copytree_fd_cancel(parent_fd, target, display):
             raise ValueError(f"refusing exotic stage entry: {shown}")
 
 
-def _copytree_cancel(source, target):
+def _copytree_cancel(source, target, *, dir_fd=None, display=None):
     """copytree(symlinks=True) honoring flag-only cancellation.
 
     Modes need not be preserved (the execute chmod pass
     normalizes everything after). The walk is pinned:
-    the top opens O_NOFOLLOW|O_DIRECTORY and every
-    component below resolves relative to a parent
-    directory descriptor, so a preparer rename of a
-    parent directory to a symlink mid-walk cannot
-    redirect the resolution outside the stage; each
-    consumed file is fstat-pinned regular, so a
-    swapped-in symlink or FIFO fails closed instead
-    of being followed or hung on.
+    the top opens O_NOFOLLOW|O_DIRECTORY — relative
+    to dir_fd when the caller passes one (execute
+    pins out/ so a preparer rename ABOVE the top
+    cannot redirect the resolution either) — and
+    every component below resolves relative to a
+    parent directory descriptor, so a preparer
+    rename of a walked directory to a symlink
+    mid-copy cannot redirect the resolution outside
+    the stage; each consumed file is fstat-pinned
+    regular, so a swapped-in symlink or FIFO fails
+    closed instead of being followed or hung on.
     """
     target.mkdir(parents=True, exist_ok=False)
-    top = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    shown = str(source) if display is None else display
+    top = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY,
+                  dir_fd=dir_fd)
     try:
-        _copytree_fd_cancel(top, target, str(source))
+        _copytree_fd_cancel(top, target, shown)
     finally:
         os.close(top)
 
@@ -1642,7 +1673,20 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                         "kryprobe-sudo-lane", str(runtime)],
                     kill_on_cancel=False, check=True)
         mounts.append(runtime)
-        _copytree_cancel(out / "stage", runtime / "stage")
+        # Pin the staging parent before the privileged
+        # copy: out/'s ancestors stay preparer-writable,
+        # so the top opens relative to this descriptor
+        # (a single atomic resolution) — a rename above
+        # it cannot redirect the read outside. The
+        # manifest digest above and the stage hashes
+        # below still gate the content itself.
+        out_fd = os.open(out, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+        try:
+            _copytree_cancel("stage", runtime / "stage",
+                             dir_fd=out_fd,
+                             display=str(out / "stage"))
+        finally:
+            os.close(out_fd)
         verify_stage(runtime, manifest)
         for path in (runtime / "stage").rglob("*"):
             path.chmod(0o555 if path.is_dir() or str(path.relative_to(runtime)) in {
@@ -1768,9 +1812,23 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         # the lock. Cancellation takes effect through the flag at
         # the end of the sequence.
         with _deferred_cancel():
-            reap_owned()
+            # The summaries initialize first: every step
+            # below records into them instead of
+            # escaping — an OSError anywhere must not
+            # strand the unmounts, the receipt, the
+            # summary, or the lock.
             publish_errors = []
             deferred = []
+            cleanup_errors = []
+            try:
+                reap_owned()
+            except OSError as error:
+                cleanup_errors.append({
+                    "target": "reap",
+                    "stderr": f"reap failed: {error}"})
+                reap_failed = True
+            else:
+                reap_failed = False
             if _CANCEL_REQUESTED:
                 receipt.update(status="failed", exit=1, error="cancelled")
                 # The site try covers payload evaluation too: the
@@ -1784,7 +1842,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                         publish_errors, deferred)
                 except BaseException as error:
                     deferred.append(error)
-            cleanup_errors = []
+            umount_failed = False
             for target in reversed(mounts):
                 # Contained per mount: a spawn failure (fork
                 # EAGAIN, missing binary) or an output decode
@@ -1796,13 +1854,19 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                         ["umount", str(target)],
                         capture_output=True, text=True)
                 except (OSError, ValueError) as error:
+                    umount_failed = True
                     cleanup_errors.append({
                         "target": str(target),
                         "stderr": f"umount failed: {error}"})
                     continue
                 if cleanup.returncode:
+                    umount_failed = True
                     cleanup_errors.append({"target": str(target), "stderr": cleanup.stderr})
-            if runtime is not None and not cleanup_errors:
+            # The rmdir gate tracks unmounts only: a reap
+            # failure must not skip an otherwise good
+            # rmdir (its record lives in cleanup_errors
+            # alongside, and the final raise still fires).
+            if runtime is not None and not umount_failed:
                 # Contained like the unmounts: a busy or
                 # foreign runtime dir must record a cleanup
                 # error, never skip the receipt, the summary
@@ -1813,6 +1877,19 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                     cleanup_errors.append({
                         "target": str(runtime),
                         "stderr": f"rmdir failed: {error}"})
+            try:
+                # No re-read after a failed reap: custody
+                # was unverified during the unmounts, so a
+                # True now would mislead. Runs before the
+                # failure summary so a verification failure
+                # lands in it like any other cleanup error.
+                receipt["children_reaped"] = (
+                    not reap_failed and not children())
+            except OSError as error:
+                receipt["children_reaped"] = False
+                cleanup_errors.append({
+                    "target": "children",
+                    "stderr": f"reap verification failed: {error}"})
             if cleanup_errors:
                 receipt.update(status="failed", exit=1, cleanup_errors=cleanup_errors)
                 try:
@@ -1822,8 +1899,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                         publish_errors, deferred)
                 except BaseException as error:
                     deferred.append(error)
-            receipt["children_reaped"] = not children()
-            receipt["owned_mounts_removed"] = not cleanup_errors
+            receipt["owned_mounts_removed"] = not umount_failed
             receipt["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             # A cancel that arrived after the entry check (e.g.
             # during the unmounts) must still reach the receipt.

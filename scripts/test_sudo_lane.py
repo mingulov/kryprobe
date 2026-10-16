@@ -1389,15 +1389,21 @@ def _binding_violations(source):
     receiver), and must not reach a read or exec primitive
     — directly as a bare argument (starred arguments
     unwrapped) to any call except the diagnostic sinks
-    (print, _say) and the run_logged consumer, both
-    voided when rebound anywhere, and except the
-    results.append publish sink narrowed to a dict
-    display or a dict-bound-only name (a bare tainted
-    path appended for a later subscript read fires);
-    or nested inside a larger argument to a read/exec
-    primitive (copy/getoutput shapes included, so
-    derived-path bookkeeping through publish sinks
-    stays allowed but laundered reads fire). Containers
+    (print, _say) and the bare run_logged consumer,
+    both voided when rebound anywhere (a dotted
+    .run_logged call is never the consumer), and
+    except the results.append publish sink narrowed
+    to a CLEAN dict display or a CLEAN dict-bound-
+    only name — dict targets must be direct Names
+    (unpacking yields keys), mutations and nested
+    def/class/global bindings void, and data
+    positions must carry no taint (a bare path, raw
+    or read back through a subscript, fires right at
+    the append); or nested inside a larger argument
+    to a read/exec primitive (copy/getoutput shapes
+    included, so derived-path bookkeeping through
+    publish sinks stays allowed but laundered reads
+    fire). Containers
     (Tuple/List/Dict/Set displays) propagate taint, so
     a container round-trip back into a read fires;
     calls with an unrecognized callee (a call, a
@@ -1501,69 +1507,6 @@ def _binding_violations(source):
 
     for func in funcs:
         tainted = {"log"}
-        # Names bound solely to dict displays in this
-        # scope: the only names results.append accepts
-        # besides a dict display itself. Comprehension
-        # targets never appear here (no binding node
-        # exists for them, and they cannot touch the
-        # function binding); every other binding form
-        # voids, including bindings inside nested
-        # bodies (fail-closed: a nested non-dict
-        # binding voids the exemption loudly rather
-        # than missing an escape silently).
-        dict_only = set()
-        voided = set()
-
-        def void_names(target):
-            for name in _bound_names(target):
-                voided.add(name)
-
-        for node in ast.walk(func):
-            if isinstance(node, ast.Assign) \
-                    and isinstance(node.value, ast.Dict):
-                for target in node.targets:
-                    for name in _bound_names(target):
-                        dict_only.add(name)
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    void_names(target)
-            elif isinstance(node, ast.AnnAssign):
-                if node.value is not None \
-                        and isinstance(node.value, ast.Dict):
-                    for name in _bound_names(node.target):
-                        dict_only.add(name)
-                else:
-                    void_names(node.target)
-            elif isinstance(node, ast.AugAssign):
-                void_names(node.target)
-            elif isinstance(node, (ast.For, ast.AsyncFor)):
-                void_names(node.target)
-            elif isinstance(node, ast.NamedExpr):
-                void_names(node.target)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                for item in node.items:
-                    if item.optional_vars is not None:
-                        void_names(item.optional_vars)
-            elif isinstance(node, ast.ExceptHandler):
-                if node.name:
-                    voided.add(node.name)
-            elif isinstance(node, ast.Match):
-                for case in node.cases:
-                    for name in _match_names(case.pattern):
-                        voided.add(name)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    voided.add(alias.asname
-                               or alias.name.split(".")[0])
-        func_args = func.args
-        for param in list(func_args.args) \
-                + list(func_args.kwonlyargs) \
-                + list(getattr(func_args, "posonlyargs", [])):
-            voided.add(param.arg)
-        for extra in (func_args.vararg, func_args.kwarg):
-            if extra is not None:
-                voided.add(extra.arg)
-        dict_bound = dict_only - voided
         for node in ast.walk(func):
             if not isinstance(node, ast.Call):
                 continue
@@ -1578,42 +1521,46 @@ def _binding_violations(source):
                         log_arg = keyword.value
             if isinstance(log_arg, ast.Name):
                 tainted.add(log_arg.id)
+
+        def direct_hit(value):
+            # a bare name only: every deeper shape goes
+            # through laundered() containment below.
+            return isinstance(value, ast.Name) \
+                and value.id in tainted
+
+        def laundered(value):
+            # targeted value-shape spread: the path
+            # survives these launderings, so a binding
+            # through any of them stays tainted.
+            # Containers (Tuple/List/Dict/Set) propagate
+            # too: the result-dict bookkeeping this
+            # taints flows only to the results.append
+            # publish sink, which stays allowed. A
+            # method call on a tainted receiver counts;
+            # a plain call with tainted arguments
+            # already fires at its own construction
+            # site (bare tainted argument), so
+            # spreading through it would add nothing.
+            if isinstance(value, (ast.IfExp, ast.BoolOp,
+                                  ast.BinOp, ast.Subscript,
+                                  ast.JoinedStr,
+                                  ast.Attribute,
+                                  ast.Tuple, ast.List,
+                                  ast.Set, ast.Dict,
+                                  ast.NamedExpr, ast.Lambda)):
+                # A lambda counts by its body (and
+                # defaults): a name bound to it yields
+                # taint when called.
+                return tainted_in(value, tainted)
+            if isinstance(value, ast.Call) and isinstance(
+                    value.func, ast.Attribute):
+                return tainted_in(value.func.value,
+                                  tainted)
+            return False
+
         changed = True
         while changed:
             changed = False
-
-            def direct_hit(value):
-                # a bare name only: every deeper shape goes
-                # through laundered() containment below.
-                return isinstance(value, ast.Name) \
-                    and value.id in tainted
-
-            def laundered(value):
-                # targeted value-shape spread: the path
-                # survives these launderings, so a binding
-                # through any of them stays tainted.
-                # Containers (Tuple/List/Dict/Set) propagate
-                # too: the result-dict bookkeeping this
-                # taints flows only to the results.append
-                # publish sink, which stays allowed. A
-                # method call on a tainted receiver counts;
-                # a plain call with tainted arguments
-                # already fires at its own construction
-                # site (bare tainted argument), so
-                # spreading through it would add nothing.
-                if isinstance(value, (ast.IfExp, ast.BoolOp,
-                                      ast.BinOp, ast.Subscript,
-                                      ast.JoinedStr,
-                                      ast.Attribute,
-                                      ast.Tuple, ast.List,
-                                      ast.Set, ast.Dict,
-                                      ast.NamedExpr)):
-                    return tainted_in(value, tainted)
-                if isinstance(value, ast.Call) and isinstance(
-                        value.func, ast.Attribute):
-                    return tainted_in(value.func.value,
-                                      tainted)
-                return False
 
             def spread(value, targets):
                 nonlocal changed
@@ -1646,6 +1593,180 @@ def _binding_violations(source):
                                 if name not in tainted:
                                     tainted.add(name)
                                     changed = True
+            for node in ast.walk(func):
+                # Minimal function summaries: a nested def
+                # returning or yielding taint binds a name
+                # that yields taint when called (appending
+                # it for a later call-readback is an
+                # escape). Runs inside the fixpoint so
+                # late taint propagates into summaries.
+                if not isinstance(node, (ast.FunctionDef,
+                                         ast.AsyncFunctionDef)) \
+                        or node is func:
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return):
+                        yielded = sub.value
+                    elif isinstance(sub, (ast.Yield,
+                                          ast.YieldFrom)):
+                        yielded = sub.value
+                    else:
+                        continue
+                    if yielded is not None \
+                            and (direct_hit(yielded)
+                                 or laundered(yielded)) \
+                            and node.name not in tainted:
+                        tainted.add(node.name)
+                        changed = True
+        # Names bound solely to dict displays in this
+        # scope (taint now final, so mutations are
+        # judged on the settled set): the only names
+        # results.append accepts besides a clean dict
+        # display itself. Only a DIRECT Name target of
+        # a Dict counts (unpacking a dict yields keys,
+        # not the dict). Comprehension targets never
+        # appear here (no binding node exists for them,
+        # and they cannot touch the function binding);
+        # every other binding form voids, including
+        # nested def/class names, global declarations,
+        # and bindings inside nested bodies
+        # (fail-closed: a nested non-dict binding voids
+        # the exemption loudly rather than missing an
+        # escape silently). A subscript store of a
+        # tainted value, or a method call carrying
+        # tainted arguments on the receiver, voids the
+        # receiver root: the dict no longer holds only
+        # its clean displays.
+        dict_only = set()
+        voided = set()
+        dict_bindings = {}
+
+        def void_names(target):
+            for name in _bound_names(target):
+                voided.add(name)
+
+        def void_root(target):
+            while isinstance(target, (ast.Subscript,
+                                      ast.Attribute)):
+                target = target.value
+            if isinstance(target, ast.Name):
+                voided.add(target.id)
+
+        def arg_tainted(arg):
+            return direct_hit(arg) or laundered(arg)
+
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) \
+                    and isinstance(node.value, ast.Dict) \
+                    and all(isinstance(target, ast.Name)
+                            for target in node.targets):
+                for target in node.targets:
+                    dict_only.add(target.id)
+                    dict_bindings.setdefault(
+                        target.id, []).append(node.value)
+            elif isinstance(node, ast.AnnAssign) \
+                    and node.value is not None \
+                    and isinstance(node.value, ast.Dict) \
+                    and isinstance(node.target, ast.Name):
+                dict_only.add(node.target.id)
+                dict_bindings.setdefault(
+                    node.target.id, []).append(node.value)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(
+                    node, ast.Assign) else [node.target]
+                value = node.value
+                for target in targets:
+                    if isinstance(target, ast.Subscript) \
+                            and value is not None \
+                            and arg_tainted(value):
+                        void_root(target)
+                    else:
+                        void_names(target)
+            elif isinstance(node, ast.AugAssign):
+                if isinstance(node.target, ast.Subscript) \
+                        and arg_tainted(node.value):
+                    void_root(node.target)
+                else:
+                    void_names(node.target)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                void_names(node.target)
+            elif isinstance(node, ast.NamedExpr):
+                void_names(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        void_names(item.optional_vars)
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name:
+                    voided.add(node.name)
+            elif isinstance(node, ast.Match):
+                for case in node.cases:
+                    for name in _match_names(case.pattern):
+                        voided.add(name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    voided.add(alias.asname
+                               or alias.name.split(".")[0])
+            elif isinstance(node, (ast.FunctionDef,
+                                   ast.AsyncFunctionDef,
+                                   ast.ClassDef)) \
+                    and node is not func:
+                voided.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                for name in node.names:
+                    voided.add(name)
+            elif isinstance(node, ast.Call) \
+                    and isinstance(node.func, ast.Attribute) \
+                    and isinstance(node.func.value, ast.Name):
+                carried = [arg.value
+                           if isinstance(arg, ast.Starred)
+                           else arg for arg in node.args]
+                carried.extend(keyword.value
+                               for keyword in node.keywords)
+                if any(arg_tainted(arg) for arg in carried):
+                    voided.add(node.func.value.id)
+        func_args = func.args
+        for param in list(func_args.args) \
+                + list(func_args.kwonlyargs) \
+                + list(getattr(func_args, "posonlyargs", [])):
+            voided.add(param.arg)
+        for extra in (func_args.vararg, func_args.kwarg):
+            if extra is not None:
+                voided.add(extra.arg)
+        dict_bound = dict_only - voided
+
+        def pos_clean(value):
+            # Data positions recurse; Calls are opaque
+            # (a bare tainted argument into any call
+            # already fires at its own construction
+            # site, so only computed strings survive
+            # here); anything else holding taint is a
+            # readable path.
+            if isinstance(value, ast.Call):
+                return True
+            if isinstance(value, ast.Dict):
+                return all(pos_clean(item)
+                           for item in value.values)
+            if isinstance(value, (ast.List, ast.Tuple,
+                                  ast.Set)):
+                return all(pos_clean(item)
+                           for item in value.elts)
+            if isinstance(value, ast.Starred):
+                return pos_clean(value.value)
+            return not tainted_in(value, tainted)
+
+        def append_clean(only):
+            if isinstance(only, ast.Dict):
+                return all(pos_clean(item)
+                           for item in only.values)
+            if isinstance(only, ast.Name) \
+                    and only.id in dict_bound:
+                return all(pos_clean(item)
+                           for display in dict_bindings.get(
+                               only.id, [])
+                           for item in display.values)
+            return False
+
         loads = {(node.id, node.lineno, node.col_offset)
                  for node in ast.walk(func)
                  if isinstance(node, ast.Name)
@@ -1730,27 +1851,38 @@ def _binding_violations(source):
                         f"{func.name}:{node.lineno} tainted "
                         "path escapes to call()")
                 continue
-            if (opener in consumers
-                    or opener.endswith(".run_logged")) \
+            if opener in consumers \
                     and not rebound_consumers:
+                # Bare run_logged only: a dotted
+                # .run_logged call is not the consumer
+                # (an attribute-store rebind would sail
+                # through an endswith exemption).
                 continue
             if opener in diagnostic_sinks \
                     and opener not in rebound_diagnostics:
                 continue
             if opener == "results.append":
-                # Publish sink, narrowly: only a dict
-                # display or a dict-bound-only name (the
-                # result-dict bookkeeping, tainted via
-                # the log strings it carries by design).
-                # Anything else — a bare tainted path
-                # most of all — falls through to the
-                # escape checks below.
+                # Publish sink, narrowly: a CLEAN dict
+                # display or a CLEAN dict-bound-only name
+                # (the result-dict bookkeeping, tainted
+                # only inside sanitizing calls by design).
+                # A tainted argument that is not clean
+                # fires right here — falling through
+                # would miss dict displays (never bare
+                # Names) and bless subscript readbacks.
                 if len(node.args) == 1 and not node.keywords:
                     only = node.args[0]
-                    if isinstance(only, ast.Dict) or (
-                            isinstance(only, ast.Name)
-                            and only.id in dict_bound):
+                    if append_clean(only):
                         continue
+                    if isinstance(only, ast.Name) \
+                            and only.id in tainted:
+                        pass
+                    elif not tainted_in(only, tainted):
+                        continue
+                    violations.append(
+                        f"{func.name}:{node.lineno} tainted path "
+                        f"escapes to {opener}()")
+                    continue
             if any(isinstance(arg, ast.Name)
                    and arg.id in tainted for arg in carried):
                 violations.append(
@@ -2093,6 +2225,43 @@ class CapturedBytesBinding(unittest.TestCase):
              head + "            shutil.copyfile(str(log), \"x\")\n"
              + "            output = decode_body_log(captured)\n",
              "tainted path escapes to shutil.copyfile()"),
+            ("append-dict-unpack",
+             anchor,
+             head + "            p, = {log: None}\n"
+             "            results.append(p)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("append-attr-consumer",
+             anchor,
+             head + "            Path.run_logged = Path.read_bytes\n"
+             "            payload = Path.run_logged(log)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to Path.run_logged()"),
+            ("append-subscript-store",
+             anchor,
+             head + "            result[\"raw\"] = log\n"
+             "            results.append(result)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("append-dict-display-readback",
+             anchor,
+             head + "            results.append({\"p\": log})\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("append-update-mutation",
+             anchor,
+             head + "            result.update(**{\"raw\": log})\n"
+             "            results.append(result)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("append-def-rebind",
+             anchor,
+             head + "            box = {\"log\": \"x\"}\n"
+             "            def box():\n"
+             "                return log\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
         ]
         for name, find, repl, fragment in cases:
             with self.subTest(shape=name):
@@ -2160,6 +2329,16 @@ class CapturedBytesBinding(unittest.TestCase):
             ("append-dict-bound-name",
              anchor,
              head + "            box = {\"log\": str(log.relative_to(out))}\n"
+             "            results.append(box)\n" + use),
+            ("append-clean-subscript-store",
+             anchor,
+             head + "            box = {\"log\": str(log.relative_to(out))}\n"
+             "            box[\"status\"] = \"ok\"\n"
+             "            results.append(box)\n" + use),
+            ("append-clean-method-update",
+             anchor,
+             head + "            box = {\"log\": str(log.relative_to(out))}\n"
+             "            box.update(status=\"ok\")\n"
              "            results.append(box)\n" + use),
         ]
         for name, find, repl in cases:
@@ -2440,11 +2619,20 @@ class LoggedPaths(unittest.TestCase):
         # instant child may already be terminal at the
         # first poll, and the poll-first branch then
         # returns before the deadline matters — the pin
-        # silently disarms. So every iteration proves it
-        # is armed (the first poll observes None) and
-        # proves the delay applied (elapsed clears the
-        # setup floor); under pathological load this
-        # fails loud, never silent.
+        # silently disarms. A second gap sits between
+        # the first poll and the expiry re-poll: a
+        # stall there lets the child exit mid-decision,
+        # and the re-poll observes termination on the
+        # mutant too. So the first two polls per child
+        # report canned alive to the lane (the decision
+        # spans canned polls regardless of preemption)
+        # while recording the real outcomes (the armed
+        # proof stays honest: the child really is alive
+        # then). Every iteration proves it is armed
+        # (the first poll observes None) and proves the
+        # delay applied (elapsed clears the setup
+        # floor); under pathological load this fails
+        # loud, never silent.
         with tempfile.TemporaryDirectory() as tmp:
             real_sink = lane._exclusive_sink
             real_popen = subprocess.Popen
@@ -2453,9 +2641,16 @@ class LoggedPaths(unittest.TestCase):
                 return real_sink(*args, **kwargs)
             polls = []
             class Recording(real_popen):
+                def __init__(self, *args, **kwargs):
+                    self._canned = 2
+                    super().__init__(*args, **kwargs)
+
                 def poll(self):
                     result = super().poll()
                     polls.append(result)
+                    if self._canned > 0:
+                        self._canned -= 1
+                        return None
                     return result
             with mock.patch.object(lane, "_exclusive_sink",
                                    side_effect=slow_sink), \
@@ -3507,6 +3702,124 @@ class ExecuteWiring(unittest.TestCase):
                 (out / "summary.json").read_text())
             self.assertIs(summary["complete"], False)
             self.assertIn("cleanup_errors", summary)
+            self._assert_lock_released(lock)
+
+    def test_reap_failure_records_and_finalizes(self):
+        # custody verification failure (children()
+        # OSError at the first cleanup step) records a
+        # reap error and finalizes: every unmount
+        # attempted, failed receipt with children_reaped
+        # False, summary rewritten, lock released.
+        # (Uncontained, the OSError escapes with 0
+        # unmounts, a stale running receipt, no summary,
+        # and a held lock.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            with mock.patch.object(
+                    lane, "children",
+                    side_effect=OSError(12, "Cannot allocate "
+                                            "memory")):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("owned mount cleanup failed",
+                          str(error))
+            self.assertEqual(
+                set(self._umount_targets(calls)),
+                set(self._mount_targets(calls)))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIs(receipt["children_reaped"], False)
+            self.assertTrue(any(entry.get("target") == "reap"
+                                for entry in receipt[
+                                    "cleanup_errors"]))
+            summary = json.loads(
+                (out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertIn("cleanup_errors", summary)
+            self._assert_lock_released(lock)
+
+    def test_reap_verification_failure_records_and_finalizes(self):
+        # children() failing at the final verification
+        # (unmounts already done): failed receipt with
+        # children_reaped False, a children record,
+        # summary rewritten, lock released — and the
+        # rmdir still ran (its gate tracks unmounts
+        # only, not the custody failure).
+        # (Uncontained: unmounts done but stale running
+        # receipt, no summary, held lock.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            real_children = lane.children
+            calls = []
+
+            def flaky():
+                calls.append(1)
+                if len(calls) > 2:
+                    raise OSError(12, "Cannot allocate memory")
+                return real_children()
+
+            with mock.patch.object(lane, "children",
+                                   side_effect=flaky):
+                outcome, error, drive_calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("owned mount cleanup failed",
+                          str(error))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIs(receipt["children_reaped"], False)
+            self.assertTrue(any(entry.get("target") == "children"
+                                for entry in receipt[
+                                    "cleanup_errors"]))
+            summary = json.loads(
+                (out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertEqual(list((root / "rt").iterdir()), [])
+            self._assert_lock_released(lock)
+
+    def test_execute_ancestor_swap_before_pin_fails_closed(self):
+        # out/'s ancestors stay preparer-writable: a
+        # swap landing before the pin resolves fails the
+        # pin open loud (ELOOP) — the privileged copy
+        # never reads the replacement tree. (Unpinned,
+        # the top resolves through the swap and foreign
+        # bytes arrive silently.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            (root / "evil-out" / "stage").mkdir(parents=True)
+            (root / "evil-out" / "stage" / "evil.txt").write_bytes(
+                b"NOT-IN-STAGE")
+            real_open = os.open
+            swapped = []
+
+            def racing_open(path, *args, **kwargs):
+                if (not swapped
+                        and kwargs.get("dir_fd") is None
+                        and args and args[0] & os.O_DIRECTORY):
+                    swapped.append(1)
+                    os.rename(out, root / "out_orig")
+                    os.symlink(root / "evil-out", out)
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("os.open", racing_open):
+                outcome, error, calls, printed = self._drive(
+                    root, out, lock,
+                    run_logged=lambda *a, **k: (0, False, b""))
+            self.assertEqual(swapped, [1])
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, OSError)
+            self.assertFalse(list((root / "rt").glob(
+                "*/stage/evil.txt")))
             self._assert_lock_released(lock)
 
     def test_execute_copy_aborts_mid_tree_on_cancel(self):
@@ -4856,6 +5169,33 @@ class CancelHelper(unittest.TestCase):
             self.assertFalse(
                 (root / "dst/sub/evil.txt").exists())
 
+    def test_copytree_dir_fd_top_ignores_ancestor_swap(self):
+        # the top opens relative to the caller's pinned
+        # parent: an ancestor renamed to a symlink after
+        # the pin cannot redirect the copy (real bytes
+        # arrive, outside bytes never do).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wrap" / "stage").mkdir(parents=True)
+            (root / "wrap" / "stage" / "real.txt").write_bytes(
+                b"REAL")
+            (root / "evil").mkdir()
+            (root / "evil" / "evil.txt").write_bytes(
+                b"NOT-IN-STAGE")
+            out_fd = os.open(root / "wrap",
+                             os.O_RDONLY | os.O_NOFOLLOW
+                             | os.O_DIRECTORY)
+            try:
+                os.rename(root / "wrap", root / "wrap_orig")
+                os.symlink(root / "evil", root / "wrap")
+                lane._copytree_cancel("stage", root / "dst",
+                                      dir_fd=out_fd)
+            finally:
+                os.close(out_fd)
+            self.assertEqual(
+                (root / "dst/real.txt").read_bytes(), b"REAL")
+            self.assertFalse((root / "dst/evil.txt").exists())
+
     def test_digest_refuses_fifo_without_hang(self):
         # digest fails closed on a FIFO: no writer ever
         # arrives, so a blocking open would hang the lane
@@ -5047,6 +5387,32 @@ class ProcessCustody(unittest.TestCase):
         self.assertNotIn("fileno", calls)
         self.assertIn("write", calls)
 
+    def test_say_pipe_still_full_at_exit_is_120(self):
+        # the EAGAIN residual: when the pipe is STILL
+        # full at interpreter shutdown, the retained
+        # flush fails and the exit becomes 120. (The
+        # defined residual — deterministic on 3.12 and
+        # 3.14, unlike the bare alias shape.)
+        reader, writer = os.pipe()
+        os.set_blocking(writer, False)
+        try:
+            while True:
+                os.write(writer, b"f" * 65536)
+        except BlockingIOError:
+            pass
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); "
+             "import sudo_lane as lane; lane._say('HELD'); "
+             "sys.exit(0)",
+             str(Path(lane.__file__).parent)],
+            stdout=writer, stderr=subprocess.DEVNULL)
+        os.close(writer)
+        # NOTE: no drain — the pipe stays full through
+        # shutdown.
+        self.assertEqual(proc.wait(timeout=30), 120)
+        os.close(reader)
+
     def test_say_transient_full_pipe_keeps_descriptor(self):
         # end to end: against a transiently full
         # nonblocking pipe the first line is swallowed
@@ -5093,6 +5459,121 @@ class ProcessCustody(unittest.TestCase):
         os.close(reader)
         self.assertEqual(proc.wait(timeout=30), 0)
         self.assertIn(b"SECOND\n", b"".join(chunks))
+
+    def test_say_non_int_fileno_leaves_fds_alone(self):
+        # fileno() returning a str, True, a float, or an
+        # absurd int: swallowed, no descriptor touched —
+        # no TypeError/OverflowError escape, no blind
+        # redirect. (Untyped discovery raises out of the
+        # diagnostic or dup2s onto fd 1.)
+        for name, value in (("str", "1"), ("bool", True),
+                            ("float", 1.5), ("huge", 10 ** 100)):
+            with self.subTest(shape=name):
+                class OddFileno:
+                    def write(self, text):
+                        raise BrokenPipeError(32, "gone")
+
+                    def flush(self):
+                        raise BrokenPipeError(32, "gone")
+
+                    def fileno(self, _value=value):
+                        return _value
+
+                saved_fd = os.dup(1)
+                reader, writer = os.pipe()
+                saved_stream = sys.stdout
+                try:
+                    os.dup2(writer, 1)
+                    sys.stdout = OddFileno()
+                    lane._say("x")
+                    target = os.readlink("/proc/self/fd/1")
+                finally:
+                    sys.stdout = saved_stream
+                    os.dup2(saved_fd, 1)
+                    os.close(saved_fd)
+                    os.close(reader)
+                    os.close(writer)
+                self.assertTrue(target.startswith("pipe:["),
+                                target)
+
+    def test_say_stream_replacement_keeps_captured_object(self):
+        # a sys.stdout swap landing between the failed
+        # print and discovery must not redirect the
+        # replacement's healthy descriptor: print and
+        # discovery use the captured object. (Re-reading
+        # discovery nulls the stranger's fd.)
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingBroken:
+            def write(self, text):
+                entered.set()
+                self.released = release.wait(10)
+                raise BrokenPipeError(32, "gone")
+
+            def flush(self):
+                pass
+
+            def fileno(self):
+                return 99
+
+        reader, writer = os.pipe()
+        replacement = os.fdopen(writer, "w", closefd=False)
+        saved = sys.stdout
+        sys.stdout = BlockingBroken()
+        errors = []
+
+        def caller():
+            try:
+                lane._say("hello")
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=caller, daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(10))
+        sys.stdout = replacement
+        release.set()
+        worker.join(10)
+        sys.stdout = saved
+        try:
+            target = os.readlink(f"/proc/self/fd/{writer}")
+        finally:
+            replacement.close()
+            os.close(reader)
+            os.close(writer)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(target.startswith("pipe:["),
+                        target)
+
+    def test_say_none_stdout_returns_silently(self):
+        # print() with a None stream is already a silent
+        # no-op; the explicit early return keeps that
+        # disposition defined (no escape, no recovery
+        # attempted against a missing stream).
+        saved = sys.stdout
+        sys.stdout = None
+        try:
+            lane._say("nothing")
+        finally:
+            sys.stdout = saved
+
+    def test_say_err_none_stderr_returns_silently(self):
+        # sys.stderr None (interpreter shutdown ordering):
+        # _say_err returns at once — nothing escapes and,
+        # critically, nothing lands on stdout (print
+        # with file=None would fall back to it).
+        saved_out, saved_err = sys.stdout, sys.stderr
+        with tempfile.TemporaryFile(mode="w+") as sink:
+            sys.stdout = sink
+            sys.stderr = None
+            try:
+                lane._say_err("LEAK?")
+            finally:
+                sys.stdout = saved_out
+                sys.stderr = saved_err
+            sink.seek(0)
+            self.assertEqual(sink.read(), "")
 
     def test_say_err_broken_stderr_subprocess_contained(self):
         # _say_err with a dead stderr reader: swallowed,
@@ -5197,6 +5678,35 @@ class ProcessCustody(unittest.TestCase):
             lane._CANCELLATION_REPAIR = saved_slot
         self.assertEqual(terms, [1])
         self.assertEqual(calls, [])
+        self.assertIsNone(lane._CANCELLATION_REPAIR)
+        self.assertIs(signal.getsignal(signal.SIGTERM), old_term)
+        self.assertIs(signal.getsignal(signal.SIGINT), old_int)
+
+    def test_cancellation_reap_failure_keeps_repair_and_raise(self):
+        # children() failing inside cancellation's
+        # custody still runs the repair, restores the
+        # foreign handlers, and raises InterruptedError.
+        # (Uncontained, the OSError leaks the repair and
+        # the handler restore.)
+        saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
+        old_term = signal.getsignal(signal.SIGTERM)
+        old_int = signal.getsignal(signal.SIGINT)
+        calls = []
+        lane._CANCEL_REQUESTED = True
+        lane._CANCELLATION_REPAIR = lambda: calls.append(1)
+        try:
+            with mock.patch.object(
+                    lane, "children",
+                    side_effect=OSError(12, "Cannot allocate "
+                                            "memory")):
+                with self.assertRaises(InterruptedError):
+                    with lane.cancellation():
+                        pass
+        finally:
+            lane._CANCEL_REQUESTED = saved_flag
+            lane._CANCELLATION_REPAIR = saved_slot
+        self.assertEqual(calls, [1])
         self.assertIsNone(lane._CANCELLATION_REPAIR)
         self.assertIs(signal.getsignal(signal.SIGTERM), old_term)
         self.assertIs(signal.getsignal(signal.SIGINT), old_int)
