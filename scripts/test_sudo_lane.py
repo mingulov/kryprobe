@@ -1387,15 +1387,21 @@ def _binding_violations(source):
     shapes (IfExp, BoolOp, BinOp, Subscript, f-string,
     attribute access, and method calls on a tainted
     receiver), and must not reach a read or exec primitive
-    — directly as a bare argument to any call except the
-    diagnostic sinks (print, _say, voided when rebound
-    anywhere) and the results.append publish sink, or
-    nested inside a larger argument to a read/exec
-    primitive (publish sinks stay allowed, so
-    derived-path bookkeeping never fires). Containers
+    — directly as a bare argument (starred arguments
+    unwrapped) to any call except the diagnostic sinks
+    (print, _say) and the run_logged consumer, both
+    voided when rebound anywhere, and except the
+    results.append publish sink narrowed to a dict
+    display or a dict-bound-only name (a bare tainted
+    path appended for a later subscript read fires);
+    or nested inside a larger argument to a read/exec
+    primitive (copy/getoutput shapes included, so
+    derived-path bookkeeping through publish sinks
+    stays allowed but laundered reads fire). Containers
     (Tuple/List/Dict/Set displays) propagate taint, so
     a container round-trip back into a read fires;
-    calls whose callee is itself a call are unknown
+    calls with an unrecognized callee (a call, a
+    subscript, any other computed shape) are unknown
     sinks (a bare tainted argument fires), and read
     methods on tainted-containing receivers fire.
     Every run_logged is 3-unpacked
@@ -1412,20 +1418,22 @@ def _binding_violations(source):
                      "check_output", "check_call", "run",
                      "Popen", "execv", "execve", "execl",
                      "execlp", "execvp", "execvpe", "system",
-                     "popen")
+                     "popen", "read_bytes", "read_text",
+                     "getoutput", "getstatusoutput",
+                     "copyfile", "copy", "copy2", "move")
     tree = ast.parse(source)
-    # A rebound diagnostic name is no diagnostic: any
-    # binding of print/_say voids the exemption for the
-    # whole module — anywhere, by any form, except the
-    # single top-level def that IS the real sink (a
-    # wholesale replacement of that def is body
+    # A rebound sink name is no sink: any binding of a
+    # diagnostic or consumer name voids its exemption
+    # for the whole module — anywhere, by any form,
+    # except the single top-level def that IS the real
+    # sink (a wholesale replacement of that def is body
     # verification, out of scope like any new helper).
     top_level_defs = set()
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
                              ast.ClassDef)):
             top_level_defs.add(id(stmt))
-    rebound_diagnostics = set()
+    rebound = set()
     for top in ast.walk(tree):
         if isinstance(top, ast.Assign):
             maybe = list(top.targets)
@@ -1447,21 +1455,17 @@ def _binding_violations(source):
             maybe = []
         for target in maybe:
             for name in _bound_names(target):
-                if name in diagnostic_sinks:
-                    rebound_diagnostics.add(name)
-        if isinstance(top, ast.ExceptHandler) \
-                and top.name in diagnostic_sinks:
-            rebound_diagnostics.add(top.name)
+                rebound.add(name)
+        if isinstance(top, ast.ExceptHandler) and top.name:
+            rebound.add(top.name)
         if isinstance(top, ast.Match):
             for case in top.cases:
                 for name in _match_names(case.pattern):
-                    if name in diagnostic_sinks:
-                        rebound_diagnostics.add(name)
+                    rebound.add(name)
         if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef,
                             ast.ClassDef)) \
-                and id(top) not in top_level_defs \
-                and top.name in diagnostic_sinks:
-            rebound_diagnostics.add(top.name)
+                and id(top) not in top_level_defs:
+            rebound.add(top.name)
         if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef,
                             ast.Lambda)):
             args = top.args
@@ -1471,13 +1475,13 @@ def _binding_violations(source):
                 if extra is not None:
                     params.append(extra)
             for param in params:
-                if param.arg in diagnostic_sinks:
-                    rebound_diagnostics.add(param.arg)
+                rebound.add(param.arg)
         if isinstance(top, (ast.Import, ast.ImportFrom)):
             for alias in top.names:
                 bound = alias.asname or alias.name.split(".")[0]
-                if bound in diagnostic_sinks:
-                    rebound_diagnostics.add(bound)
+                rebound.add(bound)
+    rebound_diagnostics = rebound & set(diagnostic_sinks)
+    rebound_consumers = rebound & set(consumers)
     funcs = [node for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef)
              and node.name in ("execute", "prepare")]
@@ -1497,6 +1501,69 @@ def _binding_violations(source):
 
     for func in funcs:
         tainted = {"log"}
+        # Names bound solely to dict displays in this
+        # scope: the only names results.append accepts
+        # besides a dict display itself. Comprehension
+        # targets never appear here (no binding node
+        # exists for them, and they cannot touch the
+        # function binding); every other binding form
+        # voids, including bindings inside nested
+        # bodies (fail-closed: a nested non-dict
+        # binding voids the exemption loudly rather
+        # than missing an escape silently).
+        dict_only = set()
+        voided = set()
+
+        def void_names(target):
+            for name in _bound_names(target):
+                voided.add(name)
+
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) \
+                    and isinstance(node.value, ast.Dict):
+                for target in node.targets:
+                    for name in _bound_names(target):
+                        dict_only.add(name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    void_names(target)
+            elif isinstance(node, ast.AnnAssign):
+                if node.value is not None \
+                        and isinstance(node.value, ast.Dict):
+                    for name in _bound_names(node.target):
+                        dict_only.add(name)
+                else:
+                    void_names(node.target)
+            elif isinstance(node, ast.AugAssign):
+                void_names(node.target)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                void_names(node.target)
+            elif isinstance(node, ast.NamedExpr):
+                void_names(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        void_names(item.optional_vars)
+            elif isinstance(node, ast.ExceptHandler):
+                if node.name:
+                    voided.add(node.name)
+            elif isinstance(node, ast.Match):
+                for case in node.cases:
+                    for name in _match_names(case.pattern):
+                        voided.add(name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    voided.add(alias.asname
+                               or alias.name.split(".")[0])
+        func_args = func.args
+        for param in list(func_args.args) \
+                + list(func_args.kwonlyargs) \
+                + list(getattr(func_args, "posonlyargs", [])):
+            voided.add(param.arg)
+        for extra in (func_args.vararg, func_args.kwarg):
+            if extra is not None:
+                voided.add(extra.arg)
+        dict_bound = dict_only - voided
         for node in ast.walk(func):
             if not isinstance(node, ast.Call):
                 continue
@@ -1627,6 +1694,7 @@ def _binding_violations(source):
                 violations.append(
                     f"{func.name}:{node.lineno} reads tainted path")
                 continue
+            unknown = False
             if isinstance(called, ast.Name):
                 opener = called.id
                 simple = called.id
@@ -1637,17 +1705,24 @@ def _binding_violations(source):
                     dotted.append(value.attr)
                     value = value.value
                 if not isinstance(value, ast.Name):
-                    continue
-                dotted.append(value.id)
-                opener = ".".join(reversed(dotted))
-                simple = called.attr
-            elif isinstance(called, ast.Call):
-                # Unknown sink (a call returning the
-                # callee, e.g. getattr(P, "m")): a bare
-                # tainted argument still escapes to it.
-                carried = [arg for arg in node.args]
-                carried.extend(keyword.value
-                               for keyword in node.keywords)
+                    unknown = True
+                else:
+                    dotted.append(value.id)
+                    opener = ".".join(reversed(dotted))
+                    simple = called.attr
+            else:
+                # Unknown sink: the callee is itself a
+                # call (getattr(P, "m")), a subscript
+                # (ops[0]), or any other computed shape
+                # — a bare tainted argument still
+                # escapes to it.
+                unknown = True
+            carried = [(arg.value
+                        if isinstance(arg, ast.Starred) else arg)
+                       for arg in node.args]
+            carried.extend(keyword.value
+                           for keyword in node.keywords)
+            if unknown:
                 if any(isinstance(arg, ast.Name)
                        and arg.id in tainted
                        for arg in carried):
@@ -1655,21 +1730,27 @@ def _binding_violations(source):
                         f"{func.name}:{node.lineno} tainted "
                         "path escapes to call()")
                 continue
-            else:
-                continue
-            if opener in consumers \
-                    or opener.endswith(".run_logged"):
+            if (opener in consumers
+                    or opener.endswith(".run_logged")) \
+                    and not rebound_consumers:
                 continue
             if opener in diagnostic_sinks \
                     and opener not in rebound_diagnostics:
                 continue
             if opener == "results.append":
-                # Publish sink: the result-dict
-                # bookkeeping (tainted via the log strings
-                # it carries by design) flows here.
-                continue
-            carried = [arg for arg in node.args]
-            carried.extend(keyword.value for keyword in node.keywords)
+                # Publish sink, narrowly: only a dict
+                # display or a dict-bound-only name (the
+                # result-dict bookkeeping, tainted via
+                # the log strings it carries by design).
+                # Anything else — a bare tainted path
+                # most of all — falls through to the
+                # escape checks below.
+                if len(node.args) == 1 and not node.keywords:
+                    only = node.args[0]
+                    if isinstance(only, ast.Dict) or (
+                            isinstance(only, ast.Name)
+                            and only.id in dict_bound):
+                        continue
             if any(isinstance(arg, ast.Name)
                    and arg.id in tainted for arg in carried):
                 violations.append(
@@ -1975,6 +2056,43 @@ class CapturedBytesBinding(unittest.TestCase):
              head + "            output = decode_body_log(captured)\n"
              "            _d = log.absolute().read_bytes()\n",
              "reads tainted path"),
+            ("append-bare-path",
+             anchor,
+             head + "            results.append(log)\n" + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("append-publish-roundtrip",
+             anchor,
+             head + "            results.append(log)\n"
+             "            _d = results[0].read_bytes()\n" + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("rebound-consumer",
+             anchor,
+             head + "            run_logged = open\n" + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to run_logged()"),
+            ("subscript-sink",
+             anchor,
+             head + "            ops[0](log)\n" + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to call()"),
+            ("starred-escape",
+             anchor,
+             head + "            pair = [log]\n"
+             "            store(*pair)\n" + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to store()"),
+            ("getoutput-nested",
+             anchor,
+             head + "            tag = getoutput(f\"cat {log}\")\n"
+             + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to getoutput()"),
+            ("classmethod-nested-read",
+             anchor,
+             head + "            data = Path.read_bytes(log.parent)\n"
+             + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to Path.read_bytes()"),
+            ("copyfile-nested",
+             anchor,
+             head + "            shutil.copyfile(str(log), \"x\")\n"
+             + "            output = decode_body_log(captured)\n",
+             "tainted path escapes to shutil.copyfile()"),
         ]
         for name, find, repl, fragment in cases:
             with self.subTest(shape=name):
@@ -2035,6 +2153,14 @@ class CapturedBytesBinding(unittest.TestCase):
              anchor,
              head + "            tag = captured.decode(\"utf-8\")\n"
              + use),
+            ("append-dict-display",
+             anchor,
+             head + "            results.append("
+             "{\"log\": str(log.relative_to(out))})\n" + use),
+            ("append-dict-bound-name",
+             anchor,
+             head + "            box = {\"log\": str(log.relative_to(out))}\n"
+             "            results.append(box)\n" + use),
         ]
         for name, find, repl in cases:
             with self.subTest(shape=name):
@@ -2306,24 +2432,48 @@ class LoggedPaths(unittest.TestCase):
             self.assertEqual((code, timed_out), (0, False))
 
     def test_sink_setup_is_not_charged_to_timeout(self):
-        # the wait budget starts at spawn: a 0.3 s sink
-        # setup with timeout=0.2 and a LIVE instant child
-        # still reports the child's code. (On the pre-spawn
-        # deadline this yields 124. A pre-reaped child
-        # cannot tell the shapes apart — the poll-first
-        # branch returns before the deadline matters — so
-        # the child must be really spawned.)
+        # the wait budget starts at spawn: a 0.5 s sink
+        # setup with timeout=0.3 and a sleep-0.1 child
+        # still reports the child's code. (On the
+        # pre-spawn deadline this yields 124.) The child
+        # lifetime is synchronized, not instant: an
+        # instant child may already be terminal at the
+        # first poll, and the poll-first branch then
+        # returns before the deadline matters — the pin
+        # silently disarms. So every iteration proves it
+        # is armed (the first poll observes None) and
+        # proves the delay applied (elapsed clears the
+        # setup floor); under pathological load this
+        # fails loud, never silent.
         with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / "slow-sink.log"
             real_sink = lane._exclusive_sink
+            real_popen = subprocess.Popen
             def slow_sink(*args, **kwargs):
-                time.sleep(0.3)
+                time.sleep(0.5)
                 return real_sink(*args, **kwargs)
+            polls = []
+            class Recording(real_popen):
+                def poll(self):
+                    result = super().poll()
+                    polls.append(result)
+                    return result
             with mock.patch.object(lane, "_exclusive_sink",
-                                   side_effect=slow_sink):
-                code, timed_out, captured = lane.run_logged(
-                    ["true"], log, 0.2)
-            self.assertEqual((code, timed_out), (0, False))
+                                   side_effect=slow_sink), \
+                    mock.patch.object(lane.subprocess, "Popen",
+                                       Recording):
+                for iteration in range(3):
+                    del polls[:]
+                    log = Path(tmp) / f"slow-sink-{iteration}.log"
+                    begin = time.monotonic()
+                    code, timed_out, captured = lane.run_logged(
+                        ["sleep", "0.1"], log, 0.3)
+                    elapsed = time.monotonic() - begin
+                    with self.subTest(iteration=iteration):
+                        self.assertEqual((code, timed_out),
+                                         (0, False))
+                        self.assertGreaterEqual(elapsed, 0.5)
+                        self.assertTrue(polls and polls[0] is None,
+                                        f"pin disarmed: {polls}")
 
     def test_expiry_repolls_before_declaring_timeout(self):
         # terminal status is re-observed at the expiry
@@ -2552,7 +2702,10 @@ class PrepareDriving(unittest.TestCase):
         # valid plant would break benign cross-step
         # agreement, so the plant is a meaningful failure
         # (cargo_artifacts rejects it), not a nominating
-        # rival.
+        # rival. BOTH cargo step logs are planted: a
+        # revert reading either log must die, and a read
+        # gated on one step's log cannot hide behind the
+        # other's absence (the C4 shape).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             host_debug, gen, out = self._scaffold(root)
@@ -2563,7 +2716,7 @@ class PrepareDriving(unittest.TestCase):
             planted_paths = []
 
             def plant(command, log):
-                if command[1:2] == ["build"]:
+                if command[1:2] in (["build"], ["test"]):
                     Path(log).write_bytes(planted.encode())
                     planted_paths.append(Path(log))
 
@@ -2575,10 +2728,11 @@ class PrepareDriving(unittest.TestCase):
                          for row in manifest["artifacts"]}
             self.assertEqual(by_target["kryprobe"]["executable"],
                              str(host_debug / "kryprobe"))
-            # the mock really did plant the conflict.
-            self.assertEqual(len(planted_paths), 1)
-            self.assertEqual(planted_paths[0].read_bytes(),
-                             planted.encode())
+            # the mock really did plant both conflicts.
+            self.assertEqual(len(planted_paths), 2)
+            for planted_path in planted_paths:
+                self.assertEqual(planted_path.read_bytes(),
+                                 planted.encode())
 
     def test_prepare_list_uses_captured_bytes_not_planted_path(self):
         # the prepare-listing site reads captured bytes: a
@@ -3278,6 +3432,83 @@ class ExecuteWiring(unittest.TestCase):
             self.assertIn("cleanup_errors", summary)
             self._assert_lock_released(lock)
 
+    def test_umount_spawn_failure_records_and_continues(self):
+        # umount containment: an OSError from the umount
+        # call itself (fork EAGAIN, missing binary)
+        # records a cleanup error per mount and every
+        # unmount is still attempted — receipt, summary
+        # rewrite, and lock release all run. (On the bare
+        # shape the exception escapes with 1/6 unmounts
+        # attempted, a stale running receipt, no summary,
+        # and a held lock.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def fail_umount(cmd):
+                if cmd[:1] == ["umount"]:
+                    raise OSError(11, "Resource temporarily "
+                                     "unavailable")
+                return None
+            outcome, error, calls, printed = self._drive(
+                root, out, lock,
+                run_logged=lambda *a, **k: (0, False, b""),
+                run_hook=fail_umount)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("owned mount cleanup failed",
+                          str(error))
+            self.assertEqual(
+                set(self._umount_targets(calls)),
+                set(self._mount_targets(calls)))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertTrue(any("umount failed" in entry.get(
+                "stderr", "") for entry in receipt[
+                    "cleanup_errors"]))
+            summary = json.loads(
+                (out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertIn("cleanup_errors", summary)
+            self._assert_lock_released(lock)
+
+    def test_umount_decode_failure_records_and_continues(self):
+        # same containment for a ValueError from the
+        # call (text-mode stderr decode of hostile
+        # umount output): record per mount, attempt
+        # every unmount, finalize.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def fail_umount(cmd):
+                if cmd[:1] == ["umount"]:
+                    raise UnicodeDecodeError(
+                        "utf-8", b"\xff", 0, 1,
+                        "invalid start byte")
+                return None
+            outcome, error, calls, printed = self._drive(
+                root, out, lock,
+                run_logged=lambda *a, **k: (0, False, b""),
+                run_hook=fail_umount)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("owned mount cleanup failed",
+                          str(error))
+            self.assertEqual(
+                set(self._umount_targets(calls)),
+                set(self._mount_targets(calls)))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertTrue(any("umount failed" in entry.get(
+                "stderr", "") for entry in receipt[
+                    "cleanup_errors"]))
+            summary = json.loads(
+                (out / "summary.json").read_text())
+            self.assertIs(summary["complete"], False)
+            self.assertIn("cleanup_errors", summary)
+            self._assert_lock_released(lock)
+
     def test_execute_copy_aborts_mid_tree_on_cancel(self):
         # the execute-site copy honors the flag mid-tree
         # (N14): shutil.copytree would run to completion.
@@ -3287,18 +3518,18 @@ class ExecuteWiring(unittest.TestCase):
             for index in range(5):
                 (out / "stage" / f"f{index}").write_bytes(
                     b"data")
-            real_is_symlink = Path.is_symlink
+            real_stat = os.stat
             fired = []
 
-            def flag_on_third(self):
-                result = real_is_symlink(self)
-                if self.name == "f2":
+            def flag_on_third(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if (path == "f2"
+                        and kwargs.get("dir_fd") is not None):
                     fired.append(1)
                     lane._CANCEL_REQUESTED = True
                 return result
 
-            with mock.patch.object(Path, "is_symlink",
-                                   flag_on_third):
+            with mock.patch("os.stat", flag_on_third):
                 outcome, error, calls, printed = self._drive(
                     root, out, lock,
                     run_logged=lambda *a, **k: (0, False, b""))
@@ -4452,21 +4683,25 @@ class CancelHelper(unittest.TestCase):
             lane._CANCEL_REQUESTED = saved_flag
 
     def test_copyfile_cancel_refuses_swapped_fifo(self):
-        # TOCTOU: a FIFO swapped in after the is_file()
-        # check fails closed without hanging (the open is
+        # TOCTOU: a FIFO swapped in after the lstat
+        # fails closed without hanging (the open is
         # O_NONBLOCK and fstat-pinned regular).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "src"
             src.mkdir()
             (src / "bin").write_bytes(b"payload")
-            real_is_file = Path.is_file
+            real_stat = os.stat
+            swapped = []
 
-            def racing_is_file(self):
-                result = real_is_file(self)
-                if self.name == "bin" and result:
-                    os.unlink(self)
-                    os.mkfifo(self)
+            def racing_stat(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if (path == "bin" and not swapped
+                        and kwargs.get("dir_fd") is not None):
+                    swapped.append(1)
+                    os.unlink(path, dir_fd=kwargs["dir_fd"])
+                    os.mkfifo(path, 0o644,
+                              dir_fd=kwargs["dir_fd"])
                 return result
 
             res = []
@@ -4479,8 +4714,7 @@ class CancelHelper(unittest.TestCase):
                     res.append(
                         f"{type(error).__name__}: {error}")
 
-            with mock.patch.object(Path, "is_file",
-                                   racing_is_file):
+            with mock.patch("os.stat", racing_stat):
                 worker = threading.Thread(target=run,
                                           daemon=True)
                 worker.start()
@@ -4493,8 +4727,8 @@ class CancelHelper(unittest.TestCase):
 
     def test_copyfile_cancel_refuses_swapped_symlink(self):
         # TOCTOU: a symlink swapped in after the
-        # is_symlink() check fails closed (O_NOFOLLOW) —
-        # the link target is never copied.
+        # lstat fails closed (O_NOFOLLOW) — the link
+        # target is never copied.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "src"
@@ -4502,20 +4736,149 @@ class CancelHelper(unittest.TestCase):
             (src / "bin").write_bytes(b"payload")
             secret = root / "secret"
             secret.write_text("SECRET")
-            real_is_symlink = Path.is_symlink
+            real_stat = os.stat
+            swapped = []
 
-            def racing_is_symlink(self):
-                result = real_is_symlink(self)
-                if self.name == "bin" and not result:
-                    os.unlink(self)
-                    os.symlink(secret, self)
+            def racing_stat(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if (path == "bin" and not swapped
+                        and kwargs.get("dir_fd") is not None):
+                    swapped.append(1)
+                    os.unlink(path, dir_fd=kwargs["dir_fd"])
+                    os.symlink(secret, path,
+                               dir_fd=kwargs["dir_fd"])
                 return result
 
-            with mock.patch.object(Path, "is_symlink",
-                                   racing_is_symlink):
+            with mock.patch("os.stat", racing_stat):
                 with self.assertRaises(OSError):
                     lane._copytree_cancel(src, root / "dst")
             self.assertFalse((root / "dst/bin").exists())
+
+    def test_copytree_parent_swap_mid_descent_stays_pinned(self):
+        # the walk resolves below pinned directory
+        # descriptors: a parent renamed to a symlink
+        # AFTER its pin opens is traversed as the
+        # pinned directory — the copy carries the
+        # original content, never the swap target's.
+        # (The hook doubles as the pre-pinned seam, so
+        # on the path-resolving shape the swap lands
+        # before descent and the outside bytes arrive.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            (src / "sub").mkdir(parents=True)
+            (src / "sub" / "inner.txt").write_bytes(b"INSIDE")
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "evil.txt").write_bytes(b"NOT-IN-STAGE")
+            real_open = os.open
+            real_is_symlink = Path.is_symlink
+            swapped = []
+
+            def swap():
+                os.rename(src / "sub", src / "sub_orig")
+                os.symlink(outside, src / "sub")
+
+            def racing_open(path, flags, *args, **kwargs):
+                fd = real_open(path, flags, *args, **kwargs)
+                if (path == "sub" and not swapped
+                        and kwargs.get("dir_fd") is not None
+                        and flags & os.O_DIRECTORY):
+                    swapped.append(1)
+                    swap()
+                return fd
+
+            def racing_is_symlink(self):
+                result = real_is_symlink(self)
+                if self.name == "sub" and not swapped \
+                        and not result:
+                    swapped.append(1)
+                    swap()
+                return result
+
+            with mock.patch("os.open", racing_open), \
+                    mock.patch.object(Path, "is_symlink",
+                                      racing_is_symlink):
+                lane._copytree_cancel(src, root / "dst")
+            self.assertEqual(swapped, [1])
+            self.assertTrue((src / "sub").is_symlink())
+            self.assertEqual(
+                (root / "dst/sub/inner.txt").read_bytes(),
+                b"INSIDE")
+            self.assertFalse(
+                (root / "dst/sub/evil.txt").exists())
+
+    def test_copytree_parent_swap_before_pin_fails_closed(self):
+        # the swap landing between the lstat (DIR) and
+        # the child pin open must fail closed: the
+        # O_NOFOLLOW|O_DIRECTORY open refuses the
+        # symlink, and the outside bytes never arrive.
+        # (On the path-resolving shape the same swap
+        # descends into the link without error.)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            (src / "sub").mkdir(parents=True)
+            (src / "sub" / "inner.txt").write_bytes(b"INSIDE")
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "evil.txt").write_bytes(b"NOT-IN-STAGE")
+            real_stat = os.stat
+            real_is_symlink = Path.is_symlink
+            swapped = []
+
+            def swap():
+                os.rename(src / "sub", src / "sub_orig")
+                os.symlink(outside, src / "sub")
+
+            def racing_stat(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if (path == "sub" and not swapped
+                        and kwargs.get("dir_fd") is not None):
+                    swapped.append(1)
+                    swap()
+                return result
+
+            def racing_is_symlink(self):
+                result = real_is_symlink(self)
+                if self.name == "sub" and not swapped \
+                        and not result:
+                    swapped.append(1)
+                    swap()
+                return result
+
+            with mock.patch("os.stat", racing_stat), \
+                    mock.patch.object(Path, "is_symlink",
+                                      racing_is_symlink):
+                with self.assertRaises(OSError):
+                    lane._copytree_cancel(src, root / "dst")
+            self.assertEqual(swapped, [1])
+            self.assertFalse(
+                (root / "dst/sub/evil.txt").exists())
+
+    def test_digest_refuses_fifo_without_hang(self):
+        # digest fails closed on a FIFO: no writer ever
+        # arrives, so a blocking open would hang the lane
+        # uninterruptibly. (The open is O_NONBLOCK and
+        # fstat-pinned regular.)
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "stalled"
+            os.mkfifo(fifo)
+            res = []
+
+            def run():
+                try:
+                    lane.digest(fifo)
+                    res.append("returned")
+                except BaseException as error:
+                    res.append(type(error).__name__)
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(5)
+            self.assertFalse(worker.is_alive(),
+                             f"digest hung on FIFO: {res}")
+            self.assertEqual(res, ["ValueError"])
 
 
 class ProcessCustody(unittest.TestCase):
@@ -4598,6 +4961,199 @@ class ProcessCustody(unittest.TestCase):
             pass_fds=(writer,))
         os.close(writer)
         self.assertEqual(proc.wait(timeout=30), 0)
+
+    def test_say_leaves_aliased_stdout_strictly_alone(self):
+        # sys.stdout rebound to a broken fd-2 stream while
+        # fd 1 stays healthy: the line is swallowed but fd
+        # 1 is never redirected — later output lands. The
+        # residual exit 120 (the broken stream still fails
+        # at shutdown) is defined, not silent. (On the
+        # blind-fallback shape fd 1 is nulled and AFTER
+        # is lost.)
+        reader, writer = os.pipe()
+        os.close(reader)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, sys; sys.path.insert(0, sys.argv[1]); "
+             "import sudo_lane as lane; "
+             "sys.stdout = os.fdopen(2, 'w', closefd=False); "
+             "lane._say('x' * 100000); "
+             "os.write(1, b'AFTER\\n'); sys.exit(0)",
+             str(Path(lane.__file__).parent)],
+            stdout=subprocess.PIPE, stderr=writer)
+        os.close(writer)
+        out, _ = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 120)
+        self.assertIn(b"AFTER\n", out)
+
+    def test_say_leaves_proxied_stdout_strictly_alone(self):
+        # a fileno-less proxy whose write raises: the
+        # line is swallowed, no descriptor discovery is
+        # possible, and fd 1 is left strictly alone —
+        # later output lands. Exit 120 at the proxy's own
+        # shutdown flush is the defined residual. (This
+        # disposition documents the leave-alone contract;
+        # it holds by the same path pre-split.)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, sys\n"
+             "sys.path.insert(0, sys.argv[1])\n"
+             "import sudo_lane as lane\n"
+             "class Proxy:\n"
+             "    def write(self, text):\n"
+             "        raise BrokenPipeError(32, 'gone')\n"
+             "    def flush(self):\n"
+             "        raise BrokenPipeError(32, 'gone')\n"
+             "sys.stdout = Proxy()\n"
+             "lane._say('lost')\n"
+             "os.write(1, b'AFTER\\n')\n"
+             "sys.exit(0)",
+             str(Path(lane.__file__).parent)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 120)
+        self.assertIn(b"AFTER\n", out)
+
+    def test_say_blocking_error_skips_recovery(self):
+        # BlockingIOError never reaches discovery: the
+        # descriptor is healthy, so fileno() must not
+        # even be consulted — let alone redirected. (On
+        # the null-on-OSError shape the OSError branch
+        # runs discovery and nulls the fd.)
+        calls = []
+        class FullPipe:
+            def write(self, text):
+                calls.append("write")
+                raise BlockingIOError(11, "full")
+            def flush(self):
+                calls.append("flush")
+                raise BlockingIOError(11, "full")
+            def fileno(self):
+                calls.append("fileno")
+                return 99
+        saved = sys.stdout
+        sys.stdout = FullPipe()
+        try:
+            lane._say("held")
+        finally:
+            sys.stdout = saved
+        self.assertNotIn("fileno", calls)
+        self.assertIn("write", calls)
+
+    def test_say_transient_full_pipe_keeps_descriptor(self):
+        # end to end: against a transiently full
+        # nonblocking pipe the first line is swallowed
+        # (EAGAIN) but the descriptor survives — output
+        # after the drain lands and the exit stays 0.
+        # (On the null-on-OSError shape fd 1 is
+        # redirected and SECOND is lost.) The ready byte
+        # proves the first attempt ran against the full
+        # pipe: nothing is drained before it arrives.
+        reader, writer = os.pipe()
+        os.set_blocking(writer, False)
+        try:
+            while True:
+                os.write(writer, b"f" * 65536)
+        except BlockingIOError:
+            pass
+        sig_reader, sig_writer = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, sys, time; "
+             "sys.path.insert(0, sys.argv[1]); "
+             "import sudo_lane as lane; "
+             "lane._say('FIRST'); "
+             "os.write(int(sys.argv[2]), b'R'); "
+             "time.sleep(2); "
+             "lane._say('SECOND'); sys.exit(0)",
+             str(Path(lane.__file__).parent),
+             str(sig_writer)],
+            stdout=writer, stderr=subprocess.DEVNULL,
+            pass_fds=(sig_writer,))
+        os.close(writer)
+        os.close(sig_writer)
+        self.assertEqual(os.read(sig_reader, 1), b"R")
+        os.close(sig_reader)
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(reader, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.close(reader)
+        self.assertEqual(proc.wait(timeout=30), 0)
+        self.assertIn(b"SECOND\n", b"".join(chunks))
+
+    def test_say_err_broken_stderr_subprocess_contained(self):
+        # _say_err with a dead stderr reader: swallowed,
+        # fd 2 recovered to null, exit 0 — no traceback,
+        # no 120. (On the bare-print shape the
+        # BrokenPipeError escapes.)
+        reader, writer = os.pipe()
+        os.close(reader)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); "
+             "import sudo_lane as lane; "
+             "lane._say_err('x' * 100000); sys.exit(0)",
+             str(Path(lane.__file__).parent)],
+            stdout=subprocess.DEVNULL, stderr=writer)
+        os.close(writer)
+        self.assertEqual(proc.wait(timeout=30), 0)
+
+    def test_reap_owned_broken_stderr_keeps_custody(self):
+        # the reap loop's pending-cleanup diagnostic goes
+        # through _say_err: with a dead stderr the
+        # announcement is swallowed and custody still
+        # completes — the owned child is reaped, nothing
+        # escapes. (On the bare-print shape the
+        # BrokenPipeError aborts the loop with the child
+        # still owned.)
+        ticks = [0]
+        def fast_clock():
+            # start, then TERM-eligible, then past the
+            # 10 s announcement line for the rest.
+            ticks[0] += 1
+            if ticks[0] == 1:
+                return 100.0
+            if ticks[0] == 2:
+                return 100.5
+            return 112.0
+        attempts = []
+        class DeadStderr:
+            def write(self, text):
+                attempts.append(text)
+                raise BrokenPipeError(32, "gone")
+            def flush(self):
+                raise BrokenPipeError(32, "gone")
+            def fileno(self):
+                raise ValueError("no descriptor")
+        saved_stderr = sys.stderr
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            sys.stderr = DeadStderr()
+            with mock.patch("time.monotonic",
+                            side_effect=fast_clock):
+                lane.reap_owned()
+        finally:
+            sys.stderr = saved_stderr
+            with contextlib.suppress(ProcessLookupError):
+                child.kill()
+            child.wait(timeout=30)
+        # the announcement was attempted through the
+        # dead stderr, swallowed, and custody completed:
+        # no escape, no child left (a zombie would
+        # still show in children()). The Popen status
+        # is meaningless after the external reap.
+        self.assertTrue(
+            any("cleanup pending" in text for text in attempts),
+            attempts)
+        self.assertFalse(lane.children())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child.pid, 0)
 
     def test_flag_during_handler_restore_is_post_completion(self):
         # one flag read governs repair and raise alike: a

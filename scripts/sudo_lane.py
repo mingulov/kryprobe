@@ -268,13 +268,30 @@ def _guarded_publish(path, value, publish_errors, deferred):
 
 
 def digest(path):
-    sha = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            if _CANCEL_REQUESTED:
-                raise InterruptedError("cancelled during digest")
-            sha.update(chunk)
-    return sha.hexdigest()
+    """sha256 of a regular file, honoring cancellation.
+
+    The leaf opens O_NOFOLLOW|O_NONBLOCK and is
+    fstat-pinned regular: a swapped-in symlink refuses
+    and a swapped-in FIFO fails closed instead of
+    hanging the lane uninterruptibly on open. Only the
+    leaf is pinned — callers resolve through
+    caller-owned (prepare) or root-owned (execute)
+    parents.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(
+                f"refusing non-regular digest input: {path}")
+        sha = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                if _CANCEL_REQUESTED:
+                    raise InterruptedError("cancelled during digest")
+                sha.update(chunk)
+        return sha.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def cargo_artifacts(text):
@@ -779,7 +796,7 @@ def reap_owned(proc=None):
                     finally:
                         os.close(fd)
             if not announced and time.monotonic() - start > 10:
-                print("FAIL sudo-lane: cleanup pending; retaining lane until owned children are reaped", file=sys.stderr, flush=True)
+                _say_err("FAIL sudo-lane: cleanup pending; retaining lane until owned children are reaped")
                 announced = True
             time.sleep(0.01)
         if proc is not None:
@@ -836,37 +853,86 @@ def _deferred_cancel():
 def _say(message):
     """Diagnostic print contained against stream failure.
 
-    OSError/ValueError (broken pipe, closed stream) are
-    swallowed so cleanup reports never abort the sequence;
-    MemoryError stays uncatchable-narrow (see _guarded_publish
-    for the deferred escape). On OSError the broken
-    descriptor is repointed at /dev/null, so interpreter
-    shutdown cannot retry the failing flush and turn exit
-    0 into exit 120 (a closed file object needs no
-    recovery: its shutdown flush is already a no-op).
-    The stream's own descriptor is recovered when it is
-    determinable (it may differ from fd 1); aliased
-    stdio (0/2) is never redirected, and when the null
-    open itself reuses the target fd it is already the
-    recovery — closing it would reopen the hole."""
+    ValueError (closed stream) and BlockingIOError
+    (transiently full nonblocking pipe) are swallowed
+    bare: the descriptor is healthy and must survive
+    for later output, so discovery is not even
+    consulted — the stream retains its buffer for a
+    later flush. On any other OSError the failure is
+    contained in two ordered phases. Discovery asks
+    the stream for its
+    own descriptor OUTSIDE the recovery suppression,
+    so a fileno that raises (a fileno-less proxy) or
+    returns nothing usable cannot skip into a blind
+    fd-1 redirect. Recovery repoints the discovered
+    descriptor at /dev/null, so interpreter shutdown
+    cannot retry the failing flush and turn exit 0
+    into exit 120; when the null open itself reuses
+    the target fd it is already the recovery —
+    closing it would reopen the hole. An
+    undiscoverable descriptor, or one aliased to
+    stdio (0/2), is left strictly alone: touching fd
+    1 there would only destroy healthy output while
+    the broken stream still fails at shutdown. That
+    residual exit 120 is unfixable from here and
+    documented, not silent (see the proxy and
+    fd2alias dispositions). Only the stream's own
+    discovered descriptor is ever redirected; the
+    conventional fd is never used as a fallback."""
     try:
         print(message, flush=True)
     except ValueError:
         pass
+    except BlockingIOError:
+        pass
     except OSError:
-        with contextlib.suppress(OSError, ValueError,
-                                 AttributeError):
-            target = 1
+        try:
             stream_fd = sys.stdout.fileno()
-            if stream_fd is not None and stream_fd >= 0 \
-                    and stream_fd not in (0, 2):
-                target = stream_fd
+        except (OSError, ValueError, AttributeError):
+            return
+        if stream_fd is None or stream_fd < 0 \
+                or stream_fd in (0, 2):
+            return
+        with contextlib.suppress(OSError, ValueError):
             null_fd = os.open("/dev/null", os.O_WRONLY)
             try:
-                if null_fd != target:
-                    os.dup2(null_fd, target)
+                if null_fd != stream_fd:
+                    os.dup2(null_fd, stream_fd)
             finally:
-                if null_fd != target:
+                if null_fd != stream_fd:
+                    os.close(null_fd)
+
+
+def _say_err(message):
+    """stderr twin of _say: same dispositions (swallow
+    ValueError/BlockingIOError bare, without
+    consulting discovery; redirect only the stream's
+    own discovered descriptor; leave unknown or
+    0/1-aliased descriptors alone). Cleanup and
+    last-chance diagnostics must never abort their
+    sequence on a broken stderr — and must never
+    redirect a descriptor they did not discover."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except ValueError:
+        pass
+    except BlockingIOError:
+        pass
+    except OSError:
+        try:
+            stream_fd = sys.stderr.fileno()
+        except (OSError, ValueError, AttributeError):
+            return
+        if stream_fd is None or stream_fd < 0 \
+                or stream_fd in (0, 1):
+            return
+        with contextlib.suppress(OSError, ValueError):
+            null_fd = os.open("/dev/null", os.O_WRONLY)
+            try:
+                if null_fd != stream_fd:
+                    os.dup2(null_fd, stream_fd)
+            finally:
+                if null_fd != stream_fd:
                     os.close(null_fd)
 
 
@@ -1053,19 +1119,25 @@ def _run_cancel(command, kill_on_cancel=True, **kwargs):
     return subprocess.CompletedProcess(command, code, None, None)
 
 
-def _copyfile_cancel(source, target):
-    # Open, never check-then-open: the staging directory
-    # stays preparer-writable, so a type check races a
-    # swap. O_NOFOLLOW refuses symlinks and O_NONBLOCK
-    # lets a swapped-in FIFO open to a descriptor that
-    # fstat then rejects — either way nothing is followed,
-    # read, or hung on. The mode comes from the open
-    # descriptor too, never from a re-resolved path.
-    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+def _copyfile_cancel(source, target, *, dir_fd=None, display=None):
+    # Open, never check-then-open: the path may sit
+    # under a preparer-writable directory, so a type
+    # check races a swap. O_NOFOLLOW refuses symlinks
+    # and O_NONBLOCK lets a swapped-in FIFO open to a
+    # descriptor that fstat then rejects — either way
+    # nothing is followed, read, or hung on. The walk
+    # passes its parent descriptor (resolution stays
+    # pinned) plus a display path for diagnostics; a
+    # direct call resolves from the trusted cwd. The
+    # mode comes from the open descriptor too, never
+    # from a re-resolved path.
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 dir_fd=dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(
-                f"refusing non-regular stage file: {source}")
+                "refusing non-regular stage file: "
+                f"{source if display is None else display}")
         with os.fdopen(fd, "rb", closefd=False) as reader, \
                 open(target, "wb") as writer:
             for chunk in iter(lambda: reader.read(1024 * 1024), b""):
@@ -1078,28 +1150,61 @@ def _copyfile_cancel(source, target):
         os.close(fd)
 
 
+def _copytree_fd_cancel(parent_fd, target, display):
+    # Every component resolves relative to its pinned
+    # parent directory descriptor: a preparer rename of
+    # a walked parent to a symlink mid-copy is
+    # traversed as the pinned directory, never
+    # re-resolved outside the stage. Per-entry type
+    # comes from lstat (no following); the open that
+    # consumes the entry re-pins (O_NOFOLLOW for dirs
+    # and files, fstat-regular for files), so a swap
+    # between the stat and the open still fails
+    # closed.
+    for name in sorted(os.listdir(parent_fd)):
+        if _CANCEL_REQUESTED:
+            raise InterruptedError("cancelled during prepare")
+        dest = target / name
+        shown = f"{display}/{name}"
+        mode = os.stat(name, dir_fd=parent_fd,
+                       follow_symlinks=False).st_mode
+        if stat.S_ISLNK(mode):
+            dest.symlink_to(os.readlink(name, dir_fd=parent_fd))
+        elif stat.S_ISDIR(mode):
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW
+                            | os.O_DIRECTORY, dir_fd=parent_fd)
+            try:
+                dest.mkdir(exist_ok=False)
+                _copytree_fd_cancel(child, dest, shown)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(mode):
+            _copyfile_cancel(name, dest, dir_fd=parent_fd,
+                             display=shown)
+        else:
+            raise ValueError(f"refusing exotic stage entry: {shown}")
+
+
 def _copytree_cancel(source, target):
     """copytree(symlinks=True) honoring flag-only cancellation.
 
     Modes need not be preserved (the execute chmod pass
-    normalizes everything after); each file is opened
-    O_NOFOLLOW and fstat-pinned regular, so a swapped-in
-    symlink or FIFO fails closed instead of being
-    followed or hung on.
+    normalizes everything after). The walk is pinned:
+    the top opens O_NOFOLLOW|O_DIRECTORY and every
+    component below resolves relative to a parent
+    directory descriptor, so a preparer rename of a
+    parent directory to a symlink mid-walk cannot
+    redirect the resolution outside the stage; each
+    consumed file is fstat-pinned regular, so a
+    swapped-in symlink or FIFO fails closed instead
+    of being followed or hung on.
     """
     target.mkdir(parents=True, exist_ok=False)
-    for entry in sorted(source.iterdir()):
-        if _CANCEL_REQUESTED:
-            raise InterruptedError("cancelled during prepare")
-        dest = target / entry.name
-        if entry.is_symlink():
-            dest.symlink_to(os.readlink(entry))
-        elif entry.is_dir():
-            _copytree_cancel(entry, dest)
-        elif entry.is_file():
-            _copyfile_cancel(entry, dest)
-        else:
-            raise ValueError(f"refusing exotic stage entry: {entry}")
+    top = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        _copytree_fd_cancel(top, target, str(source))
+    finally:
+        os.close(top)
 
 
 def _exclusive_sink(path):
@@ -1493,7 +1598,7 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
         fcntl.flock(lane_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(lane_fd)
-        print(f"NOT_RUN sudo-lane: lock held: {lock_path}", file=sys.stderr)
+        _say_err(f"NOT_RUN sudo-lane: lock held: {lock_path}")
         return 4
     receipt = {
         "pid": os.getpid(), "start_ticks": Path("/proc/self/stat").read_text().split(") ", 1)[1].split()[19],
@@ -1673,7 +1778,20 @@ def execute(out, lock_path, parent_mount_ns, calls, manifest_sha256=None):
                     deferred.append(error)
             cleanup_errors = []
             for target in reversed(mounts):
-                cleanup = subprocess.run(["umount", str(target)], capture_output=True, text=True)
+                # Contained per mount: a spawn failure (fork
+                # EAGAIN, missing binary) or an output decode
+                # failure must record and continue — never
+                # strand the remaining unmounts, the receipt,
+                # the summary, and the lock.
+                try:
+                    cleanup = subprocess.run(
+                        ["umount", str(target)],
+                        capture_output=True, text=True)
+                except (OSError, ValueError) as error:
+                    cleanup_errors.append({
+                        "target": str(target),
+                        "stderr": f"umount failed: {error}"})
+                    continue
                 if cleanup.returncode:
                     cleanup_errors.append({"target": str(target), "stderr": cleanup.stderr})
             if runtime is not None and not cleanup_errors:
@@ -1922,5 +2040,5 @@ if __name__ == "__main__":
         with cancellation():
             sys.exit(main())
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"FAIL sudo-lane: {error}", file=sys.stderr)
+        _say_err(f"FAIL sudo-lane: {error}")
         sys.exit(1)
