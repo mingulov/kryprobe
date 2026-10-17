@@ -1697,56 +1697,91 @@ def _copy_source_names(value, trusted_builtin):
     return ()
 
 
-def _load_free(value):
-    # a display/comprehension built from pure
-    # literal structure: no names, attributes,
-    # subscripts, calls, stars, walruses or
-    # unpackings anywhere inside (a load may
-    # retain the old object or its descendants:
-    # {"old": box} and [*box.values()] stay
-    # connected to the old object, so only a
-    # load-free display proves independence).
-    for node in ast.walk(value):
-        if isinstance(node, ast.Dict):
-            if any(key is None for key in node.keys):
+def _pure_binder(target):
+    # a comprehension target binding bare names
+    # only (no Subscript/Attribute: those
+    # evaluate their containers; a Starred
+    # binder holds a fresh list).
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, ast.Starred):
+        return _pure_binder(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return all(_pure_binder(elt)
+                   for elt in target.elts)
+    return False
+
+
+def _load_free(value, trusted_builtin):
+    # a value built from pure literal structure:
+    # nested displays, pure tuples, constants,
+    # no-arg trusted ctors (at any depth — a
+    # nested dict() is fresh wherever it sits),
+    # comprehension binders with load-free
+    # iters/conditions/elements, and walrus
+    # values (the target is a bare Name by
+    # grammar; the rebind is tracked as its own
+    # bind). A load may retain the old object or
+    # its descendants, so anything unrecognized
+    # — names, attributes, subscripts, other
+    # calls, operators, conditionals, lambdas —
+    # fails closed.
+    if isinstance(value, ast.Constant):
+        return True
+    if isinstance(value, ast.Dict):
+        for key, val in zip(value.keys, value.values):
+            if key is None:
+                if not _load_free(val, trusted_builtin):
+                    return False
+            elif not _load_free(key, trusted_builtin) \
+                    or not _load_free(val, trusted_builtin):
                 return False
-        elif isinstance(node, (ast.List, ast.Set,
-                               ast.ListComp, ast.SetComp,
-                               ast.DictComp,
-                               ast.GeneratorExp,
-                               ast.Constant,
-                               ast.expr_context,
-                               ast.comprehension)):
-            continue
+        return True
+    if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+        return all(_load_free(elt, trusted_builtin)
+                   for elt in value.elts)
+    if isinstance(value, ast.Starred):
+        return _load_free(value.value, trusted_builtin)
+    if isinstance(value, ast.NamedExpr):
+        return _load_free(value.value, trusted_builtin)
+    if isinstance(value, (ast.ListComp, ast.SetComp,
+                           ast.DictComp, ast.GeneratorExp)):
+        if isinstance(value, ast.DictComp):
+            parts = [value.key, value.value]
         else:
+            parts = [value.elt]
+        if not all(_load_free(part, trusted_builtin)
+                   for part in parts):
             return False
-    return True
+        return all(
+            _pure_binder(gen.target)
+            and _load_free(gen.iter, trusted_builtin)
+            and all(_load_free(cond, trusted_builtin)
+                    for cond in gen.ifs)
+            for gen in value.generators)
+    if isinstance(value, ast.Call):
+        return isinstance(value.func, ast.Name) \
+            and not value.args and not value.keywords \
+            and trusted_builtin(value.func.id)
+    return False
 
 
 def _fresh_value(value, trusted_builtin):
     # values that provably denote a new object
     # disconnected from the old one: load-free
-    # container displays (constants and nested
-    # displays only — any load may retain a
-    # reference: {"old": box} shares the old
-    # object through its values, so displays
-    # with loads stay unknown kills,
-    # fail-closed), constants, and no-arg
-    # trusted-ctor calls. Everything else —
-    # calls, subscripts, attributes, operators
+    # structure (displays, pure tuples,
+    # constants, no-arg trusted ctors,
+    # load-free comprehensions — any load may
+    # retain a reference, so displays with loads
+    # stay unknown kills, fail-closed).
+    # Everything else — names, subscripts,
+    # attributes, other calls, operators
     # (overloading may return an operand),
     # conditionals (may select the old object),
     # lambdas — stays an unknown kill: the old
     # object may flow back, so the edge
     # survives (fail-closed).
-    if isinstance(value, (ast.Dict, ast.List, ast.Set,
-                           ast.ListComp, ast.SetComp,
-                           ast.DictComp, ast.Constant)):
-        return _load_free(value)
-    return isinstance(value, ast.Call) \
-        and isinstance(value.func, ast.Name) \
-        and not value.args and not value.keywords \
-        and trusted_builtin(value.func.id)
+    return _load_free(value, trusted_builtin)
 
 
 def _target_leaves(target):
@@ -1782,22 +1817,6 @@ def _splat_elts(elts):
     return out
 
 
-def _element_copy(inner, consumed):
-    # a starred target's element provenance: the star
-    # binds a FRESH list, but its elements ARE the
-    # consumed values — exactly shallow-copy sharing
-    # (a top store stays local; a store through an
-    # element reaches the consumed object). Modelled
-    # as a copy-form over the consumed value (never
-    # an alias: that would over-taint top stores).
-    synth = ast.Call(
-        func=ast.Attribute(value=consumed, attr="copy",
-                           ctx=ast.Load()),
-        args=[], keywords=[])
-    ast.copy_location(synth, consumed)
-    return inner, synth
-
-
 def _walk_pairs(target, value):
     # (leaf-target, corresponding-value) pairs for a
     # destructured assignment; uneven shapes pair each
@@ -1808,8 +1827,9 @@ def _walk_pairs(target, value):
     # pairs a with box). Around one starred target,
     # known prefixes and suffixes pair positionally
     # and the star consumes the middle (possibly
-    # empty) with element provenance per consumed
-    # value; a lone starred target binds a FRESH
+    # empty) with element provenance as one Tuple
+    # of the consumed values; a lone starred target
+    # binds a FRESH
     # list, so it pairs with the Starred node
     # itself (a non-Name, non-copy value — callers
     # kill it) instead of the operand's object.
@@ -1838,26 +1858,41 @@ def _walk_pairs(target, value):
                 pre = target.elts[:at]
                 suf = target.elts[at + 1:]
                 if len(expanded) >= len(pre) + len(suf):
+                    # target order (the star binds
+                    # between its prefix and suffix):
+                    # same-batch same-name replays
+                    # last-target-wins.
                     for sub_target, sub_value in zip(
                             pre, expanded):
                         yield from _walk_pairs(sub_target,
                                                sub_value)
+                    middle = expanded[len(pre):len(
+                        expanded) - len(suf)] if suf \
+                        else expanded[len(pre):]
+                    inner = target.elts[at].value
+                    if middle:
+                        # element provenance rides one
+                        # parentless Tuple of the
+                        # consumed values (resolved by
+                        # the star-aware store path;
+                        # callers otherwise kill it —
+                        # real tuples stay in the
+                        # parents map, so they never
+                        # resolve).
+                        synth = ast.Tuple(
+                            elts=list(middle),
+                            ctx=ast.Load())
+                        ast.copy_location(
+                            synth, target.elts[at])
+                        yield inner, synth
+                    else:
+                        yield inner, target.elts[at]
                     if suf:
                         for sub_target, sub_value in zip(
                                 suf, expanded[len(
                                     expanded) - len(suf):]):
                             yield from _walk_pairs(
                                 sub_target, sub_value)
-                    middle = expanded[len(pre):len(
-                        expanded) - len(suf)] if suf \
-                        else expanded[len(pre):]
-                    inner = target.elts[at].value
-                    if middle:
-                        for consumed in middle:
-                            yield _element_copy(
-                                inner, consumed)
-                    else:
-                        yield inner, target.elts[at]
                     return
     if isinstance(target, (ast.Tuple, ast.List)):
         for leaf in _target_leaves(target):
@@ -2921,10 +2956,11 @@ def _binding_violations(source):
             # RHS first, then each target in order,
             # evaluating (walrus effects) before
             # storing. Target stores complete at RHS
-            # end (left-to-right by stability); a
-            # walrus inside target i completes with
+            # end per-leaf (operand index —
+            # duplicates un-tie, last target wins);
+            # a walrus inside target i completes with
             # that target (after earlier targets'
-            # stores, before its own — same-name
+            # stores, before later ones — same-name
             # same-target collisions are impossible:
             # _bound_names never yields walrus
             # targets, complex targets bind keys).
@@ -2958,9 +2994,35 @@ def _binding_violations(source):
                                 == bpos \
                                 and node.value is not None:
                             end = node.value
+                            # per-leaf order: the store
+                            # completes with its own
+                            # operand (duplicate names
+                            # across targets un-tie —
+                            # last target wins); a star
+                            # kill-pair (value outside
+                            # the RHS) defaults to 0 and
+                            # resolves by stability,
+                            # which follows target order.
+                            operands = [node.value]
+                            if isinstance(
+                                    node.value,
+                                    (ast.Tuple, ast.List)):
+                                operands = node.value.elts
+                            leaf = 0
+                            for i, operand in enumerate(
+                                    operands):
+                                if operand is value \
+                                        or (operand.lineno,
+                                            operand.col_offset) \
+                                        <= (value.lineno,
+                                            value.col_offset) \
+                                        <= (operand.end_lineno,
+                                            operand.end_col_offset):
+                                    leaf = i
+                                    break
                             return ((end.end_lineno,
                                      end.end_col_offset),
-                                    bpos, 1)
+                                    (leaf, 0), 1)
                         targets = node.targets if isinstance(
                             node, ast.Assign) else [
                                 node.target]
@@ -2971,25 +3033,36 @@ def _binding_violations(source):
                             # holding the effect (one
                             # Tuple/List level down —
                             # the tuple itself starts
-                            # at the statement).
+                            # at the statement), keyed by
+                            # index: the effect completes
+                            # with its own target (after
+                            # earlier targets' stores,
+                            # before later ones).
+                            top = 0
+                            for i, candidate in enumerate(
+                                    targets):
+                                if candidate is child:
+                                    top = i
+                                    break
                             target = child
+                            leaf = 0
                             if isinstance(
                                     target,
                                     (ast.Tuple, ast.List)):
-                                for elt in target.elts:
+                                for i, elt in enumerate(
+                                        target.elts):
                                     if (elt.lineno,
                                             elt.col_offset) \
                                             <= bpos \
                                             <= (elt.end_lineno,
                                                 elt.end_col_offset):
                                         target = elt
+                                        leaf = i
                                         break
                             end = node.value
                             return ((end.end_lineno,
                                      end.end_col_offset),
-                                    (target.lineno,
-                                     target.col_offset),
-                                    0)
+                                    (top, leaf), 0)
                         if walrus_end is not None:
                             return (walrus_end,
                                     walrus_end, 0)
@@ -3671,7 +3744,23 @@ def _binding_violations(source):
                 # in the position-current group).
                 pass
             elif isinstance(node, (ast.For, ast.AsyncFor)):
-                kill_target(node.target, node)
+                # a for-target over a load-free iter
+                # binds fresh-anonymous items every
+                # pass (a header separator); anything
+                # else may re-yield a rebound object.
+                if _load_free(node.iter, trusted_ctor):
+                    for leaf in _target_leaves(node.target):
+                        found, key = _namespace_store(leaf)
+                        if found:
+                            if key is not None:
+                                emit(node, "fresh", key,
+                                     None)
+                        else:
+                            for name in _bound_names(leaf):
+                                emit(node, "fresh", name,
+                                     None)
+                else:
+                    kill_target(node.target, node)
             elif isinstance(node, (ast.With, ast.AsyncWith)):
                 for item in node.items:
                     if item.optional_vars is not None:
@@ -4190,10 +4279,82 @@ def _binding_violations(source):
             if any(span_start <= here <= span_end
                    for span_start, span_end, _ in loop_spans):
                 mates.update(loop_union_component(root, node))
+            if depth >= 2:
+                mates.update(
+                    star_element_union(root, node, depth))
             for source, copy_pos, seed in copies_for_store(
                     root, node, depth, prefix_copies):
                 mates.update(copy_source_union(
                     source, copy_pos, stop, seed))
+            return mates
+
+        def star_element_union(root, node, depth):
+            # stores through starred-target names: the
+            # star binds a FRESH list, but index [i]
+            # resolves to the consumed element
+            # (identity) — a depth-d store applies its
+            # remainder (d-1) to each consumed value
+            # with that value's own semantics.
+            # Consumed values ride parentless
+            # synth-Tuples (real tuples never resolve
+            # — they stay killed). r=1: a Name
+            # resolves (the store lands in the
+            # object); a copy-form stays local (its
+            # top); a display stays local (a replace
+            # into fresh structure). r>=2: Names
+            # recurse fully; copy-forms consult their
+            # sources; List/Tuple displays union their
+            # elements at r-1 (transparent indexing);
+            # Dicts union their values at r-1; Starred
+            # operands recurse at the same level
+            # (fail-closed); anything unrecognized
+            # stays local (a documented miss, like
+            # unknown kills). Termination: r strictly
+            # decreases per star hop; within one hop
+            # the recursion is structural (children
+            # only).
+            mates = set()
+
+            def resolve(value, level):
+                value = _unwrap_walrus(value)
+                if isinstance(value, ast.Name):
+                    mates.update(
+                        group_mates(value.id, node, level))
+                    return
+                if isinstance(value, ast.Starred):
+                    resolve(value.value, level)
+                    return
+                if level < 2:
+                    return
+                sources = _copy_source_names(
+                    value, trusted_ctor)
+                if sources:
+                    for source in sources:
+                        mates.update(
+                            group_mates(source, node,
+                                        level))
+                    return
+                if isinstance(value, (ast.List, ast.Tuple)):
+                    for elt in value.elts:
+                        resolve(elt, level - 1)
+                    return
+                if isinstance(value, ast.Dict):
+                    for val in value.values:
+                        resolve(val, level - 1)
+                    return
+                # Set, Constant, and anything
+                # unrecognized stay local.
+
+            for _pos, kind, value in scope_binds.get(
+                    id(func), {}).get(root, []):
+                if kind != "plain" or value is None:
+                    continue
+                if not isinstance(value, ast.Tuple):
+                    continue
+                if id(value) in parents:
+                    continue
+                for consumed in value.elts:
+                    resolve(consumed, depth - 1)
             return mates
 
         def home_scope_for(photoname, scope, spos):
@@ -4214,17 +4375,26 @@ def _binding_violations(source):
                     id(current), (set(), set()))
                 if photoname in globs:
                     return tree
+                if current is scope \
+                        and isinstance(current, ast.ClassDef) \
+                        and photoname not in nonlocs:
+                    # a direct class-body name resolves
+                    # under LOAD_NAME: the class install
+                    # strictly before the store, else the
+                    # module — enclosing function locals
+                    # are never consulted (a nonlocal
+                    # name keeps the outward walk below).
+                    installs = scope_binds.get(
+                        id(current), {}).get(photoname, [])
+                    if any(pos < spos
+                           for pos, _, _ in installs):
+                        return current
+                    return tree
                 binds = scope_binds.get(
                     id(current), {}).get(photoname)
                 if binds is not None \
                         and photoname not in nonlocs:
-                    if isinstance(current, ast.ClassDef) \
-                            and not any(
-                                pos < spos
-                                for pos, _, _ in binds):
-                        pass
-                    else:
-                        return current
+                    return current
                 if current is tree:
                     return None
                 up = current
@@ -4255,16 +4425,26 @@ def _binding_violations(source):
             # shadowing param/local never sees outside.
             # A bind whose name is definitively rebound
             # later in the same scope — an alias, a
-            # load-free fresh value, or a nested def —
-            # unconditionally, strictly between the bind
-            # and the store, contributes nothing (the
-            # store observes the new object). Binds
+            # load-free fresh value, or a bare nested
+            # def — unconditionally, strictly between
+            # the bind and the store, contributes nothing
+            # (the store observes the new object). A
+            # same-object rejoin (the killer's peer
+            # already joined to the victim value) and a
+            # decorated def / keyworded class preserve
+            # instead. Binds
             # after the store, conditional rebinds and
             # unknown/copy rebinds never kill
             # (fail-closed: call timing and back-edges
             # are unknowable, copies share, unknown
             # values may flow the old object back).
-            mates = {root}
+            # a bare root matches a same-spelled outer
+            # use only for module homes (the module name
+            # IS the same variable outward); an
+            # intermediate home shadows, so its bare
+            # name never leaks (a nested param/local is
+            # not the outer variable).
+            mates = {root} if scope is tree else set()
             if (id(scope), root) in seen:
                 return mates
             seen.add((id(scope), root))
@@ -4300,11 +4480,57 @@ def _binding_violations(source):
                         return False
                 return True
 
+            def same_object(name, target, horizon,
+                              seen):
+                # True when `name` provably denotes the
+                # `target` object just before `horizon`:
+                # spelling-equal, or transitively bound
+                # through plain-Name binds (conditional
+                # binds count — fail-closed). Copy-forms,
+                # calls and defs break the chain: a copy
+                # is not its source (a copy-peer kill at
+                # depth >= 2 is a documented miss; at
+                # depth 1 the copy's top is unrelated, so
+                # killing there is exact).
+                if name == target:
+                    return True
+                if name in seen:
+                    return False
+                seen.add(name)
+                for bpos, bkind, bval in scope_binds.get(
+                        id(scope), {}).get(name, []):
+                    if not bpos < horizon:
+                        continue
+                    if bkind != "plain":
+                        continue
+                    bval = _unwrap_walrus(bval)
+                    if not isinstance(bval, ast.Name):
+                        continue
+                    if same_object(bval.id, target, bpos,
+                                    seen):
+                        return True
+                return False
+
             def killed(pos):
+                victim = None
+                for _bpos, _bkind, _bval in bound_here:
+                    if _bpos == pos:
+                        victim = _unwrap_walrus(_bval)
+                        break
                 for kpos, kkind, kvalue in bound_here:
                     if not pos < kpos < spos:
                         continue
                     if kkind == "def":
+                        # a decorated def (or a class with
+                        # keywords) may hand back the old
+                        # object — only a bare def/class
+                        # binds provably fresh storage.
+                        if getattr(kvalue, "decorator_list",
+                                   []):
+                            continue
+                        if isinstance(kvalue, ast.ClassDef) \
+                                and kvalue.keywords:
+                            continue
                         pass
                     elif kkind != "plain" \
                             or not isinstance(
@@ -4313,6 +4539,19 @@ def _binding_violations(source):
                                  or not _fresh_value(
                                      kvalue,
                                      trusted_ctor)):
+                        continue
+                    if kkind == "plain" \
+                            and isinstance(kvalue, ast.Name) \
+                            and isinstance(victim, ast.Name) \
+                            and same_object(
+                                kvalue.id, victim.id, kpos,
+                                set()):
+                        # a same-object rejoin preserves:
+                        # the killer rebinds root to a
+                        # name already joined to the
+                        # victim value (self-alias, alias
+                        # cycle) — the store still
+                        # observes the old object.
                         continue
                     if unconditional(kpos):
                         return True
@@ -4407,12 +4646,16 @@ def _binding_violations(source):
             # fail-closed), so a same-batch target
             # rebind stops like a later one (and the
             # sweep starts below the batch, not above
-            # it). A same-batch fresh target divorces
-            # an unaliased seed entirely (the old
-            # object is garbage: rebound, held by no
-            # other name, later copies cover their own
-            # observations, window unions cover
-            # re-aliases to the copy itself). A copy
+            # it). A straight-line same-batch fresh
+            # target divorces an unaliased seed only
+            # when nothing retains the old
+            # descendants (no pre-batch copies, no
+            # same-batch alias, no second same-batch
+            # copy — the old object is then garbage:
+            # rebound, held by no other name, later
+            # copies cover their own observations,
+            # window unions cover re-aliases to the
+            # copy itself). A copy
             # inside a loop re-shares every iteration
             # (no kill-stop there), and an alias-stop
             # lifts when the copy and the rebind share
@@ -4454,11 +4697,29 @@ def _binding_violations(source):
                 start, _end, loop = max(
                     shared, key=lambda span: span[0])
                 loop_id = id(loop)
+                body_start = (loop.body[0].lineno,
+                              loop.body[0].col_offset)
                 if not overwrites(rebind, loop_id):
                     return True
 
                 def separates(event):
                     if event[4] != source:
+                        return False
+                    if start <= event[:2] < body_start \
+                            and event[3] in ("kill",
+                                             "alias"):
+                        # a header kill/alias (a
+                        # for-target or header walrus
+                        # over a non-load-free value)
+                        # reinstalls every pass: the next
+                        # copy may observe the rebound
+                        # object, so it never separates.
+                        # A header FRESH (load-free
+                        # value) still separates below:
+                        # fresh displays yield objects no
+                        # rebind can name. (Nested-loop
+                        # headers in range count as before
+                        # — a documented narrow.)
                         return False
                     if event[3] in ("kill", "fresh"):
                         return overwrites(event, loop_id)
@@ -4537,7 +4798,93 @@ def _binding_violations(source):
                             and event[4] == source
                             and event[6][0] == 1
                             for event in alias_events):
-                return set()
+                # the old object is garbage (divorced)
+                # only if the batch runs whenever the
+                # store does (no conditional, loop,
+                # try, match or scope boundary between
+                # the batch and the store window end —
+                # an unbounded store never divorces),
+                # and nothing retains the old
+                # descendants: no pre-batch copies, no
+                # same-batch alias of the source (any
+                # phase — an RHS walrus rebind retains
+                # too), and no second same-batch copy
+                # (the count includes the copy itself).
+                # Loop-carried self-retention (the
+                # batch's own copy from an earlier pass
+                # observed by a pre-batch use in the
+                # same body) is a documented miss.
+                batch = None
+                for Archer in ast.walk(func):
+                    if isinstance(Archer, ast.stmt) \
+                            and (Archer.lineno,
+                                 Archer.col_offset) == copy_pos:
+                        batch = Archer
+                        break
+                if batch is None:
+                    return set()
+                bounded = stop is not None
+                if bounded:
+                    for node in ast.walk(func):
+                        if not isinstance(node, (ast.If,
+                                                 ast.For,
+                                                 ast.AsyncFor,
+                                                 ast.While,
+                                                 ast.Try,
+                                                 ast.TryStar,
+                                                 ast.Match,
+                                                 ast.FunctionDef,
+                                                 ast.AsyncFunctionDef,
+                                                 ast.Lambda,
+                                                 ast.ClassDef)):
+                            continue
+                        nstart = (node.lineno,
+                                  node.col_offset)
+                        nend = (node.end_lineno,
+                                node.end_col_offset)
+                        if nstart <= copy_pos <= nend \
+                                and not (nstart <= stop
+                                         <= nend):
+                            bounded = False
+                            break
+                pre = snap_at(copy_pos[0], copy_pos[1],
+                              strict=True)
+                if not bounded:
+                    pass
+                elif pre is not None and any(
+                        src == source
+                        for entries in pre[1].values()
+                        for src, _, _ in entries):
+                    # a pre-batch copy still holds the
+                    # old descendants.
+                    pass
+                else:
+                    span_end = (batch.end_lineno,
+                                batch.end_col_offset)
+
+                    def same_batch(event):
+                        if event[:2] == copy_pos:
+                            return True
+                        if event[6][0] != 0:
+                            return False
+                        okey = event[6]
+                        if len(okey) <= 4:
+                            return False
+                        return copy_pos <= (okey[3],
+                                            okey[4]) <= span_end
+
+                    if any(event[3] == "alias"
+                           and event[5] == source
+                           and same_batch(event)
+                           for event in alias_events):
+                        pass
+                    elif sum(event[3] == "copy"
+                             and event[5] == source
+                             and same_batch(event)
+                             for event in alias_events) >= 2:
+                        pass
+                    else:
+                        return set()
             in_loop = any(start <= copy_pos <= end
                           for start, end, _ in loop_spans)
             stop_at = None
@@ -7614,6 +7961,397 @@ class CapturedBytesBinding(unittest.TestCase):
                 self.assertEqual(
                     _binding_violations(planted), [], name)
 
+    def test_tripwire_catches_r30_plants(self):
+        # adjudication-r29 X-fixes: retained-descendant
+        # divorce guards (X1/X1b/X1c) incl. conditional
+        # batches (X1e), reinstalling loop headers
+        # (X2/X2b), per-leaf completion order (X4/X4c),
+        # same-object kills (X5/X5b/X5c/X5d),
+        # class-namespace module fallback (X6), starred
+        # element union (X7/X7b), star depth (X8b) and
+        # target order (X9/X9b).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        fire = [
+            ('x1-divorce-surviving-copy',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            keep = box.copy()\n'
+                     '            cp, box = box.copy(), {}\n'
+                     '            cp["row"]["raw"] = log\n'
+                     '            results.append(keep)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x1b-divorce-same-batch-alias',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            cp, box, y = box.copy(), {}, box\n'
+                     '            cp["row"]["raw"] = log\n'
+                     '            results.append(y)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x1c-divorce-earlier-append',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            keep = box.copy()\n'
+                     '            cp, box = box.copy(), {}\n'
+                     '            results.append(keep)\n'
+                     '            cp["row"]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x2-aliasing-header',
+             [
+              (anchor,
+               head + '            other = {"row": {}}\n'
+                     '            for box in (other, other):\n'
+                     '                cp = box.copy()\n'
+                     '                box = other\n'
+                     '                cp["row"]["raw"] = f"{log}"\n'
+                     '            results.append(other)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x2b-destructured-header',
+             [
+              (anchor,
+               head + '            other = {"row": {}}\n'
+                     '            for box, _ in ((other, 1), (other, 2)):\n'
+                     '                cp = box.copy()\n'
+                     '                box = other\n'
+                     '                cp["row"]["raw"] = f"{log}"\n'
+                     '            results.append(other)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x4-duplicate-targets',
+             [
+              (anchor,
+               head + '            def clean(self):\n'
+                     '                return None\n'
+                     '            rb = clean\n'
+                     '            container = {}\n'
+                     '            rb, container[(rb := clean)], rb = clean, '
+                     'None, Path.read_bytes\n'
+                     '            Path.r = rb\n'
+                     '            ignored = decode_body_log(log.r())\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+            ('x4c-nested-tuple-targets',
+             [
+              (anchor,
+               head + '            def clean(self):\n'
+                     '                return None\n'
+                     '            rb = clean\n'
+                     '            container = {}\n'
+                     '            (rb, container[(rb := clean)]), rb = '
+                     '(clean, None), Path.read_bytes\n'
+                     '            Path.r = rb\n'
+                     '            ignored = decode_body_log(log.r())\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+            ('x5-self-alias-kill',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            class C:\n'
+                     '                a = box\n'
+                     '                a = a\n'
+                     '                a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x5b-peer-cycle-kill',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            class C:\n'
+                     '                a = box\n'
+                     '                b = a\n'
+                     '                a = b\n'
+                     '                a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x5c-decorated-def-kill',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            class C:\n'
+                     '                a = box\n'
+                     '                @(lambda f: box)\n'
+                     '                def a():\n'
+                     '                    pass\n'
+                     '                a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x5d-func-self-alias',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            def outer():\n'
+                     '                a = box\n'
+                     '                a = a\n'
+                     '                def inner():\n'
+                     '                    a["raw"] = log\n'
+                     '                inner()\n'
+                     '            outer()\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x6-enclosing-local-fallback',
+             [
+              (mod,
+               'm_cls = {}\n'
+               'a_cls = m_cls\n'
+               + mod),
+              (anchor,
+               head + '            a_cls = {}\n'
+                     '            class C:\n'
+                     '                a_cls["raw"] = log\n'
+                     '                a_cls = {}\n'
+                     '            results.append(m_cls)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x7-starred-first-element',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            other = {}\n'
+                     '            *xs, = [box, other]\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x7b-starred-last-element',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            other = {}\n'
+                     '            *xs, = [other, box]\n'
+                     '            xs[1]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x8b-starred-nested-display',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [[box]]\n'
+                     '            xs[0][0]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x9-starred-suffix-order',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *a, a = [{}, box]\n'
+                     '            a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x9b-starred-empty-suffix',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *a, a = [box]\n'
+                     '            a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('x1e-conditional-batch-no-divorce',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            cp = box.copy()\n'
+                     '            if flag:\n'
+                     '                cp, box = box.copy(), {}\n'
+                     '            cp["row"]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+        ]
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_allows_r30_shapes(self):
+        # adjudication-r29 X-fixes, silent placements:
+        # the unretained divorce (X1d), load-free
+        # tuples/comprehensions (X3/X3b), the
+        # duplicate-target clean final (X4b),
+        # alias-to-foreign kills (X5e), the class-local
+        # inverse (X6b), copy-top star stores (X8), the
+        # fresh suffix (X9c) and nested param/local
+        # shadows (X10/X10b).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        prelude = "    _CANCELLATION_REAP_FAILED = False\n"
+        mod = "def execute("
+        cases = [
+            ('x1d-earlier-append-box',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            cp, box = box.copy(), {}\n'
+                     '            results.append(box)\n'
+                     '            cp["row"]["raw"] = log\n'
+               + use),
+             ]),
+            ('x3-tuple-display',
+             [
+              (prelude,
+               prelude + '    box = {"row": {}}\n'
+                        '    for i in range(1):\n'
+                        '        a = box\n'
+                        '        box = {"x": (0,)}\n'
+                        '        a["row"]["raw"] = log\n'
+                        '    results.append(box)\n'
+               ),
+             ]),
+            ('x3b-comprehension-stores',
+             [
+              (prelude,
+               prelude + '    box = {"row": {}}\n'
+                        '    for i in range(1):\n'
+                        '        a = box\n'
+                        '        box = [0 for _ in [0]]\n'
+                        '        a["row"]["raw"] = log\n'
+                        '    results.append(box)\n'
+               ),
+             ]),
+            ('x4b-duplicate-targets-inverse',
+             [
+              (anchor,
+               head + '            def clean(self):\n'
+                     '                return None\n'
+                     '            rb = Path.read_bytes\n'
+                     '            container = {}\n'
+                     '            rb, container[(rb := Path.read_bytes)], rb '
+                     '= Path.read_bytes, None, clean\n'
+                     '            Path.r = rb\n'
+                     '            ignored = decode_body_log(log.r())\n'
+               + use),
+             ]),
+            ('x6b-enclosing-local-inverse',
+             [
+              (mod,
+               'm_cls = {}\n'
+               'a_cls = {}\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     '            a_cls = box\n'
+                     '            class C:\n'
+                     '                a_cls["raw"] = log\n'
+                     '                a_cls = {}\n'
+                     '            results.append(box)\n'
+               + use),
+             ]),
+            ('x8-starred-copy-depth',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            *xs, = [box.copy()]\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ]),
+            ('x9c-starred-suffix-clean',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *a, a = [box, {"row": {}}]\n'
+                     '            a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ]),
+            ('x10-param-shadow-taint',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            def f(box):\n'
+                     '                box["raw"] = log\n'
+                     '            f({})\n'
+                     '            results.append(box)\n'
+               + use),
+             ]),
+            ('x10b-param-renamed-control',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            def f(a):\n'
+                     '                a["raw"] = log\n'
+                     '            f({})\n'
+                     '            results.append(box)\n'
+               + use),
+             ]),
+            ('x5e-alias-to-foreign-kills',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            other = {}\n'
+                     '            class C:\n'
+                     '                a = box\n'
+                     '                a = other\n'
+                     '                a["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ]),
+        ]
+        for name, edits in cases:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
+
     def test_tripwire_readcap_scope_isolation(self):
         # readcap provenance is per-scope: a sibling
         # scope's capability never leaks in, a local
@@ -8486,6 +9224,15 @@ class ExecuteWiring(unittest.TestCase):
                             else:
                                 child.unlink()
             if verdict is not None:
+                if kwargs.get("check") \
+                        and verdict.returncode != 0:
+                    # checked-exit fidelity: mirror what
+                    # subprocess.run and the real
+                    # _run_cancel do under check=True —
+                    # a nonzero verdict raises instead of
+                    # following the success path.
+                    raise subprocess.CalledProcessError(
+                        verdict.returncode, cmd)
                 return verdict
             return mock.Mock(returncode=0, stderr="")
         runtime_base = root / "rt"
@@ -9096,6 +9843,41 @@ class ExecuteWiring(unittest.TestCase):
                 (out / "summary.json").read_text())
             self.assertIs(summary["complete"], False)
             self.assertIn("cleanup_errors", summary)
+            self._assert_lock_released(lock)
+
+    def test_bind_mount_failure_raises_and_registers_nothing(self):
+        # checked-exit fidelity: a nonzero bind mount
+        # raises CalledProcessError (like the real
+        # _run_cancel under check=True) instead of
+        # following the success path — the remount
+        # never runs and the failed target is never
+        # registered for cleanup.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            def fail_bind(cmd):
+                if cmd[:2] == ["mount", "--bind"]:
+                    return mock.Mock(returncode=32,
+                                     stderr="mount failed")
+                return None
+            outcome, error, calls, printed = self._drive(
+                root, out, lock,
+                run_logged=lambda *a, **k: (0, False, b""),
+                run_hook=fail_bind)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error,
+                                  subprocess.CalledProcessError)
+            self.assertEqual(error.returncode, 32)
+            binds = [cmd for cmd in calls
+                     if cmd[:2] == ["mount", "--bind"]]
+            self.assertEqual(len(binds), 1)
+            self.assertFalse(any(cmd[:2] == ["mount", "-o"]
+                                 for cmd in calls))
+            self.assertNotIn(binds[0][-1],
+                             self._umount_targets(calls))
+            receipt = json.loads(
+                (out / "ownership.json").read_text())
+            self.assertEqual(receipt["status"], "failed")
             self._assert_lock_released(lock)
 
     def test_reap_failure_records_and_finalizes(self):
