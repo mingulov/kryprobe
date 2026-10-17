@@ -1378,14 +1378,23 @@ def _match_names(pattern):
 
 _NAMESPACE_FUNCS = ("globals", "locals", "vars")
 
+# sink/consumer defs the lane itself defines at top
+# level (sudo_lane.py: _say, run_logged): the only
+# top-level defs exempt from rebind-voiding. If the
+# lane ever defines another sink, extend this
+# alongside (the tripwire tests pin it).
+_LANE_DEFINED_SINKS = ("_say", "run_logged")
+
 
 def _store_root(target, fresh=None):
     # container root a subscript/attribute store lands
     # in (box for box["k"]/box.attr, None when the
-    # target binds plain names instead). Descends
-    # through getter chains (box.get("rows") is owned
-    # by box — mutating through it mutates box), but
-    # not through computed calls (get_box() has no
+    # target binds plain names instead), plus the
+    # descent depth (subscript/attribute/call steps
+    # from the target to the root). Descends through
+    # getter chains (box.get("rows") is owned by box
+    # — mutating through it mutates box), but not
+    # through computed calls (get_box() has no
     # resolvable owner): those stay a documented miss.
     # A proven-fresh .copy() result (fresh predicate
     # holds for the receiver) owns nothing either —
@@ -1398,22 +1407,237 @@ def _store_root(target, fresh=None):
     # return owned storage).
     root = target
     first = True
+    depth = 0
     while True:
         if isinstance(root, (ast.Subscript, ast.Attribute)):
+            # the store's own key/attr step keeps the
+            # immediate container: box.copy()["k"] lands
+            # in the copy (exempt), while
+            # box.copy()["rows"]["k"] lands in shared
+            # storage (the second step descends).
+            if root is not target:
+                first = False
             root = root.value
-            first = False
+            depth += 1
         elif isinstance(root, ast.Call) \
                 and isinstance(root.func, ast.Attribute):
             if first and fresh is not None \
                     and root.func.attr == "copy" \
                     and not root.args and not root.keywords \
                     and fresh(root.func.value):
-                return None
+                return None, depth
             root = root.func.value
             first = False
+            depth += 1
         else:
             break
-    return root.id if isinstance(root, ast.Name) else None
+    if isinstance(root, ast.Name):
+        return root.id, depth
+    return None, depth
+
+
+def _unwrap_walrus(value):
+    # assignments evaluate named expressions before
+    # binding targets, so a target paired with one
+    # binds the walrus VALUE (a = (t := v) binds a
+    # to v, and t too): unwrap to it.
+    while isinstance(value, ast.NamedExpr):
+        value = value.value
+    return value
+
+
+def _scope_surfaces(tree, parents):
+    # per-scope (imports, bound, globals, nonlocals)
+    # for import-alias resolution: {scope id:
+    # ({name: [root modules]}, {name: bind count},
+    # {global names}, {nonlocal names})}. import x as y
+    # binds the MODULE (from-imports bind objects —
+    # skipped); an alias counts only with exactly one
+    # bind (the import) in its own scope.
+    # Self-contained pruned walks (runs before the
+    # scope maps exist): nested scopes skipped whole,
+    # so a walrus in nested kept parts is missed for
+    # voiding (harmless verdicts on dead shapes only —
+    # the name is rebound away from the module there).
+    surfaces = {}
+    scopes = [tree] + [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef,
+                             ast.AsyncFunctionDef,
+                             ast.Lambda, ast.ClassDef))]
+    for scope in scopes:
+        own_skip = set()
+        if isinstance(scope, (ast.FunctionDef,
+                              ast.AsyncFunctionDef)):
+            parts = list(scope.decorator_list)
+            parts.extend(scope.args.defaults)
+            parts.extend(default for default in
+                         scope.args.kw_defaults
+                         if default is not None)
+            for param in list(scope.args.args) \
+                    + list(scope.args.kwonlyargs) \
+                    + list(getattr(scope.args, "posonlyargs",
+                                   [])):
+                if param.annotation is not None:
+                    parts.append(param.annotation)
+            for extra in (scope.args.vararg,
+                          scope.args.kwarg):
+                if extra is not None \
+                        and extra.annotation is not None:
+                    parts.append(extra.annotation)
+            if scope.returns is not None:
+                parts.append(scope.returns)
+        elif isinstance(scope, ast.Lambda):
+            parts = list(scope.args.defaults)
+            parts.extend(default for default in
+                         scope.args.kw_defaults
+                         if default is not None)
+        elif isinstance(scope, ast.ClassDef):
+            parts = list(scope.decorator_list)
+            parts.extend(scope.bases)
+            parts.extend(keyword.value
+                         for keyword in scope.keywords)
+        else:
+            parts = []
+        for part in parts:
+            for sub in ast.walk(part):
+                own_skip.add(id(sub))
+        imports, bound, globs, nonlocs = {}, {}, set(), set()
+
+        def count(name):
+            bound[name] = bound.get(name, 0) + 1
+
+        stack = [scope]
+        while stack:
+            node = stack.pop()
+            if id(node) in own_skip:
+                continue
+            if node is not scope and isinstance(
+                    node, (ast.FunctionDef,
+                           ast.AsyncFunctionDef,
+                           ast.Lambda, ast.ClassDef)):
+                if not isinstance(node, ast.Lambda):
+                    count(node.name)
+                continue
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname is not None:
+                        imports.setdefault(
+                            alias.asname, []).append(
+                                alias.name.split(".")[0])
+                        count(alias.asname)
+            if isinstance(node, ast.Name) \
+                    and isinstance(node.ctx, ast.Store):
+                count(node.id)
+            if isinstance(node, (ast.FunctionDef,
+                                 ast.AsyncFunctionDef,
+                                 ast.Lambda)):
+                for param in list(node.args.args) \
+                        + list(node.args.kwonlyargs) \
+                        + list(getattr(node.args,
+                                       "posonlyargs", [])):
+                    count(param.arg)
+                for extra in (node.args.vararg,
+                              node.args.kwarg):
+                    if extra is not None:
+                        count(extra.arg)
+            if isinstance(node, ast.Match):
+                for case in node.cases:
+                    for name in _match_names(case.pattern):
+                        count(name)
+            if isinstance(node, ast.Global):
+                globs.update(node.names)
+            elif isinstance(node, ast.Nonlocal):
+                nonlocs.update(node.names)
+            stack.extend(ast.iter_child_nodes(node))
+        surfaces[id(scope)] = (imports, bound, globs,
+                               nonlocs)
+    return surfaces
+
+
+def _surface_alias_at(surfaces, parents, node, name):
+    # root module when name resolves to an unrebound
+    # import alias at node (lexical: innermost
+    # binding scope decides, global jumps to the
+    # module, nonlocal to the nearest enclosing
+    # function binding it, classes transparent
+    # except directly enclosing); else None.
+    chain = []
+    current = node
+    first = True
+    while id(current) in parents:
+        current = parents[id(current)]
+        if isinstance(current, (ast.FunctionDef,
+                                ast.AsyncFunctionDef,
+                                ast.Lambda)):
+            chain.append(current)
+            first = False
+        elif isinstance(current, ast.ClassDef):
+            if first:
+                chain.append(current)
+            first = False
+    def single_import(scope_id):
+        imports, bound, _gl, _nl = surfaces[scope_id]
+        if bound.get(name, 0) != 1:
+            return None
+        mods = imports.get(name, [])
+        if len(mods) == 1:
+            return mods[0]
+        return None
+
+    chain.append(current)
+    root = current
+    index = 0
+    while index < len(chain):
+        scope = chain[index]
+        _imports, bound, globs, nonlocs = surfaces[
+            id(scope)]
+        if name in globs:
+            return single_import(id(root))
+        if name in nonlocs:
+            for outer in chain[index + 1:]:
+                if isinstance(outer, (ast.FunctionDef,
+                                      ast.AsyncFunctionDef)) \
+                        and name in surfaces[
+                            id(outer)][1]:
+                    return single_import(id(outer))
+            return None
+        if name in bound:
+            return single_import(id(scope))
+        index += 1
+    return None
+
+
+def _copy_source_names(value, trusted_builtin):
+    # names whose descendants a shallow copy shares:
+    # no-arg .copy() (any receiver — a custom copy
+    # returning fresh over-taints, fail-closed),
+    # single-arg dict()/list()/set() on trusted
+    # builtins, single-source {**x}. Multi-source
+    # unpacking and anything else yield () (unknown
+    # shapes stay kills: {**a, **b} sharing is a
+    # documented miss).
+    if isinstance(value, ast.Call):
+        if isinstance(value.func, ast.Attribute) \
+                and value.func.attr == "copy" \
+                and not value.args and not value.keywords \
+                and isinstance(value.func.value, ast.Name):
+            return (value.func.value.id,)
+        if isinstance(value.func, ast.Name) \
+                and len(value.args) == 1 \
+                and not value.keywords \
+                and isinstance(value.args[0], ast.Name) \
+                and trusted_builtin(value.func.id):
+            return (value.args[0].id,)
+        return ()
+    if isinstance(value, ast.Dict):
+        unpacked = [item for key, item in
+                    zip(value.keys, value.values)
+                    if key is None]
+        if len(unpacked) == 1 \
+                and isinstance(unpacked[0], ast.Name):
+            return (unpacked[0].id,)
+    return ()
 
 
 def _target_leaves(target):
@@ -1590,6 +1814,11 @@ def _binding_violations(source):
                      "getoutput", "getstatusoutput",
                      "copyfile", "copy", "copy2", "move")
     tree = ast.parse(source)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    surfaces = _scope_surfaces(tree, parents)
     # A rebound sink name is no sink: any binding of a
     # diagnostic or consumer name voids its exemption
     # for the whole module — anywhere, by any form,
@@ -1651,8 +1880,10 @@ def _binding_violations(source):
         # rebind), the bare __builtins__ name (a dict
         # under import — the lane runs imported), or a
         # __dict__ attribute of builtins/__builtins__
-        # (any other object's __dict__ is that object's
-        # namespace, not the module's — out of scope).
+        # (import aliases included — import builtins as
+        # b reaches the same dict; any other object's
+        # __dict__ is that object's namespace, not the
+        # module's — out of scope).
         if isinstance(value, ast.Call) \
                 and isinstance(value.func, ast.Name) \
                 and (value.func.id in _NAMESPACE_FUNCS
@@ -1661,10 +1892,13 @@ def _binding_violations(source):
         if isinstance(value, ast.Name):
             return value.id in ns_aliases \
                 or value.id == "__builtins__"
-        return isinstance(value, ast.Attribute) \
-            and value.attr == "__dict__" \
-            and _store_root(value) in ("builtins",
-                                       "__builtins__")
+        if not isinstance(value, ast.Attribute) \
+                or value.attr != "__dict__":
+            return False
+        root = _store_root(value)[0]
+        return root in ("builtins", "__builtins__") \
+            or _surface_alias_at(
+                surfaces, parents, value, root) == "builtins"
 
     ns_func_aliases = set()
     changed_func_alias = True
@@ -1817,15 +2051,17 @@ def _binding_violations(source):
         return True, keys, dynamic
 
     def _namespace_ior_keys(node):
-        # ns |= {...} on a namespace alias rebinds
-        # keys exactly like update (only | on a plain
-        # namespace-alias name counts: any other
-        # target mutates a value, not the namespace).
+        # ns |= {...} on a namespace alias (or the bare
+        # __builtins__ namespace itself) rebinds keys
+        # exactly like update (only | on a plain
+        # namespace name counts: any other target
+        # mutates a value, not the namespace).
         # Returns the same triple as above.
         if not isinstance(node, ast.AugAssign) \
                 or not isinstance(node.op, ast.BitOr) \
                 or not isinstance(node.target, ast.Name) \
-                or node.target.id not in ns_aliases:
+                or (node.target.id not in ns_aliases
+                    and node.target.id != "__builtins__"):
             return False, [], False
         keys, dynamic = [], False
         value = node.value
@@ -1854,20 +2090,30 @@ def _binding_violations(source):
 
     def _builtins_attr(leaf):
         # an attribute bind through the builtins
-        # module root (builtins.str = ...): the bare
-        # name every module resolves is rebound.
-        if isinstance(leaf, ast.Attribute) \
-                and _store_root(leaf) == "builtins":
+        # module root (builtins.str = ... — import
+        # aliases included): the bare name every
+        # module resolves is rebound.
+        if not isinstance(leaf, ast.Attribute):
+            return None
+        root = _store_root(leaf)[0]
+        if root == "builtins" \
+                or _surface_alias_at(
+                    surfaces, parents, leaf,
+                    root) == "builtins":
             return leaf.attr
         return None
 
     def _kept_parts(node):
         # subtrees of a nested scope that evaluate in
         # the ENCLOSING scope (kept): decorators, bases,
-        # defaults and returns. Bodies and params are
-        # pruned (their binds are local); lambda bodies
-        # prune whole (a walrus inside one is
-        # lambda-local — only lambda defaults stay).
+        # defaults, annotations and returns. Bodies and
+        # params are pruned (their binds are local);
+        # lambda bodies prune whole (a walrus inside one
+        # is lambda-local — only lambda defaults stay).
+        # (3.14 defers annotations lazily, but no 3.14
+        # program can bind through one — a walrus there
+        # is a SyntaxError — so keeping them is exact on
+        # 3.12 and harmless on 3.14.)
         roots = []
         if isinstance(node, (ast.FunctionDef,
                              ast.AsyncFunctionDef)):
@@ -1876,6 +2122,16 @@ def _binding_violations(source):
             roots.extend(default for default in
                          node.args.kw_defaults
                          if default is not None)
+            for param in list(node.args.args) \
+                    + list(node.args.kwonlyargs) \
+                    + list(getattr(node.args, "posonlyargs",
+                                   [])):
+                if param.annotation is not None:
+                    roots.append(param.annotation)
+            for extra in (node.args.vararg, node.args.kwarg):
+                if extra is not None \
+                        and extra.annotation is not None:
+                    roots.append(extra.annotation)
             if node.returns is not None:
                 roots.append(node.returns)
         elif isinstance(node, ast.ClassDef):
@@ -1945,6 +2201,15 @@ def _binding_violations(source):
                         note(name, pos, "plain", None)
 
         skip = _scope_skip_ids(root)
+        if isinstance(root, (ast.FunctionDef,
+                             ast.AsyncFunctionDef,
+                             ast.Lambda, ast.ClassDef)):
+            # the root's own decorators, defaults,
+            # bases and annotations evaluate in the
+            # ENCLOSING scope — they bind there (noted
+            # by the enclosing scope's own walk), never
+            # here.
+            skip = skip | _kept_parts(root)
         for node in ast.walk(root):
             if id(node) in skip:
                 continue
@@ -1966,10 +2231,11 @@ def _binding_violations(source):
                             note(key, pos, "plain", val)
                         else:
                             for name in _bound_names(leaf):
-                                note(name, pos, "plain", val)
+                                note(name, pos, "plain",
+                                     _unwrap_walrus(val))
             elif isinstance(node, ast.NamedExpr):
                 note(node.target.id, pos, "plain",
-                     node.value)
+                     _unwrap_walrus(node.value))
             elif isinstance(node, ast.AugAssign):
                 kill_leaf(node.target, pos)
             elif isinstance(node, (ast.For, ast.AsyncFor)):
@@ -2138,27 +2404,92 @@ def _binding_violations(source):
     scope_binds = {id(tree): module_scope_binds}
     for scope_node in ast.walk(tree):
         if isinstance(scope_node, (ast.FunctionDef,
-                                   ast.AsyncFunctionDef)):
+                                   ast.AsyncFunctionDef,
+                                   ast.Lambda)):
             scope_binds[id(scope_node)] = _scope_binds(
                 scope_node, _func_params(scope_node))
-    parents = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[id(child)] = node
-
-    def scope_chain(node):
-        # innermost FunctionDef chain out to the module
-        # (class bodies transparent — methods never
-        # close over them; lambdas hold no binds).
+        elif isinstance(scope_node, ast.ClassDef):
+            # class bodies bind their own namespace
+            # (methods, class attrs); bases and
+            # decorators evaluate enclosing but are
+            # walked here — a walrus inside one is
+            # misattributed to the class (documented
+            # narrow: pathological shapes only).
+            scope_binds[id(scope_node)] = _scope_binds(
+                scope_node)
+    scope_declared = {}
+    for scope_node in ast.walk(tree):
+        if scope_node is tree or isinstance(
+                scope_node, (ast.FunctionDef,
+                             ast.AsyncFunctionDef,
+                             ast.Lambda, ast.ClassDef)):
+            skip = _scope_skip_ids(scope_node)
+            globs, nonlocs = set(), set()
+            for node in ast.walk(scope_node):
+                if id(node) in skip:
+                    continue
+                if isinstance(node, ast.Global):
+                    globs.update(node.names)
+                elif isinstance(node, ast.Nonlocal):
+                    nonlocs.update(node.names)
+            scope_declared[id(scope_node)] = (globs, nonlocs)
+    def lexical_use_chain(node):
+        # scopes deciding a USE, innermost first: the
+        # enclosing functions/lambdas out to the
+        # module, plus a directly-enclosing class body
+        # (its names are visible to code directly
+        # inside it — but transparent to deeper
+        # functions, which never close over it).
         chain = []
         current = node
+        first = True
         while id(current) in parents:
             current = parents[id(current)]
             if isinstance(current, (ast.FunctionDef,
-                                    ast.AsyncFunctionDef)):
+                                    ast.AsyncFunctionDef,
+                                    ast.Lambda)):
                 chain.append(current)
-        chain.append(tree)
+                first = False
+            elif isinstance(current, ast.ClassDef):
+                if first:
+                    chain.append(current)
+                first = False
+            if current is tree:
+                break
+        if not chain or chain[-1] is not tree:
+            chain.append(tree)
         return chain
+
+    def lexical_binds(name, node):
+        # the scope whose binds decide a use of name at
+        # node: innermost scope binding it, honoring
+        # global (jump to module) and nonlocal (jump to
+        # the nearest enclosing function binding it —
+        # lambdas cannot declare either, and no def can
+        # nest inside a lambda body, so the target is
+        # always a FunctionDef). Returns None when no
+        # scope binds the name.
+        chain = lexical_use_chain(node)
+        index = 0
+        while index < len(chain):
+            scope = chain[index]
+            globs, nonlocs = scope_declared.get(
+                id(scope), (set(), set()))
+            if name in globs:
+                if name in scope_binds[id(tree)]:
+                    return tree
+                return None
+            if name in nonlocs:
+                for outer in chain[index + 1:]:
+                    if isinstance(outer, (ast.FunctionDef,
+                                          ast.AsyncFunctionDef)) \
+                            and name in scope_binds[id(outer)]:
+                        return outer
+                return None
+            if name in scope_binds.get(id(scope), {}):
+                return scope
+            index += 1
+        return None
 
     def _fresh_copy_root(value):
         # the object a copy-chain bottoms out at: walk
@@ -2232,6 +2563,12 @@ def _binding_violations(source):
         if isinstance(value, ast.Call):
             root = _fresh_copy_root(value)
             if root is value:
+                # no copy chain: a direct builtin
+                # constructor still seeds (dict()/list()/
+                # set() build fresh storage); any other
+                # call voids (fail-closed).
+                if _fresh_seed(value):
+                    return (False, set(), True)
                 return (True, set(), False)
             if isinstance(root, ast.Name):
                 return (False, {root.id}, False)
@@ -2246,14 +2583,21 @@ def _binding_violations(source):
 
     def outer_cap_in(scope):
         # order-free capability status for a scope
-        # (outer scopes have unknowable timing, so all
-        # binds count): SCC rule with peers resolved
-        # outward. Memoized per scope (the scope DAG is
-        # static within one _binding_violations call).
+        # (outer scopes have unknowable timing): a name
+        # is IN when any bind seeds it, directly or
+        # through an IN peer chain (a call could
+        # install before any clean rebind — fail
+        # closed). Peers resolve through the lexical
+        # outers, immediate enclosing scope included.
+        # Unseeded cycles stay OUT. Memoized per scope
+        # (the scope DAG is static within one
+        # _binding_violations call).
         key = id(scope)
         if key not in outer_cap_memo:
-            chain = scope_chain(scope)
-            outers = chain[1:]
+            outers = [
+                outer
+                for outer in lexical_use_chain(scope)
+                if not isinstance(outer, ast.ClassDef)]
 
             def resolve(peer):
                 for outer in outers:
@@ -2261,34 +2605,73 @@ def _binding_violations(source):
                         return peer in outer_cap_in(outer)
                 return False
 
-            def resolve_same(peer):
-                if peer in scope_binds[key]:
-                    return None
-                return resolve(peer)
-
-            outer_cap_memo[key] = _scc_in(
-                scope_binds[key], classify_cap,
-                resolve_same)
+            binds = scope_binds[key]
+            seeds = {}
+            peers_of = {}
+            for name, blist in binds.items():
+                seed_any = False
+                peers = set()
+                for bind in blist:
+                    _out, peers_one, seed = classify_cap(
+                        name, bind)
+                    seed_any = seed_any or seed
+                    for peer in peers_one:
+                        if peer == name:
+                            continue
+                        if peer in binds:
+                            peers.add(peer)
+                        elif resolve(peer):
+                            seed_any = True
+                seeds[name] = seed_any
+                peers_of[name] = peers
+            inside = {name for name, seed in seeds.items()
+                      if seed}
+            changed = True
+            while changed:
+                changed = False
+                for name, peers in peers_of.items():
+                    if name not in inside and any(
+                            peer in inside
+                            for peer in peers):
+                        inside.add(name)
+                        changed = True
+            outer_cap_memo[key] = inside
         return outer_cap_memo[key]
 
     def caps_at(node):
         # read capabilities visible at a bind: the query
-        # scope judges binds strictly before the query
-        # position (an install sees only what was bound
-        # before it — a later clean rebind never
-        # un-installs a reader), with copies resolved
-        # at the copy position (a copy snapshots the
-        # value then — a later kill of the source never
-        # un-copies it); outer scopes resolve
-        # order-free (call timing unknowable,
-        # fail-closed); shadowing names stay decided by
-        # the query scope. A sibling scope never leaks
-        # in; a module capability used but never
-        # rebound locally still resolves.
-        chain = scope_chain(node)
+        # scope (lexical, class and lambda bodies
+        # included) judges binds strictly before the
+        # query position — last decisive bind wins (a
+        # later clean rebind un-installs, a later seed
+        # re-installs; neutral never-executed binds
+        # fall through) — with copies resolved at the
+        # copy position (a copy snapshots the value
+        # then); an install inside a loop also sees
+        # seeds anywhere in the loop body (some pass
+        # installs them — back-edge). Outer scopes
+        # resolve order-free ANY-seed (call timing
+        # unknowable, fail-closed); shadowing names
+        # stay decided by the query scope. A sibling
+        # scope never leaks in; a module capability
+        # used but never rebound locally still
+        # resolves.
+        chain = lexical_use_chain(node)
         query = chain[0]
         qpos = (node.lineno, node.col_offset)
         qbinds = scope_binds[id(query)]
+        window = None
+        current = node
+        while id(current) in parents:
+            current = parents[id(current)]
+            if current is query:
+                break
+            if isinstance(current, (ast.For, ast.AsyncFor,
+                                    ast.While)):
+                window = ((current.lineno,
+                           current.col_offset),
+                          (current.end_lineno,
+                           current.end_col_offset))
         memo = {}
 
         def outer(name):
@@ -2297,47 +2680,117 @@ def _binding_violations(source):
                     return name in outer_cap_in(scope)
             return False
 
-        def holds(name, pos):
-            # capability status of name with binds
-            # strictly before pos (same-scope copies
-            # recurse at the copy position — strictly
-            # decreasing, so cycles terminate; names
-            # with no visible binds fall outward).
-            key = (name, pos)
+        def holds(name, pos, windowed):
+            # windowed (an install inside a loop): any
+            # seed later in the window counts (some pass
+            # installs it — a later kill never vetoes),
+            # else the last decisive bind before pos
+            # wins; copies resolve windowed when read
+            # inside the window (their reads repeat
+            # too) and snapshot pre-loop otherwise.
+            # Windowless: the last decisive bind before
+            # pos wins; neutral binds fall through to
+            # earlier binds, then outward. Positions
+            # strictly decrease along windowless
+            # recursion, and memo keys pin windowed
+            # cycles — both terminate.
+            key = (name, pos, windowed)
             if key in memo:
                 return memo[key]
-            visible = [bind for bind in qbinds.get(
-                name, []) if bind[0] < pos]
+            blist = qbinds.get(name, [])
+            memo[key] = False
+            if windowed and window is not None:
+                wstart, wend = window
+                later = [bind for bind in blist
+                         if wstart <= bind[0] < wend
+                         and bind[0] >= pos]
+                for _bpos, _kind, _value in later:
+                    _out, peers, seed = classify_cap(
+                        name, (_bpos, _kind, _value))
+                    if seed:
+                        memo[key] = True
+                        return True
+                    for peer in peers:
+                        if peer == name:
+                            continue
+                        if holds(peer, _bpos, True):
+                            memo[key] = True
+                            return True
+                for _bpos, _kind, _value in reversed(
+                        [bind for bind in blist
+                         if bind[0] < pos]):
+                    out, peers, seed = classify_cap(
+                        name, (_bpos, _kind, _value))
+                    if out:
+                        return False
+                    if seed:
+                        memo[key] = True
+                        return True
+                    decided = False
+                    for peer in peers:
+                        if peer == name:
+                            continue
+                        decided = True
+                        if not holds(peer, _bpos,
+                                     _bpos >= wstart):
+                            return False
+                    if decided:
+                        memo[key] = True
+                        return True
+                    # neutral: try earlier binds.
+                result = outer(name)
+                memo[key] = result
+                return result
+            visible = [bind for bind in blist
+                       if bind[0] < pos]
             if not visible:
                 result = outer(name)
                 memo[key] = result
                 return result
-            memo[key] = False
-            seeded = False
-            seen_peer = False
-            for _bpos, _kind, _value in visible:
+            for _bpos, _kind, _value in reversed(visible):
                 out, peers, seed = classify_cap(
                     name, (_bpos, _kind, _value))
                 if out:
-                    memo[key] = False
                     return False
-                seeded = seeded or seed
+                if seed:
+                    memo[key] = True
+                    return True
+                decided = False
                 for peer in peers:
                     if peer == name:
                         continue
-                    seen_peer = True
-                    if not holds(peer, _bpos):
-                        memo[key] = False
+                    decided = True
+                    if not holds(peer, _bpos, False):
                         return False
-            result = seeded or seen_peer
+                if decided:
+                    memo[key] = True
+                    return True
+                # neutral (never runs): try earlier binds.
+            result = outer(name)
             memo[key] = result
             return result
 
         names = set(qbinds)
         for scope in chain[1:]:
             names.update(scope_binds[id(scope)])
-        return {name for name in names
-                if holds(name, qpos)}
+        # fixpoint: True verdicts are sound (a True never
+        # derives from an in-progress False), but False
+        # ones may be cycle-poisoned (a copy cycle seen
+        # mid-resolution) — drop them and re-run until
+        # the held set stops growing. Without this the
+        # verdict depends on evaluation order.
+        held = set()
+        while True:
+            for key in [key for key, val in memo.items()
+                        if not val]:
+                del memo[key]
+            new = {name for name in names
+                   if holds(name, qpos, True)}
+            if new <= held:
+                held |= new
+                break
+            held |= new
+        return held
 
     for top in ast.walk(tree):
         if isinstance(top, ast.Assign):
@@ -2492,14 +2945,14 @@ def _binding_violations(source):
         if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef,
                             ast.ClassDef)) \
                 and (id(top) not in top_level_defs
-                     or top.name not in diagnostic_sinks
-                     and top.name not in consumers):
+                     or top.name not in _LANE_DEFINED_SINKS):
             # a top-level definition counts as a rebind
-            # unless it IS one of the sink/consumer defs
-            # themselves (wholesale replacement of those
-            # is body verification, out of scope) — a
-            # top-level `class dict` shadows the builtin
-            # and must void its trust.
+            # unless it IS one of the sink defs the lane
+            # actually defines (wholesale replacement of
+            # those is body verification, out of scope);
+            # anything else shadowing a sink/consumer/
+            # builtin name (def print, class dict)
+            # voids its trust.
             rebound.add(top.name)
         if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef,
                             ast.Lambda)):
@@ -2697,11 +3150,6 @@ def _binding_violations(source):
                 and "relative_to" not in attr_binds \
                 and "relative_to" not in rebound
 
-        # Provenance binds for this scope (shared
-        # pruned map): sanction, fresh and readcap all
-        # judge these; nested binds never leak in.
-        name_binds = scope_binds[id(func)]
-
         # Alias events from a pruned walk of the same
         # scope (nested binds are local — they neither
         # join nor detach outer objects; lambda bodies
@@ -2711,15 +3159,63 @@ def _binding_violations(source):
         # the sequence breaks ties — never the peer
         # spelling).
         alias_events = []
+        event_chain = {}
         seq = [0]
 
-        def emit(node, kind, name, peer):
+        def emit(node, kind, name, peer, okey=None,
+                 src=None):
+            # events sort by (line, col, seq); okey orders
+            # a same-statement store's prefix: (phase,
+            # line, col) with RHS effects (phase 0)
+            # before target binds (phase 1). Default is
+            # the emitting node's own target phase.
+            # The ancestor chain (id, typename) from the
+            # bind site up to func decides loop-relative
+            # overwrite in the loop union (a re-point
+            # under If/Try/Match/short-circuit or an
+            # inner loop never overwrites).
+            if okey is None:
+                okey = (1, node.lineno, node.col_offset)
+            if src is None:
+                src = node
+            chain = []
+            current = src
+            while current is not func:
+                if id(current) not in parents:
+                    break
+                current = parents[id(current)]
+                chain.append((id(current),
+                              type(current).__name__))
             alias_events.append((node.lineno, node.col_offset,
-                                 seq[0], kind, name, peer))
+                                 seq[0], kind, name, peer,
+                                 okey))
+            event_chain[seq[0]] = chain
             seq[0] += 1
 
         def kill_binding(name, node):
             emit(node, "kill", name, None)
+
+        def trusted_ctor(name):
+            return name in ("dict", "list", "set") \
+                and name not in rebound \
+                and name not in module_attr_binds
+
+        def walrus_event(stmt, named):
+            inner = _unwrap_walrus(named.value)
+            okey = (0, named.lineno, named.col_offset)
+            if isinstance(inner, ast.Name):
+                emit(stmt, "alias", named.target.id,
+                     inner.id, okey, named)
+            else:
+                sources = _copy_source_names(
+                    inner, trusted_ctor)
+                if sources:
+                    for source in sources:
+                        emit(stmt, "copy", named.target.id,
+                             source, okey, named)
+                else:
+                    emit(stmt, "kill", named.target.id,
+                         None, okey, named)
 
         def kill_target(target, node):
             for leaf in _target_leaves(target):
@@ -2732,8 +3228,48 @@ def _binding_violations(source):
                         kill_binding(name, node)
 
         skip = _scope_skip_ids(func)
+        claimed = set()
+        # RHS-first: named expressions inside value
+        # subtrees (and nested kept parts, which
+        # evaluate enclosing) bind before the statement
+        # binds its targets — pre-emit them keyed at
+        # the statement (phase 0) so same-statement
+        # order replays evaluation order.
         for node in ast.walk(func):
             if id(node) in skip:
+                continue
+            anchor = None
+            values = []
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                if node.value is not None:
+                    values = [node.value]
+                    anchor = node
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                values = [node.iter]
+                anchor = node
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                values = [item.context_expr
+                          for item in node.items]
+                anchor = node
+            elif isinstance(node, (ast.FunctionDef,
+                                   ast.AsyncFunctionDef,
+                                   ast.ClassDef, ast.Lambda)) \
+                    and node is not func:
+                anchor = node
+                keep = _kept_parts(node)
+                for sub in ast.walk(node):
+                    if id(sub) in keep and isinstance(
+                            sub, ast.NamedExpr):
+                        walrus_event(anchor, sub)
+                        claimed.add(id(sub))
+                continue
+            for value in values:
+                for sub in ast.walk(value):
+                    if isinstance(sub, ast.NamedExpr):
+                        walrus_event(anchor, sub)
+                        claimed.add(id(sub))
+        for node in ast.walk(func):
+            if id(node) in skip or id(node) in claimed:
                 continue
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 value = node.value
@@ -2746,26 +3282,42 @@ def _binding_violations(source):
                                                  value):
                         found, key = _namespace_store(leaf)
                         if found and key is not None:
-                            names = [key]
-                            plain = True
+                            target_names = [key]
+                            is_key = True
                         elif found:
                             continue
                         else:
-                            names = list(_bound_names(leaf))
-                            plain = isinstance(leaf, ast.Name)
-                        for name in names:
+                            target_names = list(
+                                _bound_names(leaf))
+                            is_key = False
+                        plain = (not is_key) \
+                            and isinstance(leaf, ast.Name)
+                        # a target paired with a walrus
+                        # binds the walrus value (a =
+                        # (t := v) binds a to v).
+                        val = _unwrap_walrus(val)
+                        okey = (1, leaf.lineno,
+                                leaf.col_offset)
+                        for name in target_names:
                             if isinstance(val, ast.Name) \
-                                    and plain:
+                                    and (plain or is_key):
                                 emit(node, "alias", name,
-                                     val.id)
+                                     val.id, okey, leaf)
+                            elif plain:
+                                sources = _copy_source_names(
+                                    val, trusted_ctor)
+                                if sources:
+                                    for source in sources:
+                                        emit(node, "copy",
+                                             name, source,
+                                             okey, leaf)
+                                else:
+                                    emit(node, "kill", name,
+                                         None, okey, leaf)
                             else:
                                 kill_binding(name, node)
             elif isinstance(node, ast.NamedExpr):
-                if isinstance(node.value, ast.Name):
-                    emit(node, "alias", node.target.id,
-                         node.value.id)
-                else:
-                    kill_binding(node.target.id, node)
+                walrus_event(node, node)
             elif isinstance(node, ast.AugAssign):
                 # Augmented assignment may rebind
                 # (immutables) or mutate in place
@@ -2823,51 +3375,104 @@ def _binding_violations(source):
         # peers, post-retarget stores spare them, and
         # loop back-edges re-reach joined objects — so
         # no end-state propagation is needed.
-        alias_events.sort()
-        alias_snapshots = []
-        groups = {}
-        index = 0
-        while index < len(alias_events):
-            pos = alias_events[index][:2]
-            batch = []
-            while index < len(alias_events) \
-                    and alias_events[index][:2] == pos:
-                batch.append(alias_events[index])
-                index += 1
-            names = [event[4] for event in batch]
+        def detach(groups, copies, name):
+            owned = groups.pop(name, None)
+            if owned is not None:
+                owned.discard(name)
+            copies.pop(name, None)
+
+        def apply_events(evts, groups, copies, pos):
+            # one event list (a full batch or a
+            # same-statement prefix) onto groups/copies
+            # in place. Phase-0 RHS effects apply first,
+            # left-to-right (a later read in the same
+            # RHS sees the walrus); then targets:
+            # duplicate names snapshot every RHS
+            # identity up front, then apply in pair
+            # order (the last store wins); unique names
+            # apply atomically. Copies propagate through
+            # aliases (a name joined to a copy shares
+            # its sources) and die on rebind; a copy of
+            # a copy keeps the ORIGINAL source and
+            # position (both share the descendants held
+            # then).
+            first = sorted(
+                (event for event in evts
+                 if event[6][0] == 0),
+                key=lambda event: event[6])
+            rest = [event for event in evts
+                    if event[6][0] != 0]
+            for _, _, _, kind, name, peer, _ in first:
+                if kind == "alias":
+                    detach(groups, copies, name)
+                    taken = groups.get(peer)
+                    if taken is None:
+                        taken = {peer}
+                        groups[peer] = taken
+                    taken.add(name)
+                    groups[name] = taken
+                    if peer in copies:
+                        copies[name] = set(copies[peer])
+                elif kind == "copy":
+                    detach(groups, copies, name)
+                    if peer in copies:
+                        copies[name] = set(copies[peer])
+                    else:
+                        copies[name] = {(peer, pos)}
+                else:
+                    detach(groups, copies, name)
+            if not rest:
+                return
+            names = [event[4] for event in rest]
             if len(set(names)) < len(names):
                 captured = {}
-                for _, _, _, kind, name, peer in batch:
+                cread = {key: set(val)
+                         for key, val in copies.items()}
+                for _, _, _, kind, name, peer, _ in rest:
                     if kind == "alias" \
                             and peer not in captured:
                         found = groups.get(peer)
                         if found is None:
+                            # an invented pre-batch
+                            # identity registers, so a
+                            # later rebind of the peer in
+                            # this batch detaches it (a
+                            # detached peer keeps no stale
+                            # members).
                             found = {peer}
+                            groups[peer] = found
                         captured[peer] = found
-                for _, _, _, kind, name, peer in batch:
+                for _, _, _, kind, name, peer, _ in rest:
                     if kind == "alias":
-                        owned = groups.pop(name, None)
-                        if owned is not None:
-                            owned.discard(name)
+                        detach(groups, copies, name)
                         taken = captured[peer]
                         taken.add(name)
                         groups[name] = taken
+                        if peer in cread:
+                            copies[name] = set(cread[peer])
+                    elif kind == "copy":
+                        detach(groups, copies, name)
+                        if peer in cread:
+                            copies[name] = set(cread[peer])
+                        else:
+                            copies[name] = {(peer, pos)}
                     else:
-                        owned = groups.pop(name, None)
-                        if owned is not None:
-                            owned.discard(name)
+                        detach(groups, copies, name)
             else:
                 joins = []
-                for _, _, _, kind, name, peer in batch:
+                repoints = []
+                for _, _, _, kind, name, peer, _ in rest:
                     if kind == "alias":
                         joins.append(
                             (name, peer, groups.get(peer)))
+                    elif kind == "copy":
+                        repoints.append((name, peer))
+                cread = {key: set(val)
+                         for key, val in copies.items()}
                 batch_names = {
-                    name for _, _, _, name, _, _ in batch}
-                for _, _, _, _kind, name, _peer in batch:
-                    owned = groups.pop(name, None)
-                    if owned is not None:
-                        owned.discard(name)
+                    name for _, _, _, _, name, _, _ in rest}
+                for _, _, _, _kind, name, _peer, _ in rest:
+                    detach(groups, copies, name)
                 shared = {}
                 for name, peer, found in joins:
                     if found is not None:
@@ -2890,56 +3495,219 @@ def _binding_violations(source):
                         both = {name, peer}
                         groups[name] = both
                         groups[peer] = both
+                    if peer in cread:
+                        copies[name] = set(cread[peer])
+                for name, peer in repoints:
+                    if peer in cread:
+                        copies[name] = set(cread[peer])
+                    else:
+                        copies[name] = {(peer, pos)}
                 for members in shared.values():
                     if len(members) > 1:
                         pooled = set(members)
                         for member in members:
                             groups[member] = pooled
+
+        alias_events.sort()
+        alias_snapshots = []
+        groups = {}
+        copies = {}
+        index = 0
+        while index < len(alias_events):
+            pos = alias_events[index][:2]
+            batch = []
+            while index < len(alias_events) \
+                    and alias_events[index][:2] == pos:
+                batch.append(alias_events[index])
+                index += 1
+            apply_events(batch, groups, copies, pos)
             alias_snapshots.append(
                 (pos, {name: frozenset(members)
-                       for name, members in groups.items()}))
+                       for name, members in groups.items()},
+                 {name: frozenset(sources)
+                  for name, sources in copies.items()}))
+
+        def snap_at(line, col, strict):
+            # last snapshot at or before the position
+            # (strict: strictly before), or None.
+            found = None
+            for (sline, scol), gsnap, csnap in \
+                    alias_snapshots:
+                if strict:
+                    before = (sline, scol) < (line, col)
+                else:
+                    before = (sline, scol) <= (line, col)
+                if before:
+                    found = (gsnap, csnap)
+                else:
+                    break
+            return found
 
         def group_at(name, line, col, strict=False):
             # members sharing name's object at (line,
             # col): the last snapshot at or before the
             # position (strict: strictly before).
             # Ungrouped names stand alone.
-            found = None
-            for (sline, scol), snap in alias_snapshots:
-                if strict:
-                    before = (sline, scol) < (line, col)
-                else:
-                    before = (sline, scol) <= (line, col)
-                if before:
-                    found = snap.get(name)
-                else:
-                    break
+            found = snap_at(line, col, strict)
             if found is None:
                 return frozenset({name})
-            return found
+            return found[0].get(name, frozenset({name}))
 
-        def group_mates(root, node):
+        def copies_at(name, line, col, strict=False):
+            # shallow-copy sources of name at (line,
+            # col): {(source, copy_pos)} — names share
+            # the descendants the source held at the
+            # copy. Unknown names share nothing.
+            found = snap_at(line, col, strict)
+            if found is None:
+                return frozenset()
+            return found[1].get(name, frozenset())
+
+        loop_spans = []
+        for maybe_loop in ast.walk(func):
+            if isinstance(maybe_loop, (ast.For, ast.AsyncFor,
+                                       ast.While)):
+                loop_spans.append(
+                    ((maybe_loop.lineno,
+                      maybe_loop.col_offset),
+                     (maybe_loop.end_lineno,
+                      maybe_loop.end_col_offset),
+                     maybe_loop))
+
+        def loop_union_component(root, node):
+            # names joined with root anywhere in the
+            # loops enclosing the store: back-edges
+            # compose joins across iterations (a = b
+            # then b = safe leaves a joined to safe on
+            # the next pass). A join drops out when a
+            # later bind of the name overwrites it
+            # before the store observes (same-batch
+            # later sequence wins; a later unconditional
+            # re-point at or before the store kills the
+            # join), or when the peer moved on
+            # simultaneously while holding no known
+            # object (anonymous old-object sharing —
+            # replay covers that). Anything else
+            # (conditional re-points, back-edge binds)
+            # stays joined (fail-closed).
+            batch_names = {}
+            for event in alias_events:
+                batch_names.setdefault(
+                    event[:2], set()).add(event[4])
+
+            def overwrites(other, loop_id):
+                # an unconditional re-point in the loop:
+                # no If/Try/Match/short-circuit or inner
+                # loop between the bind and the loop
+                # (With and scope crossings transparent).
+                for anc_id, typename in event_chain[
+                        other[2]]:
+                    if anc_id == loop_id:
+                        return True
+                    if typename in ("If", "Try", "TryStar",
+                                    "Match", "IfExp",
+                                    "BoolOp",
+                                    "comprehension",
+                                    "For", "AsyncFor",
+                                    "While"):
+                        return False
+                return False
+
+            pairs = []
+            here = (node.lineno, node.col_offset)
+            for span_start, span_end, loop in loop_spans:
+                if not span_start <= here <= span_end:
+                    continue
+                loop_id = id(loop)
+                for event in alias_events:
+                    if event[3] != "alias":
+                        continue
+                    epos = event[:2]
+                    if not span_start <= epos <= span_end:
+                        continue
+                    name, peer = event[4], event[5]
+                    if any(other[:2] == epos
+                           and other[2] > event[2]
+                           and other[4] == name
+                           for other in alias_events):
+                        continue
+                    if any(other[:2] > epos
+                           and other[:2] <= here
+                           and other[4] == name
+                           and overwrites(other, loop_id)
+                           for other in alias_events
+                           if span_start <= other[:2]
+                           <= span_end):
+                        continue
+                    if peer in batch_names[epos]:
+                        pre = snap_at(epos[0], epos[1],
+                                      strict=True)
+                        if pre is None \
+                                or peer not in pre[0]:
+                            continue
+                    pairs.append((name, peer))
+            parent = {}
+
+            def find(name):
+                while parent.get(name, name) != name:
+                    name = parent[name]
+                return name
+
+            for left, right in pairs:
+                parent[find(left)] = find(right)
+            if root not in parent:
+                return {root}
+            return {name for name in parent
+                    if find(name) == find(root)}
+
+        def window_union(name, start, stop):
+            mates = set(group_at(name, start[0], start[1],
+                                 strict=True))
+            for (sline, scol), gsnap, _ in alias_snapshots:
+                if (sline, scol) <= start:
+                    continue
+                if stop is not None \
+                        and (sline, scol) > stop:
+                    break
+                if name in gsnap:
+                    mates.update(gsnap[name])
+            return mates
+
+        def group_mates(root, node, depth):
             # every group a store through root may land
-            # in: from just before the enclosing
-            # statement (RHS effects and earlier target
-            # stores see pre-statement groups) through
-            # the statement itself, extended to the
-            # outermost enclosing loop end (a back-edge
-            # re-reaches joined objects) — or unbounded
-            # inside a nested function or lambda (call
-            # timing unknowable, fail closed).
+            # in: the same-statement prefix (RHS effects
+            # and earlier targets, replayed in order on
+            # scratch groups — a store observes the
+            # intermediate state), plus the window from
+            # just before the enclosing statement
+            # through the outermost enclosing loop end
+            # (back-edges re-reach joined objects), plus
+            # every component joined anywhere in an
+            # enclosing loop (composed back-edges). A
+            # store at depth >= 2 through a shallow-copy
+            # name also reaches the source's groups from
+            # the copy (copies share descendants).
+            # Nested stores resolve in their own scope:
+            # a shadowing local stays local (freevar
+            # copies join outward), globals/nonlocals
+            # and unbound names use the outer window —
+            # unbounded above (call timing unknowable,
+            # fail closed) and back to the enclosing
+            # loop start (a def in a loop is called with
+            # the current iteration's state).
             stmt = node
-            nested = False
+            nested_scope = None
             loop_end = None
             current = node
             while id(current) in parents \
                     and parents[id(current)] is not func \
                     and current is not func:
                 current = parents[id(current)]
-                if isinstance(current, (ast.FunctionDef,
-                                        ast.AsyncFunctionDef,
-                                        ast.Lambda)):
-                    nested = True
+                if nested_scope is None and isinstance(
+                        current, (ast.FunctionDef,
+                                 ast.AsyncFunctionDef,
+                                 ast.Lambda)):
+                    nested_scope = current
                 elif isinstance(current, (ast.For,
                                           ast.AsyncFor,
                                           ast.While)):
@@ -2949,23 +3717,176 @@ def _binding_violations(source):
                     and id(stmt) in parents:
                 stmt = parents[id(stmt)]
             start = (stmt.lineno, stmt.col_offset)
-            if nested:
+            if nested_scope is not None:
+                defpos = (nested_scope.lineno,
+                          nested_scope.col_offset)
+                outer_loops = [
+                    span for span in loop_spans
+                    if span[0] <= defpos <= span[1]]
+                if outer_loops:
+                    start = outer_loops[0][0]
+                    for span in outer_loops[1:]:
+                        if span[0] < start:
+                            start = span[0]
                 stop = None
             elif loop_end is not None:
                 stop = loop_end
             else:
                 stop = (node.lineno, node.col_offset)
-            mates = set(
-                group_at(root, start[0], start[1],
-                         strict=True))
-            for (sline, scol), snap in alias_snapshots:
-                if (sline, scol) <= start:
+            if nested_scope is not None:
+                bound = scope_binds.get(
+                    id(nested_scope), {}).get(root)
+                globs, nonlocs = scope_declared.get(
+                    id(nested_scope), (set(), set()))
+                if bound is not None \
+                        and root not in globs \
+                        and root not in nonlocs:
+                    return nested_local_mates(
+                        root, nested_scope, start, stop,
+                        depth, set())
+            mates = window_union(root, start, stop)
+            prefix_copies = None
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) \
+                    and nested_scope is None \
+                    and any(event[:2] == start
+                            for event in alias_events):
+                pre = snap_at(start[0], start[1],
+                              strict=True)
+                scratch_g = {}
+                scratch_c = {}
+                if pre is not None:
+                    scratch_g = {
+                        name: set(members)
+                        for name, members in
+                        pre[0].items()}
+                    scratch_c = {
+                        name: set(sources)
+                        for name, sources in
+                        pre[1].items()}
+                prefix = store_prefix_events(node, stmt)
+                apply_events(prefix, scratch_g,
+                             scratch_c, start)
+                mates.update(scratch_g.get(root, {root}))
+                prefix_copies = scratch_c.get(root, set())
+            here = (node.lineno, node.col_offset)
+            if any(span_start <= here <= span_end
+                   for span_start, span_end, _ in loop_spans):
+                mates.update(loop_union_component(root, node))
+            for source, copy_pos in copies_for_store(
+                    root, node, depth, prefix_copies):
+                mates.update(copy_source_union(
+                    source, copy_pos, stop))
+            return mates
+
+        def nested_local_mates(root, scope, start, stop,
+                               depth, seen):
+            # a nested-local root stays local, except
+            # freevar copies (a = outer joins outer's
+            # window) and copy-forms at depth >= 2
+            # (cp = outer.copy() shares descendants).
+            # Params, calls and unknown values stay
+            # purely local: no call graph exists (a
+            # store through a nested param is a
+            # documented miss).
+            mates = {root}
+            if root in seen:
+                return mates
+            seen.add(root)
+            bound = scope_binds.get(id(scope), {}).get(
+                root, [])
+            for _pos, kind, value in bound:
+                if kind != "plain" or value is None:
+                    continue
+                value = _unwrap_walrus(value)
+                if isinstance(value, ast.Name):
+                    mates.update(window_union(
+                        value.id, start, stop))
+                    if value.id in scope_binds.get(
+                            id(scope), {}):
+                        mates.update(nested_local_mates(
+                            value.id, scope, start, stop,
+                            depth, seen))
+                elif depth >= 2:
+                    for source in _copy_source_names(
+                            value, trusted_ctor):
+                        mates.update(window_union(
+                            source, start, stop))
+            return mates
+
+        def store_prefix_events(node, stmt):
+            # batch events at the store's statement
+            # ordered strictly before the store itself:
+            # RHS effects (phase 0) always precede
+            # targets (phase 1); targets compare by
+            # leaf position (left-to-right).
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                probe = node
+                phase = 1
+                while probe is not stmt:
+                    holder = parents.get(id(probe))
+                    if holder is stmt \
+                            and probe is stmt.value:
+                        phase = 0
+                    probe = holder
+                    if probe is None:
+                        break
+                store_key = (phase, node.lineno,
+                             node.col_offset)
+            else:
+                return []
+            start = (stmt.lineno, stmt.col_offset)
+            return sorted(
+                (event for event in alias_events
+                 if event[:2] == start
+                 and event[6] < store_key),
+                key=lambda event: event[2])
+
+        def copies_for_store(root, node, depth,
+                               prefix_copies):
+            # {(source, copy_pos)} shared-descendant
+            # sources when the store lands below the
+            # copy's top level (depth 1 stays local —
+            # the copy owns its own keys). A
+            # same-statement prefix replays its own
+            # copies (later targets have not bound
+            # yet); otherwise the position applies.
+            if depth < 2:
+                return set()
+            if prefix_copies is not None:
+                return set(prefix_copies)
+            return set(copies_at(root, node.lineno,
+                                 node.col_offset))
+
+        def copy_source_union(source, copy_pos, stop):
+            # the source's groups from the copy through
+            # the store window: a rebind of the source
+            # after a straight-line copy ends sharing
+            # (later joins touch the new object), while
+            # a copy inside a loop re-shares every
+            # iteration (no kill-stop there).
+            in_loop = any(start <= copy_pos <= end
+                          for start, end, _ in loop_spans)
+            kill_stop = None
+            if not in_loop:
+                for event in alias_events:
+                    if event[3] == "kill" \
+                            and event[4] == source \
+                            and event[:2] > copy_pos:
+                        kill_stop = event[:2]
+                        break
+            mates = set(group_at(source, copy_pos[0],
+                                 copy_pos[1], strict=True))
+            for (sline, scol), gsnap, _ in alias_snapshots:
+                if (sline, scol) <= copy_pos:
                     continue
                 if stop is not None \
                         and (sline, scol) > stop:
                     break
-                if root in snap:
-                    mates.update(snap[root])
+                if kill_stop is not None \
+                        and (sline, scol) >= kill_stop:
+                    break
+                if source in gsnap:
+                    mates.update(gsnap[source])
             return mates
 
         def classify_sanction(name, bind):
@@ -2981,22 +3902,63 @@ def _binding_violations(source):
                 return (False, set(), True)
             return (True, set(), False)
 
-        # Sanctioned names: the SCC rule over the
-        # scope-pruned binds — order ignored (a kill
-        # anywhere voids every use: loop back-edges,
-        # closures, RHS uses, raw branches, repeated
-        # raw targets), seeded copy cycles resolve, and
-        # lone self-copies stay OUT. The lane never
-        # stores the sanctioned string in a name (all
-        # relative_to sites are inline), so no
-        # precision is lost there.
-        def resolve_local(peer):
-            if peer in name_binds:
-                return None
-            return False
+        # Sanctioned/fresh names: the SCC rule over
+        # scope-pruned binds, resolved in the USE's
+        # lexical scope (a nested bind shadows the
+        # outer verdict — an outer sanction never
+        # exempts a nested raw local, and a nested
+        # fresh local never borrows outer trust;
+        # unbound names fall outward, so a closure
+        # over an unchanged outer value keeps it).
+        # Order ignored (a kill anywhere voids every
+        # use: loop back-edges, closures, RHS uses,
+        # raw branches, repeated raw targets), seeded
+        # copy cycles resolve, and lone self-copies
+        # stay OUT. The lane never stores the
+        # sanctioned string in a name (all relative_to
+        # sites are inline), so no precision is lost
+        # there.
+        def scope_membership(scope, classify, memo):
+            key = id(scope)
+            if key not in memo:
+                binds = scope_binds[key]
+                outers = [
+                    outer
+                    for outer in lexical_use_chain(scope)
+                    if not isinstance(outer, ast.ClassDef)]
 
-        sanctioned = _scc_in(name_binds, classify_sanction,
-                             resolve_local)
+                def resolve(peer):
+                    for outer in outers:
+                        if peer in scope_binds[id(outer)]:
+                            return peer in scope_membership(
+                                outer, classify, memo)
+                    return False
+
+                def resolve_same(peer):
+                    if peer in binds:
+                        return None
+                    return resolve(peer)
+
+                memo[key] = _scc_in(binds, classify,
+                                    resolve_same)
+            return memo[key]
+
+        sanction_memo = {}
+        fresh_memo = {}
+
+        def sanctioned_at(name, node):
+            scope = lexical_binds(name, node)
+            if scope is None:
+                return False
+            return name in scope_membership(
+                scope, classify_sanction, sanction_memo)
+
+        def fresh_at(name, node):
+            scope = lexical_binds(name, node)
+            if scope is None:
+                return False
+            return name in scope_membership(
+                scope, classify_fresh, fresh_memo)
 
         def sanction_value(value, node):
             # safe string content: a bare sanctioned
@@ -3006,14 +3968,8 @@ def _binding_violations(source):
             # (out/tag) are NOT exempt — rejoining
             # rebuilds the raw path.
             if isinstance(value, ast.Name):
-                return value.id in sanctioned
+                return sanctioned_at(value.id, value)
             return sanctioned_shape(value)
-
-        # Proven-fresh names: the SCC rule over the same
-        # pruned map. Membership EXEMPTS from descent,
-        # so only proven shapes seed (fail closed).
-        fresh = _scc_in(name_binds, classify_fresh,
-                        resolve_local)
 
         def fresh_value(node):
             if isinstance(node, (ast.Dict, ast.List,
@@ -3028,7 +3984,7 @@ def _binding_violations(source):
                     module_attr_binds:
                 return True
             if isinstance(node, ast.Name):
-                return node.id in fresh
+                return fresh_at(node.id, node)
             if isinstance(node, ast.Call) \
                     and isinstance(node.func, ast.Attribute) \
                     and node.func.attr == "copy" \
@@ -3084,10 +4040,11 @@ def _binding_violations(source):
                                 and not sanction_value(
                                     sub.slice, node))
                         if hit:
-                            root = _store_root(sub, fresh_value)
+                            root, depth = _store_root(
+                                sub, fresh_value)
                             if root is not None:
                                 for member in group_mates(
-                                        root, node):
+                                        root, sub, depth):
                                     if member not in tainted:
                                         tainted.add(member)
                                         changed = True
@@ -3117,8 +4074,8 @@ def _binding_violations(source):
                             "update", "setdefault", "extend",
                             "__setitem__"):
                     return
-                receiver = _store_root(node.func.value,
-                                       fresh_value)
+                receiver, depth = _store_root(
+                    node.func, fresh_value)
                 if receiver is None:
                     return
                 carried = [arg.value
@@ -3130,7 +4087,7 @@ def _binding_violations(source):
                        and not sanction_value(arg, node)
                        for arg in carried):
                     for member in group_mates(receiver,
-                                             node):
+                                             node, depth):
                         if member not in tainted:
                             tainted.add(member)
                             changed = True
@@ -3216,7 +4173,7 @@ def _binding_violations(source):
                         # mutate the shared object in place:
                         # the store's groups taint with it.
                         for member in group_mates(
-                                node.target.id, node):
+                                node.target.id, node, 1):
                             if member not in tainted:
                                 tainted.add(member)
                                 changed = True
@@ -3350,9 +4307,10 @@ def _binding_violations(source):
             # through getter calls like the taint side
             # (a proven-fresh immediate copy climbs
             # nowhere — the store lands in the copy).
-            root = _store_root(target, fresh_value)
+            root, depth = _store_root(target, fresh_value)
             if root is not None:
-                for member in group_mates(root, node):
+                for member in group_mates(root, target,
+                                          depth):
                     voided.add(member)
 
         def arg_tainted(arg):
@@ -3420,7 +4378,7 @@ def _binding_violations(source):
                     # the store's groups void with it
                     # (taint spreads the same way).
                     for member in group_mates(
-                            node.target.id, node):
+                            node.target.id, node, 1):
                         voided.add(member)
                 else:
                     void_names(node.target)
@@ -3482,13 +4440,14 @@ def _binding_violations(source):
                            else arg for arg in node.args]
                 carried.extend(keyword.value
                                for keyword in node.keywords)
-                root = _store_root(node.func.value,
-                                   fresh_value)
+                root, depth = _store_root(
+                    node.func, fresh_value)
                 if root is not None and any(
                         arg_tainted(arg)
                         and not sanction_value(arg, node)
                         for arg in carried):
-                    for member in group_mates(root, node):
+                    for member in group_mates(root, node,
+                                              depth):
                         voided.add(member)
                 is_mutator, keys, dynamic = \
                     _namespace_mutator_keys(node)
@@ -3531,7 +4490,7 @@ def _binding_violations(source):
             # count like values (**unpacking checks the
             # mapping itself).
             if isinstance(value, ast.Name) \
-                    and value.id in sanctioned:
+                    and sanctioned_at(value.id, value):
                 return True
             if isinstance(value, ast.Call):
                 if sanctioned_shape(value):
@@ -3704,7 +4663,7 @@ def _binding_violations(source):
                     if append_clean(only):
                         continue
                     if isinstance(only, ast.Name) \
-                            and only.id in sanctioned:
+                            and sanctioned_at(only.id, only):
                         continue
                     if isinstance(only, ast.Name) \
                             and only.id in tainted:
@@ -4801,6 +5760,162 @@ class CapturedBytesBinding(unittest.TestCase):
              "            _say(log)\n"
              "            output = decode_body_log(captured)\n",
              "dynamic namespace rebind"),
+            ("c1-batch-peer-store",
+             anchor,
+             head + "            alias = {}\n"
+             "            a = alias\n"
+             "            a[\"raw\"] = log\n"
+             "            results.append(alias)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("c2-rebind-before-store",
+             anchor,
+             head + "            box = {}\n"
+             "            a = {}\n"
+             "            a, a[\"raw\"] = box, log\n"
+             "            a = {}\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("c3-nested-sanction-shadow",
+             anchor,
+             head + "            tag = str(log.relative_to(out))\n"
+             "            def inner():\n"
+             "                tag = log\n"
+             "                results.append({\"p\": tag})\n"
+             "            inner()\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("c3b-class-sanction-shadow",
+             anchor,
+             head + "            tag = str(log.relative_to(out))\n"
+             "            class K:\n"
+             "                tag = log\n"
+             "                results.append({\"p\": tag})\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("c10-clean-before-seed",
+             anchor,
+             head + "            rb = None\n"
+             "            rb = Path.read_bytes\n"
+             "            Path.r = rb\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("c10b-loop-seed-after-clean",
+             anchor,
+             head + "            rb = None\n"
+             "            for _ in range(2):\n"
+             "                rb = Path.read_bytes\n"
+             "            Path.r = rb\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("c11-outer-clean-after-install",
+             anchor,
+             head + "            rb = Path.read_bytes\n"
+             "            def install():\n"
+             "                Path.r = rb\n"
+             "            install()\n"
+             "            rb = None\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("c12-rhs-walrus-order",
+             anchor,
+             head + "            box = {}\n"
+             "            a = {}\n"
+             "            a, b = (a := box), a\n"
+             "            b[\"raw\"] = log\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("c13-stored-shallow-copy",
+             anchor,
+             head + "            box = {\"rows\": {}}\n"
+             "            cp = box.copy()\n"
+             "            cp[\"rows\"][\"raw\"] = f\"{log}\"\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("c14-builtins-ior",
+             anchor,
+             head + "            global __builtins__\n"
+             "            __builtins__ |= {\"print\": open}\n"
+             "            print(log)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to print()"),
+            ("f3-class-cap-install",
+             anchor,
+             head + "            class K:\n"
+             "                rb = Path.read_bytes\n"
+             "                Path.r = rb\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("f3b-lambda-default-setattr",
+             anchor,
+             head + "            f = lambda rb=Path.read_bytes: "
+             "setattr(Path, \"r\", rb)\n"
+             "            f()\n"
+             "            output = decode_body_log(log.r())\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to log.r()"),
+            ("f4-composed-backedge",
+             anchor,
+             head + "            b = {}\n"
+             "            safe = {}\n"
+             "            for _i in range(2):\n"
+             "                a = b\n"
+             "                a[\"raw\"] = log\n"
+             "                b = safe\n"
+             "            results.append(safe)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("f5-comprehension-backedge",
+             anchor,
+             head + "            box = {}\n"
+             "            safe = {}\n"
+             "            _tmp = [(box.update({\"raw\": log}), "
+             "box := safe)[0] for _ in range(2)]\n"
+             "            results.append(safe)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("f6-def-in-loop-call",
+             anchor,
+             head + "            safe = {}\n"
+             "            other = {}\n"
+             "            for _i in range(2):\n"
+             "                box = safe\n"
+             "                if _i: f()\n"
+             "                box = other\n"
+             "                def f(): box.update({\"raw\": log})\n"
+             "            results.append(safe)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("f7b-dict-copy-descendant",
+             anchor,
+             head + "            box = {\"rows\": {}}\n"
+             "            cp = dict(box)\n"
+             "            cp[\"rows\"][\"raw\"] = f\"{log}\"\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("f7c-spread-copy-descendant",
+             anchor,
+             head + "            box = {\"rows\": {}}\n"
+             "            cp = {**box}\n"
+             "            cp[\"rows\"][\"raw\"] = f\"{log}\"\n"
+             "            results.append(box)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to results.append()"),
+            ("f8a-builtins-alias-dict",
+             anchor,
+             head + "            import builtins as b\n"
+             "            b.__dict__[\"print\"] = Path.read_bytes\n"
+             "            print(log)\n"
+             "            output = decode_body_log(captured)\n",
+             "tainted path escapes to print()"),
         ]
         for name, find, repl, fragment in cases:
             with self.subTest(shape=name):
@@ -4966,6 +6081,55 @@ class CapturedBytesBinding(unittest.TestCase):
              "            a, a = z, y\n"
              "            a[\"raw\"] = log\n"
              "            results.append(z)\n" + use),
+            ("c6-repeat-detached-peer-silent",
+             anchor,
+             head + "            box = {}\n"
+             "            a, a, box = box, box, {}\n"
+             "            a[\"raw\"] = log\n"
+             "            results.append(box)\n" + use),
+            ("c7-nested-local-store-silent",
+             anchor,
+             head + "            box = {}\n"
+             "            a = box\n"
+             "            def stash():\n"
+             "                a = {}\n"
+             "                a[\"raw\"] = log\n"
+             "            stash()\n"
+             "            results.append(box)\n" + use),
+            ("c7b-nested-walrus-store-silent",
+             anchor,
+             head + "            box = {}\n"
+             "            a = box\n"
+             "            def stash():\n"
+             "                (a := {})[\"raw\"] = log\n"
+             "            stash()\n"
+             "            results.append(box)\n" + use),
+            ("c8-immediate-copy-subscript-silent",
+             anchor,
+             head + "            box = {}\n"
+             "            box.copy()[\"raw\"] = f\"{log}\"\n"
+             "            results.append(box)\n" + use),
+            ("c8b-update-spelling-silent",
+             anchor,
+             head + "            box = {}\n"
+             "            box.copy().update({\"raw\": log})\n"
+             "            results.append(box)\n" + use),
+            ("c9-ctor-copy-silent",
+             anchor,
+             head + "            box = dict()\n"
+             "            box.copy().update({\"raw\": log})\n"
+             "            results.append(box)\n" + use),
+            ("c9b-list-ctor-silent",
+             anchor,
+             head + "            box = list()\n"
+             "            box.copy().update({\"raw\": log})\n"
+             "            results.append(box)\n" + use),
+            ("c13-copy-top-write-silent",
+             anchor,
+             head + "            box = {\"rows\": {}}\n"
+             "            cp = box.copy()\n"
+             "            cp[\"raw\"] = f\"{log}\"\n"
+             "            results.append(box)\n" + use),
         ]
         for name, find, repl in cases:
             with self.subTest(shape=name):
@@ -4973,6 +6137,86 @@ class CapturedBytesBinding(unittest.TestCase):
                 self.assertEqual(
                     _binding_violations(source.replace(find, repl)),
                     [], name)
+
+    def test_tripwire_catches_r25_module_level_plants(self):
+        # adjudication-r25 plants that need a module-top
+        # edit (a single anchor swap cannot express
+        # them): module-held capability (C4), top-level
+        # def shadowing a diagnostic sink (F8b/F8b2 with
+        # its bare-print control), the documented
+        # loop-union over-taint pin (M-P), and the
+        # annotation walrus (C5 — a real 3.12 runtime
+        # rebind; 3.14 rejects it only at compile time,
+        # after ast.parse, so the guard still fires on
+        # both and no version gate is needed).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        fire = [
+            ("c4-module-cap-closure",
+             [(mod, "rb = Path.read_bytes\n" + mod),
+              (anchor,
+               head + "            rb2 = rb\n"
+               "            def install():\n"
+               "                Path.r = rb2\n"
+               "            install()\n"
+               "            output = decode_body_log(log.r())\n"
+               + use)],
+             "tainted path escapes to log.r()"),
+            ("c5-annotation-walrus",
+             [(anchor,
+               head + "            tag = str(log.relative_to(out))\n"
+               "            def f(x: (tag := log)):\n"
+               "                pass\n"
+               "            results.append({\"p\": tag})\n"
+               + use)],
+             "tainted path escapes to results.append()"),
+            ("f8b-def-print-shadow",
+             [(mod,
+               "def print(p):\n"
+               "    return __import__(\"pathlib\").Path(p)"
+               ".read_bytes()\n" + mod),
+              (anchor, head + "            print(log)\n" + use)],
+             "tainted path escapes to print()"),
+            ("f8b2-exfil-shadow",
+             [(mod,
+               "def print(p):\n"
+               "    results.append(p)\n" + mod),
+              (anchor, head + "            print(log)\n" + use)],
+             "tainted path escapes to print()"),
+            ("m-p-loop-overtaint",
+             [(anchor,
+               head + "            box = {}\n"
+               "            for _ in range(2):\n"
+               "                a = {}\n"
+               "                a[\"raw\"] = log\n"
+               "                a = box\n"
+               "            results.append(box)\n"
+               + use)],
+             "tainted path escapes to results.append()"),
+        ]
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+        with self.subTest(shape="f8b-control-bare-print"):
+            planted = source.replace(
+                anchor, head + "            print(log)\n" + use)
+            self.assertEqual(_binding_violations(planted), [])
 
     def test_tripwire_readcap_scope_isolation(self):
         # readcap provenance is per-scope: a sibling
