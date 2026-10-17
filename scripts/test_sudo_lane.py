@@ -1654,9 +1654,19 @@ def _copy_source_names(value, trusted_builtin):
     # copy(), dict(box.copy()), {**{**box}} all share
     # the innermost source's descendants; recursion
     # descends strict subterms, so it terminates).
+    # A walrus receiver or operand resolves to its
+    # value ((a := box).copy() shares box — the
+    # walrus bind itself is a separate event; a
+    # copy-valued walrus recurses to the inner
+    # source).
     # Multi-source unpacking and anything else yield
     # () (unknown shapes stay kills: {**a, **b}
     # sharing is a documented miss).
+    if isinstance(value, ast.NamedExpr):
+        if isinstance(value.value, ast.Name):
+            return (value.value.id,)
+        return _copy_source_names(value.value,
+                                  trusted_builtin)
     if isinstance(value, ast.Call):
         if isinstance(value.func, ast.Attribute) \
                 and value.func.attr == "copy" \
@@ -1687,29 +1697,52 @@ def _copy_source_names(value, trusted_builtin):
     return ()
 
 
+def _load_free(value):
+    # a display/comprehension built from pure
+    # literal structure: no names, attributes,
+    # subscripts, calls, stars, walruses or
+    # unpackings anywhere inside (a load may
+    # retain the old object or its descendants:
+    # {"old": box} and [*box.values()] stay
+    # connected to the old object, so only a
+    # load-free display proves independence).
+    for node in ast.walk(value):
+        if isinstance(node, ast.Dict):
+            if any(key is None for key in node.keys):
+                return False
+        elif isinstance(node, (ast.List, ast.Set,
+                               ast.ListComp, ast.SetComp,
+                               ast.DictComp,
+                               ast.GeneratorExp,
+                               ast.Constant,
+                               ast.expr_context,
+                               ast.comprehension)):
+            continue
+        else:
+            return False
+    return True
+
+
 def _fresh_value(value, trusted_builtin):
-    # values that provably denote a new object:
-    # plain container displays (no unpacking —
-    # an unpacked display is still a fresh
-    # container, but the union may accidentally
-    # cover its shared values, so it stays an
-    # unknown kill, fail-closed), comprehensions
-    # (a fresh container even when the elements
-    # alias), constants, and no-arg trusted-ctor
-    # calls. Everything else — calls,
-    # subscripts, attributes, operators
+    # values that provably denote a new object
+    # disconnected from the old one: load-free
+    # container displays (constants and nested
+    # displays only — any load may retain a
+    # reference: {"old": box} shares the old
+    # object through its values, so displays
+    # with loads stay unknown kills,
+    # fail-closed), constants, and no-arg
+    # trusted-ctor calls. Everything else —
+    # calls, subscripts, attributes, operators
     # (overloading may return an operand),
     # conditionals (may select the old object),
     # lambdas — stays an unknown kill: the old
     # object may flow back, so the edge
     # survives (fail-closed).
-    if isinstance(value, ast.Dict):
-        return all(key is not None
-                   for key in value.keys)
-    if isinstance(value, (ast.List, ast.Set,
+    if isinstance(value, (ast.Dict, ast.List, ast.Set,
                            ast.ListComp, ast.SetComp,
                            ast.DictComp, ast.Constant)):
-        return True
+        return _load_free(value)
     return isinstance(value, ast.Call) \
         and isinstance(value.func, ast.Name) \
         and not value.args and not value.keywords \
@@ -1749,30 +1782,83 @@ def _splat_elts(elts):
     return out
 
 
+def _element_copy(inner, consumed):
+    # a starred target's element provenance: the star
+    # binds a FRESH list, but its elements ARE the
+    # consumed values — exactly shallow-copy sharing
+    # (a top store stays local; a store through an
+    # element reaches the consumed object). Modelled
+    # as a copy-form over the consumed value (never
+    # an alias: that would over-taint top stores).
+    synth = ast.Call(
+        func=ast.Attribute(value=consumed, attr="copy",
+                           ctx=ast.Load()),
+        args=[], keywords=[])
+    ast.copy_location(synth, consumed)
+    return inner, synth
+
+
 def _walk_pairs(target, value):
     # (leaf-target, corresponding-value) pairs for a
     # destructured assignment; uneven shapes pair each
     # leaf with the whole value (fail-closed: the
     # value is judged, not skipped — and no leaf
-    # hides inside the unvisited target). A starred
-    # target always binds a FRESH list, so it pairs
-    # with the Starred node itself (a non-Name,
-    # non-copy value — callers kill it) instead of
-    # the operand's object. Static RHS stars expand
-    # before elementwise pairing (a, b = *[box], {}
-    # pairs a with box).
+    # hides inside the unvisited target). Static RHS
+    # stars expand before pairing (a, b = *[box], {}
+    # pairs a with box). Around one starred target,
+    # known prefixes and suffixes pair positionally
+    # and the star consumes the middle (possibly
+    # empty) with element provenance per consumed
+    # value; a lone starred target binds a FRESH
+    # list, so it pairs with the Starred node
+    # itself (a non-Name, non-copy value — callers
+    # kill it) instead of the operand's object.
+    # Starred namespace targets (*c.x) lose element
+    # provenance (callers kill namespace pairs —
+    # documented miss).
     if isinstance(target, ast.Starred):
         yield target.value, target
         return
     if isinstance(target, (ast.Tuple, ast.List)) \
             and isinstance(value, (ast.Tuple, ast.List)):
         expanded = _splat_elts(value.elts)
-        if expanded is not None \
-                and len(expanded) == len(target.elts):
-            for sub_target, sub_value in zip(target.elts,
-                                             expanded):
-                yield from _walk_pairs(sub_target, sub_value)
-            return
+        if expanded is not None:
+            stars = [index for index, elt
+                     in enumerate(target.elts)
+                     if isinstance(elt, ast.Starred)]
+            if not stars \
+                    and len(expanded) == len(target.elts):
+                for sub_target, sub_value in zip(
+                        target.elts, expanded):
+                    yield from _walk_pairs(sub_target,
+                                           sub_value)
+                return
+            if len(stars) == 1:
+                at = stars[0]
+                pre = target.elts[:at]
+                suf = target.elts[at + 1:]
+                if len(expanded) >= len(pre) + len(suf):
+                    for sub_target, sub_value in zip(
+                            pre, expanded):
+                        yield from _walk_pairs(sub_target,
+                                               sub_value)
+                    if suf:
+                        for sub_target, sub_value in zip(
+                                suf, expanded[len(
+                                    expanded) - len(suf):]):
+                            yield from _walk_pairs(
+                                sub_target, sub_value)
+                    middle = expanded[len(pre):len(
+                        expanded) - len(suf)] if suf \
+                        else expanded[len(pre):]
+                    inner = target.elts[at].value
+                    if middle:
+                        for consumed in middle:
+                            yield _element_copy(
+                                inner, consumed)
+                    else:
+                        yield inner, target.elts[at]
+                    return
     if isinstance(target, (ast.Tuple, ast.List)):
         for leaf in _target_leaves(target):
             yield leaf, value
@@ -2831,16 +2917,41 @@ def _binding_violations(source):
             # completion order, not walk order:
             # ast.walk is breadth-first, so a deeper
             # earlier bind would wrongly decide after
-            # a later seed — and assignment targets
-            # complete only after the whole RHS
-            # evaluates (an RHS walrus binds first).
+            # a later seed — and an assignment runs
+            # RHS first, then each target in order,
+            # evaluating (walrus effects) before
+            # storing. Target stores complete at RHS
+            # end (left-to-right by stability); a
+            # walrus inside target i completes with
+            # that target (after earlier targets'
+            # stores, before its own — same-name
+            # same-target collisions are impossible:
+            # _bound_names never yields walrus
+            # targets, complex targets bind keys).
             def completion(bind):
                 bpos, kind, value = bind
                 if kind != "plain" or value is None:
-                    return (bpos, bpos)
+                    return (bpos, bpos, 0)
                 node = value
+                child = None
+                walrus_end = None
                 while id(node) in parents:
+                    child = node
                     node = parents[id(node)]
+                    if walrus_end is None \
+                            and isinstance(
+                                node, ast.NamedExpr) \
+                            and node.target.id == name:
+                        # a walrus completes when its
+                        # value finishes (inside-out
+                        # for nesting — the outer
+                        # store lands last), not when
+                        # it starts; a walrus inside
+                        # an assignment target
+                        # completes with that target
+                        # (decided at the Assign).
+                        walrus_end = (node.end_lineno,
+                                      node.end_col_offset)
                     if isinstance(node, (ast.Assign,
                                          ast.AnnAssign)):
                         if (node.lineno, node.col_offset) \
@@ -2849,11 +2960,48 @@ def _binding_violations(source):
                             end = node.value
                             return ((end.end_lineno,
                                      end.end_col_offset),
-                                    bpos)
-                        return (bpos, bpos)
+                                    bpos, 1)
+                        targets = node.targets if isinstance(
+                            node, ast.Assign) else [
+                                node.target]
+                        if child in targets \
+                                and node.value \
+                                is not None:
+                            # the top-level target
+                            # holding the effect (one
+                            # Tuple/List level down —
+                            # the tuple itself starts
+                            # at the statement).
+                            target = child
+                            if isinstance(
+                                    target,
+                                    (ast.Tuple, ast.List)):
+                                for elt in target.elts:
+                                    if (elt.lineno,
+                                            elt.col_offset) \
+                                            <= bpos \
+                                            <= (elt.end_lineno,
+                                                elt.end_col_offset):
+                                        target = elt
+                                        break
+                            end = node.value
+                            return ((end.end_lineno,
+                                     end.end_col_offset),
+                                    (target.lineno,
+                                     target.col_offset),
+                                    0)
+                        if walrus_end is not None:
+                            return (walrus_end,
+                                    walrus_end, 0)
+                        return (bpos, bpos, 0)
                     if isinstance(node, ast.stmt):
-                        return (bpos, bpos)
-                return (bpos, bpos)
+                        if walrus_end is not None:
+                            return (walrus_end,
+                                    walrus_end, 0)
+                        return (bpos, bpos, 0)
+                if walrus_end is not None:
+                    return (walrus_end, walrus_end, 0)
+                return (bpos, bpos, 0)
 
             blist = sorted(qbinds.get(name, []),
                            key=completion)
@@ -3349,12 +3497,15 @@ def _binding_violations(source):
             # bind site up to func decides loop-relative
             # overwrite in the loop union (a re-point
             # under If/Try/Match/short-circuit or an
-            # inner loop never overwrites).
+            # inner loop never overwrites). The chain
+            # starts AT the bind site itself, so a bind
+            # owned by a loop header (a for-target)
+            # counts as unconditional in that loop.
             if okey is None:
                 okey = (1, node.lineno, node.col_offset)
             if src is None:
                 src = node
-            chain = []
+            chain = [(id(src), type(src).__name__)]
             current = src
             while current is not func:
                 if id(current) not in parents:
@@ -3378,7 +3529,11 @@ def _binding_violations(source):
 
         def walrus_event(stmt, named):
             inner = _unwrap_walrus(named.value)
-            okey = (0, named.lineno, named.col_offset)
+            # the effect lands at completion (the
+            # walrus end — inside-out for nesting),
+            # not at its start.
+            okey = (0, named.end_lineno,
+                    named.end_col_offset)
             if isinstance(inner, ast.Name):
                 emit(stmt, "alias", named.target.id,
                      inner.id, okey, named)
@@ -3999,11 +4154,14 @@ def _binding_violations(source):
                 # freevar never falls straight into the
                 # func window past its binder, and an
                 # intermediate shadow never sees outside.
-                home = home_scope_for(root, nested_scope)
+                home = home_scope_for(
+                    root, nested_scope,
+                    (node.lineno, node.col_offset))
                 if home is not None and home is not func:
                     return nested_local_mates(
                         root, home, start, stop,
-                        depth, set())
+                        depth, set(),
+                        (node.lineno, node.col_offset))
             mates = window_union(root, start, stop)
             prefix_copies = None
             if isinstance(stmt, (ast.Assign, ast.AnnAssign)) \
@@ -4038,22 +4196,35 @@ def _binding_violations(source):
                     source, copy_pos, stop, seed))
             return mates
 
-        def home_scope_for(photoname, scope):
+        def home_scope_for(photoname, scope, spos):
             # innermost scope from `scope` outward
             # binding photoname (globals jump to the
             # module, nonlocals and unbound names walk
             # outward, class bodies transparent to
-            # deeper functions); None if unbound.
+            # deeper functions); None if unbound. A
+            # class body binds a direct store only
+            # through installs strictly before it —
+            # before the local install executes, the
+            # store sees the module binding (module
+            # fallback); conditional pre-installs are
+            # a documented miss (fail-open corner).
             current = scope
             while True:
                 globs, nonlocs = scope_declared.get(
                     id(current), (set(), set()))
                 if photoname in globs:
                     return tree
-                if photoname in scope_binds.get(
-                        id(current), {}) \
+                binds = scope_binds.get(
+                    id(current), {}).get(photoname)
+                if binds is not None \
                         and photoname not in nonlocs:
-                    return current
+                    if isinstance(current, ast.ClassDef) \
+                            and not any(
+                                pos < spos
+                                for pos, _, _ in binds):
+                        pass
+                    else:
+                        return current
                 if current is tree:
                     return None
                 up = current
@@ -4069,7 +4240,7 @@ def _binding_violations(source):
                 current = up
 
         def nested_local_mates(root, scope, start, stop,
-                               depth, seen):
+                               depth, seen, spos):
             # a nested-local root stays local, except
             # freevar copies (resolved in their binding
             # scope — intermediate scopes included, the
@@ -4082,13 +4253,74 @@ def _binding_violations(source):
             # miss). The peer's binding scope resolves
             # BEFORE any outer window is consulted: a
             # shadowing param/local never sees outside.
+            # A bind whose name is definitively rebound
+            # later in the same scope — an alias, a
+            # load-free fresh value, or a nested def —
+            # unconditionally, strictly between the bind
+            # and the store, contributes nothing (the
+            # store observes the new object). Binds
+            # after the store, conditional rebinds and
+            # unknown/copy rebinds never kill
+            # (fail-closed: call timing and back-edges
+            # are unknowable, copies share, unknown
+            # values may flow the old object back).
             mates = {root}
             if (id(scope), root) in seen:
                 return mates
             seen.add((id(scope), root))
 
+            def unconditional(kpos):
+                # the bind at kpos executes on every
+                # pass through the scope: no
+                # If/Try/Match/loop/short-circuit
+                # between it and the scope (scope
+                # crossings transparent, as in
+                # overwrites; orelse/finally arms count
+                # as conditional, fail-closed).
+                node = None
+                for cand in ast.walk(scope):
+                    if (getattr(cand, "lineno", 0),
+                            getattr(cand, "col_offset",
+                                    0)) == kpos:
+                        node = cand
+                if node is None:
+                    return False
+                current = node
+                while current is not scope:
+                    if id(current) not in parents:
+                        return False
+                    current = parents[id(current)]
+                    if current is scope:
+                        return True
+                    if type(current).__name__ in (
+                            "If", "Try", "TryStar",
+                            "Match", "IfExp", "BoolOp",
+                            "comprehension", "For",
+                            "AsyncFor", "While"):
+                        return False
+                return True
+
+            def killed(pos):
+                for kpos, kkind, kvalue in bound_here:
+                    if not pos < kpos < spos:
+                        continue
+                    if kkind == "def":
+                        pass
+                    elif kkind != "plain" \
+                            or not isinstance(
+                                kvalue, ast.Name) \
+                            and (kvalue is None
+                                 or not _fresh_value(
+                                     kvalue,
+                                     trusted_ctor)):
+                        continue
+                    if unconditional(kpos):
+                        return True
+                return False
+
             def outer_mates(photoname):
-                home = home_scope_for(photoname, scope)
+                home = home_scope_for(
+                    photoname, scope, spos)
                 if home is None or home is func:
                     return window_union(
                         photoname, start, stop)
@@ -4098,12 +4330,14 @@ def _binding_violations(source):
                 # homes recurse lexically.
                 return nested_local_mates(
                     photoname, home, start, stop,
-                    depth, seen)
+                    depth, seen, spos)
 
-            bound = scope_binds.get(id(scope), {}).get(
-                root, [])
-            for _pos, kind, value in bound:
+            bound_here = scope_binds.get(
+                id(scope), {}).get(root, [])
+            for _pos, kind, value in bound_here:
                 if kind != "plain" or value is None:
+                    continue
+                if killed(_pos):
                     continue
                 value = _unwrap_walrus(value)
                 if isinstance(value, ast.Name):
@@ -4166,14 +4400,27 @@ def _binding_violations(source):
             # after a straight-line copy, or an alias
             # to a peer outside the source's group at
             # the rebind (a same-object rejoin keeps
-            # sharing). A copy inside a loop re-shares
-            # every iteration (no kill-stop there), and
-            # an alias-stop lifts when the copy and the
-            # rebind share a loop with no wrap-around
-            # separator (the next iteration's copy
-            # observes the rebound object). Copy-rebinds
-            # never stop (x.copy() shares the old
-            # descendants when x is the old object).
+            # sharing). Same-statement rebinds order
+            # after the copy's operand (target stores
+            # run after all operands; same-batch walrus
+            # rebinds stay conservative — no stop,
+            # fail-closed), so a same-batch target
+            # rebind stops like a later one (and the
+            # sweep starts below the batch, not above
+            # it). A same-batch fresh target divorces
+            # an unaliased seed entirely (the old
+            # object is garbage: rebound, held by no
+            # other name, later copies cover their own
+            # observations, window unions cover
+            # re-aliases to the copy itself). A copy
+            # inside a loop re-shares every iteration
+            # (no kill-stop there), and an alias-stop
+            # lifts when the copy and the rebind share
+            # a loop with no wrap-around separator
+            # (the next iteration's copy observes the
+            # rebound object). Copy-rebinds never stop
+            # (x.copy() shares the old descendants
+            # when x is the old object).
             def wrap_open(rebind):
                 # True when the innermost loop shared by
                 # the copy and the rebind has no
@@ -4284,12 +4531,22 @@ def _binding_violations(source):
                         return False
                 return True
 
+            if seed == frozenset({source}) \
+                    and any(event[:2] == copy_pos
+                            and event[3] == "fresh"
+                            and event[4] == source
+                            and event[6][0] == 1
+                            for event in alias_events):
+                return set()
             in_loop = any(start <= copy_pos <= end
                           for start, end, _ in loop_spans)
             stop_at = None
             for event in alias_events:
-                if event[:2] <= copy_pos \
+                if event[:2] < copy_pos \
                         or event[4] != source:
+                    continue
+                if event[:2] == copy_pos \
+                        and event[6][0] != 1:
                     continue
                 if event[3] in ("kill", "fresh"):
                     if not in_loop:
@@ -4305,7 +4562,7 @@ def _binding_violations(source):
                         break
             mates = set(seed)
             for (sline, scol), gsnap, _ in alias_snapshots:
-                if (sline, scol) <= copy_pos:
+                if (sline, scol) < copy_pos:
                     continue
                 if stop is not None \
                         and (sline, scol) > stop:
@@ -6764,6 +7021,24 @@ class CapturedBytesBinding(unittest.TestCase):
              "            *a, b = box, other\n"
              "            a[0] = log\n"
              "            results.append(box)\n" + use),
+            ("w5b-reversed-target-walrus-silent",
+             anchor,
+             head + "            def clean(self):\n"
+             "                return None\n"
+             "            rb = Path.read_bytes\n"
+             "            container = {}\n"
+             "            rb, container[(rb := clean)] = "
+             "Path.read_bytes, None\n"
+             "            Path.r = rb\n"
+             "            ignored = decode_body_log(log.r())\n"
+             + use),
+            ("w6c-alias-replay-silent",
+             anchor,
+             head + "            box = {}\n"
+             "            a = {}\n"
+             "            dummy = (z := ((a := box), {})[1])\n"
+             "            z[\"raw\"] = log\n"
+             "            results.append(box)\n" + use),
         ]
         for name, find, repl in cases:
             with self.subTest(shape=name):
@@ -7104,6 +7379,231 @@ class CapturedBytesBinding(unittest.TestCase):
                "            f()\n"
                "            results.append(box)\n"
                + use)]),
+        ]
+        for name, edits in cases:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
+
+    def test_tripwire_catches_r29_plants(self):
+        # adjudication-r28 W-fixes, anchor placement:
+        # per-target walrus/store order (W5), nested
+        # walrus completion in capability resolution
+        # (W6) and alias replay (W6a).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        sunk = "tainted path escapes to results.append()"
+        fire = [
+            ("w5-target-walrus-order",
+             [(anchor,
+               head + "            def clean(self):\n"
+               "                return None\n"
+               "            rb = clean\n"
+               "            container = {}\n"
+               "            rb, container[(rb := Path.read_bytes)] = "
+               "clean, None\n"
+               "            Path.r = rb\n"
+               "            ignored = decode_body_log(log.r())\n"
+               + use)],
+             "tainted path escapes to log.r()"),
+            ("w6-nested-walrus-order",
+             [(anchor,
+               head + "            def clean(self):\n"
+               "                return None\n"
+               "            rb = Path.read_bytes\n"
+               "            dummy = (rb := ((rb := clean), "
+               "Path.read_bytes)[1])\n"
+               "            Path.r = rb\n"
+               "            ignored = decode_body_log(log.r())\n"
+               + use)],
+             "tainted path escapes to log.r()"),
+            ("w6a-nested-walrus-alias",
+             [(anchor,
+               head + "            box = {}\n"
+               "            other = {}\n"
+               "            a = other\n"
+               "            dummy = (z := ((a := box), {})[0])\n"
+               "            a[\"raw\"] = log\n"
+               "            results.append(box)\n"
+               + use)],
+             sunk),
+        ]
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_catches_r29_prelude_plants(self):
+        # adjudication-r28 W-fixes, prelude placement:
+        # same-statement copy/rebind order (W1),
+        # load-retaining fresh displays (W3/W3b/W3d1),
+        # receiver-walrus copies (W4), class early
+        # stores (W8, needs its module plant),
+        # starred element stores (W9) and prefix
+        # pairing incl. unequal splats (W10/W10c).
+        # w3c1 pins a documented fail-closed FP
+        # (key-only splats cannot disconnect
+        # without type information).
+        source = Path(lane.__file__).read_text()
+        mod = "def execute("
+        prelude = "    _CANCELLATION_REAP_FAILED = False\n"
+        cases = [
+            ("w1-same-statement-copy-rebind",
+             [(prelude,
+               prelude + "    box = {\"row\": {}}\n"
+               "    other = {\"row\": {}}\n"
+               "    for i in range(2):\n"
+               "        cp, box = box.copy(), other\n"
+               "        cp[\"row\"][\"raw\"] = f\"{log}\"\n"
+               "    results.append(other)\n")]),
+            ("w3-fresh-keeps-old-ref",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    for i in range(2):\n"
+               "        a = box\n"
+               "        box = {\"old\": box}\n"
+               "        a[\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+            ("w3b-dict-comp-wraps-old",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    for i in range(2):\n"
+               "        a = box\n"
+               "        box = {i: box for i in range(1)}\n"
+               "        a[\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+            ("w3d1-splat-values-single",
+             [(prelude,
+               prelude + "    box = {\"row\": {}}\n"
+               "    for i in range(1):\n"
+               "        a = box\n"
+               "        box = [*box.values()]\n"
+               "        a[\"row\"][\"raw\"] = f\"{log}\"\n"
+               "    results.append(box)\n")]),
+            ("w3c1-splat-keys-single-fp",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    for i in range(1):\n"
+               "        a = box\n"
+               "        box = [*box]\n"
+               "        a[\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+            ("w4-receiver-walrus-copy",
+             [(prelude,
+               prelude + "    box = {\"row\": {}}\n"
+               "    a = {\"row\": {}}\n"
+               "    dummy = (cp := (a := box).copy())\n"
+               "    cp[\"row\"][\"raw\"] = f\"{log}\"\n"
+               "    results.append(box)\n")]),
+            ("w8-class-early-store",
+             [(mod, "m_cls = {}\na_cls = m_cls\n" + mod),
+              (prelude,
+               prelude + "    class C:\n"
+               "        a_cls[\"raw\"] = log\n"
+               "        a_cls = {}\n"
+               "    results.append(m_cls)\n")]),
+            ("w9-starred-element-store",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    *a, b = box, {}\n"
+               "    a[0][\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+            ("w10-starred-prefix-pair",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    a, *rest = box, {}, {}\n"
+               "    a[\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+            ("w10c-starred-unequal-splat",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    a, *rest = *[box, {}], {}\n"
+               "    a[\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+        ]
+        fragment = "tainted path escapes to results.append()"
+        for name, edits in cases:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_allows_r29_prelude_shapes(self):
+        # adjudication-r28 silent placements: the
+        # same-statement fresh divorce (W1b — the old
+        # object is garbage when the seed is
+        # unaliased), the for-target separator (W2),
+        # in-scope kills before the store (W7 class,
+        # W7b func) and the starred top-store control
+        # (W9b).
+        source = Path(lane.__file__).read_text()
+        prelude = "    _CANCELLATION_REAP_FAILED = False\n"
+        cases = [
+            ("w1b-same-statement-fresh-divorce",
+             [(prelude,
+               prelude + "    box = {\"row\": {}}\n"
+               "    for i in range(2):\n"
+               "        box, cp = {\"row\": {}}, box.copy()\n"
+               "        cp[\"row\"][\"raw\"] = f\"{log}\"\n"
+               "    results.append(box)\n")]),
+            ("w2-for-target-separator",
+             [(prelude,
+               prelude + "    other = {\"row\": {}}\n"
+               "    for box in ({\"row\": {}}, {\"row\": {}}):\n"
+               "        cp = box.copy()\n"
+               "        box = other\n"
+               "        cp[\"row\"][\"raw\"] = f\"{log}\"\n"
+               "    results.append(other)\n")]),
+            ("w7-class-scope-kill",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    class C:\n"
+               "        a = box\n"
+               "        a = {}\n"
+               "        a[\"raw\"] = log\n"
+               "    results.append(box)\n")]),
+            ("w7b-func-scope-kill",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    def outer():\n"
+               "        a = box\n"
+               "        a = {}\n"
+               "        def inner():\n"
+               "            a[\"raw\"] = log\n"
+               "        inner()\n"
+               "    outer()\n"
+               "    results.append(box)\n")]),
+            ("w9b-starred-top-control",
+             [(prelude,
+               prelude + "    box = {}\n"
+               "    other = {}\n"
+               "    *a, b = box, other\n"
+               "    a[0] = log\n"
+               "    results.append(box)\n")]),
         ]
         for name, edits in cases:
             with self.subTest(shape=name):
