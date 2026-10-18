@@ -1701,11 +1701,15 @@ def _copy_display_operand(value, trusted_builtin):
     # the display operand of a copy-form call sharing its
     # values/elements (shallow), or None: x.copy() over a
     # dict/list/tuple/set display, dict() over a dict
-    # display, list()/set() over a list/tuple/set display
+    # display (plus dict-with-keywords, merged below),
+    # list()/set() over a list/tuple/set display
     # (trusted ctors only, mirroring _copy_source_names).
     # Mismatched pairs (list() over a dict yields keys,
-    # not values) are not copies. Recurses through
-    # compositions (d.copy().copy()).
+    # not values) are not copies. Inner copy-forms
+    # resolve before the constructor validates, so
+    # nested compositions (d.copy().copy(),
+    # dict(d.copy()), list(list(xs)), dict(dict(d)))
+    # route the innermost display.
     value = _unwrap_walrus(value)
     if not isinstance(value, ast.Call):
         return None
@@ -1716,14 +1720,63 @@ def _copy_display_operand(value, trusted_builtin):
             return None
         operand = _unwrap_walrus(value.func.value)
     elif isinstance(value.func, ast.Name) \
-            and not value.keywords \
-            and len(value.args) == 1 \
             and trusted_builtin(value.func.id):
-        operand = _unwrap_walrus(value.args[0])
         if value.func.id == "dict":
+            if len(value.args) > 1:
+                return None
+            if value.keywords:
+                # dict(x?, **kw): one structural display
+                # merging the positional (display, inner
+                # copy-form, or unpacked name) with each
+                # **mapping unpacked and each k=v
+                # explicit — routed like a mixed display.
+                keys = []
+                values = []
+                for arg in value.args:
+                    arg = _unwrap_walrus(arg)
+                    resolved = _copy_display_operand(
+                        arg, trusted_builtin)
+                    values.append(
+                        resolved
+                        if resolved is not None else arg)
+                    keys.append(None)
+                for keyword in value.keywords:
+                    kval = _unwrap_walrus(keyword.value)
+                    if keyword.arg is None:
+                        resolved = _copy_display_operand(
+                            kval, trusted_builtin)
+                        values.append(
+                            resolved
+                            if resolved is not None
+                            else kval)
+                        keys.append(None)
+                    else:
+                        key = ast.Constant(
+                            value=keyword.arg)
+                        ast.copy_location(key,
+                                          keyword.value)
+                        keys.append(key)
+                        values.append(kval)
+                synth = ast.Dict(keys=keys, values=values)
+                ast.copy_location(synth, value)
+                return synth
+            if len(value.args) != 1:
+                return None
+            operand = _unwrap_walrus(value.args[0])
+            resolved = _copy_display_operand(
+                operand, trusted_builtin)
+            if resolved is not None:
+                operand = resolved
             if not isinstance(operand, ast.Dict):
                 return None
-        elif value.func.id in ("list", "set"):
+        elif value.func.id in ("list", "set") \
+                and not value.keywords \
+                and len(value.args) == 1:
+            operand = _unwrap_walrus(value.args[0])
+            resolved = _copy_display_operand(
+                operand, trusted_builtin)
+            if resolved is not None:
+                operand = resolved
             if not isinstance(operand, (ast.List, ast.Tuple,
                                         ast.Set)):
                 return None
@@ -2971,11 +3024,14 @@ def _binding_violations(source):
 
         def rhs_span(bind):
             # the operand-evaluation span of a bind's
-            # own statement (an Assign/AnnAssign RHS, a
-            # for-iter): peers the bind reads resolve
-            # with it visible (target binds note at
-            # stmt start, but read post-RHS state);
-            # None when the bind has no operand span.
+            # own statement: from the RHS start to the
+            # end of the bind's own (narrowed) operand.
+            # Peers the bind reads resolve with it
+            # visible (target binds note at stmt start,
+            # but read as-of their operand: earlier
+            # operands' walruses completed, later ones
+            # did not). None when the bind has no
+            # operand span.
             _bpos, _bkind, _bval = bind
             if _bkind not in ("plain", "for") \
                     or _bval is None:
@@ -2986,14 +3042,14 @@ def _binding_violations(source):
                 if isinstance(cursor, ast.Assign):
                     val = cursor.value
                     return ((val.lineno, val.col_offset),
-                            (val.end_lineno,
-                             val.end_col_offset))
+                            (_bval.end_lineno,
+                             _bval.end_col_offset))
                 if isinstance(cursor, ast.AnnAssign) \
                         and cursor.value is not None:
                     val = cursor.value
                     return ((val.lineno, val.col_offset),
-                            (val.end_lineno,
-                             val.end_col_offset))
+                            (_bval.end_lineno,
+                             _bval.end_col_offset))
                 if isinstance(cursor, (ast.For, ast.AsyncFor)):
                     it = cursor.iter
                     return ((it.lineno, it.col_offset),
@@ -4615,14 +4671,17 @@ def _binding_violations(source):
             def _element_preserving(value, candidate, pos):
                 # value denotes fresh top storage holding
                 # (at least) the candidate's elements:
-                # method/ctor copies, direct self-unpacks
-                # ([*xs], (*xs,), {*xs}, extras allowed),
-                # and their compositions (list/set/tuple/
-                # frozenset of a preserving value, .copy
-                # of one). Fresh displays, transforms and
-                # anything unrecognized replace the
-                # elements (a documented miss, like
-                # unknown kills).
+                # method/ctor copies, self-unpacks ([*xs],
+                # (*xs,), {*xs}, extras allowed) and
+                # nested unpack compositions ([*[*xs]],
+                # (*(*xs,),), mixed — recursion through
+                # literal displays), plus list/set/tuple/
+                # frozenset of a preserving value and
+                # .copy of one. Unpacks share the
+                # elements (no depth cost). Fresh
+                # displays, transforms and anything
+                # unrecognized replace the elements (a
+                # documented miss, like unknown kills).
                 value = _unwrap_walrus(value)
                 if value is None:
                     return False
@@ -4635,12 +4694,16 @@ def _binding_violations(source):
                         if not isinstance(elt, ast.Starred):
                             continue
                         inner = _unwrap_walrus(elt.value)
-                        if not isinstance(inner, ast.Name):
+                        if isinstance(inner, ast.Name):
+                            if inner.id == candidate \
+                                    or same_object(
+                                        func, inner.id,
+                                        candidate, pos,
+                                        set()):
+                                return True
                             continue
-                        if inner.id == candidate \
-                                or same_object(
-                                    func, inner.id,
-                                    candidate, pos, set()):
+                        if _element_preserving(
+                                inner, candidate, pos):
                             return True
                     return False
                 if isinstance(value, ast.Call) \
@@ -4861,27 +4924,35 @@ def _binding_violations(source):
                 # leaves in `name`: skip only with an
                 # unconditional pre-capture reset (it
                 # runs every pass, overwriting feedback
-                # and pre-loop state) AND every
-                # pre-capture definition invariant
-                # (overwritten proofs don't count, and a
-                # conditional override may inject
-                # garbage — post-capture binds are always
-                # overwritten, so they never matter).
+                # and pre-loop state) AND the surviving
+                # reset plus every later pre-capture
+                # definition invariant (definitions
+                # before the last unconditional reset
+                # are overwritten on every pass, so
+                # they never matter; a conditional
+                # override after it may still inject
+                # garbage — post-capture binds are
+                # always overwritten, so they never
+                # matter).
                 resets = [
                     (_bpos, _bkind, _bval)
                     for _bpos, _bkind, _bval in homebinds.get(
                         name, [])
                     if span_start < _bpos < capos]
-                if not any(
-                        _bkind == "plain"
-                        and reaches(_bpos, capos)
-                        for _bpos, _bkind, _bval in resets):
+                unconditional = [
+                    _bpos
+                    for _bpos, _bkind, _bval in resets
+                    if _bkind == "plain"
+                    and reaches(_bpos, capos)]
+                if not unconditional:
                     continue
+                last_reset = max(unconditional)
                 if all(
                         _bkind == "plain"
                         and _pass_invariant(
                             _bval, span_start, span_end)
-                        for _bpos, _bkind, _bval in resets):
+                        for _bpos, _bkind, _bval in resets
+                        if _bpos >= last_reset):
                     skip.add(id(loop))
             mates = set(group_mates(
                 name, unpack, level, star_horizon=capos,
@@ -4898,8 +4969,20 @@ def _binding_violations(source):
                 # a later bind restores). Same-position
                 # binds postdate the edge (same-batch
                 # RHS values pre-date their stores).
-                # Termination: nested horizons strictly
-                # decrease.
+                # The identity alternative is
+                # capture-anchored: same_object answers
+                # at-horizon, so it rejoins only while
+                # the root itself still denotes the
+                # captured object (a restore through a
+                # rebound-away spelling restores
+                # nothing). Liveness is possible
+                # provenance: a restore rejoins whether
+                # definite or conditional (its source
+                # must be live then), while only a
+                # definite non-restoring bind breaks (a
+                # conditional break keeps the prior
+                # state). Termination: nested horizons
+                # strictly decrease.
                 live = True
                 ordered = sorted(
                     homebinds.get(src, []),
@@ -4907,17 +4990,19 @@ def _binding_violations(source):
                 for _bpos, _bkind, _bval in ordered:
                     if not lo < _bpos < hi:
                         continue
-                    if not reaches(_bpos, hi):
-                        continue
                     _bval = _unwrap_walrus(_bval)
                     if _bkind == "plain" \
                             and isinstance(
                                 _bval, ast.Name) \
                             and (restored(_bval.id, _bpos)
-                                 or same_object(
-                                     home if home is not None
-                                     else func, _bval.id,
-                                     name, _bpos, set())):
+                                 or (not rebased(
+                                         name, capos, _bpos)
+                                     and same_object(
+                                         home if home is not
+                                         None
+                                         else func, _bval.id,
+                                         name, _bpos,
+                                         set()))):
                         live = True
                         continue
                     if _bkind == "plain" \
@@ -4929,7 +5014,8 @@ def _binding_violations(source):
                                     _bval, trusted_ctor)):
                         live = True
                         continue
-                    live = False
+                    if reaches(_bpos, hi):
+                        live = False
                 return not live
 
             def restored(other, when):
@@ -5164,31 +5250,153 @@ def _binding_violations(source):
                                 ast.iter_child_nodes(node))
                         return found
 
+                    def catches_name_error(nodetype):
+                        # whether an except handler can
+                        # catch the del's NameError: bare
+                        # always; tuples, starred and PEP
+                        # 604 unions by members; names in
+                        # the NameError-superclass chain
+                        # (bare or builtins-dotted) yes;
+                        # other unrebound builtin
+                        # exceptions no; anything else
+                        # yes — aliasing is unknowable,
+                        # fail closed.
+                        if nodetype is None:
+                            return True
+                        if isinstance(nodetype, ast.Tuple):
+                            return any(
+                                catches_name_error(elt)
+                                for elt in nodetype.elts)
+                        if isinstance(nodetype, ast.Starred):
+                            return catches_name_error(
+                                nodetype.value)
+                        if isinstance(nodetype, ast.BinOp) \
+                                and isinstance(
+                                    nodetype.op, ast.BitOr):
+                            return catches_name_error(
+                                nodetype.left) \
+                                or catches_name_error(
+                                    nodetype.right)
+                        catching = ("NameError",
+                                    "LookupError",
+                                    "Exception",
+                                    "BaseException")
+                        if isinstance(nodetype, ast.Name):
+                            spelling = nodetype.id
+                        elif isinstance(nodetype,
+                                        ast.Attribute) \
+                                and isinstance(
+                                    nodetype.value,
+                                    ast.Name) \
+                                and nodetype.value.id == \
+                                "builtins" \
+                                and "builtins" not in \
+                                rebound:
+                            spelling = nodetype.attr
+                        else:
+                            return True
+                        if spelling in catching:
+                            return True
+                        builtin = getattr(
+                            builtins, spelling, None)
+                        if isinstance(builtin, type) \
+                                and issubclass(
+                                    builtin, BaseException) \
+                                and spelling not in rebound:
+                            return False
+                        return True
+
+                    def del_caught(dpos):
+                        # the del at dpos raises NameError
+                        # (nothing installed to remove) but
+                        # execution continues when a try body
+                        # enclosing it (up to the class body)
+                        # has a catching handler. try
+                        # orelse/finally/handler bodies do
+                        # not catch their own errors.
+                        target = None
+                        for cand in ast.walk(current):
+                            if isinstance(cand, ast.Delete) \
+                                    and (cand.lineno,
+                                         cand.col_offset) \
+                                    == dpos:
+                                target = cand
+                                break
+                        if target is None:
+                            return True
+                        try_nodes = (ast.Try,)
+                        trystar = getattr(
+                            ast, "TryStar", None)
+                        if trystar is not None:
+                            try_nodes += (trystar,)
+                        child = target
+                        cursor = target
+                        while id(cursor) in parents:
+                            cursor = parents[id(cursor)]
+                            if cursor is current:
+                                return False
+                            if isinstance(cursor, try_nodes) \
+                                    and any(sub is child
+                                            for sub in
+                                            cursor.body):
+                                for handler in \
+                                        cursor.handlers:
+                                    if catches_name_error(
+                                            handler.type):
+                                        return True
+                            child = cursor
+                        return False
+
                     declared = class_declared()
                     if installs:
+                        # replay the class namespace in
+                        # execution order: installs bind, a
+                        # del unbinds when bound; a del with
+                        # nothing to remove raises — ending
+                        # the flow (moot, resolved
+                        # class-locally) unless caught (a
+                        # caught failure continues with
+                        # outer fallback). A bound store
+                        # reads class-local, else the
+                        # module.
                         stash = [pos
                                  for pos, _, _ in installs
                                  if pos < spos]
+                        dels_before = [
+                            dpos
+                            for dpos, is_del in declared
+                            if is_del and dpos < spos]
                         events = [(pos, False)
                                   for pos in stash]
                         events.extend(
                             (dpos, True)
-                            for dpos, is_del in declared
-                            if is_del and dpos < spos)
+                            for dpos in dels_before)
                         if not events:
                             return tree
-                        latest, was_del = max(events)
-                        if not was_del:
+                        bound = False
+                        terminated = False
+                        for epos, is_del in sorted(events):
+                            if not is_del:
+                                bound = True
+                            elif bound:
+                                bound = False
+                            elif del_caught(epos):
+                                pass
+                            else:
+                                terminated = True
+                                break
+                        if terminated or bound:
                             return current
-                        if any(pos < latest
-                               for pos in stash):
-                            return tree
-                        return current
-                    dels = [dpos
-                            for dpos, is_del in declared
-                            if is_del]
-                    if any(dpos < spos for dpos in dels):
-                        return current
+                        return tree
+                    dels_before = [
+                        dpos
+                        for dpos, is_del in declared
+                        if is_del and dpos < spos]
+                    if dels_before:
+                        for dpos in sorted(dels_before):
+                            if not del_caught(dpos):
+                                return current
+                        return tree
                     if declared:
                         return tree
                 binds = scope_binds.get(
@@ -5955,14 +6163,20 @@ def _binding_violations(source):
                                 elements.append(target)
 
                         def order_key(node):
+                            # completion order: a node
+                            # completes when its span ends
+                            # (children before parents, so a
+                            # nested walrus completes before
+                            # its outer one; sequential
+                            # siblings keep source order).
                             for index, element in enumerate(
                                     elements):
                                 if any(child is node
                                        for child in ast.walk(
                                            element)):
                                     return (index,
-                                            (node.lineno,
-                                             node.col_offset))
+                                            (node.end_lineno,
+                                             node.end_col_offset))
                             return None
 
                         wkey = order_key(walrus)
@@ -6001,8 +6215,8 @@ def _binding_violations(source):
                                         child is node
                                         for child in ast.walk(
                                             batch.value)):
-                                nkey = (-1, (node.lineno,
-                                             node.col_offset))
+                                nkey = (-1, (node.end_lineno,
+                                             node.end_col_offset))
                             else:
                                 nkey = order_key(node)
                                 if nkey is None \
@@ -10280,6 +10494,309 @@ class CapturedBytesBinding(unittest.TestCase):
                      '            cp, sink[((box := {}), 2)[1]], sink[((keep := box), 0)[1]], box = box.copy(), 0, 0, {}\n'
                      '            cp["row"]["raw"] = log\n'
                      '            results.append(keep)\n'
+               + use),
+             ],
+             ),
+        ]
+        for name, edits in cases:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
+
+    def test_tripwire_catches_r34_plants(self):
+        # adjudication-r33 B-fixes: per-operand favor
+        # (B1), completion-ordered nested walrus stores
+        # (B2), caught deletions with module fallback
+        # (B5/B5b), conditional restorations (B6),
+        # nested unpack compositions (B7/B7b) and
+        # nested copy displays (B8/B8b).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        clean = ('            def clean(self):\n'
+                 '                return b"CLEAN"\n')
+        fire = [
+            ('b1-rhs-favor-late-effect',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     '                w = Path.read_bytes\n'
+                     '                rb, ignored = w, (w := clean)\n'
+                     '                Path.r = rb\n'
+                     '                ignored = decode_body_log(log.r())\n'
+                     '                results.append(ignored)\n'
+                     '            f()\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+            ('b2-nested-target-walrus',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            sink = {}\n'
+                     '            cp, sink[((box := (box, (box := {}))[0]), 0)[1]], sink[((keep := box), 1)[1]], box = box.copy(), 0, 0, {}\n'
+                     '            cp["row"]["raw"] = log\n'
+                     '            results.append(keep)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b5-caught-del',
+             [
+              (mod,
+               'module_box = {}\n'
+                     'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     '            a_cls = box\n'
+                     '            class C:\n'
+                     '                try:\n'
+                     '                    del a_cls\n'
+                     '                except NameError:\n'
+                     '                    pass\n'
+                     '                a_cls["raw"] = log\n'
+                     '                a_cls = box\n'
+                     '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b5b-caught-del-no-install',
+             [
+              (mod,
+               'module_box = {}\n'
+                     'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     '            a_cls = box\n'
+                     '            class C:\n'
+                     '                try:\n'
+                     '                    del a_cls\n'
+                     '                except NameError:\n'
+                     '                    pass\n'
+                     '                a_cls["raw"] = log\n'
+                     '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b6-conditional-restore',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [box]\n'
+                     '            a = box\n'
+                     '            a = {}\n'
+                     '            if True:\n'
+                     '                a = box\n'
+                     '            b = a\n'
+                     '            box = {}\n'
+                     '            a = {}\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(b)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b7-nested-unpack',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [box]\n'
+                     '            xs = [*[*xs]]\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b7b-nested-tuple-unpack',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [box]\n'
+                     '            xs = (*(*xs,),)\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b8-nested-copy-display',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            empty = {}\n'
+                     '            *xs, = [dict(({**empty, "slot": box}).copy())]\n'
+                     '            xs[0]["slot"]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('b8b-dict-dict',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            empty = {}\n'
+                     '            *xs, = [dict(dict(empty, **{"slot": box}))]\n'
+                     '            xs[0]["slot"]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+        ]
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_allows_r34_shapes(self):
+        # adjudication-r33 B-fixes, silent placements:
+        # the early-walrus (B1b), walrus-first-target
+        # (B1c) and clean-prebind (B1d) favor
+        # controls, restoration through rebound-away
+        # spellings at depths 1-3 (B3/B3b/B3c) and
+        # overwritten resets (B4/B4b for/while).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        clean = ('            def clean(self):\n'
+                 '                return b"CLEAN"\n')
+        cases = [
+            ('b1b-inverted-early-walrus',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     '                w = Path.read_bytes\n'
+                     '                ignored, rb = (w := clean), w\n'
+                     '                Path.r = rb\n'
+                     '                ignored = decode_body_log(log.r())\n'
+                     '                results.append(ignored)\n'
+                     '            f()\n'
+               + use),
+             ],
+             ),
+            ('b1c-walrus-first-target',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     '                w = Path.read_bytes\n'
+                     '                rb, ignored = (w := clean), w\n'
+                     '                Path.r = rb\n'
+                     '                ignored = decode_body_log(log.r())\n'
+                     '                results.append(ignored)\n'
+                     '            f()\n'
+               + use),
+             ],
+             ),
+            ('b1d-clean-prebind-late-reader',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     '                w = clean\n'
+                     '                rb, ignored = w, (w := Path.read_bytes)\n'
+                     '                Path.r = rb\n'
+                     '                ignored = decode_body_log(log.r())\n'
+                     '                results.append(ignored)\n'
+                     '            f()\n'
+               + use),
+             ],
+             ),
+            ('b3-restoration-fresh-rejoin',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [box]\n'
+                     '            a = box\n'
+                     '            box = {}\n'
+                     '            a = box\n'
+                     '            b = a\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(b)\n'
+               + use),
+             ],
+             ),
+            ('b3b-restoration-depth2',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            *xs, = [box]\n'
+                     '            a = box\n'
+                     '            box = {"row": {}}\n'
+                     '            a = box\n'
+                     '            b = a\n'
+                     '            xs[0]["row"]["raw"] = log\n'
+                     '            results.append(b)\n'
+               + use),
+             ],
+             ),
+            ('b3c-restoration-depth3',
+             [
+              (anchor,
+               head + '            box = {"row": {"cell": {}}}\n'
+                     '            *xs, = [box]\n'
+                     '            a = box\n'
+                     '            box = {"row": {"cell": {}}}\n'
+                     '            a = box\n'
+                     '            b = a\n'
+                     '            xs[0]["row"]["cell"]["raw"] = log\n'
+                     '            results.append(b)\n'
+               + use),
+             ],
+             ),
+            ('b4-overwritten-reset',
+             [
+              (anchor,
+               head + '            other = {}\n'
+                     '            sink = {}\n'
+                     '            for i in range(2):\n'
+                     '                box = other\n'
+                     '                box = {}\n'
+                     '                *xs, = [box]\n'
+                     '                other = sink\n'
+                     '                xs[0]["raw"] = log\n'
+                     '            results.append(sink)\n'
+               + use),
+             ],
+             ),
+            ('b4b-overwritten-while',
+             [
+              (anchor,
+               head + '            other = {}\n'
+                     '            sink = {}\n'
+                     '            i = 0\n'
+                     '            while i < 2:\n'
+                     '                box = other\n'
+                     '                box = {}\n'
+                     '                *xs, = [box]\n'
+                     '                other = sink\n'
+                     '                xs[0]["raw"] = log\n'
+                     '                i += 1\n'
+                     '            results.append(sink)\n'
                + use),
              ],
              ),
