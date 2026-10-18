@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import tracemalloc
@@ -1453,6 +1454,168 @@ def _unwrap_walrus(value):
     return value
 
 
+def _provable_divzero(node):
+    # a constant division/modulo by zero (any
+    # constant numerator — numerics raise
+    # ZeroDivisionError, the rest TypeError).
+    return isinstance(node, ast.BinOp) \
+        and isinstance(
+            node.op, (ast.Div, ast.Mod, ast.FloorDiv)) \
+        and isinstance(node.left, ast.Constant) \
+        and isinstance(node.right, ast.Constant) \
+        and node.right.value == 0
+
+
+def _uncond_raises_expr(node):
+    # True when evaluating node unconditionally
+    # raises (a constant division/modulo by zero
+    # outside conditional or deferred contexts:
+    # IfExp arms, BoolOp/Compare tails, lambda
+    # bodies, and comprehension interiors past
+    # the first iterable never count — only the
+    # parts that always evaluate do).
+    if _provable_divzero(node):
+        return True
+    if isinstance(node, ast.BoolOp):
+        return bool(node.values) \
+            and _uncond_raises_expr(node.values[0])
+    if isinstance(node, ast.IfExp):
+        return _uncond_raises_expr(node.test)
+    if isinstance(node, ast.Compare):
+        return _uncond_raises_expr(node.left)
+    if isinstance(node, ast.Lambda):
+        return any(_uncond_raises_expr(default)
+                   for default in
+                   list(node.args.defaults)
+                   + [default
+                      for default in
+                      node.args.kw_defaults
+                      if default is not None])
+    if isinstance(node, (ast.ListComp, ast.SetComp,
+                         ast.DictComp, ast.GeneratorExp)):
+        gens = node.generators
+        return bool(gens) \
+            and _uncond_raises_expr(gens[0].iter)
+    return any(_uncond_raises_expr(child)
+               for child in ast.iter_child_nodes(node)
+               if isinstance(child, ast.expr))
+
+
+def _simple_stmt_raises(stmt):
+    # True when a simple statement unconditionally
+    # raises during its own evaluation (constant
+    # division by zero in an always-evaluated
+    # operand — targets included).
+    if isinstance(stmt, ast.Expr):
+        parts = [stmt.value]
+    elif isinstance(stmt, ast.Assign):
+        parts = [stmt.value] + list(stmt.targets)
+    elif isinstance(stmt, ast.AnnAssign):
+        parts = [part for part in
+                 (stmt.value, stmt.target,
+                  stmt.annotation)
+                 if part is not None]
+    elif isinstance(stmt, ast.AugAssign):
+        parts = [stmt.target, stmt.value]
+    elif isinstance(stmt, ast.Delete):
+        parts = list(stmt.targets)
+    elif isinstance(stmt, ast.Return):
+        parts = [stmt.value] \
+            if stmt.value is not None else []
+    else:
+        return False
+    return any(_uncond_raises_expr(part)
+               for part in parts)
+
+
+def _stmt_may_fall(stmt, soft_raise):
+    # True when stmt may complete normally (fall
+    # through to what follows it). Direct
+    # return/break/continue never fall; raise and
+    # assert fall only under soft_raise (kept
+    # exits at top level); a provable constant
+    # raise never falls. Compound predecessors
+    # count when they definitely exit:
+    # constant-folded or both-arms ifs, trys
+    # whose body and handlers all exit (or whose
+    # finally does), with-bodies exiting by
+    # non-raise means (a raise may be suppressed
+    # by __exit__). Loops, match, and nested
+    # scopes stay opaque (an inner break binds
+    # the inner loop; a nested return leaves the
+    # block).
+    if isinstance(stmt, (ast.Return, ast.Break,
+                         ast.Continue)):
+        return False
+    if isinstance(stmt, (ast.Raise, ast.Assert)):
+        return soft_raise
+    if _simple_stmt_raises(stmt):
+        return False
+    if isinstance(stmt, ast.If):
+        if _uncond_raises_expr(stmt.test):
+            return False
+        test = _unwrap_walrus(stmt.test)
+        if isinstance(test, ast.Constant):
+            if test.value is True:
+                return _seq_may_fall(stmt.body,
+                                     soft_raise)
+            if test.value is False:
+                return _seq_may_fall(stmt.orelse,
+                                     soft_raise)
+        return _seq_may_fall(stmt.body, soft_raise) \
+            or _seq_may_fall(stmt.orelse, soft_raise)
+    try_nodes = (ast.Try,)
+    trystar = getattr(ast, "TryStar", None)
+    if trystar is not None:
+        try_nodes += (trystar,)
+    if isinstance(stmt, try_nodes):
+        if not _seq_may_fall(stmt.finalbody,
+                             soft_raise):
+            return False
+        normal = not _seq_may_fall(stmt.body,
+                                   soft_raise) \
+            or (stmt.orelse
+                and not _seq_may_fall(stmt.orelse,
+                                      soft_raise))
+        if not normal:
+            return True
+        return any(_seq_may_fall(handler.body,
+                                 soft_raise)
+                   for handler in stmt.handlers)
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return _seq_may_fall(stmt.body, True)
+    return True
+
+
+def _seq_may_fall(seq, soft_raise):
+    return all(_stmt_may_fall(sub, soft_raise)
+               for sub in seq)
+
+
+def _stmts_quiet(stmts):
+    # statements provably raising nothing: pass,
+    # constant expressions, and constant binds to
+    # bare names (anything else — calls,
+    # subscripts, deletes, raises, control flow —
+    # may raise; fail closed).
+    for stmt in stmts:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.Expr) \
+                and isinstance(stmt.value, ast.Constant):
+            continue
+        if isinstance(stmt, ast.Assign) \
+                and isinstance(stmt.value, ast.Constant) \
+                and len(stmt.targets) == 1 \
+                and isinstance(stmt.targets[0],
+                               ast.Name) \
+                and isinstance(stmt.targets[0].ctx,
+                               ast.Store):
+            continue
+        return False
+    return True
+
+
 def _scope_surfaces(tree, parents):
     # per-scope (imports, bound, globals, nonlocals)
     # for import-alias resolution: {scope id:
@@ -1641,6 +1804,93 @@ def _surface_alias_at(surfaces, parents, node, name):
         if name in bound:
             return single_import(id(scope))
         index += 1
+    return None
+
+
+def _module_alias_root(surfaces, parents, scope_binds, node, name):
+    # the import module `name` denotes at `node`,
+    # following preserved `alias = <Name>` chains
+    # (destructured pairs included — their values
+    # are the paired names; self-assigns skipped,
+    # they preserve) through the lexical scope walk
+    # (global/nonlocal honored, classes transparent
+    # except directly enclosing). None when
+    # unresolvable, rebound, or cyclic. Each link
+    # resolves as-of the site (binds strictly
+    # before it; the last one wins — a stale
+    # over-read fails closed at the callers).
+    chain = []
+    current = node
+    first = True
+    while id(current) in parents:
+        child = current
+        current = parents[id(current)]
+        if isinstance(current, (ast.FunctionDef,
+                                ast.AsyncFunctionDef,
+                                ast.Lambda)):
+            if _prologue_child(current, child):
+                continue
+            chain.append(current)
+            first = False
+        elif isinstance(current, ast.ClassDef):
+            if _prologue_child(current, child):
+                continue
+            if first:
+                chain.append(current)
+            first = False
+    chain.append(current)
+    root = current
+    sitepos = (node.lineno, node.col_offset)
+    seen = set()
+    while name not in seen:
+        seen.add(name)
+        scope = None
+        index = 0
+        while index < len(chain):
+            cand = chain[index]
+            _imports, bound, globs, nonlocs = surfaces[
+                id(cand)]
+            if name in globs:
+                scope = root
+                break
+            if name in nonlocs:
+                for outer in chain[index + 1:]:
+                    if isinstance(
+                            outer,
+                            (ast.FunctionDef,
+                             ast.AsyncFunctionDef)) \
+                            and name in surfaces[
+                                id(outer)][1]:
+                        scope = outer
+                        break
+                break
+            if name in bound:
+                scope = cand
+                break
+            index += 1
+        if scope is None:
+            return None
+        imports = surfaces[id(scope)][0]
+        target = None
+        for _bpos, bkind, bval in reversed(
+                scope_binds.get(id(scope), {}).get(
+                    name, [])):
+            if _bpos >= sitepos:
+                continue
+            if bkind == "plain" and isinstance(
+                    _unwrap_walrus(bval), ast.Name):
+                rhs = _unwrap_walrus(bval).id
+                if rhs == name:
+                    continue
+                target = rhs
+                break
+            if bval is None and name in imports \
+                    and len(imports[name]) == 1:
+                return imports[name][0]
+            return None
+        if target is None:
+            return None
+        name = target
     return None
 
 
@@ -1949,6 +2199,25 @@ def _target_leaves(target):
             yield from _target_leaves(elt)
     else:
         yield target
+
+
+def _class_annotated(home):
+    # a direct class-body annotation of a bare name
+    # (nested scopes pruned — their annotations are
+    # their own): only these install __annotations__
+    # on the pre-3.14 eager path.
+    stack = list(home.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef,
+                             ast.AsyncFunctionDef,
+                             ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.AnnAssign) \
+                and isinstance(node.target, ast.Name):
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
 
 
 def _splat_elts(elts):
@@ -2470,15 +2739,19 @@ def _binding_violations(source):
     def _builtins_attr(leaf):
         # an attribute bind through the builtins
         # module root (builtins.str = ... — import
-        # aliases included): the bare name every
-        # module resolves is rebound.
+        # aliases and preserved alias chains
+        # included): the bare name every module
+        # resolves is rebound.
         if not isinstance(leaf, ast.Attribute):
             return None
         root = _store_root(leaf)[0]
         if root == "builtins" \
                 or _surface_alias_at(
                     surfaces, parents, leaf,
-                    root) == "builtins":
+                    root) == "builtins" \
+                or _module_alias_root(
+                    surfaces, parents, scope_binds,
+                    leaf, root) == "builtins":
             return leaf.attr
         return None
 
@@ -2560,8 +2833,9 @@ def _binding_violations(source):
         # walrus inside one is lambda-local). Params
         # bind here as kill forms (callers pass
         # anything). Comprehension targets are local
-        # (correctly ignored — a walrus inside one
-        # binds here and is visited). Global/nonlocal
+        # (kept in the comp_binds_by_name side table,
+        # span-gated — a walrus inside one binds here
+        # and is visited). Global/nonlocal
         # declarations bind here (imprecise:
         # documented).
         binds = {}
@@ -2796,6 +3070,49 @@ def _binding_violations(source):
             # narrow: pathological shapes only).
             scope_binds[id(scope_node)] = _scope_binds(
                 scope_node)
+    # comprehension loop variables are local to
+    # their comprehension (never outward — they do
+    # not leak) but decide uses inside it: a walrus
+    # value in the element reads the comprehension
+    # environment, not the outer scope. Kept in a
+    # side table (never in scope_binds — other
+    # consumers assume outward visibility) merged
+    # only into the holds() candidate list; the
+    # span gate in sees() scopes them (a use
+    # outside the comprehension span, including
+    # the outermost iterable's own reads, never
+    # observes them — nesting and shadowing fall
+    # out of span containment plus position
+    # order).
+    comp_binds_by_name = {}
+    comp_spans = {}
+    for comp_node in ast.walk(tree):
+        if not isinstance(comp_node, (ast.ListComp, ast.SetComp,
+                                      ast.DictComp,
+                                      ast.GeneratorExp)):
+            continue
+        cspan = ((comp_node.lineno, comp_node.col_offset),
+                 (comp_node.end_lineno,
+                  comp_node.end_col_offset))
+        for gen in comp_node.generators:
+            comp_spans[id(gen.iter)] = (
+                cspan, (gen.iter.lineno,
+                        gen.iter.col_offset),
+                (gen.iter.end_lineno,
+                 gen.iter.end_col_offset))
+            pos = (gen.target.lineno,
+                   gen.target.col_offset)
+            for leaf in _target_leaves(gen.target):
+                found, key = _namespace_store(leaf)
+                if found and key is not None:
+                    comp_binds_by_name.setdefault(
+                        key, []).append((pos, "plain",
+                                        gen.iter))
+                else:
+                    for name in _bound_names(leaf):
+                        comp_binds_by_name.setdefault(
+                            name, []).append((pos, "for",
+                                              gen.iter))
     scope_declared = {}
     for scope_node in ast.walk(tree):
         if scope_node is tree or isinstance(
@@ -3066,6 +3383,7 @@ def _binding_violations(source):
                 span_lo = stmt_start
         qbinds = scope_binds[id(query)]
         window = None
+        window_node = None
         current = node
         while id(current) in parents:
             current = parents[id(current)]
@@ -3077,6 +3395,7 @@ def _binding_violations(source):
                            current.col_offset),
                           (current.end_lineno,
                            current.end_col_offset))
+                window_node = current
         memo = {}
 
         def rhs_span(bind):
@@ -3306,6 +3625,32 @@ def _binding_violations(source):
                             return (walrus_end,
                                     walrus_end, 0)
                         return (bpos, bpos, 0)
+                    if isinstance(node, (ast.For,
+                                         ast.AsyncFor)):
+                        # the iterator completes before
+                        # the target evaluates: every
+                        # iterator bind lands before
+                        # every target bind (phase 0
+                        # vs 1 under the loop start),
+                        # each phase ordered by
+                        # completion within it. Body
+                        # and orelse binds keep plain
+                        # position order (they run
+                        # after the target).
+                        if child is node.iter:
+                            end = walrus_end \
+                                if walrus_end is not None \
+                                else bpos
+                            return ((node.lineno,
+                                     node.col_offset),
+                                    (0, end), 0)
+                        if child is node.target:
+                            end = walrus_end \
+                                if walrus_end is not None \
+                                else bpos
+                            return ((node.lineno,
+                                     node.col_offset),
+                                    (1, end), 0)
                     if isinstance(node, ast.stmt):
                         if walrus_end is not None:
                             return (walrus_end,
@@ -3322,7 +3667,8 @@ def _binding_violations(source):
             # (the walker notes targets in completion
             # order) — values alone would all select
             # the first.
-            raw_binds = qbinds.get(name, [])
+            raw_binds = qbinds.get(name, []) \
+                + comp_binds_by_name.get(name, [])
             occ_of = {}
             counters = {}
             for idx, bind in enumerate(raw_binds):
@@ -3355,8 +3701,24 @@ def _binding_violations(source):
                 # still pending (it completes with its
                 # value, after the operand) — only a
                 # store finished by the operand end is
-                # visible.
+                # visible. Comprehension loop variables
+                # (side table, keyed by their iterable)
+                # are visible anywhere inside their own
+                # comprehension span except inside
+                # their own iterable (which reads the
+                # enclosing scope — the element
+                # precedes the generators textually
+                # but runs after them).
                 bpos = bind[0]
+                if bind[2] is not None:
+                    centry = comp_spans.get(id(bind[2]))
+                    if centry is not None:
+                        cspan, istart, iend = centry
+                        if not (cspan[0] <= pos
+                                <= cspan[1]):
+                            return False
+                        return not (istart <= pos
+                                    <= iend)
                 if favor is not None \
                         and favor[0] <= bpos:
                     if bpos >= favor[1]:
@@ -3378,9 +3740,17 @@ def _binding_violations(source):
             memo[key] = False
             if windowed and window is not None:
                 wstart, wend = window
+                single = False
+                if isinstance(window_node, (ast.For,
+                                            ast.AsyncFor)):
+                    it = window_node.iter
+                    single = (it.lineno, it.col_offset) \
+                        <= pos <= (it.end_lineno,
+                                   it.end_col_offset)
                 later = [bind for bind in blist
                          if wstart <= bind[0] < wend
-                         and bind[0] >= pos]
+                         and bind[0] >= pos
+                         and (not single or sees(bind))]
                 for _bpos, _kind, _value in later:
                     _out, peers, seed = classify_cap(
                         name, (_bpos, _kind, _value))
@@ -3456,6 +3826,10 @@ def _binding_violations(source):
         names = set(qbinds)
         for scope in chain[1:]:
             names.update(scope_binds[id(scope)])
+        # comprehension loop variables (span-gated in
+        # sees, so names bound only inside one still
+        # resolve at uses inside it).
+        names.update(comp_binds_by_name)
         # fixpoint: True verdicts are sound (a True never
         # derives from an in-progress False), but False
         # ones may be cycle-poisoned (a copy cycle seen
@@ -3616,6 +3990,11 @@ def _binding_violations(source):
                              or _surface_alias_at(
                                  surfaces, parents,
                                  top.args[0],
+                                 top.args[0].id)
+                             == "builtins"
+                             or _module_alias_root(
+                                 surfaces, parents,
+                                 scope_binds, top.args[0],
                                  top.args[0].id)
                              == "builtins"):
                     builtins_attr_binds.add(named.value)
@@ -4557,6 +4936,63 @@ def _binding_violations(source):
                 return True
             return False
 
+        def identity_equiv(scope, left, right, horizon,
+                           seen):
+            # True when `left` and `right` provably
+            # denote the same object just before
+            # `horizon`: either direction of the edge
+            # walk, or a common origin (live edges to
+            # sources equivalent at the earlier edge,
+            # with the later source unrebased between
+            # the edges). Termination: horizons
+            # strictly decrease and pairs are seen.
+            if left == right:
+                return True
+            if (left, right) in seen:
+                return False
+            seen.add((left, right))
+            seen.add((right, left))
+            if same_object(scope, left, right, horizon,
+                            set()) \
+                    or same_object(scope, right, left,
+                                   horizon, set()):
+                return True
+
+            def live_edges(name):
+                out = []
+                for bpos, bkind, bval in scope_binds.get(
+                        id(scope), {}).get(name, []):
+                    if not bpos < horizon:
+                        continue
+                    if bkind != "plain":
+                        continue
+                    bval = _unwrap_walrus(bval)
+                    if not isinstance(bval, ast.Name):
+                        continue
+                    if edge_broken(scope, name, bpos,
+                                   horizon, set()):
+                        continue
+                    out.append((bpos, bval.id))
+                return out
+
+            for apos, xname in live_edges(left):
+                for bpos, yname in live_edges(right):
+                    if apos <= bpos:
+                        gap = edge_broken(
+                            scope, yname, apos, bpos,
+                            set())
+                    else:
+                        gap = edge_broken(
+                            scope, xname, bpos, apos,
+                            set())
+                    if gap:
+                        continue
+                    if identity_equiv(
+                            scope, xname, yname,
+                            min(apos, bpos), seen):
+                        return True
+            return False
+
         def group_mates(root, node, depth, star_horizon=None,
                         skip_loops=()):
             # every group a store through root may land
@@ -4988,6 +5424,26 @@ def _binding_violations(source):
                         return None
                     return node.id
 
+                def mutated_root(target):
+                    # the root name an
+                    # AugAssign/Delete target mutates,
+                    # seeing through subscripts,
+                    # attributes and walruses (index,
+                    # slice and attribute interiors
+                    # are loads, never mutations).
+                    # None when the root is computed
+                    # (unresolvable — fail closed).
+                    node = target
+                    while isinstance(
+                            node,
+                            (ast.Subscript,
+                             ast.Attribute,
+                             ast.NamedExpr)):
+                        node = node.value
+                    if not isinstance(node, ast.Name):
+                        return None
+                    return node.id
+
                 repl = []
                 for item in ast.walk(func):
                     if not hasattr(item, "lineno") \
@@ -5052,24 +5508,18 @@ def _binding_violations(source):
                                         root, ipos):
                                     return False
                     elif isinstance(item, ast.AugAssign):
-                        for part in ast.walk(item.target):
-                            if not isinstance(
-                                    part, ast.Name):
-                                continue
-                            if part.id == cand \
-                                    or joined_mate(
-                                        part.id, ipos):
-                                return False
+                        root = mutated_root(item.target)
+                        if root is None \
+                                or root == cand \
+                                or joined_mate(root, ipos):
+                            return False
                     elif isinstance(item, ast.Delete):
-                        for gone in ast.walk(item):
-                            if isinstance(
-                                    gone, ast.Name) \
-                                    and gone.id == cand:
-                                return False
-                            if isinstance(
-                                    gone, ast.Name) \
-                                    and joined_mate(
-                                        gone.id, ipos):
+                        for gone in item.targets:
+                            root = mutated_root(gone)
+                            if root is None \
+                                    or root == cand \
+                                    or joined_mate(
+                                        root, ipos):
                                 return False
                     elif isinstance(item, ast.Call):
                         mentions = False
@@ -5233,24 +5683,31 @@ def _binding_violations(source):
                                         is not True:
                                     return False
                         elif isinstance(probe, ast.Match):
-                            cases = [
-                                case.body
-                                for case in probe.cases]
-                            mine = [
-                                body for body in cases
-                                if child in body]
-                            if not mine or not any(
+                            # the child here is the
+                            # match_case node itself —
+                            # preserve its body region
+                            # (co-executing replacements
+                            # in the same case body
+                            # prove; crossings do not).
+                            if child not in probe.cases:
+                                return False
+                            if not any(
                                     (sub.lineno,
                                      sub.col_offset)
                                     <= storepos
                                     <= (sub.end_lineno,
                                         sub.end_col_offset)
-                                    for sub in mine[0]):
+                                    for sub in child.body):
                                 return False
                         elif isinstance(
                                 probe, try_nodes_local):
+                            # each handler is its own
+                            # region (sibling handlers
+                            # never co-execute — a
+                            # replacement in one proves
+                            # nothing about a store in
+                            # another).
                             regions = [probe.body,
-                                       probe.handlers,
                                        probe.orelse,
                                        probe.finalbody]
                             mine = None
@@ -5258,6 +5715,12 @@ def _binding_violations(source):
                                 if child in region:
                                     mine = region
                                     break
+                            if mine is None:
+                                for handler in \
+                                        probe.handlers:
+                                    if child is handler:
+                                        mine = handler.body
+                                        break
                             if mine is None:
                                 return False
                             same = any(
@@ -5300,7 +5763,12 @@ def _binding_violations(source):
                                 return False
                         child = probe
                     # exits before the replacement at any
-                    # ancestor level skip it.
+                    # ancestor level skip it (definite
+                    # compound exits and provable
+                    # constant raises included — an
+                    # exception suppressed downstream
+                    # still skips the replacement while
+                    # the store resumes).
                     child = assign
                     probe = assign
                     while id(probe) in parents:
@@ -5318,13 +5786,8 @@ def _binding_violations(source):
                             for stmt in seq:
                                 if stmt is child:
                                     break
-                                if isinstance(
-                                        stmt,
-                                        (ast.Return,
-                                         ast.Raise,
-                                         ast.Break,
-                                         ast.Continue,
-                                         ast.Assert)):
+                                if not _stmt_may_fall(
+                                        stmt, False):
                                     return False
                         child = probe
                     return True
@@ -5701,9 +6164,13 @@ def _binding_violations(source):
                 # root at capture seeds the graft
                 # (post-capture aliases of the peer
                 # observe captured structure).
+                # Identity is equivalence: either
+                # edge direction, or a common origin
+                # (peers aliased to the same source
+                # before their own rebases).
                 if peer != name \
                         and peer not in graft_seen \
-                        and same_object(
+                        and identity_equiv(
                             home if home is not None
                             else func, peer, name, capos,
                             set()):
@@ -6131,12 +6598,8 @@ def _binding_violations(source):
                         for stmt in seq:
                             if stmt is child:
                                 break
-                            if isinstance(
-                                    stmt,
-                                    (ast.Return, ast.Raise,
-                                     ast.Break,
-                                     ast.Continue,
-                                     ast.Assert)):
+                            if not _stmt_may_fall(
+                                    stmt, False):
                                 return False
                     child = probe
                 return True
@@ -6172,25 +6635,58 @@ def _binding_violations(source):
                     # (transitively — an inherited
                     # metaclass __prepare__ may supply
                     # names) or unrebound object.
-                    # Anything else voids the proof.
+                    # Anything else voids the proof. The
+                    # base proves by CURRENT identity: a
+                    # single ancestral def, still
+                    # denoting it (no rebind between the
+                    # def and the class), undecorated (a
+                    # decorator may replace the base).
+                    # Cycle detection is path-based (an
+                    # ancestor revisited), not
+                    # visit-based: a default diamond
+                    # revisits its common ancestor
+                    # across siblings, which proves
+                    # again rather than voiding.
                     if id(cls) in seen:
                         return False
-                    seen.add(id(cls))
+                    seen = seen | {id(cls)}
                     for base in cls.bases:
                         base = _unwrap_walrus(base)
                         if not isinstance(
                                 base, ast.Name):
                             return False
                         if base.id == "object" \
-                                and "object" not in rebound:
+                                and "object" not in rebound \
+                                and "object" not in \
+                                builtins_attr_binds:
                             continue
+                        # bases evaluate in the scope
+                        # enclosing the class def — an
+                        # outer class body, not the
+                        # function (a class-namespace
+                        # shadow wins there).
+                        enclosing = func
+                        cursor = cls
+                        while id(cursor) in parents:
+                            cursor = parents[id(cursor)]
+                            if isinstance(
+                                    cursor,
+                                    (ast.FunctionDef,
+                                     ast.AsyncFunctionDef,
+                                     ast.Lambda,
+                                     ast.ClassDef)):
+                                enclosing = cursor
+                                break
+                            if cursor is tree:
+                                enclosing = tree
+                                break
                         bhome = home_scope_for(
-                            base.id, func,
+                            base.id, enclosing,
                             (cls.lineno, cls.col_offset))
                         if bhome is None:
                             return False
-                        binds = [
-                            bval
+                        found = [
+                            (_bpos, bval)
                             for _bpos, bkind, bval in
                             scope_binds.get(
                                 id(bhome), {}).get(
@@ -6200,12 +6696,22 @@ def _binding_violations(source):
                                 bval, ast.ClassDef)
                             and _bpos < (cls.lineno,
                                          cls.col_offset)]
-                        if len(binds) != 1:
+                        if len(found) != 1:
                             return False
-                        if binds[0].keywords:
+                        defpos, target = found[0]
+                        if target.keywords:
+                            return False
+                        if target.decorator_list:
+                            return False
+                        if any(defpos < _bpos < (cls.lineno,
+                                                 cls.col_offset)
+                               for _bpos, _, _ in
+                               scope_binds.get(
+                                   id(bhome), {}).get(
+                                       base.id, [])):
                             return False
                         if not default_namespace(
-                                binds[0], seen):
+                                target, seen):
                             return False
                     return True
 
@@ -6270,7 +6776,12 @@ def _binding_violations(source):
                                        ast.Constant)
                         and isinstance(
                             home.body[0].value.value,
-                            str))
+                            str)) \
+                    or (name == "__firstlineno__"
+                        and sys.version_info >= (3, 14)) \
+                    or (name == "__annotations__"
+                        and sys.version_info < (3, 14)
+                        and _class_annotated(home))
                 unknown = False
                 for epos, is_bind in sorted(events):
                     definite = reaches(epos, rpos)
@@ -6366,18 +6877,122 @@ def _binding_violations(source):
                 # observable contents: a same-object
                 # alias or a shallow copy (copies share
                 # descendants, which is what display
-                # routing follows).
+                # routing follows). Copy sources
+                # resolve through capture-time identity
+                # (a copy through a live alias preserves
+                # too), not spelling.
                 val = _unwrap_walrus(val)
                 if val is None:
                     return False
                 if isinstance(val, ast.Name):
                     return same_object(
                         home, val.id, name, pos, set())
-                return name in _copy_source_names(
-                    val, trusted_ctor)
+                return any(same_object(home, src, name,
+                                       pos, set())
+                           for src in _copy_source_names(
+                               val, trusted_ctor))
+
+            def _rebind_overrides(val, pos):
+                # explicit keys of a same-object unpack
+                # rebind ({**src, k: v, ...} with src
+                # denoting name): [(key, value)].
+                # Non-override shapes yield [].
+                val = _unwrap_walrus(val)
+                if not isinstance(val, ast.Dict):
+                    return []
+                unpacked = [item for key, item in
+                            zip(val.keys, val.values)
+                            if key is None]
+                if len(unpacked) != 1:
+                    return []
+                sole = unpacked[0]
+                if isinstance(sole, ast.Name):
+                    srcs = (sole.id,)
+                else:
+                    srcs = _copy_source_names(
+                        sole, trusted_ctor)
+                if not srcs or not any(
+                        same_object(home, src, name,
+                                    pos, set())
+                        for src in srcs):
+                    return []
+                return [(key, item) for key, item in
+                        zip(val.keys, val.values)
+                        if key is not None]
+
+            def _item_stores():
+                # definite direct item stores to name:
+                # [(pos, key, value)] for `name[key] =
+                # value` reaching capos (nested stores
+                # mutate descendants, never prune the
+                # branch; augassign/del/for-target forms
+                # stay conservative).
+                out = []
+                for node in ast.walk(home):
+                    if isinstance(node, ast.Assign):
+                        targets = node.targets
+                        stored = node.value
+                    elif isinstance(node, ast.AnnAssign) \
+                            and node.value is not None:
+                        targets = [node.target]
+                        stored = node.value
+                    else:
+                        continue
+                    for target in targets:
+                        if not isinstance(
+                                target, ast.Subscript) \
+                                or not isinstance(
+                                    target.value,
+                                    ast.Name) \
+                                or target.value.id != name:
+                            continue
+                        spos = (target.lineno,
+                                target.col_offset)
+                        if reaches(spos, capos):
+                            out.append(
+                                (spos, target.slice,
+                                 stored))
+                return out
+
+            def _apply_overrides(bval, events):
+                # a synthesized display with definite
+                # literal overrides applied in position
+                # order (dict last-wins: 0 and False are
+                # one key, NaN never equals; missing keys
+                # are added — routing through them must
+                # see the new value). Non-literal keys
+                # stay conservative (the branch may be
+                # live — fail closed).
+                keys = list(bval.keys)
+                vals = list(bval.values)
+                for okey, oval in events:
+                    if not isinstance(okey, ast.Constant):
+                        continue
+                    hit = None
+                    for idx, key in enumerate(keys):
+                        if key is None or not isinstance(
+                                key, ast.Constant):
+                            continue
+                        try:
+                            matched = (key.value
+                                       == okey.value)
+                        except Exception:
+                            matched = False
+                        if matched is True:
+                            hit = idx
+                            break
+                    if hit is None:
+                        keys.append(okey)
+                        vals.append(oval)
+                    else:
+                        vals[hit] = oval
+                synth = ast.Dict(keys=keys, values=vals)
+                ast.copy_location(synth, bval)
+                return synth
 
             allbinds = scope_binds.get(
                 id(home), {}).get(name, [])
+            stores = _item_stores()
             displays = []
             for bpos, bkind, bval in allbinds:
                 if bpos > capos or bkind != "plain":
@@ -6393,6 +7008,26 @@ def _binding_violations(source):
                            later_val, later)
                        for later, _, later_val in allbinds):
                     continue
+                if isinstance(bval, ast.Dict):
+                    events = []
+                    for later, _, later_val in allbinds:
+                        if bpos < later <= capos \
+                                and reaches(later, capos):
+                            for key, item in \
+                                    _rebind_overrides(
+                                        later_val, later):
+                                events.append((later, key,
+                                               item))
+                    for spos, key, item in stores:
+                        if bpos < spos <= capos:
+                            events.append((spos, key,
+                                           item))
+                    events.sort(key=lambda event: event[0])
+                    if events:
+                        bval = _apply_overrides(
+                            bval, [(key, item)
+                                   for _, key, item
+                                   in events])
                 displays.append((bval, bpos))
             return displays
 
@@ -6490,11 +7125,14 @@ def _binding_violations(source):
                     def class_trys():
                         # try statements directly in this
                         # class body (nested scopes pruned):
-                        # {id: {part: [(start, end)]}} over
+                        # ({id: {part: [(start, end)]}} over
                         # body/orelse/handlers/finalbody
-                        # spans. Statements never straddle
-                        # parts.
+                        # spans, {id} of trys whose body
+                        # provably raises nothing — their
+                        # handlers never run).
+                        # Statements never straddle parts.
                         found = {}
+                        quiet = set()
                         try_nodes = (ast.Try,)
                         trystar = getattr(
                             ast, "TryStar", None)
@@ -6526,11 +7164,43 @@ def _binding_violations(source):
                                           stmt.end_col_offset))
                                         for stmt in stmts]
                                 found[id(node)] = parts
+                                if _stmts_quiet(node.body):
+                                    quiet.add(id(node))
+                            stack.extend(
+                                ast.iter_child_nodes(node))
+                        return found, quiet
+
+                    def class_withs():
+                        # with statements directly in this
+                        # class body (nested scopes pruned):
+                        # {wid: [(start, end)]} over body
+                        # spans (items evaluate before
+                        # __enter__ — never suppressed).
+                        found = {}
+                        stack = list(current.body)
+                        while stack:
+                            node = stack.pop()
+                            if isinstance(
+                                    node, (ast.FunctionDef,
+                                           ast.AsyncFunctionDef,
+                                           ast.Lambda,
+                                           ast.ClassDef)):
+                                continue
+                            if isinstance(
+                                    node, (ast.With,
+                                           ast.AsyncWith)):
+                                found[id(node)] = [
+                                    ((stmt.lineno,
+                                      stmt.col_offset),
+                                     (stmt.end_lineno,
+                                      stmt.end_col_offset))
+                                    for stmt in node.body]
                             stack.extend(
                                 ast.iter_child_nodes(node))
                         return found
 
-                    tries = class_trys()
+                    tries, quiet_trys = class_trys()
+                    withs = class_withs()
 
                     def try_chain(pos):
                         # all (tid, part) enclosing pos,
@@ -6556,8 +7226,27 @@ def _binding_violations(source):
                                 for tid, part, _, _
                                 in found]
 
+                    def with_chain(pos):
+                        # wids whose body encloses pos,
+                        # innermost first.
+                        found = []
+                        for wid, spans in withs.items():
+                            for span_start, span_end in \
+                                    spans:
+                                if span_start <= pos \
+                                        <= span_end:
+                                    found.append(
+                                        (wid, span_start,
+                                         span_end))
+                                    break
+                        found.sort(key=lambda t: t[2])
+                        found.sort(key=lambda t: t[1],
+                                   reverse=True)
+                        return [wid for wid, _, _ in found]
+
                     def remainder_dead(pos, raised,
-                                         raised_finally=None):
+                                         raised_finally=None,
+                                         suppressed=None):
                         # pos sits in a dead try-body
                         # remainder (or a skipped else):
                         # some enclosing try raised
@@ -6568,10 +7257,20 @@ def _binding_violations(source):
                         # anything before the raise — but
                         # a finally remainder past an
                         # uncaught unwind raise is dead.
+                        # A with-body remainder past a
+                        # suppressed raise is dead the
+                        # same way (the manager swallows
+                        # the raise, then control resumes
+                        # past the with). A handler of a
+                        # quiet try never runs (its body
+                        # provably raises nothing).
                         for tid, part in try_chain(pos):
                             if part in ("body", "orelse") \
                                     and tid in raised \
                                     and pos > raised[tid]:
+                                return True
+                            if part == "handlers" \
+                                    and tid in quiet_trys:
                                 return True
                             if part == "finalbody" \
                                     and raised_finally \
@@ -6579,6 +7278,12 @@ def _binding_violations(source):
                                     and pos > raised_finally[
                                         tid]:
                                 return True
+                        if suppressed:
+                            for wid in with_chain(pos):
+                                if wid in suppressed \
+                                        and pos > suppressed[
+                                            wid]:
+                                    return True
                         return False
 
                     def try_span(tid):
@@ -6624,7 +7329,11 @@ def _binding_violations(source):
                         # try enclosing the raise), or
                         # normally inside one (bodies run,
                         # handlers and elses stay
-                        # conditional).
+                        # conditional) — unless skipped
+                        # inside its own finally by a
+                        # preceding raiser.
+                        if _finally_skipped(pos):
+                            return False
                         chain = try_chain(pos)
                         if not chain:
                             return False
@@ -6645,14 +7354,137 @@ def _binding_violations(source):
                         # any part of a normally-entered
                         # try (its handlers and elses may
                         # run; dead remainders were
-                        # already skipped).
+                        # already skipped) — except in a
+                        # quiet try's handler, which never
+                        # runs (its body provably raises
+                        # nothing to catch) — or skipped
+                        # inside its own finally by a
+                        # preceding raiser.
+                        if _finally_skipped(pos):
+                            return False
+                        chain = try_chain(pos)
+                        if chain \
+                                and chain[0][1] == "handlers" \
+                                and chain[0][0] in quiet_trys:
+                            return False
                         if unwound_runs(pos, term_pos):
                             return True
-                        chain = try_chain(pos)
                         if not chain:
                             return False
                         return chain[0][0] in unwind_normal(
                             chain, term_pos)
+
+                    def _foreign_del_raises(stmt,
+                                                delpos):
+                        # a del of a name other than the
+                        # queried one that may raise (no
+                        # reaching bind without an
+                        # intervening class-level del —
+                        # an intervening del either
+                        # raised already or unbound the
+                        # name, so this one never runs
+                        # cleanly past it either way).
+                        # The queried name's own dels are
+                        # replay events, never blockers.
+                        if not isinstance(
+                                stmt, ast.Delete):
+                            return False
+                        for target in stmt.targets:
+                            for leaf in _target_leaves(
+                                    target):
+                                if not isinstance(
+                                        leaf, ast.Name):
+                                    continue
+                                other = leaf.id
+                                if other == photoname:
+                                    continue
+                                binds = [
+                                    bpos
+                                    for bpos, _, _ in
+                                    scope_binds.get(
+                                        id(current),
+                                        {}).get(other, [])
+                                    if bpos < delpos
+                                    and reaches(
+                                        bpos, delpos)]
+                                if not binds:
+                                    return True
+                                stack = list(current.body)
+                                while stack:
+                                    node = stack.pop()
+                                    if isinstance(
+                                            node,
+                                            (ast.FunctionDef,
+                                             ast.AsyncFunctionDef,
+                                             ast.Lambda,
+                                             ast.ClassDef)):
+                                        continue
+                                    if isinstance(
+                                            node,
+                                            ast.Delete) \
+                                            and any(
+                                                bpos
+                                                < (node.lineno,
+                                                   node.col_offset)
+                                                < delpos
+                                                for bpos in
+                                                binds):
+                                        for cand in \
+                                                node.targets:
+                                            for sub in \
+                                                    _target_leaves(
+                                                        cand):
+                                                if isinstance(
+                                                        sub,
+                                                        ast.Name) \
+                                                        and sub.id \
+                                                        == other:
+                                                    return True
+                                    stack.extend(
+                                        ast.iter_child_nodes(
+                                            node))
+                        return False
+
+                    def _finally_skipped(pos):
+                        # pos skipped inside its own
+                        # finally: a preceding statement
+                        # in the same finally provably
+                        # never falls (raise, return,
+                        # constant raise — explicit
+                        # control flow, independent of
+                        # the queried binding's events)
+                        # or a del that may raise sits
+                        # before it. (A blocker inside a
+                        # dead remainder over-skips —
+                        # fail-closed, narrow.)
+                        chain = try_chain(pos)
+                        if not chain \
+                                or chain[0][1] != \
+                                "finalbody":
+                            return False
+                        tid = chain[0][0]
+                        for start, end in tries[tid][
+                                "finalbody"]:
+                            if not start < pos:
+                                continue
+                            target = None
+                            for node in ast.walk(current):
+                                if isinstance(
+                                        node, ast.stmt) \
+                                        and (node.lineno,
+                                             node.col_offset) \
+                                        == start:
+                                    target = node
+                                    break
+                            if target is None:
+                                continue
+                            if not _stmt_may_fall(
+                                    target, False):
+                                return True
+                            if _foreign_del_raises(
+                                    target, start):
+                                return True
+                        return False
 
                     def mark_unwind_raise(epos,
                                           raised_finally):
@@ -6685,20 +7517,27 @@ def _binding_violations(source):
                                     return
 
                     def del_catch_info(dpos):
-                        # (caught, mark) for the del at dpos,
-                        # which raises NameError (nothing
-                        # installed to remove). caught: an
-                        # enclosing try body inside this
-                        # class has a catching handler (a
-                        # catcher past the class still ends
-                        # the class body — only finally
-                        # runs). mark: (tid, raising-child
-                        # end) for class try bodies that
-                        # raised on the way (their
-                        # remainders past the child and
-                        # elses are dead). try orelse/
-                        # finally/handler bodies do not
-                        # catch their own errors.
+                        # (caught, mark, wmark) for the del
+                        # at dpos, which raises NameError
+                        # (nothing installed to remove).
+                        # caught: an enclosing try body
+                        # inside this class has a catching
+                        # handler, or an enclosing with
+                        # body suppresses the raise (any
+                        # manager counts, as in E5 — a
+                        # non-suppressing manager over-
+                        # fires, fail-closed). A catcher
+                        # past the class still ends the
+                        # class body — only finally runs.
+                        # mark: (tid, raising-child end)
+                        # for class try bodies that raised
+                        # on the way (their remainders
+                        # past the child and elses are
+                        # dead); wmark: (wid, raising-child
+                        # end) for the suppressing with, or
+                        # None. try orelse/finally/handler
+                        # bodies do not catch their own
+                        # errors.
                         target = None
                         for cand in ast.walk(current):
                             if isinstance(cand, ast.Delete) \
@@ -6708,7 +7547,7 @@ def _binding_violations(source):
                                 target = cand
                                 break
                         if target is None:
-                            return True, []
+                            return True, [], None
                         try_nodes = (ast.Try,)
                         trystar = getattr(
                             ast, "TryStar", None)
@@ -6720,7 +7559,7 @@ def _binding_violations(source):
                         while id(cursor) in parents:
                             cursor = parents[id(cursor)]
                             if cursor is current:
-                                return False, mark
+                                return False, mark, None
                             if isinstance(cursor, try_nodes) \
                                     and any(sub is child
                                             for sub in
@@ -6734,9 +7573,23 @@ def _binding_violations(source):
                                         cursor.handlers:
                                     if catches_name_error(
                                             handler.type):
-                                        return True, mark
+                                        return True, mark, \
+                                            None
+                            if isinstance(
+                                    cursor,
+                                    (ast.With,
+                                     ast.AsyncWith)) \
+                                    and any(sub is child
+                                            for sub in
+                                            cursor.body):
+                                if id(cursor) in withs:
+                                    return True, mark, (
+                                        id(cursor),
+                                        (child.end_lineno,
+                                         child.end_col_offset))
+                                return True, mark, None
                             child = cursor
-                        return False, mark
+                        return False, mark, None
 
                     declared = class_declared()
                     if installs:
@@ -6774,10 +7627,12 @@ def _binding_violations(source):
                         term_pos = None
                         raised = {}
                         raised_finally = {}
+                        suppressed = {}
                         for epos, is_del in sorted(events):
                             if remainder_dead(
                                     epos, raised,
-                                    raised_finally):
+                                    raised_finally,
+                                    suppressed):
                                 continue
                             if terminated:
                                 if not is_del:
@@ -6791,26 +7646,43 @@ def _binding_violations(source):
                                 elif bound:
                                     bound = False
                                 else:
-                                    caught2, mark2 = \
+                                    caught2, mark2, wmark2 = \
                                         del_catch_info(epos)
                                     for tid, cend in mark2:
                                         raised.setdefault(
                                             tid, cend)
+                                    if wmark2 is not None:
+                                        suppressed.setdefault(
+                                            wmark2[0],
+                                            wmark2[1])
                                     if not caught2:
                                         mark_unwind_raise(
                                             epos,
                                             raised_finally)
                                 continue
                             if not is_del:
+                                if _finally_skipped(epos):
+                                    continue
                                 bound = True
                             elif bound:
                                 bound = False
                             else:
-                                caught, mark = \
+                                caught, mark, wmark = \
                                     del_catch_info(epos)
                                 for tid, cend in mark:
                                     raised.setdefault(
                                         tid, cend)
+                                if wmark is not None:
+                                    suppressed.setdefault(
+                                        wmark[0], wmark[1])
+                                # a raise inside a finally
+                                # kills its remainder even
+                                # when an outward catcher
+                                # saves the class (control
+                                # still leaves the
+                                # remainder).
+                                mark_unwind_raise(
+                                    epos, raised_finally)
                                 if not caught:
                                     terminated = True
                                     term_pos = epos
@@ -6829,7 +7701,8 @@ def _binding_violations(source):
                             return tree
                         if remainder_dead(
                                 spos, raised,
-                                raised_finally):
+                                raised_finally,
+                                suppressed):
                             return current
                         if bound:
                             return current
@@ -6842,15 +7715,21 @@ def _binding_violations(source):
                         terminated = False
                         term_pos = None
                         raised = {}
+                        suppressed = {}
                         for dpos in sorted(dels_before):
-                            if remainder_dead(dpos, raised):
+                            if remainder_dead(
+                                    dpos, raised,
+                                    None, suppressed):
                                 continue
                             if terminated:
                                 continue
-                            caught, mark = \
+                            caught, mark, wmark = \
                                 del_catch_info(dpos)
                             for tid, cend in mark:
                                 raised.setdefault(tid, cend)
+                            if wmark is not None:
+                                suppressed.setdefault(
+                                    wmark[0], wmark[1])
                             if not caught:
                                 terminated = True
                                 term_pos = dpos
@@ -6859,7 +7738,9 @@ def _binding_violations(source):
                                     spos, term_pos):
                                 return current
                             return tree
-                        if remainder_dead(spos, raised):
+                        if remainder_dead(
+                                spos, raised,
+                                None, suppressed):
                             return current
                         return tree
                     if declared:
@@ -13470,6 +14351,395 @@ class CapturedBytesBinding(unittest.TestCase):
                     any(fragment in violation
                         for violation in violations),
                     f"{name}: {violations}")
+
+    def test_tripwire_catches_r38_plants(self):
+        # adjudication-r37 F-fixes: firing misses (F1,
+        # F3, F4, F6, F7, F8, F11, F12, F14, F15, F18,
+        # F19, plus F10a on 3.14+ / F10b below) and
+        # silenced precision (F2, F5/F5b, F9, F13,
+        # F16, F17, plus the off-interpreter F10
+        # counterpart): iterator/target order, the
+        # in-statement seed, the comprehension
+        # walrus, the live-alias copy, unpack and
+        # item overrides, the compound exit, the
+        # suppressed class replay, current base
+        # identity, the diamond, version implicits,
+        # the builtins chain, peer direction, the
+        # index load, sibling handlers, the
+        # suppressed replacement, the match case,
+        # the quiet handler, the outward catcher
+        # and the foreign raise.
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        clean = ('            def clean(self):\n'
+                 + '                return b"CLEAN"\n')
+        fire = [
+            ('f1-iterator-vs-target-order',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     + '                w = clean\n'
+                     + '                sink = {}\n'
+                     + '                for sink[((w := Path.read_bytes), '
+                     + '(rb := w))] in ((w := clean),):\n'
+                     + '                    pass\n'
+                     + '                Path.r = rb\n'
+                     + '                ignored = decode_body_log(log.r())\n'
+                     + '                results.append(ignored)\n'
+                     + '            f()\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+            ('f3-comprehension-walrus-env',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     + '                w = clean\n'
+                     + '                ignored = [(rb := w) for w in '
+                     + '(Path.read_bytes,)]\n'
+                     + '                Path.r = rb\n'
+                     + '                ignored = decode_body_log(log.r())\n'
+                     + '                results.append(ignored)\n'
+                     + '            f()\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+            ('f4-copy-through-live-alias',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            mapping = {"slot": box}\n'
+                     + '            alias = mapping\n'
+                     + '            mapping = alias.copy()\n'
+                     + '            *xs, = [dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f6-exit-in-preceding-compound',
+             [
+              (anchor,
+               head + '            for _ in [0]:\n'
+                     + '                if True:\n'
+                     + '                    break\n'
+                     + '                class C:\n'
+                     + '                    del absent\n'
+                     + '            results.append({"raw": log})\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f7-suppress-class-replay',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            import contextlib\n'
+                     + '            class C:\n'
+                     + '                with contextlib.suppress(NameError):\n'
+                     + '                    del a_cls\n'
+                     + '                a_cls["raw"] = log\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f8-historical-base-identity',
+             [
+              (anchor,
+               head + '            class M(type):\n'
+                     + '                @classmethod\n'
+                     + '                def __prepare__(mcls, name, bases):\n'
+                     + '                    return {"absent": 1}\n'
+                     + '            class Custom(metaclass=M):\n'
+                     + '                pass\n'
+                     + '            class B:\n'
+                     + '                pass\n'
+                     + '            B = Custom\n'
+                     + '            class C(B):\n'
+                     + '                del absent\n'
+                     + '            results.append({"raw": log})\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f11-builtins-alias-chain',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            import builtins as b\n'
+                     + '            alias = b\n'
+                     + '            old = alias.LookupError\n'
+                     + '            setattr(alias, "LookupError", NameError)\n'
+                     + '            try:\n'
+                     + '                box = {}\n'
+                     + '                a_cls = box\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        del a_cls\n'
+                     + '                    except LookupError:\n'
+                     + '                        pass\n'
+                     + '                    a_cls["raw"] = log\n'
+                     + '                results.append(module_box)\n'
+                     + '            finally:\n'
+                     + '                setattr(alias, "LookupError", old)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f12-peer-direction',
+             [
+              (anchor,
+               head + '            p = {}\n'
+                     + '            box = p\n'
+                     + '            *xs, = [box]\n'
+                     + '            a = p\n'
+                     + '            p = {}\n'
+                     + '            box = {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(a)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f14-sibling-handlers',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            try:\n'
+                     + '                raise TypeError\n'
+                     + '            except ValueError:\n'
+                     + '                xs[0] = {}\n'
+                     + '            except TypeError:\n'
+                     + '                xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f15-suppress-skipped-replacement',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            import contextlib\n'
+                     + '            with contextlib.suppress(ZeroDivisionError):\n'
+                     + '                1 / 0\n'
+                     + '                xs[0] = {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f18-outward-catcher-finally',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            class C:\n'
+                     + '                try:\n'
+                     + '                    try:\n'
+                     + '                        del a_cls\n'
+                     + '                    finally:\n'
+                     + '                        del a_cls\n'
+                     + '                        a_cls = box\n'
+                     + '                except NameError:\n'
+                     + '                    pass\n'
+                     + '                a_cls["raw"] = log\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('f19-other-name-raise',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        try:\n'
+                     + '                            del a_cls\n'
+                     + '                        finally:\n'
+                     + '                            del another_absent\n'
+                     + '                            a_cls = box\n'
+                     + '                    finally:\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+        ]
+        silent = [
+            ('f2-instatement-later-seed',
+             [
+              (anchor,
+               head + clean
+                     + '            def f():\n'
+                     + '                w = clean\n'
+                     + '                for ignored in ((rb := w), '
+                     + '(w := Path.read_bytes),\n'
+                     + '                                setattr(Path, "r", rb)):\n'
+                     + '                    pass\n'
+                     + '                Path.r = rb\n'
+                     + '                ignored = decode_body_log(log.r())\n'
+                     + '                results.append(ignored)\n'
+                     + '            f()\n'
+               + use),
+             ],
+             ),
+            ('f5-unpack-override-retained',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            mapping = {"slot": box}\n'
+                     + '            mapping = {**mapping, "slot": {}}\n'
+                     + '            *xs, = [dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('f5b-copy-then-item-replace',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            mapping = {"slot": box}\n'
+                     + '            mapping = mapping.copy()\n'
+                     + '            mapping["slot"] = {}\n'
+                     + '            *xs, = [dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('f9-diamond-false-cycle',
+             [
+              (anchor,
+               head + '            class B: pass\n'
+                     + '            class Left(B): pass\n'
+                     + '            class Right(B): pass\n'
+                     + '            class C(Left, Right):\n'
+                     + '                del absent\n'
+                     + '            results.append({"raw": log})\n'
+               + use),
+             ],
+             ),
+            ('f13-augassign-index-load',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            xs[0] = {}\n'
+                     + '            other = [[]]\n'
+                     + '            other[0 if xs else 0] += []\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('f16-match-case-coexec',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            match True:\n'
+                     + '                case True:\n'
+                     + '                    xs[0] = {}\n'
+                     + '                    xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('f17-unreachable-handler-del',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        del a_cls\n'
+                     + '                    finally:\n'
+                     + '                        a_cls = box\n'
+                     + '                        try:\n'
+                     + '                            pass\n'
+                     + '                        except NameError:\n'
+                     + '                            del a_cls\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             ),
+        ]
+        f10a = ('f10a-firstlineno',
+                [
+                 (anchor,
+                  head + '            class C:\n'
+                        + '                del __firstlineno__\n'
+                        + '            results.append({"raw": log})\n'
+                  + use),
+                ],
+                'tainted path escapes to results.append()')
+        f10b = ('f10b-annotations',
+                [
+                 (anchor,
+                  head + '            class C:\n'
+                        + '                x: int\n'
+                        + '                del __annotations__\n'
+                        + '            results.append({"raw": log})\n'
+                  + use),
+                ],
+                'tainted path escapes to results.append()')
+        if sys.version_info >= (3, 14):
+            fire.append(f10a)
+            silent.append((f10b[0], f10b[1]))
+        else:
+            silent.append((f10a[0], f10a[1]))
+            fire.append(f10b)
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+        for name, edits in silent:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
 
     def test_tripwire_readcap_scope_isolation(self):
         # readcap provenance is per-scope: a sibling
