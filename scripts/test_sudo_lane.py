@@ -1697,6 +1697,49 @@ def _copy_source_names(value, trusted_builtin):
     return ()
 
 
+def _copy_display_operand(value, trusted_builtin):
+    # the display operand of a copy-form call sharing its
+    # values/elements (shallow), or None: x.copy() over a
+    # dict/list/tuple/set display, dict() over a dict
+    # display, list()/set() over a list/tuple/set display
+    # (trusted ctors only, mirroring _copy_source_names).
+    # Mismatched pairs (list() over a dict yields keys,
+    # not values) are not copies. Recurses through
+    # compositions (d.copy().copy()).
+    value = _unwrap_walrus(value)
+    if not isinstance(value, ast.Call):
+        return None
+    operand = None
+    if isinstance(value.func, ast.Attribute):
+        if value.func.attr != "copy" or value.args \
+                or value.keywords:
+            return None
+        operand = _unwrap_walrus(value.func.value)
+    elif isinstance(value.func, ast.Name) \
+            and not value.keywords \
+            and len(value.args) == 1 \
+            and trusted_builtin(value.func.id):
+        operand = _unwrap_walrus(value.args[0])
+        if value.func.id == "dict":
+            if not isinstance(operand, ast.Dict):
+                return None
+        elif value.func.id in ("list", "set"):
+            if not isinstance(operand, (ast.List, ast.Tuple,
+                                        ast.Set)):
+                return None
+        else:
+            return None
+    else:
+        return None
+    inner = _copy_display_operand(operand, trusted_builtin)
+    if inner is not None:
+        return inner
+    if isinstance(operand, (ast.Dict, ast.List, ast.Tuple,
+                            ast.Set)):
+        return operand
+    return None
+
+
 def _pure_binder(target):
     # a comprehension target binding bare names
     # only (no Subscript/Attribute: those
@@ -2926,13 +2969,45 @@ def _binding_violations(source):
                            current.end_col_offset))
         memo = {}
 
+        def rhs_span(bind):
+            # the operand-evaluation span of a bind's
+            # own statement (an Assign/AnnAssign RHS, a
+            # for-iter): peers the bind reads resolve
+            # with it visible (target binds note at
+            # stmt start, but read post-RHS state);
+            # None when the bind has no operand span.
+            _bpos, _bkind, _bval = bind
+            if _bkind not in ("plain", "for") \
+                    or _bval is None:
+                return None
+            cursor = _bval
+            while id(cursor) in parents:
+                cursor = parents[id(cursor)]
+                if isinstance(cursor, ast.Assign):
+                    val = cursor.value
+                    return ((val.lineno, val.col_offset),
+                            (val.end_lineno,
+                             val.end_col_offset))
+                if isinstance(cursor, ast.AnnAssign) \
+                        and cursor.value is not None:
+                    val = cursor.value
+                    return ((val.lineno, val.col_offset),
+                            (val.end_lineno,
+                             val.end_col_offset))
+                if isinstance(cursor, (ast.For, ast.AsyncFor)):
+                    it = cursor.iter
+                    return ((it.lineno, it.col_offset),
+                            (it.end_lineno,
+                             it.end_col_offset))
+            return None
+
         def outer(name):
             for scope in chain[1:]:
                 if name in scope_binds[id(scope)]:
                     return name in outer_cap_in(scope)
             return False
 
-        def holds(name, pos, windowed):
+        def holds(name, pos, windowed, favor=None):
             # windowed (an install inside a loop): any
             # seed later in the window counts (some pass
             # installs it — a later kill never vetoes),
@@ -2946,7 +3021,7 @@ def _binding_violations(source):
             # strictly decrease along windowless
             # recursion, and memo keys pin windowed
             # cycles — both terminate.
-            key = (name, pos, windowed)
+            key = (name, pos, windowed, favor)
             if key in memo:
                 return memo[key]
             # completion order, not walk order:
@@ -3142,11 +3217,21 @@ def _binding_violations(source):
                 # before pos normally; post-RHS (pre-
                 # statement plus the value span, target
                 # binds excluded) in after_value mode.
+                # Favor adds a peer bind's own operand
+                # span (a target bind reads post-RHS
+                # state — RHS walruses included — even
+                # though it notes at stmt start).
                 if after_value is None:
-                    return bpos < pos
-                if bpos < stmt_start:
-                    return bpos < pos
-                return span_lo <= bpos < min(pos, span_end)
+                    if bpos < pos:
+                        return True
+                elif bpos < stmt_start:
+                    if bpos < pos:
+                        return True
+                elif span_lo <= bpos < min(pos, span_end):
+                    return True
+                if favor is not None:
+                    return favor[0] <= bpos < favor[1]
+                return False
             memo[key] = False
             if windowed and window is not None:
                 wstart, wend = window
@@ -3162,7 +3247,9 @@ def _binding_violations(source):
                     for peer in peers:
                         if peer == name:
                             continue
-                        if holds(peer, _bpos, True):
+                        if holds(peer, _bpos, True,
+                                 rhs_span((_bpos, _kind,
+                                           _value))):
                             memo[key] = True
                             return True
                 for _bpos, _kind, _value in reversed(
@@ -3181,7 +3268,9 @@ def _binding_violations(source):
                             continue
                         decided = True
                         if not holds(peer, _bpos,
-                                     _bpos >= wstart):
+                                     _bpos >= wstart,
+                                     rhs_span((_bpos, _kind,
+                                               _value))):
                             return False
                     if decided:
                         memo[key] = True
@@ -3209,7 +3298,9 @@ def _binding_violations(source):
                     if peer == name:
                         continue
                     decided = True
-                    if not holds(peer, _bpos, False):
+                    if not holds(peer, _bpos, False,
+                                 rhs_span((_bpos, _kind,
+                                           _value))):
                         return False
                 if decided:
                     memo[key] = True
@@ -4265,13 +4356,16 @@ def _binding_violations(source):
             # True when `name` provably denotes the
             # `target` object just before `horizon` in
             # `scope`: spelling-equal, or transitively
-            # bound through plain-Name binds (conditional
-            # binds count — fail-closed). Copy-forms,
-            # calls and defs break the chain: a copy is
-            # not its source (a copy-peer kill at depth
-            # >= 2 is a documented miss; at depth 1 the
-            # copy's top is unrelated, so killing there
-            # is exact).
+            # bound through plain-Name binds whose edges
+            # are still live (no reaching non-preserving
+            # rebind between the edge and the horizon —
+            # a historical alias proves nothing once
+            # rebased; conditional binds count —
+            # fail-closed). Copy-forms, calls and defs
+            # break the chain: a copy is not its source
+            # (a copy-peer kill at depth >= 2 is a
+            # documented miss; at depth 1 the copy's top
+            # is unrelated, so killing there is exact).
             if name == target:
                 return True
             if name in seen:
@@ -4286,9 +4380,33 @@ def _binding_violations(source):
                 bval = _unwrap_walrus(bval)
                 if not isinstance(bval, ast.Name):
                     continue
+                if edge_broken(scope, name, bpos, horizon,
+                               seen):
+                    continue
                 if same_object(scope, bval.id, target, bpos,
                                 seen):
                     return True
+            return False
+
+        def edge_broken(scope, name, bpos, horizon, seen):
+            # a reaching rebind of `name` strictly after
+            # the edge that does not itself preserve the
+            # edge's object severs it (termination: the
+            # shared `seen` bounds the mutual recursion
+            # with same_object).
+            for kpos, kkind, kvalue in scope_binds.get(
+                    id(scope), {}).get(name, []):
+                if not bpos < kpos <= horizon:
+                    continue
+                if not reaches(kpos, horizon):
+                    continue
+                kvalue = _unwrap_walrus(kvalue)
+                if kkind == "plain" \
+                        and isinstance(kvalue, ast.Name) \
+                        and same_object(scope, kvalue.id,
+                                        name, kpos, seen):
+                    continue
+                return True
             return False
 
         def group_mates(root, node, depth, star_horizon=None,
@@ -4485,13 +4603,64 @@ def _binding_violations(source):
                                 func, _bval.id, candidate,
                                 _bpos, set()):
                         continue
-                    if candidate in _copy_source_names(
-                            _bval, trusted_ctor):
+                    if _element_preserving(_bval, candidate,
+                                           _bpos):
                         # a self-copy rebinds the top but
                         # shares the elements: the star
                         # bind's provenance survives it.
                         continue
                     return True
+                return False
+
+            def _element_preserving(value, candidate, pos):
+                # value denotes fresh top storage holding
+                # (at least) the candidate's elements:
+                # method/ctor copies, direct self-unpacks
+                # ([*xs], (*xs,), {*xs}, extras allowed),
+                # and their compositions (list/set/tuple/
+                # frozenset of a preserving value, .copy
+                # of one). Fresh displays, transforms and
+                # anything unrecognized replace the
+                # elements (a documented miss, like
+                # unknown kills).
+                value = _unwrap_walrus(value)
+                if value is None:
+                    return False
+                if candidate in _copy_source_names(
+                        value, trusted_ctor):
+                    return True
+                if isinstance(value, (ast.List, ast.Tuple,
+                                      ast.Set)):
+                    for elt in value.elts:
+                        if not isinstance(elt, ast.Starred):
+                            continue
+                        inner = _unwrap_walrus(elt.value)
+                        if not isinstance(inner, ast.Name):
+                            continue
+                        if inner.id == candidate \
+                                or same_object(
+                                    func, inner.id,
+                                    candidate, pos, set()):
+                            return True
+                    return False
+                if isinstance(value, ast.Call) \
+                        and not value.keywords:
+                    if isinstance(value.func, ast.Name) \
+                            and value.func.id in (
+                                "list", "set", "tuple",
+                                "frozenset") \
+                            and value.func.id not in rebound \
+                            and value.func.id not in \
+                            module_attr_binds \
+                            and len(value.args) == 1:
+                        return _element_preserving(
+                            value.args[0], candidate, pos)
+                    if isinstance(value.func, ast.Attribute) \
+                            and value.func.attr == "copy" \
+                            and not value.args:
+                        return _element_preserving(
+                            value.func.value, candidate,
+                            pos)
                 return False
 
             def resolve(value, level, capos):
@@ -4505,6 +4674,15 @@ def _binding_violations(source):
                     resolve(value.value, level, capos)
                     return
                 if level < 2:
+                    return
+                disp = _copy_display_operand(value,
+                                             trusted_ctor)
+                if disp is not None:
+                    # a copy shares the operand display's
+                    # values/elements at the same depth —
+                    # resolve it structurally (explicit
+                    # values and unpacks alike).
+                    resolve(disp, level, capos)
                     return
                 # dicts always resolve structurally: a
                 # mixed display ({**source, "k": v})
@@ -4679,24 +4857,55 @@ def _binding_violations(source):
             for span_start, span_end, loop in loop_spans:
                 if not span_start <= capos <= span_end:
                     continue
-                for _bpos, _bkind, _bval in homebinds.get(
-                        name, []):
-                    if not span_start < _bpos < capos \
-                            or not reaches(_bpos, capos):
-                        continue
-                    if _bkind == "plain" \
-                            and _pass_invariant(
-                                _bval, span_start, span_end):
-                        skip.add(id(loop))
-                        break
+                # the capture reads whatever the loop
+                # leaves in `name`: skip only with an
+                # unconditional pre-capture reset (it
+                # runs every pass, overwriting feedback
+                # and pre-loop state) AND every
+                # pre-capture definition invariant
+                # (overwritten proofs don't count, and a
+                # conditional override may inject
+                # garbage — post-capture binds are always
+                # overwritten, so they never matter).
+                resets = [
+                    (_bpos, _bkind, _bval)
+                    for _bpos, _bkind, _bval in homebinds.get(
+                        name, [])
+                    if span_start < _bpos < capos]
+                if not any(
+                        _bkind == "plain"
+                        and reaches(_bpos, capos)
+                        for _bpos, _bkind, _bval in resets):
+                    continue
+                if all(
+                        _bkind == "plain"
+                        and _pass_invariant(
+                            _bval, span_start, span_end)
+                        for _bpos, _bkind, _bval in resets):
+                    skip.add(id(loop))
             mates = set(group_mates(
                 name, unpack, level, star_horizon=capos,
                 skip_loops=skip))
 
             def rebased(src, lo, hi):
-                for _bpos, _bkind, _bval in homebinds.get(
-                        src, []):
-                    if not lo < _bpos <= hi:
+                # src denotes other than captured at hi:
+                # walk its binds in (lo, hi) in order —
+                # liveness starts joined and each
+                # reaching bind re-decides it (an alias
+                # of, or at depth >= 2 a copy sharing,
+                # a name live then rejoins; anything
+                # else breaks, and a break stands until
+                # a later bind restores). Same-position
+                # binds postdate the edge (same-batch
+                # RHS values pre-date their stores).
+                # Termination: nested horizons strictly
+                # decrease.
+                live = True
+                ordered = sorted(
+                    homebinds.get(src, []),
+                    key=lambda bind: bind[0])
+                for _bpos, _bkind, _bval in ordered:
+                    if not lo < _bpos < hi:
                         continue
                     if not reaches(_bpos, hi):
                         continue
@@ -4704,13 +4913,30 @@ def _binding_violations(source):
                     if _bkind == "plain" \
                             and isinstance(
                                 _bval, ast.Name) \
-                            and same_object(
-                                home if home is not None
-                                else func, _bval.id, src,
-                                _bpos, set()):
+                            and (restored(_bval.id, _bpos)
+                                 or same_object(
+                                     home if home is not None
+                                     else func, _bval.id,
+                                     name, _bpos, set())):
+                        live = True
                         continue
-                    return True
-                return False
+                    if _bkind == "plain" \
+                            and level >= 2 \
+                            and _bval is not None \
+                            and any(
+                                restored(s, _bpos)
+                                for s in _copy_source_names(
+                                    _bval, trusted_ctor)):
+                        live = True
+                        continue
+                    live = False
+                return not live
+
+            def restored(other, when):
+                return other in graft_seen \
+                    and graft_pos[other] <= when \
+                    and not rebased(
+                        other, graft_pos[other], when)
 
             graft_seen = {name}
             graft_pos = {name: capos}
@@ -4783,13 +5009,23 @@ def _binding_violations(source):
                         if _lkind == "plain" \
                                 and isinstance(
                                     _lval, ast.Name) \
-                                and _lval.id in mates:
+                                and _lval.id in mates \
+                                and not rebased(
+                                    _lval.id,
+                                    graft_pos.get(
+                                        _lval.id, capos),
+                                    _lpos):
                             continue
                         if _lkind == "plain" \
                                 and level >= 2 \
                                 and _lval is not None \
                                 and any(
                                     src in mates
+                                    and not rebased(
+                                        src,
+                                        graft_pos.get(
+                                            src, capos),
+                                        _lpos)
                                     for src in
                                     _copy_source_names(
                                         _lval, trusted_ctor)):
@@ -4797,9 +5033,11 @@ def _binding_violations(source):
                             # descendants: at depth >= 2
                             # the rebased mate still
                             # observes captured structure
-                            # (at depth 1 the copy's top
-                            # is unrelated, so killing
-                            # there stays exact) — keep.
+                            # when the source denotes
+                            # captured at the copy (at
+                            # depth 1 the copy's top is
+                            # unrelated, so killing there
+                            # stays exact) — keep.
                             continue
                         if _lkind == "def":
                             # a bare def or a baseless,
@@ -4864,13 +5102,18 @@ def _binding_violations(source):
                     # mentions is a freevar/global and
                     # keeps the outward walk below (like a
                     # nonlocal name) — but an
-                    # annotation-only or deletion-only
-                    # declaration marks the name
-                    # class-local without installing a
-                    # value, so its loads still skip to
-                    # the module; a deletion after the
-                    # newest pre-store install unbinds it
-                    # the same way.
+                    # annotation-only declaration marks
+                    # the name class-local without
+                    # installing a value, so its loads
+                    # still skip to the module. A
+                    # deletion after an install unbinds
+                    # it the same way; a deletion with no
+                    # install before it raises, so a load
+                    # after it is moot (resolved
+                    # class-locally — silent when unbound,
+                    # fail-closed through installs, as
+                    # for any eager crash the guard does
+                    # not model).
                     installs = scope_binds.get(
                         id(current), {}).get(photoname, [])
 
@@ -4902,36 +5145,51 @@ def _binding_violations(source):
                                     ((node.lineno,
                                       node.col_offset),
                                      False))
-                            elif isinstance(node, ast.Del):
+                            elif isinstance(node, ast.Delete):
                                 for target in node.targets:
-                                    if isinstance(
-                                            target,
-                                            ast.Name) \
-                                            and target.id == \
-                                            photoname:
-                                        found.append(
-                                            ((node.lineno,
-                                              node.col_offset),
-                                             True))
-                                        break
+                                    for leaf in \
+                                            _target_leaves(
+                                                target):
+                                        if isinstance(
+                                                leaf,
+                                                ast.Name) \
+                                                and leaf.id == \
+                                                photoname:
+                                            found.append(
+                                                ((node.lineno,
+                                                  node.col_offset),
+                                                 True))
+                                            break
                             stack.extend(
                                 ast.iter_child_nodes(node))
                         return found
 
+                    declared = class_declared()
                     if installs:
                         stash = [pos
                                  for pos, _, _ in installs
                                  if pos < spos]
-                        if stash:
-                            newest = max(stash)
-                            for dpos, is_del in \
-                                    class_declared():
-                                if is_del and newest < dpos \
-                                        < spos:
-                                    return tree
+                        events = [(pos, False)
+                                  for pos in stash]
+                        events.extend(
+                            (dpos, True)
+                            for dpos, is_del in declared
+                            if is_del and dpos < spos)
+                        if not events:
+                            return tree
+                        latest, was_del = max(events)
+                        if not was_del:
                             return current
-                        return tree
-                    for _dpos, _is_del in class_declared():
+                        if any(pos < latest
+                               for pos in stash):
+                            return tree
+                        return current
+                    dels = [dpos
+                            for dpos, is_del in declared
+                            if is_del]
+                    if any(dpos < spos for dpos in dels):
+                        return current
+                    if declared:
                         return tree
                 binds = scope_binds.get(
                     id(current), {}).get(photoname)
@@ -5271,6 +5529,15 @@ def _binding_violations(source):
                                            level)
                             return
                         if level < 2:
+                            return
+                        disp = _copy_display_operand(
+                            consumed, trusted_ctor)
+                        if disp is not None:
+                            # a copy shares the operand
+                            # display's values/elements at
+                            # the same depth — resolve it
+                            # structurally.
+                            resolve_nested(disp, level)
                             return
                         # dicts always resolve
                         # structurally (mixed displays
@@ -5701,7 +5968,16 @@ def _binding_violations(source):
                         wkey = order_key(walrus)
                         if wkey is None:
                             return True
-                        last = None
+                        # stores to the source completing
+                        # before the retainer: target
+                        # leaves in order, plus target
+                        # walruses (their effect completes
+                        # at their own position) and RHS
+                        # walruses (the whole RHS precedes
+                        # the targets). Only a provably
+                        # fresh last store drops the
+                        # retainer.
+                        stores = []
                         for target in targets:
                             for leaf, val in _walk_pairs(
                                     target, batch.value):
@@ -5713,13 +5989,33 @@ def _binding_violations(source):
                                 if lkey is None \
                                         or lkey >= wkey:
                                     continue
-                                if last is None \
-                                        or lkey > last[0]:
-                                    last = (lkey, val)
-                        if last is None:
+                                stores.append((lkey, val))
+                        for node in ast.walk(batch):
+                            if not isinstance(
+                                    node, ast.NamedExpr) \
+                                    or node.target.id != \
+                                    source:
+                                continue
+                            if batch.value is not None \
+                                    and any(
+                                        child is node
+                                        for child in ast.walk(
+                                            batch.value)):
+                                nkey = (-1, (node.lineno,
+                                             node.col_offset))
+                            else:
+                                nkey = order_key(node)
+                                if nkey is None \
+                                        or nkey >= wkey:
+                                    continue
+                            stores.append((nkey, node.value))
+                        if not stores:
                             return True
+                        last_val = max(
+                            stores,
+                            key=lambda pair: pair[0])[1]
                         return not _fresh_value(
-                            last[1], batch_trusted)
+                            last_val, batch_trusted)
 
                     if any(event[3] == "alias"
                            and event[5] == source
@@ -9758,6 +10054,230 @@ class CapturedBytesBinding(unittest.TestCase):
                head + '            box = {"row": {}}\n'
                      '            sink = {}\n'
                      '            cp, box, sink[((keep := box), 0)[1]] = box.copy(), {}, 0\n'
+                     '            cp["row"]["raw"] = log\n'
+                     '            results.append(keep)\n'
+               + use),
+             ],
+             ),
+        ]
+        for name, edits in cases:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
+
+    def test_tripwire_catches_r33_plants(self):
+        # adjudication-r32 A-fixes: declared class
+        # locals across deletion (A1), restoration-
+        # aware grafts (A4), depth-preserving copy
+        # breaks (A5), overwritten resets (A6),
+        # element-preserving unpacks (A7), copy-
+        # wrapped mixed dicts (A8) and nested RHS
+        # walruses (A10).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        fire = [
+            ('a1-class-del-crash',
+             [
+              (mod,
+               'module_box = {}\n'
+                     'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     '            a_cls = box\n'
+                     '            class C:\n'
+                     '                a_cls = box\n'
+                     '                del a_cls\n'
+                     '                a_cls["raw"] = log\n'
+                     '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('a4-graft-restore',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [box]\n'
+                     '            a = box\n'
+                     '            a = {}\n'
+                     '            a = box\n'
+                     '            b = a\n'
+                     '            box = {}\n'
+                     '            a = {}\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(b)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('a5-graft-copy-break',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            *xs, = [box]\n'
+                     '            box = box.copy()\n'
+                     '            saved = box\n'
+                     '            box = {}\n'
+                     '            xs[0]["row"]["raw"] = log\n'
+                     '            results.append(saved)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('a6-overwritten-reset',
+             [
+              (anchor,
+               head + '            other = {}\n'
+                     '            sink = {}\n'
+                     '            for i in range(2):\n'
+                     '                box = {}\n'
+                     '                box = other\n'
+                     '                *xs, = [box]\n'
+                     '                other = sink\n'
+                     '                xs[0]["raw"] = log\n'
+                     '            results.append(sink)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('a7-unpack-self-copy',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            *xs, = [box]\n'
+                     '            xs = [*xs]\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('a8-copy-wrapped-mixed-dict',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            empty = {}\n'
+                     '            *xs, = [({**empty, "slot": box}).copy()]\n'
+                     '            xs[0]["slot"]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('a10-nested-rhs-walrus',
+             [
+              (anchor,
+               head + '            def clean(self):\n'
+                     '                return b"CLEAN"\n'
+                     '            def f():\n'
+                     '                rb = clean\n'
+                     '                rb, rb = ((review_cap_value := Path.read_bytes), review_cap_value)\n'
+                     '                Path.r = rb\n'
+                     '                ignored = decode_body_log(log.r())\n'
+                     '                results.append(ignored)\n'
+                     '            f()\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+        ]
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_allows_r33_shapes(self):
+        # adjudication-r32 A-fixes, silent placements:
+        # the deletion-only control (A1b), self-
+        # copies after a fresh rebind (A2), stale
+        # alias identity (A3), the depth-1 copy-
+        # break control (A5b) and source walruses
+        # stored before the retainer (A9).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        cases = [
+            ('a1b-del-only',
+             [
+              (mod,
+               'module_box = {}\n'
+                     'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     '            a_cls = box\n'
+                     '            class C:\n'
+                     '                del a_cls\n'
+                     '                a_cls["raw"] = log\n'
+                     '            results.append(module_box)\n'
+               + use),
+             ],
+             ),
+            ('a2-copy-after-fresh',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            *xs, = [box]\n'
+                     '            box = {"row": {}}\n'
+                     '            box = box.copy()\n'
+                     '            xs[0]["row"]["raw"] = log\n'
+                     '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('a3-stale-alias-identity',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     '            other = box\n'
+                     '            other = {}\n'
+                     '            *xs, = [box]\n'
+                     '            box = other\n'
+                     '            saved = box\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(saved)\n'
+               + use),
+             ],
+             ),
+            ('a5b-copy-break-depth1',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            *xs, = [box]\n'
+                     '            box = box.copy()\n'
+                     '            saved = box\n'
+                     '            box = {}\n'
+                     '            xs[0]["raw"] = log\n'
+                     '            results.append(saved)\n'
+               + use),
+             ],
+             ),
+            ('a9-walrus-store-before-retainer',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     '            sink = {}\n'
+                     '            cp, sink[((box := {}), 2)[1]], sink[((keep := box), 0)[1]], box = box.copy(), 0, 0, {}\n'
                      '            cp["row"]["raw"] = log\n'
                      '            results.append(keep)\n'
                + use),
