@@ -1521,9 +1521,22 @@ def _annotation_evaluates(stmt, parents):
     # annotations evaluate at statement time only
     # in module/class scope below 3.14 (function
     # locals never evaluate; 3.14 defers the rest
-    # into __annotate__).
+    # into __annotate__; a module-level `from
+    # __future__ import annotations` stringifies
+    # them instead — inert, never raising —
+    # while targets and values still evaluate).
     if sys.version_info >= (3, 14):
         return False
+    if parents is not None:
+        root = stmt
+        while id(root) in parents:
+            root = parents[id(root)]
+        for sub in getattr(root, "body", []):
+            if isinstance(sub, ast.ImportFrom) \
+                    and sub.module == "__future__" \
+                    and any(alias.name == "annotations"
+                            for alias in sub.names):
+                return False
     if parents is None:
         return True
     cursor = stmt
@@ -1568,22 +1581,33 @@ def _simple_stmt_raises(stmt, parents=None):
                for part in parts)
 
 
-def _stmt_may_fall(stmt, soft_raise, parents=None):
+def _stmt_may_fall(stmt, soft_raise, parents=None,
+                   del_raises=None):
     # True when stmt may complete normally (fall
     # through to what follows it). Direct
     # return/break/continue never fall; raise and
     # assert fall only under soft_raise (kept
     # exits at top level); a provable constant
-    # raise never falls. Compound predecessors
+    # raise never falls; a del never falls when
+    # the caller's del_raises predicate says it
+    # provably raises (unscoped callers pass
+    # None and dels fall). Compound predecessors
     # count when they definitely exit:
     # constant-folded or both-arms ifs, trys
     # whose body and handlers all exit (or whose
     # finally does), with-bodies exiting by
     # non-raise means (a raise may be suppressed
-    # by __exit__). Loops, match, and nested
-    # scopes stay opaque (an inner break binds
-    # the inner loop; a nested return leaves the
-    # block).
+    # by __exit__). A try's orelse runs only
+    # when its body falls, and orelse errors
+    # escape their own try (handlers never
+    # catch them): a falling body with a
+    # raising orelse falls only via a
+    # body-raise the handlers catch (a quiet
+    # body never raises, so the orelse always
+    # runs and the try never falls). Loops,
+    # match, and nested scopes stay opaque (an
+    # inner break binds the inner loop; a
+    # nested return leaves the block).
     if isinstance(stmt, (ast.Return, ast.Break,
                          ast.Continue)):
         return False
@@ -1599,69 +1623,101 @@ def _stmt_may_fall(stmt, soft_raise, parents=None):
                 and test.value:
             return True
         return soft_raise
+    if isinstance(stmt, ast.Delete) \
+            and del_raises is not None \
+            and del_raises(stmt):
+        return False
     if not soft_raise \
             and _simple_stmt_raises(stmt, parents):
         return False
     if isinstance(stmt, ast.If):
-        if _uncond_raises_expr(stmt.test):
+        if not soft_raise \
+                and _uncond_raises_expr(stmt.test):
             return False
         test = _unwrap_walrus(stmt.test)
         if isinstance(test, ast.Constant):
             taken = stmt.body if test.value \
                 else stmt.orelse
             return _seq_may_fall(taken, soft_raise,
-                                 parents)
+                                 parents, del_raises)
         return _seq_may_fall(stmt.body, soft_raise,
-                             parents) \
+                             parents, del_raises) \
             or _seq_may_fall(stmt.orelse, soft_raise,
-                             parents)
+                             parents, del_raises)
     try_nodes = (ast.Try,)
     trystar = getattr(ast, "TryStar", None)
     if trystar is not None:
         try_nodes += (trystar,)
     if isinstance(stmt, try_nodes):
         if not _seq_may_fall(stmt.finalbody,
-                             soft_raise, parents):
+                             soft_raise, parents,
+                             del_raises):
             return False
-        normal = not _seq_may_fall(stmt.body,
-                                   soft_raise,
-                                   parents) \
-            or (stmt.orelse
-                and not _seq_may_fall(stmt.orelse,
-                                      soft_raise,
-                                      parents))
-        if not normal:
+        body_falls = _seq_may_fall(
+            stmt.body, soft_raise, parents,
+            del_raises)
+        orelse_falls = not stmt.orelse \
+            or _seq_may_fall(stmt.orelse, soft_raise,
+                             parents, del_raises)
+        if body_falls and orelse_falls:
             return True
+        if body_falls \
+                and _stmts_quiet(stmt.body):
+            # the body always runs clean, so the
+            # raising orelse always runs: the
+            # try never falls (its handlers
+            # cannot catch orelse errors).
+            return False
         return any(_seq_may_fall(handler.body,
-                                 soft_raise, parents)
+                                 soft_raise, parents,
+                                 del_raises)
                    for handler in stmt.handlers)
     if isinstance(stmt, (ast.With, ast.AsyncWith)):
-        return _seq_may_fall(stmt.body, True, parents)
+        return _seq_may_fall(stmt.body, True, parents,
+                             del_raises)
     if isinstance(stmt, ast.Match):
         # the subject always evaluates (only the
-        # case arms stay opaque).
-        if _uncond_raises_expr(stmt.subject):
+        # case arms stay opaque); under
+        # soft_raise the raise is suppressed
+        # and control falls through.
+        if not soft_raise \
+                and _uncond_raises_expr(stmt.subject):
             return False
         return True
     return True
 
 
-def _seq_may_fall(seq, soft_raise, parents=None):
-    return all(_stmt_may_fall(sub, soft_raise, parents)
+def _seq_may_fall(seq, soft_raise, parents=None,
+                  del_raises=None):
+    return all(_stmt_may_fall(sub, soft_raise, parents,
+                              del_raises)
                for sub in seq)
 
 
 def _may_exit_kinds(stmt):
     # (may_break, may_continue) reachable at this
-    # loop depth: through if arms, try parts,
-    # with bodies and match cases — never into
-    # nested loops (an inner break binds the
-    # inner loop) or nested scopes.
+    # loop depth: through if arms (constant
+    # tests folded — only the taken arm), try
+    # parts, with bodies and match cases —
+    # never into nested loops (an inner break
+    # binds the inner loop) or nested scopes.
     if isinstance(stmt, ast.Break):
         return (True, False)
     if isinstance(stmt, ast.Continue):
         return (False, True)
     if isinstance(stmt, ast.If):
+        # constant tests fold: only the taken
+        # arm can exit (an `if False: break`
+        # never breaks).
+        test = _unwrap_walrus(stmt.test)
+        if isinstance(test, ast.Constant):
+            taken = stmt.body if test.value \
+                else stmt.orelse
+            left = any(_may_exit_kinds(sub)[0]
+                       for sub in taken)
+            right = any(_may_exit_kinds(sub)[1]
+                        for sub in taken)
+            return (left, right)
         left = any(_may_exit_kinds(sub)[0]
                    for sub in stmt.body) \
             or any(_may_exit_kinds(sub)[0]
@@ -1772,6 +1828,37 @@ def _skips_past(sibling, target, publish, parents):
     return False
 
 
+def _branch_dead(stmt, parents):
+    # stmt provably never executes: enclosed in
+    # an untaken constant branch (an if False
+    # body, an if True orelse, a while False
+    # body — a while False orelse still runs).
+    # Anything else may run (fail closed).
+    if parents is None:
+        return False
+    child = stmt
+    probe = stmt
+    while id(probe) in parents:
+        probe = parents[id(probe)]
+        if isinstance(probe, ast.If):
+            test = _unwrap_walrus(probe.test)
+            if isinstance(test, ast.Constant):
+                if child in probe.body \
+                        and not test.value:
+                    return True
+                if child in probe.orelse \
+                        and test.value:
+                    return True
+        elif isinstance(probe, ast.While):
+            test = _unwrap_walrus(probe.test)
+            if child in probe.body \
+                    and isinstance(test, ast.Constant) \
+                    and not test.value:
+                return True
+        child = probe
+    return False
+
+
 def _stmts_quiet(stmts):
     # statements provably raising nothing: pass,
     # constant expressions, and constant binds to
@@ -1796,17 +1883,26 @@ def _stmts_quiet(stmts):
     return True
 
 
-def _except_star_coexec(probe, mine_handler, storepos):
+def _except_star_coexec(probe, mine_handler, storepos,
+                        bound_names=None):
     # True when the store sits in a sibling
     # except* handler that provably co-executes
     # with the replacement's handler: the try is
     # a TryStar whose body starts (past provably
     # quiet predecessors) with a constant
-    # ExceptionGroup raise carrying distinctly
-    # matching members for both handlers (one
-    # member cannot feed two handlers — the
-    # first consumes it). Ordinary except
-    # handlers stay exclusive.
+    # ExceptionGroup raise whose constructor is
+    # unrebound (bound_names carries the
+    # enclosing function + module binds — a
+    # rebound constructor voids the proof).
+    # Members split through ALL handlers in
+    # source order (an earlier handler consumes
+    # its matches — a later same-type handler
+    # may never run); both handlers must
+    # receive at least one member. Literal
+    # starred members splice and literal nested
+    # groups resolve recursively (anything
+    # non-literal voids the proof). Ordinary
+    # except handlers stay exclusive.
     trystar = getattr(ast, "TryStar", None)
     if trystar is None \
             or not isinstance(probe, trystar):
@@ -1823,31 +1919,70 @@ def _except_star_coexec(probe, mine_handler, storepos):
             break
     if store_handler is None:
         return False
+
+    def _leaves(elt):
+        # leaf members of a literal member:
+        # starred lists/tuples splice, literal
+        # nested groups resolve recursively;
+        # anything non-literal voids (None).
+        elt = _unwrap_walrus(elt)
+        if isinstance(elt, ast.Starred):
+            inner = _unwrap_walrus(elt.value)
+            if not isinstance(inner, (ast.List,
+                                      ast.Tuple)):
+                return None
+            out = []
+            for sub in inner.elts:
+                got = _leaves(sub)
+                if got is None:
+                    return None
+                out.extend(got)
+            return out
+        if isinstance(elt, ast.Call) \
+                and isinstance(elt.func, ast.Name) \
+                and elt.func.id in ("ExceptionGroup",
+                                    "BaseExceptionGroup") \
+                and len(elt.args) >= 2:
+            seq = _unwrap_walrus(elt.args[1])
+            if not isinstance(seq, (ast.List, ast.Tuple)):
+                return None
+            out = []
+            for sub in seq.elts:
+                got = _leaves(sub)
+                if got is None:
+                    return None
+                out.extend(got)
+            return out
+        return [elt]
+
     members = None
+    ctor = None
     for stmt in probe.body:
         if not isinstance(stmt, ast.Raise) \
                 or stmt.exc is None:
             continue
-        if members is not None:
-            break
+        # only the first raise counts (it always
+        # runs when reached — later ones never do).
         members = []
         exc = _unwrap_walrus(stmt.exc)
-        if not isinstance(exc, ast.Call) \
-                or not isinstance(exc.func, ast.Name) \
-                or exc.func.id not in (
-                    "ExceptionGroup",
-                    "BaseExceptionGroup") \
-                or len(exc.args) < 2:
-            break
-        seq = _unwrap_walrus(exc.args[1])
-        if not isinstance(seq, (ast.List, ast.Tuple)):
-            break
-        for elt in seq.elts:
-            elt = _unwrap_walrus(elt)
-            if isinstance(elt, ast.Starred):
-                continue
-            members.append(elt)
+        if isinstance(exc, ast.Call) \
+                and isinstance(exc.func, ast.Name) \
+                and exc.func.id in ("ExceptionGroup",
+                                    "BaseExceptionGroup") \
+                and len(exc.args) >= 2:
+            ctor = exc.func.id
+            seq = _unwrap_walrus(exc.args[1])
+            if isinstance(seq, (ast.List, ast.Tuple)):
+                for elt in seq.elts:
+                    got = _leaves(elt)
+                    if got is None:
+                        members = None
+                        break
+                    members.extend(got)
+        break
     if not members:
+        return False
+    if bound_names is not None and ctor in bound_names:
         return False
     first = None
     for stmt in probe.body:
@@ -1880,19 +2015,17 @@ def _except_star_coexec(probe, mine_handler, storepos):
             return elt.func.id in names
         return False
 
-    used = set()
-    for handler in (mine_handler, store_handler):
-        hit = None
-        for idx, elt in enumerate(members):
-            if idx in used:
-                continue
-            if matches(handler, elt):
-                hit = idx
-                break
-        if hit is None:
-            return False
-        used.add(hit)
-    return True
+    remaining = list(range(len(members)))
+    got = set()
+    for handler in probe.handlers:
+        taken = [idx for idx in remaining
+                 if matches(handler, members[idx])]
+        if taken:
+            got.add(id(handler))
+        remaining = [idx for idx in remaining
+                     if idx not in taken]
+    return id(mine_handler) in got \
+        and id(store_handler) in got
 
 
 def _scope_surfaces(tree, parents):
@@ -2096,7 +2229,10 @@ def _module_alias_root(surfaces, parents, scope_binds, node, name):
     # except directly enclosing). None when
     # unresolvable, rebound, or cyclic. Each link
     # resolves as-of its own edge (a later rebind
-    # of the source never rewrites the alias).
+    # of the source never rewrites the alias),
+    # and each right-hand side resolves from the
+    # edge's own scope outward (never restarting
+    # in the consuming scope).
     chain = []
     current = node
     first = True
@@ -2120,19 +2256,22 @@ def _module_alias_root(surfaces, parents, scope_binds, node, name):
     root = current
     horizon = (node.lineno, node.col_offset)
     seen = set()
+    start = 0
     while name not in seen:
         seen.add(name)
         scope = None
-        index = 0
+        index = start
         while index < len(chain):
             cand = chain[index]
             _imports, bound, globs, nonlocs = surfaces[
                 id(cand)]
             if name in globs:
                 scope = root
+                start = len(chain) - 1
                 break
             if name in nonlocs:
-                for outer in chain[index + 1:]:
+                for pos, outer in enumerate(
+                        chain[index + 1:], index + 1):
                     if isinstance(
                             outer,
                             (ast.FunctionDef,
@@ -2140,10 +2279,12 @@ def _module_alias_root(surfaces, parents, scope_binds, node, name):
                             and name in surfaces[
                                 id(outer)][1]:
                         scope = outer
+                        start = pos
                         break
                 break
             if name in bound:
                 scope = cand
+                start = index
                 break
             index += 1
         if scope is None:
@@ -2483,17 +2624,20 @@ def _target_leaves(target):
 def _class_annotated(home, scope_binds, tree, parents):
     # a direct class-body annotation (nested scopes
     # pruned — their annotations are their own):
-    # any target shape installs __annotations__ on
-    # the pre-3.14 eager path (attribute and
-    # subscript targets evaluate and initialize
-    # the dict too) — but only when the statement
-    # itself runs cleanly first. Target roots and
-    # annotation names resolve lexically (binds
-    # before the annotation in the class, enclosing
-    # functions, the module, builtins; classes
-    # transparent); an unbound name or a provable
-    # raise means the del never runs (no seed: the
-    # publish is dead past it).
+    # static presence installs __annotations__ on
+    # the pre-3.14 eager path (entry init — even
+    # unreachable annotations and unbound roots
+    # initialize the dict), while execution still
+    # evaluates reachable targets and annotations
+    # (attribute and subscript roots read; an
+    # unbound name or a provable raise means the
+    # del never runs — no seed: the publish is
+    # dead past it). Unreachable annotations
+    # establish init without executing. Target
+    # roots and annotation names resolve lexically
+    # (binds before the annotation in the class,
+    # enclosing functions, the module, builtins;
+    # classes transparent).
     stack = list(home.body)
     while stack:
         node = stack.pop()
@@ -2504,6 +2648,8 @@ def _class_annotated(home, scope_binds, tree, parents):
         if not isinstance(node, ast.AnnAssign):
             stack.extend(ast.iter_child_nodes(node))
             continue
+        if _branch_dead(node, parents):
+            return True
         annpos = (node.lineno, node.col_offset)
         scopes = [home]
         cursor = node
@@ -6147,7 +6293,13 @@ def _binding_violations(source):
                             elif mine_handler is not None \
                                     and _except_star_coexec(
                                         probe, mine_handler,
-                                        storepos):
+                                        storepos,
+                                        set(scope_binds.get(
+                                            id(func), {}))
+                                        | set(scope_binds.get(
+                                            id(tree), {}))
+                                        | rebound
+                                        | builtins_attr_binds):
                                 pass
                             else:
                                 return False
@@ -6733,40 +6885,40 @@ def _binding_violations(source):
                             break
             return mates
 
-        def catches_name_error(nodetype):
+        def catches_name_error(nodetype, catching=(
+                "NameError", "Exception",
+                "BaseException")):
             # whether an except handler can
-            # catch the del's NameError: bare
+            # catch the raised error: bare
             # always; tuples, starred and PEP
             # 604 unions by members; names in
-            # the NameError-superclass chain
+            # the given superclass chain
             # (NameError, Exception,
-            # BaseException — LookupError is
-            # NOT one: issubclass is False)
-            # (bare or builtins-dotted) yes;
-            # other unrebound builtin
-            # exceptions no (a builtins attribute
-            # rebind voids identity too);
-            # anything else yes — aliasing is
+            # BaseException by default —
+            # LookupError is NOT one:
+            # issubclass is False) (bare or
+            # builtins-dotted) yes; other
+            # unrebound builtin exceptions no
+            # (a builtins attribute rebind
+            # voids identity too); anything
+            # else yes — aliasing is
             # unknowable, fail closed.
             if nodetype is None:
                 return True
             if isinstance(nodetype, ast.Tuple):
                 return any(
-                    catches_name_error(elt)
+                    catches_name_error(elt, catching)
                     for elt in nodetype.elts)
             if isinstance(nodetype, ast.Starred):
                 return catches_name_error(
-                    nodetype.value)
+                    nodetype.value, catching)
             if isinstance(nodetype, ast.BinOp) \
                     and isinstance(
                         nodetype.op, ast.BitOr):
                 return catches_name_error(
-                    nodetype.left) \
+                    nodetype.left, catching) \
                     or catches_name_error(
-                        nodetype.right)
-            catching = ("NameError",
-                        "Exception",
-                        "BaseException")
+                        nodetype.right, catching)
             if isinstance(nodetype, ast.Name):
                 spelling = nodetype.id
             elif isinstance(nodetype,
@@ -6798,26 +6950,30 @@ def _binding_violations(source):
 
         def publish_dead(func, call):
             # a publish downstream of a raising
-            # class-body del that no catcher saves is
-            # dead (moot): the exception propagates
-            # past it, so nothing escapes there. A
-            # catcher saves it only when the publish
-            # sits past the try (or in its handlers /
-            # finally) — a publish inside the catching
-            # body after the raise is skipped. A
-            # publish in the finally of a try holding
-            # the del runs before propagation, so it
-            # is live. Only provably-raising dels
-            # count: binding/deletion state replays in
+            # class-body del (or a provably
+            # failing assertion) that no catcher
+            # saves is dead (moot): the exception
+            # propagates past it, so nothing
+            # escapes there. A catcher saves it
+            # only when the publish sits past the
+            # try (or in its handlers / finally) —
+            # a publish inside the catching body
+            # after the raise is skipped. A
+            # publish in the finally of a try
+            # holding the raise runs before
+            # propagation, so it is live. Only
+            # provably-raising dels count:
+            # binding/deletion state replays in
             # order (a bind installs, a del removes;
             # conditional events leave Unknown — only
             # definitely-absent raises), the del must
             # reach the publish (a skipped del kills
             # nothing), and a metaclass keyword voids
             # the must-raise assumption (__prepare__
-            # may supply the name). Nested functions
-            # are pruned (unknowable calls fail
-            # closed = live).
+            # may supply the name). Assertions need
+            # no replay (a falsy constant test always
+            # raises). Nested functions are pruned
+            # (unknowable calls fail closed = live).
             key = (id(func), call.lineno, call.col_offset)
             if key in _publish_dead_memo:
                 return _publish_dead_memo[key]
@@ -6842,6 +6998,19 @@ def _binding_violations(source):
                                 ((node.lineno,
                                   node.col_offset),
                                  target.id, node))
+                if isinstance(node, ast.Assert):
+                    # a provably failing assertion
+                    # (falsy constant test) always
+                    # raises AssertionError when it
+                    # executes (normal mode — the
+                    # product never runs -O).
+                    test = _unwrap_walrus(node.test)
+                    if isinstance(test, ast.Constant) \
+                            and not test.value:
+                        raises.append(
+                            ((node.lineno,
+                              node.col_offset),
+                             None, node))
                 if isinstance(node, try_nodes):
                     trys.append(node)
                 stack.extend(ast.iter_child_nodes(node))
@@ -7039,9 +7208,21 @@ def _binding_violations(source):
                                      ast.AsyncFunctionDef,
                                      ast.Lambda)):
                         break
-                if home is None:
+                # assertion raises (name None)
+                # skip the class replay below —
+                # they always raise when they
+                # execute — but share the
+                # suppression/finally/catcher
+                # checks with their own chain.
+                catching = ("AssertionError",
+                            "Exception",
+                            "BaseException") \
+                    if name is None \
+                    else ("NameError", "Exception",
+                          "BaseException")
+                if home is None and name is not None:
                     continue
-                if home.keywords:
+                if name is not None and home.keywords:
                     continue
 
                 def default_namespace(cls, seen):
@@ -7132,7 +7313,9 @@ def _binding_violations(source):
                             return False
                     return True
 
-                if not default_namespace(home, set()):
+                if name is not None \
+                        and not default_namespace(
+                            home, set()):
                     continue
                 cursor = dnode
                 suppressed = False
@@ -7155,10 +7338,12 @@ def _binding_violations(source):
                     (bpos, True)
                     for bpos, _, _ in scope_binds.get(
                         id(home), {}).get(name, [])
-                    if bpos < rpos]
+                    if bpos < rpos] \
+                    if name is not None else []
                 # class-level dels only (nested
                 # scopes bind and delete locally).
-                delstack = [home]
+                delstack = [home] \
+                    if name is not None else []
                 while delstack:
                     top = delstack.pop()
                     for sub in ast.iter_child_nodes(top):
@@ -7183,8 +7368,9 @@ def _binding_violations(source):
                                         events.append(
                                             (dpos, False))
                         delstack.append(sub)
-                present = name in ("__module__",
-                                     "__qualname__") \
+                present = name is not None and (
+                    name in ("__module__",
+                             "__qualname__") \
                     or (name == "__doc__"
                         and home.body
                         and isinstance(home.body[0],
@@ -7203,7 +7389,7 @@ def _binding_violations(source):
                         and sys.version_info < (3, 14)
                         and _class_annotated(
                             home, scope_binds, tree,
-                            parents))
+                            parents)))
                 unknown = False
                 for epos, is_bind in sorted(events):
                     definite = reaches(epos, rpos)
@@ -7255,8 +7441,10 @@ def _binding_violations(source):
                                 sub.end_col_offset)
                             for sub in trobj.body):
                         continue
-                    if not any(catches_name_error(h.type)
-                               for h in trobj.handlers):
+                    if not any(
+                            catches_name_error(
+                                h.type, catching)
+                            for h in trobj.handlers):
                         continue
                     tend = (trobj.end_lineno,
                             trobj.end_col_offset)
@@ -7330,6 +7518,44 @@ def _binding_violations(source):
                         target = node
                 return target
 
+            def _store_del_raises(node):
+                # a del with a provably unbound
+                # plain-name target always raises
+                # (any unbound target raises the
+                # whole statement): no bind before
+                # it in the home scope, no module
+                # bind to fall back to, and no
+                # global/nonlocal declaration
+                # rescuing it. Class homes stay
+                # opaque (namespace
+                # machinery) — anything unsure
+                # falls (fail closed: a counted
+                # store keeps its branch only
+                # when every gate agrees).
+                if isinstance(home, ast.ClassDef):
+                    return False
+                globs, nonlocs = scope_declared.get(
+                    id(home), (set(), set()))
+                modbinds = scope_binds.get(
+                    id(tree), {})
+                homebinds = scope_binds.get(
+                    id(home), {})
+                dpos = (node.lineno, node.col_offset)
+                for target in node.targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    if target.id in globs \
+                            or target.id in nonlocs:
+                        continue
+                    if any(bpos < dpos
+                           for bpos, _, _ in homebinds.get(
+                               target.id, [])):
+                        continue
+                    if modbinds.get(target.id, []):
+                        continue
+                    return True
+                return False
+
             def _rebind_executes(stmt):
                 # the statement lands given capture
                 # runs: it falls itself and every
@@ -7337,11 +7563,14 @@ def _binding_violations(source):
                 # block falls (only provable skips
                 # block — may-raise predecessors keep
                 # the established fail-closed
-                # direction).
+                # direction). Unbound dels count as
+                # blockers (they raise before later
+                # siblings run).
                 if stmt is None:
                     return True
                 if not _stmt_may_fall(stmt, False,
-                                      parents):
+                                      parents,
+                                      _store_del_raises):
                     return False
                 child = stmt
                 probe = stmt
@@ -7357,7 +7586,8 @@ def _binding_violations(source):
                             if sib is child:
                                 break
                             if not _stmt_may_fall(
-                                    sib, False, parents):
+                                    sib, False, parents,
+                                    _store_del_raises):
                                 return False
                     child = probe
                 return True
@@ -7469,10 +7699,14 @@ def _binding_violations(source):
                 # live — fail closed). Override values
                 # are tagged with their own evaluation
                 # position (they resolve as-of it, not
-                # the display's bind).
+                # the display's bind); a second
+                # synthesis carries inherited tags
+                # forward (later events overwrite the
+                # same value's tag).
                 keys = list(bval.keys)
                 vals = list(bval.values)
-                at = {}
+                at = dict(getattr(bval, "_override_at",
+                                  {}))
                 for opos, okey, oval in events:
                     if not isinstance(okey, ast.Constant):
                         continue
@@ -7518,7 +7752,20 @@ def _binding_violations(source):
             # Self-copies skip (the originals already
             # ride); impure copies keep their own
             # display only.
-            recovered = []
+            # (value, lifetime, evaluated) triples:
+            # originals gate and resolve at their
+            # bind; recovered entries gate on the
+            # rebind (later rebinds and overrides
+            # apply past the copy) but resolve
+            # their original values as-of the
+            # source display's own bind (a copy
+            # shares the source's descendants as
+            # built, not as re-evaluated at the
+            # copy — both polarities pinned).
+            triples = []
+            for bpos, bkind, bval in allbinds:
+                if bkind == "plain":
+                    triples.append((bval, bpos, bpos))
             for rpos, rkind, rval in allbinds:
                 if not rpos <= capos or rkind != "plain":
                     continue
@@ -7534,22 +7781,21 @@ def _binding_violations(source):
                 for src in sources:
                     if src == name:
                         continue
-                    for sbval, _ in name_display_binds(
+                    for sbval, sbpos in name_display_binds(
                             src, rpos, scope, _seen):
-                        recovered.append(
-                            (rpos, "plain", sbval))
-            allbinds = allbinds + recovered
+                        triples.append(
+                            (sbval, rpos, sbpos))
             stores = _item_stores()
             displays = []
-            for bpos, bkind, bval in allbinds:
-                if bpos > capos or bkind != "plain":
+            for bval, lpos, vpos in triples:
+                if lpos > capos:
                     continue
                 bval = _unwrap_walrus(bval)
                 if not isinstance(
                         bval, (ast.Dict, ast.List,
                                ast.Tuple, ast.Set)):
                     continue
-                if any(bpos < later <= capos
+                if any(lpos < later <= capos
                        and _later_lands(later)
                        and not _display_preserving(
                            later_val, later)
@@ -7558,7 +7804,7 @@ def _binding_violations(source):
                 if isinstance(bval, ast.Dict):
                     events = []
                     for later, _, later_val in allbinds:
-                        if bpos < later <= capos \
+                        if lpos < later <= capos \
                                 and _later_lands(later):
                             for key, item in \
                                     _rebind_overrides(
@@ -7566,14 +7812,14 @@ def _binding_violations(source):
                                 events.append((later, key,
                                                item))
                     for spos, key, item in stores:
-                        if bpos < spos <= capos:
+                        if lpos < spos <= capos:
                             events.append((spos, key,
                                            item))
                     events.sort(key=lambda event: event[0])
                     if events:
                         bval = _apply_overrides(
                             bval, events)
-                displays.append((bval, bpos))
+                displays.append((bval, vpos))
             return displays
 
         def home_scope_for(photoname, scope, spos):
@@ -8015,9 +8261,10 @@ def _binding_violations(source):
                         # del past the last reaching
                         # installation (an earlier
                         # success does not poison a later
-                        # definite rebind). The queried
-                        # name's own dels are replay
-                        # events, never blockers.
+                        # definite rebind; an unreachable
+                        # del poisons nothing). The
+                        # queried name's own dels are
+                        # replay events, never blockers.
                         if not isinstance(
                                 stmt, ast.Delete):
                             return False
@@ -8058,7 +8305,10 @@ def _binding_violations(source):
                                             and last \
                                             < (node.lineno,
                                                node.col_offset) \
-                                            < delpos:
+                                            < delpos \
+                                            and not _branch_dead(
+                                                node,
+                                                parents):
                                         for cand in \
                                                 node.targets:
                                             for sub in \
@@ -8079,13 +8329,19 @@ def _binding_violations(source):
                         # stmt provably prevents
                         # fallthrough to later siblings:
                         # never falls, a foreign del
-                        # that may raise, or a
+                        # that may raise, a
                         # constant-folded branch whose
                         # taken arm blocks (taken arms
                         # inline — later arm statements
                         # still execute past clean
                         # fallers, and a may-exit only
-                        # adds skip paths). Other
+                        # adds skip paths), or a
+                        # provably entered loop whose
+                        # body blocks before any exit
+                        # (a break/continue first leaves
+                        # the loop, so fallthrough past
+                        # it survives; possibly empty
+                        # loops stay opaque). Other
                         # compounds stay opaque
                         # (fail-open corners).
                         if not _stmt_may_fall(
@@ -8106,6 +8362,58 @@ def _binding_violations(source):
                                 return any(
                                     _linear_blocks(sub)
                                     for sub in taken)
+                        if isinstance(
+                                stmt,
+                                (ast.For, ast.AsyncFor,
+                                 ast.While)):
+                            entered = False
+                            if isinstance(
+                                    stmt,
+                                    (ast.For,
+                                     ast.AsyncFor)):
+                                itr = _unwrap_walrus(
+                                    stmt.iter)
+                                if isinstance(
+                                        itr,
+                                        (ast.List,
+                                         ast.Tuple,
+                                         ast.Set)):
+                                    entered = any(
+                                        not isinstance(
+                                            elt,
+                                            ast.Starred)
+                                        for elt in itr.elts)
+                                elif isinstance(
+                                        itr, ast.Dict):
+                                    entered = any(
+                                        key is not None
+                                        for key in itr.keys)
+                                elif isinstance(
+                                        itr, ast.Constant) \
+                                        and isinstance(
+                                            itr.value,
+                                            (str, bytes)):
+                                    entered = bool(
+                                        itr.value)
+                            else:
+                                test = _unwrap_walrus(
+                                    stmt.test)
+                                entered = isinstance(
+                                    test, ast.Constant) \
+                                    and bool(test.value)
+                            if not entered:
+                                return False
+                            for sub in stmt.body:
+                                if isinstance(
+                                        sub,
+                                        (ast.Break,
+                                         ast.Continue)):
+                                    return False
+                                if _linear_blocks(sub):
+                                    return True
+                            return any(
+                                _linear_blocks(sub)
+                                for sub in stmt.orelse)
                         return False
 
                     def _finally_skipped(pos):
@@ -8154,6 +8462,62 @@ def _binding_violations(source):
                                     return True
                         return False
 
+                    def _body_skipped(epos):
+                        # the bind at epos never runs: a
+                        # preceding sibling in an
+                        # enclosing try body, orelse or
+                        # handler provably blocks
+                        # (foreign-del aware — a raising
+                        # orelse escapes its own try, so
+                        # the remainder past the try is
+                        # dead too). Finallys are
+                        # _finally_skipped's domain
+                        # (richer blockers there);
+                        # class-top-level sequencing is
+                        # the replay loop's own domain.
+                        target = None
+                        for node in ast.walk(current):
+                            if isinstance(node, ast.stmt) \
+                                    and (node.lineno,
+                                         node.col_offset) \
+                                    == epos:
+                                target = node
+                                break
+                        if target is None:
+                            return False
+
+                        def _del_blocks(node):
+                            return _foreign_del_raises(
+                                node, (node.lineno,
+                                       node.col_offset))
+
+                        child = target
+                        probe = target
+                        while id(probe) in parents:
+                            probe = parents[id(probe)]
+                            if probe is current:
+                                break
+                            for field in ("body", "orelse",
+                                          "finalbody"):
+                                seq = getattr(
+                                    probe, field, None)
+                                if not isinstance(
+                                        seq, list) \
+                                        or child not in seq:
+                                    continue
+                                if field == "finalbody":
+                                    continue
+                                for sib in seq:
+                                    if sib is child:
+                                        break
+                                    if not _stmt_may_fall(
+                                            sib, False,
+                                            parents,
+                                            _del_blocks):
+                                        return True
+                            child = probe
+                        return False
+
                     def mark_unwind_raise(epos,
                                           raised_finally):
                         # an uncaught raise during unwind
@@ -8162,8 +8526,10 @@ def _binding_violations(source):
                         # a raising try nested in one. A
                         # raise contained by its own
                         # try's handlers never escapes
-                        # (handlers catch body and orelse
-                        # errors, not their own).
+                        # (handlers catch body errors
+                        # only — orelse, handler and
+                        # finally errors escape the
+                        # try).
                         chain = try_chain(epos)
                         if not chain:
                             return
@@ -8177,8 +8543,7 @@ def _binding_violations(source):
                                     break
                             return
                         inner = chain[0][0]
-                        if chain[0][1] in ("body",
-                                           "orelse"):
+                        if chain[0][1] == "body":
                             for node in ast.walk(current):
                                 if id(node) != inner:
                                     continue
@@ -8205,6 +8570,10 @@ def _binding_violations(source):
                         # NameError (spelling-only —
                         # shadowed contextlib or missing
                         # imports are pathological).
+                        # Only the NameError-superclass
+                        # chain counts (LookupError is a
+                        # sibling, not a parent — it
+                        # propagates NameError outward).
                         # Anything else may propagate
                         # (marked through, fail-closed).
                         for item in node.items:
@@ -8228,7 +8597,6 @@ def _binding_violations(source):
                                 if isinstance(arg, ast.Name) \
                                         and arg.id in (
                                             "NameError",
-                                            "LookupError",
                                             "Exception",
                                             "BaseException"):
                                     return True
@@ -8279,6 +8647,30 @@ def _binding_violations(source):
                             try_nodes += (trystar,)
                         mark = []
                         layers = []
+
+                        def _handler_escapes(trobj,
+                                             handler):
+                            # the catching handler lets
+                            # the raise escape: its body
+                            # provably raises (a reraise,
+                            # a foreign del, ...) or the
+                            # try's finally does (a
+                            # raising finally propagates
+                            # past falling handlers too).
+                            def _oc_blocks(node):
+                                return _foreign_del_raises(
+                                    node, (node.lineno,
+                                           node.col_offset))
+                            if not _seq_may_fall(
+                                    handler.body, False,
+                                    parents, _oc_blocks):
+                                return True
+                            return bool(trobj.finalbody) \
+                                and not _seq_may_fall(
+                                    trobj.finalbody,
+                                    False, parents,
+                                    _oc_blocks)
+
                         child = target
                         cursor = target
                         while id(cursor) in parents:
@@ -8308,6 +8700,10 @@ def _binding_violations(source):
                                         cursor.handlers:
                                     if catches_name_error(
                                             handler.type):
+                                        if _handler_escapes(
+                                                cursor,
+                                                handler):
+                                            break
                                         return True, mark, \
                                             []
                             if isinstance(
@@ -8335,6 +8731,22 @@ def _binding_violations(source):
                         return True, mark, wmarks
 
                     declared = class_declared()
+
+                    def _del_dead(epos):
+                        # the del at epos never runs
+                        # (an untaken constant branch
+                        # holds it): it unbinds nothing
+                        # and raises nothing.
+                        for node in ast.walk(current):
+                            if isinstance(
+                                    node, ast.Delete) \
+                                    and (node.lineno,
+                                         node.col_offset) \
+                                    == epos:
+                                return _branch_dead(
+                                    node, parents)
+                        return False
+
                     if installs:
                         # replay the class namespace in
                         # execution order: installs bind, a
@@ -8377,6 +8789,8 @@ def _binding_violations(source):
                                     raised_finally,
                                     suppressed):
                                 continue
+                            if is_del and _del_dead(epos):
+                                continue
                             if terminated:
                                 if not is_del:
                                     if not unwound_runs(
@@ -8404,6 +8818,8 @@ def _binding_violations(source):
                                 continue
                             if not is_del:
                                 if _finally_skipped(epos):
+                                    continue
+                                if _body_skipped(epos):
                                     continue
                                 bound = True
                             elif bound:
@@ -8462,6 +8878,8 @@ def _binding_violations(source):
                             if remainder_dead(
                                     dpos, raised,
                                     None, suppressed):
+                                continue
+                            if _del_dead(dpos):
                                 continue
                             if terminated:
                                 continue
@@ -15906,6 +16324,449 @@ class CapturedBytesBinding(unittest.TestCase):
             with self.subTest(shape=name):
                 planted = source
                 for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
+
+    def test_tripwire_catches_r40_plants(self):
+        # adjudication-r39 H-fixes: firing misses (H1a,
+        # H2, H3, H5, H7, H8, H10, H11, H14, H15a,
+        # H15b, plus H6 below 3.14) and silenced
+        # precision (H1b, H4, H9a, H9b, H12a, H12b,
+        # H13, H16, H17, plus H6 on 3.14+): the
+        # recovered horizon (both polarities), the
+        # double synthesis, the raising-del store,
+        # the unreachable loop exit, the
+        # LookupError suppressor, the conditional
+        # annotation, the module alias home, the
+        # loop-wrapped foreign del, the suppressed
+        # compound falls, the consumed except*
+        # member, the rebound group constructor,
+        # starred/nested members, future
+        # annotations, the escaping else, the
+        # escaping handler outcomes, the
+        # unreachable del replay and the
+        # optimized assert.
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        top = "__TOP__"
+        fire = [
+            ('h1a-recovered-horizon-miss',
+             [
+              (anchor,
+               head + '            a = box\n'
+                     + '            mapping = {"slot": a}\n'
+                     + '            alias = mapping\n'
+                     + '            a = {}\n'
+                     + '            mapping = {}\n'
+                     + '            mapping = alias.copy()\n'
+                     + '            *xs, = '
+                     + '[dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h2-double-synthesis-miss',
+             [
+              (anchor,
+               head + '            a = {}\n'
+                     + '            mapping = {"slot": {}}\n'
+                     + '            a = box\n'
+                     + '            mapping["slot"] = a\n'
+                     + '            alias = mapping\n'
+                     + '            a = {}\n'
+                     + '            mapping = {}\n'
+                     + '            mapping = alias.copy()\n'
+                     + '            mapping["extra"] = {}\n'
+                     + '            *xs, = '
+                     + '[dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h3-raising-del-store',
+             [
+              (anchor,
+               head + '            mapping = {"slot": box}\n'
+                     + '            import contextlib\n'
+                     + '            with contextlib.suppress('
+                     + 'NameError):\n'
+                     + '                del missing\n'
+                     + '                mapping["slot"] = {}\n'
+                     + '            *xs, = '
+                     + '[dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h5-lookuperror-suppressor',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            import contextlib\n'
+                     + '            box = {}\n'
+                     + '            class C:\n'
+                     + '                with contextlib.suppress('
+                     + 'NameError):\n'
+                     + '                    with contextlib.'
+                     + 'suppress(LookupError):\n'
+                     + '                        del a_cls\n'
+                     + '                    a_cls = box\n'
+                     + '                a_cls["raw"] = log\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h7-module-alias-home',
+             [
+              (mod,
+               'import builtins as b\n'
+               'alias = b\n'
+               + mod),
+              (anchor,
+               head + '            b = None\n'
+                     + '            old = alias.LookupError\n'
+                     + '            setattr(alias, "LookupError", '
+                     + 'NameError)\n'
+                     + '            try:\n'
+                     + '                try:\n'
+                     + '                    class C:\n'
+                     + '                        del absent\n'
+                     + '                except LookupError:\n'
+                     + '                    pass\n'
+                     + '                results.append('
+                     + '{"raw": log})\n'
+                     + '            finally:\n'
+                     + '                setattr(alias, "LookupError", '
+                     + 'old)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h8-loop-wrapped-foreign-del',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        try:\n'
+                     + '                            del a_cls\n'
+                     + '                        finally:\n'
+                     + '                            for _ in [0]:\n'
+                     + '                                del '
+                     + 'other_absent\n'
+                     + '                            a_cls = box\n'
+                     + '                    finally:\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h10-except-star-consumed',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            try:\n'
+                     + '                raise ExceptionGroup('
+                     + '"mixed", [ValueError(), TypeError()])\n'
+                     + '            except* ValueError:\n'
+                     + '                pass\n'
+                     + '            except* ValueError:\n'
+                     + '                xs[0] = {}\n'
+                     + '            except* TypeError:\n'
+                     + '                xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h11-rebound-group-ctor',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            ExceptionGroup = '
+                     + 'lambda *args: TypeError()\n'
+                     + '            try:\n'
+                     + '                raise ExceptionGroup('
+                     + '"mixed", [ValueError(), TypeError()])\n'
+                     + '            except* ValueError:\n'
+                     + '                xs[0] = {}\n'
+                     + '            except* TypeError:\n'
+                     + '                xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h14-else-escapes-handlers',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        try:\n'
+                     + '                            pass\n'
+                     + '                        except NameError:\n'
+                     + '                            pass\n'
+                     + '                        else:\n'
+                     + '                            del '
+                     + 'other_absent\n'
+                     + '                        a_cls = box\n'
+                     + '                    finally:\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h15a-reraise-escapes',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        try:\n'
+                     + '                            del a_cls\n'
+                     + '                        except NameError:\n'
+                     + '                            raise\n'
+                     + '                        a_cls = box\n'
+                     + '                    finally:\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('h15b-foreign-del-escapes',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        try:\n'
+                     + '                            del a_cls\n'
+                     + '                        except NameError:\n'
+                     + '                            del '
+                     + 'missing_foreign\n'
+                     + '                        a_cls = box\n'
+                     + '                    finally:\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+        ]
+        h6 = ('h6-conditional-annotation-312',
+              [
+               (anchor,
+                head + '            class C:\n'
+                      + '                if False:\n'
+                      + '                    missing[0]: int\n'
+                      + '                del __annotations__\n'
+                      + '            results.append('
+                      + '{"raw": log})\n'
+                + use),
+              ],
+              'tainted path escapes to results.append()')
+        silent = [
+            ('h1b-recovered-horizon-alarm',
+             [
+              (anchor,
+               head + '            a = {}\n'
+                     + '            mapping = {"slot": a}\n'
+                     + '            alias = mapping\n'
+                     + '            a = box\n'
+                     + '            mapping = {}\n'
+                     + '            mapping = alias.copy()\n'
+                     + '            *xs, = '
+                     + '[dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ]),
+            ('h4-unreachable-loop-exit',
+             [
+              (anchor,
+               head + '            for _ in [0]:\n'
+                     + '                if False:\n'
+                     + '                    break\n'
+                     + '                class C:\n'
+                     + '                    del missing\n'
+                     + '            results.append('
+                     + '{"raw": log})\n'
+               + use),
+             ]),
+            ('h9a-match-suppressed-fall',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            import contextlib\n'
+                     + '            with contextlib.suppress('
+                     + 'ZeroDivisionError):\n'
+                     + '                match 1 / 0:\n'
+                     + '                    case _:\n'
+                     + '                        pass\n'
+                     + '            xs[0] = {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ]),
+            ('h9b-if-suppressed-fall',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            import contextlib\n'
+                     + '            with contextlib.suppress('
+                     + 'ZeroDivisionError):\n'
+                     + '                if 1 / 0:\n'
+                     + '                    pass\n'
+                     + '            xs[0] = {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ]),
+            ('h12a-starred-members',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            try:\n'
+                     + '                raise ExceptionGroup('
+                     + '"mixed", [*[ValueError(), '
+                     + 'TypeError()]])\n'
+                     + '            except* ValueError:\n'
+                     + '                xs[0] = {}\n'
+                     + '            except* TypeError:\n'
+                     + '                xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ]),
+            ('h12b-nested-group',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            try:\n'
+                     + '                raise ExceptionGroup('
+                     + '"mixed", [ExceptionGroup("inner", '
+                     + '[ValueError()]), TypeError()])\n'
+                     + '            except* ValueError:\n'
+                     + '                xs[0] = {}\n'
+                     + '            except* TypeError:\n'
+                     + '                xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ]),
+            ('h13-future-annotations-312',
+             [
+              (top,
+               'from __future__ import annotations\n'),
+              (anchor,
+               head + '            class C:\n'
+                     + '                unused: 1 / 0 = None\n'
+                     + '                del missing\n'
+                     + '            results.append('
+                     + '{"raw": log})\n'
+               + use),
+             ]),
+            ('h16-unreachable-del-replay',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            class C:\n'
+                     + '                try:\n'
+                     + '                    pass\n'
+                     + '                finally:\n'
+                     + '                    other = 1\n'
+                     + '                    if False:\n'
+                     + '                        del other\n'
+                     + '                    del other\n'
+                     + '                    a_cls = box\n'
+                     + '                a_cls["raw"] = log\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ]),
+            ('h17-optimized-assert',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            if True:\n'
+                     + '                assert False\n'
+                     + '            xs[0] = {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ]),
+        ]
+        if sys.version_info >= (3, 14):
+            silent.append((h6[0], h6[1]))
+        else:
+            fire.append(h6)
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+        for name, edits in silent:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    if find == top:
+                        planted = repl + planted
+                        continue
                     self.assertEqual(planted.count(find), 1, name)
                     planted = planted.replace(find, repl)
                 self.assertEqual(
