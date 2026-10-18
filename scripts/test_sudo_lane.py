@@ -1798,13 +1798,18 @@ def _copy_display_operand(value, trusted_builtin):
                                           keyword.value)
                         layers.append((key, kval))
                 survivors = []
-                dropped_keys = set()
+                dropped_keys = []
                 for key, val in reversed(layers):
-                    if isinstance(key, ast.Constant) \
-                            and isinstance(key.value, str):
-                        if key.value in dropped_keys:
+                    if isinstance(key, ast.Constant):
+                        # later known keys overwrite
+                        # earlier ones by dict-key
+                        # equality (0 and False are one
+                        # key; NaN never equals, like
+                        # the dict itself).
+                        if any(key.value == seen
+                               for seen in dropped_keys):
                             continue
-                        dropped_keys.add(key.value)
+                        dropped_keys.append(key.value)
                     survivors.append((key, val))
                 survivors.reverse()
                 synth = ast.Dict(
@@ -3105,8 +3110,8 @@ def _binding_violations(source):
                 if isinstance(cursor, (ast.For, ast.AsyncFor)):
                     it = cursor.iter
                     return ((it.lineno, it.col_offset),
-                            (it.end_lineno,
-                             it.end_col_offset))
+                            (_bval.end_lineno,
+                             _bval.end_col_offset))
             return None
 
         def outer(name):
@@ -4940,6 +4945,8 @@ def _binding_violations(source):
 
                 def stmt_of(inner):
                     probe = inner
+                    if isinstance(probe, ast.stmt):
+                        return probe
                     while id(probe) in parents:
                         probe = parents[id(probe)]
                         if isinstance(probe, ast.stmt):
@@ -4987,6 +4994,15 @@ def _binding_violations(source):
                                                 item) is \
                                             store_stmt:
                                         return False
+                                    if isinstance(
+                                            _unwrap_walrus(
+                                                leaf.slice),
+                                            ast.Slice):
+                                        # a slice store
+                                        # shifts indices —
+                                        # the mapping is
+                                        # gone.
+                                        return False
                                     got = const_index(
                                         leaf.slice)
                                     got = norm(got) \
@@ -5033,13 +5049,16 @@ def _binding_violations(source):
                                    item.keywords] \
                                 + [item.func]:
                             for loaded in ast.walk(part):
-                                if isinstance(
+                                if not isinstance(
                                         loaded, ast.Name) \
-                                        and isinstance(
+                                        or not isinstance(
                                             loaded.ctx,
-                                            ast.Load) \
-                                        and loaded.id \
-                                        == cand:
+                                            ast.Load):
+                                    continue
+                                if loaded.id == cand \
+                                        or joined_mate(
+                                            loaded.id,
+                                            ipos):
                                     mentions = True
                                     break
                             if mentions:
@@ -5083,9 +5102,20 @@ def _binding_violations(source):
                             return False
                 if not repl:
                     return False
-                rpos, _, rval = max(repl)
-                return _fresh_value(rval, trusted_ctor) \
-                    and reaches(rpos, horiz)
+                groups = {}
+                for _rpos, _tidx, _rval in repl:
+                    groups.setdefault(
+                        (_rpos, _tidx), []).append(_rval)
+                rpos, _ = max(groups)
+                if not all(_fresh_value(_v, trusted_ctor)
+                           for _v in groups[(rpos, _)]):
+                    # the last group wins; duplicate
+                    # leaves pair ambiguously, so a
+                    # non-fresh contender declines
+                    # (an all-fresh group kills
+                    # regardless of pairing).
+                    return False
+                return reaches(rpos, horiz)
 
             _seen_displays = set()
 
@@ -5105,9 +5135,10 @@ def _binding_violations(source):
                             _seen_displays:
                         _seen_displays.add((value.id,
                                             level))
-                        for disp in name_display_binds(
-                                value.id, capos, func):
-                            resolve(disp, level, capos)
+                        for disp, dpos in \
+                                name_display_binds(
+                                    value.id, capos, func):
+                            resolve(disp, level, dpos)
                     return
                 if isinstance(value, ast.Starred):
                     resolve(value.value, level, capos)
@@ -5140,9 +5171,11 @@ def _binding_violations(source):
                                 _seen_displays:
                             _seen_displays.add((source,
                                                 level))
-                            for disp in name_display_binds(
-                                    source, capos, func):
-                                resolve(disp, level, capos)
+                            for disp, dpos in \
+                                    name_display_binds(
+                                        source, capos,
+                                        func):
+                                resolve(disp, level, dpos)
                     return
                 if isinstance(value, (ast.List, ast.Tuple,
                                         ast.Set)):
@@ -5448,11 +5481,16 @@ def _binding_violations(source):
                         graft_pos[other] = _bpos
                         graft_queue.append((other, _bpos))
             mates.update(graft_seen)
+            # ever-joined membership: a restore keeps
+            # when its source denoted captured at the
+            # restoration (not rebased between its
+            # installation and the restore) — pruning
+            # the source later cannot retro-kill the
+            # already-captured value.
+            ever = set(mates)
             if prune_hi is not None:
                 # drop mates the prune horizon observes
-                # rebased (iterate to a fixpoint: a
-                # restore through a dropped mate
-                # restores nothing).
+                # rebased (iterate to a fixpoint).
                 changed = True
                 while changed:
                     changed = False
@@ -5493,7 +5531,7 @@ def _binding_violations(source):
                             if _lkind == "plain" \
                                     and isinstance(
                                         _lval, ast.Name) \
-                                    and _lval.id in mates \
+                                    and _lval.id in ever \
                                     and not rebased(
                                         _lval.id,
                                         graft_pos.get(
@@ -5504,7 +5542,7 @@ def _binding_violations(source):
                                     and level >= 2 \
                                     and _lval is not None \
                                     and any(
-                                        src in mates
+                                        src in ever
                                         and not rebased(
                                             src,
                                             graft_pos.get(
@@ -5574,9 +5612,10 @@ def _binding_violations(source):
             # NOT one: issubclass is False)
             # (bare or builtins-dotted) yes;
             # other unrebound builtin
-            # exceptions no; anything else
-            # yes — aliasing is unknowable,
-            # fail closed.
+            # exceptions no (a builtins attribute
+            # rebind voids identity too);
+            # anything else yes — aliasing is
+            # unknowable, fail closed.
             if nodetype is None:
                 return True
             if isinstance(nodetype, ast.Tuple):
@@ -5617,7 +5656,9 @@ def _binding_violations(source):
             if isinstance(builtin, type) \
                     and issubclass(
                         builtin, BaseException) \
-                    and spelling not in rebound:
+                    and spelling not in rebound \
+                    and spelling not in \
+                    builtins_attr_binds:
                 return False
             return True
 
@@ -5631,11 +5672,20 @@ def _binding_violations(source):
             # catcher saves it only when the publish
             # sits past the try (or in its handlers /
             # finally) — a publish inside the catching
-            # body after the raise is skipped. Only
-            # provably-raising dels count (no bind of
-            # the name before them in their class);
-            # nested functions are pruned (unknowable
-            # calls fail closed = live).
+            # body after the raise is skipped. A
+            # publish in the finally of a try holding
+            # the del runs before propagation, so it
+            # is live. Only provably-raising dels
+            # count: binding/deletion state replays in
+            # order (a bind installs, a del removes;
+            # conditional events leave Unknown — only
+            # definitely-absent raises), the del must
+            # reach the publish (a skipped del kills
+            # nothing), and a metaclass keyword voids
+            # the must-raise assumption (__prepare__
+            # may supply the name). Nested functions
+            # are pruned (unknowable calls fail
+            # closed = live).
             key = (id(func), call.lineno, call.col_offset)
             if key in _publish_dead_memo:
                 return _publish_dead_memo[key]
@@ -5663,9 +5713,151 @@ def _binding_violations(source):
                 if isinstance(node, try_nodes):
                     trys.append(node)
                 stack.extend(ast.iter_child_nodes(node))
+            def executes(dnode):
+                # the del provably runs (rather than
+                # skipped or dead): every enclosing
+                # branch definite — straight-line,
+                # with-bodies, same-region try parts,
+                # same-pass loop bodies (a pass
+                # running both orders them; a pass
+                # running only the publish is moot),
+                # loops with a proven first pass when
+                # the publish sits outside, and
+                # constant-folded if arms (same-branch
+                # publishes are dead-or-moot) — and no
+                # in-block exit (return/raise/break/
+                # continue/assert) before it.
+                child = dnode
+                probe = dnode
+                while id(probe) in parents:
+                    probe = parents[id(probe)]
+                    if probe is func:
+                        break
+                    if isinstance(probe, ast.If):
+                        branch = probe.body \
+                            if child in probe.body \
+                            else probe.orelse
+                        if any((sub.lineno,
+                                sub.col_offset)
+                               <= ppos
+                               <= (sub.end_lineno,
+                                   sub.end_col_offset)
+                               for sub in branch):
+                            pass
+                        else:
+                            test = _unwrap_walrus(
+                                probe.test)
+                            val = test.value \
+                                if isinstance(
+                                    test, ast.Constant) \
+                                else None
+                            if child in probe.body:
+                                if val is not True:
+                                    return False
+                            elif val is not False:
+                                return False
+                    elif isinstance(
+                            probe,
+                            (ast.For, ast.AsyncFor,
+                             ast.While)):
+                        if (probe.lineno,
+                                probe.col_offset) \
+                                <= ppos \
+                                <= (probe.end_lineno,
+                                    probe.end_col_offset):
+                            pass
+                        elif isinstance(
+                                probe,
+                                (ast.For, ast.AsyncFor)):
+                            itr = _unwrap_walrus(
+                                probe.iter)
+                            if isinstance(
+                                    itr,
+                                    (ast.List, ast.Tuple,
+                                     ast.Set)):
+                                if not any(
+                                        not isinstance(
+                                            elt,
+                                            ast.Starred)
+                                        for elt in
+                                        itr.elts):
+                                    return False
+                            elif isinstance(
+                                    itr, ast.Dict):
+                                if not itr.values:
+                                    return False
+                            elif isinstance(
+                                    itr, ast.Constant) \
+                                    and isinstance(
+                                        itr.value,
+                                        (str, bytes)):
+                                if not itr.value:
+                                    return False
+                            else:
+                                return False
+                        else:
+                            test = _unwrap_walrus(
+                                probe.test)
+                            if not isinstance(
+                                    test, ast.Constant) \
+                                    or test.value \
+                                    is not True:
+                                return False
+                    elif isinstance(probe, ast.Match):
+                        return False
+                    elif isinstance(probe, try_nodes):
+                        regions = [probe.body,
+                                   probe.handlers,
+                                   probe.orelse,
+                                   probe.finalbody]
+                        same = False
+                        for region in regions:
+                            if not any(
+                                    sub is child
+                                    for sub in region):
+                                continue
+                            if any(
+                                    (sub.lineno,
+                                     sub.col_offset)
+                                    <= ppos
+                                    <= (sub.end_lineno,
+                                        sub.end_col_offset)
+                                    for sub in region):
+                                same = True
+                            break
+                        if not same \
+                                and child not in \
+                                probe.body \
+                                and child not in \
+                                probe.finalbody:
+                            return False
+                    child = probe
+                parent = parents.get(id(dnode))
+                seqs = []
+                if parent is not None:
+                    for field in ("body", "orelse",
+                                  "finalbody"):
+                        seq = getattr(parent, field, None)
+                        if isinstance(seq, list) \
+                                and dnode in seq:
+                            seqs = seq
+                            break
+                for stmt in seqs:
+                    if stmt is dnode:
+                        break
+                    if isinstance(
+                            stmt,
+                            (ast.Return, ast.Raise,
+                             ast.Break, ast.Continue,
+                             ast.Assert)):
+                        return False
+                return True
+
             dead = False
             for rpos, name, dnode in raises:
                 if not rpos < ppos:
+                    continue
+                if not executes(dnode):
                     continue
                 home = None
                 cursor = dnode
@@ -5681,9 +5873,82 @@ def _binding_violations(source):
                         break
                 if home is None:
                     continue
-                binds = scope_binds.get(
-                    id(home), {}).get(name, [])
-                if any(bpos < rpos for bpos, _, _ in binds):
+                if home.keywords:
+                    continue
+                events = [
+                    (bpos, True)
+                    for bpos, _, _ in scope_binds.get(
+                        id(home), {}).get(name, [])
+                    if bpos < rpos]
+                # class-level dels only (nested
+                # scopes bind and delete locally).
+                delstack = [home]
+                while delstack:
+                    top = delstack.pop()
+                    for sub in ast.iter_child_nodes(top):
+                        if isinstance(
+                                sub,
+                                (ast.FunctionDef,
+                                 ast.AsyncFunctionDef,
+                                 ast.Lambda,
+                                 ast.ClassDef)):
+                            continue
+                        if isinstance(sub, ast.Delete):
+                            for target in sub.targets:
+                                if isinstance(
+                                        target,
+                                        ast.Name) \
+                                        and target.id \
+                                        == name:
+                                    dpos = (
+                                        target.lineno,
+                                        target.col_offset)
+                                    if dpos < rpos:
+                                        events.append(
+                                            (dpos, False))
+                        delstack.append(sub)
+                present = False
+                unknown = False
+                for epos, is_bind in sorted(events):
+                    definite = reaches(epos, rpos)
+                    if is_bind:
+                        if definite:
+                            present = True
+                            unknown = False
+                        else:
+                            unknown = True
+                    elif present and not unknown:
+                        if definite:
+                            present = False
+                        else:
+                            unknown = True
+                    elif not present and not unknown:
+                        pass
+                    else:
+                        unknown = True
+                if unknown or present:
+                    continue
+                finally_live = False
+                for trobj in trys:
+                    tspan = ((trobj.lineno, trobj.col_offset),
+                             (trobj.end_lineno,
+                              trobj.end_col_offset))
+                    if not tspan[0] <= rpos <= tspan[1]:
+                        continue
+                    if any((sub.lineno, sub.col_offset)
+                           <= rpos
+                           <= (sub.end_lineno,
+                               sub.end_col_offset)
+                           for sub in trobj.finalbody):
+                        continue
+                    if any((sub.lineno, sub.col_offset)
+                           <= ppos
+                           <= (sub.end_lineno,
+                               sub.end_col_offset)
+                           for sub in trobj.finalbody):
+                        finally_live = True
+                        break
+                if finally_live:
                     continue
                 saved = False
                 for trobj in trys:
@@ -5717,25 +5982,37 @@ def _binding_violations(source):
             return dead
 
         def name_display_binds(name, capos, scope):
-            # display values the name may denote as of
-            # capos (capture/store time): plain binds
+            # (display, bind_pos) the name may denote as
+            # of capos (capture/store time): plain binds
             # at/before capos whose unwrapped value is a
-            # dict/list/tuple/set display. Aliases cost
-            # no depth; rebound-away (post-capos) binds
-            # excluded. For-targets excluded (they bind
-            # elements, not the display).
+            # dict/list/tuple/set display, surviving to
+            # capos (a later definite bind replaces the
+            # display; conditional rebinds keep both,
+            # fail-closed). Aliases cost no depth;
+            # rebound-away (post-capos) binds excluded.
+            # For-targets excluded (they bind elements,
+            # not the display). Contained names resolve
+            # as-of the display's bind (binding-time
+            # object provenance), not the capture.
             home = home_scope_for(name, scope, capos)
             if home is None:
                 home = scope
+            allbinds = scope_binds.get(
+                id(home), {}).get(name, [])
             displays = []
-            for bpos, bkind, bval in scope_binds.get(
-                    id(home), {}).get(name, []):
+            for bpos, bkind, bval in allbinds:
                 if bpos > capos or bkind != "plain":
                     continue
                 bval = _unwrap_walrus(bval)
-                if isinstance(bval, (ast.Dict, ast.List,
-                                     ast.Tuple, ast.Set)):
-                    displays.append(bval)
+                if not isinstance(
+                        bval, (ast.Dict, ast.List,
+                               ast.Tuple, ast.Set)):
+                    continue
+                if any(bpos < later <= capos
+                       and reaches(later, capos)
+                       for later, _, _ in allbinds):
+                    continue
+                displays.append((bval, bpos))
             return displays
 
         def home_scope_for(photoname, scope, spos):
@@ -5874,28 +6151,99 @@ def _binding_violations(source):
 
                     tries = class_trys()
 
-                    def try_part(pos):
-                        # (innermost try id, part)
-                        # containing pos, or (None, None).
-                        # Containing spans nest, so the
-                        # latest start wins.
-                        best = (None, None)
-                        best_start = None
+                    def try_chain(pos):
+                        # all (tid, part) enclosing pos,
+                        # innermost first (containing
+                        # spans nest; a try contributes
+                        # at most one part).
+                        found = []
                         for tid, parts in tries.items():
                             for part, spans in parts.items():
                                 for span_start, span_end in \
                                         spans:
                                     if span_start <= pos \
-                                            <= span_end \
-                                            and (
-                                                best_start
-                                                is None
-                                                or span_start
-                                                > best_start):
-                                        best = (tid, part)
-                                        best_start = \
-                                            span_start
-                        return best
+                                            <= span_end:
+                                        found.append(
+                                            (tid, part,
+                                             span_start,
+                                             span_end))
+                                        break
+                        found.sort(key=lambda t: t[3])
+                        found.sort(key=lambda t: t[2],
+                                   reverse=True)
+                        return [(tid, part)
+                                for tid, part, _, _
+                                in found]
+
+                    def remainder_dead(pos, raised):
+                        # pos sits in a dead try-body
+                        # remainder (or a skipped else):
+                        # some enclosing try raised
+                        # before it and pos follows the
+                        # raising child. A finally nested
+                        # in the remainder still runs
+                        # (unwind runs finallys), as does
+                        # anything before the raise.
+                        for tid, part in try_chain(pos):
+                            if part not in ("body",
+                                            "orelse"):
+                                continue
+                            if tid in raised \
+                                    and pos > raised[tid]:
+                                return True
+                        return False
+
+                    def try_span(tid):
+                        starts = []
+                        ends = []
+                        for spans in tries[tid].values():
+                            for start, end in spans:
+                                starts.append(start)
+                                ends.append(end)
+                        return (min(starts), max(ends))
+
+                    def unwound_runs(pos, term_pos):
+                        # pos runs during unwind past an
+                        # uncaught raise at term_pos: in a
+                        # finally on the unwind stack (a
+                        # try enclosing the raise), or
+                        # normally inside one (bodies run,
+                        # handlers and elses stay
+                        # conditional).
+                        chain = try_chain(pos)
+                        if not chain:
+                            return False
+
+                        def on_stack(tid):
+                            start, end = try_span(tid)
+                            return start <= term_pos <= end
+
+                        def in_finalbody(tid, uid):
+                            start, end = try_span(tid)
+                            return any(
+                                fstart <= start
+                                and end <= fend
+                                for fstart, fend in
+                                tries[uid]["finalbody"])
+                        normal = set()
+                        outer_first = list(reversed(chain))
+                        for idx, (tid, _part) in enumerate(
+                                outer_first):
+                            for uid, _ in outer_first[:idx]:
+                                if not in_finalbody(
+                                        tid, uid):
+                                    continue
+                                if on_stack(uid) \
+                                        or uid in normal:
+                                    normal.add(tid)
+                                    break
+                        innermost, part = chain[0]
+                        if part == "finalbody":
+                            return on_stack(innermost) \
+                                or innermost in normal
+                        if part == "body":
+                            return innermost in normal
+                        return False
 
                     def del_catch_info(dpos):
                         # (caught, mark) for the del at dpos,
@@ -5905,11 +6253,13 @@ def _binding_violations(source):
                         # class has a catching handler (a
                         # catcher past the class still ends
                         # the class body — only finally
-                        # runs). mark: class try bodies that
+                        # runs). mark: (tid, raising-child
+                        # end) for class try bodies that
                         # raised on the way (their
-                        # remainders and elses are dead).
-                        # try orelse/finally/handler bodies
-                        # do not catch their own errors.
+                        # remainders past the child and
+                        # elses are dead). try orelse/
+                        # finally/handler bodies do not
+                        # catch their own errors.
                         target = None
                         for cand in ast.walk(current):
                             if isinstance(cand, ast.Delete) \
@@ -5937,7 +6287,10 @@ def _binding_violations(source):
                                             for sub in
                                             cursor.body):
                                 if id(cursor) in tries:
-                                    mark.append(id(cursor))
+                                    mark.append(
+                                        (id(cursor),
+                                         (child.end_lineno,
+                                          child.end_col_offset)))
                                 for handler in \
                                         cursor.handlers:
                                     if catches_name_error(
@@ -5979,15 +6332,14 @@ def _binding_violations(source):
                             return tree
                         bound = False
                         terminated = False
-                        raised = set()
+                        term_pos = None
+                        raised = {}
                         for epos, is_del in sorted(events):
-                            tid, part = try_part(epos)
-                            if tid in raised \
-                                    and part in ("body",
-                                                 "orelse"):
+                            if remainder_dead(epos, raised):
                                 continue
                             if terminated:
-                                if part != "finalbody":
+                                if not unwound_runs(
+                                        epos, term_pos):
                                     continue
                                 if not is_del:
                                     bound = True
@@ -6001,9 +6353,12 @@ def _binding_violations(source):
                             else:
                                 caught, mark = \
                                     del_catch_info(epos)
-                                raised.update(mark)
+                                for tid, cend in mark:
+                                    raised.setdefault(
+                                        tid, cend)
                                 if not caught:
                                     terminated = True
+                                    term_pos = epos
                         if terminated:
                             # only finally-effects observe
                             # the exceptional state (whether
@@ -6011,16 +6366,13 @@ def _binding_violations(source):
                             # decided at the publish — a
                             # downstream publish the raise
                             # propagates past is dead).
-                            _, part = try_part(spos)
-                            if part != "finalbody":
+                            if not unwound_runs(
+                                    spos, term_pos):
                                 return current
                             if bound:
                                 return current
                             return tree
-                        tid, part = try_part(spos)
-                        if tid in raised \
-                                and part in ("body",
-                                             "orelse"):
+                        if remainder_dead(spos, raised):
                             return current
                         if bound:
                             return current
@@ -6031,29 +6383,26 @@ def _binding_violations(source):
                         if is_del and dpos < spos]
                     if dels_before:
                         terminated = False
-                        raised = set()
+                        term_pos = None
+                        raised = {}
                         for dpos in sorted(dels_before):
-                            tid, part = try_part(dpos)
-                            if tid in raised \
-                                    and part in ("body",
-                                                 "orelse"):
+                            if remainder_dead(dpos, raised):
                                 continue
                             if terminated:
                                 continue
                             caught, mark = \
                                 del_catch_info(dpos)
-                            raised.update(mark)
+                            for tid, cend in mark:
+                                raised.setdefault(tid, cend)
                             if not caught:
                                 terminated = True
+                                term_pos = dpos
                         if terminated:
-                            _, part = try_part(spos)
-                            if part != "finalbody":
+                            if not unwound_runs(
+                                    spos, term_pos):
                                 return current
                             return tree
-                        tid, part = try_part(spos)
-                        if tid in raised \
-                                and part in ("body",
-                                             "orelse"):
+                        if remainder_dead(spos, raised):
                             return current
                         return tree
                     if declared:
@@ -6390,7 +6739,7 @@ def _binding_violations(source):
                                     _seen_nested:
                                 _seen_nested.add(
                                     (consumed.id, level))
-                                for disp in \
+                                for disp, _ in \
                                         name_display_binds(
                                             consumed.id,
                                             horizon, scope):
@@ -6434,7 +6783,7 @@ def _binding_violations(source):
                                         _seen_nested:
                                     _seen_nested.add(
                                         (source, level))
-                                    for disp in \
+                                    for disp, _ in \
                                             name_display_binds(
                                                 source,
                                                 horizon,
@@ -6865,6 +7214,45 @@ def _binding_violations(source):
                         wkey = order_key(walrus)
                         if wkey is None:
                             return True
+
+                        def executes(store):
+                            # a walrus store counts only when
+                            # it provably runs: short-circuit
+                            # right operands (BoolOp tails,
+                            # IfExp arms), comprehension
+                            # interiors (possibly empty) and
+                            # lambda/generator bodies
+                            # (deferred) may never execute.
+                            probe = store
+                            while probe is not batch \
+                                    and id(probe) in parents:
+                                child = probe
+                                probe = parents[id(probe)]
+                                if isinstance(
+                                        probe, ast.BoolOp) \
+                                        and child is not \
+                                        probe.values[0]:
+                                    return False
+                                if isinstance(
+                                        probe, ast.IfExp) \
+                                        and child is not \
+                                        probe.test:
+                                    return False
+                                if isinstance(
+                                        probe,
+                                        ast.comprehension):
+                                    return False
+                                if isinstance(
+                                        probe, ast.Lambda) \
+                                        and child is not \
+                                        probe.args:
+                                    return False
+                                if isinstance(
+                                        probe,
+                                        ast.GeneratorExp):
+                                    return False
+                            return True
+
                         if event[4] == source:
                             # a retainer that rebinds the
                             # source itself (a self-alias
@@ -6897,6 +7285,8 @@ def _binding_violations(source):
                                         node, ast.NamedExpr) \
                                         or node.target.id != \
                                         source:
+                                    continue
+                                if not executes(node):
                                     continue
                                 if batch.value is not None \
                                         and any(
@@ -6947,6 +7337,8 @@ def _binding_violations(source):
                                     node, ast.NamedExpr) \
                                     or node.target.id != \
                                     source:
+                                continue
+                            if not executes(node):
                                 continue
                             if batch.value is not None \
                                     and any(
@@ -11987,6 +12379,318 @@ class CapturedBytesBinding(unittest.TestCase):
                      + '            xs[0] = {}\n'
                      + '            xs[0]["raw"] = log\n'
                      + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+        ]
+        for name, edits in cases:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                self.assertEqual(
+                    _binding_violations(planted), [], name)
+
+    def test_tripwire_catches_r36_plants(self):
+        # adjudication-r35 D-fixes, firing placements:
+        # reachable publishes (D1a/D1b), the rebound
+        # builtins handler (D2), restoration-time
+        # liveness (D3), the skipped fresh walrus
+        # (D4), index-shift invalidations (D5a/D5b),
+        # same-statement order (D6), duplicate
+        # indexed targets incl. the documented-FP
+        # reversed control (D7/D7b), the nested
+        # skipped install (D8) and the for-iterator
+        # late store (D9).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        fire = [
+            ('d1a-dead-publish-if-false',
+             [
+              (anchor,
+               head + '            if False:\n'
+                     + '                class C:\n'
+                     + '                    del a_cls\n'
+                     + '            results.append({"raw": log})\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d1b-dead-publish-finally',
+             [
+              (anchor,
+               head + '            try:\n'
+                     + '                class C:\n'
+                     + '                    del a_cls\n'
+                     + '            finally:\n'
+                     + '                results.append({"raw": log})\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d2-builtins-lookuperror-rebind',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            import builtins\n'
+                     + '            old = builtins.LookupError\n'
+                     + '            builtins.LookupError = NameError\n'
+                     + '            try:\n'
+                     + '                box = {}\n'
+                     + '                a_cls = box\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        del a_cls\n'
+                     + '                    except LookupError:\n'
+                     + '                        pass\n'
+                     + '                    a_cls["raw"] = log\n'
+                     + '                results.append(module_box)\n'
+                     + '            finally:\n'
+                     + '                builtins.LookupError = old\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d3-prune-rebound-restore-source',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            a = box\n'
+                     + '            p = box\n'
+                     + '            a = {}\n'
+                     + '            if True:\n'
+                     + '                a = p\n'
+                     + '            p = {}\n'
+                     + '            box = {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(a)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d4-skipped-fresh-walrus',
+             [
+              (anchor,
+               head + '            box = {"row": {}}\n'
+                     + '            sink = {}\n'
+                     + '            cp,sink[((box:=box),0)[1]],sink[((False and (box:={"row":{}})),0)[1]],sink[((keep:=box),1)[1]],box=box.copy(),0,0,0,{"row":{}}\n'
+                     + '            cp["row"]["raw"] = log\n'
+                     + '            results.append(keep)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d5a-slice-shift-after-replace',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [{}, box]\n'
+                     + '            ys = xs\n'
+                     + '            xs[0] = {}\n'
+                     + '            xs[:1] = []\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d5b-alias-reverse-after-replace',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [{}, box]\n'
+                     + '            ys = xs\n'
+                     + '            xs[0] = {}\n'
+                     + '            ys.reverse()\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d6-same-statement-store-before-replace',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box]\n'
+                     + '            xs[0]["raw"], xs[0] = log, {}\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d7-duplicate-indexed-targets',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box, {}]\n'
+                     + '            xs[0], xs[0] = {}, box\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d7b-duplicate-indexed-targets-reversed',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [box, {}]\n'
+                     + '            xs[0], xs[0] = box, {}\n'
+                     + '            xs[0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d8-nested-try-skipped-install',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            a_cls = box\n'
+                     + '            class C:\n'
+                     + '                try:\n'
+                     + '                    del a_cls\n'
+                     + '                    try:\n'
+                     + '                        a_cls = box\n'
+                     + '                    except* NameError:\n'
+                     + '                        pass\n'
+                     + '                except NameError:\n'
+                     + '                    pass\n'
+                     + '                a_cls["raw"] = log\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             'tainted path escapes to results.append()'),
+            ('d9-for-iter-late-store',
+             [
+              (anchor,
+               head + '            def clean(self):\n'
+                     + '                return b"CLEAN"\n'
+                     + '            def f():\n'
+                     + '                w = Path.read_bytes\n'
+                     + '                for ignored in ((rb := w), (w := clean)):\n'
+                     + '                    pass\n'
+                     + '                Path.r = rb\n'
+                     + '                ignored = decode_body_log(log.r())\n'
+                     + '                results.append(ignored)\n'
+                     + '            f()\n'
+               + use),
+             ],
+             'tainted path escapes to log.r()'),
+        ]
+        for name, edits, fragment in fire:
+            with self.subTest(shape=name):
+                planted = source
+                for find, repl in edits:
+                    self.assertEqual(planted.count(find), 1, name)
+                    planted = planted.replace(find, repl)
+                violations = _binding_violations(planted)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_allows_r36_shapes(self):
+        # adjudication-r35 D-fixes, silent placements:
+        # the inner-wrapped finally install (D8b),
+        # non-string pair-key overwrite (D10),
+        # binding-time mapping state (D11a/D11b) and
+        # the double-delete unreachable publish
+        # (D12).
+        source = Path(lane.__file__).read_text()
+        anchor = ("            code, timed_out, captured = "
+                  "run_logged([str(cli), *args], log, 180, "
+                  "cwd=root, env=env)\n"
+                  "            output = decode_body_log(captured)\n")
+        head = ("            code, timed_out, captured = "
+                "run_logged([str(cli), *args], log, 180, "
+                "cwd=root, env=env)\n")
+        use = "            output = decode_body_log(captured)\n"
+        mod = "def execute("
+        cases = [
+            ('d8b-finally-install-inner-wrapped',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            a_cls = box\n'
+                     + '            try:\n'
+                     + '                class C:\n'
+                     + '                    try:\n'
+                     + '                        del a_cls\n'
+                     + '                    finally:\n'
+                     + '                        try:\n'
+                     + '                            a_cls = box\n'
+                     + '                        except NameError:\n'
+                     + '                            pass\n'
+                     + '                        a_cls["raw"] = log\n'
+                     + '            except NameError:\n'
+                     + '                pass\n'
+                     + '            results.append(module_box)\n'
+               + use),
+             ],
+             ),
+            ('d10-nonstring-pair-keys',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            *xs, = [dict([(0, box), (False, {})])]\n'
+                     + '            xs[0][0]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('d11a-obsolete-mapping-rebind',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            mapping = {"slot": box}\n'
+                     + '            mapping = {"slot": {}}\n'
+                     + '            *xs, = [dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('d11b-obsolete-mapping-box-rebind',
+             [
+              (anchor,
+               head + '            box = {}\n'
+                     + '            mapping = {"slot": box}\n'
+                     + '            box = {}\n'
+                     + '            *xs, = [dict(mapping.copy(), extra={})]\n'
+                     + '            xs[0]["slot"]["raw"] = log\n'
+                     + '            results.append(box)\n'
+               + use),
+             ],
+             ),
+            ('d12-double-delete-unreachable',
+             [
+              (mod,
+               'module_box = {}\n'
+               'a_cls = module_box\n'
+               + mod),
+              (anchor,
+               head + '            box = {}\n'
+                     + '            class C:\n'
+                     + '                try:\n'
+                     + '                    a_cls = box\n'
+                     + '                    del a_cls\n'
+                     + '                    del a_cls\n'
+                     + '                finally:\n'
+                     + '                    a_cls["raw"] = log\n'
+                     + '            results.append(module_box)\n'
                + use),
              ],
              ),
