@@ -97,14 +97,21 @@ jobs:
       - name: working bpftool for the link oracle
         # The image's /usr/sbin/bpftool is a stub (rc=2): azure
         # linux-tools ship no bpftool binary and noble has no
-        # bpftool package. The lane's link-count oracle shells out
-        # to `bpftool`, so take the generic-tools binary and shadow
-        # the stub via /usr/local/bin (first in PATH, including
-        # sudo's secure_path). Fail fast if the oracle stays broken.
+        # bpftool package. On resolute+ linux-tools still ship no
+        # bpftool, but a real bpftool package exists
+        # (/usr/sbin/bpftool). The lane's link-count oracle shells
+        # out to `bpftool`, so take the generic-tools binary when
+        # present, else the bpftool package, and shadow the stub
+        # via /usr/local/bin (first in PATH, including sudo's
+        # secure_path). Fail fast if the oracle stays broken.
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-generic
           REAL=$(find /usr/lib/linux-tools -name bpftool | head -1)
+          if [ -z "$REAL" ]; then
+            sudo apt-get install -y bpftool
+            REAL=$(command -v bpftool)
+          fi
           test -n "$REAL"
           sudo ln -sf "$REAL" /usr/local/bin/bpftool
           sudo bpftool link show
