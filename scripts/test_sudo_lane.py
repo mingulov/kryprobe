@@ -1550,6 +1550,29 @@ def _uncond_raises_expr(node):
     return any(True for _ in _always_eval_divs(node))
 
 
+def _signed_numeric(node):
+    # plain numeric constant, unwrapping one
+    # unary +/- (P4: -1 parses as UnaryOp, not
+    # Constant). None otherwise.
+    if isinstance(node, ast.Constant) \
+            and isinstance(
+                node.value, (int, float, complex)) \
+            and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) \
+            and isinstance(
+                node.op, (ast.UAdd, ast.USub)) \
+            and isinstance(node.operand, ast.Constant) \
+            and isinstance(
+                node.operand.value,
+                (int, float, complex)) \
+            and not isinstance(node.operand.value, bool):
+        value = node.operand.value
+        return value if isinstance(node.op, ast.UAdd) \
+            else -value
+    return None
+
+
 def _const_call_raises(node, parents):
     # True when a single-argument builtin call
     # provably raises (O10): an unshadowed
@@ -1559,6 +1582,16 @@ def _const_call_raises(node, parents):
     # hostile literal cannot burn analyzer
     # time; multi-arg, keyword and starred
     # forms stay out (minimal scope).
+    # bytes(int) never evaluates natively:
+    # allocation is proportional to the value,
+    # a resource decision rather than a
+    # semantic one — negative raises
+    # ValueError symbolically, anything else
+    # proves nothing (P4). Only semantic
+    # failures (ValueError, TypeError,
+    # OverflowError) count; resource failures
+    # (MemoryError, RecursionError) depend on
+    # the machine and never prove (P4).
     if not isinstance(node, ast.Call):
         return False
     if len(node.args) != 1 or node.keywords:
@@ -1576,10 +1609,17 @@ def _const_call_raises(node, parents):
                             func.id):
         return False
     arg = _unwrap_walrus(node.args[0])
-    if isinstance(arg, ast.Starred) \
-            or not isinstance(arg, ast.Constant):
+    if isinstance(arg, ast.Starred):
         return False
-    value = arg.value
+    if isinstance(arg, ast.Constant):
+        value = arg.value
+    else:
+        value = _signed_numeric(arg)
+        if value is None:
+            return False
+    if func.id == "bytes" \
+            and isinstance(value, int):
+        return value < 0
     if isinstance(value, (str, bytes)) \
             and len(value) > 1000:
         return False
@@ -1589,8 +1629,10 @@ def _const_call_raises(node, parents):
         return False
     try:
         getattr(builtins, func.id)(value)
-    except Exception:
+    except (ValueError, TypeError, OverflowError):
         return True
+    except Exception:
+        return False
     return False
 
 
@@ -1708,6 +1750,50 @@ def _ordered_prefix(parts):
     return None
 
 
+def _display_segments(node):
+    # construction segments of a set/dict
+    # display in evaluation order (P12):
+    # maximal runs of plain members/pairs
+    # form one BUILD batch (every part
+    # evaluates, then every member/key
+    # hashes — first-hand both interpreters,
+    # with or without unpacking elsewhere),
+    # while each starred/dstar part evaluates
+    # and merges in place. Yields ("plain",
+    # run) with run = unwrapped elements
+    # (set) or (key, value) pairs (dict),
+    # or ("star", unwrapped value expr).
+    if isinstance(node, ast.Set):
+        run = []
+        for elt in node.elts:
+            plain = _unwrap_walrus(elt)
+            if isinstance(plain, ast.Starred):
+                if run:
+                    yield ("plain", run)
+                    run = []
+                yield ("star",
+                       _unwrap_walrus(plain.value))
+            else:
+                run.append(plain)
+        if run:
+            yield ("plain", run)
+    elif isinstance(node, ast.Dict):
+        run = []
+        for key, value in zip(node.keys,
+                              node.values):
+            if key is None:
+                if run:
+                    yield ("plain", run)
+                    run = []
+                yield ("star",
+                       _unwrap_walrus(value))
+            else:
+                run.append((_unwrap_walrus(key),
+                            _unwrap_walrus(value)))
+        if run:
+            yield ("plain", run)
+
+
 def _div_prefix_exprs(node):
     # subexpressions evaluated before the first
     # always-evaluated divzero inside node, in
@@ -1758,74 +1844,68 @@ def _div_prefix_exprs(node):
     if isinstance(node, (ast.List, ast.Tuple)):
         return _ordered_prefix(list(node.elts))
     if isinstance(node, ast.Set):
-        # unpacking forces incremental
-        # construction: earlier members hash
-        # (and unpacks merge) before a later
-        # div evaluates — prove them harmless
-        # (hashable/quiet) or fail closed.
-        # Plain sets hash after all evals: the
-        # eval prefix suffices (O11).
-        elts = [_unwrap_walrus(elt)
-                for elt in node.elts]
-        if not any(isinstance(elt, ast.Starred)
-                   for elt in elts):
-            return _ordered_prefix(elts)
+        # segment batching (P12): a plain run
+        # evaluates every element before any
+        # hashes (an in-batch div preempts the
+        # hash error); starred parts
+        # evaluate+merge in place; earlier
+        # segments build fully first (O11).
         out = []
-        for elt in elts:
-            if _uncond_raises_expr(elt):
-                sub = _div_prefix_exprs(elt)
-                if sub is None:
+        for kind, part in _display_segments(node):
+            if kind == "star":
+                if _uncond_raises_expr(part):
+                    sub = _div_prefix_exprs(part)
+                    if sub is None:
+                        return None
+                    return out + sub
+                out.append(part)
+                if not _starred_members_quiet(part):
                     return None
-                return out + sub
-            out.append(elt)
-            if isinstance(elt, ast.Starred):
-                if not _starred_members_quiet(
-                        elt.value):
+                continue
+            for elt in part:
+                if _uncond_raises_expr(elt):
+                    sub = _div_prefix_exprs(elt)
+                    if sub is None:
+                        return None
+                    return out + sub
+                out.append(elt)
+            for elt in part:
+                if not _hashable_value(elt):
                     return None
-            elif not _hashable_value(elt):
-                return None
         return None
     if isinstance(node, ast.Dict):
-        # same construction boundary: plain
-        # dicts evaluate all keys/values first
-        # (first-hand); dstar forces per-pair
-        # incremental insert/merge (O11).
-        pairs = [(key, value)
-                 for key, value in zip(node.keys,
-                                       node.values)]
-        if all(key is not None for key, _ in pairs):
-            parts = []
-            for key, value in pairs:
-                parts.append(key)
-                parts.append(value)
-            return _ordered_prefix(parts)
+        # same segment batching for pairs
+        # (P12): keys hash at the batch build,
+        # after every key/value evaluates.
         out = []
-        for key, value in pairs:
-            if key is None:
+        for kind, part in _display_segments(node):
+            if kind == "star":
+                if _uncond_raises_expr(part):
+                    sub = _div_prefix_exprs(part)
+                    if sub is None:
+                        return None
+                    return out + sub
+                out.append(part)
+                merged = _unwrap_walrus(part)
+                if not isinstance(merged, ast.Dict):
+                    return None
+                continue
+            for key, value in part:
+                if _uncond_raises_expr(key):
+                    sub = _div_prefix_exprs(key)
+                    if sub is None:
+                        return None
+                    return out + sub
+                out.append(key)
                 if _uncond_raises_expr(value):
                     sub = _div_prefix_exprs(value)
                     if sub is None:
                         return None
                     return out + sub
                 out.append(value)
-                merged = _unwrap_walrus(value)
-                if not isinstance(merged, ast.Dict):
+            for key, value in part:
+                if not _hashable_value(key):
                     return None
-                continue
-            if _uncond_raises_expr(key):
-                sub = _div_prefix_exprs(key)
-                if sub is None:
-                    return None
-                return out + sub
-            out.append(key)
-            if _uncond_raises_expr(value):
-                sub = _div_prefix_exprs(value)
-                if sub is None:
-                    return None
-                return out + sub
-            out.append(value)
-            if not _hashable_value(key):
-                return None
         return None
     if isinstance(node, ast.JoinedStr):
         return _ordered_prefix(list(node.values))
@@ -2986,6 +3066,21 @@ def _group_all_exceptions(node, trusted):
     return True
 
 
+def _seven_detail_outcome(version):
+    # size-7 SyntaxError details outcome for a
+    # version tuple ("ok" constructs, "raise"
+    # raises TypeError, None unknown on 3.13):
+    # slices [:2] before comparing — a full
+    # version_info 5-tuple never compares
+    # <= (3, 12) (P14).
+    short = tuple(version[:2])
+    if short >= (3, 14):
+        return "ok"
+    if short <= (3, 12):
+        return "raise"
+    return None
+
+
 def _exc_construction(name, node, trusted=None):
     # "ok" when the `name(...)` call provably
     # constructs (any positional count except
@@ -3053,10 +3148,13 @@ def _exc_construction(name, node, trusted=None):
             else:
                 return None
         return "ok"
-    if name == "SyntaxError" and len(positionals) == 2:
+    if name in ("SyntaxError", "IndentationError",
+                  "TabError") \
+            and len(positionals) == 2:
         # details validate only at exactly two
         # positionals (a third never parses
-        # details — first-hand). The info must
+        # details — first-hand), identically
+        # for the subclasses (P8). The info must
         # be a 4/6/7-sequence (first-hand both
         # interpreters: tuples, lists, str and
         # bytes; length 7 constructs on 3.14+
@@ -3083,9 +3181,10 @@ def _exc_construction(name, node, trusted=None):
         if size in (4, 6):
             pass
         elif size == 7:
-            if sys.version_info >= (3, 14):
+            outcome = _seven_detail_outcome(sys.version_info)
+            if outcome == "ok":
                 pass
-            elif sys.version_info <= (3, 12):
+            elif outcome == "raise":
                 return "raise"
             else:
                 return None
@@ -3719,6 +3818,51 @@ def _import_executes_loop(loop_node, imp, parents):
     return True
 
 
+def _use_deferred(use, parents):
+    # True when the use executes after module
+    # load: a function/lambda body, or a lazy
+    # generator part (may consume post-load).
+    # Prologues, class bodies, eager
+    # comprehensions and the genexp's first
+    # iterable evaluate in the enclosing
+    # context — transparent. Module level is
+    # immediate.
+    # (Extracted from _load_unbound_compute
+    # for P6: suppressor authentication
+    # shares the horizon.)
+    child = use
+    cursor = use
+    while id(cursor) in parents:
+        child = cursor
+        cursor = parents[id(cursor)]
+        if isinstance(cursor, ast.comprehension):
+            upper = parents.get(id(cursor))
+            if isinstance(upper, ast.GeneratorExp) \
+                    and upper.generators \
+                    and cursor is upper.generators[0] \
+                    and child is cursor.iter:
+                continue
+            return True
+        if isinstance(cursor, (ast.FunctionDef,
+                               ast.AsyncFunctionDef,
+                               ast.Lambda)):
+            if _prologue_child(cursor, child):
+                continue
+            return True
+        if isinstance(cursor, ast.GeneratorExp):
+            if child is cursor.elt:
+                return True
+            continue
+        if isinstance(cursor, (ast.ClassDef,
+                               ast.ListComp,
+                               ast.SetComp,
+                               ast.DictComp)):
+            continue
+        if isinstance(cursor, ast.Module):
+            return False
+    return False
+
+
 def _import_visible_from(imp, use, parents):
     # True when an `import ... as name` statement
     # binds a scope visible at the use: module
@@ -3776,7 +3920,9 @@ def _contextlib_genuine_compute(root, use, parents):
     # `import contextlib as <root>` in a scope
     # visible at the use (N4), with at least
     # one such import straight-line before the
-    # use (any Store/param/def/except/match/del
+    # use — or anywhere top-level when the use
+    # is deferred past module load (P6)
+    # (any Store/param/def/except/match/del
     # bind, any from-import of the spelling,
     # or a missing/conditional import voids —
     # a shadowed callee never proves
@@ -3791,6 +3937,11 @@ def _contextlib_genuine_compute(root, use, parents):
     base = use
     while id(base) in parents:
         base = parents[id(base)]
+    # P6: the deferred horizon — a use that
+    # executes after module load sees every
+    # top-level import, including ones
+    # textually after the enclosing def.
+    deferred_use = _use_deferred(use, parents)
     found = False
     for cand in ast.walk(base):
         if isinstance(cand, ast.Import):
@@ -3802,7 +3953,18 @@ def _contextlib_genuine_compute(root, use, parents):
                     continue
                 ipos = (cand.lineno, cand.col_offset)
                 if not ipos < upos:
-                    continue
+                    # P6: top-level module statements
+                    # execute in order at load, so a
+                    # deferred use runs after every
+                    # one of them regardless of
+                    # position. Nested imports keep
+                    # the textual order check.
+                    if not deferred_use \
+                            or not isinstance(
+                                base, ast.Module) \
+                            or parents.get(id(cand)) \
+                            is not base:
+                        continue
                 if not _import_visible_from(
                         cand, use, parents):
                     continue
@@ -3895,6 +4057,79 @@ def _contextlib_genuine_compute(root, use, parents):
     return found
 
 
+def _enclosing_children(node):
+    # Children to visit when collecting binds that
+    # belong to the ENCLOSING scope (P9):
+    # comprehension targets bind in the
+    # comprehension scope, not the enclosing one —
+    # descend into iters/conditions/elements (a
+    # NamedExpr there binds enclosing) but never
+    # the target subtrees.
+    if isinstance(node, (ast.ListComp, ast.SetComp,
+                         ast.DictComp, ast.GeneratorExp)):
+        for gen in node.generators:
+            yield gen.iter
+            for cond in gen.ifs:
+                yield cond
+        if isinstance(node, ast.DictComp):
+            yield node.key
+            yield node.value
+        else:
+            yield node.elt
+    else:
+        yield from ast.iter_child_nodes(node)
+
+
+def _def_annotations(node):
+    # Eagerly evaluated annotation positions of
+    # a nested def (P7): parameter annotations
+    # and the return annotation evaluate in the
+    # enclosing scope at def-execution, so a
+    # walrus in one binds enclosing.
+    args = getattr(node, "args", None)
+    parts = []
+    if args is not None:
+        for arg in list(args.posonlyargs) \
+                + list(args.args) \
+                + list(args.kwonlyargs):
+            if arg.annotation is not None:
+                parts.append(arg.annotation)
+        for extra in (args.vararg, args.kwarg):
+            if extra is not None \
+                    and extra.annotation is not None:
+                parts.append(extra.annotation)
+    returns = getattr(node, "returns", None)
+    if returns is not None:
+        parts.append(returns)
+    return parts
+
+
+def _annotations_eager(parents, scope):
+    # True when nested-def annotations evaluate
+    # eagerly (P7): under `from __future__
+    # import annotations` they are strings and a
+    # walrus in one binds nothing.
+    mod = scope
+    while parents is not None \
+            and id(mod) in parents:
+        mod = parents[id(mod)]
+    return not _future_annotations(mod)
+
+
+def _comp_scope_targets(scope):
+    # Spelling binds owned by a comprehension scope
+    # itself: its own targets (P9).  Loads enclosed
+    # by the scope read them; enclosing scopes do
+    # not (see _enclosing_children).
+    found = set()
+    for gen in scope.generators:
+        for cand in ast.walk(gen.target):
+            if isinstance(cand, ast.Name) \
+                    and isinstance(cand.ctx, ast.Store):
+                found.add(cand.id)
+    return found
+
+
 def _scope_binds_spelling(scope, name, parents, upos):
     # True when the scope may bind the spelling where
     # the load can see it: any may-execute bind node
@@ -3908,9 +4143,10 @@ def _scope_binds_spelling(scope, name, parents, upos):
     # must-raise predecessors past the
     # divzero rule, O10) satisfy nothing
     # (N5). Over-approximate otherwise (nested
-    # bodies pruned except their names;
-    # comprehension targets and lambda params
-    # counted as binds): a missed bind never proves
+    # bodies pruned except their names; lambda
+    # params counted as binds; comprehension
+    # targets count only for the comprehension
+    # scope itself, P9): a missed bind never proves
     # unbound, only voids the proof (N4).
     # Global/nonlocal-declared binds hide in pruned
     # bodies; callers scan for those separately.
@@ -3954,7 +4190,15 @@ def _scope_binds_spelling(scope, name, parents, upos):
         return True
 
     def _visit(node, nested):
-        for child in ast.iter_child_nodes(node):
+        if isinstance(node, (ast.ListComp, ast.SetComp,
+                             ast.DictComp, ast.GeneratorExp)) \
+                and node is not scope:
+            # P9: a nested comprehension's targets
+            # bind its own scope, not ours.
+            kids = _enclosing_children(node)
+        else:
+            kids = ast.iter_child_nodes(node)
+        for child in kids:
             if nested and isinstance(
                     child,
                     (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -3964,6 +4208,12 @@ def _scope_binds_spelling(scope, name, parents, upos):
                             or (child.lineno,
                                 child.col_offset) < upos:
                         found.append(child)
+                # P7: eagerly evaluated annotations
+                # bind enclosing too (a walrus in
+                # one binds at def-execution).
+                eager = _def_annotations(child) \
+                    if _annotations_eager(
+                        parents, scope) else []
                 for part in list(child.decorator_list) \
                         + [d for d in
                            getattr(child, 'args', None)
@@ -3976,7 +4226,7 @@ def _scope_binds_spelling(scope, name, parents, upos):
                             child, 'bases', []) or []) \
                         + [k.value for k in
                            getattr(child, 'keywords', [])
-                           or []]:
+                           or []] + eager:
                     _binds_in(part, True)
                 continue
             _binds_in(child, nested)
@@ -4101,8 +4351,9 @@ def _scope_occ_binds(scope, parents):
     # nested def/class names; nested
     # def/class bodies pruned except their
     # prologues (defaults/decorators/bases/
-    # keywords evaluate in the enclosing
-    # scope). None when a star-import makes
+    # keywords/eager annotations evaluate in
+    # the enclosing scope). None when a
+    # star-import makes
     # the set unknowable (abstain). Pure
     # occurrence — no may-fall, so no
     # recursion into fall analysis.
@@ -4141,7 +4392,15 @@ def _scope_occ_binds(scope, parents):
                     found.add(target.id)
 
     def _visit(node):
-        for child in ast.iter_child_nodes(node):
+        if isinstance(node, (ast.ListComp, ast.SetComp,
+                             ast.DictComp, ast.GeneratorExp)) \
+                and node is not scope:
+            # P9: a nested comprehension's targets
+            # bind its own scope, not ours.
+            kids = _enclosing_children(node)
+        else:
+            kids = ast.iter_child_nodes(node)
+        for child in kids:
             if isinstance(
                     child,
                     (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -4154,13 +4413,19 @@ def _scope_occ_binds(scope, parents):
                     item for item in args.kw_defaults
                     if item is not None] \
                     if args is not None else []
+                # P7: eagerly evaluated annotations
+                # bind enclosing too (a walrus in
+                # one binds at def-execution).
+                eager = _def_annotations(child) \
+                    if _annotations_eager(
+                        parents, scope) else []
                 for part in list(child.decorator_list) \
                         + defaults + kw_defaults \
                         + list(getattr(
                             child, "bases", []) or []) \
                         + [key.value for key in
                            getattr(child, "keywords", [])
-                           or []]:
+                           or []] + eager:
                     _collect(part)
                 continue
             _collect(child)
@@ -4200,6 +4465,12 @@ def _scope_occ_binds(scope, parents):
                           ast.AsyncFunctionDef,
                           ast.ClassDef)):
         _type_param_names(scope)
+    if isinstance(scope, (ast.ListComp, ast.SetComp,
+                          ast.DictComp,
+                          ast.GeneratorExp)):
+        # P9: the comprehension scope's own
+        # targets bind this scope.
+        found.update(_comp_scope_targets(scope))
     _collect(scope)
     result = None if unknown else frozenset(found)
     if memo is not None:
@@ -4219,11 +4490,85 @@ def _name_chain_unbound(name, use, parents):
     # recurses into fall analysis: the
     # may-fall Name terminal. Builtins and
     # lane globals excluded by the caller.
+    # P10: the global/nonlocal escape
+    # safeguard mirrors _load_unbound_compute
+    # — a `global missing` writer hides in a
+    # pruned initializer/class body.
     if hasattr(builtins, name):
+        return False
+    chain = _scope_chain(use, parents)
+    if chain:
+        for node in ast.walk(chain[-1]):
+            if isinstance(node, (ast.Global,
+                                 ast.Nonlocal)) \
+                    and name in node.names:
+                return False
+    for scope in chain:
+        binds = _scope_occ_binds(scope, parents)
+        if binds is None or name in binds:
+            return False
+    return True
+
+
+def _scope_has_del_or_nonlocal(scope, name):
+    # True when the scope deletes the spelling
+    # or redirects it to an enclosing cell
+    # (P13): either voids a quiet-builtin load
+    # (UnboundLocalError / unexecuted cell).
+    # Nested def/class bodies pruned (their
+    # dels bind their own cells).
+    found = []
+
+    def _visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                    child,
+                    (ast.FunctionDef, ast.AsyncFunctionDef,
+                     ast.ClassDef)):
+                continue
+            _collect(child)
+
+    def _collect(node):
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
+                for cand in ast.walk(target):
+                    if isinstance(cand, ast.Name) \
+                            and cand.id == name:
+                        found.append(True)
+                        return
+        elif isinstance(node, ast.Nonlocal):
+            if name in node.names:
+                found.append(True)
+                return
+        _visit(node)
+
+    _collect(scope)
+    return bool(found)
+
+
+def _callee_quiet(name, use, parents):
+    # True when a call callee provably loads
+    # quietly (P13): a builtin spelling with no
+    # binding occurrence anywhere in the
+    # enclosing scopes and no del/nonlocal
+    # redirect in any enclosing function or
+    # lambda. Over-strict (class/module binds
+    # and params also void) but sound: loud is
+    # the conservative direction for the
+    # unhashable scan. None-safe.
+    if parents is None:
+        return False
+    if not hasattr(builtins, name):
         return False
     for scope in _scope_chain(use, parents):
         binds = _scope_occ_binds(scope, parents)
         if binds is None or name in binds:
+            return False
+        if isinstance(scope, (ast.FunctionDef,
+                              ast.AsyncFunctionDef,
+                              ast.Lambda)) \
+                and _scope_has_del_or_nonlocal(
+                    scope, name):
             return False
     return True
 
@@ -4247,48 +4592,7 @@ def _load_unbound_compute(name, use, parents):
         return False
     upos = (use.lineno, use.col_offset)
 
-    def _deferred():
-        # True when the use executes after module
-        # load: a function/lambda body, or a lazy
-        # generator part (may consume post-load).
-        # Prologues, class bodies, eager
-        # comprehensions and the genexp's first
-        # iterable evaluate in the enclosing
-        # context — transparent. Module level is
-        # immediate.
-        child = use
-        cursor = use
-        while id(cursor) in parents:
-            child = cursor
-            cursor = parents[id(cursor)]
-            if isinstance(cursor, ast.comprehension):
-                upper = parents.get(id(cursor))
-                if isinstance(upper, ast.GeneratorExp) \
-                        and upper.generators \
-                        and cursor is upper.generators[0] \
-                        and child is cursor.iter:
-                    continue
-                return True
-            if isinstance(cursor, (ast.FunctionDef,
-                                   ast.AsyncFunctionDef,
-                                   ast.Lambda)):
-                if _prologue_child(cursor, child):
-                    continue
-                return True
-            if isinstance(cursor, ast.GeneratorExp):
-                if child is cursor.elt:
-                    return True
-                continue
-            if isinstance(cursor, (ast.ClassDef,
-                                   ast.ListComp,
-                                   ast.SetComp,
-                                   ast.DictComp)):
-                continue
-            if isinstance(cursor, ast.Module):
-                return False
-        return False
-
-    deferred = _deferred()
+    deferred = _use_deferred(use, parents)
     chain = []
     current = use
     first = True
@@ -4654,7 +4958,9 @@ def _del_unbound_local(delnode, parents):
                 bound.add(alias.asname or alias.name)
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             declared.update(node.names)
-        stack.extend(ast.iter_child_nodes(node))
+        # P9: comprehension targets bind the
+        # comprehension scope, not this one.
+        stack.extend(_enclosing_children(node))
     if names & declared:
         return False
     return not (names & bound)
@@ -4711,7 +5017,108 @@ def _for_first_yield(node):
     return None
 
 
-def _iter_unhashable(iter_node):
+def _equality_key(node):
+    # canonical == key for constants and plain
+    # nested displays, None when undecidable
+    # (P1): keys compare equal exactly when the
+    # values compare == (numbers via complex,
+    # so 1 == 1.0 == True; nan keys never
+    # equal, matching nan != nan; dicts/sets
+    # order-free). Anything evaluated (names,
+    # calls, starred) voids — the comparison
+    # may be loud, not a truth value.
+    node = _unwrap_walrus(node)
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool):
+            return ("num", complex(value))
+        if isinstance(value, (int, float, complex)):
+            return ("num", complex(value))
+        if isinstance(value, str):
+            return ("str", value)
+        if isinstance(value, bytes):
+            return ("bytes", value)
+        if value is None:
+            return ("none",)
+        return None
+    if isinstance(node, (ast.List, ast.Tuple)):
+        keys = []
+        for elt in node.elts:
+            elt = _unwrap_walrus(elt)
+            if isinstance(elt, ast.Starred):
+                return None
+            key = _equality_key(elt)
+            if key is None:
+                return None
+            keys.append(key)
+        return ("seq", type(node).__name__, tuple(keys))
+    if isinstance(node, ast.Set):
+        keys = []
+        for elt in node.elts:
+            elt = _unwrap_walrus(elt)
+            if isinstance(elt, ast.Starred):
+                return None
+            key = _equality_key(elt)
+            if key is None:
+                return None
+            keys.append(key)
+        return ("set", frozenset(keys))
+    if isinstance(node, ast.Dict):
+        pairs = []
+        for key, value in zip(node.keys,
+                              node.values):
+            if key is None:
+                return None
+            kkey = _equality_key(key)
+            vkey = _equality_key(value)
+            if kkey is None or vkey is None:
+                return None
+            pairs.append((kkey, vkey))
+        return ("dict", frozenset(pairs))
+    return None
+
+
+def _truthy_value(node):
+    # True/False when the value's truthiness is
+    # provable, None when unknown (P1):
+    # constants (bool), empty/nonempty plain
+    # displays (exact types — no custom
+    # __bool__), and single ==/!= over
+    # decidable operands (proven-quiet: keys
+    # only cover constants and nested plain
+    # displays, which cannot raise).
+    node = _unwrap_walrus(node)
+    if isinstance(node, ast.Constant):
+        return bool(node.value)
+    if isinstance(node, (ast.List, ast.Tuple,
+                         ast.Set)):
+        for elt in node.elts:
+            if isinstance(_unwrap_walrus(elt),
+                           ast.Starred):
+                return None
+        return len(node.elts) > 0
+    if isinstance(node, ast.Dict):
+        for key in node.keys:
+            if key is None:
+                return None
+        return len(node.keys) > 0
+    if isinstance(node, ast.Compare) \
+            and len(node.ops) == 1 \
+            and len(node.comparators) == 1 \
+            and isinstance(node.ops[0],
+                            (ast.Eq, ast.NotEq)):
+        left = _equality_key(node.left)
+        right = _equality_key(node.comparators[0])
+        if left is None or right is None:
+            return None
+        equal = left == right
+        if isinstance(node.ops[0], ast.Eq):
+            return equal
+        return not equal
+    return None
+
+
+def _iter_unhashable(iter_node, parents=None):
     # True when evaluating the for-iterable
     # provably raises TypeError FIRST on an
     # unhashable member: ordered evaluation —
@@ -4719,10 +5126,15 @@ def _iter_unhashable(iter_node):
     # deferred (genexp body, nested def bodies)
     # parts pruned; a loud (may-raise)
     # predecessor voids the claim (unknown
-    # first error). Plain displays evaluate
-    # all parts before hashing; unpacking
-    # forces incremental construction (N9, O1,
-    # O11).
+    # first error). Displays build in
+    # segments: plain runs batch (every part
+    # evaluates before any hashes), starred
+    # parts merge in place (P12; O11's
+    # earlier-segment pins stand).
+    # Conditional evaluation needs an
+    # evaluation proof (BoolOp/IfExp
+    # truthiness, comprehension execution,
+    # resolved builtin callees) (P1, P2, P13).
     def _scan(node):
         # True = TypeError-first proven; False
         # = quiet/done; None = loud predecessor
@@ -4745,72 +5157,56 @@ def _iter_unhashable(iter_node):
                     return found
             return False
         if isinstance(node, ast.Set):
-            unpack = any(
-                isinstance(_unwrap_walrus(elt),
-                           ast.Starred)
-                for elt in node.elts)
-            if not unpack:
-                for elt in node.elts:
-                    found = _scan(elt)
-                    if found is not False:
-                        return found
-                for elt in node.elts:
-                    if _unhashable_value(elt):
-                        return True
-                return False
-            for elt in node.elts:
-                elt = _unwrap_walrus(elt)
-                if isinstance(elt, ast.Starred):
-                    found = _scan(elt.value)
+            # segment batching (P12): a plain run
+            # evaluates every element before any
+            # hashes (an in-batch loud error
+            # preempts the hash error); starred
+            # parts evaluate+merge in place;
+            # earlier segments build fully first
+            # (O11).
+            for kind, part in _display_segments(
+                    node):
+                if kind == "star":
+                    found = _scan(part)
                     if found is not False:
                         return found
                     if _starred_member_unhashable(
-                            elt.value):
+                            part):
                         return True
-                    if _starred_members_quiet(
-                            elt.value):
+                    if _starred_members_quiet(part):
                         continue
                     return None
-                found = _scan(elt)
-                if found is not False:
-                    return found
-                if _unhashable_value(elt):
-                    return True
-            return False
-        if isinstance(node, ast.Dict):
-            unpack = any(key is None
-                         for key in node.keys)
-            if not unpack:
-                for key, value in zip(node.keys,
-                                      node.values):
-                    for part in (key, value):
-                        found = _scan(part)
-                        if found is not False:
-                            return found
-                for key in node.keys:
-                    if _unhashable_value(key):
-                        return True
-                return False
-            for key, value in zip(node.keys,
-                                  node.values):
-                if key is None:
-                    found = _scan(value)
+                for elt in part:
+                    found = _scan(elt)
                     if found is not False:
                         return found
-                    merged = _unwrap_walrus(value)
+                for elt in part:
+                    if _unhashable_value(elt):
+                        return True
+            return False
+        if isinstance(node, ast.Dict):
+            for kind, part in _display_segments(
+                    node):
+                if kind == "star":
+                    found = _scan(part)
+                    if found is not False:
+                        return found
+                    merged = _unwrap_walrus(part)
                     if isinstance(merged, ast.Dict):
                         continue
                     if _expr_quiet(merged):
                         return True
                     return None
-                found = _scan(key)
-                if found is not False:
-                    return found
-                found = _scan(value)
-                if found is not False:
-                    return found
-                if _unhashable_value(key):
-                    return True
+                for key, value in part:
+                    found = _scan(key)
+                    if found is not False:
+                        return found
+                    found = _scan(value)
+                    if found is not False:
+                        return found
+                for key, value in part:
+                    if _unhashable_value(key):
+                        return True
             return False
         if isinstance(node, (ast.List, ast.Tuple)):
             for elt in node.elts:
@@ -4833,26 +5229,43 @@ def _iter_unhashable(iter_node):
                 found = _scan(value)
                 if found is not False:
                     return found
-                lit = _unwrap_walrus(value)
-                if not isinstance(lit, ast.Constant):
+                truthy = _truthy_value(value)
+                if truthy is None:
                     return False
-                if isinstance(node.op, ast.And) \
-                        and not lit.value:
+                if isinstance(node.op, ast.And):
+                    if truthy:
+                        continue
                     return False
-                if isinstance(node.op, ast.Or) \
-                        and lit.value:
+                if truthy:
                     return False
+            return False
+        if isinstance(node, ast.Call):
+            found = _scan(node.func)
+            if found is not False:
+                callee = _unwrap_walrus(node.func)
+                if not isinstance(callee, ast.Name) \
+                        or not isinstance(
+                            callee.ctx, ast.Load) \
+                        or not _callee_quiet(
+                            callee.id, callee, parents):
+                    return found
+            for part in list(node.args) \
+                    + [keyword.value
+                       for keyword in node.keywords]:
+                found = _scan(part)
+                if found is not False:
+                    return found
             return False
         if isinstance(node, ast.IfExp):
             found = _scan(node.test)
             if found is not False:
                 return found
-            test = _unwrap_walrus(node.test)
-            if isinstance(test, ast.Constant):
-                if test.value:
-                    return _scan(node.body)
-                return _scan(node.orelse)
-            return False
+            truthy = _truthy_value(node.test)
+            if truthy is None:
+                return False
+            if truthy:
+                return _scan(node.body)
+            return _scan(node.orelse)
         if isinstance(node, ast.GeneratorExp):
             found = _scan(
                 node.generators[0].iter)
@@ -4862,22 +5275,23 @@ def _iter_unhashable(iter_node):
         if isinstance(node, (ast.ListComp,
                              ast.SetComp,
                              ast.DictComp)):
-            first = node.generators[0].iter
-            found = _scan(first)
-            if found is not False:
-                return found
-            if not _literal_nonempty(first):
-                return False
             for index, gen in enumerate(
                     node.generators):
-                if index:
-                    found = _scan(gen.iter)
-                    if found is not False:
-                        return found
+                found = _scan(gen.iter)
+                if found is not False:
+                    return found
+                if not _literal_nonempty(gen.iter):
+                    return False
+                if _for_first_unpack(
+                        gen.iter, gen.target,
+                        parents) != "ok":
+                    return None
                 for cond in gen.ifs:
                     found = _scan(cond)
                     if found is not False:
                         return found
+                    if _truthy_value(cond) is not True:
+                        return False
             if isinstance(node, ast.DictComp):
                 for part in (node.key, node.value):
                     found = _scan(part)
@@ -4903,7 +5317,8 @@ def _iter_unhashable(iter_node):
     return _scan(iter_node) is True
 
 
-def _for_first_unpack(iter_node, target_node):
+def _for_first_unpack(iter_node, target_node,
+                      parents=None):
     # the first trip's target-assignment
     # outcome: "ok" when it provably succeeds,
     # a must-raise name set when it provably
@@ -4914,7 +5329,7 @@ def _for_first_unpack(iter_node, target_node):
     # (fail closed). Iterable evaluation comes
     # first: an unhashable display member/key
     # raises TypeError before any trip (N9).
-    if _iter_unhashable(iter_node):
+    if _iter_unhashable(iter_node, parents):
         return {"TypeError"}
     target = _unwrap_walrus(target_node)
     if isinstance(target, ast.Name):
@@ -5083,7 +5498,8 @@ def _first_raise_names(body, parents, del_raises,
                     return orelse_names
                 return body_names | orelse_names
             unpack = _for_first_unpack(sub.iter,
-                                       sub.target)
+                                       sub.target,
+                                       parents)
             if unpack is None:
                 return None
             if unpack != "ok":
@@ -5469,12 +5885,92 @@ def _branch_raise_names(stmts, parents, del_raises,
     return out
 
 
+def _eval_terminates(node, parents):
+    # True when evaluating node provably
+    # terminates — completes or raises, never
+    # hangs (P15): quiet exprs (no calls,
+    # comprehensions, subscripts or loads of
+    # user code — finite by form), Name loads
+    # (a value or NameError — no user code
+    # runs), and displays over terminating
+    # parts (unpackings recurse through the
+    # finite-iteration proof — finite implies
+    # terminating there). Calls, comprehensions
+    # (genexps excepted — lazy, but still out),
+    # subscripts, attributes and operators may
+    # run user code and stay out. Hash hangs
+    # via __hash__ stay out, matching the
+    # analysis depth elsewhere.
+    node = _unwrap_walrus(node)
+    if _expr_quiet(node):
+        return True
+    if isinstance(node, ast.Name) \
+            and isinstance(node.ctx, ast.Load):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple,
+                         ast.Set)):
+        return all(_eval_terminates(elt, parents)
+                   for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        for key, value in zip(node.keys,
+                              node.values):
+            if key is None:
+                if not _for_iter_finite(
+                        value, parents):
+                    return False
+            elif not _eval_terminates(key, parents) \
+                    or not _eval_terminates(
+                        value, parents):
+                return False
+        return True
+    return False
+
+
+def _for_never_hangs(cand, stmt, parents):
+    # True when the for provably never hangs
+    # (P3): dead (never executes), deferred
+    # (inside a nested def/lambda body — the
+    # def statement only defines; class
+    # bodies execute inline and stay in),
+    # enclosed by a provably zero-trip loop,
+    # or exiting first pass (break/raise/
+    # return past quiet predecessors — no
+    # second trip; continue re-trips and
+    # stays out).
+    if _dead_bind(cand, parents):
+        return True
+    probe = cand
+    while id(probe) in parents:
+        probe = parents[id(probe)]
+        if probe is stmt:
+            break
+        if isinstance(probe, (ast.FunctionDef,
+                              ast.AsyncFunctionDef,
+                              ast.Lambda)):
+            return True
+        if isinstance(probe, (ast.For, ast.AsyncFor)) \
+                and _literal_empty(
+                    _unwrap_walrus(probe.iter)):
+            return True
+        if isinstance(probe, ast.While):
+            test = _unwrap_walrus(probe.test)
+            if isinstance(test, ast.Constant) \
+                    and not test.value:
+                return True
+    first = _first_meaningful(cand.body)
+    return isinstance(first, (ast.Break, ast.Raise,
+                              ast.Return))
+
+
 def _for_iter_finite(node, parents):
     # True when a for-loop iterable provably
     # terminates iteration (O14): a display
-    # with finite members (starred parts
-    # recurse — an infinite unpack hangs at
-    # construction instead), a str/bytes
+    # with terminating plain parts (P15 — an
+    # element whose evaluation hangs, like
+    # sum(iter(int, 1)), hangs construction
+    # before any iteration) and finite
+    # starred parts (an infinite unpack hangs
+    # at construction instead), a str/bytes
     # constant, an unshadowed const-int
     # range() call, or a provable
     # non-iterable (raises at once).
@@ -5485,16 +5981,23 @@ def _for_iter_finite(node, parents):
                          ast.Set)):
         for elt in node.elts:
             elt = _unwrap_walrus(elt)
-            if isinstance(elt, ast.Starred) \
-                    and not _for_iter_finite(
+            if isinstance(elt, ast.Starred):
+                if not _for_iter_finite(
                         elt.value, parents):
+                    return False
+            elif not _eval_terminates(
+                    elt, parents):
                 return False
         return True
     if isinstance(node, ast.Dict):
         for key, value in zip(node.keys,
                               node.values):
-            if key is None \
-                    and not _for_iter_finite(
+            if key is None:
+                if not _for_iter_finite(
+                        value, parents):
+                    return False
+            elif not _eval_terminates(key, parents) \
+                    or not _eval_terminates(
                         value, parents):
                 return False
         return True
@@ -5815,7 +6318,8 @@ def _stmt_may_fall_compute(stmt, soft_raise, parents=None,
         if not _literal_nonempty(stmt.iter):
             return True
         unpack = _for_first_unpack(stmt.iter,
-                                   stmt.target)
+                                   stmt.target,
+                                   parents)
         if unpack is not None and unpack != "ok":
             # a provably-failing first-trip
             # target assignment raises before
@@ -5930,7 +6434,9 @@ def _stmt_may_fall_compute(stmt, soft_raise, parents=None,
                     if isinstance(cand, (ast.For,
                                          ast.AsyncFor)) \
                             and not _for_iter_finite(
-                                cand.iter, parents):
+                                cand.iter, parents) \
+                            and not _for_never_hangs(
+                                cand, stmt, parents):
                         hang = True
                         break
                     if isinstance(cand, ast.Continue) \
@@ -6644,7 +7150,8 @@ def _conditional_bind(node, parents):
                     return True
                 if _for_first_unpack(
                         probe.iter,
-                        probe.target) != "ok":
+                        probe.target,
+                        parents) != "ok":
                     return True
             elif child is not probe.iter:
                 return True
@@ -6886,7 +7393,8 @@ def _loop_orelse_dead(loop, parents):
         if not _literal_nonempty(loop.iter):
             return False
         if _for_first_unpack(loop.iter,
-                             loop.target) != "ok":
+                             loop.target,
+                             parents) != "ok":
             return False
     else:
         return False
@@ -7645,7 +8153,9 @@ def _scope_surfaces(tree, parents):
                 globs.update(node.names)
             elif isinstance(node, ast.Nonlocal):
                 nonlocs.update(node.names)
-            stack.extend(ast.iter_child_nodes(node))
+            # P9: comprehension targets bind the
+            # comprehension scope, not this one.
+            stack.extend(_enclosing_children(node))
         surfaces[id(scope)] = (imports, bound, globs,
                                nonlocs)
     return surfaces
@@ -13054,7 +13564,8 @@ def _binding_violations(source):
                     # raise (unproven unpacks
                     # stay out).
                     unpack = _for_first_unpack(
-                        node.iter, node.target)
+                        node.iter, node.target,
+                        parents)
                     if unpack is not None \
                             and unpack != "ok":
                         raises.append(
@@ -13333,7 +13844,24 @@ def _binding_violations(source):
                             handler, spelling)
                     if not _spelling_trusted(
                             handler, spelling):
-                        return False
+                        # P11: resolve a plain alias
+                        # (Bad=AssertionError) through
+                        # the shared entry resolver: a
+                        # resolved builtin in the
+                        # chain must-matches, a
+                        # resolved miss stays a
+                        # miss; unknowable or
+                        # invalid voids.
+                        resolved = _suppress_entry_value(
+                            spelling, handler,
+                            parents,
+                            _spelling_trusted)
+                        if resolved is None \
+                                or resolved is False:
+                            return False
+                        spelling = resolved
+                        if spelling in chain:
+                            return True
                     builtin = getattr(
                         builtins, spelling, None)
                     if not isinstance(builtin, type) \
@@ -13565,7 +14093,8 @@ def _binding_violations(source):
                         return _seq_outcome(
                             sub.orelse)
                     unpack = _for_first_unpack(
-                        sub.iter, sub.target)
+                        sub.iter, sub.target,
+                        parents)
                     if unpack is not None \
                             and unpack != "ok":
                         name = next(iter(unpack))
@@ -13925,30 +14454,46 @@ def _binding_violations(source):
                         return "quiet"
                     return None
                 if isinstance(expr, ast.Set):
-                    for elt in expr.elts:
-                        plain = _unwrap_walrus(elt)
-                        if isinstance(
-                                plain, ast.Starred):
-                            got = _part_raise(plain)
-                            if got != "quiet":
-                                if got is None and \
-                                        _starred_member_unhashable(
-                                            plain.value):
+                    # segment batching (P12): a plain
+                    # run evaluates every element
+                    # before any hashes (an in-batch
+                    # error preempts the hash error).
+                    for kind, part in \
+                            _display_segments(expr):
+                        if kind == "star":
+                            got = _part_raise(part)
+                            if got is not None \
+                                    and got != "quiet":
+                                return got
+                            if got == "quiet":
+                                if _noniterable_value(
+                                        part):
                                     return ("chain", (
                                         "TypeError",
                                         "Exception",
                                         "BaseException"))
-                                return got
-                            continue
-                        got = _part_raise(elt)
-                        if got != "quiet":
-                            return got
-                        if _unhashable_value(elt):
-                            return ("chain", (
-                                "TypeError", "Exception",
-                                "BaseException"))
-                        if not _hashable_value(elt):
+                                if _starred_members_quiet(
+                                        part):
+                                    continue
+                            if _starred_member_unhashable(
+                                    part):
+                                return ("chain", (
+                                    "TypeError",
+                                    "Exception",
+                                    "BaseException"))
                             return None
+                        for elt in part:
+                            got = _part_raise(elt)
+                            if got != "quiet":
+                                return got
+                        for elt in part:
+                            if _unhashable_value(elt):
+                                return ("chain", (
+                                    "TypeError",
+                                    "Exception",
+                                    "BaseException"))
+                            if not _hashable_value(elt):
+                                return None
                     return "quiet"
                 if isinstance(expr, (ast.List, ast.Tuple)):
                     for elt in expr.elts:
@@ -13957,14 +14502,14 @@ def _binding_violations(source):
                             return got
                     return "quiet"
                 if isinstance(expr, ast.Dict):
-                    for key, val in zip(expr.keys,
-                                        expr.values):
-                        if key is None:
-                            got = _part_raise(val)
+                    for kind, part in \
+                            _display_segments(expr):
+                        if kind == "star":
+                            got = _part_raise(part)
                             if got != "quiet":
                                 return got
                             plain = _unwrap_walrus(
-                                val)
+                                part)
                             if isinstance(
                                     plain, ast.Dict):
                                 continue
@@ -13977,18 +14522,21 @@ def _binding_violations(source):
                                     "Exception",
                                     "BaseException"))
                             return None
-                        got = _part_raise(key)
-                        if got != "quiet":
-                            return got
-                        got = _part_raise(val)
-                        if got != "quiet":
-                            return got
-                        if _unhashable_value(key):
-                            return ("chain", (
-                                "TypeError", "Exception",
-                                "BaseException"))
-                        if not _hashable_value(key):
-                            return None
+                        for key, value in part:
+                            got = _part_raise(key)
+                            if got != "quiet":
+                                return got
+                            got = _part_raise(value)
+                            if got != "quiet":
+                                return got
+                        for key, value in part:
+                            if _unhashable_value(key):
+                                return ("chain", (
+                                    "TypeError",
+                                    "Exception",
+                                    "BaseException"))
+                            if not _hashable_value(key):
+                                return None
                     return "quiet"
                 if isinstance(expr, ast.BinOp):
                     for side in (expr.left, expr.right):
@@ -14362,7 +14910,8 @@ def _binding_violations(source):
                 elif isinstance(stmt, (ast.For,
                                               ast.AsyncFor)):
                     unpack = _for_first_unpack(
-                        stmt.iter, stmt.target)
+                        stmt.iter, stmt.target,
+                        parents)
                     if unpack is None \
                             or unpack == "ok":
                         return None
@@ -14477,7 +15026,8 @@ def _binding_violations(source):
                                 return False
                             unpack = _for_first_unpack(
                                 stmt.iter,
-                                stmt.target)
+                                stmt.target,
+                                parents)
                             if unpack is not None \
                                     and unpack != "ok":
                                 return False
@@ -14701,7 +15251,8 @@ def _binding_violations(source):
                 elif isinstance(dnode, (ast.For,
                                         ast.AsyncFor)):
                     unpack = _for_first_unpack(
-                        dnode.iter, dnode.target)
+                        dnode.iter, dnode.target,
+                        parents)
                     chains = []
                     if unpack is not None \
                             and unpack != "ok":
@@ -15354,6 +15905,67 @@ def _binding_violations(source):
                             chain = None
                         else:
                             chain = ()
+                    if not saved and chain is not None \
+                            and chain != ():
+                        # P5: a handler/finalizer
+                        # replacement threaded
+                        # outward through the trys
+                        # still faces the managers
+                        # enclosing the outermost
+                        # threaded try — thread it
+                        # through them (a proven
+                        # suppress, or an
+                        # unknowable exit, saves;
+                        # propagate continues; a
+                        # replace stops unsaved —
+                        # the replaced chain's fate
+                        # through outer catchers
+                        # stays unanalyzed).
+                        outer = None
+                        for cand in reversed(ordered):
+                            if not any(
+                                    (sub.lineno,
+                                     sub.col_offset)
+                                    <= rpos
+                                    <= (sub.end_lineno,
+                                        sub.end_col_offset)
+                                    for sub in cand.body):
+                                continue
+                            if (cand.end_lineno,
+                                    cand.end_col_offset) \
+                                    >= ppos:
+                                continue
+                            outer = cand
+                            break
+                        if outer is not None:
+                            for manager in withs:
+                                if not _strictly_inside(
+                                        outer, manager):
+                                    continue
+                                cur = chain[0]
+                                res = "propagate"
+                                for item in reversed(
+                                        manager.items):
+                                    outcome = _manager_outcome(
+                                        item.context_expr,
+                                        cur,
+                                        _spelling_trusted,
+                                        parents)
+                                    if outcome is None \
+                                            or outcome == \
+                                            "suppress":
+                                        res = "saved"
+                                        break
+                                    if outcome == \
+                                            "propagate":
+                                        continue
+                                    res = "replaced"
+                                    break
+                                if res == "saved":
+                                    saved = True
+                                    break
+                                if res == "replaced":
+                                    break
                     if saved:
                         break
                 if not saved:
@@ -32100,7 +32712,8 @@ class CapturedBytesBinding(unittest.TestCase):
         for name, src in silent:
             with self.subTest(shape=name):
                 self.assertEqual(_binding_violations(src), [], name)
-        if sys.version_info >= (3, 14):
+        seven_outcome = _seven_detail_outcome(sys.version_info)
+        if seven_outcome == "ok":
             for name, src in seven_fire:
                 with self.subTest(shape=name):
                     violations = _binding_violations(src)
@@ -32109,11 +32722,576 @@ class CapturedBytesBinding(unittest.TestCase):
                             'results.append()' in violation
                             for violation in violations),
                         f"{name}: {violations}")
-        elif sys.version_info <= (3, 12):
+        elif seven_outcome == "raise":
             for name, src in seven_fire:
                 with self.subTest(shape=name):
                     self.assertEqual(
                         _binding_violations(src), [], name)
+
+    def test_seven_detail_outcome_versions(self):
+        # P14: the size-7 details outcome slices
+        # [:2] — a full 5-tuple never compares
+        # <= (3, 12), which silently skipped the
+        # 3.12 assertions and left the rule
+        # unresolved there. Full tuples here
+        # reproduce the interpreter values.
+        cases = [
+            ((3, 14, 7, 'final', 0), "ok"),
+            ((3, 14,), "ok"),
+            ((3, 13, 1, 'final', 0), None),
+            ((3, 12, 14, 'final', 0), "raise"),
+            ((3, 12,), "raise"),
+            ((3, 11, 9, 'final', 0), "raise"),
+        ]
+        for version, want in cases:
+            with self.subTest(version=version):
+                self.assertEqual(
+                    _seven_detail_outcome(version), want)
+
+    def test_const_call_resource_bounds(self):
+        # P4: const-eval never makes a resource
+        # decision — bytes(n) allocates n bytes,
+        # so large ints prove nothing (and must
+        # not allocate during analysis);
+        # resource failures (MemoryError,
+        # RecursionError) never count as
+        # semantic proofs. Negative bytes(n)
+        # raises ValueError symbolically.
+        def raises(src):
+            node = ast.parse(src).body[0].value
+            return _const_call_raises(node, {})
+
+        cases = [
+            ("bytes(1000000000)", False),
+            ("bytes(1000000000000)", False),
+            ("bytes(-1)", True),
+            ('bytes("s")', True),
+            ('int("bad")', True),
+            ("bytes(0)", False),
+        ]
+        for src, want in cases:
+            with self.subTest(src=src):
+                self.assertEqual(raises(src), want)
+
+    def test_tripwire_r48_p1(self):
+        # P1 (adjudication-r47): conditional
+        # evaluation needs an evaluation proof
+        # — `[] or missing` evaluates the tail
+        # (`[]` never short-circuits `or`) and
+        # `missing if [] == [] else 0` takes the
+        # body (the comparison is provably
+        # true), so NameError precedes the
+        # unpacking TypeError, the NameError
+        # catcher lands and the publish runs
+        # RAW.
+        fire = [
+            ('p1-bool-prefix-new-miss',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [[] or missing, *0]:\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + "    results.append({'raw':log})\n"
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('p1-if-prefix-new-miss',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [missing if [] == [] else 0, *0]:\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + "    results.append({'raw':log})\n"
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r48_p2(self):
+        # P2 (adjudication-r47): comprehension
+        # interiors need an execution proof — a
+        # dead filter, an empty later iterable
+        # and a failing target unpacking all
+        # leave the body unexecuted, so no
+        # TypeError arises and the publish runs
+        # RAW.
+        fire = [
+            ('p2-comp-false-new-miss',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [[*0] for _ in [0] if False]:\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + "    results.append({'raw':log})\n"
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('p2-comp-empty-new-miss',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [[*0] for _ in [0] for y in []]:\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + "    results.append({'raw':log})\n"
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('p2-comp-unpack-new-miss',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [[*0] for (a,b) in [()]]:\n'
+             + '            pass\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    results.append({'raw':log})\n"
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r48_p13(self):
+        # P13 (adjudication-r47): a resolved
+        # builtin callee lets the scan reach the
+        # raising argument — `len` loads quietly,
+        # `{[]}` raises TypeError, the NameError
+        # catcher misses and the shape crashes
+        # (silent).
+        silent = [
+            ('p13-len-new-fp',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [len({[]})]:\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + "    results.append({'raw':log})\n"
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p7(self):
+        # P7 (adjudication-r47): walruses in
+        # nested-def annotations bind the
+        # enclosing scope at def-execution
+        # (eager annotations) — both binding
+        # collectors must count those
+        # positions. 3.12-only: 3.14 rejects
+        # walrus-in-annotation at parse.
+        # Under `from __future__ import
+        # annotations` the annotation never
+        # evaluates, so the name stays unbound
+        # (guard shape fires).
+        if sys.version_info[:2] >= (3, 14):
+            self.skipTest(
+                'walrus in annotation needs 3.12')
+        silent = [
+            ('p7-prologue-param-annotation-clean',
+             "import contextlib\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        def unused(x: (missing:=0)): pass\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n"),
+            ('p7-prologue-return-annotation-clean',
+             "import contextlib\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        def unused() -> (missing:=0): pass\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n"),
+        ]
+        fire = [
+            ('p7-o5-param-annotation-raw',
+             'def prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    import contextlib\n    def unused(x: (cl:=contextlib)):\n        pass\n    try:\n        with cl.suppress(1/0):\n            pass\n    except ZeroDivisionError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p7-o5-return-annotation-raw',
+             'def prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    import contextlib\n    def unused() -> (cl:=contextlib):\n        pass\n    try:\n        with cl.suppress(1/0):\n            pass\n    except ZeroDivisionError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p7-future-annotations-guard-raw',
+             'from __future__ import annotations\n' + "import contextlib\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        def unused() -> (missing:=0): pass\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r48_p10(self):
+        # P10 (adjudication-r47): the O10
+        # occurrence proof must void on a
+        # global/nonlocal escape the way the
+        # full proof does — a `global missing`
+        # writer in a pruned initializer body
+        # (or an immediately executed class
+        # body) binds the load, the import
+        # executes, the publish is clean.
+        silent = [
+            ('p10-global-binding-pruned-clean',
+             "import contextlib\ndef initialize():\n    global missing\n    missing=0\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    initialize()\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n"),
+            ('p10-global-binding-class-body-clean',
+             "import contextlib\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    class Initialize:\n        global missing\n        missing=0\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n"),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p6(self):
+        # P6 (adjudication-r47): suppressor
+        # authentication shares the deferred
+        # horizon — a module import textually
+        # AFTER the defs still binds before
+        # any call, so the suppressor is
+        # genuine and the RAW publish fires.
+        # The before-variant is the control.
+        fire = [
+            ('p6-suppress-int-outer-overwrite-after',
+             "def prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    mapping={'slot':box}\n    with cl.suppress(TypeError):\n        with cl.suppress(0):\n            del missing\n        mapping['slot']={}\n    *xs, = [dict(mapping.copy(), extra={})]\n    xs[0]['slot']['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\nimport contextlib as cl\n",
+             'tainted path escapes to results.append()'),
+            ('p6-suppress-int-outer-overwrite-before',
+             "import contextlib as cl\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    mapping={'slot':box}\n    with cl.suppress(TypeError):\n        with cl.suppress(0):\n            del missing\n        mapping['slot']={}\n    *xs, = [dict(mapping.copy(), extra={})]\n    xs[0]['slot']['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r48_p5(self):
+        # P5 (adjudication-r47): handler and
+        # finalizer replacements thread outward
+        # through enclosing managers — a
+        # suppress(TypeError) swallowing the
+        # replacement keeps the publish live.
+        # The passing-handler control and the
+        # nested-caught shape already fire.
+        fire = [
+            ('p5-handler-replacement-suppressed',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    with contextlib.suppress(TypeError):\n        try:\n            raise NameError\n        except NameError:\n            raise TypeError\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p5-finally-replacement-suppressed',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    with contextlib.suppress(TypeError):\n        try:\n            raise NameError\n        finally:\n            raise TypeError\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p5-del-handler-replacement-suppressed',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    with contextlib.suppress(TypeError):\n        try:\n            del missing\n        except NameError:\n            raise TypeError\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p5-handler-replacement-control',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    with contextlib.suppress(TypeError):\n        try:\n            raise NameError\n        except NameError:\n            pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p5-nested-replacement-caught',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    with contextlib.suppress(0):\n        try:\n            with contextlib.suppress(0):\n                raise ValueError\n        except TypeError:\n            pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r48_p8(self):
+        # P8 (adjudication-r47): SyntaxError
+        # details validation covers the
+        # subclasses too — IndentationError/
+        # TabError with a non-iterable details
+        # argument raise TypeError at
+        # construction (first-hand both
+        # interpreters), like SyntaxError.
+        # Length 7 follows the O9 version
+        # gate (constructs 3.14+, raises
+        # 3.12-).
+        fire = [
+            ('p8-indent-int-typeerror',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    try:\n        raise IndentationError("m", 0)\n    except TypeError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-tab-int-typeerror',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    try:\n        raise TabError("m", 0)\n    except TypeError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-indent-3arg-syntaxerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise IndentationError("m", 0, 3)\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-tab-3arg-syntaxerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise TabError("m", 0, 3)\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-indent-str-syntaxerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise IndentationError("m", "abcd")\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-tab-str-syntaxerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise TabError("m", "abcd")\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-indent-bytes-syntaxerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise IndentationError("m", b"abcdef")\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('p8-tab-bytes-syntaxerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise TabError("m", b"abcdef")\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+        ]
+        silent = [
+            ('p8-indent-int-syntaxerror',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    try:\n        raise IndentationError("m", 0)\n    except SyntaxError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n'),
+            ('p8-tab-int-syntaxerror',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    try:\n        raise TabError("m", 0)\n    except SyntaxError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n'),
+            ('p8-indent-3arg-typeerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise IndentationError("m", 0, 3)\n' + '    except TypeError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n'),
+            ('p8-tab-3arg-typeerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise TabError("m", 0, 3)\n' + '    except TypeError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n'),
+            ('p8-indent-str-typeerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise IndentationError("m", "abcd")\n' + '    except TypeError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n'),
+            ('p8-tab-str-typeerror',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise TabError("m", "abcd")\n' + '    except TypeError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n'),
+        ]
+        seven = [
+            ('p8-indent-seven',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise IndentationError("m", (0,1,2,3,4,5,6))\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n'),
+            ('p8-tab-seven',
+             'def prepare(log):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    return captured\n' + 'def execute(log, results):\n' + '    c,t,captured=run_logged([],log,1)\n' + '    try:\n' + '        raise TabError("m", (0,1,2,3,4,5,6))\n' + '    except SyntaxError:\n' + '        pass\n' + '    results.append({"raw":log})\n' + '    output=decode_body_log(captured)\n'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+        seven_outcome = _seven_detail_outcome(
+            sys.version_info)
+        if seven_outcome == "ok":
+            for name, src in seven:
+                with self.subTest(shape=name):
+                    violations = _binding_violations(src)
+                    self.assertTrue(
+                        any('tainted path escapes to '
+                            'results.append()' in violation
+                            for violation in violations),
+                        f"{name}: {violations}")
+        elif seven_outcome == "raise":
+            for name, src in seven:
+                with self.subTest(shape=name):
+                    self.assertEqual(
+                        _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p11(self):
+        # P11 (adjudication-r47): preceding-
+        # handler shadowing resolves plain
+        # aliases — except (TypeError, Bad)
+        # with Bad=AssertionError must-matches
+        # the AssertionError, so the later
+        # falling handler is shadowed: the
+        # raising/returning head decides.
+        # Literal-name twins are controls.
+        # (The log="clean" twins fire on r47
+        # even with literal names — handler
+        # rebinds never thread into post-try
+        # taint — a separate pre-existing gap
+        # sol did not file; out of scope.)
+        silent = [
+            ('p11-shadow-alias-raise',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    Bad=AssertionError\n    Good=AssertionError\n    try:\n        assert False\n    except (TypeError, Bad):\n        raise RuntimeError\n    except Good:\n        pass\n    except 0:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n'),
+            ('p11-shadow-literal-raise',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    Good=AssertionError\n    try:\n        assert False\n    except (TypeError, AssertionError):\n        raise RuntimeError\n    except Good:\n        pass\n    except 0:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n'),
+            ('p11-shadow-alias-return',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    Bad=AssertionError\n    Good=AssertionError\n    try:\n        assert False\n    except (TypeError, Bad):\n        return\n    except Good:\n        pass\n    except 0:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n'),
+            ('p11-shadow-literal-return',
+             'import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    Good=AssertionError\n    try:\n        assert False\n    except (TypeError, AssertionError):\n        return\n    except Good:\n        pass\n    except 0:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p12(self):
+        # P12 (adjudication-r47): construction
+        # batches — an in-batch div evaluates
+        # before any member/key hashes, so the
+        # ZeroDivisionError preempts the
+        # TypeError, escapes the TypeError
+        # catcher, and the crash stays silent.
+        # (O11's earlier-segment pins still
+        # fire: separate coverage.)
+        silent = [
+            ('p12-set-batch-new-fp',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    try:\n        with contextlib.suppress({[], 1/0, *()}):\n            pass\n    except TypeError:\n        pass\n    results.append({'raw':log})\n    output=decode_body_log(captured)\n    return results\n"),
+            ('p12-dict-batch-new-fp',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    try:\n        with contextlib.suppress({[]:0, 0:1/0, **{}}):\n            pass\n    except TypeError:\n        pass\n    results.append({'raw':log})\n    output=decode_body_log(captured)\n    return results\n"),
+            ('p12-dict-postunpack-batch-new-fp',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    try:\n        with contextlib.suppress({**{}, []:0, 0:1/0}):\n            pass\n    except TypeError:\n        pass\n    results.append({'raw':log})\n    output=decode_body_log(captured)\n    return results\n"),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p3(self):
+        # P3 (adjudication-r47): hang evidence
+        # needs feasibility — an infinite-
+        # iterable for in a dead position (if
+        # False, unused def, zero-trip outer)
+        # or with a first-pass exit (break/
+        # raise) never hangs, so the first-
+        # pass raise fires and the publish
+        # runs RAW. The nested-while-False
+        # twin stays silent (O13 gap stands).
+        fire = [
+            ('p3-for-dead-if',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            if False:\n                for _ in iter(int, 1):\n                    pass\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+            ('p3-for-deferred-def',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            def unused():\n                for _ in iter(int, 1):\n                    pass\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+            ('p3-for-zero-trip-outer',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            for unused in []:\n                for _ in iter(int, 1):\n                    pass\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+            ('p3-for-infinite-break',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            for _ in iter(int, 1):\n                break\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+            ('p3-for-infinite-raise',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            for _ in iter(int, 1):\n                raise ValueError\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n",
+             'tainted path escapes to results.append()'),
+        ]
+        silent = [
+            ('p3-while-dead-nested-stands',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            while False:\n                while True:\n                    pass\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n"),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p15(self):
+        # P15 (adjudication-r47): finite
+        # iteration needs construction
+        # termination — a display element/key
+        # whose evaluation hangs (sum over an
+        # infinite iterator) hangs the loop
+        # before any iteration, so nothing
+        # publishes and the shape stays
+        # silent.
+        silent = [
+            ('p15-for-display-hanging-element',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            for _ in [sum(iter(int, 1))]:\n                pass\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n"),
+            ('p15-for-display-hanging-key',
+             "import contextlib\ndef prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log):\n    results=[]\n    c,t,captured=run_logged([],log,1)\n    box={}\n    a=box\n    try:\n        while True:\n            for _ in {sum(iter(int, 1)): 0}:\n                pass\n            raise ValueError\n        a={}\n    except ValueError:\n        pass\n    a['raw']=log\n    results.append(box)\n    output=decode_body_log(captured)\n    return results\n"),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r48_p9(self):
+        # P9 (adjudication-r47): comprehension
+        # targets bind in the comprehension
+        # scope, not the enclosing one — a
+        # default containing `[present for
+        # present in [1]]` leaves `present`
+        # unbound in the function, so `del
+        # present` raises NameError (crash,
+        # silent).
+        silent = [
+            ('p9-listcomp-target-crash',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    def unused(x=[present for present in [1]]): pass\n'
+             + '    del present\n'
+             + "    box['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('p9-genexp-target-crash',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    def unused(x=(present for present in [1])): pass\n'
+             + '    del present\n'
+             + "    box['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
 
     def test_tripwire_r47_o1(self):
         # O1 (adjudication-r46): the unhashable
@@ -32678,14 +33856,14 @@ class CapturedBytesBinding(unittest.TestCase):
                     f"{name}: {violations}")
 
     def test_tripwire_r47_o11(self):
-        # O11 (adjudication-r46): unpacking
-        # forces incremental construction —
-        # an unhashable member hashes (TypeError)
-        # BEFORE a later div evaluates, so the
-        # TypeError catcher lands (RAW). Plain
-        # (non-unpacking) displays evaluate all
-        # element exprs first: the div wins
-        # (ZD crash stays silent).
+        # O11 (adjudication-r46): displays build
+        # in segments — an unhashable member in
+        # an EARLIER segment hashes (TypeError)
+        # BEFORE a later segment's div
+        # evaluates, so the TypeError catcher
+        # lands (RAW). Within one batch every
+        # element expr evaluates first: the div
+        # wins (ZD crash stays silent) (P12).
         silent = [
             ('o11-dict-plain-crash-silent',
              'import contextlib\n'
@@ -33661,8 +34839,10 @@ class ExecuteWiring(unittest.TestCase):
         return out, lock
 
     def _drive(self, root, out, lock, *, run_logged, run_hook=None,
-               dump_hook=None, passthrough_run_cancel=False):
+               dump_hook=None, passthrough_run_cancel=False,
+               keep_slot=False):
         saved_flag = lane._CANCEL_REQUESTED
+        saved_slot = lane._CANCELLATION_REPAIR
         calls = []
         tmpfs_targets = []
         def fake_run(cmd, **kwargs):
@@ -33788,13 +34968,18 @@ class ExecuteWiring(unittest.TestCase):
                     return ("raised", error, calls,
                             captured_stdout.getvalue())
         finally:
-            # The flag restore is test hygiene (production
-            # leaves it set for the enclosing scope); the
-            # repair slot is deliberately NOT cleared — a
-            # drive under cancellation() needs it to survive
-            # until that scope consumes it, and every drive
-            # overwrites it before it can matter.
+            # Test hygiene for both globals (production
+            # leaves them set for the enclosing scope):
+            # the flag restores unconditionally; the
+            # repair slot restores too, unless the
+            # drive runs under an enclosing
+            # cancellation() that must consume it
+            # (keep_slot=True) — a leaked backstop
+            # breaks every later clean-entry
+            # assertion (suite-order failures).
             lane._CANCEL_REQUESTED = saved_flag
+            if not keep_slot:
+                lane._CANCELLATION_REPAIR = saved_slot
 
     def _assert_lock_released(self, lock):
         fd = os.open(lock, os.O_RDONLY)
@@ -33817,6 +35002,34 @@ class ExecuteWiring(unittest.TestCase):
             elif cmd[:2] == ["mount", "-t"]:
                 targets.append(cmd[-1])
         return targets
+
+    def test_drive_restores_repair_slot(self):
+        # bare drives leave no repair residue: the
+        # slot reads back what it held before the
+        # drive (None or a pre-set repair) — a
+        # leaked backstop breaks every later test
+        # that asserts clean entry (suite-order
+        # failures, green solo). Drives under an
+        # enclosing cancellation() keep the slot
+        # via keep_slot=True instead.
+        route = lambda *a, **k: (0, False, b"")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            lane._CANCELLATION_REPAIR = None
+            self._drive(root, out, lock, run_logged=route)
+            self.assertIsNone(lane._CANCELLATION_REPAIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            sentinel = lambda: None
+            lane._CANCELLATION_REPAIR = sentinel
+            try:
+                self._drive(root, out, lock, run_logged=route)
+                self.assertIs(
+                    lane._CANCELLATION_REPAIR, sentinel)
+            finally:
+                lane._CANCELLATION_REPAIR = None
 
     def test_failed_publish_keeps_cleanup_and_root_cause(self):
         # mid-run publish failures (ENOSPC-style) at both evidence
@@ -35408,7 +36621,7 @@ class ExecuteWiring(unittest.TestCase):
                             side_effect=lambda: killer_dc()):
                         outcome, error, calls, printed = self._drive(
                             root, out, lock, run_logged=lambda *a, **k: (
-                                0, False, b""))
+                                0, False, b""), keep_slot=True)
                     # _drive's flag save/restore is test
                     # hygiene; in production the flag set by
                     # the kill persists into this scope.
@@ -35494,7 +36707,8 @@ class ExecuteWiring(unittest.TestCase):
                                            side_effect=killer_print):
                         outcome, code, calls, printed = self._drive(
                             root, out, lock,
-                            run_logged=lambda *a, **k: (0, False, b""))
+                            run_logged=lambda *a, **k: (0, False, b""),
+                            keep_slot=True)
                     # _drive's flag save/restore is test
                     # hygiene; in production the flag set by
                     # the kill persists into this scope, where
@@ -35550,7 +36764,8 @@ class ExecuteWiring(unittest.TestCase):
                     with mock.patch.object(builtins, "print",
                                            side_effect=killer_print):
                         outcome, code, calls, printed = self._drive(
-                            root, out, lock, run_logged=routed)
+                            root, out, lock, run_logged=routed,
+                            keep_slot=True)
                     lane._CANCEL_REQUESTED = True
             except InterruptedError:
                 pass
@@ -35650,7 +36865,8 @@ class ExecuteWiring(unittest.TestCase):
                                 side_effect=second_kill):
                         outcome, error, calls, printed = self._drive(
                             root, out, lock,
-                            run_logged=lambda *a, **k: (0, False, b""))
+                            run_logged=lambda *a, **k: (0, False, b""),
+                            keep_slot=True)
                     # _drive's flag save/restore is test
                     # hygiene; in production the flag that
                     # fired the post-check repair persists
@@ -35726,7 +36942,8 @@ class ExecuteWiring(unittest.TestCase):
                                 self._drive(
                                     root, out, lock,
                                     run_logged=lambda *a, **k: (
-                                        0, False, b""))
+                                        0, False, b""),
+                                    keep_slot=True)
                         # _drive hygiene clears the flag the
                         # kill set; production persists it
                         # here, where the consumed slot
@@ -35832,7 +37049,8 @@ class ExecuteWiring(unittest.TestCase):
                 raise FileNotFoundError("staged binary gone")
             try:
                 outcome, error, calls, printed = self._drive(
-                    root, out, lock, run_logged=boom)
+                    root, out, lock, run_logged=boom,
+                    keep_slot=True)
                 self.assertEqual(outcome, "raised")
                 slot = lane._CANCELLATION_REPAIR
                 self.assertIs(
@@ -35866,7 +37084,8 @@ class ExecuteWiring(unittest.TestCase):
                                        side_effect=flag_on_complete):
                     outcome, error, calls, printed = self._drive(
                         root, out, lock,
-                        run_logged=lambda *a, **k: (0, False, b""))
+                        run_logged=lambda *a, **k: (0, False, b""),
+                        keep_slot=True)
                 self.assertEqual(outcome, "raised")
                 self.assertIsInstance(error, InterruptedError)
                 slot = lane._CANCELLATION_REPAIR
@@ -35909,7 +37128,8 @@ class ExecuteWiring(unittest.TestCase):
                                        side_effect=flag_on_complete):
                     outcome, error, calls, printed = self._drive(
                         root, out, lock,
-                        run_logged=lambda *a, **k: (0, False, b""))
+                        run_logged=lambda *a, **k: (0, False, b""),
+                        keep_slot=True)
                 self.assertEqual(outcome, "raised")
                 self.assertIsInstance(error, InterruptedError)
                 pre = json.loads(
@@ -36202,8 +37422,17 @@ class CancelHelper(unittest.TestCase):
             timer.cancel()
             timer.join(timeout=5)
             lane._CANCEL_REQUESTED = saved_flag
-        # no children assertion: the orphaned grandchild
-        # sleeps out its budget outside our custody.
+        # custody hygiene (not custody behavior): once any
+        # earlier test latches the process-global
+        # subreaper, the orphaned grandchild reparents to
+        # THIS process instead of init — "outside our
+        # custody" no longer holds, and its 10 s sleep
+        # outlives into later children() assertions.
+        # The fast raise above already proves the pin
+        # (the holder was alive for it); reap the orphan
+        # now so no residue leaks across tests.
+        lane.reap_owned()
+        self.assertEqual(lane.children(), set())
 
     def test_run_cancel_skips_spawn_when_flagged(self):
         # pre-launch check: a set flag raises before any
