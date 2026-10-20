@@ -1386,6 +1386,18 @@ _NAMESPACE_FUNCS = ("globals", "locals", "vars")
 # alongside (the tripwire tests pin it).
 _LANE_DEFINED_SINKS = ("_say", "run_logged")
 
+# module globals the lane itself provides
+# (sudo_lane.py top level: run_logged,
+# decode_body_log, ...): analyzed excerpts
+# execute in the lane namespace, so a load
+# of one of these spellings never raises
+# NameError — a snippet bind only shadows
+# (still bound), and snippet dels stay a
+# documented miss (abstain, as before r47).
+# Import-time snapshot (stable under test
+# monkeypatching). O10.
+_LANE_GLOBAL_NAMES = frozenset(vars(lane))
+
 
 def _store_root(target, fresh=None):
     # container root a subscript/attribute store lands
@@ -1538,6 +1550,147 @@ def _uncond_raises_expr(node):
     return any(True for _ in _always_eval_divs(node))
 
 
+def _const_call_raises(node, parents):
+    # True when a single-argument builtin call
+    # provably raises (O10): an unshadowed
+    # int/float/complex/bytes spelling applied
+    # to one plain constant whose first-hand
+    # evaluation raises. Size-guarded so a
+    # hostile literal cannot burn analyzer
+    # time; multi-arg, keyword and starred
+    # forms stay out (minimal scope).
+    if not isinstance(node, ast.Call):
+        return False
+    if len(node.args) != 1 or node.keywords:
+        return False
+    func = _unwrap_walrus(node.func)
+    if not isinstance(func, ast.Name) \
+            or not isinstance(func.ctx, ast.Load):
+        return False
+    if func.id not in ("int", "float",
+                       "complex", "bytes"):
+        return False
+    if not hasattr(builtins, func.id):
+        return False
+    if _name_bound_anywhere(node, parents,
+                            func.id):
+        return False
+    arg = _unwrap_walrus(node.args[0])
+    if isinstance(arg, ast.Starred) \
+            or not isinstance(arg, ast.Constant):
+        return False
+    value = arg.value
+    if isinstance(value, (str, bytes)) \
+            and len(value) > 1000:
+        return False
+    if isinstance(value, int) \
+            and not isinstance(value, bool) \
+            and value.bit_length() > 10000:
+        return False
+    try:
+        getattr(builtins, func.id)(value)
+    except Exception:
+        return True
+    return False
+
+
+def _display_ctor_raises(node):
+    # True when a set/dict display provably
+    # raises during construction (O10): a
+    # plainly unhashable member/key. An
+    # earlier member raising first still
+    # raises something — construction never
+    # completes either way.
+    if isinstance(node, ast.Set):
+        for elt in node.elts:
+            elt = _unwrap_walrus(elt)
+            if isinstance(elt, ast.Starred):
+                continue
+            if _unhashable_value(elt):
+                return True
+        return False
+    if isinstance(node, ast.Dict):
+        for key in node.keys:
+            if key is None:
+                continue
+            if _unhashable_value(
+                    _unwrap_walrus(key)):
+                return True
+        return False
+    return False
+
+
+def _always_eval_raises(node, parents):
+    # must-raise terminals evaluating on every
+    # path (O10): an unbound Name load, a
+    # failing const builtin call, or an
+    # unhashable set member/dict key. Same
+    # always-evaluated positions as
+    # _always_eval_divs: BoolOp past a
+    # non-constant or short-circuiting
+    # constant, IfExp arms, Compare tails,
+    # lambda bodies and comprehension
+    # interiors past the first iterable never
+    # count; lambda defaults do evaluate.
+    if isinstance(node, ast.Name) \
+            and isinstance(node.ctx, ast.Load) \
+            and parents is not None \
+            and node.id not in _LANE_GLOBAL_NAMES \
+            and _name_chain_unbound(node.id, node,
+                                    parents):
+        yield node
+        return
+    if _const_call_raises(node, parents):
+        yield node
+        return
+    if _display_ctor_raises(node):
+        yield node
+        return
+    if isinstance(node, ast.BoolOp):
+        for value in node.values:
+            yield from _always_eval_raises(
+                value, parents)
+            plain = _unwrap_walrus(value)
+            if not isinstance(plain, ast.Constant):
+                break
+            if isinstance(node.op, ast.Or) \
+                    and plain.value:
+                break
+            if isinstance(node.op, ast.And) \
+                    and not plain.value:
+                break
+        return
+    if isinstance(node, ast.IfExp):
+        yield from _always_eval_raises(
+            node.test, parents)
+        return
+    if isinstance(node, ast.Compare):
+        yield from _always_eval_raises(
+            node.left, parents)
+        if node.comparators:
+            yield from _always_eval_raises(
+                node.comparators[0], parents)
+        return
+    if isinstance(node, ast.Lambda):
+        for default in list(node.args.defaults) \
+                + [item for item in node.args.kw_defaults
+                   if item is not None]:
+            yield from _always_eval_raises(
+                default, parents)
+        return
+    if isinstance(node, (ast.ListComp, ast.SetComp,
+                         ast.DictComp,
+                         ast.GeneratorExp)):
+        if node.generators:
+            yield from _always_eval_raises(
+                node.generators[0].iter, parents)
+        return
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.expr):
+            yield from _always_eval_raises(
+                child, parents)
+
+
 def _ordered_prefix(parts):
     # locate the first part holding an
     # always-evaluated divzero: earlier parts
@@ -1602,17 +1755,78 @@ def _div_prefix_exprs(node):
         return _ordered_prefix([node.value])
     if isinstance(node, ast.NamedExpr):
         return _ordered_prefix([node.value])
-    if isinstance(node, (ast.List, ast.Tuple,
-                         ast.Set)):
+    if isinstance(node, (ast.List, ast.Tuple)):
         return _ordered_prefix(list(node.elts))
+    if isinstance(node, ast.Set):
+        # unpacking forces incremental
+        # construction: earlier members hash
+        # (and unpacks merge) before a later
+        # div evaluates — prove them harmless
+        # (hashable/quiet) or fail closed.
+        # Plain sets hash after all evals: the
+        # eval prefix suffices (O11).
+        elts = [_unwrap_walrus(elt)
+                for elt in node.elts]
+        if not any(isinstance(elt, ast.Starred)
+                   for elt in elts):
+            return _ordered_prefix(elts)
+        out = []
+        for elt in elts:
+            if _uncond_raises_expr(elt):
+                sub = _div_prefix_exprs(elt)
+                if sub is None:
+                    return None
+                return out + sub
+            out.append(elt)
+            if isinstance(elt, ast.Starred):
+                if not _starred_members_quiet(
+                        elt.value):
+                    return None
+            elif not _hashable_value(elt):
+                return None
+        return None
     if isinstance(node, ast.Dict):
-        parts = []
-        for key, value in zip(node.keys,
-                              node.values):
-            if key is not None:
+        # same construction boundary: plain
+        # dicts evaluate all keys/values first
+        # (first-hand); dstar forces per-pair
+        # incremental insert/merge (O11).
+        pairs = [(key, value)
+                 for key, value in zip(node.keys,
+                                       node.values)]
+        if all(key is not None for key, _ in pairs):
+            parts = []
+            for key, value in pairs:
                 parts.append(key)
-            parts.append(value)
-        return _ordered_prefix(parts)
+                parts.append(value)
+            return _ordered_prefix(parts)
+        out = []
+        for key, value in pairs:
+            if key is None:
+                if _uncond_raises_expr(value):
+                    sub = _div_prefix_exprs(value)
+                    if sub is None:
+                        return None
+                    return out + sub
+                out.append(value)
+                merged = _unwrap_walrus(value)
+                if not isinstance(merged, ast.Dict):
+                    return None
+                continue
+            if _uncond_raises_expr(key):
+                sub = _div_prefix_exprs(key)
+                if sub is None:
+                    return None
+                return out + sub
+            out.append(key)
+            if _uncond_raises_expr(value):
+                sub = _div_prefix_exprs(value)
+                if sub is None:
+                    return None
+                return out + sub
+            out.append(value)
+            if not _hashable_value(key):
+                return None
+        return None
     if isinstance(node, ast.JoinedStr):
         return _ordered_prefix(list(node.values))
     if isinstance(node, ast.FormattedValue):
@@ -1711,13 +1925,29 @@ def _div_raise_kind(cand):
 def _suppress_arg_harmless(arg, trusted):
     # True when the suppress argument provably
     # evaluates without raising before later
-    # arguments: quiet expressions, or trusted
+    # arguments: quiet expressions, trusted
     # builtin spellings (their loads succeed;
     # unscoped callers accept builtin-type
-    # spellings — documented parity).
+    # spellings — documented parity), or
+    # harmless containers thereof: tuples/
+    # lists evaluate members in order without
+    # hashing, and starring such a display
+    # unpacks without raising (O15). Sets,
+    # dicts and opaque starred values stay
+    # out (member hashing may raise).
     if _expr_quiet(arg):
         return True
     arg = _unwrap_walrus(arg)
+    if isinstance(arg, (ast.Tuple, ast.List)):
+        return all(_suppress_arg_harmless(elt, trusted)
+                   for elt in arg.elts)
+    if isinstance(arg, ast.Starred):
+        inner = _unwrap_walrus(arg.value)
+        if not isinstance(inner, (ast.Tuple,
+                                  ast.List)):
+            return False
+        return all(_suppress_arg_harmless(elt, trusted)
+                   for elt in inner.elts)
     if isinstance(arg, ast.Name):
         if trusted is not None:
             # trusted means unshadowed, which proves
@@ -2491,34 +2721,66 @@ def _annotation_evaluates(stmt, parents):
     return True
 
 
-def _simple_stmt_raises(stmt, parents=None):
-    # True when a simple statement unconditionally
-    # raises during its own evaluation (constant
-    # division by zero in an always-evaluated
-    # operand — targets included; annotations
-    # only where they evaluate).
+def _simple_stmt_parts(stmt, parents=None):
+    # value/target subexpressions of a simple
+    # statement (annotations only where they
+    # evaluate): the operands whose
+    # unconditional raise kills the
+    # statement. None for compound
+    # statements.
     if isinstance(stmt, ast.Expr):
-        parts = [stmt.value]
-    elif isinstance(stmt, ast.Assign):
-        parts = [stmt.value] + list(stmt.targets)
-    elif isinstance(stmt, ast.AnnAssign):
+        return [stmt.value]
+    if isinstance(stmt, ast.Assign):
+        return [stmt.value] + list(stmt.targets)
+    if isinstance(stmt, ast.AnnAssign):
         parts = [part for part in
                  (stmt.value, stmt.target)
                  if part is not None]
         if stmt.annotation is not None \
                 and _annotation_evaluates(stmt, parents):
             parts.append(stmt.annotation)
-    elif isinstance(stmt, ast.AugAssign):
-        parts = [stmt.target, stmt.value]
-    elif isinstance(stmt, ast.Delete):
-        parts = list(stmt.targets)
-    elif isinstance(stmt, ast.Return):
-        parts = [stmt.value] \
+        return parts
+    if isinstance(stmt, ast.AugAssign):
+        return [stmt.target, stmt.value]
+    if isinstance(stmt, ast.Delete):
+        return list(stmt.targets)
+    if isinstance(stmt, ast.Return):
+        return [stmt.value] \
             if stmt.value is not None else []
-    else:
+    return None
+
+
+def _simple_stmt_raises(stmt, parents=None):
+    # True when a simple statement unconditionally
+    # raises during its own evaluation (constant
+    # division by zero in an always-evaluated
+    # operand — targets included; annotations
+    # only where they evaluate).
+    parts = _simple_stmt_parts(stmt, parents)
+    if parts is None:
         return False
     return any(_uncond_raises_expr(part)
                for part in parts)
+
+
+def _import_predecessor_raises(stmt, parents=None):
+    # True when a simple statement preceding a
+    # same-block import unconditionally raises
+    # past the divzero rule (O10): an
+    # always-evaluated unbound Name, failing
+    # const builtin call, or unhashable set
+    # member/dict key. Scoped to the
+    # import-executes proof (like del_raises):
+    # global may-fall reasoning stays
+    # divzero-only, since downstream
+    # consumers (publish-dead) do not share
+    # the broader proof and the asymmetry
+    # manufactures escapes (i4).
+    parts = _simple_stmt_parts(stmt, parents)
+    if parts is None:
+        return False
+    return any(any(True for _ in _always_eval_raises(
+        part, parents)) for part in parts)
 
 
 def _name_bound_anywhere(node, parents, name):
@@ -2530,12 +2792,29 @@ def _name_bound_anywhere(node, parents, name):
     # match binds and def/class names.
     # Global/nonlocal declarations are not
     # binds. True when unknowable (no
-    # parents) — fail closed.
+    # parents) — fail closed. Memoized per
+    # analysis per spelling (O10: const-call
+    # checks re-query builtins spellings).
     if parents is None:
         return True
+    memo = _analysis_memo(parents, node)
+    if memo is not None:
+        mkey = ("nba", name)
+        hit = memo.get(mkey)
+        if hit is not None:
+            return hit[0]
+    else:
+        mkey = None
     root = node
     while id(root) in parents:
         root = parents[id(root)]
+    result = _name_bound_anywhere_scan(root, name)
+    if memo is not None:
+        memo[mkey] = (result, root)
+    return result
+
+
+def _name_bound_anywhere_scan(root, name):
     for cand in ast.walk(root):
         if isinstance(cand, ast.Name) \
                 and isinstance(cand.ctx, ast.Store) \
@@ -2774,31 +3053,44 @@ def _exc_construction(name, node, trusted=None):
             else:
                 return None
         return "ok"
-    if name == "SyntaxError" and len(positionals) >= 2:
-        # a second positional must be a
-        # 4- or 6-sequence (first-hand: tuples
-        # and lists of length 4 or 6 construct
-        # regardless of contents; lengths 0-3
-        # and 5 raise TypeError; longer
-        # sequences stay unknown; constants
-        # are not iterable; further
-        # positionals are ignored) (N6).
+    if name == "SyntaxError" and len(positionals) == 2:
+        # details validate only at exactly two
+        # positionals (a third never parses
+        # details — first-hand). The info must
+        # be a 4/6/7-sequence (first-hand both
+        # interpreters: tuples, lists, str and
+        # bytes; length 7 constructs on 3.14+
+        # only, raises on 3.12, unknown on
+        # 3.13; all other lengths raise
+        # TypeError; other constants are not
+        # iterable) (N6, O9).
         info = _unwrap_walrus(positionals[1])
+        size = None
         if isinstance(info, (ast.Tuple, ast.List)):
             if any(isinstance(
                     _unwrap_walrus(elt), ast.Starred)
                    for elt in info.elts):
                 return None
-            if len(info.elts) in (4, 6):
-                pass
-            elif len(info.elts) > 6:
-                return None
-            else:
-                return "raise"
+            size = len(info.elts)
+        elif isinstance(info, ast.Constant) \
+                and isinstance(
+                    info.value, (str, bytes)):
+            size = len(info.value)
         elif isinstance(info, ast.Constant):
             return "raise"
         else:
             return None
+        if size in (4, 6):
+            pass
+        elif size == 7:
+            if sys.version_info >= (3, 14):
+                pass
+            elif sys.version_info <= (3, 12):
+                return "raise"
+            else:
+                return None
+        else:
+            return "raise"
         return "ok"
     if name == "BlockingIOError" \
             and 3 <= len(positionals) <= 5:
@@ -2941,17 +3233,39 @@ def _suppress_entry_value(name, use, parents,
         # (global/nonlocal) into a visible scope.
         # Anything else (a sibling scope's
         # stores, imports, defs, handlers) never
-        # reaches the use (N13).
+        # reaches the use (N13). A definition
+        # binds its own name — and its prologue
+        # stores — in the ENCLOSING scope, not in
+        # itself (O7).
         scope = binder
+        prev = None
         while True:
             if isinstance(scope, (ast.FunctionDef,
                                   ast.AsyncFunctionDef,
                                   ast.Lambda,
                                   ast.ClassDef,
                                   ast.Module)):
+                if scope is binder and isinstance(
+                        scope, (ast.FunctionDef,
+                                ast.AsyncFunctionDef,
+                                ast.ClassDef)):
+                    if id(scope) not in parents:
+                        return True
+                    scope = parents[id(scope)]
+                    continue
+                if prev is not None \
+                        and not isinstance(
+                            scope, ast.Module) \
+                        and _prologue_child(scope, prev):
+                    if id(scope) not in parents:
+                        return True
+                    prev = scope
+                    scope = parents[id(scope)]
+                    continue
                 break
             if id(scope) not in parents:
                 return True
+            prev = scope
             scope = parents[id(scope)]
         if any(scope is seen for seen in chain):
             return True
@@ -3344,7 +3658,9 @@ def _import_executes_loop(loop_node, imp, parents):
     # crossing a def or class, and every
     # preceding sibling in each enclosing block
     # falls (a provable raise or transfer, e.g.
-    # 1/0 before the import, skips it) (N5).
+    # 1/0 before the import, skips it) (N5),
+    # counting must-raise predecessors past
+    # the divzero rule as skips too (O10).
     # May-raise predecessors stay out (accepted
     # hole, symmetric with the use side).
     if parents is None:
@@ -3391,6 +3707,13 @@ def _import_executes_loop(loop_node, imp, parents):
             if sib is probe:
                 break
             if not _stmt_may_fall(sib, False, parents):
+                return False
+            if _import_predecessor_raises(sib, parents):
+                # a must-raise predecessor past
+                # the divzero rule (unbound
+                # Name, failing const call,
+                # unhashable member/key) skips
+                # the import the same way (O10).
                 return False
         probe = parent
     return True
@@ -3581,7 +3904,9 @@ def _scope_binds_spelling(scope, name, parents, upos):
     # pre-use bind in a class/module namespace
     # (top-down execution, no declare). Never-execute
     # binds (dead positions, or preceded by a
-    # provably non-falling sibling) satisfy nothing
+    # provably non-falling sibling — counting
+    # must-raise predecessors past the
+    # divzero rule, O10) satisfy nothing
     # (N5). Over-approximate otherwise (nested
     # bodies pruned except their names;
     # comprehension targets and lambda params
@@ -3621,6 +3946,11 @@ def _scope_binds_spelling(scope, name, parents, upos):
                 break
             if not _stmt_may_fall(sib, False, parents):
                 return False
+            if _import_predecessor_raises(sib, parents):
+                # a must-raise predecessor past
+                # the divzero rule skips the
+                # bind the same way (O10).
+                return False
         return True
 
     def _visit(node, nested):
@@ -3638,6 +3968,10 @@ def _scope_binds_spelling(scope, name, parents, upos):
                         + [d for d in
                            getattr(child, 'args', None)
                            and child.args.defaults or []] \
+                        + [d for d in
+                           getattr(getattr(child, 'args', None),
+                                   'kw_defaults', None)
+                           or [] if d is not None] \
                         + list(getattr(
                             child, 'bases', []) or []) \
                         + [k.value for k in
@@ -3711,21 +4045,250 @@ def _scope_binds_spelling(scope, name, parents, upos):
 
 
 def _load_unbound(name, use, parents):
+    # memoized front (O10: may-fall queries
+    # re-prove the same loads; see
+    # _analysis_memo for the soundness case).
+    memo = _analysis_memo(parents, use)
+    if memo is None:
+        return _load_unbound_compute(
+            name, use, parents)
+    mkey = ("lu", id(use))
+    hit = memo.get(mkey)
+    if hit is not None:
+        return hit[0]
+    result = _load_unbound_compute(
+        name, use, parents)
+    memo[mkey] = (result, use)
+    return result
+
+
+def _scope_chain(use, parents):
+    # lexical scope chain enclosing the use,
+    # innermost-first: functions/lambdas and
+    # comprehensions always, the class scope
+    # only when directly enclosing (methods
+    # skip class namespaces but still close
+    # over functions), the module last (O10:
+    # shared by the full and occurrence
+    # unbound proofs).
+    chain = []
+    current = use
+    first = True
+    while id(current) in parents:
+        current = parents[id(current)]
+        if isinstance(current, (ast.FunctionDef,
+                                ast.AsyncFunctionDef,
+                                ast.Lambda,
+                                ast.ListComp, ast.SetComp,
+                                ast.DictComp,
+                                ast.GeneratorExp)):
+            chain.append(current)
+            first = False
+        elif isinstance(current, ast.ClassDef):
+            if first:
+                chain.append(current)
+            first = False
+        elif isinstance(current, ast.Module):
+            chain.append(current)
+    return chain
+
+
+def _scope_occ_binds(scope, parents):
+    # frozenset of spellings with a binding
+    # occurrence in scope (O10): Store names,
+    # parameters (incl. type params),
+    # imports, except-as, match binds and
+    # nested def/class names; nested
+    # def/class bodies pruned except their
+    # prologues (defaults/decorators/bases/
+    # keywords evaluate in the enclosing
+    # scope). None when a star-import makes
+    # the set unknowable (abstain). Pure
+    # occurrence — no may-fall, so no
+    # recursion into fall analysis.
+    # Memoized per analysis (scope id key).
+    memo = _analysis_memo(parents, scope)
+    if memo is not None:
+        mkey = ("ob", id(scope))
+        hit = memo.get(mkey)
+        if hit is not None:
+            return hit[0]
+    else:
+        mkey = None
+    found = set()
+    unknown = []
+
+    def _param_names(args):
+        for arg in list(args.posonlyargs) \
+                + list(args.args) \
+                + list(args.kwonlyargs):
+            found.add(arg.arg)
+        if args.vararg:
+            found.add(args.vararg.arg)
+        if args.kwarg:
+            found.add(args.kwarg.arg)
+
+    def _type_param_names(node):
+        for param in getattr(
+                node, "type_params", []) or []:
+            if isinstance(param, ast.Name):
+                found.add(param.id)
+            else:
+                target = getattr(param, "name", None)
+                if isinstance(target, str):
+                    found.add(target)
+                elif isinstance(target, ast.Name):
+                    found.add(target.id)
+
+    def _visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                    child,
+                    (ast.FunctionDef, ast.AsyncFunctionDef,
+                     ast.ClassDef)):
+                found.add(child.name)
+                args = getattr(child, "args", None)
+                defaults = list(args.defaults) \
+                    if args is not None else []
+                kw_defaults = [
+                    item for item in args.kw_defaults
+                    if item is not None] \
+                    if args is not None else []
+                for part in list(child.decorator_list) \
+                        + defaults + kw_defaults \
+                        + list(getattr(
+                            child, "bases", []) or []) \
+                        + [key.value for key in
+                           getattr(child, "keywords", [])
+                           or []]:
+                    _collect(part)
+                continue
+            _collect(child)
+
+    def _collect(node):
+        if isinstance(node, ast.Name) \
+                and isinstance(node.ctx, ast.Store):
+            found.add(node.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                found.add(alias.asname
+                          or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    unknown.append(True)
+                else:
+                    found.add(
+                        alias.asname or alias.name)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                found.add(node.name)
+        elif isinstance(node, (ast.MatchAs,
+                               ast.MatchStar)):
+            if node.name:
+                found.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                found.add(node.rest)
+        _visit(node)
+
+    if isinstance(scope, (ast.FunctionDef,
+                          ast.AsyncFunctionDef,
+                          ast.Lambda)):
+        _param_names(scope.args)
+    if isinstance(scope, (ast.FunctionDef,
+                          ast.AsyncFunctionDef,
+                          ast.ClassDef)):
+        _type_param_names(scope)
+    _collect(scope)
+    result = None if unknown else frozenset(found)
+    if memo is not None:
+        memo[mkey] = (result, scope)
+    return result
+
+
+def _name_chain_unbound(name, use, parents):
+    # True when the Name load provably reads
+    # unbound (O10): no binding occurrence
+    # of the spelling in any enclosing scope
+    # and no builtin of the spelling.
+    # Occurrence-only (dead or post-use
+    # binds void — less complete than
+    # _load_unbound there, and equally
+    # blind to sibling scopes), so it never
+    # recurses into fall analysis: the
+    # may-fall Name terminal. Builtins and
+    # lane globals excluded by the caller.
+    if hasattr(builtins, name):
+        return False
+    for scope in _scope_chain(use, parents):
+        binds = _scope_occ_binds(scope, parents)
+        if binds is None or name in binds:
+            return False
+    return True
+
+
+def _load_unbound_compute(name, use, parents):
     # True when the Name load provably reads unbound
     # (NameError/ULE): no bind of the spelling
     # visible in the lexical scope chain at the use
     # and no builtin of the spelling. Function
     # binds (any position — declare rule) and
-    # definite pre-use class/module binds satisfy;
-    # sibling scopes never satisfy (N4). Methods
-    # and nested scopes skip class namespaces but
-    # still close over functions. Conservative
-    # False otherwise (global/nonlocal-declared
-    # binds anywhere void — they hide in pruned
-    # bodies).
+    # definite pre-use class binds satisfy; module
+    # binds satisfy pre-use, or anywhere when the
+    # use is function-deferred (the module loads
+    # fully before invocation — O4). Sibling scopes
+    # never satisfy (N4). Methods and nested scopes
+    # skip class namespaces but still close over
+    # functions. Conservative False otherwise
+    # (global/nonlocal-declared binds anywhere void
+    # — they hide in pruned bodies).
     if hasattr(builtins, name):
         return False
     upos = (use.lineno, use.col_offset)
+
+    def _deferred():
+        # True when the use executes after module
+        # load: a function/lambda body, or a lazy
+        # generator part (may consume post-load).
+        # Prologues, class bodies, eager
+        # comprehensions and the genexp's first
+        # iterable evaluate in the enclosing
+        # context — transparent. Module level is
+        # immediate.
+        child = use
+        cursor = use
+        while id(cursor) in parents:
+            child = cursor
+            cursor = parents[id(cursor)]
+            if isinstance(cursor, ast.comprehension):
+                upper = parents.get(id(cursor))
+                if isinstance(upper, ast.GeneratorExp) \
+                        and upper.generators \
+                        and cursor is upper.generators[0] \
+                        and child is cursor.iter:
+                    continue
+                return True
+            if isinstance(cursor, (ast.FunctionDef,
+                                   ast.AsyncFunctionDef,
+                                   ast.Lambda)):
+                if _prologue_child(cursor, child):
+                    continue
+                return True
+            if isinstance(cursor, ast.GeneratorExp):
+                if child is cursor.elt:
+                    return True
+                continue
+            if isinstance(cursor, (ast.ClassDef,
+                                   ast.ListComp,
+                                   ast.SetComp,
+                                   ast.DictComp)):
+                continue
+            if isinstance(cursor, ast.Module):
+                return False
+        return False
+
+    deferred = _deferred()
     chain = []
     current = use
     first = True
@@ -3762,12 +4325,20 @@ def _load_unbound(name, use, parents):
                     scope, name, parents, None):
                 return False
         elif isinstance(scope, ast.ClassDef):
+            if scope.keywords or scope.bases:
+                # O6: a metaclass keyword or any base
+                # may customize the namespace
+                # (__prepare__) — default namespace
+                # behavior not established, so
+                # class-name absence proves nothing.
+                return False
             if _scope_binds_spelling(
                     scope, name, parents, upos):
                 return False
         else:
             if _scope_binds_spelling(
-                    scope, name, parents, upos):
+                    scope, name, parents,
+                    None if deferred else upos):
                 return False
     return True
 
@@ -4027,6 +4598,42 @@ def _del_unbound_local(delnode, parents):
                              ast.Lambda, ast.ClassDef)):
             if not isinstance(node, ast.Lambda):
                 bound.add(node.name)
+            # O3: the prologue (decorators, defaults,
+            # annotations, returns, bases, keywords)
+            # evaluates in the ENCLOSING scope — visit
+            # it for binds instead of pruning it with
+            # the body. (Walrus in annotations/returns
+            # is 3.14-compile-rejected but 3.12-live;
+            # visiting stays sound-direction.)
+            args = getattr(node, "args", None)
+            if args is not None:
+                stack.extend(args.defaults)
+                stack.extend(item for item in
+                             args.kw_defaults
+                             if item is not None)
+                for param in list(args.args) \
+                        + list(args.kwonlyargs) \
+                        + list(getattr(
+                            args, "posonlyargs", [])):
+                    if param.annotation is not None:
+                        stack.append(param.annotation)
+                for extra in (args.vararg,
+                              args.kwarg):
+                    if extra is not None \
+                            and extra.annotation \
+                            is not None:
+                        stack.append(extra.annotation)
+            if getattr(node, "returns", None) \
+                    is not None:
+                stack.append(node.returns)
+            stack.extend(
+                getattr(node, "decorator_list", None)
+                or [])
+            stack.extend(
+                getattr(node, "bases", None) or [])
+            for keyword in getattr(
+                    node, "keywords", None) or []:
+                stack.append(keyword.value)
             continue
         if isinstance(node, ast.Name) \
                 and isinstance(node.ctx, ast.Store):
@@ -4106,36 +4713,194 @@ def _for_first_yield(node):
 
 def _iter_unhashable(iter_node):
     # True when evaluating the for-iterable
-    # provably raises TypeError on an unhashable
-    # member: any set display with an unhashable
-    # non-starred member, or any dict display
-    # with an unhashable key, in the iterable
-    # subtree (nested def/class/lambda bodies
-    # pruned — deferred; starred/dstar members
-    # stay out as unknown) (N9).
-    stack = [_unwrap_walrus(iter_node)]
-    while stack:
-        node = _unwrap_walrus(stack.pop())
+    # provably raises TypeError FIRST on an
+    # unhashable member: ordered evaluation —
+    # short-circuited, conditional-dead and
+    # deferred (genexp body, nested def bodies)
+    # parts pruned; a loud (may-raise)
+    # predecessor voids the claim (unknown
+    # first error). Plain displays evaluate
+    # all parts before hashing; unpacking
+    # forces incremental construction (N9, O1,
+    # O11).
+    def _scan(node):
+        # True = TypeError-first proven; False
+        # = quiet/done; None = loud predecessor
+        # (abort the claim).
+        node = _unwrap_walrus(node)
+        if _expr_quiet(node):
+            return False
         if isinstance(node, (ast.FunctionDef,
                              ast.AsyncFunctionDef,
-                             ast.Lambda, ast.ClassDef)):
-            continue
+                             ast.ClassDef)):
+            return False
+        if isinstance(node, ast.Lambda):
+            for default in list(
+                    node.args.defaults) \
+                    + [item for item in
+                       node.args.kw_defaults
+                       if item is not None]:
+                found = _scan(default)
+                if found is not False:
+                    return found
+            return False
         if isinstance(node, ast.Set):
+            unpack = any(
+                isinstance(_unwrap_walrus(elt),
+                           ast.Starred)
+                for elt in node.elts)
+            if not unpack:
+                for elt in node.elts:
+                    found = _scan(elt)
+                    if found is not False:
+                        return found
+                for elt in node.elts:
+                    if _unhashable_value(elt):
+                        return True
+                return False
             for elt in node.elts:
                 elt = _unwrap_walrus(elt)
                 if isinstance(elt, ast.Starred):
-                    continue
+                    found = _scan(elt.value)
+                    if found is not False:
+                        return found
+                    if _starred_member_unhashable(
+                            elt.value):
+                        return True
+                    if _starred_members_quiet(
+                            elt.value):
+                        continue
+                    return None
+                found = _scan(elt)
+                if found is not False:
+                    return found
                 if _unhashable_value(elt):
                     return True
-        elif isinstance(node, ast.Dict):
-            for key in node.keys:
+            return False
+        if isinstance(node, ast.Dict):
+            unpack = any(key is None
+                         for key in node.keys)
+            if not unpack:
+                for key, value in zip(node.keys,
+                                      node.values):
+                    for part in (key, value):
+                        found = _scan(part)
+                        if found is not False:
+                            return found
+                for key in node.keys:
+                    if _unhashable_value(key):
+                        return True
+                return False
+            for key, value in zip(node.keys,
+                                  node.values):
                 if key is None:
-                    continue
-                if _unhashable_value(
-                        _unwrap_walrus(key)):
+                    found = _scan(value)
+                    if found is not False:
+                        return found
+                    merged = _unwrap_walrus(value)
+                    if isinstance(merged, ast.Dict):
+                        continue
+                    if _expr_quiet(merged):
+                        return True
+                    return None
+                found = _scan(key)
+                if found is not False:
+                    return found
+                found = _scan(value)
+                if found is not False:
+                    return found
+                if _unhashable_value(key):
                     return True
-        stack.extend(ast.iter_child_nodes(node))
-    return False
+            return False
+        if isinstance(node, (ast.List, ast.Tuple)):
+            for elt in node.elts:
+                elt = _unwrap_walrus(elt)
+                if isinstance(elt, ast.Starred):
+                    found = _scan(elt.value)
+                    if found is not False:
+                        return found
+                    if _noniterable_value(elt.value):
+                        return True
+                    if _expr_quiet(elt.value):
+                        continue
+                    return None
+                found = _scan(elt)
+                if found is not False:
+                    return found
+            return False
+        if isinstance(node, ast.BoolOp):
+            for value in node.values:
+                found = _scan(value)
+                if found is not False:
+                    return found
+                lit = _unwrap_walrus(value)
+                if not isinstance(lit, ast.Constant):
+                    return False
+                if isinstance(node.op, ast.And) \
+                        and not lit.value:
+                    return False
+                if isinstance(node.op, ast.Or) \
+                        and lit.value:
+                    return False
+            return False
+        if isinstance(node, ast.IfExp):
+            found = _scan(node.test)
+            if found is not False:
+                return found
+            test = _unwrap_walrus(node.test)
+            if isinstance(test, ast.Constant):
+                if test.value:
+                    return _scan(node.body)
+                return _scan(node.orelse)
+            return False
+        if isinstance(node, ast.GeneratorExp):
+            found = _scan(
+                node.generators[0].iter)
+            if found is not False:
+                return found
+            return False
+        if isinstance(node, (ast.ListComp,
+                             ast.SetComp,
+                             ast.DictComp)):
+            first = node.generators[0].iter
+            found = _scan(first)
+            if found is not False:
+                return found
+            if not _literal_nonempty(first):
+                return False
+            for index, gen in enumerate(
+                    node.generators):
+                if index:
+                    found = _scan(gen.iter)
+                    if found is not False:
+                        return found
+                for cond in gen.ifs:
+                    found = _scan(cond)
+                    if found is not False:
+                        return found
+            if isinstance(node, ast.DictComp):
+                for part in (node.key, node.value):
+                    found = _scan(part)
+                    if found is not False:
+                        return found
+            else:
+                found = _scan(node.elt)
+                if found is not False:
+                    return found
+            return False
+        if isinstance(node, (ast.expr_context,
+                             ast.operator,
+                             ast.unaryop,
+                             ast.cmpop,
+                             ast.boolop)):
+            return False
+        for child in ast.iter_child_nodes(node):
+            found = _scan(child)
+            if found is not False:
+                return found
+        return None
+
+    return _scan(iter_node) is True
 
 
 def _for_first_unpack(iter_node, target_node):
@@ -4704,6 +5469,57 @@ def _branch_raise_names(stmts, parents, del_raises,
     return out
 
 
+def _for_iter_finite(node, parents):
+    # True when a for-loop iterable provably
+    # terminates iteration (O14): a display
+    # with finite members (starred parts
+    # recurse — an infinite unpack hangs at
+    # construction instead), a str/bytes
+    # constant, an unshadowed const-int
+    # range() call, or a provable
+    # non-iterable (raises at once).
+    # Anything else (names, calls like
+    # iter(int, 1)) may hang the loop.
+    node = _unwrap_walrus(node)
+    if isinstance(node, (ast.List, ast.Tuple,
+                         ast.Set)):
+        for elt in node.elts:
+            elt = _unwrap_walrus(elt)
+            if isinstance(elt, ast.Starred) \
+                    and not _for_iter_finite(
+                        elt.value, parents):
+                return False
+        return True
+    if isinstance(node, ast.Dict):
+        for key, value in zip(node.keys,
+                              node.values):
+            if key is None \
+                    and not _for_iter_finite(
+                        value, parents):
+                return False
+        return True
+    if isinstance(node, ast.Constant) \
+            and isinstance(node.value, (str, bytes)):
+        return True
+    if _noniterable_value(node):
+        return True
+    if isinstance(node, ast.Call) \
+            and isinstance(node.func, ast.Name) \
+            and node.func.id == "range" \
+            and not node.keywords \
+            and 1 <= len(node.args) <= 3:
+        for arg in node.args:
+            plain = _unwrap_walrus(arg)
+            if not isinstance(plain, ast.Constant) \
+                    or not isinstance(plain.value, int):
+                break
+        else:
+            if not _name_bound_anywhere(
+                    node, parents, "range"):
+                return True
+    return False
+
+
 def _stmt_may_fall(stmt, soft_raise, parents=None,
                    del_raises=None, trusted=None,
                    suppresses=None):
@@ -5095,18 +5911,37 @@ def _stmt_may_fall_compute(stmt, soft_raise, parents=None,
             # body may hang instead (a live
             # continue to this loop, or a nested
             # loop): hangs never publish, so they
-            # keep the conservative fall (N15).
+            # keep the conservative fall (N15). A
+            # zero-trip nested while and a
+            # cancelled continue are impossible
+            # hangs (O13); a nested for over a
+            # possibly-nonfinite iterable hangs
+            # like a nested while (O14).
             hang = False
             for sub in stmt.body:
                 for cand in ast.walk(sub):
                     if isinstance(cand, ast.While):
+                        test = _unwrap_walrus(cand.test)
+                        if isinstance(test, ast.Constant) \
+                                and not test.value:
+                            continue
+                        hang = True
+                        break
+                    if isinstance(cand, (ast.For,
+                                         ast.AsyncFor)) \
+                            and not _for_iter_finite(
+                                cand.iter, parents):
                         hang = True
                         break
                     if isinstance(cand, ast.Continue) \
                             and _break_owner(
                                 cand, parents) is stmt \
                             and not _dead_bind(
-                                cand, parents):
+                                cand, parents) \
+                            and not _transfer_cancelled(
+                                cand, stmt, soft_raise,
+                                parents, del_raises,
+                                trusted, suppresses):
                         hang = True
                         break
                 if hang:
@@ -5944,7 +6779,9 @@ def _transfer_cancelled(node, loop, soft_raise, parents,
     # finally lets the transfer propagate to
     # the next one out; a finally carrying a
     # live break out of the same loop still
-    # exits it (N15).
+    # exits it (N15) — but only when that
+    # replacement break itself survives its
+    # own intervening finalizers (O12).
     if parents is None:
         return False
     trystar = getattr(ast, "TryStar", None)
@@ -5979,7 +6816,11 @@ def _transfer_cancelled(node, loop, soft_raise, parents,
                 if isinstance(cand, ast.Break) \
                         and _break_owner(cand, parents) \
                         is loop \
-                        and not _dead_bind(cand, parents):
+                        and not _dead_bind(cand, parents) \
+                        and not _transfer_cancelled(
+                            cand, loop, soft_raise,
+                            parents, del_raises,
+                            trusted, suppresses):
                     return False
         return True
     return False
@@ -14039,6 +14880,50 @@ def _binding_violations(source):
                 # substitutes the new chain (N17);
                 # an unknowable exit drops it too
                 # (escape unproven — fail closed).
+                def _apply_manager(chain, manager):
+                    for item in reversed(
+                            manager.items):
+                        outcome = _manager_outcome(
+                            item.context_expr,
+                            chain[0],
+                            _spelling_trusted,
+                            parents)
+                        if outcome is None \
+                                or outcome == \
+                                "suppress":
+                            return None
+                        if outcome == "propagate":
+                            continue
+                        typ = getattr(
+                            builtins, outcome[1],
+                            None)
+                        if not isinstance(
+                                typ, type) \
+                                or not issubclass(
+                                    typ,
+                                    BaseException):
+                            return None
+                        chain = tuple(
+                            cls.__name__
+                            for cls in typ.__mro__
+                            if cls is not object)
+                    return chain
+
+                def _span(node):
+                    return ((node.lineno,
+                             node.col_offset),
+                            (node.end_lineno,
+                             node.end_col_offset))
+
+                def _strictly_inside(inner, outer):
+                    # start-strict (excludes self),
+                    # end-nonstrict (a last child
+                    # shares its parent's end).
+                    ispan = _span(inner)
+                    ospan = _span(outer)
+                    return ospan[0] < ispan[0] \
+                        and ispan[1] <= ospan[1]
+
                 kept = []
                 for catching in catchings:
                     if catching is None:
@@ -14050,34 +14935,57 @@ def _binding_violations(source):
                         continue
                     chain = catching
                     for manager in withs:
-                        for item in reversed(
-                                manager.items):
-                            outcome = _manager_outcome(
-                                item.context_expr,
-                                chain[0],
-                                _spelling_trusted,
-                                parents)
-                            if outcome is None \
-                                    or outcome == \
-                                    "suppress":
-                                chain = None
-                                break
-                            if outcome == "propagate":
+                        # O2: a try strictly inside
+                        # this manager whose body holds
+                        # the raiser and whose handler
+                        # may catch with a falling
+                        # continuation runs BEFORE the
+                        # exit (unwinding order) — the
+                        # exit then sees None. Keep the
+                        # fall-path chain (threaded
+                        # through managers inside the
+                        # try only) alongside the
+                        # raise-path chain.
+                        for trobj in trys:
+                            if not _strictly_inside(
+                                    trobj, manager):
                                 continue
-                            typ = getattr(
-                                builtins, outcome[1],
-                                None)
-                            if not isinstance(
-                                    typ, type) \
-                                    or not issubclass(
-                                        typ,
-                                        BaseException):
-                                chain = None
-                                break
-                            chain = tuple(
-                                cls.__name__
-                                for cls in typ.__mro__
-                                if cls is not object)
+                            if not any(
+                                    (sub.lineno,
+                                     sub.col_offset)
+                                    <= rpos
+                                    <= (sub.end_lineno,
+                                        sub.end_col_offset)
+                                    for sub in
+                                    trobj.body):
+                                continue
+                            sub = catching
+                            for inner in withs:
+                                if not _strictly_inside(
+                                        inner, trobj):
+                                    continue
+                                sub = _apply_manager(
+                                    sub, inner)
+                                if sub is None:
+                                    break
+                            if sub is None:
+                                continue
+                            if any(
+                                    _chain_selected(
+                                        handler.type,
+                                        sub)
+                                    and _seq_may_fall(
+                                        handler.body,
+                                        False, parents)
+                                    and _seq_may_fall(
+                                        trobj.finalbody,
+                                        False, parents)
+                                    for handler in
+                                    trobj.handlers) \
+                                    and sub not in kept:
+                                kept.append(sub)
+                        chain = _apply_manager(
+                            chain, manager)
                         if chain is None:
                             break
                     if chain is not None:
@@ -14344,9 +15252,19 @@ def _binding_violations(source):
                                     < preempt_at]
                             for idx, handler in \
                                     enumerate(reach):
+                                # O8: shadowing asks
+                                # whether a prior
+                                # handler definitely
+                                # catches the
+                                # INCOMING error (tried
+                                # before any later
+                                # preempt arises) —
+                                # never the
+                                # replacement.
                                 if any(
                                         _handler_must_match(
-                                            prior, chain)
+                                            prior,
+                                            incoming)
                                         for prior in
                                         reach[:idx]):
                                     continue
@@ -30402,6 +31320,33 @@ class CapturedBytesBinding(unittest.TestCase):
         # still publishes, and a valid group
         # whose every leaf matches still
         # publishes (positive controls).
+        # O16 (adjudication-r46): the controls
+        # fire on both revisions, so the nested
+        # oversized-UDE crash fixture pins the
+        # red side (F at r45, S at r46).
+        silent = [
+            ('n16-ude-catcherless-crash',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box = {}\n'
+             + '    *xs, = [box]\n'
+             + '    try:\n'
+             + '        raise ExceptionGroup("g", '
+             + '[UnicodeDecodeError("u", b"x", '
+             + '9223372036854775808, 1, "r"), '
+             + 'ValueError(), TypeError()])\n'
+             + '    except* ValueError:\n'
+             + '        xs[0] = {}\n'
+             + '    except* TypeError:\n'
+             + '        xs[0]["raw"] = log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
         fire = [
             ('n16-overflow-caught-raw',
              'def prepare(log):\n'
@@ -30443,6 +31388,9 @@ class CapturedBytesBinding(unittest.TestCase):
              + '    return results\n',
              'tainted path escapes to results.append()'),
         ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(_binding_violations(src), [], name)
         for name, src, fragment in fire:
             with self.subTest(shape=name):
                 violations = _binding_violations(src)
@@ -30555,6 +31503,1341 @@ class CapturedBytesBinding(unittest.TestCase):
         for name, src in silent:
             with self.subTest(shape=name):
                 self.assertEqual(_binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o5(self):
+        # O5 (adjudication-r46): binding discovery
+        # must include keyword-only defaults: `def
+        # unused(*, x=(cl:=contextlib))` binds cl
+        # in execute scope (RAW), like the
+        # positional-default control.
+        fire = [
+            ('o5-kwonly-default-walrus-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    import contextlib\n'
+             + '    def unused(*, x=(cl:=contextlib)):\n'
+             + '        pass\n'
+             + '    try:\n'
+             + '        with cl.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o5-positional-default-control',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    import contextlib\n'
+             + '    def unused(x=(cl:=contextlib)):\n'
+             + '        pass\n'
+             + '    try:\n'
+             + '        with cl.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o3(self):
+        # O3 (adjudication-r46): prologue
+        # expressions (defaults, decorators,
+        # class bases/keywords) evaluate in the
+        # ENCLOSING scope, so a walrus there
+        # binds and a later del succeeds (RAW) —
+        # the del-unbound proof must visit
+        # prologues instead of pruning them
+        # with the deferred body.
+        fire = [
+            ('o3-del-prologue-default-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    def unused(x=(present:=1)): pass\n'
+             + '    del present\n'
+             + '    box[\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o3-del-prologue-decorator-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    @(present:=lambda f:f)\n'
+             + '    def unused(): pass\n'
+             + '    del present\n'
+             + '    box[\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o3-del-prologue-class-base-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    class C((present:=object)): pass\n'
+             + '    del present\n'
+             + '    box[\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o7(self):
+        # O7 (adjudication-r46): definition names
+        # and evaluated prologue stores bind in
+        # the ENCLOSING scope — a same-scope
+        # class/def rebind or default walrus
+        # voids the stale-store resolution, so
+        # the genuine NameError member (or the
+        # crash) decides: CLEAN/CRASH stay
+        # silent. (Decorated-rebind VALUE
+        # resolution stays out of scope: the
+        # o7b mirror shapes miss silent both
+        # revisions — known limitation.)
+        silent = [
+            ('o7-same-scope-class-clean',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    mapping={\'slot\':box}\n'
+             + '    Bad=0\n'
+             + '    class Bad(TypeError): pass\n'
+             + '    BadAlias=Bad\n'
+             + '    with contextlib.suppress(TypeError):\n'
+             + '        with contextlib.suppress('
+             + 'BadAlias, NameError):\n'
+             + '            del missing\n'
+             + '        mapping[\'slot\']={}\n'
+             + '    *xs, = [dict(mapping.copy(), '
+             + 'extra={})]\n'
+             + '    xs[0][\'slot\'][\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o7-same-scope-def-clean',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    mapping={\'slot\':box}\n'
+             + '    Bad=0\n'
+             + '    @lambda f: NameError\n'
+             + '    def Bad(): pass\n'
+             + '    BadAlias=Bad\n'
+             + '    with contextlib.suppress(TypeError):\n'
+             + '        with contextlib.suppress('
+             + 'BadAlias, NameError):\n'
+             + '            del missing\n'
+             + '        mapping[\'slot\']={}\n'
+             + '    *xs, = [dict(mapping.copy(), '
+             + 'extra={})]\n'
+             + '    xs[0][\'slot\'][\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o7-prologue-store-clean',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    mapping={\'slot\':box}\n'
+             + '    Bad=0\n'
+             + '    def unused(x=(Bad:=NameError)): pass\n'
+             + '    BadAlias=Bad\n'
+             + '    with contextlib.suppress(TypeError):\n'
+             + '        with contextlib.suppress('
+             + 'BadAlias, NameError):\n'
+             + '            del missing\n'
+             + '        mapping[\'slot\']={}\n'
+             + '    *xs, = [dict(mapping.copy(), '
+             + 'extra={})]\n'
+             + '    xs[0][\'slot\'][\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o7-class-binding-crash-silent',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    mapping={\'slot\':box}\n'
+             + '    Bad=0\n'
+             + '    class Bad(TypeError): pass\n'
+             + '    BadAlias=Bad\n'
+             + '    with contextlib.suppress(TypeError):\n'
+             + '        with contextlib.suppress('
+             + 'BadAlias, ValueError):\n'
+             + '            del missing\n'
+             + '        mapping[\'slot\']={}\n'
+             + '    *xs, = [dict(mapping.copy(), '
+             + 'extra={})]\n'
+             + '    xs[0][\'slot\'][\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(_binding_violations(src), [], name)
+
+    def test_tripwire_r47_o4(self):
+        # O4 (adjudication-r46): a module-level
+        # bind after the defs still binds before
+        # ANY invocation (the module loads fully
+        # first), so a function-deferred use sees
+        # it (RAW) — the horizon must not be the
+        # function body's textual position. The
+        # crash control pins the current FP hold
+        # (ZD-crash precision out of scope).
+        fire = [
+            ('o4-global-import-after-def-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with cl.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + 'import contextlib as cl\n',
+             'tainted path escapes to results.append()'),
+            ('o4-global-import-before-def-control',
+             'import contextlib as cl\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with cl.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o4-global-import-after-def-crash-hold',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with cl.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + 'import contextlib as cl\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o6(self):
+        # O6 (adjudication-r46): class-name
+        # absence proves nothing unless default
+        # namespace behavior is established — a
+        # metaclass __prepare__ (or any base,
+        # which may carry a metaclass) can
+        # supply the name (RAW). Baseless
+        # classes still prove absence (the
+        # NameError crash stays silent). The
+        # plain-base control pins the intended
+        # precision cost (fires on a crash-only
+        # shape).
+        silent = [
+            ('o6-baseless-class-absence-silent',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        class C:\n'
+             + '            with cl.suppress(1/0):\n'
+             + '                pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({\'raw\':log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        fire = [
+            ('o6-metaclass-prepare-raw',
+             'import contextlib\n'
+             + 'class Meta(type):\n'
+             + '    @classmethod\n'
+             + '    def __prepare__(mcls, name, bases):\n'
+             + '        return {\'cl\': contextlib}\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        class C(metaclass=Meta):\n'
+             + '            with cl.suppress(1/0):\n'
+             + '                pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({\'raw\':log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o6-plain-base-cost-hold',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        class C(Exception):\n'
+             + '            with cl.suppress(1/0):\n'
+             + '                pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({\'raw\':log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(_binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o2(self):
+        # O2 (adjudication-r46): unwinding order
+        # — an inner handler that catches the
+        # body error runs BEFORE the manager
+        # exit, so a bad-member suppressor never
+        # sees it (no replacement TypeError) and
+        # the publish runs (RAW). The mismatch
+        # control pins the current FP hold (a
+        # crash-only shape that fires — crash
+        # precision out of scope).
+        fire = [
+            ('o2-inner-catcher-del-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    with contextlib.suppress(0):\n'
+             + '        try:\n'
+             + '            del missing\n'
+             + '        except NameError:\n'
+             + '            pass\n'
+             + '    box[\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o2-inner-catcher-raise-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    with contextlib.suppress(0):\n'
+             + '        try:\n'
+             + '            raise ValueError\n'
+             + '        except ValueError:\n'
+             + '            pass\n'
+             + '    box[\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o2-inner-mismatch-crash-hold',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    with contextlib.suppress(0):\n'
+             + '        try:\n'
+             + '            del missing\n'
+             + '        except TypeError:\n'
+             + '            pass\n'
+             + '    box[\'raw\']=log\n'
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o9(self):
+        # O9 (adjudication-r46): SyntaxError
+        # details validate only at exactly two
+        # positionals (a third never parses
+        # details), and str/bytes sequences of
+        # length 4/6 construct like tuples/lists
+        # (first-hand both interpreters).
+        # Length 7 constructs on 3.14+ only
+        # (raises on 3.12, unknown on 3.13).
+        # The 3-arg crash shape (TypeError
+        # catcher misses the constructed
+        # SyntaxError) goes correctly silent.
+        fire = [
+            ('o9-three-args-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", 0, 3)\n'
+             + '    except SyntaxError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o9-two-str-four-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", "abcd")\n'
+             + '    except SyntaxError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o9-two-bytes-six-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", b"abcdef")\n'
+             + '    except SyntaxError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o9-two-list-six-control',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", '
+             + '["f",1,2,"txt",3,4])\n'
+             + '    except SyntaxError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o9-two-int-typeerror-control',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", 0)\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+        ]
+        silent = [
+            ('o9-three-crash-silent',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", 0, 3)\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'),
+        ]
+        seven_fire = [
+            ('o9-two-tuple-seven-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", '
+             + '(0,1,2,3,4,5,6))\n'
+             + '    except SyntaxError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'),
+            ('o9-two-str-seven-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        raise SyntaxError("m", "abcdefg")\n'
+             + '    except SyntaxError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(_binding_violations(src), [], name)
+        if sys.version_info >= (3, 14):
+            for name, src in seven_fire:
+                with self.subTest(shape=name):
+                    violations = _binding_violations(src)
+                    self.assertTrue(
+                        any('tainted path escapes to '
+                            'results.append()' in violation
+                            for violation in violations),
+                        f"{name}: {violations}")
+        elif sys.version_info <= (3, 12):
+            for name, src in seven_fire:
+                with self.subTest(shape=name):
+                    self.assertEqual(
+                        _binding_violations(src), [], name)
+
+    def test_tripwire_r47_o1(self):
+        # O1 (adjudication-r46): the unhashable
+        # member must provably execute FIRST —
+        # short-circuited, conditional-dead,
+        # deferred (genexp), or
+        # preceded-by-a-loud-error members never
+        # raise first (RAW publishes).
+        silent = [
+            ('o1-evaluated-bad-set-crash-silent',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [{[]}]:\n'
+             + '            pass\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'),
+        ]
+        fire = [
+            ('o1-shortcircuit-skipped-set-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    for a in [False and {[]}]:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o1-generator-not-evaluated-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    for a in [(x for x in [0] if {[]})]:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o1-name-before-bad-key-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in '
+             + '[{missing: 1, []: 2}]:\n'
+             + '            pass\n'
+             + '    except NameError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o1-div-before-bad-key-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in '
+             + '[{1/0: 1, []: 2}]:\n'
+             + '            pass\n'
+             + '    except ZeroDivisionError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o1-conditional-skipped-set-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    for a in '
+             + '([{[]}] if False else [0]):\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o1-evaluated-bad-set-control',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        for (a,b) in [{[]}]:\n'
+             + '            pass\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(_binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o10(self):
+        # O10 (adjudication-r46): must-raise
+        # predecessors beyond 1/0 skip a
+        # same-iteration import the same way: an
+        # unbound name, a failing builtin call and
+        # an unhashable set member all raise
+        # before the import executes. The 1/0
+        # control pins the pre-existing r46
+        # behavior.
+        fire = [
+            ('o10-unconditional-raise-control',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results = []\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    for _ in [0]:\n'
+             + '        box = {}\n'
+             + '        mapping = {\'slot\': box}\n'
+             + '        alias = mapping\n'
+             + '\n'
+             + '        try:\n'
+             + '            1/0\n'
+             + '            import contextlib as cl\n'
+             + '        except ZeroDivisionError:\n'
+             + '            pass\n'
+             + '        with contextlib.suppress(NameError):\n'
+             + '            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n'
+             + '                pass\n'
+             + '            mapping[\'slot\'] = {}\n'
+             + '        *xs, = [dict(mapping.copy(), extra={})]\n'
+             + '        xs[0][\'slot\'][\'raw\'] = log\n'
+             + '        results.append(box)\n'
+             + '        break\n'
+             + '    output = decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o10-skipped-import-name',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results = []\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    for _ in [0]:\n'
+             + '        box = {}\n'
+             + '        mapping = {\'slot\': box}\n'
+             + '        alias = mapping\n'
+             + '\n'
+             + '        try:\n'
+             + '            missing\n'
+             + '            import contextlib as cl\n'
+             + '        except NameError:\n'
+             + '            pass\n'
+             + '        with contextlib.suppress(NameError):\n'
+             + '            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n'
+             + '                pass\n'
+             + '            mapping[\'slot\'] = {}\n'
+             + '        *xs, = [dict(mapping.copy(), extra={})]\n'
+             + '        xs[0][\'slot\'][\'raw\'] = log\n'
+             + '        results.append(box)\n'
+             + '        break\n'
+             + '    output = decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o10-skipped-import-int',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results = []\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    for _ in [0]:\n'
+             + '        box = {}\n'
+             + '        mapping = {\'slot\': box}\n'
+             + '        alias = mapping\n'
+             + '\n'
+             + '        try:\n'
+             + '            int("bad")\n'
+             + '            import contextlib as cl\n'
+             + '        except ValueError:\n'
+             + '            pass\n'
+             + '        with contextlib.suppress(NameError):\n'
+             + '            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n'
+             + '                pass\n'
+             + '            mapping[\'slot\'] = {}\n'
+             + '        *xs, = [dict(mapping.copy(), extra={})]\n'
+             + '        xs[0][\'slot\'][\'raw\'] = log\n'
+             + '        results.append(box)\n'
+             + '        break\n'
+             + '    output = decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o10-skipped-import-set',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results = []\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    for _ in [0]:\n'
+             + '        box = {}\n'
+             + '        mapping = {\'slot\': box}\n'
+             + '        alias = mapping\n'
+             + '\n'
+             + '        try:\n'
+             + '            {[]}\n'
+             + '            import contextlib as cl\n'
+             + '        except TypeError:\n'
+             + '            pass\n'
+             + '        with contextlib.suppress(NameError):\n'
+             + '            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n'
+             + '                pass\n'
+             + '            mapping[\'slot\'] = {}\n'
+             + '        *xs, = [dict(mapping.copy(), extra={})]\n'
+             + '        xs[0][\'slot\'][\'raw\'] = log\n'
+             + '        results.append(box)\n'
+             + '        break\n'
+             + '    output = decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o15(self):
+        # O15 (adjudication-r46): harmless
+        # containers of trusted names prove the
+        # prior manager entered: suppress(
+        # (ValueError,)) and the starred forms
+        # evaluate quietly, the later
+        # suppress(1/0) raises ZD, the prior
+        # exit does not suppress it and the
+        # ValueError handler does not catch it
+        # — uncaught ZD, CRASH (silent). The
+        # bare-name prior pins the pre-existing
+        # r46 behavior.
+        silent = [
+            ('o15-bare-prior-control',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress(ValueError), contextlib.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o15-tuple-prior-crash',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress((ValueError,)), contextlib.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o15-list-star-prior-crash',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress(*[ValueError]), contextlib.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o15-tuple-star-prior-crash',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress(*(ValueError,)), contextlib.suppress(1/0):\n'
+             + '            pass\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+
+    def test_tripwire_r47_o12(self):
+        # O12 (adjudication-r46): a replacement
+        # break that is itself cancelled never
+        # completes the loop — the inner break
+        # dies in its own `finally: raise
+        # ValueError`, so the outer break is
+        # replaced by ValueError, the overwrite
+        # is skipped and the publish runs RAW.
+        fire = [
+            ('o12-finally-inner-break-cancelled',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        for _ in [0]:\n'
+             + '            try:\n'
+             + '                break\n'
+             + '            finally:\n'
+             + '                try:\n'
+             + '                    break\n'
+             + '                finally:\n'
+             + '                    raise ValueError\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    a['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o13(self):
+        # O13 (adjudication-r46): impossible
+        # hangs are not hang evidence — a
+        # zero-trip `while False` never
+        # executes, and a continue cancelled
+        # by its own `finally: raise` never
+        # rechecks, so the proven first-pass
+        # raise fires and the publish runs
+        # RAW. The live-continue hang pins
+        # the pre-existing N15 silence.
+        fire = [
+            ('o13-while-false-veto',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        while True:\n'
+             + '            while False:\n'
+             + '                pass\n'
+             + '            raise ValueError\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    a['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o13-while-continue-cancelled',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        while True:\n'
+             + '            try:\n'
+             + '                continue\n'
+             + '            finally:\n'
+             + '                raise ValueError\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    a['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        silent = [
+            ('o13-while-true-continue-hangs',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results = []\n'
+             + '    c, t, captured = run_logged([], log, 1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        while True:\n'
+             + '            continue\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + '    a["raw"]=log\n'
+             + '    results.append(box)\n'
+             + '    output = decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o14(self):
+        # O14 (adjudication-r46): a nested for
+        # over a provably non-finite iterable
+        # hangs like a nested while —
+        # `iter(int, 1)` never terminates, so
+        # the raise past it never fires and
+        # the shape stays silent. The plain
+        # raise pins the pre-existing N15
+        # fire, and a nested for over a
+        # finite display still terminates
+        # (no over-veto).
+        silent = [
+            ('o14-infinite-for',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        while True:\n'
+             + '            for _ in iter(int, 1):\n'
+             + '                pass\n'
+             + '            raise ValueError\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    a['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        fire = [
+            ('o14-plain-raise-control',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        while True:\n'
+             + '            raise ValueError\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    a['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o14-finite-for-still-fires',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    box={}\n'
+             + '    a=box\n'
+             + '    try:\n'
+             + '        while True:\n'
+             + '            for _ in [0]:\n'
+             + '                pass\n'
+             + '            raise ValueError\n'
+             + '        a={}\n'
+             + '    except ValueError:\n'
+             + '        pass\n'
+             + "    a['raw']=log\n"
+             + '    results.append(box)\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    _binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o11(self):
+        # O11 (adjudication-r46): unpacking
+        # forces incremental construction —
+        # an unhashable member hashes (TypeError)
+        # BEFORE a later div evaluates, so the
+        # TypeError catcher lands (RAW). Plain
+        # (non-unpacking) displays evaluate all
+        # element exprs first: the div wins
+        # (ZD crash stays silent).
+        silent = [
+            ('o11-dict-plain-crash-silent',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress('
+             + '{[]:0, 0:1/0}):\n'
+             + '            pass\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+            ('o11-set-plain-crash-silent',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress('
+             + '{[], 1/0}):\n'
+             + '            pass\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n'),
+        ]
+        fire = [
+            ('o11-dict-unpack-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress('
+             + '{[]:0, **{}, 0:1/0}):\n'
+             + '            pass\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+            ('o11-set-unpack-raw',
+             'import contextlib\n'
+             + 'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log):\n'
+             + '    results=[]\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    try:\n'
+             + '        with contextlib.suppress('
+             + '{[], *[], 1/0}):\n'
+             + '            pass\n'
+             + '    except TypeError:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n'
+             + '    return results\n',
+             'tainted path escapes to results.append()'),
+        ]
+        for name, src in silent:
+            with self.subTest(shape=name):
+                self.assertEqual(_binding_violations(src), [], name)
+        for name, src, fragment in fire:
+            with self.subTest(shape=name):
+                violations = _binding_violations(src)
+                self.assertTrue(
+                    any(fragment in violation
+                        for violation in violations),
+                    f"{name}: {violations}")
+
+    def test_tripwire_r47_o8(self):
+        # O8 (adjudication-r46): ordered-matching
+        # shadowing tests priors against the
+        # INCOMING error, not a later preempt
+        # replacement — the Good handler matches
+        # the AssertionError and falls (RAW)
+        # before the raising handler type ever
+        # evaluates.
+        fire = [
+            ('o8-prior-tuple-te-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    Bad=ValueError\n'
+             + '    Good=AssertionError\n'
+             + '    try:\n'
+             + '        assert False\n'
+             + '    except (TypeError, Bad):\n'
+             + '        return\n'
+             + '    except Good:\n'
+             + '        pass\n'
+             + '    except 0:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o8-prior-tuple-zd-raw',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    Bad=ValueError\n'
+             + '    Good=AssertionError\n'
+             + '    try:\n'
+             + '        assert False\n'
+             + '    except (ZeroDivisionError, Bad):\n'
+             + '        return\n'
+             + '    except Good:\n'
+             + '        pass\n'
+             + '    except [1/0]:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+            ('o8-prior-tuple-miss-control',
+             'def prepare(log):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    return captured\n'
+             + 'def execute(log, results):\n'
+             + '    c,t,captured=run_logged([],log,1)\n'
+             + '    Bad=ValueError\n'
+             + '    Good=AssertionError\n'
+             + '    try:\n'
+             + '        assert False\n'
+             + '    except (TypeError, Bad):\n'
+             + '        return\n'
+             + '    except Good:\n'
+             + '        pass\n'
+             + '    except [1/0]:\n'
+             + '        pass\n'
+             + '    results.append({"raw":log})\n'
+             + '    output=decode_body_log(captured)\n',
+             'tainted path escapes to results.append()'),
+        ]
         for name, src, fragment in fire:
             with self.subTest(shape=name):
                 violations = _binding_violations(src)
