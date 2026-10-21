@@ -1753,37 +1753,50 @@ def _ordered_prefix(parts):
 def _display_segments(node):
     # construction segments of a set/dict
     # display in evaluation order (P12):
-    # maximal runs of plain members/pairs
-    # form one BUILD batch (every part
-    # evaluates, then every member/key
-    # hashes — first-hand both interpreters,
-    # with or without unpacking elsewhere),
+    # Small plain runs form one BUILD batch:
+    # evaluation precedes hashing. CPython's
+    # stack guideline (30 on 3.12 and 3.14)
+    # switches large sets to SET_ADD, and
+    # dict runs above 15 pairs to MAP_ADD:
+    # each member/pair then hashes in place.
+    # Sets count starred elements in the
+    # whole display; dicts count each plain
+    # run separately. Boundary verdicts are
+    # pinned against both interpreters.
     # while each starred/dstar part evaluates
     # and merges in place. Yields ("plain",
     # run) with run = unwrapped elements
     # (set) or (key, value) pairs (dict),
     # or ("star", unwrapped value expr).
+    def batches(run, incremental):
+        if incremental:
+            for item in run:
+                yield ("plain", [item])
+        elif run:
+            yield ("plain", run)
+
     if isinstance(node, ast.Set):
+        incremental = len(node.elts) > 30
         run = []
         for elt in node.elts:
             plain = _unwrap_walrus(elt)
             if isinstance(plain, ast.Starred):
                 if run:
-                    yield ("plain", run)
+                    yield from batches(run, incremental)
                     run = []
                 yield ("star",
                        _unwrap_walrus(plain.value))
             else:
                 run.append(plain)
         if run:
-            yield ("plain", run)
+            yield from batches(run, incremental)
     elif isinstance(node, ast.Dict):
         run = []
         for key, value in zip(node.keys,
                               node.values):
             if key is None:
                 if run:
-                    yield ("plain", run)
+                    yield from batches(run, len(run) > 15)
                     run = []
                 yield ("star",
                        _unwrap_walrus(value))
@@ -1791,7 +1804,7 @@ def _display_segments(node):
                 run.append((_unwrap_walrus(key),
                             _unwrap_walrus(value)))
         if run:
-            yield ("plain", run)
+            yield from batches(run, len(run) > 15)
 
 
 def _div_prefix_exprs(node):
@@ -3463,6 +3476,26 @@ def _suppress_entry_value(name, use, parents,
         return None
     if not (holder.lineno, holder.col_offset) < upos:
         return None
+    if isinstance(use, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+        # Handler aliases must already exist when the
+        # protected try is entered. A textual assignment
+        # in a preceding conditional arm is insufficient;
+        # require it earlier in the same enclosing suite.
+        cursor = use
+        precedes = False
+        while id(cursor) in parents:
+            parent = parents[id(cursor)]
+            for _, suite in ast.iter_fields(parent):
+                if isinstance(suite, list) and holder in suite \
+                        and cursor in suite \
+                        and suite.index(holder) < suite.index(cursor):
+                    precedes = True
+                    break
+            if precedes:
+                break
+            cursor = parent
+        if not precedes:
+            return None
     cursor = holder
     while True:
         if isinstance(cursor, (ast.FunctionDef,
@@ -5021,19 +5054,17 @@ def _equality_key(node):
     # canonical == key for constants and plain
     # nested displays, None when undecidable
     # (P1): keys compare equal exactly when the
-    # values compare == (numbers via complex,
-    # so 1 == 1.0 == True; nan keys never
-    # equal, matching nan != nan; dicts/sets
+    # values compare == (native numeric
+    # equality retains exact integers and
+    # 1 == 1.0 == True; dicts/sets
     # order-free). Anything evaluated (names,
     # calls, starred) voids — the comparison
     # may be loud, not a truth value.
     node = _unwrap_walrus(node)
     if isinstance(node, ast.Constant):
         value = node.value
-        if isinstance(value, bool):
-            return ("num", complex(value))
         if isinstance(value, (int, float, complex)):
-            return ("num", complex(value))
+            return ("num", value)
         if isinstance(value, str):
             return ("str", value)
         if isinstance(value, bytes):
@@ -5074,7 +5105,7 @@ def _equality_key(node):
             if kkey is None or vkey is None:
                 return None
             pairs.append((kkey, vkey))
-        return ("dict", frozenset(pairs))
+        return ("dict", frozenset(dict(pairs).items()))
     return None
 
 
@@ -5084,9 +5115,9 @@ def _truthy_value(node):
     # constants (bool), empty/nonempty plain
     # displays (exact types — no custom
     # __bool__), and single ==/!= over
-    # decidable operands (proven-quiet: keys
-    # only cover constants and nested plain
-    # displays, which cannot raise).
+    # decidable operands. Callers must first
+    # prove evaluation quiet: key availability
+    # alone does not prove hashability.
     node = _unwrap_walrus(node)
     if isinstance(node, ast.Constant):
         return bool(node.value)
@@ -5231,7 +5262,7 @@ def _iter_unhashable(iter_node, parents=None):
                     return found
                 truthy = _truthy_value(value)
                 if truthy is None:
-                    return False
+                    return None
                 if isinstance(node.op, ast.And):
                     if truthy:
                         continue
@@ -5255,14 +5286,16 @@ def _iter_unhashable(iter_node, parents=None):
                 found = _scan(part)
                 if found is not False:
                     return found
-            return False
+            # Quiet arguments do not prove that
+            # invoking the callee completes quietly.
+            return None
         if isinstance(node, ast.IfExp):
             found = _scan(node.test)
             if found is not False:
                 return found
             truthy = _truthy_value(node.test)
             if truthy is None:
-                return False
+                return None
             if truthy:
                 return _scan(node.body)
             return _scan(node.orelse)
@@ -5275,8 +5308,7 @@ def _iter_unhashable(iter_node, parents=None):
         if isinstance(node, (ast.ListComp,
                              ast.SetComp,
                              ast.DictComp)):
-            for index, gen in enumerate(
-                    node.generators):
+            for gen in node.generators:
                 found = _scan(gen.iter)
                 if found is not False:
                     return found
@@ -5290,7 +5322,10 @@ def _iter_unhashable(iter_node, parents=None):
                     found = _scan(cond)
                     if found is not False:
                         return found
-                    if _truthy_value(cond) is not True:
+                    truthy = _truthy_value(cond)
+                    if truthy is None:
+                        return None
+                    if not truthy:
                         return False
             if isinstance(node, ast.DictComp):
                 for part in (node.key, node.value):
@@ -5941,6 +5976,7 @@ def _for_never_hangs(cand, stmt, parents):
         return True
     probe = cand
     while id(probe) in parents:
+        child = probe
         probe = parents[id(probe)]
         if probe is stmt:
             break
@@ -5949,17 +5985,61 @@ def _for_never_hangs(cand, stmt, parents):
                               ast.Lambda)):
             return True
         if isinstance(probe, (ast.For, ast.AsyncFor)) \
+                and child in probe.body \
                 and _literal_empty(
                     _unwrap_walrus(probe.iter)):
             return True
         if isinstance(probe, ast.While):
             test = _unwrap_walrus(probe.test)
             if isinstance(test, ast.Constant) \
-                    and not test.value:
+                    and not test.value \
+                    and child in probe.body:
                 return True
+    # A first-body exit helps only after a terminating
+    # first iteration. Of the non-finite forms, prove
+    # only genuine iter(int, literal): construction,
+    # int(), sentinel comparison and a plain Name
+    # target cannot invoke user code. In particular,
+    # a callable iterator with an unknown callback
+    # can hang in its first next(), before break.
+    iterator = _unwrap_walrus(cand.iter)
+    if not isinstance(cand, ast.For) \
+            or not isinstance(cand.target, ast.Name) \
+            or not isinstance(iterator, ast.Call) \
+            or not isinstance(iterator.func, ast.Name) \
+            or iterator.func.id != "iter" \
+            or not _callee_quiet("iter", iterator.func, parents) \
+            or iterator.keywords or len(iterator.args) != 2:
+        return False
+    callback = _unwrap_walrus(iterator.args[0])
+    sentinel = _unwrap_walrus(iterator.args[1])
+    if not isinstance(callback, ast.Name) \
+            or callback.id != "int" \
+            or not _callee_quiet("int", callback, parents) \
+            or not isinstance(sentinel, ast.Constant):
+        return False
     first = _first_meaningful(cand.body)
-    return isinstance(first, (ast.Break, ast.Raise,
-                              ast.Return))
+    if isinstance(first, ast.Break):
+        return True
+    if isinstance(first, ast.Return):
+        return first.value is None or _eval_terminates(first.value, parents)
+    if not isinstance(first, ast.Raise) or first.cause is not None:
+        return False
+    if first.exc is None:
+        return True
+    exc = _unwrap_walrus(first.exc)
+    if isinstance(exc, ast.Constant):
+        return True  # native TypeError for an invalid exception
+    if isinstance(exc, ast.Call):
+        if not all(_expr_quiet(arg) for arg in exc.args) \
+                or not all(_expr_quiet(kw.value) for kw in exc.keywords):
+            return False
+        exc = _unwrap_walrus(exc.func)
+    if not isinstance(exc, ast.Name) \
+            or not _callee_quiet(exc.id, exc, parents):
+        return False
+    typ = getattr(builtins, exc.id, None)
+    return isinstance(typ, type) and issubclass(typ, BaseException)
 
 
 def _for_iter_finite(node, parents):
@@ -13853,7 +13933,7 @@ def _binding_violations(source):
                         # miss; unknowable or
                         # invalid voids.
                         resolved = _suppress_entry_value(
-                            spelling, handler,
+                            spelling, parents.get(id(handler), handler),
                             parents,
                             _spelling_trusted)
                         if resolved is None \
@@ -15660,6 +15740,7 @@ def _binding_violations(source):
                     reverse=True)
                 for catching in catchings:
                     chain = catching
+                    threaded = None
                     for trobj in ordered:
                         if not any(
                                 (sub.lineno,
@@ -15669,6 +15750,21 @@ def _binding_violations(source):
                                     sub.end_col_offset)
                                 for sub in trobj.body):
                             continue
+                        if threaded is not None and chain is not None \
+                                and chain != ():
+                            # Replacement exceptions meet intervening
+                            # manager exits before the enclosing try.
+                            for manager in withs:
+                                if not _strictly_inside(threaded, manager) \
+                                        or not _strictly_inside(manager, trobj):
+                                    continue
+                                chain = _apply_manager(chain, manager)
+                                if chain is None:
+                                    saved = True
+                                    break
+                            if saved:
+                                break
+                        threaded = trobj
                         tend = (trobj.end_lineno,
                                 trobj.end_col_offset)
                         if tend >= ppos:
@@ -32773,6 +32869,164 @@ class CapturedBytesBinding(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertEqual(raises(src), want)
 
+    def _r49_source(self, body, *, loop=False):
+        import textwrap
+        prefix = (
+            'import contextlib\n'
+            'def prepare(log):\n'
+            '    c,t,captured=run_logged([],log,1)\n'
+            '    return captured\n'
+            'def execute(log):\n'
+            '    results=[]\n'
+            '    c,t,captured=run_logged([],log,1)\n')
+        if loop:
+            body = ('box={}\na=box\ntry:\n    while True:\n'
+                    + textwrap.indent(body, '        ')
+                    + '        raise ValueError\n    a={}\n'
+                    + "except ValueError:\n    pass\na['raw']=log\n")
+        publish = 'box' if loop else "{'raw':log}"
+        return (prefix + textwrap.indent(body, '    ')
+                + f'    results.append({publish})\n'
+                + '    output=decode_body_log(captured)\n'
+                + '    return results\n')
+
+    def _r49_verdict(self, body, want, *, loop=False):
+        src = self._r49_source(body, loop=loop)
+        compile(src, '<r49-fixture>', 'exec')
+        violations = _binding_violations(src)
+        if want:
+            self.assertTrue(any('tainted path escapes to results.append()'
+                                in violation for violation in violations),
+                            violations)
+        else:
+            self.assertEqual(violations, [])
+
+    def test_tripwire_r49_call_execution(self):
+        # Q1: evaluating quiet arguments does not prove the call quiet.
+        self._r49_verdict("try:\n    for a in [int('bad'), {[]}]:\n"
+                          '        pass\nexcept ValueError:\n    pass\n', True)
+        # P13's raising-argument precision must survive the call repair.
+        self._r49_verdict('try:\n    for a in [len({[]})]:\n'
+                          '        pass\nexcept NameError:\n    pass\n', False)
+
+    def test_tripwire_r49_equality(self):
+        # Q2/Q5: exact native numeric equality and dictionary overwrites.
+        huge = '1' + '0' * 1000
+        cases = [
+            ('100000000000000000000 == 100000000000000000001', False),
+            ('100000000000000000000 != 100000000000000000001', True),
+            (f'{huge} == {huge}', True),
+            ('True == 1.0', True),
+            ('{1:0,1:1} != {1:1}', False),
+            ('{1:0,1:1} == {1:1}', True),
+            ('{1:0,1:1} != {1:1,1:0}', True),
+        ]
+        for comparison, want in cases:
+            with self.subTest(comparison=comparison[:100]):
+                self._r49_verdict('try:\n    for a in [missing if '
+                                  + comparison + ' else 0, {[]}]:\n'
+                                  + '        pass\nexcept NameError:\n    pass\n',
+                                  want)
+
+    def test_tripwire_r49_unknown_execution(self):
+        # Q6: an unresolved branch/filter cannot prove a later error first.
+        for expr in ('missing if 1+1 else 0', '(1-1) or missing',
+                     '[missing for _ in [0] if 1+1]'):
+            with self.subTest(expr=expr):
+                self._r49_verdict('try:\n    for a in [' + expr + ', {[]}]:\n'
+                                  + '        pass\nexcept NameError:\n    pass\n', True)
+
+    def test_tripwire_r49_loop_else(self):
+        # Q3: a zero-trip body is dead; its else still executes.
+        for head in ('for unused in []:', 'while False:'):
+            with self.subTest(head=head):
+                self._r49_verdict(head + '\n    pass\nelse:\n'
+                                  + '    for _ in iter(int,1):\n        pass\n',
+                                  False, loop=True)
+        self._r49_verdict('for unused in []:\n'
+                          '    for _ in iter(int,1):\n        pass\n', True, loop=True)
+
+    def test_tripwire_r49_first_exit(self):
+        # Q4: construction, first next, target store and exit values matter.
+        silent = [
+            'for x in [sum(iter(int,1))]:\n    break\n',
+            'for x in iter(lambda:sum(iter(int,1)),1):\n    break\n',
+            'for x in iter(int,1):\n    raise ValueError(sum(iter(int,1)))\n',
+        ]
+        for body in silent:
+            with self.subTest(body=body):
+                self._r49_verdict(body, False, loop=True)
+        for exit_stmt in ('break', 'raise ValueError'):
+            with self.subTest(control=exit_stmt):
+                self._r49_verdict('for x in iter(int,1):\n    '
+                                  + exit_stmt + '\n', True, loop=True)
+
+    def test_tripwire_r49_display_batches(self):
+        # Q7: CPython uses incremental hashing above its stack guideline.
+        for kind, sizes in (('dict', (15,16,17)), ('set', (29,30,31))):
+            for size in sizes:
+                if kind == 'dict':
+                    parts = ['[]:0'] + [f'{i}:0' for i in range(size-2)] + ['100:1/0']
+                    display = '{' + ','.join(parts) + ',**{}}'
+                    want = size > 15
+                else:
+                    parts = ['[]'] + [str(i) for i in range(size-2)] + ['1/0']
+                    display = '{' + ','.join(parts) + ',*()}'
+                    want = size + 1 > 30
+                with self.subTest(kind=kind, size=size):
+                    self._r49_verdict('try:\n    with contextlib.suppress('
+                                      + display + '):\n        pass\n'
+                                      + 'except TypeError:\n    pass\n', want)
+
+    def test_tripwire_r49_handler_alias(self):
+        # Q8: an unbound alias raises at matching time; an outer catcher saves.
+        for binding in ('        Bad=AssertionError\n', ''):
+            body = ('try:\n    try:\n        assert False\n' + binding
+                    + '    except (TypeError,Bad):\n        raise RuntimeError\n'
+                    + '    except AssertionError:\n        pass\n'
+                    + 'except NameError:\n    pass\n')
+            with self.subTest(binding=binding):
+                self._r49_verdict(body, True)
+        self._r49_verdict('Bad=AssertionError\ntry:\n    try:\n        assert False\n'
+                          '    except (TypeError,Bad):\n        raise RuntimeError\n'
+                          '    except AssertionError:\n        pass\n'
+                          'except NameError:\n    pass\n', False)
+
+    def test_tripwire_r49_nested_managers(self):
+        # Q9: replacement exceptions cross managers between nested tries.
+        for action in ('except NameError:', 'finally:'):
+            with self.subTest(action=action):
+                self._r49_verdict('try:\n    with contextlib.suppress(TypeError):\n'
+                                  + '        try:\n            raise NameError\n'
+                                  + '        ' + action + '\n            raise TypeError\n'
+                                  + 'except ValueError:\n    pass\n', True)
+
+    def test_tripwire_r49_future_annotation_fixture(self):
+        # Q10: the P7 firing fixture must compile on its supported interpreter.
+        if sys.version_info[:2] >= (3, 14):
+            self.skipTest('P7 fixture needs eager-annotation Python')
+        tree = ast.parse(Path(__file__).read_text())
+        test = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == 'test_tripwire_r48_p7')
+        def literal(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            self.assertIsInstance(node, ast.BinOp)
+            self.assertIsInstance(node.op, ast.Add)
+            return literal(node.left) + literal(node.right)
+
+        sources = [literal(item.elts[1]) for node in test.body
+                   if isinstance(node, ast.Assign) and isinstance(node.value, ast.List)
+                   for item in node.value.elts]
+        self.assertEqual(len(sources), 5)
+        for src in sources:
+            with self.subTest(src=src[:80]):
+                try:
+                    compile(src, '<P7-fixture>', 'exec', dont_inherit=True)
+                except SyntaxError as error:
+                    self.fail(f'P7 fixture cannot execute: {error}')
+
     def test_tripwire_r48_p1(self):
         # P1 (adjudication-r47): conditional
         # evaluation needs an evaluation proof
@@ -32935,10 +33189,10 @@ class CapturedBytesBinding(unittest.TestCase):
         # collectors must count those
         # positions. 3.12-only: 3.14 rejects
         # walrus-in-annotation at parse.
-        # Under `from __future__ import
-        # annotations` the annotation never
-        # evaluates, so the name stays unbound
-        # (guard shape fires).
+        # Under future annotations a legal bare-name
+        # annotation never evaluates, so it cannot bind
+        # the name (guard shape fires). A walrus there
+        # is compile-rejected even on 3.12.
         if sys.version_info[:2] >= (3, 14):
             self.skipTest(
                 'walrus in annotation needs 3.12')
@@ -32956,7 +33210,7 @@ class CapturedBytesBinding(unittest.TestCase):
              'def prepare(log):\n    c,t,captured=run_logged([],log,1)\n    return captured\ndef execute(log, results):\n    c,t,captured=run_logged([],log,1)\n    import contextlib\n    def unused() -> (cl:=contextlib):\n        pass\n    try:\n        with cl.suppress(1/0):\n            pass\n    except ZeroDivisionError:\n        pass\n    results.append({"raw":log})\n    output=decode_body_log(captured)\n',
              'tainted path escapes to results.append()'),
             ('p7-future-annotations-guard-raw',
-             'from __future__ import annotations\n' + "import contextlib\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        def unused() -> (missing:=0): pass\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n",
+             'from __future__ import annotations\n' + "import contextlib\ndef prepare(log):\n    c, t, captured = run_logged([], log, 1)\n    return captured\ndef execute(log):\n    results = []\n    c, t, captured = run_logged([], log, 1)\n    for _ in [0]:\n        box = {}\n        mapping = {'slot': box}\n        alias = mapping\n\n        def unused() -> missing: pass\n        try:\n            missing\n            import contextlib as cl\n        except NameError:\n            pass\n        with contextlib.suppress(NameError):\n            with cl.suppress(TypeError), contextlib.suppress(NameError | 0):\n                pass\n            mapping['slot'] = {}\n        *xs, = [dict(mapping.copy(), extra={})]\n        xs[0]['slot']['raw'] = log\n        results.append(box)\n        break\n    output = decode_body_log(captured)\n    return results\n",
              'tainted path escapes to results.append()'),
         ]
         for name, src in silent:
