@@ -3296,7 +3296,8 @@ def _exc_construction(name, node, trusted=None):
 
 
 def _suppress_entry_value(name, use, parents,
-                            trusted, _seen=None):
+                            trusted, _seen=None,
+                            _before=None, _executes=None):
     # the single literal value of a suppressor
     # entry name: False when provably not an
     # exception class (a constant — first-hand:
@@ -3389,12 +3390,18 @@ def _suppress_entry_value(name, use, parents,
         return False
 
     stores = []
+    deletions = []
     for cand in ast.walk(root):
         if isinstance(cand, ast.Name) \
                 and isinstance(cand.ctx, ast.Store) \
                 and cand.id == name:
             if _bind_visible(cand):
                 stores.append(cand)
+            continue
+        if _before is not None and isinstance(cand, ast.Name) \
+                and isinstance(cand.ctx, ast.Del) and cand.id == name \
+                and _bind_visible(cand) and not _dead_bind(cand, parents):
+            deletions.append(cand)
             continue
         if isinstance(cand, ast.ExceptHandler) \
                 and cand.name == name:
@@ -3476,25 +3483,21 @@ def _suppress_entry_value(name, use, parents,
         return None
     if not (holder.lineno, holder.col_offset) < upos:
         return None
-    if isinstance(use, (ast.Try, getattr(ast, "TryStar", ast.Try))):
-        # Handler aliases must already exist when the
-        # protected try is entered. A textual assignment
-        # in a preceding conditional arm is insufficient;
-        # require it earlier in the same enclosing suite.
-        cursor = use
-        precedes = False
-        while id(cursor) in parents:
-            parent = parents[id(cursor)]
-            for _, suite in ast.iter_fields(parent):
-                if isinstance(suite, list) and holder in suite \
-                        and cursor in suite \
-                        and suite.index(holder) < suite.index(cursor):
-                    precedes = True
-                    break
-            if precedes:
-                break
-            cursor = parent
-        if not precedes:
+    if _before is not None:
+        # Handler lookup occurs on the throwing path,
+        # not necessarily at try entry. Apply the same
+        # established execution proof at EVERY alias
+        # hop, and invalidate a binding deleted before
+        # that hop is evaluated. Dead deletions do not
+        # invalidate a live value; later deletions do
+        # not rewrite an already-copied alias.
+        bpos = (holder.lineno, holder.col_offset)
+        checkpoint = (_before.lineno, _before.col_offset)
+        if not bpos < checkpoint or _executes is None \
+                or not _executes(holder, checkpoint):
+            return None
+        if any(bpos < (deleted.lineno, deleted.col_offset) < checkpoint
+               for deleted in deletions):
             return None
     cursor = holder
     while True:
@@ -3520,7 +3523,9 @@ def _suppress_entry_value(name, use, parents,
                 return value.id
             return None
         return _suppress_entry_value(
-            value.id, holder, parents, trusted, _seen)
+            value.id, holder, parents, trusted, _seen,
+            _before=holder if _before is not None else None,
+            _executes=_executes)
     return None
 
 
@@ -5012,6 +5017,88 @@ def _first_meaningful(stmts):
     return seq[0] if seq else None
 
 
+def _native_name_trusted(name, use, parents):
+    # A deliberately narrow identity proof. Lexical
+    # quietness alone misses namespace writes. Avoid
+    # reflective namespace/mutator surfaces altogether
+    # rather than depend on the later alias analysis
+    # (which itself queries loop termination).
+    if not _callee_quiet(name, use, parents):
+        return False
+    memo = _analysis_memo(parents, use)
+    if memo is None:
+        return False
+    key = ("native_namespace_syntax",)
+    if key not in memo:
+        root = use
+        while id(root) in parents:
+            root = parents[id(root)]
+        blocked = set()
+        reflective = False
+        for node in ast.walk(root):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
+                    and node.id in ("globals", "locals", "vars", "__builtins__",
+                                    "setattr", "delattr", "getattr"):
+                reflective = True
+            if isinstance(node, ast.Attribute):
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    blocked.add(node.attr)
+                elif node.attr in (_NAMESPACE_MUTATORS
+                                   + ("__dict__", "__setattr__", "__delattr__",
+                                      "pop", "popitem", "clear", "__delitem__")):
+                    reflective = True
+            if isinstance(node, ast.Subscript) \
+                    and isinstance(node.ctx, (ast.Store, ast.Del)):
+                part = _unwrap_walrus(node.slice)
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    blocked.add(part.value)
+                else:
+                    reflective = True
+        memo[key] = (frozenset(blocked), reflective)
+    blocked, reflective = memo[key]
+    return not reflective and name not in blocked
+
+
+def _native_iterator_first(node, parents):
+    # A bounded native callable-iterator proof: the
+    # listed genuine no-argument constructors return
+    # these finite builtin values. A quiet literal
+    # sentinel cannot invoke user equality code.
+    # Return (first-value AST, zero-trip), else None.
+    node = _unwrap_walrus(node)
+    if not isinstance(node, ast.Call) \
+            or not isinstance(node.func, ast.Name) \
+            or node.func.id != "iter" \
+            or not _native_name_trusted("iter", node.func, parents) \
+            or node.keywords or len(node.args) != 2:
+        return None
+    callback = _unwrap_walrus(node.args[0])
+    sentinel = _unwrap_walrus(node.args[1])
+    if not isinstance(callback, ast.Name) \
+            or not _native_name_trusted(callback.id, callback, parents) \
+            or not _expr_quiet(sentinel):
+        return None
+    defaults = {"bool": False, "int": 0, "float": 0.0,
+                "complex": 0j, "str": "", "bytes": b""}
+    if callback.id in defaults:
+        first = ast.Constant(value=defaults[callback.id])
+    elif callback.id == "tuple":
+        first = ast.Tuple(elts=[], ctx=ast.Load())
+    elif callback.id == "list":
+        first = ast.List(elts=[], ctx=ast.Load())
+    elif callback.id in ("set", "frozenset"):
+        first = ast.Set(elts=[])
+    elif callback.id == "dict":
+        first = ast.Dict(keys=[], values=[])
+    else:
+        return None
+    first_key = _equality_key(first)
+    sentinel_key = _equality_key(sentinel)
+    if sentinel_key is None:
+        return None
+    return first, first_key == sentinel_key
+
+
 def _for_first_yield(node):
     # the first value a _literal_nonempty
     # iterator yields, as an AST node when
@@ -5995,51 +6082,49 @@ def _for_never_hangs(cand, stmt, parents):
                     and not test.value \
                     and child in probe.body:
                 return True
-    # A first-body exit helps only after a terminating
-    # first iteration. Of the non-finite forms, prove
-    # only genuine iter(int, literal): construction,
-    # int(), sentinel comparison and a plain Name
-    # target cannot invoke user code. In particular,
-    # a callable iterator with an unknown callback
-    # can hang in its first next(), before break.
-    iterator = _unwrap_walrus(cand.iter)
-    if not isinstance(cand, ast.For) \
-            or not isinstance(cand.target, ast.Name) \
-            or not isinstance(iterator, ast.Call) \
-            or not isinstance(iterator.func, ast.Name) \
-            or iterator.func.id != "iter" \
-            or not _callee_quiet("iter", iterator.func, parents) \
-            or iterator.keywords or len(iterator.args) != 2:
+    # A body exit helps only after a terminating first
+    # step. Unknown callbacks/targets stay unproven;
+    # a native matching sentinel stops before either.
+    if not isinstance(cand, ast.For):
         return False
-    callback = _unwrap_walrus(iterator.args[0])
-    sentinel = _unwrap_walrus(iterator.args[1])
-    if not isinstance(callback, ast.Name) \
-            or callback.id != "int" \
-            or not _callee_quiet("int", callback, parents) \
-            or not isinstance(sentinel, ast.Constant):
+    native = _native_iterator_first(cand.iter, parents)
+    if native is None:
+        return False
+    _, empty = native
+    if empty:
+        return True
+    if not isinstance(cand.target, ast.Name):
         return False
     first = _first_meaningful(cand.body)
     if isinstance(first, ast.Break):
         return True
     if isinstance(first, ast.Return):
         return first.value is None or _eval_terminates(first.value, parents)
-    if not isinstance(first, ast.Raise) or first.cause is not None:
+    if not isinstance(first, ast.Raise):
         return False
-    if first.exc is None:
-        return True
-    exc = _unwrap_walrus(first.exc)
-    if isinstance(exc, ast.Constant):
-        return True  # native TypeError for an invalid exception
-    if isinstance(exc, ast.Call):
-        if not all(_expr_quiet(arg) for arg in exc.args) \
-                or not all(_expr_quiet(kw.value) for kw in exc.keywords):
+
+    def exception_terminates(expr):
+        if expr is None:
+            return True
+        expr = _unwrap_walrus(expr)
+        if isinstance(expr, ast.Constant):
+            return True  # None or finite native invalid-exception error
+        if isinstance(expr, ast.Name):
+            typ = getattr(builtins, expr.id, None)
+            return _native_name_trusted(expr.id, expr, parents) \
+                and isinstance(typ, type) and issubclass(typ, BaseException)
+        if not isinstance(expr, ast.Call) \
+                or not all(_expr_quiet(arg) for arg in expr.args) \
+                or not all(_expr_quiet(kw.value) for kw in expr.keywords):
             return False
-        exc = _unwrap_walrus(exc.func)
-    if not isinstance(exc, ast.Name) \
-            or not _callee_quiet(exc.id, exc, parents):
-        return False
-    typ = getattr(builtins, exc.id, None)
-    return isinstance(typ, type) and issubclass(typ, BaseException)
+        callee = _unwrap_walrus(expr.func)
+        if not isinstance(callee, ast.Name) \
+                or not _native_name_trusted(callee.id, callee, parents):
+            return False
+        typ = getattr(builtins, callee.id, None)
+        return isinstance(typ, type) and issubclass(typ, BaseException)
+
+    return exception_terminates(first.exc) and exception_terminates(first.cause)
 
 
 def _for_iter_finite(node, parents):
@@ -6057,6 +6142,9 @@ def _for_iter_finite(node, parents):
     # Anything else (names, calls like
     # iter(int, 1)) may hang the loop.
     node = _unwrap_walrus(node)
+    native = _native_iterator_first(node, parents)
+    if native is not None and native[1]:
+        return True
     if isinstance(node, (ast.List, ast.Tuple,
                          ast.Set)):
         for elt in node.elts:
@@ -13933,9 +14021,11 @@ def _binding_violations(source):
                         # miss; unknowable or
                         # invalid voids.
                         resolved = _suppress_entry_value(
-                            spelling, parents.get(id(handler), handler),
+                            spelling, handler,
                             parents,
-                            _spelling_trusted)
+                            _spelling_trusted,
+                            _before=dnode,
+                            _executes=executes)
                         if resolved is None \
                                 or resolved is False:
                             return False
@@ -14439,6 +14529,27 @@ def _binding_violations(source):
                 # and hang analysis stay out
                 # (documented punts).
                 return _seq_outcome(trobj.finalbody)
+
+            def _normal_finally_may_fall(seq):
+                # A suppressed exception resumes normally, but the
+                # finalizer must still complete. Keep global may-fall's
+                # existing contract; only this normal path additionally
+                # recognizes bounded semantic expression failures.
+                if not _seq_may_fall(seq, False, parents):
+                    return False
+                for sub in seq:
+                    if isinstance(sub, ast.If):
+                        test = _unwrap_walrus(sub.test)
+                        if isinstance(test, ast.Constant):
+                            taken = sub.body if test.value else sub.orelse
+                            if not _normal_finally_may_fall(taken):
+                                return False
+                    elif isinstance(sub, (ast.Expr, ast.Assign, ast.AnnAssign)):
+                        value = sub.value
+                        if value is not None and any(
+                                _always_eval_raises(value, parents)):
+                            return False
+                return True
 
             def _load_raise_chain(name, node):
                 # the load of name at node: its catching
@@ -15741,6 +15852,8 @@ def _binding_violations(source):
                 for catching in catchings:
                     chain = catching
                     threaded = None
+                    normal_after_suppression = False
+                    normal_certain = False
                     for trobj in ordered:
                         if not any(
                                 (sub.lineno,
@@ -15758,12 +15871,20 @@ def _binding_violations(source):
                                 if not _strictly_inside(threaded, manager) \
                                         or not _strictly_inside(manager, trobj):
                                     continue
+                                incoming_manager_chain = chain
                                 chain = _apply_manager(chain, manager)
                                 if chain is None:
-                                    saved = True
+                                    # Suppression is normal completion, not
+                                    # proof that publication survives all
+                                    # remaining enclosing finalizers.
+                                    normal_after_suppression = True
+                                    normal_certain = len(manager.items) == 1 \
+                                        and _manager_outcome(
+                                            manager.items[0].context_expr,
+                                            incoming_manager_chain[0],
+                                            _spelling_trusted, parents) == "suppress"
+                                    chain = () if normal_certain else None
                                     break
-                            if saved:
-                                break
                         threaded = trobj
                         tend = (trobj.end_lineno,
                                 trobj.end_col_offset)
@@ -15985,22 +16106,44 @@ def _binding_violations(source):
                         outcome = _finally_outcome(
                             trobj)
                         if outcome is None:
+                            if normal_after_suppression and not \
+                                    _normal_finally_may_fall(trobj.finalbody):
+                                # A bounded semantic failure can be
+                                # opaque to global may-fall. It still
+                                # ends this normal continuation; keep
+                                # its error available to outer catchers.
+                                chain = None
+                                normal_after_suppression = False
+                                normal_certain = False
                             continue
                         if outcome[0] == "live":
                             saved = True
                             break
                         if outcome[0] == "keep":
-                            if chain == ():
+                            if normal_after_suppression and not normal_certain:
+                                chain = None  # propagated error or no active error
+                            elif chain == ():
                                 chain = (
                                     "RuntimeError",
                                     "Exception",
                                     "BaseException")
+                            normal_after_suppression = False
+                            normal_certain = False
                         elif outcome[0] == "chain":
                             chain = outcome[1]
+                            normal_after_suppression = False
+                            normal_certain = False
                         elif outcome[0] == "unknown":
                             chain = None
+                            normal_after_suppression = normal_after_suppression \
+                                and _normal_finally_may_fall(trobj.finalbody)
+                            normal_certain = False
                         else:
                             chain = ()
+                            normal_after_suppression = False
+                            normal_certain = False
+                    if normal_after_suppression:
+                        saved = True
                     if not saved and chain is not None \
                             and chain != ():
                         # P5: a handler/finalizer
@@ -32900,6 +33043,82 @@ class CapturedBytesBinding(unittest.TestCase):
                             violations)
         else:
             self.assertEqual(violations, [])
+
+    def test_tripwire_r50_native_exits(self):
+        # R1: finite native causes/callbacks and an immediate sentinel stop.
+        fire = [
+            'for x in iter(int,1):\n    raise ValueError from None\n',
+            'for x in iter(int,1):\n    raise ValueError from TypeError\n',
+            'for x in iter(int,1):\n    raise ValueError from TypeError("cause")\n',
+            'for x in iter(bool,True):\n    break\n',
+            'for x in iter(float,1.0):\n    break\n',
+            'for x in iter(int,0):\n    pass\n',
+        ]
+        for body in fire:
+            with self.subTest(body=body):
+                self._r49_verdict(body, True, loop=True)
+        self._r49_verdict('for x in iter(int,1):\n'
+                          '    raise ValueError from sum(iter(int,1))\n',
+                          False, loop=True)
+
+    def test_tripwire_r50_handler_availability(self):
+        # R2/R3 and own-review: each hop must survive on the throwing path.
+        tail = ('    try:\n        assert False\n'
+                '    except (TypeError,Bad):\n        raise RuntimeError\n'
+                '    except AssertionError:\n        pass\n'
+                'except NameError:\n    pass\n')
+        cases = [
+            ('try:\n    if False:\n        Root=AssertionError\n'
+             + '    Bad=Root\n' + tail, True),
+            ('Bad=AssertionError\ndel Bad\ntry:\n' + tail, True),
+            ('try:\n    if True:\n        Bad=AssertionError\n' + tail, False),
+            ('try:\n    if False:\n        Bad=AssertionError\n' + tail, True),
+            ('Bad=AssertionError\nif False:\n    del Bad\ntry:\n' + tail, False),
+            ('try:\n    try:\n        Bad=AssertionError\n        assert False\n'
+             '    except (TypeError,Bad):\n        raise RuntimeError\n'
+             '    except 1/0:\n        pass\nexcept ZeroDivisionError:\n    pass\n', False),
+        ]
+        for body, want in cases:
+            with self.subTest(body=body):
+                self._r49_verdict(body, want)
+
+    def test_tripwire_r50_native_identity(self):
+        # Native invocation proofs need identity, not just a quiet Name load.
+        self._r49_verdict('import builtins\nbuiltins.int=lambda:(1,2)\n'
+                          'for a,b in iter(int,None):\n'
+                          "    results.append({'raw':log})\n    break\n", True)
+        for prefix in ('import builtins\nbuiltins.int=lambda:1\n',
+                       "globals()['int']=lambda:1\n",
+                       'import builtins\nsaved=iter\n'
+                       'builtins.iter=lambda *args:saved(lambda:1,0)\n'):
+            with self.subTest(prefix=prefix):
+                self._r49_verdict(prefix + 'for x in iter(int,0):\n    pass\n',
+                                  False, loop=True)
+        self._r49_verdict('import builtins\nfor x in iter(int,0):\n    pass\n',
+                          True, loop=True)
+
+    def test_tripwire_r50_manager_finalizers(self):
+        # R4: suppression resumes normally; surrounding finalizers still run.
+        prefix = ('try:\n    with contextlib.suppress(TypeError):\n'
+                  '        try:\n            raise NameError\n'
+                  '        except NameError:\n            raise TypeError\n'
+                  'finally:\n    ')
+        import warnings
+        for action, want in (('raise', False), ('raise ValueError', False),
+                             ("int('bad')", False), ('raise 0', False),
+                             ('return None', False), ('pass', True)):
+            with self.subTest(action=action):
+                with warnings.catch_warnings():
+                    if action == 'return None':
+                        # This deliberate control-flow fixture warns on 3.14.
+                        warnings.filterwarnings('ignore', category=SyntaxWarning,
+                                                message="'return' in a 'finally' block")
+                    self._r49_verdict(prefix + action + '\n', want)
+        self._r49_verdict(
+            'try:\n    try:\n        with contextlib.suppress(TypeError):\n'
+            '            try:\n                raise NameError\n'
+            '            except NameError:\n                raise TypeError\n'
+            '    finally:\n        raise\nexcept RuntimeError:\n    pass\n', True)
 
     def test_tripwire_r49_call_execution(self):
         # Q1: evaluating quiet arguments does not prove the call quiet.
