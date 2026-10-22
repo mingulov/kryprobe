@@ -4,6 +4,8 @@
 import ast
 import builtins
 import contextlib
+from dataclasses import dataclass, replace
+from collections import deque
 import hashlib
 import json
 import os
@@ -4360,6 +4362,378 @@ class _ProofScopeIndex:
 
     def namespace_open(self, scope):
         return scope in self._open_namespaces
+
+
+def _proof_immutable_token(value):
+    pending = [value]
+    while pending:
+        part = pending.pop()
+        if type(part) in (tuple, frozenset):
+            pending.extend(part)
+        elif type(part) not in (type(None), bool, int, float, complex, str, bytes):
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class _ProofValue:
+    """One value field, not a join of independently merged path records."""
+
+    atoms: frozenset = frozenset()
+    unknown: bool = False
+    reason: str | None = None
+
+    def __post_init__(self):
+        if type(self.atoms) is not frozenset or not _proof_immutable_token(self.atoms) \
+                or any(type(atom) is not tuple for atom in self.atoms) \
+                or type(self.unknown) is not bool \
+                or (self.reason is not None and type(self.reason) is not str):
+            raise TypeError("proof values require immutable symbolic atoms")
+
+    @classmethod
+    def literal(cls, value):
+        if type(value) not in (type(None), bool, int, float, complex, str, bytes):
+            raise ValueError("not a bounded literal atom")
+        return cls(frozenset({("literal", type(value).__name__, value)}))
+
+    @classmethod
+    def unbound(cls):
+        return cls(frozenset({("unbound",)}))
+
+    @classmethod
+    def unknown_value(cls, reason):
+        return cls(unknown=True, reason=reason)
+
+    @property
+    def is_unbound(self):
+        return not self.unknown and self.atoms == frozenset({("unbound",)})
+
+    def join(self, other):
+        if self.unknown or other.unknown:
+            return self.unknown_value("value-join")
+        return _ProofValue(self.atoms | other.atoms)
+
+
+@dataclass(frozen=True)
+class _ProofCompletion:
+    kind: str = "normal"
+    error: str | None = None
+    target: int | None = None
+
+    def __post_init__(self):
+        if self.kind not in ("normal", "raise", "return", "break", "continue", "diverge") \
+                or not _proof_immutable_token((self.error, self.target)):
+            raise TypeError("invalid immutable completion")
+
+
+@dataclass(frozen=True)
+class _ProofState:
+    bindings: tuple = ()
+    pending: _ProofCompletion = _ProofCompletion()
+    active: tuple = ()
+    managers: tuple = ()
+    continuation: tuple = ()
+    epoch: object = None
+
+    def __post_init__(self):
+        if type(self.bindings) is not tuple or type(self.pending) is not _ProofCompletion \
+                or any(type(field) is not tuple or not _proof_immutable_token(field)
+                       for field in (self.active, self.managers, self.continuation)):
+            raise TypeError("proof records require immutable fields")
+        keys = set()
+        for binding in self.bindings:
+            if type(binding) is not tuple or len(binding) != 3:
+                raise TypeError("invalid proof binding")
+            owner, name, value = binding
+            if type(owner) is not int or type(name) is not str or type(value) is not _ProofValue \
+                    or (owner, name) in keys:
+                raise TypeError("invalid proof binding")
+            keys.add((owner, name))
+
+    def lookup(self, scope_id, name):
+        for owner, spelling, value in self.bindings:
+            if owner == scope_id and spelling == name:
+                return value
+        return _ProofValue.unbound()
+
+    def bind(self, scope_id, name, value):
+        bindings = {(owner, spelling): old for owner, spelling, old in self.bindings}
+        bindings[scope_id, name] = value
+        return replace(self, bindings=tuple((owner, spelling, item)
+                       for (owner, spelling), item in sorted(bindings.items())))
+
+    def order_key(self):
+        def canonical(value):
+            if isinstance(value, (tuple, frozenset)):
+                parts = tuple(canonical(item) for item in value)
+                return (type(value).__name__, tuple(sorted(parts))
+                        if isinstance(value, frozenset) else parts)
+            return (type(value).__name__, repr(value))
+        return (tuple((owner, name, canonical(value.atoms), value.unknown,
+                       value.reason or "") for owner, name, value in self.bindings),
+                self.pending.kind, canonical(self.pending.error), canonical(self.pending.target),
+                canonical(self.active), canonical(self.managers), canonical(self.continuation))
+
+
+@dataclass(frozen=True)
+class _ProofSnapshot:
+    index: object
+    scope: object
+    complete: bool
+    reasons: tuple
+    stats: object
+    events: object
+    exits: tuple = ()
+
+    def states_at(self, node, role="before"):
+        if self.index is None:
+            return ()
+        try:
+            key = self.index.node_id(node)
+        except KeyError:
+            return ()
+        return self.events.get((key, role), ())
+
+    def unreachable(self, target):
+        # Empty events in an incomplete or unanalysed region are NOT bottom.
+        if not self.complete or self.index is None \
+                or not isinstance(target, (ast.stmt, ast.expr)):
+            return False
+        try:
+            if self.index.scope_for(target) is not self.scope:
+                return False
+        except KeyError:
+            return False
+        return not self.states_at(target)
+
+
+class _ProofIncomplete(Exception):
+    pass
+
+
+class _ProofContext:
+    """Per-source finite analysis. No legacy reachability callback is used.
+
+    Snapshots contain whole immutable alternatives. A partial prefix remains
+    inspectable, but never supplies an unreachable proof. Later transfer
+    models extend this solver; an unsupported event is explicitly incomplete.
+    """
+
+    _caps = MappingProxyType({
+        "source_bytes": 1_048_576, "nodes": 100_000, "depth": 128,
+        "names": 1024, "aliases": 4096, "contexts": 64,
+        "alternatives": 128, "states": 100_000, "steps": 250_000})
+
+    def __init__(self, source, semantic_key=None, limits=None):
+        self.limits = dict(self._caps)
+        for key, value in (limits or {}).items():
+            if key not in self._caps or type(value) is not int \
+                    or not 0 <= value <= self._caps[key]:
+                raise ValueError("invalid proof budget")
+            self.limits[key] = value
+        self.limits = MappingProxyType(self.limits)
+        self.tree = self.index = None
+        self._reasons = []
+        self._epoch = object()  # once per source, never once per loop visit
+        self._cache = {}
+        self._total_compute = {"steps": 0, "states": 0, "requests": 0}
+        if len(source.encode("utf-8")) > self.limits["source_bytes"]:
+            self._reasons.append("source-budget")
+            return
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            self._reasons.append("parse-failure")
+            return
+        except (MemoryError, RecursionError):
+            self._reasons.append("parse-resource-failure")
+            return
+        pending = [(tree, 1)]
+        count = 0
+        while pending:
+            node, depth = pending.pop()
+            count += 1
+            if count > self.limits["nodes"]:
+                self._reasons.append("node-budget")
+                return
+            if depth > self.limits["depth"]:
+                self._reasons.append("depth-budget")
+                return
+            pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
+        self.tree = tree
+        self.index = _ProofScopeIndex(tree, semantic_key=semantic_key)
+        if any(len(names | self.index.globals_for(owner)
+                   | self.index.nonlocals_for(owner)) > self.limits["names"]
+               for owner, names in self.index._locals.items()):
+            self._reasons.append("name-budget")
+
+    @property
+    def total_compute(self):
+        return MappingProxyType(dict(self._total_compute))
+
+    def _charge(self, stats):
+        if stats["steps"] >= self.limits["steps"]:
+            raise _ProofIncomplete("work-budget")
+        stats["steps"] += 1
+        self._total_compute["steps"] += 1
+
+    def solve(self, scope=None, entry=None):
+        scope = self.tree if scope is None else scope
+        events = {}
+        reasons = list(self._reasons)
+        exits = []
+        stats = {"steps": 0, "states": 0, "context_depth": 0}
+
+        def snapshot():
+            return _ProofSnapshot(self.index, scope, not reasons,
+                                  tuple(dict.fromkeys(reasons)),
+                                  MappingProxyType(dict(stats)),
+                                  MappingProxyType({key: tuple(states)
+                                                    for key, states in events.items()}),
+                                  tuple(dict.fromkeys(exits)))
+
+        if reasons:
+            return snapshot()
+        if scope not in self.index._locals:
+            reasons.append("foreign-scope")
+            return snapshot()
+        owner = self.index.node_id(scope)
+        if entry is None:
+            initial = _ProofState(epoch=self._epoch)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                args = scope.args
+                for arg in (list(args.posonlyargs) + list(args.args)
+                            + list(args.kwonlyargs)
+                            + [item for item in (args.vararg, args.kwarg) if item]):
+                    initial = initial.bind(owner, arg.arg, _ProofValue(
+                        frozenset({("opaque", "parameter", arg.arg)})))
+            entry = (initial,)
+        else:
+            initial_states = set()
+            owners = {self.index.node_id(item): item for item in self.index._locals}
+            for state in entry:
+                if not isinstance(state, _ProofState) or (
+                        state.epoch is not None and state.epoch is not self._epoch):
+                    reasons.append("foreign-state")
+                    return snapshot()
+                depth = len(state.active) + len(state.managers) + len(state.continuation)
+                if depth > self.limits["contexts"]:
+                    reasons.append("context-budget")
+                    return snapshot()
+                stats["context_depth"] = max(stats["context_depth"], depth)
+                names = {}
+                for storage, name, value in state.bindings:
+                    if storage not in owners:
+                        reasons.append("foreign-binding")
+                        return snapshot()
+                    declarations = self.index.locals_for(owners[storage]) \
+                        | self.index.globals_for(owners[storage]) \
+                        | self.index.nonlocals_for(owners[storage])
+                    if storage not in names:
+                        names[storage] = set(declarations)
+                    names[storage].add(name)
+                    if len(names[storage]) > self.limits["names"]:
+                        reasons.append("name-budget")
+                        return snapshot()
+                initial_states.add(replace(state, epoch=self._epoch))
+                if len(initial_states) > self.limits["alternatives"]:
+                    reasons.append("alternative-budget")
+                    return snapshot()
+            entry = frozenset(initial_states)
+        entry = frozenset(entry)
+        cache_key = (owner, entry)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        # Region requests have intrinsic budgets/results, independent of query
+        # order. The authoritative adapter must budget its ONE combined solve,
+        # never bypass that bound by repeatedly starting fresh region requests.
+        self._total_compute["requests"] += 1
+
+        def record(node, role, state):
+            key = (self.index.node_id(node), role)
+            states = events.setdefault(key, [])
+            if state in states:
+                return
+            if len(states) >= self.limits["alternatives"]:
+                raise _ProofIncomplete("alternative-budget")
+            if stats["states"] >= self.limits["states"]:
+                raise _ProofIncomplete("state-budget")
+            stats["states"] += 1
+            self._total_compute["states"] += 1
+            states.append(state)
+
+        def expression(node, state):
+            self._charge(stats)
+            record(node, "before", state)
+            if isinstance(node, ast.Constant):
+                result = _ProofValue.literal(node.value)
+            elif isinstance(node, ast.Name):
+                if node.id not in self.index.locals_for(scope) or (
+                        self.index.namespace_open(scope)):
+                    raise _ProofIncomplete("unresolved-lookup")
+                result = state.lookup(owner, node.id)
+                if result.is_unbound:
+                    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                              ast.Lambda)):
+                        raise _ProofIncomplete("unresolved-lookup")
+                    return None, replace(state, pending=_ProofCompletion(
+                        "raise", "UnboundLocalError"))
+                if result.unknown or ("unbound",) in result.atoms or not result.atoms:
+                    raise _ProofIncomplete("imprecise-load")
+            else:
+                raise _ProofIncomplete("unsupported-expression")
+            record(node, "after", state)
+            return result, state
+
+        try:
+            body = getattr(scope, "body", None)
+            if not isinstance(body, list):
+                raise _ProofIncomplete("unsupported-scope")
+            entry = tuple(sorted(entry, key=lambda state: state.order_key()))
+            for state in entry:
+                record(scope, "entry", state)
+            queue = deque((0, state) for state in dict.fromkeys(entry))
+            seen = set()
+            while queue:
+                position, state = queue.popleft()
+                if (position, state) in seen:
+                    continue
+                seen.add((position, state))
+                if state.pending.kind != "normal" or position == len(body):
+                    exits.append(state)
+                    continue
+                node = body[position]
+                self._charge(stats)
+                record(node, "before", state)
+                if isinstance(node, ast.Pass):
+                    pass
+                elif isinstance(node, (ast.Assign, ast.Expr)):
+                    value, state = expression(node.value, state)
+                    if state.pending.kind == "normal" and isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            self._charge(stats)
+                            record(target, "before", state)
+                            if not isinstance(target, ast.Name):
+                                raise _ProofIncomplete("unsupported-store")
+                            if target.id not in self.index.locals_for(scope):
+                                raise _ProofIncomplete("unresolved-store")
+                            state = state.bind(owner, target.id, value)
+                            record(target, "after", state)
+                else:
+                    raise _ProofIncomplete("unsupported-statement")
+                if state.pending.kind == "normal":
+                    record(node, "after", state)
+                queue.append((position + 1, state))
+        except _ProofIncomplete as error:
+            reasons.append(str(error))
+        except (MemoryError, RecursionError):
+            reasons.append("analysis-resource-failure")
+        result = snapshot()
+        # Bound retained cache storage too; callers may keep immutable results,
+        # but arbitrary query permutations cannot grow this context's cache.
+        self._cache.clear()
+        self._cache[cache_key] = result
+        return result
 
 
 def _scope_binds_spelling(scope, name, parents, upos):
@@ -21519,6 +21893,282 @@ def _binding_violations(source):
                 and node.func.id == "read_body_log":
             violations.append(f"deleted reader at line {node.lineno}")
     return violations
+
+
+class ProofStateTests(unittest.TestCase):
+    def _context(self, source, **kwargs):
+        factory = globals().get("_ProofContext")
+        self.assertIsNotNone(factory, "immutable point-state analysis is not implemented")
+        return factory(source, **kwargs)
+
+    def test_point_values_keep_rhs_order_and_saved_copies(self):
+        context = self._context("def f():\n    x=1\n    y=x\n    x=2\n")
+        func = context.tree.body[0]
+        first, copy_stmt, last = func.body
+        snapshot = context.solve(func)
+        key = context.index.node_id(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.states_at(first)[0].lookup(key, "x").is_unbound)
+        copied_from = snapshot.states_at(copy_stmt)[0]
+        final = snapshot.states_at(last, "after")[0]
+        self.assertEqual(copied_from.lookup(key, "x").atoms,
+                         frozenset({("literal", "int", 1)}))
+        self.assertEqual(final.lookup(key, "x").atoms, frozenset({("literal", "int", 2)}))
+        self.assertEqual(final.lookup(key, "y").atoms, frozenset({("literal", "int", 1)}))
+        self.assertEqual(copied_from.lookup(key, "x").atoms,
+                         frozenset({("literal", "int", 1)}))
+
+    def test_unbound_rhs_prevents_store_and_later_statement(self):
+        context = self._context("def f():\n    x=x\n    x=2\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.states_at(func.body[0].targets[0]), ())
+        self.assertTrue(snapshot.unreachable(func.body[1]))
+        self.assertEqual([(state.pending.kind, state.pending.error)
+                          for state in snapshot.exits], [("raise", "UnboundLocalError")])
+
+    def test_parameters_are_bound_objects_not_maybe_unbound(self):
+        context = self._context("def f(x):\n    y=x\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.states_at(func.body[0], "after")[0].lookup(
+            context.index.node_id(func), "y").atoms,
+            frozenset({("opaque", "parameter", "x")}))
+        self.assertEqual([state.pending.kind for state in snapshot.exits], ["normal"])
+
+    def test_alternative_records_do_not_cross_product_values(self):
+        context = self._context("def f():\n    z=x\n    x=0\n    y=0\n")
+        func = context.tree.body[0]
+        key = context.index.node_id(func)
+        one = _ProofState().bind(key, "x", _ProofValue.literal(1)).bind(
+            key, "y", _ProofValue.literal(2))
+        two = _ProofState().bind(key, "x", _ProofValue.literal(2)).bind(
+            key, "y", _ProofValue.literal(1))
+        snapshot = context.solve(func, entry=(one, two))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        triples = set()
+        for state in snapshot.states_at(func.body[0], "after"):
+            triples.add(tuple(next(iter(state.lookup(key, name).atoms))[2]
+                              for name in ("x", "y", "z")))
+        self.assertEqual(triples, {(1, 2, 1), (2, 1, 2)})
+
+    def test_unknown_unbound_active_and_value_joins_are_distinct(self):
+        self._context("pass\n")
+        unbound = _ProofValue.unbound()
+        unknown = _ProofValue.unknown_value("opaque-effect")
+        self.assertTrue(unbound.is_unbound)
+        self.assertFalse(unknown.is_unbound)
+        self.assertTrue(unknown.unknown)
+        joined = unbound.join(_ProofValue.literal(1))
+        self.assertEqual(joined.atoms, frozenset({("unbound",), ("literal", "int", 1)}))
+        self.assertTrue(joined.join(unknown).unknown)
+        self.assertNotEqual(_ProofValue.literal(True), _ProofValue.literal(1))
+        self.assertNotEqual(_ProofState(), _ProofState(active=(("unknown-active",),)))
+        state = _ProofState(pending=_ProofCompletion("return"),
+                            active=(("error", "LookupError"),))
+        self.assertEqual(state.pending.kind, "return")
+        self.assertEqual(state.active, (("error", "LookupError"),))
+
+    def test_work_budget_boundary_never_proves_unreachable(self):
+        for limit, want in ((0, False), (1, True), (2, True)):
+            with self.subTest(limit=limit):
+                context = self._context("def f():\n    pass\n", limits={"steps": limit})
+                func = context.tree.body[0]
+                snapshot = context.solve(func)
+                self.assertEqual(snapshot.complete, want)
+                if not want:
+                    self.assertIn("work-budget", snapshot.reasons)
+                    self.assertFalse(snapshot.unreachable(func.body[0]))
+        context = self._context("def f():\n    pass\n    pass\n", limits={"steps": 1})
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[1]))
+
+    def test_preflight_and_state_caps_are_explicit_incomplete_results(self):
+        for source, limits, reason in (
+            ("pass\n", {"source_bytes": 4}, "source-budget"),
+            ("pass\n", {"nodes": 1}, "node-budget"),
+            ("pass\n", {"depth": 1}, "depth-budget"),
+            ("x=1\n", {"names": 0}, "name-budget"),
+            ("pass\n", {"states": 0}, "state-budget"),
+            ("pass\n", {"alternatives": 0}, "alternative-budget"),
+            ("def broken(", {}, "parse-failure"),
+        ):
+            with self.subTest(reason=reason):
+                snapshot = self._context(source, limits=limits).solve()
+                self.assertFalse(snapshot.complete)
+                self.assertIn(reason, snapshot.reasons)
+                self.assertFalse(snapshot.unreachable(ast.Pass()))
+        context = self._context("pass\n", limits={"source_bytes": 5, "nodes": 2, "depth": 2})
+        self.assertTrue(context.solve().complete)
+
+    def test_incomplete_transfer_and_foreign_scope_cannot_certify_deadness(self):
+        context = self._context("def f():\n    if flag:\n        pass\n    x=1\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[1]))
+        other = self._context("def f():\n    pass\ndef g():\n    pass\n")
+        first, second = other.tree.body
+        snapshot = other.solve(first)
+        self.assertTrue(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(second.body[0]))
+
+    def test_cached_snapshots_are_stable_and_reject_foreign_derived_states(self):
+        context = self._context("def f():\n    x=1\n")
+        func = context.tree.body[0]
+        first = context.solve(func)
+        second = context.solve(func)
+        self.assertEqual(first.stats, second.stats)
+        self.assertEqual(first.states_at(func.body[0]), second.states_at(func.body[0]))
+        foreign = self._context("def f():\n    x=1\n")
+        rejected = foreign.solve(foreign.tree.body[0], entry=first.exits)
+        self.assertFalse(rejected.complete)
+        self.assertIn("foreign-state", rejected.reasons)
+
+    def test_lexical_ownership_overrides_an_injected_local_spelling(self):
+        context = self._context("def f():\n    y=x\n")
+        func = context.tree.body[0]
+        fake = _ProofState().bind(context.index.node_id(func), "x", _ProofValue.literal(1))
+        snapshot = context.solve(func, entry=(fake,))
+        self.assertFalse(snapshot.complete)
+        self.assertIn("unresolved-lookup", snapshot.reasons)
+        self.assertFalse(snapshot.unreachable(func.body[0].targets[0]))
+
+    def test_assignment_targets_are_ordered_and_rhs_is_not_reloaded(self):
+        context = self._context("def f():\n    x=0\n    x=y=x\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        key = context.index.node_id(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        first, second = func.body[1].targets
+        before_first = snapshot.states_at(first)[0]
+        before_second = snapshot.states_at(second)[0]
+        self.assertTrue(before_first.lookup(key, "y").is_unbound)
+        self.assertEqual(before_second.lookup(key, "x"), _ProofValue.literal(0))
+        self.assertEqual(snapshot.states_at(second, "after")[0].lookup(key, "y"),
+                         _ProofValue.literal(0))
+
+    def test_exact_state_and_alternative_boundaries_include_scope_entry(self):
+        for cap, complete in ((0, False), (1, True), (2, True)):
+            with self.subTest(state_cap=cap):
+                snapshot = self._context("", limits={"states": cap}).solve()
+                self.assertEqual(snapshot.complete, complete)
+        for cap, complete in ((0, False), (1, False), (2, True), (3, True)):
+            with self.subTest(alternative_cap=cap):
+                context = self._context("", limits={"alternatives": cap})
+                entries = tuple(_ProofState().bind(0, "x", _ProofValue.literal(n))
+                                for n in (1, 2))
+                snapshot = context.solve(entry=entries)
+                self.assertEqual(snapshot.complete, complete)
+                if not complete:
+                    self.assertIn("alternative-budget", snapshot.reasons)
+        snapshot = self._context("global exported\n", limits={"names": 0}).solve()
+        self.assertFalse(snapshot.complete)
+        self.assertIn("name-budget", snapshot.reasons)
+
+    def test_cache_keys_include_whole_entry_sets_and_replay_costs_nothing(self):
+        context = self._context("def f():\n    x=x\n")
+        func = context.tree.body[0]
+        key = context.index.node_id(func)
+        one, two = (_ProofState().bind(key, "x", _ProofValue.literal(n)) for n in (1, 2))
+        first = context.solve(func, entry=(one, two))
+        permutation = context.solve(func, entry=(two, one, one))
+        self.assertIs(first, permutation)
+        other = context.solve(func, entry=(one,))
+        self.assertEqual(len(first.exits), 2)
+        self.assertEqual(len(other.exits), 1)
+        self.assertLess(other.stats["steps"], first.stats["steps"])
+        self.assertEqual(context.total_compute["steps"],
+                         first.stats["steps"] + other.stats["steps"])
+        with self.assertRaises(TypeError):
+            first.stats["steps"] = 0
+        with self.assertRaises(TypeError):
+            context.limits["steps"] = 0
+
+    def test_namespace_fallback_is_not_a_fast_local_unbound_error(self):
+        for source in ("int=int\n", "class C:\n    int=int\n"):
+            with self.subTest(source=source):
+                context = self._context(source)
+                scope = context.tree if source.startswith("int") else context.tree.body[0]
+                snapshot = context.solve(scope)
+                self.assertFalse(snapshot.complete)
+                self.assertIn("unresolved-lookup", snapshot.reasons)
+                self.assertFalse(snapshot.unreachable(scope.body[0].targets[0]))
+
+    def test_only_evaluation_events_can_be_proven_unreachable(self):
+        context = self._context("def f(a):\n    x=x\n    y=1\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertFalse(snapshot.unreachable(func.args.args[0]))
+        self.assertFalse(snapshot.unreachable(func.body[1].targets[0].ctx))
+        self.assertTrue(snapshot.unreachable(func.body[1]))
+
+    def test_independent_query_order_and_cache_eviction_keep_results_intrinsic(self):
+        source = "def f():\n    pass\ndef g():\n    pass\n"
+        left = self._context(source, limits={"steps": 1, "contexts": 0})
+        right = self._context(source, limits={"steps": 1, "contexts": 0})
+        left_results = [left.solve(scope) for scope in left.tree.body]
+        right_results = [right.solve(scope) for scope in reversed(right.tree.body)]
+        for first, second in zip(left_results, reversed(right_results)):
+            self.assertTrue(first.complete, first.reasons)
+            self.assertTrue(second.complete, second.reasons)
+            self.assertEqual(first.stats, second.stats)
+        evicted = left.solve(left.tree.body[0])
+        self.assertEqual(evicted.stats, left_results[0].stats)
+        self.assertEqual(evicted.reasons, left_results[0].reasons)
+        self.assertEqual(left.total_compute["steps"], 3)
+        self.assertEqual(len(left._cache), 1)
+
+    def test_incoming_frames_names_and_binding_owners_obey_bounds(self):
+        for cap, complete in ((1, False), (2, True), (3, True)):
+            with self.subTest(frame_cap=cap):
+                context = self._context("pass\n", limits={"contexts": cap})
+                entry = _ProofState(active=(("error", "A"), ("error", "B")))
+                snapshot = context.solve(entry=(entry,))
+                self.assertEqual(snapshot.complete, complete)
+                if not complete:
+                    self.assertIn("context-budget", snapshot.reasons)
+        for cap, complete in ((0, False), (1, True), (2, True)):
+            with self.subTest(name_cap=cap):
+                context = self._context("pass\n", limits={"names": cap})
+                entry = _ProofState().bind(context.index.node_id(context.tree),
+                                           "seeded", _ProofValue.literal(1))
+                snapshot = context.solve(entry=(entry,))
+                self.assertEqual(snapshot.complete, complete)
+                if not complete:
+                    self.assertIn("name-budget", snapshot.reasons)
+        context = self._context("pass\n")
+        snapshot = context.solve(entry=(_ProofState().bind(999, "x", _ProofValue.literal(1)),))
+        self.assertFalse(snapshot.complete)
+        self.assertIn("foreign-binding", snapshot.reasons)
+
+    def test_records_reject_mutable_containers(self):
+        for fields in ({"bindings": []}, {"active": []}, {"managers": []},
+                       {"continuation": []}, {"active": (["error", "A"],)}):
+            with self.subTest(fields=fields), self.assertRaises(TypeError):
+                _ProofState(**fields)
+        with self.assertRaises(TypeError):
+            _ProofValue(atoms=set())
+
+    def test_seed_permutations_retain_the_same_bounded_prefix(self):
+        context = self._context("def f():\n    x=x\n", limits={"steps": 3})
+        func = context.tree.body[0]
+        key = context.index.node_id(func)
+        entries = tuple(_ProofState().bind(key, "x", _ProofValue.literal(n))
+                        for n in (2, 1))
+        first = context.solve(func, entry=entries)
+        # Evict the cache to exercise actual computation in opposite order.
+        context.solve(func, entry=(entries[0],))
+        second = context.solve(func, entry=reversed(entries))
+        self.assertFalse(first.complete)
+        self.assertEqual(first.stats, second.stats)
+        self.assertEqual(first.events, second.events)
+        self.assertEqual(first.exits, second.exits)
 
 
 class ProofScopeIndexTests(unittest.TestCase):
