@@ -4940,7 +4940,7 @@ class _ProofEffects:
             if value.unknown:
                 raise _ProofIncomplete("opaque-release")
             for atom in value.atoms:
-                if atom[0] in ("literal", "native", "singleton", "unbound", "absent", "const-callable", "plain-object") \
+                if atom[0] in ("literal", "native", "singleton", "unbound", "absent", "const-callable", "plain-object", "plain-string") \
                         or atom[:2] == ("opaque", "type-parameter"):
                     continue
                 if atom[0] == "namespace":
@@ -5436,7 +5436,7 @@ class _ProofContext:
                     and node.func.id == "print" and not node.keywords:
                 if "print" not in self.diagnostic_policy:
                     raise _ProofIncomplete("unapproved-diagnostic-effects")
-                if not all((atom := _ProofEffects.single(value)) and atom[0] == "literal"
+                if not all((atom := _ProofEffects.single(value)) and atom[0] in ("literal", "plain-string")
                            for value in arguments):
                     raise _ProofIncomplete("opaque-formatting")
                 site = self.index.node_id(node)
@@ -5500,14 +5500,46 @@ class _ProofContext:
                     raise _ProofIncomplete("imprecise-load")
             elif isinstance(node, ast.Dict) and not node.keys:
                 result = _ProofEffects.fresh_namespace("mapping", ("mapping", self.index.node_id(node)), state)
-            elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Call)):
-                nodes = (node.func, *node.args, *node.keywords) if isinstance(node, ast.Call) else (
-                    (node.value, node.slice) if isinstance(node, ast.Subscript) else (node.value,))
+            elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Call, ast.JoinedStr, ast.FormattedValue)):
+                if isinstance(node, ast.Call):
+                    nodes = (node.func, *node.args, *node.keywords)
+                elif isinstance(node, ast.JoinedStr):
+                    nodes = tuple(node.values)
+                elif isinstance(node, ast.FormattedValue):
+                    nodes = (node.value, node.format_spec) if node.format_spec is not None else (node.value,)
+                else:
+                    nodes = (node.value, node.slice) if isinstance(node, ast.Subscript) else (node.value,)
                 frontier, abrupt = operands(nodes, state)
                 results = list(abrupt)
                 for values, current in frontier:
                     if isinstance(node, ast.Call):
                         results.extend(call(node, values, current))
+                        continue
+                    if isinstance(node, (ast.JoinedStr, ast.FormattedValue)):
+                        if isinstance(node, ast.FormattedValue):
+                            if node.conversion not in (-1, 115, 114, 97) or (
+                                    node.format_spec is not None and node.format_spec.values):
+                                raise _ProofIncomplete("unsupported-format-specification")
+                            atom = _ProofEffects.single(values[0])
+                            if not atom or atom[0] not in ("literal", "plain-string"):
+                                raise _ProofIncomplete("opaque-formatting")
+                        elif not all((atom := _ProofEffects.single(value)) and (
+                                atom[:2] == ("literal", "str") or atom[0] == "plain-string") for value in values):
+                            raise _ProofIncomplete("unsupported-string-part")
+                        # Only exact non-overloadable primitives reach here.
+                        # Retain an exact-str category, not fabricated contents;
+                        # never run a formatter or allocate exponential text.
+                        result = _ProofValue(frozenset({("plain-string", self.index.node_id(node))}))
+                        results.extend(finish(node, result, current))
+                        if isinstance(node, ast.FormattedValue) and atom[:2] == ("literal", "int") \
+                                and atom[2].bit_length() > 3 * sys.int_info.str_digits_check_threshold:
+                            # Decimal conversion limits are configurable, even
+                            # during execution. bit_length/3 bounds digits from
+                            # above, so small ints fit the universal minimum;
+                            # larger ones retain a possible semantic ValueError.
+                            # Do not run str/repr/format or assume the host's
+                            # current setting remains the inspected program's.
+                            results.append(_ProofOutcome(replace(current, pending=_ProofCompletion("raise", "ValueError"))))
                         continue
                     if isinstance(node, ast.Subscript):
                         token = _ProofEffects.single(values[1])
@@ -24115,6 +24147,90 @@ class ProofOutcomeTests(unittest.TestCase):
         self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise"])
         self.assertEqual(len(snapshot.observations), 1)
         self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_exact_primitive_formatting_is_quiet_and_releasable(self):
+        for expression in ("f'plain text'", "f\"{'text'} {0!s} {None!r} {b'x'!a}\"",
+                           "f'{1:}'"):
+            with self.subTest(expression=expression):
+                context = self._context("text=" + expression + "\nprint(text)\ntext=1\nmarker=int\n")
+                snapshot = context.solve()
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise"])
+                self.assertEqual(len(snapshot.observations), 1)
+                self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_formatted_argument_effects_and_inner_abrupt_routes_are_preserved(self):
+        context = self._context("import builtins as b\nprint(f\"{exec('b.int=lambda:0')}\")\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+        context = self._context("print(f\"{print('inner')}\")\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise", "raise"])
+        self.assertEqual(len(snapshot.observations), 2)
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_format_value_error_precedes_unsupported_format_specification(self):
+        context = self._context("print(f'{missing:unsupported}')\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertFalse(snapshot.observations)
+        self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+        context = self._context("print(f'{1:unsupported}')\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_integer_formatting_retains_configurable_digit_limit_error(self):
+        for conversion in ("", "!s", "!r", "!a", ":"):
+            with self.subTest(conversion=conversion):
+                context = self._context("text=f'{0x" + "f" * 4000 + conversion + "}'\nmarker=int\n")
+                snapshot = context.solve()
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise"])
+                raised = next(state for state in snapshot.exits if state.pending.kind == "raise")
+                self.assertEqual(raised.pending.error, "ValueError")
+                self.assertTrue(raised.lookup(0, "text").is_unbound)
+                self.assertFalse(snapshot.observations)
+        context = self._context("text=f'{0x" + "f" * 400 + "}'\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.kind for state in snapshot.exits], ["normal"])
+
+    def test_string_category_does_not_fabricate_truth_keys_or_dynamic_payload(self):
+        for source in ("if f'':\n    pass\n", "globals()[f'key']=1\n",
+                       "import builtins as b\nexec(f'b.int=lambda:0')\n"):
+            with self.subTest(source=source):
+                context = self._context(source + "marker=int\n")
+                snapshot = context.solve()
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_format_value_and_specification_errors_keep_actual_evaluation_order(self):
+        for value in ("missing", "1"):
+            with self.subTest(value=value):
+                context = self._context("text=f'{" + value + ":{missing_spec}}'\nmarker=int\n")
+                snapshot = context.solve()
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+                specification = context.tree.body[0].value.values[0].format_spec
+                self.assertEqual(bool(snapshot.states_at(specification)), value == "1")
+                self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_nested_formatting_aggregates_outcomes_from_all_inputs(self):
+        for cap, complete in ((9, False), (10, True), (11, True)):
+            with self.subTest(cap=cap):
+                context = self._context("print(f\"{print('inner')}\")\n", limits={"alternatives": cap})
+                entries = tuple(_ProofState().bind(0, "x", _ProofValue.literal(number)) for number in (1, 2))
+                snapshot = context.solve(entry=entries)
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if complete:
+                    self.assertEqual(len(snapshot.exits), 6)
+                    self.assertEqual(len(snapshot.observations), 4)
+                else:
+                    self.assertIn("alternative-budget", snapshot.reasons)
 
 
 class ProofStateTests(unittest.TestCase):
