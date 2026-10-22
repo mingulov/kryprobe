@@ -4583,6 +4583,29 @@ class _ProofState:
                 self.entry_modes)
 
 
+@dataclass(frozen=True)
+class _ProofOutcome:
+    state: _ProofState
+    value: _ProofValue | None = None
+    observation: tuple | None = None
+
+    def __post_init__(self):
+        if type(self.state) is not _ProofState or (
+                self.value is not None and type(self.value) is not _ProofValue) or (
+                self.state.pending.kind != "normal" and self.value is not None) or (
+                self.observation is not None and (
+                    type(self.observation) is not tuple or len(self.observation) != 3
+                    or self.observation[0] != "may-diverge"
+                    or type(self.observation[1]) is not int
+                    or type(self.observation[2]) is not str
+                    or self.state.pending.kind != "normal" or self.value is not None)):
+            raise TypeError("invalid immutable expression outcome")
+
+    @property
+    def normal(self):
+        return self.observation is None and self.state.pending.kind == "normal"
+
+
 class _ProofEffects:
     """Pure symbolic lookup/effect models, independent of flow or taint queries."""
 
@@ -4968,6 +4991,7 @@ class _ProofSnapshot:
     events: object
     exits: tuple = ()
     epoch: object = None
+    observations: tuple = ()
 
     def states_at(self, node, role="before"):
         if self.index is None:
@@ -5040,10 +5064,19 @@ class _ProofContext:
         "alternatives": 128, "states": 100_000, "steps": 250_000,
         "dynamic_bytes": 1024, "dynamic_nodes": 32, "dynamic_depth": 12})
 
-    def __init__(self, source, semantic_key=None, limits=None):
+    def __init__(self, source, semantic_key=None, limits=None, diagnostic_policy=()):
+        if type(diagnostic_policy) is not tuple or any(
+                type(name) is not str or name != "print" for name in diagnostic_policy):
+            raise ValueError("invalid diagnostic-effects authorization")
+        # This is an explicit caller hypothesis, NOT inferred from builtin
+        # identity. The authoritative adapter must derive it from the existing
+        # unrebound-name policy; it also assumes the approved diagnostic body
+        # effects boundary (including its stream), not arbitrary Python I/O.
+        self.diagnostic_policy = frozenset(diagnostic_policy)
         annotation_key = tuple(semantic_key or sys.version_info)
         self.semantic_key = (sys.implementation.name, annotation_key, sys.flags.optimize,
-                             ("syntaxerror-model", "bounded-v1"))
+                             ("syntaxerror-model", "bounded-v1"),
+                             ("diagnostic-effects", tuple(sorted(self.diagnostic_policy))))
         self.limits = dict(self._caps)
         for key, value in (limits or {}).items():
             if key not in self._caps or type(value) is not int \
@@ -5217,6 +5250,7 @@ class _ProofContext:
         events = {}
         reasons = list(self._reasons)
         exits = []
+        observations = []
         stats = {"steps": 0, "states": 0, "context_depth": 0}
 
         def snapshot():
@@ -5225,7 +5259,8 @@ class _ProofContext:
                                   MappingProxyType(dict(stats)),
                                   MappingProxyType({key: tuple(states)
                                                     for key, states in events.items()}),
-                                  tuple(dict.fromkeys(exits)), self._epoch)
+                                  tuple(dict.fromkeys(exits)), self._epoch,
+                                  tuple(dict.fromkeys(observations)))
 
         if reasons:
             return snapshot()
@@ -5335,6 +5370,119 @@ class _ProofContext:
             self._total_compute["states"] += 1
             states.append(state)
 
+        outcome_events = {}
+
+        def bounded(items, event=None):
+            unique = {}
+            registered = outcome_events.setdefault(self.index.node_id(event), set()) \
+                if event is not None else None
+            for item in items:
+                if item in unique:
+                    continue
+                if len(unique) >= self.limits["alternatives"]:
+                    raise _ProofIncomplete("alternative-budget")
+                if registered is not None and item not in registered \
+                        and len(registered) >= self.limits["alternatives"]:
+                    raise _ProofIncomplete("alternative-budget")
+                self._charge(stats)
+                if stats["states"] >= self.limits["states"]:
+                    raise _ProofIncomplete("state-budget")
+                stats["states"] += 1
+                self._total_compute["states"] += 1
+                unique[item] = None
+                if registered is not None:
+                    registered.add(item)
+            return tuple(unique)
+
+        def flat_map(items, transfer):
+            return bounded(successor for item in items for successor in (
+                transfer(item) if item.normal else (item,)))
+
+        def operands(nodes, state):
+            frontier = (((), state),)
+            abrupt = ()
+            for child in nodes:
+                following = []
+                for values, current in frontier:
+                    if isinstance(child, ast.keyword):
+                        if child.arg is None:
+                            raise _ProofIncomplete("unsupported-keyword-expansion")
+                        child_node = child.value
+                    else:
+                        child_node = child
+                    for outcome in expression(child_node, current):
+                        if outcome.normal:
+                            following.append((values + (outcome.value,), outcome.state))
+                        else:
+                            abrupt += (outcome,)
+                        if len(following) + len(abrupt) > self.limits["alternatives"]:
+                            raise _ProofIncomplete("alternative-budget")
+                frontier = tuple(dict.fromkeys(following))
+            return frontier, abrupt
+
+        def finish(node, result, state, error=None):
+            if error:
+                state = replace(state, pending=_ProofCompletion("raise", error))
+            if state.pending.kind == "normal":
+                record(node, "after", state)
+            return (_ProofOutcome(state, result if state.pending.kind == "normal" else None),)
+
+        def call(node, values, state):
+            callee, arguments = values[0], values[1:1 + len(node.args)]
+            token = _ProofEffects.single(callee)
+            result = error = None
+            record(node, "invoke", state)
+            if token == ("native", "print") and isinstance(node.func, ast.Name) \
+                    and node.func.id == "print" and not node.keywords:
+                if "print" not in self.diagnostic_policy:
+                    raise _ProofIncomplete("unapproved-diagnostic-effects")
+                if not all((atom := _ProofEffects.single(value)) and atom[0] == "literal"
+                           for value in arguments):
+                    raise _ProofIncomplete("opaque-formatting")
+                site = self.index.node_id(node)
+                return (finish(node, _ProofValue.literal(None), state)[0],
+                        _ProofOutcome(replace(state, pending=_ProofCompletion(
+                            "raise", ("unknown-exception", site, "trusted-print")))),
+                        _ProofOutcome(state, observation=("may-diverge", site, "trusted-print")))
+            if token in (("native", "exec"), ("native", "eval")):
+                result, state = self._dynamic_call(node, token[1], scope, state, stats)
+            elif token and token[0] == "const-callable":
+                result, error = (None, "TypeError") if arguments or node.keywords \
+                    else (_ProofValue.literal(token[2]), None)
+            elif token == ("native", "object") or (token and token[0] == "empty-class"):
+                if arguments or node.keywords:
+                    error = "TypeError"
+                elif token == ("native", "object"):
+                    result = _ProofValue(frozenset({("plain-object", self.index.node_id(node))}))
+                else:
+                    result = _ProofEffects.fresh_namespace("object", ("object", self.index.node_id(node)), state)
+            elif token == ("native", "iter") and len(arguments) == 2 and not node.keywords:
+                callback, sentinel = map(_ProofEffects.single, arguments)
+                if (callback != ("native", "int") and not (
+                        callback and callback[0] == "const-callable")) or sentinel not in (
+                            ("literal", "int", 0), ("literal", "int", 1)):
+                    raise _ProofIncomplete("opaque-callable-iterator")
+                result = _ProofValue(frozenset({("iterator", "call-sentinel",
+                                                self.index.node_id(node), callback, sentinel)}))
+            elif token == ("native", "next") and len(arguments) == 1 and not node.keywords:
+                result, error = _ProofEffects.iterator_next(arguments[0])
+            elif token in (("native", "globals"), ("native", "locals"), ("native", "vars")):
+                if arguments or node.keywords:
+                    raise _ProofIncomplete("unsupported-namespace-call")
+                if token == ("native", "globals") or scope is self.tree:
+                    result = _ProofEffects.namespace("mapping", ("globals", 0))
+                else:
+                    raise _ProofIncomplete("unsupported-locals-view")
+            elif token == ("native", "__import__") and len(arguments) == 1 and not node.keywords \
+                    and arguments[0] == _ProofValue.literal("builtins"):
+                result = _ProofEffects.namespace("module", ("builtins", 0))
+            elif token is not None and token[0] == "literal":
+                error = "TypeError"
+            else:
+                raise _ProofIncomplete("unsupported-call" if token and token[0] == "native"
+                                       else "opaque-call")
+            return finish(node, result, state, error)
+
         def expression(node, state):
             self._charge(stats)
             record(node, "before", state)
@@ -5352,92 +5500,31 @@ class _ProofContext:
                     raise _ProofIncomplete("imprecise-load")
             elif isinstance(node, ast.Dict) and not node.keys:
                 result = _ProofEffects.fresh_namespace("mapping", ("mapping", self.index.node_id(node)), state)
-            elif isinstance(node, (ast.Attribute, ast.Subscript)):
-                receiver, state = expression(node.value, state)
-                if state.pending.kind != "normal":
-                    return None, state
-                if isinstance(node, ast.Subscript):
-                    key, state = expression(node.slice, state)
-                    if state.pending.kind != "normal":
-                        return None, state
-                    token = _ProofEffects.single(key)
-                    if token is None or token[:2] != ("literal", "str"):
-                        raise _ProofIncomplete("opaque-key")
-                    key = token[2]
-                else:
-                    key = node.attr
-                result, error = _ProofEffects.member(self.index, scope, receiver, key, state,
-                                                    attribute=isinstance(node, ast.Attribute))
-                if result is not None and result.unknown:
-                    raise _ProofIncomplete("imprecise-member")
-            elif isinstance(node, ast.Call):
-                callee, state = expression(node.func, state)
-                if state.pending.kind != "normal":
-                    return None, state
-                arguments = []
-                for arg in node.args:
-                    value, state = expression(arg, state)
-                    if state.pending.kind != "normal":
-                        return None, state
-                    arguments.append(value)
-                for keyword in node.keywords:
-                    if keyword.arg is None:
-                        # Merging **mapping is an evaluated operation here,
-                        # before later keyword values. Raw AST presence does
-                        # not establish how many arguments it supplies.
-                        raise _ProofIncomplete("unsupported-keyword-expansion")
-                    value, state = expression(keyword.value, state)
-                    if state.pending.kind != "normal":
-                        return None, state
-                token = _ProofEffects.single(callee)
-                if token in (("native", "exec"), ("native", "eval")):
-                    result, state = self._dynamic_call(node, token[1], scope, state, stats)
-                    if state.pending.kind != "normal":
-                        return None, state
-                elif token and token[0] == "const-callable":
-                    result, error = (None, "TypeError") if arguments or node.keywords \
-                        else (_ProofValue.literal(token[2]), None)
-                elif token == ("native", "object") or (token and token[0] == "empty-class"):
-                    if arguments or node.keywords:
-                        result, error = None, "TypeError"
-                    elif token == ("native", "object"):
-                        result = _ProofValue(frozenset({("plain-object", self.index.node_id(node))}))
+            elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Call)):
+                nodes = (node.func, *node.args, *node.keywords) if isinstance(node, ast.Call) else (
+                    (node.value, node.slice) if isinstance(node, ast.Subscript) else (node.value,))
+                frontier, abrupt = operands(nodes, state)
+                results = list(abrupt)
+                for values, current in frontier:
+                    if isinstance(node, ast.Call):
+                        results.extend(call(node, values, current))
+                        continue
+                    if isinstance(node, ast.Subscript):
+                        token = _ProofEffects.single(values[1])
+                        if not token or token[:2] != ("literal", "str"):
+                            raise _ProofIncomplete("opaque-key")
+                        key = token[2]
                     else:
-                        result = _ProofEffects.fresh_namespace("object", ("object", self.index.node_id(node)), state)
-                elif token == ("native", "iter") and len(arguments) == 2 and not node.keywords:
-                    callback, sentinel = map(_ProofEffects.single, arguments)
-                    if (callback != ("native", "int") and not (
-                            callback and callback[0] == "const-callable")) or sentinel not in (
-                                ("literal", "int", 0), ("literal", "int", 1)):
-                        raise _ProofIncomplete("opaque-callable-iterator")
-                    # Capture object values now. Later rebinding the names or
-                    # builtins slots cannot retarget this iterator's callback.
-                    result = _ProofValue(frozenset({("iterator", "call-sentinel",
-                                                    self.index.node_id(node), callback, sentinel)}))
-                elif token == ("native", "next") and len(arguments) == 1 and not node.keywords:
-                    result, error = _ProofEffects.iterator_next(arguments[0])
-                elif token in (("native", "globals"), ("native", "locals"), ("native", "vars")):
-                    if arguments or node.keywords:
-                        raise _ProofIncomplete("unsupported-namespace-call")
-                    if token == ("native", "globals") or scope is self.tree:
-                        result = _ProofEffects.namespace("mapping", ("globals", 0))
-                    else:
-                        raise _ProofIncomplete("unsupported-locals-view")
-                elif token == ("native", "__import__") and len(arguments) == 1 \
-                        and not node.keywords \
-                        and arguments[0] == _ProofValue.literal("builtins"):
-                    result = _ProofEffects.namespace("module", ("builtins", 0))
-                elif token is not None and token[0] == "literal":
-                    result, error = None, "TypeError"
-                else:
-                    raise _ProofIncomplete("unsupported-call" if token and token[0] == "native"
-                                           else "opaque-call")
+                        key = node.attr
+                    result, error = _ProofEffects.member(self.index, scope, values[0], key, current,
+                                                        attribute=isinstance(node, ast.Attribute))
+                    if result is not None and result.unknown:
+                        raise _ProofIncomplete("imprecise-member")
+                    results.extend(finish(node, result, current, error))
+                return bounded(results, node)
             else:
                 raise _ProofIncomplete("unsupported-expression")
-            if error:
-                return None, replace(state, pending=_ProofCompletion("raise", error))
-            record(node, "after", state)
-            return result, state
+            return bounded(finish(node, result, state, error), node)
 
         def storage(name):
             if name in self.index.globals_for(scope):
@@ -5476,30 +5563,29 @@ class _ProofContext:
             record(target, "before", state)
             if isinstance(target, ast.Name):
                 state = bind_name(target.id, value, state, delete=delete)
-                if state.pending.kind != "normal":
-                    return state
+                if state.pending.kind == "normal":
+                    record(target, "after", state)
+                return bounded((_ProofOutcome(state, value if state.pending.kind == "normal" else None),), target)
             elif isinstance(target, (ast.Attribute, ast.Subscript)):
-                receiver, state = expression(target.value, state)
-                if state.pending.kind != "normal":
-                    return state
-                if isinstance(target, ast.Subscript):
-                    key, state = expression(target.slice, state)
-                    if state.pending.kind != "normal":
-                        return state
-                    token = _ProofEffects.single(key)
-                    if token is None or token[:2] != ("literal", "str"):
-                        raise _ProofIncomplete("opaque-key")
-                    key = token[2]
-                else:
-                    key = target.attr
-                state = _ProofEffects.store(self.index, scope, receiver, key, value, state,
-                                            attribute=isinstance(target, ast.Attribute), delete=delete)
-                if state.pending.kind != "normal":
-                    return state
+                nodes = (target.value, target.slice) if isinstance(target, ast.Subscript) else (target.value,)
+                frontier, abrupt = operands(nodes, state)
+                results = list(abrupt)
+                for values, current in frontier:
+                    if isinstance(target, ast.Subscript):
+                        token = _ProofEffects.single(values[1])
+                        if token is None or token[:2] != ("literal", "str"):
+                            raise _ProofIncomplete("opaque-key")
+                        key = token[2]
+                    else:
+                        key = target.attr
+                    current = _ProofEffects.store(self.index, scope, values[0], key, value, current,
+                                                 attribute=isinstance(target, ast.Attribute), delete=delete)
+                    if current.pending.kind == "normal":
+                        record(target, "after", current)
+                    results.append(_ProofOutcome(current, value if current.pending.kind == "normal" else None))
+                return bounded(results, target)
             else:
                 raise _ProofIncomplete("unsupported-store")
-            record(target, "after", state)
-            return state
 
         try:
             body = getattr(scope, "body", None)
@@ -5513,7 +5599,7 @@ class _ProofContext:
             # work item retains its whole correlated state and cursor stack.
             queue = deque()
 
-            def enqueue(cursor, state):
+            def enqueue(cursor, state, observation=None):
                 # Each after-marker is one live compound continuation; its
                 # seq/next actions are implementation pieces, not extra frames.
                 depth = len(state.active) + len(state.managers) + len(state.continuation) \
@@ -5521,17 +5607,37 @@ class _ProofContext:
                 if depth > self.limits["contexts"]:
                     raise _ProofIncomplete("context-budget")
                 stats["context_depth"] = max(stats["context_depth"], depth)
-                queue.append((cursor, state))
+                action = "observe" if observation is not None else (
+                    "dispatch" if state.pending.kind != "normal" else "step")
+                queue.append((action, cursor, _ProofOutcome(state, observation=observation)))
+
+            def route(cursor, outcome):
+                enqueue(cursor, outcome.state, outcome.observation)
 
             for state in dict.fromkeys(entry):
                 enqueue(((owner, "body", 0),), state)
             seen = set()
             while queue:
-                cursor, state = queue.popleft()
-                if (cursor, state) in seen:
+                action, cursor, outcome = queue.popleft()
+                if (action, cursor, outcome) in seen:
                     continue
-                seen.add((cursor, state))
-                if state.pending.kind != "normal" or not cursor:
+                seen.add((action, cursor, outcome))
+                state = outcome.state
+                if action == "observe":
+                    self._charge(stats)
+                    observations.append(outcome)
+                    continue
+                if action == "dispatch":
+                    self._charge(stats)
+                    # The shared unwinding seam retains the current cursor.
+                    # Task4 adds handler/finalizer/manager frames here. Known
+                    # sequence/loop frames do not intercept abrupt completion.
+                    if any(frame[1] not in ("body", "orelse", "after", "for-first", "for-next")
+                           for frame in cursor):
+                        raise _ProofIncomplete("unsupported-dispatch-frame")
+                    exits.append(state)
+                    continue
+                if not cursor:
                     exits.append(state)
                     continue
                 container_id, field, position = cursor[-1]
@@ -5555,11 +5661,11 @@ class _ProofContext:
                         if not isinstance(container.target, ast.Name) or not all(
                                 isinstance(part, ast.Pass) for part in container.body):
                             raise _ProofIncomplete("unproven-loop-backedge")
-                        exits.append(replace(state, pending=_ProofCompletion("diverge")))
+                        enqueue(cursor, replace(state, pending=_ProofCompletion("diverge")))
                     else:
-                        state = target_store(container.target, value, state)
-                        enqueue(cursor[:-1] + ((container_id, "for-next", position),
-                                               (container_id, "body", 0)), state)
+                        for outcome in target_store(container.target, value, state):
+                            route(cursor[:-1] + ((container_id, "for-next", position),
+                                                 (container_id, "body", 0)), outcome)
                     continue
                 sequence = getattr(container, field)
                 if position == len(sequence):
@@ -5569,30 +5675,31 @@ class _ProofContext:
                 successor = cursor[:-1] + ((container_id, field, position + 1),)
                 self._charge(stats)
                 record(node, "before", state)
+                statement_outcomes = None
                 if isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal)):
                     pass
                 elif isinstance(node, ast.If):
-                    value, state = expression(node.test, state)
-                    if state.pending.kind == "normal":
-                        token = _ProofEffects.single(value)
-                        if not token or token[0] != "literal":
-                            raise _ProofIncomplete("opaque-truth")
-                        selected = "body" if bool(token[2]) else "orelse"
-                        site = self.index.node_id(node)
-                        enqueue(successor + ((site, "after", 0), (site, selected, 0)), state)
-                    else:
-                        enqueue(successor, state)
+                    for outcome in expression(node.test, state):
+                        if outcome.normal:
+                            token = _ProofEffects.single(outcome.value)
+                            if not token or token[0] != "literal":
+                                raise _ProofIncomplete("opaque-truth")
+                            selected = "body" if bool(token[2]) else "orelse"
+                            site = self.index.node_id(node)
+                            route(successor + ((site, "after", 0), (site, selected, 0)), outcome)
+                        else:
+                            route(successor, outcome)
                     continue
                 elif isinstance(node, ast.For):
-                    iterator, state = expression(node.iter, state)
-                    if state.pending.kind == "normal":
-                        token = _ProofEffects.single(iterator)
-                        if not token or token[:2] != ("iterator", "call-sentinel"):
-                            raise _ProofIncomplete("opaque-for-iterator")
-                        site = self.index.node_id(node)
-                        enqueue(successor + ((site, "after", 0), (site, "for-first", token)), state)
-                    else:
-                        enqueue(successor, state)
+                    for outcome in expression(node.iter, state):
+                        if outcome.normal:
+                            token = _ProofEffects.single(outcome.value)
+                            if not token or token[:2] != ("iterator", "call-sentinel"):
+                                raise _ProofIncomplete("opaque-for-iterator")
+                            site = self.index.node_id(node)
+                            route(successor + ((site, "after", 0), (site, "for-first", token)), outcome)
+                        else:
+                            route(successor, outcome)
                     continue
                 elif isinstance(node, ast.Break):
                     destination = next((offset for offset in range(len(cursor) - 1, -1, -1)
@@ -5613,10 +5720,10 @@ class _ProofContext:
                         state = bind_name(alias.asname or "builtins",
                                           _ProofEffects.namespace("module", ("builtins", 0)), state)
                 elif isinstance(node, ast.Delete):
+                    statement_outcomes = (_ProofOutcome(state),)
                     for target in node.targets:
-                        state = target_store(target, None, state, delete=True)
-                        if state.pending.kind != "normal":
-                            break
+                        statement_outcomes = flat_map(statement_outcomes, lambda outcome:
+                            target_store(target, None, outcome.state, delete=True))
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if node.decorator_list or node.args.defaults or any(
                             item is not None for item in node.args.kw_defaults) or node.type_params \
@@ -5630,22 +5737,23 @@ class _ProofContext:
                     value = _ProofEffects.empty_class(self.index, scope, node, state)
                     state = bind_name(node.name, value, state)
                 elif isinstance(node, (ast.Assign, ast.Expr)):
-                    value, state = expression(node.value, state)
-                    if state.pending.kind == "normal" and isinstance(node, ast.Assign):
+                    statement_outcomes = expression(node.value, state)
+                    if isinstance(node, ast.Assign):
                         for target in node.targets:
-                            state = target_store(target, value, state)
-                            if state.pending.kind != "normal":
-                                break
-                    elif state.pending.kind == "normal" and isinstance(
+                            statement_outcomes = flat_map(statement_outcomes, lambda outcome:
+                                target_store(target, outcome.value, outcome.state))
+                    elif isinstance(
                             scope, (ast.Module, ast.ClassDef)) and node is body[0] \
                             and isinstance(node.value, ast.Constant) and type(node.value.value) is str:
                         self._charge(stats)
-                        state = bind_name("__doc__", value, state)
+                        statement_outcomes = flat_map(statement_outcomes, lambda outcome: (
+                            _ProofOutcome(bind_name("__doc__", outcome.value, outcome.state), outcome.value),))
                 else:
                     raise _ProofIncomplete("unsupported-statement")
-                if state.pending.kind == "normal":
-                    record(node, "after", state)
-                enqueue(successor, state)
+                for outcome in statement_outcomes if statement_outcomes is not None else (_ProofOutcome(state),):
+                    if outcome.normal:
+                        record(node, "after", outcome.state)
+                    route(successor, outcome)
         except _ProofIncomplete as error:
             reasons.append(str(error))
         except (MemoryError, RecursionError):
@@ -23841,6 +23949,172 @@ class ProofNamespaceTests(unittest.TestCase):
         self.assertTrue(snapshot.native_identity(marker, "int"))
         self.assertEqual(snapshot.value_at(marker, "__doc__", snapshot.states_at(marker)[0]),
                          _ProofValue.literal("documentation"))
+
+
+class ProofOutcomeTests(unittest.TestCase):
+    def _context(self, source, **kwargs):
+        # Positive models explicitly assume the existing named diagnostic
+        # effects boundary. This helper does not certify policy authorization.
+        return _ProofContext(source, diagnostic_policy=("print",), **kwargs)
+
+    def test_native_print_identity_does_not_authorize_diagnostic_effects(self):
+        for source in ("print('ok')\n", "print=print\nprint('ok')\n"):
+            with self.subTest(source=source):
+                context = _ProofContext(source + "marker=int\n")
+                snapshot = context.solve()
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_alternative_cap_covers_all_inputs_at_the_same_call_event(self):
+        for cap, complete in ((3, False), (4, False), (5, False), (6, True), (7, True)):
+            with self.subTest(cap=cap):
+                context = self._context("print('ok')\n", limits={"alternatives": cap})
+                entries = tuple(_ProofState().bind(0, "x", _ProofValue.literal(number))
+                                for number in (1, 2))
+                snapshot = context.solve(entry=entries)
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if complete:
+                    self.assertEqual(len(snapshot.exits), 4)
+                    self.assertEqual(len(snapshot.observations), 2)
+                else:
+                    self.assertIn("alternative-budget", snapshot.reasons)
+
+    def test_abrupt_outcome_cannot_carry_a_success_value(self):
+        factory = globals().get("_ProofOutcome")
+        self.assertIsNotNone(factory)
+        with self.assertRaises(TypeError):
+            factory(_ProofState(pending=_ProofCompletion("raise", "NameError")),
+                    _ProofValue.literal(1))
+
+    def test_literal_print_has_normal_raise_and_possible_divergence_routes(self):
+        context = self._context("x=print('ok')\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise"])
+        normal = next(state for state in snapshot.exits if state.pending.kind == "normal")
+        raised = next(state for state in snapshot.exits if state.pending.kind == "raise")
+        self.assertEqual(normal.lookup(0, "x"), _ProofValue.literal(None))
+        self.assertTrue(raised.lookup(0, "x").is_unbound)
+        self.assertEqual(raised.pending.error[:1], ("unknown-exception",))
+        self.assertEqual(len(snapshot.observations), 1)
+        observation = snapshot.observations[0]
+        self.assertEqual(observation.observation[:1], ("may-diverge",))
+        self.assertTrue(observation.state.lookup(0, "x").is_unbound)
+        self.assertEqual(observation.state.pending.kind, "normal")
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+        self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_nested_print_only_invokes_outer_call_after_normal_inner(self):
+        context = self._context("print(print('inner'))\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(sorted(state.pending.kind for state in snapshot.exits),
+                         ["normal", "raise", "raise"])
+        self.assertEqual(len(snapshot.observations), 2)
+        outer = context.tree.body[0].value
+        self.assertEqual(len(snapshot.states_at(outer, "invoke")), 1)
+        self.assertEqual(len(snapshot.states_at(outer.args[0], "invoke")), 1)
+
+    def test_print_argument_error_prevents_invocation(self):
+        context = self._context("print(missing)\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertFalse(snapshot.states_at(context.tree.body[0].value, "invoke"))
+        self.assertFalse(getattr(snapshot, "observations", ()))
+        self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_print_keeps_post_argument_effects_not_precall_native_facts(self):
+        context = self._context("import builtins as b\nprint(exec('b.int=lambda:0'))\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+        for state in snapshot.exits + tuple(item.state for item in snapshot.observations):
+            token = _ProofEffects.single(state.region_value(("builtins", 0), "int"))
+            self.assertEqual((token[0], token[-1]), ("const-callable", 0))
+
+    def test_print_alias_or_rebound_name_does_not_gain_the_named_exemption(self):
+        for source in ("p=print\np('ok')\n", "print=object()\nprint('ok')\n"):
+            with self.subTest(source=source):
+                context = self._context(source + "marker=int\n")
+                snapshot = context.solve()
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_opaque_formatting_is_not_quiet_merely_because_print_is_trusted(self):
+        for expression in ("opaque", "f'{opaque}'", "f'{opaque!s}'"):
+            with self.subTest(expression=expression):
+                context = self._context("def f(opaque):\n    print(" + expression + ")\n    marker=int\n")
+                func = context.tree.body[0]
+                snapshot = context.solve(func)
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[-1], "int"))
+
+    def test_print_outcome_branching_obeys_alternative_limit(self):
+        for cap, complete in ((1, False), (2, False), (3, True), (4, True)):
+            with self.subTest(cap=cap):
+                context = self._context("print('ok')\nmarker=int\n", limits={"alternatives": cap})
+                snapshot = context.solve()
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if not complete:
+                    self.assertIn("alternative-budget", snapshot.reasons)
+                    self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_print_routes_preserve_ambient_context_and_cache_intrinsic_stats(self):
+        context = self._context("print('ok')\n")
+        seed = _ProofState(active=(("error", "LookupError"),))
+        snapshot = context.solve(entry=(seed,))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        for state in snapshot.exits + tuple(item.state for item in snapshot.observations):
+            self.assertEqual(state.active, seed.active)
+        before = dict(context.total_compute)
+        self.assertIs(context.solve(entry=(seed,)), snapshot)
+        self.assertEqual(dict(context.total_compute), before)
+
+    def test_later_argument_error_preserves_earlier_abrupt_routes(self):
+        context = self._context("print(print('inner'),missing)\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(len(snapshot.exits), 2)
+        self.assertTrue(all(state.pending.kind == "raise" for state in snapshot.exits))
+        self.assertEqual(sum(state.pending.error == "NameError" for state in snapshot.exits), 1)
+        self.assertEqual(len(snapshot.observations), 1)
+        self.assertFalse(snapshot.states_at(context.tree.body[0].value, "invoke"))
+        self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_only_normal_assignment_chain_writes_namespace_and_copied_value(self):
+        context = self._context("import builtins as b\nb.int=x=print('ok')\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        for state in snapshot.exits + tuple(item.state for item in snapshot.observations):
+            if state.pending.kind == "normal" and state in snapshot.exits:
+                self.assertEqual(state.lookup(0, "x"), _ProofValue.literal(None))
+                self.assertEqual(state.region_value(("builtins", 0), "int"), _ProofValue.literal(None))
+            else:
+                self.assertTrue(state.lookup(0, "x").is_unbound)
+                self.assertFalse(state.region_defined(("builtins", 0), "int"))
+
+    def test_print_test_continues_only_normal_selected_branch(self):
+        context = self._context("if print('test'):\n    unsupported()\nelse:\n    selected=1\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        normal = next(state for state in snapshot.exits if state.pending.kind == "normal")
+        self.assertEqual(normal.lookup(0, "selected"), _ProofValue.literal(1))
+        self.assertTrue(snapshot.unreachable(context.tree.body[0].body[0]))
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_zero_trip_skips_target_diagnostic_and_first_body_keeps_routes(self):
+        context = self._context("for box[print('target')] in iter(int,0):\n    pass\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertFalse(snapshot.observations)
+        self.assertTrue(snapshot.unreachable(context.tree.body[0].target))
+        context = self._context("for globals()['step'] in iter(lambda:0,1):\n    print('body')\n    break\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise"])
+        self.assertEqual(len(snapshot.observations), 1)
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
 
 
 class ProofStateTests(unittest.TestCase):
