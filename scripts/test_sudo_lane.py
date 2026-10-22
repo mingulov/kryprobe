@@ -4621,12 +4621,13 @@ class _ProofEffects:
         return (None, "StopIteration") if number == sentinel[2] \
             else (_ProofValue.literal(number), None)
 
-    @staticmethod
-    def deferred_entry_modes(index):
+    @classmethod
+    def deferred_entry_modes(cls, index):
         # A syntactic, once-per-context hazard classification, not a guessed
         # module execution/horizon. Closed entry facts still override unknown
         # defaults. Real entry interpretation is the authoritative solver's job.
         eager_annotations = index.semantic_key[:2] < (3, 14) and not _future_annotations(index.tree)
+        opaque_metadata = cls._implicit_module_names - {"__builtins__"}
 
         def quiet_expression(node):
             return isinstance(node, (ast.Constant, ast.Name)) or (
@@ -4640,33 +4641,90 @@ class _ProofEffects:
             if isinstance(node, ast.Expr):
                 return quiet_expression(node.value)
             if isinstance(node, ast.Assign):
-                return all(isinstance(target, ast.Name) for target in node.targets) \
+                return all(isinstance(target, ast.Name) and target.id not in opaque_metadata
+                           for target in node.targets) \
                     and quiet_expression(node.value)
             if isinstance(node, ast.Delete):
-                return all(isinstance(target, ast.Name) for target in node.targets)
+                return all(isinstance(target, ast.Name) and target.id not in opaque_metadata
+                           for target in node.targets)
             if isinstance(node, ast.Import):
-                return all(alias.name == "builtins" for alias in node.names)
+                return all(alias.name == "builtins" and (alias.asname or "builtins") not in opaque_metadata
+                           for alias in node.names)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 defaults = list(node.args.defaults) + [
                     item for item in node.args.kw_defaults if item is not None]
                 annotations = _def_annotations(node) if eager_annotations else ()
-                return not node.decorator_list and all(
+                return node.name not in opaque_metadata and not node.decorator_list and all(
                     quiet_expression(item) for item in defaults + list(annotations))
             if isinstance(node, ast.ClassDef):
-                return not (node.bases or node.keywords or node.decorator_list) and all(
-                    not isinstance(item, (ast.Global, ast.Nonlocal)) and quiet_statement(item)
-                    for item in node.body)
+                # Even an empty class can execute a metadata __set_name__
+                # hook. This syntactic profile has no derived entry proof.
+                return False
             return False
 
-        if not all(quiet_statement(node) for node in index.tree.body):
-            return ("builtins-open", "frame-builtins-open", "globals-open")
-        if "__builtins__" in index.locals_for(index.tree) | index.globals_for(index.tree):
-            return ("frame-builtins-open",)
-        return ()
+        opened = ("builtins-open", "frame-builtins-open", "globals-open")
+        hazardous = rebound = False
+        scope_entries = {}
+
+        def modes():
+            return opened if hazardous else ("frame-builtins-open",) if rebound else ()
+
+        for position, node in enumerate(index.tree.body):
+            if isinstance(node, ast.ClassDef):
+                # Its body precedes its own metadata hooks, not earlier
+                # classes' hooks or its own effectful header/prologue.
+                scope_entries[node] = opened if index.namespace_open(node) or node.decorator_list else modes()
+            # A leading docstring implicitly replaces __doc__, whose generic
+            # old value may run a finalizer even though a string load is quiet.
+            docstore = position == 0 and isinstance(node, ast.Expr) \
+                and isinstance(node.value, ast.Constant) and type(node.value.value) is str
+            hazardous |= docstore or not quiet_statement(node)
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                rebound |= any(isinstance(target, ast.Name) and target.id == "__builtins__"
+                               for target in node.targets)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                rebound |= node.name == "__builtins__"
+            elif isinstance(node, ast.Import):
+                rebound |= any((alias.asname or alias.name.split(".")[0]) == "__builtins__"
+                               for alias in node.names)
+        deferred = modes()
+        direct_module_nodes = frozenset(index.tree.body)
+        for scope in index._locals:
+            if scope is not index.tree and scope not in direct_module_nodes:
+                # No enclosing execution/call prefix has been proved for a
+                # nested region, even when its enclosing def statement is quiet.
+                scope_entries[scope] = opened
+        return deferred, MappingProxyType(scope_entries)
 
     @staticmethod
     def namespace(view, region):
         return _ProofValue(frozenset({("namespace", view, region)}))
+
+    @classmethod
+    def fresh_namespace(cls, view, region, state):
+        if any(owner == region for owner, name, value in state.regions) or any(
+                len(atom) == 3 and atom[0] == "namespace" and atom[2] == region
+                for value in [item[2] for item in state.bindings] + [item[2] for item in state.regions]
+                for atom in value.atoms):
+            # A repeated site can denote multiple concrete objects. Do not
+            # strongly update or retarget a live old alias using site equality.
+            raise _ProofIncomplete("repeated-allocation-site")
+        return cls.namespace(view, region)
+
+    @classmethod
+    def empty_class(cls, index, scope, node, state):
+        if node.bases or node.keywords or node.decorator_list or node.type_params \
+                or not all(isinstance(part, ast.Pass) for part in node.body):
+            raise _ProofIncomplete("unsupported-class-shape")
+        if cls.frame_builtin(state, "__build_class__") != _ProofValue(
+                frozenset({("native", "__build_class__")})):
+            raise _ProofIncomplete("class-builder-identity")
+        # Compiler-generated __module__ ignores enclosing lexical parameters.
+        # Opaque metadata (even a str subclass) can run __set_name__ here.
+        metadata = cls.single(cls.global_value(index, scope, state, "__name__"))
+        if not metadata or metadata[:2] != ("literal", "str"):
+            raise _ProofIncomplete("class-metadata")
+        return _ProofValue(frozenset({("empty-class", index.node_id(node))}))
 
     @staticmethod
     def single(value):
@@ -4826,7 +4884,9 @@ class _ProofEffects:
             raise _ProofIncomplete("opaque-member")
         _, view, region = atom
         if attribute:
-            if view != "module":
+            if view == "object" and key.startswith("__"):
+                raise _ProofIncomplete("object-protocol-member")
+            if view not in ("module", "object"):
                 raise _ProofIncomplete("unsupported-attribute")
             if region == ("builtins", 0) and "builtins-open" in state.entry_modes:
                 raise _ProofIncomplete("entry-module-protocol")
@@ -4857,7 +4917,7 @@ class _ProofEffects:
             if value.unknown:
                 raise _ProofIncomplete("opaque-release")
             for atom in value.atoms:
-                if atom[0] in ("literal", "native", "singleton", "unbound", "absent", "const-callable") \
+                if atom[0] in ("literal", "native", "singleton", "unbound", "absent", "const-callable", "plain-object") \
                         or atom[:2] == ("opaque", "type-parameter"):
                     continue
                 if atom[0] == "namespace":
@@ -4875,8 +4935,10 @@ class _ProofEffects:
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-store")
         _, view, region = atom
-        if (attribute and view != "module") or (not attribute and view != "mapping"):
+        if (attribute and view not in ("module", "object")) or (not attribute and view != "mapping"):
             raise _ProofIncomplete("unsupported-store-view")
+        if attribute and view == "object" and key.startswith("__"):
+            raise _ProofIncomplete("object-protocol-store")
         if attribute and region == ("builtins", 0) and "builtins-open" in state.entry_modes:
             raise _ProofIncomplete("entry-module-protocol")
         if attribute and key == "__dict__":
@@ -4991,6 +5053,7 @@ class _ProofContext:
         self.limits = MappingProxyType(self.limits)
         self.tree = self.index = None
         self._entry_modes = ()
+        self._scope_entry_modes = MappingProxyType({})
         self._reasons = []
         self._epoch = object()  # once per source, never once per loop visit
         self._cache = {}
@@ -5021,7 +5084,7 @@ class _ProofContext:
             pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
         self.tree = tree
         self.index = _ProofScopeIndex(tree, semantic_key=semantic_key)
-        self._entry_modes = _ProofEffects.deferred_entry_modes(self.index)
+        self._entry_modes, self._scope_entry_modes = _ProofEffects.deferred_entry_modes(self.index)
         if any(len(names | self.index.globals_for(owner)
                    | self.index.nonlocals_for(owner)) > self.limits["names"]
                for owner, names in self.index._locals.items()):
@@ -5170,9 +5233,11 @@ class _ProofContext:
             reasons.append("foreign-scope")
             return snapshot()
         owner = self.index.node_id(scope)
+        region_entry_modes = self._scope_entry_modes.get(scope, self._entry_modes) \
+            if scope is not self.tree else ()
         if entry is None:
             initial = _ProofState(epoch=self._epoch,
-                                  entry_modes=self._entry_modes if scope is not self.tree else ())
+                                  entry_modes=region_entry_modes)
             if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 args = scope.args
                 for arg in (list(args.posonlyargs) + list(args.args)
@@ -5211,7 +5276,7 @@ class _ProofContext:
                 region_names = {}
                 aliases = 0
                 for region, name, value in state.regions:
-                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping") \
+                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object") \
                             or type(region[1]) is not int or (
                                 region[0] in ("globals", "builtins") and region[1] != 0):
                         reasons.append("foreign-region")
@@ -5227,7 +5292,7 @@ class _ProofContext:
                     reasons.append("alias-budget")
                     return snapshot()
                 modes = tuple(sorted(set(state.entry_modes) | set(
-                    self._entry_modes if scope is not self.tree else ())))
+                    region_entry_modes)))
                 initial_states.add(replace(state, epoch=self._epoch, entry_modes=modes))
                 if len(initial_states) > self.limits["alternatives"]:
                     reasons.append("alternative-budget")
@@ -5286,7 +5351,7 @@ class _ProofContext:
                 if not error and (result.unknown or ("unbound",) in result.atoms or not result.atoms):
                     raise _ProofIncomplete("imprecise-load")
             elif isinstance(node, ast.Dict) and not node.keys:
-                result = _ProofEffects.namespace("mapping", ("mapping", self.index.node_id(node)))
+                result = _ProofEffects.fresh_namespace("mapping", ("mapping", self.index.node_id(node)), state)
             elif isinstance(node, (ast.Attribute, ast.Subscript)):
                 receiver, state = expression(node.value, state)
                 if state.pending.kind != "normal":
@@ -5332,6 +5397,13 @@ class _ProofContext:
                 elif token and token[0] == "const-callable":
                     result, error = (None, "TypeError") if arguments or node.keywords \
                         else (_ProofValue.literal(token[2]), None)
+                elif token == ("native", "object") or (token and token[0] == "empty-class"):
+                    if arguments or node.keywords:
+                        result, error = None, "TypeError"
+                    elif token == ("native", "object"):
+                        result = _ProofValue(frozenset({("plain-object", self.index.node_id(node))}))
+                    else:
+                        result = _ProofEffects.fresh_namespace("object", ("object", self.index.node_id(node)), state)
                 elif token == ("native", "iter") and len(arguments) == 2 and not node.keywords:
                     callback, sentinel = map(_ProofEffects.single, arguments)
                     if (callback != ("native", "int") and not (
@@ -5552,6 +5624,11 @@ class _ProofContext:
                         raise _ProofIncomplete("unsupported-definition-prologue")
                     state = bind_name(node.name, _ProofValue(frozenset({
                         ("function", self.index.node_id(node))})), state)
+                elif isinstance(node, ast.ClassDef):
+                    self._charge(stats)
+                    self._charge(stats)
+                    value = _ProofEffects.empty_class(self.index, scope, node, state)
+                    state = bind_name(node.name, value, state)
                 elif isinstance(node, (ast.Assign, ast.Expr)):
                     value, state = expression(node.value, state)
                     if state.pending.kind == "normal" and isinstance(node, ast.Assign):
@@ -5559,6 +5636,11 @@ class _ProofContext:
                             state = target_store(target, value, state)
                             if state.pending.kind != "normal":
                                 break
+                    elif state.pending.kind == "normal" and isinstance(
+                            scope, (ast.Module, ast.ClassDef)) and node is body[0] \
+                            and isinstance(node.value, ast.Constant) and type(node.value.value) is str:
+                        self._charge(stats)
+                        state = bind_name("__doc__", value, state)
                 else:
                     raise _ProofIncomplete("unsupported-statement")
                 if state.pending.kind == "normal":
@@ -22736,9 +22818,9 @@ def _binding_violations(source):
 
 
 class ProofNamespaceTests(unittest.TestCase):
-    def _solve(self, source):
+    def _solve(self, source, entry=None):
         context = _ProofContext(source)
-        snapshot = context.solve()
+        snapshot = context.solve(entry=entry)
         return context, snapshot
 
     def test_native_loads_and_same_line_point_order(self):
@@ -22893,6 +22975,12 @@ class ProofNamespaceTests(unittest.TestCase):
         outer = context.tree.body[0]
         box = outer.body[0]
         seed = _ProofState().bind(context.index.node_id(outer), "int", _ProofValue.literal(0))
+        snapshot = context.solve(box, entry=(seed,))
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(box.body[0], "int"))
+        # A derived entry supplies the global object independently of the
+        # outer parameter; lexical lookup must still ignore that parameter.
+        seed = seed.bind(0, "int", _ProofValue(frozenset({("native", "int")})))
         snapshot = context.solve(box, entry=(seed,))
         self.assertTrue(snapshot.complete, snapshot.reasons)
         self.assertTrue(snapshot.native_identity(box.body[0], "int"))
@@ -23168,12 +23256,21 @@ class ProofNamespaceTests(unittest.TestCase):
                 seed = _ProofState().bind(context.index.node_id(outer), "b",
                                           _ProofEffects.namespace("module", ("builtins", 0)))
                 snapshot = context.solve(func, entry=(seed,))
-                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                # The closure slot alone proves neither a nested-call entry
+                # nor its selected frame builtins. Test the pure dynamic
+                # transfer separately under the closed hypothesis below.
+                self.assertFalse(snapshot.complete)
+                call = next(node for node in func.body if isinstance(node, ast.Expr)
+                            and isinstance(node.value, ast.Call)).value
+                value, state = context._dynamic_call(call, "exec", func, seed,
+                                                     {"steps": 0, "states": 0})
                 if error:
-                    self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                    self.assertEqual(state.pending.kind, "raise")
+                    self.assertEqual(state.pending.error, error)
                 else:
-                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"),
-                                     _ProofValue.literal(0))
+                    self.assertEqual(state.pending.kind, "normal")
+                    token = _ProofEffects.single(state.region_value(("builtins", 0), "int"))
+                    self.assertEqual((token[0], token[-1]), ("const-callable", 0))
 
     def test_dynamic_function_local_builtin_name_does_not_select_payload_builtins(self):
         context = _ProofContext("import builtins as b\ndef f():\n    __builtins__={}\n"
@@ -23307,8 +23404,18 @@ class ProofNamespaceTests(unittest.TestCase):
                 seed = _ProofState().bind(context.index.node_id(func), name,
                                          _ProofEffects.namespace("module", ("builtins", 0)))
                 snapshot = context.solve(func, entry=(seed,))
-                self.assertTrue(snapshot.complete, snapshot.reasons)
-                token = _ProofEffects.single(snapshot.exits[0].region_value(("builtins", 0), "int"))
+                if name == "__b__":
+                    # Generic class metadata could have changed exec before
+                    # the method entry. Check the namespace transfer under a
+                    # separately supplied pristine entry, not a false horizon.
+                    self.assertFalse(snapshot.complete)
+                    result, final = context._dynamic_call(func.body[0].value, "exec", func, seed, {"steps": 0})
+                    self.assertEqual(result, _ProofValue.literal(None))
+                    self.assertEqual(final.pending.kind, "normal")
+                else:
+                    self.assertTrue(snapshot.complete, snapshot.reasons)
+                    final = snapshot.exits[0]
+                token = _ProofEffects.single(final.region_value(("builtins", 0), "int"))
                 self.assertEqual((token[0], token[2]), ("const-callable", 0))
 
     def test_namespace_horizons_skip_dead_and_sibling_body_writes(self):
@@ -23461,6 +23568,279 @@ class ProofNamespaceTests(unittest.TestCase):
                                         "else:\n    unsupported()\nmarker=int\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
         self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_empty_ordinary_instance_attribute_is_disjoint_from_builtins(self):
+        context, snapshot = self._solve("__name__='fixture'\nclass B: pass\nb=B()\nb.int=1\n"
+            "for x in iter(int,1):\n    break\nmarker=int\n",
+            entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+        self.assertEqual([state.pending.kind for state in snapshot.exits], ["normal"])
+
+    def test_distinct_empty_instances_and_copied_instance_aliases(self):
+        context, snapshot = self._solve("__name__='fixture'\nclass B: pass\nleft=B()\nright=B()\n"
+                                        "left.int=1\nright.int=2\nalias=left\nalias.int=3\n"
+            "one=left.int\ntwo=right.int\nmarker=int\n",
+            entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(0, "one"), _ProofValue.literal(3))
+        self.assertEqual(snapshot.exits[0].lookup(0, "two"), _ProofValue.literal(2))
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_empty_class_uses_explicit_absent_global_metadata_fallback(self):
+        context = _ProofContext("class B: pass\nb=B()\nb.int=1\nmarker=int\n")
+        seed = _ProofState().bind(0, "__name__", _ProofValue.absent()).write_region(
+            ("builtins", 0), "__name__", _ProofValue.literal("builtins"))
+        snapshot = context.solve(entry=(seed,))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+        self.assertFalse(context.solve().complete)  # generic implicit metadata stays Unknown
+
+    def test_empty_class_unknown_metadata_is_not_a_quiet_exact_string(self):
+        source = "class B: pass\nb=B()\nmarker=int\n"
+        for global_name, builtin_name in (
+                (_ProofValue.unknown_value("descriptor"), _ProofValue.literal("builtins")),
+                (_ProofValue.absent(), _ProofValue.unknown_value("descriptor")),
+                (_ProofValue.literal(1), _ProofValue.literal("builtins"))):
+            with self.subTest(global_name=global_name):
+                context = _ProofContext(source)
+                seed = _ProofState().bind(0, "__name__", global_name).write_region(
+                    ("builtins", 0), "__name__", builtin_name)
+                snapshot = context.solve(entry=(seed,))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+        context = _ProofContext(source)
+        seed = _ProofState().bind(0, "__name__", _ProofValue.literal("safe")).write_region(
+            ("builtins", 0), "__name__", _ProofValue.unknown_value("descriptor"))
+        snapshot = context.solve(entry=(seed,))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+
+    def test_implicit_class_metadata_ignores_enclosing_parameter(self):
+        context = _ProofContext("def f(__name__):\n    class B: pass\n    b=B()\n    marker=int\n")
+        func = context.tree.body[0]
+        seed = _ProofState().bind(0, "__name__", _ProofValue.literal("global")).bind(
+            context.index.node_id(func), "__name__", _ProofValue.unknown_value("descriptor"))
+        snapshot = context.solve(func, entry=(seed,))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(func.body[-1], "int"))
+
+    def test_empty_class_requires_frame_builder_not_a_global_spelling(self):
+        context, snapshot = self._solve("__name__='fixture'\n__build_class__=0\n"
+            "class B: pass\nb=B()\nmarker=int\n",
+            entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        for modes, builder in (((), _ProofValue.literal(0)),
+                               (("frame-builtins-open",), _ProofValue(frozenset({("native", "__build_class__")})))):
+            with self.subTest(modes=modes):
+                context = _ProofContext("__name__='fixture'\nclass B: pass\nmarker=int\n")
+                seed = _ProofState(entry_modes=modes).bind(0, "__name__", _ProofValue.absent()).write_region(
+                    ("builtins", 0), "__build_class__", builder)
+                snapshot = context.solve(entry=(seed,))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_ordinary_constructor_signature_obeys_argument_error_order(self):
+        for call, error in (("B(1)", "TypeError"), ("B(missing)", "NameError"),
+                            ("object(1)", "TypeError"), ("object(missing)", "NameError")):
+            with self.subTest(call=call):
+                context, snapshot = self._solve("__name__='fixture'\nclass B: pass\n"
+                    + call + "\nmarker=1\n",
+                    entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+
+    def test_opaque_instance_and_class_protocol_controls_remain_incomplete(self):
+        context = _ProofContext("def f(b):\n    b.int=1\n    marker=int\n")
+        snapshot = context.solve(context.tree.body[0])
+        self.assertFalse(snapshot.complete)
+        for statement in ("b.__class__=object", "B.__setattr__=int", "b.__dict__['int']=1"):
+            with self.subTest(statement=statement):
+                context, snapshot = self._solve("__name__='fixture'\nclass B: pass\nb=B()\n"
+                    + statement + "\nmarker=int\n",
+                    entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_module_copy_survives_retarget_to_exact_object(self):
+        context, snapshot = self._solve("import builtins as b\nsaved=b\nb=object()\n"
+                                        "saved.int=lambda:1\nfor x in iter(int,0):\n    pass\nmarker=1\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.kind for state in snapshot.exits], ["diverge"])
+        self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_repeated_allocation_site_is_not_a_singleton_mapping(self):
+        context, first = self._solve("box={}\nmarker=int\n")
+        self.assertTrue(first.complete, first.reasons)
+        seed = first.exits[0].bind(0, "alias", first.exits[0].lookup(0, "box"))
+        second = context.solve(entry=(seed,))
+        self.assertFalse(second.complete)
+        self.assertFalse(second.native_identity(context.tree.body[-1], "int"))
+
+    def test_repeated_instance_allocation_cannot_retarget_an_existing_alias(self):
+        context = _ProofContext("__name__='fixture'\nclass B: pass\ndef f():\n    b=B()\n")
+        module = context.solve(entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
+        self.assertTrue(module.complete, module.reasons)
+        func = context.tree.body[-1]
+        first = context.solve(func, entry=module.exits)
+        self.assertTrue(first.complete, first.reasons)
+        seed = first.exits[0].bind(0, "alias", first.exits[0].lookup(context.index.node_id(func), "b"))
+        second = context.solve(func, entry=(seed,))
+        self.assertFalse(second.complete)
+
+    def test_namespace_thirteen_case_block_matrix_with_explicit_native_entry(self):
+        first_break = "for x in iter(int,1):\n    break\n"
+        zero_trip = "for x in iter(int,0):\n    pass\n"
+        cases = (
+            ("baseline-break", first_break, "normal", True),
+            ("namespace-read", "globals()\n" + first_break, "normal", True),
+            ("unrelated-key", "box['int']=1\n" + first_break, "normal", True),
+            ("unrelated-attribute", "class B: pass\nb=B()\nb.int=1\n" + first_break, "normal", True),
+            ("dead-namespace-write", "if False:\n    globals()['int']=lambda:1\n" + first_break, "normal", True),
+            ("unexecuted-target", "for box[sum(iter(int,1))] in iter(int,0):\n    break\n", "normal", True),
+            ("exec-write", "import builtins\nexec('builtins.int=lambda:1')\n" + zero_trip, "diverge", False),
+            ("eval-write", "eval(\"setattr(__import__('builtins'),'int',lambda:1)\")\n" + zero_trip, "diverge", False),
+            ("write-after-query", zero_trip + "globals()['int']=lambda:1\n", "normal", True),
+            ("retargeted-namespace-alias", "ns=globals()\nns={}\nns['int']=1\n" + first_break, "normal", True),
+            ("module-copy-before-rebind", "import builtins as b\nsaved=b\nb=object()\nsaved.int=lambda:1\n" + zero_trip, "diverge", False),
+            ("dead-local-declaration", "if False:\n    int=lambda:1\n" + zero_trip, "raise", False),
+            ("sibling-scope-binding", "def other():\n    int=lambda:1\n" + first_break, "normal", True),
+        )
+        for name, body, kind, native in cases:
+            with self.subTest(name=name):
+                source = "def execute():\n" + "".join("    " + line + "\n" for line in
+                    ("box={}\n" + body + "marker=1\n").splitlines())
+                context = _ProofContext(source)
+                func = context.tree.body[0]
+                seed = _ProofState().bind(0, "__name__", _ProofValue.absent()).write_region(
+                    ("builtins", 0), "__name__", _ProofValue.literal("builtins"))
+                snapshot = context.solve(func, entry=(seed,))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual([state.pending.kind for state in snapshot.exits], [kind])
+                loop = next(node for node in func.body if isinstance(node, ast.For))
+                self.assertEqual(snapshot.native_identity(loop, "int"), native)
+                self.assertEqual(snapshot.unreachable(func.body[-1]), kind != "normal")
+                if kind == "raise":
+                    self.assertEqual(snapshot.exits[0].pending.error, "UnboundLocalError")
+
+    def test_deferred_class_completion_cannot_assume_pristine_builtins(self):
+        context = _ProofContext("class B: pass\ndef f():\n    marker=int\n")
+        func = context.tree.body[-1]
+        snapshot = context.solve(func)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(func.body[0], "int"))
+
+    def test_class_body_horizon_precedes_its_own_future_metadata_hook(self):
+        context = _ProofContext("class B:\n    marker=int\n")
+        box = context.tree.body[0]
+        snapshot = context.solve(box)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(box.body[0], "int"))
+        context = _ProofContext("class Earlier: pass\nclass B:\n    marker=int\n")
+        box = context.tree.body[-1]
+        snapshot = context.solve(box)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(box.body[0], "int"))
+
+    def test_deferred_implicit_metadata_release_is_not_syntactically_quiet(self):
+        for operation in ("__name__='fixture'", "del __name__"):
+            with self.subTest(operation=operation):
+                context = _ProofContext(operation + "\ndef f():\n    marker=int\n")
+                func = context.tree.body[-1]
+                snapshot = context.solve(func)
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[0], "int"))
+
+    def test_class_entry_includes_own_decorator_evaluation(self):
+        for decorator in ("eval(\"setattr(__import__('builtins'),'int',lambda:1)\")",
+                          "install()", "decorator"):
+            with self.subTest(decorator=decorator):
+                context = _ProofContext("@" + decorator + "\nclass B:\n    marker=int\n")
+                box = context.tree.body[0]
+                snapshot = context.solve(box)
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(box.body[0], "int"))
+
+    def test_nested_class_entry_does_not_skip_enclosing_predecessors(self):
+        for source in (
+                "def f():\n    eval(\"setattr(__import__('builtins'),'int',lambda:1)\")\n"
+                "    class B:\n        marker=int\n",
+                "class Outer:\n    eval(\"setattr(__import__('builtins'),'int',lambda:1)\")\n"
+                "    class B:\n        marker=int\n",
+                "if True:\n    eval(\"setattr(__import__('builtins'),'int',lambda:1)\")\n"
+                "    class B:\n        marker=int\n"):
+            with self.subTest(source=source):
+                context = _ProofContext(source)
+                box = next(node for node in ast.walk(context.tree)
+                           if isinstance(node, ast.ClassDef) and node.name == "B")
+                snapshot = context.solve(box)
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(box.body[0], "int"))
+
+    def test_nested_function_entry_does_not_skip_enclosing_predecessors(self):
+        for prefix, indent in (("def outer():\n", "    "), ("class Outer:\n", "    "),
+                               ("if True:\n", "    ")):
+            with self.subTest(prefix=prefix):
+                source = prefix + indent + "eval(\"setattr(__import__('builtins'),'int',lambda:1)\")\n" \
+                    + indent + "def inner():\n" + indent + "    marker=int\n"
+                context = _ProofContext(source)
+                func = next(node for node in ast.walk(context.tree)
+                            if isinstance(node, ast.FunctionDef) and node.name == "inner")
+                snapshot = context.solve(func)
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[0], "int"))
+                seed = _ProofState().bind(0, "int", _ProofValue.literal(1))
+                snapshot = context.solve(func, entry=(seed,))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertFalse(snapshot.native_identity(func.body[0], "int"))
+                marker = func.body[0]
+                self.assertEqual(snapshot.value_at(marker, "int", snapshot.states_at(marker)[0]),
+                                 _ProofValue.literal(1))
+
+    def test_nested_callable_entry_accounts_for_later_outer_effects(self):
+        for definition in ("def", "async def"):
+            for before in (True, False):
+                with self.subTest(definition=definition, before=before):
+                    mutation = "    eval(\"setattr(__import__('builtins'),'int',lambda:1)\")\n"
+                    nested = "    " + definition + " inner(saved):\n        marker=saved\n        after=int\n"
+                    source = "def outer():\n" + (mutation + nested if before else nested + mutation)
+                    context = _ProofContext(source)
+                    func = context.tree.body[0].body[1 if before else 0]
+                    seed = _ProofState().bind(context.index.node_id(func), "saved", _ProofValue(
+                        frozenset({("native", "int")})))
+                    snapshot = context.solve(func, entry=(seed,))
+                    self.assertFalse(snapshot.complete)
+                    self.assertFalse(snapshot.native_identity(func.body[-1], "int"))
+                    # Incompleteness withholds universal proof APIs, but the
+                    # explicitly captured parameter still survives in events.
+                    arrived = snapshot.states_at(func.body[0])
+                    self.assertTrue(arrived)
+                    self.assertEqual(snapshot.value_at(func.body[0], "saved", arrived[0]),
+                                     _ProofValue(frozenset({("native", "int")})))
+
+    def test_initial_module_docstring_can_release_opaque_metadata(self):
+        context = _ProofContext("'documentation'\ndef f():\n    marker=int\n")
+        func = context.tree.body[-1]
+        snapshot = context.solve(func)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(func.body[0], "int"))
+        context = _ProofContext("pass\n'documentation'\ndef f():\n    marker=int\n")
+        func = context.tree.body[-1]
+        snapshot = context.solve(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(func.body[0], "int"))
+
+    def test_module_docstring_store_checks_release_and_records_safe_value(self):
+        context = _ProofContext("'documentation'\nmarker=int\n")
+        snapshot = context.solve()
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+        seed = _ProofState().bind(0, "__doc__", _ProofValue.absent())
+        snapshot = context.solve(entry=(seed,))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        marker = context.tree.body[-1]
+        self.assertTrue(snapshot.native_identity(marker, "int"))
+        self.assertEqual(snapshot.value_at(marker, "__doc__", snapshot.states_at(marker)[0]),
+                         _ProofValue.literal("documentation"))
 
 
 class ProofStateTests(unittest.TestCase):
