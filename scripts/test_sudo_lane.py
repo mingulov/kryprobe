@@ -1573,7 +1573,7 @@ def _signed_numeric(node):
     return None
 
 
-def _const_call_raises(node, parents):
+def _const_call_error(node, parents):
     # True when a single-argument builtin call
     # provably raises (O10): an unshadowed
     # int/float/complex/bytes spelling applied
@@ -1593,47 +1593,51 @@ def _const_call_raises(node, parents):
     # (MemoryError, RecursionError) depend on
     # the machine and never prove (P4).
     if not isinstance(node, ast.Call):
-        return False
+        return None
     if len(node.args) != 1 or node.keywords:
-        return False
+        return None
     func = _unwrap_walrus(node.func)
     if not isinstance(func, ast.Name) \
             or not isinstance(func.ctx, ast.Load):
-        return False
+        return None
     if func.id not in ("int", "float",
                        "complex", "bytes"):
-        return False
+        return None
     if not hasattr(builtins, func.id):
-        return False
+        return None
     if _name_bound_anywhere(node, parents,
                             func.id):
-        return False
+        return None
     arg = _unwrap_walrus(node.args[0])
     if isinstance(arg, ast.Starred):
-        return False
+        return None
     if isinstance(arg, ast.Constant):
         value = arg.value
     else:
         value = _signed_numeric(arg)
         if value is None:
-            return False
+            return None
     if func.id == "bytes" \
             and isinstance(value, int):
-        return value < 0
+        return "ValueError" if value < 0 else None
     if isinstance(value, (str, bytes)) \
             and len(value) > 1000:
-        return False
+        return None
     if isinstance(value, int) \
             and not isinstance(value, bool) \
             and value.bit_length() > 10000:
-        return False
+        return None
     try:
         getattr(builtins, func.id)(value)
-    except (ValueError, TypeError, OverflowError):
-        return True
+    except (ValueError, TypeError, OverflowError) as error:
+        return type(error).__name__
     except Exception:
-        return False
-    return False
+        return None
+    return None
+
+
+def _const_call_raises(node, parents):
+    return _const_call_error(node, parents) is not None
 
 
 def _display_ctor_raises(node):
@@ -3297,7 +3301,7 @@ def _exc_construction(name, node, trusted=None):
 
 def _suppress_entry_value(name, use, parents,
                             trusted, _seen=None,
-                            _before=None, _executes=None):
+                         _before=None, _executes=None, _deletes=None):
     # the single literal value of a suppressor
     # entry name: False when provably not an
     # exception class (a constant — first-hand:
@@ -3497,6 +3501,7 @@ def _suppress_entry_value(name, use, parents,
                 or not _executes(holder, checkpoint):
             return None
         if any(bpos < (deleted.lineno, deleted.col_offset) < checkpoint
+               and (_deletes is None or _deletes(deleted, checkpoint))
                for deleted in deletions):
             return None
     cursor = holder
@@ -3525,7 +3530,7 @@ def _suppress_entry_value(name, use, parents,
         return _suppress_entry_value(
             value.id, holder, parents, trusted, _seen,
             _before=holder if _before is not None else None,
-            _executes=_executes)
+            _executes=_executes, _deletes=_deletes)
     return None
 
 
@@ -7014,6 +7019,10 @@ def _const_compare_taken(test, ifnode, parents):
     # scope (conditional, deleted, declared or
     # otherwise-bound names void). Else None.
     test = _unwrap_walrus(test)
+    if _expr_quiet(test):
+        folded = _truthy_value(test)
+        if folded is not None:
+            return folded
     if not isinstance(test, ast.Compare) \
             or len(test.ops) != 1 \
             or not isinstance(
@@ -13761,7 +13770,7 @@ def _binding_violations(source):
                 if isinstance(node, try_nodes):
                     trys.append(node)
                 stack.extend(ast.iter_child_nodes(node))
-            def executes(dnode, stop=None):
+            def executes(dnode, stop=None, may=False):
                 # the del provably runs (rather than
                 # skipped or dead): every enclosing
                 # branch definite — straight-line,
@@ -13784,6 +13793,12 @@ def _binding_violations(source):
                     probe = parents[id(probe)]
                     if probe is func:
                         break
+                    if may:
+                        # For deletion survival, a possible path is enough
+                        # to void a mandatory binding. Direct predecessor
+                        # exits are still checked in the second walk below.
+                        child = probe
+                        continue
                     if isinstance(probe, ast.If):
                         branch = probe.body \
                             if child in probe.body \
@@ -13798,10 +13813,14 @@ def _binding_violations(source):
                         else:
                             test = _unwrap_walrus(
                                 probe.test)
-                            val = test.value \
-                                if isinstance(
-                                    test, ast.Constant) \
-                                else None
+                            val = bool(test.value) if isinstance(
+                                test, ast.Constant) else None
+                            if isinstance(test, ast.Compare) and all(
+                                    _expr_quiet(part) for part in
+                                    [test.left] + list(test.comparators)):
+                                val = _truthy_value(test)
+                            if val is None:
+                                val = _const_compare_taken(test, probe, parents)
                             # constant tests fold by
                             # truthiness (if 1: takes
                             # the body like if True:).
@@ -14024,8 +14043,10 @@ def _binding_violations(source):
                             spelling, handler,
                             parents,
                             _spelling_trusted,
-                            _before=dnode,
-                            _executes=executes)
+                            _before=handler,
+                            _executes=executes,
+                            _deletes=lambda deleted, checkpoint:
+                            executes(deleted, checkpoint, may=True))
                         if resolved is None \
                                 or resolved is False:
                             return False
@@ -14153,8 +14174,7 @@ def _binding_violations(source):
                     got = _stmt_outcome(sub)
                     acc = _combine(acc, got)
                     if got is not None \
-                            and not _may_fall_scoped(
-                                sub, False):
+                            and not _may_fall_scoped(sub, False):
                         break
                 return acc
 
@@ -14531,25 +14551,63 @@ def _binding_violations(source):
                 return _seq_outcome(trobj.finalbody)
 
             def _normal_finally_may_fall(seq):
-                # A suppressed exception resumes normally, but the
-                # finalizer must still complete. Keep global may-fall's
-                # existing contract; only this normal path additionally
-                # recognizes bounded semantic expression failures.
-                if not _seq_may_fall(seq, False, parents):
-                    return False
+                # Native failures belong to _part_raise/_stmt_outcome,
+                # where namespace trust and the actual error are known.
+                return all(_may_fall_scoped(sub, False) for sub in seq)
+
+            def _normal_native_failure(seq):
+                # Preserve first-error order. A later mandatory native
+                # error still prevents normal completion, but an unknown
+                # predecessor may raise a different exception first.
+                quiet_prefix = True
                 for sub in seq:
-                    if isinstance(sub, ast.If):
-                        test = _unwrap_walrus(sub.test)
-                        if isinstance(test, ast.Constant):
-                            taken = sub.body if test.value else sub.orelse
-                            if not _normal_finally_may_fall(taken):
-                                return False
+                    got = None
+                    if isinstance(sub, ast.If) and isinstance(
+                            _unwrap_walrus(sub.test), ast.Constant):
+                        arm = sub.body if _unwrap_walrus(sub.test).value else sub.orelse
+                        got = _normal_native_failure(arm)
                     elif isinstance(sub, (ast.Expr, ast.Assign, ast.AnnAssign)):
-                        value = sub.value
-                        if value is not None and any(
-                                _always_eval_raises(value, parents)):
-                            return False
-                return True
+                        call = _unwrap_walrus(sub.value)
+                        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) \
+                                and _spelling_trusted(call.func, call.func.id):
+                            error = _const_call_error(call, parents)
+                            if error is not None:
+                                typ = getattr(builtins, error)
+                                got = ("chain", tuple(cls.__name__ for cls in
+                                                      typ.__mro__ if cls is not object))
+                    if got is not None:
+                        return got if quiet_prefix else ("unknown", ())
+                    quiet_prefix = quiet_prefix and _stmts_quiet([sub])
+                return None
+
+            def _ambient_chain(at):
+                # A nested suppression restores, rather than erases, an
+                # exception already active in an enclosing handler/finally.
+                child = at
+                cursor = at
+                while id(cursor) in parents:
+                    cursor = parents[id(cursor)]
+                    if cursor is func:
+                        break
+                    body = None
+                    handled = False
+                    if isinstance(cursor, ast.ExceptHandler):
+                        owner = parents.get(id(cursor))
+                        if isinstance(owner, try_nodes):
+                            body = owner.body
+                    elif isinstance(cursor, try_nodes) and child in cursor.finalbody:
+                        body = cursor.body
+                        handled = bool(cursor.handlers)
+                    if body is not None:
+                        got = _seq_outcome(body)
+                        if got is not None and got[0] == "chain":
+                            return None if handled else got[1]
+                        if got is not None and got[0] not in ("stop", "live"):
+                            return None
+                        if got is None and not _stmts_quiet(body):
+                            return None
+                    child = cursor
+                return ()
 
             def _load_raise_chain(name, node):
                 # the load of name at node: its catching
@@ -15651,6 +15709,31 @@ def _binding_violations(source):
                             if cls is not object)
                     return chain
 
+                def _certain_suppression(chain, manager):
+                    for item in reversed(manager.items):
+                        expr = item.context_expr
+                        if chain == ():
+                            # A proven stdlib suppressor exits normally
+                            # without consulting exception entries when no
+                            # exception is active (even an invalid entry).
+                            if _manager_outcome(expr, "BaseException",
+                                                _spelling_trusted, parents) is None:
+                                return False
+                            continue
+                        got = _manager_outcome(expr, chain[0],
+                                               _spelling_trusted, parents)
+                        if got is None:
+                            return False
+                        if got == "suppress":
+                            chain = ()
+                        elif got != "propagate":
+                            typ = getattr(builtins, got[1], None)
+                            if not isinstance(typ, type) or not issubclass(typ, BaseException):
+                                return False
+                            chain = tuple(cls.__name__ for cls in typ.__mro__
+                                          if cls is not object)
+                    return chain == ()
+
                 def _span(node):
                     return ((node.lineno,
                              node.col_offset),
@@ -15878,11 +15961,8 @@ def _binding_violations(source):
                                     # proof that publication survives all
                                     # remaining enclosing finalizers.
                                     normal_after_suppression = True
-                                    normal_certain = len(manager.items) == 1 \
-                                        and _manager_outcome(
-                                            manager.items[0].context_expr,
-                                            incoming_manager_chain[0],
-                                            _spelling_trusted, parents) == "suppress"
+                                    normal_certain = _certain_suppression(
+                                        incoming_manager_chain, manager)
                                     chain = () if normal_certain else None
                                     break
                         threaded = trobj
@@ -16103,8 +16183,31 @@ def _binding_violations(source):
                                     chain = None
                                 elif combined[0] == "stop":
                                     chain = ()
+                        if normal_after_suppression:
+                            normal_else = _seq_outcome(trobj.orelse)
+                            if normal_else is None:
+                                normal_else = _normal_native_failure(trobj.orelse)
+                            if normal_else is not None:
+                                kind, payload = normal_else
+                                if kind == "live":
+                                    saved = True
+                                    break
+                                if kind == "chain":
+                                    chain = payload
+                                elif kind == "keep":
+                                    ambient = _ambient_chain(trobj)
+                                    chain = ambient if ambient != () else (
+                                        "RuntimeError", "Exception", "BaseException")
+                                elif kind == "stop":
+                                    chain = ()
+                                else:
+                                    chain = None
+                                normal_after_suppression = False
+                                normal_certain = False
                         outcome = _finally_outcome(
                             trobj)
+                        if outcome is None and normal_after_suppression:
+                            outcome = _normal_native_failure(trobj.finalbody)
                         if outcome is None:
                             if normal_after_suppression and not \
                                     _normal_finally_may_fall(trobj.finalbody):
@@ -16123,10 +16226,9 @@ def _binding_violations(source):
                             if normal_after_suppression and not normal_certain:
                                 chain = None  # propagated error or no active error
                             elif chain == ():
-                                chain = (
-                                    "RuntimeError",
-                                    "Exception",
-                                    "BaseException")
+                                ambient = _ambient_chain(trobj)
+                                chain = ambient if ambient != () else (
+                                    "RuntimeError", "Exception", "BaseException")
                             normal_after_suppression = False
                             normal_certain = False
                         elif outcome[0] == "chain":
@@ -33043,6 +33145,91 @@ class CapturedBytesBinding(unittest.TestCase):
                             violations)
         else:
             self.assertEqual(violations, [])
+
+    def test_tripwire_r51_native_identity(self):
+        # S1/S2: namespace identity is about effects, not spellings.
+        for prefix in ('globals()\n', "box['int']=1\n",
+                       'class B: pass\nb=B()\nb.int=1\n',
+                       "if False:\n    globals()['int']=lambda:1\n"):
+            with self.subTest(prefix=prefix):
+                self._r49_verdict(prefix + 'for x in iter(int,1):\n    break\n',
+                                  True, loop=True)
+        self._r49_verdict('for box[sum(iter(int,1))] in iter(int,0):\n'
+                          '    break\n', True, loop=True)
+        for prefix in ("import builtins\nexec('builtins.int=lambda:1')\n",
+                       'eval("setattr(__import__(\'builtins\'),\'int\',lambda:1)")\n'):
+            with self.subTest(prefix=prefix):
+                self._r49_verdict(prefix + 'for x in iter(int,0):\n    pass\n',
+                                  False, loop=True)
+
+    def test_tripwire_r51_handler_unwind(self):
+        # S3/S6: aliases are loaded after unwind, not at the original raise.
+        bodies = [
+            ('Bad=AssertionError\ntry:\n    try:\n        try:\n'
+             '            assert False\n        finally:\n            del Bad\n'
+             '    except (TypeError,Bad):\n        raise RuntimeError\n'
+             '    except AssertionError:\n        pass\nexcept NameError:\n    pass\n', True),
+            ('Bad=TypeError\ntry:\n    try:\n        try:\n            raise NameError\n'
+             '        except NameError:\n            del Bad\n            raise TypeError\n'
+             '    except (RuntimeError,Bad):\n        raise ValueError\n'
+             '    except TypeError:\n        pass\nexcept NameError:\n    pass\n', True),
+            ('try:\n    if 1==1:\n        Bad=AssertionError\n    try:\n'
+             '        assert False\n    except (TypeError,Bad):\n        raise RuntimeError\n'
+             '    except 1/0:\n        pass\nexcept ZeroDivisionError:\n    pass\n', False),
+            ('Bad=AssertionError\ntry:\n    try:\n        assert False\n        del Bad\n'
+             '    except (TypeError,Bad):\n        raise RuntimeError\n'
+             '    except 1/0:\n        pass\nexcept ZeroDivisionError:\n    pass\n', False),
+            ('Bad=AssertionError\nif 1!=1:\n    del Bad\ntry:\n    try:\n'
+             '        assert False\n    except (TypeError,Bad):\n        raise RuntimeError\n'
+             '    except 1/0:\n        pass\nexcept ZeroDivisionError:\n    pass\n', False),
+        ]
+        for body, want in bodies:
+            with self.subTest(body=body):
+                self._r49_verdict(body, want)
+
+    def test_tripwire_r51_normal_unwind(self):
+        # S4/S7/S8: normal completion still carries ambient/else/exit context.
+        block = ('with contextlib.suppress(TypeError):\n    try:\n'
+                 '        raise NameError\n    except NameError:\n        raise TypeError\n')
+        import textwrap
+        for mode in ('finally', 'except LookupError'):
+            body = ('try:\n    try:\n        raise LookupError\n    ' + mode
+                    + ':\n        try:\n' + textwrap.indent(block, '            ')
+                    + '        finally:\n            raise\nexcept LookupError:\n    pass\n')
+            with self.subTest(mode=mode):
+                self._r49_verdict(body, True)
+        self._r49_verdict('try:\n' + textwrap.indent(block, '    ')
+                          + 'except ValueError:\n    pass\nelse:\n    raise RuntimeError\n', False)
+        twin = block.replace('suppress(TypeError):',
+                             'suppress(TypeError), contextlib.suppress(TypeError):')
+        self._r49_verdict('try:\n    try:\n' + textwrap.indent(twin, '        ')
+                          + '    finally:\n        raise\nexcept NameError:\n    pass\n', False)
+        # A finalizer entered normally has no ambient exception to restore.
+        self._r49_verdict('try:\n    try:\n        pass\n    finally:\n'
+                          '        try:\n' + textwrap.indent(block, '            ')
+                          + '        finally:\n            raise\n'
+                          'except LookupError:\n    pass\n', False)
+
+    def test_tripwire_r51_finalizer_native_error(self):
+        # S5/S9: authentic constructor failures retain their actual error kind.
+        import textwrap
+        block = ('try:\n    with contextlib.suppress(TypeError):\n        try:\n'
+                 '            raise NameError\n        except NameError:\n'
+                 "            raise TypeError\nfinally:\n    int('bad')\n")
+        self._r49_verdict('import builtins\nbuiltins.int=lambda *args:0\n' + block, True)
+        for catcher, want in (('NameError', False), ('TypeError', False),
+                              ('ValueError', True)):
+            with self.subTest(catcher=catcher):
+                self._r49_verdict('try:\n' + textwrap.indent(block, '    ')
+                                  + 'except ' + catcher + ':\n    pass\n', want)
+        # An opaque predecessor can raise first; do not invent ValueError.
+        noisy = block.replace("    int('bad')", "    fail()\n    int('bad')")
+        self._r49_verdict('def fail():\n    raise RuntimeError\ntry:\n'
+                          + textwrap.indent(noisy, '    ')
+                          + 'except RuntimeError:\n    pass\n', True)
+        quiet = block.replace("    int('bad')", "    x=0\n    int('bad')")
+        self._r49_verdict('try:\n' + textwrap.indent(quiet, '    ')
+                          + 'except NameError:\n    pass\n', False)
 
     def test_tripwire_r50_native_exits(self):
         # R1: finite native causes/callbacks and an immediate sentinel stop.
