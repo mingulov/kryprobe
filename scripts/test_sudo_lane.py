@@ -4338,6 +4338,53 @@ class _ProofScopeIndex:
         self._node_ids = MappingProxyType(node_ids)
         self._enclosing = MappingProxyType(enclosing)
         self._open_namespaces = frozenset(open_namespaces)
+        captures = {owner: set() for owner in local}
+        references = [(owners[id(node)], node.id) for node in ast.walk(tree)
+                      if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)]
+        # The compiler requests __class__ for an ordinary super reference too,
+        # even when the dynamic payload is the only textual __class__ use.
+        references.extend((owners[id(node)], "__class__") for node in ast.walk(tree)
+                          if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                          and node.id == "super" and isinstance(owners[id(node)],
+                              (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)))
+        references.extend((owner, name) for owner, names in self._nonlocals.items() for name in names)
+        for origin, name in references:
+            if name in self._locals[origin] or name in self._globals[origin]:
+                continue
+            path = [origin]
+            outer = enclosing[origin]
+            while outer is not None:
+                # Methods forward closure cells through class code, but never
+                # capture entries from the intervening class dictionary.
+                if isinstance(outer, ast.ClassDef):
+                    if name == "__class__":
+                        for carrier in path:
+                            captures[carrier].add(name)
+                        break
+                else:
+                    if name in self._globals[outer]:
+                        break
+                    if name in self._locals[outer]:
+                        if outer is not tree:
+                            for carrier in path:
+                                captures[carrier].add(name)
+                        break
+                path.append(outer)
+                outer = enclosing[outer]
+        self._captures = MappingProxyType({owner: frozenset(names) for owner, names in captures.items()})
+        mangled = set()
+        for owner in local:
+            names = self._locals[owner] | self._globals[owner] | self._nonlocals[owner] \
+                | self._captures[owner]
+            if not any(name.startswith("__") and not name.endswith("__") for name in names):
+                continue
+            outer = owner
+            while outer is not None:
+                if isinstance(outer, ast.ClassDef):
+                    mangled.add(owner)
+                    break
+                outer = enclosing[outer]
+        self._mangled_runtime_views = frozenset(mangled)
 
     def locals_for(self, scope):
         return self._locals[scope]
@@ -4362,6 +4409,12 @@ class _ProofScopeIndex:
 
     def namespace_open(self, scope):
         return scope in self._open_namespaces
+
+    def captures_for(self, scope):
+        return self._captures[scope]
+
+    def runtime_names_mangled(self, scope):
+        return scope in self._mangled_runtime_views
 
 
 def _proof_immutable_token(value):
@@ -4660,7 +4713,13 @@ class _ProofEffects:
         if not declared_global and not declared_local:
             outer = index.enclosing_scope(scope)
             while outer is not None:
-                if not isinstance(outer, ast.ClassDef):
+                if isinstance(outer, ast.ClassDef):
+                    if name == "__class__":
+                        # A compiler-created cell may still be empty while
+                        # its class body is being constructed. Membership is
+                        # not proof of initialization at this region entry.
+                        return _ProofValue.unknown_value("entry-class-cell"), None
+                else:
                     if name in index.globals_for(outer):
                         break
                     if name in index.locals_for(outer):
@@ -4675,6 +4734,53 @@ class _ProofEffects:
                             return _ProofValue.unknown_value("lexical-owner"), None
                 outer = index.enclosing_scope(outer)
         value = cls.global_value(index, scope, state, name)
+        return value, "NameError" if value == _ProofValue.absent() else None
+
+    @classmethod
+    def dynamic_name(cls, index, scope, state, name, selected_builtins):
+        """LOAD_NAME in the default-locals view, not a lexical LOAD_FAST."""
+        if name == "__debug__":
+            return _ProofValue.literal(__debug__), None
+        if index.runtime_names_mangled(scope):
+            # Payload strings do not inherit class private-name mangling.
+            # Do not expose raw AST parameter/cell spellings as runtime keys.
+            raise _ProofIncomplete("dynamic-mangled-view")
+        value = _ProofValue.absent()
+        if scope is index.tree:
+            value = cls.region_value(index, scope, state, ("globals", 0), name)
+        elif isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if name in index.locals_for(scope):
+                value = state.lookup(index.node_id(scope), name)
+                if value.is_unbound:
+                    value = _ProofValue.absent()
+            elif name in index.captures_for(scope):
+                value, error = cls.lookup(index, scope, state, name)
+                if error:
+                    raise _ProofIncomplete("dynamic-cell-view")
+        elif isinstance(scope, ast.ClassDef):
+            if index.namespace_open(scope) or name in index.captures_for(scope):
+                raise _ProofIncomplete("dynamic-class-view")
+            value = state.lookup(index.node_id(scope), name)
+            if value.is_unbound:
+                value = _ProofValue.absent()
+        else:
+            raise _ProofIncomplete("dynamic-locals-view")
+        if value == _ProofValue.absent() and scope is not index.tree:
+            value = cls.region_value(index, scope, state, ("globals", 0), name)
+        if value == _ProofValue.absent():
+            regions = {atom[2] for atom in selected_builtins.atoms
+                       if len(atom) == 3 and atom[0] == "namespace" and atom[1] in ("mapping", "module")}
+            if not selected_builtins.unknown and len(regions) == 1 and all(
+                    len(atom) == 3 and atom[0] == "namespace" and atom[1] in ("mapping", "module")
+                    for atom in selected_builtins.atoms):
+                region = next(iter(regions))
+                value = cls.region_value(index, scope, state, region, name)
+            elif (cls.single(selected_builtins) or (None,))[0] in ("literal", "singleton"):
+                return None, "TypeError"
+            else:
+                raise _ProofIncomplete("dynamic-builtin-view")
+        if value.unknown or ("unbound",) in value.atoms:
+            raise _ProofIncomplete("dynamic-imprecise-load")
         return value, "NameError" if value == _ProofValue.absent() else None
 
     @classmethod
@@ -4715,7 +4821,7 @@ class _ProofEffects:
             if value.unknown:
                 raise _ProofIncomplete("opaque-release")
             for atom in value.atoms:
-                if atom[0] in ("literal", "native", "singleton", "unbound", "absent") \
+                if atom[0] in ("literal", "native", "singleton", "unbound", "absent", "const-callable") \
                         or atom[:2] == ("opaque", "type-parameter"):
                     continue
                 if atom[0] == "namespace":
@@ -4833,7 +4939,8 @@ class _ProofContext:
     _caps = MappingProxyType({
         "source_bytes": 1_048_576, "nodes": 100_000, "depth": 128,
         "names": 1024, "aliases": 4096, "contexts": 64,
-        "alternatives": 128, "states": 100_000, "steps": 250_000})
+        "alternatives": 128, "states": 100_000, "steps": 250_000,
+        "dynamic_bytes": 1024, "dynamic_nodes": 32, "dynamic_depth": 12})
 
     def __init__(self, source, semantic_key=None, limits=None):
         annotation_key = tuple(semantic_key or sys.version_info)
@@ -4851,7 +4958,8 @@ class _ProofContext:
         self._reasons = []
         self._epoch = object()  # once per source, never once per loop visit
         self._cache = {}
-        self._total_compute = {"steps": 0, "states": 0, "requests": 0}
+        self._dynamic_cache = {}
+        self._total_compute = {"steps": 0, "states": 0, "requests": 0, "dynamic_parses": 0}
         if len(source.encode("utf-8")) > self.limits["source_bytes"]:
             self._reasons.append("source-budget")
             return
@@ -4892,6 +5000,123 @@ class _ProofContext:
             raise _ProofIncomplete("work-budget")
         stats["steps"] += 1
         self._total_compute["steps"] += 1
+
+    def _dynamic_payload(self, source, mode, stats):
+        self._charge(stats)
+        key = (mode, source)
+        if key not in self._dynamic_cache:
+            descriptor = reason = None
+            count = 0
+            try:
+                if len(source.encode("utf-8")) > self.limits["dynamic_bytes"]:
+                    raise _ProofIncomplete("dynamic-source-budget")
+                self._total_compute["dynamic_parses"] += 1
+                tree = ast.parse(source.strip(" \t") if mode == "eval" else source, mode=mode)
+                pending = [(tree, 1)]
+                while pending:
+                    part, depth = pending.pop()
+                    count += 1
+                    if count > self.limits["dynamic_nodes"]:
+                        raise _ProofIncomplete("dynamic-node-budget")
+                    if depth > self.limits["dynamic_depth"]:
+                        raise _ProofIncomplete("dynamic-depth-budget")
+                    pending.extend((child, depth + 1) for child in ast.iter_child_nodes(part))
+                if mode == "exec":
+                    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+                        raise _ProofIncomplete("dynamic-form")
+                    assignment = tree.body[0]
+                    if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Attribute):
+                        raise _ProofIncomplete("dynamic-form")
+                    target = assignment.targets[0]
+                    if target.attr != "int" or not isinstance(target.value, ast.Name):
+                        raise _ProofIncomplete("dynamic-form")
+                    receiver, callback = target.value.id, assignment.value
+                else:
+                    call = tree.body
+                    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) \
+                            or call.func.id != "setattr" or len(call.args) != 3 or call.keywords:
+                        raise _ProofIncomplete("dynamic-form")
+                    imported, attr, callback = call.args
+                    if not isinstance(imported, ast.Call) or not isinstance(imported.func, ast.Name) \
+                            or imported.func.id != "__import__" or len(imported.args) != 1 \
+                            or imported.keywords or not isinstance(imported.args[0], ast.Constant) \
+                            or imported.args[0].value != "builtins" or not isinstance(attr, ast.Constant) \
+                            or attr.value != "int":
+                        raise _ProofIncomplete("dynamic-form")
+                    receiver = None
+                if not isinstance(callback, ast.Lambda):
+                    raise _ProofIncomplete("dynamic-form")
+                args = callback.args
+                if args.posonlyargs or args.args or args.vararg or args.kwonlyargs \
+                        or args.kw_defaults or args.kwarg or args.defaults \
+                        or not isinstance(callback.body, ast.Constant) \
+                        or type(callback.body.value) is not int or callback.body.value not in (0, 1):
+                    raise _ProofIncomplete("dynamic-form")
+                descriptor = (receiver, callback.body.value)
+            except _ProofIncomplete as error:
+                reason = str(error)
+            except (SyntaxError, ValueError, UnicodeError):
+                reason = "dynamic-parse"
+            # Retain only a finite descriptor/reason, never a rejected AST.
+            self._dynamic_cache[key] = (descriptor, reason, count)
+        descriptor, reason, count = self._dynamic_cache[key]
+        for unused in range(count):
+            self._charge(stats)
+        if reason:
+            raise _ProofIncomplete(reason)
+        return descriptor
+
+    def _dynamic_call(self, node, mode, scope, state, stats):
+        if not isinstance(node.func, ast.Name) or node.func.id != mode or len(node.args) != 1 \
+                or node.keywords or not isinstance(node.args[0], ast.Constant) \
+                or type(node.args[0].value) is not str:
+            raise _ProofIncomplete("dynamic-form")
+        receiver_name, number = self._dynamic_payload(node.args[0].value, mode, stats)
+        selected = _ProofEffects.region_value(self.index, scope, state, ("globals", 0), "__builtins__")
+        if selected == _ProofValue.absent():
+            if "frame-builtins-open" in state.entry_modes:
+                raise _ProofIncomplete("dynamic-reinsertion-builtins")
+            selected = _ProofEffects.namespace("mapping", ("builtins", 0))
+            state = state.write_region(("globals", 0), "__builtins__", selected)
+
+        def lookup(name):
+            self._charge(stats)
+            return _ProofEffects.dynamic_name(self.index, scope, state, name, selected)
+
+        def raised(error):
+            return None, replace(state, pending=_ProofCompletion("raise", error))
+
+        if mode == "exec":
+            receiver, error = lookup(receiver_name)
+            if error:
+                return raised(error)
+        else:
+            setter, error = lookup("setattr")
+            if error:
+                return raised(error)
+            importer, error = lookup("__import__")
+            if error:
+                return raised(error)
+            token = _ProofEffects.single(importer)
+            if token and token[0] == "literal":
+                return raised("TypeError")
+            if token != ("native", "__import__"):
+                raise _ProofIncomplete("dynamic-import-identity")
+            receiver = _ProofEffects.namespace("module", ("builtins", 0))
+            token = _ProofEffects.single(setter)
+            if token and token[0] == "literal":
+                return raised("TypeError")
+            if token != ("native", "setattr"):
+                raise _ProofIncomplete("dynamic-setattr-identity")
+        token = _ProofEffects.single(receiver)
+        if token != ("namespace", "module", ("builtins", 0)):
+            if token and (token[0] in ("literal", "singleton") or token[:2] == ("namespace", "mapping")):
+                return raised("AttributeError")
+            raise _ProofIncomplete("dynamic-receiver")
+        callback = _ProofValue(frozenset({("const-callable", self.index.node_id(node), number)}))
+        self._charge(stats)
+        state = _ProofEffects.store(self.index, scope, receiver, "int", callback, state, attribute=True)
+        return _ProofValue.literal(None), state
 
     def solve(self, scope=None, entry=None):
         scope = self.tree if scope is None else scope
@@ -5055,11 +5280,43 @@ class _ProofContext:
                         return None, state
                     arguments.append(value)
                 for keyword in node.keywords:
+                    if keyword.arg is None:
+                        # Merging **mapping is an evaluated operation here,
+                        # before later keyword values. Raw AST presence does
+                        # not establish how many arguments it supplies.
+                        raise _ProofIncomplete("unsupported-keyword-expansion")
                     value, state = expression(keyword.value, state)
                     if state.pending.kind != "normal":
                         return None, state
                 token = _ProofEffects.single(callee)
-                if token in (("native", "globals"), ("native", "locals"), ("native", "vars")):
+                if token in (("native", "exec"), ("native", "eval")):
+                    result, state = self._dynamic_call(node, token[1], scope, state, stats)
+                    if state.pending.kind != "normal":
+                        return None, state
+                elif token and token[0] == "const-callable":
+                    result, error = (None, "TypeError") if arguments or node.keywords \
+                        else (_ProofValue.literal(token[2]), None)
+                elif token == ("native", "iter") and len(arguments) == 2 and not node.keywords:
+                    callback, sentinel = map(_ProofEffects.single, arguments)
+                    if (callback != ("native", "int") and not (
+                            callback and callback[0] == "const-callable")) or sentinel not in (
+                                ("literal", "int", 0), ("literal", "int", 1)):
+                        raise _ProofIncomplete("opaque-callable-iterator")
+                    # Capture object values now. Later rebinding the names or
+                    # builtins slots cannot retarget this iterator's callback.
+                    result = _ProofValue(frozenset({("iterator", "call-sentinel",
+                                                    self.index.node_id(node), callback, sentinel)}))
+                elif token == ("native", "next") and len(arguments) == 1 and not node.keywords:
+                    iterator = _ProofEffects.single(arguments[0])
+                    if not iterator or iterator[:2] != ("iterator", "call-sentinel"):
+                        raise _ProofIncomplete("opaque-iterator-next")
+                    callback, sentinel = iterator[3:]
+                    number = 0 if callback == ("native", "int") else callback[2]
+                    if number == sentinel[2]:
+                        result, error = None, "StopIteration"
+                    else:
+                        result = _ProofValue.literal(number)
+                elif token in (("native", "globals"), ("native", "locals"), ("native", "vars")):
                     if arguments or node.keywords:
                         raise _ProofIncomplete("unsupported-namespace-call")
                     if token == ("native", "globals") or scope is self.tree:
@@ -5180,6 +5437,13 @@ class _ProofContext:
                         state = target_store(target, None, state, delete=True)
                         if state.pending.kind != "normal":
                             break
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.decorator_list or node.args.defaults or any(
+                            item is not None for item in node.args.kw_defaults) or node.type_params \
+                            or list(_def_annotations(node)):
+                        raise _ProofIncomplete("unsupported-definition-prologue")
+                    state = bind_name(node.name, _ProofValue(frozenset({
+                        ("function", self.index.node_id(node))})), state)
                 elif isinstance(node, (ast.Assign, ast.Expr)):
                     value, state = expression(node.value, state)
                     if state.pending.kind == "normal" and isinstance(node, ast.Assign):
@@ -22650,6 +22914,296 @@ class ProofNamespaceTests(unittest.TestCase):
         self.assertIn("opaque-release", snapshot.reasons)
 
 
+    def test_dynamic_zero_one_side_effect_and_none_return(self):
+        for mode in ("exec", "eval"):
+            for number in (0, 1):
+                with self.subTest(mode=mode, number=number):
+                    payload = f"b.int = lambda: {number}" if mode == "exec" else (
+                        f"setattr(__import__('builtins'), 'int', lambda: {number})")
+                    context, snapshot = self._solve(
+                        f"import builtins as b\nreturned={mode}({payload!r})\n"
+                        "saved=int\nresult=saved()\n")
+                    self.assertTrue(snapshot.complete, snapshot.reasons)
+                    self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(number))
+                    self.assertEqual(snapshot.exits[0].lookup(0, "returned"), _ProofValue.literal(None))
+                    self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_dynamic_summary_rejects_other_payload_grammar(self):
+        payloads = (
+            "b.int=lambda:True", "b.int=lambda:1.0", "b.int=lambda:+1",
+            "b.int=lambda x=0:1", "b.int=lambda *args:1", "b.int=lambda **kw:1",
+            "b.int=lambda:missing", "b.int=lambda:1/0", "b.int=lambda:2",
+            "b.int=alias=lambda:1", "b.__dict__['int']=lambda:1", "b.int=1",
+            "b.int=lambda:1; b.int=lambda:0", "exec('b.int=lambda:1')", "b.int=lambda:",
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                context, snapshot = self._solve(f"import builtins as b\nexec({payload!r})\nmarker=int\n")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+                self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_dynamic_admission_needs_bare_matching_native_and_literal(self):
+        for call in ("saved=exec\nsaved('b.int=lambda:0')",
+                     "b.exec('b.int=lambda:0')", "exec=eval\nexec('b.int=lambda:0')",
+                     "code='b.int=lambda:0'\nexec(code)",
+                     "exec('b.int=lambda:0', {})", "exec('b.int=lambda:0', globals={})"):
+            with self.subTest(call=call):
+                context, snapshot = self._solve("import builtins as b\n" + call + "\nmarker=int\n")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_dynamic_payload_byte_boundary_and_unicode_receiver(self):
+        for receiver in ("b", "β"):
+            for size, complete in ((1023, True), (1024, True), (1025, False)):
+                with self.subTest(receiver=receiver, size=size):
+                    payload = receiver + ".int=lambda:0"
+                    payload += " " * (size - len(payload.encode("utf-8")))
+                    context, snapshot = self._solve(
+                        f"import builtins as {receiver}\nexec({payload!r})\nresult=int()\n")
+                    self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                    if complete:
+                        self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(0))
+                    else:
+                        self.assertIn("dynamic-source-budget", snapshot.reasons)
+
+    def test_dynamic_payload_node_depth_caps_and_parse_once(self):
+        source = "import builtins as b\nexec('b.int=lambda:0')\nexec('b.int=lambda:0')\n"
+        for field, values, reason in (("dynamic_nodes", ((8, False), (9, True), (10, True)),
+                                       "dynamic-node-budget"),
+                                      ("dynamic_depth", ((4, False), (5, True), (6, True)),
+                                       "dynamic-depth-budget")):
+            self.assertIn(field, _ProofContext._caps, "dynamic payload budgets are not implemented")
+            for cap, complete in values:
+                with self.subTest(field=field, cap=cap):
+                    context = _ProofContext(source, limits={field: cap})
+                    snapshot = context.solve()
+                    self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                    if complete:
+                        self.assertEqual(context.total_compute["dynamic_parses"], 1)
+                        context.solve()
+                        self.assertEqual(context.total_compute["dynamic_parses"], 1)
+                    else:
+                        self.assertIn(reason, snapshot.reasons)
+
+    def test_dynamic_callable_signature_and_argument_error_order(self):
+        for call, error in (("saved(1)", "TypeError"), ("saved(x=1)", "TypeError"),
+                            ("saved(missing)", "NameError")):
+            with self.subTest(call=call):
+                context, snapshot = self._solve(
+                    "import builtins as b\nexec('b.int=lambda:0')\nsaved=int\n"
+                    + call + "\nmarker=1\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_dynamic_inner_lookup_errors_precede_captured_call_error(self):
+        payload = "setattr(__import__('builtins'), 'int', lambda: 1)"
+        for prefix, error in (
+            ("setattr=0\n", "TypeError"), ("__import__=0\n", "TypeError"),
+            ("import builtins as b\nsetattr=0\ndel b.__dict__['__import__']\n", "NameError"),
+            ("import builtins as b\n__import__=0\ndel b.__dict__['setattr']\n", "NameError"),
+            ("__builtins__={}\n", "NameError"),
+        ):
+            with self.subTest(prefix=prefix):
+                context, snapshot = self._solve(prefix + f"eval({payload!r})\nmarker=1\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_dynamic_receiver_can_come_from_selected_builtin_mapping(self):
+        context, snapshot = self._solve(
+            "import builtins as b\nselected={}\nselected['receiver']=b\n"
+            "__builtins__=selected\nexec('receiver.int=lambda:0')\nresult=b.int()\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(0))
+
+    def test_dynamic_reinserts_deleted_global_builtin_mapping(self):
+        context, snapshot = self._solve(
+            "import builtins as b\ndel __builtins__\nexec('b.int=lambda:0')\n"
+            "restored=globals()['__builtins__']\nresult=int()\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(0, "restored").atoms,
+                         frozenset({("namespace", "mapping", ("builtins", 0))}))
+
+    def test_dynamic_late_local_alias_falls_through_but_bound_local_wins(self):
+        for before, after, error in (("", "    b=1\n", None),
+                                     ("    b=1\n", "", "AttributeError"),
+                                     ("    b=b\n", "", "UnboundLocalError")):
+            with self.subTest(before=before):
+                context = _ProofContext("import builtins as b\ndef f():\n" + before
+                                        + "    exec('b.int=lambda:0')\n" + after + "    result=int()\n")
+                func = context.tree.body[1]
+                seed = _ProofState().bind(0, "b", _ProofEffects.namespace("module", ("builtins", 0)))
+                snapshot = context.solve(func, entry=(seed,))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                if error:
+                    self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                else:
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"),
+                                     _ProofValue.literal(0))
+
+    def test_dynamic_payload_does_not_manufacture_closure_capture(self):
+        for body, complete, error in (
+            ("    exec('b.int=lambda:0')\n", True, "NameError"),
+            ("    nonlocal b\n    exec('b.int=lambda:0')\n", True, None),
+            ("    b\n    exec('b.int=lambda:0')\n", True, None),
+            ("    exec('b.int=lambda:0')\n    def child():\n        b\n", True, None),
+        ):
+            with self.subTest(body=body):
+                source = "def outer(b):\n    def f():\n" + "".join(
+                    "    " + line + "\n" for line in body.splitlines())
+                source += "        result=int()\n"
+                context = _ProofContext(source)
+                outer = context.tree.body[0]
+                func = outer.body[0]
+                seed = _ProofState().bind(context.index.node_id(outer), "b",
+                                          _ProofEffects.namespace("module", ("builtins", 0)))
+                snapshot = context.solve(func, entry=(seed,))
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if error:
+                    self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                else:
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"),
+                                     _ProofValue.literal(0))
+
+    def test_dynamic_function_local_builtin_name_does_not_select_payload_builtins(self):
+        context = _ProofContext("import builtins as b\ndef f():\n    __builtins__={}\n"
+                                "    exec('b.int=lambda:0')\n    result=int()\n")
+        func = context.tree.body[1]
+        seed = _ProofState().bind(0, "b", _ProofEffects.namespace("module", ("builtins", 0)))
+        snapshot = context.solve(func, entry=(seed,))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"),
+                         _ProofValue.literal(0))
+
+    def test_dynamic_eval_uses_genuine_operations_in_selected_mapping(self):
+        context, snapshot = self._solve(
+            "import builtins as b\nselected={}\nselected['setattr']=setattr\n"
+            "selected['__import__']=__import__\n__builtins__=selected\n"
+            "eval(\"setattr(__import__('builtins'), 'int', lambda: 1)\")\nresult=b.int()\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(1))
+
+    def test_dynamic_eval_rejects_noncanonical_inner_call_shapes(self):
+        for payload in ("setattr(__import__('math'), 'int', lambda:0)",
+                        "setattr(__import__('builtins'), 'other', lambda:0)",
+                        "setattr(__import__('builtins'), 'int', lambda:0, 1)",
+                        "setattr(__import__('builtins', fromlist=[]), 'int', lambda:0)",
+                        "setattr(__import__('builtins'), 'i'+'nt', lambda:0)"):
+            with self.subTest(payload=payload):
+                context, snapshot = self._solve(f"eval({payload!r})\nmarker=int\n")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_dynamic_debug_receiver_is_compiler_constant_not_mapping_alias(self):
+        context, snapshot = self._solve(
+            "import builtins as b\nglobals()['__debug__']=b\n"
+            "exec('__debug__.int=lambda:0')\nmarker=1\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["AttributeError"])
+
+    def test_dynamic_class_cell_is_not_falsely_missing(self):
+        context = _ProofContext("class C:\n    def f(self):\n"
+                                "        exec('__class__.int=lambda:0')\n        __class__\n")
+        method = context.tree.body[0].body[0]
+        snapshot = context.solve(method)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(method.body[-1]))
+
+    def test_dynamic_class_cell_from_later_super_reference_is_not_missing(self):
+        context = _ProofContext("class C:\n    def f(self):\n"
+                                "        exec('__class__.int=lambda:0')\n        super\n")
+        method = context.tree.body[0].body[0]
+        snapshot = context.solve(method)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(method.body[-1]))
+
+    def test_dynamic_captured_iterator_uses_the_original_callback(self):
+        for first, second, error in ((0, 1, "StopIteration"), (1, 0, None)):
+            with self.subTest(first=first):
+                context, snapshot = self._solve(
+                    f"import builtins as b\nexec('b.int=lambda:{first}')\nsaved=int\n"
+                    f"iterator=iter(saved,0)\nexec('b.int=lambda:{second}')\nresult=next(iterator)\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                if error:
+                    self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                else:
+                    self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(1))
+
+    def test_native_iterator_callback_is_captured_before_replacement(self):
+        context, snapshot = self._solve(
+            "import builtins as b\niterator=iter(int,0)\nexec('b.int=lambda:1')\nnext(iterator)\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["StopIteration"])
+
+    def test_iterator_unknown_callback_or_sentinel_does_not_prove_exhaustion(self):
+        for call in ("iter(callback,0)", "iter(int,sentinel)"):
+            with self.subTest(call=call):
+                context = _ProofContext("def f(callback,sentinel):\n    it=" + call + "\n    next(it)\n")
+                snapshot = context.solve(context.tree.body[0])
+                self.assertFalse(snapshot.complete)
+
+    def test_callback_argument_error_precedes_iterator_creation(self):
+        context, snapshot = self._solve("iterator=iter(int,missing)\nmarker=1\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_keyword_expansion_is_not_a_fabricated_signature_error(self):
+        for call in ("saved(**{})", "saved(**1, x=missing)"):
+            with self.subTest(call=call):
+                context, snapshot = self._solve("import builtins as b\nexec('b.int=lambda:0')\n"
+                                                f"saved=int\nresult={call}\nmarker=1\n")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_implicit_class_cell_membership_does_not_prove_initialization(self):
+        context = _ProofContext("class C:\n    class D:\n        marker=__class__\n        y=1\n")
+        inner = context.tree.body[0].body[0]
+        snapshot = context.solve(inner)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(inner.body[-1]))
+
+    def test_reinsertion_requires_known_captured_frame_builtins(self):
+        context = _ProofContext("def f(exec):\n    exec('receiver.int=lambda:0')\n    marker=1\n")
+        func = context.tree.body[0]
+        seed = _ProofState(entry_modes=("frame-builtins-open",)).bind(
+            context.index.node_id(func), "exec", _ProofValue(frozenset({("native", "exec")}))).bind(
+                0, "__builtins__", _ProofValue.absent())
+        snapshot = context.solve(func, entry=(seed,))
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_private_runtime_local_names_cannot_use_raw_ast_spelling(self):
+        for name in ("_C__b", "__b"):
+            with self.subTest(name=name):
+                context = _ProofContext("class C:\n    def f(self,__b):\n"
+                                        f"        exec('{name}.int=lambda:0')\n        marker=1\n")
+                method = context.tree.body[0].body[0]
+                seed = _ProofState().bind(context.index.node_id(method), "__b",
+                                         _ProofEffects.namespace("module", ("builtins", 0)))
+                snapshot = context.solve(method, entry=(seed,))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(method.body[-1]))
+
+    def test_unmangled_private_and_dunder_local_controls_remain_precise(self):
+        for source, name in (("def f(__b):\n    exec('__b.int=lambda:0')\n", "__b"),
+                             ("class C:\n    def f(self,__b__):\n"
+                              "        exec('__b__.int=lambda:0')\n", "__b__")):
+            with self.subTest(name=name):
+                context = _ProofContext(source)
+                func = context.tree.body[0]
+                if isinstance(func, ast.ClassDef):
+                    func = func.body[0]
+                seed = _ProofState().bind(context.index.node_id(func), name,
+                                         _ProofEffects.namespace("module", ("builtins", 0)))
+                snapshot = context.solve(func, entry=(seed,))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                token = _ProofEffects.single(snapshot.exits[0].region_value(("builtins", 0), "int"))
+                self.assertEqual((token[0], token[2]), ("const-callable", 0))
+
+
 class ProofStateTests(unittest.TestCase):
     def _context(self, source, **kwargs):
         factory = globals().get("_ProofContext")
@@ -22944,6 +23498,31 @@ class ProofScopeIndexTests(unittest.TestCase):
             "    missing=0\n")
         self.assertEqual(index.locals_for(tree.body[0]),
                          frozenset({"log", "dead", "deleted", "missing"}))
+
+    def test_capture_membership_ignores_strings_but_forwards_real_references(self):
+        tree, index = self._index(
+            "def outer(b):\n"
+            "    def payload_only():\n        exec('b.int=lambda:0')\n"
+            "    def declared():\n        nonlocal b\n        pass\n"
+            "    def carrier():\n        def child():\n            b\n")
+        self.assertIsNotNone(getattr(index, "captures_for", None), "capture membership is not indexed")
+        outer = tree.body[0]
+        payload_only, declared, carrier = outer.body
+        self.assertEqual(index.captures_for(payload_only), frozenset())
+        self.assertEqual(index.captures_for(declared), frozenset({"b"}))
+        self.assertEqual(index.captures_for(carrier), frozenset({"b"}))
+        self.assertEqual(index.captures_for(carrier.body[0]), frozenset({"b"}))
+
+    def test_capture_membership_respects_global_barriers_and_class_skip(self):
+        tree, index = self._index(
+            "def outer(b):\n    def barrier():\n        global b\n"
+            "        def child():\n            b\n"
+            "    class C:\n        b=0\n        def method(self):\n            b\n")
+        self.assertIsNotNone(getattr(index, "captures_for", None), "capture membership is not indexed")
+        outer = tree.body[0]
+        barrier, box = outer.body
+        self.assertEqual(index.captures_for(barrier.body[1]), frozenset())
+        self.assertEqual(index.captures_for(box.body[1]), frozenset({"b"}))
 
     def test_parameter_import_handler_and_pattern_declarations(self):
         tree, index = self._index(
