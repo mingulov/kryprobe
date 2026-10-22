@@ -4668,9 +4668,14 @@ class _ProofEffects:
         for name, value in vars(builtins).items()
         if isinstance(value, type) and issubclass(value, BaseException)})
     _zero_arg_exceptions = frozenset({"BaseException", "Exception", "ArithmeticError", "AssertionError",
-        "AttributeError", "ImportError", "IndexError", "KeyError", "LookupError", "NameError",
+        "AttributeError", "ImportError", "ModuleNotFoundError", "IndexError", "KeyError", "LookupError", "NameError",
         "NotImplementedError", "OSError", "OverflowError", "RuntimeError", "SyntaxError", "SystemExit",
         "TypeError", "UnboundLocalError", "UnicodeError", "ValueError", "ZeroDivisionError"})
+    _exception_arity = MappingProxyType({"ExceptionGroup": 2, "BaseExceptionGroup": 2,
+        "UnicodeDecodeError": 5, "UnicodeEncodeError": 5, "UnicodeTranslateError": 4})
+    _exception_keywords = MappingProxyType({"AttributeError": ("name", "obj"),
+        "ImportError": ("name", "path", "name_from"), "ModuleNotFoundError": ("name", "path", "name_from"),
+        "NameError": ("name",), "UnboundLocalError": ("name",)})
     _implicit_module_names = frozenset({"__builtins__", "__name__", "__doc__", "__package__",
                                         "__loader__", "__spec__", "__file__", "__cached__",
                                         "__path__", "__annotations__"})
@@ -4685,23 +4690,90 @@ class _ProofEffects:
         return None
 
     @classmethod
-    def raised_value(cls, value, site):
+    def normalize_exception(cls, value, site):
         token = cls.single(value)
         if token and token[0] == "exception":
-            return token[1]
+            return token[1], None
         if token and token[0] == "native":
             if token[1] in cls._exception_mros:
-                if token[1] in ("ExceptionGroup", "BaseExceptionGroup", "UnicodeDecodeError",
-                                "UnicodeEncodeError", "UnicodeTranslateError"):
-                    return "TypeError"
+                if token[1] in cls._exception_arity:
+                    return None, "TypeError"
                 name = cls._exception_mros[token[1]][0]
                 if name not in cls._zero_arg_exceptions:
                     raise _ProofIncomplete("unsupported-exception-construction")
-                return ("native-exception", name, site)
-            return "TypeError"
+                return ("native-exception", name, site), None
+            return None, "TypeError"
         if token and token[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string", "const-callable"):
-            return "TypeError"
+            return None, "TypeError"
         raise _ProofIncomplete("opaque-raised-value")
+
+    @classmethod
+    def raised_value(cls, value, site):
+        payload, error = cls.normalize_exception(value, site)
+        return error or payload
+
+    @classmethod
+    def construct_exception(cls, name, arguments, keywords, site):
+        name = cls._exception_mros[name][0]
+        if name not in cls._zero_arg_exceptions and name not in cls._exception_arity:
+            raise _ProofIncomplete("unsupported-exception-construction")
+        if any(key not in cls._exception_keywords.get(name, ()) for key, value in keywords):
+            return None, "TypeError"
+        if name in cls._exception_arity:
+            if len(arguments) != cls._exception_arity[name]:
+                return None, "TypeError"
+            raise _ProofIncomplete("unsupported-exception-construction")
+        if name not in cls._zero_arg_exceptions or (name == "SyntaxError" and len(arguments) == 2) \
+                or (name == "OSError" and len(arguments) >= 2):
+            raise _ProofIncomplete("unsupported-exception-construction")
+        # Arguments/keyword values become retained .args/attributes. Only
+        # finalizer-free immutable primitives are admitted here; opaque and
+        # namespace references need a retained-field/alias model, not erasure.
+        if not all((token := cls.single(value)) and token[0] in ("literal", "native", "singleton", "plain-string")
+                   for value in (*arguments, *(value for key, value in keywords))):
+            raise _ProofIncomplete("unsupported-exception-arguments")
+        return _ProofValue(frozenset({("exception", ("native-exception", name, site))})), None
+
+    @classmethod
+    def int_literal_call(cls, arguments, keywords):
+        if keywords or len(arguments) > 2:
+            if any(key != "base" for key, value in keywords) or len(arguments) > 2:
+                return None, "TypeError"
+            raise _ProofIncomplete("unsupported-int-base")
+        if not arguments:
+            return _ProofValue.literal(0), None
+        if len(arguments) == 2:
+            raise _ProofIncomplete("unsupported-int-base")
+        token = cls.single(arguments[0])
+        if token and token[:2] == ("literal", "int"):
+            return arguments[0], None
+        if token and token[:2] == ("literal", "bool"):
+            return _ProofValue.literal(1 if token[2] else 0), None
+        if token and token[:2] in (("literal", "str"), ("literal", "bytes")):
+            text = token[2]
+            if len(text) > 256 or not text.isascii():
+                raise _ProofIncomplete("unsupported-int-text")
+            if type(text) is bytes:
+                text = text.decode("ascii")
+            text = text.strip(" \t\n\r\v\f")
+            negative = text.startswith("-")
+            if text.startswith(("-", "+")):
+                text = text[1:]
+            number, digit = 0, False
+            for char in text:
+                if "0" <= char <= "9":
+                    number = number * 10 + (ord(char) - 48)
+                    digit = True
+                elif char == "_" and digit:
+                    digit = False
+                else:
+                    return None, "ValueError"
+            if not digit:
+                return None, "ValueError"
+            return _ProofValue.literal(-number if negative else number), None
+        if token and token[0] in ("literal", "singleton") and token[:2] != ("literal", "float"):
+            return None, "TypeError"
+        raise _ProofIncomplete("unsupported-int-conversion")
 
     @classmethod
     def handler_match(cls, value, error):
@@ -5236,6 +5308,10 @@ class _ProofContext:
                     or (isinstance(node, ast.ExceptHandler) and node.name == "__debug__"):
                 if "invalid-handler-structure" not in self._reasons:
                     self._reasons.append("invalid-handler-structure")
+            if isinstance(node, ast.Call):
+                names = [keyword.arg for keyword in node.keywords if keyword.arg is not None]
+                if len(names) != len(set(names)) and "invalid-call-keywords" not in self._reasons:
+                    self._reasons.append("invalid-call-keywords")
             pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
         self.tree = tree
         self.index = _ProofScopeIndex(tree, semantic_key=semantic_key)
@@ -5612,6 +5688,13 @@ class _ProofContext:
             elif token and token[0] == "const-callable":
                 result, error = (None, "TypeError") if arguments or node.keywords \
                     else (_ProofValue.literal(token[2]), None)
+            elif token and token[0] == "native" and token[1] in _ProofEffects._exception_mros:
+                result, error = _ProofEffects.construct_exception(token[1], arguments,
+                    tuple((keyword.arg, value) for keyword, value in zip(node.keywords, values[1 + len(node.args):])),
+                    self.index.node_id(node))
+            elif token == ("native", "int"):
+                result, error = _ProofEffects.int_literal_call(arguments,
+                    tuple((keyword.arg, value) for keyword, value in zip(node.keywords, values[1 + len(node.args):])))
             elif token == ("native", "object") or (token and token[0] == "empty-class"):
                 if arguments or node.keywords:
                     error = "TypeError"
@@ -6091,15 +6174,18 @@ class _ProofContext:
                         route(successor, outcome)
                     continue
                 elif isinstance(node, ast.Raise):
-                    if node.cause is not None:
-                        raise _ProofIncomplete("unsupported-raise-cause")
                     if node.exc is not None:
-                        for outcome in expression(node.exc, state):
-                            if outcome.normal:
-                                error = _ProofEffects.raised_value(outcome.value, self.index.node_id(node))
-                                outcome = _ProofOutcome(replace(outcome.state, pending=_ProofCompletion("raise", error)))
-                                record(node, "transfer", outcome.state)
+                        nodes = (node.exc,) if node.cause is None else (node.exc, node.cause)
+                        frontier, abrupt = operands(nodes, state)
+                        for outcome in abrupt:
                             route(successor, outcome)
+                        for values, current in frontier:
+                            payload, error = _ProofEffects.normalize_exception(values[0], self.index.node_id(node))
+                            if error is None and node.cause is not None and values[1] != _ProofValue.literal(None):
+                                cause, error = _ProofEffects.normalize_exception(values[1], self.index.node_id(node.cause))
+                            current = replace(current, pending=_ProofCompletion("raise", error or payload))
+                            record(node, "transfer", current)
+                            enqueue(successor, current)
                         continue
                     if not state.active or state.active[-1] == ("no-active",):
                         error = "RuntimeError"
@@ -24922,6 +25008,99 @@ class ProofFlowTests(unittest.TestCase):
                             self.assertEqual(recorded.exits, default.exits)
                         else:
                             self.assertIn("name-budget", default.reasons)
+
+    def test_native_int_literal_conversion_and_signature_errors(self):
+        for expression, value, error in (("int()", 0, None), ("int('7')", 7, None),
+                ("int(' -1_024 ')", -1024, None), ("int(b'+1_0')", 10, None),
+                ("int(True)", 1, None), ("int(7)", 7, None),
+                ("int('bad')", None, "ValueError"), ("int('')", None, "ValueError"),
+                ("int('1__0')", None, "ValueError"), ("int(None)", None, "TypeError"),
+                ("int(x=1)", None, "TypeError"), ("int(1,2,3)", None, "TypeError")):
+            with self.subTest(expression=expression):
+                context, func, snapshot = self._solve("x=" + expression + "\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                if error is None:
+                    self.assertEqual(state.pending.kind, "normal")
+                    self.assertEqual(state.lookup(context.index.node_id(func), "x"), _ProofValue.literal(value))
+                    self.assertTrue(snapshot.native_identity(func.body[-1].value, "int"))
+                else:
+                    self.assertEqual(state.pending.error, error)
+                    self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_quiet_prefix_and_first_argument_error_do_not_invent_other_errors(self):
+        for first, expected in (("len", "ValueError"), ("missing", None)):
+            with self.subTest(first=first):
+                context, func, snapshot = self._solve("try:\n    " + first + "\n    int('bad')\nexcept NameError:\n    pass\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.unreachable(func.body[-1]), expected is not None)
+        context, func, snapshot = self._solve("int(missing,unexpected=missing2)\nmarker=int")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error, "NameError")
+        self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_native_exception_literal_constructor_preserves_class_and_capture(self):
+        for constructor, expected in (("NameError('message',name='field')", "NameError"),
+                                      ("LookupError(7)", "LookupError"), ("ValueError()", "ValueError"),
+                                      ("TypeError(None,True,int)", "TypeError")):
+            with self.subTest(constructor=constructor):
+                context, func, snapshot = self._solve(
+                    "E=ValueError\ne=" + constructor + "\nsaved=e\ne=0\nraise saved\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error[:2], ("native-exception", expected))
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+        context, func, snapshot = self._solve("E=ValueError\nsaved=E\nE=0\nraise saved('message')")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error[:2], ("native-exception", "ValueError"))
+
+    def test_exception_constructor_keyword_failure_follows_argument_evaluation(self):
+        for call, expected in (("ValueError(unexpected=1)", "TypeError"),
+                               ("ValueError(unexpected=missing)", "NameError")):
+            with self.subTest(call=call):
+                context, func, snapshot = self._solve("e=" + call + "\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_explicit_cause_evaluates_after_exception_but_before_raise_validation(self):
+        for statement, expected in (("raise ValueError from None", "ValueError"),
+                                    ("raise ValueError('message') from TypeError", "ValueError"),
+                                    ("raise ValueError from 0", "TypeError"),
+                                    ("raise 0 from missing", "NameError"),
+                                    ("raise missing from missing2", "NameError"),
+                                    ("raise ValueError from UnicodeDecodeError", "TypeError")):
+            with self.subTest(statement=statement):
+                context, func, snapshot = self._solve(statement + "\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                error = snapshot.exits[0].pending.error
+                self.assertTrue(error == expected or (type(error) is tuple and error[:2] == ("native-exception", expected)), error)
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_opaque_constructor_values_and_unmodeled_numeric_forms_stay_incomplete(self):
+        for body in ("e=ValueError(x)\nx=0\ne=0\nmarker=int", "y=int(x)\nmarker=int"):
+            with self.subTest(body=body):
+                context, func, snapshot = self._solve(body, parameters="x")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[-1].value, "int"))
+
+    def test_duplicate_literal_keyword_source_is_invalid_even_before_dead_call(self):
+        context, func, snapshot = self._solve("return 7\nValueError(name=1,name=2)")
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_import_error_constructor_models_inherited_keyword_signature(self):
+        for name in ("ImportError", "ModuleNotFoundError"):
+            for keyword in ("name", "path", "name_from"):
+                with self.subTest(name=name, keyword=keyword):
+                    context, func, snapshot = self._solve("e=" + name + "(" + keyword + "='x')\nmarker=int")
+                    self.assertTrue(snapshot.complete, snapshot.reasons)
+                    self.assertEqual(snapshot.exits[0].pending.kind, "normal")
+                    self.assertTrue(snapshot.native_identity(func.body[-1].value, "int"))
+            with self.subTest(name=name, opaque_retained_field=True):
+                context, func, snapshot = self._solve("e=" + name + "(name_from=x)\nx=0\ne=0\nmarker=int", parameters="x")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[-1].value, "int"))
 
 
 
