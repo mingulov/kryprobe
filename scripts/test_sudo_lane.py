@@ -4192,8 +4192,10 @@ class _ProofScopeIndex:
         self.semantic_key = tuple(semantic_key or sys.version_info)
         parents = {}
         node_ids = {}
+        nodes = {}
         for node in ast.walk(tree):
             node_ids.setdefault(id(node), len(node_ids))
+            nodes[node_ids[id(node)]] = node
             for child in ast.iter_child_nodes(node):
                 parents[id(child)] = node
 
@@ -4336,6 +4338,7 @@ class _ProofScopeIndex:
         self._owners = MappingProxyType(owners)
         self._parents = MappingProxyType(parents)
         self._node_ids = MappingProxyType(node_ids)
+        self._nodes = MappingProxyType(nodes)
         self._enclosing = MappingProxyType(enclosing)
         self._open_namespaces = frozenset(open_namespaces)
         captures = {owner: set() for owner in local}
@@ -4400,6 +4403,9 @@ class _ProofScopeIndex:
 
     def node_id(self, node):
         return self._node_ids[id(node)]
+
+    def node_for_id(self, node_id):
+        return self._nodes[node_id]
 
     def parent(self, node):
         return self._parents.get(id(node))
@@ -4584,6 +4590,36 @@ class _ProofEffects:
     _implicit_module_names = frozenset({"__builtins__", "__name__", "__doc__", "__package__",
                                         "__loader__", "__spec__", "__file__", "__cached__",
                                         "__path__", "__annotations__"})
+
+    @staticmethod
+    def constant_lambda(node):
+        if not isinstance(node, ast.Lambda):
+            return None
+        args = node.args
+        if args.posonlyargs or args.args or args.vararg or args.kwonlyargs \
+                or args.kw_defaults or args.kwarg or args.defaults \
+                or not isinstance(node.body, ast.Constant) \
+                or type(node.body.value) is not int or node.body.value not in (0, 1):
+            return None
+        return node.body.value
+
+    @classmethod
+    def iterator_next(cls, value):
+        token = cls.single(value)
+        if not token or len(token) != 5 or token[:2] != ("iterator", "call-sentinel"):
+            raise _ProofIncomplete("opaque-iterator-next")
+        callback, sentinel = token[3:]
+        if callback == ("native", "int"):
+            number = 0
+        elif len(callback) == 3 and callback[0] == "const-callable" \
+                and type(callback[2]) is int and callback[2] in (0, 1):
+            number = callback[2]
+        else:
+            raise _ProofIncomplete("opaque-iterator-callback")
+        if sentinel not in (("literal", "int", 0), ("literal", "int", 1)):
+            raise _ProofIncomplete("opaque-iterator-sentinel")
+        return (None, "StopIteration") if number == sentinel[2] \
+            else (_ProofValue.literal(number), None)
 
     @staticmethod
     def deferred_entry_modes(index):
@@ -5044,15 +5080,10 @@ class _ProofContext:
                             or attr.value != "int":
                         raise _ProofIncomplete("dynamic-form")
                     receiver = None
-                if not isinstance(callback, ast.Lambda):
+                number = _ProofEffects.constant_lambda(callback)
+                if number is None:
                     raise _ProofIncomplete("dynamic-form")
-                args = callback.args
-                if args.posonlyargs or args.args or args.vararg or args.kwonlyargs \
-                        or args.kw_defaults or args.kwarg or args.defaults \
-                        or not isinstance(callback.body, ast.Constant) \
-                        or type(callback.body.value) is not int or callback.body.value not in (0, 1):
-                    raise _ProofIncomplete("dynamic-form")
-                descriptor = (receiver, callback.body.value)
+                descriptor = (receiver, number)
             except _ProofIncomplete as error:
                 reason = str(error)
             except (SyntaxError, ValueError, UnicodeError):
@@ -5245,6 +5276,11 @@ class _ProofContext:
             error = None
             if isinstance(node, ast.Constant):
                 result = _ProofValue.literal(node.value)
+            elif isinstance(node, ast.Lambda):
+                number = _ProofEffects.constant_lambda(node)
+                if number is None:
+                    raise _ProofIncomplete("unsupported-lambda")
+                result = _ProofValue(frozenset({("const-callable", self.index.node_id(node), number)}))
             elif isinstance(node, ast.Name):
                 result, error = _ProofEffects.lookup(self.index, scope, state, node.id)
                 if not error and (result.unknown or ("unbound",) in result.atoms or not result.atoms):
@@ -5307,15 +5343,7 @@ class _ProofContext:
                     result = _ProofValue(frozenset({("iterator", "call-sentinel",
                                                     self.index.node_id(node), callback, sentinel)}))
                 elif token == ("native", "next") and len(arguments) == 1 and not node.keywords:
-                    iterator = _ProofEffects.single(arguments[0])
-                    if not iterator or iterator[:2] != ("iterator", "call-sentinel"):
-                        raise _ProofIncomplete("opaque-iterator-next")
-                    callback, sentinel = iterator[3:]
-                    number = 0 if callback == ("native", "int") else callback[2]
-                    if number == sentinel[2]:
-                        result, error = None, "StopIteration"
-                    else:
-                        result = _ProofValue.literal(number)
+                    result, error = _ProofEffects.iterator_next(arguments[0])
                 elif token in (("native", "globals"), ("native", "locals"), ("native", "vars")):
                     if arguments or node.keywords:
                         raise _ProofIncomplete("unsupported-namespace-call")
@@ -5408,21 +5436,101 @@ class _ProofContext:
             entry = tuple(sorted(entry, key=lambda state: state.order_key()))
             for state in entry:
                 record(scope, "entry", state)
-            queue = deque((0, state) for state in dict.fromkeys(entry))
+            # Indexed sequence cursors keep nesting finite without copying
+            # whole remaining bodies or recursively invoking solve. Every
+            # work item retains its whole correlated state and cursor stack.
+            queue = deque()
+
+            def enqueue(cursor, state):
+                # Each after-marker is one live compound continuation; its
+                # seq/next actions are implementation pieces, not extra frames.
+                depth = len(state.active) + len(state.managers) + len(state.continuation) \
+                    + sum(frame[1] == "after" for frame in cursor)
+                if depth > self.limits["contexts"]:
+                    raise _ProofIncomplete("context-budget")
+                stats["context_depth"] = max(stats["context_depth"], depth)
+                queue.append((cursor, state))
+
+            for state in dict.fromkeys(entry):
+                enqueue(((owner, "body", 0),), state)
             seen = set()
             while queue:
-                position, state = queue.popleft()
-                if (position, state) in seen:
+                cursor, state = queue.popleft()
+                if (cursor, state) in seen:
                     continue
-                seen.add((position, state))
-                if state.pending.kind != "normal" or position == len(body):
+                seen.add((cursor, state))
+                if state.pending.kind != "normal" or not cursor:
                     exits.append(state)
                     continue
-                node = body[position]
+                container_id, field, position = cursor[-1]
+                container = self.index.node_for_id(container_id)
+                if field == "after":
+                    record(container, "after", state)
+                    enqueue(cursor[:-1], state)
+                    continue
+                if field in ("for-first", "for-next"):
+                    self._charge(stats)
+                    record(container, "next", state)
+                    value, error = _ProofEffects.iterator_next(_ProofValue(frozenset({position})))
+                    if error == "StopIteration":
+                        enqueue(cursor[:-1] + ((container_id, "orelse", 0),), state)
+                    elif field == "for-next":
+                        # Explicit invariant: the captured callback always
+                        # yields this exact int, differs from its exact-int
+                        # sentinel, and a pass-only body cannot change it.
+                        # A Name target now holds that int, so its later store
+                        # cannot invoke an opaque last-reference finalizer.
+                        if not isinstance(container.target, ast.Name) or not all(
+                                isinstance(part, ast.Pass) for part in container.body):
+                            raise _ProofIncomplete("unproven-loop-backedge")
+                        exits.append(replace(state, pending=_ProofCompletion("diverge")))
+                    else:
+                        state = target_store(container.target, value, state)
+                        enqueue(cursor[:-1] + ((container_id, "for-next", position),
+                                               (container_id, "body", 0)), state)
+                    continue
+                sequence = getattr(container, field)
+                if position == len(sequence):
+                    enqueue(cursor[:-1], state)
+                    continue
+                node = sequence[position]
+                successor = cursor[:-1] + ((container_id, field, position + 1),)
                 self._charge(stats)
                 record(node, "before", state)
                 if isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal)):
                     pass
+                elif isinstance(node, ast.If):
+                    value, state = expression(node.test, state)
+                    if state.pending.kind == "normal":
+                        token = _ProofEffects.single(value)
+                        if not token or token[0] != "literal":
+                            raise _ProofIncomplete("opaque-truth")
+                        selected = "body" if bool(token[2]) else "orelse"
+                        site = self.index.node_id(node)
+                        enqueue(successor + ((site, "after", 0), (site, selected, 0)), state)
+                    else:
+                        enqueue(successor, state)
+                    continue
+                elif isinstance(node, ast.For):
+                    iterator, state = expression(node.iter, state)
+                    if state.pending.kind == "normal":
+                        token = _ProofEffects.single(iterator)
+                        if not token or token[:2] != ("iterator", "call-sentinel"):
+                            raise _ProofIncomplete("opaque-for-iterator")
+                        site = self.index.node_id(node)
+                        enqueue(successor + ((site, "after", 0), (site, "for-first", token)), state)
+                    else:
+                        enqueue(successor, state)
+                    continue
+                elif isinstance(node, ast.Break):
+                    destination = next((offset for offset in range(len(cursor) - 1, -1, -1)
+                                        if cursor[offset][1] == "for-next"), None)
+                    if destination is None:
+                        raise _ProofIncomplete("break-outside-modeled-loop")
+                    record(node, "transfer", replace(state, pending=_ProofCompletion(
+                        "break", target=cursor[destination][0])))
+                    enqueue(cursor[:destination], state)
+                    continue
                 elif isinstance(node, ast.Import):
                     if _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(
                             frozenset({("native", "__import__")})):
@@ -5455,7 +5563,7 @@ class _ProofContext:
                     raise _ProofIncomplete("unsupported-statement")
                 if state.pending.kind == "normal":
                     record(node, "after", state)
-                queue.append((position + 1, state))
+                enqueue(successor, state)
         except _ProofIncomplete as error:
             reasons.append(str(error))
         except (MemoryError, RecursionError):
@@ -23203,6 +23311,157 @@ class ProofNamespaceTests(unittest.TestCase):
                 token = _ProofEffects.single(snapshot.exits[0].region_value(("builtins", 0), "int"))
                 self.assertEqual((token[0], token[2]), ("const-callable", 0))
 
+    def test_namespace_horizons_skip_dead_and_sibling_body_writes(self):
+        for source in ("ns=globals()\nns={}\nns['int']=1\nmarker=int\n",
+                       "if False:\n    globals()['int']=lambda:1\nmarker=int\n",
+                       "def other():\n    int=lambda:1\nmarker=int\n",
+                       "marker=int\nglobals()['int']=lambda:1\n"):
+            with self.subTest(source=source):
+                context, snapshot = self._solve(source)
+                marker = next(node for node in context.tree.body if isinstance(node, ast.Assign)
+                              and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "marker")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertTrue(snapshot.native_identity(marker, "int"))
+
+    def test_dead_local_declaration_still_changes_ordinary_lookup(self):
+        context = _ProofContext("def f():\n    if False:\n        int=lambda:1\n    marker=int\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["UnboundLocalError"])
+        self.assertTrue(snapshot.unreachable(func.body[-1].targets[0]))
+
+    def test_selected_if_branch_carries_actual_effect_not_the_other_branch(self):
+        context, snapshot = self._solve("if True:\n    globals()['int']=lambda:1\n"
+                                        "else:\n    unsupported()\nmarker=int\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        marker = context.tree.body[-1]
+        self.assertFalse(snapshot.native_identity(marker, "int"))
+        self.assertEqual(_ProofEffects.single(snapshot.value_at(
+            marker, "int", snapshot.states_at(marker)[0]))[0], "const-callable")
+        self.assertTrue(snapshot.unreachable(context.tree.body[0].orelse[0]))
+
+    def test_unknown_if_truth_cannot_preserve_native_identity(self):
+        context = _ProofContext("def f(flag):\n    if flag:\n        globals()['int']=lambda:1\n"
+                                "    marker=int\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(func.body[-1], "int"))
+
+    def test_missing_if_test_name_raises_before_truth_or_branch_evaluation(self):
+        context = _ProofContext("def f():\n    if flag:\n        pass\n    marker=1\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_dead_dynamic_payload_is_not_parsed_or_rejected(self):
+        context, snapshot = self._solve("if False:\n    exec('unsupported()')\nmarker=int\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+        self.assertEqual(context.total_compute["dynamic_parses"], 0)
+
+    def test_literal_zero_one_lambda_is_captured_and_signature_checked(self):
+        for value in (0, 1):
+            with self.subTest(value=value):
+                context, snapshot = self._solve(f"saved=lambda:{value}\nresult=saved()\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(value))
+        for call, error in (("saved(1)", "TypeError"), ("saved(x=1)", "TypeError"),
+                            ("saved(missing)", "NameError")):
+            with self.subTest(call=call):
+                context, snapshot = self._solve(f"saved=lambda:1\n{call}\nmarker=1\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+
+    def test_literal_lambda_with_prologue_or_effects_is_not_a_constant_summary(self):
+        for value in ("lambda:True", "lambda:1.0", "lambda:+1", "lambda:x",
+                      "lambda x=mutate():1", "lambda x:1", "lambda:fail()"):
+            with self.subTest(value=value):
+                context, snapshot = self._solve(f"saved={value}\nresult=saved()\nmarker=int\n")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_later_reflective_store_changes_later_not_earlier_point(self):
+        context, snapshot = self._solve("first=int\nglobals()['int']=lambda:1\nlast=int\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(context.tree.body[0], "int"))
+        self.assertFalse(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_first_break_loop_preserves_disjoint_namespace_controls(self):
+        for prelude in ("", "globals()\n", "box={}\nbox['int']=1\n",
+                        "if False:\n    globals()['int']=lambda:1\n",
+                        "ns=globals()\nns={}\nns['int']=1\n",
+                        "def other():\n    int=lambda:1\n"):
+            with self.subTest(prelude=prelude):
+                context, snapshot = self._solve(prelude + "for x in iter(int,1):\n    break\nmarker=int\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+                self.assertEqual(snapshot.exits[0].lookup(0, "x"), _ProofValue.literal(0))
+
+    def test_zero_trip_does_not_evaluate_complex_loop_target(self):
+        context, snapshot = self._solve("box={}\nfor box[sum(iter(int,1))] in iter(int,0):\n"
+                                        "    break\nmarker=int\n")
+        loop = context.tree.body[1]
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.unreachable(loop.target))
+        self.assertTrue(snapshot.unreachable(loop.body[0]))
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
+    def test_first_yield_evaluates_target_before_loop_body(self):
+        context, snapshot = self._solve("box={}\nfor box[missing] in iter(int,1):\n"
+                                        "    break\nmarker=1\n")
+        loop = context.tree.body[1]
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertTrue(snapshot.states_at(loop.target))
+        self.assertTrue(snapshot.unreachable(loop.body[0]))
+
+    def test_constant_callable_loop_has_explicit_normal_diverge_and_break_routes(self):
+        for form in ("exec('b.int=lambda:{number}')",
+                     "eval(\"setattr(__import__('builtins'),'int',lambda:{number})\")",
+                     "b.int=lambda:{number}"):
+            for number, body, kind in ((0, "pass", "normal"), (1, "pass", "diverge"),
+                                       (1, "break", "normal")):
+                with self.subTest(form=form, number=number, body=body):
+                    context, snapshot = self._solve("import builtins as b\n" + form.format(number=number)
+                        + f"\nfor x in iter(int,0):\n    {body}\nmarker=1\n")
+                    self.assertTrue(snapshot.complete, snapshot.reasons)
+                    self.assertEqual([state.pending.kind for state in snapshot.exits], [kind])
+                    self.assertEqual(snapshot.unreachable(context.tree.body[-1]), kind == "diverge")
+                    if number == 0:
+                        self.assertTrue(snapshot.exits[0].lookup(0, "x").is_unbound)
+
+    def test_for_else_only_receives_exhaustion_not_first_break(self):
+        for callback, body, branch in ((0, "break", "globals()['int']=lambda:1"),
+                                       (1, "break", "unsupported()")):
+            with self.subTest(callback=callback):
+                context, snapshot = self._solve(f"saved=lambda:{callback}\nfor x in iter(saved,0):\n"
+                                                f"    {body}\nelse:\n    {branch}\nmarker=int\n")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(context.tree.body[-1], "int"), callback == 1)
+
+    def test_loop_body_earlier_error_prevents_a_divergence_claim(self):
+        context, snapshot = self._solve("saved=lambda:1\nfor x in iter(saved,0):\n"
+                                        "    missing\n    pass\nmarker=1\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual([(state.pending.kind, state.pending.error) for state in snapshot.exits],
+                         [("raise", "NameError")])
+
+    def test_unproven_nonquiet_backedge_cannot_certify_dead_continuation(self):
+        context, snapshot = self._solve("saved=lambda:1\nfor x in iter(saved,0):\n"
+                                        "    globals()['int']=lambda:0\nmarker=1\n")
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_nested_first_break_consumes_only_nearest_loop_and_skips_else(self):
+        context, snapshot = self._solve("for x in iter(int,1):\n    if True:\n        break\n"
+                                        "else:\n    unsupported()\nmarker=int\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
+
 
 class ProofStateTests(unittest.TestCase):
     def _context(self, source, **kwargs):
@@ -23227,6 +23486,40 @@ class ProofStateTests(unittest.TestCase):
         self.assertEqual(copied_from.lookup(key, "x").atoms,
                          frozenset({("literal", "int", 1)}))
 
+    def test_compound_cursor_depth_obeys_context_cap_and_reports_actual_depth(self):
+        for depth, cap, complete in ((1, 0, False), (1, 1, True), (1, 2, True),
+                                      (64, 63, False), (64, 64, True), (65, 64, False)):
+            with self.subTest(depth=depth, cap=cap):
+                source = "".join("    " * n + "if True:\n" for n in range(depth)) \
+                    + "    " * depth + "pass\nmarker=1\n"
+                context = self._context(source, limits={"contexts": cap})
+                snapshot = context.solve()
+                self.assertEqual(snapshot.complete, complete)
+                self.assertLessEqual(snapshot.stats["context_depth"], cap)
+                if complete:
+                    self.assertEqual(snapshot.stats["context_depth"], depth)
+                else:
+                    self.assertIn("context-budget", snapshot.reasons)
+                    self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
+
+    def test_compound_cursors_share_ambient_and_loop_context_budget(self):
+        context = self._context("if True:\n    pass\nmarker=1\n")
+        entry = _ProofState(active=(("no-active",),) * 64)
+        snapshot = context.solve(entry=(entry,))
+        with self.subTest(ambient=64):
+            self.assertFalse(snapshot.complete)
+            self.assertIn("context-budget", snapshot.reasons)
+        for cap, complete in ((0, False), (1, True), (2, True)):
+            with self.subTest(loop_cap=cap):
+                context = self._context("for x in iter(int,0):\n    pass\nmarker=1\n",
+                                        limits={"contexts": cap})
+                snapshot = context.solve()
+                self.assertEqual(snapshot.complete, complete)
+                if complete:
+                    self.assertEqual(snapshot.stats["context_depth"], 1)
+                else:
+                    self.assertIn("context-budget", snapshot.reasons)
+                    self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
     def test_unbound_rhs_prevents_store_and_later_statement(self):
         context = self._context("def f():\n    x=x\n    x=2\n")
         func = context.tree.body[0]
@@ -23315,7 +23608,7 @@ class ProofStateTests(unittest.TestCase):
         self.assertTrue(context.solve().complete)
 
     def test_incomplete_transfer_and_foreign_scope_cannot_certify_deadness(self):
-        context = self._context("def f():\n    if flag:\n        pass\n    x=1\n")
+        context = self._context("def f(flag):\n    if flag:\n        pass\n    x=1\n")
         func = context.tree.body[0]
         snapshot = context.solve(func)
         self.assertFalse(snapshot.complete)
