@@ -4422,6 +4422,18 @@ class _ProofScopeIndex:
     def runtime_names_mangled(self, scope):
         return scope in self._mangled_runtime_views
 
+    def runtime_name(self, scope, name):
+        if name.startswith("__") and not name.endswith("__") and "." not in name:
+            owner = scope
+            while owner is not None:
+                if isinstance(owner, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+                    raise _ProofIncomplete("type-parameter-runtime-name")
+                if isinstance(owner, ast.ClassDef):
+                    prefix = owner.name.lstrip("_")
+                    return "_" + prefix + name if prefix else name
+                owner = self.enclosing_scope(owner)
+        return name
+
 
 def _proof_immutable_token(value):
     pending = [value]
@@ -4504,6 +4516,10 @@ class _ProofCompletion:
         return (self.kind, self.error, self.target, None if self.value is None else (
             self.value.atoms, self.value.unknown, self.value.reason))
 
+    @property
+    def error_kind(self):
+        return _ProofEffects.exception_name(self.error) or self.error
+
     @classmethod
     def from_token(cls, token):
         if type(token) is not tuple or len(token) != 4:
@@ -4526,7 +4542,7 @@ class _ProofCollectionObject:
         if type(self.identity) is not tuple or len(self.identity) != 4 \
                 or self.identity[0] != "collection" or self.identity[1] not in ("list", "tuple") \
                 or type(self.identity[2]) is not int or self.identity[2] < 0 \
-                or self.identity[3] not in ("literal", "args", "captured", "empty", "slice", "args-store",
+                or self.identity[3] not in ("literal", "args", "implicit-args", "captured", "empty", "slice", "args-store",
                                            "legacy-captured", "legacy-args") \
                 or type(self.items) is not tuple or any(type(item) is not _ProofValue for item in self.items) \
                 or type(self.depth) is not int or self.depth < 1:
@@ -4550,12 +4566,14 @@ class _ProofExceptionObject:
     message: _ProofValue | None = None
     args_value: _ProofValue | None = None
     captured_value: _ProofValue | None = None
+    origin: str = "constructor"
 
     def __post_init__(self):
         def payload(value):
             return type(value) is tuple and len(value) == 3 and value[0] == "native-exception" \
                 and type(value[1]) is str and type(value[2]) is int and value[2] >= 0
-        if not payload(self.payload) or type(self.arguments) is not tuple \
+        if type(self.origin) is not str or self.origin not in ("constructor", "implicit") \
+                or not payload(self.payload) or type(self.arguments) is not tuple \
                 or any(type(value) is not _ProofValue for value in self.arguments) \
                 or any(type(items) is not tuple or any(type(item) is not tuple or len(item) != 2
                     or type(item[0]) is not str or type(item[1]) is not _ProofValue for item in items)
@@ -4591,6 +4609,7 @@ class _ProofState:
     exception_metadata: tuple = ()
     collection_objects: tuple = ()
     temporaries: tuple = ()
+    borrowed_exceptions: tuple = ()
 
     def __post_init__(self):
         if type(self.bindings) is not tuple or type(self.regions) is not tuple \
@@ -4603,6 +4622,11 @@ class _ProofState:
                     "globals-open", "builtins-open", "frame-builtins-open")
                        for mode in self.entry_modes):
             raise TypeError("proof records require immutable fields")
+        if type(self.borrowed_exceptions) is not tuple or len(set(self.borrowed_exceptions)) != len(self.borrowed_exceptions) \
+                or any(type(item) is not tuple or len(item) != 3 or item[0] != "borrowed-exception"
+                       or type(item[1]) is not str or type(item[2]) is not int or item[2] < 0
+                       for item in self.borrowed_exceptions):
+            raise TypeError("invalid borrowed caller roots")
         if type(self.collection_objects) is not tuple \
                 or any(type(item) is not _ProofCollectionObject for item in self.collection_objects) \
                 or len({item.identity for item in self.collection_objects}) != len(self.collection_objects) \
@@ -4708,11 +4732,14 @@ class _ProofState:
                 tuple((canonical(item.payload), tuple(canonical(value.atoms) for value in item.arguments),
                        tuple((key, canonical(value.atoms)) for key, value in item.keywords),
                        tuple((key, canonical(value.atoms)) for key, value in item.fields),
-                       canonical(item.children), None if item.message is None else canonical(item.message.atoms))
+                       canonical(item.children), None if item.message is None else canonical(item.message.atoms),
+                       item.origin, canonical(None if item.args_value is None else item.args_value.atoms),
+                       canonical(None if item.captured_value is None else item.captured_value.atoms))
                       for item in self.exception_objects), canonical(self.exception_metadata),
                 tuple((item.identity, tuple((canonical(value.atoms), value.unknown, value.reason or "")
                        for value in item.items), item.depth) for item in self.collection_objects),
-                tuple((canonical(value.atoms), value.unknown, value.reason or "") for value in self.temporaries))
+                tuple((canonical(value.atoms), value.unknown, value.reason or "") for value in self.temporaries),
+                canonical(self.borrowed_exceptions))
 
     def collection_object(self, identity):
         return next((item for item in self.collection_objects if item.identity == identity), None)
@@ -4728,7 +4755,8 @@ class _ProofState:
             + [value for region, name, value in self.regions] + list(self.temporaries)
         if self.pending.value is not None:
             values.append(self.pending.value)
-        count = sum(atom[0] in ("namespace", "exception", "sequence", "collection") for value in values for atom in value.atoms)
+        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection")
+                                                 for value in values for atom in value.atoms)
         for frame in self.continuation:
             if frame and frame[0] == "finally" and frame[2][3] is not None:
                 count += sum(atom[0] in ("namespace", "exception", "sequence", "collection") for atom in frame[2][3][0])
@@ -4831,7 +4859,7 @@ class _ProofEffects:
     def exception_name(cls, error):
         if type(error) is str and error in cls._exception_mros:
             return cls._exception_mros[error][0]
-        if type(error) is tuple and len(error) == 3 and error[0] == "native-exception" \
+        if type(error) is tuple and len(error) == 3 and error[0] in ("native-exception", "borrowed-exception") \
                 and error[1] in cls._exception_mros and type(error[2]) is int:
             return cls._exception_mros[error[1]][0]
         return None
@@ -5054,7 +5082,8 @@ class _ProofEffects:
         # Ordinary namespace fields are edges, not independent roots.
         values = [value for owner, name, value in state.bindings] \
             + [value for region, name, value in state.regions if region[0] in ("globals", "builtins")] \
-            + list(state.temporaries)
+            + list(state.temporaries) \
+            + [_ProofValue(frozenset({("exception", payload)})) for payload in state.borrowed_exceptions]
         if state.pending.value is not None:
             values.append(state.pending.value)
         values.extend(_ProofValue(*frame[2][3]) for frame in state.continuation
@@ -5104,7 +5133,9 @@ class _ProofEffects:
             if type(part) not in (tuple, frozenset) or id(part) in seen:
                 continue
             seen.add(id(part))
-            if cls.exception_name(part) is not None and type(part) is tuple:
+            if type(part) is tuple and part and part[0] == "borrowed-exception":
+                unsafe.add(part)
+            elif cls.exception_name(part) is not None and type(part) is tuple:
                 if part in live:
                     continue
                 live.add(part)
@@ -5185,8 +5216,8 @@ class _ProofEffects:
         return tuple(sorted(blocks, key=lambda block: (block[0], tuple(sorted(block[1])))))
 
     @classmethod
-    def capture_exception(cls, state, payload, arguments, keywords, profile):
-        if cls.exception_name(payload) is None or type(payload) is not tuple:
+    def capture_exception(cls, state, payload, arguments, keywords, profile, implicit=False):
+        if cls.exception_name(payload) is None or type(payload) is not tuple or payload[0] != "native-exception":
             raise _ProofIncomplete("unowned-exception-allocation")
         if payload in cls.live_exception_ids(state, arguments + tuple(value for key, value in keywords)):
             raise _ProofIncomplete("repeated-exception-allocation")
@@ -5231,7 +5262,8 @@ class _ProofEffects:
                 fields += ((key, value),)
         elif "ImportError" in cls._exception_mros[name] and len(arguments) == 1:
             fields += (("msg", arguments[0]),)
-        args_value, state = cls.allocate_collection(state, "tuple", payload[2], retained, "args")
+        args_value, state = cls.allocate_collection(state, "tuple", payload[2], retained,
+                                                   "implicit-args" if implicit else "args")
         if name == "SystemExit" and arguments:
             fields += (("code", arguments[0] if len(arguments) == 1 else args_value),)
         captured_value = None
@@ -5242,7 +5274,8 @@ class _ProofEffects:
             else:
                 role = "legacy-captured" if token[:2] == ("sequence", "tuple") else "captured"
                 captured_value, state = cls.allocate_collection(state, "tuple", payload[2], info[0], role)
-        item = _ProofExceptionObject(payload, retained, keywords, fields, children, message, args_value, captured_value)
+        item = _ProofExceptionObject(payload, retained, keywords, fields, children, message, args_value, captured_value,
+                                     "implicit" if implicit else "constructor")
         if any(state.exception_object(reference) is None
                for reference in cls.live_exception_ids(state, item.values(), include_state=False)):
             raise _ProofIncomplete("unowned-retained-exception")
@@ -5264,8 +5297,15 @@ class _ProofEffects:
 
     @classmethod
     def explicitly_raised(cls, state, payload, cause=None, explicit_cause=False):
+        if payload in state.borrowed_exceptions:
+            # Explicit raise mutates traceback/context and may replace an
+            # opaque prior context. Bare raise never calls this operation.
+            raise _ProofIncomplete("borrowed-explicit-raise")
         if state.exception_object(payload) is None:
             return state  # Legacy/unknown seeded metadata is not pristine.
+        if state.active and state.active[-1] != ("no-active",) and (
+                len(state.active[-1]) != 2 or state.active[-1][0] != "error"):
+            raise _ProofIncomplete("unknown-active-context")
         item = state.exception_object(payload)
         objects = {old.payload: old for old in state.exception_objects}
         changed = {payload}
@@ -5276,7 +5316,9 @@ class _ProofEffects:
                 fields["__cause__"] = _ProofValue(frozenset({("exception", cause)}))
         if state.active and state.active[-1][0] == "error" and state.active[-1][1] != payload:
             context = state.active[-1][1]
-            if state.exception_object(context) is not None:
+            if context in state.borrowed_exceptions:
+                fields["__context__"] = _ProofValue(frozenset({("exception", context)}))
+            elif state.exception_object(context) is not None:
                 # CPython cuts the first context back-edge before attaching
                 # the active error. Cause links are deliberately not walked.
                 # The caller reserves the whole bounded graph walk first.
@@ -5294,6 +5336,8 @@ class _ProofEffects:
                         break
                     cursor = link[1]
                 fields["__context__"] = _ProofValue(frozenset({("exception", context)}))
+            else:
+                raise _ProofIncomplete("unowned-active-context")
         item = replace(item, fields=tuple(sorted(fields.items())))
         objects[payload] = item
         objects = tuple(objects[key] for key in sorted(objects))
@@ -5612,6 +5656,8 @@ class _ProofEffects:
                         if outer is not index.tree:
                             return _ProofValue.unknown_value("lexical-owner"), None
                 outer = index.enclosing_scope(outer)
+        if index.runtime_name(scope, name) != name:
+            raise _ProofIncomplete("mangled-runtime-namespace")
         value = cls.global_value(index, scope, state, name)
         return value, "NameError" if value == _ProofValue.absent() else None
 
@@ -5664,6 +5710,8 @@ class _ProofEffects:
 
     @classmethod
     def member(cls, index, scope, receiver, key, state, attribute=False):
+        if attribute and index.runtime_name(scope, key) != key:
+            raise _ProofIncomplete("mangled-runtime-namespace")
         atom = cls.single(receiver)
         if attribute and atom and atom[0] == "exception":
             item = state.exception_object(atom[1])
@@ -5901,6 +5949,8 @@ class _ProofEffects:
             names = ("errno", "strerror", "filename", "filename2")
         elif name == "SystemExit":
             names = ("code",)
+        elif name == "StopIteration":
+            names = ("value",)
         elif "AttributeError" in mro:
             names = ("name", "obj")
         elif "NameError" in mro:
@@ -5967,6 +6017,8 @@ class _ProofEffects:
 
     @classmethod
     def store(cls, index, scope, receiver, key, value, state, attribute=False, delete=False, profile=None, site=None):
+        if attribute and index.runtime_name(scope, key) != key:
+            raise _ProofIncomplete("mangled-runtime-namespace")
         atom = cls.single(receiver)
         if attribute and atom and atom[0] == "exception":
             if profile is None or site is None:
@@ -6249,20 +6301,26 @@ class _ProofContext:
             self._charge(stats)
             return _ProofEffects.dynamic_name(self.index, scope, state, name, selected)
 
-        def raised(error):
-            return None, replace(state, pending=_ProofCompletion("raise", error))
+        def raised(error, name=None, receiver=None):
+            fields = (("name", _ProofValue.literal(name)),) if error == "NameError" else ()
+            if error == "AttributeError" and receiver is not None:
+                if self._native_profile[0][:2] == (3, 14):
+                    fields = (("name", _ProofValue.literal("int")), ("obj", receiver))
+                elif self._native_profile[0][:2] != (3, 12):
+                    raise _ProofIncomplete("unsupported-attribute-error-version")
+            return None, self._implicit_error(node, error, state, stats, fields=fields)
 
         if mode == "exec":
             receiver, error = lookup(receiver_name)
             if error:
-                return raised(error)
+                return raised(error, receiver_name)
         else:
             setter, error = lookup("setattr")
             if error:
-                return raised(error)
+                return raised(error, "setattr")
             importer, error = lookup("__import__")
             if error:
-                return raised(error)
+                return raised(error, "__import__")
             token = _ProofEffects.single(importer)
             if token and token[0] == "literal":
                 return raised("TypeError")
@@ -6277,12 +6335,93 @@ class _ProofContext:
         token = _ProofEffects.single(receiver)
         if token != ("namespace", "module", ("builtins", 0)):
             if token and (token[0] in ("literal", "singleton") or token[:2] == ("namespace", "mapping")):
-                return raised("AttributeError")
+                return raised("AttributeError", receiver=receiver)
             raise _ProofIncomplete("dynamic-receiver")
         callback = _ProofValue(frozenset({("const-callable", self.index.node_id(node), number)}))
         self._charge(stats, 2 * _ProofEffects.exception_work(state, (receiver, callback)))
         state = _ProofEffects.store(self.index, scope, receiver, "int", callback, state, attribute=True)
         return _ProofValue.literal(None), state
+
+    @staticmethod
+    def _implicit_error_kinds(node):
+        if isinstance(node, ast.Name):
+            return ("NameError", "UnboundLocalError")
+        if isinstance(node, ast.Call):
+            return ("TypeError", "ValueError", "OverflowError", "AttributeError", "NameError", "StopIteration")
+        if isinstance(node, ast.Attribute):
+            return ("AttributeError", "TypeError", "ValueError", "OverflowError")
+        if isinstance(node, ast.Subscript):
+            return ("KeyError", "IndexError", "TypeError", "ValueError")
+        if isinstance(node, ast.Raise):
+            return ("TypeError", "RuntimeError")
+        if isinstance(node, (ast.UnaryOp, ast.ExceptHandler)):
+            return ("TypeError",)
+        if isinstance(node, ast.FormattedValue):
+            return ("ValueError",)
+        if isinstance(node, ast.AsyncFunctionDef):
+            return ("RuntimeError",)
+        return ()
+
+    def _implicit_error(self, node, kind, state, stats, arguments=None, fields=()):
+        """Allocate only at a proven native creation seam, never from a seed.
+
+        Message contents are not fabricated. Callers supply retained key/name/
+        receiver fields at their actual origin, before operand holds expire.
+        """
+        site = self.index.node_id(node)
+        if type(kind) is not str or kind not in self._implicit_error_kinds(node):
+            raise _ProofIncomplete("unknown-implicit-error-origin")
+        arguments = (() if kind == "StopIteration" else (
+            _ProofValue(frozenset({("plain-string", site)})),)) if arguments is None else arguments
+        self._charge(stats, 4 * _ProofEffects.exception_work(state,
+            arguments + tuple(value for key, value in fields)))
+        payload = ("native-exception", kind, site)
+        state = _ProofEffects.capture_exception(state, payload, arguments, fields, self._native_profile, implicit=True)
+        state = replace(state, pending=_ProofCompletion("raise", payload))
+        self._check_alias_budget(state, stats)
+        self._charge(stats, 4 * _ProofEffects.exception_work(state))
+        state = _ProofEffects.explicitly_raised(state, payload)
+        self._check_alias_budget(state, stats)
+        return state
+
+    def _check_alias_budget(self, state, stats):
+        self._charge(stats, _ProofEffects.exception_work(state))
+        if state.alias_count() > self.limits["aliases"]:
+            raise _ProofIncomplete("alias-budget")
+
+    @staticmethod
+    def _entry_control_shape(state):
+        # This cheap closed-shape check MUST precede dataclass hashing and
+        # canonical ordering. An arbitrary immutable nested error DAG is not
+        # an admitted payload; expanding it would bypass the work budget.
+        def error(payload):
+            if type(payload) is str:
+                return True  # A legacy kind hypothesis has no owned metadata.
+            if type(payload) is not tuple or len(payload) != 3 or type(payload[0]) is not str:
+                return False
+            if payload[0] in ("native-exception", "borrowed-exception"):
+                return type(payload[1]) is str and _ProofEffects.exception_name(payload) is not None \
+                    and type(payload[2]) is int
+            return payload[0] == "unknown-exception" and type(payload[1]) is int \
+                and payload[1] >= 0 and type(payload[2]) is str
+
+        def active(frames):
+            return all(frame in (("no-active",), ("unknown-active",)) or (
+                len(frame) == 2 and frame[0] == "error" and error(frame[1])) for frame in frames)
+
+        if (state.pending.kind == "raise" and not error(state.pending.error)) \
+                or not active(state.active) or state.managers:
+            return False
+        for frame in state.continuation:
+            if not frame or frame[0] not in ("finally", "except-search", "handler"):
+                return False
+            if not active(frame[3]):
+                return False
+            payload = frame[2][1] if frame[0] == "finally" and frame[2][0] == "raise" \
+                else frame[2] if frame[0] != "finally" else None
+            if payload is not None and not error(payload):
+                return False
+        return True
 
     def solve(self, scope=None, entry=None):
         scope = self.tree if scope is None else scope
@@ -6340,6 +6479,26 @@ class _ProofContext:
                 if state.temporaries:
                     reasons.append("foreign-temporary-entry")
                     return snapshot()
+                if state.context_depth() > self.limits["contexts"]:
+                    reasons.append("context-budget")
+                    return snapshot()
+                if not self._entry_control_shape(state):
+                    reasons.append("unsupported-control-entry")
+                    return snapshot()
+                if state.borrowed_exceptions and (state.epoch is None or any(
+                        _ProofEffects.exception_name(payload) is None or payload[2] >= len(state.active)
+                        or state.active[payload[2]] != ("error", payload) for payload in state.borrowed_exceptions)):
+                    reasons.append("unrooted-borrowed-entry")
+                    return snapshot()
+                if not state.borrowed_exceptions and not state.continuation and not state.managers:
+                    borrowed = tuple(("borrowed-exception", _ProofEffects.exception_name(frame[1]), position)
+                        for position, frame in enumerate(state.active)
+                        if len(frame) == 2 and frame[0] == "error" and type(frame[1]) is str
+                        and _ProofEffects.exception_name(frame[1]) is not None)
+                    by_slot = {payload[2]: payload for payload in borrowed}
+                    state = replace(state, borrowed_exceptions=borrowed, active=tuple(
+                        ("error", by_slot[position]) if position in by_slot else frame
+                        for position, frame in enumerate(state.active)))
                 modes = tuple(sorted(set(state.entry_modes) | set(region_entry_modes)))
                 requested.add(replace(state, epoch=self._epoch, entry_modes=modes))
                 if len(requested) > self.limits["alternatives"]:
@@ -6353,6 +6512,27 @@ class _ProofContext:
             # host-dependent sharing. Cache hits reuse the owned validation.
             for state in sorted(entry, key=lambda item: item.order_key()):
                 try:
+                    # Closed control shapes above bound this semantic slot
+                    # walk by context capacity. Host tuple sharing/copying is
+                    # not semantic work; charge the same stored slots either
+                    # way, once per canonical uncached entry state.
+                    slots = len(state.active) + len(state.continuation)
+                    slots += sum(len(frame[3]) for frame in state.continuation)
+                    self._charge(stats, slots + (state.pending.kind == "raise"))
+                    errors = [state.pending.error] if state.pending.kind == "raise" else []
+                    active = list(state.active)
+                    for frame in state.continuation:
+                        active.extend(frame[3])
+                        if frame[0] != "finally":
+                            errors.append(frame[2])
+                        elif frame[2][0] == "raise":
+                            errors.append(frame[2][1])
+                    errors.extend(frame[1] for frame in active if len(frame) == 2 and frame[0] == "error")
+                    for payload in errors:
+                        if type(payload) is tuple and payload[0] == "borrowed-exception" \
+                                and payload not in state.borrowed_exceptions:
+                            reasons.append("unregistered-borrowed-entry")
+                            return snapshot()
                     self._charge(stats, sum(item.edge_count() for item in state.exception_objects)
                                  + sum(1 + len(item.items) for item in state.collection_objects))
                 except _ProofIncomplete as error:
@@ -6375,6 +6555,8 @@ class _ProofContext:
                     elif identity[3] in ("args-store", "legacy-args"):
                         valid = identity[1] == "tuple" and isinstance(allocation, ast.Attribute) \
                             and allocation.attr == "args" and isinstance(allocation.ctx, ast.Store)
+                    elif identity[3] == "implicit-args":
+                        valid = identity[1] == "tuple" and bool(self._implicit_error_kinds(allocation))
                     else:
                         valid = identity[1] == "tuple" and (isinstance(allocation, (ast.Call, ast.Raise))
                             or (isinstance(parent, ast.Raise) and parent.cause is allocation))
@@ -6391,8 +6573,9 @@ class _ProofContext:
                         parent = self.index.parent(allocation)
                     except (IndexError, KeyError):
                         allocation = parent = None
-                    origin = isinstance(allocation, (ast.Call, ast.Raise)) or (
-                        isinstance(parent, ast.Raise) and parent.cause is allocation)
+                    origin = (name in self._implicit_error_kinds(allocation)
+                              if item.origin == "implicit" else isinstance(allocation, (ast.Call, ast.Raise)) or (
+                                  isinstance(parent, ast.Raise) and parent.cause is allocation))
                     grouped = name in ("ExceptionGroup", "BaseExceptionGroup")
                     if not origin or name is None or (bool(item.children) != grouped) \
                             or (grouped and item.message is None) or (not grouped and item.message is not None) \
@@ -6412,7 +6595,9 @@ class _ProofContext:
                                     not token or token[:2] != ("literal", "int")
                                     or not -self._native_profile[1] - 1 <= token[2] <= self._native_profile[1])) \
                                     or (kind == "chain" and value != _ProofValue.literal(None) and (
-                                        not token or token[0] != "exception" or state.exception_object(token[1]) is None)):
+                                        not token or token[0] != "exception" or (
+                                            state.exception_object(token[1]) is None
+                                            and token[1] not in state.borrowed_exceptions))):
                                 raise _ProofIncomplete("unsupported-exception-entry")
                         args = _ProofEffects.sequence_info(item.args_value, state) if item.args_value is not None else None
                         captured = _ProofEffects.sequence_info(item.captured_value, state) \
@@ -6452,8 +6637,8 @@ class _ProofContext:
                         if atom[0] == "collection" and state.collection_object(atom) is None:
                             reasons.append("unowned-collection-entry")
                             return snapshot()
-                        if atom[0] == "exception" and len(atom) == 2 and type(atom[1]) is tuple \
-                                and state.exception_object(atom[1]) is None:
+                        if atom[0] == "exception" and (len(atom) != 2 or (
+                                state.exception_object(atom[1]) is None and atom[1] not in state.borrowed_exceptions)):
                             reasons.append("unowned-exception-entry")
                             return snapshot()
                         if atom[0] == "expansion" or (closed and atom[0] != "sequence"
@@ -6692,9 +6877,11 @@ class _ProofContext:
                 frontier = tuple(dict.fromkeys(following))
             return frontier, abrupt
 
-        def finish(node, result, state, error=None):
+        def finish(node, result, state, error=None, arguments=None, fields=(), promote_pending=False):
+            if promote_pending and state.pending.kind == "raise" and type(state.pending.error) is str:
+                error = state.pending.error
             if error:
-                state = replace(state, pending=_ProofCompletion("raise", error))
+                state = self._implicit_error(node, error, state, stats, arguments=arguments, fields=fields)
             if state.pending.kind == "normal":
                 record(node, "after", state)
             return (_ProofOutcome(state, result if state.pending.kind == "normal" else None),)
@@ -6908,7 +7095,7 @@ class _ProofContext:
                             # larger ones retain a possible semantic ValueError.
                             # Do not run str/repr/format or assume the host's
                             # current setting remains the inspected program's.
-                            results.append(_ProofOutcome(replace(current, pending=_ProofCompletion("raise", "ValueError"))))
+                            results.extend(finish(node, None, current, "ValueError"))
                         continue
                     if isinstance(node, ast.Subscript):
                         if (_ProofEffects.single(values[0]) or (None,))[0] == "collection":
@@ -6918,7 +7105,7 @@ class _ProofContext:
                             if result is not None and (item := current.collection_object(_ProofEffects.single(result))) is not None \
                                     and item.depth > self.limits["depth"]:
                                 raise _ProofIncomplete("value-depth-budget")
-                            results.extend(finish(node, result, current))
+                            results.extend(finish(node, result, current, promote_pending=True))
                             continue
                         if isinstance(node.slice, ast.Slice):
                             raise _ProofIncomplete("unsupported-namespace-slice")
@@ -6932,11 +7119,20 @@ class _ProofContext:
                                                         attribute=isinstance(node, ast.Attribute))
                     if result is not None and result.unknown:
                         raise _ProofIncomplete("imprecise-member")
-                    results.extend(finish(node, result, current, error))
+                    fields, arguments = (), None
+                    if error == "AttributeError":
+                        fields = (("name", _ProofValue.literal(self.index.runtime_name(scope, key))), ("obj", values[0]))
+                        if (_ProofEffects.single(values[0]) or (None,))[0] == "exception" and key == "characters_written":
+                            arguments = (_ProofValue.literal(key),)
+                    elif error == "KeyError":
+                        arguments = (values[1],)
+                    results.extend(finish(node, result, current, error, arguments, fields))
                 return bounded(results, node)
             else:
                 raise _ProofIncomplete("unsupported-expression")
-            return bounded(finish(node, result, state, error), node)
+            fields = (("name", _ProofValue.literal(self.index.runtime_name(scope, node.id))),) \
+                if isinstance(node, ast.Name) and error == "NameError" else ()
+            return bounded(finish(node, result, state, error, fields=fields), node)
 
         def handler_expression(node, state):
             return expression(node, state)
@@ -6958,6 +7154,8 @@ class _ProofContext:
 
         def bind_name(name, value, state, delete=False):
             target_owner = storage(name)
+            if target_owner == 0 and self.index.runtime_name(scope, name) != name:
+                raise _ProofIncomplete("mangled-runtime-namespace")
             old = _ProofEffects.region_value(self.index, scope, state,
                 ("globals", 0), name) if target_owner == 0 else state.lookup(target_owner, name)
             if delete:
@@ -6988,6 +7186,11 @@ class _ProofContext:
             record(target, "before", state)
             if isinstance(target, ast.Name):
                 state = bind_name(target.id, value, state, delete=delete)
+                if state.pending.kind == "raise":
+                    error = state.pending.error
+                    fields = (("name", _ProofValue.literal(self.index.runtime_name(scope, target.id))),) \
+                        if error == "NameError" else ()
+                    state = self._implicit_error(target, error, state, stats, fields=fields)
                 if state.pending.kind == "normal":
                     record(target, "after", state)
                 return bounded((_ProofOutcome(state, value if state.pending.kind == "normal" else None),), target)
@@ -7001,7 +7204,7 @@ class _ProofContext:
                             reserve_graph(current, () if delete else (value,), passes=2)
                             unused, current = _ProofEffects.collection_access(values[0], subscript_key(target, values), current,
                                 self._native_profile[1], value=None if delete else value, delete=delete)
-                            results.extend(finish(target, value, current))
+                            results.extend(finish(target, value, current, promote_pending=True))
                             continue
                         if isinstance(target.slice, ast.Slice):
                             raise _ProofIncomplete("unsupported-namespace-slice")
@@ -7016,6 +7219,25 @@ class _ProofContext:
                     current = _ProofEffects.store(self.index, scope, values[0], key, value, current,
                         attribute=isinstance(target, ast.Attribute), delete=delete,
                         profile=self._native_profile, site=self.index.node_id(target))
+                    if current.pending.kind == "raise":
+                        error = current.pending.error
+                        arguments, fields = None, ()
+                        if error == "KeyError":
+                            arguments = (values[1],)
+                        elif error == "AttributeError":
+                            receiver = _ProofEffects.single(values[0])
+                            if receiver and receiver[0] == "namespace" and delete and key != "__dict__":
+                                if self._native_profile[0][:2] == (3, 14):
+                                    fields = (("name", _ProofValue.literal(self.index.runtime_name(scope, key))),
+                                              ("obj", values[0]))
+                                elif self._native_profile[0][:2] != (3, 12):
+                                    raise _ProofIncomplete("unsupported-attribute-error-version")
+                            elif receiver and receiver[0] == "exception":
+                                if key in ("message", "exceptions"):
+                                    arguments = (_ProofValue.literal("readonly attribute"),)
+                                elif key == "characters_written":
+                                    arguments = (_ProofValue.literal(key),)
+                        current = self._implicit_error(target, error, current, stats, arguments, fields)
                     if current.pending.kind == "normal":
                         record(target, "after", current)
                     results.append(_ProofOutcome(current, value if current.pending.kind == "normal" else None))
@@ -7062,8 +7284,17 @@ class _ProofContext:
                 # handlers/finally. Interior handlers must still see the
                 # original exception. Generator resumption is not modeled.
                 if isinstance(scope, ast.AsyncFunctionDef) and state.pending.kind == "raise" \
-                        and _ProofEffects.exception_name(state.pending.error) == "StopIteration":
-                    state = replace(state, pending=_ProofCompletion("raise", "RuntimeError"))
+                        and state.pending.error_kind == "StopIteration":
+                    original = state.pending.error
+                    if state.exception_object(original) is None:
+                        raise _ProofIncomplete("unowned-coroutine-stop")
+                    active = state.active
+                    state = self._implicit_error(scope, "RuntimeError", replace(state,
+                        active=active + (("error", original),)), stats)
+                    reserve_graph(state, passes=4)
+                    state = _ProofEffects.explicitly_raised(state, state.pending.error, original, True)
+                    state = replace(state, active=active)
+                    self._check_alias_budget(state, stats)
                 exits.append(state)
 
             def begin_finally(cursor, state):
@@ -7211,7 +7442,8 @@ class _ProofContext:
                         matches, error = _ProofEffects.handler_match(outcome.value, saved[2], outcome.state) \
                             if handler.type is not None else (True, None)
                         if error is not None:
-                            finish_search(cursor, outcome.state, _ProofCompletion("raise", error))
+                            current = self._implicit_error(handler, error, outcome.state, stats)
+                            finish_search(cursor, current, current.pending)
                         elif not matches:
                             enqueue(cursor[:-1] + ((container_id, "handler-next", position + 1),), outcome.state)
                         else:
@@ -7339,13 +7571,15 @@ class _ProofContext:
                             if error is None:
                                 reserve_graph(current, passes=4)
                                 current = _ProofEffects.explicitly_raised(current, payload, cause, node.cause is not None)
-                            current = replace(current, pending=_ProofCompletion("raise", error or payload))
+                            current = self._implicit_error(node, error, current, stats) if error is not None \
+                                else replace(current, pending=_ProofCompletion("raise", payload))
                             current = drop_holds(current, state.temporaries)
                             record(node, "transfer", current)
                             enqueue(successor, current)
                         continue
                     if not state.active or state.active[-1] == ("no-active",):
-                        error = "RuntimeError"
+                        state = self._implicit_error(node, "RuntimeError", state, stats)
+                        error = state.pending.error
                     elif len(state.active[-1]) == 2 and state.active[-1][0] == "error":
                         error = state.active[-1][1]
                         if error is None:
@@ -24639,7 +24873,7 @@ class ProofNamespaceTests(unittest.TestCase):
     def test_mapping_absence_does_not_fall_back_to_builtins(self):
         context, snapshot = self._solve("ns=globals()\nx=ns['int']\ny=1\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["KeyError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["KeyError"])
         self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
 
     def test_global_deletion_restores_fallback_but_builtin_deletion_removes_it(self):
@@ -24648,7 +24882,7 @@ class ProofNamespaceTests(unittest.TestCase):
         self.assertTrue(snapshot.native_identity(context.tree.body[-1], "int"))
         context, snapshot = self._solve("import builtins as b\ndel b.int\nmarker=int\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
 
     def test_function_entry_globals_are_not_silently_assumed_absent(self):
         context = _ProofContext("int=0\ndef f():\n    marker=int\n")
@@ -24689,7 +24923,7 @@ class ProofNamespaceTests(unittest.TestCase):
             with self.subTest(op=op):
                 context, snapshot = self._solve("import builtins as b\n" + op + "\nmarker=int\n")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], ["AttributeError"])
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["AttributeError"])
                 self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
 
     def test_foreign_snapshot_state_does_not_supply_point_values(self):
@@ -24780,7 +25014,7 @@ class ProofNamespaceTests(unittest.TestCase):
         self.assertFalse(snapshot.unreachable(context.tree.body[-1]))
         context, snapshot = self._solve("ordinary_missing\nx=1\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
 
     def test_bare_debug_constant_is_independent_of_builtin_mapping_entry(self):
         for operation in ("del b.__dict__['__debug__']", "b.__dict__['__debug__']=False"):
@@ -24947,7 +25181,7 @@ class ProofNamespaceTests(unittest.TestCase):
                     "import builtins as b\nexec('b.int=lambda:0')\nsaved=int\n"
                     + call + "\nmarker=1\n")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
                 self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
 
     def test_dynamic_inner_lookup_errors_precede_captured_call_error(self):
@@ -24961,7 +25195,7 @@ class ProofNamespaceTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 context, snapshot = self._solve(prefix + f"eval({payload!r})\nmarker=1\n")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
                 self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
 
     def test_dynamic_receiver_can_come_from_selected_builtin_mapping(self):
@@ -24991,7 +25225,7 @@ class ProofNamespaceTests(unittest.TestCase):
                 snapshot = context.solve(func, entry=(seed,))
                 self.assertTrue(snapshot.complete, snapshot.reasons)
                 if error:
-                    self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                    self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
                 else:
                     self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"),
                                      _ProofValue.literal(0))
@@ -25023,7 +25257,7 @@ class ProofNamespaceTests(unittest.TestCase):
                                                      {"steps": 0, "states": 0})
                 if error:
                     self.assertEqual(state.pending.kind, "raise")
-                    self.assertEqual(state.pending.error, error)
+                    self.assertEqual(state.pending.error_kind, error)
                 else:
                     self.assertEqual(state.pending.kind, "normal")
                     token = _ProofEffects.single(state.region_value(("builtins", 0), "int"))
@@ -25063,7 +25297,7 @@ class ProofNamespaceTests(unittest.TestCase):
             "import builtins as b\nglobals()['__debug__']=b\n"
             "exec('__debug__.int=lambda:0')\nmarker=1\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["AttributeError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["AttributeError"])
 
     def test_dynamic_class_cell_is_not_falsely_missing(self):
         context = _ProofContext("class C:\n    def f(self):\n"
@@ -25089,7 +25323,7 @@ class ProofNamespaceTests(unittest.TestCase):
                     f"iterator=iter(saved,0)\nexec('b.int=lambda:{second}')\nresult=next(iterator)\n")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
                 if error:
-                    self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                    self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
                 else:
                     self.assertEqual(snapshot.exits[0].lookup(0, "result"), _ProofValue.literal(1))
 
@@ -25097,7 +25331,7 @@ class ProofNamespaceTests(unittest.TestCase):
         context, snapshot = self._solve(
             "import builtins as b\niterator=iter(int,0)\nexec('b.int=lambda:1')\nnext(iterator)\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["StopIteration"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["StopIteration"])
 
     def test_iterator_unknown_callback_or_sentinel_does_not_prove_exhaustion(self):
         for call in ("iter(callback,0)", "iter(int,sentinel)"):
@@ -25109,7 +25343,7 @@ class ProofNamespaceTests(unittest.TestCase):
     def test_callback_argument_error_precedes_iterator_creation(self):
         context, snapshot = self._solve("iterator=iter(int,missing)\nmarker=1\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
         self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
 
     def test_keyword_expansion_is_not_a_fabricated_signature_error(self):
@@ -25197,7 +25431,7 @@ class ProofNamespaceTests(unittest.TestCase):
         func = context.tree.body[0]
         snapshot = context.solve(func)
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["UnboundLocalError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["UnboundLocalError"])
         self.assertTrue(snapshot.unreachable(func.body[-1].targets[0]))
 
     def test_selected_if_branch_carries_actual_effect_not_the_other_branch(self):
@@ -25223,7 +25457,7 @@ class ProofNamespaceTests(unittest.TestCase):
         func = context.tree.body[0]
         snapshot = context.solve(func)
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
         self.assertTrue(snapshot.unreachable(func.body[-1]))
 
     def test_dead_dynamic_payload_is_not_parsed_or_rejected(self):
@@ -25243,7 +25477,7 @@ class ProofNamespaceTests(unittest.TestCase):
             with self.subTest(call=call):
                 context, snapshot = self._solve(f"saved=lambda:1\n{call}\nmarker=1\n")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
 
     def test_literal_lambda_with_prologue_or_effects_is_not_a_constant_summary(self):
         for value in ("lambda:True", "lambda:1.0", "lambda:+1", "lambda:x",
@@ -25284,7 +25518,7 @@ class ProofNamespaceTests(unittest.TestCase):
                                         "    break\nmarker=1\n")
         loop = context.tree.body[1]
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
         self.assertTrue(snapshot.states_at(loop.target))
         self.assertTrue(snapshot.unreachable(loop.body[0]))
 
@@ -25316,7 +25550,7 @@ class ProofNamespaceTests(unittest.TestCase):
         context, snapshot = self._solve("saved=lambda:1\nfor x in iter(saved,0):\n"
                                         "    missing\n    pass\nmarker=1\n")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([(state.pending.kind, state.pending.error) for state in snapshot.exits],
+        self.assertEqual([(state.pending.kind, state.pending.error_kind) for state in snapshot.exits],
                          [("raise", "NameError")])
 
     def test_unproven_nonquiet_backedge_cannot_certify_dead_continuation(self):
@@ -25409,7 +25643,7 @@ class ProofNamespaceTests(unittest.TestCase):
                     + call + "\nmarker=1\n",
                     entry=(_ProofState().bind(0, "__name__", _ProofValue.absent()),))
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
 
     def test_opaque_instance_and_class_protocol_controls_remain_incomplete(self):
         context = _ProofContext("def f(b):\n    b.int=1\n    marker=int\n")
@@ -25482,7 +25716,7 @@ class ProofNamespaceTests(unittest.TestCase):
                 self.assertEqual(snapshot.native_identity(loop, "int"), native)
                 self.assertEqual(snapshot.unreachable(func.body[-1]), kind != "normal")
                 if kind == "raise":
-                    self.assertEqual(snapshot.exits[0].pending.error, "UnboundLocalError")
+                    self.assertEqual(snapshot.exits[0].pending.error_kind, "UnboundLocalError")
 
     def test_deferred_class_completion_cannot_assume_pristine_builtins(self):
         context = _ProofContext("class B: pass\ndef f():\n    marker=int\n")
@@ -25612,6 +25846,256 @@ class ProofFlowTests(unittest.TestCase):
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
 
+    def test_implicit_name_errors_own_args_and_runtime_name_without_inventing_local_name(self):
+        for body, kind, expected in (("missing", "NameError", "missing"),
+                ("local\n    local=1", "UnboundLocalError", None)):
+            with self.subTest(kind=kind):
+                context, func, snapshot = self._solve("try:\n    "+body+"\nexcept NameError as e:\n"
+                    "    saved=e\n    name=e.name\n    args=e.args\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                owner = context.index.node_id(func)
+                self.assertEqual(state.lookup(owner, "name"), _ProofValue.literal(expected))
+                item = state.exception_object(_ProofEffects.single(state.lookup(owner, "saved"))[1])
+                self.assertEqual(item.payload[1], kind)
+                args = _ProofEffects.sequence_info(state.lookup(owner, "args"), state)[0]
+                self.assertEqual(len(args), 1)
+                self.assertEqual(_ProofEffects.single(args[0])[0], "plain-string")
+                self.assertIn(("raised", frozenset({item.payload})), state.exception_metadata)
+
+    def test_implicit_member_error_retains_actual_receiver_and_key(self):
+        for operation, field, expected in (("box.missing", "obj", "box"),
+                ("box.missing", "name", "'missing'"), ("globals()['missing']", "args[0]", "'missing'")):
+            with self.subTest(operation=operation, field=field):
+                context, func, snapshot = self._solve("class Box: pass\nbox=Box()\nbox.held=x\n"
+                    "try:\n    "+operation+"\nexcept (AttributeError,KeyError) as e:\n"
+                    "    value=e."+field+"\n" + ("    same=value is box\n" if field == "obj" else "")
+                    + "    saved=e\nmarker=int", parameters="x", entry=(
+                        _ProofState().bind(0, "__name__", _ProofValue.literal("fixture")).bind(1, "x",
+                            _ProofValue(frozenset({("opaque", "parameter", 1, "x")}))),))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                if field == "obj":
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "same"), _ProofValue.literal(True))
+                else:
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "value"), _ProofValue.literal("missing"))
+
+    def test_implicit_attribute_receiver_is_a_real_retention_edge(self):
+        for keep in (False, True):
+            with self.subTest(keep=keep):
+                context, func, snapshot = self._solve("class Box: pass\nbox=Box()\nbox.held=x\n"
+                    "try:\n    box.missing\nexcept AttributeError as e:\n    saved=e\n"
+                    "x=box=0\n" + ("keep=saved.obj\n" if keep else "") + "saved=0\nmarker=int", parameters="x", entry=(
+                        _ProofState().bind(0, "__name__", _ProofValue.literal("fixture")).bind(1, "x",
+                            _ProofValue(frozenset({("opaque", "parameter", 1, "x")}))),))
+                self.assertEqual(snapshot.complete, keep, snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value, "int"), keep)
+
+    def test_implicit_error_context_is_the_active_owned_instance_not_its_kind(self):
+        context, func, snapshot = self._solve("try:\n    missing\nexcept NameError as first:\n"
+            "    try:\n        int('bad')\n    except ValueError as second:\n"
+            "        same=second.__context__ is first\n        saved=second\nmarker=int")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(state.lookup(context.index.node_id(func), "same"), _ProofValue.literal(True))
+        payload = _ProofEffects.single(state.lookup(context.index.node_id(func), "saved"))[1]
+        self.assertEqual(state.exception_object(payload).payload[1], "ValueError")
+
+    def test_implicit_error_copy_bare_reraise_and_empty_stop_iteration_are_owned(self):
+        for operation, kind, count in (("missing", "NameError", 1),
+                ("raise", "RuntimeError", 1), ("next(iter(int,0))", "StopIteration", 0)):
+            with self.subTest(operation=operation):
+                context, func, snapshot = self._solve("try:\n    "+operation+"\nexcept BaseException as e:\n"
+                    "    saved=e\n    try:\n        raise\n    except BaseException as again:\n"
+                    "        same=again is saved\nraise saved")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                self.assertEqual(state.lookup(context.index.node_id(func), "same"), _ProofValue.literal(True))
+                item = state.exception_object(state.pending.error)
+                self.assertIsNotNone(item)
+                self.assertEqual(item.payload[1], kind)
+                self.assertEqual(len(item.arguments), count)
+
+    def test_dynamic_setattr_error_uses_its_actual_receiver_and_runtime_version(self):
+        context, func, snapshot = self._solve("b=0\ntry:\n    exec('b.int=lambda:0')\n"
+            "except AttributeError as e:\n    obj=e.obj\n    name=e.name\nmarker=int")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        self.assertEqual(state.lookup(owner, "obj"), _ProofValue.literal(0 if sys.version_info[:2] == (3,14) else None))
+        self.assertEqual(state.lookup(owner, "name"), _ProofValue.literal("int" if sys.version_info[:2] == (3,14) else None))
+
+    def test_implicit_entry_requires_a_real_creation_origin_not_any_expression(self):
+        context = _ProofContext("def f(E):\n    marker=int\ndef allocate():\n    E=ValueError(123)\n")
+        func, allocate = context.tree.body
+        state = context.solve(allocate).exits[0]
+        item = state.exception_objects[0]
+        payload = ("native-exception", "ValueError", context.index.node_id(allocate.body[0].value.args[0]))
+        forged = replace(item, payload=payload, origin="implicit")
+        entry = replace(state, bindings=(), exception_objects=(forged,),
+            exception_metadata=(("raised",frozenset({payload})),)).bind(context.index.node_id(func), "E",
+                _ProofValue(frozenset({("exception",payload)})))
+        snapshot = context.solve(func, entry=(entry,))
+        self.assertFalse(snapshot.complete)
+        self.assertIn("unsupported-exception-entry", snapshot.reasons)
+
+    def test_implicit_native_descriptor_errors_preserve_args_and_load_only_augmentation(self):
+        for constructor, operation, args, name, held in (
+                ("OSError()", "E.characters_written", ("characters_written",), "characters_written", True),
+                ("OSError()", "del E.characters_written", ("characters_written",), None, False),
+                ("ExceptionGroup('g',[ValueError()])", "E.message=1", ("readonly attribute",), None, False),
+                ("ExceptionGroup('g',[ValueError()])", "del E.exceptions", ("readonly attribute",), None, False)):
+            with self.subTest(operation=operation):
+                context, func, snapshot = self._solve("E="+constructor+"\ntry:\n    "+operation+"\n"
+                    "except AttributeError as e:\n    args=e.args\n    name=e.name\n    same=e.obj is E\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                owner = context.index.node_id(func)
+                self.assertEqual(_ProofEffects.sequence_info(state.lookup(owner,"args"),state)[0],
+                                 tuple(_ProofValue.literal(value) for value in args))
+                self.assertEqual(state.lookup(owner,"name"), _ProofValue.literal(name))
+                self.assertEqual(state.lookup(owner,"same"), _ProofValue.literal(held))
+
+    def test_legacy_caller_context_is_borrowed_not_a_fabricated_owned_instance(self):
+        for body, complete in (("pass", True), ("old=e.__context__\nold.args=()", False),
+                ("old=e.__context__\nvalue=old.args", False), ("same=e.__context__ is e.__context__", False)):
+            with self.subTest(body=body):
+                context, func, snapshot = self._solve("try:\n    missing\nexcept NameError as e:\n"
+                    + "".join("    "+line+"\n" for line in body.splitlines()) + "marker=int", entry=(
+                        _ProofState(active=(("error","LookupError"),)),))
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"), complete)
+                if complete:
+                    state = snapshot.exits[0]
+                    self.assertEqual(state.borrowed_exceptions, (("borrowed-exception","LookupError",0),))
+                    self.assertEqual(state.active, (("error",state.borrowed_exceptions[0]),))
+                    self.assertFalse(state.exception_objects)
+
+    def test_legacy_same_kind_caller_slots_are_distinct_unknown_metadata_roots(self):
+        context, func, snapshot = self._solve("try:\n    missing\nexcept NameError as e:\n    saved=e\nraise",
+            entry=(_ProofState(active=(("error","LookupError"),("error","LookupError"))),))
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(len(state.borrowed_exceptions),2)
+        self.assertNotEqual(*state.borrowed_exceptions)
+        self.assertEqual(state.pending.error,state.borrowed_exceptions[1])
+        saved = state.exception_object(_ProofEffects.single(state.lookup(context.index.node_id(func),"saved"))[1])
+        self.assertEqual(dict(saved.fields)["__context__"],
+                         _ProofValue(frozenset({("exception",state.borrowed_exceptions[1])})))
+        self.assertFalse(any(set(state.borrowed_exceptions) & members for tag,members in state.exception_metadata))
+        self.assertFalse(context.solve(func,entry=(replace(state,active=()),)).complete)
+
+    def test_private_name_projection_is_not_a_runtime_namespace_lookup_proof(self):
+        context = _ProofContext("class C:\n    def f():\n        __missing\n")
+        cls = context.tree.body[0]
+        func = cls.body[0]
+        for scope in (cls,func):
+            self.assertEqual(context.index.runtime_name(scope,"__missing"),"_C__missing")
+            self.assertEqual(context.index.runtime_name(scope,"__missing__"),"__missing__")
+            self.assertEqual(context.index.runtime_name(scope,"plain"),"plain")
+
+    def test_coroutine_implicit_stop_conversion_retains_cause_and_context_identity(self):
+        context = _ProofContext("async def f():\n    next(iter(int,0))\n")
+        snapshot = context.solve(context.tree.body[0])
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        runtime = state.exception_object(state.pending.error)
+        self.assertEqual(runtime.payload[1],"RuntimeError")
+        fields = dict(runtime.fields)
+        self.assertEqual(fields["__cause__"],fields["__context__"])
+        original = state.exception_object(_ProofEffects.single(fields["__cause__"])[1])
+        self.assertEqual(original.payload[1],"StopIteration")
+        self.assertEqual(original.arguments,())
+
+    def test_unknown_active_error_cannot_become_known_empty_context(self):
+        for operation in ("missing", "raise ValueError"):
+            with self.subTest(operation=operation):
+                context,func,snapshot = self._solve("try:\n    "+operation+"\nexcept BaseException as e:\n"
+                    "    value=e.__context__\nmarker=int", entry=(_ProofState(active=(("unknown-active",),)),))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_explicit_borrowed_raise_cannot_skip_unknown_context_mutation(self):
+        context,func,snapshot = self._solve("try:\n    missing\nexcept NameError as e:\n"
+            "    previous=e.__context__\n    try:\n        raise previous\n    except LookupError:\n"
+            "        value=e.__context__\nmarker=int", entry=(_ProofState(active=(("error","LookupError"),)),))
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
+        context,func,snapshot = self._solve("raise",entry=(_ProofState(active=(("error","LookupError"),)),))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"LookupError")
+
+    def test_private_runtime_namespace_crossings_cannot_use_raw_lexical_keys(self):
+        for operation in ("__missing", "del __missing", "__missing=2", "b.__missing"):
+            for raw in (True,False):
+                with self.subTest(operation=operation,raw=raw):
+                    context = _ProofContext("_C__missing=1\nclass C:\n    global __missing\n    try:\n        "
+                        + operation + "\n    except (NameError,AttributeError):\n        marker=7\n")
+                    cls = context.tree.body[1]
+                    name = "__missing" if raw else "_C__missing"
+                    seed = _ProofState().write_region(("globals",0),name,_ProofValue.literal(1)) \
+                        .bind(context.index.node_id(cls),"b",_ProofEffects.namespace("module",("builtins",0)))
+                    snapshot = context.solve(cls,entry=(seed,))
+                    self.assertFalse(snapshot.complete)
+                    self.assertFalse(snapshot.unreachable(cls.body[-1].handlers[0].body[0]))
+
+    def test_escaping_implicit_errors_and_coroutine_conversion_obey_alias_storage_cap(self):
+        for asynchronous,body,storage in ((False,"missing",6),(True,"next(iter(int,0))",10)):
+            for cap in (0,storage-1):
+                with self.subTest(asynchronous=asynchronous,cap=cap):
+                    context = _ProofContext(("async " if asynchronous else "")+"def f():\n    "+body+"\n",
+                        limits={"aliases":cap})
+                    snapshot = context.solve(context.tree.body[0])
+                    self.assertFalse(snapshot.complete)
+                    self.assertIn("alias-budget",snapshot.reasons)
+
+    def test_borrowed_raw_control_references_require_registered_caller_roots(self):
+        context = _ProofContext("def f():\n    try:\n        raise\n    finally:\n        pass\n")
+        func = context.tree.body[0]
+        site = context.index.node_id(func.body[0])
+        for slot in (-1,0,99):
+            payload = ("borrowed-exception","LookupError",slot)
+            for seed in (_ProofState(epoch=context._epoch,active=(("error",payload),)),
+                    _ProofState(epoch=context._epoch,pending=_ProofCompletion("raise",payload)),
+                    _ProofState(epoch=context._epoch,continuation=(("finally",site,
+                        _ProofCompletion("raise",payload).token(),()),))):
+                with self.subTest(slot=slot,seed=seed):
+                    snapshot = context.solve(func,entry=(seed,))
+                    self.assertFalse(snapshot.complete)
+                    self.assertIn("unregistered-borrowed-entry",snapshot.reasons)
+
+    def test_malformed_shared_error_payloads_are_rejected_before_entry_hash_and_alias_walk(self):
+        for depth in (6,8):
+            payload = ("unknown-error",)
+            for unused in range(depth):
+                payload = (payload,payload)
+            context = _ProofContext("def f():\n    try:\n        pass\n    finally:\n        pass\n",limits={"steps":100})
+            func = context.tree.body[0]
+            site = context.index.node_id(func.body[0])
+            for seed in (_ProofState(active=(("error",payload),)),
+                    _ProofState(pending=_ProofCompletion("raise",payload)),
+                    _ProofState(continuation=(("finally",site,_ProofCompletion("raise",payload).token(),()),))):
+                with self.subTest(depth=depth,seed=seed):
+                    snapshot = context.solve(func,entry=(seed,))
+                    self.assertFalse(snapshot.complete)
+                    self.assertIn("unsupported-control-entry",snapshot.reasons)
+
+    def test_control_entry_cost_depends_on_semantic_slots_not_host_tuple_sharing(self):
+        costs = []
+        for copied in (False,True):
+            context = _ProofContext("def f():\n    try:\n        pass\n    finally:\n        pass\n")
+            func = context.tree.body[0]
+            frame = ("error","LookupError")
+            saved = tuple(list(frame)) if copied else frame
+            entry = _ProofState(active=(frame,),continuation=(("finally",context.index.node_id(func.body[0]),
+                _ProofCompletion().token(),(saved,)),))
+            snapshot = context.solve(func,entry=(entry,))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            costs.append(dict(snapshot.stats))
+            before = dict(context.total_compute)
+            self.assertIs(context.solve(func,entry=(entry,entry)),snapshot)
+            self.assertEqual(dict(context.total_compute),before)
+        self.assertEqual(*costs)
+
     def test_owned_slice_read_and_replace_keep_ordered_slots_and_aliases(self):
         context, func, snapshot = self._solve("L=[0,1,2,3,4]\nreverse=L[::-1]\npart=L[1:4:2]\n"
             "L[1:4]=[8,9]\nL[::2]=(6,7)\ndel L[1::2]\nmarker=int")
@@ -25642,7 +26126,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 context, func, snapshot = self._solve("L=[0,1,2]\nT=()\n"+operation, parameters="x")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
                 if operation == "L[missing::0]=missing2":
                     self.assertFalse(snapshot.states_at(func.body[-1].targets[0].value))
 
@@ -25715,7 +26199,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(constructor=constructor, field=field):
                 context, func, snapshot = self._solve("E="+constructor+"\nvalue=E."+field)
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, error)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, error)
                 if error is None:
                     self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "value"), _ProofValue.literal(expected))
 
@@ -25725,7 +26209,7 @@ class ProofFlowTests(unittest.TestCase):
                 context, func, snapshot = self._solve("E=SyntaxError()\nmetadata=E._metadata", semantic_key=version)
                 self.assertEqual(snapshot.complete, complete, snapshot.reasons)
                 if complete:
-                    self.assertEqual(snapshot.exits[0].pending.error, error)
+                    self.assertEqual(snapshot.exits[0].pending.error_kind, error)
 
     def test_system_exit_code_aliases_original_args_even_after_args_replacement(self):
         context, func, snapshot = self._solve("E=SystemExit(1,2)\nold=E.args\na=E.code is old\n"
@@ -25759,7 +26243,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 context, func, snapshot = self._solve("E=ExceptionGroup('g',[ValueError()])\n"+operation)
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
 
     def test_numeric_native_field_stores_normalize_and_preserve_descriptor_errors(self):
         huge = str(sys.maxsize + 1)
@@ -25774,7 +26258,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(constructor=constructor, operation=operation):
                 context, func, snapshot = self._solve("E="+constructor+"\n"+operation+("\nvalue="+value if value else ""))
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, error)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, error)
                 if value:
                     self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "value"), _ProofValue.literal(expected))
 
@@ -25806,7 +26290,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(compare=compare):
                 context, func, snapshot = self._solve("a=[]\nb=[]\nresult="+compare+"\nmarker=int")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, error)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, error)
                 if error is None:
                     self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"), _ProofValue.literal(expected))
                     self.assertFalse(snapshot.exits[0].temporaries)
@@ -25919,7 +26403,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 context, func, snapshot = self._solve(operation)
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
                 if expected is None:
                     owner = context.index.node_id(func)
                     self.assertEqual(snapshot.exits[0].lookup(owner, "a"), _ProofValue.literal(2))
@@ -26052,7 +26536,7 @@ class ProofFlowTests(unittest.TestCase):
                 self.assertTrue(snapshot.complete, snapshot.reasons)
                 self.assertEqual([state.pending.kind for state in snapshot.exits], [kind])
                 state = snapshot.exits[0]
-                self.assertEqual(state.pending.error, error)
+                self.assertEqual(state.pending.error_kind, error)
                 if kind == "return":
                     self.assertEqual(state.pending.value, _ProofValue.literal(value))
                 self.assertFalse(state.active)
@@ -26070,8 +26554,9 @@ class ProofFlowTests(unittest.TestCase):
                 context, func, snapshot = self._solve(
                     "try:\n    " + statement + "\nfinally:\n    raise\nmarker=int", entry=(entry,))
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], [error])
-                self.assertEqual(snapshot.exits[0].active, ambient)
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], [error])
+                self.assertEqual(tuple((frame[0], _ProofEffects.exception_name(frame[1]) or frame[1])
+                    if len(frame) == 2 else frame for frame in snapshot.exits[0].active), ambient)
                 self.assertFalse(snapshot.exits[0].continuation)
         context, func, snapshot = self._solve("raise\nmarker=int", entry=(
             _ProofState(active=(("unknown-active",),)),))
@@ -26328,8 +26813,9 @@ class ProofFlowTests(unittest.TestCase):
                 context = _ProofContext(source)
                 snapshot = context.solve(context.tree.body[0], entry=(_ProofState(active=ambient),))
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
-                self.assertEqual(snapshot.exits[0].active, ambient)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
+                self.assertEqual(tuple((frame[0], _ProofEffects.exception_name(frame[1]) or frame[1])
+                    if len(frame) == 2 else frame for frame in snapshot.exits[0].active), ambient)
 
     def test_handler_target_is_cleared_not_restored_even_if_deleted_in_body(self):
         for handler_body in ("pass", "del e", "e=1", "return e"):
@@ -26390,7 +26876,7 @@ class ProofFlowTests(unittest.TestCase):
                 self.assertTrue(snapshot.unreachable(func.body[-1]))
         context, func, snapshot = self._solve("NameError=0\nraise NameError\nmarker=int")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual(snapshot.exits[0].pending.error, "TypeError")
+        self.assertEqual(snapshot.exits[0].pending.error_kind, "TypeError")
 
     def test_generator_region_does_not_claim_unmodeled_escaping_stop_iteration(self):
         for body in ("raise StopIteration\nyield", "return 1\nyield"):
@@ -26444,7 +26930,7 @@ class ProofFlowTests(unittest.TestCase):
         seeds = (_ProofState(), _ProofState(active=(("error", "TypeError"),)))
         snapshot = context.solve(context.tree.body[0], entry=seeds)
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual({state.pending.error for state in snapshot.exits}, {"RuntimeError", "TypeError"})
+        self.assertEqual({state.pending.error_kind for state in snapshot.exits}, {"RuntimeError", "TypeError"})
         self.assertEqual(len(snapshot.exits), 2)
 
     def test_incoming_handler_frames_require_correct_owned_node_kinds(self):
@@ -26474,13 +26960,14 @@ class ProofFlowTests(unittest.TestCase):
                 self.assertTrue(snapshot.complete, snapshot.reasons)
                 self.assertEqual(snapshot.exits[0].pending.kind, expected)
                 if expected == "raise":
-                    self.assertEqual(snapshot.exits[0].pending.error, "RuntimeError")
+                    self.assertEqual(snapshot.exits[0].pending.error_kind, "RuntimeError")
                 else:
                     self.assertEqual(snapshot.exits[0].pending.value, _ProofValue.literal(7))
                 # Interior transfer retains StopIteration until frame escape.
                 if len(func.body) == 1 and isinstance(func.body[0], ast.Try):
                     handler = func.body[0].handlers[0]
-                    self.assertEqual(snapshot.states_at(handler, "entry")[0].active[-1], ("error", "StopIteration"))
+                    active = snapshot.states_at(handler, "entry")[0].active[-1]
+                    self.assertEqual((active[0], _ProofEffects.exception_name(active[1])), ("error", "StopIteration"))
 
     def test_compiler_invalid_handler_forms_are_rejected_even_if_dead(self):
         for body in ("try:\n    raise NameError\nexcept:\n    marker=int\nexcept BaseException:\n    pass",
@@ -26508,7 +26995,7 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext("class C:\n    del __qualname__\n    marker=__qualname__\n")
         snapshot = context.solve(context.tree.body[0])
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual(snapshot.exits[0].pending.error, "NameError")
+        self.assertEqual(snapshot.exits[0].pending.error_kind, "NameError")
 
     def test_class_implicit_module_does_not_mean_absent_or_quietly_releasable(self):
         for body in ("__module__\nmarker=int", "__module__=1\nmarker=int"):
@@ -26529,7 +27016,7 @@ class ProofFlowTests(unittest.TestCase):
             self.assertEqual(snapshot.exits[0].pending.kind, "normal")
             self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(cls), "marker"), _ProofValue.literal(1))
         else:
-            self.assertEqual(snapshot.exits[0].pending.error, "NameError")
+            self.assertEqual(snapshot.exits[0].pending.error_kind, "NameError")
         if sys.version_info < (3, 14):
             context = _ProofContext("class C:\n    try:\n        try:\n            raise NameError\n"
                                     "        except __annotations__:\n            pass\n    except TypeError:\n        marker=int\n"
@@ -26608,7 +27095,7 @@ class ProofFlowTests(unittest.TestCase):
                     self.assertEqual(state.lookup(context.index.node_id(func), "x"), _ProofValue.literal(value))
                     self.assertTrue(snapshot.native_identity(func.body[-1].value, "int"))
                 else:
-                    self.assertEqual(state.pending.error, error)
+                    self.assertEqual(state.pending.error_kind, error)
                     self.assertTrue(snapshot.unreachable(func.body[-1]))
 
     def test_quiet_prefix_and_first_argument_error_do_not_invent_other_errors(self):
@@ -26616,11 +27103,11 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(first=first):
                 context, func, snapshot = self._solve("try:\n    " + first + "\n    int('bad')\nexcept NameError:\n    pass\nmarker=int")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
                 self.assertEqual(snapshot.unreachable(func.body[-1]), expected is not None)
         context, func, snapshot = self._solve("int(missing,unexpected=missing2)\nmarker=int")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual(snapshot.exits[0].pending.error, "NameError")
+        self.assertEqual(snapshot.exits[0].pending.error_kind, "NameError")
         self.assertTrue(snapshot.unreachable(func.body[-1]))
 
     def test_native_exception_literal_constructor_preserves_class_and_capture(self):
@@ -26643,7 +27130,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(call=call):
                 context, func, snapshot = self._solve("e=" + call + "\nmarker=int")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
                 self.assertTrue(snapshot.unreachable(func.body[-1]))
 
     def test_explicit_cause_evaluates_after_exception_but_before_raise_validation(self):
@@ -26696,7 +27183,7 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(header=header):
                 context, func, snapshot = self._solve("try:\n    raise NameError\nexcept " + header + ":\n    pass")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, "TypeError")
+                self.assertEqual(snapshot.exits[0].pending.error_kind, "TypeError")
 
     def test_unicode_constructors_validate_types_and_signed_indexes(self):
         huge = str(sys.maxsize + 1)
@@ -26722,10 +27209,10 @@ class ProofFlowTests(unittest.TestCase):
             with self.subTest(indexes=indexes):
                 context, func, snapshot = self._solve("raise UnicodeDecodeError('u',0," + indexes + ",'r')\nmarker=int")
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                self.assertEqual(snapshot.exits[0].pending.error_kind, expected)
         context, func, snapshot = self._solve("raise UnicodeDecodeError('u',b'x',missing,1,'r')")
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual(snapshot.exits[0].pending.error, "NameError")
+        self.assertEqual(snapshot.exits[0].pending.error_kind, "NameError")
 
     def test_empty_argument_expansions_keep_special_constructor_arity(self):
         for constructor in ("UnicodeDecodeError(*[],'u',b'x',0,1,'r')",
@@ -26791,7 +27278,7 @@ class ProofFlowTests(unittest.TestCase):
         self.assertFalse(snapshot.unreachable(func.body[-1]))
         context, func, snapshot = self._solve("int(1,2,3)", limits={"steps": 1000})
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual(snapshot.exits[0].pending.error, "TypeError")
+        self.assertEqual(snapshot.exits[0].pending.error_kind, "TypeError")
 
     def test_composite_shape_growth_and_value_depth_fail_closed_before_hashing(self):
         for repeated, count, limits, reason in (("x=(x,x)", 22, {"steps": 1000}, "work-budget"),
@@ -27213,7 +27700,7 @@ class ProofOutcomeTests(unittest.TestCase):
         context = self._context("print(missing)\nmarker=int\n")
         snapshot = context.solve()
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
         self.assertFalse(snapshot.states_at(context.tree.body[0].value, "invoke"))
         self.assertFalse(getattr(snapshot, "observations", ()))
         self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
@@ -27260,7 +27747,8 @@ class ProofOutcomeTests(unittest.TestCase):
         snapshot = context.solve(entry=(seed,))
         self.assertTrue(snapshot.complete, snapshot.reasons)
         for state in snapshot.exits + tuple(item.state for item in snapshot.observations):
-            self.assertEqual(state.active, seed.active)
+            self.assertEqual(tuple((frame[0], _ProofEffects.exception_name(frame[1]) or frame[1])
+                for frame in state.active), seed.active)
         before = dict(context.total_compute)
         self.assertIs(context.solve(entry=(seed,)), snapshot)
         self.assertEqual(dict(context.total_compute), before)
@@ -27271,7 +27759,7 @@ class ProofOutcomeTests(unittest.TestCase):
         self.assertTrue(snapshot.complete, snapshot.reasons)
         self.assertEqual(len(snapshot.exits), 2)
         self.assertTrue(all(state.pending.kind == "raise" for state in snapshot.exits))
-        self.assertEqual(sum(state.pending.error == "NameError" for state in snapshot.exits), 1)
+        self.assertEqual(sum(state.pending.error_kind == "NameError" for state in snapshot.exits), 1)
         self.assertEqual(len(snapshot.observations), 1)
         self.assertFalse(snapshot.states_at(context.tree.body[0].value, "invoke"))
         self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
@@ -27337,7 +27825,7 @@ class ProofOutcomeTests(unittest.TestCase):
         context = self._context("print(f'{missing:unsupported}')\nmarker=int\n")
         snapshot = context.solve()
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
         self.assertFalse(snapshot.observations)
         self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
         context = self._context("print(f'{1:unsupported}')\nmarker=int\n")
@@ -27353,7 +27841,7 @@ class ProofOutcomeTests(unittest.TestCase):
                 self.assertTrue(snapshot.complete, snapshot.reasons)
                 self.assertEqual(sorted(state.pending.kind for state in snapshot.exits), ["normal", "raise"])
                 raised = next(state for state in snapshot.exits if state.pending.kind == "raise")
-                self.assertEqual(raised.pending.error, "ValueError")
+                self.assertEqual(raised.pending.error_kind, "ValueError")
                 self.assertTrue(raised.lookup(0, "text").is_unbound)
                 self.assertFalse(snapshot.observations)
         context = self._context("text=f'{0x" + "f" * 400 + "}'\nmarker=int\n")
@@ -27376,7 +27864,7 @@ class ProofOutcomeTests(unittest.TestCase):
                 context = self._context("text=f'{" + value + ":{missing_spec}}'\nmarker=int\n")
                 snapshot = context.solve()
                 self.assertTrue(snapshot.complete, snapshot.reasons)
-                self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
                 specification = context.tree.body[0].value.values[0].format_spec
                 self.assertEqual(bool(snapshot.states_at(specification)), value == "1")
                 self.assertTrue(snapshot.unreachable(context.tree.body[-1]))
@@ -27459,7 +27947,7 @@ class ProofStateTests(unittest.TestCase):
         self.assertTrue(snapshot.complete, snapshot.reasons)
         self.assertEqual(snapshot.states_at(func.body[0].targets[0]), ())
         self.assertTrue(snapshot.unreachable(func.body[1]))
-        self.assertEqual([(state.pending.kind, state.pending.error)
+        self.assertEqual([(state.pending.kind, state.pending.error_kind)
                           for state in snapshot.exits], [("raise", "UnboundLocalError")])
 
     def test_parameters_are_bound_objects_not_maybe_unbound(self):
@@ -27569,7 +28057,7 @@ class ProofStateTests(unittest.TestCase):
         fake = _ProofState().bind(context.index.node_id(func), "x", _ProofValue.literal(1))
         snapshot = context.solve(func, entry=(fake,))
         self.assertTrue(snapshot.complete, snapshot.reasons)
-        self.assertEqual([state.pending.error for state in snapshot.exits], ["NameError"])
+        self.assertEqual([state.pending.error_kind for state in snapshot.exits], ["NameError"])
         self.assertTrue(snapshot.unreachable(func.body[0].targets[0]))
 
     def test_assignment_targets_are_ordered_and_rhs_is_not_reloaded(self):
