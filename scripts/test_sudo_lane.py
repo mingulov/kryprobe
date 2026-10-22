@@ -4526,7 +4526,8 @@ class _ProofCollectionObject:
         if type(self.identity) is not tuple or len(self.identity) != 4 \
                 or self.identity[0] != "collection" or self.identity[1] not in ("list", "tuple") \
                 or type(self.identity[2]) is not int or self.identity[2] < 0 \
-                or self.identity[3] not in ("literal", "args", "captured", "empty") \
+                or self.identity[3] not in ("literal", "args", "captured", "empty", "slice", "args-store",
+                                           "legacy-captured", "legacy-args") \
                 or type(self.items) is not tuple or any(type(item) is not _ProofValue for item in self.items) \
                 or type(self.depth) is not int or self.depth < 1:
             raise TypeError("invalid immutable collection object")
@@ -4536,9 +4537,9 @@ class _ProofCollectionObject:
 class _ProofExceptionObject:
     """Owned native instance; constructor inputs are not inferred attributes.
 
-    arguments contain actual retained args contents, fields the additional
-    native retention edges. Neither exposes a public .args tuple identity.
-    Group children are the ordered captured snapshot, not mutable args[1].
+    arguments mirror the actual args tuple contents; args_value owns that
+    tuple. Fields/keywords carry native member edges. Group children mirror
+    the captured tuple, not mutable args[1]. Mirrors are not extra roots.
     """
 
     payload: tuple
@@ -5148,10 +5149,11 @@ class _ProofEffects:
         depth = 1 + max((item.depth for value in items
                          if (item := state.collection_object(cls.single(value))) is not None), default=0)
         item = _ProofCollectionObject(identity, items, depth)
-        objects = {old.identity: old for old in state.collection_objects}
-        objects[identity] = item
+        # The finite live-object order records allocation-before, not an
+        # unbounded counter/history. Ambiguous constructor args are NOT fresh.
+        objects = tuple(old for old in state.collection_objects if old.identity != identity) + (item,)
         return _ProofValue(frozenset({identity})), replace(state,
-            collection_objects=tuple(objects[key] for key in sorted(objects)))
+            collection_objects=objects)
 
     @classmethod
     def check_dropped(cls, before, after, dropped):
@@ -5209,17 +5211,37 @@ class _ProofEffects:
                     fields += (("filename", arguments[2]),)
                     if len(arguments) == 5:
                         fields += (("filename2", arguments[4]),)
-        # Other admitted constructor fields only retain references already in
-        # actual args/keywords. Public attribute/tuple-identity access remains
-        # incomplete until its specific native field model is installed.
+        if "SyntaxError" in cls._exception_mros[name]:
+            if arguments:
+                fields += (("msg", arguments[0]),)
+            if len(arguments) == 2:
+                details = cls.sequence_info(arguments[1], state)
+                if details is None:
+                    token = cls.single(arguments[1])
+                    details = (tuple(_ProofValue.literal(value) for value in token[2]),)
+                names = ("filename", "lineno", "offset", "text", "end_lineno", "end_offset", "_metadata")
+                fields += tuple(zip(names, details[0]))
+        elif name in ("UnicodeEncodeError", "UnicodeDecodeError", "UnicodeTranslateError"):
+            values = arguments if name != "UnicodeTranslateError" else (_ProofValue.literal(None),) + arguments
+            names = ("encoding", "object", "start", "end", "reason")
+            for key, value in zip(names, values):
+                if key in ("start", "end"):
+                    token = cls.single(value)
+                    value = _ProofValue.literal((1 if token[2] else 0) if token[1] == "bool" else token[2])
+                fields += ((key, value),)
+        elif "ImportError" in cls._exception_mros[name] and len(arguments) == 1:
+            fields += (("msg", arguments[0]),)
         args_value, state = cls.allocate_collection(state, "tuple", payload[2], retained, "args")
+        if name == "SystemExit" and arguments:
+            fields += (("code", arguments[0] if len(arguments) == 1 else args_value),)
         captured_value = None
         if children:
             token = cls.single(arguments[1])
             if token[0:2] == ("collection", "tuple"):
                 captured_value = arguments[1]
             else:
-                captured_value, state = cls.allocate_collection(state, "tuple", payload[2], info[0], "captured")
+                role = "legacy-captured" if token[:2] == ("sequence", "tuple") else "captured"
+                captured_value, state = cls.allocate_collection(state, "tuple", payload[2], info[0], role)
         item = _ProofExceptionObject(payload, retained, keywords, fields, children, message, args_value, captured_value)
         if any(state.exception_object(reference) is None
                for reference in cls.live_exception_ids(state, item.values(), include_state=False)):
@@ -5500,6 +5522,8 @@ class _ProofEffects:
             return _ProofValue.unknown_value("entry-builtins")
         if name == "__debug__":
             return _ProofValue.literal(__debug__)
+        if name in ("True", "False", "None"):
+            return _ProofValue.literal({"True": True, "False": False, "None": None}[name])
         if name in ("Ellipsis", "NotImplemented"):
             return _ProofValue(frozenset({("singleton", name)}))
         if name.startswith("__") and name not in ("__import__", "__build_class__"):
@@ -5651,6 +5675,18 @@ class _ProofEffects:
                 return item.captured_value, None
             if key == "message" and item.message is not None:
                 return item.message, None
+            kind = cls.exception_field_kind(item.payload[1], key, index.semantic_key)
+            if kind is not None:
+                fields = dict(item.keywords + item.fields)
+                if kind == "index" and key not in fields:
+                    raise _ProofIncomplete("missing-owned-native-field")
+                value = fields.get(key, _ProofValue.literal(None))
+                if kind == "written" and value in (_ProofValue.literal(None), _ProofValue.literal(-1)):
+                    return None, "AttributeError"
+                return value, None
+            if key == "_metadata" and "SyntaxError" in cls._exception_mros[item.payload[1]] \
+                    and index.semantic_key[:2] == (3, 12):
+                return None, "AttributeError"
             raise _ProofIncomplete("unsupported-exception-member")
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-member")
@@ -5694,11 +5730,79 @@ class _ProofEffects:
         return number + length if number < 0 else number, None
 
     @classmethod
-    def collection_access(cls, receiver, key, state, signed_max, value=None, delete=False):
+    def slice_indices(cls, parts, length, signed_max):
+        def convert(value):
+            token = cls.single(value)
+            if not token or token[0] == "opaque":
+                raise _ProofIncomplete("opaque-slice-index-protocol")
+            if token == ("literal", "NoneType", None):
+                return None, None
+            if token[:2] not in (("literal", "int"), ("literal", "bool")):
+                return None, "TypeError"
+            number = (1 if token[2] else 0) if token[1] == "bool" else token[2]
+            return min(signed_max, max(-signed_max - 1, number)), None
+        # Expressions evaluate lower/upper/step; unpack converts step FIRST.
+        step, error = convert(parts[2])
+        if error:
+            return None, error
+        step = 1 if step is None else max(-signed_max, step)
+        if step == 0:
+            return None, "ValueError"
+        ends = []
+        for value, default in ((parts[0], length - 1 if step < 0 else 0),
+                               (parts[1], -1 if step < 0 else length)):
+            number, error = convert(value)
+            if error:
+                return None, error
+            if number is None:
+                number = default
+            else:
+                if number < 0:
+                    number += length
+                number = min(length - 1 if step < 0 else length, max(-1 if step < 0 else 0, number))
+            ends.append(number)
+        return (*ends, step), None
+
+    @classmethod
+    def collection_access(cls, receiver, key, state, signed_max, value=None, delete=False, site=None):
         identity = cls.single(receiver)
         item = state.collection_object(identity)
         if item is None:
             raise _ProofIncomplete("unowned-collection")
+        if type(key) is tuple:
+            if (delete or value is not None) and identity[1] == "tuple":
+                return None, replace(state, pending=_ProofCompletion("raise", "TypeError"))
+            bounds, error = cls.slice_indices(key, len(item.items), signed_max)
+            if error:
+                return None, replace(state, pending=_ProofCompletion("raise", error))
+            start, stop, step = bounds
+            selected = tuple(range(start, stop, step))
+            old = tuple(item.items[index] for index in selected)
+            if not delete and value is None:
+                if identity[1] == "tuple" and step == 1 and start == 0 and len(selected) == len(item.items):
+                    return receiver, state
+                if site is None:
+                    raise _ProofIncomplete("unowned-slice-allocation")
+                return cls.allocate_collection(state, identity[1], site, old, "slice")
+            if delete:
+                removed = set(selected)
+                items = tuple(value for index, value in enumerate(item.items) if index not in removed)
+            else:
+                info = cls.sequence_info(value, state)
+                if info is None:
+                    raise _ProofIncomplete("unsupported-slice-iterable")
+                replacement = info[0]  # Copy before committing, including L[:]=L.
+                if step == 1:
+                    items = item.items[:start] + replacement + item.items[max(start, stop):]
+                elif len(replacement) != len(selected):
+                    return None, replace(state, pending=_ProofCompletion("raise", "ValueError"))
+                else:
+                    changed = dict(zip(selected, replacement))
+                    items = tuple(changed.get(index, value) for index, value in enumerate(item.items))
+            current = replace(state, collection_objects=tuple(replace(part, items=items)
+                              if part.identity == identity else part for part in state.collection_objects))
+            cls.check_dropped(state, current, old)
+            return value, current
         index, error = cls.collection_index(key, len(item.items), signed_max)
         if error:
             return None, replace(state, pending=_ProofCompletion("raise", error))
@@ -5716,8 +5820,158 @@ class _ProofEffects:
         return value, current
 
     @classmethod
-    def store(cls, index, scope, receiver, key, value, state, attribute=False, delete=False):
+    def identical(cls, first, second, state):
+        left, right = cls.single(first), cls.single(second)
+        if not left or not right:
+            raise _ProofIncomplete("imprecise-identity")
+        def canonical(token):
+            if token[0] == "native":
+                if token[1] in ("True", "False", "None"):
+                    return cls.single(_ProofValue.literal({"True":True, "False":False, "None":None}[token[1]]))
+                if token[1] in ("Ellipsis", "NotImplemented"):
+                    return "singleton", token[1]
+            return token
+        left, right = canonical(left), canonical(right)
+        def category(token):
+            if token[0] == "sequence":
+                raise _ProofIncomplete("legacy-sequence-identity")
+            if token[0] == "collection":
+                if state.collection_object(token) is None:
+                    raise _ProofIncomplete("unowned-identity")
+                return token[1]
+            if token[0] == "exception":
+                if state.exception_object(token[1]) is None:
+                    raise _ProofIncomplete("unowned-identity")
+                return "exception"
+            if token[0] == "namespace":
+                return token[1]
+            if token[0] == "literal":
+                return token[1]
+            if token[0] == "plain-string":
+                return "str"
+            return token[0]
+        a, b = category(left), category(right)
+        if left[0] == right[0] == "native":
+            def native(token):
+                return cls._exception_mros.get(token[1], (token[1],))[0]
+            return native(left) == native(right)
+        if {left[0], right[0]} == {"native", "singleton"}:
+            return left[1] == right[1]
+        if left[0] == right[0] == "opaque":
+            if left == right and left[:2] == ("opaque", "parameter"):
+                return True
+        elif "opaque" not in (left[0], right[0]):
+            if a != b:
+                return False
+            if left[0] == right[0] == "collection":
+                if left == right:
+                    return True
+                if a == "list":
+                    return False
+                order = {item.identity: position for position, item in enumerate(state.collection_objects)}
+                later = left if order[left] > order[right] else right
+                if later[3] in ("slice", "captured", "args-store"):
+                    return False  # Proven fresh AFTER the other live reference.
+            elif left[0] == right[0] in ("exception", "namespace", "singleton"):
+                return left == right
+            elif left[0] == right[0] == "literal" and a in ("bool", "NoneType"):
+                return left == right
+        raise _ProofIncomplete("unproven-identity")
+
+    @classmethod
+    def exception_field_kind(cls, name, key, version):
+        mro = cls._exception_mros[name]
+        if key in ("__cause__", "__context__"):
+            return "chain"
+        names = ()
+        if "SyntaxError" in mro:
+            names = ("msg", "filename", "lineno", "offset", "text", "end_lineno", "end_offset", "print_file_and_line")
+            if key == "_metadata":
+                if version[:2] == (3, 14):
+                    return "object"
+                if version[:2] != (3, 12):
+                    raise _ProofIncomplete("unsupported-syntax-field-version")
+        elif name in ("UnicodeEncodeError", "UnicodeDecodeError", "UnicodeTranslateError"):
+            if key in ("start", "end"):
+                return "index"
+            names = ("encoding", "object", "reason")
+        elif "OSError" in mro:
+            if key == "characters_written":
+                return "written"
+            names = ("errno", "strerror", "filename", "filename2")
+        elif name == "SystemExit":
+            names = ("code",)
+        elif "AttributeError" in mro:
+            names = ("name", "obj")
+        elif "NameError" in mro:
+            names = ("name",)
+        elif "ImportError" in mro:
+            names = ("name", "path", "name_from", "msg")
+        return "object" if key in names else None
+
+    @classmethod
+    def exception_store(cls, receiver, key, value, state, profile, site, delete=False):
+        item = state.exception_object(cls.single(receiver)[1])
+        if item is None:
+            raise _ProofIncomplete("unowned-exception-store")
+        def raised(error):
+            return replace(state, pending=_ProofCompletion("raise", error))
+        if key == "args":
+            if delete:
+                return raised("TypeError")
+            info = cls.sequence_info(value, state)
+            if info is None:
+                raise _ProofIncomplete("unsupported-args-iterable")
+            if (cls.single(value) or ())[:2] != ("collection", "tuple"):
+                role = "legacy-args" if (cls.single(value) or ())[:2] == ("sequence", "tuple") else "args-store"
+                value, state = cls.allocate_collection(state, "tuple", site, info[0], role)
+            updated = replace(item, args_value=value, arguments=info[0])
+            dropped = (item.args_value,) if item.args_value is not None else item.arguments
+        elif key in ("message", "exceptions") and item.captured_value is not None:
+            return raised("AttributeError")
+        else:
+            kind = cls.exception_field_kind(item.payload[1], key, profile[0])
+            if kind not in ("object", "index", "written"):
+                raise _ProofIncomplete("unsupported-exception-store")
+            fields = dict(item.fields)
+            old = dict(item.keywords + item.fields).get(key, _ProofValue.literal(None))
+            if kind in ("index", "written"):
+                if delete:
+                    if kind == "index":
+                        return raised("TypeError")
+                    if old in (_ProofValue.literal(None), _ProofValue.literal(-1)):
+                        return raised("AttributeError")
+                else:
+                    token = cls.single(value)
+                    if not token or token[0] == "opaque":
+                        raise _ProofIncomplete("opaque-native-field-index")
+                    if token[:2] not in (("literal", "int"), ("literal", "bool")):
+                        return raised("TypeError")
+                    number = (1 if token[2] else 0) if token[1] == "bool" else token[2]
+                    if not -profile[1] - 1 <= number <= profile[1]:
+                        return raised("OverflowError" if kind == "index" else "ValueError")
+                    value = _ProofValue.literal(number)
+            elif not delete and not cls.retained_value(value, state):
+                raise _ProofIncomplete("unsupported-retained-field-value")
+            if delete:
+                fields.pop(key, None)
+            else:
+                fields[key] = value
+            updated = replace(item, fields=tuple(sorted(fields.items())),
+                keywords=tuple((name, value) for name, value in item.keywords if name != key))
+            dropped = (old,)
+        current = replace(state, exception_objects=tuple(updated if old.payload == item.payload else old
+                          for old in state.exception_objects))
+        cls.check_dropped(state, current, dropped)
+        return current
+
+    @classmethod
+    def store(cls, index, scope, receiver, key, value, state, attribute=False, delete=False, profile=None, site=None):
         atom = cls.single(receiver)
+        if attribute and atom and atom[0] == "exception":
+            if profile is None or site is None:
+                raise _ProofIncomplete("unowned-exception-store-site")
+            return cls.exception_store(receiver, key, value, state, profile, site, delete)
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-store")
         _, view, region = atom
@@ -6115,6 +6369,12 @@ class _ProofContext:
                         valid = identity == ("collection", "tuple", 0, "empty") and not item.items
                     elif identity[3] == "literal":
                         valid = isinstance(allocation, ast.Tuple if identity[1] == "tuple" else ast.List)
+                    elif identity[3] == "slice":
+                        valid = isinstance(allocation, ast.Subscript) and isinstance(allocation.slice, ast.Slice) \
+                            and isinstance(allocation.ctx, ast.Load)
+                    elif identity[3] in ("args-store", "legacy-args"):
+                        valid = identity[1] == "tuple" and isinstance(allocation, ast.Attribute) \
+                            and allocation.attr == "args" and isinstance(allocation.ctx, ast.Store)
                     else:
                         valid = identity[1] == "tuple" and (isinstance(allocation, (ast.Call, ast.Raise))
                             or (isinstance(parent, ast.Raise) and parent.cause is allocation))
@@ -6141,6 +6401,19 @@ class _ProofContext:
                         reasons.append("unsupported-exception-entry")
                         return snapshot()
                     try:
+                        keys = tuple(key for key, value in item.keywords + item.fields)
+                        if len(set(keys)) != len(keys) or any(key not in _ProofEffects._exception_keywords.get(name, ())
+                                                           for key, value in item.keywords):
+                            raise _ProofIncomplete("unsupported-exception-entry")
+                        for key, value in item.keywords + item.fields:
+                            kind = _ProofEffects.exception_field_kind(name, key, self._native_profile[0])
+                            token = _ProofEffects.single(value)
+                            if kind is None or (kind in ("index", "written") and (
+                                    not token or token[:2] != ("literal", "int")
+                                    or not -self._native_profile[1] - 1 <= token[2] <= self._native_profile[1])) \
+                                    or (kind == "chain" and value != _ProofValue.literal(None) and (
+                                        not token or token[0] != "exception" or state.exception_object(token[1]) is None)):
+                                raise _ProofIncomplete("unsupported-exception-entry")
                         args = _ProofEffects.sequence_info(item.args_value, state) if item.args_value is not None else None
                         captured = _ProofEffects.sequence_info(item.captured_value, state) \
                             if item.captured_value is not None else None
@@ -6503,6 +6776,21 @@ class _ProofContext:
             return tuple(item for child, value in zip(nodes, values)
                          for item in (value if isinstance(child, ast.Starred) else (value,)))
 
+        def subscript_nodes(node):
+            if isinstance(node.slice, ast.Slice):
+                return (node.value,) + tuple(part for part in (node.slice.lower, node.slice.upper, node.slice.step)
+                                            if part is not None)
+            return node.value, node.slice
+
+        def subscript_key(node, values):
+            if not isinstance(node.slice, ast.Slice):
+                return values[1]
+            supplied = iter(values[1:])
+            # Structural per-AST data, never a semantic expansion/slice tag
+            # accepted from an incoming value or erased at another operation.
+            return tuple(next(supplied) if part is not None else _ProofValue.literal(None)
+                         for part in (node.slice.lower, node.slice.upper, node.slice.step))
+
         def expression(node, state):
             results = []
             for outcome in expression_inner(node, state):
@@ -6558,6 +6846,29 @@ class _ProofContext:
                         number = (1 if token[2] else 0) if token[1] == "bool" else token[2]
                         results.extend(finish(node, _ProofValue.literal(-number if isinstance(node.op, ast.USub) else number), outcome.state))
                 return bounded(results, node)
+            elif isinstance(node, ast.Compare) and all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
+                frontier, results = [], []
+                for outcome in expression(node.left, state):
+                    if outcome.normal:
+                        frontier.append((outcome.value, outcome.state))
+                    else:
+                        results.append(outcome)
+                for position, (op, comparator) in enumerate(zip(node.ops, node.comparators)):
+                    following = []
+                    for left, current in frontier:
+                        current = replace(current, temporaries=current.temporaries + (left,))
+                        pairs, abrupt = operands((comparator,), current)
+                        results.extend(abrupt)
+                        for values, after in pairs:
+                            same = _ProofEffects.identical(left, values[0], after)
+                            truth = not same if isinstance(op, ast.IsNot) else same
+                            if truth and position + 1 < len(node.ops):
+                                after = drop_holds(after, state.temporaries, (values[0],))
+                                following.append((values[0], after))
+                            else:
+                                results.extend(finish(node, _ProofValue.literal(truth), after))
+                    frontier = following
+                return bounded(results, node)
             elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Call, ast.JoinedStr, ast.FormattedValue)):
                 if isinstance(node, ast.Call):
                     nodes = (node.func, *node.args, *node.keywords)
@@ -6566,7 +6877,7 @@ class _ProofContext:
                 elif isinstance(node, ast.FormattedValue):
                     nodes = (node.value, node.format_spec) if node.format_spec is not None else (node.value,)
                 else:
-                    nodes = (node.value, node.slice) if isinstance(node, ast.Subscript) else (node.value,)
+                    nodes = subscript_nodes(node) if isinstance(node, ast.Subscript) else (node.value,)
                 frontier, abrupt = operands(nodes, state)
                 results = list(abrupt)
                 for values, current in frontier:
@@ -6601,10 +6912,16 @@ class _ProofContext:
                         continue
                     if isinstance(node, ast.Subscript):
                         if (_ProofEffects.single(values[0]) or (None,))[0] == "collection":
-                            result, current = _ProofEffects.collection_access(values[0], values[1], current,
-                                self._native_profile[1])
+                            reserve_graph(current, passes=2)
+                            result, current = _ProofEffects.collection_access(values[0], subscript_key(node, values), current,
+                                self._native_profile[1], site=self.index.node_id(node))
+                            if result is not None and (item := current.collection_object(_ProofEffects.single(result))) is not None \
+                                    and item.depth > self.limits["depth"]:
+                                raise _ProofIncomplete("value-depth-budget")
                             results.extend(finish(node, result, current))
                             continue
+                        if isinstance(node.slice, ast.Slice):
+                            raise _ProofIncomplete("unsupported-namespace-slice")
                         token = _ProofEffects.single(values[1])
                         if not token or token[:2] != ("literal", "str"):
                             raise _ProofIncomplete("opaque-key")
@@ -6675,26 +6992,30 @@ class _ProofContext:
                     record(target, "after", state)
                 return bounded((_ProofOutcome(state, value if state.pending.kind == "normal" else None),), target)
             elif isinstance(target, (ast.Attribute, ast.Subscript)):
-                nodes = (target.value, target.slice) if isinstance(target, ast.Subscript) else (target.value,)
+                nodes = subscript_nodes(target) if isinstance(target, ast.Subscript) else (target.value,)
                 frontier, abrupt = operands(nodes, state)
                 results = list(abrupt)
                 for values, current in frontier:
                     if isinstance(target, ast.Subscript):
                         if (_ProofEffects.single(values[0]) or (None,))[0] == "collection":
                             reserve_graph(current, () if delete else (value,), passes=2)
-                            unused, current = _ProofEffects.collection_access(values[0], values[1], current,
+                            unused, current = _ProofEffects.collection_access(values[0], subscript_key(target, values), current,
                                 self._native_profile[1], value=None if delete else value, delete=delete)
                             results.extend(finish(target, value, current))
                             continue
+                        if isinstance(target.slice, ast.Slice):
+                            raise _ProofIncomplete("unsupported-namespace-slice")
                         token = _ProofEffects.single(values[1])
                         if token is None or token[:2] != ("literal", "str"):
                             raise _ProofIncomplete("opaque-key")
                         key = token[2]
                     else:
                         key = target.attr
-                    reserve_graph(current, () if delete else (value,), passes=2)
+                    reserve_graph(current, () if delete else (value,),
+                        passes=4 if (_ProofEffects.single(values[0]) or (None,))[0] == "exception" else 2)
                     current = _ProofEffects.store(self.index, scope, values[0], key, value, current,
-                                                 attribute=isinstance(target, ast.Attribute), delete=delete)
+                        attribute=isinstance(target, ast.Attribute), delete=delete,
+                        profile=self._native_profile, site=self.index.node_id(target))
                     if current.pending.kind == "normal":
                         record(target, "after", current)
                     results.append(_ProofOutcome(current, value if current.pending.kind == "normal" else None))
@@ -25290,6 +25611,253 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_owned_slice_read_and_replace_keep_ordered_slots_and_aliases(self):
+        context, func, snapshot = self._solve("L=[0,1,2,3,4]\nreverse=L[::-1]\npart=L[1:4:2]\n"
+            "L[1:4]=[8,9]\nL[::2]=(6,7)\ndel L[1::2]\nmarker=int")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        for name, expected in (("reverse", [4,3,2,1,0]), ("part", [1,3]), ("L", [6,7])):
+            self.assertEqual(_ProofEffects.sequence_info(state.lookup(owner, name), state)[0],
+                             tuple(_ProofValue.literal(value) for value in expected))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value, "int"))
+
+    def test_owned_slice_clamps_huge_endpoints_and_accepts_bool_parts(self):
+        huge = str(sys.maxsize + 100)
+        for key, expected in (("-"+huge+":"+huge, [0,1,2]),
+                              (huge+":-"+huge+":-"+huge, [2]), ("False:True:True", [0])):
+            with self.subTest(key=key):
+                context, func, snapshot = self._solve("L=[0,1,2]\nout=L["+key+"]")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                self.assertEqual(_ProofEffects.sequence_info(state.lookup(context.index.node_id(func), "out"), state)[0],
+                                 tuple(_ProofValue.literal(value) for value in expected))
+
+    def test_slice_validation_follows_rhs_and_endpoint_evaluation_order(self):
+        for operation, expected in (("L[missing::0]=missing2", "NameError"),
+                ("L[::0]=0", "ValueError"), ("L['bad'::0]=0", "ValueError"),
+                ("L['bad':]=0", "TypeError"), ("L[::2]=[1]", "ValueError"),
+                ("T[x::0]=0", "TypeError"), ("del T[x::0]", "TypeError")):
+            with self.subTest(operation=operation):
+                context, func, snapshot = self._solve("L=[0,1,2]\nT=()\n"+operation, parameters="x")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, expected)
+                if operation == "L[missing::0]=missing2":
+                    self.assertFalse(snapshot.states_at(func.body[-1].targets[0].value))
+
+    def test_slice_commit_and_temporary_roots_cannot_hide_removed_opaque_edges(self):
+        for operation, complete in (("L[:]=L", True), ("L[:]=(L[0],)", True),
+                ("K=L[:]\nL[:]=[]", True), ("L[:]=[]", False),
+                ("L[:]=[L]", False), ("del L[::-1]", False)):
+            with self.subTest(operation=operation):
+                context, func, snapshot = self._solve("L=[x]\nx=0\n"+operation+"\nmarker=int", parameters="x")
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value, "int"), complete)
+
+    def test_group_captured_tuple_retains_leaves_after_original_list_slice_clear(self):
+        context, func, snapshot = self._solve("e=ValueError(x)\nL=[e,e]\nG=ExceptionGroup('g',L)\n"
+            "x=e=0\nL[:]=[]\nfirst=G.exceptions[0]\nsecond=G.exceptions[1]\nmarker=int\nreturn G", parameters="x")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        self.assertEqual(state.lookup(owner, "first"), state.lookup(owner, "second"))
+        self.assertEqual(_ProofEffects.sequence_info(state.lookup(owner, "L"), state)[0], ())
+        self.assertTrue(snapshot.native_identity(func.body[-2].value, "int"))
+
+    def test_identity_observations_preserve_proven_owned_aliases_and_type_disjointness(self):
+        context, func, snapshot = self._solve("e=ValueError()\nother=ValueError()\nL=[e]\nT=(e,)\n"
+            "G=ExceptionGroup('g',T)\na=G.exceptions is T\nb=G.args[1] is T\nc=G is not e\n"
+            "d=L is not T\nf=e is not other\ng=T[:] is T\nh=L[:] is L\ni=() is ()")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        for name, expected in (("a",True),("b",True),("c",True),("d",True),("f",True),("g",True),("h",False),("i",True)):
+            self.assertEqual(state.lookup(owner, name), _ProofValue.literal(expected), name)
+
+    def test_identity_comparisons_do_not_infer_distinct_tuples_or_literal_interning(self):
+        for body in ("a=(1,)\nb=(1,)\nresult=a is b", "a=1000\nb=1000\nresult=a is b"):
+            with self.subTest(body=body):
+                context, func, snapshot = self._solve(body+"\nmarker=int")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[-1].value, "int"))
+
+    def test_syntax_fields_snapshot_details_independently_of_mutable_args(self):
+        for tail, complete in (("marker=int\nreturn E", True), ("E=0\nmarker=int", False)):
+            with self.subTest(tail=tail):
+                context, func, snapshot = self._solve("details=[x,1,0,'text']\nE=SyntaxError('m',details)\n"
+                    "details[0]=None\nsaved=E.filename\nE.args=()\nx=0\nsaved=0\n"+tail, parameters="x")
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                marker = next(node for node in ast.walk(func) if isinstance(node, ast.Assign)
+                    and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "marker")
+                self.assertEqual(snapshot.native_identity(marker.value, "int"), complete)
+
+    def test_unicode_fields_normalize_indexes_without_changing_retained_args(self):
+        for constructor, start, end, encoding in (("UnicodeEncodeError('ascii','a',True,-2,'r')",1,-2,"ascii"),
+                ("UnicodeDecodeError('ascii',b'a',-3,False,'r')",-3,0,"ascii"),
+                ("UnicodeTranslateError('a',False,3,'r')",0,3,None)):
+            with self.subTest(constructor=constructor):
+                context, func, snapshot = self._solve("E="+constructor+"\nstart=E.start\nend=E.end\nencoding=E.encoding")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                owner = context.index.node_id(func)
+                for name, expected in (("start",start),("end",end),("encoding",encoding)):
+                    self.assertEqual(state.lookup(owner, name), _ProofValue.literal(expected))
+
+    def test_native_field_defaults_and_oserror_written_absence_are_not_fabricated_values(self):
+        for constructor, field, expected, error in (("SyntaxError()","msg",None,None),
+                ("OSError()","errno",None,None),("OSError(2,'m','file')","filename","file",None),
+                ("BlockingIOError(11,'m',-1)","characters_written",None,"AttributeError"),
+                ("BlockingIOError(11,'m',-2)","characters_written",-2,None),
+                ("AttributeError()","obj",None,None),("NameError()","name",None,None),
+                ("ImportError('message')","msg","message",None),
+                ("ModuleNotFoundError(name_from='module')","name_from","module",None)):
+            with self.subTest(constructor=constructor, field=field):
+                context, func, snapshot = self._solve("E="+constructor+"\nvalue=E."+field)
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, error)
+                if error is None:
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "value"), _ProofValue.literal(expected))
+
+    def test_syntax_metadata_field_is_versioned_not_guessed_from_unknown_profile(self):
+        for version, error, complete in (((3,12,14),"AttributeError",True),((3,14,7),None,True),((3,13),None,False)):
+            with self.subTest(version=version):
+                context, func, snapshot = self._solve("E=SyntaxError()\nmetadata=E._metadata", semantic_key=version)
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if complete:
+                    self.assertEqual(snapshot.exits[0].pending.error, error)
+
+    def test_system_exit_code_aliases_original_args_even_after_args_replacement(self):
+        context, func, snapshot = self._solve("E=SystemExit(1,2)\nold=E.args\na=E.code is old\n"
+            "E.args=[3]\nb=E.code is old\nc=E.args is old\nfirst=E.code[0]\nnew=E.args[0]")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        for name, expected in (("a",True),("b",True),("c",False),("first",1),("new",3)):
+            # Distinct args-store tuple versus prior args is proven fresh here,
+            # not two potentially shared literal tuples.
+            self.assertEqual(state.lookup(owner, name), _ProofValue.literal(expected))
+
+    def test_object_native_field_store_and_delete_check_actual_release_roots(self):
+        for constructor, field in (("AttributeError(obj=x)","obj"), ("NameError(name=x)","name"),
+                ("ImportError(name_from=x)","name_from"), ("OSError(2,'m',x)","filename")):
+            for retain in (False, True):
+                with self.subTest(constructor=constructor, field=field, retain=retain):
+                    context, func, snapshot = self._solve("E="+constructor+"\nx=0\n"
+                        + ("keep=E."+field+"\n" if retain else "") + "del E."+field+"\nmarker=int", parameters="x")
+                    self.assertEqual(snapshot.complete, retain, snapshot.reasons)
+                    self.assertEqual(snapshot.native_identity(func.body[-1].value, "int"), retain)
+        context, func, snapshot = self._solve("E=AttributeError(obj=x)\nx=0\nE.obj=(E.obj,)\nmarker=int", parameters="x")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+
+    def test_args_replacement_preserves_named_snapshot_and_group_children(self):
+        context, func, snapshot = self._solve("e=ValueError(x)\nG=ExceptionGroup('g',[e])\n"
+            "x=e=0\nG.args=()\nkept=G.exceptions[0]\nmarker=int\nreturn G", parameters="x")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        for operation, expected in (("del E.args","TypeError"), ("E.message=1","AttributeError"),
+                                    ("del E.exceptions","AttributeError")):
+            with self.subTest(operation=operation):
+                context, func, snapshot = self._solve("E=ExceptionGroup('g',[ValueError()])\n"+operation)
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, expected)
+
+    def test_numeric_native_field_stores_normalize_and_preserve_descriptor_errors(self):
+        huge = str(sys.maxsize + 1)
+        for constructor, operation, value, expected, error in (
+                ("UnicodeEncodeError('a','x',0,1,'r')","E.start=True","E.start",1,None),
+                ("UnicodeEncodeError('a','x',0,1,'r')","del E.start",None,None,"TypeError"),
+                ("UnicodeEncodeError('a','x',0,1,'r')","E.end="+huge,None,None,"OverflowError"),
+                ("OSError()","E.characters_written=True","E.characters_written",1,None),
+                ("OSError()","E.characters_written="+huge,None,None,"ValueError"),
+                ("OSError()","del E.characters_written",None,None,"AttributeError"),
+                ("BlockingIOError(11,'m',1)","del E.characters_written\nE.characters_written",None,None,"AttributeError")):
+            with self.subTest(constructor=constructor, operation=operation):
+                context, func, snapshot = self._solve("E="+constructor+"\n"+operation+("\nvalue="+value if value else ""))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, error)
+                if value:
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "value"), _ProofValue.literal(expected))
+
+    def test_native_field_entry_cannot_forge_descriptor_types_or_chain_values(self):
+        for constructor, field, forged in (("UnicodeEncodeError('u','x',0,1,'r')","start",True),
+                ("UnicodeDecodeError('u',b'x',0,1,'r')","end",sys.maxsize+1),
+                ("OSError()","characters_written","not-an-index"),
+                ("ValueError()","__context__",0)):
+            with self.subTest(constructor=constructor, field=field):
+                context = _ProofContext("def f(E):\n    value=E."+field+"\n    marker=int\n"
+                    "def allocate():\n    E="+constructor+"\n")
+                func, allocate = context.tree.body
+                snapshot = context.solve(allocate)
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                value = state.lookup(context.index.node_id(allocate), "E")
+                payload = _ProofEffects.single(value)[1]
+                objects = tuple(replace(item, fields=tuple(sorted(dict(item.fields, **{field:_ProofValue.literal(forged)}).items())))
+                                if item.payload == payload else item for item in state.exception_objects)
+                entry = replace(state, bindings=(), exception_objects=objects).bind(context.index.node_id(func), "E", value)
+                result = context.solve(func, entry=(entry,))
+                self.assertFalse(result.complete)
+                self.assertFalse(result.native_identity(func.body[-1].value, "int"))
+
+    def test_identity_chains_short_circuit_and_keep_only_the_next_operand(self):
+        for compare, expected, error in (("a is b is missing",False,None), ("a is a is missing",None,"NameError"),
+                ("a is not b is b",True,None), ("IOError is OSError",True,None), ("Ellipsis is ...",True,None),
+                ("True is 1",False,None)):
+            with self.subTest(compare=compare):
+                context, func, snapshot = self._solve("a=[]\nb=[]\nresult="+compare+"\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error, error)
+                if error is None:
+                    self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"), _ProofValue.literal(expected))
+                    self.assertFalse(snapshot.exits[0].temporaries)
+        # A later constructor may reuse a previously supplied exact tuple on
+        # a native call path. Its synthetic args ID is not freshness evidence.
+        context, func, snapshot = self._solve("E=ValueError()\nE.args=[1]\nsaved=E.args\n"
+            "other=ValueError(*saved)\nresult=saved is other.args\nmarker=int")
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.native_identity(func.body[-1].value, "int"))
+
+    def test_builtin_singleton_mapping_and_legacy_native_tokens_share_literal_identity(self):
+        for name, literal in (("True",True),("False",False),("None",None)):
+            with self.subTest(name=name):
+                context, func, snapshot = self._solve("d=__import__('builtins').__dict__\nresult=d['"+name+"'] is "+repr(literal))
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"), _ProofValue.literal(True))
+        for name, literal in (("True",True),("False",False),("None",None)):
+            with self.subTest(legacy=name):
+                self.assertTrue(_ProofEffects.identical(_ProofValue(frozenset({("native", name)})),
+                    _ProofValue.literal(literal), _ProofState()))
+        # Explicit writes win over the pristine builtin singleton defaults.
+        context, func, snapshot = self._solve("d=__import__('builtins').__dict__\nd['True']=False\nresult=d['True'] is True")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func), "result"), _ProofValue.literal(False))
+
+    def test_legacy_exact_tuple_views_do_not_acquire_false_freshness_on_conversion(self):
+        for kind in ("tuple", "list"):
+            for operation in ("E=ValueError()\nE.args=L\nresult=E.args is T",
+                              "G=ExceptionGroup('g',L)\nresult=G.exceptions is T"):
+                with self.subTest(kind=kind, operation=operation):
+                    source = "def f(L,T):\n"+"".join("    "+line+"\n" for line in (operation+"\nmarker=int").splitlines())
+                    source += "def allocate():\n    e=ValueError()\n    T=(e,)\n    L=[e]\n"
+                    context = _ProofContext(source)
+                    func, allocate = context.tree.body
+                    snapshot = context.solve(allocate)
+                    self.assertTrue(snapshot.complete, snapshot.reasons)
+                    state = snapshot.exits[0]
+                    tuple_value = state.lookup(context.index.node_id(allocate), "T")
+                    value = tuple_value if kind == "tuple" else state.lookup(context.index.node_id(allocate), "L")
+                    token = _ProofEffects.single(value)
+                    items = _ProofEffects.sequence_info(value, state)[0]
+                    legacy = _ProofValue(frozenset({("sequence", kind, token[2],
+                        tuple(item.atoms for item in items), 2, 1)}))
+                    entry = replace(state, bindings=()).bind(context.index.node_id(func), "T", tuple_value) \
+                        .bind(context.index.node_id(func), "L", legacy)
+                    result = context.solve(func, entry=(entry,))
+                    self.assertEqual(result.complete, kind == "list", result.reasons)
+                    if kind == "list":
+                        self.assertEqual(result.exits[0].lookup(context.index.node_id(func), "result"), _ProofValue.literal(False))
+                    else:
+                        self.assertFalse(result.native_identity(func.body[-1].value, "int"))
 
     def test_owned_collections_retain_opaque_exception_arguments_until_last_release(self):
         for tail, complete in (("marker=int\nreturn E", True), ("E=0\nmarker=int", False)):
