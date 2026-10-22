@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import MappingProxyType
 import sys
 import tempfile
 import threading
@@ -4171,6 +4172,194 @@ def _comp_scope_targets(scope):
                     and isinstance(cand.ctx, ast.Store):
                 found.add(cand.id)
     return found
+
+
+class _ProofScopeIndex:
+    """Immutable lexical occurrences/ownership, never execution reachability.
+
+    Construction uses only syntax and the annotation semantic key. Deferred
+    annotation expressions have their own indexed owner instead of being
+    mistaken for events in the enclosing function. No semantic memo or legacy
+    flow callback is consulted. Point values belong to the later flow solver.
+    """
+
+    _comprehensions = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+    def __init__(self, tree, semantic_key=None):
+        self.tree = tree
+        self.semantic_key = tuple(semantic_key or sys.version_info[:3])
+        parents = {}
+        node_ids = {}
+        for node in ast.walk(tree):
+            node_ids.setdefault(id(node), len(node_ids))
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
+
+        local = {}
+        global_names = {}
+        nonlocal_names = {}
+        owners = {}
+        enclosing = {}
+        open_namespaces = set()
+        eager = self.semantic_key[:2] < (3, 14) and not _future_annotations(tree)
+
+        def scope(node, outer):
+            local.setdefault(node, set())
+            global_names.setdefault(node, set())
+            nonlocal_names.setdefault(node, set())
+            enclosing[node] = outer
+
+        scope(tree, None)
+        pending = [(tree, tree)]
+
+        def type_parameters(node, outer):
+            params = getattr(node, "type_params", ())
+            if not params:
+                return outer
+            # The first parameter node is a stable syntax-site identity for
+            # the common PEP-695 annotation scope, not a function-local bind.
+            parameter_scope = params[0]
+            scope(parameter_scope, outer)
+            for param in params:
+                owners[id(param)] = parameter_scope
+                local[parameter_scope].add(param.name)
+                for field in ("bound", "default_value"):
+                    part = getattr(param, field, None)
+                    if isinstance(part, ast.AST):
+                        scope(part, parameter_scope)
+                        pending.append((part, part))
+            return parameter_scope
+
+        def annotations(node, outer):
+            for part in _def_annotations(node):
+                if eager:
+                    pending.append((part, outer))
+                else:
+                    scope(part, outer)
+                    pending.append((part, part))
+
+        def arguments(args, inner, outer):
+            owners[id(args)] = inner
+            params = (list(args.posonlyargs) + list(args.args)
+                      + list(args.kwonlyargs))
+            params += [arg for arg in (args.vararg, args.kwarg) if arg is not None]
+            for arg in params:
+                owners[id(arg)] = inner
+                local[inner].add(arg.arg)
+            for part in list(args.defaults) + [
+                    value for value in args.kw_defaults if value is not None]:
+                pending.append((part, outer))
+
+        while pending:
+            node, owner = pending.pop()
+            owners[id(node)] = owner
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local[owner].add(node.name)
+                parameter_scope = type_parameters(node, owner)
+                scope(node, parameter_scope)
+                arguments(node.args, node, owner)
+                annotations(node, parameter_scope)
+                pending.extend((part, owner) for part in node.decorator_list)
+                pending.extend((part, node) for part in node.body)
+                continue
+            if isinstance(node, ast.ClassDef):
+                local[owner].add(node.name)
+                parameter_scope = type_parameters(node, owner)
+                scope(node, parameter_scope)
+                if node.bases or node.keywords:
+                    open_namespaces.add(node)
+                pending.extend((part, owner) for part in node.decorator_list)
+                pending.extend((part, parameter_scope) for part in node.bases)
+                pending.extend((part, parameter_scope) for part in node.keywords)
+                pending.extend((part, node) for part in node.body)
+                continue
+            if isinstance(node, ast.TypeAlias):
+                parameter_scope = type_parameters(node, owner)
+                scope(node.value, parameter_scope)
+                pending.extend(((node.name, owner), (node.value, node.value)))
+                continue
+            if isinstance(node, ast.Lambda):
+                scope(node, owner)
+                arguments(node.args, node, owner)
+                pending.append((node.body, node))
+                continue
+            if isinstance(node, self._comprehensions):
+                scope(node, owner)
+                for position, generator in enumerate(node.generators):
+                    owners[id(generator)] = node
+                    pending.append((generator.iter, owner if position == 0 else node))
+                    pending.append((generator.target, node))
+                    pending.extend((part, node) for part in generator.ifs)
+                if isinstance(node, ast.DictComp):
+                    pending.extend(((node.key, node), (node.value, node)))
+                else:
+                    pending.append((node.elt, node))
+                continue
+            if isinstance(node, ast.NamedExpr):
+                storage = owner
+                while isinstance(storage, self._comprehensions):
+                    storage = enclosing[storage]
+                pending.append((node.target, storage))
+                pending.append((node.value, owner))
+                continue
+            if isinstance(node, ast.Global):
+                global_names[owner].update(node.names)
+            elif isinstance(node, ast.Nonlocal):
+                nonlocal_names[owner].update(node.names)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                local[owner].add(node.id)
+            elif isinstance(node, ast.Import):
+                local[owner].update(alias.asname or alias.name.split(".")[0]
+                                    for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                local[owner].update(alias.asname or alias.name for alias in node.names
+                                    if alias.name != "*")
+                if any(alias.name == "*" for alias in node.names):
+                    open_namespaces.add(owner)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                local[owner].add(node.name)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+                local[owner].add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                local[owner].add(node.rest)
+            pending.extend((child, owner) for child in ast.iter_child_nodes(node))
+
+        self._locals = MappingProxyType({
+            key: frozenset(names - global_names[key] - nonlocal_names[key])
+            for key, names in local.items()})
+        self._globals = MappingProxyType({key: frozenset(names)
+                                          for key, names in global_names.items()})
+        self._nonlocals = MappingProxyType({key: frozenset(names)
+                                            for key, names in nonlocal_names.items()})
+        self._owners = MappingProxyType(owners)
+        self._parents = MappingProxyType(parents)
+        self._node_ids = MappingProxyType(node_ids)
+        self._enclosing = MappingProxyType(enclosing)
+        self._open_namespaces = frozenset(open_namespaces)
+
+    def locals_for(self, scope):
+        return self._locals[scope]
+
+    def globals_for(self, scope):
+        return self._globals[scope]
+
+    def nonlocals_for(self, scope):
+        return self._nonlocals[scope]
+
+    def scope_for(self, node):
+        return self._owners[id(node)]
+
+    def node_id(self, node):
+        return self._node_ids[id(node)]
+
+    def parent(self, node):
+        return self._parents.get(id(node))
+
+    def enclosing_scope(self, scope):
+        return self._enclosing[scope]
+
+    def namespace_open(self, scope):
+        return scope in self._open_namespaces
 
 
 def _scope_binds_spelling(scope, name, parents, upos):
@@ -21330,6 +21519,165 @@ def _binding_violations(source):
                 and node.func.id == "read_body_log":
             violations.append(f"deleted reader at line {node.lineno}")
     return violations
+
+
+class ProofScopeIndexTests(unittest.TestCase):
+    def _index(self, source, semantic_key=None):
+        tree = ast.parse(source)
+        factory = globals().get("_ProofScopeIndex")
+        self.assertIsNotNone(factory, "pure declaration index is not implemented")
+        return tree, factory(tree, semantic_key=semantic_key)
+
+    def test_future_dead_and_deleted_names_declare_function_locals(self):
+        # A reachability-filtered declaration walk repeats the N1 cycle or
+        # mistakes an uninitialized local for a global/builtin lookup.
+        tree, index = self._index(
+            "def execute(log):\n"
+            "    if False:\n        dead=0\n        del deleted\n"
+            "    with missing:\n        pass\n"
+            "    missing=0\n")
+        self.assertEqual(index.locals_for(tree.body[0]),
+                         frozenset({"log", "dead", "deleted", "missing"}))
+
+    def test_parameter_import_handler_and_pattern_declarations(self):
+        tree, index = self._index(
+            "def f(a, /, b=1, *args, c=2, **kw):\n"
+            "    import os.path, sys as system\n"
+            "    from pathlib import Path as P\n"
+            "    try:\n        pass\n"
+            "    except Exception as caught:\n        pass\n"
+            "    match a:\n"
+            "        case {'x': cap, **rest}:\n            pass\n"
+            "        case [head, *tail]:\n            pass\n")
+        self.assertEqual(index.locals_for(tree.body[0]), frozenset({
+            "a", "b", "args", "c", "kw", "os", "system", "P", "caught",
+            "cap", "rest", "head", "tail"}))
+
+    def test_global_and_nonlocal_declarations_redirect_storage(self):
+        tree, index = self._index(
+            "def outer():\n    cell=0\n"
+            "    def inner(p):\n        global exported\n"
+            "        nonlocal cell\n        exported=1\n"
+            "        cell=2\n        own=3\n")
+        outer = tree.body[0]
+        inner = outer.body[1]
+        self.assertEqual(index.locals_for(outer), frozenset({"cell", "inner"}))
+        self.assertEqual(index.locals_for(inner), frozenset({"p", "own"}))
+        self.assertEqual(index.globals_for(inner), frozenset({"exported"}))
+        self.assertEqual(index.nonlocals_for(inner), frozenset({"cell"}))
+
+    def test_nested_bodies_do_not_leak_but_defaults_bind_enclosing_scope(self):
+        tree, index = self._index(
+            "def outer(arg):\n"
+            "    def child(param=(default:=1)):\n        buried=2\n"
+            "    callback=lambda p=(lambda_default:=1): (hidden:=p)\n"
+            "    class Box:\n        class_only=0\n"
+            "        def method(self):\n            return arg\n")
+        outer = tree.body[0]
+        child = outer.body[0]
+        callback = outer.body[1].value
+        box = outer.body[2]
+        method = box.body[1]
+        self.assertEqual(index.locals_for(outer), frozenset({
+            "arg", "child", "default", "callback", "lambda_default", "Box"}))
+        self.assertEqual(index.locals_for(child), frozenset({"param", "buried"}))
+        self.assertEqual(index.locals_for(callback), frozenset({"p", "hidden"}))
+        self.assertEqual(index.locals_for(box), frozenset({"class_only", "method"}))
+        self.assertEqual(index.locals_for(method), frozenset({"self"}))
+        self.assertIs(index.scope_for(method.body[0].value), method)
+        self.assertIs(index.scope_for(child.args.defaults[0].target), outer)
+
+    def test_comprehension_targets_and_walruses_have_distinct_owners(self):
+        tree, index = self._index(
+            "def f(xs):\n"
+            "    values=[(saved:=item) for item in xs if item]\n"
+            "    later=(inside for inside in xs)\n"
+            "    nested=[lambda: (hidden:=item) for item in xs]\n")
+        func = tree.body[0]
+        comp = func.body[0].value
+        gen = func.body[1].value
+        nested = func.body[2].value
+        self.assertEqual(index.locals_for(func), frozenset({
+            "xs", "values", "saved", "later", "nested"}))
+        self.assertEqual(index.locals_for(comp), frozenset({"item"}))
+        self.assertEqual(index.locals_for(gen), frozenset({"inside"}))
+        self.assertEqual(index.locals_for(nested.elt), frozenset({"hidden"}))
+        self.assertIs(index.scope_for(comp.generators[0].iter), func)
+        self.assertIs(index.scope_for(comp.elt.target), func)
+        self.assertIs(index.scope_for(comp.elt.value), comp)
+
+    def test_annotation_evaluation_owner_is_version_and_future_sensitive(self):
+        source = "def outer():\n    def inner(x: Marker):\n        pass\n"
+        old_tree, old = self._index(source, (3, 12, 14))
+        new_tree, new = self._index(source, (3, 14, 7))
+        old_marker = old_tree.body[0].body[0].args.args[0].annotation
+        new_marker = new_tree.body[0].body[0].args.args[0].annotation
+        self.assertIs(old.scope_for(old_marker), old_tree.body[0])
+        self.assertIsNot(new.scope_for(new_marker), new_tree.body[0])
+        future_tree, future = self._index(
+            "from __future__ import annotations\n" + source, (3, 12, 14))
+        marker = future_tree.body[1].body[0].args.args[0].annotation
+        self.assertIsNot(future.scope_for(marker), future_tree.body[1])
+
+    def test_index_never_calls_flow_and_stable_ids_survive_reparse(self):
+        source = "def f():\n    with missing:\n        pass\n    missing=0\n"
+        # These traps are not answer stubs: the actual index must obtain its
+        # result without invoking semantic proof machinery at all.
+        with contextlib.ExitStack() as stack:
+            for name in ("_dead_bind", "_stmt_may_fall", "_load_unbound",
+                         "_native_name_trusted", "_binding_violations"):
+                stack.enter_context(mock.patch(
+                    __name__ + "." + name,
+                    side_effect=AssertionError("semantic callback from lexical index")))
+            tree, index = self._index(source)
+            other_tree, other = self._index(source)
+            self.assertEqual(index.locals_for(tree.body[0]), frozenset({"missing"}))
+        names = [node for node in ast.walk(tree) if isinstance(node, ast.Name)]
+        other_names = [node for node in ast.walk(other_tree) if isinstance(node, ast.Name)]
+        self.assertEqual([index.node_id(node) for node in names],
+                         [other.node_id(node) for node in other_names])
+        self.assertIs(index.parent(tree.body[0].body[0]), tree.body[0])
+
+    def test_generic_parameter_and_lazy_alias_scopes_are_not_function_locals(self):
+        # Missing type-parameter scopes could turn a valid T/U/V load into an
+        # invented NameError/ULE when the point solver consumes this index.
+        tree, index = self._index(
+            "def f[T: Bound](x:T=Fallback):\n    return T\n"
+            "class C[U](Base[U], metaclass=Factory):\n    pass\n"
+            "type Alias[V] = tuple[V]\n")
+        func, cls, alias = tree.body
+        self.assertEqual(index.locals_for(tree), frozenset({"f", "C", "Alias"}))
+        self.assertEqual(index.locals_for(func), frozenset({"x"}))
+        try:
+            params = index.scope_for(func.type_params[0])
+        except KeyError:
+            self.fail("type-parameter scope has no indexed ownership")
+        self.assertEqual(index.locals_for(params), frozenset({"T"}))
+        self.assertIs(index.enclosing_scope(func), params)
+        self.assertIs(index.scope_for(func.args.defaults[0]), tree)
+        bound_owner = index.scope_for(func.type_params[0].bound)
+        self.assertIs(index.enclosing_scope(bound_owner), params)
+        class_params = index.scope_for(cls.type_params[0])
+        self.assertEqual(index.locals_for(class_params), frozenset({"U"}))
+        self.assertIs(index.scope_for(cls.bases[0]), class_params)
+        self.assertIs(index.scope_for(cls.keywords[0]), class_params)
+        alias_params = index.scope_for(alias.type_params[0])
+        self.assertEqual(index.locals_for(alias_params), frozenset({"V"}))
+        self.assertIs(index.enclosing_scope(index.scope_for(alias.value)), alias_params)
+
+    def test_open_namespaces_do_not_prove_absence_from_occurrences(self):
+        # A module star import or custom class namespace can supply a name
+        # absent from the finite declaration set; later proofs must abstain.
+        tree, index = self._index(
+            "from extension import *\n"
+            "class C(Base, metaclass=Factory):\n    pass\n"
+            "class Plain:\n    pass\n")
+        namespace_open = getattr(index, "namespace_open", None)
+        self.assertIsNotNone(namespace_open, "open-namespace uncertainty is missing")
+        self.assertTrue(namespace_open(tree))
+        self.assertTrue(namespace_open(tree.body[1]))
+        self.assertFalse(namespace_open(tree.body[2]))
+        self.assertIs(index.scope_for(tree.body[1].keywords[0]), tree)
 
 
 class CapturedBytesBinding(unittest.TestCase):
