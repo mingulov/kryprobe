@@ -4511,6 +4511,44 @@ class _ProofCompletion:
 
 
 @dataclass(frozen=True)
+class _ProofExceptionObject:
+    """Owned native instance; constructor inputs are not inferred attributes.
+
+    arguments contain actual retained args contents, fields the additional
+    native retention edges. Neither exposes a public .args tuple identity.
+    Group children are the ordered captured snapshot, not mutable args[1].
+    """
+
+    payload: tuple
+    arguments: tuple = ()
+    keywords: tuple = ()
+    fields: tuple = ()
+    children: tuple = ()
+    message: _ProofValue | None = None
+
+    def __post_init__(self):
+        def payload(value):
+            return type(value) is tuple and len(value) == 3 and value[0] == "native-exception" \
+                and type(value[1]) is str and type(value[2]) is int and value[2] >= 0
+        if not payload(self.payload) or type(self.arguments) is not tuple \
+                or any(type(value) is not _ProofValue for value in self.arguments) \
+                or any(type(items) is not tuple or any(type(item) is not tuple or len(item) != 2
+                    or type(item[0]) is not str or type(item[1]) is not _ProofValue for item in items)
+                       for items in (self.keywords, self.fields)) \
+                or type(self.children) is not tuple or any(not payload(item) for item in self.children) \
+                or (self.message is not None and type(self.message) is not _ProofValue):
+            raise TypeError("invalid immutable exception object")
+
+    def values(self):
+        return self.arguments + tuple(value for key, value in self.keywords + self.fields) \
+            + (() if self.message is None else (self.message,))
+
+    def edge_count(self):
+        return 1 + len(self.arguments) + len(self.keywords) + len(self.fields) + len(self.children) \
+            + (self.message is not None)
+
+
+@dataclass(frozen=True)
 class _ProofState:
     bindings: tuple = ()
     regions: tuple = ()
@@ -4520,6 +4558,8 @@ class _ProofState:
     continuation: tuple = ()
     entry_modes: tuple = ()
     epoch: object = None
+    exception_objects: tuple = ()
+    exception_metadata: tuple = ()
 
     def __post_init__(self):
         if type(self.bindings) is not tuple or type(self.regions) is not tuple \
@@ -4532,6 +4572,22 @@ class _ProofState:
                     "globals-open", "builtins-open", "frame-builtins-open")
                        for mode in self.entry_modes):
             raise TypeError("proof records require immutable fields")
+        if type(self.exception_objects) is not tuple \
+                or any(type(item) is not _ProofExceptionObject for item in self.exception_objects) \
+                or type(self.exception_metadata) is not tuple:
+            raise TypeError("invalid immutable exception graph")
+        object_ids = {item.payload for item in self.exception_objects}
+        members = set()
+        pristine = False
+        for block in self.exception_metadata:
+            if type(block) is not tuple or len(block) != 2 or block[0] not in ("pristine", "raised") \
+                    or type(block[1]) is not frozenset or not block[1] or members & block[1] \
+                    or not block[1] <= object_ids or (block[0] == "pristine" and pristine):
+                raise TypeError("invalid exception metadata partition")
+            members.update(block[1])
+            pristine |= block[0] == "pristine"
+        if len(object_ids) != len(self.exception_objects) or members != object_ids:
+            raise TypeError("incomplete exception metadata partition")
         for frame in self.continuation:
             if frame and frame[0] == "finally":
                 if len(frame) != 4 or type(frame[1]) is not int or type(frame[3]) is not tuple \
@@ -4612,18 +4668,55 @@ class _ProofState:
                 self.pending.kind, canonical(self.pending.error), canonical(self.pending.target),
                 canonical(self.pending.token()[3]),
                 canonical(self.active), canonical(self.managers), canonical(self.continuation),
-                self.entry_modes)
+                self.entry_modes,
+                tuple((canonical(item.payload), tuple(canonical(value.atoms) for value in item.arguments),
+                       tuple((key, canonical(value.atoms)) for key, value in item.keywords),
+                       tuple((key, canonical(value.atoms)) for key, value in item.fields),
+                       canonical(item.children), None if item.message is None else canonical(item.message.atoms))
+                      for item in self.exception_objects), canonical(self.exception_metadata))
+
+    def exception_object(self, payload):
+        return next((item for item in self.exception_objects if item.payload == payload), None)
+
+    def same_exception_metadata(self, first, second):
+        return any(first in members and second in members for tag, members in self.exception_metadata)
 
     def alias_count(self):
         values = [value for owner, name, value in self.bindings] \
             + [value for region, name, value in self.regions]
         if self.pending.value is not None:
             values.append(self.pending.value)
-        count = sum(atom[0] == "namespace" for value in values for atom in value.atoms)
+        count = sum(atom[0] in ("namespace", "exception", "sequence") for value in values for atom in value.atoms)
         for frame in self.continuation:
             if frame and frame[0] == "finally" and frame[2][3] is not None:
-                count += sum(atom[0] == "namespace" for atom in frame[2][3][0])
-        return count
+                count += sum(atom[0] in ("namespace", "exception", "sequence") for atom in frame[2][3][0])
+                values.append(_ProofValue(*frame[2][3]))
+        error_roots = [self.pending.error, self.active, self.managers]
+        for frame in self.continuation:
+            if frame and frame[0] == "finally":
+                error_roots.extend((frame[2][1], frame[3]))
+            elif frame and frame[0] in ("except-search", "handler"):
+                error_roots.extend((frame[2], frame[3]))
+        while error_roots:
+            part = error_roots.pop()
+            if type(part) not in (tuple, frozenset):
+                continue
+            if _ProofEffects.exception_name(part) is not None:
+                count += 1
+            else:
+                error_roots.extend(part)
+        pending = [value.atoms for value in values]
+        pending.extend(value.atoms for item in self.exception_objects for value in item.values())
+        collections = set()
+        while pending:
+            atoms = pending.pop()
+            for atom in atoms:
+                shape = _ProofEffects.sequence_shape(atom)
+                if shape is not None and atom not in collections:
+                    collections.add(atom)
+                    count += 1 + len(shape[0])
+                    pending.extend(shape[0])
+        return count + sum(item.edge_count() for item in self.exception_objects)
 
     def context_depth(self):
         active_depth = len(self.active)
@@ -4798,6 +4891,44 @@ class _ProofEffects:
         version, signed_max, platform = profile
         if name not in cls._zero_arg_exceptions and name not in cls._exception_arity:
             raise _ProofIncomplete("unsupported-exception-construction")
+        if name in ("ExceptionGroup", "BaseExceptionGroup"):
+            if len(arguments) != 2:
+                return None, "TypeError"
+            message = cls.single(arguments[0])
+            if not message or message[0] == "opaque":
+                raise _ProofIncomplete("opaque-group-message")
+            if message[:2] != ("literal", "str") and message[0] != "plain-string":
+                return None, "TypeError"
+            info = cls.sequence_info(arguments[1])
+            if info is None:
+                token = cls.single(arguments[1])
+                if token and (token[:2] in (("literal", "str"), ("literal", "bytes")) or token[0] == "plain-string"):
+                    return None, "ValueError"  # Empty or non-exception members.
+                if token and (cls.closed_leaf(token) or token[0] in ("namespace", "plain-object")):
+                    return None, "TypeError"
+                raise _ProofIncomplete("opaque-group-sequence")
+            if not info[0]:
+                return None, "ValueError"
+            base = False
+            for value in info[0]:
+                token = cls.single(value)
+                if not token or token[0] == "opaque":
+                    raise _ProofIncomplete("opaque-group-member")
+                if token[0] != "exception":
+                    return None, "ValueError"
+                member = cls.exception_name(token[1])
+                if member is None:
+                    raise _ProofIncomplete("unknown-group-member")
+                base |= "Exception" not in cls._exception_mros[member]
+            # Full member validation precedes the group-family restriction.
+            if name == "ExceptionGroup" and base:
+                return None, "TypeError"
+            if name == "BaseExceptionGroup" and not base:
+                name = "ExceptionGroup"
+            # __new__ validates first; only then __init__ rejects keywords.
+            if keywords:
+                return None, "TypeError"
+            return _ProofValue(frozenset({("exception", ("native-exception", name, site))})), None
         if any(key not in cls._exception_keywords.get(name, ()) for key, value in keywords):
             return None, "TypeError"
         if name in cls._exception_arity:
@@ -4868,6 +4999,155 @@ class _ProofEffects:
         if not all(cls.closed_value(value) for value in (*arguments, *(value for key, value in keywords))):
             raise _ProofIncomplete("unsupported-exception-arguments")
         return _ProofValue(frozenset({("exception", ("native-exception", name, site))})), None
+
+    @staticmethod
+    def exception_values(state):
+        values = [value for owner, name, value in state.bindings] + [value for region, name, value in state.regions]
+        if state.pending.value is not None:
+            values.append(state.pending.value)
+        values.extend(_ProofValue(*frame[2][3]) for frame in state.continuation
+                      if frame and frame[0] == "finally" and frame[2][3] is not None)
+        return tuple(values)
+
+    @classmethod
+    def exception_work(cls, state, extra=()):
+        values = list(cls.exception_values(state)) + list(extra)
+        count = 1 + len(state.active) + len(state.managers) + len(state.continuation)
+        for item in state.exception_objects:
+            count += item.edge_count()
+            values.extend(item.values())
+        for value in values:
+            shape = cls.sequence_shape(cls.single(value))
+            count += shape[1] if shape is not None else 1
+        return count
+
+    @classmethod
+    def live_exception_ids(cls, state, extra=(), include_state=True):
+        objects = {item.payload: item for item in state.exception_objects}
+        pending = [value.atoms for value in (cls.exception_values(state) if include_state else ()) + tuple(extra)]
+        if include_state:
+            pending.extend((state.pending.error, state.active, state.managers, state.continuation))
+        live, seen = set(), set()
+        while pending:
+            part = pending.pop()
+            if type(part) not in (tuple, frozenset) or id(part) in seen:
+                continue
+            seen.add(id(part))
+            if cls.exception_name(part) is not None and type(part) is tuple:
+                if part in live:
+                    continue
+                live.add(part)
+                item = objects.get(part)
+                if item is not None:
+                    pending.extend(value.atoms for value in item.values())
+                    pending.extend(item.children)
+            else:
+                pending.extend(part)
+        return frozenset(live)
+
+    @staticmethod
+    def _exception_partition(objects, metadata, fresh=None):
+        ids = {item.payload for item in objects}
+        blocks = [(tag, members & ids - ({fresh} if fresh is not None else set())) for tag, members in metadata]
+        blocks = [(tag, members) for tag, members in blocks if members]
+        if fresh is not None:
+            for position, (tag, members) in enumerate(blocks):
+                if tag == "pristine":
+                    blocks[position] = (tag, members | {fresh})
+                    break
+            else:
+                blocks.append(("pristine", frozenset({fresh})))
+        return tuple(sorted(blocks, key=lambda block: (block[0], tuple(sorted(block[1])))))
+
+    @classmethod
+    def capture_exception(cls, state, payload, arguments, keywords, profile):
+        if cls.exception_name(payload) is None or type(payload) is not tuple:
+            raise _ProofIncomplete("unowned-exception-allocation")
+        if payload in cls.live_exception_ids(state, arguments + tuple(value for key, value in keywords)):
+            raise _ProofIncomplete("repeated-exception-allocation")
+        name = payload[1]
+        retained, fields, children, message = arguments, (), (), None
+        if name in ("ExceptionGroup", "BaseExceptionGroup"):
+            message = arguments[0]
+            info = cls.sequence_info(arguments[1])
+            children = tuple(cls.single(value)[1] for value in info[0])
+            if any(state.exception_object(child) is None for child in children):
+                raise _ProofIncomplete("unowned-group-member")
+        elif "OSError" in cls._exception_mros[name] and 2 <= len(arguments) <= 5:
+            fields = (("errno", arguments[0]), ("strerror", arguments[1]))
+            if len(arguments) >= 3:
+                token = cls.single(arguments[2])
+                numeric = name == "BlockingIOError" and token[:2] in (("literal", "int"), ("literal", "bool"))
+                if numeric:
+                    number = (1 if token[2] else 0) if token[1] == "bool" else token[2]
+                    fields += (("characters_written", _ProofValue.literal(number)),)
+                elif arguments[2] != _ProofValue.literal(None):
+                    retained = arguments[:2]
+                    fields += (("filename", arguments[2]),)
+                    if len(arguments) == 5:
+                        fields += (("filename2", arguments[4]),)
+        # Other admitted constructor fields only retain references already in
+        # actual args/keywords. Public attribute/tuple-identity access remains
+        # incomplete until its specific native field model is installed.
+        item = _ProofExceptionObject(payload, retained, keywords, fields, children, message)
+        if any(state.exception_object(reference) is None
+               for reference in cls.live_exception_ids(state, item.values(), include_state=False)):
+            raise _ProofIncomplete("unowned-retained-exception")
+        objects = tuple(sorted((old for old in state.exception_objects if old.payload != payload),
+                               key=lambda old: old.payload)) + (item,)
+        objects = tuple(sorted(objects, key=lambda old: old.payload))
+        return replace(state, exception_objects=objects,
+                       exception_metadata=cls._exception_partition(objects, state.exception_metadata, payload))
+
+    @classmethod
+    def prune_exception_objects(cls, state):
+        live = cls.live_exception_ids(state)
+        objects = tuple(item for item in state.exception_objects if item.payload in live)
+        if objects == state.exception_objects:
+            return state
+        return replace(state, exception_objects=objects,
+                       exception_metadata=cls._exception_partition(objects, state.exception_metadata))
+
+    @classmethod
+    def explicitly_raised(cls, state, payload, cause=None, explicit_cause=False):
+        if state.exception_object(payload) is None:
+            return state  # Legacy/unknown seeded metadata is not pristine.
+        item = state.exception_object(payload)
+        objects = {old.payload: old for old in state.exception_objects}
+        changed = {payload}
+        fields = dict(item.fields)
+        if explicit_cause:
+            fields.pop("__cause__", None)
+            if cause is not None:
+                fields["__cause__"] = _ProofValue(frozenset({("exception", cause)}))
+        if state.active and state.active[-1][0] == "error" and state.active[-1][1] != payload:
+            context = state.active[-1][1]
+            if state.exception_object(context) is not None:
+                # CPython cuts the first context back-edge before attaching
+                # the active error. Cause links are deliberately not walked.
+                # The caller reserves the whole bounded graph walk first.
+                cursor, seen = context, set()
+                while cursor in objects and cursor not in seen:
+                    seen.add(cursor)
+                    following = dict(objects[cursor].fields)
+                    link = cls.single(following.get("__context__", _ProofValue.literal(None)))
+                    if not link or link[0] != "exception":
+                        break
+                    if link[1] == payload:
+                        following.pop("__context__")
+                        objects[cursor] = replace(objects[cursor], fields=tuple(sorted(following.items())))
+                        changed.add(cursor)
+                        break
+                    cursor = link[1]
+                fields["__context__"] = _ProofValue(frozenset({("exception", context)}))
+        item = replace(item, fields=tuple(sorted(fields.items())))
+        objects[payload] = item
+        objects = tuple(objects[key] for key in sorted(objects))
+        blocks = [(tag, members - changed) for tag, members in state.exception_metadata]
+        blocks = [(tag, members) for tag, members in blocks if members]
+        blocks.extend(("raised", frozenset({key})) for key in sorted(changed))
+        return replace(state, exception_objects=objects, exception_metadata=tuple(sorted(blocks,
+                       key=lambda block: (block[0], tuple(sorted(block[1]))))))
 
     @classmethod
     def int_literal_call(cls, arguments, keywords):
@@ -5644,6 +5924,9 @@ class _ProofContext:
                         state.epoch is not None and state.epoch is not self._epoch):
                     reasons.append("foreign-state")
                     return snapshot()
+                if state.exception_objects and state.epoch is None:
+                    reasons.append("unknown-exception-entry-metadata")
+                    return snapshot()
                 modes = tuple(sorted(set(state.entry_modes) | set(region_entry_modes)))
                 requested.add(replace(state, epoch=self._epoch, entry_modes=modes))
                 if len(requested) > self.limits["alternatives"]:
@@ -5656,6 +5939,27 @@ class _ProofContext:
             # Validate the semantic whole-entry set, not duplicate inputs or
             # host-dependent sharing. Cache hits reuse the owned validation.
             for state in sorted(entry, key=lambda item: item.order_key()):
+                try:
+                    self._charge(stats, sum(item.edge_count() for item in state.exception_objects))
+                except _ProofIncomplete as error:
+                    reasons.append(str(error))
+                    return snapshot()
+                for item in state.exception_objects:
+                    name = _ProofEffects.exception_name(item.payload)
+                    try:
+                        allocation = self.index.node_for_id(item.payload[2])
+                        parent = self.index.parent(allocation)
+                    except (IndexError, KeyError):
+                        allocation = parent = None
+                    origin = isinstance(allocation, (ast.Call, ast.Raise)) or (
+                        isinstance(parent, ast.Raise) and parent.cause is allocation)
+                    grouped = name in ("ExceptionGroup", "BaseExceptionGroup")
+                    if not origin or name is None or (bool(item.children) != grouped) \
+                            or (grouped and item.message is None) or (not grouped and item.message is not None) \
+                            or any(value.unknown for value in item.values()) \
+                            or any(state.exception_object(child) is None for child in item.children):
+                        reasons.append("unsupported-exception-entry")
+                        return snapshot()
                 held = [value for storage, name, value in state.bindings] \
                     + [value for region, name, value in state.regions]
                 if state.pending.value is not None:
@@ -5663,6 +5967,7 @@ class _ProofContext:
                 held.extend(_ProofValue(*frame[2][3]) for frame in state.continuation
                             if frame and frame[0] == "finally" and frame[2][3] is not None)
                 held = [(value.atoms, False) for value in held]
+                held.extend((value.atoms, True) for item in state.exception_objects for value in item.values())
                 checked = set()
                 while held:
                     atoms, closed = held.pop()
@@ -5674,6 +5979,10 @@ class _ProofContext:
                         reasons.append("unsupported-composite-entry")
                         return snapshot()
                     for atom in atoms:
+                        if atom[0] == "exception" and len(atom) == 2 and type(atom[1]) is tuple \
+                                and state.exception_object(atom[1]) is None:
+                            reasons.append("unowned-exception-entry")
+                            return snapshot()
                         if atom[0] == "expansion" or (closed and atom[0] != "sequence"
                                                      and not _ProofEffects.closed_leaf(atom)):
                             reasons.append("unsupported-composite-entry")
@@ -5811,6 +6120,8 @@ class _ProofContext:
                 names[region].add(name)
                 if len(names[region]) > self.limits["names"]:
                     raise _ProofIncomplete("name-budget")
+            if state.exception_objects:
+                self._charge(stats, _ProofEffects.exception_work(state))
             if state.alias_count() > self.limits["aliases"]:
                 raise _ProofIncomplete("alias-budget")
             if len(states) >= self.limits["alternatives"]:
@@ -5930,6 +6241,10 @@ class _ProofContext:
             elif token and token[0] == "native" and token[1] in _ProofEffects._exception_mros:
                 result, error = _ProofEffects.construct_exception(token[1], arguments, keywords,
                     self.index.node_id(node), self._native_profile)
+                if error is None:
+                    self._charge(stats, _ProofEffects.exception_work(state, arguments + tuple(value for key, value in keywords)))
+                    state = _ProofEffects.capture_exception(state, _ProofEffects.single(result)[1],
+                        arguments, keywords, self._native_profile)
             elif token == ("native", "int"):
                 result, error = _ProofEffects.int_literal_call(arguments, keywords)
             elif token == ("native", "object") or (token and token[0] == "empty-class"):
@@ -6156,6 +6471,9 @@ class _ProofContext:
             queue = deque()
 
             def enqueue(cursor, state, observation=None):
+                if state.exception_objects:
+                    self._charge(stats, _ProofEffects.exception_work(state))
+                    state = _ProofEffects.prune_exception_objects(state)
                 # Each after-marker is one live compound continuation; its
                 # seq/next actions are implementation pieces, not extra frames.
                 restoring = {frame[0] for frame in cursor if frame[1] == "finally-resume"}
@@ -6438,8 +6756,18 @@ class _ProofContext:
                             route(successor, outcome)
                         for values, current in frontier:
                             payload, error = _ProofEffects.normalize_exception(values[0], self.index.node_id(node))
+                            if error is None and _ProofEffects.single(values[0])[0] == "native":
+                                self._charge(stats, _ProofEffects.exception_work(current))
+                                current = _ProofEffects.capture_exception(current, payload, (), (), self._native_profile)
+                            cause = None
                             if error is None and node.cause is not None and values[1] != _ProofValue.literal(None):
                                 cause, error = _ProofEffects.normalize_exception(values[1], self.index.node_id(node.cause))
+                                if error is None and _ProofEffects.single(values[1])[0] == "native":
+                                    self._charge(stats, _ProofEffects.exception_work(current))
+                                    current = _ProofEffects.capture_exception(current, cause, (), (), self._native_profile)
+                            if error is None:
+                                self._charge(stats, _ProofEffects.exception_work(current))
+                                current = _ProofEffects.explicitly_raised(current, payload, cause, node.cause is not None)
                             current = replace(current, pending=_ProofCompletion("raise", error or payload))
                             record(node, "transfer", current)
                             enqueue(successor, current)
@@ -25571,6 +25899,251 @@ class ProofFlowTests(unittest.TestCase):
         compute = dict(context.total_compute)
         self.assertIs(context.solve(func, entry=(entry, entry)), snapshot)
         self.assertEqual(dict(context.total_compute), compute)
+
+    def test_native_group_constructor_errors_precede_keywords_and_family_rejection(self):
+        for constructor, expected in (
+                ("ExceptionGroup(0,[],bad=1)", "TypeError"),
+                ("ExceptionGroup('g',[],bad=1)", "ValueError"),
+                ("ExceptionGroup('g',[ValueError()],bad=1)", "TypeError"),
+                ("ExceptionGroup(message='g',exceptions=[ValueError()])", "TypeError"),
+                ("ExceptionGroup('g',[SystemExit(),None],bad=1)", "ValueError"),
+                ("ExceptionGroup('g',[None,SystemExit()])", "ValueError"),
+                ("ExceptionGroup('g',[SystemExit()])", "TypeError"),
+                ("ExceptionGroup('g',None)", "TypeError"), ("ExceptionGroup('g',{})", "TypeError"),
+                ("ExceptionGroup('g',())", "ValueError"), ("ExceptionGroup('g','')", "ValueError"),
+                ("ExceptionGroup('g','x')", "ValueError"), ("ExceptionGroup('g',b'x')", "ValueError"),
+                ("ExceptionGroup('g',[ValueError])", "ValueError"),
+                ("ExceptionGroup(0,[int('bad')])", "ValueError"),
+                ("ExceptionGroup('g',[ValueError(),TypeError()])", "ExceptionGroup"),
+                ("BaseExceptionGroup('g',[ValueError()])", "ExceptionGroup"),
+                ("BaseExceptionGroup('g',[SystemExit()])", "BaseExceptionGroup"),
+                ("ExceptionGroup('g',[BaseExceptionGroup('i',[ValueError()])])", "ExceptionGroup")):
+            with self.subTest(constructor=constructor):
+                context, func, snapshot = self._solve("raise " + constructor + "\nmarker=int")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                error = snapshot.exits[0].pending.error
+                self.assertEqual(error if type(error) is str else error[1], expected)
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_group_objects_keep_ordered_duplicates_and_original_input(self):
+        context, func, snapshot = self._solve("e=ValueError('leaf')\ninner=BaseExceptionGroup('i',[e])\n"
+            "members=[e,inner,e]\ngroup=ExceptionGroup('g',members)\nraise group")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        first = _ProofEffects.single(state.lookup(owner, "e"))[1]
+        inner = _ProofEffects.single(state.lookup(owner, "inner"))[1]
+        self.assertTrue(hasattr(state, "exception_object"), "missing owned exception retention graph")
+        group = state.exception_object(state.pending.error)
+        self.assertEqual(group.children, (first, inner, first))
+        self.assertEqual(group.message, _ProofValue.literal('g'))
+        self.assertEqual(group.arguments, (_ProofValue.literal('g'), state.lookup(owner, "members")))
+        self.assertEqual(state.exception_object(inner).children, (first,))
+        self.assertEqual(state.exception_object(first).arguments, (_ProofValue.literal('leaf'),))
+
+    def test_same_exception_allocation_site_cannot_retarget_a_live_instance(self):
+        context, func, snapshot = self._solve("e=ValueError()")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(hasattr(_ProofEffects, "capture_exception"), "missing allocation/retention model")
+        state = snapshot.exits[0]
+        payload = _ProofEffects.single(state.lookup(context.index.node_id(func), "e"))[1]
+        with self.assertRaisesRegex(_ProofIncomplete, "repeated-exception-allocation"):
+            _ProofEffects.capture_exception(state, payload, (), (), context._native_profile)
+        dead = state.bind(context.index.node_id(func), "e", _ProofValue.literal(0))
+        replaced = _ProofEffects.capture_exception(dead, payload, (), (), context._native_profile)
+        self.assertEqual(len(replaced.exception_objects), 1)
+
+    def test_native_group_is_one_correlated_outcome_not_member_alternatives(self):
+        context, func, snapshot = self._solve("raise ExceptionGroup('g',[ValueError(),TypeError(),ValueError()])",
+                                               limits={"alternatives": 1})
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertEqual(len(snapshot.exits), 1)
+        state = snapshot.exits[0]
+        self.assertTrue(hasattr(state, "exception_object"), "group membership requires an owned graph")
+        children = state.exception_object(state.pending.error).children
+        self.assertEqual([item[1] for item in children], ['ValueError', 'TypeError', 'ValueError'])
+        self.assertNotEqual(children[0], children[2])
+
+    def test_exception_metadata_partition_tracks_aliases_and_explicit_raise(self):
+        context, func, snapshot = self._solve("a=ValueError()\nb=TypeError()\nalias=a\n"
+                                             "try:\n    raise a\nexcept ValueError:\n    pass\nmarker=int")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(hasattr(snapshot.exits[0], "same_exception_metadata"), "missing finite metadata partition")
+        owner = context.index.node_id(func)
+        before = snapshot.states_at(func.body[3])[0]
+        a = _ProofEffects.single(before.lookup(owner, "a"))[1]
+        b = _ProofEffects.single(before.lookup(owner, "b"))[1]
+        self.assertNotEqual(a, b)
+        self.assertTrue(before.same_exception_metadata(a, b))
+        after = snapshot.exits[0]
+        self.assertEqual(after.lookup(owner, "a"), after.lookup(owner, "alias"))
+        self.assertFalse(after.same_exception_metadata(a, b))
+        self.assertTrue(after.same_exception_metadata(a, a))
+
+    def test_bare_reraise_preserves_owned_exception_metadata(self):
+        context, func, snapshot = self._solve("try:\n    raise ValueError()\nexcept ValueError as e:\n    raise")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertTrue(hasattr(snapshot.exits[0], "exception_metadata"), "missing metadata partition")
+        before = snapshot.states_at(func.body[0].handlers[0].body[0])[0]
+        self.assertEqual(before.exception_metadata, snapshot.exits[0].exception_metadata)
+
+    def test_incoming_exception_graph_requires_owned_closed_records(self):
+        for case in ("unknown-metadata", "foreign-site", "hidden-opaque", "dangling-child"):
+            with self.subTest(case=case):
+                context = _ProofContext("def f(x):\n    marker=int\ndef allocate():\n    ValueError()\n"
+                                        "    ExceptionGroup('g',[ValueError()])\n")
+                func = context.tree.body[0]
+                site = context.index.node_id(context.tree.body[1].body[0].value)
+                payload = ("native-exception", "ValueError", 999999 if case == "foreign-site" else site)
+                value = _ProofValue(frozenset({("exception", payload)}))
+                arguments = (_ProofValue(frozenset({("opaque", "parameter", context.index.node_id(func), "x")})),) \
+                    if case == "hidden-opaque" else ()
+                children = (("native-exception", "ValueError", 999998),) if case == "dangling-child" else ()
+                item = _ProofExceptionObject(payload, arguments=arguments, children=children)
+                entry = _ProofState(epoch=None if case == "unknown-metadata" else context._epoch,
+                    exception_objects=(item,), exception_metadata=(("pristine", frozenset({payload})),)).bind(
+                    context.index.node_id(func), "x", value)
+                snapshot = context.solve(func, entry=(entry,))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[0].value, "int"))
+
+    def test_exception_liveness_uses_real_roots_not_metadata_equivalence(self):
+        context, func, snapshot = self._solve("a=ValueError()\nb=TypeError()\n")
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        a = _ProofEffects.single(state.lookup(owner, "a"))[1]
+        b = _ProofEffects.single(state.lookup(owner, "b"))[1]
+        self.assertTrue(state.same_exception_metadata(a, b))
+        value = state.lookup(owner, "a")
+        base = state.bind(owner, "a", _ProofValue.literal(0))
+        for root in ("binding", "pending", "saved-return", "active", "cause"):
+            with self.subTest(root=root):
+                held = base
+                if root == "binding":
+                    held = held.bind(owner, "copy", value)
+                elif root == "pending":
+                    held = replace(held, pending=_ProofCompletion("return", value=value))
+                elif root == "saved-return":
+                    held = replace(held, continuation=(("finally", 0, _ProofCompletion("return", value=value).token(), ()),))
+                elif root == "active":
+                    held = replace(held, active=(("error", a),))
+                else:
+                    held = _ProofEffects.explicitly_raised(held, b, a, True)
+                with self.assertRaisesRegex(_ProofIncomplete, "repeated-exception-allocation"):
+                    _ProofEffects.capture_exception(held, a, (), (), context._native_profile)
+        fresh = _ProofEffects.capture_exception(base, a, (), (), context._native_profile)
+        self.assertTrue(fresh.same_exception_metadata(a, b))
+
+    def test_exception_graph_edges_and_work_share_hard_budgets(self):
+        source = "raise ExceptionGroup('g',[ValueError(),TypeError()])"
+        context, func, snapshot = self._solve(source)
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        self.assertGreater(snapshot.stats['steps'], 1)
+        for limit, complete in ((snapshot.stats['steps'] - 1, False), (snapshot.stats['steps'], True)):
+            with self.subTest(resource="steps", limit=limit):
+                limited, region, result = self._solve(source, limits={"steps": limit})
+                self.assertEqual(result.complete, complete, result.reasons)
+                if not complete:
+                    self.assertIn('work-budget', result.reasons)
+        # Distinct leaf allocations and both original/captured group-member
+        # slots consume storage; reducing the alias allowance cannot erase it.
+        context, func, snapshot = self._solve(source, limits={"aliases": 1})
+        self.assertFalse(snapshot.complete)
+        self.assertIn('alias-budget', snapshot.reasons)
+
+    def test_retained_collection_slots_are_counted_once_with_all_duplicate_edges(self):
+        # Three root references; two exception nodes and one args edge; one
+        # collection node and its three ordered slots: ten storage units.
+        source = "leaf=ValueError()\nmembers=[leaf,leaf,leaf]\nwrapped=ValueError(members)\nmarker=int"
+        for cap, complete in ((9, False), (10, True), (11, True)):
+            with self.subTest(cap=cap):
+                context, func, snapshot = self._solve(source, limits={"aliases": cap})
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if complete:
+                    self.assertEqual(snapshot.exits[0].alias_count(), 10)
+                    self.assertTrue(snapshot.native_identity(func.body[-1].value, "int"))
+                else:
+                    self.assertIn('alias-budget', snapshot.reasons)
+
+    def test_exact_string_group_inputs_raise_value_error_including_formatted_categories(self):
+        for name in ('ExceptionGroup', 'BaseExceptionGroup'):
+            for value in ("''", "'x'", "f''", "f'{1}'"):
+                with self.subTest(name=name, value=value):
+                    context, func, snapshot = self._solve("try:\n    " + name + "('g'," + value
+                        + ")\nexcept ValueError:\n    marker=int")
+                    self.assertTrue(snapshot.complete, snapshot.reasons)
+                    self.assertEqual(snapshot.exits[0].pending.kind, 'normal')
+                    self.assertTrue(snapshot.native_identity(func.body[0].handlers[0].body[0].value, 'int'))
+
+    def test_explicit_raise_cuts_context_backedge_but_not_explicit_cause(self):
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                context, func, snapshot = self._solve("a=ValueError()\nb=TypeError()\ntry:\n    raise a\n"
+                    "except ValueError:\n    try:\n        raise b" + (" from a" if explicit else "")
+                    + "\n    except TypeError:\n        raise a")
+                self.assertTrue(snapshot.complete, snapshot.reasons)
+                state = snapshot.exits[0]
+                owner = context.index.node_id(func)
+                a = _ProofEffects.single(state.lookup(owner, 'a'))[1]
+                b = _ProofEffects.single(state.lookup(owner, 'b'))[1]
+                self.assertEqual(dict(state.exception_object(a).fields)['__context__'], state.lookup(owner, 'b'))
+                self.assertNotIn('__context__', dict(state.exception_object(b).fields))
+                if explicit:
+                    self.assertEqual(dict(state.exception_object(b).fields)['__cause__'], state.lookup(owner, 'a'))
+
+    def test_context_cut_separates_metadata_from_an_unmodified_equivalent_object(self):
+        context, func, snapshot = self._solve('a=ValueError()\nb=TypeError()\nc=TypeError()')
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        a, b, c = tuple(_ProofEffects.single(state.lookup(owner, name))[1] for name in ('a', 'b', 'c'))
+        # Explicit hypothesis for a metadata-equivalent copy (the split model
+        # will create such objects). Only b's context edge will be cut.
+        objects = tuple(replace(item, fields=(('__context__', state.lookup(owner, 'a')),))
+                        if item.payload in (b, c) else item for item in state.exception_objects)
+        entry = replace(state, exception_objects=objects,
+            exception_metadata=(('pristine', frozenset({a})), ('raised', frozenset({b, c}))), active=(('error', b),))
+        after = _ProofEffects.explicitly_raised(entry, a)
+        self.assertFalse(after.same_exception_metadata(b, c))
+        self.assertEqual(dict(after.exception_object(c).fields)['__context__'], state.lookup(owner, 'a'))
+
+    def test_unknown_retained_fields_cannot_borrow_concrete_atoms_for_quiet_release(self):
+        for slot in ('arguments', 'fields'):
+            with self.subTest(slot=slot):
+                context = _ProofContext('def f(e):\n    e=0\n    marker=int\ndef allocation():\n    ValueError()\n')
+                func = context.tree.body[0]
+                payload = ('native-exception', 'ValueError', context.index.node_id(context.tree.body[1].body[0].value))
+                unknown = _ProofValue(_ProofValue.literal(0).atoms, unknown=True, reason='unknown-retention')
+                item = _ProofExceptionObject(payload, **({slot: (unknown,)} if slot == 'arguments'
+                                                        else {slot: (('__context__', unknown),)}))
+                entry = _ProofState(epoch=context._epoch, exception_objects=(item,),
+                    exception_metadata=(('pristine', frozenset({payload})),)).bind(context.index.node_id(func), 'e',
+                        _ProofValue(frozenset({('exception', payload)})))
+                snapshot = context.solve(func, entry=(entry,))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.native_identity(func.body[-1].value, 'int'))
+
+    def test_raise_active_and_saved_error_roots_share_the_alias_budget(self):
+        for cap, complete in ((1, False), (2, True), (3, True)):
+            with self.subTest(cap=cap):
+                context, func, snapshot = self._solve('raise ValueError()', limits={'aliases': cap})
+                self.assertEqual(snapshot.complete, complete, snapshot.reasons)
+                if complete:
+                    self.assertEqual(snapshot.exits[0].alias_count(), 2)
+                else:
+                    self.assertIn('alias-budget', snapshot.reasons)
+        context, func, snapshot = self._solve('e=ValueError()')
+        self.assertTrue(snapshot.complete, snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        payload = _ProofEffects.single(state.lookup(owner, 'e'))[1]
+        base = state.bind(owner, 'e', _ProofValue.literal(0))
+        for kwargs in ({'pending': _ProofCompletion('raise', payload)}, {'active': (('error', payload),)},
+                {'continuation': (('finally', 0, _ProofCompletion('raise', payload).token(), ()),)},
+                {'continuation': (('finally', 0, _ProofCompletion().token(), (('error', payload),)),)}):
+            with self.subTest(kwargs=kwargs):
+                self.assertEqual(replace(base, **kwargs).alias_count(), 2)
 
 
 
