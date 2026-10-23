@@ -4150,6 +4150,25 @@ def _def_annotations(node):
     return parts
 
 
+def _proof_definition_parts(node, eager):
+    """Captured expression slots in compiler order, not occurrence order."""
+    args = node.args
+    parts = [("default:" + str(position), value) for position, value in enumerate(args.defaults)]
+    parts.extend(("kwdefault:" + arg.arg, value) for arg, value in zip(args.kwonlyargs, args.kw_defaults)
+                 if value is not None)
+    if eager:
+        # CPython3.12 visits ordinary positionals BEFORE positional-only,
+        # then vararg, keyword-only, kwarg, and finally return annotation.
+        ordered = list(args.args) + list(args.posonlyargs)
+        ordered += [args.vararg] if args.vararg is not None else []
+        ordered += list(args.kwonlyargs)
+        ordered += [args.kwarg] if args.kwarg is not None else []
+        parts.extend(("annotation:" + arg.arg, arg.annotation) for arg in ordered if arg.annotation is not None)
+        if getattr(node, "returns", None) is not None:
+            parts.append(("annotation:return", node.returns))
+    return tuple(parts)
+
+
 def _annotations_eager(parents, scope):
     # True when nested-def annotations evaluate
     # eagerly (P7): under `from __future__
@@ -4205,6 +4224,7 @@ class _ProofScopeIndex:
         owners = {}
         enclosing = {}
         open_namespaces = set()
+        annotation_definitions = {}
         eager = self.semantic_key[:2] < (3, 14) and not _future_annotations(tree)
 
         def scope(node, outer):
@@ -4240,6 +4260,7 @@ class _ProofScopeIndex:
                     pending.append((part, outer))
                 else:
                     scope(part, outer)
+                    annotation_definitions[part] = node
                     pending.append((part, part))
 
         def arguments(args, inner, outer):
@@ -4378,6 +4399,34 @@ class _ProofScopeIndex:
                 outer = enclosing[outer]
         self._captures = MappingProxyType({owner: frozenset(names) for owner, names in captures.items()})
         self._cells = MappingProxyType({owner: frozenset(names) for owner, names in cells.items()})
+        self._definition_parts = MappingProxyType({node: _proof_definition_parts(node, eager)
+            for node in local if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))})
+        self._invalid_deferred_annotations = frozenset(annotation_definitions[owners[id(node)]]
+            for node in nodes.values() if isinstance(node, ast.NamedExpr) and owners[id(node)] in annotation_definitions)
+        deferred_captures = {}
+        for part, declaration in annotation_definitions.items():
+            deferred_captures.setdefault(declaration, set()).update(captures[part])
+        function_cells = {}
+        for node in self._definition_parts:
+            names = set(captures[node]) | deferred_captures.get(node, set())
+            references = set()
+            for name in names:
+                outer = enclosing[node]
+                while outer is not None:
+                    if isinstance(outer, ast.ClassDef):
+                        if name == "__class__":
+                            references.add((node_ids[id(outer)], name))
+                            break
+                    elif name in global_names[outer]:
+                        break
+                    elif name in local[outer] and outer is not tree:
+                        references.add((node_ids[id(outer)], name))
+                        break
+                    outer = enclosing[outer]
+            function_cells[node] = tuple(sorted(references))
+        self._function_cells = MappingProxyType(function_cells)
+        decorator_nodes = {id(part) for node in nodes.values()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for part in node.decorator_list}
         event_ids = {}
         event_counts = {owner: 0 for owner in local}
         for site, node in nodes.items():
@@ -4390,6 +4439,8 @@ class _ProofScopeIndex:
                 roles.append("transfer" if isinstance(node, (ast.Return, ast.Raise, ast.Break, ast.Continue)) else "after")
             if isinstance(node, ast.Call):
                 roles.append("invoke")
+            if id(node) in decorator_nodes:
+                roles.append("apply")
             if isinstance(node, ast.For):
                 roles.append("next")
             if isinstance(node, (ast.ExceptHandler, ast.withitem)):
@@ -4820,11 +4871,12 @@ class _ProofState:
                       and type(frame[2]) is tuple and bool(frame[2]))
         if self.pending.value is not None:
             values.append(self.pending.value)
-        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union")
+        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union", "function", "closure-cell")
                                                  for value in values for atom in value.atoms)
+        count += sum(region[0] == "function" for region, name, value in self.regions)
         for frame in self.continuation:
             if frame and frame[0] == "finally" and frame[2][3] is not None:
-                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union") for atom in frame[2][3][0])
+                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union", "function", "closure-cell") for atom in frame[2][3][0])
                 values.append(_ProofValue(*frame[2][3]))
         error_roots = [self.pending.error, self.active, self.managers]
         for frame in self.continuation:
@@ -5315,6 +5367,7 @@ class _ProofEffects:
     def exception_work(cls, state, extra=()):
         values = list(cls.exception_values(state)) + list(extra)
         count = 1 + len(state.active) + len(state.managers) + len(state.continuation)
+        count += sum(region[0] == "function" for region, name, value in state.regions)
         count += sum(4 + len(frame[4]) for frame in state.managers
                      if frame and frame[0] == "suppress" and len(frame) == 5 and type(frame[4]) is tuple)
         count += sum(3 + len(frame[6]) + len(frame[8]) for frame in state.continuation
@@ -5341,8 +5394,12 @@ class _ProofEffects:
         objects = {item.payload: item for item in state.exception_objects}
         collections = {item.identity: item for item in state.collection_objects}
         regions = {}
+        owned_functions = set()
         for region, name, value in state.regions:
             regions.setdefault(region, []).append(value)
+            if region[0] == "function" and name == "$owned" and value == _ProofValue.literal(True):
+                owned_functions.add(region)
+        bindings = {(owner, name): value for owner, name, value in state.bindings}
         pending = [value.atoms for value in (cls.exception_values(state) if include_state else ()) + tuple(extra)]
         unknown = any(value.unknown for value in (cls.exception_values(state) if include_state else ()) + tuple(extra))
         if include_state:
@@ -5381,7 +5438,20 @@ class _ProofEffects:
                 if region not in seen_regions:
                     seen_regions.add(region)
                     values(regions.get(region, ()))
-            elif type(part) is tuple and part and part[0] in ("opaque", "empty-class", "function"):
+            elif type(part) is tuple and part and part[0] == "function":
+                if len(part) != 2 or type(part[1]) is not int:
+                    raise _ProofIncomplete("unsupported-function-reference")
+                region = ("function", part[1])
+                if region not in owned_functions:
+                    unsafe.add(part)  # Legacy/borrowed callable retains unknown edges.
+                if region not in seen_regions:
+                    seen_regions.add(region)
+                    values(regions.get(region, ()))
+            elif type(part) is tuple and part and part[0] == "closure-cell":
+                if len(part) != 3 or type(part[1]) is not int or type(part[2]) is not str:
+                    raise _ProofIncomplete("unsupported-closure-cell")
+                values((bindings.get((part[1], part[2]), _ProofValue.unknown_value("unobserved-closure-cell")),))
+            elif type(part) is tuple and part and part[0] in ("opaque", "empty-class"):
                 if part[:2] != ("opaque", "type-parameter"):
                     unsafe.add(part)
             else:
@@ -5394,6 +5464,8 @@ class _ProofEffects:
             return False
         token = cls.single(value)
         return cls.closed_value(value) or (token[0] in ("namespace", "opaque")) \
+            or (state is not None and len(token) == 2 and token[0] == "function" and type(token[1]) is int
+                and state.region_value(("function", token[1]), "$owned") == _ProofValue.literal(True)) \
             or (token[0] == "exception-method" and len(token) == 3 and token[2] in ("split", "subgroup")
                 and state is not None and state.exception_object(token[1]) is not None) \
             or (token[0] == "collection" and state is not None and state.collection_object(token) is not None)
@@ -5519,7 +5591,7 @@ class _ProofEffects:
         live, held, unused, unknown, regions = cls.reachable(state)
         objects = tuple(item for item in state.exception_objects if item.payload in live)
         collections = tuple(item for item in state.collection_objects if item.identity in held)
-        retained_regions = tuple(item for item in state.regions if item[0][0] != "suppress" or item[0] in regions)
+        retained_regions = tuple(item for item in state.regions if item[0][0] not in ("suppress", "function") or item[0] in regions)
         if objects == state.exception_objects and collections == state.collection_objects and retained_regions == state.regions:
             return state
         return replace(state, exception_objects=objects, collection_objects=collections, regions=retained_regions,
@@ -5888,6 +5960,64 @@ class _ProofEffects:
             return None
         return node.body.value
 
+    @staticmethod
+    def name_lambda(node):
+        if not isinstance(node, ast.Lambda):
+            return None
+        args = node.args
+        parameters = list(args.posonlyargs) + list(args.args)
+        if len(parameters) != 1 or args.vararg or args.kwonlyargs or args.kw_defaults or args.kwarg or args.defaults \
+                or not isinstance(node.body, ast.Name) or not isinstance(node.body.ctx, ast.Load):
+            return None
+        return parameters[0].arg
+
+    @classmethod
+    def capture_lookup_work(cls, values, state):
+        work = 0
+        for value in values:
+            token = cls.single(value)
+            if token and token[0] == "function":
+                work += len(state.regions)
+            elif token and token[0] == "collection":
+                work += len(state.collection_objects)
+            elif token and token[0] == "exception-method":
+                work += len(state.exception_objects)
+        return work
+
+    @classmethod
+    def validate_function_rows(cls, index, state, charge):
+        functions = {}
+        for region, name, value in state.regions:
+            if len(region) != 2 or region[0] != "function":
+                continue
+            if type(region[1]) is not int:
+                raise _ProofIncomplete("unsupported-function-entry")
+            functions.setdefault(region, {})[name] = value
+        for region, rows in functions.items():
+            try:
+                node = index.node_for_id(region[1])
+                parts = index._definition_parts[node]
+                cells = index._function_cells[node]
+            except KeyError:
+                raise _ProofIncomplete("unsupported-function-entry")
+            charge(1 + len(parts) + len(cells))
+            if any(not isinstance(index.node_for_id(owner), (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                   for owner, name in cells):
+                raise _ProofIncomplete("unsupported-class-cell-capture")
+            if getattr(node, "type_params", ()) or node in index._invalid_deferred_annotations:
+                raise _ProofIncomplete("unsupported-function-entry")
+            expected_cells = {"cell:" + str(owner) + ":" + name:
+                _ProofValue(frozenset({("closure-cell", owner, name)})) for owner, name in cells}
+            if rows.get("$owned") != _ProofValue.literal(True) \
+                    or set(rows) != {"$owned", "$builtins", *(label for label, part in parts), *expected_cells} \
+                    or any(rows[name] != value for name, value in expected_cells.items()):
+                raise _ProofIncomplete("unsupported-function-entry")
+            values = tuple(rows[label] for label, part in parts) + (rows["$builtins"],)
+            charge(cls.capture_lookup_work(values, state))
+            if any(not cls.retained_value(value, state) for value in values):
+                raise _ProofIncomplete("unsupported-function-entry")
+        return frozenset(functions)
+
     @classmethod
     def iterator_next(cls, value):
         token = cls.single(value)
@@ -6041,7 +6171,18 @@ class _ProofEffects:
         return cls.builtin(state, name)
 
     @classmethod
+    def captured_builtin(cls, index, scope, state, selected, name):
+        regions = {atom[2] for atom in selected.atoms if len(atom) == 3 and atom[0] == "namespace"
+                   and atom[1] in ("module", "mapping")}
+        if not selected.unknown and len(regions) == 1 and all(len(atom) == 3 and atom[0] == "namespace"
+                and atom[1] in ("module", "mapping") for atom in selected.atoms):
+            return cls.region_value(index, scope, state, next(iter(regions)), name)
+        return _ProofValue.unknown_value("opaque-captured-builtins")
+
+    @classmethod
     def region_value(cls, index, scope, state, region, name):
+        if region[0] == "function":
+            raise _ProofIncomplete("internal-function-region")
         if state.region_defined(region, name):
             return state.region_value(region, name)
         if region == ("contextlib", 0):
@@ -6103,7 +6244,7 @@ class _ProofEffects:
         return value
 
     @classmethod
-    def lookup(cls, index, scope, state, name, dynamic=False):
+    def lookup(cls, index, scope, state, name, dynamic=False, selected_builtins=None):
         if name == "__debug__" and not dynamic:
             return _ProofValue.literal(__debug__), None
         function = isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
@@ -6146,7 +6287,12 @@ class _ProofEffects:
                 outer = index.enclosing_scope(outer)
         if index.runtime_name(scope, name) != name:
             raise _ProofIncomplete("mangled-runtime-namespace")
-        value = cls.global_value(index, scope, state, name)
+        if selected_builtins is None:
+            value = cls.global_value(index, scope, state, name)
+        else:
+            value = cls.region_value(index, scope, state, ("globals", 0), name)
+            if value == _ProofValue.absent():
+                value = cls.captured_builtin(index, scope, state, selected_builtins, name)
         return value, "NameError" if value == _ProofValue.absent() else None
 
     @classmethod
@@ -6236,6 +6382,8 @@ class _ProofEffects:
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-member")
         _, view, region = atom
+        if region[0] == "function":
+            raise _ProofIncomplete("internal-function-region")
         if attribute:
             if view == "object" and key.startswith("__"):
                 raise _ProofIncomplete("object-protocol-member")
@@ -6540,6 +6688,8 @@ class _ProofEffects:
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-store")
         _, view, region = atom
+        if region[0] == "function":
+            raise _ProofIncomplete("internal-function-region")
         if region == ("contextlib", 0) and key == "suppress":
             # Rebinding can retire the original class and its opaque members;
             # never silently keep that class alive as a borrowed global root.
@@ -6893,6 +7043,17 @@ class _ProofContext:
             if depth > self.limits["depth"]:
                 self._reasons.append("depth-budget")
                 return
+            forbidden_debug = (
+                isinstance(node, ast.Name) and node.id == "__debug__" and isinstance(node.ctx, (ast.Store, ast.Del))) \
+                or (isinstance(node, ast.arg) and node.arg == "__debug__") \
+                or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                     ast.MatchAs, ast.MatchStar, ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple))
+                    and node.name == "__debug__") \
+                or (isinstance(node, ast.MatchMapping) and node.rest == "__debug__") \
+                or (isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == "__debug__") \
+                or (isinstance(node, ast.Nonlocal) and "__debug__" in node.names)
+            if forbidden_debug and "invalid-debug-binding" not in self._reasons:
+                self._reasons.append("invalid-debug-binding")
             if (isinstance(node, ast.Try) and any(handler.type is None for handler in node.handlers[:-1])) \
                     or (isinstance(node, ast.ExceptHandler) and node.name == "__debug__"):
                 if "invalid-handler-structure" not in self._reasons:
@@ -7168,6 +7329,86 @@ class _ProofContext:
                 return False
         return True
 
+    @staticmethod
+    def _entry_token_shape(state, limits):
+        """Bound raw container expansion before hashing/canonical ordering.
+
+        This is a nonmutating input-shape preflight, like closed control
+        validation. Memoized virtual sizes count repeated semantic edges
+        without recursively expanding a hostile shared host tuple DAG.
+        Canonical semantic validation remains charged after dedup/cache lookup.
+        """
+        if len(state.bindings) + len(state.regions) + len(state.exception_objects) \
+                + len(state.collection_objects) > limits["nodes"]:
+            return "work-budget"
+
+        def roots():
+            yield state.pending.error
+            yield state.pending.target
+            if state.pending.value is not None:
+                yield state.pending.value.atoms
+            yield state.active
+            yield state.managers
+            yield state.continuation
+            yield state.exception_metadata
+            yield state.borrowed_exceptions
+            for owner, name, value in state.bindings:
+                yield value.atoms
+            for region, name, value in state.regions:
+                yield region
+                yield value.atoms
+            for value in state.temporaries:
+                yield value.atoms
+            for item in state.exception_objects:
+                yield item.payload
+                yield item.children
+                for value in item.values():
+                    yield value.atoms
+            for item in state.collection_objects:
+                yield item.identity
+                for value in item.items:
+                    yield value.atoms
+
+        memo = {}
+        remaining = limits["nodes"]
+        total = 0
+        for root in roots():
+            pending = [(root, False, 0)]
+            while pending:
+                value, ready, nesting = pending.pop()
+                if type(value) not in (tuple, frozenset) or id(value) in memo:
+                    continue
+                if not ready:
+                    if nesting > 3 * limits["depth"] + 16:
+                        return "depth-budget"
+                    if type(value) is tuple and value and type(value[0]) is str:
+                        if value[0] == "function" and (len(value) != 2 or type(value[1]) is not int):
+                            return "unsupported-function-entry"
+                        if value[0] == "closure-cell" and (len(value) != 3 or type(value[1]) is not int
+                                                          or type(value[2]) is not str):
+                            return "unsupported-function-entry"
+                    remaining -= 1 + len(value)
+                    if remaining < 0:
+                        return "work-budget"
+                    pending.append((value, True, nesting))
+                    pending.extend((child, False, nesting + 1) for child in value
+                                   if type(child) in (tuple, frozenset) and id(child) not in memo)
+                else:
+                    size, depth = 1, 1
+                    for child in value:
+                        child_size, child_depth = memo[id(child)] if type(child) in (tuple, frozenset) else (1, 0)
+                        size += child_size
+                        depth = max(depth, child_depth + 1)
+                        if size > limits["steps"]:
+                            return "work-budget"
+                    if depth > 3 * limits["depth"] + 16:
+                        return "depth-budget"
+                    memo[id(value)] = size, depth
+            total += memo[id(root)][0] if type(root) in (tuple, frozenset) else 1
+            if total > limits["steps"]:
+                return "work-budget"
+        return None
+
     def solve(self, scope=None, entry=None):
         scope = self.tree if scope is None else scope
         events = {}
@@ -7238,6 +7479,16 @@ class _ProofContext:
                 if (state.exception_objects or state.collection_objects) and state.epoch is None:
                     reasons.append("unknown-exception-entry-metadata")
                     return snapshot()
+                if any(len(region) != 2 or type(region[0]) is not str or type(region[1]) is not int
+                       for region, name, value in state.regions):
+                    reasons.append("foreign-region")
+                    return snapshot()
+                function_metadata = any(len(region) == 2 and region[0] == "function"
+                                        for region, name, value in state.regions)
+                if function_metadata and (state.epoch is None or any(len(region) == 2 and region[0] == "function"
+                        and type(region[1]) is not int for region, name, value in state.regions)):
+                    reasons.append("unsupported-function-entry")
+                    return snapshot()
                 if state.temporaries:
                     reasons.append("foreign-temporary-entry")
                     return snapshot()
@@ -7270,7 +7521,12 @@ class _ProofContext:
                         ("error", by_slot[position]) if position in by_slot else frame
                         for position, frame in enumerate(state.active)))
                 modes = tuple(sorted(set(state.entry_modes) | set(region_entry_modes)))
-                requested.add(replace(state, epoch=self._epoch, entry_modes=modes))
+                normalized = replace(state, epoch=self._epoch, entry_modes=modes)
+                shape_reason = self._entry_token_shape(normalized, self.limits)
+                if shape_reason is not None:
+                    reasons.append(shape_reason)
+                    return snapshot()
+                requested.add(normalized)
                 if len(requested) > self.limits["alternatives"]:
                     reasons.append("alternative-budget")
                     return snapshot()
@@ -7406,8 +7662,18 @@ class _ProofContext:
                                    != tuple(("exception", child) for child in item.children))):
                         reasons.append("unsupported-exception-entry")
                         return snapshot()
+                try:
+                    self._charge(stats, len(state.regions))
+                    if any(region[0] == "function" for region, name, value in state.regions):
+                        self._charge(stats, _ProofEffects.exception_work(state))
+                    function_regions = _ProofEffects.validate_function_rows(self.index, state,
+                        lambda amount: self._charge(stats, amount))
+                except _ProofIncomplete as error:
+                    reasons.append(str(error))
+                    return snapshot()
                 held = [value for storage, name, value in state.bindings] \
-                    + [value for region, name, value in state.regions]
+                    + [value for region, name, value in state.regions
+                       if not (region[0] == "function" and name.startswith("cell:"))]
                 held.extend(_ProofValue(frozenset({frame[2]})) for frame in state.managers)
                 if state.pending.value is not None:
                     held.append(state.pending.value)
@@ -7427,6 +7693,15 @@ class _ProofContext:
                         reasons.append("unsupported-composite-entry")
                         return snapshot()
                     for atom in atoms:
+                        if atom[0] == "closure-cell" or (atom[0] == "namespace" and len(atom) == 3
+                                and type(atom[2]) is tuple and atom[2] and atom[2][0] == "function"):
+                            reasons.append("internal-function-region")
+                            return snapshot()
+                        if atom[0] == "function":
+                            if len(atom) != 2 or type(atom[1]) is not int \
+                                    or self.index._nodes.get(atom[1]) not in self.index._definition_parts:
+                                reasons.append("unsupported-function-entry")
+                                return snapshot()
                         if atom[0] == "type-union":
                             members = _ProofEffects.union_types(atom)
                             if members is None:
@@ -7495,6 +7770,14 @@ class _ProofContext:
                             reasons.append("unsupported-composite-entry")
                             return snapshot()
                         held.extend((child, True) for child in children)
+                if function_regions:
+                    try:
+                        self._charge(stats, 2 * _ProofEffects.exception_work(state))
+                        if not function_regions <= _ProofEffects.reachable(state)[4]:
+                            raise _ProofIncomplete("orphan-function-metadata")
+                    except _ProofIncomplete as error:
+                        reasons.append(str(error))
+                        return snapshot()
                 for frame in state.continuation:
                     if frame and frame[0] in ("finally", "except-search", "handler", "except-star"):
                         try:
@@ -7546,7 +7829,7 @@ class _ProofContext:
                     if region == ("suppress-class", 0) and name not in _ProofEffects._suppress_hooks:
                         reasons.append("unsupported-suppress-class-entry")
                         return snapshot()
-                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object", "suppress", "contextlib", "suppress-class") \
+                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object", "suppress", "contextlib", "suppress-class", "function") \
                             or type(region[1]) is not int or (
                                 region[0] in ("globals", "builtins", "contextlib", "suppress-class") and region[1] != 0):
                         reasons.append("foreign-region")
@@ -7717,10 +8000,7 @@ class _ProofContext:
             items.append(outcome)
 
         def statement_result(origin, outcome):
-            current = outcome.state
-            if current.exception_objects or current.collection_objects:
-                self._charge(stats, _ProofEffects.exception_work(current))
-                current = _ProofEffects.prune_exception_objects(current)
+            current = prune_graph(outcome.state)
             visits = outcome.visits
             if outcome.normal:
                 visits = visit_then(visits, visit_event(self.index.node_for_id(origin_sites[origin]), "after"))
@@ -7779,6 +8059,14 @@ class _ProofContext:
             if len(state.temporaries) > len(base):
                 reserve_graph(state, extra, passes=2)
             return _ProofEffects.drop_temporaries(state, base, extra)
+
+        def prune_graph(state):
+            self._charge(stats, len(state.regions))
+            if state.exception_objects or state.collection_objects or any(
+                    region[0] == "function" for region, name, value in state.regions):
+                reserve_graph(state)
+                return _ProofEffects.prune_exception_objects(state)
+            return state
 
         def operands(nodes, state):
             frontier = (((), state, _ProofVisits()),)
@@ -7996,6 +8284,122 @@ class _ProofContext:
             return tuple(next(supplied) if part is not None else _ProofValue.literal(None)
                          for part in (node.slice.lower, node.slice.upper, node.slice.step))
 
+        def make_function(node, values, current):
+            parts = self.index._definition_parts[node]
+            cells = self.index._function_cells[node]
+            self._charge(stats, 2 + len(parts) + len(cells))
+            if len(values) != len(parts):
+                raise _ProofIncomplete("invalid-function-captures")
+            if 2 + len(parts) + len(cells) > self.limits["names"]:
+                raise _ProofIncomplete("name-budget")
+            if any(not isinstance(self.index.node_for_id(cell_owner), (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                   for cell_owner, name in cells):
+                raise _ProofIncomplete("unsupported-class-cell-capture")
+            # Missing borrowed cells are unknown. A fresh cell in this actual
+            # frame is definitely empty until its first store: record that
+            # fact explicitly instead of treating absence as empty everywhere.
+            self._charge(stats, len(current.bindings))
+            bound = {(storage, name) for storage, name, value in current.bindings}
+            for cell_owner, name in cells:
+                if cell_owner == owner and (cell_owner, name) not in bound:
+                    self._charge(stats, 1 + len(current.bindings))
+                    current = current.bind(cell_owner, name, _ProofValue.unbound())
+                    bound.add((cell_owner, name))
+            reserve_graph(current, values, passes=2)
+            self._charge(stats, _ProofEffects.capture_lookup_work(values, current))
+            if not all(_ProofEffects.retained_value(value, current) for value in values):
+                raise _ProofIncomplete("unsupported-function-capture")
+            site = self.index.node_id(node)
+            region = ("function", site)
+            reachable = _ProofEffects.reachable(current)
+            if region in reachable[4] or any(owner == region for owner, name, value in current.regions):
+                raise _ProofIncomplete("repeated-function-allocation")
+            if current.alias_count() + 3 + len(parts) + len(cells) > self.limits["aliases"]:
+                raise _ProofIncomplete("alias-budget")
+            selected = _ProofEffects.region_value(self.index, scope, current, ("globals", 0), "__builtins__")
+            if selected == _ProofValue.absent():
+                selected = _ProofValue.unknown_value("entry-frame-builtins") if "frame-builtins-open" in current.entry_modes \
+                    else _ProofEffects.namespace("mapping", ("builtins", 0))
+            regions = {atom[2] for atom in selected.atoms if len(atom) == 3 and atom[0] == "namespace"
+                       and atom[1] in ("module", "mapping")}
+            if not selected.unknown and len(regions) == 1 and all(len(atom) == 3 and atom[0] == "namespace"
+                    and atom[1] in ("module", "mapping") for atom in selected.atoms):
+                selected = _ProofEffects.namespace("mapping", next(iter(regions)))
+            elif selected.unknown or len(selected.atoms) != 1:
+                selected = _ProofValue(frozenset({("opaque", "function-builtins", site)}))
+            result = _ProofValue(frozenset({("function", site)}))
+            current = current.write_region(region, "$owned", _ProofValue.literal(True))
+            current = current.write_region(region, "$builtins", selected)
+            for (label, expression_node), value in zip(parts, values):
+                current = current.write_region(region, label, value)
+            for cell_owner, name in cells:
+                current = current.write_region(region, "cell:" + str(cell_owner) + ":" + name,
+                    _ProofValue(frozenset({("closure-cell", cell_owner, name)})))
+            self._check_alias_budget(replace(current, temporaries=current.temporaries + (result,)), stats)
+            return result, current
+
+        def name_call(callee, argument, current):
+            token = _ProofEffects.single(callee)
+            if not token or len(token) != 2 or token[0] != "function" \
+                    or current.region_value(("function", token[1]), "$owned") != _ProofValue.literal(True):
+                raise _ProofIncomplete("opaque-decorator-call")
+            declaration = self.index.node_for_id(token[1])
+            parameter = _ProofEffects.name_lambda(declaration)
+            if parameter is None:
+                raise _ProofIncomplete("unsupported-decorator-call")
+            self._charge(stats)
+            if declaration.body.id == parameter:
+                return _ProofOutcome(current, argument)
+            name = declaration.body.id
+            cell = next((cell_owner for cell_owner, cell_name in self.index._function_cells[declaration]
+                         if cell_name == name), None)
+            if cell == owner:
+                value = current.lookup(cell, name)
+                error = "NameError" if value.is_unbound else None
+            else:
+                selected = current.region_value(("function", token[1]), "$builtins")
+                value, error = _ProofEffects.lookup(self.index, declaration, current, name, selected_builtins=selected)
+            if error:
+                current = self._implicit_error(declaration.body, error, current, stats,
+                    fields=(("name", _ProofValue.literal(self.index.runtime_name(declaration, name))),))
+                return _ProofOutcome(current)
+            if value.unknown or ("unbound",) in value.atoms or not value.atoms:
+                raise _ProofIncomplete("imprecise-decorator-return")
+            return _ProofOutcome(current, value)
+
+        def definition(node, incoming):
+            if node.type_params:
+                raise _ProofIncomplete("unsupported-definition-type-parameters")
+            if node in self.index._invalid_deferred_annotations:
+                raise _ProofIncomplete("invalid-deferred-annotation")
+            parts = self.index._definition_parts[node]
+            frontiers, abrupt = operands(tuple(node.decorator_list) + tuple(part for label, part in parts), incoming)
+            results = list(abrupt)
+            for values, current, visits in frontiers:
+                decorators = values[:len(node.decorator_list)]
+                value, current = make_function(node, values[len(decorators):], current)
+                operand_holds = current.temporaries
+                current = replace(current, temporaries=operand_holds + (value,))
+                outcome = _ProofOutcome(current, value, visits=visits)
+                for decorator_node, decorator in reversed(tuple(zip(node.decorator_list, decorators))):
+                    record(decorator_node, "apply", outcome.state)
+                    prefix = visit_then(outcome.visits, visit_event(decorator_node, "apply"))
+                    applied = name_call(decorator, outcome.value, outcome.state)
+                    current = drop_holds(applied.state, operand_holds,
+                        (applied.value,) if applied.normal else ())
+                    outcome = replace(applied, state=replace(current, temporaries=operand_holds + (
+                        (applied.value,) if applied.normal else ())), visits=prefix)
+                    self._check_alias_budget(outcome.state, stats)
+                    if not outcome.normal:
+                        break
+                current = outcome.state
+                if outcome.normal:
+                    current = bind_name(node.name, outcome.value, current)
+                    self._check_alias_budget(current, stats)
+                current = drop_holds(current, incoming.temporaries)
+                results.append(_ProofOutcome(current, observation=outcome.observation, visits=outcome.visits))
+            return bounded(results, node)
+
         def expression(node, state):
             origin = region_origin(node, state)
             sync_origins.append(origin)
@@ -8020,13 +8424,23 @@ class _ProofContext:
                 result = _ProofValue.literal(node.value)
             elif isinstance(node, ast.Lambda):
                 number = _ProofEffects.constant_lambda(node)
-                if number is None:
+                if number is not None:
+                    result = _ProofValue(frozenset({("const-callable", self.index.node_id(node), number)}))
+                elif _ProofEffects.name_lambda(node) is not None:
+                    result, state = make_function(node, (), state)
+                else:
                     raise _ProofIncomplete("unsupported-lambda")
-                result = _ProofValue(frozenset({("const-callable", self.index.node_id(node), number)}))
             elif isinstance(node, ast.Name):
                 result, error = _ProofEffects.lookup(self.index, scope, state, node.id)
                 if not error and (result.unknown or ("unbound",) in result.atoms or not result.atoms):
                     raise _ProofIncomplete("imprecise-load")
+            elif isinstance(node, ast.NamedExpr):
+                results = []
+                for outcome in flat_map(expression(node.value, state),
+                        lambda item: target_store(node.target, item.value, item.state)):
+                    results.extend(finish(node, outcome.value, outcome.state, visits=outcome.visits)
+                                   if outcome.normal else (outcome,))
+                return bounded(results, node)
             elif isinstance(node, ast.Dict) and not node.keys:
                 reserve_graph(state)
                 result = _ProofEffects.fresh_namespace("mapping", ("mapping", self.index.node_id(node)), state)
@@ -8337,9 +8751,7 @@ class _ProofContext:
             queued = set()
 
             def enqueue(cursor, state, observation=None, visits=_ProofVisits()):
-                if state.exception_objects or state.collection_objects:
-                    self._charge(stats, _ProofEffects.exception_work(state))
-                    state = _ProofEffects.prune_exception_objects(state)
+                state = prune_graph(state)
                 # Each after-marker is one live compound continuation; its
                 # seq/next actions are implementation pieces, not extra frames.
                 restoring = {frame[0] for frame in cursor if frame[1] == "finally-resume"}
@@ -9116,12 +9528,7 @@ class _ProofContext:
                         statement_outcomes = flat_map(statement_outcomes, lambda outcome:
                             target_store(target, None, outcome.state, delete=True))
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if node.decorator_list or node.args.defaults or any(
-                            item is not None for item in node.args.kw_defaults) or node.type_params \
-                            or list(_def_annotations(node)):
-                        raise _ProofIncomplete("unsupported-definition-prologue")
-                    state = bind_name(node.name, _ProofValue(frozenset({
-                        ("function", self.index.node_id(node))})), state)
+                    statement_outcomes = definition(node, state)
                 elif isinstance(node, ast.ClassDef):
                     mark_interference()
                     self._charge(stats)
@@ -27359,6 +27766,299 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_prologue_named_expression_stores_only_after_a_normal_rhs(self):
+        for rhs,want in (("int('7')",7),("int('bad')",1)):
+            context,func,snapshot = self._solve("x=1\ntry:\n    result=(x:="+rhs+")\nexcept ValueError:\n    pass\nmarker=x")
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            marker = func.body[-1]
+            self.assertEqual(snapshot.value_at(marker,"x",snapshot.states_at(marker)[0]),_ProofValue.literal(want))
+            target = func.body[1].body[0].value.target
+            self.assertEqual(bool(snapshot.target_unreachable(target)),want==1)
+
+    def test_prologue_defaults_bind_the_enclosing_scope_without_running_the_body(self):
+        context,func,snapshot = self._solve("def unused(a=(present:=1)):\n    missing\ndel present\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        declaration = func.body[0]
+        self.assertTrue(snapshot.must_execute((declaration,"after")))
+        self.assertTrue(snapshot.must_execute(func.body[-1]))
+        self.assertFalse(snapshot.states_at(declaration.body[0]))
+        self.assertFalse(snapshot.must_execute(declaration.body[0]).complete)
+
+    def test_prologue_positional_and_keyword_defaults_keep_their_order(self):
+        context,func,snapshot = self._solve("def unused(a=(x:=1),*,b=(x:=2)):\n    pass\nmarker=x")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"x",snapshot.states_at(marker)[0]),_ProofValue.literal(2))
+
+    def test_prologue_first_default_error_preserves_the_old_definition_binding(self):
+        context,func,snapshot = self._solve("unused=int\ntry:\n    def unused(a=int('bad'),*,b=(later:=1)):\n        pass\nexcept ValueError:\n    pass\nmarker=unused")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        declaration = func.body[1].body[0]
+        self.assertTrue(snapshot.target_unreachable(declaration.args.kw_defaults[0]))
+        self.assertTrue(snapshot.target_unreachable((declaration,"after")))
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"unused",snapshot.states_at(marker)[0]),
+                         _ProofValue(frozenset({("native","int")})))
+
+    def test_prologue_decorator_expressions_precede_defaults_and_application_is_later(self):
+        context,func,snapshot = self._solve("@(outer:=lambda f:f)\n@(inner:=lambda f:f)\ndef unused(a=(x:=1)):\n    pass\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        declaration = func.body[0]
+        default = declaration.args.defaults[0]
+        state = snapshot.states_at(default)[0]
+        owner = context.index.node_id(func)
+        self.assertFalse(state.lookup(owner,"outer").is_unbound)
+        self.assertFalse(state.lookup(owner,"inner").is_unbound)
+        for decorator in declaration.decorator_list:
+            self.assertTrue(snapshot.must_execute((decorator,"apply")))
+            applied = snapshot.states_at(decorator,"apply")[0]
+            self.assertEqual(applied.lookup(owner,"x"),_ProofValue.literal(1))
+
+    def test_prologue_keeps_the_evaluated_decorator_across_default_rebinding(self):
+        context,func,snapshot = self._solve("deco=lambda f:f\n@deco\ndef unused(a=(deco:=NameError)):\n    pass\nmarker=unused")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(_ProofEffects.single(snapshot.value_at(marker,"unused",snapshot.states_at(marker)[0])),
+                         ("function",context.index.node_id(func.body[1])))
+
+    def test_prologue_name_return_decorator_looks_up_the_cell_at_application(self):
+        context,func,snapshot = self._solve("NameError=ValueError\n@lambda f:NameError\ndef unused(a=(NameError:=TypeError)):\n    pass\nmarker=unused")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"unused",snapshot.states_at(marker)[0]),
+                         _ProofValue(frozenset({("native","TypeError")})))
+
+    def test_prologue_decorator_application_order_is_reverse_of_expression_order(self):
+        context,func,snapshot = self._solve("@lambda f:NameError\n@lambda f:TypeError\ndef unused():\n    pass\nmarker=unused")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"unused",snapshot.states_at(marker)[0]),
+                         _ProofValue(frozenset({("native","NameError")})))
+        first,second = func.body[0].decorator_list
+        self.assertTrue(snapshot.must_execute((first,"apply")))
+        self.assertTrue(snapshot.must_execute((second,"apply")))
+
+    def test_prologue_eager_annotation_order_is_distinct_from_syntax_collection(self):
+        for signature,want in (("a:(x:=1),/,b:(x:=2)",1),("*a:(x:=1),b:(x:=2)",2)):
+            context,func,snapshot = self._solve("def unused("+signature+"):\n    pass\nmarker=x",semantic_key=(3,12,14))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            marker = func.body[-1]
+            self.assertEqual(snapshot.value_at(marker,"x",snapshot.states_at(marker)[0]),_ProofValue.literal(want))
+
+    def test_prologue_deferred_and_future_annotation_names_are_not_evaluated(self):
+        for prefix,profile in (("",(3,14,7)),("from __future__ import annotations\n",(3,12,14))):
+            source = prefix+"def f():\n    def unused(a:missing)->other:\n        pass\n    marker=1\n"
+            context = _ProofContext(source,semantic_key=profile)
+            func = context.tree.body[-1]
+            snapshot = context.solve(func)
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            self.assertTrue(snapshot.must_execute(func.body[-1]))
+            self.assertFalse(snapshot.states_at(func.body[0].args.args[0].annotation))
+
+    def test_prologue_retained_default_keeps_an_opaque_value_alive_after_name_deletion(self):
+        for alias in ("","saved=unused\ndel unused\n"):
+            context,func,snapshot = self._solve("def unused(a=x):\n    pass\n"+alias+"del x\nmarker=int",parameters="x")
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            self.assertTrue(snapshot.must_execute(func.body[-1]))
+        context,func,snapshot = self._solve("def unused(a=x):\n    pass\ndel x\ndel unused\nmarker=int",parameters="x")
+        self.assertFalse(snapshot.complete)
+        self.assertIn("opaque-release",snapshot.reasons)
+
+    def test_prologue_closure_cells_do_not_snapshot_their_old_values(self):
+        context,func,snapshot = self._solve("def unused():\n    return x\nx=1\nmarker=int",parameters="x")
+        self.assertFalse(snapshot.complete)
+        self.assertIn("opaque-release",snapshot.reasons)
+
+    def test_prologue_owned_capture_graph_can_be_reused_as_a_region_entry(self):
+        context = _ProofContext("def f(x):\n    def unused(a=x):\n        pass\n    marker=1\ndef g():\n    pass\n")
+        func,other = context.tree.body
+        first = context.solve(func)
+        self.assertTrue(first.complete,first.reasons)
+        state = first.states_at(func.body[-1])[0]
+        result = context.solve(other,entry=(state,))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(result.must_execute(other.body[0]))
+
+    def test_prologue_internal_function_metadata_is_not_a_runtime_namespace(self):
+        context,func,snapshot = self._solve("def unused(a=1):\n    pass\nmarker=1")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.states_at(func.body[-1])[0]
+        region = ("function",context.index.node_id(func.body[0]))
+        forged = _ProofEffects.namespace("module",region)
+        with self.assertRaises(_ProofIncomplete):
+            _ProofEffects.member(context.index,func,forged,"__dict__",state,attribute=True)
+
+    def test_prologue_orphan_incomplete_or_forged_capture_rows_are_rejected(self):
+        source = "def f(x):\n    def unused(a=x):\n        pass\n    marker=1\ndef g(view):\n    pass\n"
+        context = _ProofContext(source)
+        func,other = context.tree.body
+        first = context.solve(func)
+        self.assertTrue(first.complete,first.reasons)
+        state = first.states_at(func.body[-1])[0]
+        region = ("function",context.index.node_id(func.body[0]))
+        variants = [state.write_region(region,"extra",_ProofValue.literal(1)),
+            state.write_region(region,"$owned",_ProofValue.literal(False)),
+            replace(state,regions=tuple(row for row in state.regions if row[:2]!=(region,"default:0"))),
+            state.bind(context.index.node_id(func),"unused",_ProofValue.unbound()),
+            state.bind(context.index.node_id(other),"view",_ProofEffects.namespace("mapping",region)),
+            _ProofState(epoch=state.epoch,regions=(((),"$owned",_ProofValue.literal(True)),))]
+        for variant in variants:
+            result = context.solve(other,entry=(variant,))
+            self.assertFalse(result.complete)
+            self.assertFalse(result.must_execute(other.body[0]))
+
+    def test_prologue_later_decorator_failure_preserves_the_old_binding(self):
+        context,func,snapshot = self._solve("unused=int\ntry:\n    @lambda f:missing\n    def unused():\n        pass\nexcept NameError:\n    pass\nmarker=unused")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"unused",snapshot.states_at(marker)[0]),
+                         _ProofValue(frozenset({("native","int")})))
+        declaration = func.body[1].body[0]
+        self.assertTrue(snapshot.must_execute((declaration.decorator_list[0],"apply")))
+        self.assertTrue(snapshot.target_unreachable((declaration,"after")))
+
+    def test_prologue_capture_bounds_include_the_prebinding_temporary_and_stored_alias(self):
+        body = "def unused(a=x):\n    pass\nmarker=1"
+        # Stored function + held result +three capture rows +builtin mapping.
+        for aliases,want in ((5,False),(6,True),(7,True)):
+            context,func,snapshot = self._solve(body,parameters="x",limits={"aliases":aliases})
+            self.assertEqual(snapshot.complete,want,snapshot.reasons)
+            if not want:
+                self.assertIn("alias-budget",snapshot.reasons)
+                self.assertFalse(snapshot.must_execute(func.body[-1]))
+        context,func,snapshot = self._solve(body,parameters="x")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        cost = snapshot.stats["steps"]
+        for steps,want in ((cost-1,False),(cost,True),(cost+1,True)):
+            context,func,result = self._solve(body,parameters="x",limits={"steps":steps})
+            self.assertEqual(result.complete,want,result.reasons)
+
+    def test_prologue_name_return_cannot_turn_maybe_unbound_cell_into_normal_completion(self):
+        context = _ProofContext("def f():\n    @lambda z:candidate\n    def unused():\n        pass\n    marker=1\n    candidate=TypeError\n")
+        func = context.tree.body[0]
+        value = _ProofValue.unbound().join(_ProofValue(frozenset({("native","NameError")})))
+        entry = _ProofState().bind(context.index.node_id(func),"candidate",value)
+        snapshot = context.solve(func,entry=(entry,))
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.must_execute(func.body[1]))
+
+    def test_prologue_missing_closure_contents_are_unknown_rather_than_empty(self):
+        source = "def f(x):\n    def saved():\n        return x\n    marker=1\ndef g(closure):\n    del closure\n    marker=int\n"
+        context = _ProofContext(source)
+        func,other = context.tree.body
+        first = context.solve(func)
+        self.assertTrue(first.complete,first.reasons)
+        state = first.states_at(func.body[-1])[0]
+        captured = state.lookup(context.index.node_id(func),"saved")
+        transferred = replace(state,bindings=()).bind(context.index.node_id(other),"closure",captured)
+        unknown = context.solve(other,entry=(transferred,))
+        self.assertFalse(unknown.complete)
+        self.assertFalse(unknown.native_identity(other.body[-1],"int"))
+        empty = transferred.bind(context.index.node_id(func),"x",_ProofValue.unbound())
+        known = context.solve(other,entry=(empty,))
+        self.assertTrue(known.complete,known.reasons)
+        self.assertTrue(known.native_identity(other.body[-1],"int"))
+
+    def test_prologue_class_cell_is_not_the_same_storage_as_a_class_namespace_key(self):
+        context = _ProofContext("class C:\n    __class__=int\n    @lambda f:__class__\n    def unused():\n        pass\n    marker=unused\n")
+        cls = context.tree.body[0]
+        snapshot = context.solve(cls)
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.must_execute(cls.body[-1]))
+
+    def test_prologue_discarded_function_releases_the_captured_default_graph(self):
+        for decorator,want in (("lambda f:f",True),("lambda f:NameError",False)):
+            context,func,snapshot = self._solve("@"+decorator+"\ndef unused(a=x,*,b=(x:=0)):\n    pass\nmarker=int",parameters="x")
+            self.assertEqual(snapshot.complete,want,snapshot.reasons)
+            if want:
+                self.assertTrue(snapshot.must_execute(func.body[-1]))
+            else:
+                self.assertIn("opaque-release",snapshot.reasons)
+                self.assertFalse(snapshot.native_identity(func.body[-1],"int"))
+
+    def test_prologue_repeated_live_function_allocation_cannot_overwrite_old_captures(self):
+        context,func,first = self._solve("def unused(a=x):\n    pass\nmarker=1",parameters="x")
+        self.assertTrue(first.complete,first.reasons)
+        state = first.states_at(func.body[-1])[0]
+        owner = context.index.node_id(func)
+        entry = state.bind(owner,"saved",state.lookup(owner,"unused"))
+        second = context.solve(func,entry=(entry,))
+        self.assertFalse(second.complete)
+        self.assertIn("repeated-function-allocation",second.reasons)
+        self.assertTrue(first.must_execute(func.body[-1]))
+
+    def test_prologue_decorator_uses_its_captured_builtin_mapping(self):
+        for wrapped in (False,True):
+            for restore in (False,True):
+                body = ("global __builtins__\nimport builtins as b\n__builtins__={}\n"
+                    "@lambda z:int\ndef g("+("a=(__builtins__:=b.__dict__)" if restore else "")+"):\n    pass\nmarker=g")
+                context = _ProofContext("def f():\n"+"".join("    "+line+"\n" for line in body.splitlines())) if wrapped else _ProofContext(body)
+                scope = context.tree.body[0] if wrapped else context.tree
+                snapshot = context.solve(scope)
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual([state.pending.error_kind for state in snapshot.exits],["NameError"])
+                self.assertTrue(snapshot.unreachable(scope.body[-1]))
+        context,func,snapshot = self._solve("global __builtins__\n__builtins__={}\nint=NameError\n@lambda z:int\ndef g():\n    pass\nmarker=g")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"g",snapshot.states_at(marker)[0]),_ProofValue(frozenset({("native","NameError")})))
+
+    def test_prologue_saved_finally_return_counts_the_same_function_root(self):
+        source = "def f():\n    def saved():\n        pass\n    try:\n        pass\n    finally:\n        pass\n    marker=1\ndef h():\n    pass\n"
+        for cap,want in ((3,False),(4,True),(5,True)):
+            context = _ProofContext(source,limits={"aliases":cap})
+            func,other = context.tree.body
+            site = context.index.node_id(func.body[0])
+            value = _ProofValue(frozenset({("function",site)}))
+            base = _ProofState(epoch=context._epoch).write_region(("function",site),"$owned",_ProofValue.literal(True))
+            base = base.write_region(("function",site),"$builtins",_ProofEffects.namespace("mapping",("builtins",0)))
+            completion = _ProofCompletion("return",value=value)
+            pending = replace(base,pending=completion)
+            saved = replace(base,continuation=(("finally",context.index.node_id(func.body[1]),completion.token(),()),))
+            self.assertEqual(saved.alias_count(),pending.alias_count())
+            result = context.solve(other,entry=(saved,))
+            self.assertEqual(result.complete,want,result.reasons)
+
+    def test_prologue_malformed_capture_shapes_are_rejected_before_entry_ordering(self):
+        source = "def f(x):\n    def saved(a=x):\n        pass\ndef h(holder):\n    pass\n"
+        for tag,steps in (("function",20),("closure-cell",20),("function",1000),("closure-cell",1000)):
+            context = _ProofContext(source,limits={"steps":steps})
+            func,other = context.tree.body
+            site = context.index.node_id(func.body[0])
+            dag = ("bad",)
+            for unused in range(10):
+                dag = (dag,dag)
+            token = (tag,dag) if tag=="function" else (tag,dag,"x")
+            capture = _ProofValue(frozenset({token}))
+            state = _ProofState(epoch=context._epoch).bind(context.index.node_id(other),"holder",_ProofValue(frozenset({("function",site)})))
+            state = state.write_region(("function",site),"$owned",_ProofValue.literal(True))
+            state = state.write_region(("function",site),"$builtins",_ProofEffects.namespace("mapping",("builtins",0)))
+            state = state.write_region(("function",site),"default:0",capture)
+            ordered = []
+            original = _ProofState.order_key
+            def guarded(item):
+                if any(value is capture for region,name,value in item.regions):
+                    ordered.append(1)
+                return original(item)
+            with mock.patch.object(_ProofState,"order_key",guarded):
+                result = context.solve(other,entry=(state,))
+            self.assertFalse(result.complete)
+            self.assertFalse(ordered,"malformed graph reached unbounded canonical expansion")
+            if steps==1000:
+                valid = state.write_region(("function",site),"default:0",_ProofValue.literal(1))
+                accepted = context.solve(other,entry=(valid,))
+                self.assertTrue(accepted.complete,accepted.reasons)
+
+    def test_prologue_forbidden_debug_bindings_are_rejected_even_when_dead(self):
+        for source in ("(__debug__:=1)\nmarker=int\n", "if False:\n    (__debug__:=1)\nmarker=int\n",
+                "@lambda __debug__:__debug__\ndef g():\n    pass\nmarker=int\n",
+                "def g(__debug__):\n    pass\nmarker=int\n", "def __debug__():\n    pass\nmarker=int\n",
+                "import builtins as __debug__\nmarker=int\n"):
+            context = _ProofContext(source)
+            snapshot = context.solve()
+            self.assertFalse(snapshot.complete,source)
+            self.assertFalse(snapshot.native_identity(context.tree.body[-1],"int"))
 
     def test_route_call_entry_cannot_prove_invocation_after_argument_error(self):
         context,func,snapshot = self._solve("int(missing)\nmarker=int")
