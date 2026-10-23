@@ -4342,6 +4342,7 @@ class _ProofScopeIndex:
         self._enclosing = MappingProxyType(enclosing)
         self._open_namespaces = frozenset(open_namespaces)
         captures = {owner: set() for owner in local}
+        cells = {owner: set() for owner in local}
         references = [(owners[id(node)], node.id) for node in ast.walk(tree)
                       if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)]
         # The compiler requests __class__ for an ordinary super reference too,
@@ -4369,12 +4370,14 @@ class _ProofScopeIndex:
                         break
                     if name in self._locals[outer]:
                         if outer is not tree:
+                            cells[outer].add(name)
                             for carrier in path:
                                 captures[carrier].add(name)
                         break
                 path.append(outer)
                 outer = enclosing[outer]
         self._captures = MappingProxyType({owner: frozenset(names) for owner, names in captures.items()})
+        self._cells = MappingProxyType({owner: frozenset(names) for owner, names in cells.items()})
         mangled = set()
         for owner in local:
             names = self._locals[owner] | self._globals[owner] | self._nonlocals[owner] \
@@ -4418,6 +4421,9 @@ class _ProofScopeIndex:
 
     def captures_for(self, scope):
         return self._captures[scope]
+
+    def cells_for(self, scope):
+        return self._cells[scope]
 
     def runtime_names_mangled(self, scope):
         return scope in self._mangled_runtime_views
@@ -6520,6 +6526,16 @@ class _ProofRegionResult:
 
 
 @dataclass(frozen=True)
+class _ProofQueryResult:
+    complete: bool
+    value: bool | None
+    reasons: tuple = ()
+
+    def __bool__(self):
+        return self.complete and self.value is True
+
+
+@dataclass(frozen=True)
 class _ProofSnapshot:
     index: object
     scope: object
@@ -6532,6 +6548,66 @@ class _ProofSnapshot:
     observations: tuple = ()
     region_results: object = None
     region_origins: object = None
+    region_quiet: object = None
+    suite_bad: object = None
+
+    def quiet_prefix(self, region, state):
+        """A completed universal no-error/no-observable-effect prefix fact.
+
+        AST regions use their exact observed input. Suite prefixes use either
+        an actual nonempty statement prefix tuple or (container,field,stop).
+        Empty prefixes require that explicit, actually entered phase anchor.
+        """
+        if not self.complete:
+            return _ProofQueryResult(False, None, self.reasons)
+        if not isinstance(state, _ProofState) or state.epoch is not self.epoch:
+            return _ProofQueryResult(False, None, ("foreign-state",))
+        if self.index is None or self.region_origins is None:
+            return _ProofQueryResult(False, None, ("foreign-region",))
+        if type(region) is tuple:
+            if len(region) == 3 and type(region[1]) is str:
+                container, field, stop = region
+                try:
+                    container_id = self.index.node_id(container)
+                except KeyError:
+                    return _ProofQueryResult(False, None, ("foreign-region",))
+            elif region and len(region) <= len(self.index._nodes):
+                try:
+                    for node in region:
+                        self.index.node_id(node)
+                    container = self.index.parent(region[0])
+                    container_id = self.index.node_id(container)
+                except KeyError:
+                    return _ProofQueryResult(False, None, ("foreign-region",))
+                if not all(isinstance(node, ast.stmt) for node in region):
+                    return _ProofQueryResult(False, None, ("invalid-prefix",))
+                field = next((name for name in ("body", "orelse", "finalbody")
+                              if type(seq := getattr(container, name, None)) is list
+                              and len(region) <= len(seq)
+                              and all(left is right for left, right in zip(seq, region))), None)
+                stop = len(region)
+            else:
+                return _ProofQueryResult(False, None, ("unanchored-prefix",))
+            sequence = getattr(container, field, None) if field in ("body", "orelse", "finalbody") else None
+            if type(sequence) is not list or type(stop) is not int or not 0 <= stop <= len(sequence):
+                return _ProofQueryResult(False, None, ("invalid-prefix",))
+            key = (("suite", container_id, field), state)
+            origin = self.region_origins.get(key)
+            if self.suite_bad is None or origin not in self.suite_bad:
+                return _ProofQueryResult(False, None, ("unobserved-phase-entry",))
+            bad = self.suite_bad[origin]
+            return _ProofQueryResult(True, bad is None or bad >= stop)
+        try:
+            self.index.node_id(region)
+        except KeyError:
+            return _ProofQueryResult(False, None, ("foreign-region",))
+        result = self.outcomes(region, state)
+        if not result.complete:
+            return _ProofQueryResult(False, None, result.reasons)
+        origin = self.region_origins[(self.index.node_id(region), state)]
+        if self.region_quiet is None or origin not in self.region_quiet:
+            return _ProofQueryResult(False, None, ("missing-quiet-fact",))
+        return _ProofQueryResult(True, self.region_quiet[origin] and all(item.normal for item in result.alternatives))
 
     def outcomes(self, region, state):
         """Look up a finished transfer for an actually observed whole input.
@@ -6965,8 +7041,13 @@ class _ProofContext:
         observations = []
         region_results = {}
         region_origins = {}
+        region_quiet = {}
+        suite_bad = {}
+        active_origins = ()
+        active_suites = ()
+        sync_origins = []
         stats = {"steps": 0, "states": 0, "context_depth": 0,
-                 "region_keys": 0, "region_outcomes": 0}
+                 "region_keys": 0, "region_outcomes": 0, "quiet_marks": 0}
 
         def snapshot():
             return _ProofSnapshot(self.index, scope, not reasons,
@@ -6977,7 +7058,8 @@ class _ProofContext:
                                   tuple(dict.fromkeys(exits)), self._epoch,
                                   tuple(dict.fromkeys(observations)),
                                   MappingProxyType({key: tuple(items) for key, items in region_results.items()}),
-                                  MappingProxyType(region_origins))
+                                  MappingProxyType(region_origins),
+                                  MappingProxyType(region_quiet), MappingProxyType(suite_bad))
 
         if reasons:
             return snapshot()
@@ -7406,7 +7488,7 @@ class _ProofContext:
             # seams. Cursors carry these finite IDs, not historical graphs;
             # Python3.12 does not cache tuple hashes like Python3.14.
             self._charge(stats, 2 * _ProofEffects.exception_work(incoming))
-            key = (self.index.node_id(node), incoming)
+            key = (node if type(node) is tuple else self.index.node_id(node), incoming)
             origin = region_origins.get(key)
             if origin is None:
                 if stats["states"] >= self.limits["states"]:
@@ -7417,13 +7499,27 @@ class _ProofContext:
                 origin = len(region_origins)
                 region_origins[key] = origin
                 region_results[origin] = []
+                region_quiet[origin] = True
             return origin
+
+        def mark_interference(origin=None):
+            origins = active_origins + tuple(sync_origins) + (() if origin is None else (origin,))
+            work = len(origins) + len(active_suites)
+            self._charge(stats, work)
+            stats["quiet_marks"] += work
+            for item in origins:
+                region_quiet[item] = False
+            for item, position in active_suites:
+                if suite_bad[item] is None or position < suite_bad[item]:
+                    suite_bad[item] = position
 
         def record_region(origin, outcome):
             # Proof facts are excluded from runtime roots/release checks and
             # bounded jointly with the event/transfer fact store.
             self._charge(stats, 1 + _ProofEffects.exception_work(outcome.state,
                 () if outcome.value is None else (outcome.value,)))
+            if not outcome.normal:
+                mark_interference(origin)
             items = region_results[origin]
             if outcome in items:
                 return
@@ -7488,6 +7584,7 @@ class _ProofContext:
                 following = []
                 for values, current in frontier:
                     expansion = None
+                    expanded_origin = None
                     if isinstance(child, ast.keyword):
                         if child.arg is None:
                             if not isinstance(child.value, ast.Dict) or child.value.keys:
@@ -7501,7 +7598,14 @@ class _ProofContext:
                         expanded_origin = region_origin(child, current)
                     else:
                         child_node = child
-                    for outcome in expression(child_node, current):
+                    if expanded_origin is not None:
+                        sync_origins.append(expanded_origin)
+                    try:
+                        child_results = expression(child_node, current)
+                    finally:
+                        if expanded_origin is not None:
+                            sync_origins.pop()
+                    for outcome in child_results:
                         if outcome.normal:
                             value = outcome.value
                             if expansion == "args":
@@ -7560,12 +7664,14 @@ class _ProofContext:
                 if not all((atom := _ProofEffects.single(value)) and atom[0] in ("literal", "plain-string")
                            for value in arguments):
                     raise _ProofIncomplete("opaque-formatting")
+                mark_interference()
                 site = self.index.node_id(node)
                 return (finish(node, _ProofValue.literal(None), state)[0],
                         _ProofOutcome(replace(state, pending=_ProofCompletion(
                             "raise", ("unknown-exception", site, "trusted-print")))),
                         _ProofOutcome(state, observation=("may-diverge", site, "trusted-print")))
             if token in (("native", "exec"), ("native", "eval")):
+                mark_interference()
                 result, state = self._dynamic_call(node, token[1], scope, state, stats)
             elif token == _ProofEffects._suppress_class:
                 for hook in ("__new__", "__init__"):
@@ -7676,14 +7782,18 @@ class _ProofContext:
 
         def expression(node, state):
             origin = region_origin(node, state)
-            results = []
-            for outcome in expression_inner(node, state):
-                current = drop_holds(outcome.state, state.temporaries,
-                    (outcome.value,) if outcome.normal and outcome.value is not None else ())
-                result = replace(outcome, state=current)
-                record_region(origin, result)
-                results.append(result)
-            return tuple(results)
+            sync_origins.append(origin)
+            try:
+                results = []
+                for outcome in expression_inner(node, state):
+                    current = drop_holds(outcome.state, state.temporaries,
+                        (outcome.value,) if outcome.normal and outcome.value is not None else ())
+                    result = replace(outcome, state=current)
+                    record_region(origin, result)
+                    results.append(result)
+                return tuple(results)
+            finally:
+                sync_origins.pop()
 
         def expression_inner(node, state):
             self._charge(stats)
@@ -7890,6 +8000,9 @@ class _ProofContext:
             target_owner = storage(name)
             if target_owner == 0 and self.index.runtime_name(scope, name) != name:
                 raise _ProofIncomplete("mangled-runtime-namespace")
+            if target_owner != owner or not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) \
+                    or name in self.index.cells_for(scope):
+                mark_interference()
             old = _ProofEffects.region_value(self.index, scope, state,
                 ("globals", 0), name) if target_owner == 0 else state.lookup(target_owner, name)
             if delete:
@@ -7909,14 +8022,18 @@ class _ProofContext:
         def target_store(target, value, state, delete=False):
             current = replace(state, temporaries=state.temporaries + (() if delete else (value,)))
             origin = region_origin(target, current)
-            results = []
-            for outcome in target_store_inner(target, value, current, delete):
-                after = drop_holds(outcome.state, state.temporaries,
-                    (value,) if outcome.normal and not delete else ())
-                result = replace(outcome, state=after)
-                record_region(origin, result)
-                results.append(result)
-            return tuple(results)
+            sync_origins.append(origin)
+            try:
+                results = []
+                for outcome in target_store_inner(target, value, current, delete):
+                    after = drop_holds(outcome.state, state.temporaries,
+                        (value,) if outcome.normal and not delete else ())
+                    result = replace(outcome, state=after)
+                    record_region(origin, result)
+                    results.append(result)
+                return tuple(results)
+            finally:
+                sync_origins.pop()
 
         def target_store_inner(target, value, state, delete=False):
             self._charge(stats)
@@ -7939,6 +8056,7 @@ class _ProofContext:
                     if isinstance(target, ast.Subscript):
                         if (_ProofEffects.single(values[0]) or (None,))[0] == "collection":
                             reserve_graph(current, () if delete else (value,), passes=2)
+                            mark_interference()
                             unused, current = _ProofEffects.collection_access(values[0], subscript_key(target, values), current,
                                 self._native_profile[1], value=None if delete else value, delete=delete)
                             results.extend(finish(target, value, current, promote_pending=True))
@@ -7953,6 +8071,7 @@ class _ProofContext:
                         key = target.attr
                     reserve_graph(current, () if delete else (value,),
                         passes=4 if (_ProofEffects.single(values[0]) or (None,))[0] == "exception" else 2)
+                    mark_interference()
                     current = _ProofEffects.store(self.index, scope, values[0], key, value, current,
                         attribute=isinstance(target, ast.Attribute), delete=delete,
                         profile=self._native_profile, site=self.index.node_id(target))
@@ -8309,6 +8428,16 @@ class _ProofContext:
                     continue
                 seen.add((action, cursor, outcome))
                 state = outcome.state
+                active_origins = tuple(frame[2] for frame in cursor if frame[1] in ("after", "scope-exit"))
+                phases = []
+                for offset, (site, tag, data) in enumerate(cursor):
+                    if tag != "suite-exit" or offset + 1 == len(cursor):
+                        continue
+                    next_site, field, position = cursor[offset + 1]
+                    if next_site == site and field == data[1]:
+                        ordinal = position if offset + 1 == len(cursor) - 1 and action == "step" else max(0, position - 1)
+                        phases.append((data[0], ordinal))
+                active_suites = tuple(phases)
                 if action == "observe":
                     self._charge(stats)
                     observations.append(outcome)
@@ -8349,7 +8478,7 @@ class _ProofContext:
                         elif field == "after":
                             record_region(position, outcome)
                             continue
-                        elif field not in ("body", "orelse", "scope-exit", "for-first", "for-next", "finalbody", "try-body-done", "with-item"):
+                        elif field not in ("body", "orelse", "scope-exit", "suite-exit", "for-first", "for-next", "finalbody", "try-body-done", "with-item"):
                             raise _ProofIncomplete("unsupported-dispatch-frame")
                         else:
                             continue
@@ -8365,6 +8494,10 @@ class _ProofContext:
                 container = self.index.node_for_id(container_id)
                 if field == "scope-exit":
                     terminal(state)
+                    continue
+                if field == "suite-exit":
+                    self._charge(stats)
+                    enqueue(cursor[:-1], state)
                     continue
                 if field == "with-exit":
                     self._charge(stats)
@@ -8531,6 +8664,14 @@ class _ProofContext:
                                                  (container_id, "body", 0)), outcome)
                     continue
                 sequence = getattr(container, field)
+                if position == 0 and (len(cursor) < 2 or cursor[-2][0:2] != (container_id, "suite-exit")
+                                      or cursor[-2][2][1] != field):
+                    phase = region_origin(("suite", container_id, field), state)
+                    if phase not in suite_bad:
+                        self._charge(stats)
+                        suite_bad[phase] = None
+                    enqueue(cursor[:-1] + ((container_id, "suite-exit", (phase, field)), cursor[-1]), state)
+                    continue
                 if position == len(sequence):
                     enqueue(cursor[:-1], state)
                     continue
@@ -8539,6 +8680,7 @@ class _ProofContext:
                 self._charge(stats)
                 record(node, "before", state)
                 origin = region_origin(node, state)
+                active_origins += (origin,)
                 statement_outcomes = None
                 if isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal)):
                     pass
@@ -8663,6 +8805,7 @@ class _ProofContext:
                     if _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(
                             frozenset({("native", "__import__")})):
                         raise _ProofIncomplete("opaque-import")
+                    mark_interference()
                     for alias in node.names:
                         if alias.name not in ("builtins", "contextlib"):
                             raise _ProofIncomplete("unsupported-import")
@@ -8672,6 +8815,7 @@ class _ProofContext:
                     if node.level or node.module != "contextlib" or any(alias.name != "suppress" for alias in node.names) \
                             or _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(frozenset({("native", "__import__")})):
                         raise _ProofIncomplete("unsupported-import")
+                    mark_interference()
                     for alias in node.names:
                         value, error = _ProofEffects.member(self.index, scope,
                             _ProofEffects.namespace("module", ("contextlib", 0)), "suppress", state, attribute=True)
@@ -8700,6 +8844,7 @@ class _ProofContext:
                     state = bind_name(node.name, _ProofValue(frozenset({
                         ("function", self.index.node_id(node))})), state)
                 elif isinstance(node, ast.ClassDef):
+                    mark_interference()
                     self._charge(stats)
                     self._charge(stats)
                     value = _ProofEffects.empty_class(self.index, scope, node, state)
@@ -26935,6 +27080,201 @@ class ProofFlowTests(unittest.TestCase):
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
 
+    def test_quiet_query_collection_writes_and_deletes_are_observable(self):
+        for write in ("x[0]=2","del x[0]","x[:]=[2]","del x[:]"):
+            with self.subTest(write=write):
+                context,func,snapshot = self._solve("x=[1]\n"+write+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                region = func.body[1]
+                result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+                self.assertTrue(result.complete,result.reasons)
+                self.assertFalse(result)
+
+    def test_quiet_query_starred_includes_effects_of_its_iterable_evaluation(self):
+        context,func,snapshot = self._solve("import builtins as b\nx=ValueError(*[exec('b.int=lambda:0')])\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        region = func.body[1].value.args[0]
+        result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+        self.assertTrue(result.complete,result.reasons)
+        self.assertFalse(result)
+        self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_quiet_query_rejects_foreign_phase_before_accessing_attributes(self):
+        context,func,snapshot = self._solve("pass\npass")
+        incoming = snapshot.states_at(func,"entry")[0]
+        class Foreign(ast.AST):
+            @property
+            def body(self):
+                raise RuntimeError("foreign property executed")
+        class ForeignStatement(ast.Pass):
+            def __eq__(self,other):
+                raise RuntimeError("foreign equality executed")
+        for selector in ((Foreign(),"body",0),(func.body[0],ForeignStatement())):
+            with self.subTest(selector=type(selector[0]).__name__):
+                result = snapshot.quiet_prefix(selector,incoming)
+                self.assertFalse(result.complete)
+                self.assertFalse(result)
+
+    def test_quiet_query_pure_loads_and_fast_local_binds_are_normal(self):
+        context,func,snapshot = self._solve("len\nx=1\ny=int('7')\ndel x\npass")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for region in func.body:
+            result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+            self.assertTrue(result.complete,result.reasons)
+            self.assertTrue(result)
+
+    def test_quiet_query_caught_errors_and_suppression_do_not_recover_quietness(self):
+        for body in ("try:\n    1/0\nexcept ZeroDivisionError:\n    pass",
+                "try:\n    missing\nexcept NameError:\n    pass",
+                "with contextlib.suppress(ValueError):\n    raise ValueError()"):
+            with self.subTest(body=body):
+                context,func,snapshot = self._solve("import contextlib\n"+body+"\nmarker=int")
+                self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                region = func.body[1]
+                self.assertEqual(snapshot.outcomes(region,snapshot.states_at(region)[0]).alternatives[0].state.pending.kind,"normal")
+                result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+                self.assertTrue(result.complete,result.reasons)
+                self.assertFalse(result)
+                self.assertTrue(snapshot.quiet_prefix(func.body[-1],snapshot.states_at(func.body[-1])[0]))
+
+    def test_quiet_query_restored_namespace_still_records_intermediate_writes(self):
+        context,func,snapshot = self._solve("import builtins as b\nsaved=b.int\ntry:\n"
+            "    b.int=lambda:0\n    b.int=saved\nfinally:\n    pass\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        region = func.body[2]
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+        result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+        self.assertTrue(result.complete,result.reasons)
+        self.assertFalse(result)
+
+    def test_quiet_query_dynamic_mutation_and_print_are_observable(self):
+        for body,policy in (("import builtins as b\nexec('b.int=lambda:0')",()),("print('ok')",("print",))):
+            with self.subTest(body=body):
+                context,func,snapshot = self._solve(body+"\nmarker=int",diagnostic_policy=policy)
+                self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                region = func.body[-2]
+                result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+                self.assertTrue(result.complete,result.reasons)
+                self.assertFalse(result)
+
+    def test_quiet_query_prefix_boundaries_exclude_later_effects(self):
+        context,func,snapshot = self._solve("global g\nlen\ng=1\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        incoming = snapshot.states_at(func.body[0])[0]
+        for stop,want in ((0,True),(1,True),(2,True),(3,False),(4,False)):
+            result = snapshot.quiet_prefix((func,"body",stop),incoming)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(bool(result),want)
+            if stop:
+                self.assertEqual(snapshot.quiet_prefix(tuple(func.body[:stop]),incoming),result)
+        self.assertFalse(snapshot.quiet_prefix((),incoming).complete)
+
+    def test_quiet_query_nested_finally_uses_each_ancestor_index_and_ends_body_phase(self):
+        context,func,snapshot = self._solve("global g\ntry:\n    pass\nfinally:\n"
+            "    len\n    len\n    len\n    g=1\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        region = func.body[1]
+        entry = snapshot.states_at(func.body[0])[0]
+        self.assertFalse(snapshot.quiet_prefix((func,"body",2),entry))
+        body_entry = snapshot.states_at(region.body[0])[0]
+        self.assertTrue(snapshot.quiet_prefix((region,"body",1),body_entry))
+        final_entry = snapshot.states_at(region.finalbody[0])[0]
+        for stop,want in ((0,True),(1,True),(3,True),(4,False)):
+            result = snapshot.quiet_prefix((region,"finalbody",stop),final_entry)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(bool(result),want)
+
+    def test_quiet_query_completed_loop_body_is_not_poisoned_by_later_divergence(self):
+        context,func,snapshot = self._solve("for x in iter(int,1):\n    pass\nelse:\n    unreachable=True")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        loop = func.body[0]
+        incoming = snapshot.states_at(loop.body[0])[0]
+        self.assertTrue(snapshot.quiet_prefix((loop,"body",1),incoming))
+        self.assertFalse(snapshot.quiet_prefix(loop,snapshot.states_at(loop)[0]))
+        self.assertFalse(snapshot.quiet_prefix((loop,"orelse",0),incoming).complete)
+
+    def test_quiet_query_cleanup_local_region_does_not_inherit_saved_return(self):
+        context,func,snapshot = self._solve("try:\n    return 1\nfinally:\n    pass")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        region = func.body[0]
+        self.assertFalse(snapshot.quiet_prefix(region,snapshot.states_at(region)[0]))
+        self.assertFalse(snapshot.quiet_prefix(region.body[0],snapshot.states_at(region.body[0])[0]))
+        self.assertTrue(snapshot.quiet_prefix(region.body[0].value,snapshot.states_at(region.body[0].value)[0]))
+        self.assertTrue(snapshot.quiet_prefix(region.finalbody[0],snapshot.states_at(region.finalbody[0])[0]))
+
+    def test_quiet_query_error_before_later_write_does_not_invent_arrival(self):
+        context,func,snapshot = self._solve("global g\ntry:\n    missing\n    g=1\nexcept NameError:\n    pass\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        region = func.body[1]
+        incoming = snapshot.states_at(region.body[0])[0]
+        self.assertTrue(snapshot.quiet_prefix((region,"body",0),incoming))
+        self.assertFalse(snapshot.quiet_prefix((region,"body",1),incoming))
+        self.assertFalse(snapshot.quiet_prefix(region.body[1],incoming).complete)
+
+    def test_quiet_query_cell_and_nonlocal_stores_are_observable(self):
+        context,func,snapshot = self._solve("global exposed\nx=0\ndef get():\n    return x\nexposed=get\nx=1\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        result = snapshot.quiet_prefix(func.body[-2],snapshot.states_at(func.body[-2])[0])
+        self.assertTrue(result.complete,result.reasons)
+        self.assertFalse(result)
+        context = _ProofContext("def outer():\n    x=0\n    def inner():\n        nonlocal x\n        x=1\n")
+        outer = context.tree.body[0]
+        inner = outer.body[1]
+        snapshot = context.solve(inner,entry=(_ProofState().bind(context.index.node_id(outer),"x",_ProofValue.literal(0)),))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertFalse(snapshot.quiet_prefix(inner.body[1],snapshot.states_at(inner.body[1])[0]))
+
+    def test_quiet_query_exact_object_writes_are_effects_but_reads_can_be_quiet(self):
+        context,func,snapshot = self._solve("d={}\nd['x']=1\nvalue=d['x']\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for region,want in ((func.body[0],True),(func.body[1],False),(func.body[2],True)):
+            result = snapshot.quiet_prefix(region,snapshot.states_at(region)[0])
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(bool(result),want)
+
+    def test_quiet_query_distinct_observed_inputs_do_not_share_interference(self):
+        context = _ProofContext("def f(flag):\n    global g\n    if flag:\n        g=1\n    else:\n        len\n    marker=int\n")
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        snapshot = context.solve(func,entry=tuple(_ProofState().bind(owner,"flag",_ProofValue.literal(flag)) for flag in (False,True)))
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for incoming in snapshot.states_at(func.body[0]):
+            result = snapshot.quiet_prefix((func,"body",2),incoming)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(bool(result),incoming.lookup(owner,"flag")==_ProofValue.literal(False))
+
+    def test_quiet_query_is_lookup_only_and_rejects_foreign_unobserved_and_budget_entries(self):
+        context,func,snapshot = self._solve("len\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"quiet_prefix",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        incoming = snapshot.states_at(func.body[0])[0]
+        before = dict(context.total_compute)
+        self.assertTrue(snapshot.quiet_prefix((func,"body",1),incoming))
+        self.assertTrue(snapshot.quiet_prefix(func.body[0],incoming))
+        self.assertEqual(dict(context.total_compute),before)
+        for region,state in ((func,_ProofState()),(ast.Pass(),incoming),
+                ((func,"body",999),incoming),((func,"bad",0),incoming),((),incoming)):
+            result = snapshot.quiet_prefix(region,state)
+            self.assertFalse(result.complete)
+            self.assertFalse(result)
+        context,func,snapshot = self._solve("pass\npass",limits={"steps":1})
+        self.assertFalse(snapshot.complete)
+        result = snapshot.quiet_prefix(func,snapshot.states_at(func,"entry")[0])
+        self.assertFalse(result.complete)
+        self.assertTrue(result.reasons)
+
     def test_region_outcomes_include_observed_starred_expansion_and_earlier_error(self):
         for argument,error in (("t",None),("missing","NameError")):
             context,func,snapshot = self._solve("t=(1,2)\nx=ValueError(*"+argument+")\nreturn x")
@@ -29942,8 +30282,8 @@ class ProofFlowTests(unittest.TestCase):
 
     def test_incoming_collection_validation_shares_aggregate_work_budget(self):
         source = "def f(x,y):\n    pass\nfirst=(1,2)\nsecond=(3,4)\n"
-        # Validation+pass7; two origins2*7 each and results1+7 each.
-        for limit, complete in ((3, False), (50, False), (51, True), (52, True)):
+        # Prior51 + suite origin2*7 + phase entry/exit2 =67.
+        for limit, complete in ((3, False), (66, False), (67, True), (68, True)):
             with self.subTest(limit=limit):
                 context = _ProofContext(source, limits={"steps": limit})
                 func = context.tree.body[0]
@@ -29963,8 +30303,8 @@ class ProofFlowTests(unittest.TestCase):
         for copied in (False, True):
             for duplicate in (False, True):
                 with self.subTest(copied=copied, duplicate=duplicate):
-                    # Shared validation+pass4, two*(origin2*7 + result1+7).
-                    context = _ProofContext("def f(x,y):\n    pass\nshape=(1,2)\n", limits={"steps": 48})
+                    # Prior48 + suite origin2*7 + phase entry/exit2 =64.
+                    context = _ProofContext("def f(x,y):\n    pass\nshape=(1,2)\n", limits={"steps": 64})
                     func = context.tree.body[0]
                     site = context.index.node_id(context.tree.body[1].value)
                     token = ("sequence", "tuple", site, (_ProofValue.literal(1).atoms, _ProofValue.literal(2).atoms), 3, 1)
@@ -29978,8 +30318,8 @@ class ProofFlowTests(unittest.TestCase):
                     self.assertTrue(snapshot.complete, snapshot.reasons)
 
     def test_collection_entry_cache_reuses_validated_whole_state(self):
-        # Validation+pass4, two*(origin2*4 + result1+4).
-        context = _ProofContext("def f(x):\n    pass\nshape=(1,2)\n", limits={"steps": 30})
+        # Prior30 + suite origin2*4 + phase entry/exit2 =40.
+        context = _ProofContext("def f(x):\n    pass\nshape=(1,2)\n", limits={"steps": 40})
         func = context.tree.body[0]
         token = ("sequence", "tuple", context.index.node_id(context.tree.body[1].value),
                  (_ProofValue.literal(1).atoms, _ProofValue.literal(2).atoms), 3, 1)
@@ -30601,8 +30941,8 @@ class ProofStateTests(unittest.TestCase):
         self.assertEqual(state.active, (("error", "LookupError"),))
 
     def test_work_budget_boundary_never_proves_unreachable(self):
-        # One pass plus statement/scope facts:1+2*(origin2 + result2)=9.
-        for limit, want in ((8, False), (9, True), (10, True)):
+        # Prior9 + suite origin2 + phase entry/exit2 =13.
+        for limit, want in ((12, False), (13, True), (14, True)):
             with self.subTest(limit=limit):
                 context = self._context("def f():\n    pass\n", limits={"steps": limit})
                 func = context.tree.body[0]
@@ -30683,8 +31023,8 @@ class ProofStateTests(unittest.TestCase):
                          _ProofValue.literal(0))
 
     def test_exact_state_and_alternative_boundaries_include_scope_entry(self):
-        # Empty scope retains entry, relation key, and its output alternative.
-        for cap, complete in ((2, False), (3, True), (4, True)):
+        # Entry + AST origin + suite origin + scope output alternative =4.
+        for cap, complete in ((3, False), (4, True), (5, True)):
             with self.subTest(state_cap=cap):
                 snapshot = self._context("", limits={"states": cap}).solve()
                 self.assertEqual(snapshot.complete, complete)
@@ -30742,8 +31082,8 @@ class ProofStateTests(unittest.TestCase):
 
     def test_independent_query_order_and_cache_eviction_keep_results_intrinsic(self):
         source = "def f():\n    pass\ndef g():\n    pass\n"
-        left = self._context(source, limits={"steps": 9, "contexts": 0})
-        right = self._context(source, limits={"steps": 9, "contexts": 0})
+        left = self._context(source, limits={"steps": 13, "contexts": 0})
+        right = self._context(source, limits={"steps": 13, "contexts": 0})
         left_results = [left.solve(scope) for scope in left.tree.body]
         right_results = [right.solve(scope) for scope in reversed(right.tree.body)]
         for first, second in zip(left_results, reversed(right_results)):
@@ -30753,7 +31093,7 @@ class ProofStateTests(unittest.TestCase):
         evicted = left.solve(left.tree.body[0])
         self.assertEqual(evicted.stats, left_results[0].stats)
         self.assertEqual(evicted.reasons, left_results[0].reasons)
-        self.assertEqual(left.total_compute["steps"], 27)
+        self.assertEqual(left.total_compute["steps"], 39)
         self.assertEqual(len(left._cache), 1)
 
     def test_incoming_frames_names_and_binding_owners_obey_bounds(self):
